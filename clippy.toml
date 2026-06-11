@@ -1,0 +1,10 @@
+# Cell code must never block or share state through std primitives (master plan L1/L6).
+# `std::sync::Mutex` etc. are additionally grepped by scripts/check-cell-denylist.sh,
+# which scopes the ban to cell-resident crates.
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "no locks on the data plane (L1); control-thread code may use parking primitives via inf-server::control only" },
+    { path = "std::sync::RwLock", reason = "no locks on the data plane (L1)" },
+]
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "cells park via the backend driver idle strategy, never thread::sleep" },
+]

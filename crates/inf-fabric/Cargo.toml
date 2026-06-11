@@ -1,0 +1,29 @@
+[package]
+name = "inf-fabric"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+inf-foundation.workspace = true
+
+# Loom replaces the ring's atomics/cells under `RUSTFLAGS="--cfg loom"`; the
+# dependency is never compiled into normal builds.
+[target.'cfg(loom)'.dependencies]
+loom.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "ring"
+harness = false
+# Criterion provides its own main; keep `cargo test` from executing the
+# bench binary.
+test = false
+
+[lints]
+workspace = true

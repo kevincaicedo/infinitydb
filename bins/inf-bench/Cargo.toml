@@ -1,0 +1,19 @@
+[package]
+name = "inf-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "InfinityDB benchmark harness: env-check, native RESP loadgen, gate-report generator"
+
+# Tooling tier (never data plane). Deliberately NOT depending on inf-wire:
+# the client-side RESP encoder/skimmer is hand-rolled in src/resp.rs so this
+# binary builds while inf-wire is under construction, and so the measurement
+# tool shares no code with the system under test.
+[dependencies]
+inf-foundation.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

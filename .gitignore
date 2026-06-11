@@ -1,0 +1,3 @@
+target/
+*.profraw
+# benchmark artifacts ARE committed (.artifacts/) — do not ignore them

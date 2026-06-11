@@ -1,0 +1,25 @@
+# cargo-fuzz crate for inf-fabric (M0-S10 AC: decoder fuzz target wired into
+# the CI fuzz job). Standalone workspace: fuzz targets build on nightly via
+# `cargo +nightly fuzz run fabric_codec` and never enter the main workspace
+# graph.
+[package]
+name = "inf-fabric-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+inf-fabric = { path = ".." }
+
+[[bin]]
+name = "fabric_codec"
+path = "fuzz_targets/fabric_codec.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

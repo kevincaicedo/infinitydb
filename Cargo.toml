@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "bins/*", "tests/compat"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# internal crates — path-only; the dependency DAG is enforced by scripts/check-dep-dag.sh
+inf-foundation = { path = "crates/inf-foundation" }
+inf-simd = { path = "crates/inf-simd" }
+inf-alloc = { path = "crates/inf-alloc" }
+inf-fabric = { path = "crates/inf-fabric" }
+inf-runtime = { path = "crates/inf-runtime" }
+inf-wire = { path = "crates/inf-wire" }
+inf-log = { path = "crates/inf-log" }
+inf-store = { path = "crates/inf-store" }
+inf-stream = { path = "crates/inf-stream" }
+inf-doc = { path = "crates/inf-doc" }
+inf-vector = { path = "crates/inf-vector" }
+inf-compute = { path = "crates/inf-compute" }
+inf-replica = { path = "crates/inf-replica" }
+inf-server = { path = "crates/inf-server" }
+infinity-embedded = { path = "crates/infinity-embedded" }
+
+# external — data plane allows libc (kqueue/mmap FFI) and io-uring (Linux) only.
+libc = "0.2"
+io-uring = "0.7"
+
+# dev/test/tooling only — never on the data plane
+loom = "0.7"
+proptest = "1"
+# default features pull rayon + plotters; benches need neither (rayon is
+# ban-listed — nothing multithreaded belongs anywhere near the data plane).
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+toml = "1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "allow"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+
+# Benchmarks and profiling need symbols; keep debug info in release.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"

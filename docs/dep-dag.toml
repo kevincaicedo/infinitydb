@@ -1,0 +1,45 @@
+# Allowed internal dependency edges (master plan §20, milestone M0 §3.3).
+#
+# `scripts/check-dep-dag.sh` parses `cargo metadata` and fails CI on any
+# *normal* (non-dev) dependency edge between workspace crates that is not
+# listed here. Arrows point down only: inf-store knows nothing about RESP,
+# inf-wire knows nothing about storage, inf-runtime is the only crate that
+# names io_uring/kqueue symbols.
+#
+# Adding an edge here is an architecture decision — it needs an ADR.
+
+[edges]
+inf-foundation = []
+inf-simd = ["inf-foundation"]
+inf-alloc = ["inf-foundation"]
+inf-fabric = ["inf-foundation"]
+inf-runtime = ["inf-foundation", "inf-alloc"]
+inf-wire = ["inf-foundation", "inf-simd"]
+inf-log = ["inf-foundation", "inf-alloc"]
+inf-store = ["inf-foundation", "inf-alloc", "inf-simd"]
+inf-stream = ["inf-foundation", "inf-log", "inf-store"]
+inf-doc = ["inf-foundation", "inf-alloc"]
+inf-vector = ["inf-foundation", "inf-simd", "inf-alloc"]
+inf-compute = ["inf-foundation", "inf-store"]
+inf-replica = ["inf-foundation", "inf-log"]
+inf-server = [
+    "inf-foundation",
+    "inf-simd",
+    "inf-alloc",
+    "inf-fabric",
+    "inf-runtime",
+    "inf-wire",
+    "inf-log",
+    "inf-store",
+    "inf-stream",
+]
+infinity-embedded = ["inf-foundation", "inf-server"]
+
+# bins
+infinityd = ["inf-foundation", "inf-server"]
+inf = ["inf-foundation", "inf-wire"]
+inf-bench = ["inf-foundation", "inf-wire"]
+inf-sim = ["inf-foundation", "inf-fabric", "inf-runtime", "inf-wire", "inf-store", "inf-server"]
+
+# test crates
+compat = ["inf-foundation"]

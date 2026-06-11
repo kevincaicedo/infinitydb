@@ -1,0 +1,36 @@
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+    "ISC",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal workspace crates are path-only (no version), which cargo-deny
+# counts as wildcards; they are never published, so path wildcards are fine.
+allow-wildcard-paths = true
+# The data plane must stay dependency-thin: no async runtimes, no global
+# allocator surprises, no accidental tokio ecosystems (M0-S06 deny list).
+deny = [
+    { crate = "tokio" },
+    { crate = "async-std" },
+    { crate = "smol" },
+    { crate = "mio" },
+    { crate = "rayon" },
+]
+
+[advisories]
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

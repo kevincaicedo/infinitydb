@@ -1,0 +1,4 @@
+[toolchain]
+# Pinned stable (master plan: pinned MSRV, no nightly dependence).
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

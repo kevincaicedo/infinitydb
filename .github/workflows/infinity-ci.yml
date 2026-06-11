@@ -1,0 +1,111 @@
+# InfinityDB CI — M0-S02 verification-ladder scaffolding.
+#
+# NOTE (Linux validation pending): authored on the macOS dev tier; the Linux
+# jobs (io_uring suite, kernel matrix, Miri) have not been exercised against a
+# live runner yet. First Linux run must verify: io_uring feature probes on
+# 5.15 vs 6.1, Miri canary (M0-S02 AC), and the fuzz smoke job.
+name: infinity-ci
+
+on:
+  push:
+    branches: [main]
+    paths: ["infinity/**", ".github/workflows/infinity-ci.yml"]
+  pull_request:
+    paths: ["infinity/**", ".github/workflows/infinity-ci.yml"]
+
+defaults:
+  run:
+    working-directory: infinity
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: dep-DAG law
+        run: ./scripts/check-dep-dag.sh
+      - name: cell deny-list
+        run: ./scripts/check-cell-denylist.sh
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: build
+        run: cargo build --workspace
+      - name: test
+        run: cargo test --workspace
+
+  cargo-deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: infinity/Cargo.toml
+
+  miri:
+    # Scoped to the unsafe leaf crates (verification ladder §17.2).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: miri (inf-alloc, inf-fabric)
+        run: cargo +nightly miri test -p inf-alloc -p inf-fabric
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+
+  loom:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: loom model (SPSC ring)
+        run: cargo test -p inf-fabric --release loom_ -- --nocapture
+        env:
+          RUSTFLAGS: --cfg loom
+          LOOM_MAX_PREEMPTIONS: "3"
+
+  fuzz-smoke:
+    # 10-minute smoke per PR (M0-S02); 1 h corpus run is the nightly job.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: fuzz RESP parser (smoke)
+        run: cargo +nightly fuzz run resp_parse -- -max_total_time=300
+        working-directory: infinity/crates/inf-wire
+      - name: fuzz fabric codec (smoke)
+        run: cargo +nightly fuzz run fabric_codec -- -max_total_time=300
+        working-directory: infinity/crates/inf-fabric
+
+  kernel-matrix:
+    # Asserts io_uring feature-probe fallback across kernels (M0-S02).
+    # 5.15 (no multishot recv) / 6.1 / latest. Runners only provide their own
+    # kernel; older-kernel behavior is exercised via probe-forcing env vars
+    # until a self-hosted matrix box exists. PENDING LINUX VALIDATION.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: uring suite, probed features
+        run: cargo test -p inf-runtime --features uring
+      - name: uring suite, forced-degraded (oneshot recv, no provided buffers)
+        run: cargo test -p inf-runtime --features uring
+        env:
+          INF_URING_FORCE_DEGRADED: "1"

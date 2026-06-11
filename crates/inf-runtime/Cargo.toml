@@ -1,0 +1,36 @@
+[package]
+name = "inf-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Cell runtime: backend drivers (io_uring/kqueue), executor, reactor loop"
+
+[dependencies]
+inf-foundation.workspace = true
+inf-alloc.workspace = true
+libc.workspace = true
+
+# The only crate allowed to name io_uring symbols (milestone M0 §3.3).
+# Feature-gated: Linux CI runs `--features uring`; default builds stay
+# backend-free so the workspace compiles on any host.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true, optional = true }
+
+[features]
+uring = ["dep:io-uring"]
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+# Conformance tests poke sockets (setsockopt) directly.
+libc.workspace = true
+
+[[bench]]
+name = "executor"
+harness = false
+test = false
+
+[lints]
+workspace = true
