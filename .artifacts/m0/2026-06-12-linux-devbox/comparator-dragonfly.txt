@@ -1,0 +1,53 @@
+# Comparator campaign: InfinityDB vs Dragonfly v1.39.0 vs Redis 8.0.5
+# 2026-06-12 08:31:09 UTC · 7.0.0-22-generic · i7-13700KF · governor powersave (HWP) · UNPINNED · dirty tree · loadgen co-located · DEV TIER, NOT citation-grade
+# workload: inf-bench load — SET:GET 1:10, 1M keys, 16B keys/64B values, warmup 1s, interleaved reps (thermal drift hits all targets equally)
+# targets: infinityd natural (4 cells) | infinityd --route-local-only (4 cells) | dragonfly --proactor_threads=4 --dbfilename= | redis-server --save '' --appendonly no
+
+## pipelined P=16, 8s x 3 interleaved reps
+rep0 inf-natural: ops_per_sec = 4161280 p99_us = 439 p999_us = 607 
+rep0 inf-local: ops_per_sec = 10144364 p99_us = 211 p999_us = 335 
+rep0 dragonfly4: ops_per_sec = 2558352 p99_us = 639 p999_us = 943 
+rep0 redis: ops_per_sec = 1843535 p99_us = 1151 p999_us = 1279 
+rep1 inf-natural: ops_per_sec = 3992642 p99_us = 455 p999_us = 863 
+rep1 inf-local: ops_per_sec = 8613607 p99_us = 231 p999_us = 391 
+rep1 dragonfly4: ops_per_sec = 2405959 p99_us = 703 p999_us = 1375 
+rep1 redis: ops_per_sec = 1647740 p99_us = 1215 p999_us = 1279 
+rep2 inf-natural: ops_per_sec = 3964545 p99_us = 479 p999_us = 911 
+rep2 inf-local: ops_per_sec = 8459535 p99_us = 243 p999_us = 279 
+rep2 dragonfly4: ops_per_sec = 2383352 p99_us = 719 p999_us = 1439 
+rep2 redis: ops_per_sec = 1649954 p99_us = 1215 p999_us = 1279 
+
+## unpipelined 512 conns P=1, 5s x 3 interleaved reps
+rep0 inf-natural: ops_per_sec = 1147875 p999_us = 2175 
+rep0 dragonfly4: ops_per_sec = 744763 p999_us = 2687 
+rep0 redis: ops_per_sec = 381041 p999_us = 2751 
+rep1 inf-natural: ops_per_sec = 1161340 p999_us = 1695 
+rep1 dragonfly4: ops_per_sec = 766671 p999_us = 2815 
+rep1 redis: ops_per_sec = 380641 p999_us = 2687 
+rep2 inf-natural: ops_per_sec = 1160169 p999_us = 1855 
+rep2 dragonfly4: ops_per_sec = 744139 p999_us = 2751 
+rep2 redis: ops_per_sec = 382107 p999_us = 2687 
+
+## Analysis (medians)
+
+| leg | inf-natural | inf-local | dragonfly4 | redis | nat/dragonfly |
+|---|---|---|---|---|---|
+| pipelined P=16 | 3,992,642 | 8,613,607 | 2,405,959 | 1,649,954 | 1.66x |
+| unpipelined 512c | 1,160,169 | - | 744,763 | 381,041 | 1.56x |
+
+- InfinityDB natural routing (paying fabric hops on ~75% of ops) is 1.66x
+  Dragonfly at EQUAL thread count on the identical workload, with better
+  tails (p99 455 vs 703 us; p999 863 vs 1375 us, pipelined medians).
+- Comparator coordination tax: Dragonfly@4threads = 2.41M vs single-thread
+  Redis 1.65M -> 1.46x scaling over 4 threads on this shape; per-thread
+  0.60M vs our per-cell natural 1.00M. The field's production-proven
+  shared-nothing engine pays MORE per-op coordination cost on single-key
+  uniform-random pipelined traffic than InfinityDB does post-R1.
+- Our internal penalty vs all-local: 53.7% in this run (3.99M vs 8.61M).
+- Replicate spread (rel stdev): inf-natural 2.7%, dragonfly4 3.9%,
+  inf-local 10.5% (first rep cold-cache high; median used), redis 6.6%.
+- Validity: interleaved targets per rep (thermal drift fair); same loadgen,
+  ports, durations; dragonfly tuned per docs for the scenario
+  (--proactor_threads=4 to match cells, persistence off); redis untuned
+  single-thread baseline for scale reference. DEV TIER: powersave/HWP,
+  unpinned, dirty tree, co-located loadgen, kptr_restrict=1.

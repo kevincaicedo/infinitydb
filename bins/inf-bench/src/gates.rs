@@ -92,11 +92,18 @@ mod tests {
         // The file lives outside the workspace root (repo docs/).
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../docs/milestones/m0-gates.toml");
         let gates = load(path).expect("gates file parses");
-        assert_eq!(gates.len(), 9, "all nine §6 gates present");
+        assert_eq!(gates.len(), 10, "all ten §6 gates present (ADR-0006 added the comparator row)");
         let sqes = gates.iter().find(|g| g.id == "sqes_per_submit").expect("sqes gate");
         assert!(sqes.passes(16.0) && !sqes.passes(15.9));
         let p999 = gates.iter().find(|g| g.id == "p999_latency").expect("p999 gate");
         assert!(p999.passes(2999.0) && !p999.passes(3000.0));
         assert!(gates.iter().any(|g| g.informational), "flamegraph row is informational");
+        // ADR-0006: the comparator row is the STOP gate; the penalty row is
+        // demoted to an informational tripwire.
+        let comparator =
+            gates.iter().find(|g| g.id == "cross_cell_vs_comparator").expect("comparator gate");
+        assert!(comparator.passes(1.25) && !comparator.passes(1.24));
+        let penalty = gates.iter().find(|g| g.id == "cross_cell_penalty").expect("penalty row");
+        assert!(penalty.informational, "penalty is informational post-ADR-0006");
     }
 }

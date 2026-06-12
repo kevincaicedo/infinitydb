@@ -1,0 +1,41 @@
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 3 uncommitted entries
+  cpufreq-governor     FAIL  scaling_governor != performance on 24 cpus: cpu0=powersave, cpu1=powersave, cpu10=powersave, cpu11=powersave (+20 more)
+  cpufreq-epp          PASS
+  thermal-throttle     FAIL  thermal throttling occurred: cpu0/package_throttle_count=14035, cpu1/package_throttle_count=14035, cpu10/core_throttle_count=7628, cpu10/package_throttle_count=15764
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+gate-run: CONTINUING WITH FAILED ENV-CHECK — results are not citation-grade
+
+== pipelined replicates (conns=64 P=16, 10s x 3) ==
+  rep 0: 4150491 ops/s, p999 991 us, windowed sqes/submit 19.2
+  rep 1: 3896788 ops/s, p999 1119 us, windowed sqes/submit 17.2
+  rep 2: 3849401 ops/s, p999 1055 us, windowed sqes/submit 14.1
+
+== cross-cell penalty (natural vs --route-local-only) ==
+  natural 3989333 ops/s vs all-local 9101922 ops/s => penalty 56.2%
+
+== unpipelined 512-conn A/B vs redis ==
+  infinityd 1186264 ops/s vs redis 414369 ops/s => 2.86x
+
+== RSS fill: 10000000 keys x (16 B, 64 B), both engines ==
+  infinityd fill: 3996894 sets/s
+  redis fill: 1645329 sets/s
+  RSS: infinityd 1126854656 B vs redis 1854627840 B => 0.608x
+
+== gate verdicts ==
+  Pipelined GET/SET node throughput      FAIL (DEV-TIER, non-binding)
+  Unpipelined throughput vs Redis, 512 conns PASS (DEV-TIER, non-binding)
+  io_uring SQEs per submit under pipelined load PASS
+  Fabric hop RTT p50 under load          FAIL (DEV-TIER, non-binding)
+  Cross-cell architecture vs Dragonfly, uniform random PENDING (tooling)
+  Cross-cell penalty, uniform random keys (informational; M1 S17 target) FAIL (informational)
+  p99.9 latency (memtier, 8 threads)     PASS (DEV-TIER, non-binding)
+  RSS @ 10M keys x (16 B, 64 B)          PASS (DEV-TIER, non-binding)
+  Reactor loop iteration p99.9           PASS (DEV-TIER, non-binding)
+  Syscall CPU share under pipelined load PENDING (tooling)
+
+gate-run: report written to .artifacts/m0/1781253562-gate-run/report.md

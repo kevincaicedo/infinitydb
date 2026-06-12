@@ -1,26 +1,43 @@
-//! Command execution v0 (M0-S15): the ~26-command string surface, mapping
-//! parsed argv → `inf-store` ops → RESP2/RESP3 reply bytes.
+//! Command execution (M0-S15 base + M1-E1 surface): the ~55-command
+//! string/key/expiry/server surface, mapping parsed argv → `inf-store` ops →
+//! RESP2/RESP3 reply bytes.
 //!
 //! Every command enters through the `inf-wire` registry (lookup → arity →
 //! key spec); no handler bypasses the metadata path (kernel rule). Reply
 //! bytes aim to be byte-identical to Redis 7.x/8.x — the compat-diff
 //! harness (`tests/compat`) is the oracle; documented deviations:
-//! `HELLO`/`INFO`/`COMMAND` payloads (identity fields, registry size),
-//! `SET ... EXAT/PXAT` (wall-clock timebase lands with the node clock),
-//! and keys > 255 B / values > 16 MiB − 1 (record format v0 bounds).
+//! `HELLO`/`INFO`/`COMMAND`/`CLIENT LIST`/`LOLWUT`/`DEBUG OBJECT` payloads,
+//! keys > 255 B / values > 16 MiB − 1 / TTLs > ~34.8 y (record format v0
+//! bounds), `SELECT` limited to db 0 until namespaces v1 (M1-E4),
+//! `RANDOMKEY` two-level random, and `INCRBYFLOAT` f64 (Redis: long double)
+//! precision tails.
+//!
+//! Wall-clock commands (`EXPIREAT`/`EXAT`/`EXPIRETIME` …) convert through
+//! the node's injected wall anchor ([`NodeInfo::wall_anchor`]) — internal
+//! time stays the monotonic injected `Nanos` (L7); only the anchor knows the
+//! Unix epoch, so DST can fabricate any wall time deterministically.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use inf_foundation::time::Nanos;
-use inf_store::{CellStore, ExpireCond, OpError, SetCond, SetExpire, SetOptions, SetOutcome, Ttl};
+use inf_store::{
+    CellStore, CopyResult, ExpireCond, OpError, SetCond, SetExpire, SetOptions, SetOutcome, Ttl,
+    TtlUpdate,
+};
 use inf_wire::{ArgvRef, CommandId, Protocol, RespWriter, arity_ok, lookup};
 
-/// Node-level stats surfaced through `INFO` (M0-S19): the frozen tripwire
-/// snapshot plus the memory-attribution domains the store can't see. The
-/// node assembly (or sim harness) refreshes these; a default-constructed
-/// `ConnCx` carries an all-zero instance, so tests and the compat candidate
-/// need no wiring.
+use crate::admin;
+use crate::clients::ClientRegistry;
+use crate::config::ConfigStore;
+use crate::glob::glob_match;
+
+/// Node-level state surfaced through the command layer (M0-S19 + M1-S03):
+/// the frozen tripwire snapshot, the memory-attribution domains the store
+/// can't see, and the M1 cell-local registries (clients, config), the
+/// injected wall-clock anchor, and the injected RNG state. The node assembly
+/// (or sim harness) wires these; a default-constructed `ConnCx` carries an
+/// all-zero instance, so tests and the compat candidate need no wiring.
 #[derive(Default, Debug)]
 pub struct NodeInfo {
     /// Frozen order: sqes_per_submit, cqes_per_reap, cmds_per_iter,
@@ -36,6 +53,19 @@ pub struct NodeInfo {
     pub fabric_rtt_p50_ns: Cell<u64>,
     pub cell: Cell<u16>,
     pub cells: Cell<u16>,
+    /// Wall-clock anchor `(internal_ms, unix_ms)` taken at one instant by
+    /// the assembly layer (bins read the system clock ONCE at boot; the sim
+    /// injects any anchor). `(0, 0)` ⇒ wall time == internal time.
+    pub wall_anchor: Cell<(u64, u64)>,
+    /// Injected RNG state (SplitMix64 stream; RANDOMKEY) — seeded by the
+    /// assembly layer, deterministic under DST (L7).
+    pub rng_state: Cell<u64>,
+    pub tcp_port: Cell<u16>,
+    pub total_connections: Cell<u64>,
+    /// CLIENT registry for this cell's connections (single-threaded).
+    pub clients: RefCell<ClientRegistry>,
+    /// Typed CONFIG store (M1-S03 freeze: keys + hot-reload classes).
+    pub config: RefCell<ConfigStore>,
 }
 
 /// Per-connection execution state (protocol negotiated via `HELLO`).
@@ -104,10 +134,7 @@ pub fn execute(
         return unknown_command(argv, &mut w);
     };
     if !arity_ok(meta, argv.len()) {
-        return w.error(&format!(
-            "ERR wrong number of arguments for '{}' command",
-            meta.name.to_ascii_lowercase()
-        ));
+        return arity_error(meta.name, &mut w);
     }
     match meta.id {
         CommandId::Ping => {
@@ -120,12 +147,12 @@ pub fn execute(
             }
         }
         CommandId::Echo => w.bulk(argv.arg(1)),
-        CommandId::Hello => hello(argv, cx, out),
+        CommandId::Hello => admin::hello(argv, cx, now, out),
         CommandId::Get => match store.get(argv.arg(1), now) {
             Some(value) => w.bulk(value),
             None => w.null(),
         },
-        CommandId::Set => set(argv, store, now, &mut w),
+        CommandId::Set => set(argv, store, &cx.node, now, &mut w),
         CommandId::Setnx => {
             let opts = SetOptions { cond: SetCond::IfAbsent, ..Default::default() };
             match store.set(argv.arg(1), argv.arg(2), opts, now) {
@@ -165,14 +192,15 @@ pub fn execute(
             Some(value) => w.bulk(&value),
             None => w.null(),
         },
-        CommandId::Del => {
+        CommandId::Getex => getex(argv, store, &cx.node, now, &mut w),
+        CommandId::Del | CommandId::Unlink => {
             let mut removed = 0;
             for i in 1..argv.len() {
                 removed += i64::from(store.del(argv.arg(i), now));
             }
             w.int(removed);
         }
-        CommandId::Exists => {
+        CommandId::Exists | CommandId::Touch => {
             let mut found = 0;
             for i in 1..argv.len() {
                 found += i64::from(store.exists(argv.arg(i), now));
@@ -200,14 +228,108 @@ pub fn execute(
             };
             incr(store, argv.arg(1), delta, now, &mut w);
         }
+        CommandId::IncrByFloat => {
+            let Some(delta) = parse_f64(argv.arg(2)) else {
+                return w.error("ERR value is not a valid float");
+            };
+            match store.incr_by_float(argv.arg(1), delta, now) {
+                Ok(text) => w.bulk(&text),
+                Err(e) => op_error(e, &mut w),
+            }
+        }
         CommandId::Append => match store.append(argv.arg(1), argv.arg(2), now) {
             Ok(len) => w.int(len as i64),
             Err(e) => op_error(e, &mut w),
         },
         CommandId::Strlen => w.int(store.strlen(argv.arg(1), now) as i64),
+        // ---- M1-S01 · string family ----
+        CommandId::Mget => {
+            let keys: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
+            w.array_header(keys.len());
+            store.get_many(&keys, now, |_, value| match value {
+                Some(v) => w.bulk(v),
+                None => w.null(),
+            });
+        }
+        CommandId::Mset => mset(argv, store, now, &mut w),
+        CommandId::Msetnx => msetnx(argv, store, now, &mut w),
+        CommandId::Getrange | CommandId::Substr => {
+            let (Ok(start), Ok(end)) = (parse_i64(argv.arg(2)), parse_i64(argv.arg(3))) else {
+                return w.error("ERR value is not an integer or out of range");
+            };
+            let slice = store.get_range(argv.arg(1), start, end, now);
+            w.bulk(slice);
+        }
+        CommandId::Setrange => {
+            let Ok(offset) = parse_i64(argv.arg(2)) else {
+                return w.error("ERR value is not an integer or out of range");
+            };
+            if offset < 0 {
+                return w.error("ERR offset is out of range");
+            }
+            match store.set_range(argv.arg(1), offset as usize, argv.arg(3), now) {
+                Ok(len) => w.int(len as i64),
+                Err(e) => op_error(e, &mut w),
+            }
+        }
+        // ---- M1-S02 · key management ----
+        CommandId::Rename => match store.rename(argv.arg(1), argv.arg(2), now) {
+            Ok(true) => w.simple("OK"),
+            Ok(false) => w.error("ERR no such key"),
+            Err(e) => op_error(e, &mut w),
+        },
+        CommandId::Renamenx => {
+            if !store.exists(argv.arg(1), now) {
+                return w.error("ERR no such key");
+            }
+            if store.exists(argv.arg(2), now) && argv.arg(1) != argv.arg(2) {
+                return w.int(0);
+            }
+            match store.rename(argv.arg(1), argv.arg(2), now) {
+                Ok(true) => w.int(1),
+                Ok(false) => w.error("ERR no such key"),
+                Err(e) => op_error(e, &mut w),
+            }
+        }
+        CommandId::Copy => copy(argv, store, now, &mut w),
+        CommandId::Dbsize => w.int(store.len() as i64),
+        CommandId::Keys => keys(argv.arg(1), store, now, cx.proto, out),
+        CommandId::Randomkey => {
+            let roll = next_rand(&cx.node);
+            match store.random_key(roll, now) {
+                Some(key) => w.bulk(&key),
+                None => w.null(),
+            }
+        }
+        CommandId::Scan => scan(argv, store, now, cx.proto, out),
+        CommandId::Flushdb | CommandId::Flushall => {
+            for i in 1..argv.len() {
+                let opt = argv.arg(i);
+                if !opt.eq_ignore_ascii_case(b"ASYNC") && !opt.eq_ignore_ascii_case(b"SYNC") {
+                    return w.error("ERR syntax error");
+                }
+            }
+            store.flush(now);
+            w.simple("OK");
+        }
+        CommandId::Object => object(argv, store, &cx.node, now, &mut w),
+        CommandId::Debug => admin::debug(argv, store, now, &mut w),
+        // ---- M1-S03 · expiry completion + introspection ----
         CommandId::Expire | CommandId::Pexpire => {
             let unit_ms = if meta.id == CommandId::Expire { 1000 } else { 1 };
-            expire(argv, store, now, unit_ms, meta.name, &mut w);
+            expire(argv, store, now, Deadline::Relative { unit_ms }, meta.name, &cx.node, &mut w);
+        }
+        CommandId::Expireat | CommandId::Pexpireat => {
+            let unit_ms = if meta.id == CommandId::Expireat { 1000 } else { 1 };
+            expire(
+                argv,
+                store,
+                now,
+                Deadline::AbsoluteUnix { unit_ms },
+                meta.name,
+                &cx.node,
+                &mut w,
+            );
         }
         CommandId::Ttl | CommandId::Pttl => {
             let value = match store.ttl(argv.arg(1), now) {
@@ -224,12 +346,31 @@ pub fn execute(
             };
             w.int(value);
         }
+        CommandId::Expiretime | CommandId::Pexpiretime => {
+            let value = match store.expire_at(argv.arg(1), now) {
+                Ttl::Missing => -2,
+                Ttl::NoExpiry => -1,
+                Ttl::Ms(at_internal_ms) => {
+                    let unix_ms = unix_from_internal_ms(&cx.node, at_internal_ms);
+                    if meta.id == CommandId::Expiretime { unix_ms / 1000 } else { unix_ms }
+                }
+            };
+            w.int(value);
+        }
         CommandId::Persist => {
             let removed = store.expire(argv.arg(1), None, ExpireCond::Always, now);
             w.int(i64::from(removed));
         }
-        CommandId::Info => info(store, &cx.node, &mut w),
-        CommandId::Command => command_introspection(argv, &mut w),
+        CommandId::Select => select(argv, &mut w),
+        CommandId::Info => admin::info(argv, store, &cx.node, now, &mut w),
+        CommandId::Command => admin::command_introspection(argv, &mut w),
+        CommandId::Config => admin::config(argv, store, &cx.node, &mut w),
+        CommandId::Client => admin::client(argv, cx, now, out),
+        CommandId::Lolwut => w.bulk(b"InfinityDB ver. 0.1.0-alpha.0\n"),
+        // ---- internal fabric-program ops ----
+        CommandId::InfTake | CommandId::InfPeek => {
+            inf_take_peek(argv, store, meta.id == CommandId::InfTake, now, &mut w);
+        }
     }
 }
 
@@ -249,9 +390,49 @@ pub fn execute_slices(
     execute(argv, store, cx, now, out);
 }
 
+// ---- wall clock (M1-S03) -----------------------------------------------------
+
+/// Current wall-clock milliseconds (Unix epoch) through the injected anchor.
+pub(crate) fn wall_ms(node: &NodeInfo, now: Nanos) -> u64 {
+    let (internal_anchor, unix_anchor) = node.wall_anchor.get();
+    now.as_millis().saturating_sub(internal_anchor).saturating_add(unix_anchor)
+}
+
+/// Internal (injected-clock) milliseconds for a Unix-epoch deadline. Past
+/// deadlines clamp to 0 (already expired); `None` = arithmetic overflow.
+fn internal_from_unix_ms(node: &NodeInfo, unix_ms: i64) -> Option<u64> {
+    let (internal_anchor, unix_anchor) = node.wall_anchor.get();
+    let delta = unix_ms.checked_sub(i64::try_from(unix_anchor).ok()?)?;
+    let internal = i64::try_from(internal_anchor).ok()?.checked_add(delta)?;
+    Some(internal.max(0) as u64)
+}
+
+/// Unix-epoch milliseconds for an internal deadline (EXPIRETIME family).
+fn unix_from_internal_ms(node: &NodeInfo, internal_ms: u64) -> i64 {
+    let (internal_anchor, unix_anchor) = node.wall_anchor.get();
+    internal_ms as i64 - internal_anchor as i64 + unix_anchor as i64
+}
+
+/// SplitMix64 step over the node's injected RNG state (L7: the seed is
+/// injected; the stream is deterministic).
+pub(crate) fn next_rand(node: &NodeInfo) -> u64 {
+    let s = node.rng_state.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+    node.rng_state.set(s);
+    let mut z = s;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 // ---- SET ---------------------------------------------------------------------
 
-fn set(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mut RespWriter<'_>) {
+fn set(
+    argv: &(impl Argv + ?Sized),
+    store: &mut CellStore,
+    node: &NodeInfo,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) {
     let mut opts = SetOptions::default();
     let mut have_cond = false;
     let mut have_expire = false;
@@ -276,22 +457,41 @@ fn set(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mut R
             }
             have_expire = true;
             opts.expire = SetExpire::Keep;
-        } else if opt.eq_ignore_ascii_case(b"EX") || opt.eq_ignore_ascii_case(b"PX") {
+        } else if opt.eq_ignore_ascii_case(b"EX")
+            || opt.eq_ignore_ascii_case(b"PX")
+            || opt.eq_ignore_ascii_case(b"EXAT")
+            || opt.eq_ignore_ascii_case(b"PXAT")
+        {
             if have_expire || i + 1 >= argv.len() {
                 return w.error("ERR syntax error");
             }
             have_expire = true;
-            let Ok(ttl) = parse_i64(argv.arg(i + 1)) else {
+            let Ok(value) = parse_i64(argv.arg(i + 1)) else {
                 return w.error("ERR value is not an integer or out of range");
             };
-            let unit_ms = if opt.eq_ignore_ascii_case(b"EX") { 1000 } else { 1 };
-            let Some(at) = expire_deadline(now, ttl, unit_ms) else {
+            let unit_ms: i64 =
+                if opt.eq_ignore_ascii_case(b"EX") || opt.eq_ignore_ascii_case(b"EXAT") {
+                    1000
+                } else {
+                    1
+                };
+            let absolute = opt.eq_ignore_ascii_case(b"EXAT") || opt.eq_ignore_ascii_case(b"PXAT");
+            let at = if absolute {
+                // Past EXAT/PXAT is legal: SET applies, the key is born
+                // expired (Redis semantics).
+                value
+                    .checked_mul(unit_ms)
+                    .and_then(|unix| internal_from_unix_ms(node, unix))
+                    .and_then(ms_to_nanos)
+            } else {
+                expire_deadline(now, value, unit_ms)
+            };
+            let Some(at) = at else {
                 return w.error("ERR invalid expire time in 'set' command");
             };
             opts.expire = SetExpire::At(at);
             i += 1;
         } else {
-            // Includes EXAT/PXAT — recorded deviation (wall-clock timebase).
             return w.error("ERR syntax error");
         }
         i += 1;
@@ -317,17 +517,329 @@ fn set(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mut R
     }
 }
 
-// ---- EXPIRE / PEXPIRE ----------------------------------------------------------
+// ---- GETEX -------------------------------------------------------------------
+
+fn getex(
+    argv: &(impl Argv + ?Sized),
+    store: &mut CellStore,
+    node: &NodeInfo,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) {
+    let mut update = TtlUpdate::Keep;
+    let mut have = false;
+    let mut i = 2;
+    while i < argv.len() {
+        let opt = argv.arg(i);
+        if have {
+            return w.error("ERR syntax error");
+        }
+        if opt.eq_ignore_ascii_case(b"PERSIST") {
+            have = true;
+            update = TtlUpdate::Persist;
+        } else if opt.eq_ignore_ascii_case(b"EX")
+            || opt.eq_ignore_ascii_case(b"PX")
+            || opt.eq_ignore_ascii_case(b"EXAT")
+            || opt.eq_ignore_ascii_case(b"PXAT")
+        {
+            if i + 1 >= argv.len() {
+                return w.error("ERR syntax error");
+            }
+            have = true;
+            let Ok(value) = parse_i64(argv.arg(i + 1)) else {
+                return w.error("ERR value is not an integer or out of range");
+            };
+            let unit_ms: i64 =
+                if opt.eq_ignore_ascii_case(b"EX") || opt.eq_ignore_ascii_case(b"EXAT") {
+                    1000
+                } else {
+                    1
+                };
+            let absolute = opt.eq_ignore_ascii_case(b"EXAT") || opt.eq_ignore_ascii_case(b"PXAT");
+            let at = if absolute {
+                value
+                    .checked_mul(unit_ms)
+                    .and_then(|unix| internal_from_unix_ms(node, unix))
+                    .and_then(ms_to_nanos)
+            } else {
+                expire_deadline(now, value, unit_ms)
+            };
+            let Some(at) = at else {
+                return w.error("ERR invalid expire time in 'getex' command");
+            };
+            update = TtlUpdate::At(at);
+            i += 1;
+        } else {
+            return w.error("ERR syntax error");
+        }
+        i += 1;
+    }
+    match store.get_ex(argv.arg(1), update, now) {
+        Some(value) => w.bulk(&value),
+        None => w.null(),
+    }
+}
+
+// ---- MSET / MSETNX -----------------------------------------------------------
+
+fn mset(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mut RespWriter<'_>) {
+    if argv.len().is_multiple_of(2) {
+        return arity_error("MSET", w);
+    }
+    let mut i = 1;
+    while i < argv.len() {
+        // Single-cell MSET is atomic by single-threadedness; an OOM mid-way
+        // surfaces as the error (partial application — Redis can't hit this
+        // shape; recorded with the OOM backpressure semantics).
+        if let Err(e) = store.set(argv.arg(i), argv.arg(i + 1), SetOptions::default(), now) {
+            return op_error(e, w);
+        }
+        i += 2;
+    }
+    w.simple("OK");
+}
+
+fn msetnx(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mut RespWriter<'_>) {
+    if argv.len().is_multiple_of(2) {
+        return arity_error("MSETNX", w);
+    }
+    let mut i = 1;
+    while i < argv.len() {
+        if store.exists(argv.arg(i), now) {
+            return w.int(0);
+        }
+        i += 2;
+    }
+    let mut i = 1;
+    while i < argv.len() {
+        if let Err(e) = store.set(argv.arg(i), argv.arg(i + 1), SetOptions::default(), now) {
+            return op_error(e, w);
+        }
+        i += 2;
+    }
+    w.int(1);
+}
+
+// ---- COPY ----------------------------------------------------------------------
+
+fn copy(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mut RespWriter<'_>) {
+    let mut replace = false;
+    let mut i = 3;
+    while i < argv.len() {
+        let opt = argv.arg(i);
+        if opt.eq_ignore_ascii_case(b"REPLACE") {
+            replace = true;
+        } else if opt.eq_ignore_ascii_case(b"DB") {
+            if i + 1 >= argv.len() {
+                return w.error("ERR syntax error");
+            }
+            match parse_i64(argv.arg(i + 1)) {
+                Ok(0) => {}
+                Ok(1..=15) => {
+                    // Honesty over silence (L8): cross-db COPY arrives with
+                    // namespaces v1 (M1-E4).
+                    return w.error("ERR COPY to DB != 0 is not yet supported (InfinityDB M1-E4)");
+                }
+                Ok(_) => return w.error("ERR DB index is out of range"),
+                Err(()) => return w.error("ERR value is not an integer or out of range"),
+            }
+            i += 1;
+        } else {
+            return w.error("ERR syntax error");
+        }
+        i += 1;
+    }
+    if argv.arg(1) == argv.arg(2) {
+        return w.error("ERR source and destination objects are the same");
+    }
+    match store.copy(argv.arg(1), argv.arg(2), replace, now) {
+        Ok(CopyResult::Copied) => w.int(1),
+        Ok(CopyResult::SourceMissing | CopyResult::DestinationExists) => w.int(0),
+        Err(e) => op_error(e, w),
+    }
+}
+
+// ---- KEYS / SCAN ---------------------------------------------------------------
+
+fn keys(pattern: &[u8], store: &mut CellStore, now: Nanos, proto: Protocol, out: &mut Vec<u8>) {
+    // Bounded per-cell slice semantics arrive with the plane's scatter
+    // (M1-S02); locally this is one full home-group sweep.
+    let mut hits: Vec<Vec<u8>> = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        cursor = store.scan(cursor, usize::MAX, now, |key| {
+            if glob_match(pattern, key, false) {
+                hits.push(key.to_vec());
+            }
+        });
+        if cursor == 0 {
+            break;
+        }
+    }
+    let mut w = RespWriter::new(out, proto);
+    w.array_header(hits.len());
+    for key in &hits {
+        w.bulk(key);
+    }
+}
+
+fn scan(
+    argv: &(impl Argv + ?Sized),
+    store: &mut CellStore,
+    now: Nanos,
+    proto: Protocol,
+    out: &mut Vec<u8>,
+) {
+    let mut w = RespWriter::new(out, proto);
+    let Some(cursor) = parse_cursor(argv.arg(1)) else {
+        return w.error("ERR invalid cursor");
+    };
+    let mut pattern: Option<&[u8]> = None;
+    let mut count: usize = 10;
+    let mut type_filter: Option<&[u8]> = None;
+    let mut i = 2;
+    while i < argv.len() {
+        let opt = argv.arg(i);
+        if opt.eq_ignore_ascii_case(b"MATCH") && i + 1 < argv.len() {
+            pattern = Some(argv.arg(i + 1));
+            i += 2;
+        } else if opt.eq_ignore_ascii_case(b"COUNT") && i + 1 < argv.len() {
+            match parse_i64(argv.arg(i + 1)) {
+                Ok(n) if n >= 1 => count = n as usize,
+                Ok(_) => return w.error("ERR syntax error"),
+                Err(()) => return w.error("ERR value is not an integer or out of range"),
+            }
+            i += 2;
+        } else if opt.eq_ignore_ascii_case(b"TYPE") && i + 1 < argv.len() {
+            type_filter = Some(argv.arg(i + 1));
+            i += 2;
+        } else {
+            return w.error("ERR syntax error");
+        }
+    }
+    // Only strings exist until M3: a non-string TYPE filter yields nothing
+    // (cursor still advances — Redis shape).
+    let type_excludes = type_filter.is_some_and(|t| !t.eq_ignore_ascii_case(b"string"));
+    let mut hits: Vec<Vec<u8>> = Vec::new();
+    let next = store.scan(cursor, count, now, |key| {
+        if type_excludes {
+            return;
+        }
+        if pattern.is_none_or(|p| glob_match(p, key, false)) {
+            hits.push(key.to_vec());
+        }
+    });
+    w.array_header(2);
+    let mut cursor_text = [0u8; 20];
+    w.bulk(fmt_u64(&mut cursor_text, next));
+    w.array_header(hits.len());
+    for key in &hits {
+        w.bulk(key);
+    }
+}
+
+/// SCAN cursors are decimal u64 (Redis `strtoull` shape).
+pub(crate) fn parse_cursor(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() || bytes.len() > 20 || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    core::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+// ---- OBJECT --------------------------------------------------------------------
+
+fn object(
+    argv: &(impl Argv + ?Sized),
+    store: &mut CellStore,
+    node: &NodeInfo,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) {
+    let sub = argv.arg(1);
+    if sub.eq_ignore_ascii_case(b"HELP") {
+        w.array_header(2);
+        w.bulk(b"OBJECT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:");
+        w.bulk(b"ENCODING <key> | REFCOUNT <key> | IDLETIME <key> | FREQ <key>");
+        return;
+    }
+    let known = [&b"ENCODING"[..], b"REFCOUNT", b"IDLETIME", b"FREQ"]
+        .iter()
+        .any(|s| sub.eq_ignore_ascii_case(s));
+    if !known || argv.len() != 3 {
+        return object_subcommand_error(sub, w);
+    }
+    let key = argv.arg(2);
+    // Missing key is a null reply, not an error (Redis 8, oracle-pinned).
+    let Some((encoding, int_value)) = store.object_encoding(key, now) else {
+        return w.null();
+    };
+    if sub.eq_ignore_ascii_case(b"ENCODING") {
+        w.bulk(encoding.name().as_bytes());
+    } else if sub.eq_ignore_ascii_case(b"REFCOUNT") {
+        // Redis shared integers (0..10000) report INT_MAX.
+        let shared = matches!(int_value, Some(v) if (0..10_000).contains(&v));
+        w.int(if shared { 2_147_483_647 } else { 1 });
+    } else if sub.eq_ignore_ascii_case(b"IDLETIME") {
+        // No LRU clock yet (eviction engine is M1-E3) — honest zero,
+        // recorded deviation.
+        w.int(0);
+    } else {
+        // FREQ requires an LFU policy, exactly like Redis.
+        let lfu = node.config.borrow().get("maxmemory-policy").is_some_and(|p| p.contains("lfu"));
+        if lfu {
+            w.int(0);
+        } else {
+            w.error(
+                "ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.",
+            );
+        }
+    }
+}
+
+// Redis 8 unknown-subcommand format (oracle-pinned).
+fn object_subcommand_error(sub: &[u8], w: &mut RespWriter<'_>) {
+    w.error(&format!(
+        "ERR unknown subcommand '{}'. Try OBJECT HELP.",
+        String::from_utf8_lossy(sub)
+    ));
+}
+
+// ---- SELECT --------------------------------------------------------------------
+
+fn select(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
+    match parse_i64(argv.arg(1)) {
+        Ok(0) => w.simple("OK"),
+        Ok(1..=15) => {
+            // Honesty over silence (L8): dbs 1-15 map to namespaces v1
+            // (M1-E4); pretending they are empty would corrupt clients.
+            w.error("ERR SELECT is limited to DB 0 until namespaces v1 (InfinityDB M1-E4)");
+        }
+        Ok(_) => w.error("ERR DB index is out of range"),
+        Err(()) => w.error("ERR value is not an integer or out of range"),
+    }
+}
+
+// ---- EXPIRE family -------------------------------------------------------------
+
+/// How the third argument converts to an absolute internal deadline.
+#[derive(Copy, Clone)]
+enum Deadline {
+    /// EXPIRE/PEXPIRE: `now + value × unit`.
+    Relative { unit_ms: i64 },
+    /// EXPIREAT/PEXPIREAT: Unix `value × unit` through the wall anchor.
+    AbsoluteUnix { unit_ms: i64 },
+}
 
 fn expire(
     argv: &(impl Argv + ?Sized),
     store: &mut CellStore,
     now: Nanos,
-    unit_ms: i64,
+    deadline: Deadline,
     name: &str,
+    node: &NodeInfo,
     w: &mut RespWriter<'_>,
 ) {
-    let Ok(ttl) = parse_i64(argv.arg(2)) else {
+    let Ok(value) = parse_i64(argv.arg(2)) else {
         return w.error("ERR value is not an integer or out of range");
     };
     let (mut nx, mut xx, mut gt, mut lt) = (false, false, false, false);
@@ -364,7 +876,14 @@ fn expire(
         ExpireCond::Always
     };
     // Deadline overflow is "invalid expire time".
-    let Some(at) = expire_deadline_signed(now, ttl, unit_ms) else {
+    let at = match deadline {
+        Deadline::Relative { unit_ms } => expire_deadline_signed(now, value, unit_ms),
+        Deadline::AbsoluteUnix { unit_ms } => value
+            .checked_mul(unit_ms)
+            .and_then(|unix| internal_from_unix_ms(node, unix))
+            .and_then(ms_to_nanos),
+    };
+    let Some(at) = at else {
         return w
             .error(&format!("ERR invalid expire time in '{}' command", name.to_ascii_lowercase()));
     };
@@ -381,125 +900,38 @@ fn incr(store: &mut CellStore, key: &[u8], delta: i64, now: Nanos, w: &mut RespW
     }
 }
 
-// ---- HELLO / INFO / COMMAND -------------------------------------------------------
+// ---- INF.TAKE / INF.PEEK (fabric-program primitives) ------------------------------
 
-fn hello(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, out: &mut Vec<u8>) {
-    let mut requested = cx.proto;
-    if argv.len() >= 2 {
-        match parse_i64(argv.arg(1)) {
-            Ok(2) => requested = Protocol::Resp2,
-            Ok(3) => requested = Protocol::Resp3,
-            _ => {
-                let mut w = RespWriter::new(out, cx.proto);
-                w.error("NOPROTO unsupported protocol version");
-                return;
-            }
+/// `INF.TAKE key` → `[value, pttl_ms]` removing the key; `INF.PEEK` reads
+/// without removal. `pttl_ms = -1` ⇒ no TTL. Missing key ⇒ null array.
+/// Atomic at the owning cell by single-threadedness — the cross-cell
+/// RENAME/COPY program rides these (M1-S02).
+fn inf_take_peek(
+    argv: &(impl Argv + ?Sized),
+    store: &mut CellStore,
+    take: bool,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) {
+    let key = argv.arg(1);
+    let pttl: i64 = match store.ttl(key, now) {
+        Ttl::Missing => return w.null_array(),
+        Ttl::NoExpiry => -1,
+        Ttl::Ms(ms) => ms as i64,
+    };
+    w.array_header(2);
+    if take {
+        match store.getdel(key, now) {
+            Some(value) => w.bulk(&value),
+            None => w.null(), // unreachable: resolved above at the same `now`
+        }
+    } else {
+        match store.get(key, now) {
+            Some(value) => w.bulk(value),
+            None => w.null(),
         }
     }
-    if argv.len() > 2 {
-        let mut w = RespWriter::new(out, cx.proto);
-        w.error("ERR syntax error in HELLO");
-        return;
-    }
-    cx.proto = requested;
-    let mut w = RespWriter::new(out, cx.proto);
-    w.map_header(7);
-    w.bulk(b"server");
-    w.bulk(b"infinitydb");
-    w.bulk(b"version");
-    w.bulk(b"0.0.0-m0");
-    w.bulk(b"proto");
-    w.int(if cx.proto == Protocol::Resp3 { 3 } else { 2 });
-    w.bulk(b"id");
-    w.int(cx.id as i64);
-    w.bulk(b"mode");
-    w.bulk(b"standalone");
-    w.bulk(b"role");
-    w.bulk(b"master");
-    w.bulk(b"modules");
-    w.array_header(0);
-}
-
-fn info(store: &CellStore, node: &NodeInfo, w: &mut RespWriter<'_>) {
-    use inf_foundation::tripwire as tw;
-    let report = store.report();
-    let [sqes, cqes, cmds, fabric, p999] = node.tripwires.get();
-    let mut text = String::new();
-    text.push_str("# Server\r\n");
-    text.push_str("infinitydb_version:0.0.0-m0\r\n");
-    text.push_str("redis_version:7.4.0-compat\r\n");
-    text.push_str("redis_mode:standalone\r\n");
-    text.push_str("arch_bits:64\r\n");
-    text.push_str(&format!("cell:{}\r\ncells:{}\r\n", node.cell.get(), node.cells.get()));
-    text.push_str(&format!("connections:{}\r\n", node.connections.get()));
-    text.push_str("\r\n# Tripwires\r\n");
-    text.push_str(&format!("{}:{}\r\n", tw::SQES_PER_SUBMIT, sqes));
-    text.push_str(&format!("{}:{}\r\n", tw::CQES_PER_REAP, cqes));
-    text.push_str(&format!("{}:{}\r\n", tw::CMDS_PER_ITER, cmds));
-    text.push_str(&format!("{}:{}\r\n", tw::FABRIC_MSGS_PER_BATCH, fabric));
-    text.push_str(&format!("{}:{}\r\n", tw::LOOP_ITER_P999_US, p999));
-    text.push_str(&format!("fabric_rtt_p50_ns:{}\r\n", node.fabric_rtt_p50_ns.get()));
-    text.push_str(&format!("recv_dropped:{}\r\n", node.recv_dropped.get()));
-    let [submits, raw_sqes, raw_cqes, iters, commands, fabric_msgs] = node.raw_counters.get();
-    text.push_str(&format!("raw_submits:{submits}\r\n"));
-    text.push_str(&format!("raw_sqes:{raw_sqes}\r\n"));
-    text.push_str(&format!("raw_cqes:{raw_cqes}\r\n"));
-    text.push_str(&format!("raw_iterations:{iters}\r\n"));
-    text.push_str(&format!("raw_commands:{commands}\r\n"));
-    text.push_str(&format!("raw_fabric_msgs:{fabric_msgs}\r\n"));
-    text.push_str("\r\n# Memory\r\n");
-    text.push_str(&format!("{}:{}\r\n", tw::RECORDS_LIVE_BYTES, report.records_live_bytes));
-    text.push_str(&format!("{}:{}\r\n", tw::RECORDS_SLACK_BYTES, report.records_slack_bytes));
-    text.push_str(&format!("records_resident_bytes:{}\r\n", report.records_resident_bytes));
-    text.push_str(&format!("{}:{}\r\n", tw::INDEX_BYTES, report.index_bytes));
-    text.push_str(&format!("{}:{}\r\n", tw::WIRE_BUFFERS_BYTES, node.wire_buffers_bytes.get()));
-    text.push_str(&format!("{}:{}\r\n", tw::CONN_STATE_BYTES, node.conn_state_bytes.get()));
-    text.push_str(&format!("{}:{}\r\n", tw::PROCESS_RSS, process_rss_bytes()));
-    text.push_str("\r\n# Keyspace\r\n");
-    if !store.is_empty() {
-        text.push_str(&format!("db0:keys={},expires=0,avg_ttl=0\r\n", store.len()));
-    }
-    w.verbatim(b"txt", text.as_bytes());
-}
-
-/// VmRSS from procfs (Linux); 0 where unavailable. INFO is a cold admin
-/// path — reading procfs here is fine.
-fn process_rss_bytes() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("VmRSS:"))
-                .and_then(|l| l.split_whitespace().nth(1).and_then(|kb| kb.parse::<u64>().ok()))
-        })
-        .map_or(0, |kb| kb * 1024)
-}
-
-fn command_introspection(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
-    if argv.len() >= 2 && argv.arg(1).eq_ignore_ascii_case(b"COUNT") {
-        w.int(inf_wire::COMMANDS.len() as i64);
-        return;
-    }
-    if argv.len() > 1 {
-        return w.error(&format!(
-            "ERR Unknown subcommand or wrong number of arguments for '{}'. Try COMMAND HELP.",
-            String::from_utf8_lossy(argv.arg(1))
-        ));
-    }
-    w.array_header(inf_wire::COMMANDS.len());
-    for meta in &inf_wire::COMMANDS {
-        w.array_header(10);
-        w.bulk(meta.name.to_ascii_lowercase().as_bytes());
-        w.int(i64::from(meta.arity));
-        w.array_header(0); // flags (minimal at M0)
-        w.int(i64::from(meta.keys.first));
-        w.int(i64::from(meta.keys.last));
-        w.int(i64::from(meta.keys.step));
-        w.array_header(0); // acl categories
-        w.array_header(0); // tips
-        w.array_header(0); // key specs
-        w.array_header(0); // subcommands
-    }
+    w.int(pttl);
 }
 
 // ---- shared helpers ---------------------------------------------------------------
@@ -517,16 +949,22 @@ fn unknown_command(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
     w.error(&text);
 }
 
+pub(crate) fn arity_error(name: &str, w: &mut RespWriter<'_>) {
+    w.error(&format!("ERR wrong number of arguments for '{}' command", name.to_ascii_lowercase()));
+}
+
 fn op_error(e: OpError, w: &mut RespWriter<'_>) {
     match e {
         OpError::NotInt => w.error("ERR value is not an integer or out of range"),
         OpError::Overflow => w.error("ERR increment or decrement would overflow"),
+        OpError::NotFloat => w.error("ERR value is not a valid float"),
+        OpError::NanOrInf => w.error("ERR increment would produce NaN or Infinity"),
         OpError::OutOfMemory => w.error("OOM command not allowed when used memory > 'maxmemory'."),
         OpError::TooLarge => w.error("ERR key or value exceeds InfinityDB M0 record bounds"),
     }
 }
 
-/// Positive-TTL deadline for SET EX/PX and SETEX (must be > 0).
+/// Positive-TTL deadline for SET EX/PX, SETEX, and GETEX EX/PX (must be > 0).
 fn expire_deadline(now: Nanos, ttl: i64, unit_ms: i64) -> Option<Nanos> {
     if ttl <= 0 {
         return None;
@@ -543,9 +981,13 @@ fn expire_deadline_signed(now: Nanos, ttl: i64, unit_ms: i64) -> Option<Nanos> {
     Some(Nanos(at.checked_mul(1_000_000)?))
 }
 
+fn ms_to_nanos(ms: u64) -> Option<Nanos> {
+    Some(Nanos(ms.checked_mul(1_000_000)?))
+}
+
 /// Redis `string2ll`: optional sign, no leading zeros (and no `-0` —
 /// oracle-pinned against Redis 8.0.5), no '+', i64 range.
-fn parse_i64(bytes: &[u8]) -> Result<i64, ()> {
+pub(crate) fn parse_i64(bytes: &[u8]) -> Result<i64, ()> {
     if bytes.is_empty() || bytes.len() > 21 {
         return Err(());
     }
@@ -572,13 +1014,56 @@ fn parse_i64(bytes: &[u8]) -> Result<i64, ()> {
     Ok(acc)
 }
 
+/// Redis `strtold`-shape float argument parse (INCRBYFLOAT delta): strict
+/// full-string, no whitespace, NaN rejected.
+fn parse_f64(bytes: &[u8]) -> Option<f64> {
+    let s = core::str::from_utf8(bytes).ok()?;
+    if s.is_empty() || s.starts_with(char::is_whitespace) || s.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let v: f64 = s.parse().ok()?;
+    if v.is_nan() { None } else { Some(v) }
+}
+
+/// u64 → ASCII into a caller stack buffer (cursor formatting).
+pub(crate) fn fmt_u64(buf: &mut [u8; 20], mut v: u64) -> &[u8] {
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    &buf[at..]
+}
+
+/// Plane hook (M1-S02 `DEBUG SLEEP`): when `argv` is a well-formed
+/// `DEBUG SLEEP <seconds>`, the duration the executing cell should stall its
+/// connection plane (fabric service continues — deadlock safety; recorded
+/// deviation: Redis blocks the whole server).
+pub fn stall_request(argv: &[&[u8]]) -> Option<Nanos> {
+    if argv.len() != 3
+        || !argv[0].eq_ignore_ascii_case(b"DEBUG")
+        || !argv[1].eq_ignore_ascii_case(b"SLEEP")
+    {
+        return None;
+    }
+    let secs: f64 = core::str::from_utf8(argv[2]).ok()?.parse().ok()?;
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    Some(Nanos((secs * 1e9) as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use inf_store::StoreConfig;
     use inf_wire::{ConnParser, Parsed, ParserLimits};
 
-    fn run(cx: &mut ConnCx, store: &mut CellStore, parts: &[&[u8]]) -> Vec<u8> {
+    fn run_at(cx: &mut ConnCx, store: &mut CellStore, now: Nanos, parts: &[&[u8]]) -> Vec<u8> {
         let mut wire = format!("*{}\r\n", parts.len()).into_bytes();
         for p in parts {
             wire.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
@@ -589,8 +1074,12 @@ mod tests {
         let mut iter = parser.feed(&wire);
         let Some(Parsed::Command(argv)) = iter.next() else { panic!("one command") };
         let mut out = Vec::new();
-        execute(&argv, store, cx, Nanos(1), &mut out);
+        execute(&argv, store, cx, now, &mut out);
         out
+    }
+
+    fn run(cx: &mut ConnCx, store: &mut CellStore, parts: &[&[u8]]) -> Vec<u8> {
+        run_at(cx, store, Nanos(1), parts)
     }
 
     #[test]
@@ -624,5 +1113,107 @@ mod tests {
         let long_key = vec![b'k'; 256];
         let reply = run(&mut cx, &mut store, &[b"SET", &long_key, b"v"]);
         assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
+    }
+
+    #[test]
+    fn mget_mset_roundtrip() {
+        let mut cx = ConnCx::default();
+        let mut store = CellStore::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut store, &[b"MSET", b"a", b"1", b"b", b"2"]), b"+OK\r\n");
+        assert_eq!(
+            run(&mut cx, &mut store, &[b"MGET", b"a", b"nope", b"b"]),
+            b"*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n2\r\n"
+        );
+        // Odd pair count is the arity error.
+        assert_eq!(
+            run(&mut cx, &mut store, &[b"MSET", b"a", b"1", b"b"]),
+            b"-ERR wrong number of arguments for 'mset' command\r\n".to_vec()
+        );
+        // MSETNX all-or-nothing.
+        assert_eq!(run(&mut cx, &mut store, &[b"MSETNX", b"a", b"9", b"new", b"x"]), b":0\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"GET", b"new"]), b"$-1\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"MSETNX", b"n1", b"1", b"n2", b"2"]), b":1\r\n");
+    }
+
+    #[test]
+    fn expireat_family_uses_the_wall_anchor() {
+        let mut cx = ConnCx::default();
+        let mut store = CellStore::new(StoreConfig::default());
+        // Anchor: internal 1000 ms == unix 5_000_000 ms.
+        cx.node.wall_anchor.set((1_000, 5_000_000));
+        let now = Nanos::from_millis(1_000);
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        // EXPIREAT unix 5_100 s = unix ms 5_100_000 → internal 101_000 ms.
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"EXPIREAT", b"k", b"5100"]), b":1\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"TTL", b"k"]), b":100\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"EXPIRETIME", b"k"]), b":5100\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"PEXPIRETIME", b"k"]), b":5100000\r\n");
+        // Past EXPIREAT deletes.
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"EXPIREAT", b"k", b"4999"]), b":1\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"EXISTS", b"k"]), b":0\r\n");
+        // SET ... EXAT in the past: applied, born expired.
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"SET", b"p", b"v", b"EXAT", b"1"]),
+            b"+OK\r\n"
+        );
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"p"]), b"$-1\r\n");
+    }
+
+    #[test]
+    fn object_encoding_tracks_int_embstr_raw() {
+        let mut cx = ConnCx::default();
+        let mut store = CellStore::new(StoreConfig::default());
+        run(&mut cx, &mut store, &[b"SET", b"n", b"123"]);
+        assert_eq!(run(&mut cx, &mut store, &[b"OBJECT", b"ENCODING", b"n"]), b"$3\r\nint\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"OBJECT", b"REFCOUNT", b"n"]), b":2147483647\r\n");
+        run(&mut cx, &mut store, &[b"SET", b"s", b"short"]);
+        assert_eq!(run(&mut cx, &mut store, &[b"OBJECT", b"ENCODING", b"s"]), b"$6\r\nembstr\r\n");
+        let long = vec![b'x'; 45];
+        run(&mut cx, &mut store, &[b"SET", b"l", &long]);
+        assert_eq!(run(&mut cx, &mut store, &[b"OBJECT", b"ENCODING", b"l"]), b"$3\r\nraw\r\n");
+        // APPEND forces raw even when short and numeric.
+        run(&mut cx, &mut store, &[b"SET", b"a", b"12"]);
+        run(&mut cx, &mut store, &[b"APPEND", b"a", b"3"]);
+        assert_eq!(run(&mut cx, &mut store, &[b"OBJECT", b"ENCODING", b"a"]), b"$3\r\nraw\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"OBJECT", b"REFCOUNT", b"a"]), b":1\r\n");
+    }
+
+    #[test]
+    fn scan_walks_the_whole_keyspace() {
+        let mut cx = ConnCx::default();
+        let mut store = CellStore::new(StoreConfig::default());
+        for i in 0..500 {
+            let key = format!("k:{i}");
+            run(&mut cx, &mut store, &[b"SET", key.as_bytes(), b"v"]);
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor: Vec<u8> = b"0".to_vec();
+        loop {
+            let reply = run(&mut cx, &mut store, &[b"SCAN", &cursor, b"COUNT", b"17"]);
+            let text = String::from_utf8(reply).expect("ascii");
+            let mut lines = text.split("\r\n");
+            assert_eq!(lines.next(), Some("*2"));
+            let _len = lines.next().expect("cursor len");
+            cursor = lines.next().expect("cursor").as_bytes().to_vec();
+            let rest: Vec<&str> = lines.collect();
+            assert!(rest[0].starts_with('*'), "inner array header: {rest:?}");
+            for chunk in rest[1..].chunks(2) {
+                if chunk.len() == 2 && chunk[0].starts_with('$') && !chunk[1].is_empty() {
+                    seen.insert(chunk[1].to_string());
+                }
+            }
+            if cursor == b"0" {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 500, "every key emitted at least once");
+    }
+
+    #[test]
+    fn stall_request_parses_debug_sleep_only() {
+        assert_eq!(stall_request(&[b"DEBUG", b"SLEEP", b"0.5"]), Some(Nanos(500_000_000)));
+        assert_eq!(stall_request(&[b"DEBUG", b"SLEEP", b"0"]), None);
+        assert_eq!(stall_request(&[b"DEBUG", b"JMAP"]), None);
+        assert_eq!(stall_request(&[b"GET", b"k", b"x"]), None);
     }
 }

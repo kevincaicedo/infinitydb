@@ -32,8 +32,16 @@ pub const MAX_VAL_LEN: usize = (1 << 24) - 1;
 pub(crate) const HEADER_LEN: usize = 8;
 pub(crate) const TTL_EXT_LEN: usize = 5;
 const FLAG_TTL: u8 = 0b0001;
-/// u40 ms — ~34.8 years of deterministic-clock range.
-const MAX_EXPIRE_MS: u64 = (1 << 40) - 1;
+/// String was produced by a byte-surgery mutation (APPEND/SETRANGE) — drives
+/// `OBJECT ENCODING`'s `raw` answer the way Redis's `sds` conversion does
+/// (M1-S02; the value alone can't tell `embstr` from `raw`).
+const FLAG_RAW: u8 = 0b0010;
+/// u40 ms — ~34.8 years of deterministic-clock range. Deadlines beyond it
+/// clamp here (recorded deviation: "effectively never expires"; the store
+/// clamps at every deadline-conversion site so the writer assert is an
+/// internal invariant, not an input panic — M1-S03 fix of a latent M0 bound
+/// panic on ≥ 34.8-year TTLs).
+pub(crate) const MAX_EXPIRE_MS: u64 = (1 << 40) - 1;
 /// Versions live in 24 bits (see the module deviation note).
 pub(crate) const VERSION_MASK: u32 = (1 << 24) - 1;
 
@@ -59,6 +67,8 @@ pub(crate) struct RecordSpec<'a> {
     pub version: u32,
     /// Absolute deadline on the injected clock, milliseconds.
     pub expire_at_ms: Option<u64>,
+    /// Carries [`FLAG_RAW`] (`OBJECT ENCODING` honesty, M1-S02).
+    pub raw: bool,
 }
 
 impl RecordSpec<'_> {
@@ -80,7 +90,8 @@ impl RecordSpec<'_> {
         assert!(self.key.len() <= MAX_KEY_LEN, "key exceeds u8 length");
         assert!(self.value.len() <= MAX_VAL_LEN, "value exceeds u24 length");
         assert_eq!(buf.len(), self.encoded_len(), "buffer must be exact");
-        let flags = if self.expire_at_ms.is_some() { FLAG_TTL } else { 0 };
+        let flags = if self.expire_at_ms.is_some() { FLAG_TTL } else { 0 }
+            | if self.raw { FLAG_RAW } else { 0 };
         buf[0] = ((TypeTag::String as u8) << 4) | flags;
         buf[1] = self.key.len() as u8;
         let vlen = (self.value.len() as u32).to_le_bytes();
@@ -141,6 +152,12 @@ impl<'a> RecordView<'a> {
     #[inline]
     fn has_ttl(self) -> bool {
         self.bytes[0] & FLAG_TTL != 0
+    }
+
+    /// True when the value was produced by byte surgery (APPEND/SETRANGE).
+    #[inline]
+    pub fn is_raw(self) -> bool {
+        self.bytes[0] & FLAG_RAW != 0
     }
 
     #[inline]
@@ -227,17 +244,24 @@ mod tests {
 
     #[test]
     fn header_is_eight_bytes_plus_optional_ttl() {
-        let plain = RecordSpec { key: b"k", value: b"v", version: 1, expire_at_ms: None };
+        let plain =
+            RecordSpec { key: b"k", value: b"v", version: 1, expire_at_ms: None, raw: false };
         assert_eq!(plain.encoded_len(), 8 + 1 + 1);
-        let ttl = RecordSpec { key: b"k", value: b"v", version: 1, expire_at_ms: Some(5) };
+        let ttl =
+            RecordSpec { key: b"k", value: b"v", version: 1, expire_at_ms: Some(5), raw: false };
         assert_eq!(ttl.encoded_len(), 8 + 5 + 1 + 1);
     }
 
     #[test]
     fn gate_corpus_record_is_exactly_88_bytes() {
         // (16 B key, 64 B value): 8 B header + 80 payload — zero class slack.
-        let spec =
-            RecordSpec { key: &[b'k'; 16], value: &[b'v'; 64], version: 1, expire_at_ms: None };
+        let spec = RecordSpec {
+            key: &[b'k'; 16],
+            value: &[b'v'; 64],
+            version: 1,
+            expire_at_ms: None,
+            raw: false,
+        };
         assert_eq!(spec.encoded_len(), 88);
     }
 
@@ -248,6 +272,7 @@ mod tests {
             value: &[0xAB; 300],
             version: 0xAD_BEEF,
             expire_at_ms: Some(MAX_EXPIRE_MS),
+            raw: false,
         };
         let buf = roundtrip(spec);
         let view = RecordView::new(&buf);
@@ -261,14 +286,21 @@ mod tests {
 
     #[test]
     fn version_wraps_mod_2_pow_24() {
-        let spec = RecordSpec { key: b"k", value: b"v", version: u32::MAX, expire_at_ms: None };
+        let spec = RecordSpec {
+            key: b"k",
+            value: b"v",
+            version: u32::MAX,
+            expire_at_ms: None,
+            raw: false,
+        };
         let buf = roundtrip(spec);
         assert_eq!(RecordView::new(&buf).version(), VERSION_MASK);
     }
 
     #[test]
     fn expiry_is_inclusive_at_the_millisecond() {
-        let spec = RecordSpec { key: b"k", value: b"", version: 0, expire_at_ms: Some(10) };
+        let spec =
+            RecordSpec { key: b"k", value: b"", version: 0, expire_at_ms: Some(10), raw: false };
         let buf = roundtrip(spec);
         let view = RecordView::new(&buf);
         assert!(!view.is_expired(Nanos(9_999_999)));
@@ -277,14 +309,15 @@ mod tests {
 
     #[test]
     fn no_ttl_never_expires() {
-        let spec = RecordSpec { key: b"k", value: b"v", version: 0, expire_at_ms: None };
+        let spec =
+            RecordSpec { key: b"k", value: b"v", version: 0, expire_at_ms: None, raw: false };
         let buf = roundtrip(spec);
         assert!(!RecordView::new(&buf).is_expired(Nanos(u64::MAX)));
     }
 
     #[test]
     fn empty_key_and_value_are_representable() {
-        let spec = RecordSpec { key: b"", value: b"", version: 7, expire_at_ms: None };
+        let spec = RecordSpec { key: b"", value: b"", version: 7, expire_at_ms: None, raw: false };
         let buf = roundtrip(spec);
         let view = RecordView::new(&buf);
         assert_eq!((view.key(), view.value(), view.version()), (&b""[..], &b""[..], 7));
@@ -294,8 +327,13 @@ mod tests {
     fn max_bounds_roundtrip() {
         let key = vec![b'K'; MAX_KEY_LEN];
         let value = vec![b'V'; 1 << 16]; // representative large value
-        let spec =
-            RecordSpec { key: &key, value: &value, version: VERSION_MASK, expire_at_ms: None };
+        let spec = RecordSpec {
+            key: &key,
+            value: &value,
+            version: VERSION_MASK,
+            expire_at_ms: None,
+            raw: false,
+        };
         let buf = roundtrip(spec);
         let view = RecordView::new(&buf);
         assert_eq!(view.klen(), MAX_KEY_LEN);

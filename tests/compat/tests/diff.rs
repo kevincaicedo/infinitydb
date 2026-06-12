@@ -41,6 +41,8 @@ fn spawn_redis() -> Option<(RedisGuard, TcpStream)> {
             "no",
             "--bind",
             "127.0.0.1",
+            "--enable-debug-command",
+            "yes",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

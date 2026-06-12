@@ -183,6 +183,17 @@ fn cell_main(
     }
 
     let node = Rc::new(NodeInfo::default());
+    // Wall-clock anchor (M1-S03): the system clock is read ONCE here, at the
+    // cell clock's origin (internal ms 0); everything downstream converts
+    // through the anchor (L7 — EXPIREAT/EXAT stay deterministic under DST,
+    // which injects its own anchor).
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    node.wall_anchor.set((0, unix_ms));
+    node.rng_state.set(unix_ms ^ (u64::from(cell) << 48) ^ 0x9E37_79B9_7F4A_7C15);
+    node.tcp_port.set(args.port);
     let mut plane = ServerPlane::new(
         CellId(cell),
         args.cells,

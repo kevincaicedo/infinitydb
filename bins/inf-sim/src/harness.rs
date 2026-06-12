@@ -227,13 +227,17 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         let net = CellNet::new(i as u16, scenario.seed, scenario.plant);
         let driver = SimDriver::new(Rc::clone(&net));
         let pool = BufferPool::new(128, 1024);
+        // Sim wall anchor stays (0, 0): wall time == virtual time, fully
+        // deterministic; the RANDOMKEY stream is seeded from the scenario.
+        let node = Rc::new(NodeInfo::default());
+        node.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
         let plane = ServerPlane::new(
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
             CellStore::new(StoreConfig::default()),
             fabric,
-            Rc::new(NodeInfo::default()),
+            node,
             oracle.clone(),
             false,
         );
