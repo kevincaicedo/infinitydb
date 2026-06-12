@@ -12,17 +12,22 @@
 //!   asserts the correctness suite passes in both modes.
 //!
 //! ## Buffer lifecycle (the Vortex proof, carried)
-//! Recv buffers are leased from the [`BufferPool`] and either (a) provided
-//! to the kernel buffer group (modern) or (b) pinned under a oneshot recv
-//! (degraded). Every CQE — success, error, or cancellation — resolves the
-//! lease deterministically: to the consumer (`Recv`), or back to the pool.
-//! `pool.reconcile()` must hold after any storm (conformance suite).
+//! Modern mode **stages** recv buffers into the kernel's provided group —
+//! driver→kernel custody, accounted via `pool.staged()`, never a consumer
+//! lease — bounded to HALF the pool (min 1) so the send/response path can
+//! always lease (a recv ring that swallowed the whole pool would starve
+//! RESPOND; first live Linux run caught exactly that). A delivered buffer is
+//! `promote_staged` → ordinary `Recv` lease. Degraded mode pins one leased
+//! buffer under each oneshot recv; while the pool is dry it arms a `PollAdd`
+//! readability watch instead, so `RecvDropped` is reported only when data is
+//! actually pending (kqueue-equivalent timing). Every CQE — success, error,
+//! cancellation — resolves custody deterministically; `pool.reconcile()`
+//! (no consumer leaks) must hold after any storm (conformance suite).
 //!
 //! ## Validation status
-//! Authored on the macOS dev tier against the `io-uring` 0.7 API and
-//! compile-checked for Linux targets; runtime validation (kernel matrix,
-//! 1M-frame echo bench, buffer-leak storm at 10⁶ cycles) is pending the
-//! Linux reference box — tracked in `reviews/infinity-m0-skeleton.md`.
+//! Conformance suite green on Linux 7.0 in probed and `INF_URING_FORCE_DEGRADED`
+//! modes (2026-06-11); kernel-matrix CI legs and reference-box performance
+//! evidence tracked in `reviews/infinity-m0-skeleton.md`.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -69,9 +74,15 @@ enum OpState {
     },
     Cancel,
     /// One provided buffer in flight to the kernel group; on failure the
-    /// lease unwinds to the pool.
+    /// staging unwinds to the pool.
     Provide {
         buf: BufferId,
+    },
+    /// Degraded-mode readability watch while the pool is dry: `RecvDropped`
+    /// is only honest when data is actually pending.
+    PollDry {
+        fd: RawFd,
+        token: CompletionToken,
     },
 }
 
@@ -186,7 +197,14 @@ impl UringDriver {
     }
 
     fn flush_backlog(&mut self) -> io::Result<()> {
+        // M0-S19 deliberate-regression canary: submit after every SQE so the
+        // `sqes_per_submit` tripwire must trip in the gate report. Test-only.
+        let submit_per_op = std::env::var_os("INF_URING_SUBMIT_PER_OP").is_some();
         while let Some(entry) = self.backlog.pop_front() {
+            if submit_per_op {
+                self.ring.submitter().submit()?;
+                self.stats.syscalls += 1;
+            }
             // SAFETY: every entry was built over resources (fds, buffer
             // addresses) that stay live until its CQE arrives — fds are not
             // closed before their cancellations complete, and pool buffer
@@ -218,49 +236,79 @@ impl UringDriver {
         self.push_sqe(entry);
     }
 
-    /// Arm (or re-arm) recv on `fd`. Returns `false` if the pool was dry in
-    /// degraded mode (caller marks paused).
-    fn arm_recv_sqe(&mut self, fd: RawFd, token: CompletionToken, pool: &mut BufferPool) -> bool {
+    fn set_recv_op(&mut self, fd: RawFd, id: u64) {
+        if let Some(arm) = self.recvs.get_mut(&fd) {
+            arm.op_id = Some(id);
+        }
+    }
+
+    /// Arm (or re-arm) recv on `fd`: multishot over the provided group when
+    /// available; otherwise a oneshot recv over a pool lease, degrading to a
+    /// `PollDry` readability watch while the pool is dry (so the eventual
+    /// `RecvDropped` coincides with actual pending data).
+    fn arm_recv_sqe(&mut self, fd: RawFd, token: CompletionToken, pool: &mut BufferPool) {
         if self.caps.multishot_recv {
             let id = self.alloc_id(OpState::RecvMulti { fd, token });
             let entry = opcode::RecvMulti::new(Fd(fd), BGID).build().user_data(id);
             self.push_sqe(entry);
-            if let Some(arm) = self.recvs.get_mut(&fd) {
-                arm.op_id = Some(id);
-            }
-            return true;
+            self.set_recv_op(fd, id);
+            return;
         }
-        let Some(buf) = pool.try_lease(LeaseKind::Recv) else { return false };
+        match pool.try_lease(LeaseKind::Recv) {
+            Some(buf) => self.arm_oneshot_recv(fd, token, buf, pool),
+            None => {
+                let id = self.alloc_id(OpState::PollDry { fd, token });
+                let entry = opcode::PollAdd::new(Fd(fd), libc::POLLIN as u32).build().user_data(id);
+                self.push_sqe(entry);
+                self.set_recv_op(fd, id);
+            }
+        }
+    }
+
+    fn arm_oneshot_recv(
+        &mut self,
+        fd: RawFd,
+        token: CompletionToken,
+        buf: BufferId,
+        pool: &mut BufferPool,
+    ) {
         let len = u32::try_from(pool.buf_size()).expect("buffer size fits u32");
         let addr = pool.bytes_mut(buf).as_mut_ptr();
         let id = self.alloc_id(OpState::RecvOneshot { fd, token, buf });
         let entry = opcode::Recv::new(Fd(fd), addr, len).build().user_data(id);
         self.push_sqe(entry);
-        if let Some(arm) = self.recvs.get_mut(&fd) {
-            arm.op_id = Some(id);
-        }
-        true
+        self.set_recv_op(fd, id);
     }
 
-    /// Keep the kernel's provided group stocked: lease every free buffer the
-    /// pool will give us (pool exhaustion *is* the recv backpressure bound).
-    fn replenish_provided(&mut self, pool: &mut BufferPool) {
-        if !self.caps.multishot_recv {
-            return;
+    /// Provided-group recv budget: half the pool, min 1. The other half is
+    /// the send/response headroom — staging the whole pool would let inbound
+    /// traffic starve RESPOND (deadlock by buffer exhaustion).
+    fn recv_budget(pool: &BufferPool) -> usize {
+        (pool.capacity() / 2).max(1)
+    }
+
+    /// Keep the kernel's provided group stocked up to the recv budget, then
+    /// auto-resume recvs that paused on buffer exhaustion — but only once a
+    /// buffer is actually available again (re-arming an empty group would
+    /// just re-drop).
+    fn replenish_and_resume(&mut self, pool: &mut BufferPool) {
+        if self.caps.multishot_recv {
+            assert!(pool.capacity() <= usize::from(u16::MAX), "provided bids are u16");
+            let len = i32::try_from(pool.buf_size()).expect("buffer size fits i32");
+            while self.provided.len() < Self::recv_budget(pool) {
+                let Some(buf) = pool.try_stage() else { break };
+                let bid = u16::try_from(buf.as_u32()).expect("checked capacity above");
+                let addr = pool.bytes_mut(buf).as_mut_ptr();
+                let id = self.alloc_id(OpState::Provide { buf });
+                self.provided.insert(bid, buf);
+                // One SQE per buffer: pool buffers are individually boxed
+                // (not one contiguous region), so nbufs > 1 cannot describe
+                // them.
+                let entry =
+                    opcode::ProvideBuffers::new(addr, len, 1, BGID, bid).build().user_data(id);
+                self.push_sqe(entry);
+            }
         }
-        assert!(pool.capacity() <= usize::from(u16::MAX), "provided bids are u16");
-        let len = i32::try_from(pool.buf_size()).expect("buffer size fits i32");
-        while let Some(buf) = pool.try_lease(LeaseKind::Recv) {
-            let bid = u16::try_from(buf.as_u32()).expect("checked capacity above");
-            let addr = pool.bytes_mut(buf).as_mut_ptr();
-            let id = self.alloc_id(OpState::Provide { buf });
-            self.provided.insert(bid, buf);
-            // One SQE per buffer: pool buffers are individually boxed (not
-            // one contiguous region), so nbufs > 1 cannot describe them.
-            let entry = opcode::ProvideBuffers::new(addr, len, 1, BGID, bid).build().user_data(id);
-            self.push_sqe(entry);
-        }
-        // Resume recvs paused on ENOBUFS now that buffers are inbound.
         let paused: Vec<(RawFd, CompletionToken)> = self
             .recvs
             .iter()
@@ -268,6 +316,14 @@ impl UringDriver {
             .map(|(fd, a)| (*fd, a.token))
             .collect();
         for (fd, token) in paused {
+            let resumable = if self.caps.multishot_recv {
+                !self.provided.is_empty()
+            } else {
+                pool.available() > 0
+            };
+            if !resumable {
+                break;
+            }
             self.recvs.get_mut(&fd).expect("collected above").paused = false;
             self.arm_recv_sqe(fd, token, pool);
         }
@@ -284,11 +340,7 @@ impl UringDriver {
                 IoOp::RecvArm { fd, token } => {
                     self.recvs
                         .insert(fd, RecvArm { token, op_id: None, disarmed: false, paused: false });
-                    if !self.arm_recv_sqe(fd, token, pool) {
-                        let arm = self.recvs.get_mut(&fd).expect("just inserted");
-                        arm.paused = true;
-                        out.push(Completion { token, result: CompletionResult::RecvDropped });
-                    }
+                    self.arm_recv_sqe(fd, token, pool);
                 }
                 IoOp::RecvDisarm { fd } => {
                     let Some(arm) = self.recvs.get_mut(&fd) else { continue };
@@ -323,6 +375,7 @@ impl UringDriver {
                             OpState::Accept { listener, .. } if *listener == fd => Some(*id),
                             OpState::RecvMulti { fd: f, .. }
                             | OpState::RecvOneshot { fd: f, .. }
+                            | OpState::PollDry { fd: f, .. }
                             | OpState::Send { fd: f, .. }
                                 if *f == fd =>
                             {
@@ -487,10 +540,34 @@ impl UringDriver {
                 }
                 let rearm =
                     result > 0 && self.recvs.get(&fd).is_some_and(|a| !a.disarmed && !a.paused);
-                if rearm && !self.arm_recv_sqe(fd, token, pool) {
-                    let arm = self.recvs.get_mut(&fd).expect("checked above");
-                    arm.paused = true;
-                    out.push(Completion { token, result: CompletionResult::RecvDropped });
+                if rearm {
+                    // Dry pool degrades to the PollDry watch internally.
+                    self.arm_recv_sqe(fd, token, pool);
+                }
+            }
+            OpState::PollDry { fd, token } => {
+                let Some(arm) = self.recvs.get_mut(&fd) else { return };
+                arm.op_id = None;
+                if result == -libc::ECANCELED || arm.disarmed {
+                    return;
+                }
+                if result < 0 {
+                    out.push(Completion {
+                        token,
+                        result: CompletionResult::Error { errno: -result, buf: None },
+                    });
+                    return;
+                }
+                // Readable while we had no buffer: deliver if one freed up;
+                // otherwise THIS is the honest RecvDropped moment — data is
+                // pending and the pool is dry. Auto-resume on release.
+                match pool.try_lease(LeaseKind::Recv) {
+                    Some(buf) => self.arm_oneshot_recv(fd, token, buf, pool),
+                    None => {
+                        let arm = self.recvs.get_mut(&fd).expect("checked above");
+                        arm.paused = true;
+                        out.push(Completion { token, result: CompletionResult::RecvDropped });
+                    }
                 }
             }
             OpState::Send { fd, token, buf, len, written } => {
@@ -526,10 +603,10 @@ impl UringDriver {
             OpState::Cancel => {}
             OpState::Provide { buf } => {
                 if result < 0 {
-                    // Group rejected the buffer: unwind the lease.
+                    // Group rejected the buffer: unwind the staging.
                     let bid = u16::try_from(buf.as_u32()).expect("provided bids are u16");
                     self.provided.remove(&bid);
-                    pool.release(buf);
+                    pool.unstage(buf);
                 }
             }
         }
@@ -548,11 +625,12 @@ impl UringDriver {
         if result >= 0 {
             match cqueue::buffer_select(flags) {
                 Some(bid) => {
-                    // Buffer leaves the kernel group; ownership → consumer.
+                    // Buffer leaves the kernel group; custody → consumer.
                     let buf = self
                         .provided
                         .remove(&bid)
                         .expect("kernel returned a bid this driver never provided");
+                    pool.promote_staged(buf);
                     out.push(Completion {
                         token,
                         result: CompletionResult::Recv { buf, len: result as u32 },
@@ -607,20 +685,29 @@ impl BackendDriver for UringDriver {
         let before = out.len();
         self.stats = SubmitStats::default();
         self.apply_ops(pool, out);
-        self.replenish_provided(pool);
+        self.replenish_and_resume(pool);
         self.flush_backlog()?;
 
-        // ONE io_uring_enter for everything queued (+ the wait).
+        // ONE io_uring_enter for everything queued (+ the wait). GETEVENTS
+        // only rides `want > 0` in the io-uring crate, and DEFER_TASKRUN
+        // posts CQEs only on a GETEVENTS enter — so the non-blocking paths
+        // use want=1 with a ZERO timeout to harvest deferred completions
+        // without sleeping (plain submit() would stall them until a park).
         let already_satisfied = out.len() > before;
+        let zero_ts = types::Timespec::new();
         let submit_result = match wait {
-            Wait::Poll => self.ring.submitter().submit(),
-            _ if already_satisfied => self.ring.submitter().submit(),
-            Wait::Park { timeout: Some(d) } => {
+            Wait::Park { timeout: Some(d) } if !already_satisfied => {
                 let ts = types::Timespec::new().sec(d.as_secs()).nsec(d.subsec_nanos());
                 let args = types::SubmitArgs::new().timespec(&ts);
                 self.ring.submitter().submit_with_args(1, &args)
             }
-            Wait::Park { timeout: None } => self.ring.submitter().submit_and_wait(1),
+            Wait::Park { timeout: None } if !already_satisfied => {
+                self.ring.submitter().submit_and_wait(1)
+            }
+            _ => {
+                let args = types::SubmitArgs::new().timespec(&zero_ts);
+                self.ring.submitter().submit_with_args(1, &args)
+            }
         };
         self.stats.syscalls += 1;
         match submit_result {
@@ -707,6 +794,24 @@ fn set_nonblocking(fd: RawFd) {
         if flags >= 0 {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
+    }
+    set_nodelay(fd);
+}
+
+/// Replies are usually sub-MSS; without NODELAY the Nagle timer + delayed
+/// ACK serialize pipelined round-trips at ~40 ms (measured by the echo
+/// bench). Accepted sockets are TCP at M0; failure (non-TCP fd) is ignored.
+fn set_nodelay(fd: RawFd) {
+    let one: libc::c_int = 1;
+    // SAFETY: setsockopt with a valid int pointer on a live fd.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            (&raw const one).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
 }
 

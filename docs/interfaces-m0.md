@@ -40,10 +40,10 @@ pub struct LocalCounter;                   // Cell<u64>: no atomics (L1)
 pub mod tripwire { /* frozen counter names, M0 §3.2 */ }
 ```
 
-## 2. `inf-alloc`
+## 2. `inf-alloc` (implemented — the code is the spec)
 
 ```rust
-// Buffer pool (implemented — wire buffers, registered with the backend).
+// Buffer pool (wire buffers, registered with the backend).
 // Fixed capacity; buffer addresses are stable for the pool's lifetime
 // (io_uring fixed-buffer registration relies on this).
 pub struct BufferPool;
@@ -56,19 +56,38 @@ impl BufferPool {
     pub fn bytes(&self, id: BufferId) -> &[u8];
     pub fn bytes_mut(&mut self, id: BufferId) -> &mut [u8];
     pub fn buf_size(&self) -> usize;  pub fn leased(&self) -> usize;
-    pub fn reconcile(&self) -> Result<(), LeaseLeak>; // leak test hook
+    pub fn reconcile(&self) -> Result<(), LeaseLeak>; // CONSUMER-leak test hook
+
+    // 2026-06-11 extension (recorded deviation; first live uring run):
+    // a third custody state for kernel provided-buffer rings. Staged
+    // buffers are neither free nor consumer-leased; reconcile() ignores
+    // them (a live provided group legitimately holds custody). The uring
+    // driver stages at most HALF the pool — staging everything starved
+    // the send path (deadlock by buffer exhaustion, found by the
+    // conformance suite on Linux).
+    pub fn try_stage(&mut self) -> Option<BufferId>;   // Free → Staged
+    pub fn promote_staged(&mut self, id: BufferId);    // Staged → Leased(Recv)
+    pub fn unstage(&mut self, id: BufferId);           // Staged → Free
+    pub fn staged(&self) -> usize;  pub fn available(&self) -> usize;
 }
 
-// Record arena (agent-built): size-class slab allocator over mmap chunks.
+// Record arena (M0-S13): size-class slabs over anonymous-mmap chunks.
+// Classes: 16..=256 in 8 B steps, then ×1.25 geometric to chunk_size/4;
+// larger allocations get dedicated page-rounded mappings (unmap on free).
+// ArenaAddr packs {chunk:27, offset:21} = the 48-bit `addr` the index
+// slot stores. Bump-within-chunk + intrusive free lists keep untouched
+// pages uncommitted. `resize_in_place` covers same-class grow AND shrink.
 pub struct Arena;
-pub struct ArenaAddr(/* private; 48-bit addressable */);
+pub struct ArenaAddr(/* private u48 */);   // to_raw()/from_raw()
+pub struct ArenaConfig { pub chunk_size: usize, pub max_resident: Option<usize> }
 impl Arena {
     pub fn new(config: ArenaConfig) -> Self;
     pub fn alloc(&mut self, len: usize) -> Option<ArenaAddr>;   // None = budget exhausted
     pub fn free(&mut self, addr: ArenaAddr, len: usize);
+    pub fn resize_in_place(&mut self, addr: ArenaAddr, old: usize, new: usize) -> bool;
     pub fn bytes(&self, addr: ArenaAddr, len: usize) -> &[u8];
     pub fn bytes_mut(&mut self, addr: ArenaAddr, len: usize) -> &mut [u8];
-    pub fn report(&self) -> ArenaReport;   // live_bytes, slack_bytes, resident_bytes — byte-exact
+    pub fn report(&self) -> ArenaReport;   // live/slack/resident bytes, live_allocs — byte-exact
 }
 ```
 
@@ -317,23 +336,34 @@ pub fn find_crlf(buf: &[u8], from: usize) -> Option<usize>;
 pub fn scalar_scan_crlf(buf: &[u8]) -> CrlfPositions;       // the proptest oracle
 ```
 
-## 6. `inf-store` — records, index, ops, router
+## 6. `inf-store` — records, index, ops, router (implemented — the code is the spec)
+
+> Deviations from the original sketch (recorded in
+> `reviews/infinity-m0-skeleton.md`): the "8 B fixed" header is honored by
+> narrowing `version` to **u24** (the sketch's field list summed to 72
+> bits — it never fit u64; the 8 B header is load-bearing: the (16 B, 64 B)
+> gate record lands exactly in the 88 B size class with zero slack, putting
+> measured overhead at 18.7 B/key). Mutating ops return
+> `Result<_, OpError>` — arena-budget exhaustion (`OutOfMemory`) is
+> backpressure the command layer must surface, never a panic. `append`
+> returns `u64`, `strlen` returns `u64`.
 
 ```rust
 // RecordHeader v0 (master plan §7.2) — layout frozen:
-//   type:4 | flags:4 | klen:u8 | vlen:u24 | version:u32   (8 B fixed)
+//   type:4 | flags:4 | klen:u8 | vlen:u24 | version:u24   (8 B fixed)
 //   [expire_at_ms: u40 if TTL flag] [key bytes] [value bytes]
 pub struct CellStore;
 impl CellStore {
     pub fn new(cfg: StoreConfig) -> Self;
     // Every op takes `now: Nanos` (expire-on-read; deterministic — L7).
     pub fn get(&mut self, key: &[u8], now: Nanos) -> Option<&[u8]>;
-    pub fn set(&mut self, key: &[u8], value: &[u8], opts: SetOptions, now: Nanos) -> SetOutcome;
+    pub fn set(&mut self, key: &[u8], value: &[u8], opts: SetOptions, now: Nanos)
+        -> Result<SetOutcome, OpError>;
     pub fn del(&mut self, key: &[u8], now: Nanos) -> bool;
     pub fn exists(&mut self, key: &[u8], now: Nanos) -> bool;
     pub fn incr_by(&mut self, key: &[u8], delta: i64, now: Nanos) -> Result<i64, OpError>;
-    pub fn append(&mut self, key: &[u8], tail: &[u8], now: Nanos) -> Result<u32, OpError>;
-    pub fn strlen(&mut self, key: &[u8], now: Nanos) -> u32;
+    pub fn append(&mut self, key: &[u8], tail: &[u8], now: Nanos) -> Result<u64, OpError>;
+    pub fn strlen(&mut self, key: &[u8], now: Nanos) -> u64;
     pub fn getdel(&mut self, key: &[u8], now: Nanos) -> Option<Vec<u8>>;
     pub fn expire(&mut self, key: &[u8], at: Option<Nanos>, cond: ExpireCond, now: Nanos) -> bool;
     pub fn ttl(&mut self, key: &[u8], now: Nanos) -> Ttl;   // enum: Missing | NoExpiry | Ms(u64)
@@ -344,9 +374,20 @@ impl CellStore {
 pub struct SetOptions { pub cond: SetCond /* Always|IfAbsent|IfPresent */,
                         pub expire: SetExpire /* Keep|Clear|At(Nanos) */, pub get_old: bool }
 pub enum SetOutcome { Applied { old: Option<Vec<u8>> }, Skipped { old: Option<Vec<u8>> } }
+pub enum OpError { NotInt, Overflow, OutOfMemory, TooLarge }
+pub enum ExpireCond { Always, IfNoExpiry, IfHasExpiry, IfGreater, IfLess } // EXPIRE NX/XX/GT/LT
 
-// Batch prefetch pipeline (L3/L4) — hash+prefetch a parse batch, then execute:
-impl CellStore { pub fn prefetch(&self, key_hash: u64); pub fn hash_key(key: &[u8]) -> u64; }
+// Batch prefetch pipeline (L3/L4) — hash+prefetch a parse batch, then execute.
+// get_many is the full §7.3 pipeline (probe-prefetch → candidate →
+// record-prefetch → verify); it is OPT-IN per ADR-0005 (the +25% A/B gate
+// missed on the bare-loop bench: +12.5%; end-to-end retest at S21).
+impl CellStore {
+    pub fn prefetch(&self, key_hash: u64);
+    pub fn hash_key(key: &[u8]) -> u64;
+    pub fn get_with_hash(&mut self, key: &[u8], hash: u64, now: Nanos) -> Option<&[u8]>;
+    pub fn get_many(&mut self, keys: &[&[u8]], now: Nanos, out: impl FnMut(usize, Option<&[u8]>));
+    pub fn probe_groups(&self, key: &[u8]) -> usize;   // diagnostics (histogram artifact)
+}
 
 // Slot router:
 pub struct SlotRouter;
@@ -354,8 +395,67 @@ impl SlotRouter {
     pub fn new_contiguous(cells: u16) -> Self;             // static ranges (M0 topology)
     pub fn slot_of(key: &[u8]) -> KeySlot;                 // crc16(hashtag(key)) % 16384
     pub fn cell_of(&self, slot: KeySlot) -> CellId;
+    pub fn is_local(&self, key: &[u8], cell: CellId) -> bool;
 }
 ```
+
+## 6b. `inf-server` — command execution (M0-S15; implemented)
+
+```rust
+pub struct ConnCx { pub proto: Protocol, pub id: u64 }   // HELLO state
+/// One parsed command → store ops → RESP2/3 reply bytes. All commands
+/// enter through the inf-wire registry (lookup → arity → key spec).
+pub fn execute(argv: &ArgvRef<'_>, store: &mut CellStore, cx: &mut ConnCx,
+               now: Nanos, out: &mut Vec<u8>);
+```
+
+Reply bytes are oracle-pinned by the compat harness (`tests/compat`):
+132 byte-exact cases vs real Redis 8.0.5; documented deviations:
+`HELLO`/`INFO`/`COMMAND` payloads, `SET … EXAT/PXAT` (wall-clock timebase
+arrives with the node), keys > 255 B / values > 16 MiB − 1 (record v0
+bounds, typed error).
+
+## 6c. `inf-server` — node assembly (M0 E6/E7 substrate; implemented)
+
+```rust
+/// One cell's complete data plane over any BackendDriver (uring in
+/// infinityd, kqueue dev tier, SimDriver in inf-sim). Conn slab keyed
+/// {slot:24, gen:32} (the completion-token model); local commands execute
+/// synchronously (L6 fast path); remote-key commands run on a
+/// per-connection ordered pump future (FabricGate replies, WaitList credit
+/// backpressure, RecvDisarm past 1024 queued). Cross-cell = whole-argv
+/// Op::Apply returning raw RESP bytes; DEL/EXISTS split per key (typed Int).
+pub struct ServerPlane<O: PlaneObserver + 'static = NoopObserver>;
+impl ServerPlane<O> {
+    pub fn new(cell: CellId, cells: u16, listener: RawFd, store: CellStore,
+               fabric: CellFabric, node: Rc<NodeInfo>, observer: O,
+               route_local_only: bool) -> Self;   // route_local_only = §6 penalty A/B leg
+    pub fn connections(&self) -> usize;
+    pub fn suspended(&self) -> usize;             // sim quiescence probe
+}
+
+/// Apply-point hook: local execution + the owner side of remote Apply.
+/// inf-sim's linearizability oracle consumes this; production observer is
+/// a no-op that monomorphizes away.
+pub trait PlaneObserver {
+    fn on_execute(&mut self, cell: CellId, origin: ExecOrigin,
+                  argv: &[&[u8]], reply: &[u8], now: Nanos);
+}
+
+/// INFO-visible node stats (S19): frozen tripwire snapshot + raw lifetime
+/// counters (scrapers diff two snapshots for under-load ratios) + memory
+/// attribution domains the store can't see.
+pub struct NodeInfo { /* Cells: tripwires, raw_counters, wire_buffers_bytes,
+                         conn_state_bytes, connections, recv_dropped,
+                         fabric_rtt_p50_ns, cell, cells */ }
+```
+
+`inf-runtime::net` (assembly helpers, keeps bins `forbid(unsafe_code)`):
+`listen_reuseport(port) -> TcpListener` · `bound_port` ·
+`pin_current_thread(core)`. `CellLoop` additionally exposes
+`counters() -> [u64; 6]` (raw submits/sqes/cqes/iterations/commands/fabric)
+— tripwire ratios are computed from windowed deltas, lifetime ratios
+include idle parks.
 
 ## 7. Tripwire counter set (`inf-foundation::tripwire`) — names frozen
 
@@ -366,8 +466,11 @@ impl SlotRouter {
 
 ---
 
-**Linux-validation note:** the `BackendDriver` contract is exercised on macOS
-(kqueue) and in `inf-sim`; the io_uring implementation compiles under
-`--features uring` on Linux targets but its multishot/provided-buffer paths,
-kernel-matrix degradation, and all performance gates require the Linux
-reference box (tracked in `reviews/infinity-m0-skeleton.md`).
+**Linux-validation note (updated 2026-06-11):** the io_uring backend is now
+exercised on real Linux (kernel 7.0): conformance suite green in probed
+(multishot + provided buffers) and `INF_URING_FORCE_DEGRADED` modes, 1M-cycle
+lifecycle storms reconcile in both, and the S04 echo gate passes ×30+
+(artifacts under `infinitydb/.artifacts/m0/2026-06-11-linux-devbox/`). The
+first live run found and fixed three driver bugs — recorded in
+`reviews/infinity-m0-skeleton.md`. Still pending: the 5.15/6.1 kernel-matrix
+CI legs and the reference-box gate campaign (S21).

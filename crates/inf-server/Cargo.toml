@@ -5,6 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+description = "Dispatch + transports; M0: command execution + the ServerPlane node assembly"
+
+[dependencies]
+inf-foundation.workspace = true
+inf-alloc.workspace = true
+inf-fabric.workspace = true
+inf-runtime.workspace = true
+inf-wire.workspace = true
+inf-store.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+inf-runtime = { workspace = true, features = ["uring"] }

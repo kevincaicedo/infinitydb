@@ -454,6 +454,19 @@ fn set_nonblocking(fd: RawFd) {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
     }
+    // Sub-MSS replies + Nagle + delayed ACK = ~40 ms pipelined stalls;
+    // accepted sockets are TCP at M0 (failure on non-TCP fds is ignored).
+    let one: libc::c_int = 1;
+    // SAFETY: setsockopt with a valid int pointer on a live fd.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            (&raw const one).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
 }
 
 fn duration_to_timespec(d: Duration) -> libc::timespec {

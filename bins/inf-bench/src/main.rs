@@ -15,6 +15,10 @@
 
 mod cli;
 mod envcheck;
+mod gaterun;
+mod gates;
+mod load;
+mod resp;
 
 use std::process::ExitCode;
 
@@ -42,12 +46,8 @@ fn main() -> ExitCode {
     let rest = &args[1..];
     let outcome = match cmd.as_str() {
         "env-check" => envcheck::cmd_env_check(rest),
-        // M0-S18 (harness core + gate runner) is in progress; the subcommands
-        // are reserved so scripts written against the final surface fail with
-        // a clear message instead of "unknown subcommand".
-        "load" | "gate-run" => {
-            Err(format!("`{cmd}` is not built yet (M0-S18 in progress); only env-check ships"))
-        }
+        "load" => load::cmd_load(rest),
+        "gate-run" => gaterun::cmd_gate_run(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())

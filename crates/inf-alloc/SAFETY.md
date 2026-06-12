@@ -6,7 +6,11 @@ unit tests under Miri.
 
 | Location | Invariant | Coverage |
 |----------|-----------|----------|
-| (none yet — `buffer_pool` is 100% safe) | | |
+| `arena.rs::map_chunk` (`libc::mmap`) | anonymous private mapping, result checked against `MAP_FAILED` before use | unit tests + Miri (`storm_reconciles_byte_exact`) |
+| `arena.rs::unmap_chunk` / `Drop` (`libc::munmap`) | base/len are exactly one live mapping owned by the arena; entry zeroed after unmap so stale addrs hit the bounds assert, never the dead pointer | `huge_allocations_map_and_unmap`, `stale_huge_addr_panics_not_ub` |
+| `arena.rs::bytes`/`bytes_mut` (`from_raw_parts[_mut]`) | offset+len bounds-checked against the owning chunk's mapped length before the slice is formed; `&self`/`&mut self` provide aliasing discipline; chunk memory lives until unmap/drop | whole arena test suite under Miri |
+
+`buffer_pool` remains 100% safe code.
 
 Rules:
 - New `unsafe` requires: an entry here, a `// SAFETY:` comment at the block

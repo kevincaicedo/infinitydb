@@ -15,6 +15,7 @@
 mod driver;
 mod executor;
 pub mod gate;
+pub mod net;
 mod reactor;
 mod sched;
 mod timer;

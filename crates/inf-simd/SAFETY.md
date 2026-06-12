@@ -1,8 +1,8 @@
 # inf-simd SAFETY
 
 `inf-simd` is one of the four crates allowed `unsafe` (milestone M0 §3.3).
-All unsafe code is platform intrinsics in `crlf.rs`; `swar.rs` is fully safe
-(64-bit integer tricks only).
+All unsafe code is platform intrinsics in `crlf.rs` and `group16.rs`;
+`swar.rs` is fully safe (64-bit integer tricks only).
 
 ## `crlf.rs` — SIMD loads and feature-gated paths
 
@@ -17,10 +17,22 @@ All unsafe code is platform intrinsics in `crlf.rs`; `swar.rs` is fully safe
 - **No aliasing games**: intrinsics read the input slice only; results land
   in plain Rust values.
 
+## `group16.rs` — Swiss-table group probes (M0-S14)
+
+- **Bounds**: all vector loads (`_mm_loadu_si128`, `vld1q_u8`) read exactly
+  16 bytes from a borrowed `&[u8; 16]` — the type carries the bound; no
+  loop arithmetic involved.
+- **Feature availability**: SSE2/NEON baseline only (no AVX2 path yet —
+  the 32-way probe is an A/B-measured follow-up).
+- **`prefetch_read`**: `_mm_prefetch` is a pure hint and cannot fault on
+  any pointer value (the safe wrapper is therefore sound for arbitrary
+  pointers); the aarch64 body is a no-op (intrinsics unstable).
+
 ## Verification
 
-Every SIMD path is property-tested against the scalar oracle
-(`scalar_scan_crlf`) on arbitrary inputs (1000 cases per run, plus fixed
-chunk-boundary/edge corpora ported from `vortex-proto`). The aarch64 NEON
-path (new in this port — Vortex used nightly `std::simd`) is covered by the
-same equivalence suite.
+Every SIMD path is property-tested against its scalar oracle
+(`scalar_scan_crlf`, `scalar_eq_mask16`, `scalar_high_bit_mask16`) on
+arbitrary inputs (1000 cases per run, plus fixed chunk-boundary/edge corpora
+ported from `vortex-proto`). The aarch64 NEON paths (new in this port —
+Vortex used nightly `std::simd`) are covered by the same equivalence suites;
+the x86 SSE2 paths were runtime-verified on Linux on 2026-06-11.
