@@ -14,9 +14,7 @@ use std::rc::Rc;
 
 use inf_foundation::time::Nanos;
 use inf_store::{CellStore, ExpireCond, OpError, SetCond, SetExpire, SetOptions, SetOutcome, Ttl};
-use inf_wire::{
-    ArgvRef, CommandId, ConnParser, Parsed, ParserLimits, Protocol, RespWriter, arity_ok, lookup,
-};
+use inf_wire::{ArgvRef, CommandId, Protocol, RespWriter, arity_ok, lookup};
 
 /// Node-level stats surfaced through `INFO` (M0-S19): the frozen tripwire
 /// snapshot plus the memory-attribution domains the store can't see. The
@@ -55,10 +53,47 @@ impl Default for ConnCx {
     }
 }
 
+/// Argument-vector view: the parser's borrowed [`ArgvRef`] on the fast path,
+/// plain owned slices on the queued/remote paths. Monomorphized per caller —
+/// the owned path previously re-encoded to RESP and re-parsed per command,
+/// which the M0-E8 cross-cell profile flagged exactly as the reserved note
+/// predicted (allocator + `format!` machinery outweighing store work).
+pub trait Argv {
+    fn arg(&self, i: usize) -> &[u8];
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Argv for ArgvRef<'_> {
+    #[inline]
+    fn arg(&self, i: usize) -> &[u8] {
+        ArgvRef::arg(self, i)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        ArgvRef::len(self)
+    }
+}
+
+impl Argv for [&[u8]] {
+    #[inline]
+    fn arg(&self, i: usize) -> &[u8] {
+        self[i]
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        <[&[u8]]>::len(self)
+    }
+}
+
 /// Executes one parsed command against `store`, appending the reply to
 /// `out`. `now` is injected (L7) — same clock the store's TTLs live on.
 pub fn execute(
-    argv: &ArgvRef<'_>,
+    argv: &(impl Argv + ?Sized),
     store: &mut CellStore,
     cx: &mut ConnCx,
     now: Nanos,
@@ -199,10 +234,10 @@ pub fn execute(
 }
 
 /// Executes a command from owned argument slices — the queued-behind-async
-/// and remote-`Apply` paths. Re-encodes to RESP and re-parses: `ArgvRef` is
-/// parser-internal by design (borrowed offsets over the wire buffer), so the
-/// slow paths pay one copy instead of widening the fast-path type. M1 may
-/// add an owned-argv entry point if this ever shows up in a profile.
+/// and remote-`Apply` paths — through the same [`Argv`]-generic body as the
+/// fast path. Arguments arriving here were already parsed under the
+/// originating connection's `ParserLimits`; the store enforces its own
+/// record bounds, so no protocol-side recheck is needed.
 pub fn execute_slices(
     argv: &[&[u8]],
     store: &mut CellStore,
@@ -211,28 +246,12 @@ pub fn execute_slices(
     out: &mut Vec<u8>,
 ) {
     debug_assert!(!argv.is_empty(), "empty argv is a caller bug");
-    let mut wire = Vec::with_capacity(32 + argv.iter().map(|a| a.len() + 16).sum::<usize>());
-    wire.extend_from_slice(format!("*{}\r\n", argv.len()).as_bytes());
-    for arg in argv {
-        wire.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
-        wire.extend_from_slice(arg);
-        wire.extend_from_slice(b"\r\n");
-    }
-    let mut parser = ConnParser::new(ParserLimits::default());
-    let mut iter = parser.feed(&wire);
-    match iter.next() {
-        Some(Parsed::Command(parsed)) => execute(&parsed, store, cx, now, out),
-        other => {
-            // Only reachable if an argument exceeds the parser caps.
-            let _ = other;
-            RespWriter::new(out, cx.proto).error("ERR argument exceeds protocol limits");
-        }
-    }
+    execute(argv, store, cx, now, out);
 }
 
 // ---- SET ---------------------------------------------------------------------
 
-fn set(argv: &ArgvRef<'_>, store: &mut CellStore, now: Nanos, w: &mut RespWriter<'_>) {
+fn set(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mut RespWriter<'_>) {
     let mut opts = SetOptions::default();
     let mut have_cond = false;
     let mut have_expire = false;
@@ -301,7 +320,7 @@ fn set(argv: &ArgvRef<'_>, store: &mut CellStore, now: Nanos, w: &mut RespWriter
 // ---- EXPIRE / PEXPIRE ----------------------------------------------------------
 
 fn expire(
-    argv: &ArgvRef<'_>,
+    argv: &(impl Argv + ?Sized),
     store: &mut CellStore,
     now: Nanos,
     unit_ms: i64,
@@ -364,7 +383,7 @@ fn incr(store: &mut CellStore, key: &[u8], delta: i64, now: Nanos, w: &mut RespW
 
 // ---- HELLO / INFO / COMMAND -------------------------------------------------------
 
-fn hello(argv: &ArgvRef<'_>, cx: &mut ConnCx, out: &mut Vec<u8>) {
+fn hello(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, out: &mut Vec<u8>) {
     let mut requested = cx.proto;
     if argv.len() >= 2 {
         match parse_i64(argv.arg(1)) {
@@ -456,7 +475,7 @@ fn process_rss_bytes() -> u64 {
         .map_or(0, |kb| kb * 1024)
 }
 
-fn command_introspection(argv: &ArgvRef<'_>, w: &mut RespWriter<'_>) {
+fn command_introspection(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
     if argv.len() >= 2 && argv.arg(1).eq_ignore_ascii_case(b"COUNT") {
         w.int(inf_wire::COMMANDS.len() as i64);
         return;
@@ -487,7 +506,7 @@ fn command_introspection(argv: &ArgvRef<'_>, w: &mut RespWriter<'_>) {
 
 // Format pinned byte-exact against Redis 8.0.5 by the compat harness:
 // `'arg1' 'arg2' ` — space-separated, trailing space, no parentheses.
-fn unknown_command(argv: &ArgvRef<'_>, w: &mut RespWriter<'_>) {
+fn unknown_command(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
     let mut text = format!(
         "ERR unknown command '{}', with args beginning with: ",
         String::from_utf8_lossy(argv.arg(0))

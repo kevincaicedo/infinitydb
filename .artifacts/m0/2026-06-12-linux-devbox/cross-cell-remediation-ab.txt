@@ -1,0 +1,48 @@
+# M0-E8 cross-cell remediation — A/B evidence (dev tier, NOT citation-grade)
+
+env: HomeLab i7-13700KF (8P+8E, hybrid, unpinned), Linux 7.0.0-22-generic,
+governor powersave (HWP boosts ~5.3 GHz pinned; these runs UNPINNED),
+dirty tree (whole infinitydb/ uncommitted), loadgen co-located on same box.
+workload: inf-bench load defaults — 64 conns, P=16, SET:GET 1:10,
+1M keyspace, 16 B keys / 64 B values, 5 s quick legs, 4 cells.
+
+## Trajectory (natural routing vs --route-local-only)
+
+| change | natural ops/s | all-local ops/s | penalty |
+|---|---|---|---|
+| baseline (pre-session: sequential pump) | 1,294,035 (10s med) | 9.06M (prior run) | 85.8% |
+| 1. windowed pump (REMOTE_WINDOW=32, in-order emit) | 2,609,049 | 10,613,428 | 75.4% |
+| 2. + direct-argv exec (Argv trait, no re-encode/re-parse) | 2,520,095 | 10,447,297 | ~75.9% (noise) |
+| 3. + zero-alloc owner drain (execute-in-drain + reply scratch) | 3,068,276 | 10,608,417 | 71.1% |
+| EXPERIMENT (reverted): 128 B slot class (INLINE_MSG_CAP 126) | 3,315,176 | 10,463,720 | 68.3% |
+
+p999 natural: 5,631 us (baseline, 10s) -> 1,823 us (step 3, 5s legs).
+
+## Dispositions (L4)
+
+- Windowed pump: Accepted (architecture fix; +102% natural throughput;
+  DST: 10^7-op deadlock battery + 10^6-op cross-cell oracle green;
+  debug/release trace hash 0xc038aae0837a1995 identical).
+- Direct-argv execution: Accepted as correctness/structure win (kills the
+  flagged re-encode+re-parse shim); throughput-neutral alone at this load
+  shape -- the alloc traffic it removes is a small share.
+- Zero-alloc owner drain: Accepted (+22% natural; owner side of Apply now
+  allocation-free except codec spill).
+- 128 B slot class: Evidence-pending / NOT landed. +8% natural. Changing
+  the 64 B slot class needs an ADR + perf c2c re-audit (master plan section 6.1).
+  Recorded as input to the M1 remediation story.
+
+## Profile findings (perf, dwarf callgraph, cells ~95% busy)
+
+- Cell CPU split at natural routing (post-step-1): ~40% infinityd code,
+  ~28-33% libc (allocator + memmove), ~27-31% kernel.
+- Remote-op combined origin+owner cost: ~4x a local op (was ~5.5x).
+  Penalty <=30% at 75% remote requires ~1.6x -- the residual is distributed
+  per-op fabric machinery: per-op frame encode/decode, ring slot traffic,
+  spill alloc/free for frames >62 B (every 64 B-value GET-hit reply = 71 B
+  spills; SET Apply ~95 B spills), gate HashMap (SipHash) per op, deferred
+  argv copies (1+argc allocs/cmd), reply ownership copy (OwnedOutcome).
+- Remediation story for the gate (filed in ADR-0004): per-destination op
+  packing into Batch frames (section 6.2 -- one slot/spill amortized over k ops),
+  slot-class A/B with c2c re-audit, origin-side flattened defer buffers,
+  arena/pooled reply ownership, nohash/slot-indexed gate table.

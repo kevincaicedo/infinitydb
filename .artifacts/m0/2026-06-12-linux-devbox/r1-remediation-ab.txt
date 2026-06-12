@@ -1,0 +1,57 @@
+# M0-R1 fabric op-packing remediation - A/B evidence (dev tier, NOT citation-grade)
+
+env: HomeLab i7-13700KF (8P+8E hybrid), Linux 7.0.0-22-generic, powersave/HWP,
+dirty tree, loadgen co-located, thermal counters accumulating across the
+session (disclosed; later runs measurably hotter). Quick legs: inf-bench load
+defaults (64 conns, P=16, 1:10 SET:GET, 16 B/64 B, 1M keys), 4 cells, 5 s.
+
+## Step-by-step trajectory (natural / all-local / penalty)
+
+| change | natural | all-local | penalty | p999 nat |
+|---|---|---|---|---|
+| session baseline (post first verdict) | 3.34M | 10.70M | 68.8% | 1631 us |
+| C: transport frame packing (multi-frame slots, seal 2048 B / 64 frames) | 3.70M | 10.67M | 65.3% | 1631 us |
+| A+B: OwnedCmd flattening + pooled reply buffers | 3.74M | 10.69M | 65.0% | 1695 us |
+| D: replies published at FABRIC-IN end (not step 8) | 4.17M | 10.45M | 60.1% | - |
+| E: eventfd doorbell wakeups (park board + LoopWaker) | 4.26M | 10.34M | ~60% | 575 us |
+| isolation control: pinned cells 4/6/8/10, loadgen on cpus 12-23 | 4.45M | 11.07M | 59.8% | 799 us |
+
+Window/latency probes (pre-D/E): P=64 -> 4.51M (+21%); park 50 us -> 4.12M
+(+11%): the system was hop-latency-bound at P=16, not only CPU-bound.
+Post-E: park 5 ms holds 4.08M (wakeups end parks; ceiling no longer binding).
+
+## Dispositions (L4)
+
+- C (frame packing): Accepted. +11%. Codec format unchanged (frames are
+  self-delimiting; packing is transport-level). decode_prefix added
+  (additive). Spill semantics now per sealed slot; fuzz 77.5M execs clean.
+- A+B (flatten+pool): Accepted (structure/locality + allocator traffic cut:
+  libc share 28-33% -> 12-18% of cell CPU), throughput-neutral at this shape.
+- D (reply flush in FABRIC-IN): Accepted. +12%. Replies no longer wait for
+  step 8 - cuts most of an iteration off every hop RTT.
+- E (doorbell wakeups): Accepted. p999 1631 -> 575 us (~3x); throughput
+  ~neutral at this load (its win is light/bursty load and parks; closes the
+  recorded M1 doorbell item early). Dekker-style park handshake: flag ->
+  SeqCst fence -> doorbell check vs ring -> fence -> flag load; a missed
+  wake degrades to the park timeout, never a hang.
+
+## Campaign after R1 (gate-run 1781249510; thermal-throttled box, disclosed)
+
+pipelined natural median 3.70M (3.51/3.70/3.82, rel stdev 4.2%) vs gate 6M;
+cross-cell penalty 56.6% (8.63M all-local leg - hot box) vs gate <=30%;
+unpipelined 2.83x Redis; RSS 0.608x (fill rate 4.28M sets/s, ~2x faster than
+pre-R1 - packing+wakeups help the cross-cell SET fill); p999 1311-1503 us
+PASS; loop p999 PASS; windowed sqes/submit median 13.33 (3.81 pre-R1; rep
+spread 4.8-14.7, spin-enter dilution remains - M0-R3).
+
+## Residual analysis
+
+Remote op now ~3.0x a local op in combined origin+owner CPU (was 4x at the
+verdict, 5.5x originally). Gate <=30% needs ~1.6x. Isolation control shows
+the co-located loadgen does NOT materially distort the ratio (59.8% vs 60%).
+Remaining identified costs are each single-digit %: gate-table SipHash,
+double key-extraction, OwnedCmd+slices copies, conn.out double-copy,
+per-frame codec walk, observer/ConnCx per apply. No single remaining lever
+plausibly closes 60% -> 30% on this box; see ADR-0004 addendum for the
+decision fork (continue grinding / R2 reference box / evidence-backed
+master-plan amendment of the gate).

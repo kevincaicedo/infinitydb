@@ -1,0 +1,21 @@
+# M0 gate: syscall CPU share under pipelined load (informational tripwire)
+# DEV TIER -- NOT citation-grade (powersave/HWP, thermal counters nonzero,
+# dirty tree, loadgen co-located, unpinned hybrid cores).
+
+Method: pidstat -t 1s x 8 over the 4 cell threads under inf-bench load
+(64 conns, P=16, 1:10 SET:GET, 16 B/64 B); perf record -F 997 -g dwarf
+(samples saved as text reports alongside -- perf-*-self.txt, perf-*-dso.txt).
+
+  natural routing : avg/cell usr 60.1% sys 27.1% -> kernel share 31.1%
+  all-local       : avg/cell usr 59.2% sys 33.9% -> kernel share 36.4%
+
+LIMITATION (tier honesty): kptr_restrict=1 and no sudo on this host, so
+kernel stacks cannot be symbolized -- the numbers above are TOTAL kernel-time
+share, an upper bound that includes the irreducible loopback TCP stack work
+for the payload itself (~0.3-1 GB/s of socket traffic), not just
+syscall/completion overhead. The <15% gate targets syscall OVERHEAD (the
+Vortex anti-pattern: 75% CPU in completion handling at batch=1.0); the L3
+mechanism evidence here is one io_uring_enter per loop iteration by
+construction and sqes/submit ~507 on the saturated echo bench
+(2026-06-11 artifact). Verdict left PENDING for the reference-box campaign
+where kernel symbolization allows a real flamegraph decomposition.

@@ -422,6 +422,19 @@ pub fn decode(frame: &[u8]) -> Result<Op<'_>, CodecError> {
     Ok(op)
 }
 
+/// Decodes one frame from the front of `buf`, returning the op and the
+/// bytes consumed — the transport-packing entry (M0-R1): a ring slot may
+/// carry several concatenated frames, each self-delimiting via the header
+/// `len`. The frame *format* is exactly [`decode`]'s; only the
+/// one-frame-per-buffer expectation is relaxed.
+///
+/// # Errors
+/// Same conditions as [`decode`], except trailing bytes are the caller's
+/// remaining frames, not an error.
+pub fn decode_prefix(buf: &[u8]) -> Result<(Op<'_>, usize), CodecError> {
+    decode_frame(buf, false)
+}
+
 /// Decodes one frame from the front of `buf`; returns the op and the bytes
 /// consumed. `nested` is true when decoding inside a `Batch`.
 fn decode_frame(buf: &[u8], nested: bool) -> Result<(Op<'_>, usize), CodecError> {

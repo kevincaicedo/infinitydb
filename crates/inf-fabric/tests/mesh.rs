@@ -199,8 +199,11 @@ fn replies_always_fit_reserved_headroom_under_full_duplex_saturation() {
     for token in a_owes {
         a.reply(to_b, token, &Outcome::Ok);
     }
-    assert_eq!(b.flush(), credits as usize, "replies fit the reserved headroom");
-    assert_eq!(a.flush(), credits as usize);
+    // Packed transport: the count of published SLOTS varies with packing;
+    // the invariant is that every reply flushes completely (no retry stall),
+    // proven by zero remaining staged transport units.
+    assert!(b.flush() >= 1, "replies fit the reserved headroom");
+    assert!(a.flush() >= 1);
     assert_eq!(b.staged_frames(), 0);
     assert_eq!(a.staged_frames(), 0);
 
@@ -212,23 +215,35 @@ fn replies_always_fit_reserved_headroom_under_full_duplex_saturation() {
 
 #[test]
 fn spill_tripwire_counts_oversize_frames() {
+    // Packed transport (M0-R1): spills are counted per sealed SLOT — one
+    // heap allocation amortized over the whole pack, surfaced at seal time
+    // (flush or pack-cap), not per send.
     let mut cells = small_mesh(2, 8, 4);
     let _b = cells.pop();
     let mut a = cells.pop().expect("cell 0");
     let token = a.next_token();
     let big_key = vec![0xEEu8; 200]; // > INLINE_MSG_CAP once framed
     a.send(CellId(1), &read_op(token, &big_key)).expect("send");
-    assert_eq!(a.stats().spilled_frames, 1);
+    a.flush();
+    assert_eq!(a.stats().spilled_frames, 1, "oversize pack spills at seal");
     let token = a.next_token();
     a.send(CellId(1), &read_op(token, b"small")).expect("send");
-    assert_eq!(a.stats().spilled_frames, 1, "inline frames never spill");
+    a.flush();
+    assert_eq!(a.stats().spilled_frames, 1, "inline-size packs never spill");
 }
 
 /// All-to-all threaded smoke: every cell sends `OPS` reads to every peer
 /// under credit pressure, every op gets exactly one reply, nothing stalls,
 /// and all credits are restored at quiescence. Dev-tier stand-in for the
 /// DST deadlock battery (M0-S20).
+///
+/// Miri-excluded (measured: this one test cost ~20 min of a ~21 min Miri
+/// run): it is an integration smoke, not an unsafe-code probe — the ring's
+/// memory-model coverage lives in the smaller Miri tests + the Loom models,
+/// and this scenario runs natively in every workspace test pass and at
+/// 10⁷-op scale in the DST battery.
 #[test]
+#[cfg_attr(miri, ignore = "threaded integration smoke; Miri covers the unsafe leaves directly")]
 fn threaded_all_to_all_saturation_quiesces() {
     const CELLS: u16 = 4;
     const OPS_PER_PEER: u64 = 5_000;

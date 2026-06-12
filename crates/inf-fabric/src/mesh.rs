@@ -110,16 +110,57 @@ impl Doorbell {
     }
 }
 
+/// Bytes after which an open pack seals into a ring slot (also the rough
+/// per-slot spill size — one heap allocation amortized over the whole pack
+/// instead of one per >62 B frame, M0-R1).
+const PACK_SEAL_BYTES: usize = 2048;
+/// Frames after which an open pack seals (bounds frames-per-slot so a
+/// bounded drain overshoots its frame budget by at most one chunk's worth).
+const PACK_SEAL_FRAMES: u32 = 64;
+/// Slots consumed per `consume_batch` call inside `drain` — small, so the
+/// frame budget is re-checked between chunks.
+const DRAIN_SLOT_CHUNK: usize = 8;
+
 /// Per-destination outbound state.
 struct Outbound {
     producer: Producer<FabricMsg>,
     doorbell: Arc<Doorbell>,
-    /// Frames staged by `send`/`reply`, published at `flush` (FABRIC-OUT).
+    /// Sealed slots awaiting `flush` (FABRIC-OUT publication).
     staged: Vec<FabricMsg>,
     /// Remaining data credits toward this destination.
     credits: u32,
-    /// Reused encode buffer — no per-send allocation.
-    scratch: Vec<u8>,
+    /// Open pack: concatenated encoded frames (each self-delimiting via the
+    /// codec header) that will seal into ONE ring slot. This is the M0-R1
+    /// frame-packing remediation: per-op slots and per-op spill allocations
+    /// were a top cross-cell cost (`.artifacts/m0/2026-06-12-linux-devbox/`).
+    pack: Vec<u8>,
+    /// Frames currently in the open pack.
+    pack_frames: u32,
+}
+
+impl Outbound {
+    /// Seals the open pack into one staged ring slot. Returns whether the
+    /// sealed slot heap-spilled (one allocation for the whole pack).
+    fn seal(&mut self) -> bool {
+        if self.pack.is_empty() {
+            return false;
+        }
+        let msg = FabricMsg::from_frame(&self.pack);
+        let spilled = msg.is_spilled();
+        self.staged.push(msg);
+        self.pack.clear();
+        self.pack_frames = 0;
+        spilled
+    }
+
+    /// Seals when the open pack hits its byte or frame cap.
+    fn seal_if_full(&mut self) -> bool {
+        if self.pack.len() >= PACK_SEAL_BYTES || self.pack_frames >= PACK_SEAL_FRAMES {
+            self.seal()
+        } else {
+            false
+        }
+    }
 }
 
 /// Per-source inbound state.
@@ -157,6 +198,12 @@ pub struct CellFabric {
     out: Vec<Option<Outbound>>,
     /// Indexed by source cell id; `None` at `self.cell`.
     inn: Vec<Option<Inbound>>,
+    /// Per-cell parked flags (single-writer, set by each cell's park
+    /// handshake) — read at flush to decide a doorbell wakeup (M0-R1).
+    park_flags: Option<Arc<Vec<AtomicBool>>>,
+    /// Wakes a parked peer's reactor. `dyn` is fine: invoked only on the
+    /// ring-toward-parked-peer cold path.
+    peer_wake: Option<Box<dyn Fn(CellId) + Send>>,
     stats: FabricStats,
 }
 
@@ -193,6 +240,8 @@ impl Mesh {
                 config,
                 out: (0..n).map(|_| None).collect(),
                 inn: (0..n).map(|_| None).collect(),
+                park_flags: None,
+                peer_wake: None,
                 stats: FabricStats::default(),
             })
             .collect();
@@ -208,7 +257,8 @@ impl Mesh {
                     doorbell: Arc::clone(&doorbell),
                     staged: Vec::new(),
                     credits: config.data_credits,
-                    scratch: Vec::with_capacity(64),
+                    pack: Vec::with_capacity(PACK_SEAL_BYTES),
+                    pack_frames: 0,
                 });
                 fabrics[dst].inn[src] = Some(Inbound { consumer, doorbell });
             }
@@ -270,20 +320,17 @@ impl CellFabric {
             "Op::Reply goes through CellFabric::reply (reserved headroom)"
         );
         let cost = Self::credit_cost(op);
-        let spilled = {
+        let sealed_spill = {
             let outbound = self.outbound_mut(to);
             if outbound.credits < cost {
                 return Err(SendError::NoCredit { needed: cost, available: outbound.credits });
             }
             outbound.credits -= cost;
-            outbound.scratch.clear();
-            encode(op, &mut outbound.scratch);
-            let msg = FabricMsg::from_frame(&outbound.scratch);
-            let spilled = msg.is_spilled();
-            outbound.staged.push(msg);
-            spilled
+            encode(op, &mut outbound.pack);
+            outbound.pack_frames += 1;
+            outbound.seal_if_full()
         };
-        if spilled {
+        if sealed_spill {
             self.stats.spilled_frames += 1;
         }
         Ok(())
@@ -291,18 +338,17 @@ impl CellFabric {
 
     /// Stages a reply toward `to`. Infallible by design: replies consume the
     /// reserved ring headroom (`ring_capacity − data_credits`), never data
-    /// credits — this is what breaks the wait-for cycle.
+    /// credits — this is what breaks the wait-for cycle. Replies ride the
+    /// same per-destination pack as data ops, in send order (the origin's
+    /// delivery-time RTT bookkeeping depends on reply FIFO per pair).
     pub fn reply(&mut self, to: CellId, token: FabricToken, outcome: &Outcome<'_>) {
-        let spilled = {
+        let sealed_spill = {
             let outbound = self.outbound_mut(to);
-            outbound.scratch.clear();
-            encode(&Op::Reply { token, outcome: *outcome }, &mut outbound.scratch);
-            let msg = FabricMsg::from_frame(&outbound.scratch);
-            let spilled = msg.is_spilled();
-            outbound.staged.push(msg);
-            spilled
+            encode(&Op::Reply { token, outcome: *outcome }, &mut outbound.pack);
+            outbound.pack_frames += 1;
+            outbound.seal_if_full()
         };
-        if spilled {
+        if sealed_spill {
             self.stats.spilled_frames += 1;
         }
     }
@@ -313,7 +359,12 @@ impl CellFabric {
     /// sizing invariant that only happens transiently while the peer drains.
     pub fn flush(&mut self) -> usize {
         let mut published_total = 0;
-        for outbound in self.out.iter_mut().flatten() {
+        let mut seal_spills = 0;
+        for (dst, slot) in self.out.iter_mut().enumerate() {
+            let Some(outbound) = slot.as_mut() else { continue };
+            if outbound.seal() {
+                seal_spills += 1;
+            }
             if outbound.staged.is_empty() {
                 continue;
             }
@@ -325,18 +376,49 @@ impl CellFabric {
                 outbound.doorbell.ring();
                 published_total += published;
                 self.stats.msgs_published += published as u64;
+                // Doorbell wakeups (M0-R1): if the peer is parked (or about
+                // to park), kick its reactor. The SeqCst fence pairs with
+                // the peer's park handshake (flag store → fence → doorbell
+                // check) so either we see its parked flag or it sees our
+                // doorbell — a missed wake degrades to the park timeout,
+                // never a hang.
+                if let (Some(flags), Some(wake)) = (&self.park_flags, &self.peer_wake) {
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    if flags[dst].load(Ordering::Relaxed) {
+                        wake(CellId(dst as u16));
+                    }
+                }
             }
         }
+        self.stats.spilled_frames += seal_spills;
         if published_total > 0 {
             self.stats.publish_batches += 1;
         }
         published_total
     }
 
-    /// FABRIC-IN: drains up to `max` inbound frames (round-robin across
-    /// peers, bounded), decoding each and handing it to `f(from, op)`.
+    /// Wires doorbell wakeups (M0-R1): `park_flags[i]` is set by cell `i`'s
+    /// park handshake; `wake(i)` must end cell `i`'s kernel park (e.g. a
+    /// `LoopWaker` eventfd write). Cold path — invoked only when a doorbell
+    /// rings toward a parked peer.
+    pub fn set_wakeups(
+        &mut self,
+        park_flags: Arc<Vec<AtomicBool>>,
+        wake: impl Fn(CellId) + Send + 'static,
+    ) {
+        self.park_flags = Some(park_flags);
+        self.peer_wake = Some(Box::new(wake));
+    }
+
+    /// FABRIC-IN: drains inbound frames up to a budget of `max` (round-robin
+    /// across peers, bounded), decoding each and handing it to `f(from, op)`.
     /// `Op::Reply` frames return their credit to the `from` destination
     /// *before* `f` sees them. Returns frames drained.
+    ///
+    /// Slots are packed (M0-R1): one slot carries up to [`PACK_SEAL_FRAMES`]
+    /// concatenated frames, decoded in send order. Slots are consumed in
+    /// chunks of [`DRAIN_SLOT_CHUNK`] so the frame budget overshoots by at
+    /// most one chunk's packing — bounded, like every step budget.
     ///
     /// Never blocks and never sends — this unconditional progress is half of
     /// the deadlock-freedom argument (see module docs).
@@ -349,29 +431,40 @@ impl CellFabric {
             }
             let Some(inbound) = self.inn[source].as_mut() else { continue };
             inbound.doorbell.take();
-            let quota = max - drained_total;
             // Split borrows: credits live in `out[source]`, frames in
             // `inn[source]` — disjoint fields.
-            let outbound_credits = self.out[source].as_mut().map(|o| &mut o.credits);
+            let mut credits = self.out[source].as_mut().map(|o| &mut o.credits);
             let stats = &mut self.stats;
-            let mut credits = outbound_credits;
-            drained_total +=
-                inbound.consumer.consume_batch(quota, |msg| {
-                    match crate::codec::decode(msg.frame()) {
-                        Ok(op) => {
-                            if matches!(op, Op::Reply { .. })
-                                && let Some(credits) = credits.as_deref_mut()
-                            {
-                                *credits += 1;
+            while drained_total < max {
+                let chunk = DRAIN_SLOT_CHUNK.min(max - drained_total);
+                let mut frames = 0usize;
+                let consumed = inbound.consumer.consume_batch(chunk, |msg| {
+                    let mut bytes = msg.frame();
+                    while !bytes.is_empty() {
+                        match crate::codec::decode_prefix(bytes) {
+                            Ok((op, used)) => {
+                                if matches!(op, Op::Reply { .. })
+                                    && let Some(credits) = credits.as_deref_mut()
+                                {
+                                    *credits += 1;
+                                }
+                                f(CellId(source as u16), op);
+                                frames += 1;
+                                bytes = &bytes[used..];
                             }
-                            f(CellId(source as u16), op);
-                        }
-                        Err(_) => {
-                            debug_assert!(false, "fabric frame failed to decode in-process");
-                            stats.decode_errors += 1;
+                            Err(_) => {
+                                debug_assert!(false, "fabric frame failed to decode in-process");
+                                stats.decode_errors += 1;
+                                break;
+                            }
                         }
                     }
                 });
+                drained_total += frames;
+                if consumed < chunk {
+                    break;
+                }
+            }
         }
         drained_total
     }
@@ -382,9 +475,11 @@ impl CellFabric {
         self.inn.iter().flatten().any(|inbound| inbound.doorbell.pending())
     }
 
-    /// Frames staged but not yet published (tests + FABRIC-OUT accounting).
+    /// Transport slots pending publication: sealed slots plus one for each
+    /// destination with an open (non-empty) pack. Nonzero ⟺ unflushed bytes
+    /// exist (tests + FABRIC-OUT accounting).
     pub fn staged_frames(&self) -> usize {
-        self.out.iter().flatten().map(|o| o.staged.len()).sum()
+        self.out.iter().flatten().map(|o| o.staged.len() + usize::from(!o.pack.is_empty())).sum()
     }
 
     /// Outstanding (un-replied) data ops toward `to` — the exact

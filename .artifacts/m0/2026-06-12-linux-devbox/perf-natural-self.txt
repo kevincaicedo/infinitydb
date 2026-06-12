@@ -1,0 +1,147 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 3K of event 'cpu_atom/cycles/P'
+# Event count (approx.): 11125123391
+#
+# Overhead  Command  Shared Object     Symbol                                                                                                     
+# ........  .......  ................  ...........................................................................................................
+#
+     3.46%  cell-0   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     3.02%  cell-2   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     2.56%  cell-3   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     2.50%  cell-0   infinityd         [.] std::sys::backtrace::__rust_begin_short_backtrace
+     2.31%  cell-1   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     1.62%  cell-0   libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.43%  cell-2   libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.25%  cell-1   libc.so.6         [.] _int_malloc
+     1.12%  cell-1   libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.00%  cell-3   libc.so.6         [.] __memmove_avx_unaligned_erms
+     0.96%  cell-3   libc.so.6         [.] _int_malloc
+     0.95%  cell-0   libc.so.6         [.] _int_malloc
+     0.84%  cell-1   libc.so.6         [.] _int_free_chunk
+     0.79%  cell-0   infinityd         [.] inf_server::plane::Conn::state_bytes
+     0.76%  cell-2   libc.so.6         [.] _int_free_chunk
+     0.75%  cell-0   [unknown]         [k] 0xffffffffa6e001bd
+     0.75%  cell-3   libc.so.6         [.] __libc_malloc2
+     0.73%  cell-1   libc.so.6         [.] __libc_malloc2
+     0.72%  cell-0   libc.so.6         [.] _int_free_merge_chunk
+     0.71%  cell-3   libc.so.6         [.] _int_free_chunk
+     0.68%  cell-2   libc.so.6         [.] _int_malloc
+     0.68%  cell-3   infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.55%  cell-0   libc.so.6         [.] _int_free_chunk
+     0.54%  cell-1   infinityd         [.] std::sys::backtrace::__rust_begin_short_backtrace
+     0.54%  cell-1   infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.54%  cell-0   libc.so.6         [.] malloc
+     0.53%  cell-2   libc.so.6         [.] __libc_malloc2
+     0.51%  cell-3   infinityd         [.] inf_server::plane::dispatch_one::{{closure}}::{{closure}}
+     0.51%  cell-0   infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.50%  cell-3   libc.so.6         [.] _int_free_merge_chunk
+     0.47%  cell-0   libc.so.6         [.] __libc_malloc2
+     0.47%  cell-1   infinityd         [.] <inf_server::plane::ServerPlane<O> as inf_runtime::reactor::CellPlane>::parse_execute
+     0.46%  cell-3   infinityd         [.] std::sys::backtrace::__rust_begin_short_backtrace
+     0.45%  cell-2   infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.45%  cell-0   infinityd         [.] inf_server::plane::dispatch_one::{{closure}}::{{closure}}
+     0.44%  cell-2   infinityd         [.] inf_fabric::codec::decode_frame
+     0.44%  cell-0   libc.so.6         [.] cfree@GLIBC_2.2.5
+     0.43%  cell-3   libc.so.6         [.] cfree@GLIBC_2.2.5
+     0.41%  cell-2   infinityd         [.] std::sys::backtrace::__rust_begin_short_backtrace
+     0.40%  cell-1   infinityd         [.] inf_server::plane::Conn::state_bytes
+     0.40%  cell-0   infinityd         [.] inf_fabric::mesh::CellFabric::flush
+     0.40%  cell-0   infinityd         [.] inf_wire::parser::parse_count_line
+     0.40%  cell-1   infinityd         [.] inf_server::plane::dispatch_one::{{closure}}::{{closure}}
+     0.39%  cell-3   infinityd         [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap
+     0.39%  cell-3   libc.so.6         [.] unlink_chunk.isra.0
+     0.39%  cell-1   libc.so.6         [.] unlink_chunk.isra.0
+     0.39%  cell-0   infinityd         [.] <inf_server::plane::ServerPlane<O> as inf_runtime::reactor::CellPlane>::parse_execute
+     0.38%  cell-1   infinityd         [.] inf_fabric::codec::encode_bytes
+     0.37%  cell-3   libc.so.6         [.] malloc
+     0.37%  cell-0   infinityd         [.] inf_fabric::codec::decode_frame
+     0.36%  cell-2   infinityd         [.] inf_server::plane::dispatch_one::{{closure}}::{{closure}}
+     0.36%  cell-0   infinityd         [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap
+     0.36%  cell-3   infinityd         [.] inf_server::plane::send_apply::{{closure}}
+     0.35%  cell-2   infinityd         [.] core::hash::BuildHasher::hash_one
+     0.35%  cell-0   [unknown]         [k] 0xffffffffa71ae860
+     0.34%  cell-3   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.34%  cell-2   libc.so.6         [.] cfree@GLIBC_2.2.5
+     0.34%  cell-2   infinityd         [.] <inf_server::plane::ServerPlane<O> as inf_runtime::reactor::CellPlane>::parse_execute
+     0.33%  cell-0   infinityd         [.] inf_fabric::mesh::CellFabric::reply
+     0.33%  cell-1   infinityd         [.] inf_server::plane::send_apply::{{closure}}
+     0.33%  cell-1   libc.so.6         [.] cfree@GLIBC_2.2.5
+     0.33%  cell-2   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.33%  cell-3   infinityd         [.] core::hash::BuildHasher::hash_one
+     0.32%  cell-3   infinityd         [.] inf_server::plane::handle_fabric_op
+     0.32%  cell-2   libc.so.6         [.] unlink_chunk.isra.0
+     0.31%  cell-1   libc.so.6         [.] _int_free_merge_chunk
+     0.31%  cell-1   infinityd         [.] inf_wire::parser::parse_count_line
+
+
+# Samples: 26K of event 'cpu_core/cycles/P'
+# Event count (approx.): 135222162616
+#
+# Overhead  Command  Shared Object     Symbol                                                                                                     
+# ........  .......  ................  ...........................................................................................................
+#
+     3.56%  cell-1   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     3.46%  cell-3   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     3.45%  cell-2   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     3.19%  cell-0   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     1.36%  cell-0   infinityd         [.] std::sys::backtrace::__rust_begin_short_backtrace
+     1.19%  cell-1   libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.15%  cell-3   libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.13%  cell-2   libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.11%  cell-3   libc.so.6         [.] _int_free_chunk
+     1.03%  cell-1   libc.so.6         [.] _int_free_chunk
+     0.99%  cell-2   infinityd         [.] std::sys::backtrace::__rust_begin_short_backtrace
+     0.99%  cell-1   libc.so.6         [.] _int_malloc
+     0.92%  cell-3   libc.so.6         [.] _int_malloc
+     0.85%  cell-1   libc.so.6         [.] __libc_malloc2
+     0.84%  cell-3   infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.83%  cell-2   libc.so.6         [.] _int_malloc
+     0.77%  cell-0   libc.so.6         [.] __memmove_avx_unaligned_erms
+     0.75%  cell-1   infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.72%  cell-0   libc.so.6         [.] _int_malloc
+     0.71%  cell-3   libc.so.6         [.] __libc_malloc2
+     0.65%  cell-1   infinityd         [.] std::sys::backtrace::__rust_begin_short_backtrace
+     0.64%  cell-3   infinityd         [.] inf_server::plane::dispatch_one::{{closure}}::{{closure}}
+     0.63%  cell-1   infinityd         [.] inf_server::plane::dispatch_one::{{closure}}::{{closure}}
+     0.62%  cell-2   libc.so.6         [.] _int_free_chunk
+     0.61%  cell-0   infinityd         [.] inf_server::plane::Conn::state_bytes
+     0.61%  cell-1   libc.so.6         [.] _int_free_merge_chunk
+     0.59%  cell-1   infinityd         [.] inf_fabric::codec::decode_frame
+     0.58%  cell-3   infinityd         [.] inf_fabric::codec::decode_frame
+     0.57%  cell-1   infinityd         [.] inf_server::plane::send_apply::{{closure}}
+     0.57%  cell-2   infinityd         [.] inf_fabric::codec::decode_frame
+     0.56%  cell-3   infinityd         [.] std::sys::backtrace::__rust_begin_short_backtrace
+     0.56%  cell-2   infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.54%  cell-3   infinityd         [.] inf_server::plane::send_apply::{{closure}}
+     0.51%  cell-2   infinityd         [.] inf_server::plane::dispatch_one::{{closure}}::{{closure}}
+     0.50%  cell-3   libc.so.6         [.] _int_free_merge_chunk
+     0.50%  cell-2   infinityd         [.] inf_server::plane::Conn::state_bytes
+     0.47%  cell-1   libc.so.6         [.] cfree@GLIBC_2.2.5
+     0.46%  cell-2   libc.so.6         [.] __libc_malloc2
+     0.40%  cell-2   libc.so.6         [.] _int_free_merge_chunk
+     0.39%  cell-0   infinityd         [.] inf_fabric::codec::decode_frame
+     0.39%  cell-1   infinityd         [.] <inf_server::plane::ServerPlane<O> as inf_runtime::reactor::CellPlane>::parse_execute
+     0.38%  cell-0   libc.so.6         [.] _int_free_chunk
+     0.38%  cell-3   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.37%  cell-3   infinityd         [.] inf_wire::parser::parse_count_line
+     0.37%  cell-1   libc.so.6         [.] unlink_chunk.isra.0
+     0.37%  cell-2   infinityd         [.] inf_server::plane::send_apply::{{closure}}
+     0.36%  cell-3   libc.so.6         [.] cfree@GLIBC_2.2.5
+     0.36%  cell-1   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.35%  cell-3   libc.so.6         [.] malloc
+     0.34%  cell-1   infinityd         [.] inf_wire::parser::parse_count_line
+     0.34%  cell-3   infinityd         [.] inf_server::plane::handle_fabric_op
+     0.33%  cell-0   infinityd         [.] inf_server::plane::dispatch_one::{{closure}}::{{closure}}
+     0.32%  cell-3   infinityd         [.] <inf_server::plane::ServerPlane<O> as inf_runtime::reactor::CellPlane>::parse_execute
+     0.32%  cell-1   infinityd         [.] core::hash::BuildHasher::hash_one
+     0.32%  cell-0   libc.so.6         [.] realloc
+     0.31%  cell-3   libc.so.6         [.] realloc
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

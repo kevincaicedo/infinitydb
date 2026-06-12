@@ -1,0 +1,75 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 870  of event 'cpu_atom/cycles/P'
+# Event count (approx.): 2905744096
+#
+# Overhead  Command  Shared Object     Symbol                                                                                      
+# ........  .......  ................  ............................................................................................
+#
+    14.90%  cell-1   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+    10.54%  cell-2   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     8.17%  cell-0   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     5.46%  cell-3   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     1.64%  cell-1   libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.36%  cell-2   libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.21%  cell-3   infinityd         [.] inf_wire::parser::FrameIter::next
+     1.19%  cell-1   infinityd         [.] inf_wire::parser::parse_count_line
+     1.06%  cell-1   infinityd         [.] inf_wire::parser::FrameIter::next
+     1.01%  cell-1   libc.so.6         [.] __memcmp_avx2_movbe
+     0.96%  cell-0   libc.so.6         [.] __memmove_avx_unaligned_erms
+     0.93%  cell-2   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.90%  cell-0   infinityd         [.] <inf_server::plane::ServerPlane<O> as inf_runtime::reactor::CellPlane>::parse_execute
+     0.85%  cell-1   infinityd         [.] <inf_server::plane::ServerPlane<O> as inf_runtime::reactor::CellPlane>::parse_execute
+     0.83%  cell-2   libc.so.6         [.] __memcmp_avx2_movbe
+     0.70%  cell-2   infinityd         [.] inf_wire::parser::parse_count_line
+     0.56%  cell-3   libc.so.6         [.] __memmove_avx_unaligned_erms
+     0.55%  cell-2   infinityd         [.] <inf_server::plane::ServerPlane<O> as inf_runtime::reactor::CellPlane>::parse_execute
+     0.52%  cell-0   infinityd         [.] inf_wire::parser::parse_count_line
+     0.46%  cell-0   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.45%  cell-3   libc.so.6         [.] malloc
+     0.43%  cell-2   infinityd         [.] inf_runtime::uring::UringDriver::alloc_id
+     0.43%  cell-0   infinityd         [.] inf_store::store::CellStore::get_with_hash
+     0.42%  cell-1   [unknown]         [k] 0xffffffffa7ad6afc
+     0.40%  cell-2   infinityd         [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap
+     0.40%  cell-1   [unknown]         [k] 0xffffffffa71ae860
+     0.31%  cell-3   [unknown]         [k] 0xffffffffa81ce549
+     0.31%  cell-1   infinityd         [.] inf_foundation::hash::hash64
+
+
+# Samples: 18K of event 'cpu_core/cycles/P'
+# Event count (approx.): 95707622665
+#
+# Overhead  Command  Shared Object     Symbol                                                                                      
+# ........  .......  ................  ............................................................................................
+#
+    12.41%  cell-0   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+    12.27%  cell-3   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+    11.89%  cell-2   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+    11.83%  cell-1   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     0.76%  cell-2   infinityd         [.] inf_wire::parser::parse_count_line
+     0.75%  cell-1   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.74%  cell-1   infinityd         [.] <inf_server::plane::ServerPlane<O> as inf_runtime::reactor::CellPlane>::parse_execute
+     0.74%  cell-3   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.74%  cell-0   infinityd         [.] <inf_server::plane::ServerPlane<O> as inf_runtime::reactor::CellPlane>::parse_execute
+     0.72%  cell-2   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.70%  cell-3   infinityd         [.] <inf_server::plane::ServerPlane<O> as inf_runtime::reactor::CellPlane>::parse_execute
+     0.69%  cell-1   infinityd         [.] inf_wire::parser::parse_count_line
+     0.69%  cell-3   infinityd         [.] inf_wire::parser::parse_count_line
+     0.64%  cell-0   infinityd         [.] inf_wire::parser::parse_count_line
+     0.63%  cell-2   infinityd         [.] <inf_server::plane::ServerPlane<O> as inf_runtime::reactor::CellPlane>::parse_execute
+     0.62%  cell-0   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.51%  cell-3   libc.so.6         [.] __memmove_avx_unaligned_erms
+     0.48%  cell-0   libc.so.6         [.] __memmove_avx_unaligned_erms
+     0.43%  cell-2   libc.so.6         [.] __memmove_avx_unaligned_erms
+     0.42%  cell-1   libc.so.6         [.] __memmove_avx_unaligned_erms
+     0.36%  cell-2   libc.so.6         [.] __memcmp_avx2_movbe
+     0.35%  cell-1   libc.so.6         [.] __memcmp_avx2_movbe
+     0.34%  cell-3   libc.so.6         [.] __memcmp_avx2_movbe
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

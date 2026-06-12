@@ -1,0 +1,66 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 3K of event 'cpu_atom/cycles/P'
+# Event count (approx.): 11125123391
+#
+# Overhead  Shared Object   
+# ........  ................
+#
+    40.92%  infinityd       
+    35.14%  [unknown]       
+            |          
+            |--1.23%--0xffffffffa6e001c4
+            |          
+             --0.59%--0xffffffffa71ae863
+
+    23.73%  libc.so.6       
+            |          
+            |--1.25%--_int_malloc
+            |          |          
+            |           --1.01%--__libc_malloc2
+            |          
+            |--1.12%--__memmove_avx_unaligned_erms
+            |          
+            |--0.84%--_int_free_chunk
+            |          
+             --0.66%--__libc_malloc2
+
+     0.21%  [vdso]          
+
+
+# Samples: 26K of event 'cpu_core/cycles/P'
+# Event count (approx.): 135222162616
+#
+# Overhead  Shared Object   
+# ........  ................
+#
+    44.60%  infinityd       
+            |          
+             --0.59%--encoded_len_from_header (inlined)
+                       record_at (inlined)
+                       {closure#0} (inlined)
+                       find<inf_store::store::{impl#0}::resolve_hashed::{closure_env#0}> (inlined)
+                       resolve_hashed (inlined)
+
+    33.67%  [unknown]       
+    21.53%  libc.so.6       
+            |          
+            |--1.19%--__memmove_avx_unaligned_erms
+            |          
+            |--1.03%--_int_free_chunk
+            |          
+            |--0.94%--_int_malloc
+            |          |          
+            |           --0.70%--__libc_malloc2
+            |          
+             --0.81%--__libc_malloc2
+
+     0.20%  [vdso]          
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

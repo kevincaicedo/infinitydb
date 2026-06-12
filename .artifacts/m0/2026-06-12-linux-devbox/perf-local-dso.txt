@@ -1,0 +1,201 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 870  of event 'cpu_atom/cycles/P'
+# Event count (approx.): 2905744096
+#
+# Overhead  Shared Object   
+# ........  ................
+#
+    53.96%  infinityd       
+            |          
+            |--5.75%--encoded_len_from_header (inlined)
+            |          record_at (inlined)
+            |          {closure#0} (inlined)
+            |          find<inf_store::store::{impl#0}::resolve_hashed::{closure_env#0}> (inlined)
+            |          resolve_hashed (inlined)
+            |          
+            |--5.63%--find<inf_store::store::{impl#0}::resolve_hashed::{closure_env#0}> (inlined)
+            |          resolve_hashed (inlined)
+            |          
+            |--3.18%--eq_mask16 (inlined)
+            |          find<inf_store::store::{impl#0}::resolve_hashed::{closure_env#0}> (inlined)
+            |          resolve_hashed (inlined)
+            |          
+             --0.55%--parse_multibulk (inlined)
+                       parse_one (inlined)
+                       next (inlined)
+
+    37.56%  [unknown]       
+            |          
+            |--0.70%--0xffffffffa851b24d
+            |          
+            |--0.69%--0xffffffffa7ad6afe
+            |          0xffffffffa83020ff
+            |          0xffffffffa8305eda
+            |          0xffffffffa83069d0
+            |          0xffffffffa8359366
+            |          0xffffffffa81c9525
+            |          0xffffffffa7a9fcf9
+            |          0xffffffffa7a7a511
+            |          0xffffffffa7a7eddd
+            |          0xffffffffa7a7f13d
+            |          0xffffffffa7a7f80e
+            |          0xffffffffa7a7fbcc
+            |          0xffffffffa7a7fe22
+            |          0xffffffffa7147750
+            |          0xffffffffa8510b75
+            |          0xffffffffa6e0012b
+            |          
+             --0.54%--0xffffffffa71ae863
+
+     8.48%  libc.so.6       
+            |          
+            |--1.64%--__memmove_avx_unaligned_erms
+            |          |          
+            |           --1.50%--copy_nonoverlapping<u8> (inlined)
+            |                     |          
+            |                      --1.36%--append_elements<u8, alloc::alloc::Global> (inlined)
+            |                                spec_extend<u8, alloc::alloc::Global> (inlined)
+            |                                extend_from_slice<u8, alloc::alloc::Global> (inlined)
+            |                                |          
+            |                                 --1.21%--bulk (inlined)
+            |                                           execute<inf_wire::parser::ArgvRef> (inlined)
+            |                                           parse_execute<inf_server::plane::NoopObserver> (inlined)
+            |                                           run_iteration<inf_runtime::uring::UringDriver, inf_foundation::time::StdClock, inf_server::plane::ServerPlane<inf_server::plane::NoopObserver>> (inlined)
+            |                                           cell_main (inlined)
+            |                                           {closure#0} (inlined)
+            |                                           __rust_begin_short_backtrace<infinityd::main::{closure_env#0}, core::result::Result<(), std::io::error::Error>> (inlined)
+            |                                           {closure#0}<infinityd::main::{closure_env#0}, core::result::Result<(), std::io::error::Error>> (inlined)
+            |                                           call_once<core::result::Result<(), std::io::error::Error>, std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<infinityd::main::{closure_env#0}, core::result::Result<(), std::io::error::Error>>> (inlined)
+            |                                           do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<infinityd::main::{closure_env#0}, core::result::Result<(), std::io::error::Error>>>, core::result::Result<(), std::io::error::Error>> (inlined)
+            |                                           catch_unwind<core::result::Result<(), std::io::error::Error>, core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<infinityd::main::{closure_env#0}, core::result::Result<(), std::io::error::Error>>>> (inlined)
+            |                                           catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<infinityd::main::{closure_env#0}, core::result::Result<(), std::io::error::Error>>>, core::result::Result<(), std::io::error::Error>> (inlined)
+            |                                           {closure#1}<infinityd::main::{closure_env#0}, core::result::Result<(), std::io::error::Error>> (inlined)
+            |                                           call_once<std::thread::lifecycle::spawn_unchecked::{closure_env#1}<infinityd::main::{closure_env#0}, core::result::Result<(), std::io::error::Error>>, ()> (inlined)
+            |          
+             --1.01%--__memcmp_avx2_movbe
+                       |          
+                        --0.88%--equal_same_length<u8, u8> (inlined)
+                                  eq<u8, u8> (inlined)
+                                  eq<[u8], [u8]> (inlined)
+                                  {closure#0} (inlined)
+                                  find<inf_store::store::{impl#0}::resolve_hashed::{closure_env#0}> (inlined)
+                                  resolve_hashed (inlined)
+
+
+
+# Samples: 18K of event 'cpu_core/cycles/P'
+# Event count (approx.): 95707622665
+#
+# Overhead  Shared Object   
+# ........  ................
+#
+    62.79%  infinityd       
+            |          
+            |--5.07%--encoded_len_from_header (inlined)
+            |          record_at (inlined)
+            |          {closure#0} (inlined)
+            |          find<inf_store::store::{impl#0}::resolve_hashed::{closure_env#0}> (inlined)
+            |          resolve_hashed (inlined)
+            |          
+            |--4.57%--find<inf_store::store::{impl#0}::resolve_hashed::{closure_env#0}> (inlined)
+            |          resolve_hashed (inlined)
+            |          
+             --1.82%--eq_mask16 (inlined)
+                       find<inf_store::store::{impl#0}::resolve_hashed::{closure_env#0}> (inlined)
+                       resolve_hashed (inlined)
+
+    32.81%  [unknown]       
+            |          
+            |--0.85%--0xffffffffa7ad4213
+            |          0xffffffffa81e9f72
+            |          0xffffffffa81ea17b
+            |          0xffffffffa81ea353
+            |          0xffffffffa8308174
+            |          0xffffffffa83095e1
+            |          0xffffffffa835940f
+            |          0xffffffffa81c8a96
+            |          0xffffffffa7aa0a37
+            |          0xffffffffa7a7a511
+            |          0xffffffffa7a7ea71
+            |          0xffffffffa7a89b5b
+            |          0xffffffffa7a89e9b
+            |          0xffffffffa7a8af27
+            |          0xffffffffa7a8b227
+            |          |          
+            |           --0.73%--0xffffffffa7a8ba18
+            |                     0xffffffffa7a7fd91
+            |                     0xffffffffa7a7fe22
+            |                     0xffffffffa7147750
+            |                     0xffffffffa8510b75
+            |                     0xffffffffa6e0012b
+            |          
+            |--0.84%--0xffffffffa81d47c9
+            |          0xffffffffa83095e1
+            |          0xffffffffa835940f
+            |          0xffffffffa81c8a96
+            |          0xffffffffa7aa0a37
+            |          0xffffffffa7a7a511
+            |          0xffffffffa7a7ea71
+            |          0xffffffffa7a89b5b
+            |          0xffffffffa7a89e9b
+            |          0xffffffffa7a8af27
+            |          0xffffffffa7a8b227
+            |          |          
+            |           --0.70%--0xffffffffa7a8ba18
+            |                     0xffffffffa7a7fd91
+            |                     0xffffffffa7a7fe22
+            |                     0xffffffffa7147750
+            |                     0xffffffffa8510b75
+            |                     0xffffffffa6e0012b
+            |          
+            |--0.56%--0xffffffffa762aa0c
+            |          0xffffffffa7630c75
+            |          0xffffffffa7636539
+            |          0xffffffffa7637957
+            |          0xffffffffa76793b8
+            |          0xffffffffa76797b9
+            |          0xffffffffa81ce5d2
+            |          0xffffffffa81cf401
+            |          0xffffffffa8305e06
+            |          0xffffffffa83069d0
+            |          0xffffffffa8359366
+            |          0xffffffffa81c9525
+            |          0xffffffffa7a9fcf9
+            |          0xffffffffa7a7a511
+            |          0xffffffffa7a7eddd
+            |          0xffffffffa7a7f13d
+            |          0xffffffffa7a7f80e
+            |          0xffffffffa7a7fbcc
+            |          0xffffffffa7a7fe22
+            |          0xffffffffa7147750
+            |          0xffffffffa8510b75
+            |          0xffffffffa6e0012b
+            |          
+            |--0.53%--0xffffffffa81ea09b
+            |          0xffffffffa81ea353
+            |          0xffffffffa8308174
+            |          0xffffffffa83095e1
+            |          0xffffffffa835940f
+            |          0xffffffffa81c8a96
+            |          0xffffffffa7aa0a37
+            |          0xffffffffa7a7a511
+            |          0xffffffffa7a7ea71
+            |          0xffffffffa7a89b5b
+            |          0xffffffffa7a89e9b
+            |          0xffffffffa7a8af27
+            |          0xffffffffa7a8b227
+            |          
+             --0.52%--0xffffffffa730066b
+                       0xffffffffa852b01e
+
+     4.38%  libc.so.6       
+     0.02%  [vdso]          
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

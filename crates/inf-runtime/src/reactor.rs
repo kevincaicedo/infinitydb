@@ -156,6 +156,13 @@ pub trait CellPlane {
         let _ = cx;
         false
     }
+    /// Called when the loop is about to park. The plane may publish its
+    /// "parked" flag here (doorbell wakeups, M0-R1) and must return `true`
+    /// if a final check found pending work — the loop then polls instead of
+    /// parking. Default: park unconditionally.
+    fn before_park(&mut self) -> bool {
+        false
+    }
 }
 
 /// The cell reactor. Owns the driver, buffer pool, executor, timers,
@@ -212,7 +219,10 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     /// errors arrive as completions.
     pub fn run_iteration(&mut self, plane: &mut impl CellPlane) -> io::Result<IterStats> {
         // ---- steps 9 (prev iteration's ops) + 1 (reap): ONE driver entry.
-        let parked = self.spin_left == 0;
+        // `before_park` runs only when spin is exhausted: the plane
+        // publishes its parked flag and vetoes the park if a final doorbell
+        // check finds work (the lost-wakeup handshake, M0-R1).
+        let parked = self.spin_left == 0 && !plane.before_park();
         let wait = if parked { Wait::Park { timeout: self.park_timeout() } } else { Wait::Poll };
         let submitted = self.ops.len() as u64;
         for op in self.ops.drain(..) {
