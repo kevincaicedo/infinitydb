@@ -315,12 +315,25 @@ const fn build_table() -> [(u64, u8); BUCKETS] {
 /// surface.
 #[inline]
 pub fn lookup(name: &[u8]) -> Option<&'static CommandMeta> {
-    if name.is_empty() || name.len() > MAX_NAME_LEN {
+    let len = name.len();
+    if len == 0 || len > MAX_NAME_LEN {
         return None;
     }
     let mut padded = [0u8; 8];
-    padded[..name.len()].copy_from_slice(name);
-    let word = (u64::from_le_bytes(padded) & FOLD_MASK) ^ name.len() as u64;
+    // Fixed-length arms: each lowers to plain register loads. The previous
+    // runtime-length `copy_from_slice` lowered to a memcpy call that
+    // dominated the whole probe (measured on Raptor Lake, see the wire
+    // bench artifact).
+    match len {
+        1 => padded[..1].copy_from_slice(name),
+        2 => padded[..2].copy_from_slice(name),
+        3 => padded[..3].copy_from_slice(name),
+        4 => padded[..4].copy_from_slice(name),
+        5 => padded[..5].copy_from_slice(name),
+        6 => padded[..6].copy_from_slice(name),
+        _ => padded[..7].copy_from_slice(name),
+    }
+    let word = (u64::from_le_bytes(padded) & FOLD_MASK) ^ len as u64;
     let (canonical, slot) =
         TABLE[(word.wrapping_mul(HASH_MULTIPLIER) >> (64 - BUCKET_BITS)) as usize];
     // One precomputed word compare verifies name AND length (length is mixed

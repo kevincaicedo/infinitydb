@@ -35,11 +35,21 @@ inf-server = [
 ]
 infinity-embedded = ["inf-foundation", "inf-server"]
 
-# bins
-infinityd = ["inf-foundation", "inf-server"]
+# bins — infinityd assembles the node from the parts (cells, mesh, drivers),
+# which inf-server deliberately does not re-export.
+infinityd = [
+    "inf-foundation",
+    "inf-alloc",
+    "inf-fabric",
+    "inf-runtime",
+    "inf-store",
+    "inf-server",
+]
 inf = ["inf-foundation", "inf-wire"]
 inf-bench = ["inf-foundation", "inf-wire"]
-inf-sim = ["inf-foundation", "inf-fabric", "inf-runtime", "inf-wire", "inf-store", "inf-server"]
+inf-sim = ["inf-foundation", "inf-alloc", "inf-fabric", "inf-runtime", "inf-wire", "inf-store", "inf-server"]
 
-# test crates
-compat = ["inf-foundation"]
+# test crates — the compat harness (M0-S15) drives the in-process command
+# executor as the diff candidate, so it sees the wire/store/server stack.
+# Test-harness edges, not kernel boundaries (recorded in the M0 ledger).
+compat = ["inf-foundation", "inf-wire", "inf-store", "inf-server"]

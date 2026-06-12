@@ -97,6 +97,15 @@ fn bench_dispatch(c: &mut Criterion) {
     // Realistic case mix: clients send both cases.
     let names: Vec<&[u8]> =
         vec![b"GET", b"set", b"INCRBY", b"pexpire", b"DEL", b"strlen", b"PING", b"hello"];
+    // Same closure WITHOUT the lookup: the dispatch cycle cost is
+    // (hit_mix − baseline) × measured GHz, not the raw closure time.
+    group.bench_function("harness_baseline", |b| {
+        let mut i = 0;
+        b.iter(|| {
+            i = (i + 1) % names.len();
+            black_box(names[i])
+        });
+    });
     group.bench_function("lookup_hit_mix", |b| {
         let mut i = 0;
         b.iter(|| {
@@ -106,6 +115,24 @@ fn bench_dispatch(c: &mut Criterion) {
     });
     group.bench_function("lookup_miss", |b| {
         b.iter(|| black_box(lookup(black_box(b"NOSUCHC"))));
+    });
+    // Throughput shape: EXECUTE dispatches a whole parse batch, so
+    // independent lookups overlap in the pipeline — this amortized cost is
+    // what the §18.1 cycle budget (10–20 cyc dispatch) means. Divide by 64.
+    group.bench_function("lookup_hit_batch64", |b| {
+        let batch: Vec<&[u8]> = (0..64).map(|i| names[i % names.len()]).collect();
+        b.iter(|| {
+            // Results feed an accumulator (dispatch always reads the meta),
+            // black_box only at the end: per-element black_box would force
+            // every result through memory and serialize the pipeline.
+            let mut acc = 0u64;
+            for name in &batch {
+                if let Some(meta) = lookup(name) {
+                    acc = acc.wrapping_add(meta.arity.unsigned_abs() as u64);
+                }
+            }
+            black_box(acc)
+        });
     });
     group.finish();
 }

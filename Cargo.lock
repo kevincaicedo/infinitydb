@@ -142,6 +142,12 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "compat"
 version = "0.0.0"
+dependencies = [
+ "inf-foundation",
+ "inf-server",
+ "inf-store",
+ "inf-wire",
+]
 
 [[package]]
 name = "criterion"
@@ -384,10 +390,28 @@ dependencies = [
 [[package]]
 name = "inf-server"
 version = "0.0.0"
+dependencies = [
+ "inf-alloc",
+ "inf-fabric",
+ "inf-foundation",
+ "inf-runtime",
+ "inf-store",
+ "inf-wire",
+]
 
 [[package]]
 name = "inf-sim"
 version = "0.0.0"
+dependencies = [
+ "inf-alloc",
+ "inf-fabric",
+ "inf-foundation",
+ "inf-runtime",
+ "inf-server",
+ "inf-store",
+ "inf-wire",
+ "libc",
+]
 
 [[package]]
 name = "inf-simd"
@@ -399,6 +423,13 @@ dependencies = [
 [[package]]
 name = "inf-store"
 version = "0.0.0"
+dependencies = [
+ "criterion",
+ "inf-alloc",
+ "inf-foundation",
+ "inf-simd",
+ "proptest",
+]
 
 [[package]]
 name = "inf-stream"
@@ -425,6 +456,14 @@ version = "0.0.0"
 [[package]]
 name = "infinityd"
 version = "0.0.0"
+dependencies = [
+ "inf-alloc",
+ "inf-fabric",
+ "inf-foundation",
+ "inf-runtime",
+ "inf-server",
+ "inf-store",
+]
 
 [[package]]
 name = "io-uring"

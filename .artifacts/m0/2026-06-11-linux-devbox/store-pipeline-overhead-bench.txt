@@ -1,0 +1,21 @@
+# M0-S13/S14 ACs: per-key overhead, probe-length histogram at LF 0.85, L4 pipeline A/B
+# pipeline = full §7.3 shape (probe-prefetch → candidate → record-prefetch → verify), get_many()
+# pinned core 4 · 2026-06-11T19:38:23-04:00 · kernel 7.0.0-22-generic · i7-13700KF · governor powersave
+git: 88d60fc + uncommitted infinitydb/
+
+--- inf-store gate bench: 14260633 keys x (16 B key, 64 B value) ---
+load            2.1s (6.73M sets/s)
+records_live    1254935704 B
+records_slack   1258344 B
+records_resident 1256194048 B
+index_bytes     150994944 B (10.6 B/key)
+OVERHEAD/KEY    18.7 B (gate: <= 24 B at LF 0.85)
+probe 1 group(s): 94.409% (cum 94.409%)
+probe 2 group(s):  3.356% (cum 97.765%)
+probe 3 group(s):  1.340% (cum 99.106%)
+probe 4 group(s):  0.447% (cum 99.553%)
+probe 5 group(s):  0.224% (cum 99.777%)
+probe 6 group(s):  0.223% (cum 100.000%)
+GET off-pipeline 19.98M ops/s
+GET on-pipeline  22.47M ops/s
+PIPELINE GAIN   +12.5% (gate: >= +25% on the cache-miss-bound set, else demote to flag + ADR)

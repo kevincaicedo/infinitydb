@@ -915,9 +915,32 @@ mod tests {
         ]
     }
 
+    /// Fuzz regression (2026-06-11, first Linux hour): an `Apply` frame whose
+    /// second arg length was the non-minimal varint `[0x80, 0x00]` decoded
+    /// fine but re-encoded canonically — breaking decode→encode byte-exactness.
+    /// Non-minimal varints are now `BadVarint`.
+    #[test]
+    fn non_minimal_varint_in_frame_is_rejected() {
+        let crash: &[u8] = &[
+            0, 3, 0, 0, 15, 0, 0, 0, // header: v0, Apply, flags 0, len 15
+            0, 0, 145, 0, 0, 0, 2, 0, // token
+            0, 0, // slot
+            0, // cmd
+            2, // argc
+            0, // arg0 len (canonical 0)
+            128, 0, // arg1 len: NON-MINIMAL encoding of 0
+        ];
+        assert_eq!(decode(crash), Err(CodecError::BadVarint));
+    }
+
     proptest! {
         /// M0-S10 AC: arbitrary op sequences round-trip the codec byte-exact.
+        /// Ignored under Miri: proptest's failure persistence needs `getcwd`,
+        /// which Miri isolation forbids — and the codec is safe code whose
+        /// totality is fuzz-covered (`fuzz_targets/fabric_codec.rs`); Miri's
+        /// scope here is the unsafe ring (M0 §17.2 ladder).
         #[test]
+        #[cfg_attr(miri, ignore)]
         fn op_sequences_round_trip_byte_exact(ops in prop::collection::vec(any_op(), 1..16)) {
             let mut stream = Vec::new();
             let mut frame_ends = Vec::new();
@@ -939,6 +962,7 @@ mod tests {
 
         /// Decode is total: arbitrary bytes never panic.
         #[test]
+        #[cfg_attr(miri, ignore)] // see round-trip note: getcwd under isolation
         fn decode_is_total(bytes in prop::collection::vec(any::<u8>(), 0..256)) {
             let _ = decode(&bytes);
         }

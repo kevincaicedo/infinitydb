@@ -15,7 +15,12 @@ pub fn encode_u64(mut v: u64, out: &mut Vec<u8>) {
 }
 
 /// Decode a LEB128 u64 from the front of `buf`.
-/// Returns `(value, bytes_consumed)`; `None` on truncation or > 10 bytes.
+/// Returns `(value, bytes_consumed)`; `None` on truncation, > 10 bytes, or a
+/// **non-minimal encoding**. Canonical form is required so decode→encode
+/// round-trips byte-exact — the fabric codec and the log spine (L7, replay
+/// digests) both depend on one-value-one-encoding. Found by the fabric_codec
+/// fuzzer on the first Linux hour: `[0x80, 0x00]` decoded as 0 but
+/// re-encoded as `[0x00]`.
 #[inline]
 pub fn decode_u64(buf: &[u8]) -> Option<(u64, usize)> {
     let mut value: u64 = 0;
@@ -24,6 +29,12 @@ pub fn decode_u64(buf: &[u8]) -> Option<(u64, usize)> {
         if byte & 0x80 == 0 {
             // Reject non-canonical bits beyond 64 in the final byte.
             if i == 9 && byte > 0x01 {
+                return None;
+            }
+            // Reject non-minimal encodings: a final 0x00 after a
+            // continuation byte contributes no bits, so the canonical form
+            // is always shorter.
+            if i > 0 && byte == 0 {
                 return None;
             }
             return Some((value, i + 1));
@@ -57,5 +68,16 @@ mod tests {
     fn overlong_is_rejected() {
         // 11 continuation bytes can never be a valid u64.
         assert_eq!(decode_u64(&[0x80; 11]), None);
+    }
+
+    #[test]
+    fn non_minimal_is_rejected() {
+        // Fuzz regression: [0x80, 0x00] decoded as 0, re-encoded as [0x00].
+        assert_eq!(decode_u64(&[0x80, 0x00]), None);
+        assert_eq!(decode_u64(&[0x81, 0x00]), None);
+        assert_eq!(decode_u64(&[0xFF, 0x80, 0x00]), None);
+        // The shortest multi-byte canonical encodings stay accepted.
+        assert_eq!(decode_u64(&[0x80, 0x01]), Some((128, 2)));
+        assert_eq!(decode_u64(&[0xFF, 0x7F]), Some((16383, 2)));
     }
 }

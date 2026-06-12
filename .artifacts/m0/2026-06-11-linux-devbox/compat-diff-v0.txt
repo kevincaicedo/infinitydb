@@ -1,0 +1,8 @@
+# M0-S15 AC: compat-diff harness v0 — byte-exact vs real Redis
+# oracle: Redis server v=8.0.5 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=9729964261b8fc0f
+# note: AC names Redis 7.2; this box ships 8.0.5 — string-surface replies are
+# format-identical for the matrix; two formats were oracle-pinned during the run
+# (unknown-command arg list, string2ll rejecting '-0'). date: 2026-06-11T19:48:08-04:00
+
+compat-diff v0: 132 byte-compared cases, 6 documented deviations, 0 failures
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s

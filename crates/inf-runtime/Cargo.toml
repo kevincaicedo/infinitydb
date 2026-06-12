@@ -20,6 +20,9 @@ io-uring = { workspace = true, optional = true }
 
 [features]
 uring = ["dep:io-uring"]
+# M0-S19 A/B artifact only: compiles the always-on tripwire counters out to
+# prove they cost nothing. Never enabled in shipping builds.
+no-tripwires = []
 
 [dev-dependencies]
 proptest.workspace = true
@@ -31,6 +34,13 @@ libc.workspace = true
 name = "executor"
 harness = false
 test = false
+
+# M0-S04 echo gate (Linux + uring only; skipped without the feature).
+[[bench]]
+name = "uring_echo"
+harness = false
+test = false
+required-features = ["uring"]
 
 [lints]
 workspace = true

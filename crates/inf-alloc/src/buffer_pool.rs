@@ -41,6 +41,10 @@ pub enum LeaseKind {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum SlotState {
     Free,
+    /// Driver→kernel custody (e.g. io_uring provided-buffer ring): not in
+    /// use by any consumer, but not free either. Accounted separately so
+    /// `reconcile()` keeps meaning "no consumer-visible leak".
+    Staged,
     Leased(LeaseKind),
 }
 
@@ -65,6 +69,7 @@ pub struct BufferPool {
     free: Vec<u32>,
     buf_size: usize,
     leased: usize,
+    staged: usize,
     recv_leases: u64,
     send_leases: u64,
 }
@@ -80,6 +85,7 @@ impl BufferPool {
             free: (0..count as u32).rev().collect(),
             buf_size,
             leased: 0,
+            staged: 0,
             recv_leases: 0,
             send_leases: 0,
         }
@@ -117,6 +123,47 @@ impl BufferPool {
         self.leased -= 1;
     }
 
+    /// Stage a free buffer into driver→kernel custody (provided-buffer
+    /// ring). Staged buffers count in neither `leased()` nor `available()`;
+    /// they return via [`promote_staged`](Self::promote_staged) (kernel
+    /// handed it to the consumer — becomes a `Recv` lease) or
+    /// [`unstage`](Self::unstage) (kernel rejected it / group teardown).
+    #[inline]
+    pub fn try_stage(&mut self) -> Option<BufferId> {
+        let id = self.free.pop()?;
+        self.state[id as usize] = SlotState::Staged;
+        self.staged += 1;
+        Some(BufferId(id))
+    }
+
+    /// The kernel delivered a staged buffer to the consumer: it becomes an
+    /// ordinary `Recv` lease (the consumer must `release` it).
+    ///
+    /// # Panics
+    /// Panics if the buffer is not staged — a driver lifecycle bug.
+    #[inline]
+    pub fn promote_staged(&mut self, id: BufferId) {
+        let slot = &mut self.state[id.index()];
+        assert!(matches!(slot, SlotState::Staged), "buffer {} promoted while not staged", id.0);
+        *slot = SlotState::Leased(LeaseKind::Recv);
+        self.staged -= 1;
+        self.leased += 1;
+        self.recv_leases += 1;
+    }
+
+    /// Return a staged buffer to the free list without a consumer lease.
+    ///
+    /// # Panics
+    /// Panics if the buffer is not staged — a driver lifecycle bug.
+    #[inline]
+    pub fn unstage(&mut self, id: BufferId) {
+        let slot = &mut self.state[id.index()];
+        assert!(matches!(slot, SlotState::Staged), "buffer {} unstaged while not staged", id.0);
+        *slot = SlotState::Free;
+        self.free.push(id.0);
+        self.staged -= 1;
+    }
+
     #[inline]
     pub fn bytes(&self, id: BufferId) -> &[u8] {
         &self.storage[id.index()]
@@ -137,9 +184,22 @@ impl BufferPool {
         self.storage.len()
     }
 
+    /// Consumer-owned leases (excludes staged buffers).
     #[inline]
     pub fn leased(&self) -> usize {
         self.leased
+    }
+
+    /// Buffers in driver→kernel custody (provided-buffer ring).
+    #[inline]
+    pub fn staged(&self) -> usize {
+        self.staged
+    }
+
+    /// Buffers immediately available to lease or stage.
+    #[inline]
+    pub fn available(&self) -> usize {
+        self.free.len()
     }
 
     /// Total bytes reserved by this pool (memory attribution: `wire_buffers_bytes`).
@@ -148,7 +208,10 @@ impl BufferPool {
         self.capacity() * self.buf_size
     }
 
-    /// Leak check: every buffer must be back in the pool (test/shutdown hook).
+    /// Leak check: no consumer-visible lease may remain (test/shutdown
+    /// hook). Staged buffers are driver custody, accounted via `staged()`,
+    /// and are not leaks — a live provided-buffer ring legitimately holds
+    /// them for the driver's lifetime.
     pub fn reconcile(&self) -> Result<(), LeaseLeak> {
         if self.leased == 0 { Ok(()) } else { Err(LeaseLeak { leaked: self.leased }) }
     }
@@ -209,6 +272,44 @@ mod tests {
         assert_eq!(pool.try_lease(LeaseKind::Send), None);
         pool.release(a);
         assert!(pool.try_lease(LeaseKind::Recv).is_some());
+    }
+
+    #[test]
+    fn staging_lifecycle_promote_and_unstage() {
+        let mut pool = BufferPool::new(2, 16);
+        let a = pool.try_stage().expect("stage a");
+        let b = pool.try_stage().expect("stage b");
+        assert_eq!(pool.try_stage(), None);
+        assert_eq!((pool.staged(), pool.leased(), pool.available()), (2, 0, 0));
+        assert_eq!(pool.reconcile(), Ok(()), "staged buffers are not consumer leaks");
+
+        // Kernel delivers `a` to the consumer: ordinary Recv lease now.
+        pool.promote_staged(a);
+        assert_eq!((pool.staged(), pool.leased()), (1, 1));
+        assert_eq!(pool.lease_counts().0, 1, "promotion counts as a recv lease");
+        pool.release(a);
+
+        // Kernel rejects `b`: back to free without a lease.
+        pool.unstage(b);
+        assert_eq!((pool.staged(), pool.leased(), pool.available()), (0, 0, 2));
+        assert_eq!(pool.reconcile(), Ok(()));
+    }
+
+    #[test]
+    #[should_panic(expected = "promoted while not staged")]
+    fn promote_unstaged_panics() {
+        let mut pool = BufferPool::new(1, 16);
+        let id = pool.try_lease(LeaseKind::Recv).expect("lease");
+        pool.promote_staged(id);
+    }
+
+    #[test]
+    #[should_panic(expected = "unstaged while not staged")]
+    fn unstage_free_panics() {
+        let mut pool = BufferPool::new(1, 16);
+        let id = pool.try_stage().expect("stage");
+        pool.unstage(id);
+        pool.unstage(id);
     }
 
     #[test]

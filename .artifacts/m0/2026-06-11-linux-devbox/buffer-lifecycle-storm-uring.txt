@@ -1,0 +1,26 @@
+# M0-S04 AC: 1M-cycle buffer lifecycle storm on UringDriver (probed + degraded)
+date: 2026-06-11T18:46:47-04:00
+Linux HomeLab 7.0.0-22-generic #22-Ubuntu SMP PREEMPT_DYNAMIC Mon May 25 15:54:34 UTC 2026 x86_64 GNU/Linux
+model name	: 13th Gen Intel(R) Core(TM) i7-13700KF
+governor: powersave
+rustc 1.95.0 (59807616e 2026-04-14)
+git: 88d60fc (tree has uncommitted M0 work — infinitydb/ is one uncommitted unit)
+
+=== PROBED 1M ===
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.02s
+     Running tests/driver_conformance.rs (target/release/deps/driver_conformance-2bf8e8d980093041)
+
+running 1 test
+test buffer_lifecycle_storm_reconciles_to_zero ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 12.76s
+
+=== FORCE-DEGRADED 1M ===
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.02s
+     Running tests/driver_conformance.rs (target/release/deps/driver_conformance-2bf8e8d980093041)
+
+running 1 test
+test buffer_lifecycle_storm_reconciles_to_zero ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 13.11s
+

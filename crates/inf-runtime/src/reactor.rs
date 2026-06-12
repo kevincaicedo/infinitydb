@@ -220,9 +220,16 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         }
         self.completions.clear();
         let reaped = self.driver.submit_and_reap(&mut self.pool, wait, &mut self.completions)?;
-        self.submits += 1;
-        self.sqes_total += submitted;
-        self.cqes_total += reaped as u64;
+        // Count REAL backend work (driver stats), not plane-pushed ops: the
+        // driver adds provided-buffer restocks, multishot re-arms, and
+        // short-write resubmits — exactly the syscall amortization L3 gates.
+        #[cfg(not(feature = "no-tripwires"))]
+        {
+            let stats = self.driver.submit_stats();
+            self.submits += stats.syscalls.max(1);
+            self.sqes_total += stats.sqes;
+            self.cqes_total += reaped as u64;
+        }
 
         // Active time starts after the (possible) park.
         let start = self.clock.now();
@@ -291,10 +298,15 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         }
 
         let active = self.clock.now().saturating_sub(start);
-        self.iter_hist_us.record(active.as_micros());
-        self.iterations += 1;
-        self.commands_total += commands;
-        self.fabric_total += fabric_msgs;
+        // The always-on tripwires (§16). `no-tripwires` exists ONLY for the
+        // M0-S19 A/B artifact proving they cost nothing — never ship it.
+        #[cfg(not(feature = "no-tripwires"))]
+        {
+            self.iter_hist_us.record(active.as_micros());
+            self.iterations += 1;
+            self.commands_total += commands;
+            self.fabric_total += fabric_msgs;
+        }
 
         Ok(IterStats { reaped, polled, commands, fabric_msgs, submitted, parked, active })
     }
@@ -315,6 +327,21 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     /// `.percentile(99.9)` — the §6 gate reads this.
     pub fn iteration_histogram(&self) -> &LogHistogram {
         &self.iter_hist_us
+    }
+
+    /// Raw lifetime counters `(submits, sqes, cqes, iterations, commands,
+    /// fabric_msgs)` — the scrape side computes *windowed* deltas from two
+    /// snapshots so idle iterations don't dilute under-load ratios (the
+    /// lifetime ratios in [`tripwires`](Self::tripwires) include parks).
+    pub fn counters(&self) -> [u64; 6] {
+        [
+            self.submits,
+            self.sqes_total,
+            self.cqes_total,
+            self.iterations,
+            self.commands_total,
+            self.fabric_total,
+        ]
     }
 
     /// Frozen tripwire snapshot for the control-thread scrape (M0-S19):

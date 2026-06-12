@@ -1,0 +1,12 @@
+# M0-S19 AC: tripwire counters on vs compiled-out (feature no-tripwires) — must be <= 1% delta
+# workload: uring_echo, 10 s window, pinned server core; date: 2026-06-11T21:22:03-04:00
+
+=== A/B tripwires on vs no-tripwires (echo bench) ===
+frames/s/core   33136580
+sqes_per_submit 510.1
+GATES PASS: ≥1M frames/s/core, sqes_per_submit ≥ 16
+--- no-tripwires build ---
+frames/s/core   32989967
+sqes_per_submit 511.6
+
+VERDICT: 33.14M vs 32.99M frames/s = -0.4% (within run noise) — counters are free. Disposition: Accepted; no-tripwires exists only for this artifact.

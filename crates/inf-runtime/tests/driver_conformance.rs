@@ -7,6 +7,12 @@
 //! Cycle count scales via `INF_LIFECYCLE_CYCLES` (the 1M-cycle AC run);
 //! default is CI-sized.
 
+// No backend ⇒ no suite: Linux runs need `--features uring` (kqueue is the
+// macOS dev tier). An empty test crate here is correct — the CI matrix has a
+// dedicated uring leg, and a panicking `make_driver` stub would not compile
+// (`!` does not implement `BackendDriver`).
+#![cfg(any(target_os = "macos", all(target_os = "linux", feature = "uring")))]
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::IntoRawFd;
@@ -25,11 +31,6 @@ fn make_driver() -> impl BackendDriver {
 #[cfg(all(target_os = "linux", feature = "uring"))]
 fn make_driver() -> impl BackendDriver {
     inf_runtime::UringDriver::new(256).expect("io_uring")
-}
-
-#[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "uring"))))]
-fn make_driver() -> impl BackendDriver {
-    panic!("no backend for this target; Linux runs need --features uring")
 }
 
 struct Rig {
@@ -283,9 +284,15 @@ fn close_cancels_blocked_sends_and_returns_buffers() {
     rig.driver.push(IoOp::Close { fd: conn, token: CompletionToken::new(TokenClass::Close, 9, 0) });
     let seen = rig.pump_until(|c| matches!(c.result, CompletionResult::Closed));
     for c in &seen {
-        if let CompletionResult::Error { errno, buf: Some(buf) } = c.result {
-            assert_eq!(errno, libc::ECANCELED, "blocked sends cancel on close");
-            rig.pool.release(buf);
+        match c.result {
+            CompletionResult::Error { errno, buf: Some(buf) } => {
+                assert_eq!(errno, libc::ECANCELED, "blocked sends cancel on close");
+                rig.pool.release(buf);
+            }
+            // A send that raced ahead of the cancel still terminates the
+            // lease — either terminal returns the buffer, that is the proof.
+            CompletionResult::Sent { buf } => rig.pool.release(buf),
+            _ => {}
         }
     }
     assert_eq!(rig.pool.reconcile(), Ok(()), "cancelled sends returned every buffer");

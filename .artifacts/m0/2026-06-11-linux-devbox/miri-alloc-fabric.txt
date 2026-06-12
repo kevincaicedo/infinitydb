@@ -1,0 +1,15 @@
+# M0 §17.2 ladder: Miri over inf-alloc + inf-fabric (lib tests; proptest cases ignored under Miri — getcwd/isolation, fuzz-covered)
+date: 2026-06-11T18:54:46-04:00 · miri 0.1.0 (485ec3fbcc 2026-06-10)
+
+running 8 tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 87.99s
+running 18 tests
+test codec::tests::decode_is_total ... ignored
+test codec::tests::op_sequences_round_trip_byte_exact ... ignored
+test result: ok. 16 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.29s
+running 9 tests
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1460.69s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

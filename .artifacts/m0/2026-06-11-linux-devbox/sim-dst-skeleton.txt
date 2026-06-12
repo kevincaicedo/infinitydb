@@ -1,0 +1,25 @@
+# M0-S20 ACs + deferred S09/S10/S16 DST runs (sim tier — deterministic, virtual time)
+date: 2026-06-11T21:06:24-04:00 · 7.0.0-22-generic · seed-replayable via inf-sim CLI
+
+=== m0-smoke (3 cells, 100 conns, 1e5 mixed cmds) + determinism (release) ===
+inf-sim: scenario m0-smoke seed 0xc0ffee: 100000 commands, 105329 apply events, 6114 steps, trace 4440725 bytes, hash 0xb4b3404c90726037
+inf-sim: determinism verified — second run trace byte-identical
+=== debug vs release: same seed, hash comparison ===
+inf-sim: scenario m0-smoke seed 0xc0ffee: 100000 commands, 105329 apply events, 6114 steps, trace 4440725 bytes, hash 0xb4b3404c90726037
+=== planted lost-wakeup caught (catch seed printed) ===
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+lost wakeup caught at seed 0
+test planted_lost_wakeup_is_caught_within_1000_seeds ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.11s
+=== deferred S09 deadlock battery (10^7 ops, all-to-all, pipelined) + S10/S16 10^6-op cross-cell oracle (release) ===
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 2 tests
+test cross_cell_million_op_oracle ... ok
+test deadlock_battery_all_to_all_saturation ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 13.78s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

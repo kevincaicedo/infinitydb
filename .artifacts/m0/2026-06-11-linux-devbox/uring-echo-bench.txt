@@ -1,0 +1,55 @@
+# M0-S04 AC: loopback echo microbench, UringDriver, one pinned server core (core 4)
+# gates: >= 1M frames/s/core (64B frames), sqes_per_submit >= 16 under pipelined load
+# harness: custom (benches/uring_echo.rs) — criterion unfit for saturated multi-thread steady state (recorded deviation)
+date: 2026-06-11T18:50:48-04:00
+Linux HomeLab 7.0.0-22-generic #22-Ubuntu SMP PREEMPT_DYNAMIC Mon May 25 15:54:34 UTC 2026 x86_64 GNU/Linux
+model name	: 13th Gen Intel(R) Core(TM) i7-13700KF
+governor: powersave (dev-box disposition: HWP boosts under load; reference box owns citation-grade numbers)
+rustc 1.95.0 (59807616e 2026-04-14)
+git: 88d60fc + uncommitted infinitydb/ tree
+
+=== replicate 1 ===
+capabilities: Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+--- uring_echo (16 conns, 65536 B windows, 10s window) ---
+bytes           21079851008
+frames(64B)     329372672
+frames/s/core   32936710
+throughput      1.96 GiB/s
+iterations      20278
+syscalls        20278
+sqes            10292896
+sqes_per_submit 507.6
+cqes_per_reap   507.6
+recv_dropped    0
+errors          0
+GATES PASS: ≥1M frames/s/core, sqes_per_submit ≥ 16
+=== replicate 2 ===
+capabilities: Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+--- uring_echo (16 conns, 65536 B windows, 10s window) ---
+bytes           21051736064
+frames(64B)     328933376
+frames/s/core   32892872
+throughput      1.96 GiB/s
+iterations      20255
+syscalls        20255
+sqes            10279168
+sqes_per_submit 507.5
+cqes_per_reap   507.5
+recv_dropped    0
+errors          0
+GATES PASS: ≥1M frames/s/core, sqes_per_submit ≥ 16
+=== replicate 3 ===
+capabilities: Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+--- uring_echo (16 conns, 65536 B windows, 10s window) ---
+bytes           20664483840
+frames(64B)     322882560
+frames/s/core   32287973
+throughput      1.92 GiB/s
+iterations      19902
+syscalls        19902
+sqes            10090080
+sqes_per_submit 507.0
+cqes_per_reap   507.0
+recv_dropped    0
+errors          0
+GATES PASS: ≥1M frames/s/core, sqes_per_submit ≥ 16

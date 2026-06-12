@@ -1,0 +1,13 @@
+# M0-S10 evidence: 1 h cargo-fuzz run on fabric_codec AFTER the varint canonicality fix
+# (first run crashed in ~2 min: non-minimal LEB128 broke decode→encode byte-exactness;
+#  fixed in inf_foundation::varint::decode_u64, crash input promoted to the corpus)
+# invariants: decode totality + decode→encode byte-exact canonicality
+date: 2026-06-11T20:09:44-04:00 · Linux 7.0.0-22-generic
+
+#3271701041	DONE   cov: 467 ft: 606 corp: 163/4161b lim: 4096 exec/s: 908553 rss: 524Mb
+stat::number_of_executed_units: 3271701041
+stat::average_exec_per_sec:     908553
+stat::new_units_added:          437
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              524
+fabric_codec exit: 0

@@ -1,0 +1,42 @@
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 30 uncommitted entries
+  cpufreq-governor     FAIL  scaling_governor != performance on 24 cpus: cpu0=powersave, cpu1=powersave, cpu10=powersave, cpu11=powersave (+20 more)
+  cpufreq-epp          PASS
+  thermal-throttle     FAIL  thermal throttling occurred: cpu0/package_throttle_count=2457, cpu1/package_throttle_count=2457, cpu10/core_throttle_count=1989, cpu10/package_throttle_count=2689
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+gate-run: CONTINUING WITH FAILED ENV-CHECK — results are not citation-grade
+
+== pipelined replicates (conns=64 P=16, 10s x 3) ==
+  rep 0: 1294035 ops/s, p999 5631 us, windowed sqes/submit 11.7
+  rep 1: 1282013 ops/s, p999 3583 us, windowed sqes/submit 8.4
+  rep 2: 1319761 ops/s, p999 3327 us, windowed sqes/submit 13.9
+
+== cross-cell penalty (natural vs --route-local-only) ==
+  natural 1300632 ops/s vs all-local 9153797 ops/s => penalty 85.8%
+
+== unpipelined 512-conn A/B vs redis ==
+  infinityd 1095982 ops/s vs redis 418724 ops/s => 2.62x
+
+== RSS fill: 10000000 keys x (16 B, 64 B), both engines ==
+  infinityd fill: 1022614 sets/s
+  redis fill: 1625457 sets/s
+  RSS: infinityd 1125752832 B vs redis 1854599168 B => 0.607x
+
+== gate verdicts ==
+  Pipelined GET/SET node throughput      FAIL (DEV-TIER, non-binding)
+  Unpipelined throughput vs Redis, 512 conns PASS (DEV-TIER, non-binding)
+  io_uring SQEs per submit under pipelined load FAIL
+  Fabric hop RTT p50 under load          FAIL (DEV-TIER, non-binding)
+  Cross-cell penalty, uniform random keys FAIL (DEV-TIER, non-binding)
+  p99.9 latency (memtier, 8 threads)     FAIL (DEV-TIER, non-binding)
+  RSS @ 10M keys x (16 B, 64 B)          PASS (DEV-TIER, non-binding)
+  Reactor loop iteration p99.9           PASS (DEV-TIER, non-binding)
+  Syscall CPU share under pipelined load PENDING (tooling)
+
+gate-run: report written to .artifacts/m0/1781227231-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+exit: 1

@@ -9,13 +9,13 @@ name: infinity-ci
 on:
   push:
     branches: [main]
-    paths: ["infinity/**", ".github/workflows/infinity-ci.yml"]
+    paths: ["infinitydb/**", ".github/workflows/infinity-ci.yml"]
   pull_request:
-    paths: ["infinity/**", ".github/workflows/infinity-ci.yml"]
+    paths: ["infinitydb/**", ".github/workflows/infinity-ci.yml"]
 
 defaults:
   run:
-    working-directory: infinity
+    working-directory: infinitydb
 
 jobs:
   build-test:
@@ -49,7 +49,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          manifest-path: infinity/Cargo.toml
+          manifest-path: infinitydb/Cargo.toml
 
   miri:
     # Scoped to the unsafe leaf crates (verification ladder §17.2).
@@ -87,10 +87,39 @@ jobs:
         run: cargo install cargo-fuzz --locked
       - name: fuzz RESP parser (smoke)
         run: cargo +nightly fuzz run resp_parse -- -max_total_time=300
-        working-directory: infinity/crates/inf-wire
+        working-directory: infinitydb/crates/inf-wire
       - name: fuzz fabric codec (smoke)
         run: cargo +nightly fuzz run fabric_codec -- -max_total_time=300
-        working-directory: infinity/crates/inf-fabric
+        working-directory: infinitydb/crates/inf-fabric
+
+  compat-diff:
+    # M0-S15 AC: command x edge-case matrix byte-identical to real Redis.
+    # The diff test skips loudly when redis-server is absent, so this job
+    # exists to make sure it actually runs.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: install redis oracle
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - name: compat-diff matrix
+        run: cargo test -p compat -- --nocapture
+
+  sim-smoke:
+    # M0-S20: deterministic simulator — smoke scenario twice with trace
+    # comparison, plus the in-process determinism/oracle/planted-bug tests.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: sim tests (determinism, oracle, planted lost-wakeup)
+        run: cargo test -p inf-sim
+      - name: m0-smoke determinism (CLI)
+        run: cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
 
   kernel-matrix:
     # Asserts io_uring feature-probe fallback across kernels (M0-S02).

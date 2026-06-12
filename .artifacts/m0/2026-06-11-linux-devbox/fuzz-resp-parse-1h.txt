@@ -1,0 +1,13 @@
+# M0-S11 AC: 1 h cargo-fuzz (libFuzzer) run on resp_parse — zero crashes/UB
+# invariants: parser totality, bounded accumulator, poisoning, under arbitrary chunking
+date: 2026-06-11T20:05:19-04:00 · nightly 1.98.0-nightly · Linux 7.0.0-22-generic
+
+#65241967	DONE   cov: 272 ft: 1667 corp: 575/94Kb lim: 4096 exec/s: 18117 rss: 600Mb
+stat::number_of_executed_units: 65241967
+stat::average_exec_per_sec:     18117
+stat::new_units_added:          6680
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              600
+resp_parse exit: 0
+
+# final coverage: cov 272, features 1667, corpus 575 inputs / 94 Kb, ~18.1k exec/s (single job)

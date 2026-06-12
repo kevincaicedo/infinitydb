@@ -1,0 +1,20 @@
+# M0-S08 AC: SPSC ring 2-thread bench, PINNED cores 4,6 (distinct P-cores, no HT siblings)
+# gate: >= 8M msgs/s/ring-pair, amortized enqueue+dequeue < 40 ns/msg
+date: 2026-06-11T18:52:18-04:00
+7.0.0-22-generic
+model name	: 13th Gen Intel(R) Core(TM) i7-13700KF
+governor: powersave
+git: 88d60fc + uncommitted infinitydb/
+
+Benchmarking spsc_ring_2threads/msgs_64B_inline
+Benchmarking spsc_ring_2threads/msgs_64B_inline: Warming up for 3.0000 s
+Benchmarking spsc_ring_2threads/msgs_64B_inline: Collecting 10 samples in estimated 5.1517 s (715 iterations)
+Benchmarking spsc_ring_2threads/msgs_64B_inline: Analyzing
+spsc_ring_2threads/msgs_64B_inline
+                        time:   [4.6757 ms 5.3420 ms 6.5508 ms]
+                        thrpt:  [152.65 Melem/s 187.20 Melem/s 213.87 Melem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+
+
+# summary: median 187.20M msgs/s => ~5.34 ns/msg amortized enqueue+dequeue (gate: >=8M msgs/s, <40 ns/msg) — PASS (x23 headroom, pinned)

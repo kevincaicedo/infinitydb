@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+description = "Compat-diff harness: InfinityDB vs real Redis, byte-exact"
+
+[dependencies]
+inf-foundation.workspace = true
+inf-wire.workspace = true
+inf-store.workspace = true
+inf-server.workspace = true
 
 [lints]
 workspace = true
