@@ -11,6 +11,7 @@ mod config;
 mod exec;
 mod glob;
 mod plane;
+mod pubsub;
 
 pub use clients::{ClientInfo, ClientRegistry};
 pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};

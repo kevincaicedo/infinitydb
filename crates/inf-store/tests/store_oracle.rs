@@ -273,6 +273,7 @@ fn out_of_memory_is_an_error_not_a_panic() {
     let mut store = CellStore::new(StoreConfig {
         arena: inf_alloc::ArenaConfig { chunk_size: 64 << 10, max_resident: Some(64 << 10) },
         initial_keys: 16,
+        ..StoreConfig::default()
     });
     let now = Nanos(0);
     let value = vec![0xAB; 1 << 10];

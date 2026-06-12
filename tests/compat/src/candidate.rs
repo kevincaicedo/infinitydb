@@ -6,11 +6,11 @@
 
 use inf_foundation::time::Nanos;
 use inf_server::{ConnCx, execute};
-use inf_store::{CellStore, StoreConfig};
+use inf_store::{Keyspace, StoreConfig};
 use inf_wire::{ConnParser, Parsed, ParserLimits};
 
 pub struct Candidate {
-    store: CellStore,
+    store: Keyspace,
     parser: ConnParser,
     cx: ConnCx,
     epoch: std::time::Instant,
@@ -35,7 +35,7 @@ impl Candidate {
         cx.node.wall_anchor.set((0, unix_ms));
         cx.node.rng_state.set(0x1AF1_D8A5_0DB5_EED1);
         Candidate {
-            store: CellStore::new(StoreConfig::default()),
+            store: Keyspace::new(StoreConfig::default()),
             parser: ConnParser::new(ParserLimits::default()),
             cx,
             epoch: std::time::Instant::now(),

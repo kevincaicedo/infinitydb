@@ -19,7 +19,7 @@ use inf_foundation::time::StdClock;
 use inf_runtime::net::{bound_port, listen_reuseport, pin_current_thread};
 use inf_runtime::{BackendDriver, CellLoop, LoopConfig};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane};
-use inf_store::{CellStore, StoreConfig};
+use inf_store::{Keyspace, StoreConfig};
 
 /// How often (iterations) each cell refreshes its INFO stats snapshot.
 const STATS_EVERY: u64 = 1024;
@@ -198,7 +198,7 @@ fn cell_main(
         CellId(cell),
         args.cells,
         listener.into_raw_fd(), // the driver owns the listener fd now
-        CellStore::new(StoreConfig::default()),
+        Keyspace::new(StoreConfig::default()),
         fabric,
         Rc::clone(&node),
         NoopObserver,

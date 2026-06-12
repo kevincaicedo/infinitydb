@@ -32,6 +32,10 @@ enum Kind {
     Enum(&'static [&'static str]),
     /// Free-form string.
     Str,
+    /// `client-output-buffer-limit` class triples (M1-S11): SET merges the
+    /// given `<class> <hard> <soft> <secs>` groups onto the current value;
+    /// GET reports all three classes in canonical order, like Redis.
+    OutputBufferLimit,
 }
 
 #[derive(Debug)]
@@ -66,14 +70,25 @@ pub const MAXMEMORY_POLICIES: &[&str] = &[
 #[derive(Debug)]
 pub struct ConfigStore {
     entries: Vec<Entry>,
+    /// Bumped on every successful SET — the plane's MAINTAIN sweep compares
+    /// it to push `hot-per-cell` keys (eviction pressure) without re-parsing
+    /// the table each iteration (M1-E3).
+    version: u64,
 }
 
 impl Default for ConfigStore {
     fn default() -> ConfigStore {
         let e = |key, class, kind, value: &str| Entry { key, class, kind, value: value.into() };
         ConfigStore {
+            version: 0,
             entries: vec![
                 e("appendonly", ReloadClass::BootOnly, Kind::Enum(&["no", "yes"]), "no"),
+                e(
+                    "client-output-buffer-limit",
+                    ReloadClass::HotPerCell,
+                    Kind::OutputBufferLimit,
+                    "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60",
+                ),
                 e("databases", ReloadClass::BootOnly, Kind::Int, "16"),
                 e("maxclients", ReloadClass::BootOnly, Kind::Int, "10000"),
                 e("maxmemory", ReloadClass::HotPerCell, Kind::Memory, "0"),
@@ -134,15 +149,78 @@ impl ConfigStore {
                 lower
             }
             Kind::Str => text,
+            Kind::OutputBufferLimit => merge_output_buffer_limit(&entry.value, &text)
+                .ok_or(ConfigSetError::Invalid { key: key_str, value: text })?,
         };
         entry.value = normalized;
+        self.version += 1;
         Ok(entry.class)
     }
+
+    /// Monotone mutation counter (see the field note).
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+/// `client-output-buffer-limit` value as `(class_index, [hard, soft,
+/// secs])` groups. Classes: 0 = normal, 1 = slave (replica normalizes), 2 =
+/// pubsub.
+fn parse_output_buffer_groups(text: &str) -> Option<Vec<(usize, [u64; 3])>> {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    if tokens.is_empty() || !tokens.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut groups = Vec::with_capacity(tokens.len() / 4);
+    for chunk in tokens.chunks(4) {
+        let class = match chunk[0].to_lowercase().as_str() {
+            "normal" => 0,
+            "slave" | "replica" => 1,
+            "pubsub" => 2,
+            _ => return None,
+        };
+        let hard = parse_memory(chunk[1])?;
+        let soft = parse_memory(chunk[2])?;
+        let secs: u64 = chunk[3].parse().ok()?;
+        groups.push((class, [hard, soft, secs]));
+    }
+    Some(groups)
+}
+
+/// Merge-and-normalize for `CONFIG SET client-output-buffer-limit` (the
+/// Redis semantics: only the named classes change).
+fn merge_output_buffer_limit(current: &str, update: &str) -> Option<String> {
+    let mut values = [[0u64; 3]; 3];
+    for (class, v) in parse_output_buffer_groups(current)? {
+        values[class] = v;
+    }
+    for (class, v) in parse_output_buffer_groups(update)? {
+        values[class] = v;
+    }
+    let rendered: Vec<String> = ["normal", "slave", "pubsub"]
+        .iter()
+        .zip(values)
+        .map(|(name, [hard, soft, secs])| format!("{name} {hard} {soft} {secs}"))
+        .collect();
+    Some(rendered.join(" "))
+}
+
+/// The pubsub class triple `(hard, soft, soft_ms)` for the plane's
+/// output-cap enforcement (M1-S11). Zeros disable a limit.
+pub(crate) fn pubsub_output_limit(cfg: &ConfigStore) -> (u64, u64, u64) {
+    let Some(text) = cfg.get("client-output-buffer-limit") else { return (0, 0, 0) };
+    let Some(groups) = parse_output_buffer_groups(text) else { return (0, 0, 0) };
+    groups
+        .iter()
+        .rev()
+        .find(|(class, _)| *class == 2)
+        .map_or((0, 0, 0), |(_, [hard, soft, secs])| (*hard, *soft, secs.saturating_mul(1000)))
 }
 
 /// Redis memory-unit grammar: bare bytes, or `k/kb/m/mb/g/gb` suffixes
 /// (decimal vs binary multipliers, case-insensitive).
-fn parse_memory(text: &str) -> Option<u64> {
+pub(crate) fn parse_memory(text: &str) -> Option<u64> {
     let lower = text.to_lowercase();
     let (digits, mult) = match lower {
         _ if lower.ends_with("kb") => (&lower[..lower.len() - 2], 1024),

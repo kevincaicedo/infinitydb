@@ -22,15 +22,16 @@ use std::rc::Rc;
 
 use inf_foundation::time::Nanos;
 use inf_store::{
-    CellStore, CopyResult, ExpireCond, OpError, SetCond, SetExpire, SetOptions, SetOutcome, Ttl,
-    TtlUpdate,
+    CellStore, CopyResult, ExpireCond, Keyspace, OpError, SetCond, SetExpire, SetOptions,
+    SetOutcome, Ttl, TtlUpdate,
 };
-use inf_wire::{ArgvRef, CommandId, Protocol, RespWriter, arity_ok, lookup};
+use inf_wire::{ArgvRef, CmdFlags, CommandId, Protocol, RespWriter, arity_ok, lookup};
 
 use crate::admin;
 use crate::clients::ClientRegistry;
 use crate::config::ConfigStore;
 use crate::glob::glob_match;
+use crate::pubsub;
 
 /// Node-level state surfaced through the command layer (M0-S19 + M1-S03):
 /// the frozen tripwire snapshot, the memory-attribution domains the store
@@ -62,24 +63,52 @@ pub struct NodeInfo {
     pub rng_state: Cell<u64>,
     pub tcp_port: Cell<u16>,
     pub total_connections: Cell<u64>,
+    /// Pub/sub gauges + counters (M1-S10/S11), flushed by the plane's
+    /// MAINTAIN: channels this cell owns with live subscribers, live
+    /// patterns (node-wide — the index is replicated), estimated registry
+    /// bytes, fan-out messages sent, deliveries appended, and
+    /// output-buffer-cap disconnections.
+    pub pubsub_channels: Cell<u64>,
+    pub pubsub_patterns: Cell<u64>,
+    pub pubsub_state_bytes: Cell<u64>,
+    pub pubsub_fan_msgs: Cell<u64>,
+    pub pubsub_delivered: Cell<u64>,
+    pub cob_disconnections: Cell<u64>,
     /// CLIENT registry for this cell's connections (single-threaded).
     pub clients: RefCell<ClientRegistry>,
     /// Typed CONFIG store (M1-S03 freeze: keys + hot-reload classes).
     pub config: RefCell<ConfigStore>,
 }
 
-/// Per-connection execution state (protocol negotiated via `HELLO`).
+/// Per-connection execution state (protocol negotiated via `HELLO`,
+/// database selected via `SELECT` — M1-S08, subscriptions via
+/// `(P)SUBSCRIBE` — M1-S10).
 #[derive(Debug)]
 pub struct ConnCx {
     pub proto: Protocol,
     pub id: u64,
+    /// Selected default namespace (`SELECT 0..15`); 0 unless SELECTed.
+    pub db: u16,
+    /// Subscribed channels, in subscription order (M1-S10). Empty vectors
+    /// never allocate, so a non-subscriber connection pays two length
+    /// loads at most.
+    pub sub_channels: Vec<Vec<u8>>,
+    /// Subscribed glob patterns, in subscription order.
+    pub sub_patterns: Vec<Vec<u8>>,
     /// Shared node stats for `INFO` (zeroed default outside a node).
     pub node: Rc<NodeInfo>,
 }
 
 impl Default for ConnCx {
     fn default() -> ConnCx {
-        ConnCx { proto: Protocol::Resp2, id: 1, node: Rc::new(NodeInfo::default()) }
+        ConnCx {
+            proto: Protocol::Resp2,
+            id: 1,
+            db: 0,
+            sub_channels: Vec::new(),
+            sub_patterns: Vec::new(),
+            node: Rc::new(NodeInfo::default()),
+        }
     }
 }
 
@@ -120,9 +149,119 @@ impl Argv for [&[u8]] {
     }
 }
 
-/// Executes one parsed command against `store`, appending the reply to
-/// `out`. `now` is injected (L7) — same clock the store's TTLs live on.
+/// Executes one parsed command against the cell's keyspace, appending the
+/// reply to `out`. `now` is injected (L7) — same clock the store's TTLs
+/// live on. Keyspace-level commands (SELECT, FLUSHALL, cross-db COPY,
+/// INF.NS, INFO, CONFIG) dispatch here; everything else runs against the
+/// connection's selected database.
 pub fn execute(
+    argv: &(impl Argv + ?Sized),
+    ks: &mut Keyspace,
+    cx: &mut ConnCx,
+    now: Nanos,
+    out: &mut Vec<u8>,
+) {
+    let Some(meta) = lookup(argv.arg(0)) else {
+        let mut w = RespWriter::new(out, cx.proto);
+        return unknown_command(argv, &mut w);
+    };
+    if !arity_ok(meta, argv.len()) {
+        let mut w = RespWriter::new(out, cx.proto);
+        return arity_error(meta.name, &mut w);
+    }
+    // M1-S07 OOM gate: DENYOOM commands enter through metadata, never
+    // per-handler checks (kernel rule). The first test is one branch on the
+    // keyspace's cached flag; only genuine pressure pays the inline
+    // eviction escalation, and `noeviction`/unfreeable pressure answers
+    // the Redis-exact OOM error.
+    if meta.flags.contains(CmdFlags::DENYOOM) && ks.over_limit() && ks.free_for_write(now).is_err()
+    {
+        let mut w = RespWriter::new(out, cx.proto);
+        return w.error("OOM command not allowed when used memory > 'maxmemory'.");
+    }
+    // M1-S10: a RESP2 subscriber may only run the subscribe family + PING
+    // (Redis `processCommand` order: after the OOM gate). RESP3 lifts this.
+    if pubsub::subscriber_restricted(cx) && !pubsub::allowed_in_subscriber_mode(meta.id) {
+        let sub = (argv.len() > 1).then(|| argv.arg(1));
+        let mut w = RespWriter::new(out, cx.proto);
+        return pubsub::restricted_error(meta.id, meta.name, sub, &mut w);
+    }
+    match meta.id {
+        // ---- keyspace-level commands (M1-E3/E4) ----
+        CommandId::Select => {
+            let mut w = RespWriter::new(out, cx.proto);
+            select(argv, ks, cx, &mut w);
+        }
+        CommandId::Flushall => {
+            let mut w = RespWriter::new(out, cx.proto);
+            flush(argv, ks, None, now, &mut w);
+        }
+        CommandId::Flushdb => {
+            let db = cx.db;
+            let mut w = RespWriter::new(out, cx.proto);
+            flush(argv, ks, Some(db), now, &mut w);
+        }
+        CommandId::Copy => {
+            let db = cx.db;
+            let mut w = RespWriter::new(out, cx.proto);
+            copy(argv, ks, db, now, &mut w);
+        }
+        CommandId::Info => {
+            let mut w = RespWriter::new(out, cx.proto);
+            admin::info(argv, ks, &cx.node, now, &mut w);
+        }
+        CommandId::Config => {
+            let mut w = RespWriter::new(out, cx.proto);
+            admin::config(argv, ks, &cx.node, &mut w);
+        }
+        CommandId::InfNs => {
+            let mut w = RespWriter::new(out, cx.proto);
+            admin::inf_ns(argv, ks, &cx.node, &mut w);
+        }
+        // ---- pub/sub (M1-S10): conn-state ops here; registries, delivery,
+        // and fan-out are plane state, so inside a node the plane intercepts
+        // these before `execute` and this path is the planeless fallback
+        // (compat candidate, embedded) — the single-connection view, which
+        // is byte-exact Redis behavior for one client on one server.
+        CommandId::Subscribe | CommandId::Psubscribe => {
+            let kind = if meta.id == CommandId::Subscribe {
+                pubsub::SubKind::Channel
+            } else {
+                pubsub::SubKind::Pattern
+            };
+            let names: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
+            pubsub::apply_subscribe(&names, kind, cx, out);
+        }
+        CommandId::Unsubscribe | CommandId::Punsubscribe => {
+            let kind = if meta.id == CommandId::Unsubscribe {
+                pubsub::SubKind::Channel
+            } else {
+                pubsub::SubKind::Pattern
+            };
+            let names: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
+            let names = if names.is_empty() { None } else { Some(names.as_slice()) };
+            pubsub::apply_unsubscribe(names, kind, cx, out);
+        }
+        CommandId::Publish => pubsub::publish_fallback(argv.arg(1), argv.arg(2), cx, out),
+        CommandId::Pubsub => {
+            let args: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
+            pubsub::pubsub_fallback(&args, cx, out);
+        }
+        _ => {
+            let db = usize::from(cx.db);
+            execute_db(meta, argv, ks.db_mut(db), cx, now, out);
+        }
+    }
+    // Mutations refresh the cached pressure flag (no-op without a limit).
+    if meta.flags.contains(CmdFlags::WRITE) {
+        ks.refresh_pressure();
+    }
+}
+
+/// Executes one command against the selected database's store (the M0-S15
+/// body, unchanged in shape — keyspace-level commands never reach here).
+fn execute_db(
+    meta: &'static inf_wire::CommandMeta,
     argv: &(impl Argv + ?Sized),
     store: &mut CellStore,
     cx: &mut ConnCx,
@@ -130,20 +269,18 @@ pub fn execute(
     out: &mut Vec<u8>,
 ) {
     let mut w = RespWriter::new(out, cx.proto);
-    let Some(meta) = lookup(argv.arg(0)) else {
-        return unknown_command(argv, &mut w);
-    };
-    if !arity_ok(meta, argv.len()) {
-        return arity_error(meta.name, &mut w);
-    }
     match meta.id {
         CommandId::Ping => {
-            if argv.len() == 1 {
-                w.simple("PONG");
+            if argv.len() > 2 {
+                w.error("ERR wrong number of arguments for 'ping' command");
+            } else if pubsub::subscriber_restricted(cx) {
+                // RESP2 subscriber mode: `[pong, <arg|"">]` (Redis shape).
+                let arg = (argv.len() == 2).then(|| argv.arg(1));
+                pubsub::subscriber_ping(arg, cx.proto, out);
             } else if argv.len() == 2 {
                 w.bulk(argv.arg(1));
             } else {
-                w.error("ERR wrong number of arguments for 'ping' command");
+                w.simple("PONG");
             }
         }
         CommandId::Echo => w.bulk(argv.arg(1)),
@@ -291,7 +428,6 @@ pub fn execute(
                 Err(e) => op_error(e, &mut w),
             }
         }
-        CommandId::Copy => copy(argv, store, now, &mut w),
         CommandId::Dbsize => w.int(store.len() as i64),
         CommandId::Keys => keys(argv.arg(1), store, now, cx.proto, out),
         CommandId::Randomkey => {
@@ -302,16 +438,6 @@ pub fn execute(
             }
         }
         CommandId::Scan => scan(argv, store, now, cx.proto, out),
-        CommandId::Flushdb | CommandId::Flushall => {
-            for i in 1..argv.len() {
-                let opt = argv.arg(i);
-                if !opt.eq_ignore_ascii_case(b"ASYNC") && !opt.eq_ignore_ascii_case(b"SYNC") {
-                    return w.error("ERR syntax error");
-                }
-            }
-            store.flush(now);
-            w.simple("OK");
-        }
         CommandId::Object => object(argv, store, &cx.node, now, &mut w),
         CommandId::Debug => admin::debug(argv, store, now, &mut w),
         // ---- M1-S03 · expiry completion + introspection ----
@@ -361,15 +487,27 @@ pub fn execute(
             let removed = store.expire(argv.arg(1), None, ExpireCond::Always, now);
             w.int(i64::from(removed));
         }
-        CommandId::Select => select(argv, &mut w),
-        CommandId::Info => admin::info(argv, store, &cx.node, now, &mut w),
         CommandId::Command => admin::command_introspection(argv, &mut w),
-        CommandId::Config => admin::config(argv, store, &cx.node, &mut w),
         CommandId::Client => admin::client(argv, cx, now, out),
         CommandId::Lolwut => w.bulk(b"InfinityDB ver. 0.1.0-alpha.0\n"),
         // ---- internal fabric-program ops ----
         CommandId::InfTake | CommandId::InfPeek => {
             inf_take_peek(argv, store, meta.id == CommandId::InfTake, now, &mut w);
+        }
+        CommandId::Select
+        | CommandId::Flushdb
+        | CommandId::Flushall
+        | CommandId::Copy
+        | CommandId::Info
+        | CommandId::Config
+        | CommandId::InfNs
+        | CommandId::Subscribe
+        | CommandId::Unsubscribe
+        | CommandId::Psubscribe
+        | CommandId::Punsubscribe
+        | CommandId::Publish
+        | CommandId::Pubsub => {
+            unreachable!("keyspace-level and pub/sub commands dispatch in execute()")
         }
     }
 }
@@ -381,13 +519,13 @@ pub fn execute(
 /// record bounds, so no protocol-side recheck is needed.
 pub fn execute_slices(
     argv: &[&[u8]],
-    store: &mut CellStore,
+    ks: &mut Keyspace,
     cx: &mut ConnCx,
     now: Nanos,
     out: &mut Vec<u8>,
 ) {
     debug_assert!(!argv.is_empty(), "empty argv is a caller bug");
-    execute(argv, store, cx, now, out);
+    execute(argv, ks, cx, now, out);
 }
 
 // ---- wall clock (M1-S03) -----------------------------------------------------
@@ -622,8 +760,17 @@ fn msetnx(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mu
 
 // ---- COPY ----------------------------------------------------------------------
 
-fn copy(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mut RespWriter<'_>) {
+/// `COPY src dst [DB n] [REPLACE]` — cross-db is real with namespaces v1
+/// (M1-S08); the source database is the connection's selected db.
+fn copy(
+    argv: &(impl Argv + ?Sized),
+    ks: &mut Keyspace,
+    src_db: u16,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) {
     let mut replace = false;
+    let mut dst_db = src_db;
     let mut i = 3;
     while i < argv.len() {
         let opt = argv.arg(i);
@@ -634,12 +781,7 @@ fn copy(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mut 
                 return w.error("ERR syntax error");
             }
             match parse_i64(argv.arg(i + 1)) {
-                Ok(0) => {}
-                Ok(1..=15) => {
-                    // Honesty over silence (L8): cross-db COPY arrives with
-                    // namespaces v1 (M1-E4).
-                    return w.error("ERR COPY to DB != 0 is not yet supported (InfinityDB M1-E4)");
-                }
+                Ok(n @ 0..=15) => dst_db = n as u16,
                 Ok(_) => return w.error("ERR DB index is out of range"),
                 Err(()) => return w.error("ERR value is not an integer or out of range"),
             }
@@ -649,14 +791,38 @@ fn copy(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mut 
         }
         i += 1;
     }
-    if argv.arg(1) == argv.arg(2) {
+    // Same key is only an error within one database (Redis: cross-db
+    // self-copy is legal).
+    if argv.arg(1) == argv.arg(2) && src_db == dst_db {
         return w.error("ERR source and destination objects are the same");
     }
-    match store.copy(argv.arg(1), argv.arg(2), replace, now) {
+    let (src_db, dst_db) = (usize::from(src_db), usize::from(dst_db));
+    match ks.copy_between(src_db, argv.arg(1), dst_db, argv.arg(2), replace, now) {
         Ok(CopyResult::Copied) => w.int(1),
         Ok(CopyResult::SourceMissing | CopyResult::DestinationExists) => w.int(0),
         Err(e) => op_error(e, w),
     }
+}
+
+/// `FLUSHDB` (the selected db) / `FLUSHALL` (every db) — this cell's slice.
+fn flush(
+    argv: &(impl Argv + ?Sized),
+    ks: &mut Keyspace,
+    db: Option<u16>,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) {
+    for i in 1..argv.len() {
+        let opt = argv.arg(i);
+        if !opt.eq_ignore_ascii_case(b"ASYNC") && !opt.eq_ignore_ascii_case(b"SYNC") {
+            return w.error("ERR syntax error");
+        }
+    }
+    match db {
+        Some(db) => ks.db_mut(usize::from(db)).flush(now),
+        None => ks.flush_all(now),
+    }
+    w.simple("OK");
 }
 
 // ---- KEYS / SCAN ---------------------------------------------------------------
@@ -784,10 +950,12 @@ fn object(
         // recorded deviation.
         w.int(0);
     } else {
-        // FREQ requires an LFU policy, exactly like Redis.
+        // FREQ requires an LFU policy, exactly like Redis. The value is the
+        // CMS Morris estimate (recorded deviation: Redis's log-counter
+        // scale differs; both are opaque popularity scores).
         let lfu = node.config.borrow().get("maxmemory-policy").is_some_and(|p| p.contains("lfu"));
         if lfu {
-            w.int(0);
+            w.int(i64::from(store.object_freq(key, now).unwrap_or(0)));
         } else {
             w.error(
                 "ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.",
@@ -806,13 +974,16 @@ fn object_subcommand_error(sub: &[u8], w: &mut RespWriter<'_>) {
 
 // ---- SELECT --------------------------------------------------------------------
 
-fn select(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
+/// `SELECT 0..15` maps to the default namespaces (M1-S08). The selection
+/// is connection state — the plane serializes it in pipeline order exactly
+/// like HELLO's protocol switch (a conn-state barrier).
+fn select(argv: &(impl Argv + ?Sized), ks: &mut Keyspace, cx: &mut ConnCx, w: &mut RespWriter<'_>) {
     match parse_i64(argv.arg(1)) {
-        Ok(0) => w.simple("OK"),
-        Ok(1..=15) => {
-            // Honesty over silence (L8): dbs 1-15 map to namespaces v1
-            // (M1-E4); pretending they are empty would corrupt clients.
-            w.error("ERR SELECT is limited to DB 0 until namespaces v1 (InfinityDB M1-E4)");
+        Ok(n @ 0..=15) => {
+            cx.db = n as u16;
+            // Materialize eagerly: a SELECTed db is about to be used.
+            let _ = ks.db_mut(n as usize);
+            w.simple("OK");
         }
         Ok(_) => w.error("ERR DB index is out of range"),
         Err(()) => w.error("ERR value is not an integer or out of range"),
@@ -1063,7 +1234,7 @@ mod tests {
     use inf_store::StoreConfig;
     use inf_wire::{ConnParser, Parsed, ParserLimits};
 
-    fn run_at(cx: &mut ConnCx, store: &mut CellStore, now: Nanos, parts: &[&[u8]]) -> Vec<u8> {
+    fn run_at(cx: &mut ConnCx, store: &mut Keyspace, now: Nanos, parts: &[&[u8]]) -> Vec<u8> {
         let mut wire = format!("*{}\r\n", parts.len()).into_bytes();
         for p in parts {
             wire.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
@@ -1078,14 +1249,14 @@ mod tests {
         out
     }
 
-    fn run(cx: &mut ConnCx, store: &mut CellStore, parts: &[&[u8]]) -> Vec<u8> {
+    fn run(cx: &mut ConnCx, store: &mut Keyspace, parts: &[&[u8]]) -> Vec<u8> {
         run_at(cx, store, Nanos(1), parts)
     }
 
     #[test]
     fn hello_switches_protocol_and_rejects_unknown_versions() {
         let mut cx = ConnCx::default();
-        let mut store = CellStore::new(StoreConfig::default());
+        let mut store = Keyspace::new(StoreConfig::default());
         // RESP2 null is the bulk form.
         assert_eq!(run(&mut cx, &mut store, &[b"GET", b"missing"]), b"$-1\r\n");
         // Bad versions: NOPROTO, protocol unchanged.
@@ -1109,7 +1280,7 @@ mod tests {
     #[test]
     fn record_bound_deviation_is_a_typed_error() {
         let mut cx = ConnCx::default();
-        let mut store = CellStore::new(StoreConfig::default());
+        let mut store = Keyspace::new(StoreConfig::default());
         let long_key = vec![b'k'; 256];
         let reply = run(&mut cx, &mut store, &[b"SET", &long_key, b"v"]);
         assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
@@ -1118,7 +1289,7 @@ mod tests {
     #[test]
     fn mget_mset_roundtrip() {
         let mut cx = ConnCx::default();
-        let mut store = CellStore::new(StoreConfig::default());
+        let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"MSET", b"a", b"1", b"b", b"2"]), b"+OK\r\n");
         assert_eq!(
             run(&mut cx, &mut store, &[b"MGET", b"a", b"nope", b"b"]),
@@ -1138,7 +1309,7 @@ mod tests {
     #[test]
     fn expireat_family_uses_the_wall_anchor() {
         let mut cx = ConnCx::default();
-        let mut store = CellStore::new(StoreConfig::default());
+        let mut store = Keyspace::new(StoreConfig::default());
         // Anchor: internal 1000 ms == unix 5_000_000 ms.
         cx.node.wall_anchor.set((1_000, 5_000_000));
         let now = Nanos::from_millis(1_000);
@@ -1162,7 +1333,7 @@ mod tests {
     #[test]
     fn object_encoding_tracks_int_embstr_raw() {
         let mut cx = ConnCx::default();
-        let mut store = CellStore::new(StoreConfig::default());
+        let mut store = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut store, &[b"SET", b"n", b"123"]);
         assert_eq!(run(&mut cx, &mut store, &[b"OBJECT", b"ENCODING", b"n"]), b"$3\r\nint\r\n");
         assert_eq!(run(&mut cx, &mut store, &[b"OBJECT", b"REFCOUNT", b"n"]), b":2147483647\r\n");
@@ -1181,7 +1352,7 @@ mod tests {
     #[test]
     fn scan_walks_the_whole_keyspace() {
         let mut cx = ConnCx::default();
-        let mut store = CellStore::new(StoreConfig::default());
+        let mut store = Keyspace::new(StoreConfig::default());
         for i in 0..500 {
             let key = format!("k:{i}");
             run(&mut cx, &mut store, &[b"SET", key.as_bytes(), b"v"]);
@@ -1215,5 +1386,263 @@ mod tests {
         assert_eq!(stall_request(&[b"DEBUG", b"SLEEP", b"0"]), None);
         assert_eq!(stall_request(&[b"DEBUG", b"JMAP"]), None);
         assert_eq!(stall_request(&[b"GET", b"k", b"x"]), None);
+    }
+
+    // ---- M1-E4 · namespaces v1 -------------------------------------------------
+
+    #[test]
+    fn select_isolates_databases_and_flushdb_scopes() {
+        let mut cx = ConnCx::default();
+        let mut ks = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"zero"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"SELECT", b"1"]), b"+OK\r\n");
+        assert_eq!(cx.db, 1);
+        // Identical key, different namespace: never aliases (M1-S08 AC).
+        assert_eq!(run(&mut cx, &mut ks, &[b"GET", b"k"]), b"$-1\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"one"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"DBSIZE"]), b":1\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"FLUSHDB"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"DBSIZE"]), b":0\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"SELECT", b"0"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"GET", b"k"]), b"$4\r\nzero\r\n");
+        // FLUSHALL clears every db.
+        run(&mut cx, &mut ks, &[b"FLUSHALL"]);
+        assert_eq!(run(&mut cx, &mut ks, &[b"DBSIZE"]), b":0\r\n");
+        // Bounds + error wording.
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"SELECT", b"16"]),
+            b"-ERR DB index is out of range\r\n"
+        );
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"SELECT", b"abc"]),
+            b"-ERR value is not an integer or out of range\r\n"
+        );
+    }
+
+    #[test]
+    fn copy_crosses_databases_with_ttl_and_encoding() {
+        let mut cx = ConnCx::default();
+        let mut ks = Keyspace::new(StoreConfig::default());
+        let now = Nanos::from_millis(1_000);
+        run_at(&mut cx, &mut ks, now, &[b"SET", b"src", b"v", b"PX", b"5000"]);
+        run_at(&mut cx, &mut ks, now, &[b"APPEND", b"src", b"!"]); // raw encoding
+        assert_eq!(
+            run_at(&mut cx, &mut ks, now, &[b"COPY", b"src", b"src", b"DB", b"3"]),
+            b":1\r\n"
+        );
+        run_at(&mut cx, &mut ks, now, &[b"SELECT", b"3"]);
+        assert_eq!(run_at(&mut cx, &mut ks, now, &[b"GET", b"src"]), b"$2\r\nv!\r\n");
+        assert_eq!(run_at(&mut cx, &mut ks, now, &[b"PTTL", b"src"]), b":5000\r\n");
+        assert_eq!(
+            run_at(&mut cx, &mut ks, now, &[b"OBJECT", b"ENCODING", b"src"]),
+            b"$3\r\nraw\r\n"
+        );
+        // Destination exists without REPLACE: 0.
+        assert_eq!(run_at(&mut cx, &mut ks, now, &[b"SELECT", b"0"]), b"+OK\r\n");
+        assert_eq!(
+            run_at(&mut cx, &mut ks, now, &[b"COPY", b"src", b"src", b"DB", b"3"]),
+            b":0\r\n"
+        );
+        // Same key + same db is the Redis error; cross-db self-copy is legal.
+        assert_eq!(
+            run_at(&mut cx, &mut ks, now, &[b"COPY", b"src", b"src"]),
+            b"-ERR source and destination objects are the same\r\n"
+        );
+    }
+
+    #[test]
+    fn inf_ns_registry_surface() {
+        let mut cx = ConnCx::default();
+        let mut ks = Keyspace::new(StoreConfig::default());
+        assert_eq!(
+            run(
+                &mut cx,
+                &mut ks,
+                &[
+                    b"INF.NS",
+                    b"CREATE",
+                    b"cache",
+                    b"EVICTION",
+                    b"allkeys-lfu",
+                    b"MAXMEMORY",
+                    b"16mb"
+                ]
+            ),
+            b"+OK\r\n"
+        );
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"cache"]),
+            b"-ERR namespace already exists\r\n"
+        );
+        // The M1-S08 honesty AC: durable mode is a documented not-yet error.
+        let reply = run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable"]);
+        assert!(
+            reply.starts_with(b"-ERR namespace mode 'durable' is not yet supported"),
+            "{reply:?}"
+        );
+        let list = run(&mut cx, &mut ks, &[b"INF.NS", b"LIST"]);
+        let text = String::from_utf8(list).expect("ascii");
+        assert!(text.starts_with("*17\r\n"), "16 defaults + 1 named: {text}");
+        assert!(text.contains("cache"), "{text}");
+        let info = String::from_utf8(run(&mut cx, &mut ks, &[b"INF.NS", b"INFO", b"cache"]))
+            .expect("ascii");
+        assert!(info.contains("allkeys-lfu"), "{info}");
+        assert!(info.contains("16777216"), "{info}");
+        let db_info =
+            String::from_utf8(run(&mut cx, &mut ks, &[b"INF.NS", b"INFO", b"db0"])).expect("ascii");
+        assert!(db_info.contains("memory"), "{db_info}");
+        assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"DROP", b"cache"]), b"+OK\r\n");
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"INF.NS", b"DROP", b"db0"]),
+            b"-ERR db0..db15 are reserved default namespaces (SELECT)\r\n"
+        );
+    }
+
+    // ---- M1-E5 · pub/sub (exec-layer fallback + subscriber mode) -----------------
+
+    #[test]
+    fn resp2_subscriber_mode_restricts_and_reshapes_ping() {
+        let mut cx = ConnCx::default();
+        let mut ks = Keyspace::new(StoreConfig::default());
+        run(&mut cx, &mut ks, &[b"SET", b"k", b"v"]);
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"SUBSCRIBE", b"news"]),
+            b"*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n"
+        );
+        // Disallowed commands answer the Redis-exact context error.
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"GET", b"k"]),
+            b"-ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n".to_vec()
+        );
+        // PING reshapes to [pong, <arg|"">] in RESP2 subscriber mode.
+        assert_eq!(run(&mut cx, &mut ks, &[b"PING"]), b"*2\r\n$4\r\npong\r\n$0\r\n\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"PING", b"hi"]), b"*2\r\n$4\r\npong\r\n$2\r\nhi\r\n");
+        // Bare UNSUBSCRIBE drops everything and lifts the restriction.
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"UNSUBSCRIBE"]),
+            b"*3\r\n$11\r\nunsubscribe\r\n$4\r\nnews\r\n:0\r\n"
+        );
+        assert_eq!(run(&mut cx, &mut ks, &[b"GET", b"k"]), b"$1\r\nv\r\n");
+        // With no subscriptions, bare UNSUBSCRIBE is the single nil frame.
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"UNSUBSCRIBE"]),
+            b"*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n"
+        );
+    }
+
+    #[test]
+    fn resp3_lifts_the_restriction_and_self_delivers() {
+        let mut cx = ConnCx::default();
+        let mut ks = Keyspace::new(StoreConfig::default());
+        run(&mut cx, &mut ks, &[b"HELLO", b"3"]);
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"SUBSCRIBE", b"alpha"]),
+            b">3\r\n$9\r\nsubscribe\r\n$5\r\nalpha\r\n:1\r\n"
+        );
+        // RESP3: other commands keep working while subscribed.
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        // Self-delivery: the receiver count precedes the push frame
+        // (oracle-pinned Redis order).
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"PUBLISH", b"alpha", b"msg"]),
+            b":1\r\n>3\r\n$7\r\nmessage\r\n$5\r\nalpha\r\n$3\r\nmsg\r\n"
+        );
+        // Single-connection PUBSUB views.
+        assert_eq!(run(&mut cx, &mut ks, &[b"PUBSUB", b"CHANNELS"]), b"*1\r\n$5\r\nalpha\r\n");
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"PUBSUB", b"NUMSUB", b"alpha", b"none"]),
+            b"*4\r\n$5\r\nalpha\r\n:1\r\n$4\r\nnone\r\n:0\r\n"
+        );
+        assert_eq!(run(&mut cx, &mut ks, &[b"PUBSUB", b"NUMPAT"]), b":0\r\n");
+        // Pattern subscription joins the count + pmessage self-delivery.
+        run(&mut cx, &mut ks, &[b"PSUBSCRIBE", b"al*"]);
+        assert_eq!(run(&mut cx, &mut ks, &[b"PUBSUB", b"NUMPAT"]), b":1\r\n");
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"PUBLISH", b"alpha", b"x"]),
+            b":2\r\n>3\r\n$7\r\nmessage\r\n$5\r\nalpha\r\n$1\r\nx\r\n\
+              >4\r\n$8\r\npmessage\r\n$3\r\nal*\r\n$5\r\nalpha\r\n$1\r\nx\r\n"
+                .to_vec()
+        );
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"PUBSUB", b"BOGUS"]),
+            b"-ERR Unknown PUBSUB subcommand or wrong number of arguments for 'BOGUS'\r\n".to_vec()
+        );
+    }
+
+    // ---- M1-E3 · eviction + OOM honesty ------------------------------------------
+
+    #[test]
+    fn oom_gate_denies_writes_allows_reads_and_recovers() {
+        let mut cx = ConnCx::default();
+        let mut ks = Keyspace::new(StoreConfig::default());
+        run(&mut cx, &mut ks, &[b"SET", b"k", b"v"]);
+        // maxmemory 1 byte: below the fixed floor, unfreeable — every
+        // DENYOOM command answers the Redis-exact OOM error under
+        // noeviction AND under volatile policies with nothing volatile.
+        for policy in [
+            &b"noeviction"[..],
+            b"volatile-lru",
+            b"volatile-random",
+            b"volatile-ttl",
+            b"volatile-lfu",
+        ] {
+            run(
+                &mut cx,
+                &mut ks,
+                &[b"CONFIG", b"SET", b"maxmemory", b"1", b"maxmemory-policy", policy],
+            );
+            assert_eq!(
+                run(&mut cx, &mut ks, &[b"SET", b"x", b"y"]),
+                b"-OOM command not allowed when used memory > 'maxmemory'.\r\n",
+                "policy {}",
+                String::from_utf8_lossy(policy)
+            );
+            assert_eq!(
+                run(&mut cx, &mut ks, &[b"INCR", b"ctr"]),
+                b"-OOM command not allowed when used memory > 'maxmemory'.\r\n"
+            );
+            // Reads and freeing writes stay allowed (DENYOOM membership).
+            assert_eq!(run(&mut cx, &mut ks, &[b"GET", b"k"]), b"$1\r\nv\r\n");
+            assert_eq!(run(&mut cx, &mut ks, &[b"DEL", b"nope"]), b":0\r\n");
+        }
+        // allkeys-* with an unreachable floor: evicts what it can, then the
+        // honest OOM (Redis behaves identically with maxmemory=1).
+        run(&mut cx, &mut ks, &[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-lru"]);
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"SET", b"x", b"y"]),
+            b"-OOM command not allowed when used memory > 'maxmemory'.\r\n"
+        );
+        // Lifting the limit recovers immediately (hot-per-cell push at SET).
+        run(&mut cx, &mut ks, &[b"CONFIG", b"SET", b"maxmemory", b"0"]);
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"x", b"y"]), b"+OK\r\n");
+    }
+
+    #[test]
+    fn config_maxmemory_has_observable_effect_within_one_round() {
+        // The M1-S03 AC unblocked by E3: CONFIG SET maxmemory + an eviction
+        // policy makes pressure observable without any plane in the loop —
+        // the exec-layer push applies it to this cell immediately, and the
+        // eviction MAINTAIN slice (driven here directly) frees to the
+        // watermark.
+        let mut cx = ConnCx::default();
+        let mut ks = Keyspace::new(StoreConfig::default());
+        for i in 0..500 {
+            let key = format!("fill:{i}");
+            run(&mut cx, &mut ks, &[b"SET", key.as_bytes(), &[0x61; 200]]);
+        }
+        let live = ks.report().records_live_bytes;
+        let limit = ks.used_bytes() - live + live / 2;
+        let limit_text = limit.to_string();
+        run(&mut cx, &mut ks, &[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-random"]);
+        run(&mut cx, &mut ks, &[b"CONFIG", b"SET", b"maxmemory", limit_text.as_bytes()]);
+        assert!(ks.over_limit(), "pressure visible immediately after CONFIG SET");
+        let mut rounds = 0;
+        while ks.over_limit() && rounds < 10_000 {
+            ks.evict_tick(Nanos(1), inf_store::EvictBudget::default());
+            rounds += 1;
+        }
+        assert!(ks.used_bytes() <= limit, "MAINTAIN slices must reach the new budget");
+        let info = String::from_utf8(run(&mut cx, &mut ks, &[b"INFO", b"stats"])).expect("ascii");
+        assert!(!info.contains("evicted_keys:0"), "evicted_keys must be real: {info}");
     }
 }

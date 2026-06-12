@@ -78,6 +78,17 @@ pub enum CommandId {
     Config,
     Client,
     Lolwut,
+    // ---- M1-E5 · pub/sub ----
+    Subscribe,
+    Unsubscribe,
+    Psubscribe,
+    Punsubscribe,
+    Publish,
+    Pubsub,
+    /// `INF.NS CREATE/LIST/INFO/DROP` — namespace registry v1 (M1-S08), the
+    /// identity seam M2 durability classes attach to. An `INF.*` extension,
+    /// not a Redis command.
+    InfNs,
     /// Internal cross-cell program op: atomically read value+TTL and delete
     /// at the owning cell (the RENAME/MOVE fabric-program primitive). Not a
     /// Redis command; listed in `COMMAND` output as an `INF.*` extension.
@@ -96,6 +107,10 @@ impl CmdFlags {
     pub const ADMIN: CmdFlags = CmdFlags(1 << 2);
     /// Constant-ish time; never blocks or suspends locally.
     pub const FAST: CmdFlags = CmdFlags(1 << 3);
+    /// Rejected when used memory exceeds `maxmemory` and eviction cannot
+    /// free below it (Redis `DENYOOM` — the M1-S07 OOM-honesty gate enters
+    /// through this flag, never per-handler checks).
+    pub const DENYOOM: CmdFlags = CmdFlags(1 << 4);
 
     #[inline]
     pub fn contains(self, other: CmdFlags) -> bool {
@@ -152,8 +167,13 @@ pub struct CommandMeta {
 
 const RO_FAST: CmdFlags = CmdFlags::READONLY.union(CmdFlags::FAST);
 const W_FAST: CmdFlags = CmdFlags::WRITE.union(CmdFlags::FAST);
+/// DENYOOM membership mirrors Redis 8 per command (oracle-pinned by the
+/// M1-S07 compat cases) — writes that free or only re-time memory (DEL,
+/// EXPIRE, PERSIST, GETDEL, GETEX, RENAME, FLUSH*) stay allowed under OOM.
+const W_OOM: CmdFlags = CmdFlags::WRITE.union(CmdFlags::DENYOOM);
+const W_FAST_OOM: CmdFlags = W_FAST.union(CmdFlags::DENYOOM);
 
-/// One registry row (the array below stays readable at 57 entries).
+/// One registry row (the array below stays readable at 58 entries).
 const fn cmd(
     id: CommandId,
     name: &'static str,
@@ -166,25 +186,25 @@ const fn cmd(
 
 /// The registry. M1+ append here (and only here) — the hash table below is
 /// derived mechanically at compile time.
-pub static COMMANDS: [CommandMeta; 57] = [
+pub static COMMANDS: [CommandMeta; 64] = [
     cmd(CommandId::Ping, "PING", -1, CmdFlags::FAST, KeySpec::NONE),
     cmd(CommandId::Echo, "ECHO", 2, CmdFlags::FAST, KeySpec::NONE),
     cmd(CommandId::Hello, "HELLO", -1, CmdFlags::FAST, KeySpec::NONE),
     cmd(CommandId::Get, "GET", 2, RO_FAST, KeySpec::ONE),
-    cmd(CommandId::Set, "SET", -3, CmdFlags::WRITE, KeySpec::ONE),
-    cmd(CommandId::Setnx, "SETNX", 3, W_FAST, KeySpec::ONE),
-    cmd(CommandId::Setex, "SETEX", 4, CmdFlags::WRITE, KeySpec::ONE),
-    cmd(CommandId::Psetex, "PSETEX", 4, CmdFlags::WRITE, KeySpec::ONE),
-    cmd(CommandId::Getset, "GETSET", 3, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Set, "SET", -3, W_OOM, KeySpec::ONE),
+    cmd(CommandId::Setnx, "SETNX", 3, W_FAST_OOM, KeySpec::ONE),
+    cmd(CommandId::Setex, "SETEX", 4, W_OOM, KeySpec::ONE),
+    cmd(CommandId::Psetex, "PSETEX", 4, W_OOM, KeySpec::ONE),
+    cmd(CommandId::Getset, "GETSET", 3, W_FAST_OOM, KeySpec::ONE),
     cmd(CommandId::Getdel, "GETDEL", 2, W_FAST, KeySpec::ONE),
     cmd(CommandId::Del, "DEL", -2, CmdFlags::WRITE, KeySpec::ALL_TRAILING),
     cmd(CommandId::Exists, "EXISTS", -2, RO_FAST, KeySpec::ALL_TRAILING),
     cmd(CommandId::Type, "TYPE", 2, RO_FAST, KeySpec::ONE),
-    cmd(CommandId::Incr, "INCR", 2, W_FAST, KeySpec::ONE),
-    cmd(CommandId::Decr, "DECR", 2, W_FAST, KeySpec::ONE),
-    cmd(CommandId::IncrBy, "INCRBY", 3, W_FAST, KeySpec::ONE),
-    cmd(CommandId::DecrBy, "DECRBY", 3, W_FAST, KeySpec::ONE),
-    cmd(CommandId::Append, "APPEND", 3, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Incr, "INCR", 2, W_FAST_OOM, KeySpec::ONE),
+    cmd(CommandId::Decr, "DECR", 2, W_FAST_OOM, KeySpec::ONE),
+    cmd(CommandId::IncrBy, "INCRBY", 3, W_FAST_OOM, KeySpec::ONE),
+    cmd(CommandId::DecrBy, "DECRBY", 3, W_FAST_OOM, KeySpec::ONE),
+    cmd(CommandId::Append, "APPEND", 3, W_FAST_OOM, KeySpec::ONE),
     cmd(CommandId::Strlen, "STRLEN", 2, RO_FAST, KeySpec::ONE),
     cmd(CommandId::Expire, "EXPIRE", -3, W_FAST, KeySpec::ONE),
     cmd(CommandId::Pexpire, "PEXPIRE", -3, W_FAST, KeySpec::ONE),
@@ -195,17 +215,17 @@ pub static COMMANDS: [CommandMeta; 57] = [
     cmd(CommandId::Command, "COMMAND", -1, CmdFlags::ADMIN, KeySpec::NONE),
     // ---- M1-S01 · string family ----
     cmd(CommandId::Mget, "MGET", -2, RO_FAST, KeySpec::ALL_TRAILING),
-    cmd(CommandId::Mset, "MSET", -3, CmdFlags::WRITE, KeySpec::PAIRS),
-    cmd(CommandId::Msetnx, "MSETNX", -3, CmdFlags::WRITE, KeySpec::PAIRS),
+    cmd(CommandId::Mset, "MSET", -3, W_OOM, KeySpec::PAIRS),
+    cmd(CommandId::Msetnx, "MSETNX", -3, W_OOM, KeySpec::PAIRS),
     cmd(CommandId::Getrange, "GETRANGE", 4, CmdFlags::READONLY, KeySpec::ONE),
-    cmd(CommandId::Setrange, "SETRANGE", 4, CmdFlags::WRITE, KeySpec::ONE),
+    cmd(CommandId::Setrange, "SETRANGE", 4, W_OOM, KeySpec::ONE),
     cmd(CommandId::Getex, "GETEX", -2, W_FAST, KeySpec::ONE),
-    cmd(CommandId::IncrByFloat, "INCRBYFLOAT", 3, W_FAST, KeySpec::ONE),
+    cmd(CommandId::IncrByFloat, "INCRBYFLOAT", 3, W_FAST_OOM, KeySpec::ONE),
     cmd(CommandId::Substr, "SUBSTR", 4, CmdFlags::READONLY, KeySpec::ONE),
     // ---- M1-S02 · key management ----
     cmd(CommandId::Rename, "RENAME", 3, CmdFlags::WRITE, KeySpec::TWO),
     cmd(CommandId::Renamenx, "RENAMENX", 3, W_FAST, KeySpec::TWO),
-    cmd(CommandId::Copy, "COPY", -3, CmdFlags::WRITE, KeySpec::TWO),
+    cmd(CommandId::Copy, "COPY", -3, W_OOM, KeySpec::TWO),
     cmd(CommandId::Touch, "TOUCH", -2, RO_FAST, KeySpec::ALL_TRAILING),
     cmd(CommandId::Unlink, "UNLINK", -2, W_FAST, KeySpec::ALL_TRAILING),
     cmd(CommandId::Dbsize, "DBSIZE", 1, RO_FAST, KeySpec::NONE),
@@ -225,6 +245,16 @@ pub static COMMANDS: [CommandMeta; 57] = [
     cmd(CommandId::Config, "CONFIG", -2, CmdFlags::ADMIN, KeySpec::NONE),
     cmd(CommandId::Client, "CLIENT", -2, CmdFlags::ADMIN, KeySpec::NONE),
     cmd(CommandId::Lolwut, "LOLWUT", -1, CmdFlags::READONLY, KeySpec::NONE),
+    // ---- M1-E5 · pub/sub (channels are not keys: no slot routing, no
+    // key specs — ownership is the plane's slot(channel) mapping) ----
+    cmd(CommandId::Subscribe, "SUBSCRIBE", -2, CmdFlags::FAST, KeySpec::NONE),
+    cmd(CommandId::Unsubscribe, "UNSUBSCRIBE", -1, CmdFlags::FAST, KeySpec::NONE),
+    cmd(CommandId::Psubscribe, "PSUBSCRIBE", -2, CmdFlags::FAST, KeySpec::NONE),
+    cmd(CommandId::Punsubscribe, "PUNSUBSCRIBE", -1, CmdFlags::FAST, KeySpec::NONE),
+    cmd(CommandId::Publish, "PUBLISH", 3, CmdFlags::FAST, KeySpec::NONE),
+    cmd(CommandId::Pubsub, "PUBSUB", -2, CmdFlags::READONLY, KeySpec::NONE),
+    // ---- M1-E4 · namespaces v1 ----
+    cmd(CommandId::InfNs, "INF.NS", -2, CmdFlags::ADMIN, KeySpec::NONE),
     // ---- internal fabric-program ops (INF.* extension namespace) ----
     cmd(CommandId::InfTake, "INF.TAKE", 2, W_FAST, KeySpec::ONE),
     cmd(CommandId::InfPeek, "INF.PEEK", 2, RO_FAST, KeySpec::ONE),
@@ -239,10 +269,10 @@ const MAX_NAME_LEN: usize = 16;
 /// Multiply-mix constants found offline over the packed name word pairs; the
 /// const builder below proves them collision-free at compile time, so a new
 /// command that breaks them fails the build (re-search the constants then —
-/// `(w0·M1 ^ w1·M2) >> 56` over random odd pairs, ~2k attempts for 57 names
-/// in 256 buckets).
-const HASH_MULTIPLIER_LO: u64 = 0x564C_67FB_A06D_3407;
-const HASH_MULTIPLIER_HI: u64 = 0x5ECF_79F5_9A23_E099;
+/// `(w0·M1 ^ w1·M2) >> 56` over random odd pairs; the M1-E5 pub/sub growth
+/// to 64 names re-searched in ~1k attempts).
+const HASH_MULTIPLIER_LO: u64 = 0x1FC5_3112_C1E2_07B5;
+const HASH_MULTIPLIER_HI: u64 = 0xF76D_1FD1_8160_AEBB;
 /// Word-wide ASCII case fold (`a-z` → `A-Z`); zero padding stays zero.
 /// Non-letters map somewhere harmless — the verify word-compare against the
 /// canonical name rejects any non-command byte sequence.

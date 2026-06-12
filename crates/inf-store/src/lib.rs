@@ -5,14 +5,20 @@
 //! attributed byte-exactly (L5).
 #![forbid(unsafe_code)]
 
+mod evict;
 mod index;
+mod keyspace;
+mod ns;
 mod record;
 mod router;
 mod store;
 mod wheel;
 
+pub use evict::{EvictStats, EvictionPolicy};
 pub use index::Index;
 pub use inf_alloc::ArenaConfig;
+pub use keyspace::{DEFAULT_DBS, EvictBudget, Keyspace, PressureConfig};
+pub use ns::{NsError, NsMode, NsSpec, valid_ns_name};
 pub use record::{MAX_KEY_LEN, MAX_VAL_LEN, TypeTag};
 pub use router::SlotRouter;
 pub use store::{

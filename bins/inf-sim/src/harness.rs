@@ -3,7 +3,7 @@
 //!
 //! ## Oracle
 //! Every apply point (the `PlaneObserver` seam) replays the same argv
-//! against ONE model `CellStore` — in apply order, which on a single thread
+//! against ONE model `Keyspace` — in apply order, which on a single thread
 //! is a true total order — and the model's reply must equal the observed
 //! reply byte-for-byte. This is the single-key linearizability oracle at M0
 //! strength: cross-cell routing, fabric transport, and pump ordering cannot
@@ -28,7 +28,7 @@ use inf_foundation::time::{Nanos, VirtualClock};
 use inf_foundation::{CellId, hash64};
 use inf_runtime::{CellLoop, LoopConfig};
 use inf_server::{ConnCx, ExecOrigin, NodeInfo, PlaneObserver, ServerPlane, execute_slices};
-use inf_store::{CellStore, StoreConfig};
+use inf_store::{Keyspace, StoreConfig};
 use inf_wire::Protocol;
 
 use crate::net::{CellNet, Plant, SimDriver, listener_fd};
@@ -85,7 +85,7 @@ impl SimReport {
 // ---- oracle observer -----------------------------------------------------------
 
 struct Oracle {
-    model: CellStore,
+    model: Keyspace,
     trace: Vec<u8>,
     events: u64,
     violations: Vec<String>,
@@ -94,7 +94,7 @@ struct Oracle {
 impl Oracle {
     fn new(keys: usize) -> Oracle {
         Oracle {
-            model: CellStore::new(StoreConfig { initial_keys: keys, ..Default::default() }),
+            model: Keyspace::new(StoreConfig { initial_keys: keys, ..Default::default() }),
             trace: Vec::new(),
             events: 0,
             violations: Vec::new(),
@@ -235,7 +235,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
-            CellStore::new(StoreConfig::default()),
+            Keyspace::new(StoreConfig::default()),
             fabric,
             node,
             oracle.clone(),

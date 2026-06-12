@@ -27,7 +27,16 @@ fn oracle_key_indices(id: CommandId, argc: usize) -> Vec<usize> {
         | CommandId::Select
         | CommandId::Config
         | CommandId::Client
-        | CommandId::Lolwut => Vec::new(),
+        | CommandId::Lolwut
+        | CommandId::InfNs
+        // Pub/sub channels and patterns are not keys (M1-E5): ownership is
+        // the plane's slot(channel) mapping, never the key router.
+        | CommandId::Subscribe
+        | CommandId::Unsubscribe
+        | CommandId::Psubscribe
+        | CommandId::Punsubscribe
+        | CommandId::Publish
+        | CommandId::Pubsub => Vec::new(),
         // All trailing args are keys.
         CommandId::Del
         | CommandId::Exists
