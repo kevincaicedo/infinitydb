@@ -182,7 +182,10 @@ pub struct CellLoop<D: BackendDriver, C: Clock> {
     iter_hist_us: LogHistogram,
     spin_left: u32,
     iterations: u64,
+    /// SQE-carrying enters only (ADR-0007) — the L3 ratio denominator.
     submits: u64,
+    /// Every driver enter (incl. zero-SQE harvests) — `cqes_per_reap`.
+    enters_total: u64,
     sqes_total: u64,
     cqes_total: u64,
     commands_total: u64,
@@ -205,6 +208,7 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             spin_left: 0,
             iterations: 0,
             submits: 0,
+            enters_total: 0,
             sqes_total: 0,
             cqes_total: 0,
             commands_total: 0,
@@ -236,8 +240,14 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         #[cfg(not(feature = "no-tripwires"))]
         {
             let stats = self.driver.submit_stats();
-            self.submits += stats.syscalls.max(1);
-            self.sqes_total += stats.sqes;
+            // ADR-0007: zero-SQE enters (DEFER_TASKRUN harvesting during
+            // spin) are reaping, not submission — they don't enter the L3
+            // batching ratio. All enters still feed `cqes_per_reap`.
+            if stats.sqes > 0 {
+                self.submits += stats.syscalls.max(1);
+                self.sqes_total += stats.sqes;
+            }
+            self.enters_total += stats.syscalls.max(1);
             self.cqes_total += reaped as u64;
         }
 
@@ -362,7 +372,7 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         let per = |total: u64, n: u64| (total * 1000).checked_div(n).unwrap_or(0);
         [
             (tw::SQES_PER_SUBMIT, per(self.sqes_total, self.submits)),
-            (tw::CQES_PER_REAP, per(self.cqes_total, self.submits)),
+            (tw::CQES_PER_REAP, per(self.cqes_total, self.enters_total)),
             (tw::CMDS_PER_ITER, per(self.commands_total, self.iterations)),
             (tw::FABRIC_MSGS_PER_BATCH, per(self.fabric_total, self.iterations)),
             (tw::LOOP_ITER_P999_US, self.iter_hist_us.percentile(99.9)),

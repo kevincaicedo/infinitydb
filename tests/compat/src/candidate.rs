@@ -24,10 +24,20 @@ impl Default for Candidate {
 
 impl Candidate {
     pub fn new() -> Candidate {
+        let cx = ConnCx::default();
+        // Wall anchor at the candidate's epoch: EXPIREAT/EXAT/EXPIRETIME
+        // convert through the same Unix instants the redis-server oracle
+        // sees, so absolute-time cases diff within `IntWithin` tolerances.
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        cx.node.wall_anchor.set((0, unix_ms));
+        cx.node.rng_state.set(0x1AF1_D8A5_0DB5_EED1);
         Candidate {
             store: CellStore::new(StoreConfig::default()),
             parser: ConnParser::new(ParserLimits::default()),
-            cx: ConnCx::default(),
+            cx,
             epoch: std::time::Instant::now(),
         }
     }

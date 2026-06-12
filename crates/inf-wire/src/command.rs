@@ -8,10 +8,15 @@
 //! branching scans, no allocation. The table is built in `const` context and
 //! the build **fails to compile** on any bucket collision, so adding a
 //! command can never silently degrade lookup into a collision chain.
+//!
+//! M1 surface growth (M1-E1): names now pack into **two** folded u64 words
+//! (≤ 16 bytes — `INCRBYFLOAT`/`PEXPIRETIME` are 11) and the table holds 256
+//! buckets. The lookup cost is unchanged in shape: two register loads, two
+//! multiplies, one xor, one probe, one two-word compare.
 
 use crate::parser::ArgvRef;
 
-/// Every command in the M0 surface (milestone M0-S15).
+/// Every command in the M0+M1 surface (milestones M0-S15, M1-E1).
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum CommandId {
@@ -41,6 +46,44 @@ pub enum CommandId {
     Persist,
     Info,
     Command,
+    // ---- M1-S01 · string family ----
+    Mget,
+    Mset,
+    Msetnx,
+    Getrange,
+    Setrange,
+    Getex,
+    IncrByFloat,
+    Substr,
+    // ---- M1-S02 · key management ----
+    Rename,
+    Renamenx,
+    Copy,
+    Touch,
+    Unlink,
+    Dbsize,
+    Keys,
+    Randomkey,
+    Scan,
+    Flushdb,
+    Flushall,
+    Object,
+    Debug,
+    // ---- M1-S03 · expiry completion + server introspection ----
+    Expireat,
+    Pexpireat,
+    Expiretime,
+    Pexpiretime,
+    Select,
+    Config,
+    Client,
+    Lolwut,
+    /// Internal cross-cell program op: atomically read value+TTL and delete
+    /// at the owning cell (the RENAME/MOVE fabric-program primitive). Not a
+    /// Redis command; listed in `COMMAND` output as an `INF.*` extension.
+    InfTake,
+    /// Internal cross-cell program op: atomically read value+TTL (COPY).
+    InfPeek,
 }
 
 /// Command behavior flags (wire-independent bitset).
@@ -83,10 +126,16 @@ pub struct KeySpec {
 
 impl KeySpec {
     pub const NONE: KeySpec = KeySpec { first: 0, last: 0, step: 0 };
-    /// Single key at argv[1] — the dominant M0 shape.
+    /// Single key at argv[1] — the dominant shape.
     pub const ONE: KeySpec = KeySpec { first: 1, last: 1, step: 1 };
-    /// Keys from argv[1] through the final argument (DEL, EXISTS).
+    /// Keys from argv[1] through the final argument (DEL, EXISTS, MGET).
     pub const ALL_TRAILING: KeySpec = KeySpec { first: 1, last: -1, step: 1 };
+    /// Two keys at argv[1..=2] (RENAME, COPY).
+    pub const TWO: KeySpec = KeySpec { first: 1, last: 2, step: 1 };
+    /// Key/value pairs from argv[1] (MSET, MSETNX): every second argument.
+    pub const PAIRS: KeySpec = KeySpec { first: 1, last: -1, step: 2 };
+    /// Single key at argv[2] — subcommand shapes (OBJECT ENCODING key).
+    pub const SECOND: KeySpec = KeySpec { first: 2, last: 2, step: 1 };
 }
 
 /// Frozen command metadata schema (milestone §3.2).
@@ -104,223 +153,158 @@ pub struct CommandMeta {
 const RO_FAST: CmdFlags = CmdFlags::READONLY.union(CmdFlags::FAST);
 const W_FAST: CmdFlags = CmdFlags::WRITE.union(CmdFlags::FAST);
 
+/// One registry row (the array below stays readable at 57 entries).
+const fn cmd(
+    id: CommandId,
+    name: &'static str,
+    arity: i8,
+    flags: CmdFlags,
+    keys: KeySpec,
+) -> CommandMeta {
+    CommandMeta { id, name, arity, flags, keys }
+}
+
 /// The registry. M1+ append here (and only here) — the hash table below is
 /// derived mechanically at compile time.
-pub static COMMANDS: [CommandMeta; 26] = [
-    CommandMeta {
-        id: CommandId::Ping,
-        name: "PING",
-        arity: -1,
-        flags: CmdFlags::FAST,
-        keys: KeySpec::NONE,
-    },
-    CommandMeta {
-        id: CommandId::Echo,
-        name: "ECHO",
-        arity: 2,
-        flags: CmdFlags::FAST,
-        keys: KeySpec::NONE,
-    },
-    CommandMeta {
-        id: CommandId::Hello,
-        name: "HELLO",
-        arity: -1,
-        flags: CmdFlags::FAST,
-        keys: KeySpec::NONE,
-    },
-    CommandMeta { id: CommandId::Get, name: "GET", arity: 2, flags: RO_FAST, keys: KeySpec::ONE },
-    CommandMeta {
-        id: CommandId::Set,
-        name: "SET",
-        arity: -3,
-        flags: CmdFlags::WRITE,
-        keys: KeySpec::ONE,
-    },
-    CommandMeta {
-        id: CommandId::Setnx,
-        name: "SETNX",
-        arity: 3,
-        flags: W_FAST,
-        keys: KeySpec::ONE,
-    },
-    CommandMeta {
-        id: CommandId::Setex,
-        name: "SETEX",
-        arity: 4,
-        flags: CmdFlags::WRITE,
-        keys: KeySpec::ONE,
-    },
-    CommandMeta {
-        id: CommandId::Psetex,
-        name: "PSETEX",
-        arity: 4,
-        flags: CmdFlags::WRITE,
-        keys: KeySpec::ONE,
-    },
-    CommandMeta {
-        id: CommandId::Getset,
-        name: "GETSET",
-        arity: 3,
-        flags: W_FAST,
-        keys: KeySpec::ONE,
-    },
-    CommandMeta {
-        id: CommandId::Getdel,
-        name: "GETDEL",
-        arity: 2,
-        flags: W_FAST,
-        keys: KeySpec::ONE,
-    },
-    CommandMeta {
-        id: CommandId::Del,
-        name: "DEL",
-        arity: -2,
-        flags: CmdFlags::WRITE,
-        keys: KeySpec::ALL_TRAILING,
-    },
-    CommandMeta {
-        id: CommandId::Exists,
-        name: "EXISTS",
-        arity: -2,
-        flags: RO_FAST,
-        keys: KeySpec::ALL_TRAILING,
-    },
-    CommandMeta { id: CommandId::Type, name: "TYPE", arity: 2, flags: RO_FAST, keys: KeySpec::ONE },
-    CommandMeta { id: CommandId::Incr, name: "INCR", arity: 2, flags: W_FAST, keys: KeySpec::ONE },
-    CommandMeta { id: CommandId::Decr, name: "DECR", arity: 2, flags: W_FAST, keys: KeySpec::ONE },
-    CommandMeta {
-        id: CommandId::IncrBy,
-        name: "INCRBY",
-        arity: 3,
-        flags: W_FAST,
-        keys: KeySpec::ONE,
-    },
-    CommandMeta {
-        id: CommandId::DecrBy,
-        name: "DECRBY",
-        arity: 3,
-        flags: W_FAST,
-        keys: KeySpec::ONE,
-    },
-    CommandMeta {
-        id: CommandId::Append,
-        name: "APPEND",
-        arity: 3,
-        flags: W_FAST,
-        keys: KeySpec::ONE,
-    },
-    CommandMeta {
-        id: CommandId::Strlen,
-        name: "STRLEN",
-        arity: 2,
-        flags: RO_FAST,
-        keys: KeySpec::ONE,
-    },
-    CommandMeta {
-        id: CommandId::Expire,
-        name: "EXPIRE",
-        arity: -3,
-        flags: W_FAST,
-        keys: KeySpec::ONE,
-    },
-    CommandMeta {
-        id: CommandId::Pexpire,
-        name: "PEXPIRE",
-        arity: -3,
-        flags: W_FAST,
-        keys: KeySpec::ONE,
-    },
-    CommandMeta { id: CommandId::Ttl, name: "TTL", arity: 2, flags: RO_FAST, keys: KeySpec::ONE },
-    CommandMeta { id: CommandId::Pttl, name: "PTTL", arity: 2, flags: RO_FAST, keys: KeySpec::ONE },
-    CommandMeta {
-        id: CommandId::Persist,
-        name: "PERSIST",
-        arity: 2,
-        flags: W_FAST,
-        keys: KeySpec::ONE,
-    },
-    CommandMeta {
-        id: CommandId::Info,
-        name: "INFO",
-        arity: -1,
-        flags: CmdFlags::ADMIN,
-        keys: KeySpec::NONE,
-    },
-    CommandMeta {
-        id: CommandId::Command,
-        name: "COMMAND",
-        arity: -1,
-        flags: CmdFlags::ADMIN,
-        keys: KeySpec::NONE,
-    },
+pub static COMMANDS: [CommandMeta; 57] = [
+    cmd(CommandId::Ping, "PING", -1, CmdFlags::FAST, KeySpec::NONE),
+    cmd(CommandId::Echo, "ECHO", 2, CmdFlags::FAST, KeySpec::NONE),
+    cmd(CommandId::Hello, "HELLO", -1, CmdFlags::FAST, KeySpec::NONE),
+    cmd(CommandId::Get, "GET", 2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::Set, "SET", -3, CmdFlags::WRITE, KeySpec::ONE),
+    cmd(CommandId::Setnx, "SETNX", 3, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Setex, "SETEX", 4, CmdFlags::WRITE, KeySpec::ONE),
+    cmd(CommandId::Psetex, "PSETEX", 4, CmdFlags::WRITE, KeySpec::ONE),
+    cmd(CommandId::Getset, "GETSET", 3, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Getdel, "GETDEL", 2, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Del, "DEL", -2, CmdFlags::WRITE, KeySpec::ALL_TRAILING),
+    cmd(CommandId::Exists, "EXISTS", -2, RO_FAST, KeySpec::ALL_TRAILING),
+    cmd(CommandId::Type, "TYPE", 2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::Incr, "INCR", 2, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Decr, "DECR", 2, W_FAST, KeySpec::ONE),
+    cmd(CommandId::IncrBy, "INCRBY", 3, W_FAST, KeySpec::ONE),
+    cmd(CommandId::DecrBy, "DECRBY", 3, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Append, "APPEND", 3, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Strlen, "STRLEN", 2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::Expire, "EXPIRE", -3, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Pexpire, "PEXPIRE", -3, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Ttl, "TTL", 2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::Pttl, "PTTL", 2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::Persist, "PERSIST", 2, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Info, "INFO", -1, CmdFlags::ADMIN, KeySpec::NONE),
+    cmd(CommandId::Command, "COMMAND", -1, CmdFlags::ADMIN, KeySpec::NONE),
+    // ---- M1-S01 · string family ----
+    cmd(CommandId::Mget, "MGET", -2, RO_FAST, KeySpec::ALL_TRAILING),
+    cmd(CommandId::Mset, "MSET", -3, CmdFlags::WRITE, KeySpec::PAIRS),
+    cmd(CommandId::Msetnx, "MSETNX", -3, CmdFlags::WRITE, KeySpec::PAIRS),
+    cmd(CommandId::Getrange, "GETRANGE", 4, CmdFlags::READONLY, KeySpec::ONE),
+    cmd(CommandId::Setrange, "SETRANGE", 4, CmdFlags::WRITE, KeySpec::ONE),
+    cmd(CommandId::Getex, "GETEX", -2, W_FAST, KeySpec::ONE),
+    cmd(CommandId::IncrByFloat, "INCRBYFLOAT", 3, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Substr, "SUBSTR", 4, CmdFlags::READONLY, KeySpec::ONE),
+    // ---- M1-S02 · key management ----
+    cmd(CommandId::Rename, "RENAME", 3, CmdFlags::WRITE, KeySpec::TWO),
+    cmd(CommandId::Renamenx, "RENAMENX", 3, W_FAST, KeySpec::TWO),
+    cmd(CommandId::Copy, "COPY", -3, CmdFlags::WRITE, KeySpec::TWO),
+    cmd(CommandId::Touch, "TOUCH", -2, RO_FAST, KeySpec::ALL_TRAILING),
+    cmd(CommandId::Unlink, "UNLINK", -2, W_FAST, KeySpec::ALL_TRAILING),
+    cmd(CommandId::Dbsize, "DBSIZE", 1, RO_FAST, KeySpec::NONE),
+    cmd(CommandId::Keys, "KEYS", 2, CmdFlags::READONLY, KeySpec::NONE),
+    cmd(CommandId::Randomkey, "RANDOMKEY", 1, CmdFlags::READONLY, KeySpec::NONE),
+    cmd(CommandId::Scan, "SCAN", -2, CmdFlags::READONLY, KeySpec::NONE),
+    cmd(CommandId::Flushdb, "FLUSHDB", -1, CmdFlags::WRITE, KeySpec::NONE),
+    cmd(CommandId::Flushall, "FLUSHALL", -1, CmdFlags::WRITE, KeySpec::NONE),
+    cmd(CommandId::Object, "OBJECT", -2, CmdFlags::READONLY, KeySpec::SECOND),
+    cmd(CommandId::Debug, "DEBUG", -2, CmdFlags::ADMIN, KeySpec::NONE),
+    // ---- M1-S03 · expiry completion + server introspection ----
+    cmd(CommandId::Expireat, "EXPIREAT", -3, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Pexpireat, "PEXPIREAT", -3, W_FAST, KeySpec::ONE),
+    cmd(CommandId::Expiretime, "EXPIRETIME", 2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::Pexpiretime, "PEXPIRETIME", 2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::Select, "SELECT", 2, CmdFlags::FAST, KeySpec::NONE),
+    cmd(CommandId::Config, "CONFIG", -2, CmdFlags::ADMIN, KeySpec::NONE),
+    cmd(CommandId::Client, "CLIENT", -2, CmdFlags::ADMIN, KeySpec::NONE),
+    cmd(CommandId::Lolwut, "LOLWUT", -1, CmdFlags::READONLY, KeySpec::NONE),
+    // ---- internal fabric-program ops (INF.* extension namespace) ----
+    cmd(CommandId::InfTake, "INF.TAKE", 2, W_FAST, KeySpec::ONE),
+    cmd(CommandId::InfPeek, "INF.PEEK", 2, RO_FAST, KeySpec::ONE),
 ];
 
 // ---- Compile-time perfect hash ---------------------------------------------
 
-const BUCKET_BITS: u32 = 6;
+const BUCKET_BITS: u32 = 8;
 const BUCKETS: usize = 1 << BUCKET_BITS;
 /// Longest command name in the registry (verified in `build_table`).
-const MAX_NAME_LEN: usize = 7;
-/// Multiply-shift constant found offline over the packed name words; the
-/// const builder below proves it collision-free at compile time, so a new
-/// command that breaks it fails the build (re-search the constant then).
-const HASH_MULTIPLIER: u64 = 0x99C9_4309_570D_C195;
+const MAX_NAME_LEN: usize = 16;
+/// Multiply-mix constants found offline over the packed name word pairs; the
+/// const builder below proves them collision-free at compile time, so a new
+/// command that breaks them fails the build (re-search the constants then —
+/// `(w0·M1 ^ w1·M2) >> 56` over random odd pairs, ~2k attempts for 57 names
+/// in 256 buckets).
+const HASH_MULTIPLIER_LO: u64 = 0x564C_67FB_A06D_3407;
+const HASH_MULTIPLIER_HI: u64 = 0x5ECF_79F5_9A23_E099;
 /// Word-wide ASCII case fold (`a-z` → `A-Z`); zero padding stays zero.
 /// Non-letters map somewhere harmless — the verify word-compare against the
 /// canonical name rejects any non-command byte sequence.
 const FOLD_MASK: u64 = 0xDFDF_DFDF_DFDF_DFDF;
 
-/// Packs a name (≤ 8 bytes) into a folded little-endian word mixed with its
-/// length. Feature-complete by construction: distinct names ⇒ distinct
-/// words, so a collision-free multiplier always exists.
+/// Packs a name (≤ 16 bytes) into two folded little-endian words; the length
+/// mixes into the high word. Distinct names ⇒ distinct word pairs, so a
+/// collision-free multiplier pair always exists.
 #[inline(always)]
-const fn pack_folded(name: &[u8]) -> u64 {
-    let mut word = 0u64;
+const fn pack_folded(name: &[u8]) -> (u64, u64) {
+    let mut w0 = 0u64;
+    let mut w1 = 0u64;
     let mut i = 0;
     while i < name.len() {
-        word |= (name[i] as u64) << (i * 8);
+        if i < 8 {
+            w0 |= (name[i] as u64) << (i * 8);
+        } else {
+            w1 |= (name[i] as u64) << ((i - 8) * 8);
+        }
         i += 1;
     }
-    (word & FOLD_MASK) ^ name.len() as u64
+    (w0 & FOLD_MASK, (w1 & FOLD_MASK) ^ name.len() as u64)
 }
 
 #[inline(always)]
-const fn hash_folded(name: &[u8]) -> usize {
-    (pack_folded(name).wrapping_mul(HASH_MULTIPLIER) >> (64 - BUCKET_BITS)) as usize
+const fn hash_words(w0: u64, w1: u64) -> usize {
+    ((w0.wrapping_mul(HASH_MULTIPLIER_LO) ^ w1.wrapping_mul(HASH_MULTIPLIER_HI))
+        >> (64 - BUCKET_BITS)) as usize
 }
 
-/// `bucket → (canonical packed word, command index + 1)` (index 0 = empty).
-/// The packed word is precomputed so the lookup verify is a single u64
-/// compare against the probed entry — no per-lookup repack of the canonical
-/// name. Collisions fail the build.
-static TABLE: [(u64, u8); BUCKETS] = build_table();
+/// `bucket → (canonical packed words, command index + 1)` (index 0 = empty).
+/// The packed words are precomputed so the lookup verify is two u64 compares
+/// against the probed entry — no per-lookup repack of the canonical name.
+/// Collisions fail the build.
+static TABLE: [(u64, u64, u8); BUCKETS] = build_table();
 
-const fn build_table() -> [(u64, u8); BUCKETS] {
-    let mut table = [(0u64, 0u8); BUCKETS];
+const fn build_table() -> [(u64, u64, u8); BUCKETS] {
+    let mut table = [(0u64, 0u64, 0u8); BUCKETS];
     let mut i = 0;
     while i < COMMANDS.len() {
         let name = COMMANDS[i].name.as_bytes();
         assert!(name.len() <= MAX_NAME_LEN, "command name exceeds MAX_NAME_LEN");
-        let word = pack_folded(name);
-        let bucket = hash_folded(name);
-        assert!(table[bucket].1 == 0, "perfect-hash collision — adjust hash_folded mixers");
-        table[bucket] = (word, (i + 1) as u8);
+        let (w0, w1) = pack_folded(name);
+        let bucket = hash_words(w0, w1);
+        assert!(table[bucket].2 == 0, "perfect-hash collision — re-search the multipliers");
+        table[bucket] = (w0, w1, (i + 1) as u8);
         i += 1;
     }
     table
 }
 
-/// Case-insensitive O(1) command lookup: pack+fold (one ≤8-byte copy), one
-/// multiply, one probe, one word compare. `None` for anything not in the M0
-/// surface.
+/// Case-insensitive O(1) command lookup: pack+fold (one ≤16-byte copy), two
+/// multiplies, one probe, one two-word compare. `None` for anything not in
+/// the registry.
 #[inline]
 pub fn lookup(name: &[u8]) -> Option<&'static CommandMeta> {
     let len = name.len();
     if len == 0 || len > MAX_NAME_LEN {
         return None;
     }
-    let mut padded = [0u8; 8];
-    // Fixed-length arms: each lowers to plain register loads. The previous
+    let mut padded = [0u8; 16];
+    // Fixed-length arms: each lowers to plain register loads. A
     // runtime-length `copy_from_slice` lowered to a memcpy call that
     // dominated the whole probe (measured on Raptor Lake, see the wire
     // bench artifact).
@@ -331,15 +315,25 @@ pub fn lookup(name: &[u8]) -> Option<&'static CommandMeta> {
         4 => padded[..4].copy_from_slice(name),
         5 => padded[..5].copy_from_slice(name),
         6 => padded[..6].copy_from_slice(name),
-        _ => padded[..7].copy_from_slice(name),
+        7 => padded[..7].copy_from_slice(name),
+        8 => padded[..8].copy_from_slice(name),
+        9 => padded[..9].copy_from_slice(name),
+        10 => padded[..10].copy_from_slice(name),
+        11 => padded[..11].copy_from_slice(name),
+        12 => padded[..12].copy_from_slice(name),
+        13 => padded[..13].copy_from_slice(name),
+        14 => padded[..14].copy_from_slice(name),
+        15 => padded[..15].copy_from_slice(name),
+        _ => padded.copy_from_slice(name),
     }
-    let word = (u64::from_le_bytes(padded) & FOLD_MASK) ^ len as u64;
-    let (canonical, slot) =
-        TABLE[(word.wrapping_mul(HASH_MULTIPLIER) >> (64 - BUCKET_BITS)) as usize];
-    // One precomputed word compare verifies name AND length (length is mixed
-    // into the packed word; empty buckets hold word 0, which no name packs
-    // to because the length mix is non-zero).
-    if word != canonical || slot == 0 {
+    let w0 = u64::from_le_bytes(padded[..8].try_into().expect("8 bytes")) & FOLD_MASK;
+    let w1 =
+        (u64::from_le_bytes(padded[8..].try_into().expect("8 bytes")) & FOLD_MASK) ^ len as u64;
+    let (c0, c1, slot) = TABLE[hash_words(w0, w1)];
+    // Two precomputed word compares verify name AND length (length is mixed
+    // into the high packed word; empty buckets hold (0, 0), which no name
+    // packs to because the length mix is non-zero).
+    if w0 != c0 || w1 != c1 || slot == 0 {
         return None;
     }
     Some(&COMMANDS[(slot - 1) as usize])
@@ -421,9 +415,22 @@ mod tests {
 
     #[test]
     fn near_misses_do_not_resolve() {
-        for probe in
-            [&b"GETX"[..], b"GE", b"", b"PINGG", b"@ET", b"\x00\x00\x00", b"SETEXX", b"XCOMMAND"]
-        {
+        for probe in [
+            &b"GETX"[..],
+            b"GE",
+            b"",
+            b"PINGG",
+            b"@ET",
+            b"\x00\x00\x00",
+            b"SETEXX",
+            b"XCOMMAND",
+            b"GETRANGEX",
+            b"INCRBYFLOA",
+            b"INCRBYFLOATT",
+            b"PEXPIRETIMEX",
+            b"INF.TAKEN",
+            b"AAAAAAAAAAAAAAAAA", // 17 bytes — over MAX_NAME_LEN
+        ] {
             assert!(lookup(probe).is_none(), "{probe:?} must not resolve");
         }
     }
@@ -436,6 +443,34 @@ mod tests {
         for meta in &COMMANDS {
             assert!(seen.insert(meta.id), "duplicate id {:?}", meta.id);
             assert_eq!(lookup(meta.name.as_bytes()).expect("resolves").id, meta.id);
+        }
+    }
+
+    #[test]
+    fn pair_and_two_key_specs_extract_correct_keys() {
+        use crate::parser::{ConnParser, Parsed, ParserLimits};
+        type Case = (&'static [&'static [u8]], &'static [&'static [u8]]);
+        let cases: &[Case] = &[
+            (&[b"MSET", b"k1", b"v1", b"k2", b"v2"], &[b"k1", b"k2"]),
+            (&[b"RENAME", b"src", b"dst"], &[b"src", b"dst"]),
+            (&[b"COPY", b"src", b"dst", b"REPLACE"], &[b"src", b"dst"]),
+            (&[b"OBJECT", b"ENCODING", b"key"], &[b"key"]),
+            (&[b"OBJECT", b"HELP"], &[]),
+            (&[b"MGET", b"a", b"b", b"c"], &[b"a", b"b", b"c"]),
+        ];
+        for (parts, want) in cases {
+            let mut wire = format!("*{}\r\n", parts.len()).into_bytes();
+            for p in *parts {
+                wire.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+                wire.extend_from_slice(p);
+                wire.extend_from_slice(b"\r\n");
+            }
+            let mut parser = ConnParser::new(ParserLimits::default());
+            let mut iter = parser.feed(&wire);
+            let Some(Parsed::Command(argv)) = iter.next() else { panic!("one command") };
+            let meta = lookup(parts[0]).expect("registered");
+            let keys: Vec<&[u8]> = extract_keys(meta, &argv).collect();
+            assert_eq!(&keys, want, "{}", meta.name);
         }
     }
 }

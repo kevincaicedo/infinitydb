@@ -466,6 +466,17 @@ include idle parks.
 
 ---
 
+**M1 extension note (2026-06-12, ADR-0008):** the registry grew to 57
+commands through its designed growth point (two-word perfect hash,
+`MAX_NAME_LEN = 16`, 256 buckets — internal detail; `CommandMeta`/`lookup`
+shapes unchanged). Additive deltas: `OpError` + `NotFloat | NanOrInf`;
+`MemoryReport` + `wheel_bytes` (the M1-S04 TTL-wheel attribution domain);
+`KeySpec::{TWO, PAIRS, SECOND}`; `NodeInfo` + wall-clock anchor / RNG state /
+client registry / CONFIG store; new `inf-store` inherent methods for the
+M1-E1 ops and `expire_tick` (M1-E2). Deadlines past the u40-ms record bound
+now clamp (previously a latent panic). See
+`docs/adr/0008-m1-e1-interface-extensions.md`.
+
 **Linux-validation note (updated 2026-06-11):** the io_uring backend is now
 exercised on real Linux (kernel 7.0): conformance suite green in probed
 (multishot + provided buffers) and `INF_URING_FORCE_DEGRADED` modes, 1M-cycle

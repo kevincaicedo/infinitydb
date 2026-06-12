@@ -16,9 +16,36 @@ fn oracle_key_indices(id: CommandId, argc: usize) -> Vec<usize> {
         | CommandId::Echo
         | CommandId::Hello
         | CommandId::Info
-        | CommandId::Command => Vec::new(),
+        | CommandId::Command
+        | CommandId::Dbsize
+        | CommandId::Keys
+        | CommandId::Randomkey
+        | CommandId::Scan
+        | CommandId::Flushdb
+        | CommandId::Flushall
+        | CommandId::Debug
+        | CommandId::Select
+        | CommandId::Config
+        | CommandId::Client
+        | CommandId::Lolwut => Vec::new(),
         // All trailing args are keys.
-        CommandId::Del | CommandId::Exists => (1..argc).collect(),
+        CommandId::Del
+        | CommandId::Exists
+        | CommandId::Mget
+        | CommandId::Touch
+        | CommandId::Unlink => (1..argc).collect(),
+        // Key/value pairs: every second trailing arg starting at argv[1].
+        CommandId::Mset | CommandId::Msetnx => (1..argc).step_by(2).collect(),
+        // Two keys at argv[1..=2].
+        CommandId::Rename | CommandId::Renamenx | CommandId::Copy => (1..argc.min(3)).collect(),
+        // Subcommand shape: key at argv[2].
+        CommandId::Object => {
+            if argc > 2 {
+                vec![2]
+            } else {
+                Vec::new()
+            }
+        }
         // Exactly one key at argv[1].
         CommandId::Get
         | CommandId::Set
@@ -27,6 +54,11 @@ fn oracle_key_indices(id: CommandId, argc: usize) -> Vec<usize> {
         | CommandId::Psetex
         | CommandId::Getset
         | CommandId::Getdel
+        | CommandId::Getex
+        | CommandId::Getrange
+        | CommandId::Setrange
+        | CommandId::Substr
+        | CommandId::IncrByFloat
         | CommandId::Type
         | CommandId::Incr
         | CommandId::Decr
@@ -36,9 +68,15 @@ fn oracle_key_indices(id: CommandId, argc: usize) -> Vec<usize> {
         | CommandId::Strlen
         | CommandId::Expire
         | CommandId::Pexpire
+        | CommandId::Expireat
+        | CommandId::Pexpireat
+        | CommandId::Expiretime
+        | CommandId::Pexpiretime
         | CommandId::Ttl
         | CommandId::Pttl
-        | CommandId::Persist => {
+        | CommandId::Persist
+        | CommandId::InfTake
+        | CommandId::InfPeek => {
             if argc > 1 {
                 vec![1]
             } else {

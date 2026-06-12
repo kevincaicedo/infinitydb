@@ -5,8 +5,15 @@
 //! any backend driver (`infinityd` = uring/kqueue, `inf-sim` = sim).
 #![forbid(unsafe_code)]
 
+mod admin;
+mod clients;
+mod config;
 mod exec;
+mod glob;
 mod plane;
 
-pub use exec::{ConnCx, NodeInfo, execute, execute_slices};
+pub use clients::{ClientInfo, ClientRegistry};
+pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
+pub use exec::{ConnCx, NodeInfo, execute, execute_slices, stall_request};
+pub use glob::glob_match;
 pub use plane::{ExecOrigin, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane};

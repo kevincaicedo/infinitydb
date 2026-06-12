@@ -278,6 +278,73 @@ impl Index {
         }
     }
 
+    /// Probe groups in the table (the SCAN cursor space — one cursor value
+    /// per home group).
+    #[inline]
+    pub fn group_count(&self) -> usize {
+        self.capacity / GROUP
+    }
+
+    /// Home-group scan (M1-S02): emits every live address whose **home**
+    /// group (the group its full hash maps to, via `hash_of`) equals
+    /// `group`, by walking the probe chain reachable from it. Triangular
+    /// probing displaces entries off their home group, but every displaced
+    /// entry lives within its home's find-chain (groups visited until the
+    /// first one holding an EMPTY slot — `remove` only writes EMPTY into
+    /// groups that already have one, so chains never shorten), which makes
+    /// home-group enumeration exhaustive.
+    ///
+    /// Combined with reverse-binary cursor increments this gives the SCAN
+    /// guarantee across doubling growth: a home group `g` at capacity `C`
+    /// splits into exactly `{g, g + C/16}` at `2C`.
+    pub fn scan_home_group(
+        &self,
+        group: usize,
+        mut hash_of: impl FnMut(ArenaAddr) -> u64,
+        mut emit: impl FnMut(ArenaAddr),
+    ) {
+        let mask = self.group_mask();
+        let home = group & mask;
+        let mut group = home;
+        let mut stride = 0;
+        loop {
+            let ctrl = self.ctrl_group(group);
+            for (i, &c) in ctrl.iter().enumerate() {
+                if c & 0x80 == 0 {
+                    let addr = self.slots[group * GROUP + i].addr();
+                    if (hash_of(addr) as usize) & mask == home {
+                        emit(addr);
+                    }
+                }
+            }
+            if eq_mask16(ctrl, CTRL_EMPTY) != 0 {
+                return;
+            }
+            stride += 1;
+            if stride > mask {
+                return;
+            }
+            group = (group + stride) & mask;
+        }
+    }
+
+    /// First live address at or after `start_slot` (wrapping) — the
+    /// RANDOMKEY probe (two-level random is the documented deviation; the
+    /// caller rolls the slot).
+    pub fn live_from(&self, start_slot: usize) -> Option<ArenaAddr> {
+        if self.live == 0 {
+            return None;
+        }
+        let start = start_slot & (self.capacity - 1);
+        let (tail, head) = (&self.ctrl[start..], &self.ctrl[..start]);
+        for (i, &c) in tail.iter().chain(head.iter()).enumerate() {
+            if c & 0x80 == 0 {
+                return Some(self.slots[(start + i) & (self.capacity - 1)].addr());
+            }
+        }
+        None
+    }
+
     /// Doubles capacity (also sweeping tombstones), re-placing every live
     /// address via `hash_of(addr)` — the store hashes the record's key.
     /// M0 is stop-and-copy; M1 replaces this with split-order increments.
