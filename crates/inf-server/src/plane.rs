@@ -8,12 +8,19 @@
 //!   slot.
 //! - **Local commands** (every key owned by this cell, or no keys) execute
 //!   synchronously inside PARSE+EXECUTE — the L6 fast path pays nothing.
-//! - **Remote commands** run on a per-connection *pump* future executing the
-//!   connection's commands strictly in order (pipelined replies must never
-//!   reorder), suspending on a [`FabricGate`] for replies and on a
-//!   [`WaitList`] when fabric credits are exhausted. While a pump is active,
-//!   later commands queue behind it; past a watermark the connection's recv
-//!   is disarmed — credit backpressure reaches TCP (master plan §6.1).
+//! - **Remote commands** run on a per-connection *pump* future. The pump
+//!   dispatches commands in pipeline order with up to [`REMOTE_WINDOW`]
+//!   remote ops in flight at once (the M0-E8 cross-cell remediation:
+//!   one-hop-at-a-time execution was the 85% penalty), then emits replies
+//!   strictly in command order — out-of-order completions park in the
+//!   [`FabricGate`] until their turn. Sends always leave from the single
+//!   pump, so per-key order rides the per-destination ring FIFO. The pump
+//!   suspends on the front reply's gate and on a [`WaitList`] when fabric
+//!   credits are exhausted. While a pump is active, later commands queue
+//!   behind it; past a watermark the connection's recv is disarmed — credit
+//!   backpressure reaches TCP (master plan §6.1). `HELLO` mutates
+//!   connection state (protocol), so it dispatches only once every earlier
+//!   reply has been emitted (a pipeline barrier).
 //! - **Cross-cell vocabulary** (M0-experimental `Apply`, reshaped by M4):
 //!   single-owner commands ship as `Op::Apply { cmd: protocol, args: argv }`
 //!   and return the owner's raw RESP reply (`Outcome::Bytes`) — byte-exact
@@ -27,6 +34,8 @@
 use core::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering, fence};
 
 use inf_alloc::{BufferId, LeaseKind};
 use inf_fabric::{ApplyArgs, CellFabric, ErrCode, FabricToken, Op, Outcome, SendError};
@@ -34,8 +43,8 @@ use inf_foundation::time::Nanos;
 use inf_foundation::{CellId, LogHistogram};
 use inf_runtime::GroupClass;
 use inf_runtime::{
-    CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, IoOp, LoopCx, RawFd,
-    TokenClass, WaitList,
+    CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoOp, LoopCx,
+    RawFd, TokenClass, WaitList,
 };
 use inf_store::{CellStore, SlotRouter};
 use inf_wire::{
@@ -52,6 +61,17 @@ const PENDING_HIGH_WATER: usize = 1024;
 const PENDING_LOW_WATER: usize = 64;
 /// Max fabric ops drained per FABRIC-IN step (bounded drain).
 const FABRIC_DRAIN_MAX: usize = 1024;
+/// Remote ops one connection may have in flight at once. Replies that land
+/// out of order park in the `FabricGate` (≤ one value each) until emitted,
+/// so this also bounds parked-reply memory per connection.
+const REMOTE_WINDOW: usize = 32;
+/// Replies (of any kind) awaiting in-order emission per connection; locals
+/// executed eagerly behind a slow remote stage their bytes here.
+const PENDING_REPLIES_MAX: usize = 256;
+/// Reply-pool bounds: buffers kept per cell, and the largest buffer worth
+/// keeping (anything bigger is freed, so one giant value can't pin memory).
+const REPLY_POOL_MAX: usize = 256;
+const REPLY_POOL_BUF_CAP: usize = 4096;
 
 /// Apply-point hook (sim oracle seam).
 pub trait PlaneObserver {
@@ -110,6 +130,60 @@ impl OwnedOutcome {
     }
 }
 
+// ---- deferred commands --------------------------------------------------------
+
+/// One deferred command, flattened into a single allocation:
+/// `[argc:u32][end_0:u32 … end_{argc-1}:u32][arg bytes …]` with absolute end
+/// offsets. Replaces `Vec<Vec<u8>>` — 1+argc allocations per deferred
+/// command was a top origin-side cost in the M0-R1 cross-cell profile.
+struct OwnedCmd {
+    buf: Vec<u8>,
+}
+
+impl OwnedCmd {
+    fn from_argv(argv: &ArgvRef<'_>) -> OwnedCmd {
+        let argc = argv.len();
+        let head = 4 + 4 * argc;
+        let total = head + (0..argc).map(|i| argv.arg(i).len()).sum::<usize>();
+        let mut buf = Vec::with_capacity(total);
+        buf.extend_from_slice(&u32::try_from(argc).expect("argc fits u32").to_le_bytes());
+        let mut end = head;
+        for i in 0..argc {
+            end += argv.arg(i).len();
+            buf.extend_from_slice(&u32::try_from(end).expect("cmd fits u32").to_le_bytes());
+        }
+        for i in 0..argc {
+            buf.extend_from_slice(argv.arg(i));
+        }
+        OwnedCmd { buf }
+    }
+
+    fn argc(&self) -> usize {
+        u32::from_le_bytes(self.buf[..4].try_into().expect("header")) as usize
+    }
+
+    fn end(&self, i: usize) -> usize {
+        let at = 4 + 4 * i;
+        u32::from_le_bytes(self.buf[at..at + 4].try_into().expect("ends table")) as usize
+    }
+
+    fn arg(&self, i: usize) -> &[u8] {
+        let start = if i == 0 { 4 + 4 * self.argc() } else { self.end(i - 1) };
+        &self.buf[start..self.end(i)]
+    }
+
+    /// Borrowed views over the flat buffer — the one remaining allocation
+    /// per dispatched command (`extract_keys`/`ApplyArgs`/observer want
+    /// `&[&[u8]]`).
+    fn slices(&self) -> Vec<&[u8]> {
+        (0..self.argc()).map(|i| self.arg(i)).collect()
+    }
+
+    fn mem(&self) -> usize {
+        self.buf.capacity()
+    }
+}
+
 // ---- connection slab ---------------------------------------------------------
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -131,7 +205,7 @@ struct Conn {
     close_after_flush: bool,
     /// A pump future owns this connection's execution order.
     pump_active: bool,
-    queue: VecDeque<Vec<Vec<u8>>>,
+    queue: VecDeque<OwnedCmd>,
     recv_disarmed: bool,
     rearm_recv: bool,
 }
@@ -141,7 +215,7 @@ impl Conn {
         size_of::<Conn>()
             + self.parser.buffered()
             + self.out.capacity()
-            + self.queue.iter().map(|c| c.iter().map(Vec::capacity).sum::<usize>()).sum::<usize>()
+            + self.queue.iter().map(OwnedCmd::mem).sum::<usize>()
     }
 }
 
@@ -215,6 +289,14 @@ struct Shared<O: PlaneObserver + 'static> {
     now: Cell<Nanos>,
     /// Fabric token round-trip latency, nanoseconds (hop RTT gate).
     rtt_ns: RefCell<LogHistogram>,
+    /// Per-destination `(token, send time)` FIFO: replies return in send
+    /// order per cell pair, so RTT is recorded at *delivery* (FABRIC-IN),
+    /// not when the windowed pump finally awaits the parked value.
+    rtt_sent: RefCell<Vec<VecDeque<(u64, Nanos)>>>,
+    /// Recycled reply buffers (gate values, pump-local replies) — the
+    /// remote path's per-op heap traffic was a top M0-R1 cost. Bounded by
+    /// [`REPLY_POOL_MAX`]/[`REPLY_POOL_BUF_CAP`].
+    reply_pool: RefCell<Vec<Vec<u8>>>,
     recv_dropped: Cell<u64>,
 }
 
@@ -223,21 +305,41 @@ impl<O: PlaneObserver + 'static> Shared<O> {
         self.conns.borrow_mut().get_mut(key).map(f)
     }
 
-    /// Executes owned argv locally (queued and remote-`Apply` paths) and
-    /// reports the apply point; returns the reply bytes.
-    fn execute_owned(
+    /// Executes owned argv locally (queued and remote-`Apply` paths),
+    /// appending the reply to `out` (callers reuse scratch buffers — the
+    /// owner side of a remote `Apply` is zero-allocation, M0-E8), and
+    /// reports the apply point.
+    fn execute_owned_into(
         &self,
         origin: ExecOrigin,
         argv: &[&[u8]],
         proto: Protocol,
         id: u64,
-    ) -> Vec<u8> {
-        let mut out = Vec::new();
+        out: &mut Vec<u8>,
+    ) {
+        let before = out.len();
         let mut cx = ConnCx { proto, id, node: Rc::clone(&self.node) };
         let now = self.now.get();
-        execute_slices(argv, &mut self.store.borrow_mut(), &mut cx, now, &mut out);
-        self.observer.borrow_mut().on_execute(self.cell, origin, argv, &out, now);
-        out
+        execute_slices(argv, &mut self.store.borrow_mut(), &mut cx, now, out);
+        self.observer.borrow_mut().on_execute(self.cell, origin, argv, &out[before..], now);
+    }
+
+    /// An empty reply buffer, recycled when possible.
+    fn take_reply_buf(&self) -> Vec<u8> {
+        let mut buf = self.reply_pool.borrow_mut().pop().unwrap_or_default();
+        buf.clear();
+        buf
+    }
+
+    /// Returns a reply buffer to the pool (bounded; oversized buffers drop).
+    fn recycle_reply_buf(&self, buf: Vec<u8>) {
+        if buf.capacity() == 0 || buf.capacity() > REPLY_POOL_BUF_CAP {
+            return;
+        }
+        let mut pool = self.reply_pool.borrow_mut();
+        if pool.len() < REPLY_POOL_MAX {
+            pool.push(buf);
+        }
     }
 
     /// Typed single-key DEL/EXISTS apply (local or owner side): the reply is
@@ -265,6 +367,26 @@ pub struct ServerPlane<O: PlaneObserver + 'static = NoopObserver> {
     started: bool,
     /// Recv completions staged from step 1 for PARSE+EXECUTE (step 3+4).
     inbox: Vec<(ConnKey, BufferId, u32)>,
+    /// Reusable FABRIC-IN scratch: owner-side reply bytes for this drain.
+    reply_scratch: Vec<u8>,
+    /// Reusable FABRIC-IN scratch: replies staged while the fabric is
+    /// borrowed by `drain`, sent the moment it ends.
+    staged_replies: Vec<(CellId, FabricToken, StagedReply)>,
+    /// Doorbell-wakeup park board (M0-R1): this cell sets `[cell]` in the
+    /// park handshake; peers read it at flush. Single-writer per slot — the
+    /// same blessed class as the fabric doorbells, NOT shared mutable
+    /// data-plane state.
+    park_flags: Option<Arc<Vec<AtomicBool>>>,
+}
+
+/// An owner-side reply produced during the FABRIC-IN drain (ranges index
+/// into the reply scratch buffer).
+enum StagedReply {
+    Bytes(usize, usize),
+    Int(i64),
+    Nil,
+    /// Typed refusal for an op the M0 plane does not speak.
+    Refused,
 }
 
 impl<O: PlaneObserver + 'static> ServerPlane<O> {
@@ -296,12 +418,23 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
                 node,
                 now: Cell::new(Nanos(0)),
                 rtt_ns: RefCell::new(LogHistogram::new()),
+                rtt_sent: RefCell::new(vec![VecDeque::new(); usize::from(cells)]),
+                reply_pool: RefCell::new(Vec::new()),
                 recv_dropped: Cell::new(0),
             }),
             listener,
             started: false,
             inbox: Vec::new(),
+            reply_scratch: Vec::new(),
+            staged_replies: Vec::new(),
+            park_flags: None,
         }
+    }
+
+    /// Wires this plane's slot of the doorbell-wakeup park board (the same
+    /// `Arc` goes to every cell's fabric via `CellFabric::set_wakeups`).
+    pub fn set_park_flags(&mut self, flags: Arc<Vec<AtomicBool>>) {
+        self.park_flags = Some(flags);
     }
 
     /// Live connections (tests, stats).
@@ -345,27 +478,10 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
         }
     }
 
-    /// Spawn the per-connection ordered pump with its first command.
-    fn spawn_pump(&self, cx: &mut LoopCx<'_>, key: ConnKey, first: Vec<Vec<u8>>) {
+    /// Spawn the per-connection windowed pump with its first command.
+    fn spawn_pump(&self, cx: &mut LoopCx<'_>, key: ConnKey, first: OwnedCmd) {
         let shared = Rc::clone(&self.shared);
-        let _ = cx.executor.poll_immediate(async move {
-            let mut cmd = Some(first);
-            while let Some(owned) = cmd.take() {
-                run_one(&shared, key, &owned).await;
-                cmd = shared
-                    .with_conn(key, |conn| {
-                        let next = conn.queue.pop_front();
-                        if next.is_none() {
-                            conn.pump_active = false;
-                        }
-                        if conn.recv_disarmed && conn.queue.len() <= PENDING_LOW_WATER {
-                            conn.rearm_recv = true;
-                        }
-                        next
-                    })
-                    .flatten();
-            }
-        });
+        let _ = cx.executor.poll_immediate(pump(shared, key, first));
     }
 }
 
@@ -437,100 +553,73 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
         }
     }
 
-    fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {
-        self.shared.now.set(cx.now);
-        enum Staged {
-            Apply { token: FabricToken, proto: u8, args: Vec<Vec<u8>> },
-            Read { token: FabricToken, key: Vec<u8> },
-            Reply { token: FabricToken, outcome: OwnedOutcome },
-            Unsupported { token: FabricToken },
+    fn before_park(&mut self) -> bool {
+        let Some(flags) = &self.park_flags else { return false };
+        let me = usize::from(self.shared.cell.0);
+        flags[me].store(true, Ordering::Relaxed);
+        // Pairs with the producer's ring → fence → parked-flag load: either
+        // this final check sees the doorbell, or the producer sees the flag
+        // and wakes us. A doubly-missed wake degrades to the park timeout,
+        // never a hang.
+        fence(Ordering::SeqCst);
+        if self.shared.fabric.borrow().doorbell_pending() {
+            flags[me].store(false, Ordering::Relaxed);
+            return true;
         }
-        fn stage(staged: &mut Vec<(CellId, Staged)>, from: CellId, op: Op<'_>) {
-            match op {
-                Op::Apply { token, cmd, args, .. } => staged.push((
-                    from,
-                    Staged::Apply {
-                        token,
-                        proto: cmd,
-                        args: args.as_slice().iter().map(|a| a.to_vec()).collect(),
-                    },
-                )),
-                Op::Read { token, key, .. } => {
-                    staged.push((from, Staged::Read { token, key: key.to_vec() }));
-                }
-                Op::Reply { token, outcome } => {
-                    staged.push((
-                        from,
-                        Staged::Reply { token, outcome: OwnedOutcome::own(&outcome) },
-                    ));
-                }
-                Op::Batch { ops } => {
-                    for nested in ops {
-                        stage(staged, from, nested);
-                    }
-                }
-                // The M0 plane speaks Apply; a typed Write from a future peer
-                // gets a typed refusal rather than silence.
-                Op::Write { token, .. } => staged.push((from, Staged::Unsupported { token })),
-            }
-        }
+        false
+    }
 
-        let mut staged: Vec<(CellId, Staged)> = Vec::new();
-        let drained = self
-            .shared
-            .fabric
-            .borrow_mut()
-            .drain(FABRIC_DRAIN_MAX, |from, op| stage(&mut staged, from, op));
+    fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {
+        if let Some(flags) = &self.park_flags {
+            flags[usize::from(self.shared.cell.0)].store(false, Ordering::Relaxed);
+        }
+        self.shared.now.set(cx.now);
+        // Ops execute *during* the drain over their borrowed ring payloads —
+        // the owner side of a remote `Apply` is zero-allocation (M0-E8: the
+        // owned-staging copies dominated the cross-cell profile). Only the
+        // replies wait: the fabric is mutably borrowed by `drain`, so their
+        // bytes land in the reusable scratch and ship the moment it ends.
+        self.reply_scratch.clear();
+        self.staged_replies.clear();
+        let shared = &self.shared;
+        let scratch = &mut self.reply_scratch;
+        let staged = &mut self.staged_replies;
+        let mut orphans: u64 = 0;
+        let now = cx.now;
+        let drained = shared.fabric.borrow_mut().drain(FABRIC_DRAIN_MAX, |from, op| {
+            handle_fabric_op(shared, now, from, op, scratch, staged, &mut orphans);
+        });
         if drained == 0 {
             return;
         }
         cx.note_fabric(drained as u64);
 
-        for (from, item) in staged {
-            match item {
-                Staged::Reply { token, outcome } => {
-                    // The drained reply already returned one data credit;
-                    // wake one sender blocked on that destination.
-                    self.shared.credit_waiters.wake_one(from);
-                    if !self.shared.gate.complete(token.0, outcome) {
-                        self.shared.fabric.borrow_mut().note_orphan_reply();
-                    }
+        let mut fabric = self.shared.fabric.borrow_mut();
+        for _ in 0..orphans {
+            fabric.note_orphan_reply();
+        }
+        let mut had_replies = false;
+        for (to, token, reply) in self.staged_replies.drain(..) {
+            had_replies = true;
+            match reply {
+                StagedReply::Bytes(start, end) => {
+                    fabric.reply(to, token, &Outcome::Bytes(&self.reply_scratch[start..end]));
                 }
-                Staged::Apply { token, proto, args } => {
-                    let argv: Vec<&[u8]> = args.iter().map(|a| &a[..]).collect();
-                    let proto = if proto == 3 { Protocol::Resp3 } else { Protocol::Resp2 };
-                    // Single-key DEL/EXISTS contributions stay typed for
-                    // origin-side aggregation; everything else returns the
-                    // raw RESP reply.
-                    let counted = argv.len() == 2
-                        && (argv[0].eq_ignore_ascii_case(b"DEL")
-                            || argv[0].eq_ignore_ascii_case(b"EXISTS"));
-                    if counted {
-                        let del = argv[0].eq_ignore_ascii_case(b"DEL");
-                        let n = self.shared.apply_counted(ExecOrigin::Fabric(from), del, argv[1]);
-                        self.shared.fabric.borrow_mut().reply(from, token, &Outcome::Int(n));
-                    } else {
-                        let reply =
-                            self.shared.execute_owned(ExecOrigin::Fabric(from), &argv, proto, 0);
-                        self.shared.fabric.borrow_mut().reply(from, token, &Outcome::Bytes(&reply));
-                    }
+                StagedReply::Int(n) => fabric.reply(to, token, &Outcome::Int(n)),
+                StagedReply::Nil => fabric.reply(to, token, &Outcome::Nil),
+                StagedReply::Refused => {
+                    fabric.reply(to, token, &Outcome::Err(ErrCode::Unknown(0)));
                 }
-                Staged::Read { token, key } => {
-                    let value =
-                        self.shared.store.borrow_mut().get(&key, cx.now).map(<[u8]>::to_vec);
-                    let mut fabric = self.shared.fabric.borrow_mut();
-                    match value {
-                        Some(v) => fabric.reply(from, token, &Outcome::Bytes(&v)),
-                        None => fabric.reply(from, token, &Outcome::Nil),
-                    }
-                }
-                Staged::Unsupported { token } => {
-                    self.shared.fabric.borrow_mut().reply(
-                        from,
-                        token,
-                        &Outcome::Err(ErrCode::Unknown(0)),
-                    );
-                }
+            }
+        }
+        // Publish replies NOW instead of at FABRIC-OUT: the origin is
+        // blocked on them, and waiting for step 8 adds most of an iteration
+        // to every hop RTT (M0-R1 latency finding — hops were
+        // window-latency-bound, not just CPU-bound).
+        if had_replies {
+            let published = fabric.flush();
+            if published > 0 {
+                cx.note_fabric(published as u64);
             }
         }
     }
@@ -550,8 +639,8 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
             let mut commands: u32 = 0;
             // First command that must defer to a pump (everything after it
             // defers too — replies are ordered per connection).
-            let mut deferred: Vec<Vec<Vec<u8>>> = Vec::new();
-            let mut spawn_first: Option<Vec<Vec<u8>>> = None;
+            let mut deferred: Vec<OwnedCmd> = Vec::new();
+            let mut spawn_first: Option<OwnedCmd> = None;
             let mut protocol_error = false;
             {
                 let mut conns = self.shared.conns.borrow_mut();
@@ -578,7 +667,7 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                                 || !deferred.is_empty()
                                 || self.needs_fabric(&argv);
                             if defer {
-                                let owned: Vec<Vec<u8>> = argv.iter().map(<[u8]>::to_vec).collect();
+                                let owned = OwnedCmd::from_argv(&argv);
                                 if pump_was_active || spawn_first.is_some() {
                                     deferred.push(owned);
                                 } else {
@@ -702,86 +791,312 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
     }
 }
 
-/// Execute one owned command in connection order: local fast path, remote
-/// single-owner `Apply`, or per-key DEL/EXISTS aggregation.
-async fn run_one<O: PlaneObserver + 'static>(
+/// One drained fabric op, handled while its payload still borrows the ring
+/// slot (zero copies in): `Reply` completes the origin-side gate inline;
+/// `Apply`/`Read` execute against the store and stage their reply bytes
+/// into `scratch` (the fabric itself is borrowed by the drain — replies
+/// ship right after it ends). `orphans` counts gate-less replies for the
+/// fabric tripwire.
+fn handle_fabric_op<O: PlaneObserver + 'static>(
+    shared: &Shared<O>,
+    now: Nanos,
+    from: CellId,
+    op: Op<'_>,
+    scratch: &mut Vec<u8>,
+    staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
+    orphans: &mut u64,
+) {
+    match op {
+        Op::Reply { token, outcome } => {
+            // Delivery-time hop RTT: replies return in send order per cell
+            // pair, so the front send-time entry is this reply's (recording
+            // at the pump's await would charge head-of-line parking to the
+            // fabric).
+            if let Some((sent_token, t0)) =
+                shared.rtt_sent.borrow_mut()[usize::from(from.0)].pop_front()
+            {
+                debug_assert_eq!(sent_token, token.0, "reply order diverged from sends");
+                shared.rtt_ns.borrow_mut().record(now.saturating_sub(t0).0);
+            }
+            // The drained reply already returned one data credit; wake one
+            // sender blocked on that destination.
+            shared.credit_waiters.wake_one(from);
+            // Bytes outcomes own their parked value via the reply pool —
+            // no per-reply heap traffic on the steady-state path.
+            let owned = match &outcome {
+                Outcome::Bytes(bytes) => {
+                    let mut buf = shared.take_reply_buf();
+                    buf.extend_from_slice(bytes);
+                    OwnedOutcome::Bytes(buf)
+                }
+                other => OwnedOutcome::own(other),
+            };
+            if !shared.gate.complete(token.0, owned) {
+                *orphans += 1;
+            }
+        }
+        Op::Apply { token, cmd, args, .. } => {
+            let argv = args.as_slice();
+            let proto = if cmd == 3 { Protocol::Resp3 } else { Protocol::Resp2 };
+            // Single-key DEL/EXISTS contributions stay typed for
+            // origin-side aggregation; everything else returns the raw
+            // RESP reply.
+            let counted = argv.len() == 2
+                && (argv[0].eq_ignore_ascii_case(b"DEL")
+                    || argv[0].eq_ignore_ascii_case(b"EXISTS"));
+            if counted {
+                let del = argv[0].eq_ignore_ascii_case(b"DEL");
+                let n = shared.apply_counted(ExecOrigin::Fabric(from), del, argv[1]);
+                staged.push((from, token, StagedReply::Int(n)));
+            } else {
+                let start = scratch.len();
+                shared.execute_owned_into(ExecOrigin::Fabric(from), argv, proto, 0, scratch);
+                staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+            }
+        }
+        Op::Read { token, key, .. } => {
+            let start = scratch.len();
+            let hit = match shared.store.borrow_mut().get(key, now) {
+                Some(value) => {
+                    scratch.extend_from_slice(value);
+                    true
+                }
+                None => false,
+            };
+            let reply =
+                if hit { StagedReply::Bytes(start, scratch.len()) } else { StagedReply::Nil };
+            staged.push((from, token, reply));
+        }
+        Op::Batch { ops } => {
+            for nested in ops {
+                handle_fabric_op(shared, now, from, nested, scratch, staged, orphans);
+            }
+        }
+        // The M0 plane speaks Apply; a typed Write from a future peer gets
+        // a typed refusal rather than silence.
+        Op::Write { token, .. } => staged.push((from, token, StagedReply::Refused)),
+    }
+}
+
+/// A reply slot awaiting its in-order turn on the wire.
+enum PendingReply {
+    /// Executed (locally or refused) at dispatch; bytes wait their turn.
+    Done(Vec<u8>),
+    /// One remote `Apply` in flight; the owner's raw RESP reply parks in
+    /// the gate if it lands before its turn.
+    Remote { waiter: GateWait<u64, OwnedOutcome>, proto: Protocol },
+    /// Split DEL/EXISTS: locally-counted contributions in `acc`, remote
+    /// per-key contributions in flight.
+    Counted { waiters: Vec<GateWait<u64, OwnedOutcome>>, acc: i64, proto: Protocol },
+}
+
+/// What the pump found when it asked the connection for more work.
+enum Popped {
+    Cmd(OwnedCmd),
+    /// Queue empty but replies are still pending — keep emitting.
+    Empty,
+    /// Queue empty, nothing pending (pump deactivated inside the conn
+    /// borrow) or the connection is gone: the pump is done.
+    Finished,
+}
+
+fn pop_or_quiesce<O: PlaneObserver + 'static>(
+    shared: &Shared<O>,
+    key: ConnKey,
+    pending_empty: bool,
+) -> Popped {
+    let Some(next) = shared.with_conn(key, |conn| {
+        let next = conn.queue.pop_front();
+        if next.is_none() && pending_empty {
+            conn.pump_active = false;
+        }
+        if conn.recv_disarmed && conn.queue.len() <= PENDING_LOW_WATER {
+            conn.rearm_recv = true;
+        }
+        next
+    }) else {
+        return Popped::Finished;
+    };
+    match next {
+        Some(cmd) => Popped::Cmd(cmd),
+        None if pending_empty => Popped::Finished,
+        None => Popped::Empty,
+    }
+}
+
+/// Commands that mutate connection execution state must observe — and be
+/// observed by — their exact pipeline position (HELLO switches the protocol
+/// every later reply serializes under).
+fn is_conn_state(owned: &OwnedCmd) -> bool {
+    lookup(owned.arg(0)).is_some_and(|m| m.id == CommandId::Hello)
+}
+
+/// The per-connection pump: dispatch commands in pipeline order with up to
+/// [`REMOTE_WINDOW`] remote ops in flight, emit replies strictly in command
+/// order. Suspends only on the front reply's gate and on fabric credits;
+/// out-of-order completions park in the gate until their turn.
+async fn pump<O: PlaneObserver + 'static>(shared: Rc<Shared<O>>, key: ConnKey, first: OwnedCmd) {
+    let mut pending: VecDeque<PendingReply> = VecDeque::new();
+    // Remote ops sent and not yet awaited (Counted holds several).
+    let mut inflight: usize = 0;
+    // A command held back by the conn-state barrier.
+    let mut held: Option<OwnedCmd> = Some(first);
+    loop {
+        // ---- dispatch: fill the window in pipeline order.
+        while pending.len() < PENDING_REPLIES_MAX && inflight < REMOTE_WINDOW {
+            let cmd = match held.take() {
+                Some(cmd) => cmd,
+                None => match pop_or_quiesce(&shared, key, pending.is_empty()) {
+                    Popped::Cmd(cmd) => cmd,
+                    Popped::Empty => break,
+                    Popped::Finished => return,
+                },
+            };
+            if is_conn_state(&cmd) && !pending.is_empty() {
+                held = Some(cmd);
+                break;
+            }
+            if !dispatch_one(&shared, key, &cmd, &mut pending, &mut inflight).await {
+                return; // connection is gone
+            }
+        }
+
+        // ---- emit: resolve the front reply. Awaiting an already-parked
+        // value completes on first poll; only a genuinely outstanding front
+        // suspends the pump.
+        let Some(front) = pending.pop_front() else {
+            continue; // barrier held with pending drained: dispatch it now
+        };
+        let reply: Vec<u8> = match front {
+            PendingReply::Done(bytes) => bytes,
+            PendingReply::Remote { waiter, proto } => {
+                let outcome = waiter.await;
+                inflight -= 1;
+                render_outcome(&shared, outcome, proto)
+            }
+            PendingReply::Counted { waiters, mut acc, proto } => {
+                for waiter in waiters {
+                    match waiter.await {
+                        OwnedOutcome::Int(n) => acc += n,
+                        other => debug_assert!(false, "counted apply returned {other:?}"),
+                    }
+                    inflight -= 1;
+                }
+                let mut reply = shared.take_reply_buf();
+                RespWriter::new(&mut reply, proto).int(acc);
+                reply
+            }
+        };
+        let written = shared.with_conn(key, |conn| conn.out.extend_from_slice(&reply));
+        shared.recycle_reply_buf(reply);
+        if written.is_none() {
+            return;
+        }
+    }
+}
+
+/// Dispatch one command: execute locally into a `Done` slot, or ship its
+/// remote ops (suspending only on fabric credits — backpressure, never
+/// unbounded queueing) and stage the reply waiter. Returns `false` when the
+/// connection is gone.
+async fn dispatch_one<O: PlaneObserver + 'static>(
     shared: &Rc<Shared<O>>,
     key: ConnKey,
-    owned: &[Vec<u8>],
-) {
-    let argv: Vec<&[u8]> = owned.iter().map(|v| &v[..]).collect();
-    let Some((proto, id)) = shared.with_conn(key, |c| (c.cx.proto, c.cx.id)) else { return };
+    owned: &OwnedCmd,
+    pending: &mut VecDeque<PendingReply>,
+    inflight: &mut usize,
+) -> bool {
+    let argv: Vec<&[u8]> = owned.slices();
+    let Some((proto, id)) = shared.with_conn(key, |c| (c.cx.proto, c.cx.id)) else { return false };
     let origin = ExecOrigin::Conn(key.slot, key.generation);
 
     let meta = lookup(argv[0]);
     let well_formed = meta.is_some_and(|m| arity_ok(m, argv.len()));
-    let reply: Vec<u8> = match meta {
+    let has_remote_key = |meta| {
+        !shared.route_local_only
+            && extract_keys_slices(meta, &argv)
+                .iter()
+                .any(|k| !shared.router.is_local(k, shared.cell))
+    };
+    match meta {
         Some(meta)
             if well_formed
-                && !shared.route_local_only
-                && matches!(meta.id, CommandId::Del | CommandId::Exists) =>
+                && matches!(meta.id, CommandId::Del | CommandId::Exists)
+                && has_remote_key(meta) =>
         {
-            // Per-key split: local keys count directly, remote keys ride
-            // typed Apply replies. Order within the command is the argv
-            // order (matches the single-store oracle).
+            // Per-key split: local keys count at dispatch, remote keys ride
+            // typed Apply replies. Applies leave in argv order (per-key
+            // order rides the destination ring FIFO).
             let del = meta.id == CommandId::Del;
             let name: &[u8] = if del { b"DEL" } else { b"EXISTS" };
             let mut acc: i64 = 0;
+            let mut waiters = Vec::new();
             for k in &argv[1..] {
                 if shared.router.is_local(k, shared.cell) {
                     acc += shared.apply_counted(origin, del, k);
                 } else {
                     let owner = shared.router.cell_of(SlotRouter::slot_of(k));
-                    match remote_apply(shared, owner, proto, &[name, k]).await {
-                        OwnedOutcome::Int(n) => acc += n,
-                        other => {
-                            debug_assert!(false, "counted apply returned {other:?}");
+                    match send_apply(shared, owner, proto, &[name, k]).await {
+                        Ok(waiter) => {
+                            waiters.push(waiter);
+                            *inflight += 1;
                         }
+                        Err(_) => debug_assert!(false, "2-arg apply exceeded ApplyArgs"),
                     }
                 }
             }
-            let mut reply = Vec::new();
-            RespWriter::new(&mut reply, proto).int(acc);
-            reply
+            pending.push_back(PendingReply::Counted { waiters, acc, proto });
         }
-        Some(meta)
-            if well_formed && {
-                !shared.route_local_only
-                    && extract_keys_slices(meta, &argv)
-                        .iter()
-                        .any(|k| !shared.router.is_local(k, shared.cell))
-            } =>
-        {
-            // Single-key remote command: ship the whole argv; the owner
+        Some(meta) if well_formed && has_remote_key(meta) => {
+            // Single-owner remote command: ship the whole argv; the owner
             // executes and returns its raw RESP reply.
             let first_key = extract_keys_slices(meta, &argv)[0];
             let owner = shared.router.cell_of(SlotRouter::slot_of(first_key));
-            match remote_apply(shared, owner, proto, &argv).await {
-                OwnedOutcome::Bytes(reply) => reply,
-                OwnedOutcome::Err(_) => {
-                    let mut reply = Vec::new();
-                    RespWriter::new(&mut reply, proto).error("ERR cross-cell execution failed");
-                    reply
+            match send_apply(shared, owner, proto, &argv).await {
+                Ok(waiter) => {
+                    *inflight += 1;
+                    pending.push_back(PendingReply::Remote { waiter, proto });
                 }
-                other => {
-                    // Defensive: typed outcomes from a future peer.
-                    let mut reply = Vec::new();
-                    let mut w = RespWriter::new(&mut reply, proto);
-                    match other {
-                        OwnedOutcome::Ok => w.simple("OK"),
-                        OwnedOutcome::Int(i) => w.int(i),
-                        OwnedOutcome::Nil => w.null(),
-                        OwnedOutcome::Bool(b) => w.bool(b),
-                        OwnedOutcome::Bytes(_) | OwnedOutcome::Err(_) => unreachable!(),
-                    }
-                    reply
-                }
+                Err(refusal) => pending.push_back(PendingReply::Done(refusal)),
             }
         }
-        _ => shared.execute_owned(origin, &argv, proto, id),
-    };
+        _ => {
+            let mut reply = shared.take_reply_buf();
+            shared.execute_owned_into(origin, &argv, proto, id, &mut reply);
+            pending.push_back(PendingReply::Done(reply));
+        }
+    }
+    true
+}
 
-    shared.with_conn(key, |conn| conn.out.extend_from_slice(&reply));
+/// Render an owner's outcome as the RESP reply for a whole-argv `Apply`
+/// (buffers come from and return to the cell's reply pool).
+fn render_outcome<O: PlaneObserver + 'static>(
+    shared: &Shared<O>,
+    outcome: OwnedOutcome,
+    proto: Protocol,
+) -> Vec<u8> {
+    match outcome {
+        OwnedOutcome::Bytes(reply) => reply,
+        OwnedOutcome::Err(_) => {
+            let mut reply = shared.take_reply_buf();
+            RespWriter::new(&mut reply, proto).error("ERR cross-cell execution failed");
+            reply
+        }
+        other => {
+            // Defensive: typed outcomes from a future peer.
+            let mut reply = shared.take_reply_buf();
+            let mut w = RespWriter::new(&mut reply, proto);
+            match other {
+                OwnedOutcome::Ok => w.simple("OK"),
+                OwnedOutcome::Int(i) => w.int(i),
+                OwnedOutcome::Nil => w.null(),
+                OwnedOutcome::Bool(b) => w.bool(b),
+                OwnedOutcome::Bytes(_) | OwnedOutcome::Err(_) => unreachable!(),
+            }
+            reply
+        }
+    }
 }
 
 /// Owned-slice twin of `extract_keys` (the wire helper wants an `ArgvRef`).
@@ -804,22 +1119,21 @@ fn extract_keys_slices<'a>(meta: &inf_wire::CommandMeta, argv: &[&'a [u8]]) -> V
     keys
 }
 
-/// Ship `argv` to `to` as an `Apply` and await the owner's reply, waiting
+/// Ship `argv` to `to` as an `Apply` and return the reply waiter, waiting
 /// for fabric credits when exhausted (backpressure, never unbounded
-/// queueing) and recording the hop round-trip.
-async fn remote_apply<O: PlaneObserver + 'static>(
+/// queueing). The send time is queued for delivery-side RTT recording.
+/// `Err` carries the refusal reply when the argv exceeds the codec's
+/// argument cap.
+async fn send_apply<O: PlaneObserver + 'static>(
     shared: &Rc<Shared<O>>,
     to: CellId,
     proto: Protocol,
     argv: &[&[u8]],
-) -> OwnedOutcome {
+) -> Result<GateWait<u64, OwnedOutcome>, Vec<u8>> {
     let Some(args) = ApplyArgs::new(argv) else {
-        return OwnedOutcome::Bytes({
-            let mut reply = Vec::new();
-            RespWriter::new(&mut reply, proto)
-                .error("ERR too many arguments for cross-cell execution");
-            reply
-        });
+        let mut reply = Vec::new();
+        RespWriter::new(&mut reply, proto).error("ERR too many arguments for cross-cell execution");
+        return Err(reply);
     };
     let slot = SlotRouter::slot_of(argv[1]);
     let (token, waiter) = {
@@ -841,9 +1155,6 @@ async fn remote_apply<O: PlaneObserver + 'static>(
             Err(SendError::NoCredit { .. }) => shared.credit_waiters.wait(to).await,
         }
     }
-    let t0 = shared.now.get();
-    let outcome = waiter.await;
-    let rtt = shared.now.get().saturating_sub(t0);
-    shared.rtt_ns.borrow_mut().record(rtt.0);
-    outcome
+    shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
+    Ok(waiter)
 }

@@ -30,7 +30,7 @@ pub use driver::{
     BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, SubmitStats, Wait,
 };
 pub use executor::{CellExecutor, PollImmediate, TaskId};
-pub use gate::{FabricGate, IoGate, WaitList, WatermarkGate};
+pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate};
 pub use reactor::{CellLoop, CellPlane, IterStats, LoopConfig, LoopCx};
 pub use sched::{GroupClass, GroupScheduler};
 pub use timer::{TimerId, TimerWheel};

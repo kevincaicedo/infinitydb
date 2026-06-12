@@ -99,14 +99,44 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let fabrics = Mesh::new(args.cells, MeshConfig { ring_capacity: 4096, data_credits: 1024 });
+    let mut fabrics = Mesh::new(args.cells, MeshConfig { ring_capacity: 4096, data_credits: 1024 });
+
+    // Doorbell wakeups (M0-R1, Linux): each cell adopts an eventfd watch;
+    // peers wake a parked cell through the park board + LoopWaker. The dev
+    // tier (kqueue) falls back to the park-timeout ceiling.
+    let park_flags: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>> = std::sync::Arc::new(
+        (0..args.cells).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
+    );
+    #[cfg(target_os = "linux")]
+    let mut wake_fds = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        let mut wakers = Vec::new();
+        for _ in 0..args.cells {
+            let (fd, waker) = inf_runtime::net::wake_pair().expect("eventfd");
+            wake_fds.push(Some(fd));
+            wakers.push(waker);
+        }
+        for fabric in &mut fabrics {
+            let wakers = wakers.clone();
+            fabric.set_wakeups(std::sync::Arc::clone(&park_flags), move |cell| {
+                wakers[usize::from(cell.0)].wake();
+            });
+        }
+    }
+
     let mut handles = Vec::new();
     for (i, fabric) in fabrics.into_iter().enumerate() {
         let args = args.clone();
+        let park_flags = std::sync::Arc::clone(&park_flags);
+        #[cfg(target_os = "linux")]
+        let wake_fd = wake_fds[i].take();
+        #[cfg(not(target_os = "linux"))]
+        let wake_fd = None;
         handles.push(
             std::thread::Builder::new()
                 .name(format!("cell-{i}"))
-                .spawn(move || cell_main(i as u16, &args, fabric))
+                .spawn(move || cell_main(i as u16, &args, fabric, park_flags, wake_fd))
                 .expect("spawn cell thread"),
         );
     }
@@ -125,7 +155,13 @@ fn main() {
     }
 }
 
-fn cell_main(cell: u16, args: &Args, fabric: CellFabric) -> std::io::Result<()> {
+fn cell_main(
+    cell: u16,
+    args: &Args,
+    fabric: CellFabric,
+    park_flags: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>>,
+    wake_fd: Option<std::os::fd::OwnedFd>,
+) -> std::io::Result<()> {
     if let Some(start) = args.pin_start {
         pin_current_thread(start + cell as usize * 2);
     }
@@ -136,6 +172,12 @@ fn cell_main(cell: u16, args: &Args, fabric: CellFabric) -> std::io::Result<()> 
     let mut pool = BufferPool::new(args.buffers, args.buf_size);
     let mut driver = make_driver()?;
     driver.register_pool(&mut pool)?;
+    #[cfg(target_os = "linux")]
+    if let Some(fd) = wake_fd {
+        driver.adopt_wake_fd(fd);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = wake_fd;
     if cell == 0 {
         eprintln!("infinityd: capabilities {:?}", driver.capabilities());
     }
@@ -151,9 +193,15 @@ fn cell_main(cell: u16, args: &Args, fabric: CellFabric) -> std::io::Result<()> 
         NoopObserver,
         args.route_local_only,
     );
-    // Multi-cell nodes park briefly: a parked peer only notices fabric
-    // doorbells on wake (eventfd doorbell wakeups are the recorded M1
-    // follow-up). Single-cell nodes can sleep longer.
+    // Doorbell wakeups (Linux): peers end this cell's park via eventfd, so
+    // the park timeout is a fallback, not the hop-latency ceiling. The park
+    // board only helps when the driver has a wake watch.
+    #[cfg(target_os = "linux")]
+    plane.set_park_flags(park_flags);
+    #[cfg(not(target_os = "linux"))]
+    let _ = park_flags;
+    // Multi-cell dev-tier (kqueue, no wakeups) still parks briefly so a
+    // parked peer notices doorbells within the ceiling.
     let park_us = args.park_us.unwrap_or(if args.cells > 1 { 500 } else { 5_000 });
     let config = LoopConfig {
         park_default: Some(std::time::Duration::from_micros(park_us)),

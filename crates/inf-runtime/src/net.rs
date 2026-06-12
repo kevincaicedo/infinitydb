@@ -69,6 +69,49 @@ pub fn bound_port(listener: &TcpListener) -> io::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// Cross-thread reactor wake handle (M0-R1 doorbell wakeups): writing the
+/// peer cell's eventfd posts a CQE into its ring, ending a park immediately
+/// instead of at the park-timeout ceiling. Cloneable and idempotent — the
+/// driver's watch drains the counter.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct LoopWaker {
+    fd: std::sync::Arc<std::os::fd::OwnedFd>,
+}
+
+#[cfg(target_os = "linux")]
+impl LoopWaker {
+    /// Wakes the owning cell's reactor if it is (or is about to be) parked.
+    pub fn wake(&self) {
+        use std::os::fd::AsRawFd;
+        let one: u64 = 1;
+        // SAFETY: write(2) of 8 bytes from a live stack buffer to an owned
+        // eventfd. Errors (EAGAIN = counter saturated) mean the peer is
+        // already due to wake — safe to ignore.
+        let _ = unsafe { libc::write(self.fd.as_raw_fd(), (&raw const one).cast(), 8) };
+    }
+}
+
+/// Creates one cell's wake pair: the driver adopts the watch side
+/// ([`crate::UringDriver::adopt_wake_fd`]); [`LoopWaker`] clones go to every
+/// peer cell's fabric.
+///
+/// # Errors
+/// Propagates `eventfd(2)`/`dup` failure (fd exhaustion).
+#[cfg(target_os = "linux")]
+pub fn wake_pair() -> io::Result<(std::os::fd::OwnedFd, LoopWaker)> {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: plain eventfd(2); the fd is validated then owned below.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fresh fd, owned exclusively here.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let waker = LoopWaker { fd: std::sync::Arc::new(owned.try_clone()?) };
+    Ok((owned, waker))
+}
+
 /// Pins the calling thread to `core` (Linux; best-effort no-op elsewhere —
 /// the dev tier runs unpinned).
 pub fn pin_current_thread(core: usize) {

@@ -84,6 +84,10 @@ enum OpState {
         fd: RawFd,
         token: CompletionToken,
     },
+    /// Readability watch on the cell's wake eventfd (M0-R1 doorbell
+    /// wakeups): a peer's `LoopWaker::wake` posts this CQE, ending a park
+    /// immediately. Driver-internal — never surfaces as a completion.
+    WakeWatch,
 }
 
 struct RecvArm {
@@ -119,6 +123,8 @@ pub struct UringDriver {
     /// Buffers currently owned by the kernel's provided group, by bid.
     /// CQE `buffer_select` ids resolve through this map — never minted.
     provided: HashMap<u16, BufferId>,
+    /// Wake eventfd watched via `PollAdd` (see [`OpState::WakeWatch`]).
+    wake_fd: Option<std::os::fd::OwnedFd>,
     stats: SubmitStats,
 }
 
@@ -181,8 +187,25 @@ impl UringDriver {
             sends_inflight: HashMap::new(),
             closing: HashMap::new(),
             provided: HashMap::new(),
+            wake_fd: None,
             stats: SubmitStats::default(),
         })
+    }
+
+    /// Adopts the watch side of a [`crate::net::wake_pair`] eventfd. A
+    /// peer's `LoopWaker::wake` then ends this cell's park immediately
+    /// (doorbell wakeups, M0-R1) instead of at the park-timeout ceiling.
+    pub fn adopt_wake_fd(&mut self, fd: std::os::fd::OwnedFd) {
+        self.wake_fd = Some(fd);
+        self.arm_wake_watch();
+    }
+
+    fn arm_wake_watch(&mut self) {
+        use std::os::fd::AsRawFd as _;
+        let Some(fd) = &self.wake_fd else { return };
+        let raw = fd.as_raw_fd();
+        let id = self.alloc_id(OpState::WakeWatch);
+        self.push_sqe(opcode::PollAdd::new(Fd(raw), libc::POLLIN as u32).build().user_data(id));
     }
 
     fn alloc_id(&mut self, state: OpState) -> u64 {
@@ -601,6 +624,21 @@ impl UringDriver {
                 self.maybe_finish_close(fd, out);
             }
             OpState::Cancel => {}
+            OpState::WakeWatch => {
+                // Drain the eventfd counter (nonblocking; EAGAIN = already
+                // clear) and re-arm. Never surfaces as a consumer
+                // completion — its job was ending the kernel park.
+                if let Some(fd) = &self.wake_fd {
+                    use std::os::fd::AsRawFd as _;
+                    let mut counter = [0u8; 8];
+                    // SAFETY: read(2) into a stack buffer of the stated
+                    // length on an owned eventfd.
+                    let _ = unsafe {
+                        libc::read(fd.as_raw_fd(), counter.as_mut_ptr().cast(), counter.len())
+                    };
+                    self.arm_wake_watch();
+                }
+            }
             OpState::Provide { buf } => {
                 if result < 0 {
                     // Group rejected the buffer: unwind the staging.
