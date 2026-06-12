@@ -83,6 +83,19 @@ impl<'b> RespWriter<'b> {
         self.out.extend_from_slice(b"\r\n");
     }
 
+    /// Push frame of N elements: `>N\r\n` (RESP3) or a flat array (RESP2) —
+    /// pub/sub confirmations and message delivery (M1-S10).
+    pub fn push_header(&mut self, n: usize) {
+        match self.proto {
+            Protocol::Resp2 => self.array_header(n),
+            Protocol::Resp3 => {
+                self.out.push(b'>');
+                self.raw_int(n as i64);
+                self.out.extend_from_slice(b"\r\n");
+            }
+        }
+    }
+
     /// Map of N pairs: `%N\r\n` (RESP3) or a flattened `*2N\r\n` (RESP2) —
     /// 2N key/value replies follow either way.
     pub fn map_header(&mut self, pairs: usize) {

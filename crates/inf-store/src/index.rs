@@ -328,6 +328,29 @@ impl Index {
         }
     }
 
+    /// Bounded clock-hand walk (M1-S06): emits every live address in the
+    /// slot window `[start_slot, start_slot + max_slots)` (wrapping) and
+    /// returns the next hand position. The eviction sweep owns the budget;
+    /// the index only iterates — candidate policy lives in `evict.rs`
+    /// (the §3.2 candidate-iterator seam).
+    pub fn live_walk(
+        &self,
+        start_slot: usize,
+        max_slots: usize,
+        mut emit: impl FnMut(ArenaAddr),
+    ) -> usize {
+        let mask = self.capacity - 1;
+        let start = start_slot & mask;
+        let span = max_slots.min(self.capacity);
+        for i in 0..span {
+            let pos = (start + i) & mask;
+            if self.ctrl[pos] & 0x80 == 0 {
+                emit(self.slots[pos].addr());
+            }
+        }
+        (start + span) & mask
+    }
+
     /// First live address at or after `start_slot` (wrapping) — the
     /// RANDOMKEY probe (two-level random is the documented deviation; the
     /// caller rolls the slot).

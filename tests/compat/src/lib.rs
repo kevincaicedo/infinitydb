@@ -8,4 +8,5 @@
 
 pub mod candidate;
 pub mod matrix;
+pub mod matrixgen;
 pub mod resp;

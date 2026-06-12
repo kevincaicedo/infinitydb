@@ -85,6 +85,23 @@ fn parse_int_reply(reply: &[u8]) -> Option<i64> {
     std::str::from_utf8(text).ok()?.parse().ok()
 }
 
+/// How many complete RESP frames exactly cover `buf` (`None` when the bytes
+/// are not whole frames).
+fn count_frames(buf: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    let mut frames = 0;
+    while at < buf.len() {
+        match frame_len(&buf[at..]).ok()? {
+            Some(n) => {
+                at += n;
+                frames += 1;
+            }
+            None => return None,
+        }
+    }
+    Some(frames)
+}
+
 #[test]
 fn matrix_replies_match_redis() {
     let Some((_guard, mut oracle)) = spawn_redis() else {
@@ -115,6 +132,23 @@ fn matrix_replies_match_redis() {
                     ));
                 }
             }
+            Check::Frames(n) => {
+                // One command, N frames (pub/sub confirmations/deliveries):
+                // the concatenation is compared byte-exact.
+                let mut oracle_all = oracle_reply;
+                for _ in 1..n {
+                    oracle_all.extend_from_slice(&read_one_reply(&mut oracle, &mut oracle_buf));
+                }
+                let candidate_frames = count_frames(&candidate_reply);
+                if oracle_all != candidate_reply || candidate_frames != Some(n) {
+                    failures.push(format!(
+                        "case {i} {:?} ({n} frames, candidate has {candidate_frames:?}):\n  oracle    {:?}\n  candidate {:?}",
+                        case.argv,
+                        String::from_utf8_lossy(&oracle_all),
+                        String::from_utf8_lossy(&candidate_reply),
+                    ));
+                }
+            }
             Check::IntWithin(tolerance) => {
                 let (Some(a), Some(b)) =
                     (parse_int_reply(&oracle_reply), parse_int_reply(&candidate_reply))
@@ -134,12 +168,10 @@ fn matrix_replies_match_redis() {
             }
             Check::SkipDiff(why) => {
                 skipped += 1;
-                // The candidate reply must still be one complete RESP frame.
-                let framed = frame_len(&candidate_reply).expect("candidate reply parses");
-                assert_eq!(
-                    framed,
-                    Some(candidate_reply.len()),
-                    "case {i} {:?} ({why}): candidate reply is not one complete frame",
+                // The candidate reply must still be complete RESP frames.
+                assert!(
+                    count_frames(&candidate_reply).is_some_and(|n| n >= 1),
+                    "case {i} {:?} ({why}): candidate reply is not complete frames",
                     case.argv
                 );
             }
@@ -148,7 +180,7 @@ fn matrix_replies_match_redis() {
 
     let compared = MATRIX.len() - skipped;
     println!(
-        "compat-diff v0: {compared} byte-compared cases, {skipped} documented deviations, {} failures",
+        "compat-diff v1: {compared} byte-compared cases, {skipped} documented deviations, {} failures",
         failures.len()
     );
     assert!(

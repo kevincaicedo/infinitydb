@@ -477,6 +477,36 @@ M1-E1 ops and `expire_tick` (M1-E2). Deadlines past the u40-ms record bound
 now clamp (previously a latent panic). See
 `docs/adr/0008-m1-e1-interface-extensions.md`.
 
+**M1-E3/E4 extension note (2026-06-12, ADR-0009):** two frozen signatures
+changed shape — `execute(...)` and `ServerPlane::new(...)` now take
+`inf_store::Keyspace` (one cell's slice of every namespace: 16 lazily
+materialized default dbs + named-ns registry + pressure driver) instead of
+`CellStore`, whose own frozen method set is unchanged behind
+`Keyspace::db_mut(n)`. `ConnCx` gains `db: u16`. Additive deltas: registry
+57 → 58 (`INF.NS`); `CmdFlags::DENYOOM` (the M1-S07 OOM gate enters through
+metadata); `MemoryReport` + `evict_bytes`; `StoreStats` + `evicted_keys`;
+`StoreConfig` + `evict_seed`; new `inf-store` types `Keyspace` /
+`PressureConfig` / `EvictBudget` / `EvictionPolicy` / `EvictStats` /
+`NsMode` / `NsSpec` / `NsError`; `Index::live_walk` (read-only clock-hand
+iteration). The fabric codec is unchanged; `Op::Apply`'s `cmd` byte packs
+`{db:4 | proto:4}` (old encodings decode as db 0). The record header's two
+spare flag bits became the CLOCK reference counter (layout untouched). See
+`docs/adr/0009-m1-e3-e4-keyspace-eviction.md`.
+
+**M1-E5 extension note (2026-06-12, ADR-0010):** all deltas additive. The
+registry grew 58 → 64 (SUBSCRIBE/UNSUBSCRIBE/PSUBSCRIBE/PUNSUBSCRIBE/
+PUBLISH/PUBSUB; channels are not keys — `KeySpec::NONE`); the perfect-hash
+multipliers were re-searched (the build's collision proof fired as
+designed). `RespWriter` + `push_header` (RESP3 push / RESP2 array).
+`ConnCx` + `sub_channels`/`sub_patterns` (subscription state, the ADR-0009
+`db` pattern). `NodeInfo` + pub/sub gauges/counters and
+`client_output_buffer_limit_disconnections`. CONFIG store +
+`client-output-buffer-limit` (class-triple merge kind). The fabric codec is
+unchanged: the pub/sub fan-out vocabulary (`INF.PUB`/`INF.PUBFAN`/
+`INF.SUBD`/`INF.PUBSUB`) rides `Op::Apply` as unregistered argv programs
+intercepted by the plane ahead of `execute` — invisible to clients,
+reserved names for the fabric. See `docs/adr/0010-m1-e5-pubsub-plane.md`.
+
 **Linux-validation note (updated 2026-06-11):** the io_uring backend is now
 exercised on real Linux (kernel 7.0): conformance suite green in probed
 (multishot + provided buffers) and `INF_URING_FORCE_DEGRADED` modes, 1M-cycle

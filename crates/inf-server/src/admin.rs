@@ -9,7 +9,7 @@
 //! so client libraries parse it (the M1-S03 client-smoke AC).
 
 use inf_foundation::time::Nanos;
-use inf_store::CellStore;
+use inf_store::{CellStore, EvictionPolicy, Keyspace, NsError, NsMode, NsSpec, PressureConfig};
 use inf_wire::{CmdFlags, Protocol, RespWriter};
 
 use crate::clients::{format_client_line, valid_client_name};
@@ -76,7 +76,7 @@ const SECTIONS: &[&str] = &[
 
 pub(crate) fn info(
     argv: &(impl Argv + ?Sized),
-    store: &CellStore,
+    ks: &Keyspace,
     node: &NodeInfo,
     now: Nanos,
     w: &mut RespWriter<'_>,
@@ -142,12 +142,13 @@ pub(crate) fn info(
         push(&mut text, &format!("total_connections_received:{}", node.total_connections.get()));
         text.push_str("\r\n");
     }
-    let report = store.report();
+    let report = ks.report();
     if wants("memory") {
         let used = report.records_live_bytes
             + report.records_slack_bytes
             + report.index_bytes
             + report.wheel_bytes
+            + report.evict_bytes
             + node.wire_buffers_bytes.get()
             + node.conn_state_bytes.get();
         let rss = process_rss_bytes();
@@ -176,7 +177,7 @@ pub(crate) fn info(
         push(&mut text, "aof_rewrite_in_progress:0");
         text.push_str("\r\n");
     }
-    let stats = store.stats();
+    let stats = ks.stats();
     if wants("stats") {
         let [_, _, _, _, commands, _] = node.raw_counters.get();
         push(&mut text, "# Stats");
@@ -187,11 +188,15 @@ pub(crate) fn info(
         push(&mut text, &format!("expired_keys:{}", stats.expired_lazy + stats.expired_active));
         push(&mut text, &format!("expired_active:{}", stats.expired_active));
         push(&mut text, &format!("expired_lazy:{}", stats.expired_lazy));
-        push(&mut text, "evicted_keys:0");
+        push(&mut text, &format!("evicted_keys:{}", stats.evicted_keys));
         push(&mut text, &format!("keyspace_hits:{}", stats.keyspace_hits));
         push(&mut text, &format!("keyspace_misses:{}", stats.keyspace_misses));
-        push(&mut text, "pubsub_channels:0");
-        push(&mut text, "pubsub_patterns:0");
+        push(&mut text, &format!("pubsub_channels:{}", node.pubsub_channels.get()));
+        push(&mut text, &format!("pubsub_patterns:{}", node.pubsub_patterns.get()));
+        push(
+            &mut text,
+            &format!("client_output_buffer_limit_disconnections:{}", node.cob_disconnections.get()),
+        );
         push(&mut text, "latest_fork_usec:0");
         text.push_str("\r\n");
     }
@@ -234,8 +239,13 @@ pub(crate) fn info(
         push(&mut text, &format!("records_resident_bytes:{}", report.records_resident_bytes));
         push(&mut text, &format!("{}:{}", tw::INDEX_BYTES, report.index_bytes));
         push(&mut text, &format!("wheel_bytes:{}", report.wheel_bytes));
+        push(&mut text, &format!("evict_bytes:{}", report.evict_bytes));
         push(&mut text, &format!("wheel_fallback:{}", stats.wheel_fallback));
         push(&mut text, &format!("wheel_stale:{}", stats.wheel_stale));
+        push(&mut text, &format!("evicted_keys:{}", stats.evicted_keys));
+        push(&mut text, &format!("pubsub_fan_msgs:{}", node.pubsub_fan_msgs.get()));
+        push(&mut text, &format!("pubsub_delivered:{}", node.pubsub_delivered.get()));
+        push(&mut text, &format!("pubsub_state_bytes:{}", node.pubsub_state_bytes.get()));
         push(&mut text, &format!("{}:{}", tw::WIRE_BUFFERS_BYTES, node.wire_buffers_bytes.get()));
         push(&mut text, &format!("{}:{}", tw::CONN_STATE_BYTES, node.conn_state_bytes.get()));
         push(&mut text, &format!("{}:{}", tw::PROCESS_RSS, process_rss_bytes()));
@@ -243,11 +253,19 @@ pub(crate) fn info(
     }
     if wants("keyspace") {
         push(&mut text, "# Keyspace");
-        if !store.is_empty() {
-            push(
-                &mut text,
-                &format!("db0:keys={},expires={},avg_ttl=0", store.len(), stats.ttl_live),
-            );
+        // One line per non-empty database (Redis shape) — per-ns numbers
+        // reconcile with the aggregated sections above (M1-S09).
+        for (db, store) in ks.dbs() {
+            if !store.is_empty() {
+                push(
+                    &mut text,
+                    &format!(
+                        "db{db}:keys={},expires={},avg_ttl=0",
+                        store.len(),
+                        store.stats().ttl_live
+                    ),
+                );
+            }
         }
         text.push_str("\r\n");
     }
@@ -339,6 +357,8 @@ fn command_row(meta: &inf_wire::CommandMeta, w: &mut RespWriter<'_>) {
     }
     if meta.flags.contains(CmdFlags::WRITE) {
         flags.push("write");
+    }
+    if meta.flags.contains(CmdFlags::DENYOOM) {
         flags.push("denyoom");
     }
     if meta.flags.contains(CmdFlags::ADMIN) {
@@ -401,7 +421,7 @@ fn command_getkeys(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
 
 pub(crate) fn config(
     argv: &(impl Argv + ?Sized),
-    store: &mut CellStore,
+    ks: &mut Keyspace,
     node: &NodeInfo,
     w: &mut RespWriter<'_>,
 ) {
@@ -450,9 +470,13 @@ pub(crate) fn config(
             }
             i += 2;
         }
+        // hot-per-cell (M1-S03 freeze): the executing cell applies its
+        // pressure config immediately; peers apply on the scatter leg, and
+        // the MAINTAIN version sweep covers boot-time mutation.
+        push_pressure(ks, node);
         w.simple("OK");
     } else if sub.eq_ignore_ascii_case(b"RESETSTAT") {
-        store.reset_stats();
+        ks.reset_stats();
         w.simple("OK");
     } else if sub.eq_ignore_ascii_case(b"REWRITE") {
         w.error("ERR The server is running without a config file");
@@ -461,6 +485,181 @@ pub(crate) fn config(
             "ERR Unknown subcommand or wrong number of arguments for '{}'. Try CONFIG HELP.",
             String::from_utf8_lossy(sub)
         ));
+    }
+}
+
+/// Pushes the typed CONFIG store's pressure keys into the keyspace
+/// (M1-S03 `hot-per-cell`): `maxmemory` divides by the cell count — cells
+/// are symmetric by contiguous slot ranges, so the per-cell share preserves
+/// the node bound with zero shared state (L1).
+pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
+    let cfg = node.config.borrow();
+    let maxmemory: u64 = cfg.get("maxmemory").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let policy = cfg
+        .get("maxmemory-policy")
+        .and_then(EvictionPolicy::parse)
+        .unwrap_or(EvictionPolicy::NoEviction);
+    let samples: u32 = cfg.get("maxmemory-samples").and_then(|v| v.parse().ok()).unwrap_or(5);
+    drop(cfg);
+    let cells = u64::from(node.cells.get().max(1));
+    ks.set_pressure(PressureConfig { limit_bytes: maxmemory / cells, policy, samples });
+}
+
+// ---- INF.NS (M1-S08) -----------------------------------------------------------
+
+/// `INF.NS CREATE name [MODE memory|durable|topic] [EVICTION policy]
+/// [MAXMEMORY bytes] | LIST | INFO name | DROP name` — the namespace
+/// registry surface (master plan §4.2). Counters in INFO are this cell's
+/// slice (same documented scope as `INFO` until the control plane
+/// aggregates).
+pub(crate) fn inf_ns(
+    argv: &(impl Argv + ?Sized),
+    ks: &mut Keyspace,
+    node: &NodeInfo,
+    w: &mut RespWriter<'_>,
+) {
+    let sub = argv.arg(1);
+    if sub.eq_ignore_ascii_case(b"CREATE") {
+        if argv.len() < 3 {
+            return arity_error("INF.NS|CREATE", w);
+        }
+        let name = argv.arg(2);
+        let mut spec =
+            NsSpec { name: name.to_vec(), mode: NsMode::Memory, policy: None, maxmemory: None };
+        let mut i = 3;
+        while i < argv.len() {
+            let opt = argv.arg(i);
+            if i + 1 >= argv.len() {
+                return w.error("ERR syntax error");
+            }
+            let value = argv.arg(i + 1);
+            if opt.eq_ignore_ascii_case(b"MODE") {
+                let Some(mode) =
+                    core::str::from_utf8(value).ok().and_then(|v| NsMode::parse(&v.to_lowercase()))
+                else {
+                    return w.error("ERR unknown namespace mode (memory|durable|topic)");
+                };
+                spec.mode = mode;
+            } else if opt.eq_ignore_ascii_case(b"EVICTION") {
+                let Some(policy) = core::str::from_utf8(value)
+                    .ok()
+                    .and_then(|v| EvictionPolicy::parse(&v.to_lowercase()))
+                else {
+                    return w.error("ERR unknown eviction policy");
+                };
+                spec.policy = Some(policy);
+            } else if opt.eq_ignore_ascii_case(b"MAXMEMORY") {
+                let Some(bytes) =
+                    core::str::from_utf8(value).ok().and_then(crate::config::parse_memory)
+                else {
+                    return w.error("ERR invalid MAXMEMORY value");
+                };
+                spec.maxmemory = Some(bytes);
+            } else {
+                return w.error("ERR syntax error");
+            }
+            i += 2;
+        }
+        match ks.ns_create(spec) {
+            Ok(()) => w.simple("OK"),
+            Err(e) => ns_error(e, w),
+        }
+    } else if sub.eq_ignore_ascii_case(b"DROP") {
+        if argv.len() != 3 {
+            return arity_error("INF.NS|DROP", w);
+        }
+        match ks.ns_drop(argv.arg(2)) {
+            Ok(()) => w.simple("OK"),
+            Err(e) => ns_error(e, w),
+        }
+    } else if sub.eq_ignore_ascii_case(b"LIST") {
+        let named: Vec<Vec<u8>> = ks.ns_iter().map(|spec| spec.name.clone()).collect();
+        w.array_header(inf_store::DEFAULT_DBS + named.len());
+        for db in 0..inf_store::DEFAULT_DBS {
+            w.bulk(format!("db{db}").as_bytes());
+        }
+        for name in &named {
+            w.bulk(name);
+        }
+    } else if sub.eq_ignore_ascii_case(b"INFO") {
+        if argv.len() != 3 {
+            return arity_error("INF.NS|INFO", w);
+        }
+        let name = argv.arg(2);
+        // Default namespaces report live per-cell counters; named entries
+        // report their registry config (no keys until they are addressable
+        // — the recorded M1 limitation).
+        if let Some(db) = default_db_index(name) {
+            let cfg = node.config.borrow();
+            let policy = cfg.get("maxmemory-policy").unwrap_or("noeviction").to_string();
+            let maxmemory = cfg.get("maxmemory").unwrap_or("0").to_string();
+            drop(cfg);
+            let (keys, expires, used) = match ks.db(db) {
+                Some(store) => (store.len(), store.stats().ttl_live, store.used_bytes()),
+                None => (0, 0, 0),
+            };
+            w.map_header(6);
+            for (k, v) in [
+                ("name", String::from_utf8_lossy(name).into_owned()),
+                ("mode", "memory".to_string()),
+                ("eviction", policy),
+                ("maxmemory", maxmemory),
+                ("keys", keys.to_string()),
+                ("expires", expires.to_string()),
+            ] {
+                w.bulk(k.as_bytes());
+                w.bulk(v.as_bytes());
+            }
+            let _ = used; // used_bytes joins the map when the control plane aggregates
+            return;
+        }
+        let Some(spec) = ks.ns_get(name) else {
+            return w
+                .error(&format!("ERR namespace '{}' not found", String::from_utf8_lossy(name)));
+        };
+        let policy = spec.policy.map_or("inherit", EvictionPolicy::name).to_string();
+        let maxmemory = spec.maxmemory.map_or("inherit".to_string(), |b| b.to_string());
+        w.map_header(6);
+        for (k, v) in [
+            ("name", String::from_utf8_lossy(&spec.name).into_owned()),
+            ("mode", spec.mode.name().to_string()),
+            ("eviction", policy),
+            ("maxmemory", maxmemory),
+            ("keys", "0".to_string()),
+            ("expires", "0".to_string()),
+        ] {
+            w.bulk(k.as_bytes());
+            w.bulk(v.as_bytes());
+        }
+    } else {
+        w.error(&format!(
+            "ERR Unknown subcommand or wrong number of arguments for '{}'. Try INF.NS CREATE|LIST|INFO|DROP.",
+            String::from_utf8_lossy(sub)
+        ));
+    }
+}
+
+/// `dbN` for N in 0..16.
+fn default_db_index(name: &[u8]) -> Option<usize> {
+    let rest = name.strip_prefix(b"db")?;
+    let n: usize = core::str::from_utf8(rest).ok()?.parse().ok()?;
+    (!rest.is_empty() && rest.len() <= 2 && n < inf_store::DEFAULT_DBS).then_some(n)
+}
+
+fn ns_error(e: NsError, w: &mut RespWriter<'_>) {
+    match e {
+        NsError::Exists => w.error("ERR namespace already exists"),
+        NsError::Unknown => w.error("ERR namespace not found"),
+        NsError::ModeNotSupported(mode) => w.error(&format!(
+            "ERR namespace mode '{}' is not yet supported (InfinityDB M1 is memory-only; durable arrives with M2, topic with M5)",
+            mode.name()
+        )),
+        NsError::DefaultImmutable => {
+            w.error("ERR db0..db15 are reserved default namespaces (SELECT)")
+        }
+        NsError::InvalidName => w.error(
+            "ERR invalid namespace name (1..128 bytes of [a-zA-Z0-9_.-])",
+        ),
     }
 }
 
@@ -611,7 +810,7 @@ mod tests {
     use inf_store::StoreConfig;
     use inf_wire::{ConnParser, Parsed, ParserLimits};
 
-    fn run(cx: &mut ConnCx, store: &mut CellStore, parts: &[&[u8]]) -> Vec<u8> {
+    fn run(cx: &mut ConnCx, store: &mut Keyspace, parts: &[&[u8]]) -> Vec<u8> {
         let mut wire = format!("*{}\r\n", parts.len()).into_bytes();
         for p in parts {
             wire.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
@@ -629,7 +828,7 @@ mod tests {
     #[test]
     fn config_get_set_roundtrip() {
         let mut cx = ConnCx::default();
-        let mut store = CellStore::new(StoreConfig::default());
+        let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(
             run(&mut cx, &mut store, &[b"CONFIG", b"GET", b"maxmemory"]),
             b"*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n"
@@ -649,7 +848,7 @@ mod tests {
     #[test]
     fn client_name_and_kill_flow() {
         let mut cx = ConnCx::default();
-        let mut store = CellStore::new(StoreConfig::default());
+        let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"CLIENT", b"ID"]), b":1\r\n");
         // No name yet: null (Redis 8, oracle-pinned), not an empty bulk.
         assert_eq!(run(&mut cx, &mut store, &[b"CLIENT", b"GETNAME"]), b"$-1\r\n");
@@ -671,7 +870,7 @@ mod tests {
     #[test]
     fn info_sections_filter() {
         let mut cx = ConnCx::default();
-        let mut store = CellStore::new(StoreConfig::default());
+        let mut store = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut store, &[b"SET", b"k", b"v"]);
         let all = String::from_utf8(run(&mut cx, &mut store, &[b"INFO"])).expect("ascii");
         for section in
@@ -689,7 +888,7 @@ mod tests {
     #[test]
     fn command_introspection_shapes() {
         let mut cx = ConnCx::default();
-        let mut store = CellStore::new(StoreConfig::default());
+        let mut store = Keyspace::new(StoreConfig::default());
         let count = run(&mut cx, &mut store, &[b"COMMAND", b"COUNT"]);
         assert_eq!(count, format!(":{}\r\n", inf_wire::COMMANDS.len()).into_bytes());
         let getkeys = run(

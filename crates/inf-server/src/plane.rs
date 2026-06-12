@@ -46,13 +46,14 @@ use inf_runtime::{
     CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoOp, LoopCx,
     RawFd, TokenClass, WaitList,
 };
-use inf_store::{CellStore, ExpiryBudget, SlotRouter};
+use inf_store::{EvictBudget, ExpiryBudget, Keyspace, SlotRouter};
 use inf_wire::{
     ArgvRef, CommandId, ConnParser, Parsed, ParserLimits, Protocol, RespWriter, arity_ok,
     extract_keys, lookup,
 };
 
 use crate::exec::{ConnCx, NodeInfo, execute, execute_slices, stall_request};
+use crate::pubsub::{self, PubSubCell, SubKind};
 
 /// Commands queued behind an active pump before recv is disarmed (bounded
 /// everything — the backpressure watermark).
@@ -214,6 +215,11 @@ struct Conn {
     queue: VecDeque<OwnedCmd>,
     recv_disarmed: bool,
     rearm_recv: bool,
+    /// Injected-clock ms since the staged output first exceeded the pub/sub
+    /// soft cap (M1-S11); 0 = under the soft limit.
+    cob_soft_since_ms: u64,
+    /// The output-cap kill was already requested (idempotent counter guard).
+    cob_kill_sent: bool,
 }
 
 impl Conn {
@@ -222,6 +228,8 @@ impl Conn {
             + self.parser.buffered()
             + self.out.capacity()
             + self.queue.iter().map(OwnedCmd::mem).sum::<usize>()
+            + self.cx.sub_channels.iter().map(|c| c.len() + 24).sum::<usize>()
+            + self.cx.sub_patterns.iter().map(|p| p.len() + 24).sum::<usize>()
     }
 }
 
@@ -288,7 +296,7 @@ struct Shared<O: PlaneObserver + 'static> {
     /// `DEBUG SLEEP` cell stall: connection parse/respond pause until this
     /// injected-clock instant (fabric service continues — deadlock safety).
     stall_until: Cell<Nanos>,
-    store: RefCell<CellStore>,
+    store: RefCell<Keyspace>,
     fabric: RefCell<CellFabric>,
     conns: RefCell<ConnSlab>,
     gate: FabricGate<OwnedOutcome>,
@@ -308,6 +316,24 @@ struct Shared<O: PlaneObserver + 'static> {
     /// [`REPLY_POOL_MAX`]/[`REPLY_POOL_BUF_CAP`].
     reply_pool: RefCell<Vec<Vec<u8>>>,
     recv_dropped: Cell<u64>,
+    /// Pub/sub registries (M1-S10): local subscriber lists, owner-side
+    /// per-cell counts, the replicated pattern index.
+    pubsub: RefCell<PubSubCell<ConnKey>>,
+    /// Fabric-origin PUBLISHes awaiting this cell's owner pump (FIFO — the
+    /// queue preserves per-publisher delivery order across fan-outs).
+    pub_queue: RefCell<VecDeque<OwnerPub>>,
+    pub_pump_active: Cell<bool>,
+    /// Parsed `client-output-buffer-limit pubsub` `(hard, soft, soft_ms)`
+    /// (M1-S11); refreshed by the MAINTAIN config sweep. Zeros disable.
+    cob_pubsub: Cell<(u64, u64, u64)>,
+}
+
+/// One fabric-origin PUBLISH parked at the owner cell.
+struct OwnerPub {
+    origin: CellId,
+    token: FabricToken,
+    channel: Vec<u8>,
+    payload: Vec<u8>,
 }
 
 impl<O: PlaneObserver + 'static> Shared<O> {
@@ -325,10 +351,18 @@ impl<O: PlaneObserver + 'static> Shared<O> {
         argv: &[&[u8]],
         proto: Protocol,
         id: u64,
+        db: u16,
         out: &mut Vec<u8>,
     ) {
         let before = out.len();
-        let mut cx = ConnCx { proto, id, node: Rc::clone(&self.node) };
+        let mut cx = ConnCx {
+            proto,
+            id,
+            db,
+            sub_channels: Vec::new(),
+            sub_patterns: Vec::new(),
+            node: Rc::clone(&self.node),
+        };
         let now = self.now.get();
         execute_slices(argv, &mut self.store.borrow_mut(), &mut cx, now, out);
         self.observer.borrow_mut().on_execute(self.cell, origin, argv, &out[before..], now);
@@ -355,11 +389,12 @@ impl<O: PlaneObserver + 'static> Shared<O> {
     /// Typed single-key DEL/UNLINK/EXISTS/TOUCH apply (local or owner side):
     /// the reply is the integer count contribution; observer sees the
     /// synthesized single-key command with its `:N` reply.
-    fn apply_counted(&self, origin: ExecOrigin, name: &[u8], key: &[u8]) -> i64 {
+    fn apply_counted(&self, origin: ExecOrigin, name: &[u8], key: &[u8], db: u16) -> i64 {
         let now = self.now.get();
         let del = name.eq_ignore_ascii_case(b"DEL") || name.eq_ignore_ascii_case(b"UNLINK");
         let hit = {
-            let mut store = self.store.borrow_mut();
+            let mut ks = self.store.borrow_mut();
+            let store = ks.db_mut(usize::from(db));
             if del { store.del(key, now) } else { store.exists(key, now) }
         };
         let mut reply = Vec::new();
@@ -368,10 +403,10 @@ impl<O: PlaneObserver + 'static> Shared<O> {
         i64::from(hit)
     }
 
-    /// Typed DBSIZE apply (scatter contribution, M1-S02).
-    fn apply_dbsize(&self, origin: ExecOrigin) -> i64 {
+    /// Typed DBSIZE apply (scatter contribution, M1-S02; per selected db).
+    fn apply_dbsize(&self, origin: ExecOrigin, db: u16) -> i64 {
         let now = self.now.get();
-        let len = self.store.borrow().len() as i64;
+        let len = self.store.borrow_mut().db_mut(usize::from(db)).len() as i64;
         let mut reply = Vec::new();
         RespWriter::new(&mut reply, Protocol::Resp2).int(len);
         self.observer.borrow_mut().on_execute(self.cell, origin, &[b"DBSIZE"], &reply, now);
@@ -400,6 +435,9 @@ pub struct ServerPlane<O: PlaneObserver + 'static = NoopObserver> {
     /// `expiry_debt` backlog (ms the wheel trails `now`) from the previous
     /// expiry slice — drives the M1-S05 debt-aware budget escalation.
     expiry_lag: u64,
+    /// Last CONFIG-store version pushed into the keyspace (M1-E3
+    /// `hot-per-cell` sweep — one u64 compare per MAINTAIN, no re-parse).
+    config_pushed: u64,
 }
 
 /// An owner-side reply produced during the FABRIC-IN drain (ranges index
@@ -419,7 +457,7 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
         cell: CellId,
         cells: u16,
         listener: RawFd,
-        store: CellStore,
+        store: Keyspace,
         fabric: CellFabric,
         node: Rc<NodeInfo>,
         observer: O,
@@ -446,6 +484,10 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
                 rtt_sent: RefCell::new(vec![VecDeque::new(); usize::from(cells)]),
                 reply_pool: RefCell::new(Vec::new()),
                 recv_dropped: Cell::new(0),
+                pubsub: RefCell::new(PubSubCell::new(cells)),
+                pub_queue: RefCell::new(VecDeque::new()),
+                pub_pump_active: Cell::new(false),
+                cob_pubsub: Cell::new((0, 0, 0)),
             }),
             listener,
             started: false,
@@ -454,6 +496,8 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
             staged_replies: Vec::new(),
             park_flags: None,
             expiry_lag: 0,
+            // MAX forces one push on the first MAINTAIN (boot-time config).
+            config_pushed: u64::MAX,
         }
     }
 
@@ -486,14 +530,22 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
     /// key is owned by another cell, or it is a keyspace-wide scatter
     /// command on a multi-cell node (M1-S02).
     fn needs_fabric(&self, argv: &ArgvRef<'_>) -> bool {
-        if self.shared.route_local_only {
-            return false;
-        }
         let Some(meta) = lookup(argv.arg(0)) else { return false };
         if !arity_ok(meta, argv.len()) {
             return false;
         }
-        if self.shared.cells > 1 && is_scatter(meta.id) {
+        // Pub/sub always defers to the pump (even single-cell, even under
+        // route_local_only): registries and delivery are plane state, and
+        // subscriber registration must reach the owner cell before the
+        // confirmation frame is emitted (M1-S10).
+        if pubsub::is_plane_pubsub(meta.id) {
+            return true;
+        }
+        if self.shared.route_local_only {
+            return false;
+        }
+        let sub = (argv.len() > 1).then(|| argv.arg(1));
+        if self.shared.cells > 1 && is_scatter(meta.id, sub) {
             return true;
         }
         extract_keys(meta, argv).any(|key| !self.shared.router.is_local(key, self.shared.cell))
@@ -525,6 +577,9 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                     cx: ConnCx {
                         proto: Protocol::Resp2,
                         id: 0,
+                        db: 0,
+                        sub_channels: Vec::new(),
+                        sub_patterns: Vec::new(),
                         node: Rc::clone(&self.shared.node),
                     },
                     out: Vec::new(),
@@ -535,6 +590,8 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                     queue: VecDeque::new(),
                     recv_disarmed: false,
                     rearm_recv: false,
+                    cob_soft_since_ms: 0,
+                    cob_kill_sent: false,
                 });
                 let id = (u64::from(key.slot) << 32) | u64::from(key.generation);
                 self.shared.with_conn(key, |conn| conn.cx.id = id);
@@ -567,9 +624,19 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
             }
             CompletionResult::Closed => {
                 let key = Self::key_of(c.token);
-                self.shared.conns.borrow_mut().remove(key);
+                let removed = self.shared.conns.borrow_mut().remove(key);
                 let id = (u64::from(key.slot) << 32) | u64::from(key.generation);
                 self.shared.node.clients.borrow_mut().unregister(id);
+                // Pub/sub cleanup (M1-S10): drop the connection from the
+                // local registries; 1→0 transitions notify the channel
+                // owners / every cell (patterns) off the close path.
+                if let Some(conn) = removed {
+                    let notes = unsubscribe_closed_conn(&self.shared, key, &conn.cx);
+                    if !notes.is_empty() {
+                        let shared = Rc::clone(&self.shared);
+                        let _ = cx.executor.poll_immediate(flush_sub_deltas(shared, notes));
+                    }
+                }
             }
             CompletionResult::Error { buf, .. } => {
                 if let Some(buf) = buf {
@@ -622,9 +689,10 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
         let scratch = &mut self.reply_scratch;
         let staged = &mut self.staged_replies;
         let mut orphans: u64 = 0;
+        let mut pubs: Vec<OwnerPub> = Vec::new();
         let now = cx.now;
         let drained = shared.fabric.borrow_mut().drain(FABRIC_DRAIN_MAX, |from, op| {
-            handle_fabric_op(shared, now, from, op, scratch, staged, &mut orphans);
+            handle_fabric_op(shared, now, from, op, scratch, staged, &mut pubs, &mut orphans);
         });
         if drained == 0 {
             return;
@@ -657,6 +725,18 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
             let published = fabric.flush();
             if published > 0 {
                 cx.note_fabric(published as u64);
+            }
+        }
+        drop(fabric);
+        // Fabric-origin PUBLISHes fan out on this cell's owner pump (one
+        // long-lived FIFO future — arrival order is delivery order). The
+        // reply to each publisher ships when its fan acks return.
+        if !pubs.is_empty() {
+            self.shared.pub_queue.borrow_mut().extend(pubs);
+            if !self.shared.pub_pump_active.get() {
+                self.shared.pub_pump_active.set(true);
+                let shared = Rc::clone(&self.shared);
+                let _ = cx.executor.poll_immediate(owner_pub_pump(shared));
             }
         }
     }
@@ -798,13 +878,56 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
             let key = ConnKey { slot: (id >> 32) as u32, generation: id as u32 };
             self.initiate_close(cx, key);
         }
+        // ---- pressure config push (M1-E3, hot-per-cell within one MAINTAIN
+        // round): one u64 version compare per iteration; a real push only
+        // when CONFIG SET (or boot wiring) touched the store.
+        let config_version = self.shared.node.config.borrow().version();
+        if config_version != self.config_pushed {
+            self.config_pushed = config_version;
+            crate::admin::push_pressure(&mut self.shared.store.borrow_mut(), &self.shared.node);
+            // Output-cap config rides the same hot-per-cell sweep (M1-S11).
+            self.shared
+                .cob_pubsub
+                .set(crate::config::pubsub_output_limit(&self.shared.node.config.borrow()));
+        }
+        // ---- eviction slice (M1-S06/S07): budgeted clock/CMS sweep toward
+        // the low watermark + CMS decay. A no-op without a configured limit
+        // (the cached-flag refresh keeps the write path one branch).
+        let evict_budget = cx.budget(GroupClass::Maintenance);
+        if evict_budget > 0 {
+            let stats = self
+                .shared
+                .store
+                .borrow_mut()
+                .evict_tick(cx.now, EvictBudget { max_evictions: evict_budget });
+            let units = (stats.evicted + stats.scanned_slots / 64).min(u64::from(u32::MAX)) as u32;
+            if units > 0 {
+                cx.charge(GroupClass::Maintenance, units);
+            }
+        }
         // ---- stats flush
         let node = &self.shared.node;
         node.recv_dropped.set(self.shared.recv_dropped.get());
         node.fabric_rtt_p50_ns.set(self.shared.rtt_ns.borrow().percentile(50.0));
-        let conns = self.shared.conns.borrow();
+        {
+            let ps = self.shared.pubsub.borrow();
+            node.pubsub_channels.set(ps.live_owned_channel_count());
+            node.pubsub_patterns.set(ps.live_pattern_count());
+            node.pubsub_state_bytes.set(ps.state_bytes() as u64);
+        }
+        let caps = self.shared.cob_pubsub.get();
+        let mut conns = self.shared.conns.borrow_mut();
         node.connections.set(conns.live as u64);
-        let bytes: usize = conns.slots.iter().flatten().map(Conn::state_bytes).sum::<usize>();
+        let mut bytes = 0usize;
+        for conn in conns.slots.iter_mut().flatten() {
+            bytes += conn.state_bytes();
+            // Soft-cap aging continues between deliveries (M1-S11): a
+            // stalled subscriber over the soft limit dies on schedule even
+            // when no further message arrives.
+            if conn.cob_soft_since_ms != 0 {
+                enforce_output_cap(node, conn, cx.now.as_millis(), caps);
+            }
+        }
         node.conn_state_bytes.set(bytes as u64);
     }
 
@@ -875,6 +998,7 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
 /// into `scratch` (the fabric itself is borrowed by the drain — replies
 /// ship right after it ends). `orphans` counts gate-less replies for the
 /// fabric tripwire.
+#[allow(clippy::too_many_arguments)] // the FABRIC-IN drain context, not an API surface
 fn handle_fabric_op<O: PlaneObserver + 'static>(
     shared: &Shared<O>,
     now: Nanos,
@@ -882,6 +1006,7 @@ fn handle_fabric_op<O: PlaneObserver + 'static>(
     op: Op<'_>,
     scratch: &mut Vec<u8>,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
+    pubs: &mut Vec<OwnerPub>,
     orphans: &mut u64,
 ) {
     match op {
@@ -915,7 +1040,20 @@ fn handle_fabric_op<O: PlaneObserver + 'static>(
         }
         Op::Apply { token, cmd, args, .. } => {
             let argv = args.as_slice();
-            let proto = if cmd == 3 { Protocol::Resp3 } else { Protocol::Resp2 };
+            // Internal pub/sub fabric vocabulary (M1-S10) — intercepted
+            // ahead of `execute`, so it needs no registry entries and stays
+            // invisible to clients (an `INF.PUBFAN` typed by a client is an
+            // unknown command). One first-byte gate keys the comparisons.
+            if argv[0].first().is_some_and(|b| b | 0x20 == b'i')
+                && handle_pubsub_apply(shared, from, token, argv, scratch, staged, pubs)
+            {
+                return;
+            }
+            // `cmd` packs `{db:4 | proto:4}` (ADR-0009): the origin
+            // connection's SELECTed database rides the existing byte — no
+            // codec change; a bare 2/3 from an M0 peer decodes as db 0.
+            let proto = if cmd & 0x0F == 3 { Protocol::Resp3 } else { Protocol::Resp2 };
+            let db = u16::from(cmd >> 4);
             // Single-key DEL/UNLINK/EXISTS/TOUCH contributions and DBSIZE
             // stay typed for origin-side aggregation; everything else
             // returns the raw RESP reply.
@@ -924,20 +1062,22 @@ fn handle_fabric_op<O: PlaneObserver + 'static>(
                     .iter()
                     .any(|n| argv[0].eq_ignore_ascii_case(n));
             if counted {
-                let n = shared.apply_counted(ExecOrigin::Fabric(from), argv[0], argv[1]);
+                let n = shared.apply_counted(ExecOrigin::Fabric(from), argv[0], argv[1], db);
                 staged.push((from, token, StagedReply::Int(n)));
             } else if argv.len() == 1 && argv[0].eq_ignore_ascii_case(b"DBSIZE") {
-                let n = shared.apply_dbsize(ExecOrigin::Fabric(from));
+                let n = shared.apply_dbsize(ExecOrigin::Fabric(from), db);
                 staged.push((from, token, StagedReply::Int(n)));
             } else {
                 let start = scratch.len();
-                shared.execute_owned_into(ExecOrigin::Fabric(from), argv, proto, 0, scratch);
+                shared.execute_owned_into(ExecOrigin::Fabric(from), argv, proto, 0, db, scratch);
                 staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
             }
         }
         Op::Read { token, key, .. } => {
             let start = scratch.len();
-            let hit = match shared.store.borrow_mut().get(key, now) {
+            // M0 vocabulary: the typed Read has no db field; it serves db 0
+            // (the M1 paths ship GETs as Apply with the packed db byte).
+            let hit = match shared.store.borrow_mut().db_mut(0).get(key, now) {
                 Some(value) => {
                     scratch.extend_from_slice(value);
                     true
@@ -950,7 +1090,7 @@ fn handle_fabric_op<O: PlaneObserver + 'static>(
         }
         Op::Batch { ops } => {
             for nested in ops {
-                handle_fabric_op(shared, now, from, nested, scratch, staged, orphans);
+                handle_fabric_op(shared, now, from, nested, scratch, staged, pubs, orphans);
             }
         }
         // The M0 plane speaks Apply; a typed Write from a future peer gets
@@ -1018,9 +1158,10 @@ fn pop_or_quiesce<O: PlaneObserver + 'static>(
 
 /// Commands that mutate connection execution state must observe — and be
 /// observed by — their exact pipeline position (HELLO switches the protocol
-/// every later reply serializes under).
+/// every later reply serializes under; SELECT switches the database every
+/// later command routes to — M1-S08).
 fn is_conn_state(owned: &OwnedCmd) -> bool {
-    lookup(owned.arg(0)).is_some_and(|m| m.id == CommandId::Hello)
+    lookup(owned.arg(0)).is_some_and(|m| matches!(m.id, CommandId::Hello | CommandId::Select))
 }
 
 /// The per-connection pump: dispatch commands in pipeline order with up to
@@ -1133,17 +1274,25 @@ async fn pump<O: PlaneObserver + 'static>(shared: Rc<Shared<O>>, key: ConnKey, f
 }
 
 /// Keyspace-wide commands that must scatter across all cells on a
-/// multi-cell node (M1-S02).
-fn is_scatter(id: CommandId) -> bool {
-    matches!(
-        id,
+/// multi-cell node (M1-S02). `sub` is argv[1] when present: CONFIG SET /
+/// RESETSTAT and INF.NS CREATE / DROP mutate per-cell state (typed config,
+/// namespace registries — M1-E3/E4) and fan out AllOk; their read forms
+/// stay local.
+fn is_scatter(id: CommandId, sub: Option<&[u8]>) -> bool {
+    match id {
         CommandId::Dbsize
-            | CommandId::Keys
-            | CommandId::Scan
-            | CommandId::Flushdb
-            | CommandId::Flushall
-            | CommandId::Randomkey
-    )
+        | CommandId::Keys
+        | CommandId::Scan
+        | CommandId::Flushdb
+        | CommandId::Flushall
+        | CommandId::Randomkey => true,
+        CommandId::Config => sub.is_some_and(|s| {
+            s.eq_ignore_ascii_case(b"SET") || s.eq_ignore_ascii_case(b"RESETSTAT")
+        }),
+        CommandId::InfNs => sub
+            .is_some_and(|s| s.eq_ignore_ascii_case(b"CREATE") || s.eq_ignore_ascii_case(b"DROP")),
+        _ => false,
+    }
 }
 
 /// Dispatch one command: execute locally into a `Done` slot, or ship its
@@ -1160,11 +1309,42 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
     inflight: &mut usize,
 ) -> bool {
     let argv: Vec<&[u8]> = owned.slices();
-    let Some((proto, id)) = shared.with_conn(key, |c| (c.cx.proto, c.cx.id)) else { return false };
+    let Some((proto, id, db)) = shared.with_conn(key, |c| (c.cx.proto, c.cx.id, c.cx.db)) else {
+        return false;
+    };
     let origin = ExecOrigin::Conn(key.slot, key.generation);
 
     let meta = lookup(argv[0]);
     let well_formed = meta.is_some_and(|m| arity_ok(m, argv.len()));
+    // M1-S10: RESP2 subscriber-mode restriction for pump-dispatched
+    // commands — the fast path checks inside `execute`, but commands
+    // landing here would otherwise run under a synthesized ConnCx without
+    // the subscription state (remote Apply, scatter legs).
+    if let Some(meta) = meta
+        && well_formed
+        && shared.with_conn(key, |c| pubsub::subscriber_restricted(&c.cx)).unwrap_or(false)
+        && !pubsub::is_plane_pubsub(meta.id)
+    {
+        let mut reply = shared.take_reply_buf();
+        if meta.id == CommandId::Ping {
+            if argv.len() > 2 {
+                RespWriter::new(&mut reply, proto)
+                    .error("ERR wrong number of arguments for 'ping' command");
+            } else {
+                pubsub::subscriber_ping(argv.get(1).copied(), proto, &mut reply);
+            }
+        } else {
+            let sub = argv.get(1).copied();
+            pubsub::restricted_error(
+                meta.id,
+                meta.name,
+                sub,
+                &mut RespWriter::new(&mut reply, proto),
+            );
+        }
+        pending.push_back(PendingReply::Done(reply));
+        return true;
+    }
     let has_remote_key = |meta| {
         !shared.route_local_only
             && extract_keys_slices(meta, &argv)
@@ -1173,35 +1353,40 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
     };
     let owner_of = |k: &[u8]| shared.router.cell_of(SlotRouter::slot_of(k));
     match meta {
+        Some(meta) if well_formed && pubsub::is_plane_pubsub(meta.id) => {
+            return dispatch_pubsub(shared, key, meta.id, &argv, proto, pending, inflight).await;
+        }
         Some(meta)
             if well_formed
-                && is_scatter(meta.id)
+                && is_scatter(meta.id, argv.get(1).copied())
                 && shared.cells > 1
                 && !shared.route_local_only =>
         {
             match meta.id {
                 CommandId::Dbsize => {
-                    let acc = shared.apply_dbsize(origin);
+                    let acc = shared.apply_dbsize(origin, db);
                     let mut waiters = Vec::new();
                     for cell in peer_cells(shared) {
-                        if let Ok(waiter) = send_apply(shared, cell, proto, &[b"DBSIZE"]).await {
+                        if let Ok(waiter) = send_apply(shared, cell, proto, db, &[b"DBSIZE"]).await
+                        {
                             waiters.push(waiter);
                             *inflight += 1;
                         }
                     }
                     pending.push_back(PendingReply::Counted { waiters, acc, proto });
                 }
-                CommandId::Flushdb | CommandId::Flushall => {
-                    // The local leg validates options and flushes; an error
-                    // reply short-circuits the fan-out.
-                    let local = run_local(shared, origin, proto, id, &argv);
+                CommandId::Flushdb | CommandId::Flushall | CommandId::Config | CommandId::InfNs => {
+                    // Per-cell-state mutators (flush, CONFIG SET/RESETSTAT,
+                    // INF.NS CREATE/DROP): the local leg validates and
+                    // applies; an error reply short-circuits the fan-out.
+                    let local = run_local(shared, origin, proto, id, db, &argv);
                     if local.first() == Some(&b'-') {
                         pending.push_back(PendingReply::Done(local));
                     } else {
                         shared.recycle_reply_buf(local);
                         let mut waiters = Vec::new();
                         for cell in peer_cells(shared) {
-                            if let Ok(waiter) = send_apply(shared, cell, proto, &argv).await {
+                            if let Ok(waiter) = send_apply(shared, cell, proto, db, &argv).await {
                                 waiters.push(waiter);
                                 *inflight += 1;
                             }
@@ -1210,15 +1395,15 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
                     }
                 }
                 CommandId::Keys => {
-                    let reply = program_keys(shared, origin, proto, id, &argv).await;
+                    let reply = program_keys(shared, origin, proto, id, db, &argv).await;
                     pending.push_back(PendingReply::Done(reply));
                 }
                 CommandId::Scan => {
-                    let reply = program_scan(shared, origin, proto, id, &argv).await;
+                    let reply = program_scan(shared, origin, proto, id, db, &argv).await;
                     pending.push_back(PendingReply::Done(reply));
                 }
                 CommandId::Randomkey => {
-                    let reply = program_randomkey(shared, origin, proto, id, &argv).await;
+                    let reply = program_randomkey(shared, origin, proto, id, db, &argv).await;
                     pending.push_back(PendingReply::Done(reply));
                 }
                 _ => unreachable!("is_scatter covers exactly the arms above"),
@@ -1240,9 +1425,9 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
             let mut waiters = Vec::new();
             for k in &argv[1..] {
                 if shared.router.is_local(k, shared.cell) {
-                    acc += shared.apply_counted(origin, name, k);
+                    acc += shared.apply_counted(origin, name, k, db);
                 } else {
-                    match send_apply(shared, owner_of(k), proto, &[name, k]).await {
+                    match send_apply(shared, owner_of(k), proto, db, &[name, k]).await {
                         Ok(waiter) => {
                             waiters.push(waiter);
                             *inflight += 1;
@@ -1262,10 +1447,10 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
             for k in &argv[1..] {
                 if shared.router.is_local(k, shared.cell) {
                     let mut buf = shared.take_reply_buf();
-                    shared.execute_owned_into(origin, &[b"GET", k], proto, id, &mut buf);
+                    shared.execute_owned_into(origin, &[b"GET", k], proto, id, db, &mut buf);
                     parts.push(GatherPart::Done(buf));
                 } else {
-                    match send_apply(shared, owner_of(k), proto, &[b"GET", k]).await {
+                    match send_apply(shared, owner_of(k), proto, db, &[b"GET", k]).await {
                         Ok(waiter) => {
                             parts.push(GatherPart::Wait(waiter));
                             *inflight += 1;
@@ -1295,6 +1480,7 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
                             &[b"SET", argv[i], argv[i + 1]],
                             proto,
                             id,
+                            db,
                             &mut buf,
                         );
                         if buf.first() == Some(&b'-') && failure.is_none() {
@@ -1316,6 +1502,7 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
                                 shared,
                                 owner_of(argv[i]),
                                 proto,
+                                db,
                                 &[b"SET", argv[i], argv[i + 1]],
                             )
                             .await
@@ -1330,7 +1517,7 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
             }
         }
         Some(meta) if well_formed && meta.id == CommandId::Msetnx && has_remote_key(meta) => {
-            let reply = program_msetnx(shared, origin, proto, id, &argv).await;
+            let reply = program_msetnx(shared, origin, proto, id, db, &argv).await;
             pending.push_back(PendingReply::Done(reply));
         }
         Some(meta)
@@ -1342,7 +1529,7 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
             // Two owners: the read(+delete)/write fabric program. Same-owner
             // pairs fall through to the whole-argv Apply below (atomic at
             // that cell).
-            let reply = program_move(shared, origin, proto, id, meta.id, &argv).await;
+            let reply = program_move(shared, origin, proto, id, db, meta.id, &argv).await;
             pending.push_back(PendingReply::Done(reply));
         }
         Some(meta) if well_formed && has_remote_key(meta) => {
@@ -1350,7 +1537,7 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
             // executes and returns its raw RESP reply.
             let first_key = extract_keys_slices(meta, &argv)[0];
             let owner = owner_of(first_key);
-            match send_apply(shared, owner, proto, &argv).await {
+            match send_apply(shared, owner, proto, db, &argv).await {
                 Ok(waiter) => {
                     *inflight += 1;
                     pending.push_back(PendingReply::Remote { waiter, proto });
@@ -1368,6 +1555,12 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
                 let Some(mut live) = shared.with_conn(key, |c| ConnCx {
                     proto: c.cx.proto,
                     id: c.cx.id,
+                    db: c.cx.db,
+                    // Cold path: HELLO/SELECT execute under the live
+                    // subscription view (the RESP2 subscriber restriction
+                    // applies to HELLO exactly as in Redis).
+                    sub_channels: c.cx.sub_channels.clone(),
+                    sub_patterns: c.cx.sub_patterns.clone(),
                     node: Rc::clone(&shared.node),
                 }) else {
                     return false;
@@ -1375,9 +1568,12 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
                 let now = shared.now.get();
                 execute_slices(&argv, &mut shared.store.borrow_mut(), &mut live, now, &mut reply);
                 shared.observer.borrow_mut().on_execute(shared.cell, origin, &argv, &reply, now);
-                shared.with_conn(key, |c| c.cx.proto = live.proto);
+                shared.with_conn(key, |c| {
+                    c.cx.proto = live.proto;
+                    c.cx.db = live.db;
+                });
             } else {
-                shared.execute_owned_into(origin, &argv, proto, id, &mut reply);
+                shared.execute_owned_into(origin, &argv, proto, id, db, &mut reply);
                 if let Some(dur) = stall_request(&argv) {
                     shared.stall_until.set(shared.now.get().saturating_add(dur));
                 }
@@ -1456,10 +1652,11 @@ fn run_local<O: PlaneObserver + 'static>(
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
+    db: u16,
     argv: &[&[u8]],
 ) -> Vec<u8> {
     let mut reply = shared.take_reply_buf();
-    shared.execute_owned_into(origin, argv, proto, id, &mut reply);
+    shared.execute_owned_into(origin, argv, proto, id, db, &mut reply);
     reply
 }
 
@@ -1471,12 +1668,13 @@ async fn run_on<O: PlaneObserver + 'static>(
     cell: CellId,
     proto: Protocol,
     id: u64,
+    db: u16,
     argv: &[&[u8]],
 ) -> Vec<u8> {
     if cell.0 == shared.cell.0 {
-        return run_local(shared, origin, proto, id, argv);
+        return run_local(shared, origin, proto, id, db, argv);
     }
-    match send_apply(shared, cell, proto, argv).await {
+    match send_apply(shared, cell, proto, db, argv).await {
         Ok(waiter) => match waiter.await {
             OwnedOutcome::Bytes(bytes) => bytes,
             outcome => render_outcome(shared, outcome, proto),
@@ -1491,13 +1689,14 @@ async fn count_on<O: PlaneObserver + 'static>(
     origin: ExecOrigin,
     cell: CellId,
     proto: Protocol,
+    db: u16,
     name: &[u8],
     key: &[u8],
 ) -> Result<i64, Vec<u8>> {
     if cell.0 == shared.cell.0 {
-        return Ok(shared.apply_counted(origin, name, key));
+        return Ok(shared.apply_counted(origin, name, key, db));
     }
-    match send_apply(shared, cell, Protocol::Resp2, &[name, key]).await {
+    match send_apply(shared, cell, Protocol::Resp2, db, &[name, key]).await {
         Ok(waiter) => match waiter.await {
             OwnedOutcome::Int(n) => Ok(n),
             _ => Err(error_reply(shared, proto, "ERR cross-cell execution failed")),
@@ -1514,6 +1713,7 @@ async fn program_msetnx<O: PlaneObserver + 'static>(
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
+    db: u16,
     argv: &[&[u8]],
 ) -> Vec<u8> {
     if argv.len().is_multiple_of(2) {
@@ -1522,7 +1722,7 @@ async fn program_msetnx<O: PlaneObserver + 'static>(
     let mut i = 1;
     while i < argv.len() {
         let owner = shared.router.cell_of(SlotRouter::slot_of(argv[i]));
-        match count_on(shared, origin, owner, proto, b"EXISTS", argv[i]).await {
+        match count_on(shared, origin, owner, proto, db, b"EXISTS", argv[i]).await {
             Ok(0) => {}
             Ok(_) => return int_reply(shared, proto, 0),
             Err(error) => return error,
@@ -1533,7 +1733,7 @@ async fn program_msetnx<O: PlaneObserver + 'static>(
     while i < argv.len() {
         let owner = shared.router.cell_of(SlotRouter::slot_of(argv[i]));
         let reply =
-            run_on(shared, origin, owner, Protocol::Resp2, id, &[b"SET", argv[i], argv[i + 1]])
+            run_on(shared, origin, owner, Protocol::Resp2, id, db, &[b"SET", argv[i], argv[i + 1]])
                 .await;
         if reply.first() == Some(&b'-') {
             return reply;
@@ -1554,6 +1754,7 @@ async fn program_move<O: PlaneObserver + 'static>(
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
+    db: u16,
     cmd: CommandId,
     argv: &[&[u8]],
 ) -> Vec<u8> {
@@ -1561,6 +1762,7 @@ async fn program_move<O: PlaneObserver + 'static>(
     let src_owner = shared.router.cell_of(SlotRouter::slot_of(src));
     let dst_owner = shared.router.cell_of(SlotRouter::slot_of(dst));
     let mut replace = false;
+    let mut dst_db = db;
     if cmd == CommandId::Copy {
         let mut i = 3;
         while i < argv.len() {
@@ -1568,8 +1770,16 @@ async fn program_move<O: PlaneObserver + 'static>(
             if opt.eq_ignore_ascii_case(b"REPLACE") {
                 replace = true;
             } else if opt.eq_ignore_ascii_case(b"DB") && i + 1 < argv.len() {
-                if argv[i + 1] != b"0" {
-                    return error_reply(shared, proto, "ERR DB index is out of range");
+                match crate::exec::parse_i64(argv[i + 1]) {
+                    Ok(n @ 0..=15) => dst_db = n as u16,
+                    Ok(_) => return error_reply(shared, proto, "ERR DB index is out of range"),
+                    Err(()) => {
+                        return error_reply(
+                            shared,
+                            proto,
+                            "ERR value is not an integer or out of range",
+                        );
+                    }
                 }
                 i += 1;
             } else {
@@ -1581,14 +1791,14 @@ async fn program_move<O: PlaneObserver + 'static>(
     if cmd == CommandId::Renamenx {
         // Pre-check at the destination (the window between this check and
         // the SET below is the documented non-atomicity).
-        match count_on(shared, origin, dst_owner, proto, b"EXISTS", dst).await {
+        match count_on(shared, origin, dst_owner, proto, db, b"EXISTS", dst).await {
             Ok(0) => {}
             Ok(_) => return int_reply(shared, proto, 0),
             Err(error) => return error,
         }
     }
     let probe: &[u8] = if cmd == CommandId::Copy { b"INF.PEEK" } else { b"INF.TAKE" };
-    let raw = run_on(shared, origin, src_owner, Protocol::Resp2, id, &[probe, src]).await;
+    let raw = run_on(shared, origin, src_owner, Protocol::Resp2, id, db, &[probe, src]).await;
     if raw.first() == Some(&b'-') {
         return raw;
     }
@@ -1611,7 +1821,8 @@ async fn program_move<O: PlaneObserver + 'static>(
     if cmd == CommandId::Copy && !replace {
         put.push(b"NX"); // TOCTOU-free destination guard
     }
-    let reply = run_on(shared, origin, dst_owner, Protocol::Resp2, id, &put).await;
+    // COPY's destination database rides the Apply db byte (M1-S08).
+    let reply = run_on(shared, origin, dst_owner, Protocol::Resp2, id, dst_db, &put).await;
     if reply.first() == Some(&b'-') {
         return reply;
     }
@@ -1631,15 +1842,16 @@ async fn program_keys<O: PlaneObserver + 'static>(
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
+    db: u16,
     argv: &[&[u8]],
 ) -> Vec<u8> {
-    let local = run_local(shared, origin, proto, id, argv);
+    let local = run_local(shared, origin, proto, id, db, argv);
     let Some((mut total, local_off)) = parse_array_header(&local) else {
         return local; // error passthrough
     };
     let mut waiters = Vec::new();
     for cell in peer_cells(shared) {
-        match send_apply(shared, cell, proto, argv).await {
+        match send_apply(shared, cell, proto, db, argv).await {
             Ok(waiter) => waiters.push(waiter),
             Err(refusal) => return refusal,
         }
@@ -1676,6 +1888,7 @@ async fn program_scan<O: PlaneObserver + 'static>(
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
+    db: u16,
     argv: &[&[u8]],
 ) -> Vec<u8> {
     let Some(cursor) = crate::exec::parse_cursor(argv[1]) else {
@@ -1689,7 +1902,7 @@ async fn program_scan<O: PlaneObserver + 'static>(
     let local_cursor = crate::exec::fmt_u64(&mut cursor_buf, cursor & SCAN_LOCAL_MASK);
     let mut sub: Vec<&[u8]> = argv.to_vec();
     sub[1] = local_cursor;
-    let raw = run_on(shared, origin, CellId(target), proto, id, &sub).await;
+    let raw = run_on(shared, origin, CellId(target), proto, id, db, &sub).await;
     let Some((inner, rest_at)) = parse_scan_head(&raw) else {
         return raw; // error passthrough
     };
@@ -1719,12 +1932,13 @@ async fn program_randomkey<O: PlaneObserver + 'static>(
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
+    db: u16,
     argv: &[&[u8]],
 ) -> Vec<u8> {
     let start = (crate::exec::next_rand(&shared.node) % u64::from(shared.cells)) as u16;
     for i in 0..shared.cells {
         let cell = CellId((start + i) % shared.cells);
-        let raw = run_on(shared, origin, cell, proto, id, argv).await;
+        let raw = run_on(shared, origin, cell, proto, id, db, argv).await;
         if raw != b"$-1\r\n" && raw != b"_\r\n" {
             return raw;
         }
@@ -1733,6 +1947,484 @@ async fn program_randomkey<O: PlaneObserver + 'static>(
     let mut reply = shared.take_reply_buf();
     RespWriter::new(&mut reply, proto).null();
     reply
+}
+
+// ---- pub/sub plane programs (M1-S10/S11) ----------------------------------------
+
+/// Pump-side dispatch for the six public pub/sub commands. Subscribe-family
+/// ops mutate the connection state, sync this cell's registries, and ship
+/// the 0→1/1→0 transition deltas — **awaited before the confirmation frames
+/// are emitted**, so once a client sees its confirmation, a PUBLISH from
+/// anywhere reaches it. PUBLISH routes to the channel's owner; PUBSUB is an
+/// introspection program over the owner views.
+async fn dispatch_pubsub<O: PlaneObserver + 'static>(
+    shared: &Rc<Shared<O>>,
+    key: ConnKey,
+    id: CommandId,
+    argv: &[&[u8]],
+    proto: Protocol,
+    pending: &mut VecDeque<PendingReply>,
+    inflight: &mut usize,
+) -> bool {
+    match id {
+        CommandId::Subscribe
+        | CommandId::Psubscribe
+        | CommandId::Unsubscribe
+        | CommandId::Punsubscribe => {
+            let kind = if matches!(id, CommandId::Subscribe | CommandId::Unsubscribe) {
+                SubKind::Channel
+            } else {
+                SubKind::Pattern
+            };
+            let adding = matches!(id, CommandId::Subscribe | CommandId::Psubscribe);
+            let names: Vec<&[u8]> = argv[1..].to_vec();
+            let mut frames = shared.take_reply_buf();
+            let Some(changes) = shared.with_conn(key, |conn| {
+                if adding {
+                    pubsub::apply_subscribe(&names, kind, &mut conn.cx, &mut frames)
+                } else {
+                    let names = (!names.is_empty()).then_some(names.as_slice());
+                    pubsub::apply_unsubscribe(names, kind, &mut conn.cx, &mut frames)
+                }
+            }) else {
+                return false;
+            };
+            let mut notes: Vec<(SubKind, Vec<u8>, i32)> = Vec::new();
+            {
+                let mut ps = shared.pubsub.borrow_mut();
+                for (name, changed) in &changes {
+                    if !changed {
+                        continue;
+                    }
+                    let transition = if adding {
+                        ps.local_add(kind, name, key)
+                    } else {
+                        ps.local_remove(kind, name, key)
+                    };
+                    if transition {
+                        notes.push((kind, name.clone(), if adding { 1 } else { -1 }));
+                    }
+                }
+            }
+            let mut waiters = Vec::new();
+            for (kind, name, delta) in &notes {
+                send_sub_delta(shared, *kind, name, *delta, &mut waiters).await;
+            }
+            for waiter in waiters {
+                let _ = waiter.await;
+            }
+            pending.push_back(PendingReply::Done(frames));
+        }
+        CommandId::Publish => {
+            let (channel, payload) = (argv[1], argv[2]);
+            let owner = if shared.route_local_only {
+                shared.cell
+            } else {
+                shared.router.cell_of(SlotRouter::slot_of(channel))
+            };
+            if owner.0 == shared.cell.0 {
+                // This cell owns the channel: deliver locally, fan one
+                // INF.PUBFAN per subscriber-bearing peer, sum the typed
+                // per-cell delivery counts (the Counted shape). A publisher
+                // subscribed to its own channel gets its frames *after* the
+                // count reply (Redis order) via a trailing Done entry.
+                let (acc, self_frames) = deliver_local(shared, channel, payload, Some(key));
+                let targets = shared.pubsub.borrow().fan_targets(channel, shared.cell.0);
+                let mut waiters = Vec::new();
+                for cell in targets {
+                    let fan = &[&b"INF.PUBFAN"[..], channel, payload];
+                    if let Ok(waiter) =
+                        send_apply(shared, CellId(cell), Protocol::Resp2, 0, fan).await
+                    {
+                        note_fan(&shared.node);
+                        waiters.push(waiter);
+                        *inflight += 1;
+                    }
+                }
+                pending.push_back(PendingReply::Counted { waiters, acc, proto });
+                if !self_frames.is_empty() {
+                    pending.push_back(PendingReply::Done(self_frames));
+                }
+            } else {
+                let publ = &[&b"INF.PUB"[..], channel, payload];
+                match send_apply(shared, owner, Protocol::Resp2, 0, publ).await {
+                    Ok(waiter) => {
+                        *inflight += 1;
+                        pending.push_back(PendingReply::Remote { waiter, proto });
+                    }
+                    Err(refusal) => pending.push_back(PendingReply::Done(refusal)),
+                }
+            }
+        }
+        CommandId::Pubsub => {
+            let reply = program_pubsub(shared, proto, argv).await;
+            pending.push_back(PendingReply::Done(reply));
+        }
+        _ => unreachable!("is_plane_pubsub covers exactly the arms above"),
+    }
+    true
+}
+
+/// Ships one subscription transition: channel deltas go to the owner cell,
+/// pattern deltas replicate to every cell (plus this cell's slot directly).
+async fn send_sub_delta<O: PlaneObserver + 'static>(
+    shared: &Rc<Shared<O>>,
+    kind: SubKind,
+    name: &[u8],
+    delta: i32,
+    waiters: &mut Vec<GateWait<u64, OwnedOutcome>>,
+) {
+    let delta_arg: &[u8] = if delta < 0 { b"-1" } else { b"1" };
+    let subd = &[&b"INF.SUBD"[..], kind.wire_tag(), name, delta_arg];
+    match kind {
+        SubKind::Channel => {
+            let owner = if shared.route_local_only {
+                shared.cell
+            } else {
+                shared.router.cell_of(SlotRouter::slot_of(name))
+            };
+            if owner.0 == shared.cell.0 {
+                shared.pubsub.borrow_mut().apply_delta(kind, name, shared.cell.0, delta);
+            } else if let Ok(waiter) = send_apply(shared, owner, Protocol::Resp2, 0, subd).await {
+                waiters.push(waiter);
+            }
+        }
+        SubKind::Pattern => {
+            shared.pubsub.borrow_mut().apply_delta(kind, name, shared.cell.0, delta);
+            if !shared.route_local_only {
+                for cell in peer_cells(shared) {
+                    if let Ok(waiter) = send_apply(shared, cell, Protocol::Resp2, 0, subd).await {
+                        waiters.push(waiter);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Close-path subscription cleanup: ships the 1→0 deltas and consumes the
+/// acks (nothing awaits them, but every fabric op replies — credit and
+/// orphan-tripwire hygiene).
+async fn flush_sub_deltas<O: PlaneObserver + 'static>(
+    shared: Rc<Shared<O>>,
+    notes: Vec<(SubKind, Vec<u8>, i32)>,
+) {
+    let mut waiters = Vec::new();
+    for (kind, name, delta) in &notes {
+        send_sub_delta(&shared, *kind, name, *delta, &mut waiters).await;
+    }
+    for waiter in waiters {
+        let _ = waiter.await;
+    }
+}
+
+/// Removes a closed connection from the local registries, returning the
+/// cell-level transitions to notify.
+fn unsubscribe_closed_conn<O: PlaneObserver + 'static>(
+    shared: &Rc<Shared<O>>,
+    key: ConnKey,
+    cx: &ConnCx,
+) -> Vec<(SubKind, Vec<u8>, i32)> {
+    let mut notes = Vec::new();
+    let mut ps = shared.pubsub.borrow_mut();
+    for channel in &cx.sub_channels {
+        if ps.local_remove(SubKind::Channel, channel, key) {
+            notes.push((SubKind::Channel, channel.clone(), -1));
+        }
+    }
+    for pattern in &cx.sub_patterns {
+        if ps.local_remove(SubKind::Pattern, pattern, key) {
+            notes.push((SubKind::Pattern, pattern.clone(), -1));
+        }
+    }
+    notes
+}
+
+/// The owner-side publish pump: fabric-origin PUBLISHes drain strictly in
+/// arrival order — local delivery, one INF.PUBFAN per subscriber-bearing
+/// peer, then the receiver-count reply to the publisher's cell. Sends leave
+/// in queue order, so per-publisher delivery order holds end-to-end; reply
+/// aggregation is awaited inline, making publish throughput per owner cell
+/// RTT-bound — a recorded M1 simplification (no gate measures sustained
+/// publish throughput; revisit with evidence per L4 if a workload demands
+/// overlap).
+async fn owner_pub_pump<O: PlaneObserver + 'static>(shared: Rc<Shared<O>>) {
+    loop {
+        let Some(item) = shared.pub_queue.borrow_mut().pop_front() else {
+            shared.pub_pump_active.set(false);
+            return;
+        };
+        let (mut total, _) = deliver_local(&shared, &item.channel, &item.payload, None);
+        let targets = shared.pubsub.borrow().fan_targets(&item.channel, shared.cell.0);
+        let mut waiters = Vec::new();
+        for cell in targets {
+            let fan = &[&b"INF.PUBFAN"[..], &item.channel, &item.payload];
+            if let Ok(waiter) = send_apply(&shared, CellId(cell), Protocol::Resp2, 0, fan).await {
+                note_fan(&shared.node);
+                waiters.push(waiter);
+            }
+        }
+        for waiter in waiters {
+            if let OwnedOutcome::Int(n) = waiter.await {
+                total += n;
+            }
+        }
+        // Publish the reply now — the origin's pump is suspended on it.
+        let mut fabric = shared.fabric.borrow_mut();
+        fabric.reply(item.origin, item.token, &Outcome::Int(total));
+        fabric.flush();
+    }
+}
+
+/// PUBSUB introspection over the cell registries: CHANNELS merges the owner
+/// views (KEYS-style header arithmetic), NUMSUB asks each channel's owner,
+/// NUMPAT answers locally (the pattern index is replicated).
+async fn program_pubsub<O: PlaneObserver + 'static>(
+    shared: &Rc<Shared<O>>,
+    proto: Protocol,
+    argv: &[&[u8]],
+) -> Vec<u8> {
+    let sub = argv[1];
+    if sub.eq_ignore_ascii_case(b"CHANNELS") && argv.len() <= 3 {
+        let pattern = argv.get(2).copied();
+        let local = shared.pubsub.borrow().live_owned_channels(pattern);
+        let mut waiters = Vec::new();
+        if shared.cells > 1 && !shared.route_local_only {
+            let mut request: Vec<&[u8]> = vec![b"INF.PUBSUB", b"CHANNELS"];
+            if let Some(p) = pattern {
+                request.push(p);
+            }
+            for cell in peer_cells(shared) {
+                match send_apply(shared, cell, Protocol::Resp2, 0, &request).await {
+                    Ok(waiter) => waiters.push(waiter),
+                    Err(refusal) => return refusal,
+                }
+            }
+        }
+        let mut total = local.len();
+        let mut bodies: Vec<(Vec<u8>, usize)> = Vec::new();
+        for waiter in waiters {
+            match waiter.await {
+                OwnedOutcome::Bytes(bytes) => {
+                    let Some((n, off)) = parse_array_header(&bytes) else {
+                        return bytes; // peer error passthrough
+                    };
+                    total += n;
+                    bodies.push((bytes, off));
+                }
+                _ => return error_reply(shared, proto, "ERR cross-cell execution failed"),
+            }
+        }
+        let mut reply = shared.take_reply_buf();
+        {
+            let mut w = RespWriter::new(&mut reply, proto);
+            w.array_header(total);
+            for name in &local {
+                w.bulk(name);
+            }
+        }
+        for (bytes, off) in bodies {
+            reply.extend_from_slice(&bytes[off..]);
+            shared.recycle_reply_buf(bytes);
+        }
+        reply
+    } else if sub.eq_ignore_ascii_case(b"NUMSUB") {
+        enum Count {
+            Local(i64),
+            Wait(GateWait<u64, OwnedOutcome>),
+        }
+        let mut parts: Vec<(&[u8], Count)> = Vec::with_capacity(argv.len() - 2);
+        for name in &argv[2..] {
+            let owner = if shared.route_local_only {
+                shared.cell
+            } else {
+                shared.router.cell_of(SlotRouter::slot_of(name))
+            };
+            if owner.0 == shared.cell.0 {
+                parts.push((name, Count::Local(shared.pubsub.borrow().owned_count(name))));
+            } else {
+                let numsub = &[&b"INF.PUBSUB"[..], b"NUMSUB", name];
+                match send_apply(shared, owner, Protocol::Resp2, 0, numsub).await {
+                    Ok(waiter) => parts.push((name, Count::Wait(waiter))),
+                    Err(refusal) => return refusal,
+                }
+            }
+        }
+        let mut reply = shared.take_reply_buf();
+        RespWriter::new(&mut reply, proto).array_header(parts.len() * 2);
+        for (name, count) in parts {
+            let count = match count {
+                Count::Local(n) => n,
+                Count::Wait(waiter) => match waiter.await {
+                    OwnedOutcome::Int(n) => n,
+                    _ => 0,
+                },
+            };
+            let mut w = RespWriter::new(&mut reply, proto);
+            w.bulk(name);
+            w.int(count);
+        }
+        reply
+    } else if sub.eq_ignore_ascii_case(b"NUMPAT") && argv.len() == 2 {
+        int_reply(shared, proto, shared.pubsub.borrow().live_pattern_count() as i64)
+    } else {
+        let mut reply = shared.take_reply_buf();
+        pubsub::pubsub_subcommand_error(sub, &mut RespWriter::new(&mut reply, proto));
+        reply
+    }
+}
+
+/// Owner-side handling of the internal pub/sub Apply vocabulary. Returns
+/// false when `argv` is not pub/sub plumbing (the caller falls through to
+/// normal Apply execution).
+fn handle_pubsub_apply<O: PlaneObserver + 'static>(
+    shared: &Shared<O>,
+    from: CellId,
+    token: FabricToken,
+    argv: &[&[u8]],
+    scratch: &mut Vec<u8>,
+    staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
+    pubs: &mut Vec<OwnerPub>,
+) -> bool {
+    let name = argv[0];
+    if name.eq_ignore_ascii_case(b"INF.PUBFAN") && argv.len() == 3 {
+        // Subscriber-cell delivery leg: append frames locally, reply the
+        // typed per-cell receiver count. (A publisher subscribed to its own
+        // channel through a remote owner may see its message frame before
+        // its publish reply — recorded ordering deviation.)
+        let (delivered, _) = deliver_local(shared, argv[1], argv[2], None);
+        staged.push((from, token, StagedReply::Int(delivered)));
+        true
+    } else if name.eq_ignore_ascii_case(b"INF.PUB") && argv.len() == 3 {
+        // Owner leg of a remote PUBLISH: park for the owner pump (the
+        // fabric is mutably borrowed by this drain; fan-out needs sends).
+        pubs.push(OwnerPub {
+            origin: from,
+            token,
+            channel: argv[1].to_vec(),
+            payload: argv[2].to_vec(),
+        });
+        true
+    } else if name.eq_ignore_ascii_case(b"INF.SUBD") && argv.len() == 4 {
+        match SubKind::from_wire_tag(argv[1]) {
+            Some(kind) => {
+                let delta: i32 = if argv[3] == b"-1" { -1 } else { 1 };
+                shared.pubsub.borrow_mut().apply_delta(kind, argv[2], from.0, delta);
+                staged.push((from, token, StagedReply::Int(0)));
+            }
+            None => staged.push((from, token, StagedReply::Refused)),
+        }
+        true
+    } else if name.eq_ignore_ascii_case(b"INF.PUBSUB") && argv.len() >= 2 {
+        if argv[1].eq_ignore_ascii_case(b"NUMSUB") && argv.len() == 3 {
+            let count = shared.pubsub.borrow().owned_count(argv[2]);
+            staged.push((from, token, StagedReply::Int(count)));
+        } else if argv[1].eq_ignore_ascii_case(b"CHANNELS") && argv.len() <= 3 {
+            let names = shared.pubsub.borrow().live_owned_channels(argv.get(2).copied());
+            let start = scratch.len();
+            let mut w = RespWriter::new(scratch, Protocol::Resp2);
+            w.array_header(names.len());
+            for name in &names {
+                w.bulk(name);
+            }
+            staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+        } else {
+            staged.push((from, token, StagedReply::Refused));
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Delivers one published message to this cell's local subscribers:
+/// complete frames append to each subscriber connection's staged output
+/// (per-connection protocol — RESP3 push, RESP2 array), channel
+/// subscriptions before pattern subscriptions, then the output cap
+/// (M1-S11) is enforced. Returns the receiver count and — when `defer`
+/// names the publishing connection — its own frames, held back so they
+/// follow the publish reply (the Redis self-delivery order).
+fn deliver_local<O: PlaneObserver + 'static>(
+    shared: &Shared<O>,
+    channel: &[u8],
+    payload: &[u8],
+    defer: Option<ConnKey>,
+) -> (i64, Vec<u8>) {
+    let mut delivered: i64 = 0;
+    let mut deferred = Vec::new();
+    for key in shared.pubsub.borrow().channel_conns(channel) {
+        delivered += i64::from(deliver_one(shared, key, defer, &mut deferred, |out, proto| {
+            pubsub::write_message(out, proto, channel, payload);
+        }));
+    }
+    for (pattern, conns) in shared.pubsub.borrow().matching_pattern_conns(channel) {
+        for key in conns {
+            delivered += i64::from(deliver_one(shared, key, defer, &mut deferred, |out, proto| {
+                pubsub::write_pmessage(out, proto, &pattern, channel, payload);
+            }));
+        }
+    }
+    let node = &shared.node;
+    node.pubsub_delivered.set(node.pubsub_delivered.get() + delivered.unsigned_abs());
+    (delivered, deferred)
+}
+
+fn deliver_one<O: PlaneObserver + 'static>(
+    shared: &Shared<O>,
+    key: ConnKey,
+    defer: Option<ConnKey>,
+    deferred: &mut Vec<u8>,
+    write: impl FnOnce(&mut Vec<u8>, Protocol),
+) -> bool {
+    let now_ms = shared.now.get().as_millis();
+    let caps = shared.cob_pubsub.get();
+    shared
+        .with_conn(key, |conn| {
+            if conn.closing {
+                return false;
+            }
+            if defer == Some(key) {
+                // The publisher's own frames ride the reply path instead
+                // (emitted right after the receiver count).
+                write(deferred, conn.cx.proto);
+                return true;
+            }
+            write(&mut conn.out, conn.cx.proto);
+            enforce_output_cap(&shared.node, conn, now_ms, caps);
+            true
+        })
+        .unwrap_or(false)
+}
+
+/// `client-output-buffer-limit pubsub` (M1-S11): the hard cap kills at
+/// once; the soft cap kills after `soft_ms` continuously over. The kill is
+/// the CLIENT KILL handshake (registry mark + MAINTAIN sweep close) —
+/// delivery never touches another connection's I/O state directly, and the
+/// connection (with its buffered output) frees on close.
+fn enforce_output_cap(node: &NodeInfo, conn: &mut Conn, now_ms: u64, caps: (u64, u64, u64)) {
+    let (hard, soft, soft_ms) = caps;
+    if conn.cob_kill_sent {
+        return;
+    }
+    let used = conn.out.len() as u64;
+    let over_hard = hard > 0 && used > hard;
+    let soft_expired = if soft > 0 && soft_ms > 0 && used > soft {
+        if conn.cob_soft_since_ms == 0 {
+            conn.cob_soft_since_ms = now_ms.max(1);
+        }
+        now_ms.saturating_sub(conn.cob_soft_since_ms) >= soft_ms
+    } else {
+        conn.cob_soft_since_ms = 0;
+        false
+    };
+    if (over_hard || soft_expired) && node.clients.borrow_mut().request_kill(conn.cx.id) {
+        conn.cob_kill_sent = true;
+        node.cob_disconnections.set(node.cob_disconnections.get() + 1);
+    }
+}
+
+fn note_fan(node: &NodeInfo) {
+    node.pubsub_fan_msgs.set(node.pubsub_fan_msgs.get() + 1);
 }
 
 /// `*N\r\n` array header → `(N, body offset)`. `None` for errors/nulls.
@@ -1802,6 +2494,7 @@ async fn send_apply<O: PlaneObserver + 'static>(
     shared: &Rc<Shared<O>>,
     to: CellId,
     proto: Protocol,
+    db: u16,
     argv: &[&[u8]],
 ) -> Result<GateWait<u64, OwnedOutcome>, Vec<u8>> {
     let Some(args) = ApplyArgs::new(argv) else {
@@ -1819,12 +2512,16 @@ async fn send_apply<O: PlaneObserver + 'static>(
         // iteration's FABRIC-IN; the gate parks early values.
         (token, shared.gate.waiter(token.0))
     };
+    // `cmd` packs `{db:4 | proto:4}` (ADR-0009) — SELECT travels with the
+    // op on the byte the codec already had; db is < 16 by SELECT bounds.
     let proto_byte: u8 = match proto {
         Protocol::Resp3 => 3,
         Protocol::Resp2 => 2,
     };
+    debug_assert!(db < 16, "db rides 4 bits of the Apply cmd byte");
+    let cmd_byte = proto_byte | ((db as u8) << 4);
     loop {
-        let op = Op::Apply { token, slot, cmd: proto_byte, args };
+        let op = Op::Apply { token, slot, cmd: cmd_byte, args };
         let sent = shared.fabric.borrow_mut().send(to, &op);
         match sent {
             Ok(()) => break,

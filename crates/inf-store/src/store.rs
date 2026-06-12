@@ -21,9 +21,11 @@ use inf_alloc::{Arena, ArenaAddr, ArenaConfig};
 use inf_foundation::hash64;
 use inf_foundation::time::Nanos;
 
+use crate::evict::{self, EvictState, EvictStats, EvictionPolicy, Tracking};
 use crate::index::Index;
 use crate::record::{
     HEADER_LEN, MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN, RecordSpec, RecordView, TypeTag,
+    flags_ref_decrement, flags_ref_saturate, flags_ref_write,
 };
 use crate::wheel::{ArmOutcome, TtlWheel};
 
@@ -40,6 +42,9 @@ pub struct StoreConfig {
     pub arena: ArenaConfig,
     /// Index pre-sizing (entries before the first rehash).
     pub initial_keys: usize,
+    /// Seed for the eviction RNG stream (Morris rolls, random-policy slots).
+    /// Injected (L7); `Keyspace` derives a per-db stream from the node seed.
+    pub evict_seed: u64,
 }
 
 /// Typed operation failure surfaced to the command layer.
@@ -154,6 +159,14 @@ impl Encoding {
     }
 }
 
+/// A record exported for cross-db COPY (M1-S08).
+#[derive(Clone, Debug)]
+pub(crate) struct ExportedRecord {
+    pub value: Vec<u8>,
+    pub expire_at_ms: Option<u64>,
+    pub raw: bool,
+}
+
 /// `COPY` outcome (M1-S02).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum CopyResult {
@@ -196,6 +209,8 @@ pub struct StoreStats {
     pub wheel_stale: u64,
     /// TTL writes that could not arm the wheel (pool cap) — lazy-only keys.
     pub wheel_fallback: u64,
+    /// Records evicted under memory pressure (M1-S06; `INFO evicted_keys`).
+    pub evicted_keys: u64,
 }
 
 /// Frozen memory attribution domains (tripwire names, M0 §3.2; `wheel_bytes`
@@ -207,27 +222,33 @@ pub struct MemoryReport {
     pub records_resident_bytes: u64,
     pub index_bytes: u64,
     pub wheel_bytes: u64,
+    /// Eviction-engine footprint: the 8 KiB CMS while an LFU policy is
+    /// selected, 0 otherwise (M1-S06 L5 domain).
+    pub evict_bytes: u64,
     pub live_records: u64,
 }
 
 /// One cell's keyspace slice. Single-threaded by construction (owns a
 /// `!Send` arena); all time is injected.
 pub struct CellStore {
-    arena: Arena,
-    index: Index,
+    pub(crate) arena: Arena,
+    pub(crate) index: Index,
     wheel: TtlWheel,
-    stats: StoreStats,
+    pub(crate) stats: StoreStats,
+    pub(crate) evict: EvictState,
     cfg: StoreConfig,
 }
 
 impl CellStore {
     pub fn new(cfg: StoreConfig) -> CellStore {
+        let evict = EvictState { rng: cfg.evict_seed, ..EvictState::default() };
         CellStore {
             arena: Arena::new(cfg.arena),
             index: Index::with_capacity(cfg.initial_keys.max(64)),
             // Cursor 0: the first tick fast-forwards to `now` (empty wheel).
             wheel: TtlWheel::new(0),
             stats: StoreStats::default(),
+            evict,
             cfg,
         }
     }
@@ -279,6 +300,7 @@ impl CellStore {
             records_resident_bytes: arena.resident_bytes,
             index_bytes: self.index.memory_bytes() as u64,
             wheel_bytes: (self.wheel.pool_bytes() + self.wheel.table_bytes()) as u64,
+            evict_bytes: self.evict.bytes() as u64,
             live_records: arena.live_allocs,
         }
     }
@@ -374,6 +396,7 @@ impl CellStore {
                         } else {
                             self.stats.keyspace_hits += 1;
                             out(base + i, Some(view.value()));
+                            self.touch_access(hashes[i], addr);
                             continue;
                         }
                     }
@@ -751,6 +774,49 @@ impl CellStore {
         Ok(CopyResult::Copied)
     }
 
+    /// Cross-db `COPY` export (M1-S08): value, TTL, and encoding state.
+    pub(crate) fn copy_out(&mut self, key: &[u8], now: Nanos) -> Option<ExportedRecord> {
+        let (addr, len) = self.resolve(key, now)?;
+        let view = RecordView::new(self.arena.bytes(addr, len));
+        Some(ExportedRecord {
+            value: view.value().to_vec(),
+            expire_at_ms: view.expire_at_ms(),
+            raw: view.is_raw(),
+        })
+    }
+
+    /// Cross-db `COPY` import — the destination half of [`copy`](Self::copy)
+    /// with the source already materialized from another db.
+    pub(crate) fn copy_in(
+        &mut self,
+        dst: &[u8],
+        rec: &ExportedRecord,
+        replace: bool,
+        now: Nanos,
+    ) -> Result<CopyResult, OpError> {
+        check_bounds(dst, &rec.value)?;
+        let dst_existing = self.resolve(dst, now);
+        if dst_existing.is_some() && !replace {
+            return Ok(CopyResult::DestinationExists);
+        }
+        let dst_old = dst_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
+        let version = dst_old.map_or(1, |v| v.version().wrapping_add(1));
+        let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
+        let spec = RecordSpec {
+            key: dst,
+            value: &rec.value,
+            version,
+            expire_at_ms: rec.expire_at_ms,
+            raw: rec.raw,
+        };
+        self.write_record(dst, dst_existing, spec)?;
+        self.note_ttl(dst_had_ttl, rec.expire_at_ms.is_some());
+        if let Some(ms) = rec.expire_at_ms {
+            self.arm_wheel(Self::hash_key(dst), ms);
+        }
+        Ok(CopyResult::Copied)
+    }
+
     /// `EXPIRE`/`PEXPIRE`/`PERSIST` (`at: None` removes the TTL). True if
     /// the deadline was applied/removed.
     pub fn expire(&mut self, key: &[u8], at: Option<Nanos>, cond: ExpireCond, now: Nanos) -> bool {
@@ -884,6 +950,7 @@ impl CellStore {
         self.index = Index::with_capacity(self.cfg.initial_keys.max(64));
         self.wheel = TtlWheel::new(now.0 / 1_000_000);
         self.stats.ttl_live = 0;
+        self.evict.hand = 0;
     }
 
     // ---- active expiry (M1-E2) ----
@@ -927,6 +994,72 @@ impl CellStore {
         out
     }
 
+    // ---- eviction mechanism (M1-S06; policy logic lives in `evict.rs`) ----
+
+    /// Applies an eviction policy: flips the access-tracking mode and
+    /// allocates/frees the CMS (8 KiB only while LFU is selected).
+    pub fn set_eviction_policy(&mut self, policy: EvictionPolicy) {
+        self.evict.set_policy(policy);
+    }
+
+    #[inline]
+    pub fn eviction_policy(&self) -> EvictionPolicy {
+        self.evict.policy
+    }
+
+    /// Logical bytes this store costs (live records + index + wheel + CMS)
+    /// — what `maxmemory` pressure compares against (M1-S07), the Redis
+    /// `used_memory` shape. Live (not resident) bytes are the comparable:
+    /// slab chunks stay mapped and recycle, so resident is monotone while
+    /// eviction must be able to bring pressure *down*. The RSS story is the
+    /// slack bound: resident ≤ live-at-peak + class slack, asserted by the
+    /// M1-S07 pressure test and gated on the reference box.
+    pub fn used_bytes(&self) -> u64 {
+        let r = self.report();
+        r.records_live_bytes + r.index_bytes + r.wheel_bytes + r.evict_bytes
+    }
+
+    /// Evicts at most one victim under the active policy (bounded candidate
+    /// window, `samples` per selection). The pressure driver loops this.
+    pub fn evict_step(&mut self, samples: u32, now: Nanos) -> EvictStats {
+        evict::evict_one(self, samples, now)
+    }
+
+    /// Periodic eviction maintenance: CMS Morris-counter decay on the
+    /// injected clock (MAINTAIN slice).
+    pub fn evict_maintain(&mut self, now: Nanos) {
+        evict::maybe_decay(&mut self.evict, now);
+    }
+
+    /// `OBJECT FREQ` under an LFU policy: the CMS estimate (Morris-scaled —
+    /// recorded deviation: Redis reports its own log-counter scale).
+    pub fn object_freq(&mut self, key: &[u8], now: Nanos) -> Option<u8> {
+        self.resolve(key, now)?;
+        let hash = Self::hash_key(key);
+        Some(self.evict.cms.as_ref().map_or(0, |cms| cms.estimate(hash)))
+    }
+
+    /// CLOCK aging: drop one reference generation (eviction sweep).
+    pub(crate) fn age_record(&mut self, addr: ArenaAddr) {
+        let head = self.arena.bytes_mut(addr, 1);
+        head[0] = flags_ref_decrement(head[0]);
+    }
+
+    /// Reaps a record the eviction sweep found already expired.
+    pub(crate) fn reap_expired_at(&mut self, hash: u64, addr: ArenaAddr, len: usize) {
+        self.index.remove(hash, addr);
+        self.arena.free(addr, len);
+        self.note_reap_lazy();
+    }
+
+    /// Removes an eviction victim (counted separately from expirations).
+    pub(crate) fn evict_record(&mut self, hash: u64, addr: ArenaAddr, len: usize, had_ttl: bool) {
+        self.index.remove(hash, addr);
+        self.arena.free(addr, len);
+        self.note_ttl(had_ttl, false);
+        self.stats.evicted_keys += 1;
+    }
+
     // ---- internals ----
 
     fn arm_wheel(&mut self, hash: u64, deadline_ms: u64) {
@@ -968,7 +1101,29 @@ impl CellStore {
             self.note_reap_lazy();
             return None;
         }
+        self.touch_access(hash, addr);
         Some((addr, len))
+    }
+
+    /// Eviction access tracking (M1-S06): one cached branch when no LRU/LFU
+    /// policy is active (the M1-S07 hot-path rule). CLOCK saturates the
+    /// in-record reference bits (one OR on a line the access already
+    /// pulled); LFU Morris-bumps the CMS with one injected-stream roll.
+    #[inline]
+    fn touch_access(&mut self, hash: u64, addr: ArenaAddr) {
+        match self.evict.tracking {
+            Tracking::None => {}
+            Tracking::Clock => {
+                let head = self.arena.bytes_mut(addr, 1);
+                head[0] = flags_ref_saturate(head[0]);
+            }
+            Tracking::Lfu => {
+                let roll = self.evict.next_roll();
+                if let Some(cms) = self.evict.cms.as_mut() {
+                    cms.touch(hash, roll);
+                }
+            }
+        }
     }
 
     fn write_record(
@@ -990,9 +1145,14 @@ impl CellStore {
     ) -> Result<(), OpError> {
         let new_len = spec.encoded_len();
         let hash = Self::hash_key(key);
+        // Writes count as accesses (Redis updates LRU/LFU on write), at
+        // write strength: one CLOCK generation / one CMS baseline bump —
+        // repeated reads are what saturate recency, so churn cannot
+        // impersonate a hot set.
         match existing {
             Some((addr, old_len)) if self.arena.resize_in_place(addr, old_len, new_len) => {
                 spec.write(self.arena.bytes_mut(addr, new_len));
+                self.touch_write(hash, addr);
                 Ok(())
             }
             Some((addr, old_len)) => {
@@ -1000,6 +1160,7 @@ impl CellStore {
                 spec.write(self.arena.bytes_mut(new_addr, new_len));
                 self.index.replace(hash, addr, new_addr);
                 self.arena.free(addr, old_len);
+                self.touch_write(hash, new_addr);
                 Ok(())
             }
             None => {
@@ -1010,7 +1171,26 @@ impl CellStore {
                 let new_addr = self.arena.alloc(new_len).ok_or(OpError::OutOfMemory)?;
                 spec.write(self.arena.bytes_mut(new_addr, new_len));
                 self.index.insert(hash, new_addr);
+                self.touch_write(hash, new_addr);
                 Ok(())
+            }
+        }
+    }
+
+    /// Write-strength access mark (see `write_record_at`).
+    #[inline]
+    fn touch_write(&mut self, hash: u64, addr: ArenaAddr) {
+        match self.evict.tracking {
+            Tracking::None => {}
+            Tracking::Clock => {
+                let head = self.arena.bytes_mut(addr, 1);
+                head[0] = flags_ref_write(head[0]);
+            }
+            Tracking::Lfu => {
+                let roll = self.evict.next_roll();
+                if let Some(cms) = self.evict.cms.as_mut() {
+                    cms.touch(hash, roll);
+                }
             }
         }
     }
@@ -1036,7 +1216,7 @@ fn next_rev_cursor(cursor: u64, mask: u64) -> u64 {
 /// Reads the record at `addr`: header first (fixed 8 bytes) to learn the
 /// full encoded length, then the complete slice.
 #[inline]
-fn record_at(arena: &Arena, addr: ArenaAddr) -> RecordView<'_> {
+pub(crate) fn record_at(arena: &Arena, addr: ArenaAddr) -> RecordView<'_> {
     let head = arena.bytes(addr, HEADER_LEN);
     let full_len = crate::record::encoded_len_from_header(head);
     RecordView::new(arena.bytes(addr, full_len))

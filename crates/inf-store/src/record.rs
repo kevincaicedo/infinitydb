@@ -36,6 +36,12 @@ const FLAG_TTL: u8 = 0b0001;
 /// `OBJECT ENCODING`'s `raw` answer the way Redis's `sds` conversion does
 /// (M1-S02; the value alone can't tell `embstr` from `raw`).
 const FLAG_RAW: u8 = 0b0010;
+/// The last two spare flag bits hold a 2-bit CLOCK reference counter
+/// (M1-S06): access saturates it to 3, the eviction hand decrements, a
+/// record at 0 is an LRU victim. Living in the flags nibble costs zero
+/// bytes per record — the L5 reason this is CLOCK and not timestamped LRU.
+const REF_SHIFT: u32 = 2;
+const REF_MASK: u8 = 0b1100;
 /// u40 ms — ~34.8 years of deterministic-clock range. Deadlines beyond it
 /// clamp here (recorded deviation: "effectively never expires"; the store
 /// clamps at every deadline-conversion site so the writer assert is an
@@ -110,6 +116,29 @@ impl RecordSpec<'_> {
     }
 }
 
+/// Saturates the in-place CLOCK reference counter of the record whose first
+/// header byte is `flags` (access touch — one OR on a line the read already
+/// owns; TTL/RAW bits untouched).
+#[inline]
+pub(crate) fn flags_ref_saturate(flags: u8) -> u8 {
+    flags | REF_MASK
+}
+
+/// Marks a freshly-written record with one CLOCK generation (writes earn
+/// modest recency; repeated READS saturate to 3 — the differential is what
+/// lets the sweep tell a read-hot set from churn, M1-S06).
+#[inline]
+pub(crate) fn flags_ref_write(flags: u8) -> u8 {
+    (flags & !REF_MASK) | (1 << REF_SHIFT)
+}
+
+/// Decrements the CLOCK reference counter (eviction-hand sweep).
+#[inline]
+pub(crate) fn flags_ref_decrement(flags: u8) -> u8 {
+    let level = (flags & REF_MASK) >> REF_SHIFT;
+    (flags & !REF_MASK) | (level.saturating_sub(1) << REF_SHIFT)
+}
+
 /// Computes a record's full encoded length from its fixed header alone —
 /// how the store sizes the second arena read (header first, then the whole
 /// record).
@@ -158,6 +187,12 @@ impl<'a> RecordView<'a> {
     #[inline]
     pub fn is_raw(self) -> bool {
         self.bytes[0] & FLAG_RAW != 0
+    }
+
+    /// CLOCK reference level (0..=3) — eviction recency (M1-S06).
+    #[inline]
+    pub fn ref_level(self) -> u8 {
+        (self.bytes[0] & REF_MASK) >> REF_SHIFT
     }
 
     #[inline]

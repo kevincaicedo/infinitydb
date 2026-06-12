@@ -12,10 +12,22 @@
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Check {
     ByteExact,
+    /// One command producing N frames on the connection (pub/sub
+    /// confirmations per channel, self-delivery push + reply): the
+    /// concatenation of all N is compared byte-exact (M1-S12).
+    Frames(usize),
     /// Both replies are RESP integers within `0` ± tolerance of each other.
     IntWithin(i64),
     /// Replies differ by design; both must frame-parse.
     SkipDiff(&'static str),
+}
+
+impl Check {
+    /// Whether this case byte-compares against the oracle (feeds the
+    /// declared-`full` enforcement in the generated matrix — M1-S13).
+    pub fn compared(self) -> bool {
+        !matches!(self, Check::SkipDiff(_))
+    }
 }
 
 /// One scripted command.
@@ -26,6 +38,10 @@ pub struct Case {
 
 const fn c(argv: &'static [&'static str]) -> Case {
     Case { argv, check: Check::ByteExact }
+}
+
+const fn frames(argv: &'static [&'static str], n: usize) -> Case {
+    Case { argv, check: Check::Frames(n) }
 }
 
 const fn skip(argv: &'static [&'static str], why: &'static str) -> Case {
@@ -284,10 +300,12 @@ pub static MATRIX: &[Case] = &[
     c(&["COPY", "missing", "x"]),
     c(&["COPY", "cp1", "cp1"]),
     c(&["COPY", "cp1", "cp3", "DB", "0"]),
-    skip(
-        &["COPY", "cp1", "cp4", "DB", "3"],
-        "cross-db COPY arrives with namespaces v1 (M1-E4); honest error today",
-    ),
+    // Cross-db COPY (M1-E4 namespaces v1): real now, byte-exact.
+    c(&["COPY", "cp1", "cp4", "DB", "3"]),
+    c(&["COPY", "cp1", "cp4", "DB", "3"]),
+    c(&["COPY", "cp1", "cp4", "DB", "3", "REPLACE"]),
+    c(&["COPY", "cp1", "cp1", "DB", "3"]),
+    c(&["COPY", "cp1", "cp4", "DB", "99"]),
     c(&["COPY", "cp1", "cp5", "BOGUS"]),
     // --- TOUCH / UNLINK ---
     c(&["TOUCH", "cp1", "missing", "cp2"]),
@@ -337,11 +355,23 @@ pub static MATRIX: &[Case] = &[
     c(&["SCAN", "0", "COUNT", "0"]),
     c(&["DBSIZE"]),
     skip(&["RANDOMKEY"], "two-level random (cell, then key) — documented deviation"),
-    // --- SELECT ---
+    // --- SELECT + database isolation (M1-E4 namespaces v1) ---
     c(&["SELECT", "0"]),
     c(&["SELECT", "17"]),
     c(&["SELECT", "notanint"]),
-    skip(&["SELECT", "3"], "dbs 1-15 arrive with namespaces v1 (M1-E4); honest error today"),
+    c(&["SELECT", "3"]),
+    c(&["EXISTS", "cp1"]),
+    c(&["GET", "cp4"]),
+    c(&["SET", "nsk", "three"]),
+    c(&["GET", "nsk"]),
+    c(&["DBSIZE"]),
+    c(&["SELECT", "0"]),
+    c(&["GET", "nsk"]),
+    c(&["SELECT", "3"]),
+    c(&["FLUSHDB"]),
+    c(&["DBSIZE"]),
+    c(&["SELECT", "0"]),
+    c(&["DBSIZE"]),
     // --- CONFIG ---
     c(&["CONFIG", "GET", "maxmemory"]),
     c(&["CONFIG", "SET", "maxmemory", "100mb"]),
@@ -387,6 +417,64 @@ pub static MATRIX: &[Case] = &[
         "flags/acl detail differs; arity+keyspec verified in inf-wire",
     ),
     skip(&["COMMAND", "DOCS", "get"], "docs payload not implemented (honest empty map)"),
+    // ================= M1-E5 · pub/sub (M1-S10) =================
+    // The script has run in RESP3 since the introspection HELLO 3 — drop
+    // back to RESP2 so subscriber-mode restriction is actually exercised.
+    skip(&["HELLO", "2"], "identity fields differ; proto switch verified locally"),
+    // --- RESP2 subscriber mode: restriction + frame shapes ---
+    c(&["PUBLISH", "nosubs", "hello"]),
+    c(&["SUBSCRIBE", "news"]),
+    c(&["GET", "k1"]), // restricted-context error, byte-exact
+    c(&["SET", "k1", "v"]),
+    c(&["HELLO", "3"]), // not exempt from the RESP2 subscriber restriction
+    c(&["PUBSUB", "CHANNELS"]),
+    c(&["PING"]),
+    c(&["PING", "in-sub-mode"]),
+    c(&["SUBSCRIBE", "news"]), // re-subscribe: frame emitted, count unchanged
+    frames(&["SUBSCRIBE", "sports", "weather"], 2),
+    c(&["UNSUBSCRIBE", "sports"]),
+    frames(&["UNSUBSCRIBE", "news", "weather"], 2),
+    c(&["UNSUBSCRIBE"]),          // nothing left: single nil frame
+    c(&["UNSUBSCRIBE", "ghost"]), // never subscribed: frame, count unchanged
+    c(&["PSUBSCRIBE", "news.*"]),
+    c(&["PUNSUBSCRIBE", "news.*"]),
+    c(&["PUNSUBSCRIBE"]),
+    c(&["SUBSCRIBE"]), // arity errors
+    c(&["PUBLISH", "lonely"]),
+    c(&["PUBSUB"]),
+    // --- RESP3: no restriction, push frames, self-delivery ---
+    skip(&["HELLO", "3"], "identity fields differ; proto switch verified locally"),
+    c(&["SUBSCRIBE", "alpha"]),
+    c(&["PUBSUB", "CHANNELS"]),
+    c(&["PUBSUB", "CHANNELS", "al*"]),
+    c(&["PUBSUB", "CHANNELS", "none*"]),
+    c(&["PUBSUB", "NUMSUB", "alpha", "ghost"]),
+    c(&["PUBSUB", "NUMPAT"]),
+    frames(&["PUBLISH", "alpha", "selfmsg"], 2), // push frame precedes :1
+    c(&["PSUBSCRIBE", "al*"]),
+    c(&["PUBSUB", "NUMPAT"]),
+    frames(&["PUBLISH", "alpha", "both"], 3), // message, pmessage, :2
+    c(&["SET", "ps:probe", "v"]),             // RESP3 subscribers keep the full surface
+    c(&["GET", "ps:probe"]),
+    c(&["UNSUBSCRIBE", "alpha"]),
+    c(&["PUNSUBSCRIBE", "al*"]),
+    skip(
+        &["PUBSUB", "SHARDCHANNELS"],
+        "sharded pub/sub (SSUBSCRIBE family) is the recorded M3 cut line",
+    ),
+    skip(&["HELLO", "2"], "identity fields differ; proto switch verified locally"),
+    c(&["PING"]),
+    c(&["DEL", "ps:probe"]),
+    // --- client-output-buffer-limit (M1-S11) ---
+    c(&["CONFIG", "GET", "client-output-buffer-limit"]),
+    c(&["CONFIG", "SET", "client-output-buffer-limit", "pubsub 256kb 64kb 5"]),
+    c(&["CONFIG", "GET", "client-output-buffer-limit"]),
+    c(&[
+        "CONFIG",
+        "SET",
+        "client-output-buffer-limit",
+        "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60",
+    ]),
     // --- FLUSHDB / FLUSHALL (terminal: wipes the scripted state) ---
     c(&["FLUSHDB", "BOGUS"]),
     c(&["FLUSHALL"]),
@@ -396,4 +484,56 @@ pub static MATRIX: &[Case] = &[
     c(&["MGET", "m1", "m2"]),
     c(&["FLUSHDB", "ASYNC"]),
     c(&["FLUSHDB", "SYNC"]),
+    // --- OOM honesty (M1-S07): maxmemory below the baseline floor makes
+    // pressure unfreeable on BOTH engines, so every DENYOOM verdict and
+    // error byte is comparable per policy; reads and freeing writes stay
+    // allowed. allkeys-* policies evict whatever exists on both sides
+    // before the verdict (state ends empty either way).
+    c(&["SET", "oomprobe", "v"]),
+    c(&["CONFIG", "SET", "maxmemory", "1"]),
+    c(&["CONFIG", "SET", "maxmemory-policy", "noeviction"]),
+    c(&["SET", "oomk", "v"]),
+    c(&["INCR", "oomctr"]),
+    c(&["APPEND", "oomk", "x"]),
+    c(&["GET", "oomprobe"]),
+    c(&["DEL", "missing"]),
+    c(&["CONFIG", "SET", "maxmemory-policy", "volatile-lru"]),
+    c(&["SET", "oomk", "v"]),
+    c(&["GET", "oomprobe"]),
+    c(&["CONFIG", "SET", "maxmemory-policy", "volatile-random"]),
+    c(&["SET", "oomk", "v"]),
+    c(&["CONFIG", "SET", "maxmemory-policy", "volatile-ttl"]),
+    c(&["SET", "oomk", "v"]),
+    c(&["CONFIG", "SET", "maxmemory-policy", "volatile-lfu"]),
+    c(&["SET", "oomk", "v"]),
+    c(&["CONFIG", "SET", "maxmemory-policy", "allkeys-lru"]),
+    c(&["SET", "oomk", "v"]),
+    c(&["CONFIG", "SET", "maxmemory-policy", "allkeys-random"]),
+    c(&["SET", "oomk", "v"]),
+    c(&["CONFIG", "SET", "maxmemory-policy", "allkeys-lfu"]),
+    c(&["SET", "oomk", "v"]),
+    c(&["CONFIG", "SET", "maxmemory", "0"]),
+    c(&["CONFIG", "SET", "maxmemory-policy", "noeviction"]),
+    c(&["SET", "oomk", "recovered"]),
+    c(&["GET", "oomk"]),
+    // --- OBJECT FREQ under an LFU policy (M1-S06) ---
+    c(&["CONFIG", "SET", "maxmemory-policy", "allkeys-lfu"]),
+    skip(
+        &["OBJECT", "FREQ", "oomk"],
+        "popularity scale differs: CMS Morris estimate vs Redis log counter",
+    ),
+    c(&["OBJECT", "FREQ", "missing"]),
+    c(&["CONFIG", "SET", "maxmemory-policy", "noeviction"]),
+    c(&["OBJECT", "FREQ", "oomk"]),
+    // --- INF.NS (M1-S08, InfinityDB extension — unknown to the oracle) ---
+    skip(&["INF.NS", "CREATE", "cache", "EVICTION", "allkeys-lfu"], "InfinityDB extension"),
+    skip(
+        &["INF.NS", "CREATE", "ledger", "MODE", "durable"],
+        "InfinityDB extension; durable mode honestly rejected until M2",
+    ),
+    skip(&["INF.NS", "LIST"], "InfinityDB extension"),
+    skip(&["INF.NS", "INFO", "cache"], "InfinityDB extension"),
+    skip(&["INF.NS", "DROP", "cache"], "InfinityDB extension"),
+    // --- terminal cleanup ---
+    c(&["FLUSHALL"]),
 ];
