@@ -18,6 +18,7 @@ mod envcheck;
 mod gaterun;
 mod gates;
 mod load;
+mod m1rows;
 mod resp;
 
 use std::process::ExitCode;
@@ -30,10 +31,12 @@ USAGE:
     inf-bench load --host H --port P [--threads N] [--conns-per-thread N] [--pipeline P]
                    [--duration SECS] [--mix SET:GET] [--keys N] [--key-prefix S]
                    [--value-size BYTES] [--seed N] [--out FILE.toml]
-    inf-bench gate-run m0 (--target HOST:PORT | --ab A_HOST:PORT,B_HOST:PORT)
-                   [--replicates N] [--gates FILE] [--artifacts-root DIR] [--allow-dirty]
-                   [load flags: --threads --conns-per-thread --pipeline --duration
-                    --mix --keys --key-prefix --value-size --seed]
+    inf-bench gate-run m0|m1 [--replicates N] [--gates FILE] [--artifacts-root DIR]
+                   [--allow-dirty] [--unsafe-env] [--reference-box] [--skip-fill]
+                   [--cells N] [--duration SECS] [--fill-keys N]
+                   [--infinityd-bin PATH] [--redis-bin PATH]
+                   m1 rows: [--storm-keys N] [--flushall-keys N] [--maxmemory-mb N]
+                            [--subs N] [--sub-channels N]
 
 See bins/inf-bench/README.md for what runs on macOS vs what is Linux-pending.";
 

@@ -24,6 +24,7 @@ fn main() {
     let mut verify = false;
     let mut plant = Plant::None;
     let mut overrides: Vec<(String, u64)> = Vec::new();
+    let mut trace_out: Option<String> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -43,10 +44,12 @@ fn main() {
                     let value = take(&flag)?.parse().map_err(|e| format!("{flag}: {e}"))?;
                     overrides.push((flag.clone(), value));
                 }
+                "--trace-out" => trace_out = Some(take("--trace-out")?),
                 "--help" | "-h" => {
                     println!(
-                        "inf-sim --scenario m0-smoke [--seed N|0xN] [--verify-determinism] \
-                         [--plant lost-wakeup] [--cells N] [--connections N] [--commands N]"
+                        "inf-sim --scenario m0-smoke|m1-cache [--seed N|0xN] \
+                         [--verify-determinism] [--plant lost-wakeup] [--cells N] \
+                         [--connections N] [--commands N] [--trace-out FILE]"
                     );
                     std::process::exit(0);
                 }
@@ -62,8 +65,9 @@ fn main() {
 
     let mut scenario = match scenario_name.as_str() {
         "m0-smoke" => Scenario::m0_smoke(seed),
+        "m1-cache" => Scenario::m1_cache(seed),
         other => {
-            eprintln!("inf-sim: unknown scenario {other} (have: m0-smoke)");
+            eprintln!("inf-sim: unknown scenario {other} (have: m0-smoke, m1-cache)");
             std::process::exit(2);
         }
     };
@@ -88,6 +92,17 @@ fn main() {
         report.trace.len(),
         report.trace_hash
     );
+    // Machine-readable line for the nightly fleet (sim-seconds budget sum).
+    println!(
+        "inf-sim: sim_seconds={:.6} published={} delivered={}",
+        report.sim_seconds, report.published, report.delivered
+    );
+    if let Some(path) = &trace_out
+        && let Err(e) = std::fs::write(path, &report.trace)
+    {
+        eprintln!("inf-sim: --trace-out {path}: {e}");
+        std::process::exit(2);
+    }
     for violation in report.oracle_violations.iter().take(5) {
         eprintln!("inf-sim: ORACLE VIOLATION: {violation}");
     }

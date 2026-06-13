@@ -1,0 +1,12 @@
+# DST seed corpus (M1-S15). Format: `<scenario> <seed>` per line.
+#
+# Contract: every line replays green on every merge to main (the corpus
+# test) and at full size in the nightly fleet. When a nightly fresh seed
+# fails, the fix lands WITH that seed appended here — the corpus is the
+# fossil record of every bug the fleet ever caught.
+m0-smoke 0xC0FFEE
+m0-smoke 0xBEEF
+m0-smoke 0x5EED
+m1-cache 0xCAFE
+m1-cache 0xC0FFEE
+m1-cache 0xD15EA5E

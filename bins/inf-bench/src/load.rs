@@ -32,6 +32,11 @@ pub struct LoadSpec {
     pub warmup: Duration,
     /// Fill mode: SET exactly this many keys (partitioned), ignore duration.
     pub fill: Option<u64>,
+    /// M1 TTL-heavy rows: every SET carries `PX <seeded uniform in range>`.
+    pub ttl_range_ms: Option<(u64, u64)>,
+    /// M1 expiry-storm fill: every SET carries `PXAT <abs unix ms>` — the
+    /// whole fill expires at one instant (the 1M-same-second storm shape).
+    pub pxat_ms: Option<u64>,
 }
 
 impl Default for LoadSpec {
@@ -51,6 +56,8 @@ impl Default for LoadSpec {
             seed: 0xC0FFEE,
             warmup: Duration::from_secs(1),
             fill: None,
+            ttl_range_ms: None,
+            pxat_ms: None,
         }
     }
 }
@@ -113,7 +120,18 @@ fn run_conn(
                 Some(range) => match range.next() {
                     Some(i) => {
                         let key = make_key(spec, i);
-                        tx.extend_from_slice(&encode_command(&[b"SET", &key, &value]));
+                        if let Some(at) = spec.pxat_ms {
+                            let at = at.to_string();
+                            tx.extend_from_slice(&encode_command(&[
+                                b"SET",
+                                &key,
+                                &value,
+                                b"PXAT",
+                                at.as_bytes(),
+                            ]));
+                        } else {
+                            tx.extend_from_slice(&encode_command(&[b"SET", &key, &value]));
+                        }
                     }
                     None => {
                         done_sending = true;
@@ -128,7 +146,18 @@ fn run_conn(
                     let key = make_key(spec, rng.next_u64() % spec.keys);
                     let total = spec.set_weight + spec.get_weight;
                     if rng.next_u64() % total < spec.set_weight {
-                        tx.extend_from_slice(&encode_command(&[b"SET", &key, &value]));
+                        if let Some((lo, hi)) = spec.ttl_range_ms {
+                            let px = (lo + rng.next_u64() % (hi - lo).max(1)).to_string();
+                            tx.extend_from_slice(&encode_command(&[
+                                b"SET",
+                                &key,
+                                &value,
+                                b"PX",
+                                px.as_bytes(),
+                            ]));
+                        } else {
+                            tx.extend_from_slice(&encode_command(&[b"SET", &key, &value]));
+                        }
                     } else {
                         tx.extend_from_slice(&encode_command(&[b"GET", &key]));
                     }

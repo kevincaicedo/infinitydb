@@ -176,7 +176,18 @@ fn dst_virtual_time_48h_campaign() {
     const HOURS_48_MS: u64 = 48 * 3600 * 1000;
     let mut store = CellStore::new(StoreConfig::default());
     let t0 = ms(1);
-    let mut x: u64 = 0x48_4F_55_52;
+    // Seedable for the nightly DST fleet (M1-S15): distinct INF_DST_SEED
+    // values are genuinely distinct 48 h campaigns, so the fleet's
+    // sim-seconds budget is real coverage, not the same run repeated.
+    let mut x: u64 = std::env::var("INF_DST_SEED")
+        .ok()
+        .and_then(|v| {
+            let v = v.trim();
+            v.strip_prefix("0x")
+                .map_or_else(|| v.parse().ok(), |hex| u64::from_str_radix(hex, 16).ok())
+        })
+        .filter(|&s| s != 0)
+        .unwrap_or(0x48_4F_55_52);
     let mut rand = move || {
         x ^= x << 13;
         x ^= x >> 7;
