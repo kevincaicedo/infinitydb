@@ -15,6 +15,8 @@ mod pubsub;
 
 pub use clients::{ClientInfo, ClientRegistry};
 pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
+#[doc(hidden)]
+pub use exec::parse_cursor;
 pub use exec::{ConnCx, NodeInfo, execute, execute_slices, stall_request};
 pub use glob::glob_match;
 pub use plane::{ExecOrigin, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane};

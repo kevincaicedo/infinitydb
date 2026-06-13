@@ -5,13 +5,12 @@ use inf_sim::{Scenario, run_scenario};
 
 fn small(seed: u64) -> Scenario {
     Scenario {
-        seed,
         cells: 3,
         connections: 8,
         commands: 1_500,
         key_space: 64,
         pipelined_every: 4,
-        plant: Plant::None,
+        ..Scenario::m0_smoke(seed)
     }
 }
 
@@ -49,16 +48,15 @@ fn m0_smoke_oracle_green() {
 #[test]
 fn planted_lost_wakeup_is_caught_within_1000_seeds() {
     for seed in 0..1_000u64 {
-        let mut scenario = Scenario {
-            seed,
+        let scenario = Scenario {
             cells: 2,
             connections: 4,
             commands: 400,
             key_space: 32,
             pipelined_every: 0,
             plant: Plant::LostWakeup,
+            ..Scenario::m0_smoke(seed)
         };
-        scenario.plant = Plant::LostWakeup;
         let report = run_scenario(&scenario);
         if report.stalled {
             println!("lost wakeup caught at seed {seed}");
@@ -76,13 +74,12 @@ fn planted_lost_wakeup_is_caught_within_1000_seeds() {
 #[ignore = "artifact run: release tier, ~10^7 ops"]
 fn deadlock_battery_all_to_all_saturation() {
     let scenario = Scenario {
-        seed: 0xD00D,
         cells: 4,
         connections: 64,
         commands: 10_000_000,
         key_space: 512,     // hot keyspace ⇒ heavy cross-cell traffic
         pipelined_every: 1, // every client pipelined ⇒ sustained pressure
-        plant: Plant::None,
+        ..Scenario::m0_smoke(0xD00D)
     };
     let report = run_scenario(&scenario);
     assert!(!report.stalled, "deadlock battery stalled");
@@ -96,15 +93,44 @@ fn deadlock_battery_all_to_all_saturation() {
 #[ignore = "artifact run: release tier, 10^6 ops"]
 fn cross_cell_million_op_oracle() {
     let scenario = Scenario {
-        seed: 0x5EED,
         cells: 4,
         connections: 100,
         commands: 1_000_000,
         key_space: 10_000,
         pipelined_every: 3,
-        plant: Plant::None,
+        ..Scenario::m0_smoke(0x5EED)
     };
     let report = run_scenario(&scenario);
     assert!(report.ok(), "violations: {:?}", report.oracle_violations);
     assert_eq!(report.commands_done, scenario.commands);
+}
+
+/// M1-S15 AC seed: the m1-cache scenario runs the pub/sub delivery oracle
+/// (confirmed ⇒ reachable; per-publisher FIFO; exact final ledger), the TTL
+/// slice (PEXPIRE in the mix under the apply oracle), and the quiescence
+/// accounting reconciliation — all green, deterministically.
+#[test]
+fn m1_cache_oracle_green() {
+    let mut scenario = Scenario::m1_cache(0xCAFE);
+    scenario.commands = if cfg!(debug_assertions) { 12_000 } else { 60_000 };
+    let report = run_scenario(&scenario);
+    assert!(!report.stalled, "m1-cache stalled (delivery loss parks phase C)");
+    assert_eq!(report.oracle_violations, Vec::<String>::new());
+    assert_eq!(report.commands_done, scenario.commands);
+    assert!(report.published > 0, "mix produced no PUBLISH traffic");
+    // Every channel has ≥ 2 watchers (subscription plan), so deliveries
+    // strictly exceed publishes when anything was published.
+    assert!(report.delivered > report.published, "fan-out did not fan");
+}
+
+/// M1-S15: determinism holds with the pub/sub plane + subscribers active.
+#[test]
+fn m1_cache_same_seed_same_trace() {
+    let mut scenario = Scenario::m1_cache(0xC0FFEE);
+    scenario.commands = 6_000;
+    let a = run_scenario(&scenario);
+    let b = run_scenario(&scenario);
+    assert!(a.ok(), "violations: {:?}", a.oracle_violations);
+    assert_eq!(a.trace, b.trace, "trace must be byte-identical");
+    assert_eq!((a.published, a.delivered), (b.published, b.delivered));
 }

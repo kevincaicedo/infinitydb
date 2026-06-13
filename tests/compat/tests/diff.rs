@@ -5,6 +5,12 @@
 //! in-process executor as the candidate, runs the scripted matrix on both,
 //! and diffs raw reply bytes per the case's `Check` mode. Skips (with a loud
 //! marker) when `redis-server` is not installed.
+//!
+//! Oracle pinning (M1-S14): when `INF_COMPAT_ORACLE_ADDR=host:port` is set,
+//! the harness connects to that server instead of spawning one — CI runs the
+//! pinned `redis:8.0.5` container (started with `--enable-debug-command yes`,
+//! no persistence) so the oracle version can never drift with the runner's
+//! apt archive. The local dev path (spawn from PATH) is unchanged.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -24,6 +30,26 @@ impl Drop for RedisGuard {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Pinned-oracle mode: connect to an externally managed redis-server
+/// (the dockerized CI oracle). Panics if the address never answers —
+/// CI asked for a pinned oracle, so silently skipping would be a lie.
+fn connect_external(addr: &str) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        match TcpStream::connect(addr) {
+            Ok(s) => break s,
+            Err(_) if Instant::now() < deadline => {
+                // Test orchestration thread — not cell code.
+                #[allow(clippy::disallowed_methods)]
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("INF_COMPAT_ORACLE_ADDR={addr} never answered: {e}"),
+        }
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    stream
 }
 
 fn spawn_redis() -> Option<(RedisGuard, TcpStream)> {
@@ -104,9 +130,15 @@ fn count_frames(buf: &[u8]) -> Option<usize> {
 
 #[test]
 fn matrix_replies_match_redis() {
-    let Some((_guard, mut oracle)) = spawn_redis() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
-        return;
+    let (_guard, mut oracle) = match std::env::var("INF_COMPAT_ORACLE_ADDR") {
+        Ok(addr) => (None, connect_external(&addr)),
+        Err(_) => match spawn_redis() {
+            Some((guard, stream)) => (Some(guard), stream),
+            None => {
+                eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+                return;
+            }
+        },
     };
     let mut candidate = Candidate::new();
     let mut oracle_buf = Vec::new();

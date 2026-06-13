@@ -518,6 +518,39 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
         self.shared.gate.pending() + self.shared.credit_waiters.waiting()
     }
 
+    /// Memory attribution for this cell's keyspace slice (sim accounting
+    /// oracle, tooling — never the data plane).
+    pub fn keyspace_report(&self) -> inf_store::MemoryReport {
+        self.shared.store.borrow().report()
+    }
+
+    /// Pub/sub registry gauges `(owned channels, patterns, state bytes)` —
+    /// the sim teardown oracle asserts all three return to zero once every
+    /// subscriber unwound (M1-S15).
+    pub fn pubsub_gauges(&self) -> (u64, u64, usize) {
+        let ps = self.shared.pubsub.borrow();
+        (ps.live_owned_channel_count(), ps.live_pattern_count(), ps.state_bytes())
+    }
+
+    /// Reaps every wheel entry already expired at `now`, ignoring slice
+    /// budgets. Sim accounting oracle only: equalizes active-vs-lazy expiry
+    /// between the node (wheel slices ran) and the replay model (none did)
+    /// before live-record counts are compared.
+    pub fn drain_expiry(&self, now: Nanos) -> u64 {
+        let mut reaped = 0;
+        loop {
+            let stats = self
+                .shared
+                .store
+                .borrow_mut()
+                .expire_tick(now, ExpiryBudget { max_fires: u32::MAX, max_steps: u32::MAX });
+            reaped += stats.reaped;
+            if stats.reaped == 0 && stats.stale == 0 {
+                return reaped;
+            }
+        }
+    }
+
     fn token(class: TokenClass, key: ConnKey) -> CompletionToken {
         CompletionToken::new(class, key.slot, key.generation)
     }
@@ -1011,15 +1044,20 @@ fn handle_fabric_op<O: PlaneObserver + 'static>(
 ) {
     match op {
         Op::Reply { token, outcome } => {
-            // Delivery-time hop RTT: replies return in send order per cell
-            // pair, so the front send-time entry is this reply's (recording
-            // at the pump's await would charge head-of-line parking to the
-            // fabric).
-            if let Some((sent_token, t0)) =
-                shared.rtt_sent.borrow_mut()[usize::from(from.0)].pop_front()
+            // Delivery-time hop RTT: inline-handled ops reply in send order
+            // per cell pair, so the front send-time entry is this reply's
+            // (recording at the pump's await would charge head-of-line
+            // parking to the fabric). Pump-deferred replies (`INF.PUB`,
+            // M1-S10 — the owner answers after its fan-out acks) interleave
+            // arbitrarily; their sends are never recorded, and the token
+            // match lets them pass without mispairing the queue.
             {
-                debug_assert_eq!(sent_token, token.0, "reply order diverged from sends");
-                shared.rtt_ns.borrow_mut().record(now.saturating_sub(t0).0);
+                let mut sent = shared.rtt_sent.borrow_mut();
+                let queue = &mut sent[usize::from(from.0)];
+                if queue.front().is_some_and(|&(sent_token, _)| sent_token == token.0) {
+                    let (_, t0) = queue.pop_front().expect("front exists");
+                    shared.rtt_ns.borrow_mut().record(now.saturating_sub(t0).0);
+                }
             }
             // The drained reply already returned one data credit; wake one
             // sender blocked on that destination.
@@ -2528,6 +2566,11 @@ async fn send_apply<O: PlaneObserver + 'static>(
             Err(SendError::NoCredit { .. }) => shared.credit_waiters.wait(to).await,
         }
     }
-    shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
+    // RTT pairing relies on in-order replies; `INF.PUB` replies are deferred
+    // by the owner pump (fan acks first), so its hops are not RTT samples —
+    // the fan legs (`INF.PUBFAN`) cover pub/sub in the histogram instead.
+    if argv.first().copied() != Some(&b"INF.PUB"[..]) {
+        shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
+    }
     Ok(waiter)
 }

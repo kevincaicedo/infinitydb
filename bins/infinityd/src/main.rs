@@ -75,10 +75,14 @@ fn parse_args() -> Result<Args, String> {
                 args.park_us =
                     Some(take("--park-us")?.parse().map_err(|e| format!("--park-us: {e}"))?);
             }
+            "--version" | "-V" => {
+                println!("{}", version_line());
+                std::process::exit(0);
+            }
             "--help" | "-h" => {
                 println!(
                     "infinityd [--port 6379] [--cells 4] [--buffers 4096] [--buf-size 4096] \
-                     [--pin-start CORE] [--route-local-only]"
+                     [--pin-start CORE] [--route-local-only] [--version]"
                 );
                 std::process::exit(0);
             }
@@ -89,6 +93,17 @@ fn parse_args() -> Result<Args, String> {
         return Err("--cells must be >= 1".into());
     }
     Ok(args)
+}
+
+/// Build provenance (M1-S14): version + commit + target, stamped by
+/// `build.rs`. The release pipeline owns `INF_VERSION` via the tag.
+fn version_line() -> String {
+    format!(
+        "infinityd {} (git {}, {})",
+        env!("INF_VERSION"),
+        env!("INF_GIT_SHA"),
+        env!("INF_BUILD_TARGET")
+    )
 }
 
 fn main() {
@@ -140,6 +155,7 @@ fn main() {
                 .expect("spawn cell thread"),
         );
     }
+    eprintln!("{}", version_line());
     eprintln!(
         "infinityd: {} cells, port {}, backend {}, route {}",
         args.cells,

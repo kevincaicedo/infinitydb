@@ -106,4 +106,21 @@ mod tests {
         let penalty = gates.iter().find(|g| g.id == "cross_cell_penalty").expect("penalty row");
         assert!(penalty.informational, "penalty is informational post-ADR-0006");
     }
+
+    #[test]
+    fn parses_the_m1_gates_file() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../docs/milestones/m1-gates.toml");
+        let gates = load(path).expect("m1 gates file parses");
+        assert_eq!(gates.len(), 16, "all M1 §6 rows present (incl. informational pressure rows)");
+        let storm = gates.iter().find(|g| g.id == "expiry_storm_p999").expect("storm gate");
+        assert!(storm.passes(1999.0) && !storm.passes(2000.0));
+        let mem = gates.iter().find(|g| g.id == "memory_1x").expect("memory gate");
+        assert!(mem.passes(1.0) && !mem.passes(1.01), "hardened to ≤ 1.0×");
+        let fan = gates.iter().find(|g| g.id == "pubsub_fanout_p99").expect("fan-out gate");
+        assert!(fan.passes(4.9) && !fan.passes(5.0));
+        assert!(
+            gates.iter().filter(|g| g.source.starts_with("loadgen:")).count() >= 7,
+            "gate-run m1 measures the pressure rows natively"
+        );
+    }
 }

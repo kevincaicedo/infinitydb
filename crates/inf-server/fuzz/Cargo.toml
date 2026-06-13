@@ -1,0 +1,33 @@
+# cargo-fuzz crate for inf-server (M1 §5 fuzz adds: SCAN cursor decoder +
+# glob pattern matcher — the classic Redis CVE surface). Standalone
+# workspace — built only by `cargo +nightly fuzz`.
+[package]
+name = "inf-server-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+inf-server = { path = ".." }
+inf-store = { path = "../../inf-store" }
+inf-foundation = { path = "../../inf-foundation" }
+
+[[bin]]
+name = "glob_match"
+path = "fuzz_targets/glob_match.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scan_cursor"
+path = "fuzz_targets/scan_cursor.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

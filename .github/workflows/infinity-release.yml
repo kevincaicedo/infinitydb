@@ -1,0 +1,158 @@
+# InfinityDB release pipeline (M1-S14): one tag push produces the whole
+# release — linux x86-64/aarch64 static binaries, SHA256SUMS, SBOM, the
+# multi-arch Docker image on GHCR (scanned), and a GitHub release that links
+# the generated compat matrix and the claim ledger.
+#
+# NOTE (placement, same caveat as infinity-ci.yml): these workflows assume
+# the GitHub repository root contains `infinitydb/` as a subdirectory. They
+# have not been exercised against a live runner yet — first run must verify
+# the tag trigger, GHCR permissions, and the image-size/scan gates.
+#
+# The alpha tag itself stays gated on M0-R2 (reference box) per the master
+# plan; this pipeline existing does not authorize tagging.
+name: infinity-release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/infinitydb
+
+jobs:
+  binaries:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: infinitydb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+      - name: build static binaries
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p infinityd -p inf
+          strip -s target/${{ matrix.target }}/release/infinityd target/${{ matrix.target }}/release/inf
+        env:
+          INF_RELEASE_VERSION: ${{ github.ref_name }}
+      - name: provenance check
+        run: |
+          out=$(target/${{ matrix.target }}/release/infinityd --version)
+          echo "$out"
+          echo "$out" | grep -F "${{ github.ref_name }}"
+      - name: package
+        run: |
+          name=infinitydb-${{ github.ref_name }}-linux-${{ matrix.arch }}
+          mkdir -p "dist/$name"
+          cp target/${{ matrix.target }}/release/infinityd target/${{ matrix.target }}/release/inf "dist/$name/"
+          cp ../docs/compat-matrix.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: infinitydb/dist/*.tar.gz
+
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build + push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: infinitydb
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.ref_name }}
+          build-args: |
+            INF_RELEASE_VERSION=${{ github.ref_name }}
+            INF_GIT_SHA=${{ github.sha }}
+      - name: image size gate (< 30 MB)
+        run: |
+          docker pull ${{ env.IMAGE }}:${{ github.ref_name }}
+          size=$(docker image inspect ${{ env.IMAGE }}:${{ github.ref_name }} --format '{{.Size}}')
+          echo "image size: $size bytes"
+          test "$size" -lt 31457280
+      - name: smoke (redis-cli out of the box)
+        run: |
+          docker run -d --name inf -p 6399:6379 ${{ env.IMAGE }}:${{ github.ref_name }}
+          sudo apt-get update && sudo apt-get install -y redis-tools
+          for i in $(seq 1 50); do redis-cli -p 6399 PING && break || sleep 0.2; done
+          test "$(redis-cli -p 6399 PING)" = "PONG"
+          test "$(redis-cli -p 6399 SET k v)" = "OK"
+          test "$(redis-cli -p 6399 GET k)" = "v"
+          docker rm -f inf
+      - name: image scan (release-blocking)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.ref_name }}
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+
+  sbom:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: infinitydb
+          format: spdx-json
+          output-file: infinitydb-${{ github.ref_name }}.spdx.json
+          upload-artifact: false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: infinitydb-${{ github.ref_name }}.spdx.json
+
+  release:
+    needs: [binaries, docker, sbom]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+      - name: create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*
+          body: |
+            InfinityDB ${{ github.ref_name }}
+
+            - Docker: `docker run -p 6379:6379 ${{ env.IMAGE }}:${{ github.ref_name }}`
+            - Compat matrix: `docs/compat-matrix.md` (generated artifact, included in the tarballs)
+            - Claim ledger: `docs/claim-ledger.md` — every number in the announcement must be `Allowed` there
+            - Checksums: `SHA256SUMS`; SBOM: `infinitydb-${{ github.ref_name }}.spdx.json`
+
+            Release notes are drafted by hand from `docs/release/announcement-${{ github.ref_name }}.md`
+            and reviewed against the claim ledger before publishing (the draft flag is the review gate).

@@ -904,8 +904,10 @@ fn scan(
     }
 }
 
-/// SCAN cursors are decimal u64 (Redis `strtoull` shape).
-pub(crate) fn parse_cursor(bytes: &[u8]) -> Option<u64> {
+/// SCAN cursors are decimal u64 (Redis `strtoull` shape). `pub` (hidden)
+/// for the fuzz target only — command code stays the consumer.
+#[doc(hidden)]
+pub fn parse_cursor(bytes: &[u8]) -> Option<u64> {
     if bytes.is_empty() || bytes.len() > 20 || !bytes.iter().all(u8::is_ascii_digit) {
         return None;
     }

@@ -1,0 +1,114 @@
+# InfinityDB nightly DST fleet (M1-S15): the simulator as a standing army.
+#
+# Every night: (1) the curated seed corpus replays at full size, (2) a fleet
+# of fresh seeds (derived from the run id — recorded in the log, replayable
+# verbatim) runs both scenarios with determinism verification, (3) seeded
+# 48 h virtual-time expiry campaigns push the simulated-seconds budget past
+# the master-plan target (≥ 1M sim-seconds/night, §17.1). Oracles armed in
+# every run: per-key linearizability (model replay), TTL semantics, pub/sub
+# delivery (confirmed ⇒ reachable, per-publisher FIFO, exact final ledger),
+# accounting reconciliation at quiescence.
+#
+# A failure auto-files an issue carrying the exact scenario + seed + commit
+# (the determinism contract makes that a complete repro) and uploads the
+# trace bundle as an artifact. Fixes land WITH the seed appended to
+# bins/inf-sim/seeds/corpus.txt.
+#
+# NOTE: authored with infinity-ci.yml's layout assumptions (repo root
+# contains infinitydb/); not yet exercised against a live runner.
+name: infinity-dst-nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  fleet:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: infinitydb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: build (release)
+        run: cargo build --release --bin inf-sim
+
+      - name: corpus replay (full size)
+        run: |
+          grep -v '^#' bins/inf-sim/seeds/corpus.txt | grep -v '^$' | \
+          while read -r scenario seed; do
+            echo "== corpus: $scenario $seed =="
+            ./target/release/inf-sim --scenario "$scenario" --seed "$seed" --verify-determinism \
+              | tee -a /tmp/fleet.log
+          done
+
+      - name: fresh-seed fleet (replayable: seeds derive from the run id)
+        run: |
+          base=$(( ${{ github.run_id }} % 0xFFFFFFFF ))
+          echo "fleet seed base: $base (run id ${{ github.run_id }})" | tee -a /tmp/fleet.log
+          fail=0
+          for i in $(seq 0 24); do
+            for scenario in m0-smoke m1-cache; do
+              seed=$(( base + i * 7919 ))
+              if ! ./target/release/inf-sim --scenario "$scenario" --seed "$seed" \
+                     --trace-out /tmp/last-trace.bin >> /tmp/fleet.log 2>&1; then
+                echo "$scenario $seed" >> /tmp/failures.txt
+                cp /tmp/last-trace.bin "/tmp/trace-$scenario-$seed.bin" || true
+                fail=1
+              fi
+            done
+          done
+          exit $fail
+
+      - name: seeded 48h expiry campaigns (6 × 172,800 sim-seconds)
+        run: |
+          for i in $(seq 1 6); do
+            seed=$(( ${{ github.run_id }} + i ))
+            echo "== expiry campaign seed $seed ==" | tee -a /tmp/fleet.log
+            INF_DST_FULL=1 INF_DST_SEED=$seed \
+              cargo test --release -p inf-store --test expiry dst_virtual_time_48h_campaign \
+              | tee -a /tmp/fleet.log
+            echo "inf-sim: sim_seconds=172800 (expiry campaign $seed)" >> /tmp/fleet.log
+          done
+
+      - name: sim-seconds budget gate (≥ 1M)
+        run: |
+          total=$(grep -o 'sim_seconds=[0-9.]*' /tmp/fleet.log | cut -d= -f2 | paste -sd+ | bc)
+          echo "total simulated seconds this night: $total"
+          awk -v t="$total" 'BEGIN { exit (t >= 1000000) ? 0 : 1 }'
+
+      - name: upload trace bundles
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dst-failure-traces
+          path: /tmp/trace-*.bin
+          if-no-files-found: ignore
+
+      - name: file the failure issue (seed = complete repro)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          body="Nightly DST fleet failed on commit ${{ github.sha }} (run ${{ github.run_id }}).
+
+          Failing seeds (scenario seed):
+          \`\`\`
+          $(cat /tmp/failures.txt 2>/dev/null || echo 'see job log — failure outside the fresh-seed fleet')
+          \`\`\`
+
+          Repro: \`cargo run --release --bin inf-sim -- --scenario <scenario> --seed <seed>\`
+          Trace bundles: this run's \`dst-failure-traces\` artifact.
+          Contract: the fix lands WITH the seed appended to \`bins/inf-sim/seeds/corpus.txt\`."
+          gh issue create \
+            --title "DST nightly fleet failure ($(date -u +%F), run ${{ github.run_id }})" \
+            --body "$body"

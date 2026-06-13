@@ -20,7 +20,7 @@ use crate::gates;
 use crate::load::{LoadSpec, render, run as run_load};
 use crate::resp::{connect, parse_info, request};
 
-struct ServerGuard {
+pub(crate) struct ServerGuard {
     child: Child,
     pub port: u16,
 }
@@ -33,7 +33,7 @@ impl Drop for ServerGuard {
 }
 
 impl ServerGuard {
-    fn rss_bytes(&self) -> u64 {
+    pub(crate) fn rss_bytes(&self) -> u64 {
         std::fs::read_to_string(format!("/proc/{}/status", self.child.id()))
             .ok()
             .and_then(|s| {
@@ -66,7 +66,11 @@ fn wait_ready(port: u16) -> Result<(), String> {
     }
 }
 
-fn spawn_infinityd(bin: &str, cells: u16, extra: &[&str]) -> Result<ServerGuard, String> {
+pub(crate) fn spawn_infinityd(
+    bin: &str,
+    cells: u16,
+    extra: &[&str],
+) -> Result<ServerGuard, String> {
     let port = free_port();
     let mut cmd = Command::new(bin);
     cmd.args(["--port", &port.to_string(), "--cells", &cells.to_string()])
@@ -79,7 +83,7 @@ fn spawn_infinityd(bin: &str, cells: u16, extra: &[&str]) -> Result<ServerGuard,
     Ok(guard)
 }
 
-fn spawn_redis(bin: &str) -> Result<ServerGuard, String> {
+pub(crate) fn spawn_redis(bin: &str) -> Result<ServerGuard, String> {
     let port = free_port();
     let child = Command::new(bin)
         .args(["--port", &port.to_string(), "--save", "", "--appendonly", "no"])
@@ -94,7 +98,7 @@ fn spawn_redis(bin: &str) -> Result<ServerGuard, String> {
 
 /// Scrape every cell's INFO (REUSEPORT spreads connections; retry until all
 /// distinct cells answered or attempts run out).
-fn scrape_cells(port: u16, cells: u16) -> Result<Vec<BTreeMap<String, String>>, String> {
+pub(crate) fn scrape_cells(port: u16, cells: u16) -> Result<Vec<BTreeMap<String, String>>, String> {
     let mut seen: BTreeMap<u16, BTreeMap<String, String>> = BTreeMap::new();
     for _ in 0..512 {
         let mut stream = connect("127.0.0.1", port)?;
@@ -111,7 +115,7 @@ fn scrape_cells(port: u16, cells: u16) -> Result<Vec<BTreeMap<String, String>>, 
     Ok(seen.into_values().collect())
 }
 
-fn sum_field(infos: &[BTreeMap<String, String>], field: &str) -> u64 {
+pub(crate) fn sum_field(infos: &[BTreeMap<String, String>], field: &str) -> u64 {
     infos.iter().filter_map(|i| i.get(field)).filter_map(|v| v.parse::<u64>().ok()).sum()
 }
 
@@ -129,62 +133,175 @@ fn raw_counters(infos: &[BTreeMap<String, String>]) -> (u64, u64, u64) {
     (sum_field(infos, "raw_submits"), sum_field(infos, "raw_sqes"), sum_field(infos, "raw_cqes"))
 }
 
-fn median(values: &mut [f64]) -> f64 {
+pub(crate) fn median(values: &mut [f64]) -> f64 {
     values.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
     values[values.len() / 2]
 }
 
-struct Measurements {
-    values: BTreeMap<&'static str, f64>,
-    notes: Vec<String>,
-    raw: String,
+pub(crate) struct Measurements {
+    pub(crate) values: BTreeMap<&'static str, f64>,
+    pub(crate) notes: Vec<String>,
+    pub(crate) raw: String,
 }
 
 impl Measurements {
-    fn set(&mut self, key: &'static str, value: f64) {
+    pub(crate) fn new() -> Measurements {
+        Measurements { values: BTreeMap::new(), notes: Vec::new(), raw: String::new() }
+    }
+
+    pub(crate) fn set(&mut self, key: &'static str, value: f64) {
         self.values.insert(key, value);
     }
 
-    fn note(&mut self, text: impl Into<String>) {
+    pub(crate) fn note(&mut self, text: impl Into<String>) {
         self.notes.push(text.into());
     }
 
-    fn raw_section(&mut self, title: &str, body: &str) {
+    pub(crate) fn raw_section(&mut self, title: &str, body: &str) {
         self.raw.push_str(&format!("\n## {title}\n\n```\n{body}```\n"));
     }
 }
 
+/// Loads a milestone gates file via the usual relative-path candidates.
+pub(crate) fn load_gates(flags: &Flags, milestone: &str) -> Result<Vec<gates::Gate>, String> {
+    let default = format!("../docs/milestones/{milestone}-gates.toml");
+    let gates_path = flags.str_or("gates", &default);
+    gates::load(&gates_path)
+        .or_else(|_| gates::load(&format!("docs/milestones/{milestone}-gates.toml")))
+        .or_else(|_| gates::load(&format!("../../docs/milestones/{milestone}-gates.toml")))
+}
+
+/// The env-check refusal shared by every gate campaign (M0-S18 AC):
+/// `--unsafe-env` records the violation and continues, explicitly
+/// non-citation-grade. Returns whether the env passed.
+pub(crate) fn env_gate(flags: &Flags) -> Result<bool, String> {
+    let mut env_args: Vec<String> = Vec::new();
+    if flags.bool("allow-dirty") {
+        env_args.push("--allow-dirty".into());
+    }
+    let env_verdict = envcheck::cmd_env_check(&env_args);
+    let env_ok = env_verdict.is_ok();
+    if let Err(e) = env_verdict {
+        if !flags.bool("unsafe-env") {
+            return Err(format!(
+                "{e}\ngate-run refuses to run (pass --unsafe-env to record a non-citable dev run)"
+            ));
+        }
+        eprintln!("gate-run: CONTINUING WITH FAILED ENV-CHECK — results are not citation-grade");
+    }
+    Ok(env_ok)
+}
+
+/// Per-gate verdicts + the report file (shared epilogue). Errs when any
+/// binding gate failed.
+pub(crate) fn finish_report(
+    milestone: &str,
+    gates_list: &[gates::Gate],
+    m: &Measurements,
+    env_ok: bool,
+    reference_box: bool,
+    artifacts_root: &str,
+    header_facts: &str,
+) -> Result<(), String> {
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
+    let dir = format!("{artifacts_root}/{stamp}-gate-run");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
+
+    let mut report = String::new();
+    report.push_str(&format!(
+        "# {} gate-run report\n\ndate: {stamp} (unix) · {header_facts}\nenv-check: {}\ntier: {}\n\nnotes:\n",
+        milestone.to_uppercase(),
+        if env_ok { "OK" } else { "FAILED (overridden — NOT citation-grade)" },
+        if reference_box { "reference-box (binding)" } else { "dev (non-binding)" },
+    ));
+    for note in &m.notes {
+        report.push_str(&format!("- {note}\n"));
+    }
+    report.push_str("\n| gate | threshold | measured | verdict |\n|---|---|---|---|\n");
+    println!("\n== gate verdicts ==");
+    let mut binding_failures = 0;
+    for gate in gates_list {
+        let measured = m.values.get(gate.source.as_str()).copied();
+        let (measured_text, verdict) = match measured {
+            None => ("—".to_string(), "PENDING (tooling)".to_string()),
+            Some(value) => {
+                let pass = gate.passes(value);
+                let tag = if pass { "PASS" } else { "FAIL" };
+                let verdict = if gate.informational {
+                    format!("{tag} (informational)")
+                } else if gate.tier == "linux-reference-box" && !reference_box {
+                    format!("{tag} (DEV-TIER, non-binding)")
+                } else {
+                    if !pass {
+                        binding_failures += 1;
+                    }
+                    tag.to_string()
+                };
+                (format!("{value:.2}"), verdict)
+            }
+        };
+        println!("  {:<38} {}", gate.name, verdict);
+        report.push_str(&format!(
+            "| {} | {} {} {} | {} | {} |\n",
+            gate.name, gate.comparator, gate.threshold, gate.unit, measured_text, verdict
+        ));
+    }
+    report.push_str(&m.raw);
+
+    let report_path = format!("{dir}/report.md");
+    let mut file =
+        std::fs::File::create(&report_path).map_err(|e| format!("{report_path}: {e}"))?;
+    file.write_all(report.as_bytes()).map_err(|e| format!("{report_path}: {e}"))?;
+    println!("\ngate-run: report written to {report_path}");
+    if binding_failures > 0 {
+        return Err(format!("{binding_failures} binding gate(s) FAILED"));
+    }
+    Ok(())
+}
+
+pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
+    &["allow-dirty", "unsafe-env", "reference-box", "skip-fill"],
+    &[
+        "allow-dirty",
+        "unsafe-env",
+        "reference-box",
+        "skip-fill",
+        "gates",
+        "artifacts-root",
+        "replicates",
+        "duration",
+        "cells",
+        "infinityd-bin",
+        "redis-bin",
+        "fill-keys",
+        // M1 rows (ignored by the m0 flow):
+        "storm-keys",
+        "flushall-keys",
+        "maxmemory-mb",
+        "subs",
+        "sub-channels",
+    ],
+);
+
 #[allow(clippy::too_many_lines)] // orchestration script: linear, not branchy
 pub fn cmd_gate_run(args: &[String]) -> Result<(), String> {
     let Some((milestone, rest)) = args.split_first() else {
-        return Err("usage: gate-run m0 [flags]".into());
+        return Err("usage: gate-run m0|m1 [flags]".into());
     };
-    if milestone != "m0" {
-        return Err(format!("unknown milestone {milestone} (have: m0)"));
+    let flags = Flags::parse(rest, GATE_RUN_FLAGS.0, GATE_RUN_FLAGS.1)?;
+    match milestone.as_str() {
+        "m0" => cmd_gate_run_m0(&flags),
+        "m1" => crate::m1rows::cmd_gate_run_m1(&flags),
+        other => Err(format!("unknown milestone {other} (have: m0, m1)")),
     }
-    let flags = Flags::parse(
-        rest,
-        &["allow-dirty", "unsafe-env", "reference-box", "skip-fill"],
-        &[
-            "allow-dirty",
-            "unsafe-env",
-            "reference-box",
-            "skip-fill",
-            "gates",
-            "artifacts-root",
-            "replicates",
-            "duration",
-            "cells",
-            "infinityd-bin",
-            "redis-bin",
-            "fill-keys",
-        ],
-    )?;
+}
 
-    let gates_path = flags.str_or("gates", "../docs/milestones/m0-gates.toml");
-    let gates_list = gates::load(&gates_path)
-        .or_else(|_| gates::load("docs/milestones/m0-gates.toml"))
-        .or_else(|_| gates::load("../../docs/milestones/m0-gates.toml"))?;
+#[allow(clippy::too_many_lines)] // orchestration script: linear, not branchy
+fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
+    let gates_list = load_gates(flags, "m0")?;
     let artifacts_root = flags.str_or("artifacts-root", ".artifacts/m0");
     let replicates: usize = flags
         .get("replicates")
@@ -202,24 +319,10 @@ pub fn cmd_gate_run(args: &[String]) -> Result<(), String> {
     let redis_bin = flags.str_or("redis-bin", "redis-server");
     let reference_box = flags.bool("reference-box");
 
-    // 1. env-check refusal (M0-S18 AC). --unsafe-env records the violation
-    //    and continues — the report is then explicitly not citation-grade.
-    let mut env_args: Vec<String> = Vec::new();
-    if flags.bool("allow-dirty") {
-        env_args.push("--allow-dirty".into());
-    }
-    let env_verdict = envcheck::cmd_env_check(&env_args);
-    let env_ok = env_verdict.is_ok();
-    if let Err(e) = env_verdict {
-        if !flags.bool("unsafe-env") {
-            return Err(format!(
-                "{e}\ngate-run refuses to run (pass --unsafe-env to record a non-citable dev run)"
-            ));
-        }
-        eprintln!("gate-run: CONTINUING WITH FAILED ENV-CHECK — results are not citation-grade");
-    }
+    // 1. env-check refusal (M0-S18 AC).
+    let env_ok = env_gate(flags)?;
 
-    let mut m = Measurements { values: BTreeMap::new(), notes: Vec::new(), raw: String::new() };
+    let mut m = Measurements::new();
     if !env_ok {
         m.note("env-check FAILED and was overridden (--unsafe-env): not citation-grade");
     }
@@ -357,61 +460,13 @@ pub fn cmd_gate_run(args: &[String]) -> Result<(), String> {
     }
 
     // 6. Per-gate verdicts + report.
-    let stamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_secs();
-    let dir = format!("{artifacts_root}/{stamp}-gate-run");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
-
-    let mut report = String::new();
-    report.push_str(&format!(
-        "# M0 gate-run report\n\ndate: {stamp} (unix) · cells: {cells} · replicates: \
-         {replicates} · duration: {duration}s\nenv-check: {}\ntier: {}\n\nnotes:\n",
-        if env_ok { "OK" } else { "FAILED (overridden — NOT citation-grade)" },
-        if reference_box { "reference-box (binding)" } else { "dev (non-binding)" },
-    ));
-    for note in &m.notes {
-        report.push_str(&format!("- {note}\n"));
-    }
-    report.push_str("\n| gate | threshold | measured | verdict |\n|---|---|---|---|\n");
-    println!("\n== gate verdicts ==");
-    let mut binding_failures = 0;
-    for gate in &gates_list {
-        let measured = m.values.get(gate.source.as_str()).copied();
-        let (measured_text, verdict) = match measured {
-            None => ("—".to_string(), "PENDING (tooling)".to_string()),
-            Some(value) => {
-                let pass = gate.passes(value);
-                let tag = if pass { "PASS" } else { "FAIL" };
-                let verdict = if gate.informational {
-                    format!("{tag} (informational)")
-                } else if gate.tier == "linux-reference-box" && !reference_box {
-                    format!("{tag} (DEV-TIER, non-binding)")
-                } else {
-                    if !pass {
-                        binding_failures += 1;
-                    }
-                    tag.to_string()
-                };
-                (format!("{value:.2}"), verdict)
-            }
-        };
-        println!("  {:<38} {}", gate.name, verdict);
-        report.push_str(&format!(
-            "| {} | {} {} {} | {} | {} |\n",
-            gate.name, gate.comparator, gate.threshold, gate.unit, measured_text, verdict
-        ));
-    }
-    report.push_str(&m.raw);
-
-    let report_path = format!("{dir}/report.md");
-    let mut file =
-        std::fs::File::create(&report_path).map_err(|e| format!("{report_path}: {e}"))?;
-    file.write_all(report.as_bytes()).map_err(|e| format!("{report_path}: {e}"))?;
-    println!("\ngate-run: report written to {report_path}");
-    if binding_failures > 0 {
-        return Err(format!("{binding_failures} binding gate(s) FAILED"));
-    }
-    Ok(())
+    finish_report(
+        "m0",
+        &gates_list,
+        &m,
+        env_ok,
+        reference_box,
+        &artifacts_root,
+        &format!("cells: {cells} · replicates: {replicates} · duration: {duration}s"),
+    )
 }

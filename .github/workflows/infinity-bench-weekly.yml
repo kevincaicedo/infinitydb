@@ -1,0 +1,43 @@
+# InfinityDB weekly pressure-row campaign (M1 §5: "new pressure rows in
+# CI-bench — reduced, reference box weekly").
+#
+# REQUIRES a self-hosted runner labeled `reference-box` (the M0-R2 box:
+# pinned cores, performance governor, redis-server 8.x installed). Until
+# that runner is registered this workflow can only be dispatched manually
+# and will queue forever on schedule — that is intentional honesty: the
+# rows are meaningless on shared GitHub runners (L10).
+name: infinity-bench-weekly
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+jobs:
+  pressure-rows:
+    runs-on: [self-hosted, reference-box]
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: infinitydb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: build
+        run: cargo build --release -p infinityd -p inf-bench
+      - name: reduced pressure-row campaign (binding tier)
+        # Full-size gate campaign sizes (50M-key FLUSHALL row, 10M fill,
+        # 100k subscriptions) are the milestone-verdict run, executed
+        # manually per M1-S17; the weekly keeps a reduced regression watch.
+        run: |
+          ./target/release/inf-bench gate-run m1 --reference-box \
+            --duration 10 --replicates 3 \
+            --storm-keys 1000000 --flushall-keys 5000000 --fill-keys 10000000 \
+            --maxmemory-mb 1024 --subs 2000 --sub-channels 50
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: weekly-gate-report
+          path: infinitydb/.artifacts/m1/*-gate-run/report.md

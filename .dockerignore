@@ -1,0 +1,8 @@
+target/
+.artifacts/
+.git/
+.github/
+docs/
+tests/client-smoke/
+Dockerfile
+.dockerignore

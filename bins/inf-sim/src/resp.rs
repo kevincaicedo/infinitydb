@@ -50,6 +50,98 @@ fn parse_len(digits: &[u8]) -> i64 {
     text.parse().expect("RESP length parses")
 }
 
+/// One frame on a subscriber connection, classified (M1-S15 pub/sub
+/// delivery oracle). RESP2 only — sim clients never HELLO.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubFrame {
+    /// `[subscribe|unsubscribe|psubscribe|punsubscribe, name|nil, :count]`.
+    Confirm { verb: Vec<u8>, count: i64 },
+    /// `[message, channel, payload]`.
+    Message { channel: Vec<u8>, payload: Vec<u8> },
+    /// `[pmessage, pattern, channel, payload]`.
+    PMessage { channel: Vec<u8>, payload: Vec<u8> },
+}
+
+/// Classifies one complete frame from a subscriber connection.
+///
+/// # Panics
+/// Panics on anything that is not a well-formed RESP2 pub/sub frame — the
+/// server produced it on a subscribed connection, which is itself a finding
+/// the panic surfaces with the seed.
+pub fn parse_sub_frame(raw: &[u8]) -> SubFrame {
+    let items = parse_array(raw);
+    let verb = items.first().and_then(Item::bulk).expect("frame verb is a bulk").to_vec();
+    if verb == b"message" {
+        assert_eq!(items.len(), 3, "message frame arity");
+        return SubFrame::Message {
+            channel: items[1].bulk().expect("channel is a bulk").to_vec(),
+            payload: items[2].bulk().expect("payload is a bulk").to_vec(),
+        };
+    }
+    if verb == b"pmessage" {
+        assert_eq!(items.len(), 4, "pmessage frame arity");
+        return SubFrame::PMessage {
+            channel: items[2].bulk().expect("channel is a bulk").to_vec(),
+            payload: items[3].bulk().expect("payload is a bulk").to_vec(),
+        };
+    }
+    let confirms: [&[u8]; 4] = [b"subscribe", b"unsubscribe", b"psubscribe", b"punsubscribe"];
+    if confirms.contains(&verb.as_slice()) {
+        assert_eq!(items.len(), 3, "confirmation frame arity");
+        let Item::Int(count) = items[2] else {
+            panic!("confirmation count is {:?}, want integer", items[2]);
+        };
+        return SubFrame::Confirm { verb, count };
+    }
+    panic!("unexpected frame on subscriber connection: {:?}", String::from_utf8_lossy(&verb));
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Item {
+    Bulk(Vec<u8>),
+    Nil,
+    Int(i64),
+}
+
+impl Item {
+    fn bulk(&self) -> Option<&[u8]> {
+        match self {
+            Item::Bulk(b) => Some(b),
+            _ => None,
+        }
+    }
+}
+
+/// Flat RESP2 array of bulks/integers (the only shapes pub/sub frames use).
+fn parse_array(buf: &[u8]) -> Vec<Item> {
+    assert_eq!(buf.first(), Some(&b'*'), "pub/sub frame is an array");
+    let header = line_end(buf, 0).expect("complete frame");
+    let n = parse_len(&buf[1..header - 2]);
+    assert!(n >= 0, "pub/sub frame is non-null");
+    let mut items = Vec::with_capacity(n as usize);
+    let mut at = header;
+    for _ in 0..n {
+        let end = frame(buf, at).expect("element of a complete frame is complete");
+        match buf[at] {
+            b'$' => {
+                let h = line_end(buf, at).expect("bulk header");
+                if parse_len(&buf[at + 1..h - 2]) < 0 {
+                    items.push(Item::Nil);
+                } else {
+                    items.push(Item::Bulk(buf[h..end - 2].to_vec()));
+                }
+            }
+            b':' => {
+                let text = core::str::from_utf8(&buf[at + 1..end - 2]).expect("int ASCII");
+                items.push(Item::Int(text.parse().expect("int parses")));
+            }
+            other => panic!("unexpected element tag {other:#04x} in pub/sub frame"),
+        }
+        at = end;
+    }
+    items
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

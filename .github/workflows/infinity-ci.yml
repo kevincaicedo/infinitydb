@@ -91,21 +91,86 @@ jobs:
       - name: fuzz fabric codec (smoke)
         run: cargo +nightly fuzz run fabric_codec -- -max_total_time=300
         working-directory: infinitydb/crates/inf-fabric
+      - name: fuzz glob matcher (smoke, M1 §5)
+        run: cargo +nightly fuzz run glob_match -- -max_total_time=300
+        working-directory: infinitydb/crates/inf-server
+      - name: fuzz SCAN cursor (smoke, M1 §5)
+        run: cargo +nightly fuzz run scan_cursor -- -max_total_time=300
+        working-directory: infinitydb/crates/inf-server
 
   compat-diff:
     # M0-S15 AC: command x edge-case matrix byte-identical to real Redis.
-    # The diff test skips loudly when redis-server is absent, so this job
-    # exists to make sure it actually runs.
+    # M1-S14: the oracle is the PINNED redis:8.0.5 container (the version
+    # E1-E6 byte-diffed against), not whatever apt ships — version drift in
+    # the oracle would silently move the compat claim. The harness connects
+    # via INF_COMPAT_ORACLE_ADDR instead of spawning from PATH.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
-      - name: install redis oracle
-        run: sudo apt-get update && sudo apt-get install -y redis-server
-      - name: compat-diff matrix
+      - name: start pinned oracle (redis 8.0.5, debug commands on, no persistence)
+        run: |
+          docker run -d --name oracle -p 6390:6379 redis:8.0.5 \
+            redis-server --save '' --appendonly no --enable-debug-command yes
+          for i in $(seq 1 100); do
+            (echo PING | timeout 1 nc 127.0.0.1 6390 | grep -q PONG) && break || sleep 0.2
+          done
+      - name: compat-diff matrix + generated-matrix staleness gate
         run: cargo test -p compat -- --nocapture
+        env:
+          INF_COMPAT_ORACLE_ADDR: 127.0.0.1:6390
+
+  client-smoke:
+    # M1-S03/S14 AC: major Redis client libraries work against infinityd out
+    # of the box (INFO fields, CLIENT surface, pub/sub, SCAN). One job per
+    # library would waste runners; one server serves all four sequentially.
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: infinitydb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: build infinityd (release)
+        run: cargo build --release -p infinityd
+      - name: start infinityd
+        run: |
+          ./target/release/infinityd --port 6379 &
+          for i in $(seq 1 100); do
+            (echo PING | timeout 1 nc 127.0.0.1 6379 | grep -q PONG) && break || sleep 0.2
+          done
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: redis-py smoke
+        run: |
+          pip install 'redis>=5,<7'
+          python tests/client-smoke/smoke.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: node-redis smoke
+        run: |
+          npm install --no-save redis@^4
+          node tests/client-smoke/smoke.mjs
+        working-directory: infinitydb/tests/client-smoke
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: go-redis smoke
+        run: go mod tidy && go run .
+        working-directory: infinitydb/tests/client-smoke/go
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: lettuce smoke
+        run: mvn -q -B compile exec:java -Dexec.mainClass=Smoke
+        working-directory: infinitydb/tests/client-smoke/java
 
   sim-smoke:
     # M0-S20: deterministic simulator — smoke scenario twice with trace
