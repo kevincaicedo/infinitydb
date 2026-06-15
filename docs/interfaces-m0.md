@@ -474,8 +474,8 @@ shapes unchanged). Additive deltas: `OpError` + `NotFloat | NanOrInf`;
 `KeySpec::{TWO, PAIRS, SECOND}`; `NodeInfo` + wall-clock anchor / RNG state /
 client registry / CONFIG store; new `inf-store` inherent methods for the
 M1-E1 ops and `expire_tick` (M1-E2). Deadlines past the u40-ms record bound
-now clamp (previously a latent panic). See
-`docs/adr/0008-m1-e1-interface-extensions.md`.
+now clamp (previously a latent panic). See ADR-0008 (M1-E1 interface
+extensions; internal decision record).
 
 **M1-E3/E4 extension note (2026-06-12, ADR-0009):** two frozen signatures
 changed shape — `execute(...)` and `ServerPlane::new(...)` now take
@@ -491,7 +491,7 @@ metadata); `MemoryReport` + `evict_bytes`; `StoreStats` + `evicted_keys`;
 iteration). The fabric codec is unchanged; `Op::Apply`'s `cmd` byte packs
 `{db:4 | proto:4}` (old encodings decode as db 0). The record header's two
 spare flag bits became the CLOCK reference counter (layout untouched). See
-`docs/adr/0009-m1-e3-e4-keyspace-eviction.md`.
+ADR-0009 (M1-E3/E4 keyspace + eviction; internal decision record).
 
 **M1-E5 extension note (2026-06-12, ADR-0010):** all deltas additive. The
 registry grew 58 → 64 (SUBSCRIBE/UNSUBSCRIBE/PSUBSCRIBE/PUNSUBSCRIBE/
@@ -505,7 +505,8 @@ designed). `RespWriter` + `push_header` (RESP3 push / RESP2 array).
 unchanged: the pub/sub fan-out vocabulary (`INF.PUB`/`INF.PUBFAN`/
 `INF.SUBD`/`INF.PUBSUB`) rides `Op::Apply` as unregistered argv programs
 intercepted by the plane ahead of `execute` — invisible to clients,
-reserved names for the fabric. See `docs/adr/0010-m1-e5-pubsub-plane.md`.
+reserved names for the fabric. See ADR-0010 (M1-E5 pub/sub plane; internal
+decision record).
 
 **Linux-validation note (updated 2026-06-11):** the io_uring backend is now
 exercised on real Linux (kernel 7.0): conformance suite green in probed

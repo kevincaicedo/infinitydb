@@ -455,6 +455,35 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
         }
     }
 
+    // Row 8 — hit-rate parity (--with-zipfian): the zipfian LFU trace-replay
+    // that backs the `hit_rate_parity` gate. Hit rate is algorithm-determined,
+    // not governor-sensitive, so it binds anywhere the trace is replayed.
+    if flags.bool("with-zipfian") {
+        let keyspace = flags.u64_or("zipfian-keyspace", 1_000_000)?;
+        let zipf_ops = flags.u64_or("zipfian-ops", 5_000_000)?;
+        let zipf_mb = flags.u64_or("zipfian-maxmemory-mb", 512)?;
+        println!("\n== row: zipfian LFU hit-rate parity (keyspace {keyspace}, {zipf_ops} ops) ==");
+        let params = crate::zipfian::ParityParams {
+            keyspace: keyspace.min(u64::from(u32::MAX)) as u32,
+            warmup: zipf_ops,
+            ops: zipf_ops,
+            value_size: 64,
+            theta: 0.99,
+            seed: 0x5EED_2026_C0DE,
+            maxmemory_bytes: zipf_mb * 1024 * 1024,
+            cells: 1,
+            window: 256,
+        };
+        let parity = crate::zipfian::run_parity(&infinityd, &redis_bin, &params)?;
+        let pp = parity.pp_below();
+        println!(
+            "  InfinityDB {:.2}% vs Redis {:.2}% => {pp:+.2} pp below Redis",
+            parity.infinity.hit_rate() * 100.0,
+            parity.redis.hit_rate() * 100.0
+        );
+        m.set("external:zipfian_lfu", pp);
+    }
+
     finish_report(
         "m1",
         &gates_list,

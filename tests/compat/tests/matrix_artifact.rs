@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use compat::matrixgen::{Status, render, rows};
 
 fn artifact_path() -> PathBuf {
-    // tests/compat → infinitydb → repo root → docs/compat-matrix.md.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../docs/compat-matrix.md")
+    // tests/compat → tests → repo root → docs/compat-matrix.md.
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/compat-matrix.md")
 }
 
 /// The declaration table is mechanically consistent with the registry and

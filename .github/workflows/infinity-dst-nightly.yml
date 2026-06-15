@@ -14,8 +14,8 @@
 # trace bundle as an artifact. Fixes land WITH the seed appended to
 # bins/inf-sim/seeds/corpus.txt.
 #
-# NOTE: authored with infinity-ci.yml's layout assumptions (repo root
-# contains infinitydb/); not yet exercised against a live runner.
+# NOTE: the repo root is the Cargo workspace; jobs run from the root. Not yet
+# exercised against a live runner.
 name: infinity-dst-nightly
 
 on:
@@ -31,9 +31,6 @@ jobs:
   fleet:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    defaults:
-      run:
-        working-directory: infinitydb
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

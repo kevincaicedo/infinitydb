@@ -23,6 +23,7 @@ pub enum CommandId {
     Ping,
     Echo,
     Hello,
+    Quit,
     Get,
     Set,
     Setnx,
@@ -186,10 +187,13 @@ const fn cmd(
 
 /// The registry. M1+ append here (and only here) — the hash table below is
 /// derived mechanically at compile time.
-pub static COMMANDS: [CommandMeta; 64] = [
+pub static COMMANDS: [CommandMeta; 65] = [
     cmd(CommandId::Ping, "PING", -1, CmdFlags::FAST, KeySpec::NONE),
     cmd(CommandId::Echo, "ECHO", 2, CmdFlags::FAST, KeySpec::NONE),
     cmd(CommandId::Hello, "HELLO", -1, CmdFlags::FAST, KeySpec::NONE),
+    // QUIT: the server replies +OK and closes the connection after flushing
+    // (handled in the plane, which owns the connection lifecycle).
+    cmd(CommandId::Quit, "QUIT", 1, CmdFlags::FAST, KeySpec::NONE),
     cmd(CommandId::Get, "GET", 2, RO_FAST, KeySpec::ONE),
     cmd(CommandId::Set, "SET", -3, W_OOM, KeySpec::ONE),
     cmd(CommandId::Setnx, "SETNX", 3, W_FAST_OOM, KeySpec::ONE),

@@ -3,10 +3,10 @@
 # multi-arch Docker image on GHCR (scanned), and a GitHub release that links
 # the generated compat matrix and the claim ledger.
 #
-# NOTE (placement, same caveat as infinity-ci.yml): these workflows assume
-# the GitHub repository root contains `infinitydb/` as a subdirectory. They
-# have not been exercised against a live runner yet — first run must verify
-# the tag trigger, GHCR permissions, and the image-size/scan gates.
+# Layout: the repository root IS the Cargo workspace (no nested `infinitydb/`
+# directory). These jobs have not been exercised against a live runner yet —
+# first run must verify the tag trigger, GHCR permissions, and the
+# image-size/scan gates.
 #
 # The alpha tag itself stays gated on M0-R2 (reference box) per the master
 # plan; this pipeline existing does not authorize tagging.
@@ -35,9 +35,6 @@ jobs:
             target: aarch64-unknown-linux-musl
             arch: aarch64
     runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: infinitydb
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -60,12 +57,12 @@ jobs:
           name=infinitydb-${{ github.ref_name }}-linux-${{ matrix.arch }}
           mkdir -p "dist/$name"
           cp target/${{ matrix.target }}/release/infinityd target/${{ matrix.target }}/release/inf "dist/$name/"
-          cp ../docs/compat-matrix.md "dist/$name/"
+          cp docs/compat-matrix.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.arch }}
-          path: infinitydb/dist/*.tar.gz
+          path: dist/*.tar.gz
 
   docker:
     runs-on: ubuntu-24.04
@@ -81,7 +78,7 @@ jobs:
       - name: build + push multi-arch image
         uses: docker/build-push-action@v6
         with:
-          context: infinitydb
+          context: .
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
@@ -119,7 +116,7 @@ jobs:
       - name: generate SBOM (SPDX)
         uses: anchore/sbom-action@v0
         with:
-          path: infinitydb
+          path: .
           format: spdx-json
           output-file: infinitydb-${{ github.ref_name }}.spdx.json
           upload-artifact: false
@@ -151,8 +148,8 @@ jobs:
 
             - Docker: `docker run -p 6379:6379 ${{ env.IMAGE }}:${{ github.ref_name }}`
             - Compat matrix: `docs/compat-matrix.md` (generated artifact, included in the tarballs)
-            - Claim ledger: `docs/claim-ledger.md` — every number in the announcement must be `Allowed` there
             - Checksums: `SHA256SUMS`; SBOM: `infinitydb-${{ github.ref_name }}.spdx.json`
 
-            Release notes are drafted by hand from `docs/release/announcement-${{ github.ref_name }}.md`
-            and reviewed against the claim ledger before publishing (the draft flag is the review gate).
+            This is a draft. Release notes are written by the maintainer, and every
+            performance or comparative claim is verified against the project's
+            (internal) claim ledger before publishing — the draft flag is that gate.

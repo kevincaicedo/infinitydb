@@ -97,6 +97,9 @@ pub struct ConnCx {
     pub sub_patterns: Vec<Vec<u8>>,
     /// Shared node stats for `INFO` (zeroed default outside a node).
     pub node: Rc<NodeInfo>,
+    /// Set by `QUIT`: reply `+OK`, then the plane closes the connection after
+    /// flushing. Interior-mutable so a `&ConnCx` handler can request it.
+    pub close_requested: Cell<bool>,
 }
 
 impl Default for ConnCx {
@@ -108,6 +111,7 @@ impl Default for ConnCx {
             sub_channels: Vec::new(),
             sub_patterns: Vec::new(),
             node: Rc::new(NodeInfo::default()),
+            close_requested: Cell::new(false),
         }
     }
 }
@@ -285,6 +289,12 @@ fn execute_db(
         }
         CommandId::Echo => w.bulk(argv.arg(1)),
         CommandId::Hello => admin::hello(argv, cx, now, out),
+        // QUIT: acknowledge, then ask the plane to close after the reply
+        // flushes (Redis `quitCommand`). Allowed in RESP2 subscriber mode.
+        CommandId::Quit => {
+            w.simple("OK");
+            cx.close_requested.set(true);
+        }
         CommandId::Get => match store.get(argv.arg(1), now) {
             Some(value) => w.bulk(value),
             None => w.null(),
@@ -1277,6 +1287,20 @@ mod tests {
         let reply = run(&mut cx, &mut store, &[b"HELLO", b"2"]);
         assert!(reply.starts_with(b"*14\r\n"), "RESP2 flat array: {reply:?}");
         assert_eq!(run(&mut cx, &mut store, &[b"GET", b"missing"]), b"$-1\r\n");
+    }
+
+    #[test]
+    fn quit_replies_ok_and_requests_close() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut store, &[b"QUIT"]), b"+OK\r\n");
+        assert!(cx.close_requested.get(), "QUIT must request a connection close");
+        // QUIT is allowed in RESP2 subscriber mode (Redis), unlike normal
+        // commands, which get the subscriber-restriction error there.
+        cx.sub_channels.push(b"chan".to_vec());
+        cx.close_requested.set(false);
+        assert_eq!(run(&mut cx, &mut store, &[b"QUIT"]), b"+OK\r\n");
+        assert!(cx.close_requested.get());
     }
 
     #[test]

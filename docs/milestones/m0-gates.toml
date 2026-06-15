@@ -1,0 +1,127 @@
+# M0 exit gates (STOP) — machine-readable encoding of the M0 milestone plan
+# §6 (internal). Values are fixed by the project master plan §22 (M0, internal);
+# changing a threshold here is a master-plan amendment,
+# not an edit (L10: a gate may not be passed by narrowing it).
+#
+# Consumed by `inf-bench gate-run m0`. Field semantics:
+#   threshold/comparator/unit — the gate inequality, e.g. measured >= 6000000 ops/s.
+#   tier        — "linux-reference-box": a performance gate; its verdict may only
+#                 be decided from runs on the Linux reference box (macOS runs are
+#                 plumbing validation and report PENDING, never PASS/FAIL).
+#                 "any": structural gate; evaluated wherever the measurement
+#                 source actually provides a value.
+#   source      — where gate-run obtains the measurement:
+#                 "loadgen:<metric>"  native inf-bench load replicates (primary target)
+#                 "tripwire:<name>"   INFO tripwires scrape (inf_foundation::tripwire names)
+#                 "ab:<metric>"       interleaved A/B replicates (--ab), ratio A/B
+#                 "external:<what>"   gate-campaign tooling (memtier, flamegraph, smem);
+#                                     always PENDING from gate-run until that tooling lands.
+#   informational — tripwire row that does not block the verdict (still reported).
+
+schema = 1
+milestone = "m0"
+
+[[gate]]
+id = "pipelined_throughput"
+name = "Pipelined GET/SET node throughput"
+threshold = 6000000
+comparator = ">="
+unit = "ops/s"
+tier = "linux-reference-box"
+source = "loadgen:ops_per_sec"
+measured_by = "memtier P=16, 8 cells, 3-5 replicates, A/B vs Redis same box; native loadgen cross-check"
+
+[[gate]]
+id = "unpipelined_512c_vs_redis"
+name = "Unpipelined throughput vs Redis, 512 conns"
+threshold = 1.5
+comparator = ">="
+unit = "x Redis"
+tier = "linux-reference-box"
+source = "ab:ops_per_sec_ratio"
+measured_by = "memtier P=1, 512 conns, interleaved A/B replicates"
+
+[[gate]]
+id = "sqes_per_submit"
+name = "io_uring SQEs per submit under pipelined load"
+threshold = 16
+comparator = ">="
+unit = "sqes/submit"
+tier = "any"
+source = "tripwire:sqes_per_submit"
+measured_by = "tripwire counter scraped via INFO tripwires in the same runs (report-enforced; L3)"
+
+[[gate]]
+id = "fabric_hop_rtt_p50"
+name = "Fabric hop RTT p50 under load"
+threshold = 2.0
+comparator = "<"
+unit = "us"
+tier = "linux-reference-box"
+source = "external:fabric_token_histogram"
+measured_by = "in-process histogram around fabric token round-trip, loaded run"
+
+# Amended by ADR-0006 (2026-06-12): the STOP gate is comparator-anchored
+# (RC-4's own method); the penalty-vs-all-local row below is demoted to an
+# informational tripwire with an M1-owned <=50% target (S17 coalescing).
+[[gate]]
+id = "cross_cell_vs_comparator"
+name = "Cross-cell architecture vs Dragonfly, uniform random"
+threshold = 1.25
+comparator = ">="
+unit = "x Dragonfly"
+tier = "linux-reference-box"
+source = "external:comparator_ab"
+measured_by = "interleaved A/B vs dragonfly --proactor_threads=<cells>, same box/workload, persistence off (ADR-0006); comparator version recorded"
+
+[[gate]]
+id = "cross_cell_penalty"
+name = "Cross-cell penalty, uniform random keys (informational; M1 S17 target)"
+threshold = 50.0
+comparator = "<="
+unit = "% vs all-local"
+tier = "linux-reference-box"
+source = "external:slotmap_ab"
+measured_by = "same workload with slot map forcing 100% local vs natural placement (ADR-0006: informational tripwire, owned by M1-S17 coalescing)"
+informational = true
+
+[[gate]]
+id = "p999_latency"
+name = "p99.9 latency (memtier, 8 threads)"
+threshold = 3000
+comparator = "<"
+unit = "us"
+tier = "linux-reference-box"
+source = "loadgen:p999_us"
+measured_by = "memtier latency histogram, pressure row; native loadgen p999 cross-check"
+
+[[gate]]
+id = "rss_10m_vs_redis"
+name = "RSS @ 10M keys x (16 B, 64 B)"
+threshold = 1.1
+comparator = "<="
+unit = "x Redis"
+tier = "linux-reference-box"
+source = "external:rss_attribution"
+measured_by = "attribution report + smem-style RSS, same dataset loaded in both engines"
+
+[[gate]]
+id = "loop_iter_p999"
+name = "Reactor loop iteration p99.9"
+threshold = 500
+comparator = "<"
+unit = "us"
+tier = "linux-reference-box"
+source = "tripwire:loop_iter_p999_us"
+measured_by = "always-on HDR histogram, scraped via INFO tripwires under the M0 reference load"
+
+[[gate]]
+id = "syscall_cpu_share"
+name = "Syscall CPU share under pipelined load"
+threshold = 15.0
+comparator = "<"
+unit = "%"
+tier = "linux-reference-box"
+source = "external:flamegraph"
+measured_by = "flamegraph attached to the gate campaign (informational tripwire)"
+informational = true

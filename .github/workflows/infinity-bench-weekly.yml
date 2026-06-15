@@ -17,9 +17,6 @@ jobs:
   pressure-rows:
     runs-on: [self-hosted, reference-box]
     timeout-minutes: 180
-    defaults:
-      run:
-        working-directory: infinitydb
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,4 +37,4 @@ jobs:
         if: always()
         with:
           name: weekly-gate-report
-          path: infinitydb/.artifacts/m1/*-gate-run/report.md
+          path: .artifacts/m1/*-gate-run/report.md

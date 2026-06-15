@@ -103,9 +103,9 @@ pub(crate) fn subscriber_restricted(cx: &ConnCx) -> bool {
     cx.proto == Protocol::Resp2 && !(cx.sub_channels.is_empty() && cx.sub_patterns.is_empty())
 }
 
-/// QUIT/RESET are not in the InfinityDB surface yet (they would resolve as
-/// unknown commands before this check), so the allowed set is the subscribe
-/// family + PING.
+/// RESET is not in the InfinityDB surface yet (it resolves as an unknown
+/// command before this check), so the allowed set is the subscribe family,
+/// PING, and QUIT.
 pub(crate) fn allowed_in_subscriber_mode(id: CommandId) -> bool {
     matches!(
         id,
@@ -114,6 +114,7 @@ pub(crate) fn allowed_in_subscriber_mode(id: CommandId) -> bool {
             | CommandId::Psubscribe
             | CommandId::Punsubscribe
             | CommandId::Ping
+            | CommandId::Quit
     )
 }
 

@@ -263,7 +263,7 @@ pub(crate) fn finish_report(
 }
 
 pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
-    &["allow-dirty", "unsafe-env", "reference-box", "skip-fill"],
+    &["allow-dirty", "unsafe-env", "reference-box", "skip-fill", "with-zipfian"],
     &[
         "allow-dirty",
         "unsafe-env",
@@ -283,6 +283,11 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "maxmemory-mb",
         "subs",
         "sub-channels",
+        // M1 hit-rate-parity row (--with-zipfian; see zipfian.rs):
+        "with-zipfian",
+        "zipfian-keyspace",
+        "zipfian-ops",
+        "zipfian-maxmemory-mb",
     ],
 );
 

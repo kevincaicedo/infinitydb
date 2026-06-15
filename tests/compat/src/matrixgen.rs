@@ -75,6 +75,12 @@ pub static DECLARED: &[Declared] = &[
         "M0",
         "identity fields (server/version) are InfinityDB's own, as for any non-Redis server",
     ),
+    d(
+        "QUIT",
+        Status::Partial,
+        "M1",
+        "replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus because closing tears down the shared oracle connection — covered by a unit test and the client-smoke suite",
+    ),
     d("GET", Status::Full, "M0", ""),
     d("SET", Status::Full, "M0", ""),
     d("SETNX", Status::Full, "M0", ""),
