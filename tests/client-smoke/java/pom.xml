@@ -10,7 +10,9 @@
   <version>0.0.0</version>
   <packaging>jar</packaging>
   <properties>
-    <maven.compiler.release>21</maven.compiler.release>
+    <!-- Java 17 (LTS): compiles on the bundled JDK 17 (local smoke image) and
+         on the JDK 21 CI runners. -->
+    <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
   </properties>
   <dependencies>
@@ -22,6 +24,14 @@
   </dependencies>
   <build>
     <plugins>
+      <!-- Pin a modern compiler plugin so the `release` property is honored
+           regardless of the Maven distribution's default plugin binding
+           (older bindings ignore it and fall back to Java 5). -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>

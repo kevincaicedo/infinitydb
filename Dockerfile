@@ -3,7 +3,7 @@
 #
 # The binary is fully static (musl + crt-static, verified static-pie), so the
 # runtime stage carries nothing but the executable: no shell, no libc, no
-# distro CVE surface. Size gate: < 30 MB image (the stripped binary is ~3 MB).
+# distro CVE surface. Size gate: < 10 MB image (the stripped binary is ~3 MB).
 #
 #   docker build -t infinitydb:dev --build-arg INF_RELEASE_VERSION=v0.1.0-alpha.1 .
 #   docker run --rm -p 6379:6379 infinitydb:dev

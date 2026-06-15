@@ -69,6 +69,10 @@ impl Flags {
     pub fn u16_or(&self, name: &str, default: u16) -> Result<u16, String> {
         parse_num(self.get(name), name, default)
     }
+
+    pub fn f64_or(&self, name: &str, default: f64) -> Result<f64, String> {
+        parse_num(self.get(name), name, default)
+    }
 }
 
 #[allow(dead_code)] // reserved with the numeric flag accessors above (M0-S18)

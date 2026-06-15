@@ -1,0 +1,176 @@
+# M1 exit gates (STOP) — machine-readable encoding of the M1 milestone plan
+# §6 (internal). Values are fixed by the project master plan §22 (M1, internal);
+# changing a threshold here is a master-plan amendment, not an
+# edit (L10: a gate may not be passed by narrowing it).
+#
+# Consumed by `inf-bench gate-run m1`. Field semantics identical to
+# m0-gates.toml: loadgen:* rows are measured natively by gate-run; external:*
+# rows come from campaign tooling (compat suite, soak harness, zipfian trace
+# replay, M0-baseline A/B, release pipeline) and report PENDING from gate-run
+# until that artifact is supplied. tier = "linux-reference-box" verdicts bind
+# only on the reference box (M0-R2 standing obligation).
+
+schema = 1
+milestone = "m1"
+
+[[gate]]
+id = "m0_regression"
+name = "M0 gates re-pass within 5%"
+threshold = 5
+comparator = "<="
+unit = "% vs M0 baseline"
+tier = "linux-reference-box"
+source = "external:m0_regression"
+measured_by = "gate-run m0 on the M1 tree A/B vs the archived M0 baseline artifact, same box"
+
+[[gate]]
+id = "memory_1x"
+name = "RSS vs Redis, 10M x (16 B, 64 B)"
+threshold = 1.0
+comparator = "<="
+unit = "x Redis"
+tier = "linux-reference-box"
+source = "external:rss_attribution"
+measured_by = "gate-run m1 fill leg (hardened from M0's 1.1x; release-blocking)"
+
+[[gate]]
+id = "expiry_storm_p999"
+name = "Expiry storm: foreground p99.9"
+threshold = 2000
+comparator = "<"
+unit = "us"
+tier = "linux-reference-box"
+source = "loadgen:expiry_storm_p999_us"
+measured_by = "gate-run m1: 1M same-instant PXAT keys, GET traffic through the storm"
+
+[[gate]]
+id = "expiry_storm_drain"
+name = "Expiry storm: debt drains"
+threshold = 10
+comparator = "<"
+unit = "s"
+tier = "linux-reference-box"
+source = "loadgen:expiry_drain_s"
+measured_by = "gate-run m1: DBSIZE polling from the storm instant to empty"
+
+[[gate]]
+id = "eviction_pressure_p999"
+name = "Eviction pressure: read p99.9 under write storm"
+threshold = 2000
+comparator = "<"
+unit = "us"
+tier = "linux-reference-box"
+source = "loadgen:eviction_storm_p999_us"
+measured_by = "gate-run m1: mixed 1:1 storm against maxmemory, allkeys-lru"
+
+[[gate]]
+id = "eviction_bound"
+name = "Eviction bound: used memory vs maxmemory"
+threshold = 1.05
+comparator = "<="
+unit = "x maxmemory"
+tier = "linux-reference-box"
+source = "loadgen:eviction_used_over_limit"
+measured_by = "gate-run m1: INFO used_memory sum at storm end (bounded slack; RSS story in attribution)"
+
+[[gate]]
+id = "flushall_under_load"
+name = "FLUSHALL under load: read p99"
+threshold = 2000
+comparator = "<"
+unit = "us"
+tier = "linux-reference-box"
+source = "loadgen:flushall_p99_us"
+measured_by = "gate-run m1: GET traffic while FLUSHALL lands mid-run (50M-key row on the reference box)"
+
+[[gate]]
+id = "ttl_heavy_p999"
+name = "TTL-heavy mix p99.9 (feature-pressure row)"
+threshold = 2000
+comparator = "<"
+unit = "us"
+tier = "linux-reference-box"
+source = "loadgen:ttl_heavy_p999_us"
+informational = true
+measured_by = "gate-run m1: every SET carries PX 100..5000ms"
+
+[[gate]]
+id = "hit_rate_parity"
+name = "allkeys-lfu hit rate vs Redis (zipfian)"
+threshold = 2
+comparator = "<="
+unit = "pp below Redis"
+tier = "linux-reference-box"
+source = "external:zipfian_lfu"
+measured_by = "trace-replay campaign: zipfian th=0.99, same memory, vs Redis 8 LFU defaults"
+
+[[gate]]
+id = "pubsub_fanout_p99"
+name = "Pub/sub fan-out p99 (100k subscriptions)"
+threshold = 5
+comparator = "<"
+unit = "ms"
+tier = "linux-reference-box"
+source = "loadgen:pubsub_fanout_p99_ms"
+measured_by = "gate-run m1: PUBLISH reply is delivery-acked; run with --subs 2000 --sub-channels 50 (registry) and --subs sized to the box for receiver count"
+
+[[gate]]
+id = "pubsub_bg_p999"
+name = "KV p99.9 with pub/sub background traffic"
+threshold = 2000
+comparator = "<"
+unit = "us"
+tier = "linux-reference-box"
+source = "loadgen:pubsub_bg_p999_us"
+informational = true
+measured_by = "gate-run m1: saturating publisher behind the default KV mix"
+
+[[gate]]
+id = "slow_subscriber_kill"
+name = "Slow subscriber dies at the output cap"
+threshold = 1
+comparator = ">="
+unit = "killed (bool)"
+tier = "any"
+source = "loadgen:slow_subscriber_killed"
+measured_by = "gate-run m1: unread subscriber under 16 KiB publishes, pubsub cap 256kb/64kb/2"
+
+[[gate]]
+id = "compat_full_green"
+name = "100% byte-diff green on declared-full"
+threshold = 1
+comparator = ">="
+unit = "green (bool)"
+tier = "any"
+source = "external:compat_suite"
+measured_by = "cargo test -p compat vs the pinned redis:8.0.5 oracle + matrix staleness gate"
+
+[[gate]]
+id = "soak_24h"
+name = "24h soak: zero crashes, RSS slope"
+threshold = 0.5
+comparator = "<"
+unit = "%/24h"
+tier = "linux-reference-box"
+source = "external:soak"
+measured_by = "soak harness (campaign tooling); release-blocking"
+
+[[gate]]
+id = "image_size"
+name = "Docker image size"
+threshold = 10
+comparator = "<"
+unit = "MB"
+tier = "any"
+source = "external:image_size"
+measured_by = "release pipeline image-size gate (infinity-release.yml)"
+
+[[gate]]
+id = "client_smoke"
+name = "Client smoke green x4 libraries"
+threshold = 4
+comparator = ">="
+unit = "libraries"
+tier = "any"
+source = "external:client_smoke"
+measured_by = "CI client-smoke job: redis-py, node-redis, go-redis, lettuce"

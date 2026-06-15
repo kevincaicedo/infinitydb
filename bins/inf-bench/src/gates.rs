@@ -89,8 +89,8 @@ mod tests {
 
     #[test]
     fn parses_the_checked_in_gates_file() {
-        // The file lives outside the workspace root (repo docs/).
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../docs/milestones/m0-gates.toml");
+        // bins/inf-bench → bins → repo root → docs/milestones/.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/milestones/m0-gates.toml");
         let gates = load(path).expect("gates file parses");
         assert_eq!(gates.len(), 10, "all ten §6 gates present (ADR-0006 added the comparator row)");
         let sqes = gates.iter().find(|g| g.id == "sqes_per_submit").expect("sqes gate");
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn parses_the_m1_gates_file() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../docs/milestones/m1-gates.toml");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/milestones/m1-gates.toml");
         let gates = load(path).expect("m1 gates file parses");
         assert_eq!(gates.len(), 16, "all M1 §6 rows present (incl. informational pressure rows)");
         let storm = gates.iter().find(|g| g.id == "expiry_storm_p999").expect("storm gate");

@@ -362,6 +362,7 @@ impl<O: PlaneObserver + 'static> Shared<O> {
             sub_channels: Vec::new(),
             sub_patterns: Vec::new(),
             node: Rc::clone(&self.node),
+            close_requested: Cell::new(false),
         };
         let now = self.now.get();
         execute_slices(argv, &mut self.store.borrow_mut(), &mut cx, now, out);
@@ -614,6 +615,7 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                         sub_channels: Vec::new(),
                         sub_patterns: Vec::new(),
                         node: Rc::clone(&self.shared.node),
+                        close_requested: Cell::new(false),
                     },
                     out: Vec::new(),
                     send_inflight: false,
@@ -798,6 +800,7 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
             let mut deferred: Vec<OwnedCmd> = Vec::new();
             let mut spawn_first: Option<OwnedCmd> = None;
             let mut protocol_error = false;
+            let mut quit = false;
             {
                 let mut conns = self.shared.conns.borrow_mut();
                 let Some(conn) = conns.get_mut(key) else {
@@ -850,6 +853,14 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                                 if let Some(dur) = stall_request(&argv_slices) {
                                     self.shared.stall_until.set(now.saturating_add(dur));
                                 }
+                                // QUIT: stop processing this buffer (Redis
+                                // discards anything pipelined after QUIT) and
+                                // close once the +OK reply has flushed.
+                                if conn_cx.close_requested.get() {
+                                    conn_cx.close_requested.set(false);
+                                    quit = true;
+                                    break;
+                                }
                             }
                         }
                         Parsed::Incomplete => {}
@@ -863,7 +874,7 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                 }
                 drop(iter);
                 let conn = conns.get_mut(key).expect("conn checked above");
-                if protocol_error {
+                if protocol_error || quit {
                     conn.close_after_flush = true;
                 }
                 conn.queue.extend(deferred);
@@ -1600,6 +1611,7 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
                     sub_channels: c.cx.sub_channels.clone(),
                     sub_patterns: c.cx.sub_patterns.clone(),
                     node: Rc::clone(&shared.node),
+                    close_requested: Cell::new(false),
                 }) else {
                     return false;
                 };

@@ -15,6 +15,7 @@ fn oracle_key_indices(id: CommandId, argc: usize) -> Vec<usize> {
         CommandId::Ping
         | CommandId::Echo
         | CommandId::Hello
+        | CommandId::Quit
         | CommandId::Info
         | CommandId::Command
         | CommandId::Dbsize
