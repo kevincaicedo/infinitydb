@@ -1,0 +1,17 @@
+[package]
+name = "inf-compare"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "InfinityDB competitive benchmark harness: drives memtier/redis-benchmark against redis, dragonfly, and infinitydb on one box and renders a markdown report"
+
+# Tooling tier (never the data plane). Deliberately ZERO external crates: the
+# competitive harness only orchestrates external load generators and parses
+# their output with a hand-rolled JSON reader, so it shares neither code nor a
+# dependency surface with the system under test. Mirrors the inf-bench rule.
+[dependencies]
+
+[lints]
+workspace = true

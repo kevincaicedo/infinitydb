@@ -2,3 +2,6 @@ target/
 *.profraw
 # benchmark artifacts ARE committed (.artifacts/) — do not ignore them
 crates/inf-server/fuzz/corpus/
+.artifacts/compare
+crates/inf-wire/fuzz/corpus/
+crates/inf-fabric/fuzz/corpus/
