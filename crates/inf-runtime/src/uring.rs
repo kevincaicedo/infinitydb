@@ -861,6 +861,10 @@ fn kernel_version() -> (u32, u32) {
     if unsafe { libc::uname(&mut uts) } != 0 {
         return (0, 0);
     }
+    // `c` is `c_char`: `i8` on x86_64 (so `as u8` reinterprets the byte) but
+    // `u8` on aarch64 (so `as u8` is identity, which clippy flags). The chain
+    // is correct on both; allow the no-op cast on platforms where it's a no-op.
+    #[allow(clippy::unnecessary_cast)]
     let release = uts.release.iter().take_while(|&&c| c != 0).map(|&c| c as u8 as char);
     let text: String = release.collect();
     let mut parts = text.split(['.', '-']);

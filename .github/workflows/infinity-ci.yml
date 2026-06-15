@@ -151,7 +151,7 @@ jobs:
       - name: node-redis smoke
         run: |
           npm install --no-save redis@^4
-          node tests/client-smoke/smoke.mjs
+          node smoke.mjs
         working-directory: tests/client-smoke
       - uses: actions/setup-go@v5
         with:
