@@ -36,6 +36,13 @@ compat:
 sim-smoke:
     cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
 
+# Competitive benchmark: drive memtier against redis + infinitydb (Phase-1 MVP),
+# render a markdown report under .artifacts/compare/. Pass extra flags through,
+# e.g. `just benchmark --workload mixed --duration 10 --pipeline 1`.
+# See `cargo run -p inf-compare -- help` for the full flag surface.
+benchmark *ARGS:
+    cargo run --release -p inf-compare -- run {{ARGS}}
+
 # Build the release Docker image (static musl -> scratch). Usage:
 #   just docker-build [tag] [version]
 docker-build tag="infinitydb:dev" version="v0.1.0-alpha-dev":

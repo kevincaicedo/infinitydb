@@ -114,6 +114,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // `fabrics` is only borrowed mutably to install eventfd wakeups, which is
+    // Linux-only (see the cfg block below); on other targets the binding is
+    // consumed by `into_iter()` and never needs `mut`.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut fabrics = Mesh::new(args.cells, MeshConfig { ring_capacity: 4096, data_credits: 1024 });
 
     // Doorbell wakeups (M0-R1, Linux): each cell adopts an eventfd watch;
