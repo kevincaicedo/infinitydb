@@ -1,11 +1,13 @@
 //! `inf-foundation` — shared vocabulary for InfinityDB (master plan §20).
 //!
 //! Types, ids, time/randomness injection seams (L7), stable hashing, CRC16
-//! slot math, varints, the always-on latency histogram, and the frozen
-//! tripwire counter names. This crate is dependency-free and fully safe.
+//! slot math, varints, the always-on latency histogram, deterministic fault
+//! triggers, and the frozen tripwire counter names. This crate is
+//! dependency-free and fully safe.
 #![forbid(unsafe_code)]
 
 mod crc;
+pub mod fault;
 mod hash;
 mod hist;
 mod ids;

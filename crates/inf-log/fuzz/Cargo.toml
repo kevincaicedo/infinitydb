@@ -1,0 +1,24 @@
+# cargo-fuzz crate for inf-log (M2-S01 AC: frame decoder fuzz target wired
+# into CI smoke). Standalone workspace: built only by `cargo +nightly fuzz`
+# and never enters the main workspace graph.
+[package]
+name = "inf-log-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+inf-log = { path = ".." }
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

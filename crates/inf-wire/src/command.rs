@@ -46,6 +46,8 @@ pub enum CommandId {
     Pttl,
     Persist,
     Info,
+    Bgsave,
+    Lastsave,
     Command,
     // ---- M1-S01 · string family ----
     Mget,
@@ -90,6 +92,8 @@ pub enum CommandId {
     /// identity seam M2 durability classes attach to. An `INF.*` extension,
     /// not a Redis command.
     InfNs,
+    /// `INF.CKPT [CELL k] [WAIT]` — M2 manual checkpoint trigger.
+    InfCkpt,
     /// Internal cross-cell program op: atomically read value+TTL and delete
     /// at the owning cell (the RENAME/MOVE fabric-program primitive). Not a
     /// Redis command; listed in `COMMAND` output as an `INF.*` extension.
@@ -187,7 +191,7 @@ const fn cmd(
 
 /// The registry. M1+ append here (and only here) — the hash table below is
 /// derived mechanically at compile time.
-pub static COMMANDS: [CommandMeta; 65] = [
+pub static COMMANDS: [CommandMeta; 68] = [
     cmd(CommandId::Ping, "PING", -1, CmdFlags::FAST, KeySpec::NONE),
     cmd(CommandId::Echo, "ECHO", 2, CmdFlags::FAST, KeySpec::NONE),
     cmd(CommandId::Hello, "HELLO", -1, CmdFlags::FAST, KeySpec::NONE),
@@ -216,6 +220,8 @@ pub static COMMANDS: [CommandMeta; 65] = [
     cmd(CommandId::Pttl, "PTTL", 2, RO_FAST, KeySpec::ONE),
     cmd(CommandId::Persist, "PERSIST", 2, W_FAST, KeySpec::ONE),
     cmd(CommandId::Info, "INFO", -1, CmdFlags::ADMIN, KeySpec::NONE),
+    cmd(CommandId::Bgsave, "BGSAVE", -1, CmdFlags::ADMIN, KeySpec::NONE),
+    cmd(CommandId::Lastsave, "LASTSAVE", 1, CmdFlags::ADMIN.union(CmdFlags::FAST), KeySpec::NONE),
     cmd(CommandId::Command, "COMMAND", -1, CmdFlags::ADMIN, KeySpec::NONE),
     // ---- M1-S01 · string family ----
     cmd(CommandId::Mget, "MGET", -2, RO_FAST, KeySpec::ALL_TRAILING),
@@ -259,6 +265,8 @@ pub static COMMANDS: [CommandMeta; 65] = [
     cmd(CommandId::Pubsub, "PUBSUB", -2, CmdFlags::READONLY, KeySpec::NONE),
     // ---- M1-E4 · namespaces v1 ----
     cmd(CommandId::InfNs, "INF.NS", -2, CmdFlags::ADMIN, KeySpec::NONE),
+    // ---- M2-S20 · checkpoint operator surface ----
+    cmd(CommandId::InfCkpt, "INF.CKPT", -1, CmdFlags::ADMIN, KeySpec::NONE),
     // ---- internal fabric-program ops (INF.* extension namespace) ----
     cmd(CommandId::InfTake, "INF.TAKE", 2, W_FAST, KeySpec::ONE),
     cmd(CommandId::InfPeek, "INF.PEEK", 2, RO_FAST, KeySpec::ONE),
@@ -274,9 +282,9 @@ const MAX_NAME_LEN: usize = 16;
 /// const builder below proves them collision-free at compile time, so a new
 /// command that breaks them fails the build (re-search the constants then —
 /// `(w0·M1 ^ w1·M2) >> 56` over random odd pairs; the M1-E5 pub/sub growth
-/// to 64 names re-searched in ~1k attempts).
-const HASH_MULTIPLIER_LO: u64 = 0x1FC5_3112_C1E2_07B5;
-const HASH_MULTIPLIER_HI: u64 = 0xF76D_1FD1_8160_AEBB;
+/// to 68 names re-searched in 6,188 deterministic attempts).
+const HASH_MULTIPLIER_LO: u64 = 0x6477_C536_F525_842B;
+const HASH_MULTIPLIER_HI: u64 = 0x9FD6_8685_1FF2_D505;
 /// Word-wide ASCII case fold (`a-z` → `A-Z`); zero padding stays zero.
 /// Non-letters map somewhere harmless — the verify word-compare against the
 /// canonical name rejects any non-command byte sequence.

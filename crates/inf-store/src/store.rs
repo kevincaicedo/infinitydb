@@ -21,6 +21,7 @@ use inf_alloc::{Arena, ArenaAddr, ArenaConfig};
 use inf_foundation::hash64;
 use inf_foundation::time::Nanos;
 
+use crate::effect::{MutationEffect, MutationSink, NoMutationSink};
 use crate::evict::{self, EvictState, EvictStats, EvictionPolicy, Tracking};
 use crate::index::Index;
 use crate::record::{
@@ -227,6 +228,51 @@ pub struct MemoryReport {
     pub evict_bytes: u64,
     pub live_records: u64,
 }
+
+#[derive(Copy, Clone, Debug)]
+pub struct CheckpointWalkBudget {
+    pub max_home_groups: usize,
+}
+
+impl CheckpointWalkBudget {
+    pub const fn new(max_home_groups: usize) -> CheckpointWalkBudget {
+        CheckpointWalkBudget { max_home_groups }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct CheckpointWalk {
+    pub next_cursor: u64,
+    pub done: bool,
+    pub home_groups_scanned: usize,
+    pub records_emitted: usize,
+    pub payload_bytes: usize,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct CheckpointStoreRecord<'a> {
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+    pub expire_at_ms: Option<u64>,
+    pub raw: bool,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum CheckpointWalkError {
+    ZeroHomeGroupBudget,
+}
+
+impl core::fmt::Display for CheckpointWalkError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CheckpointWalkError::ZeroHomeGroupBudget => {
+                write!(f, "checkpoint walk home-group budget must be nonzero")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CheckpointWalkError {}
 
 /// One cell's keyspace slice. Single-threaded by construction (owns a
 /// `!Send` arena); all time is injected.
@@ -525,6 +571,17 @@ impl CellStore {
         opts: SetOptions,
         now: Nanos,
     ) -> Result<SetOutcome, OpError> {
+        self.set_with_effect(key, value, opts, now, &mut NoMutationSink)
+    }
+
+    pub fn set_with_effect(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        opts: SetOptions,
+        now: Nanos,
+        sink: &mut impl MutationSink,
+    ) -> Result<SetOutcome, OpError> {
         check_bounds(key, value)?;
         let existing = self.resolve(key, now);
         let old_view = existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
@@ -546,6 +603,7 @@ impl CellStore {
         };
         let spec = RecordSpec { key, value, version, expire_at_ms, raw: false };
         self.write_record(key, existing, spec)?;
+        sink.push(MutationEffect::StringPostImage { key, value, expire_at_ms, raw: false });
         self.note_ttl(old_deadline.is_some(), expire_at_ms.is_some());
         if let Some(ms) = expire_at_ms
             && old_deadline != Some(ms)
@@ -557,12 +615,22 @@ impl CellStore {
 
     /// `DEL` (single key). True if the key existed.
     pub fn del(&mut self, key: &[u8], now: Nanos) -> bool {
+        self.del_with_effect(key, now, &mut NoMutationSink)
+    }
+
+    pub fn del_with_effect(
+        &mut self,
+        key: &[u8],
+        now: Nanos,
+        sink: &mut impl MutationSink,
+    ) -> bool {
         match self.resolve(key, now) {
             Some((addr, len)) => {
                 let had_ttl = RecordView::new(self.arena.bytes(addr, len)).expire_at_ms().is_some();
                 self.index.remove(Self::hash_key(key), addr);
                 self.arena.free(addr, len);
                 self.note_ttl(had_ttl, false);
+                sink.push(MutationEffect::Delete { key });
                 true
             }
             None => false,
@@ -571,6 +639,15 @@ impl CellStore {
 
     /// `GETDEL`: the value, removing the key.
     pub fn getdel(&mut self, key: &[u8], now: Nanos) -> Option<Vec<u8>> {
+        self.getdel_with_effect(key, now, &mut NoMutationSink)
+    }
+
+    pub fn getdel_with_effect(
+        &mut self,
+        key: &[u8],
+        now: Nanos,
+        sink: &mut impl MutationSink,
+    ) -> Option<Vec<u8>> {
         let (addr, len) = self.resolve(key, now)?;
         let view = RecordView::new(self.arena.bytes(addr, len));
         let value = view.value().to_vec();
@@ -578,12 +655,23 @@ impl CellStore {
         self.index.remove(Self::hash_key(key), addr);
         self.arena.free(addr, len);
         self.note_ttl(had_ttl, false);
+        sink.push(MutationEffect::Delete { key });
         Some(value)
     }
 
     /// `GETEX`: the value, with an optional TTL side effect (M1-S01). A
     /// past deadline deletes the key after the read (Redis semantics).
     pub fn get_ex(&mut self, key: &[u8], update: TtlUpdate, now: Nanos) -> Option<Vec<u8>> {
+        self.get_ex_with_effect(key, update, now, &mut NoMutationSink)
+    }
+
+    pub fn get_ex_with_effect(
+        &mut self,
+        key: &[u8],
+        update: TtlUpdate,
+        now: Nanos,
+        sink: &mut impl MutationSink,
+    ) -> Option<Vec<u8>> {
         let value = {
             let Some((addr, len)) = self.resolve(key, now) else {
                 self.stats.keyspace_misses += 1;
@@ -595,10 +683,10 @@ impl CellStore {
         match update {
             TtlUpdate::Keep => {}
             TtlUpdate::Persist => {
-                self.expire(key, None, ExpireCond::Always, now);
+                self.expire_with_effect(key, None, ExpireCond::Always, now, sink);
             }
             TtlUpdate::At(at) => {
-                self.expire(key, Some(at), ExpireCond::Always, now);
+                self.expire_with_effect(key, Some(at), ExpireCond::Always, now, sink);
             }
         }
         Some(value)
@@ -820,6 +908,17 @@ impl CellStore {
     /// `EXPIRE`/`PEXPIRE`/`PERSIST` (`at: None` removes the TTL). True if
     /// the deadline was applied/removed.
     pub fn expire(&mut self, key: &[u8], at: Option<Nanos>, cond: ExpireCond, now: Nanos) -> bool {
+        self.expire_with_effect(key, at, cond, now, &mut NoMutationSink)
+    }
+
+    pub fn expire_with_effect(
+        &mut self,
+        key: &[u8],
+        at: Option<Nanos>,
+        cond: ExpireCond,
+        now: Nanos,
+        sink: &mut impl MutationSink,
+    ) -> bool {
         let Some((addr, len)) = self.resolve(key, now) else { return false };
         let view = RecordView::new(self.arena.bytes(addr, len));
         let current = view.expire_at_ms();
@@ -852,6 +951,7 @@ impl CellStore {
             self.index.remove(Self::hash_key(key), addr);
             self.arena.free(addr, len);
             self.note_ttl(current.is_some(), false);
+            sink.push(MutationEffect::Delete { key });
             return true;
         }
         // Rewrite with the new TTL-extension state. The ±5-byte extension
@@ -867,6 +967,7 @@ impl CellStore {
         if self.write_record_at(key, Some((addr, len)), spec).is_err() {
             return false;
         }
+        sink.push(MutationEffect::ExpireAt { key, expire_at_ms: new_ms });
         self.note_ttl(current.is_some(), new_ms.is_some());
         if let Some(ms) = new_ms
             && current != new_ms
@@ -874,6 +975,93 @@ impl CellStore {
             self.arm_wheel(Self::hash_key(key), ms);
         }
         true
+    }
+
+    /// Recovery replay: apply one logged M2 mutation without emitting another
+    /// mutation effect and without interpreting TTLs against boot time.
+    pub fn replay_mutation_effect(&mut self, effect: MutationEffect<'_>) -> Result<(), OpError> {
+        match effect {
+            MutationEffect::StringPostImage { key, value, expire_at_ms, raw } => {
+                self.replay_string_post_image(key, value, expire_at_ms, raw)
+            }
+            MutationEffect::Delete { key } => {
+                self.replay_delete(key);
+                Ok(())
+            }
+            MutationEffect::ExpireAt { key, expire_at_ms } => {
+                self.replay_expire_at(key, expire_at_ms).map(|_| ())
+            }
+        }
+    }
+
+    /// Recovery replay: install the exact logged string post-image.
+    pub fn replay_string_post_image(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        expire_at_ms: Option<u64>,
+        raw: bool,
+    ) -> Result<(), OpError> {
+        check_bounds(key, value)?;
+        check_expire_bound(expire_at_ms)?;
+
+        let existing = self.find_record(key);
+        let (version, old_deadline) = match existing {
+            Some((addr, len)) => {
+                let view = RecordView::new(self.arena.bytes(addr, len));
+                (view.version().wrapping_add(1), view.expire_at_ms())
+            }
+            None => (1, None),
+        };
+        let spec = RecordSpec { key, value, version, expire_at_ms, raw };
+        self.write_record(key, existing, spec)?;
+        self.note_ttl(old_deadline.is_some(), expire_at_ms.is_some());
+        if let Some(ms) = expire_at_ms
+            && old_deadline != Some(ms)
+        {
+            self.arm_wheel(Self::hash_key(key), ms);
+        }
+        Ok(())
+    }
+
+    /// Recovery replay: remove a key structurally, even if its logged TTL is
+    /// already in the past relative to the boot clock.
+    pub fn replay_delete(&mut self, key: &[u8]) -> bool {
+        let hash = Self::hash_key(key);
+        let Some((addr, len)) = self.find_record_hashed(key, hash) else { return false };
+        let had_ttl = RecordView::new(self.arena.bytes(addr, len)).expire_at_ms().is_some();
+        self.index.remove(hash, addr);
+        self.arena.free(addr, len);
+        self.note_ttl(had_ttl, false);
+        true
+    }
+
+    /// Recovery replay: structurally set or clear a key's TTL. Missing keys
+    /// remain missing, matching idempotent tail replay after a fuzzy snapshot.
+    pub fn replay_expire_at(
+        &mut self,
+        key: &[u8],
+        expire_at_ms: Option<u64>,
+    ) -> Result<bool, OpError> {
+        check_expire_bound(expire_at_ms)?;
+        let Some((addr, len)) = self.find_record(key) else { return Ok(false) };
+        let view = RecordView::new(self.arena.bytes(addr, len));
+        let current = view.expire_at_ms();
+        if current == expire_at_ms {
+            return Ok(false);
+        }
+
+        let key_owned = view.key().to_vec();
+        let value_owned = view.value().to_vec();
+        let version = view.version().wrapping_add(1);
+        let raw = view.is_raw();
+        let spec = RecordSpec { key: &key_owned, value: &value_owned, version, expire_at_ms, raw };
+        self.write_record_at(key, Some((addr, len)), spec)?;
+        self.note_ttl(current.is_some(), expire_at_ms.is_some());
+        if let Some(ms) = expire_at_ms {
+            self.arm_wheel(Self::hash_key(key), ms);
+        }
+        Ok(true)
     }
 
     // ---- keyspace iteration (M1-S02) ----
@@ -940,6 +1128,72 @@ impl CellStore {
             self.index.remove(hash, addr);
             self.arena.free(addr, len);
             self.note_reap_lazy();
+        }
+    }
+
+    /// Read-only checkpoint walk over live string records using the same
+    /// reverse-binary home-group cursor shape as `SCAN`.
+    ///
+    /// This is the store-local index/record seam for M2 checkpoints. It does
+    /// not reap expired records and does not allocate. A later checkpoint
+    /// scheduler is responsible for byte/time budgets across sections.
+    pub fn checkpoint_walk(
+        &self,
+        cursor: u64,
+        budget: CheckpointWalkBudget,
+        now: Nanos,
+        mut emit: impl FnMut(CheckpointStoreRecord<'_>),
+    ) -> Result<CheckpointWalk, CheckpointWalkError> {
+        if budget.max_home_groups == 0 {
+            return Err(CheckpointWalkError::ZeroHomeGroupBudget);
+        }
+
+        let mask = self.index.group_count() as u64 - 1;
+        let mut cursor = cursor & mask;
+        let mut home_groups_scanned = 0usize;
+        let mut records_emitted = 0usize;
+        let mut payload_bytes = 0usize;
+
+        loop {
+            self.index.scan_home_group(
+                cursor as usize,
+                |addr| Self::hash_key(record_at(&self.arena, addr).key()),
+                |addr| {
+                    let view = record_at(&self.arena, addr);
+                    if view.is_expired(now) {
+                        return;
+                    }
+                    let record = CheckpointStoreRecord {
+                        key: view.key(),
+                        value: view.value(),
+                        expire_at_ms: view.expire_at_ms(),
+                        raw: view.is_raw(),
+                    };
+                    payload_bytes += checkpoint_record_payload_bytes(record);
+                    records_emitted += 1;
+                    emit(record);
+                },
+            );
+            home_groups_scanned += 1;
+            cursor = next_rev_cursor(cursor, mask);
+            if cursor == 0 {
+                return Ok(CheckpointWalk {
+                    next_cursor: cursor,
+                    done: true,
+                    home_groups_scanned,
+                    records_emitted,
+                    payload_bytes,
+                });
+            }
+            if home_groups_scanned >= budget.max_home_groups {
+                return Ok(CheckpointWalk {
+                    next_cursor: cursor,
+                    done: false,
+                    home_groups_scanned,
+                    records_emitted,
+                    payload_bytes,
+                });
+            }
         }
     }
 
@@ -1105,6 +1359,20 @@ impl CellStore {
         Some((addr, len))
     }
 
+    /// Index lookup without expire-on-read or access tracking. Recovery uses
+    /// this to reconstruct the logged image exactly before live maintenance
+    /// resumes.
+    fn find_record(&self, key: &[u8]) -> Option<(ArenaAddr, usize)> {
+        self.find_record_hashed(key, Self::hash_key(key))
+    }
+
+    fn find_record_hashed(&self, key: &[u8], hash: u64) -> Option<(ArenaAddr, usize)> {
+        let arena = &self.arena;
+        let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
+        let len = record_at(arena, addr).encoded_len();
+        Some((addr, len))
+    }
+
     /// Eviction access tracking (M1-S06): one cached branch when no LRU/LFU
     /// policy is active (the M1-S07 hot-path rule). CLOCK saturates the
     /// in-record reference bits (one OR on a line the access already
@@ -1202,6 +1470,10 @@ fn wheel_cursor(wheel: &TtlWheel) -> u64 {
     wheel.cursor_ms()
 }
 
+fn checkpoint_record_payload_bytes(record: CheckpointStoreRecord<'_>) -> usize {
+    record.key.len() + record.value.len() + if record.expire_at_ms.is_some() { 8 } else { 0 }
+}
+
 /// Reverse-binary cursor increment (the Redis `dictScan` order) over a
 /// power-of-two group space: high bits advance first, so groups split by a
 /// doubling are visited adjacently and never missed.
@@ -1225,6 +1497,14 @@ pub(crate) fn record_at(arena: &Arena, addr: ArenaAddr) -> RecordView<'_> {
 #[inline]
 fn check_bounds(key: &[u8], value: &[u8]) -> Result<(), OpError> {
     if key.len() > MAX_KEY_LEN || value.len() > MAX_VAL_LEN {
+        return Err(OpError::TooLarge);
+    }
+    Ok(())
+}
+
+#[inline]
+fn check_expire_bound(expire_at_ms: Option<u64>) -> Result<(), OpError> {
+    if expire_at_ms.is_some_and(|ms| ms > MAX_EXPIRE_MS) {
         return Err(OpError::TooLarge);
     }
     Ok(())
@@ -1295,4 +1575,40 @@ fn fmt_i64(buf: &mut [u8; 20], v: i64) -> &[u8] {
         buf[at] = b'-';
     }
     &buf[at..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_expire_at_does_not_expire_against_boot_time() {
+        let mut store = CellStore::new(StoreConfig::default());
+        store.replay_string_post_image(b"k", b"value", Some(5), false).expect("post-image");
+
+        assert_eq!(store.stats().ttl_live, 1);
+        assert!(store.replay_expire_at(b"k", Some(20)).expect("expire replay"));
+
+        assert_eq!(store.get(b"k", Nanos(10_000_000)), Some(b"value".as_slice()));
+        assert_eq!(store.stats().ttl_live, 1);
+    }
+
+    #[test]
+    fn replay_delete_removes_expired_record_structurally() {
+        let mut store = CellStore::new(StoreConfig::default());
+        store.replay_string_post_image(b"k", b"value", Some(5), false).expect("post-image");
+
+        assert!(store.replay_delete(b"k"));
+
+        assert_eq!(store.get(b"k", Nanos(0)), None);
+        assert_eq!(store.stats().ttl_live, 0);
+    }
+
+    #[test]
+    fn replay_post_image_preserves_raw_encoding_flag() {
+        let mut store = CellStore::new(StoreConfig::default());
+        store.replay_string_post_image(b"k", b"42", None, true).expect("post-image");
+
+        assert_eq!(store.object_encoding(b"k", Nanos(0)), Some((Encoding::Raw, None)));
+    }
 }

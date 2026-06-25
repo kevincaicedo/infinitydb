@@ -27,7 +27,8 @@ mod kqueue;
 mod uring;
 
 pub use driver::{
-    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, SubmitStats, Wait,
+    BackendDriver, Capabilities, Completion, CompletionResult, FileOpenMode, FileSyncMode, IoOp,
+    RawFd, SubmitStats, Wait,
 };
 pub use executor::{CellExecutor, PollImmediate, TaskId};
 pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate};

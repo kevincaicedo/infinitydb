@@ -12,8 +12,14 @@
 //! byte-for-byte (the single-key linearizability oracle: apply points on a
 //! single thread form a real total order).
 
+pub mod durability;
 pub mod harness;
 pub mod net;
 pub mod resp;
 
+pub use durability::{
+    DurabilityAudit, DurabilityClass, DurabilityOracle, DurabilitySweepConfig,
+    DurabilitySweepReport, EVERYSEC_LOSS_WINDOW, IterationAppend, IterationWrite, LogSeq,
+    find_planted_ack_before_fsync_canary, run_durability_sweep,
+};
 pub use harness::{Scenario, SimReport, run_scenario};

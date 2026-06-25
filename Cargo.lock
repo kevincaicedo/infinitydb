@@ -374,6 +374,12 @@ version = "0.0.0"
 [[package]]
 name = "inf-log"
 version = "0.0.0"
+dependencies = [
+ "inf-foundation",
+ "inf-simd",
+ "proptest",
+ "toml",
+]
 
 [[package]]
 name = "inf-replica"
@@ -398,6 +404,7 @@ dependencies = [
  "inf-alloc",
  "inf-fabric",
  "inf-foundation",
+ "inf-log",
  "inf-runtime",
  "inf-store",
  "inf-wire",
@@ -410,17 +417,20 @@ dependencies = [
  "inf-alloc",
  "inf-fabric",
  "inf-foundation",
+ "inf-log",
  "inf-runtime",
  "inf-server",
  "inf-store",
  "inf-wire",
  "libc",
+ "toml",
 ]
 
 [[package]]
 name = "inf-simd"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "proptest",
 ]
 

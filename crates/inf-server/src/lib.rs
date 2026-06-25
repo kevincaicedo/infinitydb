@@ -6,17 +6,25 @@
 #![forbid(unsafe_code)]
 
 mod admin;
+pub mod checkpoint;
 mod clients;
 mod config;
+pub mod durability;
 mod exec;
 mod glob;
+pub mod log_bootstrap;
+pub mod log_maintenance;
+pub mod log_writer;
+pub mod manifest;
+pub mod ns_catalog;
 mod plane;
 mod pubsub;
+pub mod recovery;
 
 pub use clients::{ClientInfo, ClientRegistry};
 pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
 #[doc(hidden)]
 pub use exec::parse_cursor;
-pub use exec::{ConnCx, NodeInfo, execute, execute_slices, stall_request};
+pub use exec::{ConnCx, NodeInfo, execute, execute_durable, execute_slices, stall_request};
 pub use glob::glob_match;
 pub use plane::{ExecOrigin, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane};

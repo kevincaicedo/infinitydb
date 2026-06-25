@@ -47,7 +47,7 @@ const REF_MASK: u8 = 0b1100;
 /// clamps at every deadline-conversion site so the writer assert is an
 /// internal invariant, not an input panic — M1-S03 fix of a latent M0 bound
 /// panic on ≥ 34.8-year TTLs).
-pub(crate) const MAX_EXPIRE_MS: u64 = (1 << 40) - 1;
+pub const MAX_EXPIRE_MS: u64 = (1 << 40) - 1;
 /// Versions live in 24 bits (see the module deviation note).
 pub(crate) const VERSION_MASK: u32 = (1 << 24) - 1;
 

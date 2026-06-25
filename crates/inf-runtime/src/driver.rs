@@ -25,6 +25,26 @@ use crate::token::CompletionToken;
 /// perform syscalls on it.
 pub type RawFd = std::os::fd::RawFd;
 
+/// Semantic file-open modes for M2 durability code.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum FileOpenMode {
+    ReadOnly,
+    ReadWrite,
+    ReadWriteCreate,
+    /// Create if missing and truncate the file to zero bytes before writes.
+    /// This is for atomic-publish temp files whose new image length may be
+    /// shorter than the previous image.
+    ReadWriteCreateTruncate,
+    Directory,
+}
+
+/// Sync strength requested by the durability layer.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum FileSyncMode {
+    DataOnly,
+    Full,
+}
+
 /// Operations a cell may queue. `push` never performs a syscall — everything
 /// goes out in the single `submit_and_reap` per loop iteration (L3).
 #[derive(Debug)]
@@ -48,6 +68,41 @@ pub enum IoOp {
     /// Close the fd. Pending sends on it complete with `Error(ECANCELED)`
     /// (returning their buffers) before `Closed` is delivered.
     Close { fd: RawFd, token: CompletionToken },
+    /// Open a file or directory relative to `dir`. `name` is owned by the
+    /// driver until completion so async backends can keep stable C strings.
+    FileOpen { dir: RawFd, name: String, mode: FileOpenMode, token: CompletionToken },
+    /// Create a directory relative to `dir`. This is a cold boot/control-plane
+    /// operation; callers must explicitly sync the parent directory after a
+    /// successful create when crash behavior depends on the new entry.
+    FileCreateDir { dir: RawFd, name: String, mode: u32, token: CompletionToken },
+    /// Preallocate `[0, len_bytes)` on a regular file. ENOSPC is a normal
+    /// per-op error completion; durable namespaces must stop writes above it.
+    FilePreallocate { fd: RawFd, len_bytes: u64, token: CompletionToken },
+    /// Set the visible length of a regular file. This is a cold durability
+    /// boundary op used to materialize sealed log segment used bytes before
+    /// successor segment writes.
+    FileTruncate { fd: RawFd, len_bytes: u64, token: CompletionToken },
+    /// Read up to `len` bytes at `offset_bytes` into a caller-owned buffer.
+    /// The buffer returns in `FileRead` or `Error`, exactly like `Send`.
+    FileReadAt { fd: RawFd, offset_bytes: u64, buf: BufferId, len: u32, token: CompletionToken },
+    /// Write exactly `len` bytes at `offset_bytes` from a caller-owned
+    /// buffer. The buffer returns in `FileWritten` or `Error`.
+    FileWriteAt { fd: RawFd, offset_bytes: u64, buf: BufferId, len: u32, token: CompletionToken },
+    /// Sync one fd. Directory fsync uses `FileSyncMode::Full`.
+    FileSync { fd: RawFd, mode: FileSyncMode, token: CompletionToken },
+    /// Close a file fd. File close is separate from socket `Close` so network
+    /// cancellation rules do not leak into durability code.
+    FileClose { fd: RawFd, token: CompletionToken },
+    /// Atomic rename relative to two directory fds.
+    FileRename {
+        old_dir: RawFd,
+        old_name: String,
+        new_dir: RawFd,
+        new_name: String,
+        token: CompletionToken,
+    },
+    /// Remove one non-directory name relative to `dir`.
+    FileUnlink { dir: RawFd, name: String, token: CompletionToken },
 }
 
 /// One reaped completion: the token that was armed plus the outcome.
@@ -78,6 +133,19 @@ pub enum CompletionResult {
         buf: BufferId,
     },
     Closed,
+    FileOpened {
+        fd: RawFd,
+    },
+    /// File read completion. `len == 0` is EOF for the requested offset.
+    FileRead {
+        buf: BufferId,
+        len: u32,
+    },
+    FileWritten {
+        buf: BufferId,
+    },
+    FileDone,
+    FileClosed,
     /// Terminal failure. Any buffer the op still held ALWAYS comes back
     /// here; `None` means no consumer-owned buffer was involved.
     Error {

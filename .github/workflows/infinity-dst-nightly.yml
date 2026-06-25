@@ -28,6 +28,90 @@ permissions:
   issues: write
 
 jobs:
+  m2-durability-oracle-10k:
+    # M2-S19 gate rehearsal: synthetic oracle only. Real recovered-state
+    # durability sweeps still require the later S17/S19 runner integration.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: build inf-sim (release)
+        run: cargo build --release --bin inf-sim
+
+      - name: M2 durability-oracle synthetic 10k shard
+        run: |
+          ./target/release/inf-sim \
+            --scenario m2-durability-oracle \
+            --seed 0xD2D2 \
+            --sweep-seeds 10000 \
+            --sweep-shard-index ${{ matrix.shard }} \
+            --sweep-shard-count 4 \
+            --writes-per-seed 96 \
+            --verify-determinism \
+            --trace-out /tmp/m2-durability-oracle-shard-${{ matrix.shard }}.bin \
+            | tee /tmp/m2-durability-oracle-shard-${{ matrix.shard }}.log
+
+      - name: M2 public recovered-state durability shard
+        run: |
+          ./target/release/inf-sim \
+            --scenario m2-public-durability-sweep \
+            --seed 0xD2550000 \
+            --sweep-seeds 10000 \
+            --sweep-shard-index ${{ matrix.shard }} \
+            --sweep-shard-count 4 \
+            --writes-per-seed 24 \
+            --key-space 8 \
+            --verify-determinism \
+            --trace-out /tmp/m2-public-durability-shard-${{ matrix.shard }}.bin \
+            | tee /tmp/m2-public-durability-shard-${{ matrix.shard }}.log
+
+      - name: M2 public everysec loss-window shard
+        run: |
+          ./target/release/inf-sim \
+            --scenario m2-public-everysec-sweep \
+            --seed 0xE5EC0000 \
+            --sweep-seeds 10000 \
+            --sweep-shard-index ${{ matrix.shard }} \
+            --sweep-shard-count 4 \
+            --verify-determinism \
+            --trace-out /tmp/m2-public-everysec-shard-${{ matrix.shard }}.bin \
+            | tee /tmp/m2-public-everysec-shard-${{ matrix.shard }}.log
+
+      - name: M2 public everysec workload shard
+        run: |
+          ./target/release/inf-sim \
+            --scenario m2-public-everysec-workload-sweep \
+            --seed 0xE5EC8500 \
+            --sweep-seeds 10000 \
+            --sweep-shard-index ${{ matrix.shard }} \
+            --sweep-shard-count 4 \
+            --writes-per-seed 24 \
+            --key-space 8 \
+            --verify-determinism \
+            --trace-out /tmp/m2-public-everysec-workload-shard-${{ matrix.shard }}.bin \
+            | tee /tmp/m2-public-everysec-workload-shard-${{ matrix.shard }}.log
+
+      - name: upload M2 durability shard manifests
+        uses: actions/upload-artifact@v4
+        with:
+          name: m2-durability-shard-${{ matrix.shard }}
+          path: |
+            /tmp/m2-durability-oracle-shard-${{ matrix.shard }}.bin
+            /tmp/m2-durability-oracle-shard-${{ matrix.shard }}.log
+            /tmp/m2-public-durability-shard-${{ matrix.shard }}.bin
+            /tmp/m2-public-durability-shard-${{ matrix.shard }}.log
+            /tmp/m2-public-everysec-shard-${{ matrix.shard }}.bin
+            /tmp/m2-public-everysec-shard-${{ matrix.shard }}.log
+            /tmp/m2-public-everysec-workload-shard-${{ matrix.shard }}.bin
+            /tmp/m2-public-everysec-workload-shard-${{ matrix.shard }}.log
+
   fleet:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -48,7 +132,13 @@ jobs:
               | tee -a /tmp/fleet.log
           done
 
-      - name: fresh-seed fleet (replayable: seeds derive from the run id)
+      - name: M2 crash-matrix partial runner (checked runner_rows)
+        run: |
+          echo "== m2-crash-matrix partial runner ==" | tee -a /tmp/fleet.log
+          ./target/release/inf-sim --scenario m2-crash-matrix --verify-determinism \
+            | tee -a /tmp/fleet.log
+
+      - name: "fresh-seed fleet (replayable: seeds derive from the run id)"
         run: |
           base=$(( ${{ github.run_id }} % 0xFFFFFFFF ))
           echo "fleet seed base: $base (run id ${{ github.run_id }})" | tee -a /tmp/fleet.log

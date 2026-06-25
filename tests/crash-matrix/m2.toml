@@ -1,0 +1,399 @@
+schema = "infinitydb.m2.crash-matrix.v1"
+milestone = "M2-S17"
+status = "partial-runner"
+
+fault_points = [
+    "log_append_short_write",
+    "torn_frame",
+    "fsync_err",
+    "manifest_rename_fail",
+    "power_cut_after_manifest",
+    "dir_fsync_fail",
+    "checkpoint_write_enospc",
+    "power_cut_after_seal",
+]
+
+fsync_policies = [
+    "everysec",
+    "always",
+]
+
+[[workload_shapes]]
+name = "single_write"
+description = "one durable namespace write followed by crash and recovery"
+oracle = "recovered state matches the acked-write contract for the selected fsync policy"
+
+[[workload_shapes]]
+name = "batched_pipeline"
+description = "multiple durable writes coalesced into one LOG iteration"
+oracle = "acked writes survive, unacked writes do not leak past the policy watermark"
+
+[[workload_shapes]]
+name = "restart_watermark"
+description = "a durable prefix followed by a failed later batch and restart"
+oracle = "restart recovers exactly the durable prefix watermark: prior acked writes survive and failed-batch writes remain absent"
+
+[[workload_shapes]]
+name = "segment_recovery"
+description = "writes around segment tail, seal, and recovered writer bootstrap"
+oracle = "recovery reaches a valid frame boundary and state digest matches reference replay"
+
+[[workload_shapes]]
+name = "checkpoint_tail"
+description = "checkpoint image plus MANIFEST publication followed by tail replay"
+oracle = "checkpoint image state and post-checkpoint tail state survive while pre-checkpoint-only log state is skipped"
+
+[[workload_shapes]]
+name = "live_checkpoint_command"
+description = "public INF.CKPT WAIT command path with live checkpoint image and MANIFEST publication"
+oracle = "WAIT replies only after MANIFEST durability; a failed live MANIFEST publish fail-stops before any reply and recovery falls back to the complete log"
+
+[[workload_shapes]]
+name = "manifest_replacement"
+description = "already-published MANIFEST followed by a failed newer MANIFEST replacement"
+oracle = "old durable MANIFEST remains the recovery root, its tail is replayed, and partial-new checkpoint image state is ignored"
+
+[[workload_shapes]]
+name = "public_recovered_state_sweep"
+description = "shardable public RESP workload sweep with simulated power cuts and recovery digests"
+oracle = "the checked CI-sized sweep manifest matches the public recovered-state oracle; 10k gate-scale artifacts run in the nightly S19 fleet"
+
+[[workload_shapes]]
+name = "public_everysec_workload_sweep"
+description = "shardable public everysec multi-write workload with timer-fsynced prefix and loss-window suffix"
+oracle = "the checked CI-sized sweep recovers a valid prefix at or after the timer-fsynced boundary and fully recovers after timer fsync"
+
+[[fault_coverage]]
+fault_point = "log_append_short_write"
+status = "runner-covered"
+test = "inf-sim::net::tests::public_log_append_write_fault_fail_stop"
+notes = "public runner row injects EIO into the current FileWriteAt terminal-error path, fail-stops before ACK, and recovers the pre-batch state; kernel short-write retry remains S17 work until BackendDriver exposes partial-write progress"
+
+[[fault_coverage]]
+fault_point = "torn_frame"
+status = "unit-covered"
+test = "inf-server::log_bootstrap::tests::recovered_data_root_bootstrap_torn_frame_fault_truncates_bad_crc_final_frame"
+notes = "recovered active-tail bad-CRC final-frame path truncates to the last complete frame"
+
+[[fault_coverage]]
+fault_point = "fsync_err"
+status = "unit-covered"
+test = "inf-server::log_writer::tests::fsync_err_fault_is_fatal_before_frame_is_durable"
+notes = "writer returns SyncQueued before fdatasync, then fsync_err returns fatal Fsync; live plane fail-stop is unit-tested and public runner rows now cover zero-watermark replay, non-zero previous-watermark replay, and process non-zero exit, while the full process matrix remains S17 work"
+
+[[fault_coverage]]
+fault_point = "manifest_rename_fail"
+status = "unit-covered"
+test = "inf-server::manifest::tests::manifest_rename_fail_fault_is_typed_before_directory_sync"
+notes = "real MANIFEST publish path covers rename failure before directory fsync; public runner rows now prove a failed first-publish MANIFEST rename falls back to full-log replay and failed replacement MANIFEST rename preserves the old durable MANIFEST"
+
+[[fault_coverage]]
+fault_point = "power_cut_after_manifest"
+status = "runner-covered"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+notes = "public checkpoint-tail row power-cuts after checkpoint image and MANIFEST directory fsync, then recovers through the production MANIFEST bootstrap; pre-MANIFEST swap failures and full cartesian rows remain S17 work"
+
+[[fault_coverage]]
+fault_point = "dir_fsync_fail"
+status = "unit-covered"
+test = "inf-server::log_bootstrap::tests::first_boot_layout_dir_fsync_fault_is_typed_error"
+notes = "first-boot directory sync failure returns a typed non-success error before durable layout claim; public runner rows now prove failed first-publish MANIFEST directory fsync falls back to full-log replay, failed replacement MANIFEST directory fsync preserves the old durable MANIFEST, and live INF.CKPT WAIT fail-stops before reply on final MANIFEST dir-fsync EIO"
+
+[[fault_coverage]]
+fault_point = "checkpoint_write_enospc"
+status = "runner-covered"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+notes = "public runner row injects ENOSPC into checkpoint image temp writes, returns a typed publish error before MANIFEST replacement, and recovers through the old durable MANIFEST; full cartesian rows remain M2-S17 work"
+
+[[fault_coverage]]
+fault_point = "power_cut_after_seal"
+status = "runner-covered"
+test = "inf-sim::net::tests::public_power_cut_after_non_exact_seal_recovers_truncated_segment"
+notes = "public runner rows cover exact-fill segment seal and non-exact truncate-before-rotate through a MAINTAIN-preallocated segment 1, then power-cut and recover through the production two-segment replay path"
+
+[[recovery_path_coverage]]
+path = "torn_final_frame"
+fault_point = "torn_frame"
+workload = "segment_recovery"
+status = "runner-covered"
+test = "inf-sim::net::tests::public_torn_final_frame_recovers_stable_prefix"
+oracle = "bad-CRC final frame recovers by positioning the writer at the last complete frame while replaying only the stable prefix"
+notes = "public runner row corrupts the final frame trailer in the deterministic sim disk image, power-cuts, and recovers through production active-tail replay"
+
+[[recovery_path_coverage]]
+path = "active_tail_later_magic"
+fault_point = "torn_frame"
+workload = "segment_recovery"
+status = "runner-covered"
+test = "inf-sim::net::tests::public_active_tail_later_magic_truncates_prefix"
+oracle = "later frame magic after a corrupt active-tail frame is discarded after truncating to the stable prefix"
+notes = "public runner row constructs a deterministic active-tail image with a corrupt frame followed by later frame magic, power-cuts, and recovers through production active-tail replay"
+
+[[runner_rows]]
+id = "public_always_single_write_power_cut"
+fault_point = "torn_frame"
+fsync_policy = "always"
+workload = "single_write"
+status = "ci-green"
+seed = "0xD247"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "acked always write survives simulated power cut and active-tail replay"
+notes = "public single-cell row; full process kill/recover matrix remains M2-S17 work"
+
+[[runner_rows]]
+id = "public_always_batched_pipeline_power_cut"
+fault_point = "torn_frame"
+fsync_policy = "always"
+workload = "batched_pipeline"
+status = "ci-green"
+seed = "0xBA7C0017"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "two production mutation effects coalesce into one durable frame with two records, survive simulated power cut, and replay as a single batch visible through public GET"
+notes = "log-seam batched-pipeline row for the always policy; public client pipelining currently serializes into separate frames, and broader cartesian/process kill-recover coverage remains M2-S17 work"
+
+[[runner_rows]]
+id = "public_everysec_single_write_contract"
+fault_point = "torn_frame"
+fsync_policy = "everysec"
+workload = "single_write"
+status = "ci-green"
+seed = "0xE5EC0046"
+loss_seed_base = "0xE5EC0000"
+loss_seed_count = "32"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "acked everysec write may be lost before timer fsync and must survive after timer fsync"
+notes = "public single-cell row with bounded loss-window seed search; full process kill/recover matrix remains M2-S17 work"
+
+[[runner_rows]]
+id = "public_always_single_write_fsync_err_fail_stop"
+fault_point = "fsync_err"
+fsync_policy = "always"
+workload = "single_write"
+status = "ci-green"
+seed = "0xF5E10023"
+loss_seed_base = "0xF5E10000"
+loss_seed_count = "32"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+process_test = "inf-sim::m2_crash_matrix::m2_fsync_err_process_fail_stop_exits_nonzero"
+process_runner = "inf-sim --scenario m2-fsync-err-process-fail-stop --seed 0xF5E10023"
+process_oracle = "child process exits non-zero with fatal fdatasync errno and no pre-fail-stop ACK escape"
+oracle = "fdatasync EIO fail-stops before ACK, leaves watermark at zero, and a bounded seeded power-cut replay recovers the pre-batch state"
+notes = "public single-cell row for the S17 fsyncgate path plus a spawned process non-zero proof; plain process-kill restart watermark oracle and full cartesian matrix remain M2-S17 work"
+
+[[runner_rows]]
+id = "public_fsync_err_after_prior_frame_recovers_previous_watermark"
+fault_point = "fsync_err"
+fsync_policy = "always"
+workload = "restart_watermark"
+status = "ci-green"
+seed = "0xF5E10081"
+loss_seed_base = "0xF5E18000"
+loss_seed_count = "32"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "after one acknowledged always frame, fdatasync EIO on the next frame fail-stops before ACK and seeded restart recovers exactly the previous watermark"
+notes = "public single-cell restart-watermark row for the S17 fsyncgate path; full process kill/recover matrix remains M2-S17 work"
+
+[[runner_rows]]
+id = "public_log_append_write_fault_fail_stop"
+fault_point = "log_append_short_write"
+fsync_policy = "always"
+workload = "single_write"
+oracle_scope = "terminal_file_write_error_under_current_backend_contract"
+status = "ci-green"
+seed = "0xD279"
+power_cut_seed = "0xA11CE079"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+process_test = "inf-sim::m2_crash_matrix::m2_log_append_write_fault_process_fail_stop_exits_nonzero"
+process_runner = "inf-sim --scenario m2-log-append-write-fault-process-fail-stop --seed 0xD279"
+process_oracle = "child process exits non-zero with fatal file-write errno and no pre-fail-stop ACK escape"
+oracle = "log FileWriteAt EIO fail-stops before ACK, leaves watermark at zero, and seeded replay recovers the pre-batch state"
+notes = "public row covers the current terminal write-error contract plus a spawned process non-zero proof; true kernel short-write retry needs a separate BackendDriver partial-progress seam and remains S17 work"
+
+[[runner_rows]]
+id = "public_power_cut_after_seal_recovers_rotated_segment"
+fault_point = "power_cut_after_seal"
+fsync_policy = "always"
+workload = "segment_recovery"
+status = "ci-green"
+seed = "0xD272"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "two exact-fill public SET frames seal segment 0, MAINTAIN preallocates and directory-fsyncs segment 1, a third SET rotates, power cut preserves the two-segment replay"
+notes = "exact-fill seal power-cut runner row; paired with the non-exact truncate-before-rotate row"
+
+[[runner_rows]]
+id = "public_power_cut_after_non_exact_seal_recovers_truncated_segment"
+fault_point = "power_cut_after_seal"
+fsync_policy = "always"
+workload = "segment_recovery"
+status = "ci-green"
+seed = "0xD273"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "public SET frames leave segment 0 at 208/256 bytes, LOG truncates and syncs the sealed file before writing segment 1, and power cut preserves the two-segment replay"
+notes = "covers the non-exact sealed-segment truncation path from ADR-0073; broader process kill/recover matrix remains M2-S17 work"
+
+[[runner_rows]]
+id = "public_torn_final_frame_recovers_stable_prefix"
+fault_point = "torn_frame"
+fsync_policy = "always"
+workload = "segment_recovery"
+path = "torn_final_frame"
+status = "ci-green"
+seed = "0xD277"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "bad-CRC final frame is treated as a torn tail, so recovery replays the stable prefix and positions the writer at the last complete frame"
+notes = "public S14 runner row using a deterministic sim disk image and production active-tail replay; full cartesian kill/recover matrix remains M2-S17 work"
+
+[[runner_rows]]
+id = "public_active_tail_later_magic_truncates_prefix"
+fault_point = "torn_frame"
+fsync_policy = "always"
+workload = "segment_recovery"
+path = "active_tail_later_magic"
+status = "ci-green"
+seed = "0xD278"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "a corrupt active-tail frame followed by later frame magic truncates recovery to the stable prefix and does not replay either tail value"
+notes = "public S14 runner row using a deterministic sim disk image and production active-tail replay; arbitrary media corruption in an active segment needs a future persisted frontier if it must be distinguished from an un-fsynced tail"
+
+[[runner_rows]]
+id = "public_manifest_checkpoint_tail_power_cut"
+fault_point = "power_cut_after_manifest"
+fsync_policy = "always"
+workload = "checkpoint_tail"
+status = "ci-green"
+seed = "0xD265"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "checkpoint image state and post-checkpoint tail state survive through production MANIFEST recovery while pre-checkpoint-only state is not replayed"
+notes = "public single-cell MANIFEST checkpoint-tail row; before-MANIFEST failure cases, truncation coordination, and the full cartesian matrix remain M2-S17 work"
+
+[[runner_rows]]
+id = "public_manifest_rename_fail_full_log_recovery"
+fault_point = "manifest_rename_fail"
+fsync_policy = "always"
+workload = "checkpoint_tail"
+status = "ci-green"
+seed = "0xD266"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "failed MANIFEST rename leaves no active MANIFEST, so recovery ignores the checkpoint image and replays the complete log"
+notes = "public single-cell MANIFEST failure row; old-vs-new manifest swap, truncation coordination, and full cartesian rows remain M2-S17 work"
+
+[[runner_rows]]
+id = "public_manifest_dir_fsync_fail_full_log_recovery"
+fault_point = "dir_fsync_fail"
+fsync_policy = "always"
+workload = "checkpoint_tail"
+status = "ci-green"
+seed = "0xD267"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "failed MANIFEST directory fsync leaves no active MANIFEST in the conservative sim model, so recovery ignores the checkpoint image and replays the complete log"
+notes = "public single-cell MANIFEST failure row using a mode-specific Full sync fault; replacement rename failure, truncation coordination, and full cartesian rows remain M2-S17 work"
+
+[[runner_rows]]
+id = "public_live_checkpoint_wait_dir_fsync_fail_no_reply"
+fault_point = "dir_fsync_fail"
+fsync_policy = "always"
+workload = "live_checkpoint_command"
+status = "ci-green"
+seed = "0xD290"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+process_test = "inf-sim::m2_crash_matrix::m2_live_checkpoint_dir_fsync_process_fail_stop_exits_nonzero"
+process_runner = "inf-sim --scenario m2-live-checkpoint-dir-fsync-process-fail-stop --seed 0xD290"
+process_oracle = "child process exits non-zero with fatal checkpoint directory fsync errno and no pre-fail-stop WAIT reply escape"
+oracle = "public INF.CKPT WAIT drives the live checkpoint publisher, final MANIFEST directory fsync EIO fail-stops before any WAIT reply, no MANIFEST loads after power cut, and full-log replay recovers the acknowledged pre-checkpoint writes"
+notes = "S20 live-command crash row plus process non-zero proof; fault is armed only after the checkpoint image path is directory-fsynced so it lands on the final MANIFEST directory sync. Broader live-command process kill/recover coverage remains M2-S17/S20 work"
+
+[[runner_rows]]
+id = "public_checkpoint_write_enospc_preserves_old_manifest"
+fault_point = "checkpoint_write_enospc"
+fsync_policy = "always"
+workload = "manifest_replacement"
+status = "ci-green"
+seed = "0xD275"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "failed newer checkpoint image write returns ENOSPC before MANIFEST replacement, recovers the old durable MANIFEST, and ignores the partial new checkpoint image"
+notes = "public single-cell checkpoint image ENOSPC row; cleanup unlinks the temp checkpoint image best-effort before returning the original write error; full cartesian rows remain M2-S17 work"
+
+[[runner_rows]]
+id = "public_manifest_replacement_dir_fsync_fail_preserves_old_manifest"
+fault_point = "dir_fsync_fail"
+fsync_policy = "always"
+workload = "manifest_replacement"
+status = "ci-green"
+seed = "0xD268"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "failed replacement MANIFEST directory fsync recovers the old durable MANIFEST, replays the old-manifest tail, and ignores the partial new checkpoint image"
+notes = "public single-cell old-vs-new MANIFEST replacement row using a mode-specific Full sync fault; truncation coordination and full cartesian rows remain M2-S17 work"
+
+[[runner_rows]]
+id = "public_manifest_replacement_rename_fail_preserves_old_manifest"
+fault_point = "manifest_rename_fail"
+fsync_policy = "always"
+workload = "manifest_replacement"
+status = "ci-green"
+seed = "0xD269"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "failed replacement MANIFEST rename recovers the old durable MANIFEST, replays the old-manifest tail, and ignores the partial new checkpoint image"
+notes = "public single-cell old-vs-new MANIFEST replacement row using the real rename fault; truncation coordination and full cartesian rows remain M2-S17 work"
+
+[[runner_rows]]
+id = "public_always_recovered_state_sweep"
+fault_point = "torn_frame"
+fsync_policy = "always"
+workload = "public_recovered_state_sweep"
+status = "ci-green"
+seed = "0xD2550000"
+sweep_seeds = "64"
+writes_per_seed = "24"
+key_space = "8"
+expected_hash = "0x1eed9ef5c384106c"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "public always recovered-state sweep recovers the final GET digest for every seed"
+notes = "CI-sized S19 integration row; gate-scale 10k public recovered-state artifacts run in the nightly S19 fleet"
+
+[[runner_rows]]
+id = "public_everysec_loss_window_sweep"
+fault_point = "torn_frame"
+fsync_policy = "everysec"
+workload = "public_recovered_state_sweep"
+status = "ci-green"
+seed = "0xE5EC0000"
+sweep_seeds = "64"
+expected_hash = "0x16fcc31ffe8f0abc"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "public everysec single-write sweep realizes at least one pre-timer loss-window case and recovers every post-timer write"
+notes = "CI-sized S19 integration row; gate-scale 10k public everysec artifacts run in the nightly S19 fleet"
+
+[[runner_rows]]
+id = "public_everysec_workload_sweep"
+fault_point = "torn_frame"
+fsync_policy = "everysec"
+workload = "public_everysec_workload_sweep"
+status = "ci-green"
+seed = "0xE5EC8500"
+sweep_seeds = "64"
+writes_per_seed = "24"
+key_space = "8"
+expected_hash = "0xfa3f3bee48af8e28"
+test = "inf-sim::net::tests::m2_crash_matrix_cli_runner_manifest_is_deterministic"
+runner = "inf-sim --scenario m2-crash-matrix --verify-determinism"
+oracle = "public everysec multi-write workload sweep recovers a valid fsynced prefix after loss-window cut and full state after timer fsync"
+notes = "CI-sized S19 integration row; ADR-0087 covers randomized multi-suffix active-tail prefix truncation"

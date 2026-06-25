@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use inf_foundation::time::Nanos;
-use inf_store::{CellStore, SetExpire, SetOptions, StoreConfig};
+use inf_store::{CellStore, CheckpointWalkBudget, SetExpire, SetOptions, StoreConfig};
 
 const NOW: Nanos = Nanos(1_000_000);
 
@@ -17,6 +17,17 @@ fn scan_step(store: &mut CellStore, cursor: u64, seen: &mut HashSet<Vec<u8>>) ->
     store.scan(cursor, 8, NOW, |key| {
         seen.insert(key.to_vec());
     })
+}
+
+fn checkpoint_step(store: &CellStore, cursor: u64, seen: &mut HashSet<Vec<u8>>) -> u64 {
+    let walk = store
+        .checkpoint_walk(cursor, CheckpointWalkBudget::new(1), NOW, |record| {
+            assert!(!record.raw);
+            seen.insert(record.key.to_vec());
+        })
+        .unwrap();
+    assert_eq!(walk.home_groups_scanned, 1);
+    if walk.done { 0 } else { walk.next_cursor }
 }
 
 #[test]
@@ -111,4 +122,60 @@ fn scan_terminates_and_covers_on_static_tables_of_all_sizes() {
         }
         assert_eq!(seen.len(), size, "static table must be covered exactly");
     }
+}
+
+#[test]
+fn checkpoint_walk_terminates_and_covers_static_live_records() {
+    for size in [0usize, 1, 15, 16, 17, 100, 1_000] {
+        let mut store = CellStore::new(StoreConfig::default());
+        for i in 0..size {
+            let key = format!("ckpt:{i}");
+            store.set(key.as_bytes(), b"value", SetOptions::default(), NOW).expect("set");
+        }
+
+        let mut seen = HashSet::new();
+        let mut cursor = checkpoint_step(&store, 0, &mut seen);
+        let mut steps = 0u32;
+        while cursor != 0 {
+            cursor = checkpoint_step(&store, cursor, &mut seen);
+            steps += 1;
+            assert!(steps < 10_000_000, "checkpoint walk failed to terminate at size {size}");
+        }
+        assert_eq!(seen.len(), size, "static live table must be checkpoint-covered exactly");
+    }
+}
+
+#[test]
+fn checkpoint_walk_skips_expired_records_without_reaping() {
+    let mut store = CellStore::new(StoreConfig::default());
+    store
+        .set(
+            b"expired",
+            b"value",
+            SetOptions { expire: SetExpire::At(Nanos(1_000_000)), ..Default::default() },
+            Nanos(0),
+        )
+        .expect("set expired candidate");
+
+    let mut seen = HashSet::new();
+    let walk = store
+        .checkpoint_walk(0, CheckpointWalkBudget::new(usize::MAX), Nanos(2_000_000), |record| {
+            seen.insert(record.key.to_vec());
+        })
+        .unwrap();
+
+    assert!(walk.done);
+    assert_eq!(walk.records_emitted, 0);
+    assert!(seen.is_empty());
+    assert_eq!(store.len(), 1, "checkpoint walk is read-only and does not reap");
+}
+
+#[test]
+fn checkpoint_walk_rejects_zero_home_group_budget() {
+    let store = CellStore::new(StoreConfig::default());
+
+    assert_eq!(
+        store.checkpoint_walk(0, CheckpointWalkBudget::new(0), NOW, |_| {}),
+        Err(inf_store::CheckpointWalkError::ZeroHomeGroupBudget)
+    );
 }

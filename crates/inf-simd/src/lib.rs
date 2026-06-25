@@ -8,10 +8,13 @@
 #![deny(unsafe_code)]
 
 #[allow(unsafe_code)]
+mod crc32c;
+#[allow(unsafe_code)]
 mod crlf;
 mod group16;
 mod swar;
 
+pub use crc32c::{Crc32c, crc32c, scalar_crc32c};
 pub use crlf::{CrlfPositions, find_crlf, scalar_scan_crlf, scan_crlf};
 pub use group16::{
     eq_mask16, high_bit_mask16, prefetch_read, scalar_eq_mask16, scalar_high_bit_mask16,

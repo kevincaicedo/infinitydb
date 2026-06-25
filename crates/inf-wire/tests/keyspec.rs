@@ -17,6 +17,8 @@ fn oracle_key_indices(id: CommandId, argc: usize) -> Vec<usize> {
         | CommandId::Hello
         | CommandId::Quit
         | CommandId::Info
+        | CommandId::Bgsave
+        | CommandId::Lastsave
         | CommandId::Command
         | CommandId::Dbsize
         | CommandId::Keys
@@ -30,6 +32,7 @@ fn oracle_key_indices(id: CommandId, argc: usize) -> Vec<usize> {
         | CommandId::Client
         | CommandId::Lolwut
         | CommandId::InfNs
+        | CommandId::InfCkpt
         // Pub/sub channels and patterns are not keys (M1-E5): ownership is
         // the plane's slot(channel) mapping, never the key router.
         | CommandId::Subscribe

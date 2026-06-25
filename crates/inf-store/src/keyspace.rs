@@ -10,7 +10,8 @@
 //! slot ranges, so per-cell division preserves the global bound without any
 //! shared state (L1). The default databases share the budget exactly like
 //! Redis databases share the instance budget; named namespaces carry their
-//! own (dormant until M2 makes them addressable — see `ns.rs`).
+//! own policy/budget and become addressable when their owning milestone
+//! activates the mode.
 //!
 //! The write path pays **one branch on a cached flag** (`over_limit`): the
 //! flag is recomputed after mutations and after eviction slices, never
@@ -24,7 +25,9 @@
 use inf_foundation::time::Nanos;
 
 use crate::evict::{EvictStats, EvictionPolicy};
-use crate::ns::{NsError, NsRegistry, NsSpec};
+use crate::ns::{
+    NsCatalog, NsCatalogError, NsCreateSpec, NsError, NsId, NsMode, NsRegistry, NsSpec,
+};
 use crate::store::{CellStore, ExpiryStats, MemoryReport, OpError, StoreConfig, StoreStats};
 use crate::wheel::ExpiryBudget;
 
@@ -70,11 +73,17 @@ pub struct Keyspace {
     dbs: [Option<Box<CellStore>>; DEFAULT_DBS],
     cfg: StoreConfig,
     named: NsRegistry,
+    named_stores: Vec<NamedStore>,
     pressure: PressureConfig,
     /// Cached `used > limit` (the M1-S07 one-branch write-path flag).
     over_limit: bool,
     /// Eviction rotation cursor across populated dbs.
     hand_db: usize,
+}
+
+struct NamedStore {
+    id: NsId,
+    store: Option<Box<CellStore>>,
 }
 
 impl Keyspace {
@@ -85,6 +94,7 @@ impl Keyspace {
             dbs: Default::default(),
             cfg,
             named: NsRegistry::default(),
+            named_stores: Vec::new(),
             pressure: PressureConfig::default(),
             over_limit: false,
             hand_db: 0,
@@ -121,6 +131,21 @@ impl Keyspace {
         self.dbs.iter().enumerate().filter_map(|(i, s)| s.as_deref().map(|s| (i, s)))
     }
 
+    /// Materialized named namespaces, in catalog-slot order.
+    pub fn named_dbs(&self) -> impl Iterator<Item = (NsId, &CellStore)> {
+        self.named_stores
+            .iter()
+            .filter_map(|entry| entry.store.as_deref().map(|store| (entry.id, store)))
+    }
+
+    /// Read-only view of a named namespace when it has been materialized.
+    pub fn named_db(&self, id: NsId) -> Option<&CellStore> {
+        self.named_stores
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.store.as_deref())
+    }
+
     // ---- aggregation (M1-S09: per-ns numbers must reconcile with totals) ----
 
     /// Aggregated memory attribution: the exact field-wise sum of every
@@ -136,6 +161,16 @@ impl Keyspace {
             live_records: 0,
         };
         for (_, store) in self.dbs() {
+            let r = store.report();
+            total.records_live_bytes += r.records_live_bytes;
+            total.records_slack_bytes += r.records_slack_bytes;
+            total.records_resident_bytes += r.records_resident_bytes;
+            total.index_bytes += r.index_bytes;
+            total.wheel_bytes += r.wheel_bytes;
+            total.evict_bytes += r.evict_bytes;
+            total.live_records += r.live_records;
+        }
+        for (_, store) in self.named_dbs() {
             let r = store.report();
             total.records_live_bytes += r.records_live_bytes;
             total.records_slack_bytes += r.records_slack_bytes;
@@ -162,6 +197,17 @@ impl Keyspace {
             total.wheel_fallback += s.wheel_fallback;
             total.evicted_keys += s.evicted_keys;
         }
+        for (_, store) in self.named_dbs() {
+            let s = store.stats();
+            total.keyspace_hits += s.keyspace_hits;
+            total.keyspace_misses += s.keyspace_misses;
+            total.expired_lazy += s.expired_lazy;
+            total.expired_active += s.expired_active;
+            total.ttl_live += s.ttl_live;
+            total.wheel_stale += s.wheel_stale;
+            total.wheel_fallback += s.wheel_fallback;
+            total.evicted_keys += s.evicted_keys;
+        }
         total
     }
 
@@ -170,12 +216,22 @@ impl Keyspace {
         for store in self.dbs.iter_mut().flatten() {
             store.reset_stats();
         }
+        for entry in &mut self.named_stores {
+            if let Some(store) = &mut entry.store {
+                store.reset_stats();
+            }
+        }
     }
 
     /// `FLUSHALL` (this cell's slice): every database.
     pub fn flush_all(&mut self, now: Nanos) {
         for store in self.dbs.iter_mut().flatten() {
             store.flush(now);
+        }
+        for entry in &mut self.named_stores {
+            if let Some(store) = &mut entry.store {
+                store.flush(now);
+            }
         }
         self.refresh_pressure();
     }
@@ -205,6 +261,24 @@ impl Keyspace {
         if total.reaped > 0 {
             self.refresh_pressure();
         }
+        for entry in &mut self.named_stores {
+            let Some(store) = &mut entry.store else { continue };
+            if left.max_fires == 0 || left.max_steps == 0 {
+                break;
+            }
+            let s = store.expire_tick(now, left);
+            let consumed = (s.reaped + s.stale).min(u64::from(u32::MAX)) as u32;
+            left.max_fires = left.max_fires.saturating_sub(consumed);
+            left.max_steps = left.max_steps.saturating_sub(s.steps);
+            total.reaped += s.reaped;
+            total.stale += s.stale;
+            total.steps += s.steps;
+            total.lag_ms = total.lag_ms.max(s.lag_ms);
+            total.armed += s.armed;
+        }
+        if total.reaped > 0 {
+            self.refresh_pressure();
+        }
         total
     }
 
@@ -216,6 +290,11 @@ impl Keyspace {
         self.pressure = pressure;
         for store in self.dbs.iter_mut().flatten() {
             store.set_eviction_policy(pressure.policy);
+        }
+        for entry in &mut self.named_stores {
+            if let Some(store) = &mut entry.store {
+                store.set_eviction_policy(pressure.policy);
+            }
         }
         self.refresh_pressure();
     }
@@ -233,7 +312,8 @@ impl Keyspace {
 
     /// Logical used bytes across dbs (the `maxmemory` comparable).
     pub fn used_bytes(&self) -> u64 {
-        self.dbs().map(|(_, s)| s.used_bytes()).sum()
+        self.dbs().map(|(_, s)| s.used_bytes()).sum::<u64>()
+            + self.named_dbs().map(|(_, s)| s.used_bytes()).sum::<u64>()
     }
 
     /// Recomputes the cached pressure flag. Called after mutations (cheap:
@@ -339,26 +419,101 @@ impl Keyspace {
 
     // ---- named namespaces (M1-S08) ----
 
-    pub fn ns_create(&mut self, spec: NsSpec) -> Result<(), NsError> {
-        self.named.create(spec)
+    pub fn ns_create(&mut self, spec: NsCreateSpec) -> Result<crate::ns::NsId, NsError> {
+        let id = self.named.create(spec)?;
+        self.named_stores.push(NamedStore { id, store: None });
+        Ok(id)
+    }
+
+    /// Replace named-namespace state from the recovered catalog at boot.
+    ///
+    /// This intentionally bypasses public `INF.NS CREATE` side effects: the
+    /// bytes were already decoded and validated as recovery state.
+    pub fn ns_replace_with_recovered_catalog(
+        &mut self,
+        catalog: NsCatalog,
+    ) -> Result<(), NsCatalogError> {
+        let named_stores =
+            catalog.specs().iter().map(|spec| NamedStore { id: spec.id, store: None }).collect();
+        self.named
+            .replace_with_recovered_catalog(catalog)
+            .map(|()| self.named_stores = named_stores)
     }
 
     pub fn ns_drop(&mut self, name: &[u8]) -> Result<(), NsError> {
-        self.named.drop_ns(name)
+        let id = self.named.get(name).map(|spec| spec.id);
+        self.named.drop_ns(name)?;
+        if let Some(at) =
+            id.and_then(|id| self.named_stores.iter().position(|entry| entry.id == id))
+        {
+            self.named_stores.remove(at);
+        }
+        Ok(())
     }
 
     pub fn ns_get(&self, name: &[u8]) -> Option<&NsSpec> {
         self.named.get(name)
     }
 
+    pub fn ns_get_by_id(&self, id: NsId) -> Option<&NsSpec> {
+        self.named.get_by_id(id)
+    }
+
+    /// Store for an addressable named namespace.
+    ///
+    /// Public command execution uses this for memory-mode named namespaces
+    /// and for durable namespaces once the server plane has selected the
+    /// durability-aware write path. Replay uses [`Self::durable_named_db_mut`]
+    /// so log records cannot materialize memory/topic stores by accident.
+    pub fn named_db_mut(&mut self, id: NsId) -> Option<&mut CellStore> {
+        let policy = {
+            let spec = self.named.get_by_id(id)?;
+            if spec.mode == NsMode::Topic {
+                return None;
+            }
+            spec.policy.unwrap_or(self.pressure.policy)
+        };
+        let at = self.named_stores.iter().position(|entry| entry.id == id)?;
+        if self.named_stores[at].store.is_none() {
+            let mut cfg = self.cfg;
+            cfg.evict_seed =
+                self.cfg.evict_seed ^ u64::from(id.get()).wrapping_mul(0xD1B5_4A32_D192_ED03);
+            let mut store = Box::new(CellStore::new(cfg));
+            store.set_eviction_policy(policy);
+            self.named_stores[at].store = Some(store);
+        }
+        self.named_stores[at].store.as_mut().map(Box::as_mut)
+    }
+
+    /// Store for a recovered durable named namespace.
+    ///
+    /// This is the recovery-only materialization path for M2-S08.
+    pub fn durable_named_db_mut(&mut self, id: NsId) -> Option<&mut CellStore> {
+        let spec = self.named.get_by_id(id)?;
+        if spec.mode != NsMode::Durable {
+            return None;
+        }
+        self.named_db_mut(id)
+    }
+
+    pub fn has_durable_namespaces(&self) -> bool {
+        self.named.iter().any(|spec| spec.mode == NsMode::Durable)
+    }
+
     pub fn ns_iter(&self) -> impl Iterator<Item = &NsSpec> {
         self.named.iter()
+    }
+
+    /// Snapshot named namespace specs in catalog order for cold publish.
+    pub fn ns_catalog_snapshot(&self) -> NsCatalog {
+        self.named.catalog_snapshot()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ns::{NsCatalog, NsCatalogError, NsCreateSpec, NsFsyncPolicy, NsId, NsMode};
     use crate::store::{SetOptions, StoreConfig};
 
     fn now() -> Nanos {
@@ -404,6 +559,112 @@ mod tests {
         assert_eq!(total.live_records, 150);
         let used_by_hand: u64 = ks.dbs().map(|(_, s)| s.used_bytes()).sum();
         assert_eq!(ks.used_bytes(), used_by_hand);
+    }
+
+    #[test]
+    fn recovered_namespace_catalog_replaces_keyspace_registry_atomically() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        ks.ns_create(NsCreateSpec {
+            name: b"cache".to_vec(),
+            mode: NsMode::Memory,
+            fsync: None,
+            policy: None,
+            maxmemory: Some(2048),
+        })
+        .expect("create initial memory namespace");
+        let before = ks.ns_iter().cloned().collect::<Vec<_>>();
+
+        let recovered = vec![
+            NsSpec {
+                id: NsId::new(16),
+                name: b"ledger".to_vec(),
+                mode: NsMode::Durable,
+                fsync: Some(NsFsyncPolicy::Always),
+                policy: None,
+                maxmemory: None,
+            },
+            NsSpec {
+                id: NsId::new(17),
+                name: b"sessions".to_vec(),
+                mode: NsMode::Durable,
+                fsync: Some(NsFsyncPolicy::Everysec),
+                policy: None,
+                maxmemory: None,
+            },
+        ];
+        let recovered_catalog =
+            NsCatalog::new(NsId::new(18), recovered.clone()).expect("recovered catalog");
+
+        ks.ns_replace_with_recovered_catalog(recovered_catalog).expect("recover namespaces");
+        assert_eq!(ks.ns_iter().cloned().collect::<Vec<_>>(), recovered);
+        let new_id = ks
+            .ns_create(NsCreateSpec {
+                name: b"new-ledger".to_vec(),
+                mode: NsMode::Durable,
+                fsync: Some(NsFsyncPolicy::Always),
+                policy: None,
+                maxmemory: None,
+            })
+            .expect("public durable create is active");
+        assert_eq!(new_id, NsId::new(18));
+        let after_public_create = ks.ns_iter().cloned().collect::<Vec<_>>();
+
+        let err = ks
+            .ns_replace_with_recovered_catalog(NsCatalog::from_parts_unchecked_for_test(
+                NsId::new(17),
+                vec![NsSpec {
+                    id: NsId::new(16),
+                    name: b"db0".to_vec(),
+                    mode: NsMode::Memory,
+                    fsync: None,
+                    policy: None,
+                    maxmemory: None,
+                }],
+            ))
+            .expect_err("invalid recovery state");
+
+        assert_eq!(err, NsCatalogError::InvalidName { index: 0 });
+        assert_eq!(ks.ns_iter().cloned().collect::<Vec<_>>(), after_public_create);
+        assert_ne!(ks.ns_iter().cloned().collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn recovered_durable_namespace_id_materializes_named_store() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        let recovered = vec![
+            NsSpec {
+                id: NsId::new(16),
+                name: b"ledger".to_vec(),
+                mode: NsMode::Durable,
+                fsync: Some(NsFsyncPolicy::Always),
+                policy: None,
+                maxmemory: None,
+            },
+            NsSpec {
+                id: NsId::new(17),
+                name: b"cache".to_vec(),
+                mode: NsMode::Memory,
+                fsync: None,
+                policy: None,
+                maxmemory: None,
+            },
+        ];
+        let catalog = NsCatalog::new(NsId::new(18), recovered).expect("catalog");
+
+        ks.ns_replace_with_recovered_catalog(catalog).expect("recover namespaces");
+        assert!(ks.named_dbs().next().is_none());
+        ks.durable_named_db_mut(NsId::new(16))
+            .expect("durable named store")
+            .set(b"k", b"v", SetOptions::default(), now())
+            .expect("set");
+
+        assert_eq!(
+            ks.durable_named_db_mut(NsId::new(16)).unwrap().get(b"k", now()),
+            Some(&b"v"[..])
+        );
+        assert!(ks.durable_named_db_mut(NsId::new(17)).is_none());
+        assert!(ks.durable_named_db_mut(NsId::new(99)).is_none());
+        assert_eq!(ks.named_dbs().count(), 1);
     }
 
     #[test]

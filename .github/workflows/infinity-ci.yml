@@ -89,6 +89,9 @@ jobs:
       - name: fuzz fabric codec (smoke)
         run: cargo +nightly fuzz run fabric_codec -- -max_total_time=300
         working-directory: crates/inf-fabric
+      - name: fuzz log frame decoder (smoke, M2-S01)
+        run: cargo +nightly fuzz run frame_decode -- -max_total_time=300
+        working-directory: crates/inf-log
       - name: fuzz glob matcher (smoke, M1 §5)
         run: cargo +nightly fuzz run glob_match -- -max_total_time=300
         working-directory: crates/inf-server
@@ -180,6 +183,8 @@ jobs:
         run: cargo test -p inf-sim
       - name: m0-smoke determinism (CLI)
         run: cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
+      - name: m2 crash-matrix partial runner (CLI)
+        run: cargo run --release --bin inf-sim -- --scenario m2-crash-matrix --verify-determinism
 
   kernel-matrix:
     # Asserts io_uring feature-probe fallback across kernels (M0-S02).

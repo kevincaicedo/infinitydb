@@ -75,6 +75,12 @@ cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE
 # verify determinism: run twice, byte-compare the traces
 cargo run --release --bin inf-sim -- --scenario m1-cache --seed 0xCAFE --verify-determinism
 
+# M2 crash-matrix partial runner: executes checked-in runner_rows
+cargo run --release --bin inf-sim -- --scenario m2-crash-matrix --verify-determinism
+
+# M2 fsyncgate negative process proof: expected to exit non-zero
+cargo run --release --bin inf-sim -- --scenario m2-fsync-err-process-fail-stop --seed 0xF5E10023
+
 # the just shortcut
 just sim-smoke
 ```
@@ -82,19 +88,21 @@ just sim-smoke
 ### Flags
 
 ```
-inf-sim --scenario m0-smoke|m1-cache [--seed N|0xN] [--verify-determinism]
+inf-sim --scenario m0-smoke|m1-cache|m2-durability-oracle|m2-crash-matrix|m2-fsync-err-process-fail-stop
+        [--seed N|0xN] [--verify-determinism]
         [--plant lost-wakeup] [--cells N] [--connections N] [--commands N]
-        [--key-space N] [--trace-out FILE]
+        [--key-space N] [--sweep-seeds N] [--writes-per-seed N] [--trace-out FILE]
 ```
 
 | Flag | Meaning |
 |---|---|
-| `--scenario` | `m0-smoke` (KV + cross-cell mix) or `m1-cache` (adds TTL traffic + cross-cell pub/sub fan-out). |
+| `--scenario` | `m0-smoke` (KV + cross-cell mix), `m1-cache` (adds TTL traffic + cross-cell pub/sub fan-out), `m2-durability-oracle` (synthetic M2 oracle sweep), `m2-crash-matrix` (checked M2 partial runner rows), or `m2-fsync-err-process-fail-stop` (negative fsyncgate process proof; expected non-zero). |
 | `--seed` | Seed (decimal or `0x` hex). The seed *is* the reproduction. |
 | `--verify-determinism` | Run the scenario twice and assert the traces are byte-identical. |
 | `--plant lost-wakeup` | Inject a known bug to prove the oracle/stall detector catches it (a self-test). |
 | `--cells` / `--connections` / `--commands` / `--key-space` | Override scenario size. |
-| `--trace-out FILE` | Write the raw event trace to a file (for offline diffing). |
+| `--sweep-seeds` / `--writes-per-seed` | Override the synthetic M2 durability-oracle sweep size. |
+| `--trace-out FILE` | Write the raw event trace or M2 manifest to a file (for offline diffing). |
 
 ### Output
 
@@ -114,6 +122,9 @@ mismatch — and prints the first few violations.
 |---|---|
 | `m0-smoke` | 3 cells, 100 connections, 100k mixed commands incl. cross-cell. The original M0 acceptance scenario. |
 | `m1-cache` | 3 cells, 80 connections, 60k commands, plus TTL traffic and cross-cell pub/sub (channel + pattern subscribers), with the delivery + accounting oracles armed. |
+| `m2-durability-oracle` | CI-sized synthetic durability sweep with mixed `memory` / `everysec` / `always` batches, manifest hash, and planted canary coverage. |
+| `m2-crash-matrix` | Partial M2-S17 runner over `tests/crash-matrix/m2.toml` `runner_rows`; currently public single-write power-cut and fsync-error rows, not the full cartesian crash matrix. |
+| `m2-fsync-err-process-fail-stop` | Failure-only S17 row support: injects fdatasync `EIO` in a public `FSYNC always` write path and must terminate the process non-zero before an ACK escapes. |
 
 ## The seed corpus & nightly fleet
 

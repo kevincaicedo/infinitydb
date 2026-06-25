@@ -1,8 +1,26 @@
 # inf-simd SAFETY
 
 `inf-simd` is one of the four crates allowed `unsafe` (milestone M0 §3.3).
-All unsafe code is platform intrinsics in `crlf.rs` and `group16.rs`;
-`swar.rs` is fully safe (64-bit integer tricks only).
+All unsafe code is platform intrinsics in `crlf.rs`, `group16.rs`, and
+`crc32c.rs`; `swar.rs` is fully safe (64-bit integer tricks only).
+
+## `crc32c.rs` — log-frame checksum acceleration (M2-S01)
+
+- **Feature availability**: x86-64 calls the SSE4.2 `crc32` intrinsics only
+  after `is_x86_feature_detected!("sse4.2")`; aarch64 calls the CRC extension
+  intrinsics only after `is_aarch64_feature_detected!("crc")`.
+- **Bounds**: the hardware paths read from a borrowed slice using explicit
+  `offset + 8 <= data.len()` and `offset < data.len()` loop guards before
+  constructing little-endian words or loading tail bytes.
+- **Fallback**: unsupported CPUs use the safe scalar CRC32C table. The scalar
+  path is public as `scalar_crc32c` so benchmarks and tests have a fixed oracle.
+- **Incremental state**: `Crc32c` carries only the unfinalized `u32` CRC state;
+  hardware and scalar updates consume borrowed byte slices under the same bounds
+  checks as the one-shot path, and `finish()` performs the final xor exactly
+  once.
+- **Verification**: fixed CRC32C reference vectors and proptests compare the
+  runtime-dispatched path to the scalar oracle on arbitrary byte strings; split
+  proptests verify incremental updates are byte-equivalent to one-shot CRCs.
 
 ## `crlf.rs` — SIMD loads and feature-gated paths
 

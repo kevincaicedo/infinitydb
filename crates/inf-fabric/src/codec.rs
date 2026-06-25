@@ -1,4 +1,5 @@
-//! Fabric op codec **v0** (M0-S10) — frozen at M0 exit (interfaces-m0.md §4).
+//! Fabric op codec **v1** (M2-S08) — v0 was frozen at M0 exit and widened by
+//! ADR-0037 when named namespaces became addressable.
 //!
 //! Frame layout (all integers little-endian):
 //!
@@ -7,7 +8,7 @@
 //! payload { per-op, `len` bytes }
 //! ```
 //!
-//! Header `flags` are reserved and must be zero at v0. Payload fields use
+//! Header `flags` are reserved and must be zero at v1. Payload fields use
 //! fixed-width encodings for routing-hot fields (token, slot) and
 //! `inf_foundation::varint` for byte-slice lengths and counts. `Batch`
 //! payloads nest complete non-batch frames, so M4's `LockOp`/`ExecOp` extend
@@ -27,7 +28,7 @@ use inf_foundation::{KeySlot, varint};
 use crate::msg::FabricToken;
 
 /// Wire version emitted and accepted by this codec.
-pub const CODEC_VERSION: u8 = 0;
+pub const CODEC_VERSION: u8 = 1;
 
 /// Maximum number of argument slices in an [`Op::Apply`].
 pub const MAX_APPLY_ARGS: usize = 16;
@@ -212,7 +213,7 @@ impl PartialEq for ApplyArgs<'_> {
 
 impl Eq for ApplyArgs<'_> {}
 
-/// Fabric op vocabulary v0 (master plan §6.2). Decoded values borrow all
+/// Fabric op vocabulary v1 (master plan §6.2). Decoded values borrow all
 /// byte payloads from the input frame.
 // `Write` dominates the size; boxing it would put an allocation on the
 // decode path of every fabric write — ops are transient stack values
@@ -232,8 +233,8 @@ pub enum Op<'a> {
         flags: WriteFlags,
     },
     /// Generic remote command execution — M0-experimental (M4 reshapes into
-    /// `ExecOp`).
-    Apply { token: FabricToken, slot: KeySlot, cmd: u8, args: ApplyArgs<'a> },
+    /// `ExecOp`). `namespace` is the selected default-db/named namespace id.
+    Apply { token: FabricToken, slot: KeySlot, namespace: u32, cmd: u8, args: ApplyArgs<'a> },
     /// Per-destination coalescing of non-batch data ops (one destination).
     /// `Reply` and nested `Batch` are rejected by [`encode`]/[`decode`].
     Batch { ops: Vec<Op<'a>> },
@@ -254,7 +255,7 @@ impl Op<'_> {
 }
 
 /// Typed decode failure — the full set of ways arbitrary bytes can fail to
-/// be a v0 frame.
+/// be a v1 frame.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum CodecError {
     /// Input ends before the header or declared payload length.
@@ -318,8 +319,8 @@ pub fn encode(op: &Op<'_>, out: &mut Vec<u8>) {
     if let Op::Batch { ops } = op {
         for nested in ops {
             match nested {
-                Op::Batch { .. } => panic!("Batch must not nest Batch (codec v0)"),
-                Op::Reply { .. } => panic!("Batch must not nest Reply (codec v0)"),
+                Op::Batch { .. } => panic!("Batch must not nest Batch (codec v1)"),
+                Op::Reply { .. } => panic!("Batch must not nest Reply (codec v1)"),
                 _ => {}
             }
         }
@@ -354,9 +355,10 @@ fn encode_payload(op: &Op<'_>, out: &mut Vec<u8>) {
             encode_bytes(key, out);
             encode_bytes(value, out);
         }
-        Op::Apply { token, slot, cmd, args } => {
+        Op::Apply { token, slot, namespace, cmd, args } => {
             out.extend_from_slice(&token.0.to_le_bytes());
             out.extend_from_slice(&slot.get().to_le_bytes());
+            out.extend_from_slice(&namespace.to_le_bytes());
             out.push(*cmd);
             varint::encode_u64(args.len() as u64, out);
             for arg in args.as_slice() {
@@ -480,6 +482,7 @@ fn decode_frame(buf: &[u8], nested: bool) -> Result<(Op<'_>, usize), CodecError>
         OP_APPLY => {
             let token = reader.token()?;
             let slot = reader.slot()?;
+            let namespace = reader.u32_le()?;
             let cmd = reader.u8()?;
             let argc = reader.varint()?;
             if argc > MAX_APPLY_ARGS as u64 {
@@ -490,7 +493,13 @@ fn decode_frame(buf: &[u8], nested: bool) -> Result<(Op<'_>, usize), CodecError>
                 *arg = reader.bytes()?;
             }
             // argc <= MAX_APPLY_ARGS < 256, so the cast is lossless.
-            Op::Apply { token, slot, cmd, args: ApplyArgs { args: packed, len: argc as u8 } }
+            Op::Apply {
+                token,
+                slot,
+                namespace,
+                cmd,
+                args: ApplyArgs { args: packed, len: argc as u8 },
+            }
         }
         OP_BATCH => {
             if nested {
@@ -548,6 +557,11 @@ impl<'a> Reader<'a> {
     fn u16_le(&mut self) -> Result<u16, CodecError> {
         let b = self.take(2)?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn u32_le(&mut self) -> Result<u32, CodecError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     fn u64_le(&mut self) -> Result<u64, CodecError> {
@@ -642,13 +656,20 @@ mod tests {
         round_trip(&Op::Apply {
             token: token(7, 1),
             slot: slot(100),
+            namespace: 16,
             cmd: 0xEE,
             args: ApplyArgs::new(&[b"a".as_slice(), b"".as_slice(), b"ccc".as_slice()]).unwrap(),
         });
         round_trip(&Op::Batch {
             ops: vec![
                 Op::Read { token: token(2, 5), slot: slot(7), key: b"x" },
-                Op::Apply { token: token(2, 6), slot: slot(8), cmd: 1, args: ApplyArgs::EMPTY },
+                Op::Apply {
+                    token: token(2, 6),
+                    slot: slot(8),
+                    namespace: 0,
+                    cmd: 1,
+                    args: ApplyArgs::EMPTY,
+                },
             ],
         });
         round_trip(&Op::Batch { ops: Vec::new() });
@@ -677,8 +698,8 @@ mod tests {
         assert_eq!(decode(&good[..good.len() - 1]), Err(CodecError::Truncated));
 
         let mut bad_version = good.clone();
-        bad_version[0] = 1;
-        assert_eq!(decode(&bad_version), Err(CodecError::UnknownVersion(1)));
+        bad_version[0] = 0;
+        assert_eq!(decode(&bad_version), Err(CodecError::UnknownVersion(0)));
 
         let mut bad_op = good.clone();
         bad_op[1] = 0;
@@ -770,6 +791,7 @@ mod tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(&token(1, 1).0.to_le_bytes());
         payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
         payload.push(0); // cmd
         varint::encode_u64(MAX_APPLY_ARGS as u64 + 1, &mut payload);
         let frame = frame_with(OP_APPLY, &payload);
@@ -813,6 +835,7 @@ mod tests {
         Apply {
             token: u64,
             slot: u16,
+            namespace: u32,
             cmd: u8,
             args: Vec<Vec<u8>>,
         },
@@ -849,11 +872,12 @@ mod tests {
                     expire_at: expire.map(Nanos),
                     flags: WriteFlags::from_bits(*flags).unwrap(),
                 },
-                OwnedOp::Apply { token, slot, cmd, args } => {
+                OwnedOp::Apply { token, slot, namespace, cmd, args } => {
                     let slices: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
                     Op::Apply {
                         token: FabricToken(*token),
                         slot: KeySlot::new(*slot).unwrap(),
+                        namespace: *namespace,
                         cmd: *cmd,
                         args: ApplyArgs::new(&slices).unwrap(),
                     }
@@ -891,12 +915,14 @@ mod tests {
             (
                 any::<u64>(),
                 0..16384u16,
+                any::<u32>(),
                 any::<u8>(),
                 prop::collection::vec(bytes.clone(), 0..MAX_APPLY_ARGS)
             )
-                .prop_map(|(token, slot, cmd, args)| OwnedOp::Apply {
+                .prop_map(|(token, slot, namespace, cmd, args)| OwnedOp::Apply {
                     token,
                     slot,
+                    namespace,
                     cmd,
                     args
                 }),
@@ -935,9 +961,10 @@ mod tests {
     #[test]
     fn non_minimal_varint_in_frame_is_rejected() {
         let crash: &[u8] = &[
-            0, 3, 0, 0, 15, 0, 0, 0, // header: v0, Apply, flags 0, len 15
+            1, 3, 0, 0, 19, 0, 0, 0, // header: v1, Apply, flags 0, len 19
             0, 0, 145, 0, 0, 0, 2, 0, // token
             0, 0, // slot
+            0, 0, 0, 0, // namespace
             0, // cmd
             2, // argc
             0, // arg0 len (canonical 0)
