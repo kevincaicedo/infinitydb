@@ -8,7 +8,8 @@
 //! harness (`tests/compat`) is the oracle; documented deviations:
 //! `HELLO`/`INFO`/`COMMAND`/`CLIENT LIST`/`LOLWUT`/`DEBUG OBJECT` payloads,
 //! keys > 255 B / values > 16 MiB − 1 / TTLs > ~34.8 y (record format v0
-//! bounds), `SELECT` limited to db 0 until namespaces v1 (M1-E4),
+//! bounds), named namespaces selected through `INF.NS USE` (Infinity
+//! extension, not Redis `SELECT`),
 //! `RANDOMKEY` two-level random, and `INCRBYFLOAT` f64 (Redis: long double)
 //! precision tails.
 //!
@@ -21,15 +22,17 @@ use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use inf_foundation::time::Nanos;
+use inf_log::{LogStagingError, NamespaceId};
 use inf_store::{
-    CellStore, CopyResult, ExpireCond, Keyspace, OpError, SetCond, SetExpire, SetOptions,
-    SetOutcome, Ttl, TtlUpdate,
+    CellStore, CopyResult, ExpireCond, Keyspace, MAX_EXPIRE_MS, MutationEffect, NsId, NsMode,
+    OpError, SetCond, SetExpire, SetOptions, SetOutcome, Ttl, TtlUpdate,
 };
-use inf_wire::{ArgvRef, CmdFlags, CommandId, Protocol, RespWriter, arity_ok, lookup};
+use inf_wire::{ArgvRef, CmdFlags, CommandId, CommandMeta, Protocol, RespWriter, arity_ok, lookup};
 
 use crate::admin;
 use crate::clients::ClientRegistry;
 use crate::config::ConfigStore;
+use crate::durability::{DurabilityCell, MutationStageError, mutation_effect_record_len};
 use crate::glob::glob_match;
 use crate::pubsub;
 
@@ -48,6 +51,17 @@ pub struct NodeInfo {
     /// fabric_msgs) — scrapers diff two snapshots for under-load ratios.
     pub raw_counters: Cell<[u64; 6]>,
     pub wire_buffers_bytes: Cell<u64>,
+    pub log_staging_bytes: Cell<u64>,
+    pub log_staging_capacity_bytes: Cell<u64>,
+    pub pending_log_bytes: Cell<u64>,
+    pub last_durable_lsn: Cell<u64>,
+    pub watermark_lag_lsn: Cell<u64>,
+    pub log_writer_installed: Cell<u64>,
+    pub log_active_segment: Cell<u64>,
+    pub log_active_offset_bytes: Cell<u64>,
+    pub log_pending_unsynced: Cell<u64>,
+    pub checkpoint_in_progress: Cell<u64>,
+    pub last_checkpoint_unix_ms: Cell<u64>,
     pub conn_state_bytes: Cell<u64>,
     pub connections: Cell<u64>,
     pub recv_dropped: Cell<u64>,
@@ -80,15 +94,62 @@ pub struct NodeInfo {
     pub config: RefCell<ConfigStore>,
 }
 
+/// Per-connection selected logical keyspace.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ConnNamespace {
+    /// Redis-compatible default namespace selected by `SELECT 0..15`.
+    Default(u16),
+    /// Named namespace selected by `INF.NS USE`.
+    Named(NsId),
+}
+
+impl ConnNamespace {
+    #[inline]
+    pub const fn default_db(db: u16) -> ConnNamespace {
+        ConnNamespace::Default(db)
+    }
+
+    #[inline]
+    pub const fn from_id(raw: u32) -> ConnNamespace {
+        if raw < 16 {
+            ConnNamespace::Default(raw as u16)
+        } else {
+            ConnNamespace::Named(NsId::new(raw))
+        }
+    }
+
+    #[inline]
+    pub const fn id(self) -> u32 {
+        match self {
+            ConnNamespace::Default(db) => db as u32,
+            ConnNamespace::Named(id) => id.get(),
+        }
+    }
+
+    #[inline]
+    pub const fn selected_db(self) -> Option<u16> {
+        match self {
+            ConnNamespace::Default(db) => Some(db),
+            ConnNamespace::Named(_) => None,
+        }
+    }
+}
+
+impl Default for ConnNamespace {
+    fn default() -> ConnNamespace {
+        ConnNamespace::Default(0)
+    }
+}
+
 /// Per-connection execution state (protocol negotiated via `HELLO`,
-/// database selected via `SELECT` — M1-S08, subscriptions via
+/// namespace selected via `SELECT`/`INF.NS USE`, subscriptions via
 /// `(P)SUBSCRIBE` — M1-S10).
 #[derive(Debug)]
 pub struct ConnCx {
     pub proto: Protocol,
     pub id: u64,
-    /// Selected default namespace (`SELECT 0..15`); 0 unless SELECTed.
-    pub db: u16,
+    /// Selected logical namespace; defaults to Redis db0.
+    pub namespace: ConnNamespace,
     /// Subscribed channels, in subscription order (M1-S10). Empty vectors
     /// never allocate, so a non-subscriber connection pays two length
     /// loads at most.
@@ -107,7 +168,7 @@ impl Default for ConnCx {
         ConnCx {
             proto: Protocol::Resp2,
             id: 1,
-            db: 0,
+            namespace: ConnNamespace::default(),
             sub_channels: Vec::new(),
             sub_patterns: Vec::new(),
             node: Rc::new(NodeInfo::default()),
@@ -165,13 +226,192 @@ pub fn execute(
     now: Nanos,
     out: &mut Vec<u8>,
 ) {
+    let Some(meta) = preflight_command(argv, ks, cx, now, out) else { return };
+    execute_preflighted(meta, argv, ks, cx, now, out);
+}
+
+pub fn execute_durable(
+    argv: &(impl Argv + ?Sized),
+    ks: &mut Keyspace,
+    durability: &mut DurabilityCell,
+    namespace: NamespaceId,
+    cx: &mut ConnCx,
+    now: Nanos,
+    out: &mut Vec<u8>,
+) {
+    let Some(meta) = preflight_command(argv, ks, cx, now, out) else { return };
+    match meta.id {
+        CommandId::Set
+        | CommandId::Setnx
+        | CommandId::Setex
+        | CommandId::Psetex
+        | CommandId::Getset => {
+            let mut w = RespWriter::new(out, cx.proto);
+            {
+                let store = match selected_store_mut(ks, cx.namespace, true) {
+                    Ok(store) => store,
+                    Err(error) => return selected_namespace_error(error, &mut w),
+                };
+                let mut durable = DurableWriteCtx { store, durability, namespace, now, w: &mut w };
+                execute_durable_set_family(meta, argv, &cx.node, &mut durable);
+            }
+            ks.refresh_pressure();
+        }
+        CommandId::Del | CommandId::Unlink => {
+            let mut w = RespWriter::new(out, cx.proto);
+            {
+                let store = match selected_store_mut(ks, cx.namespace, true) {
+                    Ok(store) => store,
+                    Err(error) => return selected_namespace_error(error, &mut w),
+                };
+                let mut durable = DurableWriteCtx { store, durability, namespace, now, w: &mut w };
+                del_durable(argv, &mut durable);
+            }
+            ks.refresh_pressure();
+        }
+        CommandId::Getdel => {
+            let mut w = RespWriter::new(out, cx.proto);
+            {
+                let store = match selected_store_mut(ks, cx.namespace, true) {
+                    Ok(store) => store,
+                    Err(error) => return selected_namespace_error(error, &mut w),
+                };
+                let mut durable = DurableWriteCtx { store, durability, namespace, now, w: &mut w };
+                getdel_durable(argv, &mut durable);
+            }
+            ks.refresh_pressure();
+        }
+        CommandId::Getex => {
+            let mut w = RespWriter::new(out, cx.proto);
+            {
+                let store = match selected_store_mut(ks, cx.namespace, true) {
+                    Ok(store) => store,
+                    Err(error) => return selected_namespace_error(error, &mut w),
+                };
+                let mut durable = DurableWriteCtx { store, durability, namespace, now, w: &mut w };
+                getex_durable(argv, &cx.node, &mut durable);
+            }
+            ks.refresh_pressure();
+        }
+        CommandId::Expire | CommandId::Pexpire | CommandId::Expireat | CommandId::Pexpireat => {
+            let mut w = RespWriter::new(out, cx.proto);
+            let deadline = match meta.id {
+                CommandId::Expire => Deadline::Relative { unit_ms: 1000 },
+                CommandId::Pexpire => Deadline::Relative { unit_ms: 1 },
+                CommandId::Expireat => Deadline::AbsoluteUnix { unit_ms: 1000 },
+                CommandId::Pexpireat => Deadline::AbsoluteUnix { unit_ms: 1 },
+                _ => unreachable!("durable expire family filtered above"),
+            };
+            {
+                let store = match selected_store_mut(ks, cx.namespace, true) {
+                    Ok(store) => store,
+                    Err(error) => return selected_namespace_error(error, &mut w),
+                };
+                let mut durable = DurableWriteCtx { store, durability, namespace, now, w: &mut w };
+                expire_durable(argv, deadline, meta.name, &cx.node, &mut durable);
+            }
+            ks.refresh_pressure();
+        }
+        CommandId::Persist => {
+            let mut w = RespWriter::new(out, cx.proto);
+            {
+                let store = match selected_store_mut(ks, cx.namespace, true) {
+                    Ok(store) => store,
+                    Err(error) => return selected_namespace_error(error, &mut w),
+                };
+                let mut durable = DurableWriteCtx { store, durability, namespace, now, w: &mut w };
+                persist_durable(argv, &mut durable);
+            }
+            ks.refresh_pressure();
+        }
+        _ if meta.flags.contains(CmdFlags::WRITE) => {
+            let mut w = RespWriter::new(out, cx.proto);
+            durable_unsupported(meta, &mut w);
+        }
+        _ => execute_preflighted(meta, argv, ks, cx, now, out),
+    }
+}
+
+fn execute_durable_set_family(
+    meta: &'static CommandMeta,
+    argv: &(impl Argv + ?Sized),
+    node: &NodeInfo,
+    cx: &mut DurableWriteCtx<'_, '_>,
+) {
+    match meta.id {
+        CommandId::Set => set_durable(argv, node, cx),
+        CommandId::Setnx => setnx_durable(argv, cx),
+        CommandId::Setex | CommandId::Psetex => setex_durable(meta, argv, cx),
+        CommandId::Getset => getset_durable(argv, cx),
+        _ => unreachable!("caller filters durable SET-family commands"),
+    }
+}
+
+struct DurableWriteCtx<'a, 'w> {
+    store: &'a mut CellStore,
+    durability: &'a mut DurabilityCell,
+    namespace: NamespaceId,
+    now: Nanos,
+    w: &'a mut RespWriter<'w>,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum SelectedNamespaceError {
+    Unknown,
+    DurablePending,
+    TopicUnsupported,
+}
+
+fn selected_store_mut(
+    ks: &mut Keyspace,
+    namespace: ConnNamespace,
+    allow_durable: bool,
+) -> Result<&mut CellStore, SelectedNamespaceError> {
+    match namespace {
+        ConnNamespace::Default(db) => Ok(ks.db_mut(usize::from(db))),
+        ConnNamespace::Named(id) => {
+            let mode =
+                ks.ns_get_by_id(id).map(|spec| spec.mode).ok_or(SelectedNamespaceError::Unknown)?;
+            match mode {
+                NsMode::Memory => ks.named_db_mut(id).ok_or(SelectedNamespaceError::Unknown),
+                NsMode::Durable if allow_durable => {
+                    ks.named_db_mut(id).ok_or(SelectedNamespaceError::Unknown)
+                }
+                NsMode::Durable => Err(SelectedNamespaceError::DurablePending),
+                NsMode::Topic => Err(SelectedNamespaceError::TopicUnsupported),
+            }
+        }
+    }
+}
+
+fn selected_namespace_error(error: SelectedNamespaceError, w: &mut RespWriter<'_>) {
+    match error {
+        SelectedNamespaceError::Unknown => w.error("ERR selected namespace not found"),
+        SelectedNamespaceError::DurablePending => {
+            w.error("ERR durable namespace command routing is not yet supported")
+        }
+        SelectedNamespaceError::TopicUnsupported => {
+            w.error("ERR topic namespaces are not key-value namespaces")
+        }
+    }
+}
+
+fn preflight_command(
+    argv: &(impl Argv + ?Sized),
+    ks: &mut Keyspace,
+    cx: &mut ConnCx,
+    now: Nanos,
+    out: &mut Vec<u8>,
+) -> Option<&'static CommandMeta> {
     let Some(meta) = lookup(argv.arg(0)) else {
         let mut w = RespWriter::new(out, cx.proto);
-        return unknown_command(argv, &mut w);
+        unknown_command(argv, &mut w);
+        return None;
     };
     if !arity_ok(meta, argv.len()) {
         let mut w = RespWriter::new(out, cx.proto);
-        return arity_error(meta.name, &mut w);
+        arity_error(meta.name, &mut w);
+        return None;
     }
     // M1-S07 OOM gate: DENYOOM commands enter through metadata, never
     // per-handler checks (kernel rule). The first test is one branch on the
@@ -181,15 +421,28 @@ pub fn execute(
     if meta.flags.contains(CmdFlags::DENYOOM) && ks.over_limit() && ks.free_for_write(now).is_err()
     {
         let mut w = RespWriter::new(out, cx.proto);
-        return w.error("OOM command not allowed when used memory > 'maxmemory'.");
+        w.error("OOM command not allowed when used memory > 'maxmemory'.");
+        return None;
     }
     // M1-S10: a RESP2 subscriber may only run the subscribe family + PING
     // (Redis `processCommand` order: after the OOM gate). RESP3 lifts this.
     if pubsub::subscriber_restricted(cx) && !pubsub::allowed_in_subscriber_mode(meta.id) {
         let sub = (argv.len() > 1).then(|| argv.arg(1));
         let mut w = RespWriter::new(out, cx.proto);
-        return pubsub::restricted_error(meta.id, meta.name, sub, &mut w);
+        pubsub::restricted_error(meta.id, meta.name, sub, &mut w);
+        return None;
     }
+    Some(meta)
+}
+
+fn execute_preflighted(
+    meta: &'static CommandMeta,
+    argv: &(impl Argv + ?Sized),
+    ks: &mut Keyspace,
+    cx: &mut ConnCx,
+    now: Nanos,
+    out: &mut Vec<u8>,
+) {
     match meta.id {
         // ---- keyspace-level commands (M1-E3/E4) ----
         CommandId::Select => {
@@ -201,18 +454,24 @@ pub fn execute(
             flush(argv, ks, None, now, &mut w);
         }
         CommandId::Flushdb => {
-            let db = cx.db;
             let mut w = RespWriter::new(out, cx.proto);
-            flush(argv, ks, Some(db), now, &mut w);
+            flush(argv, ks, Some(cx.namespace), now, &mut w);
         }
         CommandId::Copy => {
-            let db = cx.db;
             let mut w = RespWriter::new(out, cx.proto);
-            copy(argv, ks, db, now, &mut w);
+            copy(argv, ks, cx.namespace, now, &mut w);
         }
         CommandId::Info => {
             let mut w = RespWriter::new(out, cx.proto);
             admin::info(argv, ks, &cx.node, now, &mut w);
+        }
+        CommandId::Lastsave => {
+            let mut w = RespWriter::new(out, cx.proto);
+            w.int((cx.node.last_checkpoint_unix_ms.get() / 1000) as i64);
+        }
+        CommandId::Bgsave | CommandId::InfCkpt => {
+            let mut w = RespWriter::new(out, cx.proto);
+            w.error("ERR checkpoint publisher is not installed");
         }
         CommandId::Config => {
             let mut w = RespWriter::new(out, cx.proto);
@@ -220,7 +479,7 @@ pub fn execute(
         }
         CommandId::InfNs => {
             let mut w = RespWriter::new(out, cx.proto);
-            admin::inf_ns(argv, ks, &cx.node, &mut w);
+            admin::inf_ns(argv, ks, cx, &mut w);
         }
         // ---- pub/sub (M1-S10): conn-state ops here; registries, delivery,
         // and fan-out are plane state, so inside a node the plane intercepts
@@ -251,10 +510,13 @@ pub fn execute(
             let args: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
             pubsub::pubsub_fallback(&args, cx, out);
         }
-        _ => {
-            let db = usize::from(cx.db);
-            execute_db(meta, argv, ks.db_mut(db), cx, now, out);
-        }
+        _ => match selected_store_mut(ks, cx.namespace, !meta.flags.contains(CmdFlags::WRITE)) {
+            Ok(store) => execute_db(meta, argv, store, cx, now, out),
+            Err(error) => {
+                let mut w = RespWriter::new(out, cx.proto);
+                selected_namespace_error(error, &mut w);
+            }
+        },
     }
     // Mutations refresh the cached pressure flag (no-op without a limit).
     if meta.flags.contains(CmdFlags::WRITE) {
@@ -509,8 +771,11 @@ fn execute_db(
         | CommandId::Flushall
         | CommandId::Copy
         | CommandId::Info
+        | CommandId::Bgsave
+        | CommandId::Lastsave
         | CommandId::Config
         | CommandId::InfNs
+        | CommandId::InfCkpt
         | CommandId::Subscribe
         | CommandId::Unsubscribe
         | CommandId::Psubscribe
@@ -581,6 +846,118 @@ fn set(
     now: Nanos,
     w: &mut RespWriter<'_>,
 ) {
+    let Some(opts) = parse_set_options(argv, node, now, w) else { return };
+    match store.set(argv.arg(1), argv.arg(2), opts, now) {
+        Ok(outcome) => set_reply(outcome, opts, w),
+        Err(e) => op_error(e, w),
+    }
+}
+
+fn set_durable(argv: &(impl Argv + ?Sized), node: &NodeInfo, cx: &mut DurableWriteCtx<'_, '_>) {
+    let Some(opts) = parse_set_options(argv, node, cx.now, &mut *cx.w) else { return };
+    let Some(result) = apply_durable_set_mutation(argv.arg(1), argv.arg(2), opts, cx) else {
+        return;
+    };
+    match result {
+        Ok(outcome) => set_reply(outcome, opts, &mut *cx.w),
+        Err(e) => op_error(e, &mut *cx.w),
+    }
+}
+
+fn setnx_durable(argv: &(impl Argv + ?Sized), cx: &mut DurableWriteCtx<'_, '_>) {
+    let opts = SetOptions { cond: SetCond::IfAbsent, ..Default::default() };
+    let Some(result) = apply_durable_set_mutation(argv.arg(1), argv.arg(2), opts, cx) else {
+        return;
+    };
+    match result {
+        Ok(SetOutcome::Applied { .. }) => cx.w.int(1),
+        Ok(SetOutcome::Skipped { .. }) => cx.w.int(0),
+        Err(e) => op_error(e, &mut *cx.w),
+    }
+}
+
+fn setex_durable(
+    meta: &'static CommandMeta,
+    argv: &(impl Argv + ?Sized),
+    cx: &mut DurableWriteCtx<'_, '_>,
+) {
+    let unit_ms = if meta.id == CommandId::Setex { 1000 } else { 1 };
+    let Ok(ttl) = parse_i64(argv.arg(2)) else {
+        return cx.w.error("ERR value is not an integer or out of range");
+    };
+    let Some(at) = expire_deadline(cx.now, ttl, unit_ms) else {
+        return cx.w.error(&format!(
+            "ERR invalid expire time in '{}' command",
+            meta.name.to_ascii_lowercase()
+        ));
+    };
+    let opts = SetOptions { expire: SetExpire::At(at), ..Default::default() };
+    let Some(result) = apply_durable_set_mutation(argv.arg(1), argv.arg(3), opts, cx) else {
+        return;
+    };
+    match result {
+        Ok(_) => cx.w.simple("OK"),
+        Err(e) => op_error(e, &mut *cx.w),
+    }
+}
+
+fn getset_durable(argv: &(impl Argv + ?Sized), cx: &mut DurableWriteCtx<'_, '_>) {
+    let opts = SetOptions { get_old: true, ..Default::default() };
+    let Some(result) = apply_durable_set_mutation(argv.arg(1), argv.arg(2), opts, cx) else {
+        return;
+    };
+    match result {
+        Ok(outcome) => set_reply(outcome, opts, &mut *cx.w),
+        Err(e) => op_error(e, &mut *cx.w),
+    }
+}
+
+fn apply_durable_set_mutation(
+    key: &[u8],
+    value: &[u8],
+    opts: SetOptions,
+    cx: &mut DurableWriteCtx<'_, '_>,
+) -> Option<Result<SetOutcome, OpError>> {
+    let Some(expire_at_ms) = set_reservation_expire_at_ms(opts) else {
+        cx.w.error("ERR durable SET KEEPTTL is not wired yet");
+        return None;
+    };
+    let effect = MutationEffect::StringPostImage { key, value, expire_at_ms, raw: false };
+    let reservation = match cx.durability.reserve_mutation_effect(effect) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            durability_error(error, &mut *cx.w);
+            return None;
+        }
+    };
+    let mut sink = match cx.durability.reserved_mutation_sink(cx.namespace, reservation) {
+        Ok(sink) => sink,
+        Err(error) => {
+            durability_error(error, &mut *cx.w);
+            return None;
+        }
+    };
+
+    let result = cx.store.set_with_effect(key, value, opts, cx.now, &mut sink);
+    let staged = sink.finish();
+    match &result {
+        Ok(SetOutcome::Applied { .. }) => {
+            assert!(staged, "applied durable SET did not emit a mutation effect");
+        }
+        Ok(SetOutcome::Skipped { .. }) => {
+            assert!(!staged, "skipped durable SET emitted a mutation effect");
+        }
+        Err(_) => assert!(!staged, "failed durable SET emitted a mutation effect"),
+    }
+    Some(result)
+}
+
+fn parse_set_options(
+    argv: &(impl Argv + ?Sized),
+    node: &NodeInfo,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) -> Option<SetOptions> {
     let mut opts = SetOptions::default();
     let mut have_cond = false;
     let mut have_expire = false;
@@ -589,7 +966,8 @@ fn set(
         let opt = argv.arg(i);
         if opt.eq_ignore_ascii_case(b"NX") || opt.eq_ignore_ascii_case(b"XX") {
             if have_cond {
-                return w.error("ERR syntax error");
+                w.error("ERR syntax error");
+                return None;
             }
             have_cond = true;
             opts.cond = if opt.eq_ignore_ascii_case(b"NX") {
@@ -601,7 +979,8 @@ fn set(
             opts.get_old = true;
         } else if opt.eq_ignore_ascii_case(b"KEEPTTL") {
             if have_expire {
-                return w.error("ERR syntax error");
+                w.error("ERR syntax error");
+                return None;
             }
             have_expire = true;
             opts.expire = SetExpire::Keep;
@@ -611,11 +990,13 @@ fn set(
             || opt.eq_ignore_ascii_case(b"PXAT")
         {
             if have_expire || i + 1 >= argv.len() {
-                return w.error("ERR syntax error");
+                w.error("ERR syntax error");
+                return None;
             }
             have_expire = true;
             let Ok(value) = parse_i64(argv.arg(i + 1)) else {
-                return w.error("ERR value is not an integer or out of range");
+                w.error("ERR value is not an integer or out of range");
+                return None;
             };
             let unit_ms: i64 =
                 if opt.eq_ignore_ascii_case(b"EX") || opt.eq_ignore_ascii_case(b"EXAT") {
@@ -635,34 +1016,333 @@ fn set(
                 expire_deadline(now, value, unit_ms)
             };
             let Some(at) = at else {
-                return w.error("ERR invalid expire time in 'set' command");
+                w.error("ERR invalid expire time in 'set' command");
+                return None;
             };
             opts.expire = SetExpire::At(at);
             i += 1;
         } else {
-            return w.error("ERR syntax error");
+            w.error("ERR syntax error");
+            return None;
         }
         i += 1;
     }
-    match store.set(argv.arg(1), argv.arg(2), opts, now) {
-        Ok(outcome) => {
-            let (applied, old) = match outcome {
-                SetOutcome::Applied { old } => (true, old),
-                SetOutcome::Skipped { old } => (false, old),
-            };
-            if opts.get_old {
-                match old {
-                    Some(value) => w.bulk(&value),
-                    None => w.null(),
+    Some(opts)
+}
+
+fn set_reservation_expire_at_ms(opts: SetOptions) -> Option<Option<u64>> {
+    match opts.expire {
+        SetExpire::Clear => Some(None),
+        SetExpire::At(_) => Some(Some(0)),
+        SetExpire::Keep => None,
+    }
+}
+
+fn set_reply(outcome: SetOutcome, opts: SetOptions, w: &mut RespWriter<'_>) {
+    let (applied, old) = match outcome {
+        SetOutcome::Applied { old } => (true, old),
+        SetOutcome::Skipped { old } => (false, old),
+    };
+    if opts.get_old {
+        match old {
+            Some(value) => w.bulk(&value),
+            None => w.null(),
+        }
+    } else if applied {
+        w.simple("OK");
+    } else {
+        w.null();
+    }
+}
+
+fn del_durable(argv: &(impl Argv + ?Sized), cx: &mut DurableWriteCtx<'_, '_>) {
+    let Some(reservation) = reserve_durable_delete_batch(argv, cx) else { return };
+    if reservation.record_count == 0 {
+        return cx.w.int(0);
+    }
+
+    let mut sink =
+        match cx.durability.reserved_mutation_batch_sink(cx.namespace, reservation.reservation) {
+            Ok(sink) => sink,
+            Err(error) => return durability_error(error, &mut *cx.w),
+        };
+
+    let mut removed = 0i64;
+    for i in 1..argv.len() {
+        if cx.store.del_with_effect(argv.arg(i), cx.now, &mut sink) {
+            removed += 1;
+        }
+    }
+    let outcome = sink.finish();
+    assert_eq!(outcome.record_count, removed as u32);
+    assert!(outcome.len_bytes <= reservation.len_bytes);
+    cx.w.int(removed);
+}
+
+struct DurableDeleteReservation {
+    reservation: crate::durability::MutationBatchReservation,
+    record_count: u32,
+    len_bytes: usize,
+}
+
+fn reserve_durable_delete_batch(
+    argv: &(impl Argv + ?Sized),
+    cx: &mut DurableWriteCtx<'_, '_>,
+) -> Option<DurableDeleteReservation> {
+    let mut record_count = 0u32;
+    let mut len_bytes = 0usize;
+    // Duplicate keys may over-reserve. Avoiding a per-command set keeps this
+    // path allocation-free; an over-reserve can only reject before mutation.
+    for i in 1..argv.len() {
+        if cx.store.exists(argv.arg(i), cx.now) {
+            let effect = MutationEffect::Delete { key: argv.arg(i) };
+            record_count = match record_count.checked_add(1) {
+                Some(count) => count,
+                None => {
+                    durability_error(
+                        MutationStageError::Log(LogStagingError::RecordCountOverflow),
+                        &mut *cx.w,
+                    );
+                    return None;
                 }
-            } else if applied {
-                w.simple("OK");
-            } else {
-                w.null();
+            };
+            let record_len = match mutation_effect_record_len(effect) {
+                Ok(record_len) => record_len,
+                Err(error) => {
+                    durability_error(error, &mut *cx.w);
+                    return None;
+                }
+            };
+            len_bytes = len_bytes.saturating_add(record_len);
+        }
+    }
+    let reservation = match cx.durability.reserve_mutation_effect_batch(record_count, len_bytes) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            durability_error(error, &mut *cx.w);
+            return None;
+        }
+    };
+    Some(DurableDeleteReservation { reservation, record_count, len_bytes })
+}
+
+fn getdel_durable(argv: &(impl Argv + ?Sized), cx: &mut DurableWriteCtx<'_, '_>) {
+    match cx.store.expire_at(argv.arg(1), cx.now) {
+        Ttl::Missing => cx.w.null(),
+        Ttl::NoExpiry | Ttl::Ms(_) => {
+            let effect = MutationEffect::Delete { key: argv.arg(1) };
+            let reservation = match cx.durability.reserve_mutation_effect(effect) {
+                Ok(reservation) => reservation,
+                Err(error) => return durability_error(error, &mut *cx.w),
+            };
+            let mut sink = match cx.durability.reserved_mutation_sink(cx.namespace, reservation) {
+                Ok(sink) => sink,
+                Err(error) => return durability_error(error, &mut *cx.w),
+            };
+            let value = cx.store.getdel_with_effect(argv.arg(1), cx.now, &mut sink);
+            assert!(sink.finish());
+            match value {
+                Some(value) => cx.w.bulk(&value),
+                None => unreachable!("GETDEL precheck resolved a live key"),
             }
         }
-        Err(e) => op_error(e, w),
     }
+}
+
+fn getex_durable(argv: &(impl Argv + ?Sized), node: &NodeInfo, cx: &mut DurableWriteCtx<'_, '_>) {
+    let Some(update) = parse_getex_update(argv, node, cx.now, &mut *cx.w) else { return };
+    let Some(effect) = getex_effect_if_applies(cx.store, argv.arg(1), update, cx.now) else {
+        match cx.store.get_ex(argv.arg(1), update, cx.now) {
+            Some(value) => return cx.w.bulk(&value),
+            None => return cx.w.null(),
+        }
+    };
+
+    let reservation = match cx.durability.reserve_mutation_effect(effect) {
+        Ok(reservation) => reservation,
+        Err(error) => return durability_error(error, &mut *cx.w),
+    };
+    let mut sink = match cx.durability.reserved_mutation_sink(cx.namespace, reservation) {
+        Ok(sink) => sink,
+        Err(error) => return durability_error(error, &mut *cx.w),
+    };
+    let value = cx.store.get_ex_with_effect(argv.arg(1), update, cx.now, &mut sink);
+    assert!(sink.finish());
+    match value {
+        Some(value) => cx.w.bulk(&value),
+        None => unreachable!("GETEX effect precheck resolved a live key"),
+    }
+}
+
+fn getex_effect_if_applies<'a>(
+    store: &mut CellStore,
+    key: &'a [u8],
+    update: TtlUpdate,
+    now: Nanos,
+) -> Option<MutationEffect<'a>> {
+    match update {
+        TtlUpdate::Keep => None,
+        TtlUpdate::Persist => match store.expire_at(key, now) {
+            Ttl::Ms(_) => Some(MutationEffect::ExpireAt { key, expire_at_ms: None }),
+            Ttl::Missing | Ttl::NoExpiry => None,
+        },
+        TtlUpdate::At(at) => expire_effect_if_applies(store, key, at, ExpireCond::Always, now),
+    }
+}
+
+fn persist_durable(argv: &(impl Argv + ?Sized), cx: &mut DurableWriteCtx<'_, '_>) {
+    match cx.store.expire_at(argv.arg(1), cx.now) {
+        Ttl::Missing | Ttl::NoExpiry => cx.w.int(0),
+        Ttl::Ms(_) => {
+            let effect = MutationEffect::ExpireAt { key: argv.arg(1), expire_at_ms: None };
+            apply_durable_expire_effect(argv.arg(1), None, effect, cx);
+        }
+    }
+}
+
+fn expire_durable(
+    argv: &(impl Argv + ?Sized),
+    deadline: Deadline,
+    name: &str,
+    node: &NodeInfo,
+    cx: &mut DurableWriteCtx<'_, '_>,
+) {
+    let Some(spec) = parse_expire_spec(argv, cx.now, deadline, name, node, &mut *cx.w) else {
+        return;
+    };
+    if spec.requires_existing_ttl && !matches!(cx.store.ttl(argv.arg(1), cx.now), Ttl::Ms(_)) {
+        return cx.w.int(0);
+    }
+    let Some(effect) = expire_effect_if_applies(cx.store, argv.arg(1), spec.at, spec.cond, cx.now)
+    else {
+        return cx.w.int(0);
+    };
+    apply_durable_expire_effect(argv.arg(1), Some((spec.at, spec.cond)), effect, cx);
+}
+
+struct ExpireSpec {
+    at: Nanos,
+    cond: ExpireCond,
+    requires_existing_ttl: bool,
+}
+
+fn parse_expire_spec(
+    argv: &(impl Argv + ?Sized),
+    now: Nanos,
+    deadline: Deadline,
+    name: &str,
+    node: &NodeInfo,
+    w: &mut RespWriter<'_>,
+) -> Option<ExpireSpec> {
+    let Ok(value) = parse_i64(argv.arg(2)) else {
+        w.error("ERR value is not an integer or out of range");
+        return None;
+    };
+    let (mut nx, mut xx, mut gt, mut lt) = (false, false, false, false);
+    for i in 3..argv.len() {
+        match argv.arg(i) {
+            f if f.eq_ignore_ascii_case(b"NX") => nx = true,
+            f if f.eq_ignore_ascii_case(b"XX") => xx = true,
+            f if f.eq_ignore_ascii_case(b"GT") => gt = true,
+            f if f.eq_ignore_ascii_case(b"LT") => lt = true,
+            other => {
+                w.error(&format!("ERR Unsupported option {}", String::from_utf8_lossy(other)));
+                return None;
+            }
+        }
+    }
+    if nx && (xx || gt || lt) {
+        w.error("ERR NX and XX, GT or LT options at the same time are not compatible");
+        return None;
+    }
+    if gt && lt {
+        w.error("ERR GT and LT options at the same time are not compatible");
+        return None;
+    }
+
+    let cond = if nx {
+        ExpireCond::IfNoExpiry
+    } else if gt {
+        ExpireCond::IfGreater
+    } else if lt {
+        ExpireCond::IfLess
+    } else {
+        ExpireCond::Always
+    };
+    let at = match deadline {
+        Deadline::Relative { unit_ms } => expire_deadline_signed(now, value, unit_ms),
+        Deadline::AbsoluteUnix { unit_ms } => value
+            .checked_mul(unit_ms)
+            .and_then(|unix| internal_from_unix_ms(node, unix))
+            .and_then(ms_to_nanos),
+    };
+    let Some(at) = at else {
+        w.error(&format!("ERR invalid expire time in '{}' command", name.to_ascii_lowercase()));
+        return None;
+    };
+
+    Some(ExpireSpec { at, cond, requires_existing_ttl: xx })
+}
+
+fn expire_effect_if_applies<'a>(
+    store: &mut CellStore,
+    key: &'a [u8],
+    at: Nanos,
+    cond: ExpireCond,
+    now: Nanos,
+) -> Option<MutationEffect<'a>> {
+    let current = match store.expire_at(key, now) {
+        Ttl::Missing => return None,
+        Ttl::NoExpiry => None,
+        Ttl::Ms(expire_at_ms) => Some(expire_at_ms),
+    };
+    let new_ms = (at.0 / 1_000_000).min(MAX_EXPIRE_MS);
+    let applies = match cond {
+        ExpireCond::Always => true,
+        ExpireCond::IfNoExpiry => current.is_none(),
+        ExpireCond::IfHasExpiry => current.is_some(),
+        ExpireCond::IfGreater => current.is_some_and(|current_ms| new_ms > current_ms),
+        ExpireCond::IfLess => current.is_none_or(|current_ms| new_ms < current_ms),
+    };
+    if !applies {
+        return None;
+    }
+    if new_ms <= now.0 / 1_000_000 {
+        Some(MutationEffect::Delete { key })
+    } else {
+        Some(MutationEffect::ExpireAt { key, expire_at_ms: Some(0) })
+    }
+}
+
+fn apply_durable_expire_effect(
+    key: &[u8],
+    apply: Option<(Nanos, ExpireCond)>,
+    effect: MutationEffect<'_>,
+    cx: &mut DurableWriteCtx<'_, '_>,
+) {
+    let reservation = match cx.durability.reserve_mutation_effect(effect) {
+        Ok(reservation) => reservation,
+        Err(error) => return durability_error(error, &mut *cx.w),
+    };
+    let mut sink = match cx.durability.reserved_mutation_sink(cx.namespace, reservation) {
+        Ok(sink) => sink,
+        Err(error) => return durability_error(error, &mut *cx.w),
+    };
+    let applied = match apply {
+        Some((at, cond)) => cx.store.expire_with_effect(key, Some(at), cond, cx.now, &mut sink),
+        None => cx.store.expire_with_effect(key, None, ExpireCond::Always, cx.now, &mut sink),
+    };
+    assert!(applied);
+    assert!(sink.finish());
+    cx.w.int(1);
+}
+
+fn durability_error(error: MutationStageError, w: &mut RespWriter<'_>) {
+    w.error(&format!("ERR durable write rejected: {error}"));
+}
+
+fn durable_unsupported(meta: &'static CommandMeta, w: &mut RespWriter<'_>) {
+    w.error(&format!("ERR durable command '{}' is not wired yet", meta.name.to_ascii_lowercase()));
 }
 
 // ---- GETEX -------------------------------------------------------------------
@@ -674,13 +1354,27 @@ fn getex(
     now: Nanos,
     w: &mut RespWriter<'_>,
 ) {
+    let Some(update) = parse_getex_update(argv, node, now, w) else { return };
+    match store.get_ex(argv.arg(1), update, now) {
+        Some(value) => w.bulk(&value),
+        None => w.null(),
+    }
+}
+
+fn parse_getex_update(
+    argv: &(impl Argv + ?Sized),
+    node: &NodeInfo,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) -> Option<TtlUpdate> {
     let mut update = TtlUpdate::Keep;
     let mut have = false;
     let mut i = 2;
     while i < argv.len() {
         let opt = argv.arg(i);
         if have {
-            return w.error("ERR syntax error");
+            w.error("ERR syntax error");
+            return None;
         }
         if opt.eq_ignore_ascii_case(b"PERSIST") {
             have = true;
@@ -691,11 +1385,13 @@ fn getex(
             || opt.eq_ignore_ascii_case(b"PXAT")
         {
             if i + 1 >= argv.len() {
-                return w.error("ERR syntax error");
+                w.error("ERR syntax error");
+                return None;
             }
             have = true;
             let Ok(value) = parse_i64(argv.arg(i + 1)) else {
-                return w.error("ERR value is not an integer or out of range");
+                w.error("ERR value is not an integer or out of range");
+                return None;
             };
             let unit_ms: i64 =
                 if opt.eq_ignore_ascii_case(b"EX") || opt.eq_ignore_ascii_case(b"EXAT") {
@@ -713,19 +1409,18 @@ fn getex(
                 expire_deadline(now, value, unit_ms)
             };
             let Some(at) = at else {
-                return w.error("ERR invalid expire time in 'getex' command");
+                w.error("ERR invalid expire time in 'getex' command");
+                return None;
             };
             update = TtlUpdate::At(at);
             i += 1;
         } else {
-            return w.error("ERR syntax error");
+            w.error("ERR syntax error");
+            return None;
         }
         i += 1;
     }
-    match store.get_ex(argv.arg(1), update, now) {
-        Some(value) => w.bulk(&value),
-        None => w.null(),
-    }
+    Some(update)
 }
 
 // ---- MSET / MSETNX -----------------------------------------------------------
@@ -770,17 +1465,17 @@ fn msetnx(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mu
 
 // ---- COPY ----------------------------------------------------------------------
 
-/// `COPY src dst [DB n] [REPLACE]` — cross-db is real with namespaces v1
-/// (M1-S08); the source database is the connection's selected db.
+/// `COPY src dst [DB n] [REPLACE]` — cross-db is real for default namespaces;
+/// named memory namespaces support same-namespace COPY without `DB`.
 fn copy(
     argv: &(impl Argv + ?Sized),
     ks: &mut Keyspace,
-    src_db: u16,
+    namespace: ConnNamespace,
     now: Nanos,
     w: &mut RespWriter<'_>,
 ) {
     let mut replace = false;
-    let mut dst_db = src_db;
+    let mut dst_db = namespace.selected_db();
     let mut i = 3;
     while i < argv.len() {
         let opt = argv.arg(i);
@@ -791,7 +1486,7 @@ fn copy(
                 return w.error("ERR syntax error");
             }
             match parse_i64(argv.arg(i + 1)) {
-                Ok(n @ 0..=15) => dst_db = n as u16,
+                Ok(n @ 0..=15) => dst_db = Some(n as u16),
                 Ok(_) => return w.error("ERR DB index is out of range"),
                 Err(()) => return w.error("ERR value is not an integer or out of range"),
             }
@@ -801,13 +1496,34 @@ fn copy(
         }
         i += 1;
     }
+    if let Some(src_db) = namespace.selected_db() {
+        let dst_db = dst_db.expect("default source carries a default destination");
+        // Same key is only an error within one database (Redis: cross-db
+        // self-copy is legal).
+        if argv.arg(1) == argv.arg(2) && src_db == dst_db {
+            return w.error("ERR source and destination objects are the same");
+        }
+        let (src_db, dst_db) = (usize::from(src_db), usize::from(dst_db));
+        match ks.copy_between(src_db, argv.arg(1), dst_db, argv.arg(2), replace, now) {
+            Ok(CopyResult::Copied) => w.int(1),
+            Ok(CopyResult::SourceMissing | CopyResult::DestinationExists) => w.int(0),
+            Err(e) => op_error(e, w),
+        }
+        return;
+    }
+    if dst_db.is_some() {
+        return w.error("ERR COPY DB is only valid from default namespaces");
+    }
     // Same key is only an error within one database (Redis: cross-db
     // self-copy is legal).
-    if argv.arg(1) == argv.arg(2) && src_db == dst_db {
+    if argv.arg(1) == argv.arg(2) {
         return w.error("ERR source and destination objects are the same");
     }
-    let (src_db, dst_db) = (usize::from(src_db), usize::from(dst_db));
-    match ks.copy_between(src_db, argv.arg(1), dst_db, argv.arg(2), replace, now) {
+    let store = match selected_store_mut(ks, namespace, false) {
+        Ok(store) => store,
+        Err(error) => return selected_namespace_error(error, w),
+    };
+    match store.copy(argv.arg(1), argv.arg(2), replace, now) {
         Ok(CopyResult::Copied) => w.int(1),
         Ok(CopyResult::SourceMissing | CopyResult::DestinationExists) => w.int(0),
         Err(e) => op_error(e, w),
@@ -818,7 +1534,7 @@ fn copy(
 fn flush(
     argv: &(impl Argv + ?Sized),
     ks: &mut Keyspace,
-    db: Option<u16>,
+    namespace: Option<ConnNamespace>,
     now: Nanos,
     w: &mut RespWriter<'_>,
 ) {
@@ -828,9 +1544,20 @@ fn flush(
             return w.error("ERR syntax error");
         }
     }
-    match db {
-        Some(db) => ks.db_mut(usize::from(db)).flush(now),
-        None => ks.flush_all(now),
+    match namespace {
+        Some(namespace) => {
+            let store = match selected_store_mut(ks, namespace, false) {
+                Ok(store) => store,
+                Err(error) => return selected_namespace_error(error, w),
+            };
+            store.flush(now);
+        }
+        None => {
+            if ks.has_durable_namespaces() {
+                return w.error("ERR durable command 'flushall' is not wired yet");
+            }
+            ks.flush_all(now);
+        }
     }
     w.simple("OK");
 }
@@ -992,7 +1719,7 @@ fn object_subcommand_error(sub: &[u8], w: &mut RespWriter<'_>) {
 fn select(argv: &(impl Argv + ?Sized), ks: &mut Keyspace, cx: &mut ConnCx, w: &mut RespWriter<'_>) {
     match parse_i64(argv.arg(1)) {
         Ok(n @ 0..=15) => {
-            cx.db = n as u16;
+            cx.namespace = ConnNamespace::default_db(n as u16);
             // Materialize eagerly: a SELECTed db is about to be used.
             let _ = ks.db_mut(n as usize);
             w.simple("OK");
@@ -1022,55 +1749,13 @@ fn expire(
     node: &NodeInfo,
     w: &mut RespWriter<'_>,
 ) {
-    let Ok(value) = parse_i64(argv.arg(2)) else {
-        return w.error("ERR value is not an integer or out of range");
-    };
-    let (mut nx, mut xx, mut gt, mut lt) = (false, false, false, false);
-    for i in 3..argv.len() {
-        match argv.arg(i) {
-            f if f.eq_ignore_ascii_case(b"NX") => nx = true,
-            f if f.eq_ignore_ascii_case(b"XX") => xx = true,
-            f if f.eq_ignore_ascii_case(b"GT") => gt = true,
-            f if f.eq_ignore_ascii_case(b"LT") => lt = true,
-            other => {
-                return w
-                    .error(&format!("ERR Unsupported option {}", String::from_utf8_lossy(other)));
-            }
-        }
-    }
-    if nx && (xx || gt || lt) {
-        return w.error("ERR NX and XX, GT or LT options at the same time are not compatible");
-    }
-    if gt && lt {
-        return w.error("ERR GT and LT options at the same time are not compatible");
-    }
+    let Some(spec) = parse_expire_spec(argv, now, deadline, name, node, w) else { return };
     // XX composes with GT/LT (the store cond is single-valued; an XX
     // pre-check on the TTL state reproduces the conjunction exactly).
-    if xx && !matches!(store.ttl(argv.arg(1), now), Ttl::Ms(_)) {
+    if spec.requires_existing_ttl && !matches!(store.ttl(argv.arg(1), now), Ttl::Ms(_)) {
         return w.int(0);
     }
-    let cond = if nx {
-        ExpireCond::IfNoExpiry
-    } else if gt {
-        ExpireCond::IfGreater
-    } else if lt {
-        ExpireCond::IfLess
-    } else {
-        ExpireCond::Always
-    };
-    // Deadline overflow is "invalid expire time".
-    let at = match deadline {
-        Deadline::Relative { unit_ms } => expire_deadline_signed(now, value, unit_ms),
-        Deadline::AbsoluteUnix { unit_ms } => value
-            .checked_mul(unit_ms)
-            .and_then(|unix| internal_from_unix_ms(node, unix))
-            .and_then(ms_to_nanos),
-    };
-    let Some(at) = at else {
-        return w
-            .error(&format!("ERR invalid expire time in '{}' command", name.to_ascii_lowercase()));
-    };
-    let applied = store.expire(argv.arg(1), Some(at), cond, now);
+    let applied = store.expire(argv.arg(1), Some(spec.at), spec.cond, now);
     w.int(i64::from(applied));
 }
 
@@ -1261,6 +1946,27 @@ mod tests {
         out
     }
 
+    fn run_durable_at(
+        cx: &mut ConnCx,
+        store: &mut Keyspace,
+        durability: &mut DurabilityCell,
+        now: Nanos,
+        parts: &[&[u8]],
+    ) -> Vec<u8> {
+        let mut wire = format!("*{}\r\n", parts.len()).into_bytes();
+        for p in parts {
+            wire.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+            wire.extend_from_slice(p);
+            wire.extend_from_slice(b"\r\n");
+        }
+        let mut parser = ConnParser::new(ParserLimits::default());
+        let mut iter = parser.feed(&wire);
+        let Some(Parsed::Command(argv)) = iter.next() else { panic!("one command") };
+        let mut out = Vec::new();
+        execute_durable(&argv, store, durability, NamespaceId::new(0), cx, now, &mut out);
+        out
+    }
+
     fn run(cx: &mut ConnCx, store: &mut Keyspace, parts: &[&[u8]]) -> Vec<u8> {
         run_at(cx, store, Nanos(1), parts)
     }
@@ -1310,6 +2016,407 @@ mod tests {
         let long_key = vec![b'k'; 256];
         let reply = run(&mut cx, &mut store, &[b"SET", &long_key, b"v"]);
         assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
+    }
+
+    #[test]
+    fn durable_set_reserves_stages_and_replies() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut durability = DurabilityCell::new();
+        let now = Nanos(1);
+
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"SET", b"k", b"v"]),
+            b"+OK\r\n"
+        );
+        assert!(durability.log_staging_bytes() > 0);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"k"]),
+            b"$1\r\nv\r\n"
+        );
+    }
+
+    #[test]
+    fn durable_set_backpressure_rejects_before_mutation() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut durability = DurabilityCell::with_capacity(1).unwrap();
+        let now = Nanos(1);
+
+        let reply =
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"SET", b"k", b"v"]);
+
+        assert!(reply.starts_with(b"-ERR durable write rejected: log staging full"), "{reply:?}");
+        assert_eq!(durability.log_staging_bytes(), 0);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"k"]),
+            b"$-1\r\n"
+        );
+    }
+
+    #[test]
+    fn durable_set_family_variants_stage_or_skip_correctly() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut durability = DurabilityCell::new();
+        let now = Nanos(1);
+
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"SETNX", b"k", b"v"]),
+            b":1\r\n"
+        );
+        let after_setnx = durability.log_staging_bytes();
+        assert!(after_setnx > 0);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"SETNX", b"k", b"again"]),
+            b":0\r\n"
+        );
+        assert_eq!(durability.log_staging_bytes(), after_setnx);
+        assert_eq!(
+            run_durable_at(
+                &mut cx,
+                &mut store,
+                &mut durability,
+                now,
+                &[b"SETEX", b"ttl", b"3", b"v"]
+            ),
+            b"+OK\r\n"
+        );
+        assert!(durability.log_staging_bytes() > after_setnx);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GETSET", b"k", b"new"]),
+            b"$1\r\nv\r\n"
+        );
+    }
+
+    #[test]
+    fn durable_del_and_unlink_reserve_stage_and_reply() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut durability = DurabilityCell::new();
+        let now = Nanos(1);
+
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"a", b"1"]), b"+OK\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"b", b"2"]), b"+OK\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"c", b"3"]), b"+OK\r\n");
+
+        assert_eq!(
+            run_durable_at(
+                &mut cx,
+                &mut store,
+                &mut durability,
+                now,
+                &[b"DEL", b"a", b"missing", b"a", b"b"]
+            ),
+            b":2\r\n"
+        );
+        let after_del = durability.log_staging_bytes();
+        assert!(after_del > 0);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"UNLINK", b"c"]),
+            b":1\r\n"
+        );
+        assert!(durability.log_staging_bytes() > after_del);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"a"]),
+            b"$-1\r\n"
+        );
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"b"]),
+            b"$-1\r\n"
+        );
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"c"]),
+            b"$-1\r\n"
+        );
+    }
+
+    #[test]
+    fn durable_del_backpressure_rejects_whole_batch_before_mutation() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let now = Nanos(1);
+        let one_delete = mutation_effect_record_len(MutationEffect::Delete { key: b"a" }).unwrap();
+        let mut durability = DurabilityCell::with_capacity(one_delete).unwrap();
+
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"a", b"1"]), b"+OK\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"b", b"2"]), b"+OK\r\n");
+
+        let reply =
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"DEL", b"a", b"b"]);
+
+        assert!(reply.starts_with(b"-ERR durable write rejected: log staging full"), "{reply:?}");
+        assert_eq!(durability.log_staging_bytes(), 0);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"a"]),
+            b"$1\r\n1\r\n"
+        );
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"b"]),
+            b"$1\r\n2\r\n"
+        );
+    }
+
+    #[test]
+    fn durable_getdel_reserves_stages_and_replies() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut durability = DurabilityCell::new();
+        let now = Nanos(1);
+
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GETDEL", b"k"]),
+            b"$1\r\nv\r\n"
+        );
+        assert!(durability.log_staging_bytes() > 0);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"k"]),
+            b"$-1\r\n"
+        );
+    }
+
+    #[test]
+    fn durable_getdel_backpressure_rejects_before_mutation() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut durability = DurabilityCell::with_capacity(1).unwrap();
+        let now = Nanos(1);
+
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+
+        let reply = run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GETDEL", b"k"]);
+
+        assert!(reply.starts_with(b"-ERR durable write rejected: log staging full"), "{reply:?}");
+        assert_eq!(durability.log_staging_bytes(), 0);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"k"]),
+            b"$1\r\nv\r\n"
+        );
+    }
+
+    #[test]
+    fn durable_expire_persist_and_past_deadline_stage() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut durability = DurabilityCell::new();
+        let now = Nanos::from_millis(1_000);
+
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"EXPIRE", b"k", b"10"]),
+            b":1\r\n"
+        );
+        let after_expire = durability.log_staging_bytes();
+        assert!(after_expire > 0);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"PTTL", b"k"]),
+            b":10000\r\n"
+        );
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"PERSIST", b"k"]),
+            b":1\r\n"
+        );
+        let after_persist = durability.log_staging_bytes();
+        assert!(after_persist > after_expire);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"PTTL", b"k"]),
+            b":-1\r\n"
+        );
+        assert_eq!(
+            run_durable_at(
+                &mut cx,
+                &mut store,
+                &mut durability,
+                now,
+                &[b"PEXPIREAT", b"k", b"999"]
+            ),
+            b":1\r\n"
+        );
+        assert!(durability.log_staging_bytes() > after_persist);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"k"]),
+            b"$-1\r\n"
+        );
+    }
+
+    #[test]
+    fn durable_expire_backpressure_rejects_before_mutation() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut durability = DurabilityCell::with_capacity(1).unwrap();
+        let now = Nanos::from_millis(1_000);
+
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+
+        let reply =
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"EXPIRE", b"k", b"10"]);
+
+        assert!(reply.starts_with(b"-ERR durable write rejected: log staging full"), "{reply:?}");
+        assert_eq!(durability.log_staging_bytes(), 0);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"PTTL", b"k"]),
+            b":-1\r\n"
+        );
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"k"]),
+            b"$1\r\nv\r\n"
+        );
+    }
+
+    #[test]
+    fn durable_expire_skips_without_staging_when_condition_fails() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut durability = DurabilityCell::new();
+        let now = Nanos::from_millis(1_000);
+
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        assert_eq!(
+            run_durable_at(
+                &mut cx,
+                &mut store,
+                &mut durability,
+                now,
+                &[b"EXPIRE", b"k", b"10", b"XX"]
+            ),
+            b":0\r\n"
+        );
+        assert_eq!(durability.log_staging_bytes(), 0);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"PTTL", b"k"]),
+            b":-1\r\n"
+        );
+    }
+
+    #[test]
+    fn durable_expire_gt_uses_store_deadline_clamp_before_reserving() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut durability = DurabilityCell::new();
+        let now = Nanos::from_millis(1);
+
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v", b"PX", b"2000000000000"]),
+            b"+OK\r\n"
+        );
+        assert_eq!(
+            run_durable_at(
+                &mut cx,
+                &mut store,
+                &mut durability,
+                now,
+                &[b"EXPIRE", b"k", b"3000000000", b"GT"]
+            ),
+            b":0\r\n"
+        );
+        assert_eq!(durability.log_staging_bytes(), 0);
+    }
+
+    #[test]
+    fn durable_getex_stages_ttl_updates_and_skips_plain_reads() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut durability = DurabilityCell::new();
+        let now = Nanos::from_millis(1_000);
+
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GETEX", b"k"]),
+            b"$1\r\nv\r\n"
+        );
+        assert_eq!(durability.log_staging_bytes(), 0);
+        assert_eq!(
+            run_durable_at(
+                &mut cx,
+                &mut store,
+                &mut durability,
+                now,
+                &[b"GETEX", b"k", b"PX", b"10000"]
+            ),
+            b"$1\r\nv\r\n"
+        );
+        let after_expire = durability.log_staging_bytes();
+        assert!(after_expire > 0);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"PTTL", b"k"]),
+            b":10000\r\n"
+        );
+        assert_eq!(
+            run_durable_at(
+                &mut cx,
+                &mut store,
+                &mut durability,
+                now,
+                &[b"GETEX", b"k", b"PERSIST"]
+            ),
+            b"$1\r\nv\r\n"
+        );
+        let after_persist = durability.log_staging_bytes();
+        assert!(after_persist > after_expire);
+        assert_eq!(
+            run_durable_at(
+                &mut cx,
+                &mut store,
+                &mut durability,
+                now,
+                &[b"GETEX", b"k", b"PXAT", b"999"]
+            ),
+            b"$1\r\nv\r\n"
+        );
+        assert!(durability.log_staging_bytes() > after_persist);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"k"]),
+            b"$-1\r\n"
+        );
+    }
+
+    #[test]
+    fn durable_getex_backpressure_rejects_before_mutation() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut durability = DurabilityCell::with_capacity(1).unwrap();
+        let now = Nanos::from_millis(1_000);
+
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+
+        let reply = run_durable_at(
+            &mut cx,
+            &mut store,
+            &mut durability,
+            now,
+            &[b"GETEX", b"k", b"PX", b"10000"],
+        );
+
+        assert!(reply.starts_with(b"-ERR durable write rejected: log staging full"), "{reply:?}");
+        assert_eq!(durability.log_staging_bytes(), 0);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"PTTL", b"k"]),
+            b":-1\r\n"
+        );
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"k"]),
+            b"$1\r\nv\r\n"
+        );
+    }
+
+    #[test]
+    fn durable_unsupported_write_rejects_without_mutation() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut durability = DurabilityCell::new();
+        let now = Nanos(1);
+
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"APPEND", b"k", b"!"]),
+            b"-ERR durable command 'append' is not wired yet\r\n"
+        );
+        assert_eq!(durability.log_staging_bytes(), 0);
+        assert_eq!(
+            run_durable_at(&mut cx, &mut store, &mut durability, now, &[b"GET", b"k"]),
+            b"$1\r\nv\r\n"
+        );
     }
 
     #[test]
@@ -1422,7 +2529,7 @@ mod tests {
         let mut ks = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"zero"]), b"+OK\r\n");
         assert_eq!(run(&mut cx, &mut ks, &[b"SELECT", b"1"]), b"+OK\r\n");
-        assert_eq!(cx.db, 1);
+        assert_eq!(cx.namespace, ConnNamespace::Default(1));
         // Identical key, different namespace: never aliases (M1-S08 AC).
         assert_eq!(run(&mut cx, &mut ks, &[b"GET", b"k"]), b"$-1\r\n");
         assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"one"]), b"+OK\r\n");
@@ -1443,6 +2550,28 @@ mod tests {
             run(&mut cx, &mut ks, &[b"SELECT", b"abc"]),
             b"-ERR value is not an integer or out of range\r\n"
         );
+    }
+
+    #[test]
+    fn inf_ns_use_selects_named_memory_namespace() {
+        let mut cx = ConnCx::default();
+        let mut ks = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"cache"]), b"+OK\r\n");
+
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"default"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"USE", b"cache"]), b"+OK\r\n");
+        assert!(matches!(cx.namespace, ConnNamespace::Named(_)));
+        assert_eq!(run(&mut cx, &mut ks, &[b"GET", b"k"]), b"$-1\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"named"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"DBSIZE"]), b":1\r\n");
+
+        let info = String::from_utf8(run(&mut cx, &mut ks, &[b"INF.NS", b"INFO", b"cache"]))
+            .expect("ascii");
+        assert!(info.contains("$4\r\nkeys\r\n$1\r\n1\r\n"), "{info}");
+
+        assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"USE", b"db0"]), b"+OK\r\n");
+        assert_eq!(cx.namespace, ConnNamespace::Default(0));
+        assert_eq!(run(&mut cx, &mut ks, &[b"GET", b"k"]), b"$7\r\ndefault\r\n");
     }
 
     #[test]
@@ -1500,24 +2629,74 @@ mod tests {
             run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"cache"]),
             b"-ERR namespace already exists\r\n"
         );
-        // The M1-S08 honesty AC: durable mode is a documented not-yet error.
-        let reply = run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable"]);
-        assert!(
-            reply.starts_with(b"-ERR namespace mode 'durable' is not yet supported"),
-            "{reply:?}"
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable"]),
+            b"-ERR durable namespace requires FSYNC always|everysec\r\n"
+        );
+        assert_eq!(
+            run(
+                &mut cx,
+                &mut ks,
+                &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"always"]
+            ),
+            b"+OK\r\n"
+        );
+        assert_eq!(
+            run(
+                &mut cx,
+                &mut ks,
+                &[b"INF.NS", b"CREATE", b"sessions", b"MODE", b"durable", b"FSYNC", b"everysec"]
+            ),
+            b"+OK\r\n"
+        );
+        assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"USE", b"ledger"]), b"+OK\r\n");
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"SET", b"k", b"v"]),
+            b"-ERR durable namespace command routing is not yet supported\r\n"
+        );
+        assert_eq!(run(&mut cx, &mut ks, &[b"GET", b"k"]), b"$-1\r\n");
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"FLUSHALL"]),
+            b"-ERR durable command 'flushall' is not wired yet\r\n"
+        );
+        assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"USE", b"db0"]), b"+OK\r\n");
+        assert_eq!(
+            run(
+                &mut cx,
+                &mut ks,
+                &[b"INF.NS", b"CREATE", b"badcache", b"MODE", b"memory", b"FSYNC", b"always"]
+            ),
+            b"-ERR FSYNC is only valid with MODE durable (got MODE memory)\r\n"
+        );
+        assert_eq!(
+            run(
+                &mut cx,
+                &mut ks,
+                &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"sync"]
+            ),
+            b"-ERR unknown FSYNC policy (always|everysec)\r\n"
         );
         let list = run(&mut cx, &mut ks, &[b"INF.NS", b"LIST"]);
         let text = String::from_utf8(list).expect("ascii");
-        assert!(text.starts_with("*17\r\n"), "16 defaults + 1 named: {text}");
+        assert!(text.starts_with("*19\r\n"), "16 defaults + 3 named: {text}");
         assert!(text.contains("cache"), "{text}");
         let info = String::from_utf8(run(&mut cx, &mut ks, &[b"INF.NS", b"INFO", b"cache"]))
             .expect("ascii");
         assert!(info.contains("allkeys-lfu"), "{info}");
         assert!(info.contains("16777216"), "{info}");
+        let ledger_info =
+            String::from_utf8(run(&mut cx, &mut ks, &[b"INF.NS", b"INFO", b"ledger"]))
+                .expect("ascii");
+        assert!(ledger_info.contains("durable"), "{ledger_info}");
+        assert!(ledger_info.contains("always"), "{ledger_info}");
         let db_info =
             String::from_utf8(run(&mut cx, &mut ks, &[b"INF.NS", b"INFO", b"db0"])).expect("ascii");
         assert!(db_info.contains("memory"), "{db_info}");
         assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"DROP", b"cache"]), b"+OK\r\n");
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"INF.NS", b"DROP", b"ledger"]),
+            b"-ERR durable namespace operation is not yet supported\r\n"
+        );
         assert_eq!(
             run(&mut cx, &mut ks, &[b"INF.NS", b"DROP", b"db0"]),
             b"-ERR db0..db15 are reserved default namespaces (SELECT)\r\n"

@@ -22,6 +22,8 @@ pub const RECORDS_LIVE_BYTES: &str = "records_live_bytes";
 pub const RECORDS_SLACK_BYTES: &str = "records_slack_bytes";
 pub const INDEX_BYTES: &str = "index_bytes";
 pub const WIRE_BUFFERS_BYTES: &str = "wire_buffers_bytes";
+pub const LOG_STAGING_BYTES: &str = "log_staging_bytes";
+pub const LOG_STAGING_CAPACITY_BYTES: &str = "log_staging_capacity_bytes";
 pub const CONN_STATE_BYTES: &str = "conn_state_bytes";
 pub const PROCESS_RSS: &str = "process_rss";
 
@@ -36,6 +38,8 @@ pub const ALL: &[&str] = &[
     RECORDS_SLACK_BYTES,
     INDEX_BYTES,
     WIRE_BUFFERS_BYTES,
+    LOG_STAGING_BYTES,
+    LOG_STAGING_CAPACITY_BYTES,
     CONN_STATE_BYTES,
     PROCESS_RSS,
 ];

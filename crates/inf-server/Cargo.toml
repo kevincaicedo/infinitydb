@@ -13,7 +13,11 @@ inf-alloc.workspace = true
 inf-fabric.workspace = true
 inf-runtime.workspace = true
 inf-wire.workspace = true
+inf-log.workspace = true
 inf-store.workspace = true
+
+[dev-dependencies]
+inf-foundation = { workspace = true, features = ["fault-injection"] }
 
 [lints]
 workspace = true

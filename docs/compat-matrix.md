@@ -10,8 +10,8 @@ pin lands with the M1-S14 release pipeline). Every declared-`full` behavior is
 byte-diffed against the oracle on every test run; any new deviation fails CI
 until it is allowlisted with a justification (L8 — honesty is total).
 
-**Corpus:** 378 byte-compared cases · 32 documented deviations · 0 tolerated failures.
-**Surface:** 65 commands — 47 full · 15 partial · 0 stub · 1 extension · 2 internal.
+**Corpus:** 377 byte-compared cases · 34 documented deviations · 0 tolerated failures.
+**Surface:** 68 commands — 47 full · 17 partial · 0 stub · 2 extension · 2 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
 are representational: ordering, identity payloads, opaque cursors/art);
@@ -49,6 +49,8 @@ program primitives, not a client surface.
 | `PTTL` | full | M0 | readonly fast | 2 | 3 |  |
 | `PERSIST` | full | M0 | write fast | 2 | 3 |  |
 | `INFO` | partial | M0 | admin | -1 | 0 | sections + field vocabulary present; gauges are this cell's slice until the control plane aggregates (client-smoke CI is the open M1-S14 AC) |
+| `BGSAVE` | partial | M2 | admin | -1 | 0 | alias for cell-local live checkpoint scheduling; no fork; returns BUSY while a checkpoint is active; byte-diff corpus pending |
+| `LASTSAVE` | partial | M2 | admin fast | 1 | 0 | returns the latest completed live checkpoint Unix timestamp for this cell; startup timestamp semantics differ from Redis |
 | `COMMAND` | partial | M0 | admin | -1 | 3 | COMMAND DOCS is an honest empty map; the registry covers the implemented surface only |
 | `MGET` | full | M1 | readonly fast | -2 | 4 |  |
 | `MSET` | full | M1 | write denyoom | -3 | 3 |  |
@@ -68,7 +70,7 @@ program primitives, not a client surface.
 | `RANDOMKEY` | full | M1 | readonly | 1 | 1 | two-level random: cell, then key |
 | `SCAN` | full | M1 | readonly | -2 | 2 | cursor values are engine-internal; the every-resident-key-≥-once guarantee is proptested |
 | `FLUSHDB` | full | M1 | write | -1 | 4 |  |
-| `FLUSHALL` | partial | M1 | write | -1 | 2 | atomic per cell, eventually complete across cells within one scatter round (no global pause) |
+| `FLUSHALL` | partial | M1 | write | -1 | 1 | atomic per cell, eventually complete across cells within one scatter round (no global pause) |
 | `OBJECT` | partial | M1 | readonly | -2 | 11 | IDLETIME is an honest 0 (CLOCK recency, no LRU clock); FREQ is the CMS Morris estimate |
 | `DEBUG` | partial | M1 | admin | -2 | 3 | subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE; SLEEP stalls one cell, never the node |
 | `EXPIREAT` | full | M1 | write fast | -3 | 6 |  |
@@ -86,6 +88,7 @@ program primitives, not a client surface.
 | `PUBLISH` | full | M1 | fast | 3 | 4 | a publisher subscribed to its own channel via a remote owner cell may receive its frame before the publish reply (local owners match Redis order) |
 | `PUBSUB` | partial | M1 | readonly | -2 | 8 | SHARDCHANNELS / SHARDNUMSUB arrive with sharded pub/sub (M3 cut line) |
 | `INF.NS` | extension | M1 | admin | -2 | 0 | namespace registry v1 — the M2 durability seam |
+| `INF.CKPT` | extension | M2 | admin | -1 | 0 | cell-local or explicit CELL target checkpoint trigger; WAIT gates on the target MANIFEST durability; whole-node aggregation is not implemented |
 | `INF.TAKE` | internal | M1 | write fast | 2 | 0 | cross-cell RENAME/COPY program primitive |
 | `INF.PEEK` | internal | M1 | readonly fast | 2 | 0 | cross-cell COPY program primitive |
 
@@ -125,6 +128,10 @@ oracle by design.
 - cursor values are engine-internal; guarantee proptested in inf-store
 - cursor values engine-internal
 
+### `FLUSHALL`
+
+- durable namespace FLUSHALL is refused until typed record semantics exist
+
 ### `OBJECT`
 
 - no LRU clock until the eviction engine (M1-E3); honest 0
@@ -157,13 +164,14 @@ oracle by design.
 ### `INF.NS`
 
 - InfinityDB extension
-- InfinityDB extension; durable mode honestly rejected until M2
+- InfinityDB extension; durable mode requires explicit FSYNC policy in M2
+- InfinityDB extension; durable mode with explicit FSYNC policy is active in M2
 
 ## Absent (owner milestone)
 
 | Family | Arrives |
 |---|---|
-| Persistence admin (SAVE, BGSAVE, INF.CKPT, …) | M2 — durability |
+| Persistence admin (SAVE, -LOADING, broader redis-cli byte-diff corpus) | M2 — durability |
 | Hashes, lists, sets, zsets, bitmaps, bitfield, HyperLogLog | M3 — data types |
 | Keyspace notifications, SLOWLOG, MONITOR, sharded pub/sub (SSUBSCRIBE/SPUBLISH) | M3 |
 | Connection control (QUIT, RESET) | M3 (RESET pairs with transaction state) |

@@ -16,6 +16,8 @@ pub enum TokenClass {
     Close = 3,
     /// Reserved for cross-thread wakeups (doorbell integration, fabric M0-E3).
     Wake = 4,
+    /// M2 durable file operations: open/preallocate/sync/rename/unlink.
+    File = 5,
 }
 
 impl TokenClass {
@@ -26,6 +28,7 @@ impl TokenClass {
             2 => Some(TokenClass::Send),
             3 => Some(TokenClass::Close),
             4 => Some(TokenClass::Wake),
+            5 => Some(TokenClass::File),
             _ => None,
         }
     }
@@ -97,6 +100,7 @@ mod tests {
             TokenClass::Send,
             TokenClass::Close,
             TokenClass::Wake,
+            TokenClass::File,
         ] {
             for (slot, generation) in
                 [(0, 0), (1, u32::MAX), (MAX_SLOT, 7u32), (0xAB_CDEF, 0xDEAD_BEEF)]

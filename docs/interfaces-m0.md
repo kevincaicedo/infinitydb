@@ -101,7 +101,7 @@ impl Arena {
 
 ```rust
 pub struct CompletionToken(u64);           // {class:8, slot:24, gen:32}
-pub enum TokenClass { Accept, Recv, Send, Close, Wake }
+pub enum TokenClass { Accept, Recv, Send, Close, Wake, File }
 impl CompletionToken {
     pub fn new(class: TokenClass, slot: u32, generation: u32) -> Self;  // slot < 2^24
     pub fn class(self) -> TokenClass;  pub fn slot(self) -> u32;
@@ -122,6 +122,30 @@ pub enum IoOp {
     /// Buffer was leased by the caller; ownership returns in the completion.
     Send { fd: RawFd, buf: BufferId, len: u32, token: CompletionToken },
     Close { fd: RawFd, token: CompletionToken },
+    // 2026-06-24 M2 extension (ADR-0015): initial durable file metadata ops.
+    // FileOpenMode::ReadWrite is non-creating, for recovered active segments.
+    // ADR-0028 adds ReadWriteCreateTruncate for exact-length atomic-publish
+    // temp files such as namespace META.tmp.
+    FileOpen { dir: RawFd, name: String, mode: FileOpenMode, token: CompletionToken },
+    // 2026-06-24 M2 extension (ADR-0015 addendum): cold first-boot directory
+    // creation. Parent directory fsync is explicit via FileSync::Full.
+    FileCreateDir { dir: RawFd, name: String, mode: u32, token: CompletionToken },
+    FilePreallocate { fd: RawFd, len_bytes: u64, token: CompletionToken },
+    // 2026-06-24 M2 extension (ADR-0018): positioned recovery/segment reads.
+    // The caller leases `buf`; completion returns the same buffer on success
+    // or failure. Write/fsync policy remains M2-S05.
+    FileReadAt { fd: RawFd, offset_bytes: u64, buf: BufferId,
+                 len: u32, token: CompletionToken },
+    // 2026-06-24 M2 extension (ADR-0019): positioned segment/log writes.
+    // The caller leases `buf`; completion returns the same buffer on success
+    // or failure. This is the current one-iovec case of the S05 write path.
+    FileWriteAt { fd: RawFd, offset_bytes: u64, buf: BufferId,
+                  len: u32, token: CompletionToken },
+    FileSync { fd: RawFd, mode: FileSyncMode, token: CompletionToken },
+    FileClose { fd: RawFd, token: CompletionToken },
+    FileRename { old_dir: RawFd, old_name: String, new_dir: RawFd,
+                 new_name: String, token: CompletionToken },
+    FileUnlink { dir: RawFd, name: String, token: CompletionToken },
 }
 
 pub struct Completion { pub token: CompletionToken, pub result: CompletionResult }
@@ -131,6 +155,11 @@ pub enum CompletionResult {
     RecvDropped,                            // pool dry; recv paused, re-arm needed
     Sent { buf: BufferId },
     Closed,
+    FileOpened { fd: RawFd },
+    FileRead { buf: BufferId, len: u32 },
+    FileWritten { buf: BufferId },
+    FileDone,
+    FileClosed,
     Error { errno: i32, buf: Option<BufferId> }, // any held buffer ALWAYS returns
 }
 
@@ -352,6 +381,7 @@ pub fn scalar_scan_crlf(buf: &[u8]) -> CrlfPositions;       // the proptest orac
 // RecordHeader v0 (master plan §7.2) — layout frozen:
 //   type:4 | flags:4 | klen:u8 | vlen:u24 | version:u24   (8 B fixed)
 //   [expire_at_ms: u40 if TTL flag] [key bytes] [value bytes]
+pub const MAX_EXPIRE_MS: u64 = (1 << 40) - 1;
 pub struct CellStore;
 impl CellStore {
     pub fn new(cfg: StoreConfig) -> Self;
@@ -507,6 +537,32 @@ unchanged: the pub/sub fan-out vocabulary (`INF.PUB`/`INF.PUBFAN`/
 intercepted by the plane ahead of `execute` — invisible to clients,
 reserved names for the fabric. See ADR-0010 (M1-E5 pub/sub plane; internal
 decision record).
+
+**M2-S08 extension note (2026-06-24, ADR-0037):** the ADR-0009 trigger fired.
+Named namespaces beyond `db0..db15` became publicly addressable for
+memory-mode namespaces through `INF.NS USE name`, so the fabric codec moved to
+Apply v1. `ConnCx` now carries `ConnNamespace::{Default(u16), Named(NsId)}` and
+`Op::Apply` carries `namespace:u32` explicitly; `cmd` is again only the RESP
+protocol byte. The old `{db:4 | proto:4}` packing remains the M1 historical
+record, not the current M2 wire shape. ADR-0038 added the owner-cell reply lane
+that waits for LOG assignment plus the owner fsync watermark before a remote
+`always` Apply reply returns to the origin cell.
+
+**M2-S05/S08 extension note (2026-06-24, ADR-0039):** `LogWriteIo` completion
+semantics now distinguish an unsynced `FrameWritten(meta)` from
+`FrameDurable(meta)`. `ServerPlane` advances the durability watermark only for
+`FrameDurable`; everysec writes ack on apply, arm a one-shot injected
+one-second timer, and queue `FileSyncMode::DataOnly` for pending unsynced bytes
+when the timer fires.
+
+**M2-S08 extension note (2026-06-24, ADR-0040):** public named durable
+activation is live for the wired M2 string/delete/expiry command family.
+`NsRegistry::create` accepts `MODE durable FSYNC always|everysec`,
+`INF.NS USE` may select durable KV namespaces, and `INF.NS INFO` reports the
+fsync policy. Normal execution without a `DurabilityCell` still rejects durable
+writes before mutation; `ServerPlane` is the public durable write router.
+Unsupported write families (`FLUSHDB`, `FLUSHALL`, `COPY`, collection writes)
+remain explicit durable-not-wired errors until they have log-record semantics.
 
 **Linux-validation note (updated 2026-06-11):** the io_uring backend is now
 exercised on real Linux (kernel 7.0): conformance suite green in probed

@@ -442,6 +442,7 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         let domains = sum_field(&infos, "records_resident_bytes")
             + sum_field(&infos, "index_bytes")
             + sum_field(&infos, "wire_buffers_bytes")
+            + sum_field(&infos, "log_staging_capacity_bytes")
             + sum_field(&infos, "conn_state_bytes");
         let divergence = ((our_rss as f64 - domains as f64) / our_rss as f64 * 100.0).abs();
         m.set("attribution_divergence_pct", divergence);

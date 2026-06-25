@@ -39,7 +39,9 @@ use inf_fabric::{Mesh, MeshConfig};
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_foundation::{CellId, hash64};
-use inf_runtime::{CellLoop, LoopConfig};
+use inf_runtime::{CellLoop, LoopConfig, Wait};
+use inf_server::log_bootstrap::{LogLayoutConfig, open_first_boot_log_writer, open_log_directory};
+use inf_server::log_maintenance::{LogSegmentMaintenance, LogSegmentMaintenanceConfig};
 use inf_server::{ConnCx, ExecOrigin, NodeInfo, PlaneObserver, ServerPlane, execute_slices};
 use inf_store::{ExpiryBudget, Keyspace, StoreConfig};
 use inf_wire::Protocol;
@@ -450,6 +452,9 @@ fn subscription_plan(index: usize, channels: u64) -> SubPlan {
 /// Steps with zero progress (no apply events, no client bytes) before the
 /// run is declared stalled — the lost-wakeup detector.
 const STALL_STEPS: u64 = 20_000;
+const SIM_LOG_BOOTSTRAP_TOKEN_SLOT: u32 = 0x00_FF00;
+const SIM_LOG_WRITER_TOKEN_SLOT: u32 = 0x00_FF01;
+const SIM_LOG_MAINTENANCE_TOKEN_SLOT: u32 = 0x00_FF02;
 
 /// Runs one scenario to quiescence (all clients done, all connections torn
 /// down) or to a stall verdict.
@@ -465,13 +470,41 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     let fabrics = Mesh::new(scenario.cells, MeshConfig { ring_capacity: 1024, data_credits: 256 });
     for (i, fabric) in fabrics.into_iter().enumerate() {
         let net = CellNet::new(i as u16, scenario.seed, scenario.plant);
-        let driver = SimDriver::new(Rc::clone(&net));
-        let pool = BufferPool::new(128, 1024);
+        let mut driver = SimDriver::new(Rc::clone(&net));
+        let mut pool = BufferPool::new(128, 1024);
+        let mut log_bootstrap_completions = Vec::new();
+        let log_config = LogLayoutConfig::first_boot_sized(
+            libc::AT_FDCWD,
+            CellId(i as u16),
+            64 * 1024,
+            1024,
+            16 * 1024,
+            SIM_LOG_BOOTSTRAP_TOKEN_SLOT,
+            SIM_LOG_WRITER_TOKEN_SLOT,
+        )
+        .expect("valid sim log segment config")
+        .with_generations(i as u32, i as u32)
+        .with_wait(Wait::Poll)
+        .with_max_reaps(4);
+        let log_writer = open_first_boot_log_writer(
+            &mut driver,
+            &mut pool,
+            log_config,
+            &mut log_bootstrap_completions,
+        )
+        .expect("sim log segment bootstrap");
+        let log_dir =
+            open_log_directory(&mut driver, &mut pool, log_config, &mut log_bootstrap_completions)
+                .expect("sim log directory maintenance bootstrap");
+        let log_maintenance = LogSegmentMaintenance::new(
+            LogSegmentMaintenanceConfig::new(log_dir, SIM_LOG_MAINTENANCE_TOKEN_SLOT)
+                .with_generation(i as u32),
+        );
         // Sim wall anchor stays (0, 0): wall time == virtual time, fully
         // deterministic; the RANDOMKEY stream is seeded from the scenario.
         let node = Rc::new(NodeInfo::default());
         node.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
-        let plane = ServerPlane::new(
+        let mut plane = ServerPlane::new(
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
@@ -481,6 +514,8 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             oracle.clone(),
             false,
         );
+        plane.install_log_writer(log_writer);
+        plane.install_log_segment_maintenance(log_maintenance);
         let config = LoopConfig { spin_iters: 4, ..Default::default() };
         let cell_loop = CellLoop::new(driver, Rc::clone(&clock), pool, config);
         nets.push(net);

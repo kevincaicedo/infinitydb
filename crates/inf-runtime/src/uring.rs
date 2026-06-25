@@ -30,6 +30,7 @@
 //! evidence tracked in `reviews/infinity-m0-skeleton.md`.
 
 use std::collections::{HashMap, VecDeque};
+use std::ffi::CString;
 use std::io;
 
 use inf_alloc::{BufferId, BufferPool, LeaseKind};
@@ -37,7 +38,8 @@ use io_uring::types::Fd;
 use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
 
 use crate::driver::{
-    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, SubmitStats, Wait,
+    BackendDriver, Capabilities, Completion, CompletionResult, FileOpenMode, FileSyncMode, IoOp,
+    RawFd, SubmitStats, Wait,
 };
 use crate::token::CompletionToken;
 
@@ -71,6 +73,47 @@ enum OpState {
     },
     Close {
         fd: RawFd,
+    },
+    FileOpen {
+        token: CompletionToken,
+        _path: CString,
+    },
+    FileCreateDir {
+        token: CompletionToken,
+        _path: CString,
+    },
+    FilePreallocate {
+        token: CompletionToken,
+    },
+    FileTruncate {
+        token: CompletionToken,
+    },
+    FileReadAt {
+        token: CompletionToken,
+        buf: BufferId,
+    },
+    FileWriteAt {
+        fd: RawFd,
+        token: CompletionToken,
+        buf: BufferId,
+        len: u32,
+        written: u32,
+        offset_bytes: u64,
+    },
+    FileSync {
+        token: CompletionToken,
+    },
+    FileClose {
+        token: CompletionToken,
+    },
+    FileRename {
+        token: CompletionToken,
+        _old_path: CString,
+        _new_path: CString,
+    },
+    FileUnlink {
+        token: CompletionToken,
+        _path: CString,
     },
     Cancel,
     /// One provided buffer in flight to the kernel group; on failure the
@@ -125,6 +168,7 @@ pub struct UringDriver {
     provided: HashMap<u16, BufferId>,
     /// Wake eventfd watched via `PollAdd` (see [`OpState::WakeWatch`]).
     wake_fd: Option<std::os::fd::OwnedFd>,
+    file_truncate_supported: bool,
     stats: SubmitStats,
 }
 
@@ -159,6 +203,7 @@ impl UringDriver {
         let mut probe = Probe::new();
         ring.submitter().register_probe(&mut probe)?;
         let provide_supported = probe.is_supported(opcode::ProvideBuffers::CODE);
+        let file_truncate_supported = probe.is_supported(opcode::Ftruncate::CODE);
         let (kmajor, kminor) = kernel_version();
         // Multishot accept: 5.19+. Multishot recv (provided buffers): 6.0+.
         // Flags aren't probeable (same opcodes); version-gate, then the
@@ -188,6 +233,7 @@ impl UringDriver {
             closing: HashMap::new(),
             provided: HashMap::new(),
             wake_fd: None,
+            file_truncate_supported,
             stats: SubmitStats::default(),
         })
     }
@@ -418,6 +464,169 @@ impl UringDriver {
                     let id = self.alloc_id(OpState::Close { fd });
                     self.push_sqe(opcode::Close::new(Fd(fd)).build().user_data(id));
                 }
+                IoOp::FileOpen { dir, name, mode, token } => {
+                    let path = match CString::new(name) {
+                        Ok(path) => path,
+                        Err(_) => {
+                            out.push(Completion {
+                                token,
+                                result: CompletionResult::Error { errno: libc::EINVAL, buf: None },
+                            });
+                            continue;
+                        }
+                    };
+                    let path_ptr = path.as_ptr();
+                    let flags = file_open_flags(mode);
+                    let id = self.alloc_id(OpState::FileOpen { token, _path: path });
+                    self.push_sqe(
+                        opcode::OpenAt::new(Fd(dir), path_ptr)
+                            .flags(flags)
+                            .mode(0o666)
+                            .build()
+                            .user_data(id),
+                    );
+                }
+                IoOp::FileCreateDir { dir, name, mode, token } => {
+                    let path = match CString::new(name) {
+                        Ok(path) => path,
+                        Err(_) => {
+                            out.push(Completion {
+                                token,
+                                result: CompletionResult::Error { errno: libc::EINVAL, buf: None },
+                            });
+                            continue;
+                        }
+                    };
+                    let path_ptr = path.as_ptr();
+                    let id = self.alloc_id(OpState::FileCreateDir { token, _path: path });
+                    self.push_sqe(
+                        opcode::MkDirAt::new(Fd(dir), path_ptr)
+                            .mode(mode as libc::mode_t)
+                            .build()
+                            .user_data(id),
+                    );
+                }
+                IoOp::FilePreallocate { fd, len_bytes, token } => {
+                    let id = self.alloc_id(OpState::FilePreallocate { token });
+                    self.push_sqe(opcode::Fallocate::new(Fd(fd), len_bytes).build().user_data(id));
+                }
+                IoOp::FileTruncate { fd, len_bytes, token } => {
+                    if !self.file_truncate_supported {
+                        out.push(Completion {
+                            token,
+                            result: CompletionResult::Error { errno: libc::EOPNOTSUPP, buf: None },
+                        });
+                        continue;
+                    }
+                    let id = self.alloc_id(OpState::FileTruncate { token });
+                    self.push_sqe(opcode::Ftruncate::new(Fd(fd), len_bytes).build().user_data(id));
+                }
+                IoOp::FileReadAt { fd, offset_bytes, buf, len, token } => {
+                    if len as usize > pool.buf_size() {
+                        out.push(Completion {
+                            token,
+                            result: CompletionResult::Error { errno: libc::EINVAL, buf: Some(buf) },
+                        });
+                        continue;
+                    }
+                    let addr = pool.bytes_mut(buf).as_mut_ptr();
+                    let id = self.alloc_id(OpState::FileReadAt { token, buf });
+                    self.push_sqe(
+                        opcode::Read::new(Fd(fd), addr, len)
+                            .offset(offset_bytes)
+                            .build()
+                            .user_data(id),
+                    );
+                }
+                IoOp::FileWriteAt { fd, offset_bytes, buf, len, token } => {
+                    if len == 0
+                        || len as usize > pool.buf_size()
+                        || offset_bytes.checked_add(u64::from(len)).is_none()
+                    {
+                        out.push(Completion {
+                            token,
+                            result: CompletionResult::Error { errno: libc::EINVAL, buf: Some(buf) },
+                        });
+                        continue;
+                    }
+                    let addr = pool.bytes(buf).as_ptr();
+                    let id = self.alloc_id(OpState::FileWriteAt {
+                        fd,
+                        token,
+                        buf,
+                        len,
+                        written: 0,
+                        offset_bytes,
+                    });
+                    self.push_sqe(
+                        opcode::Write::new(Fd(fd), addr, len)
+                            .offset(offset_bytes)
+                            .build()
+                            .user_data(id),
+                    );
+                }
+                IoOp::FileSync { fd, mode, token } => {
+                    let id = self.alloc_id(OpState::FileSync { token });
+                    self.push_sqe(
+                        opcode::Fsync::new(Fd(fd))
+                            .flags(file_sync_flags(mode))
+                            .build()
+                            .user_data(id),
+                    );
+                }
+                IoOp::FileClose { fd, token } => {
+                    let id = self.alloc_id(OpState::FileClose { token });
+                    self.push_sqe(opcode::Close::new(Fd(fd)).build().user_data(id));
+                }
+                IoOp::FileRename { old_dir, old_name, new_dir, new_name, token } => {
+                    let old_path = match CString::new(old_name) {
+                        Ok(path) => path,
+                        Err(_) => {
+                            out.push(Completion {
+                                token,
+                                result: CompletionResult::Error { errno: libc::EINVAL, buf: None },
+                            });
+                            continue;
+                        }
+                    };
+                    let new_path = match CString::new(new_name) {
+                        Ok(path) => path,
+                        Err(_) => {
+                            out.push(Completion {
+                                token,
+                                result: CompletionResult::Error { errno: libc::EINVAL, buf: None },
+                            });
+                            continue;
+                        }
+                    };
+                    let old_ptr = old_path.as_ptr();
+                    let new_ptr = new_path.as_ptr();
+                    let id = self.alloc_id(OpState::FileRename {
+                        token,
+                        _old_path: old_path,
+                        _new_path: new_path,
+                    });
+                    self.push_sqe(
+                        opcode::RenameAt::new(Fd(old_dir), old_ptr, Fd(new_dir), new_ptr)
+                            .build()
+                            .user_data(id),
+                    );
+                }
+                IoOp::FileUnlink { dir, name, token } => {
+                    let path = match CString::new(name) {
+                        Ok(path) => path,
+                        Err(_) => {
+                            out.push(Completion {
+                                token,
+                                result: CompletionResult::Error { errno: libc::EINVAL, buf: None },
+                            });
+                            continue;
+                        }
+                    };
+                    let path_ptr = path.as_ptr();
+                    let id = self.alloc_id(OpState::FileUnlink { token, _path: path });
+                    self.push_sqe(opcode::UnlinkAt::new(Fd(dir), path_ptr).build().user_data(id));
+                }
             }
         }
     }
@@ -622,6 +831,81 @@ impl UringDriver {
                     wait.close_result = result;
                 }
                 self.maybe_finish_close(fd, out);
+            }
+            OpState::FileOpen { token, .. } => {
+                out.push(Completion {
+                    token,
+                    result: if result >= 0 {
+                        CompletionResult::FileOpened { fd: result }
+                    } else {
+                        CompletionResult::Error { errno: -result, buf: None }
+                    },
+                });
+            }
+            OpState::FileCreateDir { token, .. }
+            | OpState::FilePreallocate { token }
+            | OpState::FileTruncate { token }
+            | OpState::FileSync { token }
+            | OpState::FileRename { token, .. }
+            | OpState::FileUnlink { token, .. } => {
+                out.push(Completion {
+                    token,
+                    result: if result >= 0 {
+                        CompletionResult::FileDone
+                    } else {
+                        CompletionResult::Error { errno: -result, buf: None }
+                    },
+                });
+            }
+            OpState::FileReadAt { token, buf } => {
+                out.push(Completion {
+                    token,
+                    result: if result >= 0 {
+                        CompletionResult::FileRead { buf, len: result as u32 }
+                    } else {
+                        CompletionResult::Error { errno: -result, buf: Some(buf) }
+                    },
+                });
+            }
+            OpState::FileWriteAt { fd, token, buf, len, written, offset_bytes } => {
+                if result > 0 {
+                    let written = written + result as u32;
+                    if written < len {
+                        let addr = pool.bytes(buf)[written as usize..].as_ptr();
+                        let id = self.alloc_id(OpState::FileWriteAt {
+                            fd,
+                            token,
+                            buf,
+                            len,
+                            written,
+                            offset_bytes,
+                        });
+                        self.push_sqe(
+                            opcode::Write::new(Fd(fd), addr, len - written)
+                                .offset(offset_bytes + u64::from(written))
+                                .build()
+                                .user_data(id),
+                        );
+                        return;
+                    }
+                    out.push(Completion { token, result: CompletionResult::FileWritten { buf } });
+                } else {
+                    let errno = if result == 0 { libc::EIO } else { -result };
+                    out.push(Completion {
+                        token,
+                        result: CompletionResult::Error { errno, buf: Some(buf) },
+                    });
+                }
+            }
+            OpState::FileClose { token } => {
+                out.push(Completion {
+                    token,
+                    result: if result >= 0 {
+                        CompletionResult::FileClosed
+                    } else {
+                        CompletionResult::Error { errno: -result, buf: None }
+                    },
+                });
             }
             OpState::Cancel => {}
             OpState::WakeWatch => {
@@ -850,6 +1134,25 @@ fn set_nodelay(fd: RawFd) {
             (&raw const one).cast(),
             size_of::<libc::c_int>() as libc::socklen_t,
         );
+    }
+}
+
+fn file_open_flags(mode: FileOpenMode) -> i32 {
+    match mode {
+        FileOpenMode::ReadOnly => libc::O_RDONLY | libc::O_CLOEXEC,
+        FileOpenMode::ReadWrite => libc::O_RDWR | libc::O_CLOEXEC,
+        FileOpenMode::ReadWriteCreate => libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
+        FileOpenMode::ReadWriteCreateTruncate => {
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC
+        }
+        FileOpenMode::Directory => libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    }
+}
+
+fn file_sync_flags(mode: FileSyncMode) -> types::FsyncFlags {
+    match mode {
+        FileSyncMode::DataOnly => types::FsyncFlags::DATASYNC,
+        FileSyncMode::Full => types::FsyncFlags::empty(),
     }
 }
 

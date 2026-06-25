@@ -109,6 +109,18 @@ pub static DECLARED: &[Declared] = &[
         "sections + field vocabulary present; gauges are this cell's slice until the control plane aggregates (client-smoke CI is the open M1-S14 AC)",
     ),
     d(
+        "BGSAVE",
+        Status::Partial,
+        "M2",
+        "alias for cell-local live checkpoint scheduling; no fork; returns BUSY while a checkpoint is active; byte-diff corpus pending",
+    ),
+    d(
+        "LASTSAVE",
+        Status::Partial,
+        "M2",
+        "returns the latest completed live checkpoint Unix timestamp for this cell; startup timestamp semantics differ from Redis",
+    ),
+    d(
         "COMMAND",
         Status::Partial,
         "M0",
@@ -215,6 +227,12 @@ pub static DECLARED: &[Declared] = &[
         "SHARDCHANNELS / SHARDNUMSUB arrive with sharded pub/sub (M3 cut line)",
     ),
     d("INF.NS", Status::Extension, "M1", "namespace registry v1 — the M2 durability seam"),
+    d(
+        "INF.CKPT",
+        Status::Extension,
+        "M2",
+        "cell-local or explicit CELL target checkpoint trigger; WAIT gates on the target MANIFEST durability; whole-node aggregation is not implemented",
+    ),
     d("INF.TAKE", Status::Internal, "M1", "cross-cell RENAME/COPY program primitive"),
     d("INF.PEEK", Status::Internal, "M1", "cross-cell COPY program primitive"),
 ];
@@ -306,7 +324,7 @@ pub fn rows() -> Vec<CommandRow> {
 /// `absent` half of the matrix — a static table in generator code, still
 /// never hand-edited in the artifact).
 pub static ABSENT: &[(&str, &str)] = &[
-    ("Persistence admin (SAVE, BGSAVE, INF.CKPT, …)", "M2 — durability"),
+    ("Persistence admin (SAVE, -LOADING, broader redis-cli byte-diff corpus)", "M2 — durability"),
     ("Hashes, lists, sets, zsets, bitmaps, bitfield, HyperLogLog", "M3 — data types"),
     ("Keyspace notifications, SLOWLOG, MONITOR, sharded pub/sub (SSUBSCRIBE/SPUBLISH)", "M3"),
     ("Connection control (QUIT, RESET)", "M3 (RESET pairs with transaction state)"),

@@ -6,5 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Enables deterministic fault trigger evaluation for DST/crash-matrix runs.
+# Shipping builds leave this off; call sites compile to no-ops until a harness
+# explicitly enables injection.
+fault-injection = []
+
 [lints]
 workspace = true

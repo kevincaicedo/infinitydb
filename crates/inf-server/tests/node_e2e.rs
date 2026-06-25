@@ -198,7 +198,7 @@ fn hello_switch_and_protocol_error_close() {
     node.stop();
 }
 
-/// The SELECTed database rides the fabric Apply byte (M1-S08/ADR-0009):
+/// The SELECTed database rides the fabric Apply namespace field:
 /// cross-cell single-key ops, counted splits, and scatters all act on the
 /// origin connection's database — and never leak into db 0.
 #[test]
@@ -236,6 +236,47 @@ fn select_travels_with_cross_cell_ops() {
     node.stop();
 }
 
+/// Named memory namespaces use the same Apply v1 namespace field as default
+/// dbs, so local and remote owners see the selected namespace id.
+#[test]
+fn named_namespace_use_travels_with_cross_cell_ops() {
+    let node = Node::start(2);
+    let mut conn = node.connect();
+    let k0 = key_for_cell(2, 0);
+    let k1 = key_for_cell(2, 1);
+
+    let mut script = Vec::new();
+    script.extend_from_slice(&cmd(&[b"INF.NS", b"CREATE", b"cache"]));
+    script.extend_from_slice(&cmd(&[b"INF.NS", b"USE", b"cache"]));
+    script.extend_from_slice(&cmd(&[b"SET", &k0, b"zero-owner"]));
+    script.extend_from_slice(&cmd(&[b"SET", &k1, b"one-owner"]));
+    script.extend_from_slice(&cmd(&[b"MGET", &k0, &k1]));
+    script.extend_from_slice(&cmd(&[b"DBSIZE"]));
+    script.extend_from_slice(&cmd(&[b"INF.NS", b"USE", b"db0"]));
+    script.extend_from_slice(&cmd(&[b"MGET", &k0, &k1]));
+    script.extend_from_slice(&cmd(&[b"DBSIZE"]));
+    script.extend_from_slice(&cmd(&[b"INF.NS", b"USE", b"cache"]));
+    script.extend_from_slice(&cmd(&[b"DEL", &k0, &k1]));
+    script.extend_from_slice(&cmd(&[b"DBSIZE"]));
+    conn.write_all(&script).expect("write");
+
+    let mut want = Vec::new();
+    want.extend_from_slice(b"+OK\r\n"); // CREATE
+    want.extend_from_slice(b"+OK\r\n"); // USE cache
+    want.extend_from_slice(b"+OK\r\n");
+    want.extend_from_slice(b"+OK\r\n");
+    want.extend_from_slice(b"*2\r\n$10\r\nzero-owner\r\n$9\r\none-owner\r\n");
+    want.extend_from_slice(b":2\r\n");
+    want.extend_from_slice(b"+OK\r\n"); // USE db0
+    want.extend_from_slice(b"*2\r\n$-1\r\n$-1\r\n");
+    want.extend_from_slice(b":0\r\n");
+    want.extend_from_slice(b"+OK\r\n"); // USE cache
+    want.extend_from_slice(b":2\r\n");
+    want.extend_from_slice(b":0\r\n");
+    read_exactly(&mut conn, &want);
+    node.stop();
+}
+
 /// Reads one complete RESP bulk reply (`$len\r\n<body>\r\n`) and returns
 /// the body (INFO parsing).
 fn read_bulk(stream: &mut TcpStream) -> Vec<u8> {
@@ -262,6 +303,10 @@ fn info_text(conn: &mut TcpStream, section: &[u8]) -> String {
     String::from_utf8(read_bulk(conn)).expect("ascii")
 }
 
+fn info_field(text: &str, name: &str) -> Option<u64> {
+    text.lines().find_map(|line| line.strip_prefix(name)?.strip_prefix(':')?.parse().ok())
+}
+
 /// Connects until landing on `cell` (SO_REUSEPORT spreads arbitrarily).
 fn conn_on_cell(node: &Node, cell: u16) -> TcpStream {
     for _ in 0..256 {
@@ -272,6 +317,23 @@ fn conn_on_cell(node: &Node, cell: u16) -> TcpStream {
         }
     }
     panic!("no connection landed on cell {cell}");
+}
+
+#[test]
+fn info_reports_log_staging_domain() {
+    let node = Node::start(1);
+    let mut conn = conn_on_cell(&node, 0);
+
+    let memory = info_text(&mut conn, b"memory");
+    assert_eq!(info_field(&memory, "log_staging_bytes"), Some(0), "{memory}");
+    let capacity = info_field(&memory, "log_staging_capacity_bytes").expect("capacity field");
+    assert!(capacity > 0, "{memory}");
+
+    let tripwires = info_text(&mut conn, b"tripwires");
+    assert_eq!(info_field(&tripwires, "log_staging_bytes"), Some(0), "{tripwires}");
+    assert_eq!(info_field(&tripwires, "log_staging_capacity_bytes"), Some(capacity));
+
+    node.stop();
 }
 
 /// M1-S10: channel owned by cell 0, subscribers on both cells, publisher on

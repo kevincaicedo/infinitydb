@@ -9,12 +9,15 @@
 //! so client libraries parse it (the M1-S03 client-smoke AC).
 
 use inf_foundation::time::Nanos;
-use inf_store::{CellStore, EvictionPolicy, Keyspace, NsError, NsMode, NsSpec, PressureConfig};
+use inf_store::{
+    CellStore, EvictionPolicy, Keyspace, NsCreateSpec, NsError, NsFsyncPolicy, NsMode,
+    PressureConfig,
+};
 use inf_wire::{CmdFlags, Protocol, RespWriter};
 
 use crate::clients::{format_client_line, valid_client_name};
 use crate::config::ConfigSetError;
-use crate::exec::{Argv, ConnCx, NodeInfo, arity_error, parse_i64, wall_ms};
+use crate::exec::{Argv, ConnCx, ConnNamespace, NodeInfo, arity_error, parse_i64, wall_ms};
 
 // ---- HELLO -------------------------------------------------------------------
 
@@ -150,12 +153,18 @@ pub(crate) fn info(
             + report.wheel_bytes
             + report.evict_bytes
             + node.wire_buffers_bytes.get()
+            + node.log_staging_capacity_bytes.get()
             + node.conn_state_bytes.get();
         let rss = process_rss_bytes();
         push(&mut text, "# Memory");
         push(&mut text, &format!("used_memory:{used}"));
         push(&mut text, &format!("used_memory_human:{}", human_bytes(used)));
         push(&mut text, &format!("used_memory_rss:{rss}"));
+        push(&mut text, &format!("log_staging_bytes:{}", node.log_staging_bytes.get()));
+        push(
+            &mut text,
+            &format!("log_staging_capacity_bytes:{}", node.log_staging_capacity_bytes.get()),
+        );
         let cfg = node.config.borrow();
         push(&mut text, &format!("maxmemory:{}", cfg.get("maxmemory").unwrap_or("0")));
         push(
@@ -172,7 +181,18 @@ pub(crate) fn info(
         push(&mut text, "# Persistence");
         push(&mut text, "loading:0");
         push(&mut text, "rdb_changes_since_last_save:0");
-        push(&mut text, "rdb_bgsave_in_progress:0");
+        push(&mut text, &format!("rdb_bgsave_in_progress:{}", node.checkpoint_in_progress.get()));
+        push(
+            &mut text,
+            &format!("rdb_last_save_time:{}", node.last_checkpoint_unix_ms.get() / 1000),
+        );
+        push(&mut text, &format!("pending_log_bytes:{}", node.pending_log_bytes.get()));
+        push(&mut text, &format!("last_durable_lsn:{}", node.last_durable_lsn.get()));
+        push(&mut text, &format!("watermark_lag_lsn:{}", node.watermark_lag_lsn.get()));
+        push(&mut text, &format!("log_writer_installed:{}", node.log_writer_installed.get()));
+        push(&mut text, &format!("log_active_segment:{}", node.log_active_segment.get()));
+        push(&mut text, &format!("log_active_offset_bytes:{}", node.log_active_offset_bytes.get()));
+        push(&mut text, &format!("log_pending_unsynced:{}", node.log_pending_unsynced.get()));
         push(&mut text, "aof_enabled:0");
         push(&mut text, "aof_rewrite_in_progress:0");
         text.push_str("\r\n");
@@ -240,6 +260,15 @@ pub(crate) fn info(
         push(&mut text, &format!("{}:{}", tw::INDEX_BYTES, report.index_bytes));
         push(&mut text, &format!("wheel_bytes:{}", report.wheel_bytes));
         push(&mut text, &format!("evict_bytes:{}", report.evict_bytes));
+        push(&mut text, &format!("{}:{}", tw::LOG_STAGING_BYTES, node.log_staging_bytes.get()));
+        push(
+            &mut text,
+            &format!(
+                "{}:{}",
+                tw::LOG_STAGING_CAPACITY_BYTES,
+                node.log_staging_capacity_bytes.get()
+            ),
+        );
         push(&mut text, &format!("wheel_fallback:{}", stats.wheel_fallback));
         push(&mut text, &format!("wheel_stale:{}", stats.wheel_stale));
         push(&mut text, &format!("evicted_keys:{}", stats.evicted_keys));
@@ -507,15 +536,15 @@ pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
 
 // ---- INF.NS (M1-S08) -----------------------------------------------------------
 
-/// `INF.NS CREATE name [MODE memory|durable|topic] [EVICTION policy]
-/// [MAXMEMORY bytes] | LIST | INFO name | DROP name` — the namespace
+/// `INF.NS CREATE name [MODE memory|durable|topic] [FSYNC always|everysec]
+/// [EVICTION policy] [MAXMEMORY bytes] | LIST | INFO name | DROP name` — the namespace
 /// registry surface (master plan §4.2). Counters in INFO are this cell's
 /// slice (same documented scope as `INFO` until the control plane
 /// aggregates).
 pub(crate) fn inf_ns(
     argv: &(impl Argv + ?Sized),
     ks: &mut Keyspace,
-    node: &NodeInfo,
+    cx: &mut ConnCx,
     w: &mut RespWriter<'_>,
 ) {
     let sub = argv.arg(1);
@@ -524,8 +553,13 @@ pub(crate) fn inf_ns(
             return arity_error("INF.NS|CREATE", w);
         }
         let name = argv.arg(2);
-        let mut spec =
-            NsSpec { name: name.to_vec(), mode: NsMode::Memory, policy: None, maxmemory: None };
+        let mut spec = NsCreateSpec {
+            name: name.to_vec(),
+            mode: NsMode::Memory,
+            fsync: None,
+            policy: None,
+            maxmemory: None,
+        };
         let mut i = 3;
         while i < argv.len() {
             let opt = argv.arg(i);
@@ -540,6 +574,14 @@ pub(crate) fn inf_ns(
                     return w.error("ERR unknown namespace mode (memory|durable|topic)");
                 };
                 spec.mode = mode;
+            } else if opt.eq_ignore_ascii_case(b"FSYNC") {
+                let Some(policy) = core::str::from_utf8(value)
+                    .ok()
+                    .and_then(|v| NsFsyncPolicy::parse(&v.to_lowercase()))
+                else {
+                    return w.error("ERR unknown FSYNC policy (always|everysec)");
+                };
+                spec.fsync = Some(policy);
             } else if opt.eq_ignore_ascii_case(b"EVICTION") {
                 let Some(policy) = core::str::from_utf8(value)
                     .ok()
@@ -561,7 +603,7 @@ pub(crate) fn inf_ns(
             i += 2;
         }
         match ks.ns_create(spec) {
-            Ok(()) => w.simple("OK"),
+            Ok(_) => w.simple("OK"),
             Err(e) => ns_error(e, w),
         }
     } else if sub.eq_ignore_ascii_case(b"DROP") {
@@ -581,16 +623,38 @@ pub(crate) fn inf_ns(
         for name in &named {
             w.bulk(name);
         }
+    } else if sub.eq_ignore_ascii_case(b"USE") {
+        if argv.len() != 3 {
+            return arity_error("INF.NS|USE", w);
+        }
+        let name = argv.arg(2);
+        if let Some(db) = default_db_index(name) {
+            cx.namespace = ConnNamespace::default_db(db as u16);
+            let _ = ks.db_mut(db);
+            return w.simple("OK");
+        }
+        let Some(spec) = ks.ns_get(name) else {
+            return w
+                .error(&format!("ERR namespace '{}' not found", String::from_utf8_lossy(name)));
+        };
+        let id = spec.id;
+        match spec.mode {
+            NsMode::Memory => {}
+            NsMode::Durable => {}
+            NsMode::Topic => return w.error("ERR topic namespaces are not key-value namespaces"),
+        }
+        let _ = ks.named_db_mut(id);
+        cx.namespace = ConnNamespace::Named(id);
+        w.simple("OK");
     } else if sub.eq_ignore_ascii_case(b"INFO") {
         if argv.len() != 3 {
             return arity_error("INF.NS|INFO", w);
         }
         let name = argv.arg(2);
         // Default namespaces report live per-cell counters; named entries
-        // report their registry config (no keys until they are addressable
-        // — the recorded M1 limitation).
+        // report live counters once their store is materialized.
         if let Some(db) = default_db_index(name) {
-            let cfg = node.config.borrow();
+            let cfg = cx.node.config.borrow();
             let policy = cfg.get("maxmemory-policy").unwrap_or("noeviction").to_string();
             let maxmemory = cfg.get("maxmemory").unwrap_or("0").to_string();
             drop(cfg);
@@ -619,21 +683,27 @@ pub(crate) fn inf_ns(
         };
         let policy = spec.policy.map_or("inherit", EvictionPolicy::name).to_string();
         let maxmemory = spec.maxmemory.map_or("inherit".to_string(), |b| b.to_string());
-        w.map_header(6);
+        let (keys, expires) = match ks.named_db(spec.id) {
+            Some(store) => (store.len().to_string(), store.stats().ttl_live.to_string()),
+            None => ("0".to_string(), "0".to_string()),
+        };
+        let fsync = spec.fsync.map_or("none", inf_store::NsFsyncPolicy::name).to_string();
+        w.map_header(7);
         for (k, v) in [
             ("name", String::from_utf8_lossy(&spec.name).into_owned()),
             ("mode", spec.mode.name().to_string()),
+            ("fsync", fsync),
             ("eviction", policy),
             ("maxmemory", maxmemory),
-            ("keys", "0".to_string()),
-            ("expires", "0".to_string()),
+            ("keys", keys),
+            ("expires", expires),
         ] {
             w.bulk(k.as_bytes());
             w.bulk(v.as_bytes());
         }
     } else {
         w.error(&format!(
-            "ERR Unknown subcommand or wrong number of arguments for '{}'. Try INF.NS CREATE|LIST|INFO|DROP.",
+            "ERR Unknown subcommand or wrong number of arguments for '{}'. Try INF.NS CREATE|LIST|USE|INFO|DROP.",
             String::from_utf8_lossy(sub)
         ));
     }
@@ -650,16 +720,28 @@ fn ns_error(e: NsError, w: &mut RespWriter<'_>) {
     match e {
         NsError::Exists => w.error("ERR namespace already exists"),
         NsError::Unknown => w.error("ERR namespace not found"),
-        NsError::ModeNotSupported(mode) => w.error(&format!(
-            "ERR namespace mode '{}' is not yet supported (InfinityDB M1 is memory-only; durable arrives with M2, topic with M5)",
+        NsError::ModeNotSupported(NsMode::Durable) => {
+            w.error("ERR durable namespace operation is not yet supported")
+        }
+        NsError::ModeNotSupported(NsMode::Memory) => {
+            w.error("ERR memory namespace operation is not supported in this context")
+        }
+        NsError::ModeNotSupported(NsMode::Topic) => {
+            w.error("ERR namespace mode 'topic' is not yet supported (topic arrives with M5)")
+        }
+        NsError::FsyncRequired => w.error("ERR durable namespace requires FSYNC always|everysec"),
+        NsError::FsyncNotAllowed(mode) => w.error(&format!(
+            "ERR FSYNC is only valid with MODE durable (got MODE {})",
             mode.name()
         )),
+        NsError::TooManyNamespaces => w.error("ERR too many named namespaces"),
+        NsError::NamespaceIdsExhausted => w.error("ERR namespace id space exhausted"),
         NsError::DefaultImmutable => {
             w.error("ERR db0..db15 are reserved default namespaces (SELECT)")
         }
-        NsError::InvalidName => w.error(
-            "ERR invalid namespace name (1..128 bytes of [a-zA-Z0-9_.-])",
-        ),
+        NsError::InvalidName => {
+            w.error("ERR invalid namespace name (1..128 bytes of [a-zA-Z0-9_.-])")
+        }
     }
 }
 
@@ -878,11 +960,53 @@ mod tests {
         {
             assert!(all.contains(section), "missing {section}: {all}");
         }
+        assert!(all.contains("log_staging_bytes:0"), "{all}");
+        assert!(all.contains("log_staging_capacity_bytes:0"), "{all}");
         assert!(all.contains("db0:keys=1,expires=0"), "{all}");
         let server_only =
             String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"server"])).expect("ascii");
         assert!(server_only.contains("# Server"));
         assert!(!server_only.contains("# Memory"), "{server_only}");
+    }
+
+    #[test]
+    fn info_persistence_reports_node_counters() {
+        let mut cx = ConnCx::default();
+        cx.node.pending_log_bytes.set(11);
+        cx.node.last_durable_lsn.set(0x0000_0002_0000_0040);
+        cx.node.watermark_lag_lsn.set(7);
+        cx.node.log_writer_installed.set(1);
+        cx.node.log_active_segment.set(2);
+        cx.node.log_active_offset_bytes.set(71);
+        cx.node.log_pending_unsynced.set(1);
+        cx.node.checkpoint_in_progress.set(1);
+        cx.node.last_checkpoint_unix_ms.set(1_234_567_000);
+        let mut store = Keyspace::new(StoreConfig::default());
+
+        let persistence =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"persistence"])).expect("ascii");
+
+        assert!(persistence.contains("# Persistence"), "{persistence}");
+        assert!(persistence.contains("pending_log_bytes:11"), "{persistence}");
+        assert!(persistence.contains("last_durable_lsn:8589934656"), "{persistence}");
+        assert!(persistence.contains("watermark_lag_lsn:7"), "{persistence}");
+        assert!(persistence.contains("log_writer_installed:1"), "{persistence}");
+        assert!(persistence.contains("log_active_segment:2"), "{persistence}");
+        assert!(persistence.contains("log_active_offset_bytes:71"), "{persistence}");
+        assert!(persistence.contains("log_pending_unsynced:1"), "{persistence}");
+        assert!(persistence.contains("rdb_bgsave_in_progress:1"), "{persistence}");
+        assert!(persistence.contains("rdb_last_save_time:1234567"), "{persistence}");
+        assert!(!persistence.contains("# Memory"), "{persistence}");
+    }
+
+    #[test]
+    fn lastsave_reports_last_checkpoint_seconds() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+
+        assert_eq!(run(&mut cx, &mut store, &[b"LASTSAVE"]), b":0\r\n");
+        cx.node.last_checkpoint_unix_ms.set(42_999);
+        assert_eq!(run(&mut cx, &mut store, &[b"LASTSAVE"]), b":42\r\n");
     }
 
     #[test]

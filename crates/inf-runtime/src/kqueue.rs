@@ -15,13 +15,15 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::ffi::CString;
 use std::io;
 use std::time::Duration;
 
 use inf_alloc::{BufferId, BufferPool, LeaseKind};
 
 use crate::driver::{
-    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, SubmitStats, Wait,
+    BackendDriver, Capabilities, Completion, CompletionResult, FileOpenMode, FileSyncMode, IoOp,
+    RawFd, SubmitStats, Wait,
 };
 use crate::token::CompletionToken;
 
@@ -155,6 +157,58 @@ impl KqueueDriver {
                             }
                         },
                     });
+                }
+                IoOp::FileOpen { dir, name, mode, token } => {
+                    let result = file_open(dir, name, mode, &mut self.stats);
+                    out.push(Completion { token, result });
+                }
+                IoOp::FileCreateDir { dir, name, mode, token } => {
+                    let result = file_create_dir(dir, name, mode, &mut self.stats);
+                    out.push(Completion { token, result });
+                }
+                IoOp::FilePreallocate { fd, len_bytes, token } => {
+                    let result = file_preallocate(fd, len_bytes, &mut self.stats);
+                    out.push(Completion { token, result });
+                }
+                IoOp::FileTruncate { fd, len_bytes, token } => {
+                    let result = file_truncate(fd, len_bytes, &mut self.stats);
+                    out.push(Completion { token, result });
+                }
+                IoOp::FileReadAt { fd, offset_bytes, buf, len, token } => {
+                    let result = file_read_at(fd, offset_bytes, buf, len, pool, &mut self.stats);
+                    out.push(Completion { token, result });
+                }
+                IoOp::FileWriteAt { fd, offset_bytes, buf, len, token } => {
+                    let result = file_write_at(fd, offset_bytes, buf, len, pool, &mut self.stats);
+                    out.push(Completion { token, result });
+                }
+                IoOp::FileSync { fd, mode, token } => {
+                    let result = file_sync(fd, mode, &mut self.stats);
+                    out.push(Completion { token, result });
+                }
+                IoOp::FileClose { fd, token } => {
+                    // SAFETY: closing a file fd handed to this backend.
+                    let rc = unsafe { libc::close(fd) };
+                    self.stats.syscalls += 1;
+                    out.push(Completion {
+                        token,
+                        result: if rc == 0 {
+                            CompletionResult::FileClosed
+                        } else {
+                            CompletionResult::Error {
+                                errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                                buf: None,
+                            }
+                        },
+                    });
+                }
+                IoOp::FileRename { old_dir, old_name, new_dir, new_name, token } => {
+                    let result = file_rename(old_dir, old_name, new_dir, new_name, &mut self.stats);
+                    out.push(Completion { token, result });
+                }
+                IoOp::FileUnlink { dir, name, token } => {
+                    let result = file_unlink(dir, name, &mut self.stats);
+                    out.push(Completion { token, result });
                 }
             }
         }
@@ -443,6 +497,227 @@ fn drain_sends(
         return true;
     }
     true
+}
+
+fn file_open(
+    dir: RawFd,
+    name: String,
+    mode: FileOpenMode,
+    stats: &mut SubmitStats,
+) -> CompletionResult {
+    let path = match CString::new(name) {
+        Ok(path) => path,
+        Err(_) => return CompletionResult::Error { errno: libc::EINVAL, buf: None },
+    };
+    // SAFETY: path is a live NUL-terminated string and dir is caller-owned.
+    let fd = unsafe { libc::openat(dir, path.as_ptr(), file_open_flags(mode), 0o666) };
+    stats.syscalls += 1;
+    if fd >= 0 {
+        CompletionResult::FileOpened { fd }
+    } else {
+        CompletionResult::Error {
+            errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            buf: None,
+        }
+    }
+}
+
+fn file_create_dir(
+    dir: RawFd,
+    name: String,
+    mode: u32,
+    stats: &mut SubmitStats,
+) -> CompletionResult {
+    let path = match CString::new(name) {
+        Ok(path) => path,
+        Err(_) => return CompletionResult::Error { errno: libc::EINVAL, buf: None },
+    };
+    // SAFETY: path is a live NUL-terminated string and dir is caller-owned.
+    let rc = unsafe { libc::mkdirat(dir, path.as_ptr(), mode as libc::mode_t) };
+    stats.syscalls += 1;
+    if rc == 0 {
+        CompletionResult::FileDone
+    } else {
+        CompletionResult::Error {
+            errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            buf: None,
+        }
+    }
+}
+
+fn file_preallocate(fd: RawFd, len_bytes: u64, stats: &mut SubmitStats) -> CompletionResult {
+    let Ok(len) = libc::off_t::try_from(len_bytes) else {
+        return CompletionResult::Error { errno: libc::EINVAL, buf: None };
+    };
+    // macOS development tier: ftruncate reserves the visible segment length;
+    // Linux uses fallocate in the io_uring backend.
+    // SAFETY: ftruncate on a caller-owned file descriptor.
+    let rc = unsafe { libc::ftruncate(fd, len) };
+    stats.syscalls += 1;
+    if rc == 0 {
+        CompletionResult::FileDone
+    } else {
+        CompletionResult::Error {
+            errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            buf: None,
+        }
+    }
+}
+
+fn file_truncate(fd: RawFd, len_bytes: u64, stats: &mut SubmitStats) -> CompletionResult {
+    let Ok(len) = libc::off_t::try_from(len_bytes) else {
+        return CompletionResult::Error { errno: libc::EINVAL, buf: None };
+    };
+    // SAFETY: ftruncate on a caller-owned file descriptor.
+    let rc = unsafe { libc::ftruncate(fd, len) };
+    stats.syscalls += 1;
+    if rc == 0 {
+        CompletionResult::FileDone
+    } else {
+        CompletionResult::Error {
+            errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            buf: None,
+        }
+    }
+}
+
+fn file_read_at(
+    fd: RawFd,
+    offset_bytes: u64,
+    buf: BufferId,
+    len: u32,
+    pool: &mut BufferPool,
+    stats: &mut SubmitStats,
+) -> CompletionResult {
+    if len as usize > pool.buf_size() {
+        return CompletionResult::Error { errno: libc::EINVAL, buf: Some(buf) };
+    }
+    let Ok(offset) = libc::off_t::try_from(offset_bytes) else {
+        return CompletionResult::Error { errno: libc::EINVAL, buf: Some(buf) };
+    };
+    let dst = &mut pool.bytes_mut(buf)[..len as usize];
+    // SAFETY: `dst` is a live unique borrow of the caller-owned buffer.
+    let rc = unsafe { libc::pread(fd, dst.as_mut_ptr().cast(), dst.len(), offset) };
+    stats.syscalls += 1;
+    if rc >= 0 {
+        CompletionResult::FileRead { buf, len: rc as u32 }
+    } else {
+        CompletionResult::Error {
+            errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            buf: Some(buf),
+        }
+    }
+}
+
+fn file_write_at(
+    fd: RawFd,
+    offset_bytes: u64,
+    buf: BufferId,
+    len: u32,
+    pool: &BufferPool,
+    stats: &mut SubmitStats,
+) -> CompletionResult {
+    if len == 0 || len as usize > pool.buf_size() {
+        return CompletionResult::Error { errno: libc::EINVAL, buf: Some(buf) };
+    }
+    let Ok(mut offset) = libc::off_t::try_from(offset_bytes) else {
+        return CompletionResult::Error { errno: libc::EINVAL, buf: Some(buf) };
+    };
+    let mut written = 0usize;
+    while written < len as usize {
+        let src = &pool.bytes(buf)[written..len as usize];
+        // SAFETY: `src` is a live immutable borrow of the caller-owned buffer.
+        let rc = unsafe { libc::pwrite(fd, src.as_ptr().cast(), src.len(), offset) };
+        stats.syscalls += 1;
+        if rc > 0 {
+            written += rc as usize;
+            offset += rc as libc::off_t;
+            continue;
+        }
+        if rc == 0 {
+            return CompletionResult::Error { errno: libc::EIO, buf: Some(buf) };
+        }
+        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno == libc::EINTR {
+            continue;
+        }
+        return CompletionResult::Error { errno, buf: Some(buf) };
+    }
+    CompletionResult::FileWritten { buf }
+}
+
+fn file_sync(fd: RawFd, _mode: FileSyncMode, stats: &mut SubmitStats) -> CompletionResult {
+    // macOS correctness tier uses fsync for both DataOnly and Full; no M2
+    // performance or fsync-latency claim may cite this backend.
+    // SAFETY: fsync on a caller-owned file descriptor.
+    let rc = unsafe { libc::fsync(fd) };
+    stats.syscalls += 1;
+    if rc == 0 {
+        CompletionResult::FileDone
+    } else {
+        CompletionResult::Error {
+            errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            buf: None,
+        }
+    }
+}
+
+fn file_rename(
+    old_dir: RawFd,
+    old_name: String,
+    new_dir: RawFd,
+    new_name: String,
+    stats: &mut SubmitStats,
+) -> CompletionResult {
+    let old_path = match CString::new(old_name) {
+        Ok(path) => path,
+        Err(_) => return CompletionResult::Error { errno: libc::EINVAL, buf: None },
+    };
+    let new_path = match CString::new(new_name) {
+        Ok(path) => path,
+        Err(_) => return CompletionResult::Error { errno: libc::EINVAL, buf: None },
+    };
+    // SAFETY: both paths are live NUL-terminated strings.
+    let rc = unsafe { libc::renameat(old_dir, old_path.as_ptr(), new_dir, new_path.as_ptr()) };
+    stats.syscalls += 1;
+    if rc == 0 {
+        CompletionResult::FileDone
+    } else {
+        CompletionResult::Error {
+            errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            buf: None,
+        }
+    }
+}
+
+fn file_unlink(dir: RawFd, name: String, stats: &mut SubmitStats) -> CompletionResult {
+    let path = match CString::new(name) {
+        Ok(path) => path,
+        Err(_) => return CompletionResult::Error { errno: libc::EINVAL, buf: None },
+    };
+    // SAFETY: path is a live NUL-terminated string.
+    let rc = unsafe { libc::unlinkat(dir, path.as_ptr(), 0) };
+    stats.syscalls += 1;
+    if rc == 0 {
+        CompletionResult::FileDone
+    } else {
+        CompletionResult::Error {
+            errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            buf: None,
+        }
+    }
+}
+
+fn file_open_flags(mode: FileOpenMode) -> i32 {
+    match mode {
+        FileOpenMode::ReadOnly => libc::O_RDONLY | libc::O_CLOEXEC,
+        FileOpenMode::ReadWrite => libc::O_RDWR | libc::O_CLOEXEC,
+        FileOpenMode::ReadWriteCreate => libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
+        FileOpenMode::ReadWriteCreateTruncate => {
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC
+        }
+        FileOpenMode::Directory => libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    }
 }
 
 fn set_nonblocking(fd: RawFd) {

@@ -529,11 +529,15 @@ pub static MATRIX: &[Case] = &[
     skip(&["INF.NS", "CREATE", "cache", "EVICTION", "allkeys-lfu"], "InfinityDB extension"),
     skip(
         &["INF.NS", "CREATE", "ledger", "MODE", "durable"],
-        "InfinityDB extension; durable mode honestly rejected until M2",
+        "InfinityDB extension; durable mode requires explicit FSYNC policy in M2",
+    ),
+    skip(
+        &["INF.NS", "CREATE", "ledger", "MODE", "durable", "FSYNC", "always"],
+        "InfinityDB extension; durable mode with explicit FSYNC policy is active in M2",
     ),
     skip(&["INF.NS", "LIST"], "InfinityDB extension"),
     skip(&["INF.NS", "INFO", "cache"], "InfinityDB extension"),
     skip(&["INF.NS", "DROP", "cache"], "InfinityDB extension"),
     // --- terminal cleanup ---
-    c(&["FLUSHALL"]),
+    skip(&["FLUSHALL"], "durable namespace FLUSHALL is refused until typed record semantics exist"),
 ];

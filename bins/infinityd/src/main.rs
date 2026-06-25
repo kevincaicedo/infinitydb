@@ -3,13 +3,16 @@
 //! parser + executor + store slice + fabric endpoint), one `SO_REUSEPORT`
 //! listener per cell (master plan §4/§5).
 //!
-//! M0 surface: flags only, no config file (anti-goal); no signal handling —
-//! there is no durable state before M2, so the OS reclaiming the process IS
-//! clean shutdown. `--route-local-only` is the cross-cell penalty A/B leg
-//! (§6 gate): the router treats every key as local to the accepting cell.
+//! M2 still keeps configuration deliberately explicit: `--data-dir DIR`
+//! enables the cold log-writer bootstrap and namespace `META` load, but
+//! public durable namespaces remain gated until routing and fsync policy are
+//! wired. `--route-local-only` is the cross-cell penalty A/B leg (§6 gate):
+//! the router treats every key as local to the accepting cell.
 #![forbid(unsafe_code)]
 
+use std::io;
 use std::os::fd::IntoRawFd;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use inf_alloc::BufferPool;
@@ -17,12 +20,34 @@ use inf_fabric::{CellFabric, Mesh, MeshConfig};
 use inf_foundation::CellId;
 use inf_foundation::time::StdClock;
 use inf_runtime::net::{bound_port, listen_reuseport, pin_current_thread};
-use inf_runtime::{BackendDriver, CellLoop, LoopConfig};
+use inf_runtime::{BackendDriver, CellLoop, LoopConfig, Wait};
+use inf_server::checkpoint::{LiveCheckpointPublishConfig, LiveCheckpointPublisher};
+use inf_server::log_bootstrap::{
+    LogDataRootConfig, LogRecoveryManifest, load_recovery_manifest_in_data_root,
+    open_checkpoint_directory_in_data_root, open_first_boot_log_writer_in_data_root,
+    open_log_directory_in_data_root, open_recovered_log_writer_replaying_in_data_root,
+    open_recovered_log_writer_replaying_manifest_in_data_root,
+};
+use inf_server::log_maintenance::{LogSegmentMaintenance, LogSegmentMaintenanceConfig};
+use inf_server::log_writer::LogWriteIo;
+use inf_server::ns_catalog::{
+    NamespaceCatalogDataRootLoadConfig, NamespaceCatalogLivePublishConfig,
+    NamespaceCatalogLivePublisher, load_namespace_catalog_in_data_root,
+};
+use inf_server::recovery::scan_host_segment_directory;
 use inf_server::{NodeInfo, NoopObserver, ServerPlane};
-use inf_store::{Keyspace, StoreConfig};
+use inf_store::{Keyspace, NsCatalog, StoreConfig};
 
 /// How often (iterations) each cell refreshes its INFO stats snapshot.
 const STATS_EVERY: u64 = 1024;
+const PROD_LOG_BOOTSTRAP_TOKEN_SLOT: u32 = 0x00_FE00;
+const PROD_LOG_WRITER_TOKEN_SLOT: u32 = 0x00_FE01;
+const PROD_NS_CATALOG_TOKEN_SLOT: u32 = 0x00_FE02;
+const PROD_LOG_MAINTENANCE_TOKEN_SLOT: u32 = 0x00_FE03;
+const PROD_CHECKPOINT_TOKEN_SLOT: u32 = 0x00_FE04;
+const STARTUP_FILE_WAIT: Wait = Wait::Park { timeout: None };
+const STARTUP_FILE_REAP_LIMIT: u32 = 4096;
+const ENOENT_ERRNO: i32 = 2;
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -33,6 +58,7 @@ struct Args {
     pin_start: Option<usize>,
     route_local_only: bool,
     park_us: Option<u64>,
+    data_dir: Option<String>,
 }
 
 impl Default for Args {
@@ -45,13 +71,22 @@ impl Default for Args {
             pin_start: None,
             route_local_only: false,
             park_us: None,
+            data_dir: None,
         }
     }
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from<I, S>(raw_args: I) -> Result<Args, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
     let mut args = Args::default();
-    let mut it = std::env::args().skip(1);
+    let mut it = raw_args.into_iter().map(Into::into);
     while let Some(flag) = it.next() {
         let mut take = |name: &str| it.next().ok_or_else(|| format!("{name} requires a value"));
         match flag.as_str() {
@@ -75,6 +110,11 @@ fn parse_args() -> Result<Args, String> {
                 args.park_us =
                     Some(take("--park-us")?.parse().map_err(|e| format!("--park-us: {e}"))?);
             }
+            "--data-dir" => {
+                let value = take("--data-dir")?;
+                validate_data_dir_name(&value)?;
+                args.data_dir = Some(value);
+            }
             "--version" | "-V" => {
                 println!("{}", version_line());
                 std::process::exit(0);
@@ -82,7 +122,7 @@ fn parse_args() -> Result<Args, String> {
             "--help" | "-h" => {
                 println!(
                     "infinityd [--port 6379] [--cells 4] [--buffers 4096] [--buf-size 4096] \
-                     [--pin-start CORE] [--route-local-only] [--version]"
+                     [--pin-start CORE] [--route-local-only] [--data-dir DIR] [--version]"
                 );
                 std::process::exit(0);
             }
@@ -93,6 +133,22 @@ fn parse_args() -> Result<Args, String> {
         return Err("--cells must be >= 1".into());
     }
     Ok(args)
+}
+
+fn validate_data_dir_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("--data-dir must not be empty".into());
+    }
+    if name.as_bytes().contains(&0) {
+        return Err("--data-dir must not contain NUL bytes".into());
+    }
+    if matches!(name, "." | "..") {
+        return Err("--data-dir must name a real directory entry".into());
+    }
+    if name.as_bytes().contains(&b'/') {
+        return Err("--data-dir currently expects one relative directory name".into());
+    }
+    Ok(())
 }
 
 /// Build provenance (M1-S14): version + commit + target, stamped by
@@ -161,11 +217,12 @@ fn main() {
     }
     eprintln!("{}", version_line());
     eprintln!(
-        "infinityd: {} cells, port {}, backend {}, route {}",
+        "infinityd: {} cells, port {}, backend {}, route {}, log {}",
         args.cells,
         args.port,
         backend_name(),
-        if args.route_local_only { "local-only" } else { "natural" }
+        if args.route_local_only { "local-only" } else { "natural" },
+        args.data_dir.as_deref().unwrap_or("disabled")
     );
     for handle in handles {
         if let Err(e) = handle.join().expect("cell thread panicked") {
@@ -192,6 +249,16 @@ fn cell_main(
     let mut pool = BufferPool::new(args.buffers, args.buf_size);
     let mut driver = make_driver()?;
     driver.register_pool(&mut pool)?;
+    let recovery_manifest = match args.data_dir.as_deref() {
+        Some(data_dir) => load_cell_recovery_manifest(cell, data_dir, &mut driver, &mut pool)?,
+        None => None,
+    };
+    let recovered_namespace_catalog = match (args.data_dir.as_deref(), recovery_manifest.as_ref()) {
+        (Some(data_dir), None) => {
+            load_cell_namespace_catalog(cell, data_dir, &mut driver, &mut pool)?
+        }
+        _ => NsCatalog::empty(),
+    };
     #[cfg(target_os = "linux")]
     if let Some(fd) = wake_fd {
         driver.adopt_wake_fd(fd);
@@ -214,16 +281,80 @@ fn cell_main(
     node.wall_anchor.set((0, unix_ms));
     node.rng_state.set(unix_ms ^ (u64::from(cell) << 48) ^ 0x9E37_79B9_7F4A_7C15);
     node.tcp_port.set(args.port);
+    let mut keyspace = Keyspace::new(StoreConfig::default());
+    keyspace
+        .ns_replace_with_recovered_catalog(recovered_namespace_catalog)
+        .map_err(|error| io::Error::other(format!("cell {cell} namespace recovery: {error:?}")))?;
+    let log_writer = match args.data_dir.as_deref() {
+        Some(data_dir) => Some(open_cell_log_writer(
+            cell,
+            data_dir,
+            recovery_manifest.as_ref(),
+            &mut driver,
+            &mut pool,
+            &mut keyspace,
+        )?),
+        None => None,
+    };
+    let checkpoint_publisher = match args.data_dir.as_deref() {
+        Some(data_dir) => {
+            let mut completions = Vec::new();
+            let config = LogDataRootConfig::first_boot_default(
+                data_dir.to_string(),
+                CellId(cell),
+                PROD_LOG_BOOTSTRAP_TOKEN_SLOT,
+                PROD_LOG_WRITER_TOKEN_SLOT,
+            )
+            .with_generations(u32::from(cell), u32::from(cell))
+            .with_wait(STARTUP_FILE_WAIT)
+            .with_max_reaps(STARTUP_FILE_REAP_LIMIT);
+            let ckpt_dir = open_checkpoint_directory_in_data_root(
+                &mut driver,
+                &mut pool,
+                &config,
+                &mut completions,
+            )
+            .map_err(|error| {
+                io::Error::other(format!("cell {cell} checkpoint directory: {error}"))
+            })?;
+            Some(LiveCheckpointPublisher::new(
+                LiveCheckpointPublishConfig::new(ckpt_dir, PROD_CHECKPOINT_TOKEN_SLOT)
+                    .with_generation(u32::from(cell)),
+            ))
+        }
+        None => None,
+    };
     let mut plane = ServerPlane::new(
         CellId(cell),
         args.cells,
         listener.into_raw_fd(), // the driver owns the listener fd now
-        Keyspace::new(StoreConfig::default()),
+        keyspace,
         fabric,
         Rc::clone(&node),
         NoopObserver,
         args.route_local_only,
     );
+    if let Some((writer, maintenance)) = log_writer {
+        plane.install_log_writer(writer);
+        plane.install_log_segment_maintenance(maintenance);
+    }
+    if let Some(manifest) = recovery_manifest.as_ref() {
+        plane.seed_checkpoint_next_id_after(manifest.checkpoint_id());
+    }
+    if let Some(publisher) = checkpoint_publisher {
+        plane.install_checkpoint_publisher(publisher);
+    }
+    if let Some(data_dir) = args.data_dir.as_deref() {
+        let config = NamespaceCatalogLivePublishConfig::new(
+            data_dir.to_string(),
+            PROD_NS_CATALOG_TOKEN_SLOT,
+        )
+        .with_generation(u32::from(cell));
+        let publisher = NamespaceCatalogLivePublisher::new(config).map_err(|error| {
+            io::Error::other(format!("cell {cell} namespace catalog live publisher: {error}"))
+        })?;
+        plane.install_namespace_catalog_publisher(publisher);
+    }
     // Doorbell wakeups (Linux): peers end this cell's park via eventfd, so
     // the park timeout is a fallback, not the hop-latency ceiling. The park
     // board only helps when the driver has a wake watch.
@@ -251,6 +382,128 @@ fn cell_main(
             node.wire_buffers_bytes.set(cell_loop.pool().reserved_bytes() as u64);
         }
     }
+}
+
+fn open_cell_log_writer<D>(
+    cell: u16,
+    data_dir: &str,
+    recovery_manifest: Option<&LogRecoveryManifest>,
+    driver: &mut D,
+    pool: &mut BufferPool,
+    keyspace: &mut Keyspace,
+) -> io::Result<(LogWriteIo, LogSegmentMaintenance)>
+where
+    D: BackendDriver,
+{
+    let mut completions = Vec::new();
+    let config = LogDataRootConfig::first_boot_default(
+        data_dir.to_string(),
+        CellId(cell),
+        PROD_LOG_BOOTSTRAP_TOKEN_SLOT,
+        PROD_LOG_WRITER_TOKEN_SLOT,
+    )
+    .with_generations(u32::from(cell), u32::from(cell))
+    .with_wait(STARTUP_FILE_WAIT)
+    .with_max_reaps(STARTUP_FILE_REAP_LIMIT);
+    let writer = if let Some(manifest) = recovery_manifest {
+        open_recovered_log_writer_replaying_manifest_in_data_root(
+            driver,
+            pool,
+            &config,
+            manifest,
+            keyspace,
+            &mut completions,
+        )
+        .map(|(writer, _applied, _replay_stats)| writer)
+    } else {
+        let mut segment_names = Vec::new();
+        let catalog = scan_host_segment_directory(cell_log_dir(data_dir, cell), &mut segment_names)
+            .map_err(|error| {
+                io::Error::other(format!("cell {cell} log directory scan: {error}"))
+            })?;
+        match catalog {
+            Some(catalog) if !catalog.is_empty() => {
+                open_recovered_log_writer_replaying_in_data_root(
+                    driver,
+                    pool,
+                    &config,
+                    &catalog,
+                    keyspace,
+                    &mut completions,
+                )
+                .map(|(writer, _replay_stats)| writer)
+            }
+            Some(_) | None => {
+                open_first_boot_log_writer_in_data_root(driver, pool, &config, &mut completions)
+            }
+        }
+    }
+    .map_err(|error| io::Error::other(format!("cell {cell} log bootstrap: {error}")))?;
+
+    let log_dir = open_log_directory_in_data_root(driver, pool, &config, &mut completions)
+        .map_err(|error| {
+            io::Error::other(format!("cell {cell} log maintenance directory: {error}"))
+        })?;
+    let maintenance = LogSegmentMaintenance::new(
+        LogSegmentMaintenanceConfig::new(log_dir, PROD_LOG_MAINTENANCE_TOKEN_SLOT)
+            .with_generation(u32::from(cell)),
+    );
+    Ok((writer, maintenance))
+}
+
+fn load_cell_recovery_manifest<D>(
+    cell: u16,
+    data_dir: &str,
+    driver: &mut D,
+    pool: &mut BufferPool,
+) -> io::Result<Option<LogRecoveryManifest>>
+where
+    D: BackendDriver,
+{
+    let mut completions = Vec::new();
+    let config = LogDataRootConfig::first_boot_default(
+        data_dir.to_string(),
+        CellId(cell),
+        PROD_LOG_BOOTSTRAP_TOKEN_SLOT,
+        PROD_LOG_WRITER_TOKEN_SLOT,
+    )
+    .with_generations(u32::from(cell), u32::from(cell))
+    .with_wait(STARTUP_FILE_WAIT)
+    .with_max_reaps(STARTUP_FILE_REAP_LIMIT);
+    load_recovery_manifest_in_data_root(driver, pool, &config, &mut completions)
+        .map_err(|error| io::Error::other(format!("cell {cell} recovery manifest load: {error}")))
+}
+
+fn load_cell_namespace_catalog<D>(
+    cell: u16,
+    data_dir: &str,
+    driver: &mut D,
+    pool: &mut BufferPool,
+) -> io::Result<NsCatalog>
+where
+    D: BackendDriver,
+{
+    let mut completions = Vec::new();
+    let config =
+        NamespaceCatalogDataRootLoadConfig::new(data_dir.to_string(), PROD_NS_CATALOG_TOKEN_SLOT)
+            .with_generation(u32::from(cell))
+            .with_wait(STARTUP_FILE_WAIT)
+            .with_max_reaps(STARTUP_FILE_REAP_LIMIT);
+    match load_namespace_catalog_in_data_root(driver, pool, &config, &mut completions) {
+        Ok(catalog) => Ok(catalog),
+        Err(inf_server::ns_catalog::NamespaceCatalogLoadError::OpenDataRoot {
+            errno: ENOENT_ERRNO,
+            ..
+        }) => Ok(NsCatalog::empty()),
+        Err(error) => Err(io::Error::other(format!("cell {cell} namespace catalog load: {error}"))),
+    }
+}
+
+fn cell_log_dir(data_dir: &str, cell: u16) -> PathBuf {
+    let mut path = PathBuf::from(data_dir);
+    path.push(format!("shard-{cell}"));
+    path.push("log");
+    path
 }
 
 #[cfg(target_os = "linux")]
@@ -308,4 +561,31 @@ fn backend_name() -> &'static str {
     return "kqueue";
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     "none"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_data_dir_flag() {
+        let args = parse_args_from(["--data-dir", ".infinitydb", "--cells", "2"]).unwrap();
+
+        assert_eq!(args.data_dir.as_deref(), Some(".infinitydb"));
+        assert_eq!(args.cells, 2);
+    }
+
+    #[test]
+    fn rejects_recursive_data_dir_for_now() {
+        let error = parse_args_from(["--data-dir", "var/lib/infinity"]).unwrap_err();
+
+        assert!(error.contains("one relative directory name"));
+    }
+
+    #[test]
+    fn rejects_special_data_dir_entries() {
+        let error = parse_args_from(["--data-dir", "."]).unwrap_err();
+
+        assert!(error.contains("real directory entry"));
+    }
 }

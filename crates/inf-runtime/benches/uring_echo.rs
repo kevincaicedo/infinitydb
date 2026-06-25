@@ -172,6 +172,13 @@ mod imp {
                     CompletionResult::Sent { buf } => pool.release(buf),
                     CompletionResult::RecvDropped => drops += 1,
                     CompletionResult::Closed => {}
+                    CompletionResult::FileOpened { .. }
+                    | CompletionResult::FileRead { .. }
+                    | CompletionResult::FileWritten { .. }
+                    | CompletionResult::FileDone
+                    | CompletionResult::FileClosed => {
+                        unreachable!("file completion in echo bench");
+                    }
                     CompletionResult::Error { buf, .. } => {
                         errs += 1;
                         if let Some(buf) = buf {
