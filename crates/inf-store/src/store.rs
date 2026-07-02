@@ -978,6 +978,58 @@ impl CellStore {
         }
     }
 
+    /// The fuzzy-checkpoint walk (M2-S10, ADR-0016 D2): the same
+    /// resize-stable home-group enumeration as [`scan`](Self::scan), but
+    /// emitting each live entry's post-image `(key, value, expire_at_ms)`
+    /// instead of the key — expiry deadline in *internal* ms (the caller
+    /// converts through its `WallAnchor` when encoding records). Inherits
+    /// the SCAN guarantee: every entry present for the whole walk is
+    /// emitted at least once across doublings and tombstone rehashes;
+    /// entries written mid-walk may appear zero or more times (harmless —
+    /// checkpoint replay is a blind idempotent upsert and the log tail
+    /// from `ckpt-begin` re-covers them). Expired records encountered are
+    /// reaped, never emitted. No access-tracking side effects on emitted
+    /// entries. Returns the next cursor (0 = done).
+    pub fn scan_post_images(
+        &mut self,
+        cursor: u64,
+        count: usize,
+        now: Nanos,
+        mut emit: impl FnMut(&[u8], &[u8], Option<u64>),
+    ) -> u64 {
+        let mask = self.index.group_count() as u64 - 1;
+        let mut cursor = cursor & mask;
+        let mut emitted = 0usize;
+        let mut batch: Vec<ArenaAddr> = Vec::new();
+        loop {
+            batch.clear();
+            {
+                let arena = &self.arena;
+                self.index.scan_home_group(
+                    cursor as usize,
+                    |addr| Self::hash_key(record_at(arena, addr).key()),
+                    |addr| batch.push(addr),
+                );
+            }
+            for &addr in &batch {
+                let view = record_at(&self.arena, addr);
+                if view.is_expired(now) {
+                    let (hash, len) = (Self::hash_key(view.key()), view.encoded_len());
+                    self.index.remove(hash, addr);
+                    self.arena.free(addr, len);
+                    self.note_reap_lazy();
+                } else {
+                    emit(view.key(), view.value(), view.expire_at_ms());
+                    emitted += 1;
+                }
+            }
+            cursor = next_rev_cursor(cursor, mask);
+            if cursor == 0 || emitted >= count {
+                return cursor;
+            }
+        }
+    }
+
     /// `RANDOMKEY` probe: first live key at/after a caller-rolled slot
     /// (randomness is injected — L7). Two-level random (cell, then slot) is
     /// the documented compat deviation.

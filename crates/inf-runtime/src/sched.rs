@@ -1,21 +1,24 @@
 //! Scheduler groups v0: deficit-weighted budgets for the reactor loop's
 //! EXECUTE and MAINTAIN steps (master plan §5.2, Seastar's discipline).
 //!
-//! Two classes exist at M0 — `Foreground` (parse/execute) and `Maintenance`
-//! (stats flush; expiry/eviction/checkpoint slices join in M1/M2). Each
+//! Three classes — `Foreground` (parse/execute), `Maintenance` (expiry,
+//! eviction, stats flush), and `Checkpoint` (the M2-S10 fuzzy-checkpoint
+//! slice; its own group so a 10 GB walk cannot starve expiry and vice
+//! versa — ADR-0016 D5, §5.2 names it as a first-class group). Each
 //! iteration refills every group's deficit by `quantum × weight`; work
 //! charges against the deficit; the cap keeps an idle group from hoarding an
 //! unbounded burst. Budgets are abstract work units — the loop charges one
-//! unit per command executed / maintenance item processed.
+//! unit per command executed / maintenance item processed / KiB streamed.
 
 /// Scheduling class. Indexes into the group table.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum GroupClass {
     Foreground = 0,
     Maintenance = 1,
+    Checkpoint = 2,
 }
 
-const GROUPS: usize = 2;
+const GROUPS: usize = 3;
 
 #[derive(Copy, Clone, Debug)]
 struct Group {
@@ -44,22 +47,28 @@ impl GroupScheduler {
         max_deficit: u32,
         fg_weight: u32,
         maint_weight: u32,
+        ckpt_weight: u32,
     ) -> GroupScheduler {
-        assert!(quantum > 0 && fg_weight > 0 && maint_weight > 0, "zero quantum/weight");
+        assert!(
+            quantum > 0 && fg_weight > 0 && maint_weight > 0 && ckpt_weight > 0,
+            "zero quantum/weight"
+        );
         GroupScheduler {
             groups: [
                 Group { weight: fg_weight, deficit: quantum * fg_weight },
                 Group { weight: maint_weight, deficit: quantum * maint_weight },
+                Group { weight: ckpt_weight, deficit: quantum * ckpt_weight },
             ],
             quantum,
             max_deficit,
         }
     }
 
-    /// M0 defaults: foreground-heavy (8:1), one-command quantum granularity
-    /// scaled for pipelined batches.
+    /// M0 defaults: foreground-heavy (8:1:1), one-command quantum
+    /// granularity scaled for pipelined batches; checkpoint sits at the
+    /// maintenance tier with its own deficit (ADR-0016 D5).
     pub fn m0_default() -> GroupScheduler {
-        GroupScheduler::new(64, 4096, 8, 1)
+        GroupScheduler::new(64, 4096, 8, 1, 1)
     }
 
     /// Per-iteration refill (loop step boundary).
@@ -89,19 +98,21 @@ mod tests {
 
     #[test]
     fn weighted_refill_and_cap() {
-        let mut s = GroupScheduler::new(10, 100, 8, 1);
+        let mut s = GroupScheduler::new(10, 100, 8, 1, 1);
         assert_eq!(s.budget(GroupClass::Foreground), 80);
         assert_eq!(s.budget(GroupClass::Maintenance), 10);
+        assert_eq!(s.budget(GroupClass::Checkpoint), 10);
         for _ in 0..20 {
             s.refill();
         }
         assert_eq!(s.budget(GroupClass::Foreground), 100, "cap bounds the burst");
         assert_eq!(s.budget(GroupClass::Maintenance), 100);
+        assert_eq!(s.budget(GroupClass::Checkpoint), 100);
     }
 
     #[test]
     fn charge_is_saturating() {
-        let mut s = GroupScheduler::new(10, 100, 1, 1);
+        let mut s = GroupScheduler::new(10, 100, 1, 1, 1);
         s.charge(GroupClass::Foreground, 9999);
         assert_eq!(s.budget(GroupClass::Foreground), 0);
         s.refill();
@@ -112,13 +123,15 @@ mod tests {
     fn maintenance_keeps_progressing_under_foreground_load() {
         // The HoL guarantee in miniature: however much foreground charges,
         // maintenance's refill is untouched.
-        let mut s = GroupScheduler::new(10, 1000, 8, 1);
+        let mut s = GroupScheduler::new(10, 1000, 8, 1, 1);
         for _ in 0..100 {
             s.refill();
             let fg = s.budget(GroupClass::Foreground);
             s.charge(GroupClass::Foreground, fg); // saturate foreground
             s.charge(GroupClass::Maintenance, 5);
+            s.charge(GroupClass::Checkpoint, 5);
         }
         assert!(s.budget(GroupClass::Maintenance) >= 5, "maintenance never starved");
+        assert!(s.budget(GroupClass::Checkpoint) >= 5, "checkpoint never starved");
     }
 }

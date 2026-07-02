@@ -27,8 +27,7 @@ use inf_foundation::varint;
 pub struct NsId(pub u32);
 
 /// Record type tags, v1. Discriminants are wire format — never reuse or
-/// renumber (the registry only grows: M3 collection ops, M2-S10 `ckpt-begin`
-/// claim tag 5 onward).
+/// renumber (the registry only grows: M3 collection ops claim tag 6 onward).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum RecordType {
@@ -41,6 +40,11 @@ pub enum RecordType {
     ExpireAt = 3,
     /// Namespace DDL (payload vocabulary owned by M2-S08).
     NsOp = 4,
+    /// Checkpoint-begin marker (M2-S10, ADR-0016): the LSN the `.ick`
+    /// header names as `begin-LSN`; tail replay from it re-covers every
+    /// entry the fuzzy walker missed or observed early. Replay treats it
+    /// as a marker (skip + count), never state.
+    CkptBegin = 5,
 }
 
 impl RecordType {
@@ -51,6 +55,7 @@ impl RecordType {
             2 => RecordType::Delete,
             3 => RecordType::ExpireAt,
             4 => RecordType::NsOp,
+            5 => RecordType::CkptBegin,
             _ => return None,
         })
     }
@@ -65,10 +70,30 @@ const RECORD_FLAGS_V1: u8 = 0;
 /// hold by construction: invalid records are unrepresentable as views.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum RecordView<'a> {
-    StringPostImage { ns: NsId, key: &'a [u8], value: &'a [u8] },
-    Delete { ns: NsId, key: &'a [u8] },
-    ExpireAt { ns: NsId, at_unix_ms: u64, key: &'a [u8] },
-    NsOp { ns: NsId, payload: &'a [u8] },
+    StringPostImage {
+        ns: NsId,
+        key: &'a [u8],
+        value: &'a [u8],
+    },
+    Delete {
+        ns: NsId,
+        key: &'a [u8],
+    },
+    ExpireAt {
+        ns: NsId,
+        at_unix_ms: u64,
+        key: &'a [u8],
+    },
+    NsOp {
+        ns: NsId,
+        payload: &'a [u8],
+    },
+    /// Cell-scoped checkpoint marker (`ns` is 0 by convention; the field
+    /// stays because every record body carries one).
+    CkptBegin {
+        ns: NsId,
+        ckpt_id: u64,
+    },
 }
 
 impl RecordView<'_> {
@@ -92,6 +117,9 @@ impl RecordView<'_> {
                 varint_len(u64::from(ns.0)) + varint_len(at_unix_ms) + key.len()
             }
             RecordView::NsOp { ns, payload } => varint_len(u64::from(ns.0)) + payload.len(),
+            RecordView::CkptBegin { ns, ckpt_id } => {
+                varint_len(u64::from(ns.0)) + varint_len(ckpt_id)
+            }
         }
     }
 
@@ -127,6 +155,12 @@ impl RecordView<'_> {
                 varint::encode_u64(u64::from(ns.0), out);
                 out.extend_from_slice(payload);
             }
+            RecordView::CkptBegin { ns, ckpt_id } => {
+                out.push(RecordType::CkptBegin as u8);
+                out.push(RECORD_FLAGS_V1);
+                varint::encode_u64(u64::from(ns.0), out);
+                varint::encode_u64(ckpt_id, out);
+            }
         }
     }
 }
@@ -148,6 +182,10 @@ pub enum RecordDecodeError {
     NsOutOfRange(u64),
     /// A declared key length overruns the record body.
     KeyOverrun,
+    /// Bytes remain after a fixed-width payload (`CkptBegin` is the first
+    /// type where trailing garbage is representable — one value, one
+    /// encoding, so it is rejected).
+    TrailingBytes,
 }
 
 impl fmt::Display for RecordDecodeError {
@@ -161,6 +199,7 @@ impl fmt::Display for RecordDecodeError {
             }
             RecordDecodeError::NsOutOfRange(ns) => write!(f, "namespace id {ns} out of range"),
             RecordDecodeError::KeyOverrun => write!(f, "key length overruns record body"),
+            RecordDecodeError::TrailingBytes => write!(f, "trailing bytes after record payload"),
         }
     }
 }
@@ -222,6 +261,17 @@ pub fn decode_record(buf: &[u8]) -> Result<(RecordView<'_>, usize), RecordDecode
             RecordView::ExpireAt { ns, at_unix_ms, key: &payload[at_len..] }
         }
         RecordType::NsOp => RecordView::NsOp { ns, payload },
+        RecordType::CkptBegin => {
+            let (ckpt_id, id_len) = varint::decode_u64(payload).ok_or(if payload.is_empty() {
+                RecordDecodeError::Truncated
+            } else {
+                RecordDecodeError::Varint
+            })?;
+            if id_len != payload.len() {
+                return Err(RecordDecodeError::TrailingBytes);
+            }
+            RecordView::CkptBegin { ns, ckpt_id }
+        }
     };
     Ok((view, prefix_len + body_len))
 }
@@ -257,6 +307,17 @@ mod tests {
         round_trip(RecordView::Delete { ns: NsId(3), key: b"gone" });
         round_trip(RecordView::ExpireAt { ns: NsId(7), at_unix_ms: u64::MAX, key: b"session" });
         round_trip(RecordView::NsOp { ns: NsId(1), payload: b"create ledger" });
+        round_trip(RecordView::CkptBegin { ns: NsId(0), ckpt_id: 0 });
+        round_trip(RecordView::CkptBegin { ns: NsId(0), ckpt_id: u64::MAX });
+    }
+
+    #[test]
+    fn ckpt_begin_rejects_trailing_bytes() {
+        let mut buf = Vec::new();
+        RecordView::CkptBegin { ns: NsId(0), ckpt_id: 7 }.encode_into(&mut buf);
+        buf.push(0x00); // trailing garbage inside a lengthened body
+        buf[0] += 1; // grow the declared body_len to cover it
+        assert_eq!(decode_record(&buf), Err(RecordDecodeError::TrailingBytes));
     }
 
     #[test]

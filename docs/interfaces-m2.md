@@ -21,10 +21,11 @@ Formats defined by ADR-0011 unless noted.
 | Driver file ops (`LogWrite`/`Fdatasync`) | `inf-runtime` | implemented (M2-S05, ADR-0013 D1 — extends the frozen M0 `BackendDriver` contract) |
 | Node catalog `META` swap (`inf-log::meta`) | `inf-log` | implemented (M2-S08, ADR-0015 D3 — the S11 MANIFEST protocol class; payload = `inf-store::catalog` v1) |
 | Namespace selection + `Op::ApplyNs` | `inf-server`/`inf-fabric` | implemented (M2-S08, ADR-0015 D1 — the ADR-0009 §4 codec revision, additive opcode 6; `ns ≥ 16` enforced at decode) |
-| `.ick` checkpoint format v1 | `inf-log` | pending (M2-S10) |
+| `.ick` checkpoint format v1 | `inf-log` | implemented (M2-S10, ADR-0016 — record-v1 payload; digest = hash64 chain, recorded deviation from "xxh3") |
+| Checkpoint scheduler group + ckpt token classes | `inf-runtime` | implemented (M2-S10, ADR-0016 D4/D5 — `GroupClass::Checkpoint`; `TokenClass::{CkptWrite,CkptSync}` routing-only extension of the frozen M0 token contract) |
 | MANIFEST schema v1 | `inf-log` | pending (M2-S11) |
 | Fault-point registry | `inf-foundation`/`inf-log` | pending (M2-S16) |
-| Persistence counter set | `inf-log`/`inf-bench` | pending (M2-S21) |
+| Persistence counter set | `inf-log`/`inf-bench` | pending (M2-S21; S10 adds `ckpts_completed/aborted`, `ckpt_last_unix_ms`, `ckpt_last_begin_lsn`, `ckpt_buffer_bytes` to `INFO persistence`) |
 
 ## Record format v1 (`inf-log::record`)
 
@@ -245,3 +246,49 @@ the module docs; `inf-server` adopts it at S08):
 - `SegmentFile::raw_fd() -> Option<RawFd>` (`None` on in-memory tiers; the
   reactor path requires a real-file tier — the sim implements the driver
   ops themselves, S18).
+
+## `.ick` checkpoint format v1 (`inf-log::ckpt`, M2-S10, ADR-0016)
+
+```text
+header  := magic8 "INFICK1\0" · version u16 · cell u16 · ckpt_id u64 ·
+           begin_lsn u64 (Lsn::to_u64) · ns_count u32 · ns_ids [u32] · crc u32
+section := tag 0x01 · body_len u32 · record_count u32 ·
+           body (record-v1 encodings) · crc u32       (CRC32C over tag..body)
+footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
+           (ns_id u32 · entries u64)* · digest u64 · crc u32
+```
+
+- **The checkpoint is a materialized log prefix** (ADR-0016 D1): section
+  bodies are ordinary record-v1 encodings (post-image + expire-at per live
+  entry), replayed by `Keyspace::apply_record` — the same upsert the tail
+  uses. M3+ record tags flow into checkpoints with zero format changes.
+- `digest` = chained `inf_foundation::hash64` over the header CRC and each
+  section CRC in order (seeded; part of the v1 wire contract). Recorded
+  deviation from the plan's "xxh3" (ADR-0016 D6); the version field is the
+  upgrade path.
+- Footer per-ns entry counts are S13's table-presizing input.
+- Writer tiers: `IckStream` (double-buffered section pair, `SectionLease`
+  custody — the reactor tier rides `IoOp::LogWrite`/`Fdatasync` on the
+  `.ick` fd with `TokenClass::CkptWrite/CkptSync`) and `SyncIckWriter`
+  (tests/tooling over `SegmentFs`). Both produce identical bytes.
+- Publication: stream to `ckpt-NNNNNN.ick.new`, then fdatasync → rename →
+  dir-fsync (the `meta.rs` protocol class) — a file named `*.ick` is always
+  footer-complete; `.new` orphans are S11 GC's job. S11's MANIFEST is the
+  only authority that *names* checkpoints and must enforce
+  `begin-LSN ≤ durability watermark` before publishing.
+- Loader `read_ick`: validate-then-yield per section, footer audit
+  (counts + digest + no trailing bytes); every structural error is typed
+  and fail-stop for recovery. Fuzz target `ick_decode` (per-PR smoke +
+  nightly hour).
+- `ckpt-begin` = record tag 5 (`RecordView::CkptBegin{ns: 0, ckpt_id}`),
+  staged through the ordinary ring as `MutationEffect::CkptBegin` — its
+  LSN resolves via `FrameLease::lsn_of` at LOG; replay counts it as
+  `ReplayOutcome::SkippedMarker`. Decode rejects trailing payload bytes
+  (`RecordDecodeError::TrailingBytes` — first fixed-width record payload).
+- Checkpoint I/O failure **aborts the checkpoint, never the process**
+  (milestone risk-table rule; deliberately narrower than §8.4 — nothing
+  was acked against the checkpoint and the log stays authoritative).
+- Trigger v1 (ADR-0016 D7): cell-local `interval_bytes` threshold +
+  `ControlHandle::request_ckpt_all()` epoch (polled in MAINTAIN — the
+  persisted-epoch pattern). One checkpoint in flight per cell; triggers
+  latch, never stack. `INF.CKPT`/`BGSAVE` ride this at S20.

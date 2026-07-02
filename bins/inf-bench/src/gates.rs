@@ -108,6 +108,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_m2_gates_file() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/milestones/m2-gates.toml");
+        let gates = load(path).expect("m2 gates file parses");
+        assert_eq!(gates.len(), 18, "S09 A/B + counter rows, §6 STOP gates, tripwires");
+        let zero = gates.iter().find(|g| g.id == "mem_only_log_records").expect("counter tripwire");
+        assert!(zero.passes(0.0) && !zero.passes(1.0));
+        assert_eq!(zero.tier, "any", "the counter tripwire binds on every box");
+        let ab = gates.iter().find(|g| g.id == "mem_ab_pipelined_ops").expect("A/B gate");
+        assert!(ab.passes(1.0) && !ab.passes(1.01), "the ≤1% zero-cost bar");
+        let always = gates.iter().find(|g| g.id == "always_grouped_wps").expect("always gate");
+        assert!(always.passes(300_000.0) && !always.passes(299_999.0));
+        let ckpt =
+            gates.iter().find(|g| g.id == "ckpt_under_load_p999").expect("anti-BGREWRITEAOF");
+        assert!(ckpt.passes(1999.0) && !ckpt.passes(2000.0));
+        assert!(
+            gates.iter().find(|g| g.id == "grouping_ratio").expect("ratio row").informational,
+            "grouping floor is informational until S21 fixes the value"
+        );
+    }
+
+    #[test]
     fn parses_the_m1_gates_file() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/milestones/m1-gates.toml");
         let gates = load(path).expect("m1 gates file parses");

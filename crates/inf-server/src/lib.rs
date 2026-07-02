@@ -9,6 +9,7 @@
 #![deny(unsafe_code)]
 
 mod admin;
+mod ckpt;
 mod clients;
 mod config;
 mod control;
@@ -20,6 +21,7 @@ mod plane;
 mod pubsub;
 mod recover;
 
+pub use ckpt::CkptStats;
 pub use clients::{ClientInfo, ClientRegistry};
 pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
 pub use control::{ControlHandle, load_catalog, spawn as spawn_control};

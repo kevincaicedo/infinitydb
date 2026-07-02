@@ -29,6 +29,7 @@ jobs:
           - { dir: crates/inf-server, target: scan_cursor }
           - { dir: crates/inf-log, target: frame_decode }
           - { dir: crates/inf-log, target: segment_read }
+          - { dir: crates/inf-log, target: ick_decode }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

@@ -25,21 +25,39 @@ struct Node {
     port: u16,
     stop: Arc<AtomicBool>,
     handles: Vec<std::thread::JoinHandle<()>>,
+    /// Control handle of a durable node (manual checkpoint trigger — the
+    /// surface `INF.CKPT` rides at S20).
+    control: Option<Arc<inf_server::ControlHandle>>,
 }
 
 impl Node {
     fn start(cells: u16) -> Node {
-        Node::start_with(cells, None)
+        Node::start_with(cells, None, 0)
     }
 
     /// A node with the durable plane enabled (M2-S08): catalog loaded and
     /// seeded before cells serve, per-cell log recovery, control thread as
     /// the catalog's single writer — the boot order infinityd adopts.
+    /// Automatic checkpoints stay off (tests own the trigger).
     fn start_durable(cells: u16, data_dir: &std::path::Path) -> Node {
-        Node::start_with(cells, Some(data_dir.to_path_buf()))
+        Node::start_with(cells, Some(data_dir.to_path_buf()), 0)
     }
 
-    fn start_with(cells: u16, data_dir: Option<std::path::PathBuf>) -> Node {
+    /// Durable node with the bytes-appended checkpoint trigger armed
+    /// (M2-S10, ADR-0016 D7).
+    fn start_durable_auto_ckpt(
+        cells: u16,
+        data_dir: &std::path::Path,
+        interval_bytes: u64,
+    ) -> Node {
+        Node::start_with(cells, Some(data_dir.to_path_buf()), interval_bytes)
+    }
+
+    fn start_with(
+        cells: u16,
+        data_dir: Option<std::path::PathBuf>,
+        ckpt_interval_bytes: u64,
+    ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
         // Bind cell 0 first on an ephemeral port, then the rest join it.
         let first = listen_reuseport(0).expect("listen");
@@ -78,6 +96,12 @@ impl Node {
                             segment_bytes: 8 << 20, // small: tests rotate
                             ..Default::default()
                         },
+                        // 0 = automatic trigger off: e2e checkpoints fire
+                        // via the control handle so tests own the timing.
+                        ckpt: inf_log::CkptConfig {
+                            interval_bytes: ckpt_interval_bytes,
+                            ..Default::default()
+                        },
                     };
                     let (internal_ms, unix_ms) = node.wall_anchor.get();
                     let anchor = inf_store::WallAnchor { internal_ms, unix_ms };
@@ -98,7 +122,7 @@ impl Node {
                     false,
                 );
                 if let Some((cfg, rotor, control)) = durable {
-                    plane.enable_durable(cfg.staging, rotor);
+                    plane.enable_durable(&cfg, i as u16, rotor).expect("ckpt dir scan");
                     plane.set_control(control);
                 }
                 let config = LoopConfig {
@@ -111,7 +135,8 @@ impl Node {
                 }
             }));
         }
-        Node { port, stop, handles }
+        let control = boot.map(|(_, _, control)| control);
+        Node { port, stop, handles, control }
     }
 
     fn connect(&self) -> TcpStream {
@@ -664,6 +689,269 @@ fn durable_cross_cell_applyns_round_trip() {
         c.write_all(&cmd(&[b"GET", k])).expect("write");
         read_exactly(&mut c, want);
     }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M2-S10: a fuzzy checkpoint streams to `ckpt-000001.ick` on the REAL
+/// reactor path (uring `LogWrite` sections on the `.ick` fd, `CkptSync`
+/// completion barrier, rename + dir-fsync publication) while writes keep
+/// flowing — then the published file validates end to end (per-section
+/// CRC, footer digest + counts) and a restart on the same dir still
+/// replays cleanly (the begin marker is a counted skip).
+#[test]
+fn fuzzy_checkpoint_streams_under_live_writes() {
+    let dir = temp_data_dir("ckpt");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"books",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"books"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for i in 0..400 {
+        let key = format!("book:{i:04}");
+        let value = format!("title-{i}");
+        c.write_all(&cmd(&[b"SET", key.as_bytes(), value.as_bytes()])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    c.write_all(&cmd(&[b"SET", b"book:ttl", b"loan", b"EX", b"5000"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+
+    // Manual trigger (the surface INF.CKPT rides at S20), then keep
+    // writing while the walker streams — the dirty-under-checkpoint shape
+    // on the real path.
+    node.control.as_ref().expect("durable node").request_ckpt_all();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let info = loop {
+        for i in 0..20 {
+            let key = format!("book:{:04}", 4000 + i);
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), b"late"])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
+        let mut buf = vec![0u8; 4096];
+        let n = c.read(&mut buf).expect("read info");
+        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        if info.contains("ckpts_completed:1") || Instant::now() > deadline {
+            break info;
+        }
+    };
+    assert!(info.contains("ckpts_completed:1"), "checkpoint completed under load: {info}");
+    assert!(info.contains("ckpts_aborted:0"), "no aborts: {info}");
+    assert!(info.contains("ckpt_buffer_bytes:0"), "buffer domain freed at completion: {info}");
+    drop(c);
+    node.stop();
+
+    // The published .ick validates end to end and covers the seed writes.
+    let ick = dir.join("shard-0").join("ckpt").join("ckpt-000001.ick");
+    let mut post_images = 0u64;
+    let (ick_info, audit) = inf_log::ckpt::read_ick(
+        &inf_log::fs::StdSegmentFs,
+        &ick,
+        inf_log::ckpt::IckReaderConfig::default(),
+        |view| {
+            if matches!(view, inf_log::RecordView::StringPostImage { .. }) {
+                post_images += 1;
+            }
+            Ok::<(), ()>(())
+        },
+    )
+    .expect("published checkpoint validates");
+    assert_eq!(ick_info.cell, 0);
+    assert_eq!(ick_info.ckpt_id, 1);
+    assert!(ick_info.begin_lsn.to_u64() > 0, "begin LSN recorded");
+    assert!(post_images >= 401, "walk covered the pre-trigger writes: {post_images}");
+    assert_eq!(audit.entries_per_ns.len(), 1, "one durable namespace walked");
+
+    // Restart on the same dir: replay (which now crosses the begin
+    // marker) still yields the data.
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"books"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"book:0000"])).expect("write");
+    read_exactly(&mut c, b"$7\r\ntitle-0\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M2-S10 trigger policy v1: the bytes-appended-since-last-checkpoint
+/// threshold fires without any manual request (ADR-0016 D7).
+#[test]
+fn bytes_threshold_triggers_a_checkpoint() {
+    let dir = temp_data_dir("ckpt-auto");
+    let node = Node::start_durable_auto_ckpt(1, &dir, 16 << 10);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"logs", b"MODE", b"durable", b"FSYNC", b"everysec"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"logs"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let value = vec![b'v'; 256];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut i = 0u32;
+    let info = loop {
+        for _ in 0..64 {
+            let key = format!("evt:{i:06}");
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), &value])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+            i += 1;
+        }
+        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
+        let mut buf = vec![0u8; 4096];
+        let n = c.read(&mut buf).expect("read info");
+        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        if !info.contains("ckpts_completed:0") || Instant::now() > deadline {
+            break info;
+        }
+    };
+    assert!(!info.contains("ckpts_completed:0"), "threshold trigger produced a checkpoint: {info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M2-S10 slice-budget rehearsal (dev tier — run manually, output feeds
+/// the artifact): a few-hundred-MB durable dataset, checkpoint triggered
+/// under continuous GET load, foreground latency sampled per request and
+/// the loop-iteration p99.9 scraped before/after. The binding
+/// checkpoint-under-full-load row is M2-S12/S22 (saturating writes,
+/// reference box); this run proves the budgeted-slice mechanism holds a
+/// flat foreground tail while sections stream.
+///
+/// `cargo test -p inf-server --release --test node_e2e -- --ignored
+/// ckpt_slice_budget_rehearsal --nocapture`
+#[test]
+#[ignore = "manual evidence run (writes the S10 dev-tier artifact input)"]
+fn ckpt_slice_budget_rehearsal() {
+    let dir = temp_data_dir("ckpt-slice");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"bulk", b"MODE", b"durable", b"FSYNC", b"everysec"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"bulk"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+
+    // Fill ~240 MB: 240k keys x 1 KiB, pipelined in batches.
+    let value = vec![b'd'; 1024];
+    let keys: u32 = 240_000;
+    let batch: u32 = 512;
+    let fill_started = Instant::now();
+    let mut written = 0u32;
+    while written < keys {
+        let n = batch.min(keys - written);
+        let mut wire = Vec::with_capacity(1100 * n as usize);
+        for i in written..written + n {
+            wire.extend_from_slice(&cmd(&[b"SET", format!("blob:{i:07}").as_bytes(), &value]));
+        }
+        c.write_all(&wire).expect("write batch");
+        for _ in 0..n {
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        written += n;
+    }
+    println!("fill: {keys} x 1 KiB in {:.1}s", fill_started.elapsed().as_secs_f64());
+
+    let info_before = {
+        c.write_all(&cmd(&[b"INFO"])).expect("write");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 65536];
+        loop {
+            let n = c.read(&mut chunk).expect("read info");
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(2).rev().take(64).any(|w| w == b"\r\n") && n < chunk.len() {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+
+    // Trigger, then hammer GETs and sample per-request latency until the
+    // checkpoint completes.
+    node.control.as_ref().expect("durable").request_ckpt_all();
+    let ckpt_started = Instant::now();
+    let mut max_get_us = 0u128;
+    let mut gets = 0u64;
+    let mut over_2ms = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let done = loop {
+        for i in 0..64 {
+            let key = format!(
+                "blob:{:07}",
+                (gets as u32).wrapping_mul(2654435761).wrapping_add(i) % keys
+            );
+            let started = Instant::now();
+            c.write_all(&cmd(&[b"GET", key.as_bytes()])).expect("write");
+            let mut hdr = [0u8; 8];
+            c.read_exact(&mut hdr).expect("len header");
+            assert_eq!(&hdr[..5], b"$1024", "value present");
+            let mut rest = vec![0u8; 1024 + 1]; // remainder of "$1024\r\n" + payload + crlf
+            c.read_exact(&mut rest).expect("payload");
+            let us = started.elapsed().as_micros();
+            max_get_us = max_get_us.max(us);
+            if us > 2_000 {
+                over_2ms += 1;
+            }
+            gets += 1;
+        }
+        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
+        let mut buf = vec![0u8; 4096];
+        let n = c.read(&mut buf).expect("read info");
+        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        if info.contains("ckpts_completed:1") {
+            break true;
+        }
+        if Instant::now() > deadline {
+            break false;
+        }
+    };
+    let ckpt_secs = ckpt_started.elapsed().as_secs_f64();
+    assert!(done, "checkpoint completed within the deadline");
+
+    let info_after = {
+        c.write_all(&cmd(&[b"INFO"])).expect("write");
+        let mut buf = vec![0u8; 65536];
+        let n = c.read(&mut buf).expect("read info");
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    };
+    let iter_p999 = |s: &str| {
+        s.lines()
+            .find(|l| l.starts_with("loop_iter_p999_us"))
+            .map(|l| l.trim().to_string())
+            .unwrap_or_default()
+    };
+    println!("checkpoint: completed in {ckpt_secs:.2}s under GET load");
+    println!("foreground GETs during ckpt: {gets} · max {max_get_us} µs · >2ms: {over_2ms}");
+    println!("loop_iter before: {} · after: {}", iter_p999(&info_before), iter_p999(&info_after));
+
+    // Audit the published file (size + sections).
+    let ick = dir.join("shard-0").join("ckpt").join("ckpt-000001.ick");
+    let (_, audit) = inf_log::ckpt::read_ick(
+        &inf_log::fs::StdSegmentFs,
+        &ick,
+        inf_log::ckpt::IckReaderConfig::default(),
+        |_| Ok::<(), ()>(()),
+    )
+    .expect("published checkpoint validates");
+    println!(
+        "ick: {} sections · {} records · {} MiB",
+        audit.sections,
+        audit.records,
+        audit.bytes >> 20
+    );
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
