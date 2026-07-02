@@ -14,11 +14,13 @@ Formats defined by ADR-0011 unless noted.
 | LSN addressing | `inf-log` | implemented (M2-S01) |
 | Segment naming + lifecycle | `inf-log` | implemented (M2-S02) |
 | `SegmentFs` injection seam | `inf-log` | implemented (M2-S02; extended by S05/S11/S16) |
-| `MutationEffect` → record seam | `inf-store` → `inf-log` | implemented (M2-S03, ADR-0012; store-side emission + dep edge land at S08) |
+| `MutationEffect` → record seam | `inf-store` → `inf-log` | implemented (M2-S03/S08, ADR-0012/0015; dep edge + command-layer post-image emission live) |
 | Log staging domain (`StagingRing`) | `inf-log` | implemented (M2-S03; reactor wiring at S05) |
 | Sequential read path (`SegmentReader`) | `inf-log` | implemented (M2-S04; `BackendDriver` reads at S05; S14 adds tail policy) |
-| Durability watermark contract | `inf-log`/`inf-runtime` | implemented (M2-S05/S06, ADR-0013; store-side wiring at S08, sim disk at S18) |
+| Durability watermark contract | `inf-log`/`inf-runtime` | implemented (M2-S05/S06/S08, ADR-0013/0015; live on `ServerPlane` — acks seq-keyed, semantics unchanged; sim disk at S18) |
 | Driver file ops (`LogWrite`/`Fdatasync`) | `inf-runtime` | implemented (M2-S05, ADR-0013 D1 — extends the frozen M0 `BackendDriver` contract) |
+| Node catalog `META` swap (`inf-log::meta`) | `inf-log` | implemented (M2-S08, ADR-0015 D3 — the S11 MANIFEST protocol class; payload = `inf-store::catalog` v1) |
+| Namespace selection + `Op::ApplyNs` | `inf-server`/`inf-fabric` | implemented (M2-S08, ADR-0015 D1 — the ADR-0009 §4 codec revision, additive opcode 6; `ns ≥ 16` enforced at decode) |
 | `.ick` checkpoint format v1 | `inf-log` | pending (M2-S10) |
 | MANIFEST schema v1 | `inf-log` | pending (M2-S11) |
 | Fault-point registry | `inf-foundation`/`inf-log` | pending (M2-S16) |
@@ -107,6 +109,14 @@ one (L7). Tiers: `StdSegmentFs` (boot/dev; `set_len` prealloc — real
 (deterministic, fault-injectable test tier), the M2-S18 sim disk. The
 per-iteration hot-path write + linked fsync is **not** part of this seam —
 it rides `BackendDriver` (S05).
+
+### S08 additions (ADR-0015 D3)
+
+- `SegmentFs` gained `rename` + `remove_file` — the atomic small-file swap
+  vocabulary (`inf-log::meta`: write `META.new` + fsync + rename +
+  dir-fsync, CRC32C-enveloped, payload-opaque). First consumer: the
+  namespace catalog, single-written by `inf-server::control`; S11's
+  MANIFEST reuses the protocol.
 
 ## `MutationEffect` → record seam (`inf-log::effect`, ADR-0012)
 

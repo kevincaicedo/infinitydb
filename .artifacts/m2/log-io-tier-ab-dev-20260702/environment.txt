@@ -1,0 +1,24 @@
+date: 2026-07-02T12:39:45-04:00
+kernel: 7.0.0-27-generic
+governor: performance
+epp: performance
+device: /dev/nvme0n1p3 (ADATA LEGEND 700, consumer NVMe, no PLP)
+fs: ext4
+git: db57e78 dirty=yes
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 3 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 3 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree

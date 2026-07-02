@@ -74,6 +74,14 @@ pub struct NodeInfo {
     pub pubsub_fan_msgs: Cell<u64>,
     pub pubsub_delivered: Cell<u64>,
     pub cob_disconnections: Cell<u64>,
+    /// Durable-plane gauges (M2-S08, flushed by MAINTAIN — the S21
+    /// vocabulary for `INFO persistence`).
+    pub log_records_appended: Cell<u64>,
+    pub log_pending_bytes: Cell<u64>,
+    pub log_last_durable_lsn: Cell<u64>,
+    pub log_watermark_lag: Cell<u64>,
+    pub log_fsyncs_completed: Cell<u64>,
+    pub log_acks_gated: Cell<u64>,
     /// CLIENT registry for this cell's connections (single-threaded).
     pub clients: RefCell<ClientRegistry>,
     /// Typed CONFIG store (M1-S03 freeze: keys + hot-reload classes).
@@ -89,6 +97,10 @@ pub struct ConnCx {
     pub id: u64,
     /// Selected default namespace (`SELECT 0..15`); 0 unless SELECTed.
     pub db: u16,
+    /// Selected *named* namespace (`INF.NS USE`, M2-S08); `None` = the
+    /// default-db path. One `Option` load is the memory fast path's whole
+    /// cost for the durable feature (M2-S09).
+    pub ns: Option<inf_store::NsId>,
     /// Subscribed channels, in subscription order (M1-S10). Empty vectors
     /// never allocate, so a non-subscriber connection pays two length
     /// loads at most.
@@ -108,6 +120,7 @@ impl Default for ConnCx {
             proto: Protocol::Resp2,
             id: 1,
             db: 0,
+            ns: None,
             sub_channels: Vec::new(),
             sub_patterns: Vec::new(),
             node: Rc::new(NodeInfo::default()),
@@ -198,16 +211,30 @@ pub fn execute(
         }
         CommandId::Flushall => {
             let mut w = RespWriter::new(out, cx.proto);
+            // A durable flush needs per-key Delete records (S10/S11 makes
+            // truncation cheap); refuse loudly until then (ADR-0015).
+            if ks.ns_iter().any(|s| s.mode == inf_store::NsMode::Durable) {
+                return w.error(
+                    "ERR FLUSHALL on a node with durable namespaces is not yet supported (M2)",
+                );
+            }
             flush(argv, ks, None, now, &mut w);
         }
         CommandId::Flushdb => {
             let db = cx.db;
             let mut w = RespWriter::new(out, cx.proto);
+            if cx.ns.is_some() {
+                return w
+                    .error("ERR FLUSHDB on a named namespace is not yet supported (M2, ADR-0015)");
+            }
             flush(argv, ks, Some(db), now, &mut w);
         }
         CommandId::Copy => {
             let db = cx.db;
             let mut w = RespWriter::new(out, cx.proto);
+            if cx.ns.is_some() {
+                return w.error("ERR COPY within a named namespace is not yet supported (M2)");
+            }
             copy(argv, ks, db, now, &mut w);
         }
         CommandId::Info => {
@@ -219,8 +246,9 @@ pub fn execute(
             admin::config(argv, ks, &cx.node, &mut w);
         }
         CommandId::InfNs => {
+            let node = Rc::clone(&cx.node);
             let mut w = RespWriter::new(out, cx.proto);
-            admin::inf_ns(argv, ks, &cx.node, &mut w);
+            admin::inf_ns(argv, ks, cx, &node, &mut w);
         }
         // ---- pub/sub (M1-S10): conn-state ops here; registries, delivery,
         // and fan-out are plane state, so inside a node the plane intercepts
@@ -252,8 +280,19 @@ pub fn execute(
             pubsub::pubsub_fallback(&args, cx, out);
         }
         _ => {
-            let db = usize::from(cx.db);
-            execute_db(meta, argv, ks.db_mut(db), cx, now, out);
+            if let Some(id) = cx.ns {
+                // Named-namespace path (M2-S08): resolve by id — the
+                // registry is authoritative, so a namespace dropped after
+                // `INF.NS USE` answers a typed error, never a ghost store.
+                let Some(store) = ks.ns_store_mut(id) else {
+                    let mut w = RespWriter::new(out, cx.proto);
+                    return w.error("ERR the selected namespace was dropped (INF.NS USE again)");
+                };
+                execute_db(meta, argv, store, cx, now, out);
+            } else {
+                let db = usize::from(cx.db);
+                execute_db(meta, argv, ks.db_mut(db), cx, now, out);
+            }
         }
     }
     // Mutations refresh the cached pressure flag (no-op without a limit).
@@ -993,6 +1032,7 @@ fn select(argv: &(impl Argv + ?Sized), ks: &mut Keyspace, cx: &mut ConnCx, w: &m
     match parse_i64(argv.arg(1)) {
         Ok(n @ 0..=15) => {
             cx.db = n as u16;
+            cx.ns = None; // SELECT returns the connection to the defaults
             // Materialize eagerly: a SELECTed db is about to be used.
             let _ = ks.db_mut(n as usize);
             w.simple("OK");
@@ -1500,12 +1540,20 @@ mod tests {
             run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"cache"]),
             b"-ERR namespace already exists\r\n"
         );
-        // The M1-S08 honesty AC: durable mode is a documented not-yet error.
+        // M2-S08: the M1 "not yet supported" rejection is gone. Durable
+        // creation on the *planeless* tier still refuses (no control plane
+        // to persist the catalog, no cell log) — with its own documented
+        // error; the node path is exercised in tests/node_e2e.rs.
         let reply = run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable"]);
-        assert!(
-            reply.starts_with(b"-ERR namespace mode 'durable' is not yet supported"),
-            "{reply:?}"
-        );
+        assert!(reply.starts_with(b"-ERR durable namespaces need the node runtime"), "{reply:?}");
+        // FSYNC without durable mode is a typed error (registry rule).
+        let reply = run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"c2", b"FSYNC", b"always"]);
+        assert!(reply.starts_with(b"-ERR FSYNC applies to MODE durable"), "{reply:?}");
+        // INF.NS USE selects a named namespace; SELECT returns to defaults.
+        assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"USE", b"cache"]), b"+OK\r\n");
+        assert!(cx.ns.is_some(), "USE selects the named namespace");
+        assert_eq!(run(&mut cx, &mut ks, &[b"SELECT", b"0"]), b"+OK\r\n");
+        assert!(cx.ns.is_none(), "SELECT returns to the defaults");
         let list = run(&mut cx, &mut ks, &[b"INF.NS", b"LIST"]);
         let text = String::from_utf8(list).expect("ascii");
         assert!(text.starts_with("*17\r\n"), "16 defaults + 1 named: {text}");

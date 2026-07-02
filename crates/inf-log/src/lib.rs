@@ -22,6 +22,7 @@ mod effect;
 mod frame;
 pub mod fs;
 mod lsn;
+pub mod meta;
 mod reader;
 mod record;
 mod scan;

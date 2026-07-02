@@ -51,3 +51,26 @@ row (staging → rotor → WatermarkGate under the reactor) binds at M2-S08/S22.
   gate row remains **Evidence-pending (reference box)**.
 - Latency is honestly storage-bound: p50 0.93–1.38 ms, p99.9 ≤ 3.1 ms —
   the histogram every durable-mode claim must carry (§8.2).
+
+## Addendum (2026-07-02, later session): pinned-governor rerun
+
+The `powersave` disclosure above is resolved: rerun with governor
+`performance` + EPP `performance` (`setup-infinity-benchmark-env.sh`;
+`inf-bench env-check` green except the disclosed dirty tree), 3
+replicates, same command — `replicates-performance-governor.txt`:
+
+```text
+ group   frames/s   fsyncs/s     writes/s     p50us     p99us    p999us
+     1       1058       1058         1058       927      1663      2431
+    64        775        775        49573      1247      2015      2111
+   256        824        824       210915      1279      2015      2751
+  1024        757        757       775051      1375      2175      3775
+```
+
+Reading: **774k w/s @ group 1024** (was 778k) — within 1% of the
+powersave rows at real payloads, confirming the rows are fsync-bound
+(device flush latency dominates; CPU frequency second-order, exactly as
+the original disclosure hypothesized). Group-1 improved 1047 → 1058/s.
+Spread across replicates < 0.5% on every row. Status unchanged:
+dev-tier, non-citable; the ≥ 300k gate row stays **Evidence-pending
+(reference box)**.

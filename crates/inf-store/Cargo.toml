@@ -11,6 +11,7 @@ description = "Per-cell records, index, string ops, slot routing"
 inf-foundation.workspace = true
 inf-alloc.workspace = true
 inf-simd.workspace = true
+inf-log.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -104,6 +104,15 @@ pub enum SetOutcome {
     Skipped { old: Option<Vec<u8>> },
 }
 
+/// Post-mutation view of one key for durable effect emission (M2-S08):
+/// borrowed value bytes plus the store's absolute internal deadline in
+/// milliseconds (`None` = no TTL). See [`CellStore::post_image`].
+#[derive(Copy, Clone, Debug)]
+pub struct PostImage<'a> {
+    pub value: &'a [u8],
+    pub expire_at_ms: Option<u64>,
+}
+
 /// `EXPIRE` condition flags (NX/XX/GT/LT).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum ExpireCond {
@@ -579,6 +588,49 @@ impl CellStore {
         self.arena.free(addr, len);
         self.note_ttl(had_ttl, false);
         Some(value)
+    }
+
+    // ---- durable-namespace hooks (M2-S08, ADR-0015 D5/D7) ----
+
+    /// Post-mutation snapshot of one key for durable effect emission: the
+    /// live value bytes plus the store's absolute internal deadline, read
+    /// **without** access-tracking or expire-on-read side effects (staging
+    /// a log record must not perturb LRU/LFU the way a client read does).
+    /// An expired-but-unreaped key reads as absent — correct for emission:
+    /// its deadline already passed, so the post-image is "gone".
+    pub fn post_image(&self, key: &[u8], now: Nanos) -> Option<PostImage<'_>> {
+        let hash = Self::hash_key(key);
+        let arena = &self.arena;
+        let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
+        let view = record_at(arena, addr);
+        if view.is_expired(now) {
+            return None;
+        }
+        Some(PostImage { value: view.value(), expire_at_ms: view.expire_at_ms() })
+    }
+
+    /// Replay upsert (blind idempotent post-image apply — ADR-0011 D4).
+    /// Clears any TTL; a following `ExpireAt` record re-arms it, exactly
+    /// mirroring emission order. Never consults eviction pressure: the OOM
+    /// gate is a Keyspace-level DENYOOM concern and replay must not be
+    /// refused by `maxmemory` (recovery degrades loudly on real allocation
+    /// failure instead).
+    ///
+    /// # Errors
+    /// Arena/bounds failures only (`OpError::TooLarge`/`OutOfMemory`).
+    pub fn replay_set(&mut self, key: &[u8], value: &[u8], now: Nanos) -> Result<(), OpError> {
+        self.set(key, value, SetOptions::default(), now).map(|_| ())
+    }
+
+    /// Replay delete. Absent keys are a no-op (idempotent re-apply).
+    pub fn replay_del(&mut self, key: &[u8], now: Nanos) {
+        let _ = self.del(key, now);
+    }
+
+    /// Replay TTL arm at an absolute internal deadline. Absent keys are a
+    /// no-op (idempotent re-apply of a delete-then-expire suffix).
+    pub fn replay_expire_at(&mut self, key: &[u8], at: Nanos, now: Nanos) {
+        let _ = self.expire(key, Some(at), ExpireCond::Always, now);
     }
 
     /// `GETEX`: the value, with an optional TTL side effect (M1-S01). A

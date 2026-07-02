@@ -10,7 +10,7 @@ pin lands with the M1-S14 release pipeline). Every declared-`full` behavior is
 byte-diffed against the oracle on every test run; any new deviation fails CI
 until it is allowlisted with a justification (L8 — honesty is total).
 
-**Corpus:** 378 byte-compared cases · 32 documented deviations · 0 tolerated failures.
+**Corpus:** 378 byte-compared cases · 33 documented deviations · 0 tolerated failures.
 **Surface:** 65 commands — 47 full · 15 partial · 0 stub · 1 extension · 2 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
@@ -157,7 +157,8 @@ oracle by design.
 ### `INF.NS`
 
 - InfinityDB extension
-- InfinityDB extension; durable mode honestly rejected until M2
+- InfinityDB extension; durable live since M2-S08 (node tier — the planeless compat candidate answers its documented no-runtime error)
+- InfinityDB extension (M2-S08): named-namespace selection, SELECT-class conn state; durable-mode deviations documented in ADR-0015
 
 ## Absent (owner milestone)
 

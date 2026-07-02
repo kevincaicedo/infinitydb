@@ -52,3 +52,10 @@ required-features = ["uring"]
 
 [lints]
 workspace = true
+
+# M2-S07 buffered vs O_DIRECT A/B (Linux + uring only).
+[[bench]]
+name = "log_io_tier"
+harness = false
+test = false
+required-features = ["uring"]
