@@ -17,6 +17,7 @@
 //! `BackendDriver` from M2-S05.
 #![forbid(unsafe_code)]
 
+pub mod ckpt;
 mod commit;
 mod effect;
 mod frame;
@@ -29,6 +30,7 @@ mod scan;
 mod segment;
 mod staging;
 
+pub use ckpt::{CkptConfig, IckStream, IckSummary, SectionLease};
 pub use commit::{CommitStats, FsyncClass, FsyncTicket, GroupCommit, SyncReason};
 pub use effect::MutationEffect;
 pub use frame::{

@@ -63,6 +63,14 @@ impl Lsn {
     pub fn to_u64(self) -> u64 {
         (u64::from(self.segment.0) << 32) | u64::from(self.offset)
     }
+
+    /// Inverse of [`to_u64`](Self::to_u64) — decodes the order-preserving
+    /// packed form (the `.ick` header's `begin-LSN` field, M2-S10).
+    #[inline]
+    #[must_use]
+    pub fn from_u64(packed: u64) -> Lsn {
+        Lsn { segment: SegmentId((packed >> 32) as u32), offset: packed as u32 }
+    }
 }
 
 impl fmt::Display for Lsn {

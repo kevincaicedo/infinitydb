@@ -288,6 +288,11 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "zipfian-keyspace",
         "zipfian-ops",
         "zipfian-maxmemory-mb",
+        // M2 zero-cost A/B (ignored by the m0/m1 flows): the pre-M2
+        // infinityd build the ab:* rows compare against, and optional cell
+        // pinning (both legs share the set — they never run concurrently).
+        "baseline-bin",
+        "pin-start",
     ],
 );
 
@@ -300,7 +305,8 @@ pub fn cmd_gate_run(args: &[String]) -> Result<(), String> {
     match milestone.as_str() {
         "m0" => cmd_gate_run_m0(&flags),
         "m1" => crate::m1rows::cmd_gate_run_m1(&flags),
-        other => Err(format!("unknown milestone {other} (have: m0, m1)")),
+        "m2" => crate::m2rows::cmd_gate_run_m2(&flags),
+        other => Err(format!("unknown milestone {other} (have: m0, m1, m2)")),
     }
 }
 

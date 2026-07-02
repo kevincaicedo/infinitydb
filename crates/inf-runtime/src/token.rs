@@ -21,6 +21,11 @@ pub enum TokenClass {
     LogWrite = 5,
     /// fdatasync-class durability barrier (M2-S05, ADR-0013).
     Fsync = 6,
+    /// Checkpoint section write on the `.ick` fd (M2-S10, ADR-0016 D4 —
+    /// routing-only: the op is an ordinary `LogWrite`).
+    CkptWrite = 7,
+    /// Checkpoint-completion fdatasync on the `.ick` fd (M2-S10).
+    CkptSync = 8,
 }
 
 impl TokenClass {
@@ -33,6 +38,8 @@ impl TokenClass {
             4 => Some(TokenClass::Wake),
             5 => Some(TokenClass::LogWrite),
             6 => Some(TokenClass::Fsync),
+            7 => Some(TokenClass::CkptWrite),
+            8 => Some(TokenClass::CkptSync),
             _ => None,
         }
     }
@@ -106,6 +113,8 @@ mod tests {
             TokenClass::Wake,
             TokenClass::LogWrite,
             TokenClass::Fsync,
+            TokenClass::CkptWrite,
+            TokenClass::CkptSync,
         ] {
             for (slot, generation) in
                 [(0, 0), (1, u32::MAX), (MAX_SLOT, 7u32), (0xAB_CDEF, 0xDEAD_BEEF)]

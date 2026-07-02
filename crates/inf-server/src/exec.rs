@@ -82,6 +82,12 @@ pub struct NodeInfo {
     pub log_watermark_lag: Cell<u64>,
     pub log_fsyncs_completed: Cell<u64>,
     pub log_acks_gated: Cell<u64>,
+    /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).
+    pub ckpts_completed: Cell<u64>,
+    pub ckpts_aborted: Cell<u64>,
+    pub ckpt_last_unix_ms: Cell<u64>,
+    pub ckpt_last_begin_lsn: Cell<u64>,
+    pub ckpt_buffer_bytes: Cell<u64>,
     /// CLIENT registry for this cell's connections (single-threaded).
     pub clients: RefCell<ClientRegistry>,
     /// Typed CONFIG store (M1-S03 freeze: keys + hot-reload classes).

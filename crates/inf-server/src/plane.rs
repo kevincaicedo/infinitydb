@@ -42,7 +42,7 @@ use inf_fabric::{ApplyArgs, CellFabric, ErrCode, FabricToken, Op, Outcome, SendE
 use inf_foundation::time::Nanos;
 use inf_foundation::{CellId, LogHistogram};
 use inf_log::fs::StdSegmentFs;
-use inf_log::{FsyncClass, MutationEffect, SegmentRotor, StagingConfig};
+use inf_log::{FsyncClass, MutationEffect, SegmentRotor};
 use inf_runtime::GroupClass;
 use inf_runtime::{
     CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoOp, LoopCx,
@@ -55,7 +55,7 @@ use inf_wire::{
 };
 
 use crate::control::ControlHandle;
-use crate::durable::{DurableCell, EVERYSEC_TIMER_KEY};
+use crate::durable::{DurableCell, DurableConfig, EVERYSEC_TIMER_KEY};
 use crate::exec::{ConnCx, NodeInfo, execute, execute_slices, stall_request};
 use crate::pubsub::{self, PubSubCell, SubKind};
 
@@ -671,6 +671,9 @@ pub struct ServerPlane<O: PlaneObserver + 'static = NoopObserver> {
     config_pushed: u64,
     /// The everysec wheel key was armed (M2-S05; once per plane).
     everysec_armed: bool,
+    /// Last manual-checkpoint epoch observed on the control handle
+    /// (M2-S10 — one relaxed load per MAINTAIN, edge-detected).
+    ckpt_epoch_seen: u64,
 }
 
 /// An owner-side reply produced during the FABRIC-IN drain (ranges index
@@ -736,14 +739,32 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
             // MAX forces one push on the first MAINTAIN (boot-time config).
             config_pushed: u64::MAX,
             everysec_armed: false,
+            ckpt_epoch_seen: 0,
         }
     }
 
-    /// Enables the durable plane for this cell (M2-S08): the assembly runs
-    /// recovery first (`recover::open_cell_log`) and hands the tail-opened
-    /// rotor here, before the loop starts.
-    pub fn enable_durable(&mut self, staging: StagingConfig, rotor: SegmentRotor<StdSegmentFs>) {
-        *self.shared.durable.borrow_mut() = Some(DurableCell::new(staging, rotor));
+    /// Enables the durable plane for this cell (M2-S08/S10): the assembly
+    /// runs recovery first (`recover::open_cell_log`) and hands the
+    /// tail-opened rotor here, before the loop starts. `cell_id` names the
+    /// shard directory the checkpoint driver writes under.
+    ///
+    /// # Errors
+    /// Checkpoint-directory scan failure (boot-time listing).
+    pub fn enable_durable(
+        &mut self,
+        cfg: &DurableConfig,
+        cell_id: u16,
+        rotor: SegmentRotor<StdSegmentFs>,
+    ) -> std::io::Result<()> {
+        let ckpt_dir = cfg.data_dir.join(format!("shard-{cell_id}")).join("ckpt");
+        let ckpt = crate::ckpt::CkptCell::new(ckpt_dir, cell_id, cfg.ckpt)?;
+        *self.shared.durable.borrow_mut() = Some(DurableCell::new(cfg.staging, rotor, ckpt));
+        Ok(())
+    }
+
+    /// Checkpoint gauges for tests/stats (`None` = memory-only cell).
+    pub fn ckpt_stats(&self) -> Option<crate::ckpt::CkptStats> {
+        self.shared.durable.borrow().as_ref().map(DurableCell::ckpt_stats)
     }
 
     /// Wires the node control-thread handle (DDL id allocation + catalog
@@ -946,6 +967,15 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                     let cell = durable.as_mut().expect("log completion without durable plane");
                     cell.on_log_error(c.token, errno);
                 }
+                // Checkpoint-op failures abort the checkpoint, never the
+                // process (ADR-0016: the old checkpoint + log stay valid);
+                // the token is not a connection.
+                if matches!(c.token.class(), TokenClass::CkptWrite | TokenClass::CkptSync) {
+                    let mut durable = self.shared.durable.borrow_mut();
+                    let cell = durable.as_mut().expect("ckpt completion without durable plane");
+                    cell.on_ckpt_error(errno);
+                    return;
+                }
                 let key = Self::key_of(c.token);
                 let live = self
                     .shared
@@ -958,18 +988,27 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                     self.initiate_close(cx, key);
                 }
             }
-            // Log file ops (M2-S05/S08, ADR-0013 D2): route into the
-            // durable cell — lease release on the write's terminal
-            // completion, watermark advance + gated-ack wakes on Synced.
+            // Log + checkpoint file ops (M2-S05/S08/S10): routed by token
+            // class into the durable cell — lease release on a write's
+            // terminal completion; watermark advance + gated-ack wakes on
+            // a log Synced; checkpoint progress on the ckpt classes.
             CompletionResult::LogWritten => {
                 let mut durable = self.shared.durable.borrow_mut();
                 let cell = durable.as_mut().expect("LogWritten without durable plane");
-                cell.on_log_written();
+                if c.token.class() == TokenClass::CkptWrite {
+                    cell.on_ckpt_written();
+                } else {
+                    cell.on_log_written();
+                }
             }
             CompletionResult::Synced => {
                 let mut durable = self.shared.durable.borrow_mut();
                 let cell = durable.as_mut().expect("Synced without durable plane");
-                cell.on_synced(c.token, cx.now);
+                if c.token.class() == TokenClass::CkptSync {
+                    cell.on_ckpt_synced();
+                } else {
+                    cell.on_synced(c.token, cx.now);
+                }
             }
         }
     }
@@ -1283,6 +1322,26 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
         // into NodeInfo for INFO persistence (S21 vocabulary).
         if let Some(cell) = self.shared.durable.borrow_mut().as_mut() {
             cell.maintain(cx.now.as_millis());
+            // Manual checkpoint requests ride the control handle (one
+            // relaxed load — the persisted-epoch pattern, ADR-0016 D7).
+            if let Some(control) = self.shared.control.borrow().as_ref() {
+                let epoch = control.ckpt_epoch();
+                if epoch != self.ckpt_epoch_seen {
+                    self.ckpt_epoch_seen = epoch;
+                    cell.request_ckpt();
+                }
+            }
+            // ---- checkpoint slice (M2-S10, ADR-0016 D5): its own deficit
+            // class — a 10 GB walk can't starve expiry, and vice versa.
+            let ckpt_budget = cx.budget(GroupClass::Checkpoint);
+            if ckpt_budget > 0 {
+                let anchor = self.shared.wall_anchor();
+                let used =
+                    cell.ckpt_slice(&mut self.shared.store.borrow_mut(), cx, ckpt_budget, anchor);
+                if used > 0 {
+                    cx.charge(GroupClass::Checkpoint, used);
+                }
+            }
             let stats = cell.stats();
             let node = &self.shared.node;
             node.log_records_appended.set(stats.records_appended);
@@ -1291,6 +1350,12 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
             node.log_watermark_lag.set(stats.watermark_lag_lsn);
             node.log_fsyncs_completed.set(stats.fsyncs_completed);
             node.log_acks_gated.set(stats.acks_gated);
+            let ckpt = cell.ckpt_stats();
+            node.ckpts_completed.set(ckpt.completed);
+            node.ckpts_aborted.set(ckpt.aborted);
+            node.ckpt_last_unix_ms.set(ckpt.last_unix_ms);
+            node.ckpt_last_begin_lsn.set(ckpt.last_begin_lsn);
+            node.ckpt_buffer_bytes.set(ckpt.buffer_bytes);
         }
         // ---- DDL persist wakes (ADR-0015 D3): one relaxed load per
         // MAINTAIN; parked DDL pumps wake on epoch edges.

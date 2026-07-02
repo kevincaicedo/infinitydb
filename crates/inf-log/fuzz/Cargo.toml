@@ -28,4 +28,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ick_decode"
+path = "fuzz_targets/ick_decode.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

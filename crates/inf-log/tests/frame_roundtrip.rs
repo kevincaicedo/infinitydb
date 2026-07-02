@@ -15,6 +15,7 @@ enum OwnedRecord {
     Delete { ns: u32, key: Vec<u8> },
     ExpireAt { ns: u32, at: u64, key: Vec<u8> },
     NsOp { ns: u32, payload: Vec<u8> },
+    CkptBegin { ns: u32, id: u64 },
 }
 
 impl OwnedRecord {
@@ -28,6 +29,9 @@ impl OwnedRecord {
                 RecordView::ExpireAt { ns: NsId(*ns), at_unix_ms: *at, key }
             }
             OwnedRecord::NsOp { ns, payload } => RecordView::NsOp { ns: NsId(*ns), payload },
+            OwnedRecord::CkptBegin { ns, id } => {
+                RecordView::CkptBegin { ns: NsId(*ns), ckpt_id: *id }
+            }
         }
     }
 }
@@ -47,6 +51,7 @@ fn record_strategy() -> impl Strategy<Value = OwnedRecord> {
             key
         }),
         (any::<u32>(), bytes()).prop_map(|(ns, payload)| OwnedRecord::NsOp { ns, payload }),
+        (any::<u32>(), any::<u64>()).prop_map(|(ns, id)| OwnedRecord::CkptBegin { ns, id }),
     ]
 }
 
@@ -172,6 +177,7 @@ fn view_to_owned(view: &RecordView<'_>) -> OwnedRecord {
         RecordView::NsOp { ns, payload } => {
             OwnedRecord::NsOp { ns: ns.0, payload: payload.to_vec() }
         }
+        RecordView::CkptBegin { ns, ckpt_id } => OwnedRecord::CkptBegin { ns: ns.0, id: ckpt_id },
     }
 }
 

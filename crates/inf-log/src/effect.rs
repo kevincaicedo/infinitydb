@@ -33,6 +33,11 @@ pub enum MutationEffect<'a> {
     ExpireAt { ns: NsId, at_unix_ms: u64, key: &'a [u8] },
     /// Namespace DDL (payload vocabulary owned by M2-S08).
     NsOp { ns: NsId, payload: &'a [u8] },
+    /// Checkpoint-begin marker (M2-S10, ADR-0016 D3): not a mutation — the
+    /// checkpoint slice stages it through the same ring so the
+    /// one-frame-per-iteration rule holds and its LSN resolves through the
+    /// ordinary `FrameLease::lsn_of` path. Cell-scoped (records as ns 0).
+    CkptBegin { ckpt_id: u64 },
 }
 
 impl<'a> MutationEffect<'a> {
@@ -49,6 +54,7 @@ impl<'a> MutationEffect<'a> {
                 RecordView::ExpireAt { ns, at_unix_ms, key }
             }
             MutationEffect::NsOp { ns, payload } => RecordView::NsOp { ns, payload },
+            MutationEffect::CkptBegin { ckpt_id } => RecordView::CkptBegin { ns: NsId(0), ckpt_id },
         }
     }
 
@@ -72,6 +78,7 @@ mod tests {
             MutationEffect::Delete { ns: NsId(0), key: b"gone" },
             MutationEffect::ExpireAt { ns: NsId(9), at_unix_ms: 1_780_000_000_123, key: b"s" },
             MutationEffect::NsOp { ns: NsId(1), payload: b"create" },
+            MutationEffect::CkptBegin { ckpt_id: 42 },
         ];
         for effect in effects {
             let record = effect.record();

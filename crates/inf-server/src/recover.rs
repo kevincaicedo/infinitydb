@@ -24,6 +24,9 @@ pub struct RecoverStats {
     pub frames: u64,
     pub records_applied: u64,
     pub records_skipped: u64,
+    /// Checkpoint-begin markers seen (S13 consumes their LSNs; until then
+    /// they are counted so recovery output stays honest about them).
+    pub markers: u64,
 }
 
 /// Opens (or creates) cell `cell`'s log under the node data dir, replaying
@@ -66,6 +69,7 @@ pub fn open_cell_log(
                         ReplayOutcome::SkippedUnknownNs | ReplayOutcome::SkippedReserved => {
                             stats.records_skipped += 1;
                         }
+                        ReplayOutcome::SkippedMarker => stats.markers += 1,
                     }
                 }
                 Ok::<(), io::Error>(())

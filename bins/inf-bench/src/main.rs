@@ -20,6 +20,7 @@ mod gaterun;
 mod gates;
 mod load;
 mod m1rows;
+mod m2rows;
 mod resp;
 mod zipfian;
 
@@ -33,12 +34,14 @@ USAGE:
     inf-bench load --host H --port P [--threads N] [--conns-per-thread N] [--pipeline P]
                    [--duration SECS] [--mix SET:GET] [--keys N] [--key-prefix S]
                    [--value-size BYTES] [--seed N] [--out FILE.toml]
-    inf-bench gate-run m0|m1 [--replicates N] [--gates FILE] [--artifacts-root DIR]
+    inf-bench gate-run m0|m1|m2 [--replicates N] [--gates FILE] [--artifacts-root DIR]
                    [--allow-dirty] [--unsafe-env] [--reference-box] [--skip-fill]
                    [--cells N] [--duration SECS] [--fill-keys N]
                    [--infinityd-bin PATH] [--redis-bin PATH]
                    m1 rows: [--storm-keys N] [--flushall-keys N] [--maxmemory-mb N]
                             [--subs N] [--sub-channels N]
+                   m2 rows: [--baseline-bin PATH]  (pre-M2 infinityd for the
+                            zero-cost A/B; delta rows PENDING without it)
     inf-bench zipfian [--keyspace N] [--ops N] [--warmup N] [--theta F] [--seed N]
                    [--maxmemory-mb N] [--value-size BYTES] [--cells N] [--window N]
                    [--threshold-pp F] [--infinityd-bin PATH] [--redis-bin PATH]

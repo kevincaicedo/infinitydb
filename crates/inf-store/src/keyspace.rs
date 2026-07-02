@@ -431,6 +431,17 @@ impl Keyspace {
         if spec.mode == NsMode::Durable { spec.fsync } else { None }
     }
 
+    /// Ascending ids of durable namespaces — the checkpoint walk order
+    /// (M2-S10, ADR-0016 D2; memory namespaces have a null log and null
+    /// checkpoint coverage).
+    #[must_use]
+    pub fn durable_ns_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> =
+            self.ns_iter().filter(|s| s.mode == NsMode::Durable).map(|s| s.id.0).collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Boot-time catalog seed (ADR-0015 D3): replaces the registry with the
     /// persisted entries. Runs before the cell replays or serves; any
     /// existing named stores are dropped with their data.
@@ -499,6 +510,9 @@ impl Keyspace {
             // Reserved in M2: the catalog is META-owned; no NsOp records
             // are emitted (ADR-0015 D7).
             LogRecordView::NsOp { .. } => Ok(ReplayOutcome::SkippedReserved),
+            // Checkpoint marker (M2-S10, ADR-0016 D3): carries no state —
+            // S13's recovery orchestration consumes its LSN, not replay.
+            LogRecordView::CkptBegin { .. } => Ok(ReplayOutcome::SkippedMarker),
         }
     }
 
@@ -530,6 +544,9 @@ pub enum ReplayOutcome {
     SkippedUnknownNs,
     /// A record type M2 never emits (`NsOp`) — reserved, skipped.
     SkippedReserved,
+    /// A checkpoint-begin marker (M2-S10): expected in every log with
+    /// checkpoints, counted separately from foreign skips.
+    SkippedMarker,
 }
 
 #[cfg(test)]

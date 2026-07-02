@@ -34,6 +34,12 @@ pub struct ControlHandle {
     next_ns_id: AtomicU32,
     next_epoch: AtomicU64,
     persisted_epoch: Arc<AtomicU64>,
+    /// Manual-checkpoint request epoch (M2-S10, ADR-0016 D7): bumping it
+    /// asks every durable cell to checkpoint; cells edge-detect it in
+    /// MAINTAIN (one relaxed load — the persisted-epoch pattern).
+    /// `INF.CKPT`/`BGSAVE` ride this at S20 (per-cell targeting refines
+    /// there).
+    ckpt_epoch: AtomicU64,
 }
 
 impl ControlHandle {
@@ -67,6 +73,17 @@ impl ControlHandle {
     pub fn persisted_epoch(&self) -> u64 {
         self.persisted_epoch.load(Ordering::Acquire)
     }
+
+    /// Requests a checkpoint on every durable cell (M2-S10; the S20
+    /// `INF.CKPT` surface calls this). Returns the request epoch.
+    pub fn request_ckpt_all(&self) -> u64 {
+        self.ckpt_epoch.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The manual-checkpoint request epoch (MAINTAIN edge-detection input).
+    pub fn ckpt_epoch(&self) -> u64 {
+        self.ckpt_epoch.load(Ordering::Relaxed)
+    }
 }
 
 /// Reads the catalog at boot (`None` = fresh node). Corruption is a typed
@@ -95,6 +112,7 @@ pub fn spawn(data_dir: PathBuf, seed: Option<&NsCatalog>) -> Arc<ControlHandle> 
         next_ns_id: AtomicU32::new(next_id),
         next_epoch: AtomicU64::new(0),
         persisted_epoch: Arc::clone(&persisted),
+        ckpt_epoch: AtomicU64::new(0),
     });
     let allocator = Arc::clone(&handle);
     std::thread::Builder::new()

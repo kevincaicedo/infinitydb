@@ -183,6 +183,12 @@ pub(crate) fn info(
         push(&mut text, &format!("watermark_lag_lsn:{}", node.log_watermark_lag.get()));
         push(&mut text, &format!("fsyncs_completed:{}", node.log_fsyncs_completed.get()));
         push(&mut text, &format!("acks_gated:{}", node.log_acks_gated.get()));
+        // Fuzzy-checkpoint gauges (M2-S10; `ckpt_age_s` derives at S21).
+        push(&mut text, &format!("ckpts_completed:{}", node.ckpts_completed.get()));
+        push(&mut text, &format!("ckpts_aborted:{}", node.ckpts_aborted.get()));
+        push(&mut text, &format!("ckpt_last_unix_ms:{}", node.ckpt_last_unix_ms.get()));
+        push(&mut text, &format!("ckpt_last_begin_lsn:{}", node.ckpt_last_begin_lsn.get()));
+        push(&mut text, &format!("ckpt_buffer_bytes:{}", node.ckpt_buffer_bytes.get()));
         text.push_str("\r\n");
     }
     let stats = ks.stats();

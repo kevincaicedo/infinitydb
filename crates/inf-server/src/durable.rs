@@ -22,11 +22,13 @@ use std::path::PathBuf;
 use inf_foundation::time::Nanos;
 use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{
-    FsyncClass, FsyncTicket, GroupCommit, MutationEffect, SegmentConfig, SegmentRotor,
-    StagingConfig, StagingRing,
+    FsyncClass, FsyncTicket, GroupCommit, MutationEffect, NsId, RecordView, SegmentConfig,
+    SegmentRotor, StagingConfig, StagingRing,
 };
 use inf_runtime::{CompletionToken, IoOp, LoopCx, TokenClass, WaitList, WatermarkGate};
+use inf_store::{Keyspace, WallAnchor};
 
+use crate::ckpt::{CkptCell, CkptPhase, CkptStats, SCAN_CHUNK_ENTRIES, ckpt_token};
 use crate::log_bytes;
 
 /// Timer-wheel key for the everysec tick (plane-armed, injected clock).
@@ -42,6 +44,8 @@ pub struct DurableConfig {
     pub data_dir: PathBuf,
     pub staging: StagingConfig,
     pub segment: SegmentConfig,
+    /// Fuzzy-checkpoint policy (M2-S10, ADR-0016).
+    pub ckpt: inf_log::CkptConfig,
 }
 
 /// Cumulative durable counters flushed into `NodeInfo` by MAINTAIN (the
@@ -66,6 +70,8 @@ pub(crate) struct DurableCell {
     /// Wakes pump futures parked on staging backpressure (`StagingFull`)
     /// once the in-flight frame releases.
     pub drained: WaitList<()>,
+    /// Fuzzy-checkpoint driver (M2-S10, ADR-0016).
+    pub ckpt: CkptCell,
     in_flight: Option<inf_log::FrameLease>,
     /// Last durable seq assigned (0 = none; the gate starts at 0).
     last_seq: u64,
@@ -80,13 +86,18 @@ pub(crate) struct DurableCell {
 }
 
 impl DurableCell {
-    pub fn new(staging: StagingConfig, rotor: SegmentRotor<StdSegmentFs>) -> DurableCell {
+    pub fn new(
+        staging: StagingConfig,
+        rotor: SegmentRotor<StdSegmentFs>,
+        ckpt: CkptCell,
+    ) -> DurableCell {
         DurableCell {
             staging: StagingRing::new(staging),
             rotor,
             commit: GroupCommit::new(),
             ack_gate: WatermarkGate::new(),
             drained: WaitList::new(),
+            ckpt,
             in_flight: None,
             last_seq: 0,
             frame_seqs: VecDeque::new(),
@@ -165,6 +176,9 @@ impl DurableCell {
             }
             let end = slot.base().advance(frame_len);
             let lease = self.staging.seal(slot.first_record_lsn());
+            // A pending ckpt-begin marker rides this frame: its LSN is now
+            // real (ADR-0016 D3).
+            self.ckpt.on_frame_sealed(&lease);
             self.frame_seqs.push_back((end.to_u64(), self.last_seq));
             self.commit.note_frame_queued(end, frame_len);
             let fsync = self
@@ -236,6 +250,222 @@ impl DurableCell {
             let _ = self.commit.on_fsync_error(token_ticket(token));
         }
         self.fail_stop("I/O", &format!("errno {errno} on {:?}", token.class()))
+    }
+
+    /// One fuzzy-checkpoint slice (M2-S10, ADR-0016 D5): runs under the
+    /// `GroupClass::Checkpoint` deficit — `budget_units` convert at
+    /// 1 unit ≈ 1 KiB streamed, hard-capped by `CkptConfig::slice_bytes`.
+    /// Returns the units to charge. All data writes ride the driver; the
+    /// only blocking ops are file create/rename/dir-fsync metadata (the
+    /// rotor-prealloc class).
+    pub fn ckpt_slice(
+        &mut self,
+        ks: &mut Keyspace,
+        cx: &mut LoopCx<'_>,
+        budget_units: u32,
+        anchor: WallAnchor,
+    ) -> u32 {
+        if self.failed {
+            return 0;
+        }
+        // Idle: trigger check → stage the begin marker (one record; its
+        // frame seals at this iteration's LOG step).
+        if matches!(self.ckpt.phase, CkptPhase::Idle) {
+            let total = self.staging.stats().append_bytes;
+            if self.ckpt.should_begin(total) {
+                let id = self.ckpt.pending_id();
+                let effect = MutationEffect::CkptBegin { ckpt_id: id };
+                if self.staging.would_fit(effect.encoded_len()) {
+                    let at = self.staging.stage(&effect).expect("admission pre-checked");
+                    self.commit.note_staged(FsyncClass::Everysec);
+                    self.records_appended += 1;
+                    self.last_seq += 1;
+                    self.ckpt.requested = false;
+                    self.ckpt.phase = CkptPhase::AwaitBeginLsn { id, at };
+                }
+            }
+            return 0;
+        }
+        // Begin LSN resolves at LOG (`on_frame_sealed`); nothing to do yet.
+        if matches!(self.ckpt.phase, CkptPhase::AwaitBeginLsn { .. }) {
+            return 0;
+        }
+        // Begun: create the .ick.new file + queue the header write.
+        if let CkptPhase::Begun { id, begin_lsn } = self.ckpt.phase {
+            let ns_ids = ks.durable_ns_ids();
+            if let Err(err) = self.ckpt.open_stream(id, begin_lsn, ns_ids) {
+                self.ckpt.abort("create", &err.to_string());
+                return 1;
+            }
+            let CkptPhase::Stream(st) = &mut self.ckpt.phase else { unreachable!("just opened") };
+            let lease = st.in_flight.as_ref().expect("header staged by open_stream");
+            st.write_seq += 1;
+            cx.push(IoOp::LogWrite {
+                fd: st.fd,
+                offset: lease.offset(),
+                data: log_bytes::ckpt_block(&st.stream, lease),
+                token: ckpt_token(TokenClass::CkptWrite, st.write_seq),
+                fsync_token: None,
+            });
+            return 1;
+        }
+        let cfg = self.ckpt.cfg;
+        // Publish once the completion fdatasync landed (rename+dir-fsync).
+        if matches!(&self.ckpt.phase, CkptPhase::Stream(st) if st.sync_done) {
+            let CkptPhase::Stream(st) = std::mem::replace(&mut self.ckpt.phase, CkptPhase::Idle)
+            else {
+                unreachable!("matched above")
+            };
+            let total = self.staging.stats().append_bytes;
+            let unix_now = anchor.unix_from_internal(cx.now);
+            if let Err(err) = self.ckpt.publish(st, unix_now, total) {
+                self.ckpt.abort("publish", &err.to_string());
+            }
+            return 1;
+        }
+        let CkptPhase::Stream(st) = &mut self.ckpt.phase else { return 0 };
+        // One deref, split fields (borrow splitting doesn't cross `Box`).
+        let crate::ckpt::Streaming {
+            stream,
+            fd,
+            ns_ids,
+            ns_idx,
+            cursor,
+            walk_done,
+            footer_staged,
+            sync_issued,
+            in_flight,
+            write_seq,
+            ..
+        } = &mut **st;
+        // One section in flight max: wait for its completion.
+        if in_flight.is_some() {
+            return 0;
+        }
+        // Footer written+released → the completion barrier.
+        if *footer_staged {
+            if !*sync_issued {
+                *sync_issued = true;
+                *write_seq += 1;
+                cx.push(IoOp::Fdatasync {
+                    fd: *fd,
+                    token: ckpt_token(TokenClass::CkptSync, *write_seq),
+                });
+            }
+            return 0;
+        }
+        // Fill: pull post-images under the byte budget (the walker — the
+        // resize-stable SCAN cursor, ADR-0016 D2).
+        let mut emitted: u32 = 0;
+        if !*walk_done {
+            let slice_cap = cfg.slice_bytes.min(budget_units.saturating_mul(1024)).max(1);
+            while emitted < slice_cap && !*walk_done && !stream.section_full() {
+                let Some(&ns_raw) = ns_ids.get(*ns_idx) else {
+                    *walk_done = true;
+                    break;
+                };
+                let ns = NsId(ns_raw);
+                match ks.ns_store_mut(ns) {
+                    // Dropped mid-walk: its records replay as skips anyway.
+                    None => {
+                        *ns_idx += 1;
+                        *cursor = 0;
+                    }
+                    Some(store) => {
+                        let bytes = &mut emitted;
+                        let next = store.scan_post_images(
+                            *cursor,
+                            SCAN_CHUNK_ENTRIES,
+                            cx.now,
+                            |key, value, expire_ms| {
+                                let rec = RecordView::StringPostImage { ns, key, value };
+                                *bytes = bytes.saturating_add(rec.encoded_len() as u32);
+                                stream.stage_record(&rec);
+                                if let Some(ms) = expire_ms {
+                                    let at_unix_ms =
+                                        anchor.unix_from_internal(Nanos::from_millis(ms));
+                                    let rec = RecordView::ExpireAt { ns, at_unix_ms, key };
+                                    *bytes = bytes.saturating_add(rec.encoded_len() as u32);
+                                    stream.stage_record(&rec);
+                                }
+                            },
+                        );
+                        if next == 0 {
+                            *ns_idx += 1;
+                            *cursor = 0;
+                        } else {
+                            *cursor = next;
+                        }
+                        if *ns_idx == ns_ids.len() {
+                            *walk_done = true;
+                        }
+                    }
+                }
+            }
+        }
+        // Queue at most one block per slice: a full (or final partial)
+        // section, or — once everything drained — the footer.
+        if stream.section_full() || (*walk_done && stream.can_seal()) {
+            let lease = stream.seal_section();
+            *write_seq += 1;
+            cx.push(IoOp::LogWrite {
+                fd: *fd,
+                offset: lease.offset(),
+                data: log_bytes::ckpt_block(stream, &lease),
+                token: ckpt_token(TokenClass::CkptWrite, *write_seq),
+                fsync_token: None,
+            });
+            *in_flight = Some(lease);
+        } else if *walk_done {
+            let lease = stream.finish();
+            *write_seq += 1;
+            cx.push(IoOp::LogWrite {
+                fd: *fd,
+                offset: lease.offset(),
+                data: log_bytes::ckpt_block(stream, &lease),
+                token: ckpt_token(TokenClass::CkptWrite, *write_seq),
+                fsync_token: None,
+            });
+            *in_flight = Some(lease);
+            *footer_staged = true;
+        }
+        emitted.div_ceil(1024).max(1)
+    }
+
+    /// REAP: a checkpoint section/header/footer write completed — release
+    /// the lease (the `StableBytes` custody point).
+    pub fn on_ckpt_written(&mut self) {
+        let CkptPhase::Stream(st) = &mut self.ckpt.phase else {
+            panic!("CkptWrite completion with no checkpoint streaming")
+        };
+        let lease = st.in_flight.take().expect("CkptWrite with no in-flight lease");
+        st.stream.release(lease);
+    }
+
+    /// REAP: the checkpoint's completion fdatasync landed — publish next
+    /// MAINTAIN slice.
+    pub fn on_ckpt_synced(&mut self) {
+        let CkptPhase::Stream(st) = &mut self.ckpt.phase else {
+            panic!("CkptSync completion with no checkpoint streaming")
+        };
+        st.sync_done = true;
+    }
+
+    /// REAP: a checkpoint op failed — abort the checkpoint, never the
+    /// process (the old checkpoint and the whole log stay valid; the
+    /// milestone's "checkpoints abort cleanly" rule).
+    pub fn on_ckpt_error(&mut self, errno: i32) {
+        self.ckpt.abort("I/O", &format!("errno {errno}"));
+    }
+
+    /// Manual trigger latch (`INF.CKPT` rides the control handle — S20).
+    pub fn request_ckpt(&mut self) {
+        self.ckpt.requested = true;
+    }
+
+    /// Checkpoint gauges for the MAINTAIN stats flush.
+    pub fn ckpt_stats(&self) -> CkptStats {
+        self.ckpt.stats()
     }
 
     /// Counters for the MAINTAIN stats flush (S21 vocabulary).
