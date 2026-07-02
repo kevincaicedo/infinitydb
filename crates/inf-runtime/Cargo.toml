@@ -42,5 +42,13 @@ harness = false
 test = false
 required-features = ["uring"]
 
+# M2-S05/S06 group-commit rehearsal: LogWrite + linked fdatasync rows with
+# fsync latency histograms (dev tier; gate values bind on the reference box).
+[[bench]]
+name = "log_fsync"
+harness = false
+test = false
+required-features = ["uring"]
+
 [lints]
 workspace = true

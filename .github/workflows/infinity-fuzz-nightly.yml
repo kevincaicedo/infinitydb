@@ -1,0 +1,46 @@
+# Nightly 1 h fuzz campaign per decoder (M0-S02 promised it; M2-S01 makes it
+# an AC for the log frame decoder). Each target runs a full hour on its own
+# runner; a crash uploads the reproducing artifact — fixes land WITH the
+# input minimized into the target's corpus.
+#
+# NOTE: the repo root is the Cargo workspace; jobs run from the root. Not
+# yet exercised against a live runner.
+name: infinity-fuzz-nightly
+
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-hour:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { dir: crates/inf-wire, target: resp_parse }
+          - { dir: crates/inf-fabric, target: fabric_codec }
+          - { dir: crates/inf-server, target: glob_match }
+          - { dir: crates/inf-server, target: scan_cursor }
+          - { dir: crates/inf-log, target: frame_decode }
+          - { dir: crates/inf-log, target: segment_read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: "fuzz ${{ matrix.target }} (1 h)"
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=3600
+        working-directory: ${{ matrix.dir }}
+      - name: upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: ${{ matrix.dir }}/fuzz/artifacts/
+          if-no-files-found: ignore

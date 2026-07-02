@@ -15,7 +15,9 @@ inf-alloc = ["inf-foundation"]
 inf-fabric = ["inf-foundation"]
 inf-runtime = ["inf-foundation", "inf-alloc"]
 inf-wire = ["inf-foundation", "inf-simd"]
-inf-log = ["inf-foundation", "inf-alloc"]
+# inf-log → inf-simd: hardware CRC32C kernel for frame/checkpoint/manifest
+# checksums (ADR-0011, M2-S01).
+inf-log = ["inf-foundation", "inf-alloc", "inf-simd"]
 inf-store = ["inf-foundation", "inf-alloc", "inf-simd"]
 inf-stream = ["inf-foundation", "inf-log", "inf-store"]
 inf-doc = ["inf-foundation", "inf-alloc"]

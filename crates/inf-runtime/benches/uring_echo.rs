@@ -172,6 +172,8 @@ mod imp {
                     CompletionResult::Sent { buf } => pool.release(buf),
                     CompletionResult::RecvDropped => drops += 1,
                     CompletionResult::Closed => {}
+                    // No file ops in the echo bench (M2-S05 vocabulary).
+                    CompletionResult::LogWritten | CompletionResult::Synced => unreachable!(),
                     CompletionResult::Error { buf, .. } => {
                         errs += 1;
                         if let Some(buf) = buf {

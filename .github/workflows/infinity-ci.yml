@@ -95,6 +95,12 @@ jobs:
       - name: fuzz SCAN cursor (smoke, M1 §5)
         run: cargo +nightly fuzz run scan_cursor -- -max_total_time=300
         working-directory: crates/inf-server
+      - name: fuzz log frame decoder (smoke, M2-S01)
+        run: cargo +nightly fuzz run frame_decode -- -max_total_time=300
+        working-directory: crates/inf-log
+      - name: fuzz segment reader (smoke, M2-S04)
+        run: cargo +nightly fuzz run segment_read -- -max_total_time=300
+        working-directory: crates/inf-log
 
   compat-diff:
     # M0-S15 AC: command x edge-case matrix byte-identical to real Redis.
