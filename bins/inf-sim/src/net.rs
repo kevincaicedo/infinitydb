@@ -182,6 +182,12 @@ impl BackendDriver for SimDriver {
                     }
                     out.push(Completion { token, result: CompletionResult::Closed });
                 }
+                // The simulated DISK (lose/tear/reorder of un-fsynced
+                // writes) is M2-S18; until it lands the sim plane issues no
+                // log file ops (durable namespaces are not wired — M2-S08).
+                IoOp::LogWrite { .. } | IoOp::Fdatasync { .. } => {
+                    unreachable!("sim disk model lands at M2-S18 (ADR-0013)")
+                }
             }
         }
 

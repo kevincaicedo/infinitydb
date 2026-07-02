@@ -16,6 +16,11 @@ pub enum TokenClass {
     Close = 3,
     /// Reserved for cross-thread wakeups (doorbell integration, fabric M0-E3).
     Wake = 4,
+    /// Log-segment frame write (M2-S05, ADR-0013). The token layout is
+    /// frozen; the class *vocabulary* is the extensible dimension.
+    LogWrite = 5,
+    /// fdatasync-class durability barrier (M2-S05, ADR-0013).
+    Fsync = 6,
 }
 
 impl TokenClass {
@@ -26,6 +31,8 @@ impl TokenClass {
             2 => Some(TokenClass::Send),
             3 => Some(TokenClass::Close),
             4 => Some(TokenClass::Wake),
+            5 => Some(TokenClass::LogWrite),
+            6 => Some(TokenClass::Fsync),
             _ => None,
         }
     }
@@ -97,6 +104,8 @@ mod tests {
             TokenClass::Send,
             TokenClass::Close,
             TokenClass::Wake,
+            TokenClass::LogWrite,
+            TokenClass::Fsync,
         ] {
             for (slot, generation) in
                 [(0, 0), (1, u32::MAX), (MAX_SLOT, 7u32), (0xAB_CDEF, 0xDEAD_BEEF)]

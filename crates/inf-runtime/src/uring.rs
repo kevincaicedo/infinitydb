@@ -37,7 +37,8 @@ use io_uring::types::Fd;
 use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
 
 use crate::driver::{
-    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, SubmitStats, Wait,
+    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
+    SubmitStats, Wait,
 };
 use crate::token::CompletionToken;
 
@@ -88,6 +89,31 @@ enum OpState {
     /// wakeups): a peer's `LoopWaker::wake` posts this CQE, ending a park
     /// immediately. Driver-internal — never surfaces as a completion.
     WakeWatch,
+    /// Positional log-frame write (M2-S05, ADR-0013). `fsync` carries the
+    /// linked fdatasync's (consumer token, op id) so a short write can
+    /// supersede it and a failed write's cancellation is attributable.
+    LogWrite {
+        fd: RawFd,
+        token: CompletionToken,
+        data: StableBytes,
+        offset: u64,
+        written: u32,
+        fsync: Option<(CompletionToken, u64)>,
+    },
+    /// fdatasync — linked behind a `LogWrite` or standalone. `superseded`
+    /// marks a sync that raced a short write: its CQE is swallowed; a fresh
+    /// sync linked behind the remainder owns the consumer token.
+    LogFsync {
+        token: CompletionToken,
+        superseded: bool,
+    },
+}
+
+/// One backlog unit: a lone SQE, or an `IOSQE_IO_LINK` pair that must enter
+/// the same submission window (a link chain cannot span submit boundaries).
+struct SqeChain {
+    first: squeue::Entry,
+    linked: Option<squeue::Entry>,
 }
 
 struct RecvArm {
@@ -111,7 +137,7 @@ pub struct UringDriver {
     caps: Capabilities,
     pending_ops: Vec<IoOp>,
     /// SQEs that did not fit the SQ; flushed first next submit.
-    backlog: VecDeque<squeue::Entry>,
+    backlog: VecDeque<SqeChain>,
     states: HashMap<u64, OpState>,
     next_id: u64,
     accepts: HashMap<RawFd, CompletionToken>,
@@ -216,35 +242,96 @@ impl UringDriver {
 
     /// Queue an SQE (backlog when the SQ is full; flushed next submit).
     fn push_sqe(&mut self, entry: squeue::Entry) {
-        self.backlog.push_back(entry);
+        self.backlog.push_back(SqeChain { first: entry, linked: None });
+    }
+
+    /// Queue an `IOSQE_IO_LINK` pair. `first` must carry the link flag; the
+    /// flush keeps both inside one submission window so the kernel actually
+    /// chains them.
+    fn push_chain(&mut self, first: squeue::Entry, linked: squeue::Entry) {
+        self.backlog.push_back(SqeChain { first, linked: Some(linked) });
     }
 
     fn flush_backlog(&mut self) -> io::Result<()> {
         // M0-S19 deliberate-regression canary: submit after every SQE so the
         // `sqes_per_submit` tripwire must trip in the gate report. Test-only.
         let submit_per_op = std::env::var_os("INF_URING_SUBMIT_PER_OP").is_some();
-        while let Some(entry) = self.backlog.pop_front() {
+        while let Some(chain) = self.backlog.pop_front() {
             if submit_per_op {
                 self.ring.submitter().submit()?;
                 self.stats.syscalls += 1;
             }
-            // SAFETY: every entry was built over resources (fds, buffer
-            // addresses) that stay live until its CQE arrives — fds are not
-            // closed before their cancellations complete, and pool buffer
-            // addresses are stable for the pool's lifetime.
-            if unsafe { self.ring.submission().push(&entry) }.is_err() {
-                // SQ full: hand the kernel what we have and retry once.
+            let needed = 1 + usize::from(chain.linked.is_some());
+            let room = {
+                let sq = self.ring.submission();
+                sq.capacity() - sq.len()
+            };
+            if room < needed {
+                // SQ full (a chain also refuses to split across the submit
+                // boundary): hand the kernel what we have and retry once.
                 self.ring.submitter().submit()?;
                 self.stats.syscalls += 1;
-                // SAFETY: as above.
-                if unsafe { self.ring.submission().push(&entry) }.is_err() {
-                    self.backlog.push_front(entry);
+                let room = {
+                    let sq = self.ring.submission();
+                    sq.capacity() - sq.len()
+                };
+                if room < needed {
+                    self.backlog.push_front(chain);
                     return Err(io::Error::other("io_uring SQ stuck full after submit"));
                 }
             }
-            self.stats.sqes += 1;
+            // SAFETY: every entry was built over resources (fds, buffer
+            // addresses) that stay live until its CQE arrives — fds are not
+            // closed before their cancellations complete, pool buffer
+            // addresses are stable for the pool's lifetime, and log-frame
+            // addresses are stable under the `StableBytes` contract.
+            unsafe {
+                let mut sq = self.ring.submission();
+                sq.push(&chain.first).expect("room checked above");
+                if let Some(linked) = chain.linked {
+                    sq.push(&linked).expect("room checked above");
+                }
+            }
+            self.stats.sqes += needed as u64;
         }
         Ok(())
+    }
+
+    /// Arm a positional log-frame write, optionally with a linked fdatasync
+    /// (ADR-0013 D1). `written` > 0 is the short-write resubmission path —
+    /// the remainder gets a FRESH linked sync so `Synced` can never cover a
+    /// prefix.
+    fn arm_log_write(
+        &mut self,
+        fd: RawFd,
+        offset: u64,
+        data: StableBytes,
+        token: CompletionToken,
+        written: u32,
+        fsync_token: Option<CompletionToken>,
+    ) {
+        let fsync = fsync_token.map(|ft| {
+            let fid = self.alloc_id(OpState::LogFsync { token: ft, superseded: false });
+            (ft, fid)
+        });
+        let wid = self.alloc_id(OpState::LogWrite { fd, token, data, offset, written, fsync });
+        // SAFETY: `data` upholds the StableBytes contract (live + stable
+        // until terminal completion); `written` never exceeds `data.len()`.
+        let ptr = unsafe { data.as_ptr().add(written as usize) };
+        let entry = opcode::Write::new(Fd(fd), ptr, data.len() - written)
+            .offset(offset + u64::from(written))
+            .build()
+            .user_data(wid);
+        match fsync {
+            Some((_, fid)) => {
+                let fentry = opcode::Fsync::new(Fd(fd))
+                    .flags(types::FsyncFlags::DATASYNC)
+                    .build()
+                    .user_data(fid);
+                self.push_chain(entry.flags(squeue::Flags::IO_LINK), fentry);
+            }
+            None => self.push_sqe(entry),
+        }
     }
 
     fn arm_accept_sqe(&mut self, listener: RawFd, token: CompletionToken) {
@@ -417,6 +504,17 @@ impl UringDriver {
                         .insert(fd, CloseWait { token, close_seen: false, close_result: 0 });
                     let id = self.alloc_id(OpState::Close { fd });
                     self.push_sqe(opcode::Close::new(Fd(fd)).build().user_data(id));
+                }
+                IoOp::LogWrite { fd, offset, data, token, fsync_token } => {
+                    self.arm_log_write(fd, offset, data, token, 0, fsync_token);
+                }
+                IoOp::Fdatasync { fd, token } => {
+                    let id = self.alloc_id(OpState::LogFsync { token, superseded: false });
+                    let entry = opcode::Fsync::new(Fd(fd))
+                        .flags(types::FsyncFlags::DATASYNC)
+                        .build()
+                        .user_data(id);
+                    self.push_sqe(entry);
                 }
             }
         }
@@ -645,6 +743,59 @@ impl UringDriver {
                     let bid = u16::try_from(buf.as_u32()).expect("provided bids are u16");
                     self.provided.remove(&bid);
                     pool.unstage(buf);
+                }
+            }
+            OpState::LogWrite { fd, token, data, offset, written, fsync } => {
+                if result > 0 || (result == 0 && data.len() == written) {
+                    let written = written + result as u32;
+                    if written < data.len() {
+                        // Short write: the already-linked fdatasync would
+                        // cover a prefix only — supersede it; the remainder
+                        // re-links a fresh sync (ADR-0013 D1).
+                        let fsync_token = fsync.map(|(ft, fid)| {
+                            if let Some(OpState::LogFsync { superseded, .. }) =
+                                self.states.get_mut(&fid)
+                            {
+                                *superseded = true;
+                            }
+                            ft
+                        });
+                        self.arm_log_write(fd, offset, data, token, written, fsync_token);
+                        return;
+                    }
+                    out.push(Completion { token, result: CompletionResult::LogWritten });
+                } else {
+                    // Zero-progress writes on a non-empty range cannot
+                    // happen on a healthy fd; surface them as EIO rather
+                    // than resubmitting forever.
+                    let errno = match result {
+                        0 => libc::EIO,
+                        r if r == -libc::ECANCELED => libc::ECANCELED,
+                        r => -r,
+                    };
+                    // The linked fdatasync (if any, not superseded) is
+                    // cancelled by the kernel and surfaces ECANCELED on its
+                    // own token — no sync-past-failed-write.
+                    out.push(Completion {
+                        token,
+                        result: CompletionResult::Error { errno, buf: None },
+                    });
+                }
+            }
+            OpState::LogFsync { token, superseded } => {
+                if superseded {
+                    // Stale sync from a short-write chain: the consumer
+                    // token now belongs to the re-linked sync.
+                    return;
+                }
+                if result >= 0 {
+                    out.push(Completion { token, result: CompletionResult::Synced });
+                } else {
+                    let errno = if result == -libc::ECANCELED { libc::ECANCELED } else { -result };
+                    out.push(Completion {
+                        token,
+                        result: CompletionResult::Error { errno, buf: None },
+                    });
                 }
             }
         }

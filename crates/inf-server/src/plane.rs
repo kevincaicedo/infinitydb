@@ -689,6 +689,11 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                     self.initiate_close(cx, key);
                 }
             }
+            // Log file ops (M2-S05): the server plane issues none until the
+            // durable-namespace wiring lands (M2-S08, ADR-0013).
+            CompletionResult::LogWritten | CompletionResult::Synced => {
+                unreachable!("no log ops are issued before M2-S08")
+            }
         }
     }
 

@@ -25,6 +25,52 @@ use crate::token::CompletionToken;
 /// perform syscalls on it.
 pub type RawFd = std::os::fd::RawFd;
 
+/// A byte range whose stability outlives the borrow it was made from — the
+/// handoff shape for log-frame writes (M2-S05, ADR-0013 D1). The staging
+/// ring's `FrameLease` is the canonical stability proof: the sealed frame
+/// buffer never reallocates and is not reset until the write's terminal
+/// completion releases the lease.
+#[derive(Copy, Clone, Debug)]
+pub struct StableBytes {
+    ptr: *const u8,
+    len: u32,
+}
+
+impl StableBytes {
+    /// Capture `bytes` for a driver op that outlives this borrow.
+    ///
+    /// # Safety
+    /// The caller must guarantee the bytes stay live, at this address, and
+    /// unmodified until the op carrying them reaches its **terminal**
+    /// completion (`LogWritten` or `Error`). Holding a staging `FrameLease`
+    /// until that completion satisfies this.
+    #[must_use]
+    pub unsafe fn new(bytes: &[u8]) -> StableBytes {
+        StableBytes {
+            ptr: bytes.as_ptr(),
+            len: u32::try_from(bytes.len()).expect("stable byte range fits u32"),
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Address for the backend syscall/SQE. Public because out-of-crate
+    /// drivers (the `inf-sim` disk, test drivers) execute the op too;
+    /// dereferencing is sound only under the constructor's contract.
+    #[must_use]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+}
+
 /// Operations a cell may queue. `push` never performs a syscall — everything
 /// goes out in the single `submit_and_reap` per loop iteration (L3).
 #[derive(Debug)]
@@ -48,6 +94,25 @@ pub enum IoOp {
     /// Close the fd. Pending sends on it complete with `Error(ECANCELED)`
     /// (returning their buffers) before `Closed` is delivered.
     Close { fd: RawFd, token: CompletionToken },
+    /// Positional write of one sealed log frame (M2-S05, ADR-0013). Short
+    /// writes are resubmitted internally: `LogWritten` means ALL bytes hit
+    /// the fd. With `fsync_token`, an fdatasync is chained after the write
+    /// — `IOSQE_IO_LINK` on io_uring (ordering enforced in-kernel), issued
+    /// after the write's completion on fallback tiers. The chained sync's
+    /// `Synced` is delivered only once every byte of THIS write is both
+    /// written and covered (a sync that raced a short write is superseded
+    /// internally); a failed write cancels it (`Error{ECANCELED}` on
+    /// `fsync_token` — never a sync-past-failed-write).
+    LogWrite {
+        fd: RawFd,
+        offset: u64,
+        data: StableBytes,
+        token: CompletionToken,
+        fsync_token: Option<CompletionToken>,
+    },
+    /// Standalone fdatasync-class barrier (everysec tick, segment seal —
+    /// M2-S05). `Synced` on completion is the durability fact (L2).
+    Fdatasync { fd: RawFd, token: CompletionToken },
 }
 
 /// One reaped completion: the token that was armed plus the outcome.
@@ -77,6 +142,12 @@ pub enum CompletionResult {
     Sent {
         buf: BufferId,
     },
+    /// Every byte of a `LogWrite` reached the fd (page cache, NOT durable).
+    /// This is the staging lease's release point — never an ack point.
+    LogWritten,
+    /// An fdatasync completed: everything it covers is durable. The ONLY
+    /// event that may advance the durability watermark (§8.2, ADR-0013).
+    Synced,
     Closed,
     /// Terminal failure. Any buffer the op still held ALWAYS comes back
     /// here; `None` means no consumer-owned buffer was involved.

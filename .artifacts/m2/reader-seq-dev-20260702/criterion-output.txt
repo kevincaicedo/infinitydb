@@ -1,0 +1,28 @@
+   Compiling inf-simd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-simd)
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 7.36s
+     Running benches/reader_seq.rs (target/release/deps/reader_seq-050b4314e941984f)
+Benchmarking reader_seq/full_pass/262144
+Benchmarking reader_seq/full_pass/262144: Warming up for 3.0000 s
+Benchmarking reader_seq/full_pass/262144: Collecting 20 samples in estimated 5.5077 s (80 iterations)
+Benchmarking reader_seq/full_pass/262144: Analyzing
+reader_seq/full_pass/262144
+                        time:   [68.576 ms 68.658 ms 68.734 ms]
+                        thrpt:  [3.6232 GiB/s 3.6272 GiB/s 3.6315 GiB/s]
+Benchmarking reader_seq/full_pass/1048576
+Benchmarking reader_seq/full_pass/1048576: Warming up for 3.0000 s
+Benchmarking reader_seq/full_pass/1048576: Collecting 20 samples in estimated 5.5148 s (80 iterations)
+Benchmarking reader_seq/full_pass/1048576: Analyzing
+reader_seq/full_pass/1048576
+                        time:   [68.822 ms 68.882 ms 68.935 ms]
+                        thrpt:  [3.6127 GiB/s 3.6154 GiB/s 3.6186 GiB/s]
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) low mild
+Benchmarking reader_seq/full_pass/4194304
+Benchmarking reader_seq/full_pass/4194304: Warming up for 3.0000 s
+Benchmarking reader_seq/full_pass/4194304: Collecting 20 samples in estimated 5.7093 s (80 iterations)
+Benchmarking reader_seq/full_pass/4194304: Analyzing
+reader_seq/full_pass/4194304
+                        time:   [71.203 ms 71.270 ms 71.334 ms]
+                        thrpt:  [3.4912 GiB/s 3.4943 GiB/s 3.4976 GiB/s]
+

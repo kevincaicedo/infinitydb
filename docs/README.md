@@ -26,8 +26,10 @@ Public documentation for InfinityDB. Start with the
 - **[Compatibility matrix](compat-matrix.md)** — every command's Redis
   compatibility status, with documented deviations. *Generated artifact —
   do not edit by hand.*
-- **[Interfaces](interfaces-m0.md)** — the frozen internal seams between
+- **[Interfaces (M0)](interfaces-m0.md)** — the frozen internal seams between
   crates (engineering reference).
+- **[Interfaces (M2)](interfaces-m2.md)** — the log-spine formats and seams
+  (record/frame/LSN/segment lifecycle); draft until M2 exit.
 
 ## Operations artifacts
 

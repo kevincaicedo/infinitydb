@@ -98,6 +98,11 @@ impl Arena {
 > (edition-2024 keyword), the Pin-sound `PollImmediate` shape,
 > `FabricGate<V>`, `submit_stats()`/`performance_tier`, fallible
 > `run_iteration`, `CellPlane::on_timer`.
+>
+> **Extended at M2-S05 under the freeze discipline (ADR-0013):** `IoOp`
+> gains `LogWrite`/`Fdatasync`, `CompletionResult` gains
+> `LogWritten`/`Synced`, `TokenClass` gains `LogWrite = 5`/`Fsync = 6`.
+> Layouts unchanged; the new surface is documented in `interfaces-m2.md`.
 
 ```rust
 pub struct CompletionToken(u64);           // {class:8, slot:24, gen:32}
