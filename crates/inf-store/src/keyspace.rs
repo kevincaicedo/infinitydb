@@ -22,10 +22,13 @@
 //! writes cannot monopolize the loop (the bounded-everything rule).
 
 use inf_foundation::time::Nanos;
+use inf_log::{FsyncClass, NsId, RecordView as LogRecordView};
 
+use crate::catalog::NsCatalog;
 use crate::evict::{EvictStats, EvictionPolicy};
-use crate::ns::{NsError, NsRegistry, NsSpec};
+use crate::ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsRegistry, NsSpec};
 use crate::store::{CellStore, ExpiryStats, MemoryReport, OpError, StoreConfig, StoreStats};
+use crate::wall::WallAnchor;
 use crate::wheel::ExpiryBudget;
 
 /// Redis default database count (`SELECT 0..15`; CONFIG `databases`).
@@ -70,6 +73,10 @@ pub struct Keyspace {
     dbs: [Option<Box<CellStore>>; DEFAULT_DBS],
     cfg: StoreConfig,
     named: NsRegistry,
+    /// Named-namespace stores, materialized on first touch (M2-S08).
+    /// Linear scan by id — a node has few named namespaces, and the id is
+    /// resolved once per command, not per key.
+    named_stores: Vec<(NsId, Box<CellStore>)>,
     pressure: PressureConfig,
     /// Cached `used > limit` (the M1-S07 one-branch write-path flag).
     over_limit: bool,
@@ -85,6 +92,7 @@ impl Keyspace {
             dbs: Default::default(),
             cfg,
             named: NsRegistry::default(),
+            named_stores: Vec::new(),
             pressure: PressureConfig::default(),
             over_limit: false,
             hand_db: 0,
@@ -135,7 +143,7 @@ impl Keyspace {
             evict_bytes: 0,
             live_records: 0,
         };
-        for (_, store) in self.dbs() {
+        for store in self.all_stores() {
             let r = store.report();
             total.records_live_bytes += r.records_live_bytes;
             total.records_slack_bytes += r.records_slack_bytes;
@@ -151,7 +159,7 @@ impl Keyspace {
     /// Aggregated lifetime counters across dbs.
     pub fn stats(&self) -> StoreStats {
         let mut total = StoreStats::default();
-        for (_, store) in self.dbs() {
+        for store in self.all_stores() {
             let s = store.stats();
             total.keyspace_hits += s.keyspace_hits;
             total.keyspace_misses += s.keyspace_misses;
@@ -165,17 +173,29 @@ impl Keyspace {
         total
     }
 
-    /// `CONFIG RESETSTAT` across every db.
+    /// `CONFIG RESETSTAT` across every db and named store.
     pub fn reset_stats(&mut self) {
         for store in self.dbs.iter_mut().flatten() {
             store.reset_stats();
         }
+        for (_, store) in &mut self.named_stores {
+            store.reset_stats();
+        }
     }
 
-    /// `FLUSHALL` (this cell's slice): every database.
+    /// `FLUSHALL` (this cell's slice): every default database plus named
+    /// *memory* namespaces. Durable stores are skipped by construction — a
+    /// durable flush needs per-key `Delete` records (S10/S11 territory) and
+    /// the command layer refuses it first (ADR-0015 deviations); the skip
+    /// here is defense in depth, never the primary gate.
     pub fn flush_all(&mut self, now: Nanos) {
         for store in self.dbs.iter_mut().flatten() {
             store.flush(now);
+        }
+        for (id, store) in &mut self.named_stores {
+            if self.named.get_by_id(*id).is_none_or(|s| s.mode == NsMode::Memory) {
+                store.flush(now);
+            }
         }
         self.refresh_pressure();
     }
@@ -188,7 +208,8 @@ impl Keyspace {
     pub fn expire_tick(&mut self, now: Nanos, budget: ExpiryBudget) -> ExpiryStats {
         let mut total = ExpiryStats::default();
         let mut left = budget;
-        for store in self.dbs.iter_mut().flatten() {
+        let named = self.named_stores.iter_mut().map(|(_, s)| s.as_mut());
+        for store in self.dbs.iter_mut().flatten().map(Box::as_mut).chain(named) {
             if left.max_fires == 0 || left.max_steps == 0 {
                 break;
             }
@@ -231,9 +252,14 @@ impl Keyspace {
         self.over_limit
     }
 
-    /// Logical used bytes across dbs (the `maxmemory` comparable).
+    /// Logical used bytes across dbs and named stores (the `maxmemory`
+    /// comparable). Named stores count toward pressure but never join the
+    /// eviction hand (M2-S08 — see `ns_store_mut`), so sustained pressure
+    /// from a named namespace resolves as honest OOM refusals, not silent
+    /// eviction of durable data.
     pub fn used_bytes(&self) -> u64 {
-        self.dbs().map(|(_, s)| s.used_bytes()).sum()
+        let named: u64 = self.named_stores.iter().map(|(_, s)| s.used_bytes()).sum();
+        self.dbs().map(|(_, s)| s.used_bytes()).sum::<u64>() + named
     }
 
     /// Recomputes the cached pressure flag. Called after mutations (cheap:
@@ -337,29 +363,179 @@ impl Keyspace {
         self.db_mut(dst_db).copy_in(dst, &rec, replace, now)
     }
 
-    // ---- named namespaces (M1-S08) ----
+    // ---- named namespaces (M1-S08 registry; M2-S08 stores + catalog) ----
 
     pub fn ns_create(&mut self, spec: NsSpec) -> Result<(), NsError> {
         self.named.create(spec)
     }
 
+    /// Drops the registry entry **and** its store (with all its data). The
+    /// id is never reused; log records naming it are skipped on replay.
     pub fn ns_drop(&mut self, name: &[u8]) -> Result<(), NsError> {
-        self.named.drop_ns(name)
+        let id = self.named.get(name).map(|s| s.id);
+        self.named.drop_ns(name)?;
+        if let Some(id) = id {
+            self.named_stores.retain(|(nid, _)| *nid != id);
+            self.refresh_pressure();
+        }
+        Ok(())
     }
 
     pub fn ns_get(&self, name: &[u8]) -> Option<&NsSpec> {
         self.named.get(name)
     }
 
+    pub fn ns_get_by_id(&self, id: NsId) -> Option<&NsSpec> {
+        self.named.get_by_id(id)
+    }
+
     pub fn ns_iter(&self) -> impl Iterator<Item = &NsSpec> {
         self.named.iter()
     }
+
+    /// The store behind named namespace `id`, materializing it on first
+    /// touch; `None` when the id isn't registered (unknown or dropped).
+    ///
+    /// Named stores never join the eviction hand regardless of the server
+    /// policy: durable namespaces must not evict (ADR-0015 D5 — eviction
+    /// without `Delete` records resurrects keys on replay), and per-ns
+    /// eviction for named *memory* namespaces is a recorded M2 limitation
+    /// (their `EVICTION`/`MAXMEMORY` config is honored as registry state,
+    /// enforced post-M2).
+    pub fn ns_store_mut(&mut self, id: NsId) -> Option<&mut CellStore> {
+        self.named.get_by_id(id)?;
+        if let Some(i) = self.named_stores.iter().position(|(nid, _)| *nid == id) {
+            return Some(self.named_stores[i].1.as_mut());
+        }
+        let mut cfg = self.cfg;
+        cfg.evict_seed = self.cfg.evict_seed ^ u64::from(id.0).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut store = Box::new(CellStore::new(cfg));
+        store.set_eviction_policy(EvictionPolicy::NoEviction);
+        self.named_stores.push((id, store));
+        Some(self.named_stores.last_mut().expect("pushed above").1.as_mut())
+    }
+
+    /// Read-only view of named namespace `id` when materialized.
+    pub fn ns_store(&self, id: NsId) -> Option<&CellStore> {
+        self.named_stores.iter().find(|(nid, _)| *nid == id).map(|(_, s)| s.as_ref())
+    }
+
+    /// The durability class of namespace `id`: `None` for memory (default
+    /// dbs and memory-mode named), `Some` for durable — the one branch the
+    /// mutation path pays (L2's degenerate case stays free, M2-S09).
+    pub fn ns_fsync_class(&self, id: NsId) -> Option<FsyncClass> {
+        if id.0 < FIRST_NAMED_NS_ID {
+            return None;
+        }
+        let spec = self.named.get_by_id(id)?;
+        if spec.mode == NsMode::Durable { spec.fsync } else { None }
+    }
+
+    /// Boot-time catalog seed (ADR-0015 D3): replaces the registry with the
+    /// persisted entries. Runs before the cell replays or serves; any
+    /// existing named stores are dropped with their data.
+    ///
+    /// # Errors
+    /// The first registry-rule violation — a failing catalog is a
+    /// fail-stop at boot, never a partial seed.
+    pub fn seed_catalog(&mut self, cat: &NsCatalog) -> Result<(), NsError> {
+        self.named = NsRegistry::default();
+        self.named_stores.clear();
+        for spec in &cat.entries {
+            self.named.create(spec.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot the registry as a catalog (the DDL persist path; the caller
+    /// owns `next_id` — it lives on the node-level allocator).
+    pub fn export_catalog(&self, next_id: u32) -> NsCatalog {
+        NsCatalog { next_id, entries: self.ns_iter().cloned().collect() }
+    }
+
+    // ---- replay (M2-S08, ADR-0015 D7) ----
+
+    /// Applies one decoded log record — the blind idempotent upsert of
+    /// ADR-0011 D4. Records naming an unregistered id (dropped namespace)
+    /// or a reserved one are skipped and counted, never an error: the
+    /// catalog is authoritative and foreign logs must not wedge recovery.
+    ///
+    /// `ExpireAt` deadlines convert from record Unix-ms through `anchor`;
+    /// a deadline too far in the future for the internal clock clamps to
+    /// the maximum representable (never to `now` — clamping forward-lost
+    /// deadlines to the past would expire keys that should live).
+    ///
+    /// # Errors
+    /// Arena/bounds failures from the store (recovery fail-stop).
+    pub fn apply_record(
+        &mut self,
+        rec: &LogRecordView<'_>,
+        now: Nanos,
+        anchor: WallAnchor,
+    ) -> Result<ReplayOutcome, OpError> {
+        match *rec {
+            LogRecordView::StringPostImage { ns, key, value } => {
+                let Some(store) = self.replay_store(ns) else {
+                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                };
+                store.replay_set(key, value, now)?;
+                Ok(ReplayOutcome::Applied)
+            }
+            LogRecordView::Delete { ns, key } => {
+                let Some(store) = self.replay_store(ns) else {
+                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                };
+                store.replay_del(key, now);
+                Ok(ReplayOutcome::Applied)
+            }
+            LogRecordView::ExpireAt { ns, at_unix_ms, key } => {
+                let Some(store) = self.replay_store(ns) else {
+                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                };
+                let at = anchor.internal_from_unix(at_unix_ms).unwrap_or(Nanos(u64::MAX));
+                store.replay_expire_at(key, at, now);
+                Ok(ReplayOutcome::Applied)
+            }
+            // Reserved in M2: the catalog is META-owned; no NsOp records
+            // are emitted (ADR-0015 D7).
+            LogRecordView::NsOp { .. } => Ok(ReplayOutcome::SkippedReserved),
+        }
+    }
+
+    fn replay_store(&mut self, ns: NsId) -> Option<&mut CellStore> {
+        // Defaults never log (memory namespaces have a null log — L2);
+        // an id below the named floor in a real log is foreign data.
+        if ns.0 < FIRST_NAMED_NS_ID {
+            return None;
+        }
+        self.ns_store_mut(ns)
+    }
+
+    /// Every materialized store: default dbs, then named (aggregation
+    /// order is stable but unspecified).
+    fn all_stores(&self) -> impl Iterator<Item = &CellStore> {
+        self.dbs
+            .iter()
+            .filter_map(|s| s.as_deref())
+            .chain(self.named_stores.iter().map(|(_, s)| s.as_ref()))
+    }
+}
+
+/// What [`Keyspace::apply_record`] did with one record.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ReplayOutcome {
+    Applied,
+    /// The record names an id the catalog doesn't know (dropped namespace,
+    /// or a reserved default id) — skipped and counted by the caller.
+    SkippedUnknownNs,
+    /// A record type M2 never emits (`NsOp`) — reserved, skipped.
+    SkippedReserved,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{SetOptions, StoreConfig};
+    use crate::store::{SetExpire, SetOptions, StoreConfig};
 
     fn now() -> Nanos {
         Nanos(1_000_000)
@@ -502,5 +678,122 @@ mod tests {
             ks.used_bytes() <= limit - limit / 16 + 256,
             "and settle near the low watermark (hysteresis)"
         );
+    }
+
+    // ---- M2-S08: named stores, catalog, replay ----
+
+    fn durable_spec(id: u32, name: &[u8]) -> NsSpec {
+        NsSpec {
+            id: NsId(id),
+            name: name.to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+        }
+    }
+
+    #[test]
+    fn named_stores_are_isolated_and_dropped_with_their_namespace() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        let now = Nanos(1);
+        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.db_mut(0).set(b"k", b"db0", SetOptions::default(), now).expect("set db0");
+        ks.ns_store_mut(NsId(16))
+            .expect("registered")
+            .set(b"k", b"ledger", SetOptions::default(), now)
+            .expect("set named");
+        assert_eq!(ks.db_mut(0).get(b"k", now), Some(&b"db0"[..]));
+        assert_eq!(ks.ns_store_mut(NsId(16)).expect("live").get(b"k", now), Some(&b"ledger"[..]));
+        assert_eq!(ks.ns_fsync_class(NsId(16)), Some(FsyncClass::Always));
+        assert_eq!(ks.ns_fsync_class(NsId(0)), None, "defaults are memory");
+        ks.ns_drop(b"ledger").expect("drop");
+        assert!(ks.ns_store_mut(NsId(16)).is_none(), "dropped ids resolve to no store");
+    }
+
+    #[test]
+    fn catalog_seed_and_export_round_trip() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        let cat = ks.export_catalog(17);
+        let mut fresh = Keyspace::new(StoreConfig::default());
+        fresh.seed_catalog(&cat).expect("seed");
+        assert_eq!(fresh.export_catalog(17), cat);
+        assert!(fresh.ns_store_mut(NsId(16)).is_some());
+    }
+
+    #[test]
+    fn apply_record_is_a_blind_idempotent_upsert() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        let now = Nanos::from_millis(10);
+        let anchor = WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 };
+        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+
+        let set = LogRecordView::StringPostImage { ns: NsId(16), key: b"k", value: b"v1" };
+        for _ in 0..2 {
+            // Double apply: replay from an older checkpoint re-covers records.
+            assert_eq!(ks.apply_record(&set, now, anchor).expect("apply"), ReplayOutcome::Applied);
+        }
+        assert_eq!(ks.ns_store_mut(NsId(16)).expect("live").get(b"k", now), Some(&b"v1"[..]));
+
+        // ExpireAt in the future keeps the key; a past deadline kills it.
+        let future_unix = anchor.unix_from_internal(Nanos::from_millis(60_000));
+        let exp = LogRecordView::ExpireAt { ns: NsId(16), at_unix_ms: future_unix, key: b"k" };
+        assert_eq!(ks.apply_record(&exp, now, anchor).expect("apply"), ReplayOutcome::Applied);
+        assert_eq!(ks.ns_store_mut(NsId(16)).expect("live").get(b"k", now), Some(&b"v1"[..]));
+        assert_eq!(
+            ks.ns_store_mut(NsId(16)).expect("live").get(b"k", Nanos::from_millis(61_000)),
+            None,
+            "replayed deadline fires"
+        );
+
+        let del = LogRecordView::Delete { ns: NsId(16), key: b"gone" };
+        assert_eq!(ks.apply_record(&del, now, anchor).expect("apply"), ReplayOutcome::Applied);
+
+        // Unknown / reserved ids skip, never error (dropped-ns tolerance).
+        let foreign = LogRecordView::StringPostImage { ns: NsId(99), key: b"x", value: b"y" };
+        assert_eq!(
+            ks.apply_record(&foreign, now, anchor).expect("apply"),
+            ReplayOutcome::SkippedUnknownNs
+        );
+        let reserved = LogRecordView::StringPostImage { ns: NsId(3), key: b"x", value: b"y" };
+        assert_eq!(
+            ks.apply_record(&reserved, now, anchor).expect("apply"),
+            ReplayOutcome::SkippedUnknownNs
+        );
+        let nsop = LogRecordView::NsOp { ns: NsId(16), payload: b"reserved" };
+        assert_eq!(
+            ks.apply_record(&nsop, now, anchor).expect("apply"),
+            ReplayOutcome::SkippedReserved
+        );
+    }
+
+    #[test]
+    fn post_image_reads_without_touching_stats() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        let now = Nanos(1);
+        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        let store = ks.ns_store_mut(NsId(16)).expect("live");
+        store
+            .set(
+                b"k",
+                b"v",
+                SetOptions {
+                    expire: SetExpire::At(Nanos::from_millis(5_000)),
+                    ..SetOptions::default()
+                },
+                now,
+            )
+            .expect("set");
+        let hits_before = store.stats().keyspace_hits;
+        let img = store.post_image(b"k", now).expect("live key");
+        assert_eq!(img.value, b"v");
+        assert_eq!(img.expire_at_ms, Some(5_000));
+        assert_eq!(store.stats().keyspace_hits, hits_before, "no read-stat side effect");
+        assert!(
+            store.post_image(b"k", Nanos::from_millis(6_000)).is_none(),
+            "expired reads absent"
+        );
+        assert!(store.post_image(b"missing", now).is_none());
     }
 }

@@ -31,7 +31,7 @@ pub use driver::{
     SubmitStats, Wait,
 };
 pub use executor::{CellExecutor, PollImmediate, TaskId};
-pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate};
+pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate, WatermarkWait};
 pub use reactor::{CellLoop, CellPlane, IterStats, LoopConfig, LoopCx};
 pub use sched::{GroupClass, GroupScheduler};
 pub use timer::{TimerId, TimerWheel};

@@ -11,6 +11,7 @@ description = "Dispatch + transports; M0: command execution + the ServerPlane no
 inf-foundation.workspace = true
 inf-alloc.workspace = true
 inf-fabric.workspace = true
+inf-log.workspace = true
 inf-runtime.workspace = true
 inf-wire.workspace = true
 inf-store.workspace = true

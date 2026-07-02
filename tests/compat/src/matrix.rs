@@ -529,7 +529,13 @@ pub static MATRIX: &[Case] = &[
     skip(&["INF.NS", "CREATE", "cache", "EVICTION", "allkeys-lfu"], "InfinityDB extension"),
     skip(
         &["INF.NS", "CREATE", "ledger", "MODE", "durable"],
-        "InfinityDB extension; durable mode honestly rejected until M2",
+        "InfinityDB extension; durable live since M2-S08 (node tier — the \
+         planeless compat candidate answers its documented no-runtime error)",
+    ),
+    skip(
+        &["INF.NS", "USE", "cache"],
+        "InfinityDB extension (M2-S08): named-namespace selection, SELECT-class \
+         conn state; durable-mode deviations documented in ADR-0015",
     ),
     skip(&["INF.NS", "LIST"], "InfinityDB extension"),
     skip(&["INF.NS", "INFO", "cache"], "InfinityDB extension"),

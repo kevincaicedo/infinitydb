@@ -41,17 +41,21 @@ use inf_alloc::{BufferId, LeaseKind};
 use inf_fabric::{ApplyArgs, CellFabric, ErrCode, FabricToken, Op, Outcome, SendError};
 use inf_foundation::time::Nanos;
 use inf_foundation::{CellId, LogHistogram};
+use inf_log::fs::StdSegmentFs;
+use inf_log::{FsyncClass, MutationEffect, SegmentRotor, StagingConfig};
 use inf_runtime::GroupClass;
 use inf_runtime::{
     CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoOp, LoopCx,
     RawFd, TokenClass, WaitList,
 };
-use inf_store::{EvictBudget, ExpiryBudget, Keyspace, SlotRouter};
+use inf_store::{EvictBudget, ExpiryBudget, Keyspace, NsId, NsMode, SlotRouter, WallAnchor};
 use inf_wire::{
-    ArgvRef, CommandId, ConnParser, Parsed, ParserLimits, Protocol, RespWriter, arity_ok,
+    ArgvRef, CmdFlags, CommandId, ConnParser, Parsed, ParserLimits, Protocol, RespWriter, arity_ok,
     extract_keys, lookup,
 };
 
+use crate::control::ControlHandle;
+use crate::durable::{DurableCell, EVERYSEC_TIMER_KEY};
 use crate::exec::{ConnCx, NodeInfo, execute, execute_slices, stall_request};
 use crate::pubsub::{self, PubSubCell, SubKind};
 
@@ -326,6 +330,15 @@ struct Shared<O: PlaneObserver + 'static> {
     /// Parsed `client-output-buffer-limit pubsub` `(hard, soft, soft_ms)`
     /// (M1-S11); refreshed by the MAINTAIN config sweep. Zeros disable.
     cob_pubsub: Cell<(u64, u64, u64)>,
+    /// The durable plane (M2-S08, ADR-0015): `None` = memory-only cell —
+    /// the zero-cost branch every memory-path check reduces to (M2-S09).
+    durable: RefCell<Option<DurableCell>>,
+    /// Node control-thread handle (id allocation + catalog persistence).
+    control: RefCell<Option<Arc<ControlHandle>>>,
+    /// DDL pumps parked on catalog persistence (ADR-0015 D3).
+    ddl_waiters: WaitList<u8>,
+    /// Last persist epoch MAINTAIN observed (edge-detects wakes).
+    ddl_epoch_seen: Cell<u64>,
 }
 
 /// One fabric-origin PUBLISH parked at the owner cell.
@@ -345,6 +358,7 @@ impl<O: PlaneObserver + 'static> Shared<O> {
     /// appending the reply to `out` (callers reuse scratch buffers — the
     /// owner side of a remote `Apply` is zero-allocation, M0-E8), and
     /// reports the apply point.
+    #[allow(clippy::too_many_arguments)] // internal execution funnel
     fn execute_owned_into(
         &self,
         origin: ExecOrigin,
@@ -352,6 +366,7 @@ impl<O: PlaneObserver + 'static> Shared<O> {
         proto: Protocol,
         id: u64,
         db: u16,
+        ns: Option<NsId>,
         out: &mut Vec<u8>,
     ) {
         let before = out.len();
@@ -359,6 +374,7 @@ impl<O: PlaneObserver + 'static> Shared<O> {
             proto,
             id,
             db,
+            ns,
             sub_channels: Vec::new(),
             sub_patterns: Vec::new(),
             node: Rc::clone(&self.node),
@@ -413,6 +429,220 @@ impl<O: PlaneObserver + 'static> Shared<O> {
         self.observer.borrow_mut().on_execute(self.cell, origin, &[b"DBSIZE"], &reply, now);
         len
     }
+
+    // ---- durable-namespace execution (M2-S08, ADR-0015 D5/D6) ----
+
+    /// The wall anchor for `ExpireAt` record conversion (L7-injected).
+    fn wall_anchor(&self) -> WallAnchor {
+        let (internal_ms, unix_ms) = self.node.wall_anchor.get();
+        WallAnchor { internal_ms, unix_ms }
+    }
+
+    /// Conservative staging-bytes estimate for one command's effects:
+    /// per write key, the key + the current post-image + record overhead,
+    /// plus every argument byte (covers APPEND/SETRANGE growth). Checked
+    /// *before* execution so a mutation is never applied unlogged.
+    fn estimate_effect_bytes(
+        &self,
+        ns: NsId,
+        meta: &'static inf_wire::CommandMeta,
+        argv: &[&[u8]],
+    ) -> usize {
+        let ks = self.store.borrow();
+        let now = self.now.get();
+        let arg_bytes: usize = argv.iter().map(|a| a.len()).sum();
+        let mut est = 64 + arg_bytes;
+        let store = ks.ns_store(ns);
+        for key in extract_keys_slices(meta, argv) {
+            est += key.len() + 96;
+            if let Some(store) = store {
+                est += store.post_image(key, now).map_or(0, |img| img.value.len());
+            }
+        }
+        est
+    }
+
+    /// Post-execution effect emission (ADR-0015 D5): per written key, the
+    /// post-image (+ `ExpireAt` when a deadline is set) or a `Delete` —
+    /// the one hook covering every string/key/expiry command. Returns the
+    /// last staged seq (the `always` gate key).
+    fn stage_durable_effects(
+        &self,
+        ns: NsId,
+        meta: &'static inf_wire::CommandMeta,
+        argv: &[&[u8]],
+        class: FsyncClass,
+    ) -> Option<u64> {
+        let ks = self.store.borrow();
+        let mut durable = self.durable.borrow_mut();
+        let cell = durable.as_mut().expect("emission requires the durable plane");
+        let store = ks.ns_store(ns)?;
+        let now = self.now.get();
+        let anchor = self.wall_anchor();
+        let mut last = None;
+        for key in extract_keys_slices(meta, argv) {
+            match store.post_image(key, now) {
+                Some(img) => {
+                    let set = MutationEffect::StringSet { ns, key, value: img.value };
+                    last = Some(cell.stage(&set, class));
+                    if let Some(ms) = img.expire_at_ms {
+                        let at_unix_ms = anchor.unix_from_internal(Nanos::from_millis(ms));
+                        let exp = MutationEffect::ExpireAt { ns, at_unix_ms, key };
+                        last = Some(cell.stage(&exp, class));
+                    }
+                }
+                None => {
+                    last = Some(cell.stage(&MutationEffect::Delete { ns, key }, class));
+                }
+            }
+        }
+        last
+    }
+
+    /// Owner-side named-namespace apply (the `ApplyNs` handler): admission,
+    /// execution, emission — and for `always` writes the deferred-reply
+    /// verdict (the fabric reply waits for this cell's fsync watermark).
+    fn execute_ns_owned(
+        &self,
+        from: CellId,
+        argv: &[&[u8]],
+        proto: Protocol,
+        ns: NsId,
+        out: &mut Vec<u8>,
+    ) -> NsApplyOutcome {
+        let before = out.len();
+        let meta = lookup(argv[0]);
+        let class = self.store.borrow().ns_fsync_class(ns);
+        let is_write = meta.is_some_and(|m| m.flags.contains(CmdFlags::WRITE));
+        if let (Some(meta), Some(_)) = (meta, class)
+            && is_write
+            && let Some(refusal) = self.durable_admission(ns, meta, argv)
+        {
+            RespWriter::new(out, proto).error(refusal);
+            return NsApplyOutcome::Reply;
+        }
+        self.execute_owned_into(ExecOrigin::Fabric(from), argv, proto, 0, 0, Some(ns), out);
+        if is_write
+            && out.get(before) != Some(&b'-')
+            && let (Some(meta), Some(class)) = (meta, class)
+            && let Some(seq) = self.stage_durable_effects(ns, meta, argv, class)
+            && class == FsyncClass::Always
+        {
+            self.durable.borrow_mut().as_mut().expect("staged above").note_gated_ack();
+            return NsApplyOutcome::Gated(seq);
+        }
+        NsApplyOutcome::Reply
+    }
+
+    /// Durable-write admission (owner side — cannot suspend inside the
+    /// fabric drain, so pressure answers a typed retryable refusal; the
+    /// local pump path parks instead). `None` = admitted.
+    fn durable_admission(
+        &self,
+        ns: NsId,
+        meta: &'static inf_wire::CommandMeta,
+        argv: &[&[u8]],
+    ) -> Option<&'static str> {
+        let durable = self.durable.borrow();
+        let Some(cell) = durable.as_ref() else {
+            return Some("ERR durable namespace on a cell without durable storage");
+        };
+        if cell.failed {
+            return Some("ERR durable plane failed (fail-stop)");
+        }
+        if cell.space_exhausted() {
+            return Some("ERR durable write refused: log storage exhausted (NOSPACE)");
+        }
+        drop(durable);
+        let est = self.estimate_effect_bytes(ns, meta, argv);
+        if !self.durable.borrow().as_ref().expect("checked above").would_fit(est) {
+            return Some("BUSY durable log staging is full, retry");
+        }
+        None
+    }
+}
+
+/// One owner-side `always` reply deferred on the fsync watermark.
+struct GatedReply {
+    to: CellId,
+    token: FabricToken,
+    seq: u64,
+    reply: Vec<u8>,
+}
+
+/// Owner-side verdict for one `ApplyNs`.
+enum NsApplyOutcome {
+    /// The reply is staged in the scratch range — ship it now.
+    Reply,
+    /// `always` write: ship the reply only once seq is durable.
+    Gated(u64),
+}
+
+/// Applies the internal `INF.NSFAN` DDL fan on a peer cell (M2-S08):
+/// `CREATE name mode fsync policy maxmemory id` / `DROP name`, fields as
+/// the origin serialized them (`-` = none). Returns false for non-NSFAN.
+fn handle_ns_apply<O: PlaneObserver + 'static>(
+    shared: &Shared<O>,
+    from: CellId,
+    token: FabricToken,
+    argv: &[&[u8]],
+    scratch: &mut Vec<u8>,
+    staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
+) -> bool {
+    if !argv[0].eq_ignore_ascii_case(b"INF.NSFAN") {
+        return false;
+    }
+    let start = scratch.len();
+    let mut w = RespWriter::new(scratch, Protocol::Resp2);
+    match apply_nsfan(shared, argv) {
+        Ok(()) => w.simple("OK"),
+        Err(e) => crate::admin::ns_error(e, &mut w),
+    }
+    staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+    true
+}
+
+fn apply_nsfan<O: PlaneObserver + 'static>(
+    shared: &Shared<O>,
+    argv: &[&[u8]],
+) -> Result<(), inf_store::NsError> {
+    use inf_store::NsError;
+    let malformed = NsError::InvalidName; // internal vocabulary; never client-visible
+    if argv.len() == 3 && argv[1].eq_ignore_ascii_case(b"DROP") {
+        return shared.store.borrow_mut().ns_drop(argv[2]);
+    }
+    if argv.len() != 8 || !argv[1].eq_ignore_ascii_case(b"CREATE") {
+        return Err(malformed);
+    }
+    fn parse_str(b: &[u8]) -> Result<&str, inf_store::NsError> {
+        core::str::from_utf8(b).map_err(|_| inf_store::NsError::InvalidName)
+    }
+    let mode = NsMode::parse(parse_str(argv[3])?).ok_or_else(|| malformed.clone())?;
+    let fsync = match argv[4] {
+        b"-" => None,
+        b"everysec" => Some(FsyncClass::Everysec),
+        b"always" => Some(FsyncClass::Always),
+        _ => return Err(malformed),
+    };
+    let policy = match argv[5] {
+        b"-" => None,
+        p => {
+            Some(inf_store::EvictionPolicy::parse(parse_str(p)?).ok_or_else(|| malformed.clone())?)
+        }
+    };
+    let maxmemory = match argv[6] {
+        b"-" => None,
+        b => Some(parse_str(b)?.parse::<u64>().map_err(|_| malformed.clone())?),
+    };
+    let id: u32 = parse_str(argv[7])?.parse().map_err(|_| malformed.clone())?;
+    shared.store.borrow_mut().ns_create(inf_store::NsSpec {
+        id: NsId(id),
+        name: argv[2].to_vec(),
+        mode,
+        fsync,
+        policy,
+        maxmemory,
+    })
 }
 
 /// One cell's data plane. Construct per cell, drive with
@@ -439,6 +669,8 @@ pub struct ServerPlane<O: PlaneObserver + 'static = NoopObserver> {
     /// Last CONFIG-store version pushed into the keyspace (M1-E3
     /// `hot-per-cell` sweep — one u64 compare per MAINTAIN, no re-parse).
     config_pushed: u64,
+    /// The everysec wheel key was armed (M2-S05; once per plane).
+    everysec_armed: bool,
 }
 
 /// An owner-side reply produced during the FABRIC-IN drain (ranges index
@@ -489,6 +721,10 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
                 pub_queue: RefCell::new(VecDeque::new()),
                 pub_pump_active: Cell::new(false),
                 cob_pubsub: Cell::new((0, 0, 0)),
+                durable: RefCell::new(None),
+                control: RefCell::new(None),
+                ddl_waiters: WaitList::new(),
+                ddl_epoch_seen: Cell::new(0),
             }),
             listener,
             started: false,
@@ -499,7 +735,26 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
             expiry_lag: 0,
             // MAX forces one push on the first MAINTAIN (boot-time config).
             config_pushed: u64::MAX,
+            everysec_armed: false,
         }
+    }
+
+    /// Enables the durable plane for this cell (M2-S08): the assembly runs
+    /// recovery first (`recover::open_cell_log`) and hands the tail-opened
+    /// rotor here, before the loop starts.
+    pub fn enable_durable(&mut self, staging: StagingConfig, rotor: SegmentRotor<StdSegmentFs>) {
+        *self.shared.durable.borrow_mut() = Some(DurableCell::new(staging, rotor));
+    }
+
+    /// Wires the node control-thread handle (DDL id allocation + catalog
+    /// persistence — ADR-0015 D2/D3).
+    pub fn set_control(&mut self, control: Arc<ControlHandle>) {
+        *self.shared.control.borrow_mut() = Some(control);
+    }
+
+    /// Durable counters for tests/stats (`None` = memory-only cell).
+    pub fn durable_stats(&self) -> Option<crate::durable::DurableStats> {
+        self.shared.durable.borrow().as_ref().map(DurableCell::stats)
     }
 
     /// Wires this plane's slot of the doorbell-wakeup park board (the same
@@ -575,6 +830,12 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
         if pubsub::is_plane_pubsub(meta.id) {
             return true;
         }
+        // INF.NS always dispatches on the pump (M2-S08): CREATE/DROP run
+        // the DDL program (id allocation + catalog persist) even on a
+        // 1-cell node; USE is a conn-state barrier there.
+        if meta.id == CommandId::InfNs {
+            return true;
+        }
         if self.shared.route_local_only {
             return false;
         }
@@ -612,6 +873,7 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                         proto: Protocol::Resp2,
                         id: 0,
                         db: 0,
+                        ns: None,
                         sub_channels: Vec::new(),
                         sub_patterns: Vec::new(),
                         node: Rc::clone(&self.shared.node),
@@ -673,9 +935,16 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                     }
                 }
             }
-            CompletionResult::Error { buf, .. } => {
+            CompletionResult::Error { buf, errno } => {
                 if let Some(buf) = buf {
                     cx.pool.release(buf);
+                }
+                // Log-op failures are fail-stop territory (§8.4), never
+                // connection housekeeping.
+                if matches!(c.token.class(), TokenClass::LogWrite | TokenClass::Fsync) {
+                    let mut durable = self.shared.durable.borrow_mut();
+                    let cell = durable.as_mut().expect("log completion without durable plane");
+                    cell.on_log_error(c.token, errno);
                 }
                 let key = Self::key_of(c.token);
                 let live = self
@@ -689,11 +958,27 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                     self.initiate_close(cx, key);
                 }
             }
-            // Log file ops (M2-S05): the server plane issues none until the
-            // durable-namespace wiring lands (M2-S08, ADR-0013).
-            CompletionResult::LogWritten | CompletionResult::Synced => {
-                unreachable!("no log ops are issued before M2-S08")
+            // Log file ops (M2-S05/S08, ADR-0013 D2): route into the
+            // durable cell — lease release on the write's terminal
+            // completion, watermark advance + gated-ack wakes on Synced.
+            CompletionResult::LogWritten => {
+                let mut durable = self.shared.durable.borrow_mut();
+                let cell = durable.as_mut().expect("LogWritten without durable plane");
+                cell.on_log_written();
             }
+            CompletionResult::Synced => {
+                let mut durable = self.shared.durable.borrow_mut();
+                let cell = durable.as_mut().expect("Synced without durable plane");
+                cell.on_synced(c.token, cx.now);
+            }
+        }
+    }
+
+    fn on_timer(&mut self, cx: &mut LoopCx<'_>, key: u64) {
+        if key == EVERYSEC_TIMER_KEY
+            && let Some(cell) = self.shared.durable.borrow_mut().as_mut()
+        {
+            cell.on_everysec_tick(cx);
         }
     }
 
@@ -730,9 +1015,20 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
         let staged = &mut self.staged_replies;
         let mut orphans: u64 = 0;
         let mut pubs: Vec<OwnerPub> = Vec::new();
+        let mut gated: Vec<GatedReply> = Vec::new();
         let now = cx.now;
         let drained = shared.fabric.borrow_mut().drain(FABRIC_DRAIN_MAX, |from, op| {
-            handle_fabric_op(shared, now, from, op, scratch, staged, &mut pubs, &mut orphans);
+            handle_fabric_op(
+                shared,
+                now,
+                from,
+                op,
+                scratch,
+                staged,
+                &mut pubs,
+                &mut gated,
+                &mut orphans,
+            );
         });
         if drained == 0 {
             return;
@@ -768,6 +1064,25 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
             }
         }
         drop(fabric);
+        // Owner-side `always` applies (M2-S08, ADR-0015 D6): the fabric
+        // reply itself is deferred — a future awaits this cell's ack gate,
+        // then publishes the reply (flushed by the next FABRIC-OUT). The
+        // client-visible ack never precedes the owning cell's fsync.
+        for g in gated {
+            let shared = Rc::clone(&self.shared);
+            let _ = cx.executor.poll_immediate(async move {
+                let waiter = {
+                    let durable = shared.durable.borrow();
+                    durable
+                        .as_ref()
+                        .expect("gated reply implies durable plane")
+                        .ack_gate
+                        .waiter(g.seq)
+                };
+                waiter.await;
+                shared.fabric.borrow_mut().reply(g.to, g.token, &Outcome::Bytes(&g.reply));
+            });
+        }
         // Fabric-origin PUBLISHes fan out on this cell's owner pump (one
         // long-lived FIFO future — arrival order is delivery order). The
         // reply to each publisher ships when its fan acks return.
@@ -788,6 +1103,10 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                 listener: self.listener,
                 token: CompletionToken::new(TokenClass::Accept, 0, 0),
             });
+        }
+        if !self.everysec_armed && self.shared.durable.borrow().is_some() {
+            self.everysec_armed = true;
+            cx.timers.insert(cx.now + Nanos::from_secs(1), EVERYSEC_TIMER_KEY);
         }
         self.shared.now.set(cx.now);
         // DEBUG SLEEP stall: connection processing pauses (inbox buffers
@@ -826,9 +1145,14 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                     match parsed {
                         Parsed::Command(argv) | Parsed::Inline(argv) => {
                             commands += 1;
+                            // Named-namespace commands always ride the pump
+                            // (M2-S08): durable acks suspend, staging
+                            // admission may park, and emission lives there —
+                            // one `Option` load on the memory fast path.
                             let defer = pump_was_active
                                 || spawn_first.is_some()
                                 || !deferred.is_empty()
+                                || conn_cx.ns.is_some()
                                 || self.needs_fabric(&argv);
                             if defer {
                                 let owned = OwnedCmd::from_argv(&argv);
@@ -954,6 +1278,29 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                 cx.charge(GroupClass::Maintenance, units);
             }
         }
+        // ---- durable plane (M2-S08): segment prealloc rides MAINTAIN
+        // (rotation stays a pointer swap — S02); durable counters flush
+        // into NodeInfo for INFO persistence (S21 vocabulary).
+        if let Some(cell) = self.shared.durable.borrow_mut().as_mut() {
+            cell.maintain(cx.now.as_millis());
+            let stats = cell.stats();
+            let node = &self.shared.node;
+            node.log_records_appended.set(stats.records_appended);
+            node.log_pending_bytes.set(stats.pending_log_bytes);
+            node.log_last_durable_lsn.set(stats.last_durable_lsn);
+            node.log_watermark_lag.set(stats.watermark_lag_lsn);
+            node.log_fsyncs_completed.set(stats.fsyncs_completed);
+            node.log_acks_gated.set(stats.acks_gated);
+        }
+        // ---- DDL persist wakes (ADR-0015 D3): one relaxed load per
+        // MAINTAIN; parked DDL pumps wake on epoch edges.
+        if let Some(control) = self.shared.control.borrow().as_ref() {
+            let epoch = control.persisted_epoch();
+            if epoch != self.shared.ddl_epoch_seen.get() {
+                self.shared.ddl_epoch_seen.set(epoch);
+                self.shared.ddl_waiters.wake_all(0);
+            }
+        }
         // ---- stats flush
         let node = &self.shared.node;
         node.recv_dropped.set(self.shared.recv_dropped.get());
@@ -978,6 +1325,12 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
             }
         }
         node.conn_state_bytes.set(bytes as u64);
+    }
+
+    fn seal_log(&mut self, cx: &mut LoopCx<'_>) {
+        if let Some(cell) = self.shared.durable.borrow_mut().as_mut() {
+            cell.seal_log(cx);
+        }
     }
 
     fn respond(&mut self, cx: &mut LoopCx<'_>) {
@@ -1056,6 +1409,7 @@ fn handle_fabric_op<O: PlaneObserver + 'static>(
     scratch: &mut Vec<u8>,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
     pubs: &mut Vec<OwnerPub>,
+    gated: &mut Vec<GatedReply>,
     orphans: &mut u64,
 ) {
     match op {
@@ -1098,10 +1452,16 @@ fn handle_fabric_op<O: PlaneObserver + 'static>(
             // ahead of `execute`, so it needs no registry entries and stays
             // invisible to clients (an `INF.PUBFAN` typed by a client is an
             // unknown command). One first-byte gate keys the comparisons.
-            if argv[0].first().is_some_and(|b| b | 0x20 == b'i')
-                && handle_pubsub_apply(shared, from, token, argv, scratch, staged, pubs)
-            {
-                return;
+            if argv[0].first().is_some_and(|b| b | 0x20 == b'i') {
+                if handle_pubsub_apply(shared, from, token, argv, scratch, staged, pubs) {
+                    return;
+                }
+                // Internal namespace-DDL fan (M2-S08): peers apply the
+                // origin-assigned spec; invisible to clients (unknown
+                // command if typed) — the INF.PUBFAN discipline.
+                if handle_ns_apply(shared, from, token, argv, scratch, staged) {
+                    return;
+                }
             }
             // `cmd` packs `{db:4 | proto:4}` (ADR-0009): the origin
             // connection's SELECTed database rides the existing byte — no
@@ -1123,7 +1483,15 @@ fn handle_fabric_op<O: PlaneObserver + 'static>(
                 staged.push((from, token, StagedReply::Int(n)));
             } else {
                 let start = scratch.len();
-                shared.execute_owned_into(ExecOrigin::Fabric(from), argv, proto, 0, db, scratch);
+                shared.execute_owned_into(
+                    ExecOrigin::Fabric(from),
+                    argv,
+                    proto,
+                    0,
+                    db,
+                    None,
+                    scratch,
+                );
                 staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
             }
         }
@@ -1142,9 +1510,27 @@ fn handle_fabric_op<O: PlaneObserver + 'static>(
                 if hit { StagedReply::Bytes(start, scratch.len()) } else { StagedReply::Nil };
             staged.push((from, token, reply));
         }
+        Op::ApplyNs { token, cmd, ns, args, .. } => {
+            // Named-namespace apply (M2-S08, ADR-0015 D1): the namespace
+            // travels as an explicit id; the owner resolves class and
+            // semantics authoritatively (never trusting the origin).
+            let argv = args.as_slice();
+            let proto = if cmd & 0x0F == 3 { Protocol::Resp3 } else { Protocol::Resp2 };
+            let start = scratch.len();
+            match shared.execute_ns_owned(from, argv, proto, NsId(ns), scratch) {
+                NsApplyOutcome::Reply => {
+                    staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+                }
+                NsApplyOutcome::Gated(seq) => {
+                    let reply = scratch[start..].to_vec();
+                    scratch.truncate(start);
+                    gated.push(GatedReply { to: from, token, seq, reply });
+                }
+            }
+        }
         Op::Batch { ops } => {
             for nested in ops {
-                handle_fabric_op(shared, now, from, nested, scratch, staged, pubs, orphans);
+                handle_fabric_op(shared, now, from, nested, scratch, staged, pubs, gated, orphans);
             }
         }
         // The M0 plane speaks Apply; a typed Write from a future peer gets
@@ -1174,6 +1560,10 @@ enum PendingReply {
     /// Fanned MSET / scattered FLUSH: all legs must come back `+OK` (the
     /// first error leg wins the reply otherwise).
     AllOk { waiters: Vec<GateWait<u64, OwnedOutcome>>, proto: Protocol },
+    /// `always` durable write (M2-S08): the reply bytes are staged but the
+    /// slot resolves only once the fsync watermark covers the record's
+    /// durable seq (§8.2 — ack after fsync; FIFO per connection holds).
+    Durable { waiter: inf_runtime::WatermarkWait, reply: Vec<u8> },
 }
 
 /// What the pump found when it asked the connection for more work.
@@ -1215,7 +1605,13 @@ fn pop_or_quiesce<O: PlaneObserver + 'static>(
 /// every later reply serializes under; SELECT switches the database every
 /// later command routes to — M1-S08).
 fn is_conn_state(owned: &OwnedCmd) -> bool {
-    lookup(owned.arg(0)).is_some_and(|m| matches!(m.id, CommandId::Hello | CommandId::Select))
+    lookup(owned.arg(0)).is_some_and(|m| match m.id {
+        CommandId::Hello | CommandId::Select => true,
+        // `INF.NS USE` switches the namespace every later command routes
+        // to — the SELECT barrier class (M2-S08).
+        CommandId::InfNs => owned.argc() > 1 && owned.arg(1).eq_ignore_ascii_case(b"USE"),
+        _ => false,
+    })
 }
 
 /// The per-connection pump: dispatch commands in pipeline order with up to
@@ -1297,6 +1693,10 @@ async fn pump<O: PlaneObserver + 'static>(shared: Rc<Shared<O>>, key: ConnKey, f
                 }
                 reply
             }
+            PendingReply::Durable { waiter, reply } => {
+                waiter.await;
+                reply
+            }
             PendingReply::AllOk { waiters, proto } => {
                 let mut failure: Option<Vec<u8>> = None;
                 for waiter in waiters {
@@ -1363,7 +1763,9 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
     inflight: &mut usize,
 ) -> bool {
     let argv: Vec<&[u8]> = owned.slices();
-    let Some((proto, id, db)) = shared.with_conn(key, |c| (c.cx.proto, c.cx.id, c.cx.db)) else {
+    let Some((proto, id, db, conn_ns)) =
+        shared.with_conn(key, |c| (c.cx.proto, c.cx.id, c.cx.db, c.cx.ns))
+    else {
         return false;
     };
     let origin = ExecOrigin::Conn(key.slot, key.generation);
@@ -1409,6 +1811,30 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
     match meta {
         Some(meta) if well_formed && pubsub::is_plane_pubsub(meta.id) => {
             return dispatch_pubsub(shared, key, meta.id, &argv, proto, pending, inflight).await;
+        }
+        // Namespace DDL (M2-S08, ADR-0015 D2/D3): id allocation, local
+        // apply, peer fan, catalog persist — on every node shape (1-cell
+        // included), which is why `needs_fabric` routes all INF.NS here.
+        Some(meta)
+            if well_formed
+                && meta.id == CommandId::InfNs
+                && argv.get(1).is_some_and(|s| {
+                    s.eq_ignore_ascii_case(b"CREATE") || s.eq_ignore_ascii_case(b"DROP")
+                }) =>
+        {
+            let reply = program_ns_ddl(shared, origin, proto, id, db, &argv).await;
+            pending.push_back(PendingReply::Done(reply));
+        }
+        // Named-namespace commands (M2-S08): single-owner shape — local
+        // execution with durable admission/emission/gating, or a whole-argv
+        // `ApplyNs` to the owning cell. Conn-state (SELECT/HELLO/USE) falls
+        // through to the mirror arm below.
+        Some(meta) if well_formed && conn_ns.is_some() && !is_conn_state(owned) => {
+            let ns = conn_ns.expect("guarded");
+            return dispatch_ns(
+                shared, key, origin, meta, &argv, proto, id, db, ns, pending, inflight,
+            )
+            .await;
         }
         Some(meta)
             if well_formed
@@ -1501,7 +1927,7 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
             for k in &argv[1..] {
                 if shared.router.is_local(k, shared.cell) {
                     let mut buf = shared.take_reply_buf();
-                    shared.execute_owned_into(origin, &[b"GET", k], proto, id, db, &mut buf);
+                    shared.execute_owned_into(origin, &[b"GET", k], proto, id, db, None, &mut buf);
                     parts.push(GatherPart::Done(buf));
                 } else {
                     match send_apply(shared, owner_of(k), proto, db, &[b"GET", k]).await {
@@ -1535,6 +1961,7 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
                             proto,
                             id,
                             db,
+                            None,
                             &mut buf,
                         );
                         if buf.first() == Some(&b'-') && failure.is_none() {
@@ -1610,6 +2037,7 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
                     proto: c.cx.proto,
                     id: c.cx.id,
                     db: c.cx.db,
+                    ns: c.cx.ns,
                     // Cold path: HELLO/SELECT execute under the live
                     // subscription view (the RESP2 subscriber restriction
                     // applies to HELLO exactly as in Redis).
@@ -1626,9 +2054,10 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
                 shared.with_conn(key, |c| {
                     c.cx.proto = live.proto;
                     c.cx.db = live.db;
+                    c.cx.ns = live.ns;
                 });
             } else {
-                shared.execute_owned_into(origin, &argv, proto, id, db, &mut reply);
+                shared.execute_owned_into(origin, &argv, proto, id, db, conn_ns, &mut reply);
                 if let Some(dur) = stall_request(&argv) {
                     shared.stall_until.set(shared.now.get().saturating_add(dur));
                 }
@@ -1711,7 +2140,7 @@ fn run_local<O: PlaneObserver + 'static>(
     argv: &[&[u8]],
 ) -> Vec<u8> {
     let mut reply = shared.take_reply_buf();
-    shared.execute_owned_into(origin, argv, proto, id, db, &mut reply);
+    shared.execute_owned_into(origin, argv, proto, id, db, None, &mut reply);
     reply
 }
 
@@ -2538,6 +2967,231 @@ fn extract_keys_slices<'a>(meta: &inf_wire::CommandMeta, argv: &[&'a [u8]]) -> V
         i += usize::from(spec.step);
     }
     keys
+}
+
+/// One named-namespace command on the pump (M2-S08). Returns `false` when
+/// the connection is gone.
+#[allow(clippy::too_many_arguments)] // the pump dispatch context
+async fn dispatch_ns<O: PlaneObserver + 'static>(
+    shared: &Rc<Shared<O>>,
+    key: ConnKey,
+    origin: ExecOrigin,
+    meta: &'static inf_wire::CommandMeta,
+    argv: &[&[u8]],
+    proto: Protocol,
+    id: u64,
+    db: u16,
+    ns: NsId,
+    pending: &mut VecDeque<PendingReply>,
+    inflight: &mut usize,
+) -> bool {
+    // The registry is authoritative: a dropped namespace answers a typed
+    // error before any routing.
+    let class = {
+        let ks = shared.store.borrow();
+        if ks.ns_get_by_id(ns).is_none() {
+            pending.push_back(PendingReply::Done(error_reply(
+                shared,
+                proto,
+                "ERR the selected namespace was dropped (INF.NS USE again)",
+            )));
+            return true;
+        }
+        ks.ns_fsync_class(ns)
+    };
+    let keys = extract_keys_slices(meta, argv);
+    let owner_of = |k: &[u8]| shared.router.cell_of(SlotRouter::slot_of(k));
+    if !keys.is_empty() && !shared.route_local_only {
+        let owner = owner_of(keys[0]);
+        if keys[1..].iter().any(|k| owner_of(k) != owner) {
+            // Recorded M2 limitation (ADR-0015 deviations): multi-key
+            // commands spanning cells bind with the M3 named-ns programs.
+            pending.push_back(PendingReply::Done(error_reply(
+                shared,
+                proto,
+                "ERR multi-key commands spanning cells are not yet supported in named namespaces (M2)",
+            )));
+            return true;
+        }
+        if owner.0 != shared.cell.0 {
+            match send_apply_ns(shared, owner, proto, ns, argv).await {
+                Ok(waiter) => {
+                    *inflight += 1;
+                    pending.push_back(PendingReply::Remote { waiter, proto });
+                }
+                Err(refusal) => pending.push_back(PendingReply::Done(refusal)),
+            }
+            return true;
+        }
+    }
+    // Local path: durable admission parks on the drain waitlist instead of
+    // erroring (bounded-everything; the owner-side refusal is fabric-only).
+    let is_write = meta.flags.contains(CmdFlags::WRITE);
+    if class.is_some() && is_write {
+        loop {
+            match shared.durable_admission(ns, meta, argv) {
+                None => break,
+                Some(refusal) if !refusal.starts_with("BUSY") => {
+                    pending.push_back(PendingReply::Done(error_reply(shared, proto, refusal)));
+                    return true;
+                }
+                Some(_full) => {
+                    let wait = {
+                        let durable = shared.durable.borrow();
+                        durable.as_ref().expect("durable admission ran").drained.wait(())
+                    };
+                    wait.await;
+                }
+            }
+        }
+    }
+    let mut reply = shared.take_reply_buf();
+    shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), &mut reply);
+    if is_write
+        && reply.first() != Some(&b'-')
+        && let Some(class) = class
+        && let Some(seq) = shared.stage_durable_effects(ns, meta, argv, class)
+        && class == FsyncClass::Always
+    {
+        let waiter = {
+            let mut durable = shared.durable.borrow_mut();
+            let cell = durable.as_mut().expect("staged above");
+            cell.note_gated_ack();
+            cell.ack_gate.waiter(seq)
+        };
+        pending.push_back(PendingReply::Durable { waiter, reply });
+        return shared.with_conn(key, |_| ()).is_some();
+    }
+    pending.push_back(PendingReply::Done(reply));
+    true
+}
+
+/// The namespace-DDL program (M2-S08, ADR-0015 D2/D3): parse → allocate id
+/// (CREATE) → apply locally → fan `INF.NSFAN` to every peer (AllOk) →
+/// persist the catalog through the control thread → `+OK` only after the
+/// swap is durable.
+async fn program_ns_ddl<O: PlaneObserver + 'static>(
+    shared: &Rc<Shared<O>>,
+    origin: ExecOrigin,
+    proto: Protocol,
+    id: u64,
+    db: u16,
+    argv: &[&[u8]],
+) -> Vec<u8> {
+    let _ = (origin, id, db);
+    let Some(control) = shared.control.borrow().clone() else {
+        return error_reply(
+            shared,
+            proto,
+            "ERR namespace DDL requires the node control plane (planeless tier is read-only here)",
+        );
+    };
+    let create = argv[1].eq_ignore_ascii_case(b"CREATE");
+    let fan: Vec<Vec<u8>> = if create {
+        let draft = match crate::admin::parse_ns_create(argv) {
+            Ok(draft) => draft,
+            Err(msg) => return error_reply(shared, proto, &msg),
+        };
+        if draft.mode == NsMode::Durable && shared.durable.borrow().is_none() {
+            return error_reply(
+                shared,
+                proto,
+                "ERR this node has no durable storage (start infinityd with a data dir)",
+            );
+        }
+        let ns_id = control.alloc_ns_id();
+        let spec = draft.with_id(ns_id);
+        if let Err(e) = shared.store.borrow_mut().ns_create(spec.clone()) {
+            let mut reply = shared.take_reply_buf();
+            crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
+            return reply;
+        }
+        let fsync = spec.fsync.map_or("-", |f| match f {
+            FsyncClass::Everysec => "everysec",
+            FsyncClass::Always => "always",
+        });
+        let policy = spec.policy.map_or("-", inf_store::EvictionPolicy::name);
+        let maxmemory = spec.maxmemory.map_or_else(|| "-".to_string(), |b| b.to_string());
+        vec![
+            b"INF.NSFAN".to_vec(),
+            b"CREATE".to_vec(),
+            spec.name.clone(),
+            spec.mode.name().as_bytes().to_vec(),
+            fsync.as_bytes().to_vec(),
+            policy.as_bytes().to_vec(),
+            maxmemory.into_bytes(),
+            ns_id.to_string().into_bytes(),
+        ]
+    } else {
+        if argv.len() != 3 {
+            return error_reply(shared, proto, "ERR wrong number of arguments for 'INF.NS|DROP'");
+        }
+        if let Err(e) = shared.store.borrow_mut().ns_drop(argv[2]) {
+            let mut reply = shared.take_reply_buf();
+            crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
+            return reply;
+        }
+        vec![b"INF.NSFAN".to_vec(), b"DROP".to_vec(), argv[2].to_vec()]
+    };
+    // Fan to peers (AllOk — partial failure surfaces as the first error
+    // leg, the recorded M1 scatter semantics).
+    let fan_argv: Vec<&[u8]> = fan.iter().map(Vec::as_slice).collect();
+    let mut failure: Option<Vec<u8>> = None;
+    for cell in peer_cells(shared) {
+        if let Ok(waiter) = send_apply(shared, cell, proto, 0, &fan_argv).await
+            && let OwnedOutcome::Bytes(bytes) = waiter.await
+            && bytes.first() == Some(&b'-')
+            && failure.is_none()
+        {
+            failure = Some(bytes);
+        }
+    }
+    if let Some(error) = failure {
+        return error;
+    }
+    // Persist the catalog; ack only once the swap is durable (a DDL whose
+    // definition can vanish after +OK would be a §8.2 violation).
+    let epoch = control.request_persist(shared.store.borrow().export_catalog(control.next_ns_id()));
+    while !control.persisted(epoch) {
+        shared.ddl_waiters.wait(0).await;
+    }
+    simple_reply(shared, proto, "OK")
+}
+
+/// Ship `argv` to `to` as an `ApplyNs` (named-namespace op — ADR-0015 D1)
+/// and return the reply waiter. Mirrors [`send_apply`]; never RTT-recorded
+/// (`always` replies are owner-deferred and would mispair the queue).
+async fn send_apply_ns<O: PlaneObserver + 'static>(
+    shared: &Rc<Shared<O>>,
+    to: CellId,
+    proto: Protocol,
+    ns: NsId,
+    argv: &[&[u8]],
+) -> Result<GateWait<u64, OwnedOutcome>, Vec<u8>> {
+    let Some(args) = ApplyArgs::new(argv) else {
+        let mut reply = Vec::new();
+        RespWriter::new(&mut reply, proto).error("ERR too many arguments for cross-cell execution");
+        return Err(reply);
+    };
+    let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
+    let (token, waiter) = {
+        let mut fabric = shared.fabric.borrow_mut();
+        let token = fabric.next_token();
+        (token, shared.gate.waiter(token.0))
+    };
+    let proto_byte: u8 = match proto {
+        Protocol::Resp3 => 3,
+        Protocol::Resp2 => 2,
+    };
+    loop {
+        let op = Op::ApplyNs { token, slot, cmd: proto_byte, ns: ns.0, args };
+        let sent = shared.fabric.borrow_mut().send(to, &op);
+        match sent {
+            Ok(()) => break,
+            Err(SendError::NoCredit { .. }) => shared.credit_waiters.wait(to).await,
+        }
+    }
+    Ok(waiter)
 }
 
 /// Ship `argv` to `to` as an `Apply` and return the reply waiter, waiting

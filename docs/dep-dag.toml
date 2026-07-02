@@ -18,7 +18,10 @@ inf-wire = ["inf-foundation", "inf-simd"]
 # inf-log → inf-simd: hardware CRC32C kernel for frame/checkpoint/manifest
 # checksums (ADR-0011, M2-S01).
 inf-log = ["inf-foundation", "inf-alloc", "inf-simd"]
-inf-store = ["inf-foundation", "inf-alloc", "inf-simd"]
+# inf-store → inf-log: effect/record vocabulary (`NsId`, `FsyncClass`,
+# `RecordView`) for durable namespaces, the catalog encoding, and
+# `Keyspace::apply_record` replay (ADR-0012 D1 direction, ADR-0015 D7 wiring).
+inf-store = ["inf-foundation", "inf-alloc", "inf-simd", "inf-log"]
 inf-stream = ["inf-foundation", "inf-log", "inf-store"]
 inf-doc = ["inf-foundation", "inf-alloc"]
 inf-vector = ["inf-foundation", "inf-simd", "inf-alloc"]

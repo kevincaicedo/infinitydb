@@ -175,6 +175,14 @@ pub(crate) fn info(
         push(&mut text, "rdb_bgsave_in_progress:0");
         push(&mut text, "aof_enabled:0");
         push(&mut text, "aof_rewrite_in_progress:0");
+        // Durable-namespace gauges (M2-S08, this cell's slice — the S21
+        // counter set; control-plane aggregation lands with S21).
+        push(&mut text, &format!("log_records_appended:{}", node.log_records_appended.get()));
+        push(&mut text, &format!("pending_log_bytes:{}", node.log_pending_bytes.get()));
+        push(&mut text, &format!("last_durable_lsn:{}", node.log_last_durable_lsn.get()));
+        push(&mut text, &format!("watermark_lag_lsn:{}", node.log_watermark_lag.get()));
+        push(&mut text, &format!("fsyncs_completed:{}", node.log_fsyncs_completed.get()));
+        push(&mut text, &format!("acks_gated:{}", node.log_acks_gated.get()));
         text.push_str("\r\n");
     }
     let stats = ks.stats();
@@ -515,55 +523,51 @@ pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
 pub(crate) fn inf_ns(
     argv: &(impl Argv + ?Sized),
     ks: &mut Keyspace,
+    cx: &mut ConnCx,
     node: &NodeInfo,
     w: &mut RespWriter<'_>,
 ) {
     let sub = argv.arg(1);
     if sub.eq_ignore_ascii_case(b"CREATE") {
-        if argv.len() < 3 {
-            return arity_error("INF.NS|CREATE", w);
+        // On a node, INF.NS CREATE/DROP always ride the pump's DDL program
+        // (id allocation + catalog persist — ADR-0015 D2/D3); this arm is
+        // the planeless tier (compat candidate, embedded, unit tests):
+        // memory-mode only, ids allocated locally, nothing persisted.
+        let draft = match parse_ns_create(argv) {
+            Ok(draft) => draft,
+            Err(msg) => return w.error(&msg),
+        };
+        if draft.mode != NsMode::Memory {
+            return w.error(
+                "ERR durable namespaces need the node runtime (planeless tier is memory-only)",
+            );
         }
-        let name = argv.arg(2);
-        let mut spec =
-            NsSpec { name: name.to_vec(), mode: NsMode::Memory, policy: None, maxmemory: None };
-        let mut i = 3;
-        while i < argv.len() {
-            let opt = argv.arg(i);
-            if i + 1 >= argv.len() {
-                return w.error("ERR syntax error");
-            }
-            let value = argv.arg(i + 1);
-            if opt.eq_ignore_ascii_case(b"MODE") {
-                let Some(mode) =
-                    core::str::from_utf8(value).ok().and_then(|v| NsMode::parse(&v.to_lowercase()))
-                else {
-                    return w.error("ERR unknown namespace mode (memory|durable|topic)");
-                };
-                spec.mode = mode;
-            } else if opt.eq_ignore_ascii_case(b"EVICTION") {
-                let Some(policy) = core::str::from_utf8(value)
-                    .ok()
-                    .and_then(|v| EvictionPolicy::parse(&v.to_lowercase()))
-                else {
-                    return w.error("ERR unknown eviction policy");
-                };
-                spec.policy = Some(policy);
-            } else if opt.eq_ignore_ascii_case(b"MAXMEMORY") {
-                let Some(bytes) =
-                    core::str::from_utf8(value).ok().and_then(crate::config::parse_memory)
-                else {
-                    return w.error("ERR invalid MAXMEMORY value");
-                };
-                spec.maxmemory = Some(bytes);
-            } else {
-                return w.error("ERR syntax error");
-            }
-            i += 2;
-        }
-        match ks.ns_create(spec) {
+        let id = next_local_ns_id(ks);
+        match ks.ns_create(draft.with_id(id)) {
             Ok(()) => w.simple("OK"),
             Err(e) => ns_error(e, w),
         }
+    } else if sub.eq_ignore_ascii_case(b"USE") {
+        if argv.len() != 3 {
+            return arity_error("INF.NS|USE", w);
+        }
+        let name = argv.arg(2);
+        // `USE dbN` is SELECT symmetry: back to the default namespace.
+        if let Some(db) = default_db_index(name) {
+            cx.db = db as u16;
+            cx.ns = None;
+            let _ = ks.db_mut(db);
+            return w.simple("OK");
+        }
+        let Some(spec) = ks.ns_get(name) else {
+            return w
+                .error(&format!("ERR namespace '{}' not found", String::from_utf8_lossy(name)));
+        };
+        if spec.mode == NsMode::Topic {
+            return w.error("ERR topic namespaces are not addressable before M5");
+        }
+        cx.ns = Some(spec.id);
+        w.simple("OK")
     } else if sub.eq_ignore_ascii_case(b"DROP") {
         if argv.len() != 3 {
             return arity_error("INF.NS|DROP", w);
@@ -619,21 +623,33 @@ pub(crate) fn inf_ns(
         };
         let policy = spec.policy.map_or("inherit", EvictionPolicy::name).to_string();
         let maxmemory = spec.maxmemory.map_or("inherit".to_string(), |b| b.to_string());
-        w.map_header(6);
+        let fsync = spec.fsync.map_or("-", |f| match f {
+            inf_store::FsyncClass::Everysec => "everysec",
+            inf_store::FsyncClass::Always => "always",
+        });
+        // Named namespaces are addressable since M2-S08: live per-cell
+        // counters (same documented cell-slice scope as `INFO`).
+        let (keys, expires) = match ks.ns_store(spec.id) {
+            Some(store) => (store.len(), store.stats().ttl_live),
+            None => (0, 0),
+        };
+        w.map_header(8);
         for (k, v) in [
             ("name", String::from_utf8_lossy(&spec.name).into_owned()),
+            ("id", spec.id.0.to_string()),
             ("mode", spec.mode.name().to_string()),
+            ("fsync", fsync.to_string()),
             ("eviction", policy),
             ("maxmemory", maxmemory),
-            ("keys", "0".to_string()),
-            ("expires", "0".to_string()),
+            ("keys", keys.to_string()),
+            ("expires", expires.to_string()),
         ] {
             w.bulk(k.as_bytes());
             w.bulk(v.as_bytes());
         }
     } else {
         w.error(&format!(
-            "ERR Unknown subcommand or wrong number of arguments for '{}'. Try INF.NS CREATE|LIST|INFO|DROP.",
+            "ERR Unknown subcommand or wrong number of arguments for '{}'. Try INF.NS CREATE|USE|LIST|INFO|DROP.",
             String::from_utf8_lossy(sub)
         ));
     }
@@ -646,21 +662,110 @@ fn default_db_index(name: &[u8]) -> Option<usize> {
     (!rest.is_empty() && rest.len() <= 2 && n < inf_store::DEFAULT_DBS).then_some(n)
 }
 
-fn ns_error(e: NsError, w: &mut RespWriter<'_>) {
+pub(crate) fn ns_error(e: NsError, w: &mut RespWriter<'_>) {
     match e {
         NsError::Exists => w.error("ERR namespace already exists"),
         NsError::Unknown => w.error("ERR namespace not found"),
         NsError::ModeNotSupported(mode) => w.error(&format!(
-            "ERR namespace mode '{}' is not yet supported (InfinityDB M1 is memory-only; durable arrives with M2, topic with M5)",
+            "ERR namespace mode '{}' is not yet supported (topic namespaces arrive with M5)",
             mode.name()
         )),
         NsError::DefaultImmutable => {
             w.error("ERR db0..db15 are reserved default namespaces (SELECT)")
         }
-        NsError::InvalidName => w.error(
-            "ERR invalid namespace name (1..128 bytes of [a-zA-Z0-9_.-])",
+        NsError::InvalidName => {
+            w.error("ERR invalid namespace name (1..128 bytes of [a-zA-Z0-9_.-])")
+        }
+        NsError::FsyncRequiresDurable => {
+            w.error("ERR FSYNC applies to MODE durable namespaces only")
+        }
+        NsError::EvictionNotAllowedDurable => w.error(
+            "ERR durable namespaces do not evict (M2, ADR-0015); EVICTION applies to MODE memory",
         ),
     }
+}
+
+/// A parsed `INF.NS CREATE` before id assignment (the id comes from the
+/// node allocator on the pump path, or locally on the planeless tier).
+pub(crate) struct NsSpecDraft {
+    pub name: Vec<u8>,
+    pub mode: NsMode,
+    pub fsync: Option<inf_store::FsyncClass>,
+    pub policy: Option<EvictionPolicy>,
+    pub maxmemory: Option<u64>,
+}
+
+impl NsSpecDraft {
+    pub(crate) fn with_id(self, id: u32) -> NsSpec {
+        NsSpec {
+            id: inf_store::NsId(id),
+            name: self.name,
+            mode: self.mode,
+            fsync: self.fsync,
+            policy: self.policy,
+            maxmemory: self.maxmemory,
+        }
+    }
+}
+
+/// Parses `INF.NS CREATE name [MODE m] [FSYNC always|everysec]
+/// [EVICTION p] [MAXMEMORY b]` — shared by the planeless arm and the
+/// pump's DDL program (registry rules validate after id assignment).
+pub(crate) fn parse_ns_create(argv: &(impl Argv + ?Sized)) -> Result<NsSpecDraft, String> {
+    if argv.len() < 3 {
+        return Err("ERR wrong number of arguments for 'INF.NS|CREATE'".to_string());
+    }
+    let mut draft = NsSpecDraft {
+        name: argv.arg(2).to_vec(),
+        mode: NsMode::Memory,
+        fsync: None,
+        policy: None,
+        maxmemory: None,
+    };
+    let mut i = 3;
+    while i < argv.len() {
+        let opt = argv.arg(i);
+        if i + 1 >= argv.len() {
+            return Err("ERR syntax error".to_string());
+        }
+        let value = argv.arg(i + 1);
+        if opt.eq_ignore_ascii_case(b"MODE") {
+            draft.mode = core::str::from_utf8(value)
+                .ok()
+                .and_then(|v| NsMode::parse(&v.to_lowercase()))
+                .ok_or("ERR unknown namespace mode (memory|durable|topic)")?;
+        } else if opt.eq_ignore_ascii_case(b"FSYNC") {
+            draft.fsync = Some(match value.to_ascii_lowercase().as_slice() {
+                b"always" => inf_store::FsyncClass::Always,
+                b"everysec" => inf_store::FsyncClass::Everysec,
+                _ => return Err("ERR unknown FSYNC class (always|everysec)".to_string()),
+            });
+        } else if opt.eq_ignore_ascii_case(b"EVICTION") {
+            draft.policy = Some(
+                core::str::from_utf8(value)
+                    .ok()
+                    .and_then(|v| EvictionPolicy::parse(&v.to_lowercase()))
+                    .ok_or("ERR unknown eviction policy")?,
+            );
+        } else if opt.eq_ignore_ascii_case(b"MAXMEMORY") {
+            draft.maxmemory = Some(
+                core::str::from_utf8(value)
+                    .ok()
+                    .and_then(crate::config::parse_memory)
+                    .ok_or("ERR invalid MAXMEMORY value")?,
+            );
+        } else {
+            return Err("ERR syntax error".to_string());
+        }
+        i += 2;
+    }
+    Ok(draft)
+}
+
+/// Planeless-tier id allocation: past the registered maximum, floor 16.
+/// (Node ids come from the control allocator; this tier never persists.)
+fn next_local_ns_id(ks: &Keyspace) -> u32 {
+    ks.ns_iter().map(|s| s.id.0 + 1).max().unwrap_or(inf_store::FIRST_NAMED_NS_ID)
 }
 
 // ---- CLIENT ------------------------------------------------------------------

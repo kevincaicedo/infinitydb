@@ -407,6 +407,7 @@ dependencies = [
  "inf-alloc",
  "inf-fabric",
  "inf-foundation",
+ "inf-log",
  "inf-runtime",
  "inf-store",
  "inf-wire",
@@ -441,6 +442,7 @@ dependencies = [
  "criterion",
  "inf-alloc",
  "inf-foundation",
+ "inf-log",
  "inf-simd",
  "proptest",
 ]

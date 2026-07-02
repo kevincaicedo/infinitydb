@@ -1,9 +1,10 @@
 //! Injected filesystem seam (milestone M2 §3.3, L7): every durable-path
 //! file operation inf-log performs directly — segment creation and
-//! preallocation (MAINTAIN slices), seal fsync, boot-time directory scan —
-//! flows through [`SegmentFs`] so the deterministic-simulation tier can
-//! fault each one (the M2-S18 sim disk implements this trait; M2-S16 names
-//! the fault points).
+//! preallocation (MAINTAIN slices), seal fsync, boot-time directory scan,
+//! the META/MANIFEST atomic swap ([`crate::meta`], M2-S08/S11) — flows
+//! through [`SegmentFs`] so the deterministic-simulation tier can fault
+//! each one (the M2-S18 sim disk implements this trait; M2-S16 names the
+//! fault points).
 //!
 //! The *hot* path — the per-iteration frame `writev` + linked fdatasync —
 //! is not here: it rides `BackendDriver` file ops wired in M2-S05, where
@@ -64,6 +65,14 @@ pub trait SegmentFs {
     fn open_write(&self, path: &Path) -> io::Result<Self::File>;
     /// Open an existing segment read-only (sealed segments, recovery).
     fn open_read(&self, path: &Path) -> io::Result<Self::File>;
+    /// Atomically rename `from` onto `to`, replacing an existing `to`
+    /// (POSIX rename semantics) — the commit point of the META/MANIFEST
+    /// swap protocol (M2-S08/S11). A missing `from` is `NotFound`. Durable
+    /// only after the following `sync_dir`.
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// Remove a file; `NotFound` when it does not exist — callers clearing
+    /// staging debris (`META.new`) ignore that case explicitly.
+    fn remove_file(&self, path: &Path) -> io::Result<()>;
 }
 
 /// `std::fs`-backed tier for boot scan, dev, and integration tests.
@@ -129,6 +138,14 @@ impl SegmentFs for StdSegmentFs {
 
     fn open_read(&self, path: &Path) -> io::Result<Self::File> {
         Ok(StdSegmentFile(std::fs::File::open(path)?))
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
     }
 }
 
@@ -327,6 +344,34 @@ pub mod mem {
 
         fn open_read(&self, path: &Path) -> io::Result<Self::File> {
             self.open_write(path)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            let mut state = self.state.borrow_mut();
+            let parent = to.parent().unwrap_or_else(|| Path::new(""));
+            if !state.dirs.contains(parent) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no dir {}", parent.display()),
+                ));
+            }
+            let data = state.files.remove(from).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("no file {}", from.display()))
+            })?;
+            // Replaces an existing destination atomically, like POSIX rename.
+            state.files.insert(to.to_path_buf(), data);
+            Ok(())
+        }
+
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            let mut state = self.state.borrow_mut();
+            if state.files.remove(path).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no file {}", path.display()),
+                ));
+            }
+            Ok(())
         }
     }
 }

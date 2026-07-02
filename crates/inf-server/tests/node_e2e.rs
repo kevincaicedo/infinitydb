@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use inf_alloc::BufferPool;
 use inf_fabric::{Mesh, MeshConfig};
 use inf_foundation::CellId;
-use inf_foundation::time::StdClock;
+use inf_foundation::time::{Clock, StdClock};
 use inf_runtime::net::{bound_port, listen_reuseport};
 use inf_runtime::{BackendDriver, CellLoop, LoopConfig, UringDriver};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane};
@@ -29,6 +29,17 @@ struct Node {
 
 impl Node {
     fn start(cells: u16) -> Node {
+        Node::start_with(cells, None)
+    }
+
+    /// A node with the durable plane enabled (M2-S08): catalog loaded and
+    /// seeded before cells serve, per-cell log recovery, control thread as
+    /// the catalog's single writer — the boot order infinityd adopts.
+    fn start_durable(cells: u16, data_dir: &std::path::Path) -> Node {
+        Node::start_with(cells, Some(data_dir.to_path_buf()))
+    }
+
+    fn start_with(cells: u16, data_dir: Option<std::path::PathBuf>) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
         // Bind cell 0 first on an ephemeral port, then the rest join it.
         let first = listen_reuseport(0).expect("listen");
@@ -38,24 +49,58 @@ impl Node {
             listeners.push(listen_reuseport(port).expect("listen same port"));
         }
         let fabrics = Mesh::new(cells, MeshConfig { ring_capacity: 1024, data_credits: 256 });
+        // Catalog before cells (ADR-0015 D3): the id→definition map must
+        // exist before any cell replays records that name ids.
+        let boot = data_dir.map(|dir| {
+            let catalog = inf_server::load_catalog(&dir).expect("readable catalog");
+            let control = inf_server::spawn_control(dir.clone(), catalog.as_ref());
+            (dir, catalog, control)
+        });
         let mut handles = Vec::new();
         for (i, (fabric, listener)) in fabrics.into_iter().zip(listeners).enumerate() {
             let stop = Arc::clone(&stop);
+            let boot = boot.clone();
             handles.push(std::thread::spawn(move || {
                 let mut pool = BufferPool::new(256, 4096);
                 let mut driver = UringDriver::new(256).expect("uring");
                 driver.register_pool(&mut pool).expect("register");
                 let node = Rc::new(NodeInfo::default());
+                let mut ks = Keyspace::new(StoreConfig::default());
+                let mut durable = None;
+                if let Some((dir, catalog, control)) = &boot {
+                    if let Some(catalog) = catalog {
+                        ks.seed_catalog(catalog).expect("seed catalog");
+                    }
+                    let cfg = inf_server::DurableConfig {
+                        data_dir: dir.clone(),
+                        staging: inf_log::StagingConfig::default(),
+                        segment: inf_log::SegmentConfig {
+                            segment_bytes: 8 << 20, // small: tests rotate
+                            ..Default::default()
+                        },
+                    };
+                    let (internal_ms, unix_ms) = node.wall_anchor.get();
+                    let anchor = inf_store::WallAnchor { internal_ms, unix_ms };
+                    let now = StdClock::new().now();
+                    let (rotor, _stats) =
+                        inf_server::open_cell_log(&mut ks, i as u16, &cfg, anchor, now)
+                            .expect("cell log recovery");
+                    durable = Some((cfg, rotor, Arc::clone(control)));
+                }
                 let mut plane = ServerPlane::new(
                     CellId(i as u16),
                     cells,
                     listener.into_raw_fd(),
-                    Keyspace::new(StoreConfig::default()),
+                    ks,
                     fabric,
                     node,
                     NoopObserver,
                     false,
                 );
+                if let Some((cfg, rotor, control)) = durable {
+                    plane.enable_durable(cfg.staging, rotor);
+                    plane.set_control(control);
+                }
                 let config = LoopConfig {
                     park_default: Some(Duration::from_millis(5)),
                     ..Default::default()
@@ -442,4 +487,184 @@ fn many_connections_spread_across_cells() {
         read_exactly(&mut last, b"$1\r\nv\r\n");
     }
     node.stop();
+}
+
+// ---- M2-S08: durable namespaces ------------------------------------------------
+
+fn temp_data_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("inf-s08-{tag}-{}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("clear stale test dir");
+    }
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    dir
+}
+
+fn read_line(stream: &mut TcpStream) -> Vec<u8> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte).expect("read byte");
+        line.push(byte[0]);
+        if line.ends_with(b"\r\n") {
+            return line;
+        }
+    }
+}
+
+/// `INF.NS CREATE … MODE durable` goes live: create → USE → write → read,
+/// `always` acks return (after fsync — the reply itself is the proof the
+/// gate opened), then a full restart recovers both the namespace
+/// definition (catalog META) and the data (log replay). The S08 ACs
+/// "create durable ns → write → restart → recover" and "M1's error is
+/// gone", end to end over TCP.
+#[test]
+fn durable_namespace_survives_restart() {
+    let dir = temp_data_dir("restart");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"ledger"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // `always`: the +OK below is fsync-gated (§8.2 ack point).
+    c.write_all(&cmd(&[b"SET", b"acct:1", b"100"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"sess:9", b"tok", b"EX", b"1000"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"DEL", b"acct:gone"])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+    c.write_all(&cmd(&[b"GET", b"acct:1"])).expect("write");
+    read_exactly(&mut c, b"$3\r\n100\r\n");
+    let info = {
+        c.write_all(&cmd(&[b"INF.NS", b"INFO", b"ledger"])).expect("write");
+        let mut buf = vec![0u8; 512];
+        let n = c.read(&mut buf).expect("read info");
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    };
+    assert!(info.contains("always"), "INFO reports the fsync class: {info}");
+    drop(c);
+    node.stop();
+
+    // Restart on the same data dir: definition + data both present.
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"ledger"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"acct:1"])).expect("write");
+    read_exactly(&mut c, b"$3\r\n100\r\n");
+    c.write_all(&cmd(&[b"GET", b"acct:gone"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    // The replayed TTL is armed (exact value shifts with the test clock
+    // anchor; the deadline's existence is the replay assertion).
+    c.write_all(&cmd(&[b"TTL", b"sess:9"])).expect("write");
+    let ttl = read_line(&mut c);
+    assert!(ttl.starts_with(b":") && ttl != b":-1\r\n" && ttl != b":-2\r\n", "{ttl:?}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Mixed classes interleaved on one cell (§8.2 semantics table): `memory`,
+/// `everysec`, and `always` namespaces each honor their ack point, and the
+/// memory namespace appends zero log records (the L2 null-log case,
+/// counter-asserted through INFO persistence).
+#[test]
+fn mixed_classes_share_one_cell_and_memory_stays_off_the_log() {
+    let dir = temp_data_dir("mixed");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+
+    for create in [
+        &cmd(&[b"INF.NS", b"CREATE", b"cache2", b"MODE", b"memory"]),
+        &cmd(&[b"INF.NS", b"CREATE", b"sess", b"MODE", b"durable", b"FSYNC", b"everysec"]),
+        &cmd(&[b"INF.NS", b"CREATE", b"led", b"MODE", b"durable", b"FSYNC", b"always"]),
+    ] {
+        c.write_all(create).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    // Interleave writes across the three classes on one connection (one
+    // cell ⇒ one shared frame/fsync per iteration by construction).
+    for (ns, key, value) in [
+        (&b"cache2"[..], &b"k"[..], &b"mem"[..]),
+        (b"sess", b"k", b"sec"),
+        (b"led", b"k", b"alw"),
+        (b"cache2", b"k2", b"mem2"),
+        (b"led", b"k2", b"alw2"),
+    ] {
+        c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"SET", key, value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    for (ns, key, want) in [
+        (&b"cache2"[..], &b"k"[..], &b"$3\r\nmem\r\n"[..]),
+        (b"sess", b"k", b"$3\r\nsec\r\n"),
+        (b"led", b"k", b"$3\r\nalw\r\n"),
+    ] {
+        c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"GET", key])).expect("write");
+        read_exactly(&mut c, want);
+    }
+    // Zero-cost assert (M2-S09 mechanism): exactly the durable records —
+    // one everysec + two always SETs — hit the log; the two memory-ns SETs
+    // stayed off it. The gauge flushes via MAINTAIN, so poll briefly.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let info = loop {
+        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
+        let mut buf = vec![0u8; 2048];
+        let n = c.read(&mut buf).expect("read info");
+        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        if info.contains("log_records_appended:3") || Instant::now() > deadline {
+            break info;
+        }
+    };
+    assert!(info.contains("log_records_appended:3"), "2 always + 1 everysec, zero memory: {info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Cross-cell durable writes (ADR-0015 D1/D6): a 2-cell node, an `always`
+/// namespace, keys owned by both cells — remote writes ride `ApplyNs` and
+/// their acks return only after the OWNING cell's fsync (the deferred
+/// fabric reply), then every key survives restart.
+#[test]
+fn durable_cross_cell_applyns_round_trip() {
+    let dir = temp_data_dir("xcell");
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"led2", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"led2"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let k0 = key_for_cell(2, 0);
+    let k1 = key_for_cell(2, 1);
+    for (k, v) in [(&k0, &b"zero"[..]), (&k1, b"one")] {
+        c.write_all(&cmd(&[b"SET", k, v])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    for (k, want) in [(&k0, &b"$4\r\nzero\r\n"[..]), (&k1, b"$3\r\none\r\n")] {
+        c.write_all(&cmd(&[b"GET", k])).expect("write");
+        read_exactly(&mut c, want);
+    }
+    drop(c);
+    node.stop();
+
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"led2"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for (k, want) in [(&k0, &b"$4\r\nzero\r\n"[..]), (&k1, b"$3\r\none\r\n")] {
+        c.write_all(&cmd(&[b"GET", k])).expect("write");
+        read_exactly(&mut c, want);
+    }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
 }
