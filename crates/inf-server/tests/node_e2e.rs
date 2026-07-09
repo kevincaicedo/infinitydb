@@ -1501,17 +1501,17 @@ fn memory_namespace_serves_while_durable_plane_is_exhausted() {
     let dir = temp_data_dir("enospc-live");
 
     // Seed one durable key on a healthy node, then restart exhausted.
+    // FSYNC always: the +OK gates on the fsync watermark, so the seeded
+    // frame is provably in the segment before `stop()`. An everysec ack
+    // promises nothing at the harness stop (crash-equivalent: no drain,
+    // the ring dies with the frame write still queued) — the seed was
+    // occasionally lost and recovery replayed zero records (the ~1/8
+    // full-suite flake this test carried).
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
         c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
-            b"led",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"everysec",
+            b"INF.NS", b"CREATE", b"led", b"MODE", b"durable", b"FSYNC", b"always",
         ]))
         .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
