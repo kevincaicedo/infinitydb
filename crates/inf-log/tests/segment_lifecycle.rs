@@ -6,12 +6,19 @@
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, StdSegmentFs};
 use inf_log::{
-    DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN, FrameBuilder, FrameIter, LogError, Lsn, NsId,
-    RecordView, SegmentConfig, SegmentId, SegmentRotor, create_cell_dirs, scan_log_dir,
+    DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN, FrameBuilder, FrameIter, FrameStamp, LogError, Lsn,
+    NsId, RecordView, SegmentConfig, SegmentId, SegmentRotor, create_cell_dirs, scan_log_dir,
 };
 use std::path::PathBuf;
 
 const SEGMENT_BYTES: u32 = 4096;
+
+/// Canonical v2 stamp for hand-built test frames (epoch 1, covered 0 —
+/// attests nothing). `seq` matters only where a test builds sequential
+/// frames the recovery policy will walk; readers/scanners ignore it.
+fn stamp(seq: u64) -> FrameStamp {
+    FrameStamp { epoch: 1, seq, covered_lsn: 0 }
+}
 
 fn cfg() -> SegmentConfig {
     SegmentConfig { segment_bytes: SEGMENT_BYTES, seal_after_ms: None }
@@ -29,7 +36,7 @@ fn append_frame(rotor: &mut SegmentRotor<MemFs>, filler: usize, now_ms: u64) -> 
     builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: &value });
     let slot = rotor.begin_frame(builder.frame_len(), now_ms).expect("reserve");
     let first_record_lsn = slot.first_record_lsn();
-    let frame = builder.finalize(first_record_lsn);
+    let frame = builder.finalize(first_record_lsn, stamp(1));
     rotor.commit_frame(slot, frame).expect("commit")
 }
 
@@ -110,7 +117,7 @@ fn enospc_surfaces_in_maintain_before_writes_need_it() {
         match rotor.begin_frame(builder.frame_len(), 0) {
             Ok(slot) => {
                 let lsn = slot.first_record_lsn();
-                let bytes = builder.finalize(lsn);
+                let bytes = builder.finalize(lsn, stamp(1));
                 rotor.commit_frame(slot, bytes).expect("commit within active");
             }
             Err(err) => break err,
@@ -188,7 +195,7 @@ fn std_fs_lifecycle_smoke() {
     let slot = rotor.begin_frame(builder.frame_len(), 0).expect("reserve");
     let lsn = slot.first_record_lsn();
     let first_end = {
-        let frame = builder.finalize(lsn);
+        let frame = builder.finalize(lsn, stamp(1));
         let base = rotor.commit_frame(slot, frame).expect("commit");
         assert_eq!(base, Lsn::new(SegmentId(0), 0));
         rotor.active_written()
@@ -205,7 +212,7 @@ fn std_fs_lifecycle_smoke() {
     let slot = rotor.begin_frame(builder.frame_len(), 0).expect("reserve");
     let lsn = slot.first_record_lsn();
     assert_eq!(lsn, Lsn::new(SegmentId(0), first_end + FRAME_HEADER_LEN as u32));
-    let frame = builder.finalize(lsn);
+    let frame = builder.finalize(lsn, stamp(2));
     rotor.commit_frame(slot, frame).expect("commit");
 
     // Replay the segment: exactly the two frames, in order.

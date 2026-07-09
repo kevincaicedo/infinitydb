@@ -506,7 +506,8 @@ impl CellPlane for DurablePlane {
                 cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
             }
             let end = slot.base().advance(frame_len);
-            let lease = self.staging.seal(slot.first_record_lsn());
+            let covered = self.commit.watermark().map_or(0, |lsn| lsn.to_u64());
+            let lease = self.staging.seal(slot.first_record_lsn(), covered);
             // Records have LSNs now: resolve the replay log + spawn gated
             // ack futures for `always` records (S06).
             for (at, idx) in self.pending_lsn_resolve.drain(..) {

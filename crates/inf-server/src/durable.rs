@@ -166,8 +166,12 @@ impl<F: SegmentFs> DurableCell<F> {
         ckpt: CkptCell<F>,
         manifest: ManifestCell<F>,
     ) -> DurableCell<F> {
+        // ADR-0031 D5/D6: frames sealed here stamp the recovery-derived
+        // log life (1 on fresh logs).
+        let mut staging = StagingRing::new(staging);
+        staging.set_frame_epoch(rotor.resume_epoch());
         DurableCell {
-            staging: StagingRing::new(staging),
+            staging,
             rotor,
             commit: GroupCommit::with_sync_pipeline(usize::from(sync_pipeline)),
             ack_gate: WatermarkGate::new(),
@@ -294,7 +298,8 @@ impl<F: SegmentFs> DurableCell<F> {
                 cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
             }
             let end = slot.base().advance(frame_len);
-            let lease = self.staging.seal(slot.first_record_lsn());
+            let covered = self.commit.watermark().map_or(0, |lsn| lsn.to_u64());
+            let lease = self.staging.seal(slot.first_record_lsn(), covered);
             // A pending ckpt-begin marker rides this frame: its LSN is now
             // real (ADR-0016 D3).
             self.ckpt.on_frame_sealed(&lease);
