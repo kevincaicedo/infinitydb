@@ -20,15 +20,18 @@
 pub mod ckpt;
 mod commit;
 mod effect;
+pub mod fault;
 mod frame;
 pub mod fs;
 mod lsn;
+pub mod manifest;
 pub mod meta;
 mod reader;
 mod record;
 mod scan;
 mod segment;
 mod staging;
+mod tail;
 
 pub use ckpt::{CkptConfig, IckStream, IckSummary, SectionLease};
 pub use commit::{CommitStats, FsyncClass, FsyncTicket, GroupCommit, SyncReason};
@@ -39,9 +42,15 @@ pub use frame::{
     decode_frame,
 };
 pub use lsn::{Lsn, SegmentId};
+pub use manifest::{
+    Manifest, ManifestDecodeError, manifest_envelope, read_manifest, write_manifest,
+};
 pub use reader::{ApplyError, DEFAULT_READ_CHUNK, ReadEnd, ReadError, ReaderConfig, SegmentReader};
 pub use record::{NsId, RecordDecodeError, RecordType, RecordView, decode_record};
-pub use scan::{CellDirs, ScanError, SegmentScan, create_cell_dirs, scan_log_dir};
+pub use scan::{
+    CellDirs, ScanError, ScanOutcome, SegmentScan, create_cell_dirs, create_cell_dirs_deferred,
+    scan_log_dir, scan_log_dir_from,
+};
 pub use segment::{
     DEFAULT_SEGMENT_BYTES, DeferredBegin, FrameSlot, FsyncFailed, LogError, MaintainReport,
     RotorStats, SealHandoff, SegmentConfig, SegmentRotor, parse_segment_file_name,
@@ -51,3 +60,4 @@ pub use staging::{
     DEFAULT_STAGING_BYTES, FrameLease, StagedAt, StagingConfig, StagingFull, StagingRing,
     StagingStats,
 };
+pub use tail::{LogCorruption, RegionScan, scan_region};

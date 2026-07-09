@@ -6,6 +6,9 @@ check:
     cargo fmt --all --check
     ./scripts/check-dep-dag.sh
     ./scripts/check-cell-denylist.sh
+    ./scripts/check-fault-points.sh
+    ./scripts/check-fsync-fail-stop.sh
+    ./scripts/check-panic-policy.sh
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
 
@@ -35,6 +38,19 @@ compat:
 # Deterministic simulator smoke scenario, twice, comparing traces.
 sim-smoke:
     cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
+
+# M2-S19 durability sweep (the §6 dst_sweep gate shape). Usage:
+#   just durable-sweep [seeds] [base]
+durable-sweep seeds="10000" base="0xD5EE0000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --bin inf-sim
+    out=$(mktemp -d)
+    for i in 0 1 2 3 4 5 6 7; do
+        ./target/release/inf-sim --scenario m2-durable --sweep {{seeds}} --seed {{base}} \
+            --shard "$i/8" --out "$out" & done
+    wait
+    cat "$out"/manifest-shard-*.txt
 
 # Competitive benchmark: drive memtier against redis + infinitydb (Phase-1 MVP),
 # render a markdown report under .artifacts/compare/. Pass extra flags through,

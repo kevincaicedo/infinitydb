@@ -10,8 +10,8 @@ pin lands with the M1-S14 release pipeline). Every declared-`full` behavior is
 byte-diffed against the oracle on every test run; any new deviation fails CI
 until it is allowlisted with a justification (L8 — honesty is total).
 
-**Corpus:** 378 byte-compared cases · 33 documented deviations · 0 tolerated failures.
-**Surface:** 65 commands — 47 full · 15 partial · 0 stub · 1 extension · 2 internal.
+**Corpus:** 378 byte-compared cases · 36 documented deviations · 0 tolerated failures.
+**Surface:** 68 commands — 47 full · 17 partial · 0 stub · 2 extension · 2 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
 are representational: ordering, identity payloads, opaque cursors/art);
@@ -86,6 +86,9 @@ program primitives, not a client surface.
 | `PUBLISH` | full | M1 | fast | 3 | 4 | a publisher subscribed to its own channel via a remote owner cell may receive its frame before the publish reply (local owners match Redis order) |
 | `PUBSUB` | partial | M1 | readonly | -2 | 8 | SHARDCHANNELS / SHARDNUMSUB arrive with sharded pub/sub (M3 cut line) |
 | `INF.NS` | extension | M1 | admin | -2 | 0 | namespace registry v1 — the M2 durability seam |
+| `INF.CKPT` | extension | M2 | admin | -1 | 0 | checkpoint operator surface (M2-S20): [CELL k] [WAIT]; WAIT returns after the new MANIFEST is durable — no fork, per-cell timing (ADR-0021) |
+| `BGSAVE` | partial | M2 | admin | -1 | 0 | maps onto INF.CKPT (fuzzy checkpoint, no fork, no RDB file); SCHEDULE accepted and moot; reply byte-identical; memory-only nodes answer a documented error |
+| `LASTSAVE` | partial | M2 | readonly fast | 1 | 0 | unix seconds of the newest durable MANIFEST publication; 0 before the first (Redis reports process-start time); loading flag docs-derived, not capture-verified |
 | `INF.TAKE` | internal | M1 | write fast | 2 | 0 | cross-cell RENAME/COPY program primitive |
 | `INF.PEEK` | internal | M1 | readonly fast | 2 | 0 | cross-cell COPY program primitive |
 
@@ -160,11 +163,23 @@ oracle by design.
 - InfinityDB extension; durable live since M2-S08 (node tier — the planeless compat candidate answers its documented no-runtime error)
 - InfinityDB extension (M2-S08): named-namespace selection, SELECT-class conn state; durable-mode deviations documented in ADR-0015
 
+### `INF.CKPT`
+
+- InfinityDB extension (M2-S20): checkpoint trigger; the planeless compat candidate answers its documented no-durable-plane error
+
+### `BGSAVE`
+
+- maps onto INF.CKPT (M2-S20): fuzzy checkpoint, no fork, no RDB file; reply byte-identical on durable nodes; the planeless candidate answers its documented error (node_e2e pins the live reply)
+
+### `LASTSAVE`
+
+- M2-S20: newest durable MANIFEST publication time; 0 before the first save vs Redis's process-start time; the planeless candidate answers its documented error
+
 ## Absent (owner milestone)
 
 | Family | Arrives |
 |---|---|
-| Persistence admin (SAVE, BGSAVE, INF.CKPT, …) | M2 — durability |
+| Persistence admin (SAVE, …) | M9 — RDB import/export |
 | Hashes, lists, sets, zsets, bitmaps, bitfield, HyperLogLog | M3 — data types |
 | Keyspace notifications, SLOWLOG, MONITOR, sharded pub/sub (SSUBSCRIBE/SPUBLISH) | M3 |
 | Connection control (QUIT, RESET) | M3 (RESET pairs with transaction state) |

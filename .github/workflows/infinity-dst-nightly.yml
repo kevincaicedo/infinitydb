@@ -1,13 +1,18 @@
 # InfinityDB nightly DST fleet (M1-S15): the simulator as a standing army.
 #
-# Every night: (1) the curated seed corpus replays at full size, (2) a fleet
-# of fresh seeds (derived from the run id — recorded in the log, replayable
-# verbatim) runs both scenarios with determinism verification, (3) seeded
-# 48 h virtual-time expiry campaigns push the simulated-seconds budget past
-# the master-plan target (≥ 1M sim-seconds/night, §17.1). Oracles armed in
-# every run: per-key linearizability (model replay), TTL semantics, pub/sub
-# delivery (confirmed ⇒ reachable, per-publisher FIFO, exact final ledger),
-# accounting reconciliation at quiescence.
+# Every night: (1) 12k m2-durable + 4k m2-combined seeds sweep on the S14
+# stall device (device-stall service time makes the group-commit / everysec
+# pathologies sim-visible), (2) the curated seed corpus replays at full size,
+# (3) a fleet of fresh m0/m1/boot-storm seeds (derived from the run id —
+# recorded in the log, replayable verbatim) runs with determinism
+# verification, (4) seeded 48 h virtual-time expiry campaigns push the
+# simulated-seconds budget past the master-plan target (≥ 1M sim-seconds/
+# night, §17.1). Oracles armed: per-key linearizability (model replay), TTL
+# semantics, pub/sub delivery (confirmed ⇒ reachable, per-publisher FIFO,
+# exact final ledger), accounting reconciliation at quiescence, §8.2 durable
+# admissible-set + survival audit, everysec ack-deferral (M2.5-S14),
+# L2 memory-volatility + log-scan (M2.5-S14), boot-storm fsync-free ready
+# path (M2.5-S01).
 #
 # A failure auto-files an issue carrying the exact scenario + seed + commit
 # (the determinism contract makes that a complete repro) and uploads the
@@ -28,6 +33,24 @@ permissions:
   issues: write
 
 jobs:
+  # M2-S17 (ADR-0020 D5): the kill-and-recover crash matrix with the
+  # expanded seed set. The per-PR tier runs via `cargo test --workspace`
+  # in infinity-ci on EVERY PR (strictly stronger than the plan's
+  # "required on PRs touching inf-log"); the nightly hunts
+  # seed-dependent states. Deterministic: the seed set is a fixed
+  # superset of the PR set — any failure reproduces locally with the
+  # same CRASH_MATRIX_SEEDS value (L7).
+  crash-matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: crash matrix (expanded seeds)
+        run: CRASH_MATRIX_SEEDS=256 cargo test -p crash-matrix -- --nocapture
+
   fleet:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -38,6 +61,48 @@ jobs:
           toolchain: 1.95.0
       - name: build (release)
         run: cargo build --release --bin inf-sim
+
+      - name: durability sweep (M2-S19; M2.5-S14 raised to 12k on the stall device)
+        run: |
+          base=$(( ${{ github.run_id }} % 0xFFFFFFFF ))
+          echo "durable sweep seed base: $base (run id ${{ github.run_id }})" | tee -a /tmp/fleet.log
+          # 12,000 m2-durable seeds across 8 shards (≥ 10k, S14 budget). The
+          # stall device (on by default in m2_durable) adds ~5–15%/seed; the
+          # wider sharding offsets it. Determinism-verified per seed by the
+          # runner's replay contract; any failing seed replays via --seed.
+          for i in 0 1 2 3 4 5 6 7; do
+            ./target/release/inf-sim --scenario m2-durable --sweep 12000 --seed "$base" \
+              --shard "$i/8" --out /tmp/durable-sweep >> /tmp/fleet.log 2>&1 &
+          done
+          wait
+          fail=0
+          for i in 0 1 2 3 4 5 6 7; do
+            grep -q " violations=0 " /tmp/durable-sweep/manifest-shard-$i.txt || {
+              echo "durable sweep shard $i has violations" | tee -a /tmp/fleet.log
+              grep VIOLATION /tmp/durable-sweep/results-shard-$i.txt | head -5 >> /tmp/failures.txt || true
+              fail=1
+            }
+          done
+          exit $fail
+
+      - name: combined sweep (M2.5-S14 — durable+memory+pub/sub+expiry, L2 oracles)
+        run: |
+          base=$(( ${{ github.run_id }} % 0xFFFFFFFF ))
+          echo "combined sweep seed base: $base" | tee -a /tmp/fleet.log
+          for i in 0 1 2 3 4 5 6 7; do
+            ./target/release/inf-sim --scenario m2-combined --sweep 4000 --seed "$base" \
+              --shard "$i/8" --out /tmp/combined-sweep >> /tmp/fleet.log 2>&1 &
+          done
+          wait
+          fail=0
+          for i in 0 1 2 3 4 5 6 7; do
+            grep -q " violations=0 " /tmp/combined-sweep/manifest-shard-$i.txt || {
+              echo "combined sweep shard $i has violations" | tee -a /tmp/fleet.log
+              grep VIOLATION /tmp/combined-sweep/results-shard-$i.txt | head -5 >> /tmp/failures.txt || true
+              fail=1
+            }
+          done
+          exit $fail
 
       - name: corpus replay (full size)
         run: |
@@ -54,10 +119,12 @@ jobs:
           echo "fleet seed base: $base (run id ${{ github.run_id }})" | tee -a /tmp/fleet.log
           fail=0
           for i in $(seq 0 24); do
-            for scenario in m0-smoke m1-cache; do
+            # boot-storm (M2.5-S14) joins the fresh-seed fleet — the wedge
+            # oracle as a standing scenario, not just the corpus.
+            for scenario in m0-smoke m1-cache boot-storm; do
               seed=$(( base + i * 7919 ))
               if ! ./target/release/inf-sim --scenario "$scenario" --seed "$seed" \
-                     --trace-out /tmp/last-trace.bin >> /tmp/fleet.log 2>&1; then
+                     --verify-determinism --trace-out /tmp/last-trace.bin >> /tmp/fleet.log 2>&1; then
                 echo "$scenario $seed" >> /tmp/failures.txt
                 cp /tmp/last-trace.bin "/tmp/trace-$scenario-$seed.bin" || true
                 fail=1

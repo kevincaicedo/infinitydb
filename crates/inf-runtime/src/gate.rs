@@ -23,8 +23,18 @@ use core::task::{Context, Poll, Waker};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::Rc;
 
+use inf_foundation::BuildIntHasher;
+
 use crate::driver::CompletionResult;
 use crate::token::CompletionToken;
+
+/// Gate tables key by internally-generated integer tokens (fabric tokens,
+/// completion tokens, cell ids) — never attacker-chosen input — so they use
+/// the trusted-integer hasher: one folded multiply per lookup instead of
+/// SipHash rounds. On the remote hot path every fabric op pays three table
+/// operations (register, complete, waiter poll); the S21 cycle split
+/// attributed ~2.2% of natural-leg cycles to `DefaultHasher` (M2.5 Phase H).
+type GateMap<K, V> = HashMap<K, V, BuildIntHasher>;
 
 // ---- KeyedGate (FabricGate / IoGate) ----------------------------------------
 
@@ -40,7 +50,7 @@ enum SlotState<V> {
 /// Single-waiter, value-carrying gate keyed by `K`. The primitive behind
 /// [`FabricGate`] and [`IoGate`].
 pub struct KeyedGate<K: Eq + Hash + Copy, V> {
-    slots: Rc<RefCell<HashMap<K, SlotState<V>>>>,
+    slots: Rc<RefCell<GateMap<K, SlotState<V>>>>,
 }
 
 impl<K: Eq + Hash + Copy, V> Default for KeyedGate<K, V> {
@@ -51,7 +61,7 @@ impl<K: Eq + Hash + Copy, V> Default for KeyedGate<K, V> {
 
 impl<K: Eq + Hash + Copy, V> KeyedGate<K, V> {
     pub fn new() -> KeyedGate<K, V> {
-        KeyedGate { slots: Rc::new(RefCell::new(HashMap::new())) }
+        KeyedGate { slots: Rc::new(RefCell::new(GateMap::default())) }
     }
 
     /// Register interest in `key` and get the future that resolves when
@@ -115,7 +125,7 @@ impl<K: Eq + Hash + Copy, V> core::fmt::Debug for KeyedGate<K, V> {
 /// deregisters the key; a late `complete` then returns `false` instead of
 /// waking a dead task.
 pub struct GateWait<K: Eq + Hash + Copy, V> {
-    slots: Rc<RefCell<HashMap<K, SlotState<V>>>>,
+    slots: Rc<RefCell<GateMap<K, SlotState<V>>>>,
     key: K,
     done: bool,
 }
@@ -177,7 +187,7 @@ struct Waiter {
     waker: RefCell<Option<Waker>>,
 }
 
-type WaitQueues<K> = Rc<RefCell<HashMap<K, VecDeque<Rc<Waiter>>>>>;
+type WaitQueues<K> = Rc<RefCell<GateMap<K, VecDeque<Rc<Waiter>>>>>;
 
 /// Key-keyed FIFO wait list for blocking ops (M1+: BLPOP, XREAD BLOCK…).
 /// Multiple tasks may wait on one key; `wake_one` hands the key to the
@@ -194,7 +204,7 @@ impl<K: Eq + Hash + Copy> Default for WaitList<K> {
 
 impl<K: Eq + Hash + Copy> WaitList<K> {
     pub fn new() -> WaitList<K> {
-        WaitList { queues: Rc::new(RefCell::new(HashMap::new())) }
+        WaitList { queues: Rc::new(RefCell::new(GateMap::default())) }
     }
 
     /// Join the FIFO for `key`. The future resolves when a mutation wakes
@@ -257,6 +267,11 @@ impl<K: Eq + Hash + Copy> core::fmt::Debug for WaitList<K> {
 
 fn wake_one_in<K: Eq + Hash + Copy>(queues: &WaitQueues<K>, key: K) -> bool {
     let mut map = queues.borrow_mut();
+    // Hot-path guard: credit wakes probe this per fabric reply and the list
+    // is empty unless a sender actually ran out of credits — skip the hash.
+    if map.is_empty() {
+        return false;
+    }
     let Some(queue) = map.get_mut(&key) else { return false };
     // Skip lazily-cancelled entries.
     let woken = loop {

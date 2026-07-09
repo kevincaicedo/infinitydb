@@ -12,6 +12,7 @@
 //! simulator driver implemented in `inf-sim` (M0-S20) against
 //! [`BackendDriver`].
 
+mod affinity;
 mod driver;
 mod executor;
 pub mod gate;
@@ -26,6 +27,7 @@ mod kqueue;
 #[cfg(all(target_os = "linux", feature = "uring"))]
 mod uring;
 
+pub use affinity::unpin_current_thread;
 pub use driver::{
     BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
     SubmitStats, Wait,

@@ -1,0 +1,30 @@
+[package]
+name = "crash-matrix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "M2-S17 crash matrix: {fault point} x {fsync policy} x {workload} kill-and-recover runner (ADR-0020)"
+
+[dependencies]
+inf-foundation.workspace = true
+inf-log.workspace = true
+inf-store.workspace = true
+inf-server.workspace = true
+
+[dev-dependencies]
+# The matrix arms named points; the feature reaches the library tiers
+# through dev-dependency unification only — `cargo build --workspace
+# --release` never carries the machinery (the M2-S16 cost contract).
+inf-foundation = { workspace = true, features = ["fault-points"] }
+
+# The fsyncgate row boots a real single-cell uring node in a child
+# process (ADR-0020 D3) — assembly parts, test-harness edges.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+inf-runtime = { workspace = true, features = ["uring"] }
+inf-alloc.workspace = true
+inf-fabric.workspace = true
+
+[lints]
+workspace = true

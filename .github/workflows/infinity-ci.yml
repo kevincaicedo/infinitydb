@@ -34,6 +34,10 @@ jobs:
         run: ./scripts/check-dep-dag.sh
       - name: cell deny-list
         run: ./scripts/check-cell-denylist.sh
+      - name: fault-point inventory (M2-S16)
+        run: ./scripts/check-fault-points.sh
+      - name: fsync fail-stop grep (M2-S17, §8.4)
+        run: ./scripts/check-fsync-fail-stop.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build

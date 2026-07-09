@@ -170,9 +170,41 @@ pub(crate) fn info(
     }
     if wants("persistence") {
         push(&mut text, "# Persistence");
-        push(&mut text, "loading:0");
+        // Boot-recovery fields (M2-S15): shapes mirror Redis (`loading:1`
+        // plus `loading_*` while a load is in progress — capture artifact
+        // `.artifacts/m2/loading-redis-capture-20260703/`); byte totals
+        // are file extents including preallocated slack (upper bound).
+        let loading = node.loading.get() != 0;
+        push(&mut text, &format!("loading:{}", u8::from(loading)));
+        if loading {
+            let (anchor_internal_ms, anchor_unix_ms) = node.wall_anchor.get();
+            let wall_now_ms = anchor_unix_ms + now.as_millis().saturating_sub(anchor_internal_ms);
+            let start_ms = node.loading_start_unix_ms.get();
+            let done = node.loading_loaded_bytes.get();
+            let total = node.loading_total_bytes.get();
+            let elapsed_ms = wall_now_ms.saturating_sub(start_ms);
+            let perc = if total > 0 { done as f64 * 100.0 / total as f64 } else { 0.0 };
+            let eta_s = if done > 0 {
+                let remaining = total.saturating_sub(done) as f64;
+                (elapsed_ms as f64 / 1000.0 * remaining / done as f64).ceil() as u64
+            } else {
+                0
+            };
+            push(&mut text, &format!("loading_start_time:{}", start_ms / 1000));
+            push(&mut text, &format!("loading_total_bytes:{total}"));
+            push(&mut text, &format!("loading_loaded_bytes:{done}"));
+            push(&mut text, &format!("loading_loaded_perc:{perc:.2}"));
+            push(&mut text, &format!("loading_eta_seconds:{eta_s}"));
+            // Extension fields (per-cell recovery is an InfinityDB shape).
+            push(&mut text, &format!("loading_cells_ready:{}", node.loading_cells_ready.get()));
+            push(&mut text, &format!("loading_cells:{}", node.cells.get()));
+        }
         push(&mut text, "rdb_changes_since_last_save:0");
-        push(&mut text, "rdb_bgsave_in_progress:0");
+        // M2-S20: BGSAVE maps onto the fuzzy checkpoint (no fork); the
+        // save time is the newest durable MANIFEST publication (board
+        // max across cells, unix seconds — the LASTSAVE currency).
+        push(&mut text, &format!("rdb_bgsave_in_progress:{}", node.ckpt_in_progress.get()));
+        push(&mut text, &format!("rdb_last_save_time:{}", node.rdb_last_save_ms.get() / 1000));
         push(&mut text, "aof_enabled:0");
         push(&mut text, "aof_rewrite_in_progress:0");
         // Durable-namespace gauges (M2-S08, this cell's slice — the S21
@@ -183,12 +215,35 @@ pub(crate) fn info(
         push(&mut text, &format!("watermark_lag_lsn:{}", node.log_watermark_lag.get()));
         push(&mut text, &format!("fsyncs_completed:{}", node.log_fsyncs_completed.get()));
         push(&mut text, &format!("acks_gated:{}", node.log_acks_gated.get()));
+        // M2-S22: frames queued (log_writes_per_iter numerator) + the
+        // staging domain's resident bytes (attribution observable).
+        push(&mut text, &format!("log_frames_queued:{}", node.log_frames_queued.get()));
+        push(&mut text, &format!("log_staging_bytes:{}", node.log_staging_bytes.get()));
+        // M2-S21: windowed rates (previous everysec tick window, injected
+        // clock) + fsync latency percentiles (HDR-class histogram, ~3%
+        // quantization — the §8.2 storage-bound honesty fields).
+        push(&mut text, &format!("fsyncs_per_sec:{}", node.fsyncs_per_sec.get()));
+        push(&mut text, &format!("acks_per_sec:{}", node.acks_per_sec.get()));
+        push(&mut text, &format!("fsync_latency_p50_us:{}", node.fsync_p50_us.get()));
+        push(&mut text, &format!("fsync_latency_p99_us:{}", node.fsync_p99_us.get()));
+        push(&mut text, &format!("fsync_latency_p999_us:{}", node.fsync_p999_us.get()));
+        // M2.5-S07: group formation — records covered per durability
+        // fsync (the >= 0.8x available-in-flight-writes gate observable).
+        push(&mut text, &format!("fsync_group_p50:{}", node.fsync_group_p50.get()));
+        push(&mut text, &format!("fsync_group_p99:{}", node.fsync_group_p99.get()));
         // Fuzzy-checkpoint gauges (M2-S10; `ckpt_age_s` derives at S21).
         push(&mut text, &format!("ckpts_completed:{}", node.ckpts_completed.get()));
         push(&mut text, &format!("ckpts_aborted:{}", node.ckpts_aborted.get()));
         push(&mut text, &format!("ckpt_last_unix_ms:{}", node.ckpt_last_unix_ms.get()));
         push(&mut text, &format!("ckpt_last_begin_lsn:{}", node.ckpt_last_begin_lsn.get()));
         push(&mut text, &format!("ckpt_buffer_bytes:{}", node.ckpt_buffer_bytes.get()));
+        push(&mut text, &format!("ckpt_age_s:{}", node.ckpt_age_s.get()));
+        // MANIFEST + truncation gauges (M2-S11 — the reclamation-bound
+        // observables: live segments stay bounded once truncation runs).
+        push(&mut text, &format!("manifests_published:{}", node.manifests_published.get()));
+        push(&mut text, &format!("manifests_aborted:{}", node.manifests_aborted.get()));
+        push(&mut text, &format!("segments_truncated:{}", node.segments_truncated.get()));
+        push(&mut text, &format!("log_segments_live:{}", node.log_segments_live.get()));
         text.push_str("\r\n");
     }
     let stats = ks.stats();

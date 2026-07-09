@@ -1,0 +1,34 @@
+# Allowlist for scripts/check-ledger-copy.py — one canonical token per line,
+# format "<number> <unit>", lowercase, no thousands separators.
+#
+# RULE: a token may only be added here if
+#   (a) an **Allowed** row in docs/claim-ledger.md covers the number, in
+#       which case the comment names the row; or
+#   (b) it is demonstrably NOT a performance claim (config example, wire
+#       format bound), in which case the comment says so explicitly.
+# Regenerate/review this file whenever the ledger changes.
+
+# --- ledger C12 (Allowed): DST durability sweep -------------------------
+1.33 %          # C12 disclosure: fraction of simulated boots that legally refuse
+
+# --- ledger C14 (Allowed): cold-boot recovery ---------------------------
+10 gb           # C14: dataset size of the measured boot
+10 s            # C14: "under 10 seconds" measured wording
+9.8 s           # C14: measured boot time (3 replicates)
+15 s            # C14: the gate value, disclosed alongside the measurement
+1 %             # C14 replicate spread; also C15 "≤ 1% on every gate mix"
+
+# --- ledger C15 (Allowed): memory namespaces pay zero for durability ----
+0.63 %          # C15: worst-case A/B delta
+
+# --- ledger C16 (Allowed): fork-free, memory-flat checkpoints -----------
+15 mib          # C16: RSS-overhead bound vs no-checkpoint control
+14.4 mib        # C16: measured value
+
+# --- ledger C21 (Allowed): exact memory attribution ---------------------
+1.1 %           # C21: sum(domains) vs RSS divergence
+1 gb            # C21: durable fill size of the measured row
+
+# --- non-claims (documented) ---------------------------------------------
+16 gb           # config example in the INF.NS docs (MAXMEMORY 16gb) — master plan §4.2 example, not a measurement
+16 mib          # record-format value bound (SETRANGE note) from the generated compat matrix — wire format, not a measurement

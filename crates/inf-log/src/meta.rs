@@ -1,8 +1,10 @@
 //! Node META-file atomic-swap protocol (M2-S08, ADR-0015 D3): a small
 //! whole-file envelope replaced by write-new + fsync + rename + dir-fsync.
-//! This is the M2-S11 MANIFEST protocol class, first used by the M2-S08
-//! namespace catalog; the payload is opaque bytes (`inf-store` owns the
-//! catalog encoding — `inf-log` never knows namespace semantics).
+//! This is the **MANIFEST protocol class** (M2-S11): [`crate::manifest`]
+//! rides the same envelope and the same swap steps; the payload is opaque
+//! bytes at this layer (`inf-store` owns the catalog encoding,
+//! [`crate::manifest`] owns the manifest schema — `inf-log::meta` never
+//! knows either).
 //!
 //! ```text
 //! envelope := magic: [u8;8] = "INFMETA1"   — version-tagged
@@ -11,14 +13,19 @@
 //!             crc: CRC32C(magic · payload_len · payload): u32 LE
 //! ```
 //!
-//! Crash consistency: [`write_meta`] stages the full envelope in
-//! [`META_STAGING_FILE`], fdatasyncs it, renames it over [`META_FILE`],
-//! and dir-fsyncs — a reader sees either the old envelope or the new one,
+//! Crash consistency: [`write_envelope`] stages the full envelope in the
+//! staging file, fdatasyncs it, renames it over the committed file, and
+//! dir-fsyncs — a reader sees either the old envelope or the new one,
 //! never a blend. Staging debris from a crash mid-protocol is removed by
-//! the next write and never read. Every step's failure propagates: a
-//! failed swap is fatal to the caller (§8.4 fail-stop), and a corrupt
-//! `META` is a named `InvalidData` error — never silently treated as
-//! absent.
+//! the next write and never read. Every step's failure propagates; the
+//! caller owns the failure policy (the catalog treats it as fail-stop —
+//! ADR-0015 D3; the manifest aborts the publication and keeps the old
+//! recovery unit — ADR-0017). A corrupt committed file is a named
+//! `InvalidData` error — never silently treated as absent.
+//!
+//! Swap steps, in order (each becomes a named fault point at M2-S16):
+//! remove stale staging → create staging → write envelope → fdatasync →
+//! rename → dir-fsync.
 
 use std::io;
 use std::path::Path;
@@ -43,29 +50,13 @@ const MIN_ENVELOPE_LEN: usize = HEADER_LEN + TRAILER_LEN;
 
 /// Durably replace `dir/META` with an envelope holding `payload`.
 ///
-/// Protocol: remove stale `META.new` (absent is fine), create `META.new`,
-/// write the envelope, fdatasync, rename onto `META`, dir-fsync. On return
-/// the new payload survives power loss; a crash at any earlier point leaves
-/// the previous `META` (or its absence) intact.
-///
 /// # Errors
-/// Any step's I/O failure, unchanged — callers treat a failed swap as
-/// fatal (§8.4); there is no partial-success state to continue from.
-/// `InvalidInput` when `payload` exceeds the `u32` length field.
+/// Any swap step's I/O failure, unchanged — the catalog caller treats a
+/// failed swap as fatal (§8.4); there is no partial-success state to
+/// continue from. `InvalidInput` when `payload` exceeds the `u32` length
+/// field.
 pub fn write_meta<F: SegmentFs>(fs: &F, dir: &Path, payload: &[u8]) -> io::Result<()> {
-    let staged_path = dir.join(META_STAGING_FILE);
-    match fs.remove_file(&staged_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
-    }
-    let envelope = encode_envelope(payload)?;
-    let mut staged = fs.create_segment(&staged_path, 0)?;
-    staged.write_at(0, &envelope)?;
-    staged.sync_data()?;
-    drop(staged);
-    fs.rename(&staged_path, &dir.join(META_FILE))?;
-    fs.sync_dir(dir)
+    write_envelope(fs, dir, META_STAGING_FILE, META_FILE, payload)
 }
 
 /// Read and validate `dir/META`.
@@ -79,28 +70,97 @@ pub fn write_meta<F: SegmentFs>(fs: &F, dir: &Path, payload: &[u8]) -> io::Resul
 /// fail-stop for the caller, never treated as an absent file. Other I/O
 /// errors propagate unchanged.
 pub fn read_meta<F: SegmentFs>(fs: &F, dir: &Path) -> io::Result<Option<Vec<u8>>> {
-    let file = match fs.open_read(&dir.join(META_FILE)) {
+    read_envelope(fs, &dir.join(META_FILE))
+}
+
+/// The generic swap: stage `staging_name`, fdatasync, rename onto
+/// `committed_name`, dir-fsync. On return the new payload survives power
+/// loss; a crash at any earlier point leaves the previous committed file
+/// (or its absence) intact. Shared by the catalog (`META`) and the
+/// per-cell recovery-unit manifest (`MANIFEST` — M2-S11).
+///
+/// # Errors
+/// Any step's I/O failure, unchanged. `InvalidInput` when `payload`
+/// exceeds the `u32` length field.
+pub fn write_envelope<F: SegmentFs>(
+    fs: &F,
+    dir: &Path,
+    staging_name: &str,
+    committed_name: &str,
+    payload: &[u8],
+) -> io::Result<()> {
+    let staged_path = dir.join(staging_name);
+    // Step 1 (fault point: stale-staging remove): absent is fine.
+    match fs.remove_file(&staged_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let envelope = encode_envelope(payload)?;
+    // Step 2 + 3 (fault points: staging create, staging write). The
+    // create carries no durability of its own — the fdatasync below owns
+    // the data, the final dir-fsync owns the name (M2-S12: a create-time
+    // sync is a wasted device barrier).
+    let mut staged = fs.create_meta(&staged_path)?;
+    staged.write_at(0, &envelope)?;
+    // Step 4 (fault point: staging fdatasync).
+    staged.sync_data()?;
+    drop(staged);
+    // Step 5 (M2-S16 `manifest_rename_fail`: rename — the commit point
+    // once durable; a failed swap leaves the old envelope authoritative).
+    if inf_foundation::fault::fire(crate::fault::MANIFEST_RENAME_FAIL) {
+        return Err(crate::fault::injected(crate::fault::MANIFEST_RENAME_FAIL));
+    }
+    fs.rename(&staged_path, &dir.join(committed_name))?;
+    // Step 6 (M2-S16 `dir_fsync_fail`: the barrier making the name durable).
+    if inf_foundation::fault::fire(crate::fault::DIR_FSYNC_FAIL) {
+        return Err(crate::fault::injected(crate::fault::DIR_FSYNC_FAIL));
+    }
+    fs.sync_dir(dir)
+}
+
+/// Read and validate one committed envelope file. `Ok(None)` when absent.
+///
+/// # Errors
+/// As [`read_meta`]: corruption is a named `InvalidData`, never `None`.
+pub fn read_envelope<F: SegmentFs>(fs: &F, path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let file = match fs.open_read(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    let len = usize::try_from(file.file_size()?).expect("META size fits usize");
-    if len < MIN_ENVELOPE_LEN {
-        return Err(invalid(format!(
-            "META too short: {len} bytes, envelope minimum is {MIN_ENVELOPE_LEN}"
-        )));
-    }
+    let len = usize::try_from(file.file_size()?).expect("envelope size fits usize");
     let mut buf = vec![0u8; len];
     let mut read = 0;
     while read < buf.len() {
         let n = file.read_at(read as u64, &mut buf[read..])?;
         if n == 0 {
-            return Err(invalid(format!("META torn: EOF at {read} of {len} bytes")));
+            return Err(invalid(format!("envelope torn: EOF at {read} of {len} bytes")));
         }
         read += n;
     }
+    decode_envelope(&buf)?;
+    buf.truncate(len - TRAILER_LEN);
+    buf.drain(..HEADER_LEN);
+    Ok(Some(buf))
+}
+
+/// Validate one envelope image and return its payload slice. Pure — the
+/// fuzz seam for every envelope-carried format (frame decoders get their
+/// own targets; this covers the META/MANIFEST transport).
+///
+/// # Errors
+/// `InvalidData` naming what failed: short file, bad magic, length
+/// mismatch, or CRC mismatch.
+pub fn decode_envelope(buf: &[u8]) -> io::Result<&[u8]> {
+    let len = buf.len();
+    if len < MIN_ENVELOPE_LEN {
+        return Err(invalid(format!(
+            "envelope too short: {len} bytes, envelope minimum is {MIN_ENVELOPE_LEN}"
+        )));
+    }
     if buf[..META_MAGIC.len()] != META_MAGIC {
-        return Err(invalid(format!("META bad magic {:02x?}", &buf[..META_MAGIC.len()])));
+        return Err(invalid(format!("envelope bad magic {:02x?}", &buf[..META_MAGIC.len()])));
     }
     let payload_len =
         u32::from_le_bytes(buf[META_MAGIC.len()..HEADER_LEN].try_into().expect("4-byte slice"))
@@ -108,7 +168,7 @@ pub fn read_meta<F: SegmentFs>(fs: &F, dir: &Path) -> io::Result<Option<Vec<u8>>
     let expected = MIN_ENVELOPE_LEN + payload_len;
     if len != expected {
         return Err(invalid(format!(
-            "META length mismatch: envelope declares a {payload_len}-byte payload \
+            "envelope length mismatch: envelope declares a {payload_len}-byte payload \
              ({expected} bytes total), file holds {len}"
         )));
     }
@@ -117,17 +177,15 @@ pub fn read_meta<F: SegmentFs>(fs: &F, dir: &Path) -> io::Result<Option<Vec<u8>>
     let computed = crc32c(covered);
     if stored != computed {
         return Err(invalid(format!(
-            "META CRC mismatch: stored {stored:#010x}, computed {computed:#010x}"
+            "envelope CRC mismatch: stored {stored:#010x}, computed {computed:#010x}"
         )));
     }
-    buf.truncate(len - TRAILER_LEN);
-    buf.drain(..HEADER_LEN);
-    Ok(Some(buf))
+    Ok(&covered[HEADER_LEN..])
 }
 
-fn encode_envelope(payload: &[u8]) -> io::Result<Vec<u8>> {
+pub(crate) fn encode_envelope(payload: &[u8]) -> io::Result<Vec<u8>> {
     let payload_len = u32::try_from(payload.len()).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "META payload exceeds the u32 length field")
+        io::Error::new(io::ErrorKind::InvalidInput, "envelope payload exceeds the u32 length field")
     })?;
     let mut envelope = Vec::with_capacity(MIN_ENVELOPE_LEN + payload.len());
     envelope.extend_from_slice(&META_MAGIC);

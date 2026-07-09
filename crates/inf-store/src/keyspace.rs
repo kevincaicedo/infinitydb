@@ -21,6 +21,7 @@
 //! (`limit − limit/16`, hysteresis) under its own budget so a storm of
 //! writes cannot monopolize the loop (the bounded-everything rule).
 
+use inf_foundation::hash64;
 use inf_foundation::time::Nanos;
 use inf_log::{FsyncClass, NsId, RecordView as LogRecordView};
 
@@ -525,6 +526,44 @@ impl Keyspace {
         self.ns_store_mut(ns)
     }
 
+    /// M2-S13: presize a namespace's store from the `.ick` footer's entry
+    /// count before recovery streams the checkpoint (see
+    /// [`CellStore::reserve_keys`]). Unknown ids are ignored — a foreign
+    /// count must not materialize state the catalog doesn't know.
+    pub fn reserve_ns(&mut self, ns: NsId, entries: u64) {
+        if ns.0 < FIRST_NAMED_NS_ID {
+            return;
+        }
+        if let Some(store) = self.ns_store_mut(ns) {
+            store.reserve_keys(usize::try_from(entries).unwrap_or(usize::MAX));
+        }
+    }
+
+    // ---- state digest (M2-S13, ADR-0018) ----
+
+    /// Order-independent digest of the cell's live logical state: every
+    /// non-expired entry's `(store identity, key, value, expire_at)`
+    /// hashed and folded commutatively, so physically different layouts
+    /// (arena order, index geometry, materialization order) of the same
+    /// logical state digest identically. The recovery determinism oracle:
+    /// recovering the same files twice — or recovery vs a reference
+    /// full-log replay — must produce equal digests **under the same
+    /// injected `now` and wall anchor** (expiry deadlines and cutoffs are
+    /// part of the state; L7 injects the clock that interprets them).
+    ///
+    /// Empty stores contribute nothing: a materialized-but-empty db
+    /// digests the same as one never touched.
+    pub fn state_digest(&self, now: Nanos) -> StateDigest {
+        let mut acc = StateDigest::default();
+        for (db, store) in self.dbs() {
+            fold_store(&mut acc, store, db as u64, now);
+        }
+        for (ns, store) in &self.named_stores {
+            fold_store(&mut acc, store, NAMED_TAG | u64::from(ns.0), now);
+        }
+        acc
+    }
+
     /// Every materialized store: default dbs, then named (aggregation
     /// order is stable but unspecified).
     fn all_stores(&self) -> impl Iterator<Item = &CellStore> {
@@ -532,6 +571,47 @@ impl Keyspace {
             .iter()
             .filter_map(|s| s.as_deref())
             .chain(self.named_stores.iter().map(|(_, s)| s.as_ref()))
+    }
+}
+
+/// A deterministic, layout-independent summary of live logical state
+/// (M2-S13). Two keyspaces holding the same entries under the same
+/// injected clock compare equal, however they were built.
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub struct StateDigest {
+    /// Live (non-expired) entries covered.
+    pub entries: u64,
+    /// Commutative fold of per-entry hashes.
+    pub digest: u64,
+}
+
+/// Distinguishes named-namespace store tags from default-db indices in
+/// the digest (named ids and db indices share small integers).
+const NAMED_TAG: u64 = 1 << 32;
+
+const DIGEST_SEED: u64 = 0xD16E_57A7_E5EE_D001;
+
+/// Fold one store's live entries into the digest. Per entry the fields
+/// chain (each hash seeds the next, binding key↔value↔expiry↔store), and
+/// entries combine by wrapping addition — a multiset hash, insensitive to
+/// walk order.
+fn fold_store(acc: &mut StateDigest, store: &CellStore, tag: u64, now: Nanos) {
+    let mut cursor = 0u64;
+    loop {
+        cursor = store.digest_post_images(cursor, 1024, now, |key, value, expire_at_ms| {
+            let hk = hash64(key, DIGEST_SEED ^ tag);
+            let hv = hash64(value, hk);
+            let mut exp = [0u8; 9];
+            if let Some(ms) = expire_at_ms {
+                exp[0] = 1;
+                exp[1..].copy_from_slice(&ms.to_le_bytes());
+            }
+            acc.digest = acc.digest.wrapping_add(hash64(&exp, hv));
+            acc.entries += 1;
+        });
+        if cursor == 0 {
+            break;
+        }
     }
 }
 
@@ -812,5 +892,98 @@ mod tests {
             "expired reads absent"
         );
         assert!(store.post_image(b"missing", now).is_none());
+    }
+
+    // ---- state digest (M2-S13) ----
+
+    #[test]
+    fn digest_is_insertion_order_independent() {
+        let now = Nanos(1);
+        let mut a = Keyspace::new(StoreConfig::default());
+        let mut b = Keyspace::new(StoreConfig::default());
+        for i in 0..500 {
+            let key = format!("k:{i}");
+            let val = format!("v:{i}");
+            a.db_mut(0).set(key.as_bytes(), val.as_bytes(), SetOptions::default(), now).unwrap();
+            let j = 499 - i;
+            let key = format!("k:{j}");
+            let val = format!("v:{j}");
+            b.db_mut(0).set(key.as_bytes(), val.as_bytes(), SetOptions::default(), now).unwrap();
+        }
+        assert_eq!(a.state_digest(now), b.state_digest(now));
+        assert_eq!(a.state_digest(now).entries, 500);
+    }
+
+    #[test]
+    fn digest_is_layout_independent() {
+        // Same final logical state via different histories: overwrites,
+        // deletes, and a different db-materialization order.
+        let now = Nanos(1);
+        let mut a = Keyspace::new(StoreConfig::default());
+        a.db_mut(2).set(b"x", b"seen", SetOptions::default(), now).unwrap();
+        a.db_mut(0).set(b"k", b"old", SetOptions::default(), now).unwrap();
+        a.db_mut(0).set(b"k", b"final", SetOptions::default(), now).unwrap();
+        a.db_mut(0).set(b"dead", b"gone", SetOptions::default(), now).unwrap();
+        a.db_mut(0).del(b"dead", now);
+
+        let mut b = Keyspace::new(StoreConfig::default());
+        b.db_mut(0).set(b"k", b"final", SetOptions::default(), now).unwrap();
+        b.db_mut(2).set(b"x", b"seen", SetOptions::default(), now).unwrap();
+        // A materialized-but-empty db must not perturb the digest.
+        let _ = b.db_mut(7);
+
+        assert_eq!(a.state_digest(now), b.state_digest(now));
+    }
+
+    #[test]
+    fn digest_distinguishes_value_ttl_db_and_namespace() {
+        let now = Nanos(1);
+        let base = |value: &[u8], expire: SetExpire, db: usize| {
+            let mut ks = Keyspace::new(StoreConfig::default());
+            ks.db_mut(db)
+                .set(b"k", value, SetOptions { expire, ..SetOptions::default() }, now)
+                .unwrap();
+            ks.state_digest(now)
+        };
+        let reference = base(b"v", SetExpire::Clear, 0);
+        assert_ne!(reference, base(b"w", SetExpire::Clear, 0), "value must bind");
+        assert_ne!(
+            reference,
+            base(b"v", SetExpire::At(Nanos::from_millis(5_000)), 0),
+            "expiry must bind"
+        );
+        assert_ne!(reference, base(b"v", SetExpire::Clear, 1), "db identity must bind");
+
+        let mut named = Keyspace::new(StoreConfig::default());
+        named.ns_create(durable_spec(16, b"ledger")).expect("create");
+        named.ns_store_mut(NsId(16)).unwrap().set(b"k", b"v", SetOptions::default(), now).unwrap();
+        assert_ne!(reference, named.state_digest(now), "namespace identity must bind");
+        assert_eq!(named.state_digest(now).entries, 1);
+    }
+
+    #[test]
+    fn digest_excludes_expired_entries_without_reaping() {
+        let now = Nanos(1);
+        let mut ks = Keyspace::new(StoreConfig::default());
+        ks.db_mut(0).set(b"live", b"v", SetOptions::default(), now).unwrap();
+        ks.db_mut(0)
+            .set(
+                b"dying",
+                b"v",
+                SetOptions { expire: SetExpire::At(Nanos::from_millis(5)), ..Default::default() },
+                now,
+            )
+            .unwrap();
+
+        let mut only_live = Keyspace::new(StoreConfig::default());
+        only_live.db_mut(0).set(b"live", b"v", SetOptions::default(), now).unwrap();
+
+        let after = Nanos::from_millis(10);
+        assert_eq!(ks.state_digest(after), only_live.state_digest(after));
+        // Read-only: the digest walk reaped nothing (the record is still
+        // physically resident, just logically dead).
+        assert_eq!(ks.db_mut(0).len(), 2, "digest must not reap");
+        // Before the deadline both entries count.
+        assert_eq!(ks.state_digest(now).entries, 2);
     }
 }

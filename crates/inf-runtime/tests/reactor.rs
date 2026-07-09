@@ -228,3 +228,106 @@ fn tripwires_report_the_frozen_names() {
     let cmds_per_iter_x1000 = lp.tripwires()[2].1;
     assert!(cmds_per_iter_x1000 > 0, "5 commands over 10 iterations must register");
 }
+
+/// Records the order of plane phase calls; parse_execute spawns a parked
+/// future (a pump awaiting a remote reply) whose waker fabric_in fires on
+/// the next iteration — exactly the reply-wake path the remote-first lever
+/// reorders around.
+struct PhaseOrderPlane {
+    calls: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    waker: std::rc::Rc<std::cell::RefCell<Option<std::task::Waker>>>,
+    done: std::rc::Rc<std::cell::Cell<bool>>,
+    spawned: bool,
+}
+
+impl PhaseOrderPlane {
+    fn new(spawned: bool) -> PhaseOrderPlane {
+        PhaseOrderPlane {
+            calls: std::rc::Rc::default(),
+            waker: std::rc::Rc::default(),
+            done: std::rc::Rc::default(),
+            spawned,
+        }
+    }
+}
+
+/// Parks until `done` flips (the stored waker is the wake handle).
+struct ParkedReply {
+    waker: std::rc::Rc<std::cell::RefCell<Option<std::task::Waker>>>,
+    done: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl Future for ParkedReply {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.done.get() {
+            std::task::Poll::Ready(())
+        } else {
+            *self.waker.borrow_mut() = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
+}
+
+impl CellPlane for PhaseOrderPlane {
+    fn on_completion(&mut self, _cx: &mut LoopCx<'_>, _c: Completion) {}
+    fn fabric_in(&mut self, _cx: &mut LoopCx<'_>) {
+        // The "reply arrived" moment: wake the parked pump.
+        if let Some(waker) = self.waker.borrow_mut().take() {
+            self.done.set(true);
+            waker.wake();
+        }
+    }
+    fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
+        self.calls.borrow_mut().push("parse_execute");
+        if !self.spawned {
+            self.spawned = true;
+            cx.executor.spawn_local(ParkedReply {
+                waker: std::rc::Rc::clone(&self.waker),
+                done: std::rc::Rc::clone(&self.done),
+            });
+        }
+    }
+    fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+    fn fabric_out(&mut self, _cx: &mut LoopCx<'_>) -> bool {
+        self.calls.borrow_mut().push("fabric_out");
+        false
+    }
+}
+
+#[test]
+fn remote_first_execute_publishes_before_the_local_bulk() {
+    // M2.5-S21 lever choreography: with the flag on, the iteration whose
+    // FABRIC-IN wakes a parked pump runs an early FABRIC-OUT *before*
+    // PARSE+EXECUTE (the hop overlaps local work); step 8 still runs.
+    let mut lp = test_loop(LoopConfig { remote_first_execute: true, ..LoopConfig::default() });
+    let mut plane = PhaseOrderPlane::new(false);
+    let calls = std::rc::Rc::clone(&plane.calls);
+    lp.run_iteration(&mut plane).expect("iteration"); // spawns + parks the pump
+    calls.borrow_mut().clear();
+    lp.run_iteration(&mut plane).expect("iteration"); // fabric_in wakes it
+    assert_eq!(*calls.borrow(), vec!["fabric_out", "parse_execute", "fabric_out"]);
+}
+
+#[test]
+fn remote_first_execute_early_flush_needs_a_resumed_future() {
+    // No ready futures => no early FABRIC-OUT (the lever never adds an
+    // unconditional flush); and with the lever off the reply-wake iteration
+    // keeps the default single-flush ordering.
+    for (lever, spawned) in [(false, false), (true, true)] {
+        let mut lp = test_loop(LoopConfig { remote_first_execute: lever, ..LoopConfig::default() });
+        let mut plane = PhaseOrderPlane::new(spawned);
+        let calls = std::rc::Rc::clone(&plane.calls);
+        lp.run_iteration(&mut plane).expect("iteration");
+        calls.borrow_mut().clear();
+        lp.run_iteration(&mut plane).expect("iteration");
+        assert_eq!(
+            *calls.borrow(),
+            vec!["parse_execute", "fabric_out"],
+            "lever={lever} spawned={spawned}"
+        );
+    }
+}

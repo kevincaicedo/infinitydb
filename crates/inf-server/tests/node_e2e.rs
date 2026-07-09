@@ -58,6 +58,56 @@ impl Node {
         data_dir: Option<std::path::PathBuf>,
         ckpt_interval_bytes: u64,
     ) -> Node {
+        Node::start_full(cells, data_dir, ckpt_interval_bytes, Default::default(), Vec::new())
+    }
+
+    /// Durable node with a boot-recovery pacing override (M2-S15): the
+    /// throttled variant holds the node in its `-LOADING` window so tests
+    /// can observe it.
+    fn start_with_recover(
+        cells: u16,
+        data_dir: Option<std::path::PathBuf>,
+        ckpt_interval_bytes: u64,
+        recover: inf_server::RecoverConfig,
+    ) -> Node {
+        Node::start_full(cells, data_dir, ckpt_interval_bytes, recover, Vec::new())
+    }
+
+    /// Durable node with named fault points armed on every cell thread at
+    /// boot (M2-S16): the registry is thread-local, so the plan is applied
+    /// by each cell before its recovery begins — deterministic per cell.
+    fn start_durable_with_faults(
+        cells: u16,
+        data_dir: &std::path::Path,
+        faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
+    ) -> Node {
+        Node::start_full(cells, Some(data_dir.to_path_buf()), 0, Default::default(), faults)
+    }
+
+    /// Node with the M2.5 Phase-H fabric-apply prefetch enabled (the A/B
+    /// lever's on-arm correctness surface).
+    fn start_with_apply_prefetch(cells: u16) -> Node {
+        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), true)
+    }
+
+    fn start_full(
+        cells: u16,
+        data_dir: Option<std::path::PathBuf>,
+        ckpt_interval_bytes: u64,
+        recover: inf_server::RecoverConfig,
+        faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
+    ) -> Node {
+        Node::start_cfg(cells, data_dir, ckpt_interval_bytes, recover, faults, false)
+    }
+
+    fn start_cfg(
+        cells: u16,
+        data_dir: Option<std::path::PathBuf>,
+        ckpt_interval_bytes: u64,
+        recover: inf_server::RecoverConfig,
+        faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
+        apply_prefetch: bool,
+    ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
         // Bind cell 0 first on an ephemeral port, then the rest join it.
         let first = listen_reuseport(0).expect("listen");
@@ -71,18 +121,36 @@ impl Node {
         // exist before any cell replays records that name ids.
         let boot = data_dir.map(|dir| {
             let catalog = inf_server::load_catalog(&dir).expect("readable catalog");
-            let control = inf_server::spawn_control(dir.clone(), catalog.as_ref());
+            let boot_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let control =
+                inf_server::spawn_control(dir.clone(), catalog.as_ref(), cells, boot_unix_ms);
             (dir, catalog, control)
         });
         let mut handles = Vec::new();
         for (i, (fabric, listener)) in fabrics.into_iter().zip(listeners).enumerate() {
             let stop = Arc::clone(&stop);
             let boot = boot.clone();
+            let faults = faults.clone();
             handles.push(std::thread::spawn(move || {
+                // M2-S16: arm this cell's fault plan before recovery — the
+                // registry is thread-local (cells are single-threaded, L1).
+                for &(point, spec) in &faults {
+                    inf_foundation::fault::arm(point, spec);
+                }
                 let mut pool = BufferPool::new(256, 4096);
                 let mut driver = UringDriver::new(256).expect("uring");
                 driver.register_pool(&mut pool).expect("register");
                 let node = Rc::new(NodeInfo::default());
+                // Real wall anchor (the infinityd boot pattern): LASTSAVE/
+                // rdb_last_save_time report true unix seconds (M2-S20).
+                let unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                node.wall_anchor.set((0, unix_ms));
                 let mut ks = Keyspace::new(StoreConfig::default());
                 let mut durable = None;
                 if let Some((dir, catalog, control)) = &boot {
@@ -102,14 +170,10 @@ impl Node {
                             interval_bytes: ckpt_interval_bytes,
                             ..Default::default()
                         },
+                        recover,
+                        sync_pipeline: 1,
                     };
-                    let (internal_ms, unix_ms) = node.wall_anchor.get();
-                    let anchor = inf_store::WallAnchor { internal_ms, unix_ms };
-                    let now = StdClock::new().now();
-                    let (rotor, _stats) =
-                        inf_server::open_cell_log(&mut ks, i as u16, &cfg, anchor, now)
-                            .expect("cell log recovery");
-                    durable = Some((cfg, rotor, Arc::clone(control)));
+                    durable = Some((cfg, Arc::clone(control)));
                 }
                 let mut plane = ServerPlane::new(
                     CellId(i as u16),
@@ -121,9 +185,17 @@ impl Node {
                     NoopObserver,
                     false,
                 );
-                if let Some((cfg, rotor, control)) = durable {
-                    plane.enable_durable(&cfg, i as u16, rotor).expect("ckpt dir scan");
+                plane.set_fabric_apply_prefetch(apply_prefetch);
+                if let Some((cfg, control)) = durable {
+                    // Loop-resident recovery (M2-S15): the cell serves
+                    // -LOADING while MAINTAIN replays its log.
                     plane.set_control(control);
+                    plane.begin_recovery(
+                        inf_server::StdSegmentFs,
+                        &cfg,
+                        i as u16,
+                        StdClock::new().now(),
+                    );
                 }
                 let config = LoopConfig {
                     park_default: Some(Duration::from_millis(5)),
@@ -132,11 +204,28 @@ impl Node {
                 let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config);
                 while !stop.load(Ordering::Relaxed) {
                     cell_loop.run_iteration(&mut plane).expect("iteration");
+                    if let Some(err) = plane.take_boot_error() {
+                        panic!("cell {i} recovery failed (fail-stop, §8.4): {err}");
+                    }
                 }
             }));
         }
         let control = boot.map(|(_, _, control)| control);
-        Node { port, stop, handles, control }
+        let node = Node { port, stop, handles, control };
+        // Most tests speak data commands immediately after start: wait out
+        // the -LOADING window unless the test throttled recovery to
+        // observe it (the throttle IS the -LOADING test's subject).
+        if recover.throttle_bytes_per_sec.is_none()
+            && let Some(control) = &node.control
+        {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !control.recovery_board().all_ready() {
+                assert!(Instant::now() < deadline, "recovery did not finish in 30s");
+                #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        node
     }
 
     fn connect(&self) -> TcpStream {
@@ -232,6 +321,61 @@ fn two_cell_node_serves_local_and_cross_cell() {
     // EXISTS aggregates across cells, counting duplicates.
     client.write_all(&cmd(&[b"EXISTS", &k0, &k1, &k0, b"nope"])).expect("write");
     read_exactly(&mut client, b":3\r\n");
+
+    node.stop();
+}
+
+/// The fabric-apply staged prefetch (M2.5 Phase H, `--fabric-apply-prefetch`)
+/// must be behavior-invisible: same replies, same order, expiry-on-read
+/// intact (a reap between the batch's prefetch pass and its execute pass is
+/// the edge the unverified probe must not corrupt).
+#[test]
+fn cross_cell_with_apply_prefetch_matches_inline_semantics() {
+    let node = Node::start_with_apply_prefetch(2);
+    let mut client = node.connect();
+
+    let k0 = key_for_cell(2, 0);
+    let k1 = key_for_cell(2, 1);
+
+    // The same pipelined mix the inline path pins: SET/GET/DEL/counted.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", &k0, b"zero"]));
+    pipeline.extend(cmd(&[b"SET", &k1, b"one"]));
+    pipeline.extend(cmd(&[b"GET", &k0]));
+    pipeline.extend(cmd(&[b"GET", &k1]));
+    pipeline.extend(cmd(&[b"DEL", &k0, &k1, b"missing"]));
+    pipeline.extend(cmd(&[b"GET", &k0]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n$4\r\nzero\r\n$3\r\none\r\n:2\r\n$-1\r\n");
+
+    // Reply order under a long interleaved remote/local pipeline (the
+    // staged batch must preserve arrival order exactly).
+    let mut pipeline = Vec::new();
+    for _ in 0..50 {
+        pipeline.extend(cmd(&[b"INCR", &k0]));
+        pipeline.extend(cmd(&[b"INCR", &k1]));
+    }
+    client.write_all(&pipeline).expect("write");
+    let mut want = Vec::new();
+    for round in 1..=50 {
+        want.extend_from_slice(format!(":{round}\r\n:{round}\r\n").as_bytes());
+    }
+    read_exactly(&mut client, &want);
+
+    // Expiry-on-read through the batched path: a key expired between ops
+    // still reads as gone (the probe prefetch never resurrects records).
+    client.write_all(&cmd(&[b"SET", &k0, b"soon", b"PX", b"1"])).expect("write");
+    read_exactly(&mut client, b"+OK\r\n");
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(10));
+    client.write_all(&cmd(&[b"GET", &k0])).expect("write");
+    read_exactly(&mut client, b"$-1\r\n");
+
+    // Scatter + counted aggregation still route through the same drain.
+    client.write_all(&cmd(&[b"EXISTS", &k1, &k1, b"nope"])).expect("write");
+    read_exactly(&mut client, b":2\r\n");
+    client.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut client, b":1\r\n");
 
     node.stop();
 }
@@ -823,6 +967,166 @@ fn bytes_threshold_triggers_a_checkpoint() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Numeric INFO field (first match — single-cell tests).
+fn info_u64(info: &str, field: &str) -> u64 {
+    info.lines()
+        .find_map(|l| l.strip_prefix(&format!("{field}:")))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("field {field} in {info}"))
+}
+
+/// M2-S11 AC (dev-tier soak-lite; the 24 h leg rides the S22 soak):
+/// checkpoint cycles advance the MANIFEST floor and the truncation slice
+/// deletes covered segments — steady-state retained log ≈ ckpt interval +
+/// one segment (+ the prealloc'd next), asserted at every sample once
+/// truncation reaches steady state. Early keys then live ONLY in the
+/// checkpoint (their segments are gone), so the restart leg proves
+/// manifest-named recovery end to end: MANIFEST → `.ick` load → tail
+/// replay from begin.
+#[test]
+fn truncation_bounds_log_size_and_restart_recovers_from_checkpoint() {
+    let dir = temp_data_dir("trunc");
+    // 8 MiB segments (harness), checkpoint every 1 MiB appended.
+    let node = Node::start_durable_auto_ckpt(1, &dir, 1 << 20);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"soak", b"MODE", b"durable", b"FSYNC", b"everysec"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"soak"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+
+    // ~19 MiB of records → two 8 MiB rotations while checkpoints cycle.
+    let value = vec![b'v'; 4096];
+    let mut ok = Vec::new();
+    for wave in 0..3u32 {
+        for batch in 0..12u32 {
+            let mut wire = Vec::with_capacity(128 * 4200);
+            ok.clear();
+            for i in 0..128u32 {
+                let key = format!("w{wave}:{:05}", batch * 128 + i);
+                wire.extend_from_slice(&cmd(&[b"SET", key.as_bytes(), &value]));
+                ok.extend_from_slice(b"+OK\r\n");
+            }
+            c.write_all(&wire).expect("write wave");
+            read_exactly(&mut c, &ok);
+        }
+    }
+
+    // Trickle writes drive further triggers until truncation reaches
+    // steady state: floor in the active segment, both sealed ones gone.
+    // The trickle is byte-bounded, not just time-bounded (M2.5-S11): in
+    // the release profile a lap is fast enough to write GiBs into the
+    // 16 GiB tmpfs before a 30 s deadline — every shell on the box then
+    // fails. 8192 ticks ≈ 32 MiB caps the footprint; the adaptive drain
+    // (ADR-0022 D8.4) reaches steady state well inside it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut i = 0u32;
+    let info = loop {
+        if i < 8192 {
+            for _ in 0..16 {
+                let key = format!("tick:{i:06}");
+                c.write_all(&cmd(&[b"SET", key.as_bytes(), &value])).expect("write");
+                read_exactly(&mut c, b"+OK\r\n");
+                i += 1;
+            }
+        } else {
+            // Write cap reached: the latched checkpoint/manifest cycles
+            // complete on MAINTAIN without further traffic — poll for them.
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
+        let mut buf = vec![0u8; 4096];
+        let n = c.read(&mut buf).expect("read info");
+        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        if info_u64(&info, "segments_truncated") >= 2 || Instant::now() > deadline {
+            break info;
+        }
+    };
+    assert!(info_u64(&info, "manifests_published") >= 1, "manifest published: {info}");
+    assert!(info_u64(&info, "segments_truncated") >= 2, "both sealed segments deleted: {info}");
+
+    // Writes stopped: let the in-flight (paced — ADR-0017) cycle drain,
+    // then every sample must hold the steady-state bound — interval
+    // (1 MiB) fits inside the active segment, so live = active +
+    // prealloc'd next (+1 transient around a rotation).
+    let settle = Instant::now() + Duration::from_secs(15);
+    loop {
+        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
+        let mut buf = vec![0u8; 4096];
+        let n = c.read(&mut buf).expect("read info");
+        let sample = String::from_utf8_lossy(&buf[..n]).into_owned();
+        if info_u64(&sample, "log_segments_live") <= 3 {
+            break;
+        }
+        assert!(Instant::now() < settle, "never settled to the bound: {sample}");
+    }
+    for _ in 0..5 {
+        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
+        let mut buf = vec![0u8; 4096];
+        let n = c.read(&mut buf).expect("read info");
+        let sample = String::from_utf8_lossy(&buf[..n]).into_owned();
+        assert!(
+            info_u64(&sample, "log_segments_live") <= 3,
+            "retained log bounded by interval + one segment (+ next): {sample}"
+        );
+    }
+    drop(c);
+    node.stop();
+
+    // On-disk truth matches the gauges: ≤ 3 segment files — polled
+    // briefly, because unlinks are *delegated* to the control thread
+    // (ADR-0017: a large unlink on the loop is a measured p99.9 stall)
+    // and it drains its queue asynchronously after the cells stop. The
+    // runtime GC kept exactly one published .ick (a walk may have been
+    // mid-flight at shutdown — its .ick.new orphan is the boot GC's job,
+    // asserted after the restart below).
+    let unlink_deadline = Instant::now() + Duration::from_secs(10);
+    let log_files = loop {
+        let n = std::fs::read_dir(dir.join("shard-0").join("log")).expect("log dir").count();
+        if n <= 3 || Instant::now() > unlink_deadline {
+            break n;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(log_files <= 3, "segment files on disk: {log_files}");
+    let icks = |dir: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(dir.join("shard-0").join("ckpt"))
+            .expect("ckpt dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect()
+    };
+    let published: Vec<_> = icks(&dir).into_iter().filter(|name| name.ends_with(".ick")).collect();
+    assert_eq!(published.len(), 1, "GC keeps only the manifest-named checkpoint: {published:?}");
+
+    // Restart on the truncated log: wave-0 keys exist only in the
+    // checkpoint now — this GET proves the MANIFEST → .ick → tail path.
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"soak"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let mut want = b"$4096\r\n".to_vec();
+    want.extend_from_slice(&value);
+    want.extend_from_slice(b"\r\n");
+    for key in ["w0:00000", "w2:01535", &format!("tick:{:06}", i - 1)] {
+        c.write_all(&cmd(&[b"GET", key.as_bytes()])).expect("write");
+        read_exactly(&mut c, &want);
+    }
+    drop(c);
+    node.stop();
+
+    // Boot GC removed the mid-flight .ick.new orphan (and any unnamed
+    // .ick); exactly the named checkpoint remains.
+    let after: Vec<String> = std::fs::read_dir(dir.join("shard-0").join("ckpt"))
+        .expect("ckpt dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(after.len(), 1, "boot GC leaves only the named checkpoint: {after:?}");
+    assert!(after[0].ends_with(".ick") && !after[0].ends_with(".ick.new"), "{after:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// M2-S10 slice-budget rehearsal (dev tier — run manually, output feeds
 /// the artifact): a few-hundred-MB durable dataset, checkpoint triggered
 /// under continuous GET load, foreground latency sampled per request and
@@ -952,6 +1256,411 @@ fn ckpt_slice_budget_rehearsal() {
         audit.records,
         audit.bytes >> 20
     );
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M2-S15: the `-LOADING` window, byte-diffed against the Redis 8.0.5
+/// oracle capture (`.artifacts/m2/loading-redis-capture-20260703/`).
+/// Gated commands — including PING, which Redis 8.0.5 *observably* gates —
+/// answer the exact Redis error bytes; ECHO/SELECT/pubsub/INFO pass;
+/// unknown commands resolve before the gate (Redis order); and the same
+/// connection serves normally once recovery completes (loading-era
+/// connections survive the transition). Recovery is throttled by the
+/// test-only pacing knob — the designed vehicle for observing the window.
+#[test]
+fn loading_gate_byte_matches_redis_and_lifts() {
+    const LOADING: &[u8] = b"-LOADING Redis is loading the dataset in memory\r\n";
+    let dir = temp_data_dir("loading");
+    let val = vec![b'v'; 4096];
+
+    // Phase 1: build ~1 MiB of durable log to replay.
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"led",
+            b"MODE",
+            b"durable",
+            b"FSYNC",
+            b"everysec",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"led"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        for i in 0..256u32 {
+            c.write_all(&cmd(&[b"SET", format!("k:{i}").as_bytes(), &val])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        drop(c);
+        node.stop();
+    }
+
+    // Phase 2: throttled reboot — ~1 MiB at 128 KiB/s holds the window
+    // ~8 s (pacing meters consumed bytes, never prealloc slack).
+    let node = Node::start_with_recover(
+        1,
+        Some(dir.clone()),
+        0,
+        inf_server::RecoverConfig { step_bytes: 32 << 10, throttle_bytes_per_sec: Some(128 << 10) },
+    );
+    let mut c = node.connect();
+
+    // We are inside the window: INFO passes the gate and reports the
+    // loading fields (Redis field names; totals are file extents).
+    let info = info_text(&mut c, b"persistence");
+    assert!(info.contains("loading:1\r\n"), "window missed: {info}");
+    assert!(info.contains("loading_start_time:"), "{info}");
+    assert!(info.contains("loading_total_bytes:"), "{info}");
+    assert!(info.contains("loading_loaded_bytes:"), "{info}");
+    assert!(info.contains("loading_loaded_perc:"), "{info}");
+    assert!(info.contains("loading_eta_seconds:"), "{info}");
+    assert!(info.contains("loading_cells_ready:0\r\n"), "{info}");
+    assert!(info.contains("loading_cells:1\r\n"), "{info}");
+
+    // Gated commands answer the exact oracle bytes.
+    for gated in [
+        cmd(&[b"GET", b"k:0"]),
+        cmd(&[b"SET", b"x", b"y"]),
+        cmd(&[b"PING"]),
+        cmd(&[b"DEL", b"x"]),
+        cmd(&[b"FLUSHALL"]),
+        cmd(&[b"DBSIZE"]),
+        cmd(&[b"INF.NS", b"USE", b"led"]),
+    ] {
+        c.write_all(&gated).expect("write");
+        read_exactly(&mut c, LOADING);
+    }
+
+    // Loading-allowed commands serve normally (oracle capture set).
+    c.write_all(&cmd(&[b"ECHO", b"hi"])).expect("write");
+    read_exactly(&mut c, b"$2\r\nhi\r\n");
+    c.write_all(&cmd(&[b"SELECT", b"1"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SELECT", b"0"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+
+    // Unknown commands resolve before the gate (Redis order).
+    c.write_all(&cmd(&[b"NOSUCHCMD", b"x"])).expect("write");
+    let line = read_line(&mut c);
+    assert!(line.starts_with(b"-ERR unknown command"), "{line:?}");
+
+    // Pub/sub is fully live during loading (loading-flagged in Redis).
+    let mut sub = node.connect();
+    sub.write_all(&cmd(&[b"SUBSCRIBE", b"ch"])).expect("write");
+    read_exactly(&mut sub, b"*3\r\n$9\r\nsubscribe\r\n$2\r\nch\r\n:1\r\n");
+    c.write_all(&cmd(&[b"PUBLISH", b"ch", b"m"])).expect("write");
+    read_exactly(&mut c, b":1\r\n");
+    read_exactly(&mut sub, b"*3\r\n$7\r\nmessage\r\n$2\r\nch\r\n$1\r\nm\r\n");
+
+    // The SAME connection lifts into normal service when the load ends.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        c.write_all(&cmd(&[b"GET", b"k:0"])).expect("write");
+        let line = read_line(&mut c);
+        if line == b"$-1\r\n" {
+            break; // default ns: key absent — the gate lifted
+        }
+        assert_eq!(line, LOADING.to_vec(), "unexpected reply {line:?}");
+        assert!(Instant::now() < deadline, "loading never lifted");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let info = info_text(&mut c, b"persistence");
+    assert!(info.contains("loading:0\r\n"), "{info}");
+
+    // Recovered data intact in the durable namespace, same connection.
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"led"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"k:0"])).expect("write");
+    let mut want = format!("${}\r\n", val.len()).into_bytes();
+    want.extend_from_slice(&val);
+    want.extend_from_slice(b"\r\n");
+    read_exactly(&mut c, &want);
+
+    drop(c);
+    drop(sub);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M2-S15 orchestration: the gate lifts only when EVERY cell is ready.
+/// Cell 1 has (nearly) no log and recovers instantly; cell 0 replays a
+/// throttled ~1 MiB — a connection landed on the *ready* cell must still
+/// answer `-LOADING` (node semantics over per-cell recovery), and INFO
+/// exposes the partial readiness.
+#[test]
+fn loading_lifts_only_when_every_cell_recovered() {
+    const LOADING: &[u8] = b"-LOADING Redis is loading the dataset in memory\r\n";
+    let dir = temp_data_dir("loading-cells");
+    let val = vec![b'v'; 4096];
+    let k0 = key_for_cell(2, 0);
+
+    {
+        let node = Node::start_durable(2, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"led",
+            b"MODE",
+            b"durable",
+            b"FSYNC",
+            b"everysec",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"led"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        // Every write keys to cell 0: cell 1's log stays empty.
+        for i in 0..256u32 {
+            let key = [k0.as_slice(), format!(":{i}").as_bytes()].concat();
+            let hashtag = [b"{", k0.as_slice(), b"}", key.as_slice()].concat();
+            c.write_all(&cmd(&[b"SET", &hashtag, &val])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        drop(c);
+        node.stop();
+    }
+
+    let node = Node::start_with_recover(
+        2,
+        Some(dir.clone()),
+        0,
+        inf_server::RecoverConfig { step_bytes: 32 << 10, throttle_bytes_per_sec: Some(128 << 10) },
+    );
+
+    // Wait until cell 1 (empty log) is ready while cell 0 still loads.
+    let board = Arc::clone(node.control.as_ref().expect("durable node").recovery_board());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while board.ready_cells() == 0 {
+        assert!(Instant::now() < deadline, "no cell became ready");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!board.all_ready(), "throttled cell finished too fast for the window");
+
+    // A connection on the READY cell still answers -LOADING: the gate is
+    // node-scoped, not cell-scoped.
+    let ready_cell = if board.slot(0).ready() { 0 } else { 1 };
+    let mut c = conn_on_cell(&node, ready_cell);
+    c.write_all(&cmd(&[b"GET", b"anykey"])).expect("write");
+    read_exactly(&mut c, LOADING);
+    let info = info_text(&mut c, b"persistence");
+    assert!(info.contains("loading:1\r\n"), "{info}");
+    assert!(info.contains("loading_cells_ready:1\r\n"), "{info}");
+    assert!(info.contains("loading_cells:2\r\n"), "{info}");
+
+    // Lift: both cells serve, the throttled cell's data is intact.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !board.all_ready() {
+        assert!(Instant::now() < deadline, "loading never lifted");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut c2 = node.connect();
+    let probe =
+        [b"{".as_slice(), k0.as_slice(), b"}".as_slice(), k0.as_slice(), b":0".as_slice()].concat();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        c2.write_all(&cmd(&[b"INF.NS", b"USE", b"led"])).expect("write");
+        let line = read_line(&mut c2);
+        if line == b"+OK\r\n" {
+            break;
+        }
+        assert_eq!(line, LOADING.to_vec(), "unexpected reply {line:?}");
+        assert!(Instant::now() < deadline, "USE never accepted after all-ready");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    c2.write_all(&cmd(&[b"GET", &probe])).expect("write");
+    let mut want = format!("${}\r\n", val.len()).into_bytes();
+    want.extend_from_slice(&val);
+    want.extend_from_slice(b"\r\n");
+    read_exactly(&mut c2, &want);
+
+    drop(c);
+    drop(c2);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M2-S16 (the re-bound S02 observation row): on a LIVE node whose
+/// durable plane is ENOSPC-exhausted — `prealloc_no_space` armed from the
+/// second prealloc, so exhaustion surfaces in the first MAINTAIN after
+/// boot — durable writes refuse with the documented NOSPACE error while
+/// memory namespaces (and the default DB) keep serving, and reads of
+/// recovered durable state still work. Degrade loudly, never corrupt.
+#[test]
+fn memory_namespace_serves_while_durable_plane_is_exhausted() {
+    use inf_foundation::fault::FaultSpec;
+    let dir = temp_data_dir("enospc-live");
+
+    // Seed one durable key on a healthy node, then restart exhausted.
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"led",
+            b"MODE",
+            b"durable",
+            b"FSYNC",
+            b"everysec",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"led"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"SET", b"seeded", b"1"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        drop(c);
+        node.stop();
+    }
+
+    // Recovery reopens the tail segment without preallocating, so boot
+    // completes; the first MAINTAIN's next-segment prealloc (occurrence
+    // #1) fails and every retry after it — the durable plane exhausts on
+    // a live, serving node.
+    let node = Node::start_durable_with_faults(
+        1,
+        &dir,
+        vec![(inf_log::fault::PREALLOC_NO_SPACE, FaultSpec::FromNth(1))],
+    );
+    let mut c = node.connect();
+
+    // Recovered durable state reads fine (reads need no log append).
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"led"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"seeded"])).expect("write");
+    read_exactly(&mut c, b"$1\r\n1\r\n");
+
+    // Durable writes refuse loudly with the documented NOSPACE error
+    // (poll: exhaustion surfaces in a MAINTAIN slice shortly after boot).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        c.write_all(&cmd(&[b"SET", b"blocked", b"x"])).expect("write");
+        let line = read_line(&mut c);
+        if line == b"-ERR durable write refused: log storage exhausted (NOSPACE)\r\n" {
+            break;
+        }
+        assert_eq!(line, b"+OK\r\n".to_vec(), "unexpected reply {line:?}");
+        assert!(Instant::now() < deadline, "exhaustion never surfaced");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Memory namespaces are unaffected: named memory ns and default DB.
+    let mut m = node.connect();
+    m.write_all(&cmd(&[b"INF.NS", b"CREATE", b"cache", b"MODE", b"memory"])).expect("write");
+    read_exactly(&mut m, b"+OK\r\n");
+    m.write_all(&cmd(&[b"INF.NS", b"USE", b"cache"])).expect("write");
+    read_exactly(&mut m, b"+OK\r\n");
+    m.write_all(&cmd(&[b"SET", b"hot", b"v"])).expect("write");
+    read_exactly(&mut m, b"+OK\r\n");
+    m.write_all(&cmd(&[b"GET", b"hot"])).expect("write");
+    read_exactly(&mut m, b"$1\r\nv\r\n");
+    let mut d = node.connect();
+    d.write_all(&cmd(&[b"SET", b"plain", b"ok"])).expect("write");
+    read_exactly(&mut d, b"+OK\r\n");
+    d.write_all(&cmd(&[b"GET", b"plain"])).expect("write");
+    read_exactly(&mut d, b"$2\r\nok\r\n");
+
+    drop(c);
+    drop(m);
+    drop(d);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M2-S20 AC: `INF.CKPT WAIT` returns only after the new MANIFEST is
+/// durable — with `manifest_rename_fail` armed on the first swap attempt,
+/// the reply must outlast the counted abort and land after the *retried*
+/// swap commits (fault-injection verified). `BGSAVE`/`LASTSAVE` map onto
+/// the same machinery: LASTSAVE is 0 before the first publication and
+/// advances after it.
+#[test]
+fn inf_ckpt_wait_returns_after_manifest_durability() {
+    let dir = temp_data_dir("ckptwait");
+    let node = Node::start_durable_with_faults(
+        1,
+        &dir,
+        vec![(inf_log::fault::MANIFEST_RENAME_FAIL, inf_foundation::fault::FaultSpec::Nth(1))],
+    );
+    let mut c = node.connect();
+
+    c.write_all(&cmd(&[b"LASTSAVE"])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"gate", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"gate"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"k", b"v"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+
+    // WAIT must survive the injected first-swap abort: the fault fires at
+    // envelope step 5, the swap aborts (counted), the trigger stays
+    // latched, the retry commits — only then may +OK arrive.
+    c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+
+    let info = info_text(&mut c, b"persistence");
+    assert!(info_u64(&info, "manifests_published") >= 1, "durable manifest: {info}");
+    assert!(info_u64(&info, "manifests_aborted") >= 1, "the injected abort happened: {info}");
+    assert!(info_u64(&info, "rdb_last_save_time") > 0, "save time follows the publish: {info}");
+
+    // LASTSAVE now reports the publication (unix seconds, > 0).
+    c.write_all(&cmd(&[b"LASTSAVE"])).expect("write");
+    let lastsave = read_line(&mut c);
+    assert!(lastsave.starts_with(b":") && lastsave != b":0\r\n", "{lastsave:?}");
+
+    // BGSAVE: the Redis reply byte-for-byte; a later INF.CKPT WAIT
+    // fences it (deterministic save-then-check without polling).
+    c.write_all(&cmd(&[b"BGSAVE"])).expect("write");
+    read_exactly(&mut c, b"+Background saving started\r\n");
+    c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let info = info_text(&mut c, b"persistence");
+    assert!(info_u64(&info, "manifests_published") >= 2, "BGSAVE published too: {info}");
+
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M2-S20: `INF.CKPT CELL k WAIT` targets one cell — the reply fences that
+/// cell's durable MANIFEST without requiring peers to checkpoint.
+#[test]
+fn inf_ckpt_cell_targets_one_cell() {
+    let dir = temp_data_dir("ckptcell");
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"gate", b"MODE", b"durable", b"FSYNC", b"everysec"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"gate"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for i in 0..8u32 {
+        c.write_all(&cmd(&[b"SET", format!("k{i}").as_bytes(), b"v"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    c.write_all(&cmd(&[b"INF.CKPT", b"CELL", b"0", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.CKPT", b"CELL", b"1", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // Out-of-range cell: documented refusal.
+    c.write_all(&cmd(&[b"INF.CKPT", b"CELL", b"9", b"WAIT"])).expect("write");
+    let err = read_line(&mut c);
+    assert!(err.starts_with(b"-ERR CELL"), "{err:?}");
+
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();

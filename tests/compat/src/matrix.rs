@@ -537,6 +537,22 @@ pub static MATRIX: &[Case] = &[
         "InfinityDB extension (M2-S08): named-namespace selection, SELECT-class \
          conn state; durable-mode deviations documented in ADR-0015",
     ),
+    skip(
+        &["INF.CKPT"],
+        "InfinityDB extension (M2-S20): checkpoint trigger; the planeless compat candidate \
+         answers its documented no-durable-plane error",
+    ),
+    skip(
+        &["BGSAVE"],
+        "maps onto INF.CKPT (M2-S20): fuzzy checkpoint, no fork, no RDB file; reply \
+         byte-identical on durable nodes; the planeless candidate answers its documented \
+         error (node_e2e pins the live reply)",
+    ),
+    skip(
+        &["LASTSAVE"],
+        "M2-S20: newest durable MANIFEST publication time; 0 before the first save vs \
+         Redis's process-start time; the planeless candidate answers its documented error",
+    ),
     skip(&["INF.NS", "LIST"], "InfinityDB extension"),
     skip(&["INF.NS", "INFO", "cache"], "InfinityDB extension"),
     skip(&["INF.NS", "DROP", "cache"], "InfinityDB extension"),

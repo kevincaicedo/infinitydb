@@ -19,5 +19,22 @@ inf-store.workspace = true
 [lints]
 workspace = true
 
+[dev-dependencies]
+# M2-S16: recovery/fault tests arm named points (dev-only unification).
+inf-foundation = { workspace = true, features = ["fault-points"] }
+# M2-S22: bench-only page-cache cooling (fadvise DONTNEED) for the
+# cold-cache recovery/boot gate rows. The library keeps its no-libc rule.
+libc.workspace = true
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 inf-runtime = { workspace = true, features = ["uring"] }
+
+[[bench]]
+name = "recovery_replay"
+harness = false
+test = false
+
+[[bench]]
+name = "parallel_boot"
+harness = false
+test = false

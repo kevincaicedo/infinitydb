@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod crc;
+pub mod fault;
 mod hash;
 mod hist;
 mod ids;
@@ -16,7 +17,7 @@ pub mod tripwire;
 pub mod varint;
 
 pub use crc::{crc16, hashtag};
-pub use hash::hash64;
+pub use hash::{BuildIntHasher, IntHasher, hash64};
 pub use hist::LogHistogram;
 pub use ids::{CellId, KeySlot, SLOT_COUNT};
 pub use local::{CachePadded, LocalCounter};

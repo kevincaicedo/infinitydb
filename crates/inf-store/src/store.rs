@@ -275,6 +275,21 @@ impl CellStore {
         self.index.prefetch(key_hash);
     }
 
+    /// Unverified-probe record prefetch — §7.3 phase 2 as a standalone step
+    /// (the fabric-apply staged batch, M2.5 Phase H / ADR-0005 shape): find
+    /// the first fingerprint candidate and prefetch its record head lines.
+    /// The caller executes the exact path afterwards, so a fingerprint
+    /// collision (≈2⁻²²) or a reap between prefetch and execute costs
+    /// nothing but the wasted lines.
+    #[inline]
+    pub fn probe_prefetch(&self, key_hash: u64) {
+        if let Some(addr) = self.index.find(key_hash, |_| true) {
+            let head = self.arena.bytes(addr, HEADER_LEN).as_ptr();
+            inf_simd::prefetch_read(head);
+            inf_simd::prefetch_read(head.wrapping_add(64));
+        }
+    }
+
     /// Live key count (post-expiry keys may still be counted until read or
     /// wheel-reaped) — `DBSIZE`.
     #[inline]
@@ -1023,6 +1038,60 @@ impl CellStore {
                     emitted += 1;
                 }
             }
+            cursor = next_rev_cursor(cursor, mask);
+            if cursor == 0 || emitted >= count {
+                return cursor;
+            }
+        }
+    }
+
+    /// M2-S13: presize the index for `keys` live entries — recovery's
+    /// hint from the `.ick` footer's per-ns counts, applied before the
+    /// bulk replay so it avoids the doubling-rehash storm (each doubling
+    /// is a stop-and-copy over the whole table). Only effective while the
+    /// store is empty; a populated index keeps its geometry (growth on
+    /// insert remains correct either way). The hint is clamped defensively
+    /// — it may come from a damaged file, and a wrong hint may only cost
+    /// memory geometry, never correctness.
+    pub fn reserve_keys(&mut self, keys: usize) {
+        const MAX_RESERVE: usize = 1 << 28;
+        if self.is_empty() && keys > 64 {
+            self.index = Index::with_capacity(keys.min(MAX_RESERVE));
+        }
+    }
+
+    /// M2-S13 (ADR-0018): read-only sibling of
+    /// [`scan_post_images`](Self::scan_post_images) for the recovery state
+    /// digest — emits each live entry's `(key, value, expire_at_ms)`
+    /// **without reaping** expired entries, so the walk performs no
+    /// structural mutation and a full cursor sweep emits every live entry
+    /// exactly once (the digest oracle needs exactly-once; the mutating
+    /// walk guarantees only at-least-once across rehashes). Expired
+    /// entries are skipped: they are logically dead at `now` whatever
+    /// their physical residue.
+    pub fn digest_post_images(
+        &self,
+        cursor: u64,
+        count: usize,
+        now: Nanos,
+        mut emit: impl FnMut(&[u8], &[u8], Option<u64>),
+    ) -> u64 {
+        let mask = self.index.group_count() as u64 - 1;
+        let mut cursor = cursor & mask;
+        let mut emitted = 0usize;
+        loop {
+            let arena = &self.arena;
+            self.index.scan_home_group(
+                cursor as usize,
+                |addr| Self::hash_key(record_at(arena, addr).key()),
+                |addr| {
+                    let view = record_at(arena, addr);
+                    if !view.is_expired(now) {
+                        emit(view.key(), view.value(), view.expire_at_ms());
+                        emitted += 1;
+                    }
+                },
+            );
             cursor = next_rev_cursor(cursor, mask);
             if cursor == 0 || emitted >= count {
                 return cursor;

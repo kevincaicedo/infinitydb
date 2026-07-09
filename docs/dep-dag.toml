@@ -52,9 +52,16 @@ infinityd = [
 ]
 inf = ["inf-foundation", "inf-wire"]
 inf-bench = ["inf-foundation", "inf-wire"]
-inf-sim = ["inf-foundation", "inf-alloc", "inf-fabric", "inf-runtime", "inf-wire", "inf-store", "inf-server"]
+# inf-sim → inf-log: the M2-S19 durability oracle's survival audit reads
+# the surviving disk image directly (ADR-0021 — DST tooling, not a kernel
+# boundary).
+inf-sim = ["inf-foundation", "inf-alloc", "inf-fabric", "inf-runtime", "inf-wire", "inf-log", "inf-store", "inf-server"]
 
 # test crates — the compat harness (M0-S15) drives the in-process command
 # executor as the diff candidate, so it sees the wire/store/server stack.
 # Test-harness edges, not kernel boundaries (recorded in the M0 ledger).
 compat = ["inf-foundation", "inf-wire", "inf-store", "inf-server"]
+# crash-matrix (M2-S17, ADR-0020 D1): the kill-and-recover matrix runner
+# drives the log/staging/recovery stack directly. Test-harness edges, the
+# compat class — not kernel boundaries.
+crash-matrix = ["inf-foundation", "inf-log", "inf-store", "inf-server"]

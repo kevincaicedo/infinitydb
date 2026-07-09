@@ -103,6 +103,13 @@ pub struct ScriptedDriver {
     pub log_writes_submitted: u64,
     pub fsyncs_submitted: u64,
     stats: SubmitStats,
+    /// File references taken at push, mirroring the uring contract (the
+    /// kernel refs the file at SQE submission): a delayed schedule may
+    /// execute an op after the app dropped its fd — e.g. a standalone
+    /// fdatasync racing a deferred-seal handle drop (M2-S22, the
+    /// one-in-flight group-commit gate made this reachable). Held for the
+    /// driver's lifetime; test-scale op counts make that cheap.
+    held: Vec<File>,
 }
 
 impl ScriptedDriver {
@@ -118,6 +125,7 @@ impl ScriptedDriver {
             log_writes_submitted: 0,
             fsyncs_submitted: 0,
             stats: SubmitStats::default(),
+            held: Vec::new(),
         }
     }
 
@@ -149,10 +157,36 @@ impl ScriptedDriver {
         let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
         file.sync_data().expect("test fdatasync");
     }
+
+    /// Duplicate `fd` and keep the dup alive for the driver's lifetime —
+    /// the scripted analog of the kernel's file reference at submission.
+    fn hold(&mut self, fd: RawFd) -> RawFd {
+        // SAFETY: dup on a live fd; returns a fresh owned fd or -1 (asserted).
+        let dup = unsafe { libc::dup(fd) };
+        assert!(dup >= 0, "dup({fd}) failed: {}", io::Error::last_os_error());
+        // SAFETY: `dup` is owned by no one else; the `File` in `held`
+        // closes it exactly once when the driver drops.
+        self.held.push(unsafe { File::from_raw_fd(dup) });
+        dup
+    }
 }
 
 impl BackendDriver for ScriptedDriver {
     fn push(&mut self, op: IoOp) {
+        // Take the file reference the kernel would take at SQE submission
+        // (see `held`): the op keeps executing on the dup'd fd even if the
+        // app closes its own copy before a delayed schedule runs the op.
+        let op = match op {
+            IoOp::LogWrite { fd, offset, data, token, fsync_token }
+                if self.mode != IoMode::Recorded =>
+            {
+                IoOp::LogWrite { fd: self.hold(fd), offset, data, token, fsync_token }
+            }
+            IoOp::Fdatasync { fd, token } if self.mode != IoMode::Recorded => {
+                IoOp::Fdatasync { fd: self.hold(fd), token }
+            }
+            other => other,
+        };
         self.queued.push(op);
     }
 

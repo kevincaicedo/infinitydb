@@ -38,26 +38,31 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering, fence};
 
 use inf_alloc::{BufferId, LeaseKind};
-use inf_fabric::{ApplyArgs, CellFabric, ErrCode, FabricToken, Op, Outcome, SendError};
+use inf_fabric::{
+    ApplyArgs, CellFabric, ErrCode, FabricToken, MAX_APPLY_ARGS, Op, Outcome, SendError,
+};
 use inf_foundation::time::Nanos;
 use inf_foundation::{CellId, LogHistogram};
-use inf_log::fs::StdSegmentFs;
+use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{FsyncClass, MutationEffect, SegmentRotor};
 use inf_runtime::GroupClass;
 use inf_runtime::{
     CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoOp, LoopCx,
     RawFd, TokenClass, WaitList,
 };
-use inf_store::{EvictBudget, ExpiryBudget, Keyspace, NsId, NsMode, SlotRouter, WallAnchor};
+use inf_store::{
+    CellStore, EvictBudget, ExpiryBudget, Keyspace, NsId, NsMode, SlotRouter, WallAnchor,
+};
 use inf_wire::{
     ArgvRef, CmdFlags, CommandId, ConnParser, Parsed, ParserLimits, Protocol, RespWriter, arity_ok,
     extract_keys, lookup,
 };
 
-use crate::control::ControlHandle;
+use crate::control::{ControlHandle, RecoveryBoard};
 use crate::durable::{DurableCell, DurableConfig, EVERYSEC_TIMER_KEY};
 use crate::exec::{ConnCx, NodeInfo, execute, execute_slices, stall_request};
 use crate::pubsub::{self, PubSubCell, SubKind};
+use crate::recover::{Recovery, RecoveryProgress};
 
 /// Commands queued behind an active pump before recv is disarmed (bounded
 /// everything — the backpressure watermark).
@@ -75,8 +80,24 @@ const REMOTE_WINDOW: usize = 32;
 const PENDING_REPLIES_MAX: usize = 256;
 /// Reply-pool bounds: buffers kept per cell, and the largest buffer worth
 /// keeping (anything bigger is freed, so one giant value can't pin memory).
-const REPLY_POOL_MAX: usize = 256;
+/// Sized to the parked-reply working set — up to `conns × REMOTE_WINDOW`
+/// `Bytes` gate values hold pool buffers at once on the natural-routing
+/// leg; at 256 the pool exhausted and the overflow paid malloc/free per
+/// reply (M2.5 Phase H allocator lever). Worst-case retention is
+/// `REPLY_POOL_MAX × REPLY_POOL_BUF_CAP` = 16 MiB/cell, reached only if a
+/// ≥ 4 KiB-reply workload actually held that many buffers concurrently
+/// (the pool only keeps what the workload used; L5 note in the ledger).
+const REPLY_POOL_MAX: usize = 4096;
 const REPLY_POOL_BUF_CAP: usize = 4096;
+/// Deferred-command pool bounds (`OwnedCmd` flat buffers), mirroring the
+/// reply pool: the queue depth behind an active pump is bounded by
+/// `PENDING_HIGH_WATER` per connection, and buffers recycle at dispatch.
+const CMD_POOL_MAX: usize = 4096;
+const CMD_POOL_BUF_CAP: usize = 4096;
+/// Argv views for dispatch live on the stack up to this arity (M2.5
+/// Phase H: `OwnedCmd::slices` was one heap `Vec` per dispatched command);
+/// wider commands (MSET…) fall back to the heap.
+const ARGV_INLINE: usize = 16;
 /// Hard cap on wheel fires per expiry MAINTAIN slice — the debt-aware
 /// escalation (M1-S05) may multiply the deficit budget, never exceed this.
 const MAX_EXPIRY_FIRES_PER_SLICE: u32 = 4096;
@@ -152,11 +173,15 @@ struct OwnedCmd {
 }
 
 impl OwnedCmd {
-    fn from_argv(argv: &ArgvRef<'_>) -> OwnedCmd {
+    /// Flatten `argv` into `buf` (recycled through `Shared::cmd_pool` —
+    /// M2.5 Phase H: `from_argv` was one malloc/free per deferred command,
+    /// and on the natural-routing leg every remote command defers).
+    fn from_argv_into(argv: &ArgvRef<'_>, mut buf: Vec<u8>) -> OwnedCmd {
         let argc = argv.len();
         let head = 4 + 4 * argc;
         let total = head + (0..argc).map(|i| argv.arg(i).len()).sum::<usize>();
-        let mut buf = Vec::with_capacity(total);
+        buf.clear();
+        buf.reserve(total);
         buf.extend_from_slice(&u32::try_from(argc).expect("argc fits u32").to_le_bytes());
         let mut end = head;
         for i in 0..argc {
@@ -183,15 +208,20 @@ impl OwnedCmd {
         &self.buf[start..self.end(i)]
     }
 
-    /// Borrowed views over the flat buffer — the one remaining allocation
-    /// per dispatched command (`extract_keys`/`ApplyArgs`/observer want
-    /// `&[&[u8]]`).
+    /// Borrowed views over the flat buffer (`extract_keys`/`ApplyArgs`/
+    /// observer want `&[&[u8]]`). Heap fallback for wide commands — the
+    /// dispatch hot path uses the [`ARGV_INLINE`] stack array instead.
     fn slices(&self) -> Vec<&[u8]> {
         (0..self.argc()).map(|i| self.arg(i)).collect()
     }
 
     fn mem(&self) -> usize {
         self.buf.capacity()
+    }
+
+    /// Surrender the flat buffer for recycling (`Shared::recycle_cmd_buf`).
+    fn into_buf(self) -> Vec<u8> {
+        self.buf
     }
 }
 
@@ -291,7 +321,7 @@ impl ConnSlab {
 
 // ---- shared cell state (futures hold an Rc) -----------------------------------
 
-struct Shared<O: PlaneObserver + 'static> {
+struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     cell: CellId,
     cells: u16,
     router: SlotRouter,
@@ -319,6 +349,11 @@ struct Shared<O: PlaneObserver + 'static> {
     /// remote path's per-op heap traffic was a top M0-R1 cost. Bounded by
     /// [`REPLY_POOL_MAX`]/[`REPLY_POOL_BUF_CAP`].
     reply_pool: RefCell<Vec<Vec<u8>>>,
+    /// Recycled `OwnedCmd` flat buffers (deferred commands) — one
+    /// malloc/free per queued command otherwise; on the natural-routing
+    /// leg every remote command defers (M2.5 Phase H). Bounded by
+    /// [`CMD_POOL_MAX`]/[`CMD_POOL_BUF_CAP`].
+    cmd_pool: RefCell<Vec<Vec<u8>>>,
     recv_dropped: Cell<u64>,
     /// Pub/sub registries (M1-S10): local subscriber lists, owner-side
     /// per-cell counts, the replicated pattern index.
@@ -332,13 +367,26 @@ struct Shared<O: PlaneObserver + 'static> {
     cob_pubsub: Cell<(u64, u64, u64)>,
     /// The durable plane (M2-S08, ADR-0015): `None` = memory-only cell —
     /// the zero-cost branch every memory-path check reduces to (M2-S09).
-    durable: RefCell<Option<DurableCell>>,
+    durable: RefCell<Option<DurableCell<F>>>,
     /// Node control-thread handle (id allocation + catalog persistence).
     control: RefCell<Option<Arc<ControlHandle>>>,
     /// DDL pumps parked on catalog persistence (ADR-0015 D3).
     ddl_waiters: WaitList<u8>,
+    /// `INF.CKPT WAIT` pumps parked on checkpoint-board publications
+    /// (M2-S20 — the persist-epoch waitlist class).
+    ckpt_waiters: WaitList<u8>,
     /// Last persist epoch MAINTAIN observed (edge-detects wakes).
     ddl_epoch_seen: Cell<u64>,
+    /// Board published-sum at the last MAINTAIN (the ckpt-wake edge).
+    ckpt_pub_seen: Cell<u64>,
+    /// Node is loading (M2-S15): commands without the LOADING flag answer
+    /// `-LOADING` until every cell's recovery completes. One predictable
+    /// `Cell<bool>` load on the command path; false forever after boot.
+    loading: Cell<bool>,
+    /// Fabric-apply staged prefetch (M2.5 Phase H, ADR-0005 shape): FABRIC-IN
+    /// stages drained applies, prefetches the whole batch's store lines, then
+    /// executes. Off by default until its binding A/B (`--fabric-apply-prefetch`).
+    apply_prefetch: Cell<bool>,
 }
 
 /// One fabric-origin PUBLISH parked at the owner cell.
@@ -349,7 +397,7 @@ struct OwnerPub {
     payload: Vec<u8>,
 }
 
-impl<O: PlaneObserver + 'static> Shared<O> {
+impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     fn with_conn<R>(&self, key: ConnKey, f: impl FnOnce(&mut Conn) -> R) -> Option<R> {
         self.conns.borrow_mut().get_mut(key).map(f)
     }
@@ -399,6 +447,22 @@ impl<O: PlaneObserver + 'static> Shared<O> {
         }
         let mut pool = self.reply_pool.borrow_mut();
         if pool.len() < REPLY_POOL_MAX {
+            pool.push(buf);
+        }
+    }
+
+    /// An empty `OwnedCmd` flat buffer, recycled when possible.
+    fn take_cmd_buf(&self) -> Vec<u8> {
+        self.cmd_pool.borrow_mut().pop().unwrap_or_default()
+    }
+
+    /// Returns an `OwnedCmd` buffer to the pool (bounded; oversized drop).
+    fn recycle_cmd_buf(&self, buf: Vec<u8>) {
+        if buf.capacity() == 0 || buf.capacity() > CMD_POOL_BUF_CAP {
+            return;
+        }
+        let mut pool = self.cmd_pool.borrow_mut();
+        if pool.len() < CMD_POOL_MAX {
             pool.push(buf);
         }
     }
@@ -581,8 +645,8 @@ enum NsApplyOutcome {
 /// Applies the internal `INF.NSFAN` DDL fan on a peer cell (M2-S08):
 /// `CREATE name mode fsync policy maxmemory id` / `DROP name`, fields as
 /// the origin serialized them (`-` = none). Returns false for non-NSFAN.
-fn handle_ns_apply<O: PlaneObserver + 'static>(
-    shared: &Shared<O>,
+fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
     from: CellId,
     token: FabricToken,
     argv: &[&[u8]],
@@ -602,8 +666,8 @@ fn handle_ns_apply<O: PlaneObserver + 'static>(
     true
 }
 
-fn apply_nsfan<O: PlaneObserver + 'static>(
-    shared: &Shared<O>,
+fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
     argv: &[&[u8]],
 ) -> Result<(), inf_store::NsError> {
     use inf_store::NsError;
@@ -647,14 +711,20 @@ fn apply_nsfan<O: PlaneObserver + 'static>(
 
 /// One cell's data plane. Construct per cell, drive with
 /// [`CellLoop::run_iteration`](inf_runtime::CellLoop::run_iteration).
-pub struct ServerPlane<O: PlaneObserver + 'static = NoopObserver> {
-    shared: Rc<Shared<O>>,
+pub struct ServerPlane<
+    O: PlaneObserver + 'static = NoopObserver,
+    F: SegmentFs + Clone + 'static = StdSegmentFs,
+> {
+    shared: Rc<Shared<O, F>>,
     listener: RawFd,
     started: bool,
     /// Recv completions staged from step 1 for PARSE+EXECUTE (step 3+4).
     inbox: Vec<(ConnKey, BufferId, u32)>,
     /// Reusable FABRIC-IN scratch: owner-side reply bytes for this drain.
     reply_scratch: Vec<u8>,
+    /// Fabric-apply prefetch batch (reused across FABRIC-IN steps).
+    apply_stage: Vec<StagedApply>,
+    apply_stage_bytes: Vec<u8>,
     /// Reusable FABRIC-IN scratch: replies staged while the fabric is
     /// borrowed by `drain`, sent the moment it ends.
     staged_replies: Vec<(CellId, FabricToken, StagedReply)>,
@@ -674,6 +744,33 @@ pub struct ServerPlane<O: PlaneObserver + 'static = NoopObserver> {
     /// Last manual-checkpoint epoch observed on the control handle
     /// (M2-S10 — one relaxed load per MAINTAIN, edge-detected).
     ckpt_epoch_seen: u64,
+    /// Early fabric publish at the head of MAINTAIN (M2.5-S21 lever,
+    /// A/B-gated): remote ops staged during EXECUTE reach peers before
+    /// this cell's MAINTAIN/LOG/RESPOND instead of at step 8.
+    early_fabric_flush: bool,
+    /// In-flight loop-resident boot recovery (M2-S15); `None` once this
+    /// cell's log is recovered (or on memory-only cells).
+    boot: Option<BootRecovery<F>>,
+    /// Fatal boot-recovery error (§8.4): the assembly polls this after
+    /// each iteration and fail-stops the process.
+    boot_error: Option<std::io::Error>,
+    /// Node recovery board while any cell is still loading (M2-S15);
+    /// dropped once `all_ready` is observed.
+    loading_board: Option<Arc<RecoveryBoard>>,
+}
+
+/// One cell's loop-resident boot recovery (M2-S15): the [`Recovery`]
+/// machine plus the config that seeds `enable_durable` on completion.
+struct BootRecovery<F: SegmentFs> {
+    rec: Recovery<F>,
+    /// The filesystem tier, cloned into the ckpt/manifest drivers at
+    /// `enable_durable` (M2-S19: `StdSegmentFs` on the node, `SimDisk`
+    /// in the simulator).
+    fs: F,
+    cfg: DurableConfig,
+    cell_id: u16,
+    /// Earliest next step under the test-only throttle (`Nanos(0)` = now).
+    next_due: Nanos,
 }
 
 /// An owner-side reply produced during the FABRIC-IN drain (ranges index
@@ -686,7 +783,7 @@ enum StagedReply {
     Refused,
 }
 
-impl<O: PlaneObserver + 'static> ServerPlane<O> {
+impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
     /// `listener` must be a listening fd this plane's driver will own.
     #[allow(clippy::too_many_arguments)] // construction-time wiring, not an API surface
     pub fn new(
@@ -698,7 +795,7 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
         node: Rc<NodeInfo>,
         observer: O,
         route_local_only: bool,
-    ) -> ServerPlane<O> {
+    ) -> ServerPlane<O, F> {
         node.cell.set(cell.0);
         node.cells.set(cells);
         ServerPlane {
@@ -719,6 +816,7 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
                 rtt_ns: RefCell::new(LogHistogram::new()),
                 rtt_sent: RefCell::new(vec![VecDeque::new(); usize::from(cells)]),
                 reply_pool: RefCell::new(Vec::new()),
+                cmd_pool: RefCell::new(Vec::new()),
                 recv_dropped: Cell::new(0),
                 pubsub: RefCell::new(PubSubCell::new(cells)),
                 pub_queue: RefCell::new(VecDeque::new()),
@@ -727,12 +825,18 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
                 durable: RefCell::new(None),
                 control: RefCell::new(None),
                 ddl_waiters: WaitList::new(),
+                ckpt_waiters: WaitList::new(),
                 ddl_epoch_seen: Cell::new(0),
+                ckpt_pub_seen: Cell::new(0),
+                loading: Cell::new(false),
+                apply_prefetch: Cell::new(false),
             }),
             listener,
             started: false,
             inbox: Vec::new(),
             reply_scratch: Vec::new(),
+            apply_stage: Vec::new(),
+            apply_stage_bytes: Vec::new(),
             staged_replies: Vec::new(),
             park_flags: None,
             expiry_lag: 0,
@@ -740,31 +844,172 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
             config_pushed: u64::MAX,
             everysec_armed: false,
             ckpt_epoch_seen: 0,
+            early_fabric_flush: false,
+            boot: None,
+            boot_error: None,
+            loading_board: None,
         }
     }
 
-    /// Enables the durable plane for this cell (M2-S08/S10): the assembly
-    /// runs recovery first (`recover::open_cell_log`) and hands the
-    /// tail-opened rotor here, before the loop starts. `cell_id` names the
-    /// shard directory the checkpoint driver writes under.
+    /// Starts loop-resident boot recovery (M2-S15): the cell serves from
+    /// its first iteration — answering `-LOADING` per the wire-layer gate —
+    /// while MAINTAIN replays the cell log in bounded steps;
+    /// [`enable_durable`](Self::enable_durable) fires internally on
+    /// completion and the cell's board slot flips ready. Requires
+    /// [`set_control`](Self::set_control) first (the board lives there).
+    /// `now` is the injected clock instant recovery replays records under
+    /// (one instant for the whole replay — L7, same contract as
+    /// `open_cell_log`).
+    ///
+    /// # Panics
+    /// If the control handle is not wired yet.
+    pub fn begin_recovery(&mut self, fs: F, cfg: &DurableConfig, cell_id: u16, now: Nanos) {
+        let board = {
+            let control = self.shared.control.borrow();
+            let control = control.as_ref().expect("set_control before begin_recovery");
+            Arc::clone(control.recovery_board())
+        };
+        let anchor = self.shared.wall_anchor();
+        self.boot = Some(BootRecovery {
+            // Loop-resident boots defer boot-metadata fsyncs into driver
+            // barriers (M2.5-S01): ready never blocks on the device.
+            rec: Recovery::new(fs.clone(), cell_id, cfg, anchor, now).deferred_boot_sync(),
+            fs,
+            cfg: cfg.clone(),
+            cell_id,
+            next_due: Nanos(0),
+        });
+        self.loading_board = Some(board);
+        self.shared.loading.set(true);
+    }
+
+    /// Fatal boot-recovery error, if one occurred (§8.4 fail-stop): the
+    /// assembly polls this after each iteration and refuses to serve.
+    pub fn take_boot_error(&mut self) -> Option<std::io::Error> {
+        self.boot_error.take()
+    }
+
+    /// One bounded boot-recovery step (M2-S15), driven from MAINTAIN.
+    /// Unthrottled boots replay flat-out (`before_park` keeps the loop
+    /// polling); the test-only throttle paces steps against the loop
+    /// clock, bounded below by the park timeout.
+    fn drive_recovery(&mut self, cx: &mut LoopCx<'_>) {
+        let Some(boot) = self.boot.as_mut() else { return };
+        if cx.now < boot.next_due {
+            return;
+        }
+        // Publish the phase BEFORE stepping (M2.5-S01): a step that stalls
+        // inside the kernel leaves the board naming the stuck phase, so a
+        // wedged cell is diagnosable from the control thread's narration
+        // instead of silent (the ADR-0022 D7 signature).
+        if let Some(board) = &self.loading_board {
+            board.slot(boot.cell_id).publish_phase(boot.rec.phase_code());
+        }
+        let before = boot.rec.bytes_consumed();
+        let step = {
+            let mut store = self.shared.store.borrow_mut();
+            boot.rec.step(&mut store, boot.cfg.recover.step_bytes)
+        };
+        // Pace on bytes actually read — never the slack credits progress
+        // also carries (a near-empty prealloc'd segment must not charge
+        // its extent to the throttle clock).
+        let used = boot.rec.bytes_consumed() - before;
+        if used > 0 {
+            if let Some(rate) = boot.cfg.recover.throttle_bytes_per_sec {
+                let delay = used.saturating_mul(1_000_000_000) / rate.max(1);
+                boot.next_due = Nanos(cx.now.0.saturating_add(delay));
+            }
+            // Charged, never budget-gated: boot replay outranks the idle
+            // maintenance classes (foreground is `-LOADING`-only here).
+            cx.charge(GroupClass::Maintenance, u32::try_from(used / 1024).unwrap_or(u32::MAX));
+        }
+        if let Some(board) = &self.loading_board {
+            let (segs_done, segs_total) = boot.rec.segments_progress();
+            board.slot(boot.cell_id).publish(
+                boot.rec.bytes_done(),
+                boot.rec.bytes_total(),
+                segs_done,
+                segs_total,
+            );
+        }
+        match step {
+            Ok(RecoveryProgress::Working) => {}
+            Ok(RecoveryProgress::Complete) => {
+                let mut boot = self.boot.take().expect("boot present");
+                let fs = boot.fs;
+                let barrier_dirs = boot.rec.take_boot_barrier_dirs();
+                let (rotor, stats, seed) = boot.rec.finish();
+                match self.enable_durable(fs, &boot.cfg, boot.cell_id, rotor, seed) {
+                    Ok(()) => {
+                        // Boot-metadata durability rides driver barriers at
+                        // the head of the commit ledger (M2.5-S01): every
+                        // durable ack is fenced behind them by the
+                        // done-prefix rule; ready flips now, without
+                        // waiting on the device.
+                        if let Some(cell) = self.shared.durable.borrow_mut().as_mut() {
+                            cell.arm_boot_barriers(cx, barrier_dirs);
+                        }
+                        if let Some(board) = &self.loading_board {
+                            let slot = board.slot(boot.cell_id);
+                            slot.mark_ready(
+                                stats.ckpt_records + stats.records_applied,
+                                stats.torn_truncated_at,
+                            );
+                        }
+                    }
+                    Err(err) => self.boot_error = Some(err),
+                }
+            }
+            Err(err) => {
+                self.boot = None;
+                self.boot_error = Some(err);
+            }
+        }
+    }
+
+    /// Enables the durable plane for this cell (M2-S08/S10/S11): the
+    /// assembly runs recovery first (`recover::open_cell_log`) and hands
+    /// the tail-opened rotor plus the recovered manifest here, before the
+    /// loop starts. `cell_id` names the shard directory the checkpoint and
+    /// manifest drivers write under.
     ///
     /// # Errors
     /// Checkpoint-directory scan failure (boot-time listing).
     pub fn enable_durable(
         &mut self,
+        fs: F,
         cfg: &DurableConfig,
         cell_id: u16,
-        rotor: SegmentRotor<StdSegmentFs>,
+        rotor: SegmentRotor<F>,
+        recovered: Option<crate::RecoveredManifest>,
     ) -> std::io::Result<()> {
-        let ckpt_dir = cfg.data_dir.join(format!("shard-{cell_id}")).join("ckpt");
-        let ckpt = crate::ckpt::CkptCell::new(ckpt_dir, cell_id, cfg.ckpt)?;
-        *self.shared.durable.borrow_mut() = Some(DurableCell::new(cfg.staging, rotor, ckpt));
+        let shard_dir = cfg.data_dir.join(format!("shard-{cell_id}"));
+        let ckpt_dir = shard_dir.join("ckpt");
+        let ckpt = crate::ckpt::CkptCell::new(fs.clone(), ckpt_dir.clone(), cell_id, cfg.ckpt)?;
+        let manifest = crate::ckpt::ManifestCell::new(
+            fs,
+            shard_dir,
+            ckpt_dir,
+            cell_id,
+            recovered.map(|m| crate::ckpt::PendingManifest {
+                ckpt_id: m.ckpt_id,
+                begin_lsn: m.begin_lsn,
+            }),
+        );
+        *self.shared.durable.borrow_mut() =
+            Some(DurableCell::new(cfg.staging, cfg.sync_pipeline, rotor, ckpt, manifest));
         Ok(())
     }
 
     /// Checkpoint gauges for tests/stats (`None` = memory-only cell).
     pub fn ckpt_stats(&self) -> Option<crate::ckpt::CkptStats> {
         self.shared.durable.borrow().as_ref().map(DurableCell::ckpt_stats)
+    }
+
+    /// Manifest/truncation gauges for tests/stats (`None` = memory-only
+    /// cell — M2-S11).
+    pub fn manifest_stats(&self) -> Option<crate::ckpt::ManifestStats> {
+        self.shared.durable.borrow().as_ref().map(DurableCell::manifest_stats)
     }
 
     /// Wires the node control-thread handle (DDL id allocation + catalog
@@ -782,6 +1027,19 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
     /// `Arc` goes to every cell's fabric via `CellFabric::set_wakeups`).
     pub fn set_park_flags(&mut self, flags: Arc<Vec<AtomicBool>>) {
         self.park_flags = Some(flags);
+    }
+
+    /// Enables the M2.5-S21 early fabric publish (A/B lever): remote ops
+    /// staged during EXECUTE are published at the head of MAINTAIN.
+    pub fn set_early_fabric_flush(&mut self, on: bool) {
+        self.early_fabric_flush = on;
+    }
+
+    /// Enables the M2.5 Phase-H fabric-apply staged prefetch (A/B lever,
+    /// ADR-0005 shape): FABRIC-IN stages drained applies, prefetches the
+    /// batch's store lines, then executes in arrival order.
+    pub fn set_fabric_apply_prefetch(&mut self, on: bool) {
+        self.shared.apply_prefetch.set(on);
     }
 
     /// Live connections (tests, stats).
@@ -857,6 +1115,11 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
         if meta.id == CommandId::InfNs {
             return true;
         }
+        // INF.CKPT/BGSAVE/LASTSAVE ride the pump (M2-S20): they speak to
+        // the control handle (request epochs, the checkpoint board).
+        if matches!(meta.id, CommandId::InfCkpt | CommandId::Bgsave | CommandId::Lastsave) {
+            return true;
+        }
         if self.shared.route_local_only {
             return false;
         }
@@ -883,7 +1146,7 @@ impl<O: PlaneObserver + 'static> ServerPlane<O> {
     }
 }
 
-impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
+impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for ServerPlane<O, F> {
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion) {
         match c.result {
             CompletionResult::Accepted { fd } => {
@@ -976,6 +1239,14 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                     cell.on_ckpt_error(errno);
                     return;
                 }
+                // MANIFEST-swap barrier failure: old recovery unit kept
+                // (M2-S11, the checkpoint-abort class — ADR-0017).
+                if c.token.class() == TokenClass::ManifestSync {
+                    let mut durable = self.shared.durable.borrow_mut();
+                    let cell = durable.as_mut().expect("manifest completion without durable plane");
+                    cell.on_manifest_error(errno);
+                    return;
+                }
                 let key = Self::key_of(c.token);
                 let live = self
                     .shared
@@ -1006,8 +1277,10 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                 let cell = durable.as_mut().expect("Synced without durable plane");
                 if c.token.class() == TokenClass::CkptSync {
                     cell.on_ckpt_synced();
+                } else if c.token.class() == TokenClass::ManifestSync {
+                    cell.on_manifest_synced();
                 } else {
-                    cell.on_synced(c.token, cx.now);
+                    cell.on_synced(cx, c.token);
                 }
             }
         }
@@ -1022,6 +1295,14 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
     }
 
     fn before_park(&mut self) -> bool {
+        // Boot replay pending: keep polling (M2-S15) — parking would gate
+        // recovery throughput on the park timeout. Throttled (test-only)
+        // boots do park; the park timeout bounds their step cadence.
+        if let Some(boot) = &self.boot
+            && boot.cfg.recover.throttle_bytes_per_sec.is_none()
+        {
+            return true;
+        }
         let Some(flags) = &self.park_flags else { return false };
         let me = usize::from(self.shared.cell.0);
         flags[me].store(true, Ordering::Relaxed);
@@ -1047,28 +1328,52 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
         // owned-staging copies dominated the cross-cell profile). Only the
         // replies wait: the fabric is mutably borrowed by `drain`, so their
         // bytes land in the reusable scratch and ship the moment it ends.
+        // With `--fabric-apply-prefetch` (M2.5 Phase H), applies instead
+        // stage (one small copy) so the whole pack's store lines prefetch
+        // before any op executes — the ADR-0005 pipeline on the batch the
+        // fabric naturally provides; order per source pair is unchanged.
         self.reply_scratch.clear();
         self.staged_replies.clear();
+        let apply_prefetch = self.shared.apply_prefetch.get();
         let shared = &self.shared;
         let scratch = &mut self.reply_scratch;
         let staged = &mut self.staged_replies;
+        let stage = &mut self.apply_stage;
+        let stage_bytes = &mut self.apply_stage_bytes;
         let mut orphans: u64 = 0;
         let mut pubs: Vec<OwnerPub> = Vec::new();
         let mut gated: Vec<GatedReply> = Vec::new();
         let now = cx.now;
         let drained = shared.fabric.borrow_mut().drain(FABRIC_DRAIN_MAX, |from, op| {
-            handle_fabric_op(
-                shared,
-                now,
-                from,
-                op,
-                scratch,
-                staged,
-                &mut pubs,
-                &mut gated,
-                &mut orphans,
-            );
+            if apply_prefetch {
+                stage_or_handle(
+                    shared,
+                    now,
+                    from,
+                    op,
+                    stage,
+                    stage_bytes,
+                    scratch,
+                    staged,
+                    &mut pubs,
+                    &mut gated,
+                    &mut orphans,
+                );
+            } else {
+                handle_fabric_op(
+                    shared,
+                    now,
+                    from,
+                    op,
+                    scratch,
+                    staged,
+                    &mut pubs,
+                    &mut gated,
+                    &mut orphans,
+                );
+            }
         });
+        flush_apply_stage(shared, stage, stage_bytes, scratch, staged, &mut pubs);
         if drained == 0 {
             return;
         }
@@ -1184,6 +1489,29 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                     match parsed {
                         Parsed::Command(argv) | Parsed::Inline(argv) => {
                             commands += 1;
+                            // M2-S15 `-LOADING` gate: while the node loads,
+                            // only LOADING-flagged commands run; the rest
+                            // answer exactly Redis's error (oracle capture
+                            // artifact). Unknown commands keep their normal
+                            // error — Redis resolves the command first. The
+                            // board re-check serves commands that arrive in
+                            // the same iteration the last cell flips ready.
+                            if self.shared.loading.get()
+                                && lookup(argv.arg(0))
+                                    .is_some_and(|meta| !meta.flags.contains(CmdFlags::LOADING))
+                            {
+                                if self
+                                    .loading_board
+                                    .as_deref()
+                                    .is_some_and(RecoveryBoard::all_ready)
+                                {
+                                    self.shared.loading.set(false);
+                                } else {
+                                    let mut w = RespWriter::new(out, conn_cx.proto);
+                                    w.error("LOADING Redis is loading the dataset in memory");
+                                    continue;
+                                }
+                            }
                             // Named-namespace commands always ride the pump
                             // (M2-S08): durable acks suspend, staging
                             // admission may park, and emission lives there —
@@ -1194,7 +1522,8 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                                 || conn_cx.ns.is_some()
                                 || self.needs_fabric(&argv);
                             if defer {
-                                let owned = OwnedCmd::from_argv(&argv);
+                                let owned =
+                                    OwnedCmd::from_argv_into(&argv, self.shared.take_cmd_buf());
                                 if pump_was_active || spawn_first.is_some() {
                                     deferred.push(owned);
                                 } else {
@@ -1264,6 +1593,42 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
 
     fn maintain(&mut self, cx: &mut LoopCx<'_>) {
         self.shared.now.set(cx.now);
+        // ---- early fabric publish (M2.5-S21): remote ops staged during
+        // EXECUTE become peer-visible NOW instead of at FABRIC-OUT (step
+        // 8) — the peer drains them while this cell runs MAINTAIN/LOG/
+        // RESPOND, so the hop RTT overlaps local work instead of
+        // following it (the request-path sibling of the M0-R1 "publish
+        // replies NOW" finding; remote throughput is window/RTT-bound at
+        // REMOTE_WINDOW, so RTT saved converts directly). One extra
+        // Release store + doorbell per destination per iteration; step 8
+        // stays for late stagers.
+        if self.early_fabric_flush {
+            let mut fabric = self.shared.fabric.borrow_mut();
+            let published = fabric.flush();
+            if published > 0 {
+                cx.note_fabric(published as u64);
+            }
+        }
+        // ---- boot recovery (M2-S15): budgeted replay steps while the
+        // cell answers -LOADING; enable_durable fires on completion.
+        if self.boot.is_some() {
+            self.drive_recovery(cx);
+        }
+        if let Some(board) = &self.loading_board {
+            let node = &self.shared.node;
+            let (done, total) = board.bytes();
+            node.loading_start_unix_ms.set(board.start_unix_ms());
+            node.loading_loaded_bytes.set(done);
+            node.loading_total_bytes.set(total);
+            node.loading_cells_ready.set(board.ready_cells());
+            if board.all_ready() {
+                node.loading.set(0);
+                self.shared.loading.set(false);
+                self.loading_board = None;
+            } else {
+                node.loading.set(1);
+            }
+        }
         // ---- expiry slice (M1-S05): wheel ticks under the Maintenance
         // deficit budget; the `expiry_debt` lag escalates the slice (×1..16,
         // hard-capped) so storms drain on idle headroom while foreground
@@ -1321,14 +1686,14 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
         // (rotation stays a pointer swap — S02); durable counters flush
         // into NodeInfo for INFO persistence (S21 vocabulary).
         if let Some(cell) = self.shared.durable.borrow_mut().as_mut() {
-            cell.maintain(cx.now.as_millis());
+            cell.maintain(cx);
             // Manual checkpoint requests ride the control handle (one
             // relaxed load — the persisted-epoch pattern, ADR-0016 D7).
             if let Some(control) = self.shared.control.borrow().as_ref() {
-                let epoch = control.ckpt_epoch();
+                let epoch = control.ckpt_board().slot(self.shared.cell.0).req();
                 if epoch != self.ckpt_epoch_seen {
                     self.ckpt_epoch_seen = epoch;
-                    cell.request_ckpt();
+                    cell.request_ckpt(epoch);
                 }
             }
             // ---- checkpoint slice (M2-S10, ADR-0016 D5): its own deficit
@@ -1342,6 +1707,17 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                     cx.charge(GroupClass::Checkpoint, used);
                 }
             }
+            // ---- MANIFEST + truncation slice (M2-S11/S12, ADR-0017):
+            // watermark-gated swap machine (barriers ride the driver),
+            // bounded segment forgets (unlinks delegated to the control
+            // thread), orphan GC — charged to Maintenance.
+            let control = self.shared.control.borrow();
+            let unix_now_ms = self.shared.wall_anchor().unix_from_internal(cx.now);
+            let manifest_units = cell.manifest_slice(cx, control.as_deref(), unix_now_ms);
+            drop(control);
+            if manifest_units > 0 {
+                cx.charge(GroupClass::Maintenance, manifest_units);
+            }
             let stats = cell.stats();
             let node = &self.shared.node;
             node.log_records_appended.set(stats.records_appended);
@@ -1350,7 +1726,27 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
             node.log_watermark_lag.set(stats.watermark_lag_lsn);
             node.log_fsyncs_completed.set(stats.fsyncs_completed);
             node.log_acks_gated.set(stats.acks_gated);
+            node.log_frames_queued.set(stats.frames_queued);
+            node.log_staging_bytes.set(stats.staging_resident_bytes);
+            node.manifests_published.set(stats.manifests_published);
+            node.manifests_aborted.set(stats.manifests_aborted);
+            node.ckpt_in_progress.set(stats.ckpt_in_progress);
+            node.segments_truncated.set(stats.segments_truncated);
+            node.fsyncs_per_sec.set(stats.fsyncs_per_sec);
+            node.acks_per_sec.set(stats.acks_per_sec);
+            node.fsync_p50_us.set(stats.fsync_p50_us);
+            node.fsync_p99_us.set(stats.fsync_p99_us);
+            node.fsync_p999_us.set(stats.fsync_p999_us);
+            node.fsync_group_p50.set(stats.fsync_group_p50);
+            node.fsync_group_p99.set(stats.fsync_group_p99);
+            node.log_segments_live.set(stats.log_segments_live);
             let ckpt = cell.ckpt_stats();
+            let unix_now_ms = self.shared.wall_anchor().unix_from_internal(cx.now);
+            node.ckpt_age_s.set(if ckpt.last_unix_ms == 0 {
+                0
+            } else {
+                unix_now_ms.saturating_sub(ckpt.last_unix_ms) / 1000
+            });
             node.ckpts_completed.set(ckpt.completed);
             node.ckpts_aborted.set(ckpt.aborted);
             node.ckpt_last_unix_ms.set(ckpt.last_unix_ms);
@@ -1365,6 +1761,16 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
                 self.shared.ddl_epoch_seen.set(epoch);
                 self.shared.ddl_waiters.wake_all(0);
             }
+            // ---- checkpoint-publication wakes (M2-S20): any cell's
+            // durable MANIFEST changes the board sum; parked INF.CKPT
+            // WAIT pumps re-check their target. Also the LASTSAVE gauge.
+            let board = control.ckpt_board();
+            let sum = board.published_sum();
+            if sum != self.shared.ckpt_pub_seen.get() {
+                self.shared.ckpt_pub_seen.set(sum);
+                self.shared.ckpt_waiters.wake_all(0);
+            }
+            self.shared.node.rdb_last_save_ms.set(board.max_unix_ms());
         }
         // ---- stats flush
         let node = &self.shared.node;
@@ -1466,8 +1872,8 @@ impl<O: PlaneObserver + 'static> CellPlane for ServerPlane<O> {
 /// ship right after it ends). `orphans` counts gate-less replies for the
 /// fabric tripwire.
 #[allow(clippy::too_many_arguments)] // the FABRIC-IN drain context, not an API surface
-fn handle_fabric_op<O: PlaneObserver + 'static>(
-    shared: &Shared<O>,
+fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
     now: Nanos,
     from: CellId,
     op: Op<'_>,
@@ -1512,7 +1918,68 @@ fn handle_fabric_op<O: PlaneObserver + 'static>(
             }
         }
         Op::Apply { token, cmd, args, .. } => {
+            handle_apply(shared, from, token, cmd, args.as_slice(), scratch, staged, pubs);
+        }
+        Op::Read { token, key, .. } => {
+            let start = scratch.len();
+            // M0 vocabulary: the typed Read has no db field; it serves db 0
+            // (the M1 paths ship GETs as Apply with the packed db byte).
+            let hit = match shared.store.borrow_mut().db_mut(0).get(key, now) {
+                Some(value) => {
+                    scratch.extend_from_slice(value);
+                    true
+                }
+                None => false,
+            };
+            let reply =
+                if hit { StagedReply::Bytes(start, scratch.len()) } else { StagedReply::Nil };
+            staged.push((from, token, reply));
+        }
+        Op::ApplyNs { token, cmd, ns, args, .. } => {
+            // Named-namespace apply (M2-S08, ADR-0015 D1): the namespace
+            // travels as an explicit id; the owner resolves class and
+            // semantics authoritatively (never trusting the origin).
             let argv = args.as_slice();
+            let proto = if cmd & 0x0F == 3 { Protocol::Resp3 } else { Protocol::Resp2 };
+            let start = scratch.len();
+            match shared.execute_ns_owned(from, argv, proto, NsId(ns), scratch) {
+                NsApplyOutcome::Reply => {
+                    staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+                }
+                NsApplyOutcome::Gated(seq) => {
+                    let reply = scratch[start..].to_vec();
+                    scratch.truncate(start);
+                    gated.push(GatedReply { to: from, token, seq, reply });
+                }
+            }
+        }
+        Op::Batch { ops } => {
+            for nested in ops {
+                handle_fabric_op(shared, now, from, nested, scratch, staged, pubs, gated, orphans);
+            }
+        }
+        // The M0 plane speaks Apply; a typed Write from a future peer gets
+        // a typed refusal rather than silence.
+        Op::Write { token, .. } => staged.push((from, token, StagedReply::Refused)),
+    }
+}
+
+/// The `Op::Apply` body of [`handle_fabric_op`], callable per staged entry
+/// by the fabric-apply prefetch batch (M2.5 Phase H): argv may borrow the
+/// ring slot (inline path) or the stage scratch (batched path).
+#[allow(clippy::too_many_arguments)] // the FABRIC-IN drain context, not an API surface
+fn handle_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    from: CellId,
+    token: FabricToken,
+    cmd: u8,
+    argv: &[&[u8]],
+    scratch: &mut Vec<u8>,
+    staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
+    pubs: &mut Vec<OwnerPub>,
+) {
+    {
+        {
             // Internal pub/sub fabric vocabulary (M1-S10) — intercepted
             // ahead of `execute`, so it needs no registry entries and stays
             // invisible to clients (an `INF.PUBFAN` typed by a client is an
@@ -1560,48 +2027,150 @@ fn handle_fabric_op<O: PlaneObserver + 'static>(
                 staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
             }
         }
-        Op::Read { token, key, .. } => {
-            let start = scratch.len();
-            // M0 vocabulary: the typed Read has no db field; it serves db 0
-            // (the M1 paths ship GETs as Apply with the packed db byte).
-            let hit = match shared.store.borrow_mut().db_mut(0).get(key, now) {
-                Some(value) => {
-                    scratch.extend_from_slice(value);
-                    true
-                }
-                None => false,
-            };
-            let reply =
-                if hit { StagedReply::Bytes(start, scratch.len()) } else { StagedReply::Nil };
-            staged.push((from, token, reply));
-        }
-        Op::ApplyNs { token, cmd, ns, args, .. } => {
-            // Named-namespace apply (M2-S08, ADR-0015 D1): the namespace
-            // travels as an explicit id; the owner resolves class and
-            // semantics authoritatively (never trusting the origin).
+    }
+}
+
+/// One fabric `Apply` staged by the prefetch batch (M2.5 Phase H — the
+/// ADR-0005 pipeline shape applied to the owner-side fabric path, where a
+/// drained pack provides the natural batch the demoted parse-time pipeline
+/// never had): argv flat-copied into the stage scratch, key hash computed
+/// (and index probe lines prefetched) at stage time.
+struct StagedApply {
+    from: CellId,
+    token: FabricToken,
+    cmd: u8,
+    /// Offset of the flat argv block in the stage scratch.
+    off: u32,
+    /// `CellStore::hash_key(argv[1])` when the op carries a key argument.
+    hash: u64,
+    db: u16,
+    has_key: bool,
+}
+
+/// Flat-encode `argv` into the stage scratch (the `OwnedCmd` layout:
+/// `[argc:u32][end_0..end_{argc-1}:u32][bytes]`, ends relative to the block
+/// start). Returns the block offset.
+fn stage_argv_block(bytes: &mut Vec<u8>, argv: &[&[u8]]) -> u32 {
+    let off = u32::try_from(bytes.len()).expect("stage scratch fits u32");
+    let argc = argv.len();
+    let head = 4 + 4 * argc;
+    bytes.extend_from_slice(&u32::try_from(argc).expect("argc fits u32").to_le_bytes());
+    let mut end = head;
+    for a in argv {
+        end += a.len();
+        bytes.extend_from_slice(&u32::try_from(end).expect("block fits u32").to_le_bytes());
+    }
+    for a in argv {
+        bytes.extend_from_slice(a);
+    }
+    off
+}
+
+/// Decode a staged argv block into `out`, returning argc — the inverse of
+/// [`stage_argv_block`] (argc ≤ [`MAX_APPLY_ARGS`] by codec construction).
+fn read_argv_block<'b>(bytes: &'b [u8], off: u32, out: &mut [&'b [u8]; MAX_APPLY_ARGS]) -> usize {
+    let block = &bytes[off as usize..];
+    let argc = u32::from_le_bytes(block[..4].try_into().expect("block header")) as usize;
+    let mut start = 4 + 4 * argc;
+    for (i, slot) in out[..argc].iter_mut().enumerate() {
+        let at = 4 + 4 * i;
+        let end = u32::from_le_bytes(block[at..at + 4].try_into().expect("ends table")) as usize;
+        *slot = &block[start..end];
+        start = end;
+    }
+    argc
+}
+
+/// The FABRIC-IN drain callback with apply-prefetch on: `Apply` ops stage
+/// (copy + hash + index-line prefetch) instead of executing inline; any
+/// other op flushes the stage first — an order barrier, so execution and
+/// reply order per source pair are exactly the inline path's.
+#[allow(clippy::too_many_arguments)] // the FABRIC-IN drain context, not an API surface
+fn stage_or_handle<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    now: Nanos,
+    from: CellId,
+    op: Op<'_>,
+    stage: &mut Vec<StagedApply>,
+    stage_bytes: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
+    staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
+    pubs: &mut Vec<OwnerPub>,
+    gated: &mut Vec<GatedReply>,
+    orphans: &mut u64,
+) {
+    match op {
+        Op::Apply { token, cmd, args, .. } => {
             let argv = args.as_slice();
-            let proto = if cmd & 0x0F == 3 { Protocol::Resp3 } else { Protocol::Resp2 };
-            let start = scratch.len();
-            match shared.execute_ns_owned(from, argv, proto, NsId(ns), scratch) {
-                NsApplyOutcome::Reply => {
-                    staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+            let db = u16::from(cmd >> 4);
+            let (hash, has_key) = match argv.get(1) {
+                Some(key) => {
+                    let hash = CellStore::hash_key(key);
+                    // Phase 1 at stage time: the index probe lines get the
+                    // rest of the drain window to arrive.
+                    if let Some(store) = shared.store.borrow().db(usize::from(db)) {
+                        store.prefetch(hash);
+                    }
+                    (hash, true)
                 }
-                NsApplyOutcome::Gated(seq) => {
-                    let reply = scratch[start..].to_vec();
-                    scratch.truncate(start);
-                    gated.push(GatedReply { to: from, token, seq, reply });
-                }
-            }
+                None => (0, false),
+            };
+            let off = stage_argv_block(stage_bytes, argv);
+            stage.push(StagedApply { from, token, cmd, off, hash, db, has_key });
         }
         Op::Batch { ops } => {
             for nested in ops {
-                handle_fabric_op(shared, now, from, nested, scratch, staged, pubs, gated, orphans);
+                stage_or_handle(
+                    shared,
+                    now,
+                    from,
+                    nested,
+                    stage,
+                    stage_bytes,
+                    scratch,
+                    staged,
+                    pubs,
+                    gated,
+                    orphans,
+                );
             }
         }
-        // The M0 plane speaks Apply; a typed Write from a future peer gets
-        // a typed refusal rather than silence.
-        Op::Write { token, .. } => staged.push((from, token, StagedReply::Refused)),
+        other => {
+            flush_apply_stage(shared, stage, stage_bytes, scratch, staged, pubs);
+            handle_fabric_op(shared, now, from, other, scratch, staged, pubs, gated, orphans);
+        }
     }
+}
+
+/// Execute the staged applies: one record-line prefetch pass over the whole
+/// batch (§7.3 phase 2 — the misses overlap across the batch instead of
+/// serializing per op), then execution in arrival order.
+fn flush_apply_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    stage: &mut Vec<StagedApply>,
+    stage_bytes: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
+    staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
+    pubs: &mut Vec<OwnerPub>,
+) {
+    if stage.is_empty() {
+        return;
+    }
+    {
+        let ks = shared.store.borrow();
+        for e in stage.iter().filter(|e| e.has_key) {
+            if let Some(store) = ks.db(usize::from(e.db)) {
+                store.probe_prefetch(e.hash);
+            }
+        }
+    }
+    let mut argv_buf: [&[u8]; MAX_APPLY_ARGS] = [b""; MAX_APPLY_ARGS];
+    for e in stage.iter() {
+        let argc = read_argv_block(stage_bytes, e.off, &mut argv_buf);
+        handle_apply(shared, e.from, e.token, e.cmd, &argv_buf[..argc], scratch, staged, pubs);
+    }
+    stage.clear();
+    stage_bytes.clear();
 }
 
 /// One MGET position: rendered locally at dispatch, or one remote `GET`.
@@ -1641,8 +2210,8 @@ enum Popped {
     Finished,
 }
 
-fn pop_or_quiesce<O: PlaneObserver + 'static>(
-    shared: &Shared<O>,
+fn pop_or_quiesce<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
     key: ConnKey,
     pending_empty: bool,
 ) -> Popped {
@@ -1683,7 +2252,11 @@ fn is_conn_state(owned: &OwnedCmd) -> bool {
 /// [`REMOTE_WINDOW`] remote ops in flight, emit replies strictly in command
 /// order. Suspends only on the front reply's gate and on fabric credits;
 /// out-of-order completions park in the gate until their turn.
-async fn pump<O: PlaneObserver + 'static>(shared: Rc<Shared<O>>, key: ConnKey, first: OwnedCmd) {
+async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: Rc<Shared<O, F>>,
+    key: ConnKey,
+    first: OwnedCmd,
+) {
     let mut pending: VecDeque<PendingReply> = VecDeque::new();
     // Remote ops sent and not yet awaited (Counted holds several).
     let mut inflight: usize = 0;
@@ -1707,6 +2280,10 @@ async fn pump<O: PlaneObserver + 'static>(shared: Rc<Shared<O>>, key: ConnKey, f
             if !dispatch_one(&shared, key, &cmd, &mut pending, &mut inflight).await {
                 return; // connection is gone
             }
+            // The command's flat buffer recycles once dispatched (waiters
+            // own their inputs via `ApplyArgs`/reply slots — nothing
+            // borrows `cmd` past this point).
+            shared.recycle_cmd_buf(cmd.into_buf());
         }
 
         // ---- emit: resolve the front reply. Awaiting an already-parked
@@ -1820,17 +2397,32 @@ fn is_scatter(id: CommandId, sub: Option<&[u8]>) -> bool {
 /// per key; RENAME/RENAMENX/COPY across two owners and keyspace-wide
 /// commands run as inline fabric programs (M1-S02). Returns `false` when
 /// the connection is gone.
-async fn dispatch_one<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     key: ConnKey,
     owned: &OwnedCmd,
     pending: &mut VecDeque<PendingReply>,
     inflight: &mut usize,
 ) -> bool {
-    let argv: Vec<&[u8]> = owned.slices();
-    let Some((proto, id, db, conn_ns)) =
-        shared.with_conn(key, |c| (c.cx.proto, c.cx.id, c.cx.db, c.cx.ns))
-    else {
+    // Argv views live on the stack for the common arity; wide commands
+    // (MSET…) fall back to `slices()` (M2.5 Phase H allocator lever).
+    let argc = owned.argc();
+    let mut argv_inline: [&[u8]; ARGV_INLINE] = [b""; ARGV_INLINE];
+    let argv_heap: Vec<&[u8]>;
+    let argv: &[&[u8]] = if argc <= ARGV_INLINE {
+        for (i, slot) in argv_inline[..argc].iter_mut().enumerate() {
+            *slot = owned.arg(i);
+        }
+        &argv_inline[..argc]
+    } else {
+        argv_heap = owned.slices();
+        &argv_heap
+    };
+    // One slab lookup per command: execution context + subscriber
+    // restriction together (was two separate `with_conn` walks).
+    let Some((proto, id, db, conn_ns, restricted)) = shared.with_conn(key, |c| {
+        (c.cx.proto, c.cx.id, c.cx.db, c.cx.ns, pubsub::subscriber_restricted(&c.cx))
+    }) else {
         return false;
     };
     let origin = ExecOrigin::Conn(key.slot, key.generation);
@@ -1843,7 +2435,7 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
     // the subscription state (remote Apply, scatter legs).
     if let Some(meta) = meta
         && well_formed
-        && shared.with_conn(key, |c| pubsub::subscriber_restricted(&c.cx)).unwrap_or(false)
+        && restricted
         && !pubsub::is_plane_pubsub(meta.id)
     {
         let mut reply = shared.take_reply_buf();
@@ -1866,16 +2458,36 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
         pending.push_back(PendingReply::Done(reply));
         return true;
     }
-    let has_remote_key = |meta| {
-        !shared.route_local_only
-            && extract_keys_slices(meta, &argv)
-                .iter()
-                .any(|k| !shared.router.is_local(k, shared.cell))
-    };
+    // One routing pass per command (M2.5 Phase H: was one
+    // `extract_keys_slices` Vec per match guard plus a second — and a
+    // second `slot_of` — inside the single-owner arm): the first key, its
+    // owner, and remote presence, computed together. The pass stops at the
+    // first remote key; the first key is always index 0 of the spec, so
+    // `first_owner` is captured before any early exit.
+    let mut first_owner = shared.cell;
+    let mut any_remote = false;
+    if let Some(m) = meta
+        && well_formed
+        && !shared.route_local_only
+    {
+        let mut first = true;
+        for k in extract_keys_iter(m, argv) {
+            let owner = shared.router.cell_of(SlotRouter::slot_of(k));
+            if first {
+                first_owner = owner;
+                first = false;
+            }
+            if owner != shared.cell {
+                any_remote = true;
+                break;
+            }
+        }
+    }
+    let has_remote_key = |_meta| any_remote;
     let owner_of = |k: &[u8]| shared.router.cell_of(SlotRouter::slot_of(k));
     match meta {
         Some(meta) if well_formed && pubsub::is_plane_pubsub(meta.id) => {
-            return dispatch_pubsub(shared, key, meta.id, &argv, proto, pending, inflight).await;
+            return dispatch_pubsub(shared, key, meta.id, argv, proto, pending, inflight).await;
         }
         // Namespace DDL (M2-S08, ADR-0015 D2/D3): id allocation, local
         // apply, peer fan, catalog persist — on every node shape (1-cell
@@ -1887,7 +2499,18 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
                     s.eq_ignore_ascii_case(b"CREATE") || s.eq_ignore_ascii_case(b"DROP")
                 }) =>
         {
-            let reply = program_ns_ddl(shared, origin, proto, id, db, &argv).await;
+            let reply = program_ns_ddl(shared, origin, proto, id, db, argv).await;
+            pending.push_back(PendingReply::Done(reply));
+        }
+        // Checkpoint operator surface (M2-S20, ADR-0021 D6).
+        Some(meta)
+            if well_formed
+                && matches!(
+                    meta.id,
+                    CommandId::InfCkpt | CommandId::Bgsave | CommandId::Lastsave
+                ) =>
+        {
+            let reply = program_ckpt(shared, proto, meta.id, argv).await;
             pending.push_back(PendingReply::Done(reply));
         }
         // Named-namespace commands (M2-S08): single-owner shape — local
@@ -1897,7 +2520,7 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
         Some(meta) if well_formed && conn_ns.is_some() && !is_conn_state(owned) => {
             let ns = conn_ns.expect("guarded");
             return dispatch_ns(
-                shared, key, origin, meta, &argv, proto, id, db, ns, pending, inflight,
+                shared, key, origin, meta, argv, proto, id, db, ns, pending, inflight,
             )
             .await;
         }
@@ -1924,14 +2547,14 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
                     // Per-cell-state mutators (flush, CONFIG SET/RESETSTAT,
                     // INF.NS CREATE/DROP): the local leg validates and
                     // applies; an error reply short-circuits the fan-out.
-                    let local = run_local(shared, origin, proto, id, db, &argv);
+                    let local = run_local(shared, origin, proto, id, db, argv);
                     if local.first() == Some(&b'-') {
                         pending.push_back(PendingReply::Done(local));
                     } else {
                         shared.recycle_reply_buf(local);
                         let mut waiters = Vec::new();
                         for cell in peer_cells(shared) {
-                            if let Ok(waiter) = send_apply(shared, cell, proto, db, &argv).await {
+                            if let Ok(waiter) = send_apply(shared, cell, proto, db, argv).await {
                                 waiters.push(waiter);
                                 *inflight += 1;
                             }
@@ -1940,15 +2563,15 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
                     }
                 }
                 CommandId::Keys => {
-                    let reply = program_keys(shared, origin, proto, id, db, &argv).await;
+                    let reply = program_keys(shared, origin, proto, id, db, argv).await;
                     pending.push_back(PendingReply::Done(reply));
                 }
                 CommandId::Scan => {
-                    let reply = program_scan(shared, origin, proto, id, db, &argv).await;
+                    let reply = program_scan(shared, origin, proto, id, db, argv).await;
                     pending.push_back(PendingReply::Done(reply));
                 }
                 CommandId::Randomkey => {
-                    let reply = program_randomkey(shared, origin, proto, id, db, &argv).await;
+                    let reply = program_randomkey(shared, origin, proto, id, db, argv).await;
                     pending.push_back(PendingReply::Done(reply));
                 }
                 _ => unreachable!("is_scatter covers exactly the arms above"),
@@ -2063,7 +2686,7 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
             }
         }
         Some(meta) if well_formed && meta.id == CommandId::Msetnx && has_remote_key(meta) => {
-            let reply = program_msetnx(shared, origin, proto, id, db, &argv).await;
+            let reply = program_msetnx(shared, origin, proto, id, db, argv).await;
             pending.push_back(PendingReply::Done(reply));
         }
         Some(meta)
@@ -2075,15 +2698,15 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
             // Two owners: the read(+delete)/write fabric program. Same-owner
             // pairs fall through to the whole-argv Apply below (atomic at
             // that cell).
-            let reply = program_move(shared, origin, proto, id, db, meta.id, &argv).await;
+            let reply = program_move(shared, origin, proto, id, db, meta.id, argv).await;
             pending.push_back(PendingReply::Done(reply));
         }
         Some(meta) if well_formed && has_remote_key(meta) => {
             // Single-owner remote command: ship the whole argv; the owner
-            // executes and returns its raw RESP reply.
-            let first_key = extract_keys_slices(meta, &argv)[0];
-            let owner = owner_of(first_key);
-            match send_apply(shared, owner, proto, db, &argv).await {
+            // executes and returns its raw RESP reply. The destination is
+            // the first key's owner, computed in the routing pass above.
+            let owner = first_owner;
+            match send_apply(shared, owner, proto, db, argv).await {
                 Ok(waiter) => {
                     *inflight += 1;
                     pending.push_back(PendingReply::Remote { waiter, proto });
@@ -2114,16 +2737,16 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
                     return false;
                 };
                 let now = shared.now.get();
-                execute_slices(&argv, &mut shared.store.borrow_mut(), &mut live, now, &mut reply);
-                shared.observer.borrow_mut().on_execute(shared.cell, origin, &argv, &reply, now);
+                execute_slices(argv, &mut shared.store.borrow_mut(), &mut live, now, &mut reply);
+                shared.observer.borrow_mut().on_execute(shared.cell, origin, argv, &reply, now);
                 shared.with_conn(key, |c| {
                     c.cx.proto = live.proto;
                     c.cx.db = live.db;
                     c.cx.ns = live.ns;
                 });
             } else {
-                shared.execute_owned_into(origin, &argv, proto, id, db, conn_ns, &mut reply);
-                if let Some(dur) = stall_request(&argv) {
+                shared.execute_owned_into(origin, argv, proto, id, db, conn_ns, &mut reply);
+                if let Some(dur) = stall_request(argv) {
                     shared.stall_until.set(shared.now.get().saturating_add(dur));
                 }
             }
@@ -2135,8 +2758,8 @@ async fn dispatch_one<O: PlaneObserver + 'static>(
 
 /// Render an owner's outcome as the RESP reply for a whole-argv `Apply`
 /// (buffers come from and return to the cell's reply pool).
-fn render_outcome<O: PlaneObserver + 'static>(
-    shared: &Shared<O>,
+fn render_outcome<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
     outcome: OwnedOutcome,
     proto: Protocol,
 ) -> Vec<u8> {
@@ -2166,12 +2789,14 @@ fn render_outcome<O: PlaneObserver + 'static>(
 // ---- fabric-program helpers (M1-S02) -------------------------------------------
 
 /// All cells except this one (scatter targets).
-fn peer_cells<O: PlaneObserver + 'static>(shared: &Shared<O>) -> Vec<CellId> {
+fn peer_cells<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+) -> Vec<CellId> {
     (0..shared.cells).map(CellId).filter(|c| c.0 != shared.cell.0).collect()
 }
 
-fn error_reply<O: PlaneObserver + 'static>(
-    shared: &Shared<O>,
+fn error_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
     proto: Protocol,
     text: &str,
 ) -> Vec<u8> {
@@ -2180,14 +2805,18 @@ fn error_reply<O: PlaneObserver + 'static>(
     reply
 }
 
-fn int_reply<O: PlaneObserver + 'static>(shared: &Shared<O>, proto: Protocol, n: i64) -> Vec<u8> {
+fn int_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    proto: Protocol,
+    n: i64,
+) -> Vec<u8> {
     let mut reply = shared.take_reply_buf();
     RespWriter::new(&mut reply, proto).int(n);
     reply
 }
 
-fn simple_reply<O: PlaneObserver + 'static>(
-    shared: &Shared<O>,
+fn simple_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
     proto: Protocol,
     text: &str,
 ) -> Vec<u8> {
@@ -2196,8 +2825,8 @@ fn simple_reply<O: PlaneObserver + 'static>(
     reply
 }
 
-fn run_local<O: PlaneObserver + 'static>(
-    shared: &Shared<O>,
+fn run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
@@ -2211,8 +2840,8 @@ fn run_local<O: PlaneObserver + 'static>(
 
 /// One program step: execute `argv` on `cell` (locally or via Apply) and
 /// return its raw RESP reply bytes.
-async fn run_on<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
     cell: CellId,
     proto: Protocol,
@@ -2233,8 +2862,8 @@ async fn run_on<O: PlaneObserver + 'static>(
 }
 
 /// One typed counted step (EXISTS/DEL shape) on `cell`.
-async fn count_on<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn count_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
     cell: CellId,
     proto: Protocol,
@@ -2257,8 +2886,8 @@ async fn count_on<O: PlaneObserver + 'static>(
 /// Cross-cell MSETNX: existence sweep, then the SET fan. Recorded deviation
 /// (compat matrix): check-then-set is not atomic across cells until M4
 /// transactions; single-cell MSETNX stays exact.
-async fn program_msetnx<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn program_msetnx<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
@@ -2298,8 +2927,8 @@ async fn program_msetnx<O: PlaneObserver + 'static>(
 /// full cross-cell atomicity arrives with M4 transactions (documented). The
 /// TTL transfers as relative milliseconds — the hop skew is microseconds
 /// (recorded deviation vs Redis's absolute deadline).
-async fn program_move<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
@@ -2386,8 +3015,8 @@ async fn program_move<O: PlaneObserver + 'static>(
 
 /// Scattered KEYS: local sweep + one Apply per peer, arrays merged by
 /// header arithmetic (bodies concatenate untouched).
-async fn program_keys<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
@@ -2432,8 +3061,8 @@ async fn program_keys<O: PlaneObserver + 'static>(
 /// Scattered SCAN: the cursor packs `{cell:16 | per-cell cursor:48}`; one
 /// cell serves each call, the cursor hops to the next cell when a cell's
 /// local scan wraps.
-async fn program_scan<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn program_scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
@@ -2476,8 +3105,8 @@ async fn program_scan<O: PlaneObserver + 'static>(
 
 /// Scattered RANDOMKEY: two-level random — a random starting cell, then the
 /// first non-empty cell in rotation answers (documented deviation).
-async fn program_randomkey<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn program_randomkey<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
@@ -2506,8 +3135,8 @@ async fn program_randomkey<O: PlaneObserver + 'static>(
 /// are emitted**, so once a client sees its confirmation, a PUBLISH from
 /// anywhere reaches it. PUBLISH routes to the channel's owner; PUBSUB is an
 /// introspection program over the owner views.
-async fn dispatch_pubsub<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     key: ConnKey,
     id: CommandId,
     argv: &[&[u8]],
@@ -2616,8 +3245,8 @@ async fn dispatch_pubsub<O: PlaneObserver + 'static>(
 
 /// Ships one subscription transition: channel deltas go to the owner cell,
 /// pattern deltas replicate to every cell (plus this cell's slot directly).
-async fn send_sub_delta<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn send_sub_delta<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     kind: SubKind,
     name: &[u8],
     delta: i32,
@@ -2654,8 +3283,8 @@ async fn send_sub_delta<O: PlaneObserver + 'static>(
 /// Close-path subscription cleanup: ships the 1→0 deltas and consumes the
 /// acks (nothing awaits them, but every fabric op replies — credit and
 /// orphan-tripwire hygiene).
-async fn flush_sub_deltas<O: PlaneObserver + 'static>(
-    shared: Rc<Shared<O>>,
+async fn flush_sub_deltas<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: Rc<Shared<O, F>>,
     notes: Vec<(SubKind, Vec<u8>, i32)>,
 ) {
     let mut waiters = Vec::new();
@@ -2669,8 +3298,8 @@ async fn flush_sub_deltas<O: PlaneObserver + 'static>(
 
 /// Removes a closed connection from the local registries, returning the
 /// cell-level transitions to notify.
-fn unsubscribe_closed_conn<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+fn unsubscribe_closed_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     key: ConnKey,
     cx: &ConnCx,
 ) -> Vec<(SubKind, Vec<u8>, i32)> {
@@ -2697,7 +3326,9 @@ fn unsubscribe_closed_conn<O: PlaneObserver + 'static>(
 /// RTT-bound — a recorded M1 simplification (no gate measures sustained
 /// publish throughput; revisit with evidence per L4 if a workload demands
 /// overlap).
-async fn owner_pub_pump<O: PlaneObserver + 'static>(shared: Rc<Shared<O>>) {
+async fn owner_pub_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: Rc<Shared<O, F>>,
+) {
     loop {
         let Some(item) = shared.pub_queue.borrow_mut().pop_front() else {
             shared.pub_pump_active.set(false);
@@ -2728,8 +3359,8 @@ async fn owner_pub_pump<O: PlaneObserver + 'static>(shared: Rc<Shared<O>>) {
 /// PUBSUB introspection over the cell registries: CHANNELS merges the owner
 /// views (KEYS-style header arithmetic), NUMSUB asks each channel's owner,
 /// NUMPAT answers locally (the pattern index is replicated).
-async fn program_pubsub<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     proto: Protocol,
     argv: &[&[u8]],
 ) -> Vec<u8> {
@@ -2826,8 +3457,8 @@ async fn program_pubsub<O: PlaneObserver + 'static>(
 /// Owner-side handling of the internal pub/sub Apply vocabulary. Returns
 /// false when `argv` is not pub/sub plumbing (the caller falls through to
 /// normal Apply execution).
-fn handle_pubsub_apply<O: PlaneObserver + 'static>(
-    shared: &Shared<O>,
+fn handle_pubsub_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
     from: CellId,
     token: FabricToken,
     argv: &[&[u8]],
@@ -2893,8 +3524,8 @@ fn handle_pubsub_apply<O: PlaneObserver + 'static>(
 /// (M1-S11) is enforced. Returns the receiver count and — when `defer`
 /// names the publishing connection — its own frames, held back so they
 /// follow the publish reply (the Redis self-delivery order).
-fn deliver_local<O: PlaneObserver + 'static>(
-    shared: &Shared<O>,
+fn deliver_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
     channel: &[u8],
     payload: &[u8],
     defer: Option<ConnKey>,
@@ -2918,8 +3549,8 @@ fn deliver_local<O: PlaneObserver + 'static>(
     (delivered, deferred)
 }
 
-fn deliver_one<O: PlaneObserver + 'static>(
-    shared: &Shared<O>,
+fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
     key: ConnKey,
     defer: Option<ConnKey>,
     deferred: &mut Vec<u8>,
@@ -3016,29 +3647,37 @@ fn parse_take_reply(raw: &[u8]) -> Option<Option<(Vec<u8>, i64)>> {
 
 /// Owned-slice twin of `extract_keys` (the wire helper wants an `ArgvRef`).
 fn extract_keys_slices<'a>(meta: &inf_wire::CommandMeta, argv: &[&'a [u8]]) -> Vec<&'a [u8]> {
+    extract_keys_iter(meta, argv).collect()
+}
+
+/// Non-allocating key iterator over owned slices — the dispatch hot path
+/// probes key routing once per command without a `Vec` per probe (M2.5
+/// Phase H allocator lever). Semantics identical to `extract_keys_slices`:
+/// `first == 0` or `step == 0` yields nothing; `last < 0` counts from the
+/// end; iteration stops at the argv boundary.
+fn extract_keys_iter<'v, 'a>(
+    meta: &inf_wire::CommandMeta,
+    argv: &'v [&'a [u8]],
+) -> impl Iterator<Item = &'a [u8]> + 'v {
     let spec = meta.keys;
-    if spec.first == 0 || argv.is_empty() {
-        return Vec::new();
-    }
     let last = if spec.last >= 0 {
         spec.last as usize
     } else {
         argv.len().saturating_sub(spec.last.unsigned_abs() as usize)
     };
-    let mut keys = Vec::new();
-    let mut i = usize::from(spec.first);
-    while i <= last && i < argv.len() && spec.step > 0 {
-        keys.push(argv[i]);
-        i += usize::from(spec.step);
-    }
-    keys
+    let (start, last) = if spec.first == 0 || spec.step == 0 || argv.is_empty() {
+        (1, 0) // empty range
+    } else {
+        (usize::from(spec.first), last)
+    };
+    (start..=last).step_by(usize::from(spec.step).max(1)).map_while(move |i| argv.get(i).copied())
 }
 
 /// One named-namespace command on the pump (M2-S08). Returns `false` when
 /// the connection is gone.
 #[allow(clippy::too_many_arguments)] // the pump dispatch context
-async fn dispatch_ns<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     key: ConnKey,
     origin: ExecOrigin,
     meta: &'static inf_wire::CommandMeta,
@@ -3131,12 +3770,91 @@ async fn dispatch_ns<O: PlaneObserver + 'static>(
     true
 }
 
+/// `INF.CKPT [CELL k] [WAIT]` + `BGSAVE`/`LASTSAVE` (M2-S20, ADR-0021
+/// D6): requests bump the control board's epochs (cells run checkpoints
+/// in their own MAINTAIN slices — L1); `WAIT` parks the pump until every
+/// targeted slot's **published** epoch covers the request. Publication
+/// happens at the MANIFEST swap's dir-fsync commit, so `WAIT` returns
+/// only after durability — a swap abort does not publish; the retried
+/// swap does (fault-injection verified). `LASTSAVE` = unix seconds of
+/// the newest publication across cells (0 before the first — deviation
+/// documented; Redis reports process-start time).
+async fn program_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    proto: Protocol,
+    id: CommandId,
+    argv: &[&[u8]],
+) -> Vec<u8> {
+    let no_plane = "ERR checkpointing requires a durable node (no data dir)";
+    let control = shared.control.borrow().clone();
+    let Some(control) = control else {
+        return error_reply(shared, proto, no_plane);
+    };
+    if shared.durable.borrow().is_none() {
+        return error_reply(shared, proto, no_plane);
+    }
+    if id == CommandId::Lastsave {
+        let unix_s = control.ckpt_board().max_unix_ms() / 1000;
+        return int_reply(shared, proto, unix_s as i64);
+    }
+    let mut cell: Option<u16> = None;
+    let mut wait = false;
+    if id == CommandId::InfCkpt {
+        let mut i = 1;
+        while i < argv.len() {
+            if argv[i].eq_ignore_ascii_case(b"WAIT") {
+                wait = true;
+                i += 1;
+            } else if argv[i].eq_ignore_ascii_case(b"CELL") && i + 1 < argv.len() {
+                let parsed = core::str::from_utf8(argv[i + 1]).ok().and_then(|s| s.parse().ok());
+                let Some(k) = parsed.filter(|&k: &u16| k < shared.cells) else {
+                    return error_reply(
+                        shared,
+                        proto,
+                        "ERR CELL wants an index below the cell count",
+                    );
+                };
+                cell = Some(k);
+                i += 2;
+            } else {
+                return error_reply(shared, proto, "ERR syntax: INF.CKPT [CELL k] [WAIT]");
+            }
+        }
+    } else if argv.len() > 2 || (argv.len() == 2 && !argv[1].eq_ignore_ascii_case(b"SCHEDULE")) {
+        // BGSAVE [SCHEDULE]: SCHEDULE is accepted and moot — checkpoints
+        // never fork, so there is nothing to defer (deviation documented).
+        return error_reply(shared, proto, "ERR syntax: BGSAVE [SCHEDULE]");
+    }
+    let epoch = match cell {
+        Some(k) => control.request_ckpt_cell(k),
+        None => control.request_ckpt_all(),
+    };
+    if wait {
+        loop {
+            let board = control.ckpt_board();
+            let satisfied = match cell {
+                Some(k) => board.slot(k).published() >= epoch,
+                None => board.min_published() >= epoch,
+            };
+            if satisfied {
+                break;
+            }
+            shared.ckpt_waiters.wait(0).await;
+        }
+    }
+    if id == CommandId::Bgsave {
+        simple_reply(shared, proto, "Background saving started")
+    } else {
+        simple_reply(shared, proto, "OK")
+    }
+}
+
 /// The namespace-DDL program (M2-S08, ADR-0015 D2/D3): parse → allocate id
 /// (CREATE) → apply locally → fan `INF.NSFAN` to every peer (AllOk) →
 /// persist the catalog through the control thread → `+OK` only after the
 /// swap is durable.
-async fn program_ns_ddl<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
@@ -3226,8 +3944,8 @@ async fn program_ns_ddl<O: PlaneObserver + 'static>(
 /// Ship `argv` to `to` as an `ApplyNs` (named-namespace op — ADR-0015 D1)
 /// and return the reply waiter. Mirrors [`send_apply`]; never RTT-recorded
 /// (`always` replies are owner-deferred and would mispair the queue).
-async fn send_apply_ns<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn send_apply_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     to: CellId,
     proto: Protocol,
     ns: NsId,
@@ -3264,8 +3982,8 @@ async fn send_apply_ns<O: PlaneObserver + 'static>(
 /// queueing). The send time is queued for delivery-side RTT recording.
 /// `Err` carries the refusal reply when the argv exceeds the codec's
 /// argument cap.
-async fn send_apply<O: PlaneObserver + 'static>(
-    shared: &Rc<Shared<O>>,
+async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
     to: CellId,
     proto: Protocol,
     db: u16,
@@ -3279,13 +3997,6 @@ async fn send_apply<O: PlaneObserver + 'static>(
     // Routing is the `to` cell; the slot field is advisory (keyless scatter
     // applies carry the empty-key slot).
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
-    let (token, waiter) = {
-        let mut fabric = shared.fabric.borrow_mut();
-        let token = fabric.next_token();
-        // Register before sending: the reply may arrive in this very
-        // iteration's FABRIC-IN; the gate parks early values.
-        (token, shared.gate.waiter(token.0))
-    };
     // `cmd` packs `{db:4 | proto:4}` (ADR-0009) — SELECT travels with the
     // op on the byte the codec already had; db is < 16 by SELECT bounds.
     let proto_byte: u8 = match proto {
@@ -3294,13 +4005,23 @@ async fn send_apply<O: PlaneObserver + 'static>(
     };
     debug_assert!(db < 16, "db rides 4 bits of the Apply cmd byte");
     let cmd_byte = proto_byte | ((db as u8) << 4);
-    loop {
+    // Token draw + first send attempt share one fabric borrow (M2.5
+    // Phase H). Registering the waiter *after* staging stays safe: `send`
+    // only stages into the outbound pack — the peer cannot observe the op
+    // until FABRIC-OUT publishes it, after this synchronous stretch — so
+    // no reply can precede the registration (and the gate parks any value
+    // arriving before the waiter's first poll regardless).
+    let (token, mut sent) = {
+        let mut fabric = shared.fabric.borrow_mut();
+        let token = fabric.next_token();
+        let sent = fabric.send(to, &Op::Apply { token, slot, cmd: cmd_byte, args });
+        (token, sent)
+    };
+    let waiter = shared.gate.waiter(token.0);
+    while let Err(SendError::NoCredit { .. }) = sent {
+        shared.credit_waiters.wait(to).await;
         let op = Op::Apply { token, slot, cmd: cmd_byte, args };
-        let sent = shared.fabric.borrow_mut().send(to, &op);
-        match sent {
-            Ok(()) => break,
-            Err(SendError::NoCredit { .. }) => shared.credit_waiters.wait(to).await,
-        }
+        sent = shared.fabric.borrow_mut().send(to, &op);
     }
     // RTT pairing relies on in-order replies; `INF.PUB` replies are deferred
     // by the owner pump (fan acks first), so its hops are not RTT samples —

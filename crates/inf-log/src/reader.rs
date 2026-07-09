@@ -395,6 +395,16 @@ impl<File: SegmentFile> SegmentReader<File> {
                 self.file_pos += read as u64;
             }
         }
+        // Double-buffered read-ahead (M2.5-S08): hint the next two windows
+        // so their device reads overlap the caller's decode+apply of this
+        // one — cold replay composed read and apply serially (0.68 GB/s
+        // measured); overlap bounds it by min(read, apply). Two deep keeps
+        // the prefetcher's wakeup latency out of the reader's critical
+        // path. Hint-only (no-op on in-memory tiers): bytes and digests
+        // unchanged.
+        if !self.hit_eof {
+            self.file.advise_read_ahead(self.file_pos, 2 * self.cfg.chunk_bytes as u64);
+        }
         Ok(())
     }
 }

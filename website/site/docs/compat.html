@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis compatibility matrix — InfinityDB Docs</title>
+<meta name="description" content="Per-command Redis compatibility for InfinityDB, byte-diff-verified against Redis 8.0.5. Rendered from the generated repository artifact.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='20'%20fill='%23201826'/%3E%3Ctext%20x='50'%20y='71'%20font-size='62'%20text-anchor='middle'%20fill='%23cf7ff5'%20font-family='system-ui'%3E%E2%88%9E%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+.stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin: 28px 0; }
+.stat { background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: 10px; padding: 14px 16px; }
+.stat .v { font: 600 26px/1.1 var(--sans); letter-spacing: -0.02em; }
+.stat .l { font: 500 10px/1.4 var(--mono); letter-spacing: 0.1em; color: var(--text-faint); text-transform: uppercase; margin-top: 6px; }
+.st { display: inline-block; font: 500 10px/1 var(--mono); letter-spacing: 0.06em; border-radius: 100px; padding: 4px 9px; }
+.st-full { color: oklch(0.75 0.16 150); border: 1px solid oklch(0.75 0.16 150 / 0.4); }
+.st-partial { color: oklch(0.8 0.14 80); border: 1px solid oklch(0.8 0.14 80 / 0.4); }
+.st-stub { color: var(--text-faint); border: 1px solid var(--border-strong); }
+.st-ext { color: var(--accent); border: 1px solid var(--accent-dim); }
+.st-int { color: var(--text-faint); border: 1px dashed var(--border-strong); }
+.filters { display: flex; gap: 8px; flex-wrap: wrap; margin: 18px 0 6px; }
+.filters button {
+  font: 500 11px/1 var(--mono); letter-spacing: 0.06em; cursor: pointer;
+  background: var(--bg-raise); color: var(--text-muted);
+  border: 1px solid var(--border-strong); border-radius: 100px; padding: 8px 14px;
+}
+.filters button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent-dim); background: var(--accent-wash); }
+.dev h3 { font-size: 16px; margin: 26px 0 8px; font-family: var(--mono); font-weight: 500; }
+.dev ul { margin: 0 0 0 2px; padding-left: 20px; }
+.dev li { font-size: 14px; color: var(--text-muted); }
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="../index.html" class="nav-brand">
+      <span class="mark">&infin; InfinityDB</span>
+      <span class="nav-badge">v0.2.0-alpha.1 &middot; IN DEV</span>
+    </a>
+    <span class="nav-spacer"></span>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="nav-links">
+      <a href="../index.html#spine">Architecture</a>
+      <a href="../index.html#workloads">Workloads</a>
+      <a href="roadmap.html">Roadmap</a>
+      <a href="index.html" aria-current="page">Docs</a>
+      <a href="../blog/index.html">Blog</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<main class="doc-wide">
+  <p class="breadcrumb"><a href="index.html">Docs</a> / Redis compatibility matrix</p>
+  <h1 class="page-title">Redis compatibility matrix</h1>
+  <p class="lede">Compatibility is declared per command and verified byte-for-byte against a real Redis oracle in CI &mdash; any new deviation fails the build until it is documented. This page is <strong>rendered from the repository&rsquo;s generated artifact</strong>, never written by hand, so it cannot drift from the implementation.</p>
+
+  <div class="callout">
+    <span class="callout-tag"><strong>Generated page &mdash; do not edit.</strong></span>
+    Rendered from <code>infinitydb/docs/compat-matrix.md</code> (itself generated from the <code>inf-wire</code> command registry and the oracle-diff corpus by <code>tests/compat/src/matrixgen.rs</code>, with a CI staleness gate) by <code>scripts/gen-compat-page.py</code> on 2026-07-07. Upstream regenerate: <code>INF_REGEN_MATRIX=1 cargo test -p compat --test matrix_artifact</code> (CI fails when this file is stale — the release pipeline inherits that refusal).
+  </div>
+
+  <div class="stat-row">
+    <div class="stat"><div class="v">68</div><div class="l">commands declared</div></div>
+    <div class="stat"><div class="v">47</div><div class="l">full</div></div>
+    <div class="stat"><div class="v">17</div><div class="l">partial</div></div>
+    <div class="stat"><div class="v">2</div><div class="l">extension</div></div>
+    <div class="stat"><div class="v">2</div><div class="l">internal</div></div>
+  </div>
+  <p class="mono-note">CORPUS: 378 byte-compared cases · 36 documented deviations · 0 tolerated failures &middot; SURFACE: 68 commands — 47 full · 17 partial · 0 stub · 2 extension · 2 internal</p>
+
+  <h2 style="margin-top:40px">Status vocabulary</h2>
+  <ul>
+    <li><span class="st st-full">full</span>&ensp;behavior-contract equivalent (recorded deviations are representational: ordering, identity payloads, opaque cursors/art)</li>
+    <li><span class="st st-partial">partial</span>&ensp;a documented semantic difference exists</li>
+    <li><span class="st st-stub">stub</span>&ensp;accepted but inert</li>
+    <li><span class="st st-ext">extension</span>&ensp;<code>INF.*</code> surface unknown to Redis</li>
+    <li><span class="st st-int">internal</span>&ensp;fabric program primitives, not a client surface</li>
+  </ul>
+
+  <h2>Commands</h2>
+  <div class="filters" role="group" aria-label="Filter by status">
+    <button data-f="all" aria-pressed="true">ALL (68)</button>
+    <button data-f="full" aria-pressed="false">FULL (47)</button>
+    <button data-f="partial" aria-pressed="false">PARTIAL (17)</button>
+    <button data-f="extension" aria-pressed="false">EXTENSION (2)</button>
+    <button data-f="internal" aria-pressed="false">INTERNAL (2)</button>
+  </div>
+  <div class="table-wrap">
+    <table class="data" id="matrix">
+      <thead>
+        <tr><th>Command</th><th>Status</th><th>Since</th><th>Flags</th><th>Arity</th><th>Cases</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr data-status="full"><td><code>PING</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">fast</td><td>-1</td><td>7</td><td></td></tr>
+        <tr data-status="full"><td><code>ECHO</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">fast</td><td>2</td><td>3</td><td></td></tr>
+        <tr data-status="full"><td><code>HELLO</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">fast</td><td>-1</td><td>1</td><td>identity fields (server/version) are InfinityDB's own, as for any non-Redis server</td></tr>
+        <tr data-status="partial"><td><code>QUIT</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">fast</td><td>1</td><td>0</td><td>replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus because closing tears down the shared oracle connection — covered by a unit test and the client-smoke suite</td></tr>
+        <tr data-status="full"><td><code>GET</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>2</td><td>27</td><td></td></tr>
+        <tr data-status="full"><td><code>SET</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom</td><td>-3</td><td>71</td><td></td></tr>
+        <tr data-status="full"><td><code>SETNX</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>3</td><td>2</td><td></td></tr>
+        <tr data-status="full"><td><code>SETEX</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom</td><td>4</td><td>4</td><td></td></tr>
+        <tr data-status="full"><td><code>PSETEX</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom</td><td>4</td><td>2</td><td></td></tr>
+        <tr data-status="full"><td><code>GETSET</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>3</td><td>2</td><td></td></tr>
+        <tr data-status="full"><td><code>GETDEL</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write fast</td><td>2</td><td>2</td><td></td></tr>
+        <tr data-status="full"><td><code>DEL</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write</td><td>-2</td><td>4</td><td></td></tr>
+        <tr data-status="full"><td><code>EXISTS</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>-2</td><td>10</td><td></td></tr>
+        <tr data-status="full"><td><code>TYPE</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>2</td><td>2</td><td>only the string type exists until M3</td></tr>
+        <tr data-status="full"><td><code>INCR</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>2</td><td>8</td><td></td></tr>
+        <tr data-status="full"><td><code>DECR</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>2</td><td>2</td><td></td></tr>
+        <tr data-status="full"><td><code>INCRBY</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>3</td><td>3</td><td></td></tr>
+        <tr data-status="full"><td><code>DECRBY</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>3</td><td>2</td><td></td></tr>
+        <tr data-status="full"><td><code>APPEND</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>3</td><td>4</td><td></td></tr>
+        <tr data-status="full"><td><code>STRLEN</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>2</td><td>5</td><td></td></tr>
+        <tr data-status="full"><td><code>EXPIRE</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write fast</td><td>-3</td><td>17</td><td>TTLs ≥ ~34.8 years clamp to the u40 record bound</td></tr>
+        <tr data-status="full"><td><code>PEXPIRE</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write fast</td><td>-3</td><td>1</td><td>same u40 clamp</td></tr>
+        <tr data-status="full"><td><code>TTL</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>2</td><td>18</td><td></td></tr>
+        <tr data-status="full"><td><code>PTTL</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>2</td><td>3</td><td></td></tr>
+        <tr data-status="full"><td><code>PERSIST</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write fast</td><td>2</td><td>3</td><td></td></tr>
+        <tr data-status="partial"><td><code>INFO</code></td><td><span class="st st-partial">partial</span></td><td>M0</td><td class="faint">admin</td><td>-1</td><td>0</td><td>sections + field vocabulary present; gauges are this cell's slice until the control plane aggregates (client-smoke CI is the open M1-S14 AC)</td></tr>
+        <tr data-status="partial"><td><code>COMMAND</code></td><td><span class="st st-partial">partial</span></td><td>M0</td><td class="faint">admin</td><td>-1</td><td>3</td><td>COMMAND DOCS is an honest empty map; the registry covers the implemented surface only</td></tr>
+        <tr data-status="full"><td><code>MGET</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>-2</td><td>4</td><td></td></tr>
+        <tr data-status="full"><td><code>MSET</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write denyoom</td><td>-3</td><td>3</td><td></td></tr>
+        <tr data-status="partial"><td><code>MSETNX</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write denyoom</td><td>-3</td><td>3</td><td>cross-cell keys are check-then-set until M4 transactions; single-cell exact</td></tr>
+        <tr data-status="full"><td><code>GETRANGE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly</td><td>4</td><td>8</td><td></td></tr>
+        <tr data-status="full"><td><code>SETRANGE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write denyoom</td><td>4</td><td>4</td><td>values bound at 16 MiB − 1 (record format v0)</td></tr>
+        <tr data-status="full"><td><code>GETEX</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write fast</td><td>-2</td><td>8</td><td></td></tr>
+        <tr data-status="partial"><td><code>INCRBYFLOAT</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write denyoom fast</td><td>3</td><td>6</td><td>computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision tails may differ</td></tr>
+        <tr data-status="full"><td><code>SUBSTR</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly</td><td>4</td><td>1</td><td></td></tr>
+        <tr data-status="partial"><td><code>RENAME</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write</td><td>3</td><td>2</td><td>cross-owner pairs run as a two-cell fabric program — atomic per cell, not across cells until M4; same-owner pairs exact</td></tr>
+        <tr data-status="partial"><td><code>RENAMENX</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write fast</td><td>3</td><td>3</td><td>same cross-owner window as RENAME</td></tr>
+        <tr data-status="partial"><td><code>COPY</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write denyoom</td><td>-3</td><td>12</td><td>same cross-owner window as RENAME; TTL transfers as relative ms across cells</td></tr>
+        <tr data-status="full"><td><code>TOUCH</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>-2</td><td>1</td><td></td></tr>
+        <tr data-status="full"><td><code>UNLINK</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write fast</td><td>-2</td><td>1</td><td></td></tr>
+        <tr data-status="full"><td><code>DBSIZE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>1</td><td>5</td><td></td></tr>
+        <tr data-status="full"><td><code>KEYS</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly</td><td>2</td><td>4</td><td>result ordering is engine-defined (set equality holds)</td></tr>
+        <tr data-status="full"><td><code>RANDOMKEY</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly</td><td>1</td><td>1</td><td>two-level random: cell, then key</td></tr>
+        <tr data-status="full"><td><code>SCAN</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly</td><td>-2</td><td>2</td><td>cursor values are engine-internal; the every-resident-key-≥-once guarantee is proptested</td></tr>
+        <tr data-status="full"><td><code>FLUSHDB</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write</td><td>-1</td><td>4</td><td></td></tr>
+        <tr data-status="partial"><td><code>FLUSHALL</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write</td><td>-1</td><td>2</td><td>atomic per cell, eventually complete across cells within one scatter round (no global pause)</td></tr>
+        <tr data-status="partial"><td><code>OBJECT</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">readonly</td><td>-2</td><td>11</td><td>IDLETIME is an honest 0 (CLOCK recency, no LRU clock); FREQ is the CMS Morris estimate</td></tr>
+        <tr data-status="partial"><td><code>DEBUG</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>3</td><td>subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE; SLEEP stalls one cell, never the node</td></tr>
+        <tr data-status="full"><td><code>EXPIREAT</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write fast</td><td>-3</td><td>6</td><td></td></tr>
+        <tr data-status="full"><td><code>PEXPIREAT</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write fast</td><td>-3</td><td>1</td><td></td></tr>
+        <tr data-status="full"><td><code>EXPIRETIME</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>2</td><td>5</td><td></td></tr>
+        <tr data-status="full"><td><code>PEXPIRETIME</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>2</td><td>4</td><td></td></tr>
+        <tr data-status="full"><td><code>SELECT</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>2</td><td>7</td><td></td></tr>
+        <tr data-status="partial"><td><code>CONFIG</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>27</td><td>typed M1 key subset with frozen hot-reload classes</td></tr>
+        <tr data-status="partial"><td><code>CLIENT</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>5</td><td>KILL supports the ID filter form; LIST addr/fd are placeholders until peername capture</td></tr>
+        <tr data-status="partial"><td><code>LOLWUT</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">readonly</td><td>-1</td><td>0</td><td>the whole reply is version art (nothing byte-comparable by design)</td></tr>
+        <tr data-status="full"><td><code>SUBSCRIBE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>-2</td><td>5</td><td></td></tr>
+        <tr data-status="full"><td><code>UNSUBSCRIBE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>-1</td><td>5</td><td>bare-form confirmations emit in subscription order (Redis: dict order)</td></tr>
+        <tr data-status="full"><td><code>PSUBSCRIBE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>-2</td><td>2</td><td></td></tr>
+        <tr data-status="full"><td><code>PUNSUBSCRIBE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>-1</td><td>3</td><td>same bare-form ordering note as UNSUBSCRIBE</td></tr>
+        <tr data-status="full"><td><code>PUBLISH</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>3</td><td>4</td><td>a publisher subscribed to its own channel via a remote owner cell may receive its frame before the publish reply (local owners match Redis order)</td></tr>
+        <tr data-status="partial"><td><code>PUBSUB</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">readonly</td><td>-2</td><td>8</td><td>SHARDCHANNELS / SHARDNUMSUB arrive with sharded pub/sub (M3 cut line)</td></tr>
+        <tr data-status="extension"><td><code>INF.NS</code></td><td><span class="st st-ext">extension</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>0</td><td>namespace registry v1 — the M2 durability seam</td></tr>
+        <tr data-status="extension"><td><code>INF.CKPT</code></td><td><span class="st st-ext">extension</span></td><td>M2</td><td class="faint">admin</td><td>-1</td><td>0</td><td>checkpoint operator surface (M2-S20): [CELL k] [WAIT]; WAIT returns after the new MANIFEST is durable — no fork, per-cell timing (ADR-0021)</td></tr>
+        <tr data-status="partial"><td><code>BGSAVE</code></td><td><span class="st st-partial">partial</span></td><td>M2</td><td class="faint">admin</td><td>-1</td><td>0</td><td>maps onto INF.CKPT (fuzzy checkpoint, no fork, no RDB file); SCHEDULE accepted and moot; reply byte-identical; memory-only nodes answer a documented error</td></tr>
+        <tr data-status="partial"><td><code>LASTSAVE</code></td><td><span class="st st-partial">partial</span></td><td>M2</td><td class="faint">readonly fast</td><td>1</td><td>0</td><td>unix seconds of the newest durable MANIFEST publication; 0 before the first (Redis reports process-start time); loading flag docs-derived, not capture-verified</td></tr>
+        <tr data-status="internal"><td><code>INF.TAKE</code></td><td><span class="st st-int">internal</span></td><td>M1</td><td class="faint">write fast</td><td>2</td><td>0</td><td>cross-cell RENAME/COPY program primitive</td></tr>
+        <tr data-status="internal"><td><code>INF.PEEK</code></td><td><span class="st st-int">internal</span></td><td>M1</td><td class="faint">readonly fast</td><td>2</td><td>0</td><td>cross-cell COPY program primitive</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Documented deviations (the allowlist, verbatim)</h2>
+  <p class="muted">Each entry is a justification from the diff corpus: the candidate must still produce well-formed RESP for these cases, but the bytes differ from the oracle by design.</p>
+  <div class="dev">
+    <h3><code>HELLO</code></h3>
+    <ul>
+      <li>identity fields differ by design (L8: server/version)</li>
+      <li>identity fields differ; proto switch verified locally</li>
+      <li>NOPROTO error text verified in unit tests</li>
+    </ul>
+    <h3><code>INFO</code></h3>
+    <ul>
+      <li>section payloads differ (InfinityDB identity/tripwires); shape client-parseable</li>
+    </ul>
+    <h3><code>COMMAND</code></h3>
+    <ul>
+      <li>registry is the M0+M1 surface, not the full Redis set</li>
+      <li>registry size differs by design</li>
+      <li>flags/acl detail differs; arity+keyspec verified in inf-wire</li>
+      <li>docs payload not implemented (honest empty map)</li>
+    </ul>
+    <h3><code>KEYS</code></h3>
+    <ul>
+      <li>result ordering differs (home-group vs dict order); set equality via DBSIZE</li>
+    </ul>
+    <h3><code>RANDOMKEY</code></h3>
+    <ul>
+      <li>two-level random (cell, then key) — documented deviation</li>
+    </ul>
+    <h3><code>SCAN</code></h3>
+    <ul>
+      <li>cursor values are engine-internal; guarantee proptested in inf-store</li>
+      <li>cursor values engine-internal</li>
+    </ul>
+    <h3><code>OBJECT</code></h3>
+    <ul>
+      <li>no LRU clock until the eviction engine (M1-E3); honest 0</li>
+      <li>popularity scale differs: CMS Morris estimate vs Redis log counter</li>
+    </ul>
+    <h3><code>DEBUG</code></h3>
+    <ul>
+      <li>removed in Redis 8; InfinityDB accepts it as a no-op (M1-S03 surface)</li>
+      <li>value-address/serialized-length fields are engine-internal</li>
+    </ul>
+    <h3><code>CONFIG</code></h3>
+    <ul>
+      <li>InfinityDB returns the typed M1 key subset</li>
+      <li>error detail text differs; both reject</li>
+      <li>error text shape differs slightly</li>
+    </ul>
+    <h3><code>CLIENT</code></h3>
+    <ul>
+      <li>connection ids are engine-internal counters</li>
+      <li>addr/fd/timing fields differ; field vocabulary matches</li>
+    </ul>
+    <h3><code>LOLWUT</code></h3>
+    <ul>
+      <li>version art differs by design</li>
+    </ul>
+    <h3><code>PUBSUB</code></h3>
+    <ul>
+      <li>sharded pub/sub (SSUBSCRIBE family) is the recorded M3 cut line</li>
+    </ul>
+    <h3><code>INF.NS</code></h3>
+    <ul>
+      <li>InfinityDB extension</li>
+      <li>InfinityDB extension; durable live since M2-S08 (node tier — the planeless compat candidate answers its documented no-runtime error)</li>
+      <li>InfinityDB extension (M2-S08): named-namespace selection, SELECT-class conn state; durable-mode deviations documented in ADR-0015</li>
+    </ul>
+    <h3><code>INF.CKPT</code></h3>
+    <ul>
+      <li>InfinityDB extension (M2-S20): checkpoint trigger; the planeless compat candidate answers its documented no-durable-plane error</li>
+    </ul>
+    <h3><code>BGSAVE</code></h3>
+    <ul>
+      <li>maps onto INF.CKPT (M2-S20): fuzzy checkpoint, no fork, no RDB file; reply byte-identical on durable nodes; the planeless candidate answers its documented error (node_e2e pins the live reply)</li>
+    </ul>
+    <h3><code>LASTSAVE</code></h3>
+    <ul>
+      <li>M2-S20: newest durable MANIFEST publication time; 0 before the first save vs Redis's process-start time; the planeless candidate answers its documented error</li>
+    </ul>
+  </div>
+
+  <div class="doc-footer-nav">
+    <a href="architecture.html">&larr; Architecture</a>
+    <a href="roadmap.html">Roadmap &rarr;</a>
+  </div>
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span class="mark">&infin; InfinityDB</span>
+    <span class="meta">APACHE 2.0 &middot; RUST &middot; BEST ON LINUX WITH io_uring</span>
+    <div class="footer-links">
+      <a href="index.html">Docs</a>
+      <a href="../blog/index.html">Blog</a>
+      <a href="roadmap.html">Roadmap</a>
+      <a href="https://github.com/">GitHub &#8599;</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var t = document.querySelector('.nav-toggle');
+  var l = document.querySelector('.nav-links');
+  if (t && l) t.addEventListener('click', function () {
+    var open = l.classList.toggle('open');
+    t.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+  var buttons = document.querySelectorAll('.filters button');
+  var rows = document.querySelectorAll('#matrix tbody tr');
+  buttons.forEach(function (b) {
+    b.addEventListener('click', function () {
+      buttons.forEach(function (x) { x.setAttribute('aria-pressed', 'false'); });
+      b.setAttribute('aria-pressed', 'true');
+      var f = b.getAttribute('data-f');
+      rows.forEach(function (r) {
+        r.style.display = (f === 'all' || r.getAttribute('data-status') === f) ? '' : 'none';
+      });
+    });
+  });
+})();
+</script>
+</body>
+</html>

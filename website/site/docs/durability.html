@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Namespaces &amp; durability — InfinityDB Docs</title>
+<meta name="description" content="InfinityDB durability classes (memory, everysec, always), ack points, loss windows, checkpoints, recovery, and fail-stop rules.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='20'%20fill='%23201826'/%3E%3Ctext%20x='50'%20y='71'%20font-size='62'%20text-anchor='middle'%20fill='%23cf7ff5'%20font-family='system-ui'%3E%E2%88%9E%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="../index.html" class="nav-brand">
+      <span class="mark">&infin; InfinityDB</span>
+      <span class="nav-badge">v0.2.0-alpha.1 &middot; IN DEV</span>
+    </a>
+    <span class="nav-spacer"></span>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="nav-links">
+      <a href="../index.html#spine">Architecture</a>
+      <a href="../index.html#workloads">Workloads</a>
+      <a href="roadmap.html">Roadmap</a>
+      <a href="index.html" aria-current="page">Docs</a>
+      <a href="../blog/index.html">Blog</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<main class="doc">
+  <p class="breadcrumb"><a href="index.html">Docs</a> / Namespaces &amp; durability</p>
+  <h1 class="page-title">Namespaces &amp; durability</h1>
+  <p class="lede">Durability in InfinityDB is a property of the <strong>namespace</strong>, not the server. One node simultaneously serves a cache and a system of record &mdash; the difference is which namespace a key lives in. This page states the semantics exactly: what an ack means, what each mode can lose, and how the node behaves after a crash.</p>
+
+  <h2>Namespaces</h2>
+  <p>A namespace is a logical keyspace with its own durability class, eviction policy, and memory budget. Redis <code>SELECT 0..15</code> maps to default namespaces; named namespaces are created with <code>INF.NS</code>:</p>
+<pre><code>INF.NS CREATE cache    MODE memory   EVICTION allkeys-lfu MAXMEMORY 16gb
+INF.NS CREATE ledger   MODE durable  FSYNC always
+INF.NS CREATE sessions MODE durable  FSYNC everysec</code></pre>
+  <p>A <code>memory</code> namespace never touches the log &mdash; not &ldquo;rarely,&rdquo; never: memory-only workloads append zero log records, which is verified by a report-enforced check in the benchmark harness. <code>topic</code> namespaces (retention instead of eviction, the queue substrate) arrive at M7.</p>
+
+  <h2>Durability classes</h2>
+  <p>Per namespace, exactly as the engine implements them:</p>
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr><th>Mode</th><th>Ack point</th><th>Mechanism</th><th>Loss window on crash</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>memory</code></td>
+          <td>on apply</td>
+          <td>no log</td>
+          <td>everything (cache semantics)</td>
+        </tr>
+        <tr>
+          <td><code>everysec</code></td>
+          <td>on apply</td>
+          <td>group commit each reactor loop; fsync on a one-second timer (and on segment seal)</td>
+          <td>at most the last second of acknowledged writes</td>
+        </tr>
+        <tr>
+          <td><code>always</code></td>
+          <td><strong>after fsync</strong></td>
+          <td>the response suspends on the durability watermark; group commit batches all concurrent <code>always</code> writers into one fsync</td>
+          <td>zero (single node) &mdash; an acknowledged write survives any crash</td>
+        </tr>
+        <tr>
+          <td><code>wait-replica</code> <span class="pill pill-plan">M9</span></td>
+          <td>after R replicas ack</td>
+          <td>watermark = replicated LSN</td>
+          <td>zero across node loss (roadmap &mdash; not shipped)</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Two consequences worth internalizing:</p>
+  <ul>
+    <li><strong>An <code>always</code> ack is a durability fact, not a courtesy.</strong> The mutation applies immediately, but the client&rsquo;s reply is gated: the command future suspends until the group-commit fsync covering its log position completes. Throughput comes from grouping &mdash; every concurrent writer shares one fsync &mdash; and the fsync latency histogram is reported honestly in <code>INFO persistence</code>, because <code>always</code> is storage-bound by definition.</li>
+    <li><strong><code>everysec</code> is a real window, stated plainly.</strong> Writes are acknowledged on apply and the log is fsynced on a one-second timer, so a power cut can lose up to the last second of acknowledged writes in that namespace. If that window is unacceptable, use <code>always</code>.</li>
+  </ul>
+
+  <h2>fsync failure is fail-stop</h2>
+  <p>If the device reports an fsync failure, InfinityDB does not retry, degrade, or pretend: the durability watermark <strong>freezes forever</strong> (no further ack can be issued against unverified storage) and the process exits with a dedicated code (<code>EXIT_DURABLE_FAILSTOP</code>). This is the PostgreSQL-fsyncgate lesson, enforced mechanically &mdash; a repo script audits that fsync-error types can only appear at allowlisted fail-stop sites, and a child-process test proves the affected batch is never acknowledged.</p>
+
+  <h2>Checkpoints &mdash; no fork, no stop-the-world</h2>
+  <p>Checkpoints replace the <code>BGREWRITEAOF</code>-style rewrite. A checkpoint is a <em>fuzzy snapshot</em> taken by the owning cell in bounded background slices: the live index and records stream incrementally to a <code>.ick</code> file (records mutated mid-checkpoint are simply re-covered by the log tail), then a <code>MANIFEST</code> atomically names the new recovery unit (write-new + fsync + rename + directory-fsync) and older log segments are truncated. Properties:</p>
+  <ul>
+    <li><strong>No <code>fork()</code></strong>, no copy-on-write page games, no doubled memory during a rewrite &mdash; the cell streams its own memory at its own pace, paced to avoid dirty-page stalls.</li>
+    <li>A <code>MANIFEST</code> is published only once the durability watermark covers the checkpoint&rsquo;s starting position &mdash; a checkpoint can never name state the log hasn&rsquo;t made durable.</li>
+    <li>Checkpoint I/O failure aborts the checkpoint, never the process &mdash; nothing was acknowledged against it and the log stays authoritative.</li>
+    <li>Operator surface: <code>INF.CKPT [CELL k] [WAIT]</code>; <code>BGSAVE</code> maps onto it (reply byte-identical, no RDB file); <code>LASTSAVE</code> reports the newest durable MANIFEST publication.</li>
+  </ul>
+
+  <h2>Recovery</h2>
+  <p>Recovery is per cell and parallel: each cell loads its named checkpoint (a materialized log prefix in the same record format), then replays its log tail from the checkpoint&rsquo;s position. There is no global log sequence number and no merge step &mdash; cells recover independently.</p>
+  <ul>
+    <li><strong>While loading,</strong> the node answers exactly like Redis does: non-exempt commands receive <code>-LOADING Redis is loading the dataset in memory</code> (the exempt set is pinned to observed Redis behavior). Loading progress is visible in <code>INFO persistence</code>. The gate is node-scoped: a recovered cell still answers <code>-LOADING</code> while a peer replays.</li>
+    <li><strong>Torn tails are expected physics:</strong> a torn final batch frame (detected by CRC) is truncated, and replay resumes cleanly behind it. That is the one form of damage recovery repairs silently, because it is the defined crash window.</li>
+    <li><strong>Everything else is a refusal, not a guess.</strong> Corruption in the body of the log, a validating frame beyond a segment&rsquo;s recorded end, a MANIFEST that names a checkpoint or segment that is missing or corrupt, an unknown record type or flag &mdash; each is a <em>named</em> error and the boot fail-stops. InfinityDB never silently skips records and never falls back to &ldquo;replay whatever we can find,&rdquo; because a database that boots with quietly missing acknowledged data is worse than one that refuses and says why.</li>
+  </ul>
+  <div class="callout">
+    <span class="callout-tag"><strong>What a refusal means for you:</strong></span>
+    a refused boot names the corruption class and the file. It means the on-disk state failed an integrity check that <em>could</em> have hidden lost data. The simulation evidence below audits these refusals: in the sweep, every refusal was legal (the fault genuinely destroyed named state) &mdash; refusals are not false alarms, and they are rare.
+  </div>
+
+  <h2>The evidence</h2>
+  <p>These are the claim-ledger rows behind this page &mdash; each <strong>Allowed</strong>, each citing a committed artifact. Environment for the measured rows: the project&rsquo;s designated reference box (i7-13700KF, pinned P-cores, <code>performance</code> governor, consumer Gen3 DRAM-less NVMe &mdash; the device class is disclosed because it matters).</p>
+
+  <div class="evidence">
+    <span class="tag">Deterministic durability testing (ledger C12).</span>
+    &ldquo;Durability is deterministically tested: 10,000 simulated power-cut/disk-fault seeds, zero durability-oracle violations &mdash; every <code>always</code>-acked write survives, <code>everysec</code> loses at most one second (simulated time); every seed replays byte-identically.&rdquo; Disclosed alongside: 1.33% of simulated boots legally refuse with a named corruption error (survival-audited).
+    <span class="artifact">artifact: infinitydb/.artifacts/m2/dst-sweep-10k-s22-20260705/</span>
+  </div>
+
+  <div class="evidence">
+    <span class="tag">Crash matrix (ledger C13).</span>
+    &ldquo;The crash matrix &mdash; 8 named fault points &times; fsync policies &times; workloads, kill-and-recover with digest verification &mdash; is green at 256 seeds per combination; fsync failure is fail-stop.&rdquo;
+    <span class="artifact">artifact: crash-matrix run 2026-07-05 &middot; tests/crash-matrix/m2.toml</span>
+  </div>
+
+  <div class="evidence">
+    <span class="tag">Cold-boot recovery (ledger C14).</span>
+    &ldquo;A 10 GB node (8 cells) cold-boots to serving in under 10 seconds on the reference box (9.8 s, cold page cache, 3 replicates &lt; 1% spread).&rdquo; Measured 9.8 s against a 15 s gate; Gen3 DRAM-less device named.
+    <span class="artifact">artifact: infinitydb/.artifacts/m2/parallel-boot-cold-20260705/</span>
+  </div>
+
+  <div class="evidence">
+    <span class="tag">Memory namespaces pay zero for durability (ledger C15).</span>
+    &ldquo;Memory namespaces pay zero for durability: A/B vs the pre-durability build shows &le; 1% on every gate mix (worst 0.63%, p99.9 same-bucket-or-better), and memory-only runs append zero log records (report-enforced).&rdquo;
+    <span class="artifact">artifact: infinitydb/.artifacts/m2/1783232863-gate-run/</span>
+  </div>
+
+  <div class="evidence">
+    <span class="tag">Checkpoints are fork-free and memory-flat (ledger C16).</span>
+    &ldquo;Checkpoints are fork-free and memory-flat: continuous checkpoint cycling under a saturating durable write mix costs &le; 15 MiB of peak RSS vs a no-checkpoint control (a fork/COW rewrite would cost the dataset).&rdquo; Measured 14.4 MiB over 176 cycles.
+    <span class="artifact">artifact: M2-S22 binding report &middot; infinitydb/.artifacts/m2/</span>
+  </div>
+
+  <div class="evidence">
+    <span class="tag">Exact memory accounting with the durable plane live (ledger C21).</span>
+    &ldquo;Memory attribution stays exact with the durable plane live: sum(domains) &mdash; including log staging and checkpoint buffers &mdash; within 1.1% of RSS on a 1 GB durable fill.&rdquo;
+    <span class="artifact">artifact: M2-S22 binding report attribution row</span>
+  </div>
+
+  <p class="muted" style="font-size:14px">What you will <em>not</em> find here: <code>always</code>-mode throughput numbers, <code>everysec</code> penalty percentages, or replay-bandwidth claims. Those rows are still Evidence-pending or Narrowed in the ledger (several are gated on a Gen4-class device), and this project does not publish targets as achievements. When they flip to Allowed, they appear here with their artifacts.</p>
+
+  <div class="doc-footer-nav">
+    <a href="quickstart.html">&larr; Quickstart</a>
+    <a href="architecture.html">Architecture &rarr;</a>
+  </div>
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span class="mark">&infin; InfinityDB</span>
+    <span class="meta">APACHE 2.0 &middot; RUST &middot; BEST ON LINUX WITH io_uring</span>
+    <div class="footer-links">
+      <a href="index.html">Docs</a>
+      <a href="../blog/index.html">Blog</a>
+      <a href="roadmap.html">Roadmap</a>
+      <a href="https://github.com/">GitHub &#8599;</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var t = document.querySelector('.nav-toggle');
+  var l = document.querySelector('.nav-links');
+  if (t && l) t.addEventListener('click', function () {
+    var open = l.classList.toggle('open');
+    t.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+})();
+</script>
+</body>
+</html>

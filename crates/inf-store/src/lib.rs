@@ -24,7 +24,9 @@ pub use index::Index;
 pub use inf_alloc::ArenaConfig;
 // One import point for the shared store↔log vocabulary (ADR-0015 D2/D5).
 pub use inf_log::{FsyncClass, NsId};
-pub use keyspace::{DEFAULT_DBS, EvictBudget, Keyspace, PressureConfig, ReplayOutcome};
+pub use keyspace::{
+    DEFAULT_DBS, EvictBudget, Keyspace, PressureConfig, ReplayOutcome, StateDigest,
+};
 pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, valid_ns_name};
 pub use record::{MAX_KEY_LEN, MAX_VAL_LEN, TypeTag};
 pub use router::SlotRouter;

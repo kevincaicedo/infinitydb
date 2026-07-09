@@ -90,6 +90,17 @@ pub enum CommandId {
     /// identity seam M2 durability classes attach to. An `INF.*` extension,
     /// not a Redis command.
     InfNs,
+    /// `INF.CKPT [CELL k] [WAIT]` — the checkpoint operator surface
+    /// (M2-S20): requests ride the control-plane epoch board; cells run
+    /// checkpoints in their own MAINTAIN slices (L1); `WAIT` returns only
+    /// after the new MANIFEST is durable. An `INF.*` extension.
+    InfCkpt,
+    /// `BGSAVE [SCHEDULE]` — maps onto `INF.CKPT` (all cells, no wait);
+    /// no fork, per-cell timing (deviations documented, L8).
+    Bgsave,
+    /// `LASTSAVE` — unix seconds of the newest durable MANIFEST
+    /// publication across cells (0 before the first; deviation noted).
+    Lastsave,
     /// Internal cross-cell program op: atomically read value+TTL and delete
     /// at the owning cell (the RENAME/MOVE fabric-program primitive). Not a
     /// Redis command; listed in `COMMAND` output as an `INF.*` extension.
@@ -112,6 +123,12 @@ impl CmdFlags {
     /// free below it (Redis `DENYOOM` — the M1-S07 OOM-honesty gate enters
     /// through this flag, never per-handler checks).
     pub const DENYOOM: CmdFlags = CmdFlags(1 << 4);
+    /// Allowed while the node is loading (M2-S15 `-LOADING` gate).
+    /// Membership mirrors Redis 8.0.5 *observed* behavior, not its docs —
+    /// oracle capture `.artifacts/m2/loading-redis-capture-20260703/`:
+    /// ECHO/SELECT/HELLO/pubsub/INFO/CONFIG/CLIENT/COMMAND/DEBUG/QUIT pass;
+    /// **PING does not** (it answers `-LOADING` there, so it does here).
+    pub const LOADING: CmdFlags = CmdFlags(1 << 5);
 
     #[inline]
     pub fn contains(self, other: CmdFlags) -> bool {
@@ -172,6 +189,11 @@ const W_FAST: CmdFlags = CmdFlags::WRITE.union(CmdFlags::FAST);
 /// M1-S07 compat cases) — writes that free or only re-time memory (DEL,
 /// EXPIRE, PERSIST, GETDEL, GETEX, RENAME, FLUSH*) stay allowed under OOM.
 const W_OOM: CmdFlags = CmdFlags::WRITE.union(CmdFlags::DENYOOM);
+/// Loading-allowed membership mirrors observed Redis 8.0.5 (M2-S15 capture
+/// artifact) — notably PING is NOT loading-allowed there.
+const LOADING_FAST: CmdFlags = CmdFlags::FAST.union(CmdFlags::LOADING);
+const LOADING_ADMIN: CmdFlags = CmdFlags::ADMIN.union(CmdFlags::LOADING);
+const LOADING_RO_FAST: CmdFlags = CmdFlags::READONLY.union(CmdFlags::FAST).union(CmdFlags::LOADING);
 const W_FAST_OOM: CmdFlags = W_FAST.union(CmdFlags::DENYOOM);
 
 /// One registry row (the array below stays readable at 58 entries).
@@ -187,13 +209,13 @@ const fn cmd(
 
 /// The registry. M1+ append here (and only here) — the hash table below is
 /// derived mechanically at compile time.
-pub static COMMANDS: [CommandMeta; 65] = [
+pub static COMMANDS: [CommandMeta; 68] = [
     cmd(CommandId::Ping, "PING", -1, CmdFlags::FAST, KeySpec::NONE),
-    cmd(CommandId::Echo, "ECHO", 2, CmdFlags::FAST, KeySpec::NONE),
-    cmd(CommandId::Hello, "HELLO", -1, CmdFlags::FAST, KeySpec::NONE),
+    cmd(CommandId::Echo, "ECHO", 2, LOADING_FAST, KeySpec::NONE),
+    cmd(CommandId::Hello, "HELLO", -1, LOADING_FAST, KeySpec::NONE),
     // QUIT: the server replies +OK and closes the connection after flushing
     // (handled in the plane, which owns the connection lifecycle).
-    cmd(CommandId::Quit, "QUIT", 1, CmdFlags::FAST, KeySpec::NONE),
+    cmd(CommandId::Quit, "QUIT", 1, LOADING_FAST, KeySpec::NONE),
     cmd(CommandId::Get, "GET", 2, RO_FAST, KeySpec::ONE),
     cmd(CommandId::Set, "SET", -3, W_OOM, KeySpec::ONE),
     cmd(CommandId::Setnx, "SETNX", 3, W_FAST_OOM, KeySpec::ONE),
@@ -215,8 +237,8 @@ pub static COMMANDS: [CommandMeta; 65] = [
     cmd(CommandId::Ttl, "TTL", 2, RO_FAST, KeySpec::ONE),
     cmd(CommandId::Pttl, "PTTL", 2, RO_FAST, KeySpec::ONE),
     cmd(CommandId::Persist, "PERSIST", 2, W_FAST, KeySpec::ONE),
-    cmd(CommandId::Info, "INFO", -1, CmdFlags::ADMIN, KeySpec::NONE),
-    cmd(CommandId::Command, "COMMAND", -1, CmdFlags::ADMIN, KeySpec::NONE),
+    cmd(CommandId::Info, "INFO", -1, LOADING_ADMIN, KeySpec::NONE),
+    cmd(CommandId::Command, "COMMAND", -1, LOADING_ADMIN, KeySpec::NONE),
     // ---- M1-S01 · string family ----
     cmd(CommandId::Mget, "MGET", -2, RO_FAST, KeySpec::ALL_TRAILING),
     cmd(CommandId::Mset, "MSET", -3, W_OOM, KeySpec::PAIRS),
@@ -239,26 +261,39 @@ pub static COMMANDS: [CommandMeta; 65] = [
     cmd(CommandId::Flushdb, "FLUSHDB", -1, CmdFlags::WRITE, KeySpec::NONE),
     cmd(CommandId::Flushall, "FLUSHALL", -1, CmdFlags::WRITE, KeySpec::NONE),
     cmd(CommandId::Object, "OBJECT", -2, CmdFlags::READONLY, KeySpec::SECOND),
-    cmd(CommandId::Debug, "DEBUG", -2, CmdFlags::ADMIN, KeySpec::NONE),
+    cmd(CommandId::Debug, "DEBUG", -2, LOADING_ADMIN, KeySpec::NONE),
     // ---- M1-S03 · expiry completion + server introspection ----
     cmd(CommandId::Expireat, "EXPIREAT", -3, W_FAST, KeySpec::ONE),
     cmd(CommandId::Pexpireat, "PEXPIREAT", -3, W_FAST, KeySpec::ONE),
     cmd(CommandId::Expiretime, "EXPIRETIME", 2, RO_FAST, KeySpec::ONE),
     cmd(CommandId::Pexpiretime, "PEXPIRETIME", 2, RO_FAST, KeySpec::ONE),
-    cmd(CommandId::Select, "SELECT", 2, CmdFlags::FAST, KeySpec::NONE),
-    cmd(CommandId::Config, "CONFIG", -2, CmdFlags::ADMIN, KeySpec::NONE),
-    cmd(CommandId::Client, "CLIENT", -2, CmdFlags::ADMIN, KeySpec::NONE),
+    cmd(CommandId::Select, "SELECT", 2, LOADING_FAST, KeySpec::NONE),
+    cmd(CommandId::Config, "CONFIG", -2, LOADING_ADMIN, KeySpec::NONE),
+    cmd(CommandId::Client, "CLIENT", -2, LOADING_ADMIN, KeySpec::NONE),
     cmd(CommandId::Lolwut, "LOLWUT", -1, CmdFlags::READONLY, KeySpec::NONE),
     // ---- M1-E5 · pub/sub (channels are not keys: no slot routing, no
     // key specs — ownership is the plane's slot(channel) mapping) ----
-    cmd(CommandId::Subscribe, "SUBSCRIBE", -2, CmdFlags::FAST, KeySpec::NONE),
-    cmd(CommandId::Unsubscribe, "UNSUBSCRIBE", -1, CmdFlags::FAST, KeySpec::NONE),
-    cmd(CommandId::Psubscribe, "PSUBSCRIBE", -2, CmdFlags::FAST, KeySpec::NONE),
-    cmd(CommandId::Punsubscribe, "PUNSUBSCRIBE", -1, CmdFlags::FAST, KeySpec::NONE),
-    cmd(CommandId::Publish, "PUBLISH", 3, CmdFlags::FAST, KeySpec::NONE),
-    cmd(CommandId::Pubsub, "PUBSUB", -2, CmdFlags::READONLY, KeySpec::NONE),
+    cmd(CommandId::Subscribe, "SUBSCRIBE", -2, LOADING_FAST, KeySpec::NONE),
+    cmd(CommandId::Unsubscribe, "UNSUBSCRIBE", -1, LOADING_FAST, KeySpec::NONE),
+    cmd(CommandId::Psubscribe, "PSUBSCRIBE", -2, LOADING_FAST, KeySpec::NONE),
+    cmd(CommandId::Punsubscribe, "PUNSUBSCRIBE", -1, LOADING_FAST, KeySpec::NONE),
+    cmd(CommandId::Publish, "PUBLISH", 3, LOADING_FAST, KeySpec::NONE),
+    cmd(
+        CommandId::Pubsub,
+        "PUBSUB",
+        -2,
+        CmdFlags::READONLY.union(CmdFlags::LOADING),
+        KeySpec::NONE,
+    ),
     // ---- M1-E4 · namespaces v1 ----
     cmd(CommandId::InfNs, "INF.NS", -2, CmdFlags::ADMIN, KeySpec::NONE),
+    // ---- M2-E8 · checkpoint operator surface (M2-S20, ADR-0021 D6) ----
+    cmd(CommandId::InfCkpt, "INF.CKPT", -1, CmdFlags::ADMIN, KeySpec::NONE),
+    cmd(CommandId::Bgsave, "BGSAVE", -1, CmdFlags::ADMIN, KeySpec::NONE),
+    // LASTSAVE loading membership is docs-derived (loading+stale in the
+    // Redis command table), not capture-verified like the M2-S15 set —
+    // recorded deviation.
+    cmd(CommandId::Lastsave, "LASTSAVE", 1, LOADING_RO_FAST, KeySpec::NONE),
     // ---- internal fabric-program ops (INF.* extension namespace) ----
     cmd(CommandId::InfTake, "INF.TAKE", 2, W_FAST, KeySpec::ONE),
     cmd(CommandId::InfPeek, "INF.PEEK", 2, RO_FAST, KeySpec::ONE),
@@ -274,9 +309,10 @@ const MAX_NAME_LEN: usize = 16;
 /// const builder below proves them collision-free at compile time, so a new
 /// command that breaks them fails the build (re-search the constants then —
 /// `(w0·M1 ^ w1·M2) >> 56` over random odd pairs; the M1-E5 pub/sub growth
-/// to 64 names re-searched in ~1k attempts).
-const HASH_MULTIPLIER_LO: u64 = 0x1FC5_3112_C1E2_07B5;
-const HASH_MULTIPLIER_HI: u64 = 0xF76D_1FD1_8160_AEBB;
+/// to 64 names re-searched in ~1k attempts; the M2-S20 growth to 68 in
+/// ~9k).
+const HASH_MULTIPLIER_LO: u64 = 0xD3DC_D685_F6E9_CA63;
+const HASH_MULTIPLIER_HI: u64 = 0x15EB_AA73_4AD2_E425;
 /// Word-wide ASCII case fold (`a-z` → `A-Z`); zero padding stays zero.
 /// Non-letters map somewhere harmless — the verify word-compare against the
 /// canonical name rejects any non-command byte sequence.

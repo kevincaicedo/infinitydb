@@ -12,8 +12,14 @@
 //! byte-for-byte (the single-key linearizability oracle: apply points on a
 //! single thread form a real total order).
 
+pub mod bootstorm;
+pub mod combined;
+pub mod durable;
 pub mod harness;
 pub mod net;
 pub mod resp;
 
+pub use bootstorm::{BootStormReport, BootStormScenario, run_boot_storm_scenario};
+pub use combined::{CombinedReport, CombinedScenario, run_combined_scenario};
+pub use durable::{DurableReport, DurableScenario, run_durable_scenario};
 pub use harness::{Scenario, SimReport, run_scenario};

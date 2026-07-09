@@ -37,6 +37,10 @@ pub struct LoadSpec {
     /// M1 expiry-storm fill: every SET carries `PXAT <abs unix ms>` — the
     /// whole fill expires at one instant (the 1M-same-second storm shape).
     pub pxat_ms: Option<u64>,
+    /// Commands each connection sends (and awaits, error-checked) before
+    /// the load starts — connection state like `INF.NS USE` (M2-S12 durable
+    /// rows). Never counted or timed.
+    pub setup: Vec<Vec<Vec<u8>>>,
 }
 
 impl Default for LoadSpec {
@@ -58,6 +62,7 @@ impl Default for LoadSpec {
             fill: None,
             ttl_range_ms: None,
             pxat_ms: None,
+            setup: Vec::new(),
         }
     }
 }
@@ -93,6 +98,17 @@ fn run_conn(
     deadline: Instant,
 ) -> Result<ConnResult, String> {
     let mut stream = connect(&spec.host, spec.port)?;
+    for command in &spec.setup {
+        let argv: Vec<&[u8]> = command.iter().map(Vec::as_slice).collect();
+        let reply = crate::resp::request(&mut stream, &argv)?;
+        if reply.starts_with(b"-") {
+            return Err(format!(
+                "setup command {:?} failed: {}",
+                String::from_utf8_lossy(&command[0]),
+                String::from_utf8_lossy(&reply)
+            ));
+        }
+    }
     let mut rng = SplitMix64::new(spec.seed ^ (0xB0A7 + conn_index as u64));
     let value = vec![0xABu8; spec.value_size];
     let mut result = ConnResult { ops: 0, errors: 0, hist_us: LogHistogram::new() };
@@ -267,6 +283,10 @@ pub fn cmd_load(args: &[String]) -> Result<(), String> {
             "seed",
             "fill",
             "out",
+            // M2-S22: one space-separated command every connection sends
+            // (error-checked, untimed) before the load — e.g.
+            // `--setup "INF.NS USE soak_es"` for durable-namespace legs.
+            "setup",
         ],
     )?;
     let mut spec = LoadSpec::default();
@@ -303,6 +323,13 @@ pub fn cmd_load(args: &[String]) -> Result<(), String> {
     }
     if let Some(v) = flags.get("fill") {
         spec.fill = Some(v.parse().map_err(|e| format!("--fill: {e}"))?);
+    }
+    if let Some(v) = flags.get("setup") {
+        let cmd: Vec<Vec<u8>> = v.split_whitespace().map(|w| w.as_bytes().to_vec()).collect();
+        if cmd.is_empty() {
+            return Err("--setup: empty command".into());
+        }
+        spec.setup = vec![cmd];
     }
 
     let report = run(&spec)?;

@@ -160,6 +160,16 @@ source = "loadgen:ckpt_under_load_p999_us"
 measured_by = "S12 pressure row: saturating writes + continuous checkpoints, foreground latency histogram"
 
 [[gate]]
+id = "ckpt_rss_overhead"
+name = "RSS under continuous checkpoints vs no-checkpoint control (anti-2x)"
+threshold = 64
+comparator = "<="
+unit = "MiB peak-VmRSS delta (ckpt buffer domain is ~0.5 MiB/cell; a fork/COW would be dataset-sized)"
+tier = "linux-reference-box"
+source = "loadgen:ckpt_rss_overhead_mib"
+measured_by = "S12 pressure row: identical fill+mix with interval 0 vs continuous cycling, VmRSS sampled at 100 ms in both legs; per-run ckpt_buffer_bytes gauge disclosed in the notes (the S22 attribution row binds the exact-budget assert)"
+
+[[gate]]
 id = "m0m1_regression"
 name = "M0/M1 gates re-pass"
 threshold = 5
@@ -190,7 +200,7 @@ unit = "acks per fsync"
 tier = "any"
 source = "tripwire:acks_per_fsync"
 informational = true
-measured_by = "S21 finalizes the configured floor; ratio near 1 = broken group commit (informational until then)"
+measured_by = "S21: the always row computes acks_gated/fsyncs_completed and HARD-FAILS the run below the floor (report-enforced; the canary mode proves the wire fires); the verdict row stays informational — enforcement is in-row"
 
 [[gate]]
 id = "attribution"

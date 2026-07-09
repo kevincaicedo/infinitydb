@@ -14,6 +14,7 @@
 //! test (client-side RESP lives in [`resp`]).
 #![forbid(unsafe_code)]
 
+mod bootstorm;
 mod cli;
 mod envcheck;
 mod gaterun;
@@ -42,6 +43,10 @@ USAGE:
                             [--subs N] [--sub-channels N]
                    m2 rows: [--baseline-bin PATH]  (pre-M2 infinityd for the
                             zero-cost A/B; delta rows PENDING without it)
+    inf-bench boot-storm --infinityd-bin PATH [--cycles 500] [--cells 4]
+                   [--pressure-mb 2048] [--data-root DIR] [--ready-timeout-s 10]
+                   [--pin-start N] [--artifacts-root DIR]
+                   (M2.5-S01 wedge regression; data-root must not be tmpfs)
     inf-bench zipfian [--keyspace N] [--ops N] [--warmup N] [--theta F] [--seed N]
                    [--maxmemory-mb N] [--value-size BYTES] [--cells N] [--window N]
                    [--threshold-pp F] [--infinityd-bin PATH] [--redis-bin PATH]
@@ -60,6 +65,7 @@ fn main() -> ExitCode {
         "env-check" => envcheck::cmd_env_check(rest),
         "load" => load::cmd_load(rest),
         "gate-run" => gaterun::cmd_gate_run(rest),
+        "boot-storm" => bootstorm::cmd_boot_storm(rest),
         "zipfian" => zipfian::cmd_zipfian(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");

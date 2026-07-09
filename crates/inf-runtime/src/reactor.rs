@@ -11,6 +11,9 @@
 //!   2   FABRIC-IN     plane.fabric_in (bounded drain)
 //!  3+4  PARSE+EXECUTE plane.parse_execute under the foreground budget,
 //!                     then executor.run_ready for resumed futures
+//!                     (`remote_first_execute` prepends a bounded run_ready
+//!                     + FABRIC-OUT so resumed pumps' remote ops publish
+//!                     before the local bulk — M2.5-S21 lever, default off)
 //!   5   MAINTAIN      plane.maintain under the maintenance budget
 //!   6   LOG           plane.seal_log (no-op at M0)
 //!   7   RESPOND       plane.respond (queues Send ops)
@@ -45,6 +48,12 @@ pub struct LoopConfig {
     pub exec_budget: usize,
     /// Park ceiling when no timer is armed; `None` parks indefinitely.
     pub park_default: Option<Duration>,
+    /// M2.5-S21 A/B knob: run reply-woken futures and publish staged fabric
+    /// ops (an extra FABRIC-OUT) *before* PARSE+EXECUTE, so a remote hop
+    /// issued by a resumed pump overlaps this iteration's local work instead
+    /// of waiting for step 8. Each `run_ready` pass keeps its own
+    /// `exec_budget` bound — two bounded slices, never a queue.
+    pub remote_first_execute: bool,
 }
 
 impl Default for LoopConfig {
@@ -53,6 +62,7 @@ impl Default for LoopConfig {
             spin_iters: 64,
             exec_budget: 1024,
             park_default: Some(Duration::from_millis(100)),
+            remote_first_execute: false,
         }
     }
 }
@@ -285,8 +295,20 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             plane.fabric_in(&mut cx);
 
             // ---- steps 3+4: PARSE + EXECUTE (foreground budget).
+            // Remote-first ordering (M2.5-S21 lever): futures woken by this
+            // iteration's FABRIC-IN replies dispatch their follow-on remote
+            // ops NOW, and an early FABRIC-OUT makes them peer-visible before
+            // the local parse+execute bulk — the hop RTT overlaps local work.
+            // Off by default; both slices stay bounded by `exec_budget`.
+            let mut early_polled = 0;
+            if self.config.remote_first_execute {
+                early_polled = cx.executor.run_ready(self.config.exec_budget);
+                if early_polled > 0 {
+                    plane.fabric_out(&mut cx);
+                }
+            }
             plane.parse_execute(&mut cx);
-            polled = cx.executor.run_ready(self.config.exec_budget);
+            polled = early_polled + cx.executor.run_ready(self.config.exec_budget);
 
             // ---- step 5: MAINTAIN (maintenance budget).
             plane.maintain(&mut cx);

@@ -36,6 +36,7 @@ fn cell(
             spin_iters: 4,
             exec_budget: 1024,
             park_default: Some(std::time::Duration::from_millis(1)),
+            remote_first_execute: false,
         },
     );
     let plane = DurablePlane::new(
