@@ -512,106 +512,141 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("inf-control".into())
         .spawn(move || {
-            let handle_msg = |msg: ControlMsg| match msg {
-                ControlMsg::Persist(req) => {
-                    // The persisted next_id must always cover the
-                    // allocator so ids never regress across restart,
-                    // even for namespaces whose DDL raced this
-                    // snapshot.
-                    let mut catalog = req.catalog;
-                    catalog.next_id = catalog.next_id.max(allocator.next_ns_id());
-                    let payload = catalog.encode();
-                    if let Err(err) = write_meta(&StdSegmentFs, &data_dir, &payload) {
-                        // §8.4 fail-stop: a DDL was acked against this swap.
-                        panic!("catalog META swap failed (fail-stop): {err}");
-                    }
-                    persisted.store(req.epoch, Ordering::Release);
+            // This thread is detached (the JoinHandle drops below): a
+            // swallowed unwind would leave cells serving with catalog
+            // persistence, checkpoint epochs, and delegated unlinks
+            // silently dead — the ADR-0026 D2 class. Same boundary as
+            // the cell threads (M2.5-S01/S16): panic ⇒ loud process exit.
+            let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                control_main(&data_dir, &allocator, &persisted, &board, &rx, cells);
+            }));
+            if body.is_err() {
+                // The default hook already printed the panic.
+                eprintln!("infinityd: control thread panicked — fail-stop");
+                std::process::exit(101);
+            }
+        })
+        .expect("spawn control thread");
+    handle
+}
+
+/// The control thread's message loop + boot narration (M2-S15/M2.5-S01),
+/// extracted so [`spawn`] can wrap it in the panic fail-stop boundary.
+fn control_main(
+    data_dir: &Path,
+    allocator: &Arc<ControlHandle>,
+    persisted: &Arc<AtomicU64>,
+    board: &Arc<RecoveryBoard>,
+    rx: &mpsc::Receiver<ControlMsg>,
+    cells: u16,
+) {
+    {
+        let handle_msg = |msg: ControlMsg| match msg {
+            ControlMsg::Persist(req) => {
+                // The persisted next_id must always cover the
+                // allocator so ids never regress across restart,
+                // even for namespaces whose DDL raced this
+                // snapshot.
+                let mut catalog = req.catalog;
+                catalog.next_id = catalog.next_id.max(allocator.next_ns_id());
+                let payload = catalog.encode();
+                if let Err(err) = write_meta(&StdSegmentFs, data_dir, &payload) {
+                    // §8.4 fail-stop: a DDL was acked against this
+                    // swap. `process::exit`, never `panic!` — this
+                    // thread is detached (the JoinHandle is dropped),
+                    // so an unwind would kill only the control plane
+                    // and leave cells serving with catalog
+                    // persistence, checkpoint epochs, and delegated
+                    // unlinks silently dead (the ADR-0026 D2
+                    // swallowed-death class; M2.5-S16 audit fix).
+                    eprintln!("FATAL: catalog META swap failed (fail-stop, §8.4): {err}");
+                    std::process::exit(crate::EXIT_DURABLE_FAILSTOP);
                 }
-                ControlMsg::Unlink(path) => {
-                    // Never fatal: the file is outside every recovery
-                    // unit; a survivor is re-collected at boot.
-                    if let Err(err) = std::fs::remove_file(&path)
-                        && err.kind() != std::io::ErrorKind::NotFound
-                    {
-                        eprintln!("control: unlink {} failed: {err}", path.display());
-                    }
+                persisted.store(req.epoch, Ordering::Release);
+            }
+            ControlMsg::Unlink(path) => {
+                // Never fatal: the file is outside every recovery
+                // unit; a survivor is re-collected at boot.
+                if let Err(err) = std::fs::remove_file(&path)
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!("control: unlink {} failed: {err}", path.display());
                 }
-            };
-            // Boot narration (M2-S15): until every cell reports ready,
-            // poll the channel with a timeout and print per-cell ready
-            // lines + a periodic aggregate progress line (segments/bytes/
-            // ETA). Log-line clocks are ambient wall time — control-plane
-            // narration only, never oracle input (those ride the
-            // injected clocks).
-            let mut announced = vec![false; usize::from(cells)];
-            let boot_started = std::time::Instant::now();
-            let mut next_progress = boot_started + Duration::from_secs(1);
-            while !board.all_ready() {
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(msg) => handle_msg(msg),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                }
-                for (cell, seen) in announced.iter_mut().enumerate() {
-                    let slot = board.slot(cell as u16);
-                    if !*seen && slot.ready() {
-                        *seen = true;
-                        let (_, total) = slot.bytes();
-                        let (segs, _) = slot.segments();
-                        let torn = slot.torn_truncated_at().map_or(String::new(), |lsn| {
-                            format!(", torn tail truncated at {lsn} (M2-S14)")
-                        });
-                        eprintln!(
-                            "control: cell {cell} recovered ({segs} segments, {total} bytes, {} records{torn})",
-                            slot.records()
-                        );
-                    }
-                }
-                let now = std::time::Instant::now();
-                if now >= next_progress && !board.all_ready() {
-                    next_progress = now + Duration::from_secs(1);
-                    let (done, total) = board.bytes();
-                    let elapsed = boot_started.elapsed().as_secs_f64();
-                    let eta = if done > 0 {
-                        (elapsed * (total.saturating_sub(done)) as f64 / done as f64).ceil()
-                    } else {
-                        0.0
-                    };
+            }
+        };
+        // Boot narration (M2-S15): until every cell reports ready,
+        // poll the channel with a timeout and print per-cell ready
+        // lines + a periodic aggregate progress line (segments/bytes/
+        // ETA). Log-line clocks are ambient wall time — control-plane
+        // narration only, never oracle input (those ride the
+        // injected clocks).
+        let mut announced = vec![false; usize::from(cells)];
+        let boot_started = std::time::Instant::now();
+        let mut next_progress = boot_started + Duration::from_secs(1);
+        while !board.all_ready() {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(msg) => handle_msg(msg),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            for (cell, seen) in announced.iter_mut().enumerate() {
+                let slot = board.slot(cell as u16);
+                if !*seen && slot.ready() {
+                    *seen = true;
+                    let (_, total) = slot.bytes();
+                    let (segs, _) = slot.segments();
+                    let torn = slot.torn_truncated_at().map_or(String::new(), |lsn| {
+                        format!(", torn tail truncated at {lsn} (M2-S14)")
+                    });
                     eprintln!(
-                        "control: recovery {}/{} cells ready, {done}/{total} bytes ({:.1}%), eta {eta:.0}s",
-                        board.ready_cells(),
-                        board.cell_count(),
-                        if total > 0 { done as f64 * 100.0 / total as f64 } else { 100.0 },
+                        "control: cell {cell} recovered ({segs} segments, {total} bytes, {} records{torn})",
+                        slot.records()
                     );
-                    // Stuck-cell narration (M2.5-S01): after 5 s, name each
-                    // not-ready cell and the phase it published before its
-                    // current step — the ADR-0022 D7 wedge signature was a
-                    // silent cell; a stalled boot must say where it stalled.
-                    if elapsed >= 5.0 {
-                        for cell in 0..cells {
-                            let slot = board.slot(cell);
-                            if !slot.ready() {
-                                let (done, total) = slot.bytes();
-                                eprintln!(
-                                    "control: cell {cell} not ready — in {} ({done}/{total} bytes) for {elapsed:.0}s",
-                                    CellRecoverySlot::phase_name(slot.phase()),
-                                );
-                            }
+                }
+            }
+            let now = std::time::Instant::now();
+            if now >= next_progress && !board.all_ready() {
+                next_progress = now + Duration::from_secs(1);
+                let (done, total) = board.bytes();
+                let elapsed = boot_started.elapsed().as_secs_f64();
+                let eta = if done > 0 {
+                    (elapsed * (total.saturating_sub(done)) as f64 / done as f64).ceil()
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "control: recovery {}/{} cells ready, {done}/{total} bytes ({:.1}%), eta {eta:.0}s",
+                    board.ready_cells(),
+                    board.cell_count(),
+                    if total > 0 { done as f64 * 100.0 / total as f64 } else { 100.0 },
+                );
+                // Stuck-cell narration (M2.5-S01): after 5 s, name each
+                // not-ready cell and the phase it published before its
+                // current step — the ADR-0022 D7 wedge signature was a
+                // silent cell; a stalled boot must say where it stalled.
+                if elapsed >= 5.0 {
+                    for cell in 0..cells {
+                        let slot = board.slot(cell);
+                        if !slot.ready() {
+                            let (done, total) = slot.bytes();
+                            eprintln!(
+                                "control: cell {cell} not ready — in {} ({done}/{total} bytes) for {elapsed:.0}s",
+                                CellRecoverySlot::phase_name(slot.phase()),
+                            );
                         }
                     }
                 }
             }
-            eprintln!(
-                "control: recovery complete — {} cells serving ({} ms)",
-                board.cell_count(),
-                boot_started.elapsed().as_millis()
-            );
-            while let Ok(msg) = rx.recv() {
-                handle_msg(msg);
-            }
-            // Channel closed = node shutdown; nothing to flush (every
-            // acked DDL already persisted before its reply).
-        })
-        .expect("spawn control thread");
-    handle
+        }
+        eprintln!(
+            "control: recovery complete — {} cells serving ({} ms)",
+            board.cell_count(),
+            boot_started.elapsed().as_millis()
+        );
+        while let Ok(msg) = rx.recv() {
+            handle_msg(msg);
+        }
+        // Channel closed = node shutdown; nothing to flush (every
+        // acked DDL already persisted before its reply).
+    }
 }

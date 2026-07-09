@@ -9,6 +9,7 @@ check:
     ./scripts/check-fault-points.sh
     ./scripts/check-fsync-fail-stop.sh
     ./scripts/check-panic-policy.sh
+    ./scripts/check-safety-inventory.sh
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
 

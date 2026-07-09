@@ -38,6 +38,10 @@ jobs:
         run: ./scripts/check-fault-points.sh
       - name: fsync fail-stop grep (M2-S17, §8.4)
         run: ./scripts/check-fsync-fail-stop.sh
+      - name: panic-policy grep (M2.5-S13)
+        run: ./scripts/check-panic-policy.sh
+      - name: SAFETY.md inventory (M2.5-S16, §17.3)
+        run: ./scripts/check-safety-inventory.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build
