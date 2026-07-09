@@ -1,0 +1,4 @@
+tier: fault-points ON (unarmed)
+empty loop: 0.296 ns/iter
+fire loop:  0.765 ns/iter
+fire cost:  0.469 ns/call (delta)

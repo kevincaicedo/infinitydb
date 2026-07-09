@@ -276,6 +276,40 @@ impl<F: SegmentFs> SegmentRotor<F> {
         })
     }
 
+    /// [`create_fresh`](Self::create_fresh) with **no blocking syncs**
+    /// (M2.5-S01): neither the segment file nor its directory entry is
+    /// fsynced here — the caller registers boot barriers (driver-ridden
+    /// fdatasyncs on the log-dir handle and the active segment fd) at the
+    /// head of the group-commit ledger, fencing every durable ack behind
+    /// them. `PREALLOC_NO_SPACE` still fires: ENOSPC admission is not a
+    /// durability side effect.
+    pub fn create_fresh_deferred(
+        fs: F,
+        log_dir: PathBuf,
+        cfg: SegmentConfig,
+    ) -> Result<Self, LogError> {
+        let id = SegmentId(0);
+        let file = create_prealloc_deferred(&fs, &log_dir, id, &cfg)?;
+        Ok(SegmentRotor {
+            fs,
+            log_dir,
+            cfg,
+            active: ActiveSegment { id, file, written: 0, first_append_at_ms: None },
+            next: None,
+            sealed: Vec::new(),
+            space_exhausted: false,
+            stats: RotorStats::default(),
+        })
+    }
+
+    /// The exclusive end of everything appended so far — the boot-barrier
+    /// coverage floor (M2.5-S01): a barrier registered at this LSN orders
+    /// before every future frame and sync in the commit ledger.
+    #[must_use]
+    pub fn append_cursor(&self) -> Lsn {
+        Lsn::new(self.active.id, self.active.written)
+    }
+
     /// Reopen after a boot scan: the highest-numbered segment is the tail;
     /// recovery (M2-S13/S14) computes `tail_offset` — the byte after the
     /// last valid frame — and hands it here.
@@ -313,7 +347,29 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// MAINTAIN slice: preallocate the next segment if missing and perform
     /// a time-bound seal when due. Runs off the hot path (§5.1 step 5).
     pub fn maintain(&mut self, now_ms: u64) -> Result<MaintainReport, LogError> {
+        let (report, _barrier) = self.maintain_inner(now_ms, false)?;
+        Ok(report)
+    }
+
+    /// [`maintain`](Self::maintain) for the reactor tier (M2.5-S01): the
+    /// next-segment prealloc runs **unsynced** — a blocking fsync here is
+    /// the same reactor-stall class as the boot wedge — and the returned
+    /// barrier (a log-dir handle) rides the driver as a ledger-fronted
+    /// fdatasync. The prealloc file itself needs no separate sync: its
+    /// first frame's linked fdatasync covers the data and the size needed
+    /// to retrieve it, and an empty prealloc lost to a crash is a legal
+    /// empty tail either way.
+    pub fn maintain_deferred(&mut self, now_ms: u64) -> Result<DeferredMaintain<F>, LogError> {
+        self.maintain_inner(now_ms, true)
+    }
+
+    fn maintain_inner(
+        &mut self,
+        now_ms: u64,
+        deferred: bool,
+    ) -> Result<DeferredMaintain<F>, LogError> {
         let mut report = MaintainReport::default();
+        let mut barrier = None;
         if self.time_seal_due(now_ms) {
             self.rotate()?;
             self.stats.time_seals += 1;
@@ -321,8 +377,20 @@ impl<F: SegmentFs> SegmentRotor<F> {
         }
         if self.next.is_none() {
             let id = self.active.id.next();
-            match create_prealloc(&self.fs, &self.log_dir, id, &self.cfg) {
+            let created = if deferred {
+                create_prealloc_deferred(&self.fs, &self.log_dir, id, &self.cfg)
+            } else {
+                create_prealloc(&self.fs, &self.log_dir, id, &self.cfg)
+            };
+            match created {
                 Ok(file) => {
+                    if deferred {
+                        let dir = self
+                            .fs
+                            .open_dir(&self.log_dir)
+                            .map_err(|source| LogError::Io { segment: id, source })?;
+                        barrier = Some(PreallocBarrier { segment: id, dir });
+                    }
                     self.next = Some((id, file));
                     self.stats.preallocs += 1;
                     self.space_exhausted = false;
@@ -336,7 +404,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
                 Err(other) => return Err(other),
             }
         }
-        Ok(report)
+        Ok((report, barrier))
     }
 
     /// True once preallocation has failed for lack of space and no next
@@ -455,6 +523,32 @@ impl<F: SegmentFs> SegmentRotor<F> {
             Lsn::new(self.active.id, self.active.written),
             "frame slot is stale (out-of-order commit)"
         );
+        // M2-S16 `log_append_short_write`: the device accepts a prefix and
+        // the append FAILS — the caller must treat the frame as never
+        // written (the reactor tier's short-write resubmit contract is the
+        // scripted driver's leg; this is the sync tier's).
+        if inf_foundation::fault::fire(crate::fault::LOG_APPEND_SHORT_WRITE) {
+            let cut = frame.len() / 2;
+            let _ = self.active.file.write_at(u64::from(slot.base.offset), &frame[..cut]);
+            return Err(LogError::Io {
+                segment: self.active.id,
+                source: crate::fault::injected(crate::fault::LOG_APPEND_SHORT_WRITE),
+            });
+        }
+        // M2-S16 `torn_frame`: a prefix lands and the append *succeeds* —
+        // lying-disk/power-cut physics. Only meaningful as the final write
+        // before a crash (anything appended after it lands beyond a gap a
+        // validating frame would turn into fail-stop corruption — exactly
+        // the M2-S14 taxonomy).
+        if inf_foundation::fault::fire(crate::fault::TORN_FRAME) {
+            let cut = frame.len() * 2 / 3;
+            self.active
+                .file
+                .write_at(u64::from(slot.base.offset), &frame[..cut.max(1)])
+                .map_err(|source| LogError::Io { segment: self.active.id, source })?;
+            self.active.written += slot.len;
+            return Ok(slot.base);
+        }
         self.active
             .file
             .write_at(u64::from(slot.base.offset), frame)
@@ -468,12 +562,30 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// (`inline_preallocs`) and is where `NoSpace` surfaces if MAINTAIN's
     /// early warning was ignored.
     fn rotate(&mut self) -> Result<(), LogError> {
+        // M2-S16 `fsync_err`: the seal fsync fails — typed, non-recoverable
+        // by contract (§8.4: no caller may catch and continue).
+        if inf_foundation::fault::fire(crate::fault::FSYNC_ERR) {
+            return Err(LogError::Fsync(FsyncFailed {
+                segment: self.active.id,
+                source: crate::fault::injected(crate::fault::FSYNC_ERR),
+            }));
+        }
         // Seal: durably flush, then drop the write handle — a sealed
         // segment is immutable by construction.
         self.active
             .file
             .sync_data()
             .map_err(|source| LogError::Fsync(FsyncFailed { segment: self.active.id, source }))?;
+        // M2-S16 `power_cut_after_seal`: the seal is durable; the process
+        // dies before anything after it exists (the pointer swap, the next
+        // segment's first frame). The typed error stands in for death —
+        // tests drop the rotor here and recover the surviving image.
+        if inf_foundation::fault::fire(crate::fault::POWER_CUT_AFTER_SEAL) {
+            return Err(LogError::Io {
+                segment: self.active.id,
+                source: crate::fault::injected(crate::fault::POWER_CUT_AFTER_SEAL),
+            });
+        }
         let (next_id, next_file) = match self.next.take() {
             Some(ready) => ready,
             None => {
@@ -518,6 +630,36 @@ impl<F: SegmentFs> SegmentRotor<F> {
         &self.sealed
     }
 
+    /// Sealed segments strictly below the truncation `floor` (M2-S11) —
+    /// fully covered by a durable manifest, deletable. Ascending (the
+    /// sealed list is append-ordered).
+    #[must_use]
+    pub fn sealed_below(&self, floor: SegmentId) -> &[SegmentId] {
+        let end = self.sealed.partition_point(|&id| id < floor);
+        &self.sealed[..end]
+    }
+
+    /// Truncation (M2-S11): forget one sealed segment and return its file
+    /// path — the **caller** owns the unlink. On the reactor tier the
+    /// unlink is delegated to the control thread (ADR-0017): freeing a
+    /// segment's pages is O(size) in the kernel, a measured multi-ms loop
+    /// stall when done in MAINTAIN. No dir-fsync follows the unlink: a
+    /// power cut may resurrect the file, but it stays below the durable
+    /// manifest's floor and is re-collected as stale at the next boot.
+    ///
+    /// # Panics
+    /// If `id` is not in the sealed list — truncating the active or next
+    /// segment is an internal invariant violation.
+    pub fn forget_sealed(&mut self, id: SegmentId) -> PathBuf {
+        let pos = self
+            .sealed
+            .iter()
+            .position(|&s| s == id)
+            .expect("forget_sealed targets a sealed segment");
+        self.sealed.remove(pos);
+        self.log_dir.join(segment_file_name(id))
+    }
+
     #[must_use]
     pub fn stats(&self) -> RotorStats {
         self.stats
@@ -532,6 +674,42 @@ impl<F: SegmentFs> SegmentRotor<F> {
     }
 }
 
+/// What one deferred MAINTAIN slice produced (M2.5-S01): the report plus
+/// the prealloc's metadata barrier when a segment was preallocated.
+pub type DeferredMaintain<F> = (MaintainReport, Option<PreallocBarrier<<F as SegmentFs>::File>>);
+
+/// One deferred prealloc's metadata barrier (M2.5-S01): the log-dir handle
+/// whose driver-ridden fdatasync makes the new segment's directory entry
+/// durable. Registered coverage-neutral in the commit ledger — a dir sync
+/// promises no log-data coverage.
+pub struct PreallocBarrier<File> {
+    /// The preallocated segment (log line / debugging).
+    pub segment: SegmentId,
+    /// Log-dir handle: the ledger holds it until its `Synced` arrives.
+    pub dir: File,
+}
+
+/// Unsynced prealloc for the reactor tier (M2.5-S01): no file sync, no
+/// dir sync — see [`SegmentRotor::maintain_deferred`].
+fn create_prealloc_deferred<F: SegmentFs>(
+    fs: &F,
+    log_dir: &Path,
+    id: SegmentId,
+    cfg: &SegmentConfig,
+) -> Result<F::File, LogError> {
+    let path = log_dir.join(segment_file_name(id));
+    if inf_foundation::fault::fire(crate::fault::PREALLOC_NO_SPACE) {
+        return Err(LogError::NoSpace { segment: id });
+    }
+    fs.create_segment_unsynced(&path, u64::from(cfg.segment_bytes)).map_err(|source| {
+        if source.kind() == io::ErrorKind::StorageFull || source.raw_os_error() == Some(28) {
+            LogError::NoSpace { segment: id }
+        } else {
+            LogError::Io { segment: id, source }
+        }
+    })
+}
+
 fn create_prealloc<F: SegmentFs>(
     fs: &F,
     log_dir: &Path,
@@ -539,6 +717,12 @@ fn create_prealloc<F: SegmentFs>(
     cfg: &SegmentConfig,
 ) -> Result<F::File, LogError> {
     let path = log_dir.join(segment_file_name(id));
+    // M2-S16 `prealloc_no_space`: the S02 ENOSPC discipline — surfaced
+    // before any write needs the space, typed refusal downstream, memory
+    // namespaces unaffected (the re-bound S02 observation row).
+    if inf_foundation::fault::fire(crate::fault::PREALLOC_NO_SPACE) {
+        return Err(LogError::NoSpace { segment: id });
+    }
     let file = fs.create_segment(&path, u64::from(cfg.segment_bytes)).map_err(|source| {
         if source.kind() == io::ErrorKind::StorageFull || source.raw_os_error() == Some(28) {
             LogError::NoSpace { segment: id }
@@ -547,7 +731,13 @@ fn create_prealloc<F: SegmentFs>(
         }
     })?;
     // The segment must exist durably before anything refers to it: sync
-    // the directory entry now (a named fault point from M2-S16).
+    // the directory entry now (M2-S16 `dir_fsync_fail`).
+    if inf_foundation::fault::fire(crate::fault::DIR_FSYNC_FAIL) {
+        return Err(LogError::Fsync(FsyncFailed {
+            segment: id,
+            source: crate::fault::injected(crate::fault::DIR_FSYNC_FAIL),
+        }));
+    }
     fs.sync_dir(log_dir).map_err(|source| LogError::Fsync(FsyncFailed { segment: id, source }))?;
     Ok(file)
 }

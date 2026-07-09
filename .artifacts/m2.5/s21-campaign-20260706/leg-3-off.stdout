@@ -1,0 +1,19 @@
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 23 uncommitted entries
+  cpufreq-governor     FAIL  scaling_governor != performance on 24 cpus: cpu0=powersave, cpu1=powersave, cpu10=powersave, cpu11=powersave (+20 more)
+  cpufreq-epp          PASS
+  thermal-throttle     FAIL  thermal throttling occurred: cpu0/core_throttle_count=62, cpu0/package_throttle_count=13106, cpu1/core_throttle_count=62, cpu1/package_throttle_count=13106
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+gate-run: CONTINUING WITH FAILED ENV-CHECK — results are not citation-grade
+
+== pipelined replicates (conns=64 P=16, 10s x 3) ==
+  rep 0: 3577319 ops/s, p999 1727 us, windowed sqes/submit 10.8
+  rep 1: 3663536 ops/s, p999 1311 us, windowed sqes/submit 19.3
+  rep 2: 3645246 ops/s, p999 1503 us, windowed sqes/submit 19.3
+
+== cross-cell penalty (natural vs --route-local-only) ==
+inf-bench: connect: Connection refused (os error 111)

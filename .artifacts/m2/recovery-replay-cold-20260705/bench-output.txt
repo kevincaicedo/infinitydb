@@ -1,0 +1,34 @@
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 6.13s
+     Running benches/recovery_replay.rs (target/release/deps/recovery_replay-37bcc6aa7cc13573)
+recovery_replay (M2-S13 dev rehearsal)
+  kernel   7.0.0-27-generic
+  governor performance
+  target   1024 MiB (~2025927 records), 5 replicates, COLD (fadvise-DONTNEED per rep) page cache
+
+== row: tail-only ==
+   image: 2025927 records, 1024.7 MiB replayed per boot
+   rep 0:   1469.8 ms    0.68 GiB/s     1378339 records/s  (applied 2025927 + ckpt 0)
+   rep 1:   1472.6 ms    0.68 GiB/s     1375772 records/s  (applied 2025927 + ckpt 0)
+   rep 2:   1478.5 ms    0.68 GiB/s     1370214 records/s  (applied 2025927 + ckpt 0)
+   rep 3:   1500.4 ms    0.67 GiB/s     1350292 records/s  (applied 2025927 + ckpt 0)
+   rep 4:   1486.3 ms    0.67 GiB/s     1363097 records/s  (applied 2025927 + ckpt 0)
+   state digest 0x931565df6815d6ae identical across 5 replicates (L7)
+
+== row: ick-tail ==
+   image: 2025927 records, 1024.8 MiB replayed per boot
+   rep 0:   1538.2 ms    0.65 GiB/s     1317067 records/s  (applied 1012964 + ckpt 1012963)
+   rep 1:   1532.4 ms    0.65 GiB/s     1322077 records/s  (applied 1012964 + ckpt 1012963)
+   rep 2:   1538.9 ms    0.65 GiB/s     1316488 records/s  (applied 1012964 + ckpt 1012963)
+   rep 3:   1532.6 ms    0.65 GiB/s     1321928 records/s  (applied 1012964 + ckpt 1012963)
+   rep 4:   1539.1 ms    0.65 GiB/s     1316337 records/s  (applied 1012964 + ckpt 1012963)
+   state digest 0x931565df6815d6ae identical across 5 replicates (L7)
+
+== row: slack-floor (S14 scan cost) ==
+   image: 8000 records, 4.0 MiB replayed per boot
+   rep 0:     90.5 ms    0.04 GiB/s       88422 records/s  (applied 8000 + ckpt 0)
+   rep 1:     89.5 ms    0.04 GiB/s       89411 records/s  (applied 8000 + ckpt 0)
+   rep 2:     91.4 ms    0.04 GiB/s       87553 records/s  (applied 8000 + ckpt 0)
+   rep 3:     90.5 ms    0.04 GiB/s       88409 records/s  (applied 8000 + ckpt 0)
+   rep 4:     90.4 ms    0.04 GiB/s       88513 records/s  (applied 8000 + ckpt 0)
+   state digest 0xec318f4276c71c51 identical across 5 replicates (L7)

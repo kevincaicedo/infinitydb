@@ -1,0 +1,12 @@
+inf-sim: m2-durable sweep shard 5/8: 1250 seeds, 0 violations, 13 legal taxonomy refusals
+inf-sim: sim_seconds=4802.415990 published=0 delivered=0
+inf-sim: m2-durable sweep shard 2/8: 1250 seeds, 0 violations, 10 legal taxonomy refusals
+inf-sim: sim_seconds=4800.743927 published=0 delivered=0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=0/8 plant=None seeds_run=1250 violations=0 refused=13
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=1/8 plant=None seeds_run=1250 violations=0 refused=20
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=2/8 plant=None seeds_run=1250 violations=0 refused=10
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=3/8 plant=None seeds_run=1250 violations=0 refused=16
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=4/8 plant=None seeds_run=1250 violations=0 refused=19
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=5/8 plant=None seeds_run=1250 violations=0 refused=13
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=6/8 plant=None seeds_run=1250 violations=0 refused=17
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=7/8 plant=None seeds_run=1250 violations=0 refused=25

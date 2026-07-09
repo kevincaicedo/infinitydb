@@ -1,0 +1,23 @@
+infinityd 78d4055 (git 78d405538128-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 45953, backend io_uring, route natural
+infinityd: listening on 45953
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: false, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records)
+control: cell 2 recovered (0 segments, 0 bytes, 0 records)
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 3 not ready — in spawned (0/0 bytes) for 5s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 3 not ready — in spawned (0/0 bytes) for 6s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 3 not ready — in spawned (0/0 bytes) for 7s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 3 not ready — in spawned (0/0 bytes) for 8s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 3 not ready — in spawned (0/0 bytes) for 9s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 3 not ready — in spawned (0/0 bytes) for 10s

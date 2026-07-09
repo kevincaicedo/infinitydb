@@ -82,12 +82,46 @@ pub struct NodeInfo {
     pub log_watermark_lag: Cell<u64>,
     pub log_fsyncs_completed: Cell<u64>,
     pub log_acks_gated: Cell<u64>,
+    /// M2-S22 tripwire + attribution observables: cumulative frames
+    /// queued (one per LOG-step writev — `log_writes_per_iter` divides
+    /// this by `raw_iterations`) and the staging domain's resident bytes
+    /// (2 × buffer capacity by construction — the L5 log-staging domain).
+    pub log_frames_queued: Cell<u64>,
+    pub log_staging_bytes: Cell<u64>,
     /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).
     pub ckpts_completed: Cell<u64>,
     pub ckpts_aborted: Cell<u64>,
     pub ckpt_last_unix_ms: Cell<u64>,
     pub ckpt_last_begin_lsn: Cell<u64>,
     pub ckpt_buffer_bytes: Cell<u64>,
+    /// MANIFEST + truncation gauges (M2-S11, flushed by MAINTAIN).
+    pub manifests_published: Cell<u64>,
+    pub manifests_aborted: Cell<u64>,
+    pub segments_truncated: Cell<u64>,
+    pub log_segments_live: Cell<u64>,
+    /// Checkpoint operator surface (M2-S20): streaming-now flag +
+    /// newest durable MANIFEST publication (unix ms, node-wide board
+    /// max — `rdb_last_save_time`/`LASTSAVE`).
+    pub ckpt_in_progress: Cell<u64>,
+    pub rdb_last_save_ms: Cell<u64>,
+    /// M2-S21: windowed rates (previous everysec-tick window) + fsync
+    /// latency percentiles (µs) + checkpoint age (s).
+    pub fsyncs_per_sec: Cell<u64>,
+    pub acks_per_sec: Cell<u64>,
+    pub fsync_p50_us: Cell<u64>,
+    pub fsync_p99_us: Cell<u64>,
+    pub fsync_p999_us: Cell<u64>,
+    /// M2.5-S07 group formation: records covered per durability fsync.
+    pub fsync_group_p50: Cell<u64>,
+    pub fsync_group_p99: Cell<u64>,
+    pub ckpt_age_s: Cell<u64>,
+    /// Boot-recovery gauges (M2-S15, flushed by MAINTAIN while any cell
+    /// is loading; `loading` drops to 0 the iteration after all-ready).
+    pub loading: Cell<u64>,
+    pub loading_start_unix_ms: Cell<u64>,
+    pub loading_total_bytes: Cell<u64>,
+    pub loading_loaded_bytes: Cell<u64>,
+    pub loading_cells_ready: Cell<u64>,
     /// CLIENT registry for this cell's connections (single-threaded).
     pub clients: RefCell<ClientRegistry>,
     /// Typed CONFIG store (M1-S03 freeze: keys + hot-reload classes).
@@ -319,6 +353,13 @@ fn execute_db(
 ) {
     let mut w = RespWriter::new(out, cx.proto);
     match meta.id {
+        // Checkpoint operator surface (M2-S20): on a node the plane
+        // intercepts these before `execute` (they speak to the control
+        // handle); this is the planeless fallback (compat candidate,
+        // embedded) — the documented no-durable-plane error.
+        CommandId::InfCkpt | CommandId::Bgsave | CommandId::Lastsave => {
+            w.error("ERR checkpointing requires a durable node (no data dir)");
+        }
         CommandId::Ping => {
             if argv.len() > 2 {
                 w.error("ERR wrong number of arguments for 'ping' command");

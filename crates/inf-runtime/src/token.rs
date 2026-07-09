@@ -26,6 +26,11 @@ pub enum TokenClass {
     CkptWrite = 7,
     /// Checkpoint-completion fdatasync on the `.ick` fd (M2-S10).
     CkptSync = 8,
+    /// MANIFEST-swap barrier (M2-S11/S12, ADR-0017 — routing-only): the
+    /// staging-file fdatasync, the `.ick`/shard dir-fsyncs. The swap's
+    /// fsync-class steps ride the driver so publication never stalls the
+    /// loop; at most one is in flight per cell.
+    ManifestSync = 9,
 }
 
 impl TokenClass {
@@ -40,6 +45,7 @@ impl TokenClass {
             6 => Some(TokenClass::Fsync),
             7 => Some(TokenClass::CkptWrite),
             8 => Some(TokenClass::CkptSync),
+            9 => Some(TokenClass::ManifestSync),
             _ => None,
         }
     }
@@ -115,6 +121,7 @@ mod tests {
             TokenClass::Fsync,
             TokenClass::CkptWrite,
             TokenClass::CkptSync,
+            TokenClass::ManifestSync,
         ] {
             for (slot, generation) in
                 [(0, 0), (1, u32::MAX), (MAX_SLOT, 7u32), (0xAB_CDEF, 0xDEAD_BEEF)]

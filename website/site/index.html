@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InfinityDB — One engine for the cache, the ledger, the queue, the document, and the vector</title>
+<meta name="description" content="InfinityDB is an extensible Redis-compatible key/value engine kernel in Rust: durable KV today, documents, queues, and vector search on a gated milestone train.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='20'%20fill='%23201826'/%3E%3Ctext%20x='50'%20y='71'%20font-size='62'%20text-anchor='middle'%20fill='%23cf7ff5'%20font-family='system-ui'%3E%E2%88%9E%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+<style>
+/* ---- landing-only styles ---- */
+.hero { position: relative; overflow: hidden; }
+.hero-glow { position: absolute; inset: 0; background: radial-gradient(720px 460px at 50% -8%, oklch(0.7 0.2 310 / 0.14), transparent 70%); pointer-events: none; }
+.hero-dots {
+  position: absolute; inset: 0; pointer-events: none;
+  background-image: radial-gradient(oklch(0.94 0.004 310 / 0.06) 1px, transparent 1px);
+  background-size: 26px 26px;
+  -webkit-mask-image: linear-gradient(to bottom, black, transparent 75%);
+  mask-image: linear-gradient(to bottom, black, transparent 75%);
+}
+.hero-inner { position: relative; max-width: var(--container); margin: 0 auto; padding: clamp(64px, 10vw, 110px) var(--pad-x) clamp(72px, 11vw, 120px); }
+.hero h1 {
+  font-size: clamp(36px, 6vw, 64px); font-weight: 700; letter-spacing: -0.035em;
+  line-height: 1.05; margin: 0 0 28px; max-width: 1000px;
+}
+.hero h1 .hl { box-shadow: inset 0 -0.16em oklch(0.7 0.2 310 / 0.55); }
+.hero .sub { font-size: clamp(16px, 2.2vw, 19px); line-height: 1.65; color: var(--text-muted); max-width: 740px; margin: 0 0 36px; }
+.hero-ctas { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.hero-tape { font: 400 11px/1.9 var(--mono); letter-spacing: 0.1em; color: var(--text-faint); margin: 34px 0 0; }
+.status-strip {
+  display: flex; gap: 0; flex-wrap: wrap; margin: 56px auto 0; max-width: 880px;
+  border: 1px solid var(--border-strong); border-radius: 12px; overflow: hidden;
+  background: var(--bg-raise);
+}
+.status-strip > div { flex: 1 1 260px; padding: 18px 22px; }
+.status-strip > div + div { border-left: 1px solid var(--border); }
+.status-strip .label { font: 500 10px/1 var(--mono); letter-spacing: 0.14em; margin: 0 0 10px; }
+.status-strip p { font-size: 13.5px; line-height: 1.6; color: var(--text-muted); margin: 0; }
+@media (max-width: 620px) { .status-strip > div + div { border-left: 0; border-top: 1px solid var(--border); } }
+
+.step-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 36px; }
+.step { border-top: 1px solid var(--border-strong); padding-top: 24px; }
+.step .n { font: 500 12px/1 var(--mono); color: var(--text-faint); margin: 0 0 14px; }
+.step h3 { font-size: 21px; margin: 0 0 10px; }
+.step p { font-size: 15px; line-height: 1.65; color: var(--text-muted); margin: 0; }
+
+/* spine diagram — responsive rework of the prototype's absolute-positioned scene */
+.spine-layout { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: clamp(32px, 5vw, 72px); align-items: start; }
+@media (max-width: 880px) { .spine-layout { grid-template-columns: 1fr; } }
+.spine-steps { display: flex; flex-direction: column; gap: 26px; margin-top: 26px; }
+.spine-step .k { font: 500 12px/1 var(--mono); color: var(--accent); margin: 0 0 10px; letter-spacing: 0.06em; }
+.spine-step p { font-size: 16px; line-height: 1.7; color: var(--text-body); margin: 0; }
+.spine-diagram { display: grid; grid-template-columns: auto 1fr; gap: 0 clamp(18px, 3vw, 40px); }
+.spine-log {
+  border: 1px solid var(--border-strong); border-radius: 8px; background: var(--bg-raise);
+  padding: 12px 10px 14px; display: flex; flex-direction: column; gap: 8px; align-self: start;
+}
+.spine-log .file { font: 400 9px/1.3 var(--mono); letter-spacing: 0.06em; color: var(--text-faint); margin: 0 0 4px; text-align: center; }
+.spine-rec {
+  min-width: 76px; text-align: center; background: oklch(0.22 0.018 310);
+  border: 1px solid oklch(0.32 0.02 310); border-radius: 4px; padding: 8px 8px;
+  font: 500 10px/1 var(--mono); color: oklch(0.8 0.01 310);
+}
+.spine-rec.dim { opacity: 0.45; border-style: dashed; }
+.spine-log .arrow { font: 400 12px/1 var(--mono); color: var(--accent); text-align: center; padding-top: 2px; }
+.spine-projs { display: flex; flex-direction: column; gap: 14px; }
+.spine-proj {
+  position: relative; background: var(--bg-panel); border: 1px solid var(--border-strong);
+  border-radius: 8px; padding: 14px 16px;
+}
+.spine-proj::before {
+  content: ""; position: absolute; left: calc(-1 * clamp(18px, 3vw, 40px)); top: 50%;
+  width: clamp(18px, 3vw, 40px); height: 2px;
+  background: linear-gradient(to right, var(--accent), oklch(0.34 0.02 310));
+}
+.spine-proj .t { font: 500 11px/1 var(--mono); letter-spacing: 0.1em; color: var(--text); margin: 0 0 7px; }
+.spine-proj .t .pill { margin-left: 8px; }
+.spine-proj p { font-size: 12.5px; line-height: 1.55; color: var(--text-muted); margin: 0; }
+
+/* shard cells */
+.cells { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
+.cell { background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: 10px; padding: 16px; }
+.cell .t { font: 500 10px/1 var(--mono); letter-spacing: 0.1em; color: var(--accent); margin: 0 0 12px; padding-bottom: 11px; border-bottom: 1px solid var(--border); }
+.cell p { font: 400 11.5px/2.1 var(--mono); color: oklch(0.68 0.015 310); margin: 0; }
+.fabric-band {
+  border: 1px solid var(--accent-dim); background: var(--accent-wash); border-radius: 10px;
+  padding: 18px 20px; text-align: center; margin-top: 28px;
+  font: 500 11.5px/1.7 var(--mono); letter-spacing: 0.08em; color: oklch(0.85 0.05 310);
+}
+.fabric-band::before { content: "▼ ▼ ▼ ▼"; display: block; color: var(--accent-dim); letter-spacing: 1.2em; margin-bottom: 8px; font-size: 9px; }
+.plane-strips { display: flex; gap: 14px; margin-top: 14px; flex-wrap: wrap; }
+.plane-strips > div {
+  flex: 1 1 300px; border: 1px dashed var(--border-strong); border-radius: 10px;
+  padding: 13px 20px; font: 400 10.5px/1.6 var(--mono); color: var(--text-faint);
+}
+
+/* workloads */
+.workload { display: grid; grid-template-columns: 56px 1fr 300px; gap: 24px; align-items: baseline; border-top: 1px solid var(--border); padding: 26px 0; }
+.workload:last-of-type { border-bottom: 1px solid var(--border); }
+.workload .n { font: 400 13px/1 var(--mono); color: var(--text-faint); }
+.workload h3 { font-size: 22px; margin: 0 0 7px; }
+.workload h3 .pill { margin-left: 10px; }
+.workload p { font-size: 14.5px; line-height: 1.6; color: var(--text-muted); margin: 0; max-width: 560px; }
+.workload .r { font: 400 10.5px/1.8 var(--mono); letter-spacing: 0.06em; color: var(--text-faint); text-align: right; }
+.workload.plus { border-top: 1px solid var(--accent-dim); border-bottom: 1px solid var(--accent-dim); background: oklch(0.7 0.2 310 / 0.05); }
+.workload.plus .n, .workload.plus .r { color: var(--accent); }
+@media (max-width: 820px) {
+  .workload { grid-template-columns: 40px 1fr; }
+  .workload .r { grid-column: 2; text-align: left; }
+}
+
+/* roadmap strip */
+.rail { position: relative; margin-top: 24px; }
+.rail-track { display: grid; grid-template-columns: repeat(14, minmax(64px, 1fr)); gap: 0; overflow-x: auto; padding-bottom: 8px; position: relative; }
+.rail-stop { position: relative; padding-top: 0; min-width: 64px; }
+.rail-stop::before {
+  content: ""; position: absolute; top: 6px; left: 14px; right: 0; height: 2px;
+  background: oklch(0.28 0.02 310);
+}
+.rail-stop:last-child::before { display: none; }
+.rail-stop.done::before { background: var(--accent); }
+.rail-dot { width: 14px; height: 14px; border-radius: 50%; background: var(--bg); border: 2px solid oklch(0.35 0.02 310); position: relative; z-index: 1; }
+.rail-stop.done .rail-dot { background: var(--accent); border-color: var(--accent); }
+.rail-stop.now .rail-dot { background: var(--accent); border-color: var(--accent); animation: pulse 2s infinite; }
+.rail-stop.ga .rail-dot { border-color: var(--accent-dim); }
+.rail-stop .m { font: 500 10px/1.5 var(--mono); color: oklch(0.8 0.01 310); margin: 12px 0 2px; }
+.rail-stop.now .m { color: var(--accent); }
+.rail-stop .d { font: 400 10px/1.4 var(--mono); color: var(--text-faint); margin: 0; padding-right: 8px; }
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 oklch(0.7 0.2 310 / 0.5); }
+  70% { box-shadow: 0 0 0 12px oklch(0.7 0.2 310 / 0); }
+  100% { box-shadow: 0 0 0 0 oklch(0.7 0.2 310 / 0); }
+}
+
+.cta-band { border-top: 1px solid var(--border); position: relative; overflow: hidden; }
+.cta-band .glow { position: absolute; inset: 0; background: radial-gradient(640px 380px at 50% 120%, oklch(0.7 0.2 310 / 0.14), transparent 70%); pointer-events: none; }
+.cta-band .inner { position: relative; max-width: var(--container); margin: 0 auto; padding: var(--sp-7) var(--pad-x); text-align: center; }
+.cta-band h2 { font-size: clamp(34px, 5vw, 52px); font-weight: 700; letter-spacing: -0.03em; line-height: 1.08; margin: 0 0 18px; }
+.cta-band p { font-size: 17px; line-height: 1.65; color: var(--text-muted); max-width: 560px; margin: 0 auto 36px; }
+.cta-band .ctas { display: flex; align-items: center; justify-content: center; gap: 14px; flex-wrap: wrap; }
+
+/* Scroll-driven enhancement: static by default, animated only where supported. */
+@supports (animation-timeline: view()) {
+  @media (prefers-reduced-motion: no-preference) {
+    @keyframes rev { from { opacity: 0; transform: translateY(26px); } to { opacity: 1; transform: none; } }
+    @keyframes popIn { from { opacity: 0; transform: translateY(10px) scale(0.97); } to { opacity: 1; transform: none; } }
+    .reveal { animation: rev 0.8s both; animation-timeline: view(); animation-range: entry 0% entry 40%; }
+    .reveal-pop { animation: popIn 0.8s both; animation-timeline: view(); animation-range: entry 0% entry 42%; }
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes typeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(26px); } to { opacity: 1; transform: none; } }
+  @keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+  .hero .fx-1 { animation: fadeUp 0.7s both; }
+  .hero .fx-2 { animation: fadeUp 0.8s 0.08s both; }
+  .hero .fx-3 { animation: fadeUp 0.8s 0.16s both; }
+  .hero .fx-4 { animation: fadeUp 0.8s 0.24s both; }
+  .hero .fx-5 { animation: fadeUp 0.8s 0.3s both; }
+  .hero .fx-6 { animation: fadeUp 0.9s 0.35s both; }
+  .terminal-body .line { animation: typeIn 0.4s both; }
+  .terminal-body .line:nth-child(1) { animation-delay: 0.6s; }
+  .terminal-body .line:nth-child(2) { animation-delay: 0.95s; }
+  .terminal-body .line:nth-child(3) { animation-delay: 1.3s; }
+  .terminal-body .line:nth-child(4) { animation-delay: 1.65s; }
+  .terminal-body .line:nth-child(5) { animation-delay: 2.0s; }
+  .terminal-body .line:nth-child(6) { animation-delay: 2.35s; }
+  .terminal-body .line:nth-child(7) { animation-delay: 2.6s; }
+  .terminal-body .line:nth-child(8) { animation-delay: 2.85s; }
+  .terminal-body .line:nth-child(9) { animation-delay: 3.1s; }
+  .terminal-body .line:nth-child(10) { animation-delay: 3.35s; }
+  .terminal-body .line:nth-child(11) { animation-delay: 3.6s; }
+  .cursor { display: inline-block; width: 8px; height: 15px; background: var(--accent); vertical-align: -2px; animation: blink 1.1s step-end infinite; }
+}
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="nav-brand">
+      <span class="mark">&infin; InfinityDB</span>
+      <span class="nav-badge">v0.2.0-alpha.1 &middot; IN DEV</span>
+    </a>
+    <span class="nav-spacer"></span>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="nav-links">
+      <a href="#spine">Architecture</a>
+      <a href="#workloads">Workloads</a>
+      <a href="docs/roadmap.html">Roadmap</a>
+      <a href="docs/index.html">Docs</a>
+      <a href="blog/index.html">Blog</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header id="top" class="hero">
+  <div class="hero-glow"></div>
+  <div class="hero-dots"></div>
+  <div class="hero-inner">
+    <p class="kicker fx-1">Open source &middot; Apache 2.0 &middot; Written in Rust</p>
+    <h1 class="fx-2"><span class="hl">One engine</span> for the cache, the ledger, the queue, the document, and the vector.</h1>
+    <p class="sub fx-3">InfinityDB is an extensible key/value engine kernel &mdash; Redis-compatible on the wire, durable like a system of record, designed to grow JSON documents, Kafka-class queues, and vector search from one primitive: a per-core, append-only log. Built in the open, milestone by milestone, behind hard evidence gates.</p>
+    <div class="hero-ctas fx-4">
+      <a class="btn btn-primary" href="https://github.com/">&#9733; Star on GitHub</a>
+      <a class="btn btn-ghost" href="#spine">Read the architecture &darr;</a>
+    </div>
+    <p class="hero-tape fx-5">RESP2/3 DROP-IN &middot; PORT 6379 &middot; KEEP redis-cli &middot; KEEP EVERY SDK &middot; LINUX io_uring</p>
+
+    <div class="terminal fx-6" style="margin-top:70px">
+      <div class="terminal-bar">
+        <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+        <span class="title">one engine &middot; one session</span>
+      </div>
+      <div class="terminal-body">
+        <div class="line"><span class="c">$</span> redis-cli <span class="c"># your existing CLI, unchanged</span></div>
+        <div class="line"><span class="p">inf&gt;</span> SET cart:{u42}:items "lens-kit &times;3" <span class="c"># cache-speed, evictable</span></div>
+        <div class="line"><span class="p">inf&gt;</span> INF.NS CREATE orders MODE durable FSYNC always <span class="c"># a namespace becomes a ledger</span></div>
+        <div class="line"><span class="p">inf&gt;</span> SET orders:{u42}:1009 "status=paid" <span class="c"># acked only after group-commit fsync</span></div>
+        <div class="line"><span class="p">inf&gt;</span> INF.CKPT WAIT <span class="c"># fuzzy checkpoint &mdash; no fork, no stop-the-world</span></div>
+        <div class="line"><span class="p">inf&gt;</span> SUBSCRIBE orders:events <span class="c"># pub/sub, RESP3 push</span></div>
+        <div class="terminal-divider">ROADMAP SURFACE &mdash; SAME SESSION, LATER MILESTONES</div>
+        <div class="line dim"><span class="p">inf&gt;</span> JSON.SET catalog:{sku9} $ '{"name":"Lens","price":4999}' <span class="c"># documents &middot; M3</span></div>
+        <div class="line dim"><span class="p">inf&gt;</span> INF.QL "SELECT * FROM catalog WHERE price &lt; 5000" <span class="c"># planner-free PartiQL &middot; M4.5</span></div>
+        <div class="line dim"><span class="p">inf&gt;</span> XREADGROUP GROUP billing c1 STREAMS events &gt; <span class="c"># the queue is the log &middot; M7</span></div>
+        <div class="line dim"><span class="p">inf&gt;</span> VSIM catalog:emb 10 VECTOR &hellip; <span class="c"># vector search &middot; M8</span></div>
+        <div class="line"><span class="p">inf&gt;</span> <span class="cursor"></span></div>
+      </div>
+    </div>
+
+    <div class="status-strip fx-6">
+      <div>
+        <p class="label" style="color:var(--ok)">SHIPPING TODAY</p>
+        <p>A Redis-compatible in-memory cache (strings, keys, expiry, all 8 eviction policies, pub/sub) plus <strong>durable KV namespaces</strong> &mdash; per-namespace <code>always</code>/<code>everysec</code> fsync, fork-free checkpoints, parallel crash recovery.</p>
+      </div>
+      <div>
+        <p class="label" style="color:var(--accent)">IN PROGRESS &middot; M2.5</p>
+        <p>Hardening the durable core for the first public tag, <code>v0.2.0-alpha.1</code>: soak, crash-matrix and simulation campaigns, evidence closure &mdash; performance debt paid before the tag.</p>
+      </div>
+      <div>
+        <p class="label" style="color:var(--text-faint)">ON THE TRAIN</p>
+        <p>JSON documents (M3), tiered storage (M4), indexes + PartiQL subset (M4.5), collections (M5), transactions (M6), streams (M7), vectors (M8), HA (M9), WASM compute (M10). <a href="docs/roadmap.html">The full train &rarr;</a></p>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section id="wedge" class="section">
+  <div class="section-inner">
+    <p class="kicker reveal">01 / The wedge</p>
+    <h2 class="reveal" style="margin-top:0;max-width:780px">Keep redis-cli. Keep every SDK.<br>Adopt progressively.</h2>
+    <p class="lede reveal" style="margin-bottom:64px">Redis compatibility is the wedge, not the ceiling. You replace systems one namespace at a time &mdash; never one migration at a time.</p>
+    <div class="step-grid">
+      <div class="step reveal">
+        <p class="n">STEP 1 &middot; TODAY</p>
+        <h3>Point your client at it</h3>
+        <p>RESP2/RESP3 on port 6379, with per-command compatibility declared in a <a href="docs/compat.html">generated, byte-diff-verified matrix</a> &mdash; never a breadth claim. Day one, nothing about your stack changes.</p>
+      </div>
+      <div class="step reveal">
+        <p class="n">STEP 2 &middot; TODAY</p>
+        <h3>Turn on durability</h3>
+        <p>Durability is a property of the <em>namespace</em>, not the server. One command turns a cache namespace into an fsync-gated system of record &mdash; <a href="docs/durability.html">classes and loss windows documented precisely</a>.</p>
+      </div>
+      <div class="step reveal">
+        <p class="n">STEP 3 &middot; ROADMAP</p>
+        <h3>Retire adjacent systems</h3>
+        <p>Model entities as JSON documents (M3), query them without a planner (M4.5), move queues onto topics (M7), add vector search (M8) &mdash; same client libraries, same node, same operational surface.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="spine" class="section">
+  <div class="section-inner">
+    <p class="kicker reveal">02 / The primitive</p>
+    <div class="spine-layout">
+      <div>
+        <h2 class="reveal" style="margin-top:0">Everything is a projection of the log.</h2>
+        <div class="spine-steps">
+          <div class="spine-step reveal">
+            <p class="k">APPEND</p>
+            <p>Every durable fact is an append to a per-core, append-only log &mdash; before it is anything else.</p>
+          </div>
+          <div class="spine-step reveal">
+            <p class="k">PROJECT</p>
+            <p>The hash index, checkpoints, tiered storage: derived projections &mdash; rebuildable from the log by replay.</p>
+          </div>
+          <div class="spine-step reveal">
+            <p class="k">CONSUME</p>
+            <p>Topics and consumer groups read the same log forward. The queue isn&rsquo;t bolted on &mdash; it&rsquo;s the spine, exposed.</p>
+          </div>
+          <div class="spine-step reveal">
+            <p class="k">SHIP</p>
+            <p>Replication ships the log to a follower. CDC hands it to a subscriber. Point-in-time recovery replays it.</p>
+          </div>
+          <div class="spine-step reveal">
+            <p class="k">ONE PRIMITIVE</p>
+            <p>A cache is just the log with durability off. <span style="color:var(--text)">One mechanism to make correct &mdash; not five.</span></p>
+          </div>
+        </div>
+      </div>
+      <div class="spine-diagram reveal-pop">
+        <div>
+          <p class="mono-note" style="margin:0 0 8px;text-align:center">shard-3/log/<br>seg-000017.ilog</p>
+          <div class="spine-log">
+            <div class="spine-rec">SET</div>
+            <div class="spine-rec">EXPIRE</div>
+            <div class="spine-rec">DEL</div>
+            <div class="spine-rec dim">JSON.SET</div>
+            <div class="spine-rec dim">XADD</div>
+            <div class="spine-rec dim">VADD</div>
+            <div class="arrow">&#9660;</div>
+            <p class="file">append-only</p>
+          </div>
+        </div>
+        <div class="spine-projs">
+          <div class="spine-proj">
+            <p class="t">DURABLE KV <span class="pill pill-ship">SHIPPING</span></p>
+            <p>index + checkpoints, replayed in parallel after a crash</p>
+          </div>
+          <div class="spine-proj">
+            <p class="t">QUEUES &amp; STREAMS <span class="pill pill-plan">M7</span></p>
+            <p>consumer groups read the log forward &mdash; Kafka&rsquo;s storage model, minus the JVM</p>
+          </div>
+          <div class="spine-proj">
+            <p class="t">REPLICAS <span class="pill pill-plan">M9</span></p>
+            <p>sealed segments + live tail, shipped per cell to followers</p>
+          </div>
+          <div class="spine-proj">
+            <p class="t">CDC / SUBSCRIBERS <span class="pill pill-plan">M9+</span></p>
+            <p>change data capture is the log, handed to a subscriber</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="arch" class="section">
+  <div class="section-inner">
+    <p class="kicker reveal">03 / The shape</p>
+    <h2 class="reveal" style="margin-top:0;max-width:760px">One core, one shard, one owner.</h2>
+    <p class="lede reveal" style="margin-bottom:60px">Every key, partition, and log segment is owned by exactly one core. Each shard cell is a complete miniature database. No locks on the hot path &mdash; cells talk only through a batched, lock-free fabric.</p>
+
+    <div class="cells">
+      <div class="cell reveal-pop">
+        <p class="t">SHARD CELL 0 &middot; CORE 0</p>
+        <p>reactor &middot; io_uring<br>SIMD wire parser<br>executor (1-thread async)<br>keyspace slice<br>arena allocator<br>log writer &#9660;</p>
+      </div>
+      <div class="cell reveal-pop">
+        <p class="t">SHARD CELL 1 &middot; CORE 1</p>
+        <p>reactor &middot; io_uring<br>SIMD wire parser<br>executor (1-thread async)<br>keyspace slice<br>arena allocator<br>log writer &#9660;</p>
+      </div>
+      <div class="cell reveal-pop">
+        <p class="t">SHARD CELL 2 &middot; CORE 2</p>
+        <p>reactor &middot; io_uring<br>SIMD wire parser<br>executor (1-thread async)<br>keyspace slice<br>arena allocator<br>log writer &#9660;</p>
+      </div>
+      <div class="cell reveal-pop">
+        <p class="t">SHARD CELL N &middot; CORE N</p>
+        <p>reactor &middot; io_uring<br>SIMD wire parser<br>executor (1-thread async)<br>keyspace slice<br>arena allocator<br>log writer &#9660;</p>
+      </div>
+    </div>
+
+    <div class="fabric-band reveal-pop">FABRIC &mdash; N&times;(N&minus;1) SPSC RING PAIRS &middot; BATCHED &middot; CREDIT-BASED FLOW CONTROL &middot; ZERO SYSCALLS &middot; ZERO LOCKS</div>
+
+    <div class="plane-strips reveal">
+      <div>STORAGE &middot; per-shard owned files &mdash; seg-*.ilog &middot; ckpt-*.ick &middot; MANIFEST &mdash; no sharing, parallel replay</div>
+      <div>CONTROL THREAD &middot; config &middot; topology &middot; stats &middot; checkpoint scheduling &middot; (M9) Raft &mdash; never on the data path</div>
+    </div>
+
+    <div class="step-grid" style="margin-top:72px">
+      <div class="step reveal">
+        <h3 style="font-size:19px">Batch every boundary</h3>
+        <p style="font-size:14.5px">Syscalls, fabric hops, fsyncs, and cache misses are paid per batch, never per operation. One submission per reactor iteration, by construction &mdash; and the batching metrics are CI-gated tripwires, not dashboards.</p>
+      </div>
+      <div class="step reveal">
+        <h3 style="font-size:19px">Commands that suspend</h3>
+        <p style="font-size:14.5px">Every command is a resumable state machine: disk reads, cross-shard hops, and fsync-gated acks suspend without blocking the core. The fast path never suspends &mdash; and pays nothing for the capability.</p>
+      </div>
+      <div class="step reveal">
+        <h3 style="font-size:19px">Deterministic by design</h3>
+        <p style="font-size:14.5px">Time, randomness, and I/O are injected. The whole node runs deterministically in simulation &mdash; every failure is a replayable seed, FoundationDB-style. Simulated disks tear writes and lie about fsync; oracles check every ack survived.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="workloads" class="section">
+  <div class="section-inner">
+    <p class="kicker reveal">04 / Workloads</p>
+    <h2 class="reveal" style="margin-top:0;margin-bottom:16px;max-width:760px">Five systems. One operational surface.</h2>
+    <p class="lede reveal" style="margin-bottom:56px">Each workload is a projection of the same kernel &mdash; and each arrives on the train with its milestone named. Two ship today; the rest are design, not claims.</p>
+
+    <div>
+      <div class="workload reveal">
+        <span class="n">01</span>
+        <div>
+          <h3>In-memory cache <span class="pill pill-ship">SHIPPING</span></h3>
+          <p>RESP2/3, the string/key/expiry command families, all 8 eviction policies, pub/sub. Memory-only namespaces never touch the log. Collections (hashes, lists, sets, zsets) arrive at M5.</p>
+        </div>
+        <span class="r">TARGETS REDIS &middot; VALKEY &middot; DRAGONFLY WORKLOADS</span>
+      </div>
+      <div class="workload reveal">
+        <span class="n">02</span>
+        <div>
+          <h3>Durable key-value <span class="pill pill-ship">SHIPPING</span></h3>
+          <p>Per-namespace fsync classes, fuzzy fork-free checkpoints, parallel recovery. Acks gated on the durability watermark. Larger-than-RAM tiered storage arrives at M4.</p>
+        </div>
+        <span class="r">TARGETS DYNAMODB-CLASS KV (SINGLE REGION)</span>
+      </div>
+      <div class="workload reveal">
+        <span class="n">03</span>
+        <div>
+          <h3>JSON documents <span class="pill pill-plan">M3 &middot; NEXT</span></h3>
+          <p>RedisJSON-compatible JSON.* with JSONPath over a compact binary document tree. Mutated by path, durable by delta. Typed secondary indexes and a planner-free PartiQL subset follow at M4.5.</p>
+        </div>
+        <span class="r">TARGETS DOCUMENT-STORE WORKLOADS</span>
+      </div>
+      <div class="workload reveal">
+        <span class="n">04</span>
+        <div>
+          <h3>Streams &amp; queues <span class="pill pill-plan">M7</span></h3>
+          <p>Kafka-model topics and consumer groups on the log spine, full Redis Streams API, plus DLQs, delays, redelivery, idempotent producers.</p>
+        </div>
+        <span class="r">TARGETS KAFKA-CORE &middot; RABBITMQ-CORE</span>
+      </div>
+      <div class="workload reveal">
+        <span class="n">05</span>
+        <div>
+          <h3>Vector search <span class="pill pill-plan">M8</span></h3>
+          <p>Per-core HNSW with quantization and SIMD distance kernels. Vectors are ordinary durable records &mdash; replicated and tiered like everything else.</p>
+        </div>
+        <span class="r">TARGETS DEDICATED VECTOR DBS</span>
+      </div>
+      <div class="workload plus reveal">
+        <span class="n">+1</span>
+        <div>
+          <h3>In-database compute <span class="pill pill-plan">M10</span></h3>
+          <p>Sandboxed WASM reducers execute inside the process, on the core that owns the data &mdash; zero network, zero serialization, transactional. Plus embedded and shared-memory modes.</p>
+        </div>
+        <span class="r">NONE OF THOSE SYSTEMS OFFER THIS</span>
+      </div>
+    </div>
+
+    <div class="card-grid" style="margin-top:72px">
+      <div class="card reveal">
+        <p class="kicker" style="margin-bottom:14px;font-size:11px">A kernel, not a monolith</p>
+        <p style="font-size:15px;line-height:1.7;margin:0">Documents, streams, vectors, and compute are engines attached to versioned seams &mdash; feature-gated crates, not special cases. A cache-only build compiles none of the rest: smaller binary, smaller attack surface, nothing cold in the icache. You compose what you run.</p>
+      </div>
+      <div class="card reveal">
+        <p class="kicker" style="margin-bottom:14px;font-size:11px">Move code to data</p>
+        <p style="font-size:15px;line-height:1.7;margin:0">The same seams first-party engines use are the programmability surface: WASM reducers (M10), an embedded Rust crate and shm IPC for co-located services &mdash; and a stabilized native extension SDK after 1.0.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="roadmap" class="section">
+  <div class="section-inner">
+    <p class="kicker reveal">05 / Status</p>
+    <h2 class="reveal" style="margin-top:0;max-width:760px">Where it actually is.</h2>
+    <p class="lede reveal" style="margin-bottom:22px">InfinityDB is in development, built milestone by milestone behind hard STOP gates &mdash; a milestone that fails its gate halts feature work. M0 (architecture proof), M1 (cache core), and M2 (durability) are complete; M2.5 is hardening the durable core into the first public tag, <code>v0.2.0-alpha.1</code>.</p>
+    <div class="callout reveal" style="max-width:720px">
+      <span class="callout-tag"><strong>Why there are no benchmark numbers on this page:</strong></span>
+      the project&rsquo;s evidence policy forbids publishing a number before a validated, replicated artifact exists &mdash; and comparative numbers additionally require the competitor in the same run on the same box. Every public number lives in the <a href="docs/index.html#claims">claim ledger</a> with its artifact, or it does not exist. When the ledger allows one, it appears here &mdash; not before.
+    </div>
+
+    <div class="rail reveal">
+      <div class="rail-track">
+        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M0</p><p class="d">skeleton &#10003;</p></div>
+        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M1</p><p class="d">cache core &#10003;</p></div>
+        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M2</p><p class="d">durability &#10003;</p></div>
+        <div class="rail-stop now"><div class="rail-dot"></div><p class="m">M2.5 &middot; NOW</p><p class="d">hardening &middot; &alpha; tag</p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M3</p><p class="d">json docs</p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M4</p><p class="d">tiered</p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M4.5</p><p class="d">indexes &middot; query</p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M5</p><p class="d">data types</p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M6</p><p class="d">txns &middot; lua</p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M7 &middot; &beta;</p><p class="d">streams</p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M8</p><p class="d">vectors</p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M9</p><p class="d">replication</p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M10</p><p class="d">compute</p></div>
+        <div class="rail-stop ga"><div class="rail-dot"></div><p class="m">1.0.0</p><p class="d">GA</p></div>
+      </div>
+    </div>
+    <p class="mono-note reveal" style="margin-top:26px">TRAIN REORDERED DOCUMENTS-FIRST BY ADR-0023 &middot; M4.5 INSERTED BY ADR-0024 &middot; M2.5 RESTRUCTURED PERFORMANCE-FIRST BY ADR-0025 &mdash; <a href="docs/roadmap.html" style="letter-spacing:0">milestone-by-milestone detail &rarr;</a></p>
+  </div>
+</section>
+
+<section class="cta-band">
+  <div class="glow"></div>
+  <div class="inner">
+    <h2 class="reveal">Follow the build.</h2>
+    <p class="reveal">Gates before features. Evidence before claims. Watch the milestones land &mdash; or read the master plan and hold us to it.</p>
+    <div class="ctas reveal">
+      <a class="btn btn-primary" href="https://github.com/">&#9733; Star on GitHub</a>
+      <a class="btn btn-ghost" href="blog/the-log-is-the-database.html">Read how it&rsquo;s built &rarr;</a>
+    </div>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span class="mark">&infin; InfinityDB</span>
+    <span class="meta">APACHE 2.0 &middot; RUST &middot; BEST ON LINUX WITH io_uring</span>
+    <div class="footer-links">
+      <a href="docs/index.html">Docs</a>
+      <a href="blog/index.html">Blog</a>
+      <a href="docs/roadmap.html">Roadmap</a>
+      <a href="https://github.com/">GitHub &#8599;</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var t = document.querySelector('.nav-toggle');
+  var l = document.querySelector('.nav-links');
+  if (t && l) t.addEventListener('click', function () {
+    var open = l.classList.toggle('open');
+    t.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+})();
+</script>
+</body>
+</html>

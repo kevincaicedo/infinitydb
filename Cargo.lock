@@ -150,6 +150,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "crash-matrix"
+version = "0.0.0"
+dependencies = [
+ "inf-alloc",
+ "inf-fabric",
+ "inf-foundation",
+ "inf-log",
+ "inf-runtime",
+ "inf-server",
+ "inf-store",
+]
+
+[[package]]
 name = "criterion"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -411,6 +424,7 @@ dependencies = [
  "inf-runtime",
  "inf-store",
  "inf-wire",
+ "libc",
 ]
 
 [[package]]
@@ -420,6 +434,7 @@ dependencies = [
  "inf-alloc",
  "inf-fabric",
  "inf-foundation",
+ "inf-log",
  "inf-runtime",
  "inf-server",
  "inf-store",

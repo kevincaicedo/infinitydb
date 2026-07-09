@@ -1,0 +1,41 @@
+infinityd: listening on 36399
+infinityd 78d4055 (git 78d405538128-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 36399, backend io_uring, route natural
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: false, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records)
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 5s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 6s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 7s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 8s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 9s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 10s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 11s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 12s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 13s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 14s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 15s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 16s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 17s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 18s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 19s

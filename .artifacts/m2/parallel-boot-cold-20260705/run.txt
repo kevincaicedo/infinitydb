@@ -1,0 +1,64 @@
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 8.31s
+     Running benches/parallel_boot.rs (target/release/deps/parallel_boot-c3afd89a98cb1d2d)
+# parallel_boot dev rehearsal: 8 cells × 1280 MiB (≈ 2532409 records/cell), reps 3
+# built 8 images in 39.5s — replay set 11.01 GiB (data extents + .ick)
+# cold-cache mode: fadvise(DONTNEED) over every image file before each rep
+control: recovery 0/8 cells ready, 881539680/16106389880 bytes (5.5%), eta 18s
+control: recovery 0/8 cells ready, 1754683744/16106389880 bytes (10.9%), eta 17s
+control: recovery 0/8 cells ready, 2720179584/16106389880 bytes (16.9%), eta 15s
+control: recovery 0/8 cells ready, 3710862272/16106389880 bytes (23.0%), eta 14s
+control: recovery 0/8 cells ready, 4802292352/16106389880 bytes (29.8%), eta 12s
+control: recovery 0/8 cells ready, 5882476472/16106389880 bytes (36.5%), eta 11s
+control: recovery 0/8 cells ready, 7592218296/16106389880 bytes (47.1%), eta 8s
+control: recovery 0/8 cells ready, 9073806008/16106389880 bytes (56.3%), eta 7s
+control: recovery 0/8 cells ready, 10741457272/16106389880 bytes (66.7%), eta 5s
+control: cell 4 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 0 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 1 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 2 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 3 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 5 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 6 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 7 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: recovery complete — 8 cells serving (9810 ms)
+boot rep 0: 9775 ms to all-ready — aggregate 1.13 GiB/s (0.14 GiB/s/cell effective)
+control: recovery 0/8 cells ready, 873144064/18253873528 bytes (4.8%), eta 20s
+control: recovery 0/8 cells ready, 1754683744/18253873528 bytes (9.6%), eta 19s
+control: recovery 0/8 cells ready, 2736970816/18253873528 bytes (15.0%), eta 18s
+control: recovery 0/8 cells ready, 3769631584/18253873528 bytes (20.7%), eta 16s
+control: recovery 0/8 cells ready, 4819083584/18253873528 bytes (26.4%), eta 14s
+control: recovery 0/8 cells ready, 5916148920/18253873528 bytes (32.4%), eta 13s
+control: recovery 0/8 cells ready, 7592218296/18253873528 bytes (41.6%), eta 10s
+control: recovery 0/8 cells ready, 9082224120/18253873528 bytes (49.8%), eta 9s
+control: recovery 0/8 cells ready, 10758293496/18253873528 bytes (58.9%), eta 7s
+control: cell 4 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: cell 6 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: cell 7 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: cell 0 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: cell 1 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: cell 2 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: cell 3 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: cell 5 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: recovery complete — 8 cells serving (9911 ms)
+boot rep 1: 9828 ms to all-ready — aggregate 1.12 GiB/s (0.14 GiB/s/cell effective)
+control: recovery 0/8 cells ready, 873144064/20401357176 bytes (4.3%), eta 23s
+control: recovery 0/8 cells ready, 1746288128/20401357176 bytes (8.6%), eta 22s
+control: recovery 0/8 cells ready, 2745366432/20401357176 bytes (13.5%), eta 20s
+control: recovery 0/8 cells ready, 3769631584/20401357176 bytes (18.5%), eta 18s
+control: recovery 0/8 cells ready, 4827479200/20401357176 bytes (23.7%), eta 17s
+control: recovery 0/8 cells ready, 5949821368/20401357176 bytes (29.2%), eta 15s
+control: recovery 0/8 cells ready, 7651145080/20401357176 bytes (37.5%), eta 12s
+control: recovery 0/8 cells ready, 9149569016/20401357176 bytes (44.8%), eta 10s
+control: recovery 0/8 cells ready, 10817220280/20401357176 bytes (53.0%), eta 8s
+control: cell 0 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 1 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 2 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 3 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 4 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 5 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 6 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 7 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: recovery complete — 8 cells serving (9911 ms)
+boot rep 2: 9864 ms to all-ready — aggregate 1.12 GiB/s (0.14 GiB/s/cell effective)
+# gate context: 10 GB/8 cells < 15 s binds on the reference box (S22, cold cache)

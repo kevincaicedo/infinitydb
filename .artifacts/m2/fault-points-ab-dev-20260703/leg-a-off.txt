@@ -1,0 +1,4 @@
+tier: OFF
+empty loop: 0.296 ns/iter
+fire loop:  0.295 ns/iter
+fire cost:  0.000 ns/call (delta)

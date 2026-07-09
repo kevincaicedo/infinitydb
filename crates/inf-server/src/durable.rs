@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use inf_foundation::time::Nanos;
-use inf_log::fs::{SegmentFs, StdSegmentFs};
+use inf_log::fs::SegmentFs;
 use inf_log::{
     FsyncClass, FsyncTicket, GroupCommit, MutationEffect, NsId, RecordView, SegmentConfig,
     SegmentRotor, StagingConfig, StagingRing,
@@ -28,11 +28,18 @@ use inf_log::{
 use inf_runtime::{CompletionToken, IoOp, LoopCx, TokenClass, WaitList, WatermarkGate};
 use inf_store::{Keyspace, WallAnchor};
 
-use crate::ckpt::{CkptCell, CkptPhase, CkptStats, SCAN_CHUNK_ENTRIES, ckpt_token};
+use crate::ckpt::{
+    CkptCell, CkptPhase, CkptStats, MAX_TRUNC_PER_SLICE_ADAPTIVE, MAX_UNLINKS_PER_SLICE,
+    ManifestCell, ManifestStats, SCAN_CHUNK_ENTRIES, ckpt_token,
+};
 use crate::log_bytes;
 
 /// Timer-wheel key for the everysec tick (plane-armed, injected clock).
 pub(crate) const EVERYSEC_TIMER_KEY: u64 = 0xE5EC_0001;
+
+/// POSIX `EIO` (this crate carries no libc dep): the errno the
+/// `durable_fsync_eio` fault point injects (M2-S17).
+const EIO: i32 = 5;
 
 /// Durable-path configuration one cell receives from the node assembly.
 /// Absent config means a memory-only cell: durable DDL is refused with a
@@ -46,6 +53,35 @@ pub struct DurableConfig {
     pub segment: SegmentConfig,
     /// Fuzzy-checkpoint policy (M2-S10, ADR-0016).
     pub ckpt: inf_log::CkptConfig,
+    /// Boot-recovery stepping (M2-S15).
+    pub recover: RecoverConfig,
+    /// Durability fsyncs allowed in flight per cell (M2.5-S07): 1 = the
+    /// ADR-0022 D3 discipline; 2 = the bounded two-in-flight pipeline
+    /// under A/B evaluation. Never more.
+    pub sync_pipeline: u8,
+}
+
+/// Boot-recovery stepping policy (M2-S15). The default replays flat-out
+/// in large MAINTAIN steps; the throttle exists so tests can hold a node
+/// in its `-LOADING` window long enough to observe it (never a
+/// production tuning knob — recovery throughput is a gate, not a dial).
+#[derive(Copy, Clone, Debug)]
+pub struct RecoverConfig {
+    /// Max checkpoint/replay bytes one MAINTAIN recovery step consumes
+    /// before yielding to the loop — bounds `-LOADING` reply latency
+    /// during boot (one frame/section may overshoot).
+    pub step_bytes: u64,
+    /// Test-only pacing: cap recovery at roughly this rate against the
+    /// injected loop clock (`None` = flat out).
+    pub throttle_bytes_per_sec: Option<u64>,
+}
+
+impl Default for RecoverConfig {
+    fn default() -> RecoverConfig {
+        // 8 MiB ≈ single-digit-ms steps at the ≥ 1 GB/s replay gate: the
+        // loop keeps answering -LOADING while paying < 0.1% step overhead.
+        RecoverConfig { step_bytes: 8 << 20, throttle_bytes_per_sec: None }
+    }
 }
 
 /// Cumulative durable counters flushed into `NodeInfo` by MAINTAIN (the
@@ -58,53 +94,123 @@ pub struct DurableStats {
     pub last_durable_lsn: u64,
     pub watermark_lag_lsn: u64,
     pub fsyncs_completed: u64,
+    /// M2-S22: cumulative frames queued (one per LOG writev — the
+    /// `log_writes_per_iter` tripwire numerator) and the staging
+    /// domain's resident bytes (the L5 attribution observable).
+    pub frames_queued: u64,
+    pub staging_resident_bytes: u64,
+    /// MANIFEST swaps + truncation (M2-S11, ADR-0017).
+    pub manifests_published: u64,
+    pub manifests_aborted: u64,
+    /// M2-S21: last-window rates + fsync latency percentiles (µs).
+    pub fsyncs_per_sec: u64,
+    pub acks_per_sec: u64,
+    pub fsync_p50_us: u64,
+    pub fsync_p99_us: u64,
+    pub fsync_p999_us: u64,
+    /// M2.5-S07 group formation: records newly covered per
+    /// durability-fsync completion (distribution percentiles).
+    pub fsync_group_p50: u64,
+    pub fsync_group_p99: u64,
+    pub segments_truncated: u64,
+    /// 1 while a checkpoint is streaming (`rdb_bgsave_in_progress`).
+    pub ckpt_in_progress: u64,
+    /// On-disk segments the rotor tracks (sealed + active + prealloc'd
+    /// next) — the reclamation-bound observable.
+    pub log_segments_live: u64,
 }
 
 /// One cell's durable plane state (plane-owned; `inf-store` never sees it).
-pub(crate) struct DurableCell {
+pub(crate) struct DurableCell<F: SegmentFs> {
     pub staging: StagingRing,
-    pub rotor: SegmentRotor<StdSegmentFs>,
-    pub commit: GroupCommit<<StdSegmentFs as SegmentFs>::File>,
+    pub rotor: SegmentRotor<F>,
+    pub commit: GroupCommit<F::File>,
     /// Ack gate keyed by durable seq (see module docs).
     pub ack_gate: WatermarkGate,
     /// Wakes pump futures parked on staging backpressure (`StagingFull`)
     /// once the in-flight frame releases.
     pub drained: WaitList<()>,
     /// Fuzzy-checkpoint driver (M2-S10, ADR-0016).
-    pub ckpt: CkptCell,
+    pub ckpt: CkptCell<F>,
+    /// MANIFEST + truncation driver (M2-S11, ADR-0017).
+    pub manifest: ManifestCell<F>,
     in_flight: Option<inf_log::FrameLease>,
     /// Last durable seq assigned (0 = none; the gate starts at 0).
     last_seq: u64,
+    /// Last seq the ack gate advanced to (group-formation bookkeeping).
+    acked_seq: u64,
+    /// Records newly covered per durability-fsync completion (M2.5-S07):
+    /// the group-formation distribution the ≥ 0.8× gate reads.
+    group_hist_records: inf_foundation::LogHistogram,
     /// Frames queued but not yet durable: (exclusive-end LSN, last seq).
     frame_seqs: VecDeque<(u64, u64)>,
     write_seq: u64,
     records_appended: u64,
     acks_gated: u64,
+    /// M2-S21 windowed rates: counters snapshotted at the everysec tick;
+    /// the delta is "per second" against the injected clock.
+    tick_fsyncs_prev: u64,
+    tick_acks_prev: u64,
+    fsyncs_last_sec: u64,
+    acks_last_sec: u64,
     /// §8.4: a terminal log-I/O error freezes the cell's durable plane
     /// (checked before fail-stop so tests can observe the frozen state).
     pub failed: bool,
 }
 
-impl DurableCell {
+impl<F: SegmentFs> DurableCell<F> {
     pub fn new(
         staging: StagingConfig,
-        rotor: SegmentRotor<StdSegmentFs>,
-        ckpt: CkptCell,
-    ) -> DurableCell {
+        sync_pipeline: u8,
+        rotor: SegmentRotor<F>,
+        ckpt: CkptCell<F>,
+        manifest: ManifestCell<F>,
+    ) -> DurableCell<F> {
         DurableCell {
             staging: StagingRing::new(staging),
             rotor,
-            commit: GroupCommit::new(),
+            commit: GroupCommit::with_sync_pipeline(usize::from(sync_pipeline)),
             ack_gate: WatermarkGate::new(),
             drained: WaitList::new(),
             ckpt,
+            manifest,
             in_flight: None,
             last_seq: 0,
+            acked_seq: 0,
+            group_hist_records: inf_foundation::LogHistogram::new(),
             frame_seqs: VecDeque::new(),
             write_seq: 0,
             records_appended: 0,
             acks_gated: 0,
+            tick_fsyncs_prev: 0,
+            tick_acks_prev: 0,
+            fsyncs_last_sec: 0,
+            acks_last_sec: 0,
             failed: false,
+        }
+    }
+
+    /// Arm the boot-metadata barriers (M2.5-S01): one driver-ridden
+    /// fdatasync per boot directory handle plus one on the active segment
+    /// fd, registered at the head of the commit ledger so the done-prefix
+    /// rule fences every durable ack (and the manifest's watermark guard)
+    /// behind boot-metadata durability. Boot-ready never waits on them —
+    /// that is the fix for the ADR-0022 D7 wedge: the old blocking
+    /// dir-fsyncs could stall a reactor thread for minutes behind foreign
+    /// journal writeback. Barrier failure surfaces as an fsync-error CQE
+    /// → fail-stop (§8.4), same as any durability sync.
+    pub fn arm_boot_barriers(&mut self, cx: &mut LoopCx<'_>, dirs: Vec<F::File>) {
+        let floor = self.rotor.append_cursor();
+        for handle in dirs {
+            // Fd-less tiers (MemFs) have process-KILL physics — completed
+            // writes survive by construction, so they carry no barriers.
+            let Some(fd) = inf_log::fs::SegmentFile::raw_fd(&handle) else { continue };
+            let ticket = self.commit.register_boot_barrier(floor, Some(handle), cx.now);
+            cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
+        }
+        if let Some(fd) = self.rotor.active_raw_fd() {
+            let ticket = self.commit.register_boot_barrier(floor, None, cx.now);
+            cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
         }
     }
 
@@ -133,17 +239,30 @@ impl DurableCell {
     }
 
     /// MAINTAIN slice: keep the next segment preallocated (rotation stays
-    /// a pointer swap — S02).
-    pub fn maintain(&mut self, now_ms: u64) {
+    /// a pointer swap — S02). The prealloc is unsynced (M2.5-S01): its
+    /// log-dir fdatasync rides the driver as a coverage-neutral ledger
+    /// barrier instead of blocking the reactor behind the journal.
+    pub fn maintain(&mut self, cx: &mut LoopCx<'_>) {
         if self.failed {
             return;
         }
-        if let Err(err) = self.rotor.maintain(now_ms) {
-            // ENOSPC discipline (S02): surfaced before any write needs the
-            // space; `space_exhausted()` gates admission at the command
-            // layer. Other I/O errors are fail-stop territory.
-            if !self.rotor.space_exhausted() {
-                self.fail_stop("segment maintain", &err.to_string());
+        match self.rotor.maintain_deferred(cx.now.as_millis()) {
+            Ok((_report, Some(barrier))) => {
+                // Fd-less tiers (MemFs) have process-KILL physics — no
+                // barrier needed (completed writes survive by construction).
+                if let Some(fd) = inf_log::fs::SegmentFile::raw_fd(&barrier.dir) {
+                    let ticket = self.commit.register_prealloc_barrier(barrier.dir, cx.now);
+                    cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
+                }
+            }
+            Ok((_report, None)) => {}
+            Err(err) => {
+                // ENOSPC discipline (S02): surfaced before any write needs
+                // the space; `space_exhausted()` gates admission at the
+                // command layer. Other I/O errors are fail-stop territory.
+                if !self.rotor.space_exhausted() {
+                    self.fail_stop("segment maintain", &err.to_string());
+                }
             }
         }
     }
@@ -214,34 +333,64 @@ impl DurableCell {
         self.drained.wake_all(());
     }
 
-    /// REAP: an fsync completed — advance the durability watermark and
-    /// wake every ack whose frame it covers (FIFO by seq == by LSN).
-    pub fn on_synced(&mut self, token: CompletionToken, now: Nanos) {
-        if let Some(end) = self.commit.on_fsync_complete(token_ticket(token), now) {
+    /// REAP: an fsync completed — advance the durability watermark, wake
+    /// every ack whose frame it covers (FIFO by seq == by LSN), record the
+    /// group-formation sample, and (M2.5-S07, pipeline bound ≥ 2) issue
+    /// the deferred sync immediately at this CQE instead of waiting for
+    /// the next LOG step.
+    pub fn on_synced(&mut self, cx: &mut LoopCx<'_>, token: CompletionToken) {
+        // M2-S17 fsyncgate: a firing point turns this completion into the
+        // device-reported-EIO path — deterministic stand-in for an fsync
+        // error CQE (the reactor tier's analog of `fsync_err`, ADR-0020).
+        if inf_foundation::fault::fire(crate::fault::DURABLE_FSYNC_EIO) {
+            self.on_log_error(token, EIO);
+        }
+        if let Some(end) = self.commit.on_fsync_complete(token_ticket(token), cx.now) {
             let watermark = end.to_u64();
             let mut last_covered = None;
             while self.frame_seqs.front().is_some_and(|&(end_lsn, _)| end_lsn <= watermark) {
                 last_covered = self.frame_seqs.pop_front().map(|(_, seq)| seq);
             }
             if let Some(seq) = last_covered {
+                // Group formation (M2.5-S07): records newly covered by
+                // this completion — the distribution behind the
+                // ≥ 0.8× available-in-flight-writes gate.
+                debug_assert!(seq >= self.acked_seq, "ack seq regressed — frame_seqs FIFO broken");
+                self.group_hist_records.record(seq - self.acked_seq);
+                self.acked_seq = seq;
                 self.ack_gate.advance(seq);
             }
+        }
+        if self.commit.completion_fsync_due() {
+            let ticket = self.commit.register_completion_fsync(cx.now);
+            let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
+            cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
         }
     }
 
     /// Timer: the everysec tick (idle ticks are free — counted, no I/O).
     pub fn on_everysec_tick(&mut self, cx: &mut LoopCx<'_>) {
+        // M2-S21: the tick doubles as the 1 s rate window (injected clock).
+        let fsyncs = self.commit.stats().fsyncs_completed;
+        self.fsyncs_last_sec = fsyncs - self.tick_fsyncs_prev;
+        self.tick_fsyncs_prev = fsyncs;
+        self.acks_last_sec = self.acks_gated - self.tick_acks_prev;
+        self.tick_acks_prev = self.acks_gated;
         self.commit.note_everysec_tick();
         cx.timers.insert(cx.now + Nanos::from_secs(1), EVERYSEC_TIMER_KEY);
     }
 
     /// §8.4 fail-stop: a terminal error on the durable path. The watermark
-    /// freezes (no ack for the affected batch can ever fire) and the
-    /// process exits via panic — fsync failure is never caught-and-continued
-    /// (the fsyncgate rule; S17 formalizes exit codes).
+    /// freezes (no ack for the affected batch can ever fire), the typed
+    /// error goes to stderr, and the process exits with
+    /// [`EXIT_DURABLE_FAILSTOP`](crate::EXIT_DURABLE_FAILSTOP) — fsync
+    /// failure is never caught-and-continued and never retried against
+    /// possibly-clean pages (the fsyncgate rule; exit codes formalized at
+    /// M2-S17, ADR-0020 D3).
     pub fn fail_stop(&mut self, what: &str, detail: &str) -> ! {
         self.failed = true;
-        panic!("durable-path {what} failed (fail-stop, §8.4): {detail}");
+        eprintln!("durable-path {what} failed (fail-stop, §8.4): {detail}");
+        std::process::exit(crate::EXIT_DURABLE_FAILSTOP);
     }
 
     /// Terminal error routed from REAP (write or fsync token).
@@ -269,10 +418,13 @@ impl DurableCell {
             return 0;
         }
         // Idle: trigger check → stage the begin marker (one record; its
-        // frame seals at this iteration's LOG step).
+        // frame seals at this iteration's LOG step). A pending MANIFEST
+        // blocks the next trigger: one recovery-unit transition in flight,
+        // ever (M2-S11 — the pending swap resolves within one everysec
+        // window, so this never starves the trigger).
         if matches!(self.ckpt.phase, CkptPhase::Idle) {
             let total = self.staging.stats().append_bytes;
-            if self.ckpt.should_begin(total) {
+            if self.manifest.idle() && self.ckpt.should_begin(total) {
                 let id = self.ckpt.pending_id();
                 let effect = MutationEffect::CkptBegin { ckpt_id: id };
                 if self.staging.would_fit(effect.encoded_len()) {
@@ -281,6 +433,13 @@ impl DurableCell {
                     self.records_appended += 1;
                     self.last_seq += 1;
                     self.ckpt.requested = false;
+                    // The epoch this checkpoint satisfies (M2-S20) — one
+                    // transition in flight, so a single value suffices.
+                    self.ckpt.epoch_in_flight = self.ckpt.req_epoch;
+                    // Trigger re-base is begin-anchored (`bytes_at_last`
+                    // docs): everything staged after this instant is tail
+                    // the new checkpoint does not cover.
+                    self.ckpt.bytes_at_begin = total;
                     self.ckpt.phase = CkptPhase::AwaitBeginLsn { id, at };
                 }
             }
@@ -293,7 +452,7 @@ impl DurableCell {
         // Begun: create the .ick.new file + queue the header write.
         if let CkptPhase::Begun { id, begin_lsn } = self.ckpt.phase {
             let ns_ids = ks.durable_ns_ids();
-            if let Err(err) = self.ckpt.open_stream(id, begin_lsn, ns_ids) {
+            if let Err(err) = self.ckpt.open_stream(id, begin_lsn, ns_ids, cx.now) {
                 self.ckpt.abort("create", &err.to_string());
                 return 1;
             }
@@ -311,15 +470,21 @@ impl DurableCell {
         }
         let cfg = self.ckpt.cfg;
         // Publish once the completion fdatasync landed (rename+dir-fsync).
+        // A published `.ick` hands off to the MANIFEST driver: the swap
+        // waits for the watermark to cover begin (M2-S11 publication
+        // guard), then runs in `manifest_slice`.
         if matches!(&self.ckpt.phase, CkptPhase::Stream(st) if st.sync_done) {
             let CkptPhase::Stream(st) = std::mem::replace(&mut self.ckpt.phase, CkptPhase::Idle)
             else {
                 unreachable!("matched above")
             };
-            let total = self.staging.stats().append_bytes;
+            let (id, begin_lsn) = (st.id, st.begin_lsn);
             let unix_now = anchor.unix_from_internal(cx.now);
-            if let Err(err) = self.ckpt.publish(st, unix_now, total) {
-                self.ckpt.abort("publish", &err.to_string());
+            match self.ckpt.publish(st, unix_now) {
+                Ok(()) => {
+                    self.manifest.note_published_ick(id, begin_lsn, self.ckpt.epoch_in_flight);
+                }
+                Err(err) => self.ckpt.abort("publish", &err.to_string()),
             }
             return 1;
         }
@@ -336,11 +501,25 @@ impl DurableCell {
             sync_issued,
             in_flight,
             write_seq,
+            opened_at,
+            streamed_bytes,
             ..
         } = &mut **st;
         // One section in flight max: wait for its completion.
         if in_flight.is_some() {
             return 0;
+        }
+        // Pacing (ADR-0017): the walk streams at most `stream_bytes_per_sec
+        // × elapsed` — an unpaced walk dirties pages at memcpy speed and
+        // the kernel's writeback throttling then stalls the log write's
+        // CQE path (the S12-measured foreground cliff). Injected time, so
+        // DST compresses it (L7).
+        if !*walk_done && cfg.stream_bytes_per_sec > 0 {
+            let elapsed_ms = cx.now.saturating_sub(*opened_at).as_millis();
+            let allowed = (u64::from(cfg.stream_bytes_per_sec) * elapsed_ms.max(1)) / 1000;
+            if *streamed_bytes >= allowed {
+                return 0;
+            }
         }
         // Footer written+released → the completion barrier.
         if *footer_staged {
@@ -429,6 +608,7 @@ impl DurableCell {
             *in_flight = Some(lease);
             *footer_staged = true;
         }
+        *streamed_bytes += u64::from(emitted);
         emitted.div_ceil(1024).max(1)
     }
 
@@ -458,9 +638,108 @@ impl DurableCell {
         self.ckpt.abort("I/O", &format!("errno {errno}"));
     }
 
-    /// Manual trigger latch (`INF.CKPT` rides the control handle — S20).
-    pub fn request_ckpt(&mut self) {
+    /// The MANIFEST + truncation slice (M2-S11/S12, ADR-0017), from
+    /// MAINTAIN — never the hot path, **never a device barrier on the
+    /// loop**, and **never a large unlink on the loop** (freeing a
+    /// truncated file's pages is O(size) in the kernel — a measured
+    /// multi-ms stall):
+    ///
+    /// 1. **Swap machine**: `.ick` dir-fsync → watermark guard →
+    ///    `MANIFEST.new` stage+fdatasync → rename → shard dir-fsync →
+    ///    commit (floor advance). Barriers ride the driver
+    ///    (`TokenClass::ManifestSync`); one in flight, ever.
+    /// 2. **Truncate**: forget sealed segments below the floor (fully
+    ///    covered by the named checkpoint; the M5 retention hook can exempt
+    ///    topic segments) and delegate their unlinks to the control thread.
+    ///    Budget adapts to the covered backlog (M2.5-S11, ADR-0022 D8.4):
+    ///    ≥ [`MAX_UNLINKS_PER_SLICE`], ≤ [`MAX_TRUNC_PER_SLICE_ADAPTIVE`].
+    /// 3. **GC**: delegate ≤ [`MAX_UNLINKS_PER_SLICE`] stale-`.ick`/orphan
+    ///    unlinks queued at commit.
+    ///
+    /// `control = None` (planeless/test tiers) falls back to inline
+    /// unlinks — those tiers have no foreground tail to protect.
+    /// Returns Maintenance units to charge (≈ one per file op).
+    pub fn manifest_slice(
+        &mut self,
+        cx: &mut LoopCx<'_>,
+        control: Option<&crate::ControlHandle>,
+        unix_now_ms: u64,
+    ) -> u32 {
+        if self.failed {
+            return 0;
+        }
+        let watermark = self.commit.watermark().map(|l| l.to_u64());
+        let mut units = self.manifest.swap_slice(cx, watermark, self.rotor.active_segment());
+        // A MANIFEST just committed (dir-fsync durable): publish the
+        // control-board slot — the `INF.CKPT WAIT`/`LASTSAVE` observable
+        // (M2-S20, ADR-0021 D6).
+        if let Some((epoch, ckpt_id)) = self.manifest.take_published()
+            && let Some(control) = control
+        {
+            control.ckpt_board().slot(self.manifest.cell()).publish(epoch, ckpt_id, unix_now_ms);
+        }
+        if let Some(floor) = self.manifest.floor() {
+            // Adaptive drain (M2.5-S11, ADR-0022 D8.4): the budget follows
+            // the covered backlog — half of it per slice, floored at the
+            // fixed cap, ceilinged at MAX_TRUNC_PER_SLICE_ADAPTIVE — so a
+            // fast writer cannot grow retained log unboundedly while the
+            // drain plods at 2/slice. Still a bounded slice, never a burst.
+            let backlog = self
+                .rotor
+                .sealed_below(floor)
+                .iter()
+                .filter(|&&id| !self.manifest.truncation_exempt(id))
+                .count();
+            let budget =
+                MAX_UNLINKS_PER_SLICE.max(backlog.div_ceil(2)).min(MAX_TRUNC_PER_SLICE_ADAPTIVE);
+            for _ in 0..budget {
+                let Some(&id) = self
+                    .rotor
+                    .sealed_below(floor)
+                    .iter()
+                    .find(|&&id| !self.manifest.truncation_exempt(id))
+                else {
+                    break;
+                };
+                // Forget-then-unlink: the rotor drops the segment first so
+                // a failed/late unlink can never resurrect it in the live
+                // set (boot GC re-collects survivors below the floor).
+                let path = self.rotor.forget_sealed(id);
+                match control {
+                    Some(control) => {
+                        if !control.request_unlink(path.clone()) {
+                            // Queue full: the path joins the GC queue and
+                            // retries next slice (bounded, never a stall).
+                            self.manifest.defer_unlink(path);
+                        }
+                    }
+                    None => self.manifest.unlink_now(&path),
+                }
+                self.manifest.note_truncated(1);
+                units += 1;
+            }
+        }
+        units + self.manifest.gc_slice(MAX_UNLINKS_PER_SLICE, control)
+    }
+
+    /// REAP: a MANIFEST-swap barrier (`TokenClass::ManifestSync`) landed —
+    /// phase flip only; follow-up metadata ops run next MAINTAIN slice.
+    pub fn on_manifest_synced(&mut self) {
+        self.manifest.on_synced();
+    }
+
+    /// REAP: a MANIFEST-swap barrier failed — the old recovery unit stays
+    /// authoritative (the checkpoint-abort class, ADR-0017).
+    pub fn on_manifest_error(&mut self, errno: i32) {
+        self.manifest.on_sync_error(errno);
+    }
+
+    /// Manual trigger latch (`INF.CKPT`/`BGSAVE`, M2-S20): `epoch` is the
+    /// control-board request this checkpoint will satisfy; it publishes
+    /// back at the MANIFEST swap's dir-fsync commit.
+    pub fn request_ckpt(&mut self, epoch: u64) {
         self.ckpt.requested = true;
+        self.ckpt.req_epoch = self.ckpt.req_epoch.max(epoch);
     }
 
     /// Checkpoint gauges for the MAINTAIN stats flush.
@@ -472,6 +751,7 @@ impl DurableCell {
     pub fn stats(&self) -> DurableStats {
         let durable = self.commit.watermark().map_or(0, |l| l.to_u64());
         let queued = self.commit.queued_up_to().map_or(0, |l| l.to_u64());
+        let manifest = self.manifest.stats();
         DurableStats {
             records_appended: self.records_appended,
             acks_gated: self.acks_gated,
@@ -479,7 +759,28 @@ impl DurableCell {
             last_durable_lsn: durable,
             watermark_lag_lsn: queued.saturating_sub(durable),
             fsyncs_completed: self.commit.stats().fsyncs_completed,
+            frames_queued: self.commit.stats().frames_queued,
+            staging_resident_bytes: self.staging.resident_bytes() as u64,
+            manifests_published: manifest.published,
+            manifests_aborted: manifest.aborted,
+            fsyncs_per_sec: self.fsyncs_last_sec,
+            acks_per_sec: self.acks_last_sec,
+            fsync_p50_us: self.commit.fsync_latency_hist().percentile(50.0),
+            fsync_p99_us: self.commit.fsync_latency_hist().percentile(99.0),
+            fsync_p999_us: self.commit.fsync_latency_hist().percentile(99.9),
+            fsync_group_p50: self.group_hist_records.percentile(50.0),
+            fsync_group_p99: self.group_hist_records.percentile(99.0),
+            segments_truncated: manifest.truncated_segments,
+            ckpt_in_progress: u64::from(!matches!(self.ckpt.phase, CkptPhase::Idle)),
+            log_segments_live: self.rotor.sealed().len() as u64
+                + 1
+                + u64::from(self.rotor.next_ready().is_some()),
         }
+    }
+
+    /// Manifest/truncation gauges (tests, INFO).
+    pub fn manifest_stats(&self) -> ManifestStats {
+        self.manifest.stats()
     }
 
     /// Admission gate for durable writes when preallocation failed

@@ -30,7 +30,11 @@ pub fn create_cell_dirs<F: SegmentFs>(fs: &F, shard_dir: &Path) -> io::Result<Ce
     fs.create_dir_all(&dirs.log)?;
     fs.create_dir_all(&dirs.ckpt)?;
     // dir-fsync children, the shard dir, and its parent: the new entries
-    // must survive power loss before anything is written under them.
+    // must survive power loss before anything is written under them
+    // (M2-S16 `dir_fsync_fail` covers this barrier class too).
+    if inf_foundation::fault::fire(crate::fault::DIR_FSYNC_FAIL) {
+        return Err(crate::fault::injected(crate::fault::DIR_FSYNC_FAIL));
+    }
     fs.sync_dir(&dirs.log)?;
     fs.sync_dir(&dirs.ckpt)?;
     fs.sync_dir(shard_dir)?;
@@ -38,6 +42,33 @@ pub fn create_cell_dirs<F: SegmentFs>(fs: &F, shard_dir: &Path) -> io::Result<Ce
         fs.sync_dir(parent)?;
     }
     Ok(dirs)
+}
+
+/// Deferred-barrier variant of [`create_cell_dirs`] (M2.5-S01): create the
+/// per-cell directories with **no blocking dir-fsyncs** and return open
+/// directory handles instead. The caller registers each handle's
+/// driver-ridden fdatasync as a boot barrier at the head of the
+/// group-commit ledger, so every durable ack is fenced behind the entries
+/// becoming durable while boot-ready never waits on the device. A blocking
+/// fsync here can stall the reactor for minutes behind foreign journal
+/// writeback — the captured cell-2 boot wedge (ADR-0022 D7).
+///
+/// Handle order: log, ckpt, shard, parent (when it exists).
+pub fn create_cell_dirs_deferred<F: SegmentFs>(
+    fs: &F,
+    shard_dir: &Path,
+) -> io::Result<(CellDirs, Vec<F::File>)> {
+    let dirs = CellDirs { log: shard_dir.join("log"), ckpt: shard_dir.join("ckpt") };
+    fs.create_dir_all(&dirs.log)?;
+    fs.create_dir_all(&dirs.ckpt)?;
+    let mut handles = Vec::with_capacity(4);
+    handles.push(fs.open_dir(&dirs.log)?);
+    handles.push(fs.open_dir(&dirs.ckpt)?);
+    handles.push(fs.open_dir(shard_dir)?);
+    if let Some(parent) = shard_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        handles.push(fs.open_dir(parent)?);
+    }
+    Ok((dirs, handles))
 }
 
 /// Scan outcome: segment ids in ascending, contiguous order. May start at
@@ -104,6 +135,33 @@ impl std::error::Error for ScanError {}
 
 /// Validate the log directory and return the ordered segment set.
 pub fn scan_log_dir<F: SegmentFs>(fs: &F, log_dir: &Path) -> Result<SegmentScan, ScanError> {
+    let outcome = scan_log_dir_from(fs, log_dir, SegmentId(0))?;
+    debug_assert!(outcome.stale.is_empty(), "floor 0 admits no stale segments");
+    Ok(outcome.scan)
+}
+
+/// A floor-aware scan (M2-S11): live segments (≥ floor) plus the stale
+/// prefix a crash mid-truncation may have left behind.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanOutcome {
+    /// The validated live set: contiguous, ascending, all ids ≥ floor.
+    pub scan: SegmentScan,
+    /// Segments below the floor, ascending. Fully covered by the
+    /// manifest-named checkpoint — recovery deletes them (gaps among them
+    /// are fine: un-fsynced unlinks may survive a power cut in any subset).
+    pub stale: Vec<SegmentId>,
+}
+
+/// Validate the log directory against a truncation `floor` (the manifest's
+/// `begin_lsn.segment` — M2-S11). Contiguity is enforced only at and above
+/// the floor; ids below it are returned as `stale` for deletion. Foreign
+/// names and duplicates are errors everywhere — honesty does not stop at
+/// the floor.
+pub fn scan_log_dir_from<F: SegmentFs>(
+    fs: &F,
+    log_dir: &Path,
+    floor: SegmentId,
+) -> Result<ScanOutcome, ScanError> {
     let names = fs
         .list_dir(log_dir)
         .map_err(|err| ScanError::Io { path: log_dir.to_path_buf(), kind: err.kind() })?;
@@ -123,10 +181,15 @@ pub fn scan_log_dir<F: SegmentFs>(fs: &F, log_dir: &Path) -> Result<SegmentScan,
         if curr == prev {
             return Err(ScanError::Duplicate { id: *curr, name: curr_name.clone() });
         }
-        if curr.0 != prev.0 + 1 {
+        if *curr >= floor && *prev >= floor && curr.0 != prev.0 + 1 {
             return Err(ScanError::Gap { expected: prev.next(), found: *curr });
         }
     }
 
-    Ok(SegmentScan { segments: entries.into_iter().map(|(id, _)| id).collect() })
+    let split = entries.partition_point(|(id, _)| *id < floor);
+    let stale = entries[..split].iter().map(|(id, _)| *id).collect();
+    Ok(ScanOutcome {
+        scan: SegmentScan { segments: entries[split..].iter().map(|(id, _)| *id).collect() },
+        stale,
+    })
 }

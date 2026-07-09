@@ -1,0 +1,21 @@
+M2.5-S01 planted-bug demonstration (2026-07-06, dev box; kernel 7.0.0-27-generic)
+Tree: S01 fix implemented; revert = begin_recovery without .deferred_boot_sync()
+Command: inf-sim --scenario boot-storm --seed 0xB007
+
+== reverted (pre-S01 synchronous boot path) ==
+inf-sim: scenario boot-storm seed 0xb007: 6 boots, ready-steps max 6, hash 0x35158b2124752dea
+inf-sim: VIOLATION: cycle 0: 20 blocking sync_dir call(s) on the ready path - the ADR-0022 D7 wedge mechanism (boot metadata must ride driver barriers)
+inf-sim: VIOLATION: cycle 1: 16 blocking sync_dir call(s) on the ready path - ...
+inf-sim: VIOLATION: cycle 2: 20 blocking sync_dir call(s) ...
+inf-sim: VIOLATION: cycle 3: 16 blocking sync_dir call(s) ...
+inf-sim: VIOLATION: cycle 4: 20 blocking sync_dir call(s) ...
+inf-sim: VIOLATION: cycle 5: 16 blocking sync_dir call(s) ...
+exit=1
+
+== fix restored ==
+inf-sim: scenario boot-storm seed 0xb007: 6 boots, ready-steps max 6, hash 0xd6abfd736d55ed2c
+exit=0
+
+Per-boot counts: fresh boot = 4 cells x (4 create_cell_dirs sync_dirs + 1 create_prealloc
+sync_dir) = 20; reboot = 4 cells x 4 sync_dirs = 16 (segments already exist).
+CI pins the discriminator: bins/inf-sim/tests/bootstorm.rs::oracle_catches_the_synchronous_boot_path.

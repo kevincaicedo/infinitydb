@@ -1,0 +1,41 @@
+# Redis 8.0.5 -LOADING capture, 2026-07-03 03:19:19
+# populate=8000000, dir=/tmp/claude-1000/-home-kcaicedo-Documents-Projects-databases/1af1d704-4b83-485c-976c-2cc7a0ebaf04/scratchpad/redis-loading-capture
+# still-loading-after-sweep: True
+
+GET => b'-LOADING Redis is loading the dataset in memory\r\n'
+SET => b'-LOADING Redis is loading the dataset in memory\r\n'
+DEL => b'-LOADING Redis is loading the dataset in memory\r\n'
+MGET => b'-LOADING Redis is loading the dataset in memory\r\n'
+EXISTS => b'-LOADING Redis is loading the dataset in memory\r\n'
+TTL => b'-LOADING Redis is loading the dataset in memory\r\n'
+EXPIRE => b'-LOADING Redis is loading the dataset in memory\r\n'
+INCR => b'-LOADING Redis is loading the dataset in memory\r\n'
+SCAN => b'-LOADING Redis is loading the dataset in memory\r\n'
+DBSIZE => b'-LOADING Redis is loading the dataset in memory\r\n'
+KEYS => b'-LOADING Redis is loading the dataset in memory\r\n'
+FLUSHALL => b'-LOADING Redis is loading the dataset in memory\r\n'
+RANDOMKEY => b'-LOADING Redis is loading the dataset in memory\r\n'
+TYPE => b'-LOADING Redis is loading the dataset in memory\r\n'
+PING => b'-LOADING Redis is loading the dataset in memory\r\n'
+ECHO => b'$2\r\nhi\r\n'
+SELECT => b'+OK\r\n'
+HELLO => b'*14\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$5\r\n8.0.5\r\n$5\r\nproto\r\n:2\r\n$2\r\nid\r\n:22\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*1\r\n*8\r\n$4\r\nname\r\n$9\r\nvectorset\r\n$3\r\nver\r\n:1\r\n$4\r\npath\r\n$0\r\n\r\n$4\r\nargs\r\n*0\r\n'
+HELLO3 => b'%7\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$5\r\n8.0.5\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:23\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*1\r\n%4\r\n$4\r\nname\r\n$9\r\nvectorset\r\n$3\r\nver\r\n:1\r\n$4\r\npath\r\n$0\r\n\r\n$4\r\nargs\r\n*0\r\n'
+SUBSCRIBE => b'*3\r\n$9\r\nsubscribe\r\n$2\r\nch\r\n:1\r\n'
+UNSUBSCRIBE => b'*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n'
+PSUBSCRIBE => b'*3\r\n$10\r\npsubscribe\r\n$2\r\np*\r\n:1\r\n'
+PUBLISH => b':0\r\n'
+PUBSUB => b'*0\r\n'
+INFO-persistence => b'$954\r\n# Persistence\r\nloading:1\r\nasync_loading:0\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:0\r\nrdb_bgsave_in_progress:0\r\nrdb_last_save_time:1783063158\r\nrdb_last_bgsave_status:ok\r\nrdb_last_bgsave_time_sec:-1\r\nrdb_current_bgsave_time_sec:-1\r\nrdb_saves:0\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:0\r\nrdb_last_load_keys_loaded:510149\r\naof_enabled:0\r\naof_rewrite_in_progress:0\r\naof_rewrite_scheduled:0\r\naof_last_rewrite_time_sec:-1\r\naof_current_rewrite_time_sec:-1\r\naof_last_bgrewrite_status:ok\r\naof_rewrites:0\r\naof_rewrites_consecutive_failures:0\r\naof_last_write_status:ok\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\nloading_start_time:1783063158\r\nloading_total_bytes:213777877\r\nloading_rdb_used_mem:819845456\r\nloading_loaded_bytes:13631484\r\nloading_loaded_perc:6.38\r\nloading_eta_seconds:14\r\n\r\n'
+CONFIG-GET => b'*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n'
+CLIENT-GETNAME => b'$-1\r\n'
+CLIENT-ID => b':32\r\n'
+COMMAND-COUNT => b':265\r\n'
+DEBUG-JMAP => b'+OK\r\n'
+OBJECT => b'-LOADING Redis is loading the dataset in memory\r\n'
+LOLWUT => b'-LOADING Redis is loading the dataset in memory\r\n'
+UNKNOWNCMD => b"-ERR unknown command 'NOSUCHCMD', with args beginning with: 'x' \r\n"
+QUIT => b'+OK\r\n'
+
+INFO persistence during load:
+b'$950\r\n# Persistence\r\nloading:1\r\nasync_loading:0\r\ncurrent_cow_peak:0\r\ncurrent_cow_size:0\r\ncurrent_cow_size_age:0\r\ncurrent_fork_perc:0.00\r\ncurrent_save_keys_processed:0\r\ncurrent_save_keys_total:0\r\nrdb_changes_since_last_save:0\r\nrdb_bgsave_in_progress:0\r\nrdb_last_save_time:1783063158\r\nrdb_last_bgsave_status:ok\r\nrdb_last_bgsave_time_sec:-1\r\nrdb_current_bgsave_time_sec:-1\r\nrdb_saves:0\r\nrdb_last_cow_size:0\r\nrdb_last_load_keys_expired:0\r\nrdb_last_load_keys_loaded:19611\r\naof_enabled:0\r\naof_rewrite_in_progress:0\r\naof_rewrite_scheduled:0\r\naof_last_rewrite_time_sec:-1\r\naof_current_rewrite_time_sec:-1\r\naof_last_bgrewrite_status:ok\r\naof_rewrites:0\r\naof_rewrites_consecutive_failures:0\r\naof_last_write_status:ok\r\naof_last_cow_size:0\r\nmodule_fork_in_progress:0\r\nmodule_fork_last_cow_size:0\r\nloading_start_time:1783063158\r\nloading_total_bytes:213777877\r\nloading_rdb_used_mem:819845456\r\nloading_loaded_bytes:524275\r\nloading_loaded_perc:0.25\r\nloading_eta_seconds:1\r\n\r\n'

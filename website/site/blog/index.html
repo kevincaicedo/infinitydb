@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blog — InfinityDB</title>
+<meta name="description" content="Engineering notes from the InfinityDB build: architecture, evidence discipline, and milestone reports.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='20'%20fill='%23201826'/%3E%3Ctext%20x='50'%20y='71'%20font-size='62'%20text-anchor='middle'%20fill='%23cf7ff5'%20font-family='system-ui'%3E%E2%88%9E%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="../index.html" class="nav-brand">
+      <span class="mark">&infin; InfinityDB</span>
+      <span class="nav-badge">v0.2.0-alpha.1 &middot; IN DEV</span>
+    </a>
+    <span class="nav-spacer"></span>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="nav-links">
+      <a href="../index.html#spine">Architecture</a>
+      <a href="../index.html#workloads">Workloads</a>
+      <a href="../docs/roadmap.html">Roadmap</a>
+      <a href="../docs/index.html">Docs</a>
+      <a href="index.html" aria-current="page">Blog</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<main class="doc">
+  <p class="kicker">Blog</p>
+  <h1 class="page-title">Engineering notes</h1>
+  <p class="lede">Reports from the build: architecture decisions, milestone verdicts, and the occasional post-mortem. Written under the same rules as the rest of the site &mdash; no number ships without a validated artifact behind it.</p>
+
+  <article class="card" style="margin-top:44px">
+    <p class="mono-note" style="margin:0 0 10px">2026-07-07 &middot; DISCIPLINE</p>
+    <h3 style="margin:0 0 10px"><a href="the-log-is-the-database.html" style="color:inherit">The log is the database &mdash; how InfinityDB is being built</a></h3>
+    <p class="muted" style="font-size:15px;margin:0 0 14px">One primitive, eleven laws, hard STOP gates, deterministic simulation, and a claim ledger that treats marketing numbers as liabilities until proven. The inaugural post explains the discipline model behind the project &mdash; including why this site publishes no benchmark numbers yet.</p>
+    <a href="the-log-is-the-database.html">Read the post &rarr;</a>
+  </article>
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span class="mark">&infin; InfinityDB</span>
+    <span class="meta">APACHE 2.0 &middot; RUST &middot; BEST ON LINUX WITH io_uring</span>
+    <div class="footer-links">
+      <a href="../docs/index.html">Docs</a>
+      <a href="index.html">Blog</a>
+      <a href="../docs/roadmap.html">Roadmap</a>
+      <a href="https://github.com/">GitHub &#8599;</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var t = document.querySelector('.nav-toggle');
+  var l = document.querySelector('.nav-links');
+  if (t && l) t.addEventListener('click', function () {
+    var open = l.classList.toggle('open');
+    t.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+})();
+</script>
+</body>
+</html>

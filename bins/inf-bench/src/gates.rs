@@ -111,7 +111,11 @@ mod tests {
     fn parses_the_m2_gates_file() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/milestones/m2-gates.toml");
         let gates = load(path).expect("m2 gates file parses");
-        assert_eq!(gates.len(), 18, "S09 A/B + counter rows, §6 STOP gates, tripwires");
+        assert_eq!(
+            gates.len(),
+            19,
+            "S09 A/B + counter rows, §6 STOP gates, S12 ckpt-RSS row, tripwires"
+        );
         let zero = gates.iter().find(|g| g.id == "mem_only_log_records").expect("counter tripwire");
         assert!(zero.passes(0.0) && !zero.passes(1.0));
         assert_eq!(zero.tier, "any", "the counter tripwire binds on every box");

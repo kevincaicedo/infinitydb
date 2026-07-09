@@ -1,0 +1,47 @@
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 19.50s
+     Running benches/reader_seq.rs (target/release/deps/reader_seq-c41fc94eb907fee3)
+Benchmarking reader_seq/full_pass/262144
+Benchmarking reader_seq/full_pass/262144: Warming up for 3.0000 s
+Benchmarking reader_seq/full_pass/262144: Collecting 20 samples in estimated 7.1570 s (40 iterations)
+Benchmarking reader_seq/full_pass/262144: Analyzing
+reader_seq/full_pass/262144
+                        time:   [172.79 ms 173.43 ms 174.42 ms]
+                        thrpt:  [1.4278 GiB/s 1.4360 GiB/s 1.4413 GiB/s]
+                 change:
+                        time:   [+151.58% +152.60% +154.24%] (p = 0.00 < 0.05)
+                        thrpt:  [−60.667% −60.411% −60.251%]
+                        Performance has regressed.
+Found 4 outliers among 20 measurements (20.00%)
+  2 (10.00%) high mild
+  2 (10.00%) high severe
+Benchmarking reader_seq/full_pass/1048576
+Benchmarking reader_seq/full_pass/1048576: Warming up for 3.0000 s
+Benchmarking reader_seq/full_pass/1048576: Collecting 20 samples in estimated 6.9813 s (40 iterations)
+Benchmarking reader_seq/full_pass/1048576: Analyzing
+reader_seq/full_pass/1048576
+                        time:   [174.51 ms 174.62 ms 174.75 ms]
+                        thrpt:  [1.4251 GiB/s 1.4262 GiB/s 1.4271 GiB/s]
+                 change:
+                        time:   [+153.25% +153.50% +153.81%] (p = 0.00 < 0.05)
+                        thrpt:  [−60.600% −60.553% −60.513%]
+                        Performance has regressed.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+Benchmarking reader_seq/full_pass/4194304
+Benchmarking reader_seq/full_pass/4194304: Warming up for 3.0000 s
+Benchmarking reader_seq/full_pass/4194304: Collecting 20 samples in estimated 7.8634 s (40 iterations)
+Benchmarking reader_seq/full_pass/4194304: Analyzing
+reader_seq/full_pass/4194304
+                        time:   [196.75 ms 197.25 ms 198.04 ms]
+                        thrpt:  [1.2575 GiB/s 1.2625 GiB/s 1.2658 GiB/s]
+                 change:
+                        time:   [+175.98% +176.77% +177.89%] (p = 0.00 < 0.05)
+                        thrpt:  [−64.014% −63.868% −63.766%]
+                        Performance has regressed.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+

@@ -6,5 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# M2-S16 fault-point registry. OFF in every shipping build — test builds
+# get it through dev-dependency feature unification; `fault::fire` is a
+# constant `false` without it (zero cost, A/B-verified).
+fault-points = []
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "fault_fire"
+harness = false
+test = false

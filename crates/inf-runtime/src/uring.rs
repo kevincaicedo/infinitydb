@@ -33,8 +33,14 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 
 use inf_alloc::{BufferId, BufferPool, LeaseKind};
+use inf_foundation::BuildIntHasher;
 use io_uring::types::Fd;
 use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
+
+/// Driver-internal op tables key by kernel-issued fds and our own sequential
+/// tokens — trusted integers, hashed with one folded multiply (see
+/// `gate::GateMap`; the S21 Phase-H hashing lever).
+type DriverMap<K, V> = HashMap<K, V, BuildIntHasher>;
 
 use crate::driver::{
     BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
@@ -138,17 +144,17 @@ pub struct UringDriver {
     pending_ops: Vec<IoOp>,
     /// SQEs that did not fit the SQ; flushed first next submit.
     backlog: VecDeque<SqeChain>,
-    states: HashMap<u64, OpState>,
+    states: DriverMap<u64, OpState>,
     next_id: u64,
-    accepts: HashMap<RawFd, CompletionToken>,
-    recvs: HashMap<RawFd, RecvArm>,
+    accepts: DriverMap<RawFd, CompletionToken>,
+    recvs: DriverMap<RawFd, RecvArm>,
     /// Outstanding sends per fd — `Closed` is delivered only after they
     /// resolve (cancelled sends return their buffers first, per contract).
-    sends_inflight: HashMap<RawFd, u32>,
-    closing: HashMap<RawFd, CloseWait>,
+    sends_inflight: DriverMap<RawFd, u32>,
+    closing: DriverMap<RawFd, CloseWait>,
     /// Buffers currently owned by the kernel's provided group, by bid.
     /// CQE `buffer_select` ids resolve through this map — never minted.
-    provided: HashMap<u16, BufferId>,
+    provided: DriverMap<u16, BufferId>,
     /// Wake eventfd watched via `PollAdd` (see [`OpState::WakeWatch`]).
     wake_fd: Option<std::os::fd::OwnedFd>,
     stats: SubmitStats,
@@ -163,7 +169,11 @@ impl UringDriver {
     pub fn new(entries: u32) -> io::Result<UringDriver> {
         let force_degraded = std::env::var_os("INF_URING_FORCE_DEGRADED").is_some();
 
-        // Setup-flag fallback chain: the builder flags are 6.0/6.1 features.
+        // Setup-flag fallback chain: the builder flags are 6.0/6.1 features,
+        // and an old kernel rejects them with EINVAL. Only EINVAL retries
+        // with fewer flags — anything else (ENOMEM under dirty-page
+        // pressure was the M2.5-S01 mechanism-2 capture) must propagate
+        // untouched, never silently strip performance flags from one cell.
         let mut single_issuer = true;
         let mut defer_taskrun = true;
         let ring = loop {
@@ -176,8 +186,12 @@ impl UringDriver {
             }
             match builder.build(entries) {
                 Ok(ring) => break ring,
-                Err(_) if defer_taskrun => defer_taskrun = false,
-                Err(_) if single_issuer => single_issuer = false,
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) && defer_taskrun => {
+                    defer_taskrun = false;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) && single_issuer => {
+                    single_issuer = false;
+                }
                 Err(e) => return Err(e),
             }
         };
@@ -206,13 +220,13 @@ impl UringDriver {
             },
             pending_ops: Vec::with_capacity(64),
             backlog: VecDeque::new(),
-            states: HashMap::new(),
+            states: DriverMap::default(),
             next_id: 0,
-            accepts: HashMap::new(),
-            recvs: HashMap::new(),
-            sends_inflight: HashMap::new(),
-            closing: HashMap::new(),
-            provided: HashMap::new(),
+            accepts: DriverMap::default(),
+            recvs: DriverMap::default(),
+            sends_inflight: DriverMap::default(),
+            closing: DriverMap::default(),
+            provided: DriverMap::default(),
             wake_fd: None,
             stats: SubmitStats::default(),
         })

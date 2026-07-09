@@ -1,0 +1,4262 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 63K of event 'cpu_core/cycles/P'
+# Event count (approx.): 108226011849
+#
+# Overhead  Symbol                                                                                                                                                                     IPC   [IPC Coverage]
+# ........  .........................................................................................................................................................................  ....................
+#
+     5.63%  [.] __memmove_avx_unaligned_erms                                                                                                                                           -      -            
+            |          
+             --1.35%--__memmove_avx_unaligned_erms
+
+     5.16%  [.] inf_server::plane::dispatch_one::{{closure}}                                                                                                                           -      -            
+     4.76%  [.] inf_store::store::CellStore::resolve_hashed                                                                                                                            -      -            
+     2.71%  [.] inf_server::plane::send_apply::{{closure}}                                                                                                                             -      -            
+     2.43%  [.] inf_server::plane::pump::{{closure}}                                                                                                                                   -      -            
+     2.18%  [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration                                                                                                                     -      -            
+     2.17%  [.] inf_fabric::codec::decode_frame                                                                                                                                        -      -            
+     1.79%  [.] inf_wire::parser::FrameIter::next                                                                                                                                      -      -            
+     1.55%  [.] inf_wire::parser::parse_count_line                                                                                                                                     -      -            
+     1.44%  [.] <inf_runtime::gate::GateWait<K,V> as core::future::future::Future>::poll                                                                                               -      -            
+     1.40%  [.] inf_server::plane::OwnedCmd::from_argv_into                                                                                                                            -      -            
+     1.24%  [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap                                                                               -      -            
+     1.17%  [.] inf_server::plane::handle_fabric_op                                                                                                                                    -      -            
+     1.16%  [.] inf_server::plane::stage_or_handle                                                                                                                                     -      -            
+     0.98%  [.] inf_server::plane::flush_apply_stage                                                                                                                                   -      -            
+     0.84%  [.] inf_fabric::codec::encode                                                                                                                                              -      -            
+     0.76%  [k] 0xffffffffa74d5951                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7beba72
+               0xffffffffa7bebc7b
+               0xffffffffa7bebe53
+               0xffffffffa7d09c94
+               0xffffffffa7d0b101
+               0xffffffffa7d5af4f
+               0xffffffffa7bca596
+               0xffffffffa74a2137
+               0xffffffffa747ba91
+               0xffffffffa747fff1
+               0xffffffffa748b0db
+               0xffffffffa748b41b
+               0xffffffffa748c4a7
+               0xffffffffa748c7a7
+               |          
+               |--0.66%--0xffffffffa748cf98
+               |          0xffffffffa7481311
+               |          0xffffffffa74813a2
+               |          0xffffffffa6b47750
+               |          0xffffffffa7f12b65
+               |          0xffffffffa680012b
+               |          |          
+               |           --0.15%--syscall
+               |          
+                --0.10%--0xffffffffa748d002
+                          0xffffffffa748d516
+                          0xffffffffa7481231
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+
+     0.75%  [.] inf_wire::command::lookup                                                                                                                                              -      -            
+     0.68%  [.] _int_malloc                                                                                                                                                            -      -            
+            |          
+             --0.13%--_int_malloc
+                       |          
+                        --0.08%--_int_realloc
+                                  __libc_realloc (inlined)
+
+     0.63%  [k] 0xffffffffa7f2d857                                                                                                                                                     -      -            
+            |          
+            |--0.30%--0xffffffffa7d0b0e8
+            |          0xffffffffa7d5af4f
+            |          0xffffffffa7bca596
+            |          0xffffffffa74a2137
+            |          0xffffffffa747ba91
+            |          0xffffffffa747fff1
+            |          0xffffffffa748b0db
+            |          0xffffffffa748b41b
+            |          0xffffffffa748c4a7
+            |          0xffffffffa748c7a7
+            |          |          
+            |           --0.27%--0xffffffffa748cf98
+            |                     0xffffffffa7481311
+            |                     0xffffffffa74813a2
+            |                     0xffffffffa6b47750
+            |                     0xffffffffa7f12b65
+            |                     0xffffffffa680012b
+            |                     |          
+            |                      --0.07%--syscall
+            |          
+            |--0.13%--0xffffffffa7d084e1
+            |          0xffffffffa7d5aea6
+            |          0xffffffffa7bcb025
+            |          0xffffffffa74a13f9
+            |          0xffffffffa747ba91
+            |          0xffffffffa748035d
+            |          0xffffffffa74806bd
+            |          0xffffffffa7480d8e
+            |          0xffffffffa748114c
+            |          0xffffffffa74813a2
+            |          0xffffffffa6b47750
+            |          0xffffffffa7f12b65
+            |          0xffffffffa680012b
+            |          
+            |--0.08%--0xffffffffc299879f
+            |          0xffffffffc299c7e8
+            |          0xffffffffa7cdf308
+            |          0xffffffffa7cf50a9
+            |          0xffffffffa7cf513e
+            |          0xffffffffa7cf5328
+            |          0xffffffffa7cf5665
+            |          0xffffffffa7d24435
+            |          0xffffffffa7d2677d
+            |          0xffffffffa7d26dc9
+            |          0xffffffffa7d068dd
+            |          0xffffffffa7d07868
+            |          0xffffffffa7d084f0
+            |          0xffffffffa7d5aea6
+            |          0xffffffffa7bcb025
+            |          0xffffffffa74a13f9
+            |          0xffffffffa747ba91
+            |          0xffffffffa748035d
+            |          0xffffffffa74806bd
+            |          0xffffffffa7480d8e
+            |          0xffffffffa748114c
+            |          0xffffffffa74813a2
+            |          0xffffffffa6b47750
+            |          0xffffffffa7f12b65
+            |          0xffffffffa680012b
+            |          
+            |--0.07%--0xffffffffa7d0b10c
+            |          0xffffffffa7d5af4f
+            |          0xffffffffa7bca596
+            |          0xffffffffa74a2137
+            |          0xffffffffa747ba91
+            |          0xffffffffa747fff1
+            |          0xffffffffa748b0db
+            |          0xffffffffa748b41b
+            |          0xffffffffa748c4a7
+            |          0xffffffffa748c7a7
+            |          |          
+            |           --0.06%--0xffffffffa748cf98
+            |                     0xffffffffa7481311
+            |                     0xffffffffa74813a2
+            |                     0xffffffffa6b47750
+            |                     0xffffffffa7f12b65
+            |                     0xffffffffa680012b
+            |          
+             --0.06%--0xffffffffa7d084fb
+                       0xffffffffa7d5aea6
+                       0xffffffffa7bcb025
+                       0xffffffffa74a13f9
+                       0xffffffffa747ba91
+                       0xffffffffa748035d
+                       0xffffffffa74806bd
+                       0xffffffffa7480d8e
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+
+     0.63%  [k] 0xffffffffc2997d5c                                                                                                                                                     -      -            
+            |
+            ---0xffffffffc29982db
+               0xffffffffc299856d
+               0xffffffffc299c7e8
+               0xffffffffa7cdf308
+               0xffffffffa7cf50a9
+               0xffffffffa7cf513e
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.14%--syscall
+
+     0.62%  [.] inf_runtime::uring::UringDriver::alloc_id                                                                                                                              -      -            
+     0.58%  [.] inf_runtime::gate::KeyedGate<K,V>::waiter                                                                                                                              -      -            
+     0.56%  [k] 0xffffffffa6d006a7                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7f2d01e
+               |          
+               |--0.38%--0xffffffffa6ca7758
+               |          0xffffffffa6ca80fa
+               |          0xffffffffa6ceb607
+               |          0xffffffffa6ce8af1
+               |          0xffffffffa6cf1750
+               |          0xffffffffa7bd2226
+               |          0xffffffffa7d1b4c9
+               |          0xffffffffa7d1c8ff
+               |          0xffffffffa7d3193a
+               |          0xffffffffa7d33c9a
+               |          0xffffffffa7ceda26
+               |          0xffffffffa7cedc96
+               |          0xffffffffa7cedd95
+               |          0xffffffffa7cee43d
+               |          0xffffffffa7c0c4ad
+               |          0xffffffffa7c0c536
+               |          0xffffffffa7c0c7e0
+               |          0xffffffffa7c0cfa4
+               |          0xffffffffa7c0d377
+               |          0xffffffffa6c4cb71
+               |          0xffffffffa7f2ed90
+               |          0xffffffffa6c4c49f
+               |          0xffffffffa6c4cf9a
+               |          0xffffffffa7c0a1a1
+               |          0xffffffffa7cf178f
+               |          0xffffffffa7cf47d8
+               |          0xffffffffa7cf4b61
+               |          0xffffffffa7cf4ca6
+               |          0xffffffffa7cf4e41
+               |          0xffffffffa7cf5181
+               |          0xffffffffa7cf5328
+               |          0xffffffffa7cf5665
+               |          0xffffffffa7d24435
+               |          0xffffffffa7d2677d
+               |          0xffffffffa7d26dc9
+               |          0xffffffffa7d068dd
+               |          0xffffffffa7d07868
+               |          0xffffffffa7d084f0
+               |          0xffffffffa7d5aea6
+               |          0xffffffffa7bcb025
+               |          0xffffffffa74a13f9
+               |          0xffffffffa747ba91
+               |          0xffffffffa748035d
+               |          0xffffffffa74806bd
+               |          0xffffffffa7480d8e
+               |          0xffffffffa748114c
+               |          0xffffffffa74813a2
+               |          0xffffffffa6b47750
+               |          0xffffffffa7f12b65
+               |          0xffffffffa680012b
+               |          |          
+               |           --0.11%--syscall
+               |          
+               |--0.08%--0xffffffffa6ca9633
+               |          0xffffffffa6cab315
+               |          0xffffffffa6ca14f6
+               |          0xffffffffa6ca78c1
+               |          0xffffffffa6ca80fa
+               |          0xffffffffa6ceb607
+               |          0xffffffffa6ce8af1
+               |          0xffffffffa6cf1750
+               |          0xffffffffa7bd2226
+               |          0xffffffffa7d1b4c9
+               |          0xffffffffa7d1c8ff
+               |          0xffffffffa7d3193a
+               |          0xffffffffa7d33c9a
+               |          0xffffffffa7ceda26
+               |          0xffffffffa7cedc96
+               |          0xffffffffa7cedd95
+               |          0xffffffffa7cee43d
+               |          0xffffffffa7c0c4ad
+               |          0xffffffffa7c0c536
+               |          0xffffffffa7c0c7e0
+               |          0xffffffffa7c0cfa4
+               |          0xffffffffa7c0d377
+               |          0xffffffffa6c4cb71
+               |          0xffffffffa7f2ed90
+               |          0xffffffffa6c4c49f
+               |          0xffffffffa6c4cf9a
+               |          0xffffffffa7c0a1a1
+               |          0xffffffffa7cf178f
+               |          0xffffffffa7cf47d8
+               |          0xffffffffa7cf4b61
+               |          0xffffffffa7cf4ca6
+               |          0xffffffffa7cf4e41
+               |          0xffffffffa7cf5181
+               |          0xffffffffa7cf5328
+               |          0xffffffffa7cf5665
+               |          0xffffffffa7d24435
+               |          0xffffffffa7d2677d
+               |          0xffffffffa7d26dc9
+               |          0xffffffffa7d068dd
+               |          0xffffffffa7d07868
+               |          0xffffffffa7d084f0
+               |          0xffffffffa7d5aea6
+               |          0xffffffffa7bcb025
+               |          0xffffffffa74a13f9
+               |          0xffffffffa747ba91
+               |          0xffffffffa748035d
+               |          0xffffffffa74806bd
+               |          0xffffffffa7480d8e
+               |          0xffffffffa748114c
+               |          0xffffffffa74813a2
+               |          0xffffffffa6b47750
+               |          0xffffffffa7f12b65
+               |          0xffffffffa680012b
+               |          
+                --0.06%--0xffffffffa6cf1734
+                          0xffffffffa7bd2226
+                          0xffffffffa7d1b4c9
+                          0xffffffffa7d1c8ff
+                          0xffffffffa7d3193a
+                          0xffffffffa7d33c9a
+                          0xffffffffa7ceda26
+                          0xffffffffa7cedc96
+                          0xffffffffa7cedd95
+                          0xffffffffa7cee43d
+                          0xffffffffa7c0c4ad
+                          0xffffffffa7c0c536
+                          0xffffffffa7c0c7e0
+                          0xffffffffa7c0cfa4
+                          0xffffffffa7c0d377
+                          0xffffffffa6c4cb71
+                          0xffffffffa7f2ed90
+                          0xffffffffa6c4c49f
+                          0xffffffffa6c4cf9a
+                          0xffffffffa7c0a1a1
+                          0xffffffffa7cf178f
+                          0xffffffffa7cf47d8
+                          0xffffffffa7cf4b61
+                          0xffffffffa7cf4ca6
+                          0xffffffffa7cf4e41
+                          0xffffffffa7cf5181
+                          0xffffffffa7cf5328
+                          0xffffffffa7cf5665
+                          0xffffffffa7d24435
+                          0xffffffffa7d2677d
+                          0xffffffffa7d26dc9
+                          0xffffffffa7d068dd
+                          0xffffffffa7d07868
+                          0xffffffffa7d084f0
+                          0xffffffffa7d5aea6
+                          0xffffffffa7bcb025
+                          0xffffffffa74a13f9
+                          0xffffffffa747ba91
+                          0xffffffffa748035d
+                          0xffffffffa74806bd
+                          0xffffffffa7480d8e
+                          0xffffffffa748114c
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+
+     0.55%  [.] inf_fabric::mesh::CellFabric::flush                                                                                                                                    -      -            
+     0.55%  [k] 0xffffffffa7d13085                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d19a27
+               0xffffffffa7d1c86b
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.15%--syscall
+
+     0.53%  [.] inf_server::exec::execute_slices                                                                                                                                       -      -            
+     0.53%  [k] 0xffffffffa7bebb97                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7bebe53
+               0xffffffffa7d09c94
+               0xffffffffa7d0b101
+               0xffffffffa7d5af4f
+               0xffffffffa7bca596
+               0xffffffffa74a2137
+               0xffffffffa747ba91
+               0xffffffffa747fff1
+               0xffffffffa748b0db
+               0xffffffffa748b41b
+               0xffffffffa748c4a7
+               0xffffffffa748c7a7
+               |          
+               |--0.42%--0xffffffffa748cf98
+               |          0xffffffffa7481311
+               |          0xffffffffa74813a2
+               |          0xffffffffa6b47750
+               |          0xffffffffa7f12b65
+               |          0xffffffffa680012b
+               |          |          
+               |           --0.09%--syscall
+               |          
+                --0.11%--0xffffffffa748d002
+                          0xffffffffa748d516
+                          0xffffffffa7481231
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+
+     0.53%  [.] realloc                                                                                                                                                                -      -            
+            |          
+             --0.12%--__libc_realloc (inlined)
+
+     0.53%  [k] 0xffffffffa7bfbd10                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7c0d2e1
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.12%--syscall
+
+     0.49%  [k] 0xffffffffa6ce8aa9                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               |          
+                --0.49%--0xffffffffa7d33c9a
+                          0xffffffffa7ceda26
+                          0xffffffffa7cedc96
+                          0xffffffffa7cedd95
+                          0xffffffffa7cee43d
+                          0xffffffffa7c0c4ad
+                          0xffffffffa7c0c536
+                          0xffffffffa7c0c7e0
+                          0xffffffffa7c0cfa4
+                          0xffffffffa7c0d377
+                          0xffffffffa6c4cb71
+                          0xffffffffa7f2ed90
+                          0xffffffffa6c4c49f
+                          0xffffffffa6c4cf9a
+                          0xffffffffa7c0a1a1
+                          0xffffffffa7cf178f
+                          0xffffffffa7cf47d8
+                          0xffffffffa7cf4b61
+                          0xffffffffa7cf4ca6
+                          0xffffffffa7cf4e41
+                          0xffffffffa7cf5181
+                          0xffffffffa7cf5328
+                          0xffffffffa7cf5665
+                          0xffffffffa7d24435
+                          0xffffffffa7d2677d
+                          0xffffffffa7d26dc9
+                          0xffffffffa7d068dd
+                          0xffffffffa7d07868
+                          0xffffffffa7d084f0
+                          0xffffffffa7d5aea6
+                          0xffffffffa7bcb025
+                          0xffffffffa74a13f9
+                          0xffffffffa747ba91
+                          0xffffffffa748035d
+                          0xffffffffa74806bd
+                          0xffffffffa7480d8e
+                          0xffffffffa748114c
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+                          |          
+                           --0.13%--syscall
+
+     0.49%  [k] 0xffffffffa74dc8c3                                                                                                                                                     -      -            
+            |          
+            |--0.41%--0xffffffffa748cf98
+            |          0xffffffffa7481311
+            |          0xffffffffa74813a2
+            |          0xffffffffa6b47750
+            |          0xffffffffa7f12b65
+            |          0xffffffffa680012b
+            |          |          
+            |           --0.11%--syscall
+            |          
+             --0.08%--0xffffffffa748d002
+                       0xffffffffa748d516
+                       0xffffffffa7481231
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+
+     0.48%  [.] _int_free_merge_chunk                                                                                                                                                  -      -            
+            |          
+             --0.07%--_int_free_create_chunk (inlined)
+                       _int_free_merge_chunk
+                       _int_free_chunk
+
+     0.47%  [k] 0xffffffffa7f2db28                                                                                                                                                     -      -            
+            |          
+             --0.43%--0xffffffffa6c9be21
+                       |          
+                        --0.42%--0xffffffffa6ca7c24
+                                  0xffffffffa6ca80fa
+                                  0xffffffffa6ceb607
+                                  0xffffffffa6ce8af1
+                                  0xffffffffa6cf1750
+                                  0xffffffffa7bd2226
+                                  0xffffffffa7d1b4c9
+                                  0xffffffffa7d1c8ff
+                                  0xffffffffa7d3193a
+                                  0xffffffffa7d33c9a
+                                  0xffffffffa7ceda26
+                                  0xffffffffa7cedc96
+                                  0xffffffffa7cedd95
+                                  0xffffffffa7cee43d
+                                  0xffffffffa7c0c4ad
+                                  0xffffffffa7c0c536
+                                  0xffffffffa7c0c7e0
+                                  0xffffffffa7c0cfa4
+                                  0xffffffffa7c0d377
+                                  0xffffffffa6c4cb71
+                                  0xffffffffa7f2ed90
+                                  0xffffffffa6c4c49f
+                                  0xffffffffa6c4cf9a
+                                  0xffffffffa7c0a1a1
+                                  0xffffffffa7cf178f
+                                  0xffffffffa7cf47d8
+                                  0xffffffffa7cf4b61
+                                  0xffffffffa7cf4ca6
+                                  0xffffffffa7cf4e41
+                                  0xffffffffa7cf5181
+                                  0xffffffffa7cf5328
+                                  0xffffffffa7cf5665
+                                  0xffffffffa7d24435
+                                  0xffffffffa7d2677d
+                                  0xffffffffa7d26dc9
+                                  0xffffffffa7d068dd
+                                  0xffffffffa7d07868
+                                  0xffffffffa7d084f0
+                                  0xffffffffa7d5aea6
+                                  0xffffffffa7bcb025
+                                  0xffffffffa74a13f9
+                                  0xffffffffa747ba91
+                                  0xffffffffa748035d
+                                  0xffffffffa74806bd
+                                  0xffffffffa7480d8e
+                                  0xffffffffa748114c
+                                  0xffffffffa74813a2
+                                  0xffffffffa6b47750
+                                  0xffffffffa7f12b65
+                                  0xffffffffa680012b
+                                  |          
+                                   --0.10%--syscall
+
+     0.45%  [k] 0xffffffffa7bdd063                                                                                                                                                     -      -            
+            |          
+             --0.44%--0xffffffffa7beb83b
+                       0xffffffffa7bfbd20
+                       0xffffffffa7c0d2e1
+                       0xffffffffa6c4cb71
+                       0xffffffffa7f2ed90
+                       0xffffffffa6c4c49f
+                       0xffffffffa6c4cf9a
+                       0xffffffffa7c0a1a1
+                       0xffffffffa7cf178f
+                       0xffffffffa7cf47d8
+                       0xffffffffa7cf4b61
+                       0xffffffffa7cf4ca6
+                       0xffffffffa7cf4e41
+                       0xffffffffa7cf5181
+                       0xffffffffa7cf5328
+                       0xffffffffa7cf5665
+                       0xffffffffa7d24435
+                       0xffffffffa7d2677d
+                       0xffffffffa7d26dc9
+                       0xffffffffa7d068dd
+                       0xffffffffa7d07868
+                       0xffffffffa7d084f0
+                       0xffffffffa7d5aea6
+                       0xffffffffa7bcb025
+                       0xffffffffa74a13f9
+                       0xffffffffa747ba91
+                       0xffffffffa748035d
+                       0xffffffffa74806bd
+                       0xffffffffa7480d8e
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+                       |          
+                        --0.09%--syscall
+
+     0.45%  [.] inf_server::plane::stage_argv_block                                                                                                                                    -      -            
+     0.45%  [k] 0xffffffffa70d3df9                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa70d3fd6
+               |          
+                --0.44%--0xffffffffa7beba5e
+                          0xffffffffa7bebc7b
+                          0xffffffffa7bebe53
+                          0xffffffffa7d09c94
+                          0xffffffffa7d0b101
+                          0xffffffffa7d5af4f
+                          0xffffffffa7bca596
+                          0xffffffffa74a2137
+                          0xffffffffa747ba91
+                          0xffffffffa747fff1
+                          0xffffffffa748b0db
+                          0xffffffffa748b41b
+                          0xffffffffa748c4a7
+                          0xffffffffa748c7a7
+                          |          
+                          |--0.37%--0xffffffffa748cf98
+                          |          0xffffffffa7481311
+                          |          0xffffffffa74813a2
+                          |          0xffffffffa6b47750
+                          |          0xffffffffa7f12b65
+                          |          0xffffffffa680012b
+                          |          |          
+                          |           --0.08%--syscall
+                          |          
+                           --0.07%--0xffffffffa748d002
+                                     0xffffffffa748d516
+                                     0xffffffffa7481231
+                                     0xffffffffa74813a2
+                                     0xffffffffa6b47750
+                                     0xffffffffa7f12b65
+                                     0xffffffffa680012b
+
+     0.43%  [.] inf_fabric::codec::Reader::bytes                                                                                                                                       -      -            
+     0.42%  [k] 0xffffffffa7cfb8ae                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d33728
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.12%--syscall
+
+     0.42%  [.] inf_fabric::codec::encode_bytes                                                                                                                                        -      -            
+     0.42%  [k] 0xffffffffa7d16912                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d09876
+               0xffffffffa7d0b101
+               0xffffffffa7d5af4f
+               0xffffffffa7bca596
+               0xffffffffa74a2137
+               0xffffffffa747ba91
+               0xffffffffa747fff1
+               0xffffffffa748b0db
+               0xffffffffa748b41b
+               0xffffffffa748c4a7
+               0xffffffffa748c7a7
+               |          
+               |--0.36%--0xffffffffa748cf98
+               |          0xffffffffa7481311
+               |          0xffffffffa74813a2
+               |          0xffffffffa6b47750
+               |          0xffffffffa7f12b65
+               |          0xffffffffa680012b
+               |          |          
+               |           --0.09%--syscall
+               |          
+                --0.06%--0xffffffffa748d002
+                          0xffffffffa748d516
+                          0xffffffffa7481231
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+
+     0.41%  [k] 0xffffffffa7d0812b                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.11%--syscall
+
+     0.40%  [.] inf_server::plane::is_conn_state                                                                                                                                       -      -            
+     0.39%  [.] _int_free_chunk                                                                                                                                                        -      -            
+            |          
+             --0.11%--_int_free_chunk
+
+     0.38%  [.] alloc::collections::vec_deque::VecDeque<T,A>::push_back                                                                                                                -      -            
+     0.37%  [k] 0xffffffffa7be1615                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7beb833
+               0xffffffffa7bfbd20
+               0xffffffffa7c0d2e1
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.09%--syscall
+
+     0.37%  [k] 0xffffffffa7bdfccf                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d06a7a
+               0xffffffffa7d07661
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.10%--syscall
+
+     0.36%  [k] 0xffffffffa6cacd4f                                                                                                                                                     -      -            
+            |          
+            |--0.25%--0xffffffffa6cb1623
+            |          0xffffffffa6cb45d7
+            |          0xffffffffa6cbf340
+            |          0xffffffffa6ca7686
+            |          0xffffffffa6ca787a
+            |          0xffffffffa6ca80fa
+            |          0xffffffffa6ceb607
+            |          0xffffffffa6ce8af1
+            |          0xffffffffa6cf1750
+            |          0xffffffffa7bd2226
+            |          0xffffffffa7d1b4c9
+            |          |          
+            |           --0.24%--0xffffffffa7d1c8ff
+            |                     0xffffffffa7d3193a
+            |                     0xffffffffa7d33c9a
+            |                     0xffffffffa7ceda26
+            |                     0xffffffffa7cedc96
+            |                     0xffffffffa7cedd95
+            |                     0xffffffffa7cee43d
+            |                     0xffffffffa7c0c4ad
+            |                     0xffffffffa7c0c536
+            |                     0xffffffffa7c0c7e0
+            |                     0xffffffffa7c0cfa4
+            |                     0xffffffffa7c0d377
+            |                     0xffffffffa6c4cb71
+            |                     0xffffffffa7f2ed90
+            |                     0xffffffffa6c4c49f
+            |                     0xffffffffa6c4cf9a
+            |                     0xffffffffa7c0a1a1
+            |                     0xffffffffa7cf178f
+            |                     0xffffffffa7cf47d8
+            |                     0xffffffffa7cf4b61
+            |                     0xffffffffa7cf4ca6
+            |                     0xffffffffa7cf4e41
+            |                     0xffffffffa7cf5181
+            |                     0xffffffffa7cf5328
+            |                     0xffffffffa7cf5665
+            |                     0xffffffffa7d24435
+            |                     0xffffffffa7d2677d
+            |                     0xffffffffa7d26dc9
+            |                     0xffffffffa7d068dd
+            |                     0xffffffffa7d07868
+            |                     0xffffffffa7d084f0
+            |                     0xffffffffa7d5aea6
+            |                     0xffffffffa7bcb025
+            |                     0xffffffffa74a13f9
+            |                     0xffffffffa747ba91
+            |                     0xffffffffa748035d
+            |                     0xffffffffa74806bd
+            |                     0xffffffffa7480d8e
+            |                     0xffffffffa748114c
+            |                     0xffffffffa74813a2
+            |                     0xffffffffa6b47750
+            |                     0xffffffffa7f12b65
+            |                     0xffffffffa680012b
+            |                     |          
+            |                      --0.07%--syscall
+            |          
+             --0.12%--0xffffffffa6cb18b6
+                       0xffffffffa6cb45d7
+                       0xffffffffa6cbf340
+                       0xffffffffa6ca7686
+                       0xffffffffa6ca787a
+                       0xffffffffa6ca80fa
+                       0xffffffffa6ceb607
+                       0xffffffffa6ce8af1
+                       0xffffffffa6cf1750
+                       0xffffffffa7bd2226
+                       0xffffffffa7d1b4c9
+                       0xffffffffa7d1c8ff
+                       0xffffffffa7d3193a
+                       0xffffffffa7d33c9a
+                       0xffffffffa7ceda26
+                       0xffffffffa7cedc96
+                       0xffffffffa7cedd95
+                       0xffffffffa7cee43d
+                       0xffffffffa7c0c4ad
+                       0xffffffffa7c0c536
+                       0xffffffffa7c0c7e0
+                       0xffffffffa7c0cfa4
+                       0xffffffffa7c0d377
+                       0xffffffffa6c4cb71
+                       0xffffffffa7f2ed90
+                       0xffffffffa6c4c49f
+                       0xffffffffa6c4cf9a
+                       0xffffffffa7c0a1a1
+                       0xffffffffa7cf178f
+                       0xffffffffa7cf47d8
+                       0xffffffffa7cf4b61
+                       0xffffffffa7cf4ca6
+                       0xffffffffa7cf4e41
+                       0xffffffffa7cf5181
+                       0xffffffffa7cf5328
+                       0xffffffffa7cf5665
+                       0xffffffffa7d24435
+                       0xffffffffa7d2677d
+                       0xffffffffa7d26dc9
+                       0xffffffffa7d068dd
+                       0xffffffffa7d07868
+                       0xffffffffa7d084f0
+                       0xffffffffa7d5aea6
+                       0xffffffffa7bcb025
+                       0xffffffffa74a13f9
+                       0xffffffffa747ba91
+                       0xffffffffa748035d
+                       0xffffffffa74806bd
+                       0xffffffffa7480d8e
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+
+     0.36%  [.] inf_fabric::mesh::CellFabric::send                                                                                                                                     -      -            
+     0.36%  [.] inf_fabric::mesh::CellFabric::reply                                                                                                                                    -      -            
+     0.35%  [k] 0xffffffffa6ca7765                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.08%--syscall
+
+     0.34%  [k] 0xffffffffa7d095b5                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d0b101
+               0xffffffffa7d5af4f
+               0xffffffffa7bca596
+               0xffffffffa74a2137
+               0xffffffffa747ba91
+               0xffffffffa747fff1
+               0xffffffffa748b0db
+               0xffffffffa748b41b
+               0xffffffffa748c4a7
+               0xffffffffa748c7a7
+               |          
+               |--0.27%--0xffffffffa748cf98
+               |          0xffffffffa7481311
+               |          0xffffffffa74813a2
+               |          0xffffffffa6b47750
+               |          0xffffffffa7f12b65
+               |          0xffffffffa680012b
+               |          |          
+               |           --0.07%--syscall
+               |          
+                --0.07%--0xffffffffa748d002
+                          0xffffffffa748d516
+                          0xffffffffa7481231
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+
+     0.33%  [k] 0xffffffffa6bae860                                                                                                                                                     -      -            
+            |          
+            |--0.14%--0xffffffffa7d26231
+            |          0xffffffffa7d26dc9
+            |          0xffffffffa7d068dd
+            |          0xffffffffa7d07868
+            |          0xffffffffa7d084f0
+            |          0xffffffffa7d5aea6
+            |          0xffffffffa7bcb025
+            |          0xffffffffa74a13f9
+            |          0xffffffffa747ba91
+            |          0xffffffffa748035d
+            |          0xffffffffa74806bd
+            |          0xffffffffa7480d8e
+            |          0xffffffffa748114c
+            |          0xffffffffa74813a2
+            |          0xffffffffa6b47750
+            |          0xffffffffa7f12b65
+            |          0xffffffffa680012b
+            |          
+            |--0.10%--0xffffffffa7cedcc8
+            |          0xffffffffa7cedd95
+            |          0xffffffffa7cee43d
+            |          0xffffffffa7c0c4ad
+            |          0xffffffffa7c0c536
+            |          0xffffffffa7c0c7e0
+            |          0xffffffffa7c0cfa4
+            |          0xffffffffa7c0d377
+            |          0xffffffffa6c4cb71
+            |          0xffffffffa7f2ed90
+            |          0xffffffffa6c4c49f
+            |          0xffffffffa6c4cf9a
+            |          0xffffffffa7c0a1a1
+            |          0xffffffffa7cf178f
+            |          0xffffffffa7cf47d8
+            |          0xffffffffa7cf4b61
+            |          0xffffffffa7cf4ca6
+            |          0xffffffffa7cf4e41
+            |          0xffffffffa7cf5181
+            |          0xffffffffa7cf5328
+            |          0xffffffffa7cf5665
+            |          0xffffffffa7d24435
+            |          0xffffffffa7d2677d
+            |          0xffffffffa7d26dc9
+            |          0xffffffffa7d068dd
+            |          0xffffffffa7d07868
+            |          0xffffffffa7d084f0
+            |          0xffffffffa7d5aea6
+            |          0xffffffffa7bcb025
+            |          0xffffffffa74a13f9
+            |          0xffffffffa747ba91
+            |          0xffffffffa748035d
+            |          0xffffffffa74806bd
+            |          0xffffffffa7480d8e
+            |          0xffffffffa748114c
+            |          0xffffffffa74813a2
+            |          0xffffffffa6b47750
+            |          0xffffffffa7f12b65
+            |          0xffffffffa680012b
+            |          
+             --0.08%--0xffffffffa7d21b32
+                       0xffffffffa7d1be40
+                       0xffffffffa7d3193a
+                       0xffffffffa7d33c9a
+                       0xffffffffa7ceda26
+                       0xffffffffa7cedc96
+                       0xffffffffa7cedd95
+                       0xffffffffa7cee43d
+                       0xffffffffa7c0c4ad
+                       0xffffffffa7c0c536
+                       0xffffffffa7c0c7e0
+                       0xffffffffa7c0cfa4
+                       0xffffffffa7c0d377
+                       0xffffffffa6c4cb71
+                       0xffffffffa7f2ed90
+                       0xffffffffa6c4c49f
+                       0xffffffffa6c4cf9a
+                       0xffffffffa7c0a1a1
+                       0xffffffffa7cf178f
+                       0xffffffffa7cf47d8
+                       0xffffffffa7cf4b61
+                       0xffffffffa7cf4ca6
+                       0xffffffffa7cf4e41
+                       0xffffffffa7cf5181
+                       0xffffffffa7cf5328
+                       0xffffffffa7cf5665
+                       0xffffffffa7d24435
+                       0xffffffffa7d2677d
+                       0xffffffffa7d26dc9
+                       0xffffffffa7d068dd
+                       0xffffffffa7d07868
+                       0xffffffffa7d084f0
+                       0xffffffffa7d5aea6
+                       0xffffffffa7bcb025
+                       0xffffffffa74a13f9
+                       0xffffffffa747ba91
+                       0xffffffffa748035d
+                       0xffffffffa74806bd
+                       0xffffffffa7480d8e
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+
+     0.32%  [.] inf_server::plane::render_outcome                                                                                                                                      -      -            
+     0.31%  [.] inf_foundation::hash::hash64                                                                                                                                           -      -            
+     0.31%  [.] inf_server::plane::Shared<O,F>::execute_owned_into                                                                                                                     -      -            
+     0.30%  [k] 0xffffffffa6d9f7cc                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6c9b6bb
+               0xffffffffa6ca7919
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.08%--syscall
+
+     0.30%  [k] 0xffffffffa7d1c8a4                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.09%--syscall
+
+     0.29%  [.] __memcmp_avx2_movbe                                                                                                                                                    -      -            
+            |          
+             --0.09%--__memcmp_avx2_movbe
+
+     0.29%  [k] 0xffffffffa6cb94ac                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6ca0429
+               0xffffffffa6ca0c65
+               0xffffffffa6ca7c78
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.07%--syscall
+
+     0.28%  [.] inf_wire::writer::RespWriter::raw_int                                                                                                                                  -      -            
+     0.28%  [k] 0xffffffffa6cb4211                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6cbf340
+               0xffffffffa6ca7686
+               0xffffffffa6ca787a
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.08%--syscall
+
+     0.28%  [.] inf_server::plane::read_argv_block                                                                                                                                     -      -            
+     0.27%  [k] 0xffffffffa7d1be77                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.06%--syscall
+
+     0.27%  [.] <inf_server::plane::ServerPlane<O,F> as inf_runtime::reactor::CellPlane>::maintain                                                                                     -      -            
+     0.27%  [k] 0xffffffffa7bfbcf3                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7c0d2e1
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.08%--syscall
+
+     0.27%  [.] inf_server::plane::OwnedCmd::arg                                                                                                                                       -      -            
+     0.27%  [k] 0xffffffffa74d825c                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d03c1f
+               0xffffffffa7d079fa
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.26%  [.] inf_server::plane::handle_apply                                                                                                                                        -      -            
+     0.26%  [.] inf_server::plane::Shared<O,F>::recycle_reply_buf                                                                                                                      -      -            
+     0.26%  [.] inf_wire::writer::RespWriter::bulk                                                                                                                                     -      -            
+     0.26%  [.] inf_server::exec::execute_db                                                                                                                                           -      -            
+     0.25%  [.] malloc                                                                                                                                                                 -      -            
+     0.25%  [k] 0xffffffffa7be1631                                                                                                                                                     -      -            
+            |          
+             --0.23%--0xffffffffa7beb833
+                       0xffffffffa7bfbd20
+                       0xffffffffa7c0d2e1
+                       0xffffffffa6c4cb71
+                       0xffffffffa7f2ed90
+                       0xffffffffa6c4c49f
+                       0xffffffffa6c4cf9a
+                       0xffffffffa7c0a1a1
+                       0xffffffffa7cf178f
+                       0xffffffffa7cf47d8
+                       0xffffffffa7cf4b61
+                       0xffffffffa7cf4ca6
+                       0xffffffffa7cf4e41
+                       0xffffffffa7cf5181
+                       0xffffffffa7cf5328
+                       0xffffffffa7cf5665
+                       0xffffffffa7d24435
+                       0xffffffffa7d2677d
+                       0xffffffffa7d26dc9
+                       0xffffffffa7d068dd
+                       0xffffffffa7d07868
+                       0xffffffffa7d084f0
+                       0xffffffffa7d5aea6
+                       0xffffffffa7bcb025
+                       0xffffffffa74a13f9
+                       0xffffffffa747ba91
+                       0xffffffffa748035d
+                       0xffffffffa74806bd
+                       0xffffffffa7480d8e
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+                       |          
+                        --0.06%--syscall
+
+     0.25%  [k] 0xffffffffa7cfb85d                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d33728
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.06%--syscall
+
+     0.25%  [.] inf_foundation::hash::hash64                                                                                                                                           -      -            
+     0.25%  [k] 0xffffffffa7c0a0fe                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.05%--syscall
+
+     0.25%  [.] __libc_malloc2                                                                                                                                                         -      -            
+            |          
+             --0.06%--__libc_malloc2
+
+     0.25%  [k] 0xffffffffa7f2d7e3                                                                                                                                                     -      -            
+            |          
+            |--0.09%--0xffffffffa7c0597f
+            |          0xffffffffa7c05e29
+            |          0xffffffffa7c05faa
+            |          0xffffffffa79d403b
+            |          0xffffffffa7bff207
+            |          0xffffffffa7c09bd7
+            |          0xffffffffa7c0a4bf
+            |          0xffffffffa7cf178f
+            |          0xffffffffa7cf47d8
+            |          0xffffffffa7cf4b61
+            |          0xffffffffa7cf4ca6
+            |          0xffffffffa7cf4e41
+            |          0xffffffffa7cf5181
+            |          0xffffffffa7cf5328
+            |          0xffffffffa7cf5665
+            |          0xffffffffa7d24435
+            |          0xffffffffa7d2677d
+            |          0xffffffffa7d26dc9
+            |          0xffffffffa7d068dd
+            |          0xffffffffa7d07868
+            |          0xffffffffa7d084f0
+            |          0xffffffffa7d5aea6
+            |          0xffffffffa7bcb025
+            |          0xffffffffa74a13f9
+            |          0xffffffffa747ba91
+            |          0xffffffffa748035d
+            |          0xffffffffa74806bd
+            |          0xffffffffa7480d8e
+            |          0xffffffffa748114c
+            |          0xffffffffa74813a2
+            |          0xffffffffa6b47750
+            |          0xffffffffa7f12b65
+            |          0xffffffffa680012b
+            |          
+             --0.09%--0xffffffffa6ca7c24
+                       0xffffffffa6ca80fa
+                       0xffffffffa6ceb607
+                       0xffffffffa6ce8af1
+                       0xffffffffa6cf1750
+                       0xffffffffa7bd2226
+                       0xffffffffa7d1b4c9
+                       0xffffffffa7d1c8ff
+                       0xffffffffa7d3193a
+                       0xffffffffa7d33c9a
+                       0xffffffffa7ceda26
+                       0xffffffffa7cedc96
+                       0xffffffffa7cedd95
+                       0xffffffffa7cee43d
+                       0xffffffffa7c0c4ad
+                       0xffffffffa7c0c536
+                       0xffffffffa7c0c7e0
+                       0xffffffffa7c0cfa4
+                       0xffffffffa7c0d377
+                       0xffffffffa6c4cb71
+                       0xffffffffa7f2ed90
+                       0xffffffffa6c4c49f
+                       0xffffffffa6c4cf9a
+                       0xffffffffa7c0a1a1
+                       0xffffffffa7cf178f
+                       0xffffffffa7cf47d8
+                       0xffffffffa7cf4b61
+                       0xffffffffa7cf4ca6
+                       0xffffffffa7cf4e41
+                       0xffffffffa7cf5181
+                       0xffffffffa7cf5328
+                       0xffffffffa7cf5665
+                       0xffffffffa7d24435
+                       0xffffffffa7d2677d
+                       0xffffffffa7d26dc9
+                       0xffffffffa7d068dd
+                       0xffffffffa7d07868
+                       0xffffffffa7d084f0
+                       0xffffffffa7d5aea6
+                       0xffffffffa7bcb025
+                       0xffffffffa74a13f9
+                       0xffffffffa747ba91
+                       0xffffffffa748035d
+                       0xffffffffa74806bd
+                       0xffffffffa7480d8e
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+
+     0.24%  [.] inf_fabric::codec::Reader::outcome                                                                                                                                     -      -            
+     0.23%  [k] 0xffffffffa711573e                                                                                                                                                     -      -            
+            |          
+             --0.22%--0xffffffffa748022c
+                       0xffffffffa74804a5
+                       0xffffffffa74806bd
+                       0xffffffffa7480d8e
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+                       |          
+                        --0.06%--syscall
+
+     0.23%  [k] 0xffffffffa6cb94c8                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6ca0429
+               0xffffffffa6ca0c65
+               0xffffffffa6ca7c78
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.05%--syscall
+
+     0.23%  [.] inf_store::store::CellStore::get_with_hash                                                                                                                             -      -            
+     0.22%  [k] 0xffffffffa6cab369                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6ca14f6
+               0xffffffffa6ca78c1
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.07%--syscall
+
+     0.22%  [.] inf_runtime::uring::UringDriver::handle_recv_payload                                                                                                                   -      -            
+     0.22%  [k] 0xffffffffa702aaca                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7030d35
+               0xffffffffa70365f9
+               0xffffffffa7037a17
+               0xffffffffa70794b8
+               0xffffffffa70798b9
+               0xffffffffa7bd00d2
+               0xffffffffa7bd0f01
+               0xffffffffa7d07926
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.05%--syscall
+
+     0.21%  [k] 0xffffffffa7f1d24b                                                                                                                                                     -      -            
+            |          
+            |--0.10%--0xffffffffa7bdb853
+            |          0xffffffffa7bdfc35
+            |          0xffffffffa7d06a7a
+            |          0xffffffffa7d07661
+            |          0xffffffffa7d084f0
+            |          0xffffffffa7d5aea6
+            |          0xffffffffa7bcb025
+            |          0xffffffffa74a13f9
+            |          0xffffffffa747ba91
+            |          0xffffffffa748035d
+            |          0xffffffffa74806bd
+            |          0xffffffffa7480d8e
+            |          0xffffffffa748114c
+            |          0xffffffffa74813a2
+            |          0xffffffffa6b47750
+            |          0xffffffffa7f12b65
+            |          0xffffffffa680012b
+            |          
+             --0.08%--0xffffffffa7bdfbb8
+                       0xffffffffa7d06a7a
+                       0xffffffffa7d07661
+                       0xffffffffa7d084f0
+                       0xffffffffa7d5aea6
+                       0xffffffffa7bcb025
+                       0xffffffffa74a13f9
+                       0xffffffffa747ba91
+                       0xffffffffa748035d
+                       0xffffffffa74806bd
+                       0xffffffffa7480d8e
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+
+     0.21%  [k] 0xffffffffa6ceea3f                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6cfc708
+               0xffffffffa6ca049c
+               0xffffffffa6ca0c65
+               0xffffffffa6ca7c78
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.06%--syscall
+
+     0.21%  [.] cfree@GLIBC_2.2.5                                                                                                                                                      -      -            
+     0.21%  [k] 0xffffffffa7bd0049                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7bd0f01
+               0xffffffffa7d07926
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.07%--syscall
+
+     0.20%  [k] 0xffffffffa7d1c257                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               |          
+                --0.20%--0xffffffffa7d2677d
+                          0xffffffffa7d26dc9
+                          0xffffffffa7d068dd
+                          0xffffffffa7d07868
+                          0xffffffffa7d084f0
+                          0xffffffffa7d5aea6
+                          0xffffffffa7bcb025
+                          0xffffffffa74a13f9
+                          0xffffffffa747ba91
+                          0xffffffffa748035d
+                          0xffffffffa74806bd
+                          0xffffffffa7480d8e
+                          0xffffffffa748114c
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+                          |          
+                           --0.07%--syscall
+
+     0.20%  [.] core::ptr::drop_in_place<inf_server::exec::ConnCx>                                                                                                                     -      -            
+     0.20%  [k] 0xffffffffa7beb611                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d0991f
+               0xffffffffa7d0b101
+               0xffffffffa7d5af4f
+               0xffffffffa7bca596
+               0xffffffffa74a2137
+               0xffffffffa747ba91
+               0xffffffffa747fff1
+               0xffffffffa748b0db
+               0xffffffffa748b41b
+               0xffffffffa748c4a7
+               0xffffffffa748c7a7
+               |          
+                --0.18%--0xffffffffa748cf98
+                          0xffffffffa7481311
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+
+     0.20%  [.] inf_runtime::executor::CellExecutor::run_ready                                                                                                                         -      -            
+     0.19%  [.] inf_wire::command::lookup                                                                                                                                              -      -            
+     0.19%  [k] 0xffffffffa6ca2c86                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6d9f891
+               0xffffffffa6c9b6bb
+               0xffffffffa6ca7919
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.06%--syscall
+
+     0.19%  [k] 0xffffffffa7bd62c2                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d0b101
+               0xffffffffa7d5af4f
+               0xffffffffa7bca596
+               0xffffffffa74a2137
+               0xffffffffa747ba91
+               0xffffffffa747fff1
+               0xffffffffa748b0db
+               0xffffffffa748b41b
+               0xffffffffa748c4a7
+               0xffffffffa748c7a7
+               |          
+                --0.17%--0xffffffffa748cf98
+                          0xffffffffa7481311
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+
+     0.19%  [.] inf_runtime::executor::waker_wake                                                                                                                                      -      -            
+     0.18%  [k] 0xffffffffa7d12e03                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d19a27
+               0xffffffffa7d1c86b
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.05%--syscall
+
+     0.18%  [k] 0xffffffffa7cf1628                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7cf4fe2
+               0xffffffffa7cf513e
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+               |          
+                --0.05%--syscall
+
+     0.17%  [k] 0xffffffffa6ca7894                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.16%  [.] inf_fabric::codec::Reader::varint                                                                                                                                      -      -            
+     0.16%  [k] 0xffffffffa7d0b0d0                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d5af4f
+               0xffffffffa7bca596
+               0xffffffffa74a2137
+               0xffffffffa747ba91
+               0xffffffffa747fff1
+               0xffffffffa748b0db
+               0xffffffffa748b41b
+               0xffffffffa748c4a7
+               0xffffffffa748c7a7
+               |          
+                --0.13%--0xffffffffa748cf98
+                          0xffffffffa7481311
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+
+     0.16%  [.] inf_server::plane::Conn::state_bytes                                                                                                                                   -      -            
+     0.15%  [k] 0xffffffffa6cb94b3                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6ca0429
+               0xffffffffa6ca0c65
+               0xffffffffa6ca7c78
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.15%  [k] 0xffffffffa7f2d8d1                                                                                                                                                     -      -            
+            |          
+             --0.15%--0xffffffffa7c0c80a
+                       0xffffffffa7c0cfa4
+                       0xffffffffa7c0d377
+                       0xffffffffa6c4cb71
+                       0xffffffffa7f2ed90
+                       0xffffffffa6c4c49f
+                       0xffffffffa6c4cf9a
+                       0xffffffffa7c0a1a1
+                       0xffffffffa7cf178f
+                       0xffffffffa7cf47d8
+                       0xffffffffa7cf4b61
+                       0xffffffffa7cf4ca6
+                       0xffffffffa7cf4e41
+                       0xffffffffa7cf5181
+                       0xffffffffa7cf5328
+                       0xffffffffa7cf5665
+                       0xffffffffa7d24435
+                       0xffffffffa7d2677d
+                       0xffffffffa7d26dc9
+                       0xffffffffa7d068dd
+                       0xffffffffa7d07868
+                       0xffffffffa7d084f0
+                       0xffffffffa7d5aea6
+                       0xffffffffa7bcb025
+                       0xffffffffa74a13f9
+                       0xffffffffa747ba91
+                       0xffffffffa748035d
+                       0xffffffffa74806bd
+                       0xffffffffa7480d8e
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+                       |          
+                        --0.05%--syscall
+
+     0.14%  [k] 0xffffffffa6c9e545                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6ca7c65
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.14%  [k] 0xffffffffa7481c0f                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa74824c2
+               0xffffffffa74a087b
+               0xffffffffa74a2239
+               0xffffffffa747ba91
+               0xffffffffa747fff1
+               0xffffffffa748b0db
+               0xffffffffa748b41b
+               0xffffffffa748c4a7
+               0xffffffffa748c7a7
+               |          
+                --0.12%--0xffffffffa748cf98
+                          0xffffffffa7481311
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+
+     0.14%  [.] inf_store::keyspace::Keyspace::db_mut                                                                                                                                  -      -            
+     0.14%  [k] 0xffffffffa6d4392d                                                                                                                                                     -      -            
+     0.13%  [.] unlink_chunk.isra.0                                                                                                                                                    -      -            
+     0.13%  [k] 0xffffffffa7f2db2a                                                                                                                                                     -      -            
+            |          
+             --0.11%--0xffffffffa6c9be21
+                       0xffffffffa6ca7c24
+                       0xffffffffa6ca80fa
+                       0xffffffffa6ceb607
+                       0xffffffffa6ce8af1
+                       0xffffffffa6cf1750
+                       0xffffffffa7bd2226
+                       0xffffffffa7d1b4c9
+                       0xffffffffa7d1c8ff
+                       0xffffffffa7d3193a
+                       0xffffffffa7d33c9a
+                       0xffffffffa7ceda26
+                       0xffffffffa7cedc96
+                       0xffffffffa7cedd95
+                       0xffffffffa7cee43d
+                       0xffffffffa7c0c4ad
+                       0xffffffffa7c0c536
+                       0xffffffffa7c0c7e0
+                       0xffffffffa7c0cfa4
+                       0xffffffffa7c0d377
+                       0xffffffffa6c4cb71
+                       0xffffffffa7f2ed90
+                       0xffffffffa6c4c49f
+                       0xffffffffa6c4cf9a
+                       0xffffffffa7c0a1a1
+                       0xffffffffa7cf178f
+                       0xffffffffa7cf47d8
+                       0xffffffffa7cf4b61
+                       0xffffffffa7cf4ca6
+                       0xffffffffa7cf4e41
+                       0xffffffffa7cf5181
+                       0xffffffffa7cf5328
+                       0xffffffffa7cf5665
+                       0xffffffffa7d24435
+                       0xffffffffa7d2677d
+                       0xffffffffa7d26dc9
+                       0xffffffffa7d068dd
+                       0xffffffffa7d07868
+                       0xffffffffa7d084f0
+                       0xffffffffa7d5aea6
+                       0xffffffffa7bcb025
+                       0xffffffffa74a13f9
+                       0xffffffffa747ba91
+                       0xffffffffa748035d
+                       0xffffffffa74806bd
+                       0xffffffffa7480d8e
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+
+     0.13%  [k] 0xffffffffa7cdf303                                                                                                                                                     -      -            
+     0.13%  [.] inf_runtime::gate::wake_one_in                                                                                                                                         -      -            
+     0.12%  [.] alloc::raw_vec::RawVecInner<A>::finish_grow                                                                                                                            -      -            
+     0.12%  [k] 0xffffffffc2997e9c                                                                                                                                                     -      -            
+            |
+            ---0xffffffffc29982db
+               0xffffffffc299856d
+               0xffffffffc299c7e8
+               0xffffffffa7cdf308
+               0xffffffffa7cf50a9
+               0xffffffffa7cf513e
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.12%  [k] 0xffffffffc2997d48                                                                                                                                                     -      -            
+            |
+            ---0xffffffffc29982db
+               0xffffffffc299856d
+               0xffffffffc299c7e8
+               0xffffffffa7cdf308
+               0xffffffffa7cf50a9
+               0xffffffffa7cf513e
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.12%  [k] 0xffffffffa7be16dd                                                                                                                                                     -      -            
+            |          
+             --0.10%--0xffffffffa7be4169
+                       0xffffffffa7d130dc
+                       0xffffffffa7d19a27
+                       0xffffffffa7d1c86b
+                       0xffffffffa7d3193a
+                       |          
+                        --0.10%--0xffffffffa7d33c9a
+                                  0xffffffffa7ceda26
+                                  0xffffffffa7cedc96
+                                  0xffffffffa7cedd95
+                                  0xffffffffa7cee43d
+                                  0xffffffffa7c0c4ad
+                                  0xffffffffa7c0c536
+                                  0xffffffffa7c0c7e0
+                                  0xffffffffa7c0cfa4
+                                  0xffffffffa7c0d377
+                                  0xffffffffa6c4cb71
+                                  0xffffffffa7f2ed90
+                                  0xffffffffa6c4c49f
+                                  0xffffffffa6c4cf9a
+                                  0xffffffffa7c0a1a1
+                                  0xffffffffa7cf178f
+                                  0xffffffffa7cf47d8
+                                  0xffffffffa7cf4b61
+                                  0xffffffffa7cf4ca6
+                                  0xffffffffa7cf4e41
+                                  0xffffffffa7cf5181
+                                  0xffffffffa7cf5328
+                                  0xffffffffa7cf5665
+                                  0xffffffffa7d24435
+                                  0xffffffffa7d2677d
+                                  0xffffffffa7d26dc9
+                                  0xffffffffa7d068dd
+                                  0xffffffffa7d07868
+                                  0xffffffffa7d084f0
+                                  0xffffffffa7d5aea6
+                                  0xffffffffa7bcb025
+                                  0xffffffffa74a13f9
+                                  0xffffffffa747ba91
+                                  0xffffffffa748035d
+                                  0xffffffffa74806bd
+                                  0xffffffffa7480d8e
+                                  0xffffffffa748114c
+                                  0xffffffffa74813a2
+                                  0xffffffffa6b47750
+                                  0xffffffffa7f12b65
+                                  0xffffffffa680012b
+
+     0.11%  [k] 0xffffffffa748b107                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa748b41b
+               0xffffffffa748c4a7
+               0xffffffffa748c7a7
+               |          
+                --0.10%--0xffffffffa748cf98
+                          0xffffffffa7481311
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+
+     0.11%  [k] 0xffffffffa6d43944                                                                                                                                                     -      -            
+     0.11%  [k] 0xffffffffa7cfb8be                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d33728
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.11%  [k] 0xffffffffa7d125f3                                                                                                                                                     -      -            
+            |          
+             --0.11%--0xffffffffa7d1c83c
+                       0xffffffffa7d3193a
+                       0xffffffffa7d33c9a
+                       0xffffffffa7ceda26
+                       0xffffffffa7cedc96
+                       0xffffffffa7cedd95
+                       0xffffffffa7cee43d
+                       0xffffffffa7c0c4ad
+                       0xffffffffa7c0c536
+                       0xffffffffa7c0c7e0
+                       0xffffffffa7c0cfa4
+                       0xffffffffa7c0d377
+                       0xffffffffa6c4cb71
+                       0xffffffffa7f2ed90
+                       0xffffffffa6c4c49f
+                       0xffffffffa6c4cf9a
+                       0xffffffffa7c0a1a1
+                       0xffffffffa7cf178f
+                       0xffffffffa7cf47d8
+                       0xffffffffa7cf4b61
+                       0xffffffffa7cf4ca6
+                       0xffffffffa7cf4e41
+                       0xffffffffa7cf5181
+                       0xffffffffa7cf5328
+                       0xffffffffa7cf5665
+                       0xffffffffa7d24435
+                       0xffffffffa7d2677d
+                       0xffffffffa7d26dc9
+                       0xffffffffa7d068dd
+                       0xffffffffa7d07868
+                       0xffffffffa7d084f0
+                       0xffffffffa7d5aea6
+                       0xffffffffa7bcb025
+                       0xffffffffa74a13f9
+                       0xffffffffa747ba91
+                       0xffffffffa748035d
+                       0xffffffffa74806bd
+                       0xffffffffa7480d8e
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+
+     0.11%  [.] _int_realloc                                                                                                                                                           -      -            
+     0.10%  [k] 0xffffffffc29acf00                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7cf4ed5
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.10%  [k] 0xffffffffa74dbeb3                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7c0d2e1
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.10%  [.] inf_store::store::CellStore::get                                                                                                                                       -      -            
+     0.10%  [.] core::ptr::drop_in_place<inf_server::plane::dispatch_one<inf_server::plane::NoopObserver,inf_server::readahead::ReadAheadFs<inf_log::fs::StdSegmentFs>>::{{closure}}>  -      -            
+     0.09%  [k] 0xffffffffa7d2dfd9                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d33cc0
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.09%  [k] 0xffffffffa6c9b68d                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6ca7919
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.09%  [k] 0xffffffffa73a14c0                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7cf4ed5
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.09%  [k] 0xffffffffa73ba6ca                                                                                                                                                     -      -            
+     0.09%  [k] 0xffffffffa70e4afe                                                                                                                                                     -      -            
+            |          
+             --0.08%--0xffffffffa747f8bf
+                       0xffffffffa747fd0d
+                       0xffffffffa7480dc9
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+
+     0.08%  [k] 0xffffffffa6d395c5                                                                                                                                                     -      -            
+     0.08%  [k] 0xffffffffa7bd2204                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.08%  [k] 0xffffffffa6d395ae                                                                                                                                                     -      -            
+     0.08%  [k] 0xffffffffa6ca961b                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6cab315
+               0xffffffffa6ca14f6
+               0xffffffffa6ca78c1
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.08%  [k] 0xffffffffa7be2ee9                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d24064
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.08%  [k] 0xffffffffa7c18725                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d1ca6f
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.08%  [.] inf_store::store::CellStore::set                                                                                                                                       -      -            
+     0.08%  [k] 0xffffffffa74dbeac                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7c0d2e1
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.08%  [k] 0xffffffffc299c7a0                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7cf50a9
+               0xffffffffa7cf513e
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.08%  [k] 0xffffffffa6d395c0                                                                                                                                                     -      -            
+     0.08%  [k] 0xffffffffa6cb432a                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6cbf340
+               0xffffffffa6ca7686
+               0xffffffffa6ca787a
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.08%  [.] inf_server::plane::Shared<O,F>::take_reply_buf                                                                                                                         -      -            
+     0.08%  [k] 0xffffffffa6ceb5f9                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.08%  [.] inf_server::plane::is_scatter                                                                                                                                          -      -            
+     0.07%  [k] 0xffffffffa7d20c3f                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d26790
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.07%  [k] 0xffffffffa6d9f7c3                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6c9b6bb
+               0xffffffffa6ca7919
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.07%  [k] 0xffffffffc29acc00                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7cedde8
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.07%  [k] 0xffffffffa7d239c9                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.07%  [k] 0xffffffffa7ced0c0                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7cee35e
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.07%  [k] 0xffffffffa7cee3a5                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               |          
+                --0.07%--0xffffffffa7d2677d
+                          0xffffffffa7d26dc9
+                          0xffffffffa7d068dd
+                          0xffffffffa7d07868
+                          0xffffffffa7d084f0
+                          0xffffffffa7d5aea6
+                          0xffffffffa7bcb025
+                          0xffffffffa74a13f9
+                          0xffffffffa747ba91
+                          0xffffffffa748035d
+                          0xffffffffa74806bd
+                          0xffffffffa7480d8e
+                          0xffffffffa748114c
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+
+     0.07%  [k] 0xffffffffa7d0f425                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d1c86b
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.07%  [k] 0xffffffffc29986f9                                                                                                                                                     -      -            
+            |
+            ---0xffffffffc299c7e8
+               0xffffffffa7cdf308
+               0xffffffffa7cf50a9
+               0xffffffffa7cf513e
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.07%  [k] 0xffffffffa7beb626                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d0991f
+               0xffffffffa7d0b101
+               0xffffffffa7d5af4f
+               0xffffffffa7bca596
+               0xffffffffa74a2137
+               0xffffffffa747ba91
+               0xffffffffa747fff1
+               0xffffffffa748b0db
+               0xffffffffa748b41b
+               0xffffffffa748c4a7
+               0xffffffffa748c7a7
+               |          
+                --0.05%--0xffffffffa748cf98
+                          0xffffffffa7481311
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+
+     0.07%  [k] 0xffffffffa7bd220a                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               |          
+                --0.07%--0xffffffffa7d33c9a
+                          0xffffffffa7ceda26
+                          0xffffffffa7cedc96
+                          0xffffffffa7cedd95
+                          0xffffffffa7cee43d
+                          0xffffffffa7c0c4ad
+                          0xffffffffa7c0c536
+                          0xffffffffa7c0c7e0
+                          0xffffffffa7c0cfa4
+                          0xffffffffa7c0d377
+                          0xffffffffa6c4cb71
+                          0xffffffffa7f2ed90
+                          0xffffffffa6c4c49f
+                          0xffffffffa6c4cf9a
+                          0xffffffffa7c0a1a1
+                          0xffffffffa7cf178f
+                          0xffffffffa7cf47d8
+                          0xffffffffa7cf4b61
+                          0xffffffffa7cf4ca6
+                          0xffffffffa7cf4e41
+                          0xffffffffa7cf5181
+                          0xffffffffa7cf5328
+                          0xffffffffa7cf5665
+                          0xffffffffa7d24435
+                          0xffffffffa7d2677d
+                          0xffffffffa7d26dc9
+                          0xffffffffa7d068dd
+                          0xffffffffa7d07868
+                          0xffffffffa7d084f0
+                          0xffffffffa7d5aea6
+                          0xffffffffa7bcb025
+                          0xffffffffa74a13f9
+                          0xffffffffa747ba91
+                          0xffffffffa748035d
+                          0xffffffffa74806bd
+                          0xffffffffa7480d8e
+                          0xffffffffa748114c
+                          0xffffffffa74813a2
+                          0xffffffffa6b47750
+                          0xffffffffa7f12b65
+                          0xffffffffa680012b
+
+     0.07%  [k] 0xffffffffa7bfbd05                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7c0d2e1
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.07%  [k] 0xffffffffa7cdf316                                                                                                                                                     -      -            
+     0.06%  [k] 0xffffffffa73ba6d7                                                                                                                                                     -      -            
+     0.06%  [k] 0xffffffffa6cb1578                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6cb45d7
+               0xffffffffa6cbf340
+               0xffffffffa6ca7686
+               0xffffffffa6ca787a
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.06%  [k] 0xffffffffa6cacce1                                                                                                                                                     -      -            
+     0.06%  [k] 0xffffffffa7cf5081                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7cf513e
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.06%  [k] 0xffffffffa7d202e1                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d23ccb
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.06%  [k] 0xffffffffc299cf45                                                                                                                                                     -      -            
+     0.06%  [k] 0xffffffffa7f2dd32                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7f2d80f
+               0xffffffffa6c9be21
+               0xffffffffa6ca7c24
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.06%  [.] inf_server::clients::ClientRegistry::take_kill_requests                                                                                                                -      -            
+     0.06%  [.] core::ptr::drop_in_place<inf_runtime::gate::GateWait<u64,inf_server::plane::OwnedOutcome>>                                                                             -      -            
+     0.06%  [.] inf_fabric::mesh::Outbound::seal                                                                                                                                       -      -            
+     0.06%  [k] 0xffffffffa70d3d80                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d03c0d
+               0xffffffffa7d079fa
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.06%  [.] core::ptr::drop_in_place<inf_fabric::codec::Op>                                                                                                                        -      -            
+     0.06%  [k] 0xffffffffa7bcaf5e                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.06%  [k] 0xffffffffa7bdfc26                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d06a7a
+               0xffffffffa7d07661
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.05%  [.] _int_free_maybe_trim                                                                                                                                                   -      -            
+     0.05%  [k] 0xffffffffa6cabe47                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6cb8fee
+               0xffffffffa6cb93fa
+               0xffffffffa6ca0429
+               0xffffffffa6ca0c65
+               0xffffffffa6ca7c78
+               0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.05%  [k] 0xffffffffa6d43934                                                                                                                                                     -      -            
+     0.05%  [k] 0xffffffffa70d3f89                                                                                                                                                     -      -            
+            |          
+             --0.05%--0xffffffffa7d03c0d
+                       0xffffffffa7d079fa
+                       0xffffffffa7d084f0
+                       0xffffffffa7d5aea6
+                       0xffffffffa7bcb025
+                       0xffffffffa74a13f9
+                       0xffffffffa747ba91
+                       0xffffffffa748035d
+                       0xffffffffa74806bd
+                       0xffffffffa7480d8e
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+
+     0.05%  [k] 0xffffffffc299c490                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7cee3c9
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.05%  [k] 0xffffffffa6ca7cc8                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6ca80fa
+               0xffffffffa6ceb607
+               0xffffffffa6ce8af1
+               0xffffffffa6cf1750
+               0xffffffffa7bd2226
+               0xffffffffa7d1b4c9
+               0xffffffffa7d1c8ff
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.05%  [k] 0xffffffffa7be16b6                                                                                                                                                     -      -            
+            |          
+             --0.05%--0xffffffffa7be4169
+                       0xffffffffa7d130dc
+                       0xffffffffa7d19a27
+                       0xffffffffa7d1c86b
+                       0xffffffffa7d3193a
+                       0xffffffffa7d33c9a
+                       0xffffffffa7ceda26
+                       0xffffffffa7cedc96
+                       0xffffffffa7cedd95
+                       0xffffffffa7cee43d
+                       0xffffffffa7c0c4ad
+                       0xffffffffa7c0c536
+                       0xffffffffa7c0c7e0
+                       0xffffffffa7c0cfa4
+                       0xffffffffa7c0d377
+                       0xffffffffa6c4cb71
+                       0xffffffffa7f2ed90
+                       0xffffffffa6c4c49f
+                       0xffffffffa6c4cf9a
+                       0xffffffffa7c0a1a1
+                       0xffffffffa7cf178f
+                       0xffffffffa7cf47d8
+                       0xffffffffa7cf4b61
+                       0xffffffffa7cf4ca6
+                       0xffffffffa7cf4e41
+                       0xffffffffa7cf5181
+                       0xffffffffa7cf5328
+                       0xffffffffa7cf5665
+                       0xffffffffa7d24435
+                       0xffffffffa7d2677d
+                       0xffffffffa7d26dc9
+                       0xffffffffa7d068dd
+                       0xffffffffa7d07868
+                       0xffffffffa7d084f0
+                       0xffffffffa7d5aea6
+                       0xffffffffa7bcb025
+                       0xffffffffa74a13f9
+                       0xffffffffa747ba91
+                       0xffffffffa748035d
+                       0xffffffffa74806bd
+                       0xffffffffa7480d8e
+                       0xffffffffa748114c
+                       0xffffffffa74813a2
+                       0xffffffffa6b47750
+                       0xffffffffa7f12b65
+                       0xffffffffa680012b
+
+     0.05%  [.] core::ptr::drop_in_place<inf_fabric::codec::Op>                                                                                                                        -      -            
+     0.05%  [k] 0xffffffffa73a7d40                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7cf50a9
+               0xffffffffa7cf513e
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.05%  [.] inf_server::exec::set                                                                                                                                                  -      -            
+     0.05%  [k] 0xffffffffa70bafd9                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7049137
+               0xffffffffa74828ef
+               0xffffffffa74a0601
+               0xffffffffa74a20ea
+               0xffffffffa747ba91
+               0xffffffffa747fff1
+               0xffffffffa748b0db
+               0xffffffffa748b41b
+               0xffffffffa748c4a7
+               0xffffffffa748c7a7
+
+     0.05%  [k] 0xffffffffa79d404f                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7bff207
+               0xffffffffa7c09bd7
+               0xffffffffa7c0a4bf
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.05%  [k] 0xffffffffa7d19b79                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7d1c86b
+               0xffffffffa7d3193a
+               0xffffffffa7d33c9a
+               0xffffffffa7ceda26
+               0xffffffffa7cedc96
+               0xffffffffa7cedd95
+               0xffffffffa7cee43d
+               0xffffffffa7c0c4ad
+               0xffffffffa7c0c536
+               0xffffffffa7c0c7e0
+               0xffffffffa7c0cfa4
+               0xffffffffa7c0d377
+               0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.05%  [k] 0xffffffffa74d5956                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7beba72
+               0xffffffffa7bebc7b
+               0xffffffffa7bebe53
+               0xffffffffa7d09c94
+               0xffffffffa7d0b101
+               0xffffffffa7d5af4f
+               0xffffffffa7bca596
+               0xffffffffa74a2137
+               0xffffffffa747ba91
+               0xffffffffa747fff1
+               0xffffffffa748b0db
+               0xffffffffa748b41b
+               0xffffffffa748c4a7
+               0xffffffffa748c7a7
+
+     0.05%  [.] std::sys::env::unix::getenv::{closure#0}                                                                                                                               -      -            
+     0.05%  [k] 0xffffffffa73ba6de                                                                                                                                                     -      -            
+     0.05%  [k] 0xffffffffa7c0d23c                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa6c4cb71
+               0xffffffffa7f2ed90
+               0xffffffffa6c4c49f
+               0xffffffffa6c4cf9a
+               0xffffffffa7c0a1a1
+               0xffffffffa7cf178f
+               0xffffffffa7cf47d8
+               0xffffffffa7cf4b61
+               0xffffffffa7cf4ca6
+               0xffffffffa7cf4e41
+               0xffffffffa7cf5181
+               0xffffffffa7cf5328
+               0xffffffffa7cf5665
+               0xffffffffa7d24435
+               0xffffffffa7d2677d
+               0xffffffffa7d26dc9
+               0xffffffffa7d068dd
+               0xffffffffa7d07868
+               0xffffffffa7d084f0
+               0xffffffffa7d5aea6
+               0xffffffffa7bcb025
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.05%  [k] 0xffffffffa73a0a3d                                                                                                                                                     -      -            
+            |
+            ---0xffffffffa7bcaf96
+               0xffffffffa74a13f9
+               0xffffffffa747ba91
+               0xffffffffa748035d
+               0xffffffffa74806bd
+               0xffffffffa7480d8e
+               0xffffffffa748114c
+               0xffffffffa74813a2
+               0xffffffffa6b47750
+               0xffffffffa7f12b65
+               0xffffffffa680012b
+
+     0.05%  [k] 0xffffffffa6c0843b                                                                                                                                                     -      -            
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

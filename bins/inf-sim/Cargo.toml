@@ -23,6 +23,10 @@ inf-runtime.workspace = true
 inf-wire.workspace = true
 inf-store.workspace = true
 inf-server.workspace = true
+# M2-S19 (ADR-0021): the durability oracle's survival audit replays the
+# surviving disk image directly (manifest -> ick -> tail prefix) when a
+# boot legally refuses — dep-DAG edge recorded.
+inf-log.workspace = true
 libc.workspace = true
 
 [lints]

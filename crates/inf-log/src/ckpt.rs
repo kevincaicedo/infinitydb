@@ -67,6 +67,14 @@ pub const DEFAULT_SECTION_BYTES: u32 = 256 << 10;
 pub const DEFAULT_CKPT_INTERVAL_BYTES: u64 = 256 << 20;
 /// Default hard per-slice streamed-byte cap.
 pub const DEFAULT_CKPT_SLICE_BYTES: u32 = 64 << 10;
+/// Default streaming pace (bytes/second of wall — injected — time). The
+/// per-slice cap bounds one MAINTAIN visit; this bounds the *rate*: an
+/// unpaced walk dirties pages at memcpy speed, and the kernel's
+/// dirty-page throttling then stalls the io-wq workers the log write
+/// rides — a foreground p99.9 cliff under write-saturated load (the
+/// M2-S12 pressure row measured it; ADR-0017). Checkpoints are background
+/// by design: longer checkpoints are correct, bursts are not.
+pub const DEFAULT_CKPT_STREAM_BYTES_PER_SEC: u32 = 64 << 20;
 
 /// Checkpoint policy configuration (per cell).
 #[derive(Copy, Clone, Debug)]
@@ -78,6 +86,8 @@ pub struct CkptConfig {
     /// Hard cap on bytes streamed per MAINTAIN slice (budget in bytes —
     /// the deficit scheduler's units convert against this, ADR-0016 D5).
     pub slice_bytes: u32,
+    /// Streaming pace in bytes/second (0 = unpaced — tests/sync tier).
+    pub stream_bytes_per_sec: u32,
 }
 
 impl Default for CkptConfig {
@@ -86,6 +96,7 @@ impl Default for CkptConfig {
             section_bytes: DEFAULT_SECTION_BYTES,
             interval_bytes: DEFAULT_CKPT_INTERVAL_BYTES,
             slice_bytes: DEFAULT_CKPT_SLICE_BYTES,
+            stream_bytes_per_sec: DEFAULT_CKPT_STREAM_BYTES_PER_SEC,
         }
     }
 }
@@ -633,10 +644,339 @@ fn le_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes.try_into().expect("8 bytes"))
 }
 
+/// Footer peek (M2-S13): hop the section headers to the footer and return
+/// its per-ns entry counts — the presize hint recovery applies *before*
+/// streaming [`read_ick`], so the bulk apply avoids the doubling-rehash
+/// storm (measured 0.84 → 1.0 GiB/s on the S13 dev rehearsal). Sections
+/// are length-hopped, not CRC-validated here: the streaming pass that
+/// follows still performs the complete audit; the counts themselves are
+/// protected by the footer's own CRC, and a wrong hint could only cost
+/// memory geometry, never correctness.
+///
+/// # Errors
+/// Structural damage (bad magic/version, truncation, absurd lengths,
+/// unknown block tags, footer CRC mismatch) — the same fail-stop class as
+/// [`read_ick`].
+pub fn read_ick_counts<F: SegmentFs>(
+    fs: &F,
+    path: &Path,
+    cfg: IckReaderConfig,
+) -> Result<Vec<(u32, u64)>, IckReadError> {
+    let file = fs.open_read(path).map_err(IckReadError::Io)?;
+    let mut fixed = [0u8; HEADER_FIXED_LEN];
+    read_exact_at(&file, 0, &mut fixed)?;
+    if fixed[0..8] != ICK_MAGIC {
+        return Err(IckReadError::BadMagic);
+    }
+    let version = u16::from_le_bytes([fixed[8], fixed[9]]);
+    if version != ICK_VERSION {
+        return Err(IckReadError::UnsupportedVersion(version));
+    }
+    let ns_count = le_u32(&fixed[28..32]) as usize;
+    if ns_count > (1 << 20) {
+        return Err(IckReadError::Truncated { at: 28 });
+    }
+    let file_size = file.file_size()?;
+    let mut offset = (HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN) as u64;
+    // Direct footer probe (M2.5-S08): a well-formed `.ick` ends exactly at
+    // its footer, whose length is computable from the header's `ns_count` —
+    // two reads instead of hopping every section header (a chain of
+    // *dependent* small reads; cold, each hop is a synchronous page fault —
+    // measured as the dominant cold ick cost). The footer CRC validates the
+    // probe; any mismatch falls back to the hop below, and a wrong hint
+    // could only ever cost memory geometry (the streaming pass re-audits).
+    let probe_len = FOOTER_FIXED_LEN + ns_count * 12 + 8 + CRC_LEN;
+    if file_size >= offset + probe_len as u64 {
+        let probe_at = file_size - probe_len as u64;
+        let mut block = vec![0u8; probe_len];
+        if read_exact_at(&file, probe_at, &mut block).is_ok()
+            && block[0] == BLOCK_FOOTER
+            && le_u32(&block[13..17]) as usize == ns_count
+            && crc32c(&block[..probe_len - CRC_LEN]) == le_u32(&block[probe_len - CRC_LEN..])
+        {
+            return Ok(block[FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + ns_count * 12]
+                .chunks_exact(12)
+                .map(|chunk| (le_u32(&chunk[0..4]), le_u64(&chunk[4..12])))
+                .collect());
+        }
+    }
+    loop {
+        if offset >= file_size {
+            return Err(IckReadError::MissingFooter);
+        }
+        let mut head = [0u8; SECTION_HEADER_LEN];
+        read_exact_at(&file, offset, &mut head)?;
+        match head[0] {
+            BLOCK_SECTION => {
+                let body_len = le_u32(&head[1..5]);
+                if body_len > cfg.max_section_bytes {
+                    return Err(IckReadError::SectionTooLarge {
+                        len: body_len,
+                        max: cfg.max_section_bytes,
+                    });
+                }
+                offset += (SECTION_HEADER_LEN + body_len as usize + CRC_LEN) as u64;
+            }
+            BLOCK_FOOTER => {
+                let mut fixed = [0u8; FOOTER_FIXED_LEN];
+                read_exact_at(&file, offset, &mut fixed)?;
+                let footer_ns = le_u32(&fixed[13..17]) as usize;
+                if footer_ns > (1 << 20) {
+                    return Err(IckReadError::Truncated { at: offset + 13 });
+                }
+                let block_len = FOOTER_FIXED_LEN + footer_ns * 12 + 8 + CRC_LEN;
+                let mut block = vec![0u8; block_len];
+                read_exact_at(&file, offset, &mut block)?;
+                let stored_crc = le_u32(&block[block_len - CRC_LEN..]);
+                if crc32c(&block[..block_len - CRC_LEN]) != stored_crc {
+                    return Err(IckReadError::FooterCrc { at: offset });
+                }
+                return Ok(block[FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + footer_ns * 12]
+                    .chunks_exact(12)
+                    .map(|chunk| (le_u32(&chunk[0..4]), le_u64(&chunk[4..12])))
+                    .collect());
+            }
+            tag => return Err(IckReadError::UnknownBlock { tag, at: offset }),
+        }
+    }
+}
+
+/// One [`IckReader::next_step`] outcome.
+#[derive(Debug)]
+pub enum IckStep {
+    /// One section validated and applied; `bytes` = on-disk block bytes
+    /// consumed (the M2-S15 progress currency).
+    Section { bytes: u64 },
+    /// Footer validated — the load is complete and fully audited.
+    Done(IckSummary),
+}
+
+/// Pull-based validating `.ick` loader (M2-S15): the same header → section
+/// CRC-then-apply → footer audit as [`read_ick`], one section per
+/// [`next_step`](Self::next_step) call, so boot recovery can load a
+/// checkpoint in bounded MAINTAIN slices while the cell answers
+/// `-LOADING`. [`read_ick`] is this reader run to completion — one code
+/// path, one audit, one fuzz surface.
+pub struct IckReader<File: SegmentFile> {
+    file: File,
+    cfg: IckReaderConfig,
+    info: IckInfo,
+    file_size: u64,
+    offset: u64,
+    sections: u32,
+    records_total: u64,
+    entries_seen: Vec<(u32, u64)>,
+    digest: u64,
+    block: Vec<u8>,
+    done: bool,
+}
+
+impl<File: SegmentFile> IckReader<File> {
+    /// Opens `path` and validates the header (magic, version, header CRC).
+    ///
+    /// # Errors
+    /// Structural damage in the header — the [`read_ick`] fail-stop class.
+    pub fn open<F: SegmentFs<File = File>>(
+        fs: &F,
+        path: &Path,
+        cfg: IckReaderConfig,
+    ) -> Result<IckReader<File>, IckReadError> {
+        let file = fs.open_read(path).map_err(IckReadError::Io)?;
+        let mut fixed = [0u8; HEADER_FIXED_LEN];
+        read_exact_at(&file, 0, &mut fixed)?;
+        if fixed[0..8] != ICK_MAGIC {
+            return Err(IckReadError::BadMagic);
+        }
+        let version = u16::from_le_bytes([fixed[8], fixed[9]]);
+        if version != ICK_VERSION {
+            return Err(IckReadError::UnsupportedVersion(version));
+        }
+        let cell = u16::from_le_bytes([fixed[10], fixed[11]]);
+        let ckpt_id = le_u64(&fixed[12..20]);
+        let begin_lsn = Lsn::from_u64(le_u64(&fixed[20..28]));
+        let ns_count = le_u32(&fixed[28..32]) as usize;
+        if ns_count > (1 << 20) {
+            return Err(IckReadError::Truncated { at: 28 }); // absurd count: damaged length
+        }
+        let mut rest = vec![0u8; ns_count * 4 + CRC_LEN];
+        read_exact_at(&file, HEADER_FIXED_LEN as u64, &mut rest)?;
+        let mut header_crc_input = Vec::with_capacity(HEADER_FIXED_LEN + ns_count * 4);
+        header_crc_input.extend_from_slice(&fixed);
+        header_crc_input.extend_from_slice(&rest[..ns_count * 4]);
+        let stored_header_crc = le_u32(&rest[ns_count * 4..]);
+        if crc32c(&header_crc_input) != stored_header_crc {
+            return Err(IckReadError::HeaderCrc);
+        }
+        let ns_ids: Vec<u32> = rest[..ns_count * 4].chunks_exact(4).map(le_u32).collect();
+        let file_size = file.file_size()?;
+        Ok(IckReader {
+            file,
+            cfg,
+            info: IckInfo { version, cell, ckpt_id, begin_lsn, ns_ids },
+            file_size,
+            offset: (HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN) as u64,
+            sections: 0,
+            records_total: 0,
+            entries_seen: Vec::new(),
+            digest: fold_digest(DIGEST_SEED, stored_header_crc),
+            block: Vec::new(),
+            done: false,
+        })
+    }
+
+    /// The validated header.
+    #[must_use]
+    pub fn info(&self) -> &IckInfo {
+        &self.info
+    }
+
+    /// Total file bytes (the progress denominator).
+    #[must_use]
+    pub fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    /// Validates and applies the next block. Sections yield
+    /// [`IckStep::Section`]; the footer completes the audit and yields
+    /// [`IckStep::Done`] (calling again afterwards is a caller bug).
+    ///
+    /// # Errors
+    /// [`IckApplyError::Read`] for any structural damage (fail-stop for
+    /// recovery); [`IckApplyError::Apply`] propagates the callback's error
+    /// at the failing section.
+    ///
+    /// # Panics
+    /// If called after [`IckStep::Done`] was returned.
+    pub fn next_step<E>(
+        &mut self,
+        mut apply: impl FnMut(RecordView<'_>) -> Result<(), E>,
+    ) -> Result<IckStep, IckApplyError<E>> {
+        assert!(!self.done, "IckReader stepped past its footer");
+        if self.offset == self.file_size {
+            return Err(IckReadError::MissingFooter.into());
+        }
+        let mut tag = [0u8; 1];
+        read_exact_at(&self.file, self.offset, &mut tag)?;
+        match tag[0] {
+            BLOCK_SECTION => {
+                let mut head = [0u8; SECTION_HEADER_LEN];
+                read_exact_at(&self.file, self.offset, &mut head)?;
+                let body_len = le_u32(&head[1..5]);
+                if body_len > self.cfg.max_section_bytes {
+                    return Err(IckReadError::SectionTooLarge {
+                        len: body_len,
+                        max: self.cfg.max_section_bytes,
+                    }
+                    .into());
+                }
+                let record_count = le_u32(&head[5..9]);
+                let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
+                self.block.resize(block_len, 0);
+                read_exact_at(&self.file, self.offset, &mut self.block)?;
+                // Read-ahead the next blocks (M2.5-S08): their device reads
+                // overlap this section's CRC + decode + apply. Four blocks
+                // deep — sections share the staging capacity class and are
+                // small enough that one-ahead loses the race against the
+                // prefetcher's wakeup latency. Hint-only; EOF-safe.
+                self.file.advise_read_ahead(self.offset + block_len as u64, 4 * block_len as u64);
+                let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
+                if crc32c(&self.block[..block_len - CRC_LEN]) != stored_crc {
+                    return Err(
+                        IckReadError::SectionCrc { index: self.sections, at: self.offset }.into()
+                    );
+                }
+                self.digest = fold_digest(self.digest, stored_crc);
+                let mut body = &self.block[SECTION_HEADER_LEN..block_len - CRC_LEN];
+                let mut decoded = 0u32;
+                while !body.is_empty() {
+                    let (view, consumed) = decode_record(body)
+                        .map_err(|error| IckReadError::Record { section: self.sections, error })?;
+                    if let RecordView::StringPostImage { ns, .. } = view {
+                        match self.entries_seen.iter_mut().find(|(id, _)| *id == ns.0) {
+                            Some((_, n)) => *n += 1,
+                            None => self.entries_seen.push((ns.0, 1)),
+                        }
+                    }
+                    apply(view)
+                        .map_err(|error| IckApplyError::Apply { section: self.sections, error })?;
+                    decoded += 1;
+                    body = &body[consumed..];
+                }
+                if decoded != record_count {
+                    return Err(
+                        IckReadError::FooterMismatch { field: "section record_count" }.into()
+                    );
+                }
+                self.sections += 1;
+                self.records_total += u64::from(record_count);
+                self.offset += block_len as u64;
+                Ok(IckStep::Section { bytes: block_len as u64 })
+            }
+            BLOCK_FOOTER => {
+                let mut fixed = [0u8; FOOTER_FIXED_LEN];
+                read_exact_at(&self.file, self.offset, &mut fixed)?;
+                let footer_sections = le_u32(&fixed[1..5]);
+                let footer_records = le_u64(&fixed[5..13]);
+                let footer_ns = le_u32(&fixed[13..17]) as usize;
+                if footer_ns > (1 << 20) {
+                    return Err(IckReadError::Truncated { at: self.offset + 13 }.into());
+                }
+                let tail_len = footer_ns * 12 + 8 + CRC_LEN;
+                let block_len = FOOTER_FIXED_LEN + tail_len;
+                self.block.resize(block_len, 0);
+                read_exact_at(&self.file, self.offset, &mut self.block)?;
+                let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
+                if crc32c(&self.block[..block_len - CRC_LEN]) != stored_crc {
+                    return Err(IckReadError::FooterCrc { at: self.offset }.into());
+                }
+                let stored_digest =
+                    le_u64(&self.block[block_len - CRC_LEN - 8..block_len - CRC_LEN]);
+                if footer_sections != self.sections {
+                    return Err(IckReadError::FooterMismatch { field: "section_count" }.into());
+                }
+                if footer_records != self.records_total {
+                    return Err(IckReadError::FooterMismatch { field: "records_total" }.into());
+                }
+                if stored_digest != self.digest {
+                    return Err(IckReadError::FooterMismatch { field: "digest" }.into());
+                }
+                let mut footer_entries: Vec<(u32, u64)> = Vec::with_capacity(footer_ns);
+                for chunk in
+                    self.block[FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + footer_ns * 12].chunks_exact(12)
+                {
+                    footer_entries.push((le_u32(&chunk[0..4]), le_u64(&chunk[4..12])));
+                }
+                let mut seen_sorted = self.entries_seen.clone();
+                seen_sorted.sort_unstable();
+                let mut footer_sorted = footer_entries.clone();
+                footer_sorted.sort_unstable();
+                if seen_sorted != footer_sorted {
+                    return Err(IckReadError::FooterMismatch { field: "entries_per_ns" }.into());
+                }
+                let end = self.offset + block_len as u64;
+                if end != self.file_size {
+                    return Err(IckReadError::TrailingData { at: end }.into());
+                }
+                self.done = true;
+                Ok(IckStep::Done(IckSummary {
+                    sections: self.sections,
+                    records: self.records_total,
+                    entries_per_ns: footer_entries,
+                    digest: self.digest,
+                    bytes: end,
+                }))
+            }
+            tag => Err(IckReadError::UnknownBlock { tag, at: self.offset }.into()),
+        }
+    }
+}
+
 /// Validating streaming load: header → per-section CRC-then-apply → footer
 /// audit (counts + digest + no trailing bytes). `apply` sees every record
-/// in file order — S13 feeds `Keyspace::apply_record` here, then replays
-/// the tail from `info.begin_lsn` via the S04 reader.
+/// in file order — S13 feeds `Keyspace::apply_record` here (presized via
+/// [`read_ick_counts`]), then replays the tail from `info.begin_lsn` via
+/// the S04 reader. Implemented as [`IckReader`] run to completion (S15
+/// chunks the same reader across MAINTAIN slices).
 ///
 /// # Errors
 /// [`IckApplyError::Read`] for any structural damage (fail-stop for
@@ -648,151 +988,11 @@ pub fn read_ick<F: SegmentFs, E>(
     cfg: IckReaderConfig,
     mut apply: impl FnMut(RecordView<'_>) -> Result<(), E>,
 ) -> Result<(IckInfo, IckSummary), IckApplyError<E>> {
-    let file = fs.open_read(path).map_err(IckReadError::Io)?;
-
-    // Header: fixed part, then the ns set + CRC.
-    let mut fixed = [0u8; HEADER_FIXED_LEN];
-    read_exact_at(&file, 0, &mut fixed)?;
-    if fixed[0..8] != ICK_MAGIC {
-        return Err(IckReadError::BadMagic.into());
-    }
-    let version = u16::from_le_bytes([fixed[8], fixed[9]]);
-    if version != ICK_VERSION {
-        return Err(IckReadError::UnsupportedVersion(version).into());
-    }
-    let cell = u16::from_le_bytes([fixed[10], fixed[11]]);
-    let ckpt_id = le_u64(&fixed[12..20]);
-    let begin_lsn = Lsn::from_u64(le_u64(&fixed[20..28]));
-    let ns_count = le_u32(&fixed[28..32]) as usize;
-    if ns_count > (1 << 20) {
-        return Err(IckReadError::Truncated { at: 28 }.into()); // absurd count: damaged length
-    }
-    let mut rest = vec![0u8; ns_count * 4 + CRC_LEN];
-    read_exact_at(&file, HEADER_FIXED_LEN as u64, &mut rest)?;
-    let mut header_crc_input = Vec::with_capacity(HEADER_FIXED_LEN + ns_count * 4);
-    header_crc_input.extend_from_slice(&fixed);
-    header_crc_input.extend_from_slice(&rest[..ns_count * 4]);
-    let stored_header_crc = le_u32(&rest[ns_count * 4..]);
-    if crc32c(&header_crc_input) != stored_header_crc {
-        return Err(IckReadError::HeaderCrc.into());
-    }
-    let ns_ids: Vec<u32> = rest[..ns_count * 4].chunks_exact(4).map(le_u32).collect();
-    let info = IckInfo { version, cell, ckpt_id, begin_lsn, ns_ids };
-    let mut digest = fold_digest(DIGEST_SEED, stored_header_crc);
-
-    // Blocks.
-    let file_size = file.file_size()?;
-    let mut offset = (HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN) as u64;
-    let mut sections = 0u32;
-    let mut records_total = 0u64;
-    let mut entries_seen: Vec<(u32, u64)> = Vec::new();
-    let mut block: Vec<u8> = Vec::new();
+    let mut reader = IckReader::open(fs, path, cfg)?;
     loop {
-        if offset == file_size {
-            return Err(IckReadError::MissingFooter.into());
-        }
-        let mut tag = [0u8; 1];
-        read_exact_at(&file, offset, &mut tag)?;
-        match tag[0] {
-            BLOCK_SECTION => {
-                let mut head = [0u8; SECTION_HEADER_LEN];
-                read_exact_at(&file, offset, &mut head)?;
-                let body_len = le_u32(&head[1..5]);
-                if body_len > cfg.max_section_bytes {
-                    return Err(IckReadError::SectionTooLarge {
-                        len: body_len,
-                        max: cfg.max_section_bytes,
-                    }
-                    .into());
-                }
-                let record_count = le_u32(&head[5..9]);
-                let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
-                block.resize(block_len, 0);
-                read_exact_at(&file, offset, &mut block)?;
-                let stored_crc = le_u32(&block[block_len - CRC_LEN..]);
-                if crc32c(&block[..block_len - CRC_LEN]) != stored_crc {
-                    return Err(IckReadError::SectionCrc { index: sections, at: offset }.into());
-                }
-                digest = fold_digest(digest, stored_crc);
-                let mut body = &block[SECTION_HEADER_LEN..block_len - CRC_LEN];
-                let mut decoded = 0u32;
-                while !body.is_empty() {
-                    let (view, consumed) = decode_record(body)
-                        .map_err(|error| IckReadError::Record { section: sections, error })?;
-                    if let RecordView::StringPostImage { ns, .. } = view {
-                        match entries_seen.iter_mut().find(|(id, _)| *id == ns.0) {
-                            Some((_, n)) => *n += 1,
-                            None => entries_seen.push((ns.0, 1)),
-                        }
-                    }
-                    apply(view)
-                        .map_err(|error| IckApplyError::Apply { section: sections, error })?;
-                    decoded += 1;
-                    body = &body[consumed..];
-                }
-                if decoded != record_count {
-                    return Err(
-                        IckReadError::FooterMismatch { field: "section record_count" }.into()
-                    );
-                }
-                sections += 1;
-                records_total += u64::from(record_count);
-                offset += block_len as u64;
-            }
-            BLOCK_FOOTER => {
-                let mut fixed = [0u8; FOOTER_FIXED_LEN];
-                read_exact_at(&file, offset, &mut fixed)?;
-                let footer_sections = le_u32(&fixed[1..5]);
-                let footer_records = le_u64(&fixed[5..13]);
-                let footer_ns = le_u32(&fixed[13..17]) as usize;
-                if footer_ns > (1 << 20) {
-                    return Err(IckReadError::Truncated { at: offset + 13 }.into());
-                }
-                let tail_len = footer_ns * 12 + 8 + CRC_LEN;
-                let block_len = FOOTER_FIXED_LEN + tail_len;
-                block.resize(block_len, 0);
-                read_exact_at(&file, offset, &mut block)?;
-                let stored_crc = le_u32(&block[block_len - CRC_LEN..]);
-                if crc32c(&block[..block_len - CRC_LEN]) != stored_crc {
-                    return Err(IckReadError::FooterCrc { at: offset }.into());
-                }
-                let stored_digest = le_u64(&block[block_len - CRC_LEN - 8..block_len - CRC_LEN]);
-                if footer_sections != sections {
-                    return Err(IckReadError::FooterMismatch { field: "section_count" }.into());
-                }
-                if footer_records != records_total {
-                    return Err(IckReadError::FooterMismatch { field: "records_total" }.into());
-                }
-                if stored_digest != digest {
-                    return Err(IckReadError::FooterMismatch { field: "digest" }.into());
-                }
-                let mut footer_entries: Vec<(u32, u64)> = Vec::with_capacity(footer_ns);
-                for chunk in
-                    block[FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + footer_ns * 12].chunks_exact(12)
-                {
-                    footer_entries.push((le_u32(&chunk[0..4]), le_u64(&chunk[4..12])));
-                }
-                let mut seen_sorted = entries_seen.clone();
-                seen_sorted.sort_unstable();
-                let mut footer_sorted = footer_entries.clone();
-                footer_sorted.sort_unstable();
-                if seen_sorted != footer_sorted {
-                    return Err(IckReadError::FooterMismatch { field: "entries_per_ns" }.into());
-                }
-                let end = offset + block_len as u64;
-                if end != file_size {
-                    return Err(IckReadError::TrailingData { at: end }.into());
-                }
-                let summary = IckSummary {
-                    sections,
-                    records: records_total,
-                    entries_per_ns: footer_entries,
-                    digest,
-                    bytes: end,
-                };
-                return Ok((info, summary));
-            }
-            tag => return Err(IckReadError::UnknownBlock { tag, at: offset }.into()),
+        match reader.next_step(&mut apply)? {
+            IckStep::Section { .. } => {}
+            IckStep::Done(summary) => return Ok((reader.info, summary)),
         }
     }
 }
@@ -866,6 +1066,50 @@ mod tests {
         let want: Vec<(Vec<u8>, Vec<u8>)> =
             sample_records().into_iter().map(|(k, v, _)| (k, v)).collect();
         assert_eq!(got, want, "records replay in file order, byte-identical");
+    }
+
+    #[test]
+    fn counts_peek_matches_the_streamed_footer() {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let summary = write_sample(&fs, dir);
+        let path = dir.join(ick_file_name(7));
+
+        let counts = read_ick_counts(&fs, &path, IckReaderConfig::default()).expect("footer peek");
+        assert_eq!(counts, summary.entries_per_ns, "the presize hint is the footer's truth");
+
+        // The peek's own integrity: any single-byte corruption of the
+        // footer block is caught by its CRC.
+        let bytes = fs.contents(&path).expect("ick bytes");
+        let footer_at = bytes.len() - (FOOTER_FIXED_LEN + 12 + 8 + CRC_LEN);
+        for at in footer_at..bytes.len() {
+            let mut damaged = bytes.clone();
+            damaged[at] ^= 0x01;
+            let dmg = MemFs::new();
+            dmg.create_dir_all(dir).unwrap();
+            use crate::fs::{SegmentFile, SegmentFs as _};
+            let mut f = dmg.create_meta(&path).expect("create");
+            f.write_at(0, &damaged).expect("write");
+            assert!(
+                read_ick_counts(&dmg, &path, IckReaderConfig::default()).is_err(),
+                "corrupt footer byte {at} must not yield counts"
+            );
+        }
+
+        // Fallback (M2.5-S08): trailing bytes defeat the direct end-of-file
+        // footer probe; the section hop still finds the footer and returns
+        // the same hint.
+        let mut padded = bytes.clone();
+        padded.extend_from_slice(b"junk");
+        let pad = MemFs::new();
+        pad.create_dir_all(dir).unwrap();
+        use crate::fs::{SegmentFile, SegmentFs as _};
+        let mut f = pad.create_meta(&path).expect("create");
+        f.write_at(0, &padded).expect("write");
+        let counts =
+            read_ick_counts(&pad, &path, IckReaderConfig::default()).expect("hop fallback");
+        assert_eq!(counts, summary.entries_per_ns, "fallback hint matches the footer");
     }
 
     #[test]

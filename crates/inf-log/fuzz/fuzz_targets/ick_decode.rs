@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use inf_log::ckpt::{IckReaderConfig, read_ick};
+use inf_log::ckpt::{IckReaderConfig, read_ick, read_ick_counts};
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use libfuzzer_sys::fuzz_target;
@@ -37,9 +37,15 @@ fuzz_target!(|data: &[u8]| {
         records += 1;
         Ok::<(), ()>(())
     });
+    // The presize-hint path (M2.5-S08: direct footer probe + hop fallback)
+    // must never panic, and on a cleanly-loading image must agree with the
+    // audited footer entries.
+    let counts = read_ick_counts(&fs, &path, IckReaderConfig::default());
     if let Ok((info, summary)) = result {
         assert_eq!(u64::from(info.version), 1, "only v1 loads");
         assert_eq!(summary.records, records, "audit counts what apply saw");
         assert_eq!(summary.bytes, data.len() as u64, "no trailing bytes tolerated");
+        let counts = counts.expect("clean image must yield a presize hint");
+        assert_eq!(counts, summary.entries_per_ns, "hint must match the audited footer");
     }
 });

@@ -215,6 +215,27 @@ pub static DECLARED: &[Declared] = &[
         "SHARDCHANNELS / SHARDNUMSUB arrive with sharded pub/sub (M3 cut line)",
     ),
     d("INF.NS", Status::Extension, "M1", "namespace registry v1 — the M2 durability seam"),
+    d(
+        "INF.CKPT",
+        Status::Extension,
+        "M2",
+        "checkpoint operator surface (M2-S20): [CELL k] [WAIT]; WAIT returns after the new \
+         MANIFEST is durable — no fork, per-cell timing (ADR-0021)",
+    ),
+    d(
+        "BGSAVE",
+        Status::Partial,
+        "M2",
+        "maps onto INF.CKPT (fuzzy checkpoint, no fork, no RDB file); SCHEDULE accepted and \
+         moot; reply byte-identical; memory-only nodes answer a documented error",
+    ),
+    d(
+        "LASTSAVE",
+        Status::Partial,
+        "M2",
+        "unix seconds of the newest durable MANIFEST publication; 0 before the first \
+         (Redis reports process-start time); loading flag docs-derived, not capture-verified",
+    ),
     d("INF.TAKE", Status::Internal, "M1", "cross-cell RENAME/COPY program primitive"),
     d("INF.PEEK", Status::Internal, "M1", "cross-cell COPY program primitive"),
 ];
@@ -306,7 +327,7 @@ pub fn rows() -> Vec<CommandRow> {
 /// `absent` half of the matrix — a static table in generator code, still
 /// never hand-edited in the artifact).
 pub static ABSENT: &[(&str, &str)] = &[
-    ("Persistence admin (SAVE, BGSAVE, INF.CKPT, …)", "M2 — durability"),
+    ("Persistence admin (SAVE, …)", "M9 — RDB import/export"),
     ("Hashes, lists, sets, zsets, bitmaps, bitfield, HyperLogLog", "M3 — data types"),
     ("Keyspace notifications, SLOWLOG, MONITOR, sharded pub/sub (SSUBSCRIBE/SPUBLISH)", "M3"),
     ("Connection control (QUIT, RESET)", "M3 (RESET pairs with transaction state)"),

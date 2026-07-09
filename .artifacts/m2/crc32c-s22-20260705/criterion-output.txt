@@ -1,0 +1,110 @@
+   Compiling inf-simd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-simd)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 18.39s
+     Running benches/crc32c.rs (target/release/deps/crc32c-3aad80f3f6733867)
+Benchmarking crc32c/dispatched/64
+Benchmarking crc32c/dispatched/64: Warming up for 3.0000 s
+Benchmarking crc32c/dispatched/64: Collecting 100 samples in estimated 5.0000 s (1.9B iterations)
+Benchmarking crc32c/dispatched/64: Analyzing
+crc32c/dispatched/64    time:   [2.6494 ns 2.6502 ns 2.6510 ns]
+                        thrpt:  [22.483 GiB/s 22.490 GiB/s 22.498 GiB/s]
+                 change:
+                        time:   [−0.1785% −0.0501% +0.0934%] (p = 0.52 > 0.05)
+                        thrpt:  [−0.0934% +0.0501% +0.1789%]
+                        No change in performance detected.
+Found 7 outliers among 100 measurements (7.00%)
+  2 (2.00%) low mild
+  3 (3.00%) high mild
+  2 (2.00%) high severe
+Benchmarking crc32c/software/64
+Benchmarking crc32c/software/64: Warming up for 3.0000 s
+Benchmarking crc32c/software/64: Collecting 100 samples in estimated 5.0000 s (266M iterations)
+Benchmarking crc32c/software/64: Analyzing
+crc32c/software/64      time:   [18.814 ns 18.816 ns 18.819 ns]
+                        thrpt:  [3.1672 GiB/s 3.1677 GiB/s 3.1681 GiB/s]
+                 change:
+                        time:   [−0.1825% −0.0771% +0.0463%] (p = 0.20 > 0.05)
+                        thrpt:  [−0.0463% +0.0771% +0.1828%]
+                        No change in performance detected.
+Found 8 outliers among 100 measurements (8.00%)
+  5 (5.00%) high mild
+  3 (3.00%) high severe
+Benchmarking crc32c/dispatched/4096
+Benchmarking crc32c/dispatched/4096: Warming up for 3.0000 s
+Benchmarking crc32c/dispatched/4096: Collecting 100 samples in estimated 5.0012 s (14M iterations)
+Benchmarking crc32c/dispatched/4096: Analyzing
+crc32c/dispatched/4096  time:   [370.44 ns 370.50 ns 370.55 ns]
+                        thrpt:  [10.295 GiB/s 10.296 GiB/s 10.298 GiB/s]
+                 change:
+                        time:   [−0.1861% −0.0646% +0.0299%] (p = 0.28 > 0.05)
+                        thrpt:  [−0.0299% +0.0647% +0.1864%]
+                        No change in performance detected.
+Found 10 outliers among 100 measurements (10.00%)
+  3 (3.00%) high mild
+  7 (7.00%) high severe
+Benchmarking crc32c/software/4096
+Benchmarking crc32c/software/4096: Warming up for 3.0000 s
+Benchmarking crc32c/software/4096: Collecting 100 samples in estimated 5.0091 s (2.1M iterations)
+Benchmarking crc32c/software/4096: Analyzing
+crc32c/software/4096    time:   [2.4084 µs 2.4087 µs 2.4090 µs]
+                        thrpt:  [1.5836 GiB/s 1.5837 GiB/s 1.5839 GiB/s]
+                 change:
+                        time:   [−0.0940% −0.0020% +0.0962%] (p = 0.96 > 0.05)
+                        thrpt:  [−0.0961% +0.0020% +0.0941%]
+                        No change in performance detected.
+Found 8 outliers among 100 measurements (8.00%)
+  6 (6.00%) high mild
+  2 (2.00%) high severe
+Benchmarking crc32c/dispatched/65536
+Benchmarking crc32c/dispatched/65536: Warming up for 3.0000 s
+Benchmarking crc32c/dispatched/65536: Collecting 100 samples in estimated 5.0337 s (702k iterations)
+Benchmarking crc32c/dispatched/65536: Analyzing
+crc32c/dispatched/65536 time:   [7.1737 µs 7.1745 µs 7.1754 µs]
+                        thrpt:  [8.5062 GiB/s 8.5072 GiB/s 8.5082 GiB/s]
+                 change:
+                        time:   [−0.1153% −0.0244% +0.0657%] (p = 0.64 > 0.05)
+                        thrpt:  [−0.0656% +0.0244% +0.1155%]
+                        No change in performance detected.
+Found 7 outliers among 100 measurements (7.00%)
+  4 (4.00%) high mild
+  3 (3.00%) high severe
+Benchmarking crc32c/software/65536
+Benchmarking crc32c/software/65536: Warming up for 3.0000 s
+Benchmarking crc32c/software/65536: Collecting 100 samples in estimated 5.1023 s (131k iterations)
+Benchmarking crc32c/software/65536: Analyzing
+crc32c/software/65536   time:   [38.870 µs 38.875 µs 38.881 µs]
+                        thrpt:  [1.5698 GiB/s 1.5700 GiB/s 1.5702 GiB/s]
+                 change:
+                        time:   [−0.1389% −0.0272% +0.0866%] (p = 0.67 > 0.05)
+                        thrpt:  [−0.0866% +0.0272% +0.1391%]
+                        No change in performance detected.
+Found 7 outliers among 100 measurements (7.00%)
+  3 (3.00%) high mild
+  4 (4.00%) high severe
+Benchmarking crc32c/dispatched/1048576
+Benchmarking crc32c/dispatched/1048576: Warming up for 3.0000 s
+Benchmarking crc32c/dispatched/1048576: Collecting 100 samples in estimated 5.2662 s (45k iterations)
+Benchmarking crc32c/dispatched/1048576: Analyzing
+crc32c/dispatched/1048576
+                        time:   [115.90 µs 115.91 µs 115.92 µs]
+                        thrpt:  [8.4243 GiB/s 8.4253 GiB/s 8.4263 GiB/s]
+                 change:
+                        time:   [−1.8579% −0.9038% −0.1598%] (p = 0.02 < 0.05)
+                        thrpt:  [+0.1601% +0.9121% +1.8931%]
+                        Change within noise threshold.
+Found 10 outliers among 100 measurements (10.00%)
+  4 (4.00%) high mild
+  6 (6.00%) high severe
+Benchmarking crc32c/software/1048576
+Benchmarking crc32c/software/1048576: Warming up for 3.0000 s
+Benchmarking crc32c/software/1048576: Collecting 100 samples in estimated 6.2901 s (10k iterations)
+Benchmarking crc32c/software/1048576: Analyzing
+crc32c/software/1048576 time:   [623.09 µs 623.24 µs 623.40 µs]
+                        thrpt:  [1.5665 GiB/s 1.5669 GiB/s 1.5673 GiB/s]
+                 change:
+                        time:   [−0.2482% −0.1579% −0.0743%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.0743% +0.1581% +0.2488%]
+                        Change within noise threshold.
+Found 6 outliers among 100 measurements (6.00%)
+  3 (3.00%) high mild
+  3 (3.00%) high severe
+

@@ -2,7 +2,10 @@
 //! here (reduced command quota in debug); the nightly fleet runs every line
 //! at full scenario size via the CLI.
 
-use inf_sim::{Scenario, run_scenario};
+use inf_sim::{
+    BootStormScenario, CombinedScenario, DurableScenario, Scenario, run_boot_storm_scenario,
+    run_combined_scenario, run_durable_scenario, run_scenario,
+};
 
 fn parse_seed(text: &str) -> u64 {
     text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")).map_or_else(
@@ -22,6 +25,42 @@ fn corpus_seeds_replay_green() {
         }
         let (name, seed_text) = line.split_once(' ').expect("`<scenario> <seed>` per line");
         let seed = parse_seed(seed_text.trim());
+        // The M2-S19 durable scenario has its own runner + verdict shape
+        // (taxonomy refusals are legal; the survival audit still runs).
+        if name == "m2-durable" {
+            let report = run_durable_scenario(&DurableScenario::m2_durable(seed));
+            assert!(
+                report.ok(),
+                "corpus seed {line} regressed: stalled={} violations={:?}",
+                report.stalled,
+                report.violations
+            );
+            ran += 1;
+            continue;
+        }
+        // M2.5-S14 scenarios: their own runners + verdict shapes (the
+        // combined L2/pub-sub oracles; the boot-storm ready-path oracle).
+        if name == "m2-combined" {
+            let report = run_combined_scenario(&CombinedScenario::m2_combined(seed));
+            assert!(
+                report.ok(),
+                "corpus seed {line} regressed: stalled={} violations={:?}",
+                report.stalled,
+                report.violations
+            );
+            ran += 1;
+            continue;
+        }
+        if name == "boot-storm" {
+            let report = run_boot_storm_scenario(&BootStormScenario::m2_boot_storm(seed));
+            assert!(
+                report.ok(),
+                "corpus seed {line} regressed: violations={:?}",
+                report.violations
+            );
+            ran += 1;
+            continue;
+        }
         let mut scenario = match name {
             "m0-smoke" => Scenario::m0_smoke(seed),
             "m1-cache" => Scenario::m1_cache(seed),

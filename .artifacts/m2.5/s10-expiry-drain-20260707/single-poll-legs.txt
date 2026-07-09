@@ -1,0 +1,3 @@
+== additional single-poll legs (protocol: zero traffic between fill and the one DBSIZE)
+baseline-4f9f113 400k +1s: 0 remaining (rep1, rep2)
+baseline-4f9f113 1M +2s: 0 remaining (rep1 +2019ms, rep2 +2006ms)

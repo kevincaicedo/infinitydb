@@ -22,6 +22,8 @@
 use std::io;
 use std::path::Path;
 
+pub mod sim;
+
 /// One open segment file. Offsets are absolute; the caller (the rotor)
 /// owns position bookkeeping.
 pub trait SegmentFile {
@@ -42,6 +44,18 @@ pub trait SegmentFile {
     /// sim tier implements the driver ops themselves. `inf-log` never
     /// performs a syscall on it.
     fn raw_fd(&self) -> Option<std::os::fd::RawFd>;
+    /// Advisory (M2.5-S08 read/apply overlap): the caller will soon read
+    /// `[offset, offset + len)` sequentially. Tiers that can prefetch pull
+    /// that window toward the page cache in the background, so the device
+    /// read overlaps the caller's CPU work on the *current* window. A hint,
+    /// never an effect: it changes no bytes the caller reads, so L7
+    /// determinism and every digest are untouched — the default (and every
+    /// in-memory/sim tier) is a no-op. The real implementation is
+    /// `inf-server`'s `ReadAheadFs` boot wrapper (a per-file prefetch
+    /// thread; this crate forbids unsafe and never blocks on the hint).
+    fn advise_read_ahead(&self, offset: u64, len: u64) {
+        let _ = (offset, len);
+    }
 }
 
 /// Filesystem operations for the per-cell log directory.
@@ -60,6 +74,28 @@ pub trait SegmentFs {
     /// ENOSPC discipline seam: it must surface *before* any write needs
     /// the space (M2-S02).
     fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File>;
+    /// [`create_segment`](Self::create_segment) with **no durability side
+    /// effects** (M2.5-S01 boot barriers): the caller owns making the file
+    /// and its directory entry durable — driver-ridden fdatasync barriers
+    /// registered ahead of every data fsync in the group-commit ledger —
+    /// before any durable ack can reference it. A create-time sync here
+    /// blocks the reactor behind foreign journal writeback (the boot-wedge
+    /// mechanism). The default falls back to the synced create: correct,
+    /// but it pays the barrier at create time.
+    fn create_segment_unsynced(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
+        self.create_segment(path, prealloc_bytes)
+    }
+    /// Create a new *staging* file (create-new semantics) with **no
+    /// durability side effects** (M2-S11/S12): META/MANIFEST `.new` and
+    /// `.ick.new` staging gets its data durability from an explicit
+    /// fdatasync and its name durability from the publication dir-fsync —
+    /// a create-time sync here is a wasted device barrier on the loop.
+    fn create_meta(&self, path: &Path) -> io::Result<Self::File>;
+    /// Open a directory as a syncable handle (M2-S11/S12): `sync_data` on
+    /// it is the dir-fsync, and `raw_fd` is the address a driver
+    /// `Fdatasync` targets so publication barriers never block the loop.
+    /// Reads/writes on the handle are meaningless and unused.
+    fn open_dir(&self, dir: &Path) -> io::Result<Self::File>;
     /// Open an existing segment for reading and appending (the recovered
     /// tail).
     fn open_write(&self, path: &Path) -> io::Result<Self::File>;
@@ -132,6 +168,27 @@ impl SegmentFs for StdSegmentFs {
         Ok(StdSegmentFile(file))
     }
 
+    fn create_segment_unsynced(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
+        // No sync_all: an fsync here commits the whole ext4 journal and
+        // blocks the reactor behind any entangled foreign writeback for
+        // an unbounded time (M2.5-S01). Durability rides the boot-barrier
+        // fdatasyncs the caller registers in the group-commit ledger.
+        let file =
+            std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
+        file.set_len(prealloc_bytes)?;
+        Ok(StdSegmentFile(file))
+    }
+
+    fn create_meta(&self, path: &Path) -> io::Result<Self::File> {
+        let file =
+            std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
+        Ok(StdSegmentFile(file))
+    }
+
+    fn open_dir(&self, dir: &Path) -> io::Result<Self::File> {
+        Ok(StdSegmentFile(std::fs::File::open(dir)?))
+    }
+
     fn open_write(&self, path: &Path) -> io::Result<Self::File> {
         Ok(StdSegmentFile(std::fs::OpenOptions::new().read(true).write(true).open(path)?))
     }
@@ -175,6 +232,25 @@ pub mod mem {
         /// `create_segment` — the ENOSPC injection point.
         capacity: Option<u64>,
         fail_next_sync_data: bool,
+        /// Crash-at-step injection (M2-S11): `Some(n)` allows `n` more
+        /// mutating operations, then **every** further mutating op fails —
+        /// modeling a dead process whose best-effort cleanup also never
+        /// runs. Cleared by `clear_op_fault` (the "reboot").
+        ops_until_fault: Option<u64>,
+    }
+
+    impl State {
+        /// Charge one mutating operation against the crash countdown.
+        fn tick_op(&mut self) -> io::Result<()> {
+            match self.ops_until_fault {
+                None => Ok(()),
+                Some(0) => Err(io::Error::other("injected fault: op budget exhausted (crash)")),
+                Some(ref mut n) => {
+                    *n -= 1;
+                    Ok(())
+                }
+            }
+        }
     }
 
     /// Shared-handle in-memory filesystem.
@@ -211,6 +287,20 @@ pub mod mem {
             self.state.borrow_mut().fail_next_sync_data = true;
         }
 
+        /// Crash-at-step injection (M2-S11 swap matrix): allow `n` more
+        /// mutating operations (create, write, sync, rename, remove), then
+        /// fail every one until [`Self::clear_op_fault`] — the dead
+        /// process's cleanup must fail too, or the crash state would be
+        /// tidied away before "recovery" observes it.
+        pub fn fail_after_ops(&self, n: u64) {
+            self.state.borrow_mut().ops_until_fault = Some(n);
+        }
+
+        /// Lift the op-countdown fault (the "reboot" before recovery runs).
+        pub fn clear_op_fault(&self) {
+            self.state.borrow_mut().ops_until_fault = None;
+        }
+
         /// Raw contents of a file (test assertions).
         #[must_use]
         pub fn contents(&self, path: &Path) -> Option<Vec<u8>> {
@@ -227,6 +317,7 @@ pub mod mem {
 
     impl SegmentFile for MemFile {
         fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
+            self.fs.borrow_mut().tick_op()?;
             let mut bytes = self.data.borrow_mut();
             let offset = usize::try_from(offset).expect("offset fits usize");
             let end = offset + data.len();
@@ -254,6 +345,7 @@ pub mod mem {
 
         fn sync_data(&mut self) -> io::Result<()> {
             let mut state = self.fs.borrow_mut();
+            state.tick_op()?;
             if state.fail_next_sync_data {
                 state.fail_next_sync_data = false;
                 return Err(io::Error::other("injected fsync failure"));
@@ -280,7 +372,9 @@ pub mod mem {
         }
 
         fn sync_dir(&self, dir: &Path) -> io::Result<()> {
-            if self.state.borrow().dirs.contains(dir) {
+            let mut state = self.state.borrow_mut();
+            state.tick_op()?;
+            if state.dirs.contains(dir) {
                 Ok(())
             } else {
                 Err(io::Error::new(io::ErrorKind::NotFound, format!("no dir {}", dir.display())))
@@ -306,6 +400,7 @@ pub mod mem {
 
         fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
             let mut state = self.state.borrow_mut();
+            state.tick_op()?;
             let parent = path.parent().unwrap_or_else(|| Path::new(""));
             if !state.dirs.contains(parent) {
                 return Err(io::Error::new(
@@ -334,6 +429,25 @@ pub mod mem {
             Ok(MemFile { data, fs: Rc::clone(&self.state) })
         }
 
+        fn create_meta(&self, path: &Path) -> io::Result<Self::File> {
+            // Same create-new semantics, zero length, no capacity debit
+            // (staging envelopes, not preallocated segments).
+            self.create_segment(path, 0)
+        }
+
+        fn open_dir(&self, dir: &Path) -> io::Result<Self::File> {
+            let state = self.state.borrow();
+            if !state.dirs.contains(dir) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no dir {}", dir.display()),
+                ));
+            }
+            // A syncable stand-in: `sync_data` ticks the fault countdown
+            // like every other barrier; the buffer is never read/written.
+            Ok(MemFile { data: Rc::new(RefCell::new(Vec::new())), fs: Rc::clone(&self.state) })
+        }
+
         fn open_write(&self, path: &Path) -> io::Result<Self::File> {
             let state = self.state.borrow();
             let data = state.files.get(path).ok_or_else(|| {
@@ -348,6 +462,7 @@ pub mod mem {
 
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
             let mut state = self.state.borrow_mut();
+            state.tick_op()?;
             let parent = to.parent().unwrap_or_else(|| Path::new(""));
             if !state.dirs.contains(parent) {
                 return Err(io::Error::new(
@@ -365,6 +480,7 @@ pub mod mem {
 
         fn remove_file(&self, path: &Path) -> io::Result<()> {
             let mut state = self.state.borrow_mut();
+            state.tick_op()?;
             if state.files.remove(path).is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,

@@ -1,0 +1,9 @@
+ops = 105461801
+errors = 0
+elapsed_s = 40.001
+ops_per_sec = 2636463
+p50_us = 399
+p99_us = 735
+p999_us = 847
+p9999_us = 975
+max_us = 2769

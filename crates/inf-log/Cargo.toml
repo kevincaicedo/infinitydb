@@ -14,6 +14,9 @@ inf-foundation.workspace = true
 inf-simd.workspace = true
 
 [dev-dependencies]
+# M2-S16: tests arm named fault points; the feature reaches this crate's
+# lib through dev-dependency unification and never a shipping build.
+inf-foundation = { workspace = true, features = ["fault-points"] }
 proptest.workspace = true
 criterion.workspace = true
 # Test-harness edges only (ADR-0013 D2): the S05/S06 integration tests drive

@@ -15,20 +15,43 @@ mod config;
 mod control;
 mod durable;
 mod exec;
+pub mod fault;
 mod glob;
 mod log_bytes;
 mod plane;
 mod pubsub;
+mod readahead;
 mod recover;
 
-pub use ckpt::CkptStats;
+/// Process exit code for a durable-path fail-stop (§8.4, the fsyncgate
+/// rule): an fsync/log-write error freezes the watermark — no ack for the
+/// affected batch ever fires — and the process exits with this code
+/// (M2-S17, ADR-0020 D3). Boot-recovery failure keeps exit code 1
+/// (`infinityd`'s `take_boot_error` path).
+pub const EXIT_DURABLE_FAILSTOP: i32 = 3;
+
+pub use ckpt::{CkptStats, ManifestStats};
 pub use clients::{ClientInfo, ClientRegistry};
 pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
-pub use control::{ControlHandle, load_catalog, spawn as spawn_control};
-pub use durable::{DurableConfig, DurableStats};
+pub use control::{
+    CellRecoverySlot, ControlHandle, ControlInbox, RecoveryBoard, load_catalog, load_catalog_from,
+    spawn as spawn_control,
+};
+pub use durable::{DurableConfig, DurableStats, RecoverConfig};
+// Durable-config vocabulary re-exported for the assembly tier: bins name
+// `inf-server` only (dep-DAG), and `DurableConfig`'s fields are these
+// types — an assembly cannot fill one without naming them.
 #[doc(hidden)]
 pub use exec::parse_cursor;
 pub use exec::{ConnCx, NodeInfo, execute, execute_slices, stall_request};
 pub use glob::glob_match;
+pub use inf_log::ckpt::DEFAULT_CKPT_INTERVAL_BYTES;
+pub use inf_log::fs::StdSegmentFs;
+// M2-S18 (ADR-0020 D6/D7): the sim tier's disk, re-exported for the
+// assembly/simulator tier exactly like `StdSegmentFs` above — bins name
+// `inf-server` only (dep-DAG).
+pub use inf_log::fs::sim::{SimDisk, SimDiskConfig, StallConfig};
+pub use inf_log::{CkptConfig, DEFAULT_SEGMENT_BYTES, SegmentConfig, StagingConfig};
 pub use plane::{ExecOrigin, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane};
-pub use recover::{RecoverStats, open_cell_log};
+pub use readahead::{ReadAheadFile, ReadAheadFs};
+pub use recover::{RecoverStats, RecoveredManifest, Recovery, RecoveryProgress, open_cell_log};

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docs — InfinityDB</title>
+<meta name="description" content="InfinityDB documentation: quickstart, durability and namespaces, architecture, Redis compatibility matrix, roadmap.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='20'%20fill='%23201826'/%3E%3Ctext%20x='50'%20y='71'%20font-size='62'%20text-anchor='middle'%20fill='%23cf7ff5'%20font-family='system-ui'%3E%E2%88%9E%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="../index.html" class="nav-brand">
+      <span class="mark">&infin; InfinityDB</span>
+      <span class="nav-badge">v0.2.0-alpha.1 &middot; IN DEV</span>
+    </a>
+    <span class="nav-spacer"></span>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="nav-links">
+      <a href="../index.html#spine">Architecture</a>
+      <a href="../index.html#workloads">Workloads</a>
+      <a href="roadmap.html">Roadmap</a>
+      <a href="index.html" aria-current="page">Docs</a>
+      <a href="../blog/index.html">Blog</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<main class="doc-wide">
+  <p class="kicker">Documentation</p>
+  <h1 class="page-title">InfinityDB docs</h1>
+  <p class="lede">Alpha-stage documentation for operators and the curious. Everything here follows the project&rsquo;s honesty rules: shipped behavior is described precisely, roadmap behavior is labeled with its milestone, and every number is backed by the claim ledger.</p>
+
+  <div class="card-grid" style="margin-top:44px">
+    <a class="card" href="quickstart.html" style="display:block;color:inherit">
+      <h3>Quickstart</h3>
+      <p class="muted" style="font-size:14.5px;margin:0">Build from source or build the Docker image from the repo, point <code>redis-cli</code> at it, and create your first durable namespace. Includes the io_uring seccomp note for Docker.</p>
+    </a>
+    <a class="card" href="durability.html" style="display:block;color:inherit">
+      <h3>Namespaces &amp; durability</h3>
+      <p class="muted" style="font-size:14.5px;margin:0">Durability classes (<code>memory</code> / <code>everysec</code> / <code>always</code>), ack points, loss windows, checkpoints, recovery behavior, and the fail-stop rules &mdash; stated plainly, with the evidence behind them.</p>
+    </a>
+    <a class="card" href="architecture.html" style="display:block;color:inherit">
+      <h3>Architecture</h3>
+      <p class="muted" style="font-size:14.5px;margin:0">Shard cells, the fabric, the log spine, deterministic simulation, and the design laws &mdash; a condensed tour with pointers into the repository.</p>
+    </a>
+    <a class="card" href="compat.html" style="display:block;color:inherit">
+      <h3>Redis compatibility matrix</h3>
+      <p class="muted" style="font-size:14.5px;margin:0">Per-command status (<code>full</code> / <code>partial</code> / <code>extension</code>), byte-diff-verified against Redis 8.0.5. Rendered from the generated repo artifact &mdash; never hand-written.</p>
+    </a>
+    <a class="card" href="roadmap.html" style="display:block;color:inherit">
+      <h3>Roadmap</h3>
+      <p class="muted" style="font-size:14.5px;margin:0">The milestone train, gate by gate: what is done, what is in progress (M2.5), what each future milestone ships, and the ADRs that reordered the train.</p>
+    </a>
+    <a class="card" href="../blog/the-log-is-the-database.html" style="display:block;color:inherit">
+      <h3>How it&rsquo;s built</h3>
+      <p class="muted" style="font-size:14.5px;margin:0">The discipline model &mdash; design laws, STOP gates, deterministic simulation, and the evidence policy &mdash; explained in the inaugural blog post.</p>
+    </a>
+  </div>
+
+  <h2 id="claims">Claims &amp; evidence</h2>
+  <p>Every number or comparative statement in InfinityDB&rsquo;s public copy must have an <strong>Allowed</strong> row in the project&rsquo;s claim ledger, citing a validated artifact (replicated runs, clean tree, recorded environment, competitors in the same run). A claim absent from the ledger does not exist &mdash; and this website is checked against the ledger in CI.</p>
+  <p>The ledger lives in the repository at <code>docs/claim-ledger.md</code> (a snapshot used by the site&rsquo;s CI check is committed as <a href="../_ledger-snapshot.md"><code>_ledger-snapshot.md</code></a>). The benchmark story, honestly: performance and comparison numbers for the alpha are still moving through the evidence pipeline, so this site publishes correctness evidence (simulation sweeps, crash matrices, byte-compat counts) and leaves throughput/latency marketing at zero until the ledger allows otherwise.</p>
+
+  <h2>In the repository</h2>
+  <ul>
+    <li><code>docs/infinity-master-plan.md</code> &mdash; the architectural authority: laws, gates, and the roadmap.</li>
+    <li><code>infinitydb/ARCHITECTURE.md</code> &mdash; the internals overview (the long form of the <a href="architecture.html">architecture page</a>).</li>
+    <li><code>infinitydb/docs/compat-matrix.md</code> &mdash; the generated compatibility matrix source.</li>
+    <li><code>infinitydb/docs/deployment.md</code> &mdash; deployment detail, including the full seccomp explanation.</li>
+    <li><code>docs/claim-ledger.md</code> &mdash; the claim ledger.</li>
+  </ul>
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span class="mark">&infin; InfinityDB</span>
+    <span class="meta">APACHE 2.0 &middot; RUST &middot; BEST ON LINUX WITH io_uring</span>
+    <div class="footer-links">
+      <a href="index.html">Docs</a>
+      <a href="../blog/index.html">Blog</a>
+      <a href="roadmap.html">Roadmap</a>
+      <a href="https://github.com/">GitHub &#8599;</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var t = document.querySelector('.nav-toggle');
+  var l = document.querySelector('.nav-links');
+  if (t && l) t.addEventListener('click', function () {
+    var open = l.classList.toggle('open');
+    t.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+})();
+</script>
+</body>
+</html>
