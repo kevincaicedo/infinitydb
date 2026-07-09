@@ -10,7 +10,8 @@ Formats defined by ADR-0011 unless noted.
 | Interface | Crate | Status |
 |-----------|-------|--------|
 | Log record format v1 | `inf-log` | implemented (M2-S01) |
-| Batch frame layout v1 | `inf-log` | implemented (M2-S01) |
+| Batch frame layout v1 | `inf-log` | implemented (M2-S01); **read-only since M2.5-S12** (ADR-0031 — v2 is the written format; v1 accepted forever on the alpha line) |
+| Batch frame layout v2 (per-frame sequencing) | `inf-log` | implemented (M2.5-S12, ADR-0031 — epoch · seq · covered-LSN stamp under the CRC; the tail-scan attestation taxonomy consumes it) |
 | LSN addressing | `inf-log` | implemented (M2-S01) |
 | Segment naming + lifecycle | `inf-log` | implemented (M2-S02) |
 | `SegmentFs` injection seam | `inf-log` | implemented (M2-S02; extended by S05/S11/S16; sim-disk tier at S18) |
@@ -74,12 +75,54 @@ len-4  4    CRC32C(header·body): u32 LE   (kernel: inf-simd::crc32c)
   applies per frame; record-level errors inside a CRC-valid frame are
   corruption-or-bug and fail-stop.
 - Public surface: `FrameBuilder` (reusable buffer; `append(&RecordView)`,
-  `frame_len()`, `finalize(first_record_lsn) -> &[u8]`, `sealed_frame()`
-  (post-finalize re-access for the leased in-flight write), `reset()`),
-  `decode_frame(&[u8], max_frame_len)`, `FrameRef::records()` yielding
-  `(Lsn, RecordView)`, `FrameIter` (validate-then-yield; stops at zero
-  magic; `offset()` = bytes consumed — the tail-scan input for S04/S14),
-  `FrameDecodeError`, `FrameRecordError`.
+  `frame_len()`, `finalize(first_record_lsn, stamp) -> &[u8]`,
+  `sealed_frame()` (post-finalize re-access for the leased in-flight
+  write), `reset()`), `decode_frame(&[u8], max_frame_len)` (both formats),
+  `FrameRef::records()` yielding `(Lsn, RecordView)`, `FrameRef::stamp()`,
+  `FrameIter` (validate-then-yield; stops at zero magic; `offset()` =
+  bytes consumed — the tail-scan input for S04/S14), `FrameDecodeError`,
+  `FrameRecordError`.
+
+## Batch frame layout v2 (`inf-log::frame`, M2.5-S12 — ADR-0031)
+
+```text
+offset size field
+0      4    magic = "IFR2"        (all-zero magic ⇒ preallocated tail; "IFR1" ⇒ v1, read-only)
+4      4    frame_len: u32 LE     (total: header+body+trailer; ≥ 48)
+8      4    record_count: u32 LE  (≥ 1)
+12     8    first_lsn: segment u32 LE · offset u32 LE   (first RECORD's LSN — base + 40)
+20     4    epoch: u32 LE         (log life; ≥ 1 — 0 is a decode error)
+24     8    seq: u64 LE           (frame ordinal within the epoch, from 1; 0 is a decode error)
+32     8    covered_lsn: u64 LE   (Lsn::to_u64 of the durability watermark at seal;
+                                   > first_lsn is a decode error — the watermark never
+                                   leads the append cursor)
+40     …    body: records
+len-4  4    CRC32C(header·body): u32 LE
+```
+
+- The stamp is what recovery's evidence taxonomy consumes (ADR-0031
+  D3–D5): prefix continuity (epoch nondecreasing; seq +1 within an epoch
+  and within a segment; seq 1 at an epoch step; `covered_lsn`
+  nondecreasing within a run), the beyond-the-data-end **attestation
+  rule** (a surviving frame attesting coverage past the data end → named
+  refusal; otherwise the gap is provably un-covered and truncates — the
+  retired ADR-0021 D3 refusal class, counted in
+  `RecoverStats::beyond_frames_discarded`), the **cross-segment
+  attestation check** (coverage claims must lie within earlier segments'
+  surviving data), and **epoch residue** (a lower-epoch frame ends replay
+  — discarded-life residue never re-enters a prefix;
+  `RecoverStats::epoch_residue_stops`).
+- Epoch derivation: every recovery-for-append resumes at 1 + max(epoch
+  over the valid prefix and every validating beyond-frame); fresh logs
+  start at 1. Carried on `SegmentRotor::{set_,}resume_epoch`; the cell
+  assembly wires `StagingRing::set_frame_epoch` (seq restarts at 1).
+- Writer surface: `StagingRing::seal(first_record_lsn, covered_lsn)` —
+  the plane passes `GroupCommit::watermark()`; the synchronous tiers
+  (`flush_into`) stamp `covered_lsn = 0` (attests nothing, conservative).
+- v1 frames decode with `stamp() == None`, attest nothing, and keep the
+  conservative pre-ADR-0031 refusal beyond a gap; a v1 frame *after* a v2
+  frame in a replay prefix is a named refusal (append order — no
+  downgrade after the first v2 frame).
 
 ## LSN addressing (`inf-log::lsn`)
 

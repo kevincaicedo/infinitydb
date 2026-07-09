@@ -855,6 +855,11 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             // bug (the canary) cannot hide behind the refusal.
             if err.to_string().contains("log corruption") {
                 report.refused_boot = true;
+                // Refusals are counted in the sweep manifest; the *class*
+                // must be visible too (§8.4 never-silent, M2.5-S12: the
+                // residual-refusal taxonomy after ADR-0031 is a ledger
+                // observable).
+                eprintln!("refused boot {boots}: {err}");
                 let mut tally = AuditTally::default();
                 survival_audit(scenario, &disk, &writers, cut_time, &mut tally);
                 report.required_ops += tally.required_ops;

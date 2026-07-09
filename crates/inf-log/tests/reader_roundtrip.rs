@@ -10,11 +10,18 @@ use std::path::{Path, PathBuf};
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    FRAME_HEADER_LEN, FrameBuilder, FrameDecodeError, Lsn, MutationEffect, NsId, ReadEnd,
-    ReadError, ReaderConfig, RecordView, SegmentConfig, SegmentId, SegmentReader, SegmentRotor,
-    StagingConfig, StagingRing, create_cell_dirs, scan_log_dir, segment_file_name,
+    FRAME_HEADER_LEN, FrameBuilder, FrameDecodeError, FrameStamp, Lsn, MutationEffect, NsId,
+    ReadEnd, ReadError, ReaderConfig, RecordView, SegmentConfig, SegmentId, SegmentReader,
+    SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, scan_log_dir, segment_file_name,
 };
 use proptest::prelude::*;
+
+/// Canonical v2 stamp for hand-built test frames (epoch 1, covered 0 —
+/// attests nothing). `seq` matters only where a test builds sequential
+/// frames the recovery policy will walk; readers/scanners ignore it.
+fn stamp(seq: u64) -> FrameStamp {
+    FrameStamp { epoch: 1, seq, covered_lsn: 0 }
+}
 
 fn mem_rotor(fs: &MemFs, segment_bytes: u32) -> (SegmentRotor<MemFs>, PathBuf) {
     let dirs = create_cell_dirs(fs, &PathBuf::from("data/shard-0")).expect("dirs");
@@ -233,7 +240,7 @@ fn write_frame(rotor: &mut SegmentRotor<MemFs>, records: &[RecordView<'_>]) -> L
     }
     let slot = rotor.begin_frame(builder.frame_len(), 0).expect("reserve");
     let first = slot.first_record_lsn();
-    let bytes = builder.finalize(first);
+    let bytes = builder.finalize(first, stamp(1));
     rotor.commit_frame(slot, bytes).expect("commit")
 }
 
@@ -371,7 +378,7 @@ fn misdirected_frame_is_an_lsn_mismatch() {
     builder.append(&RecordView::Delete { ns: NsId(1), key: b"x" });
     let slot = rotor.begin_frame(builder.frame_len(), 0).expect("reserve");
     let lied = Lsn::new(SegmentId(9), 0x400);
-    let bytes = builder.finalize(lied);
+    let bytes = builder.finalize(lied, stamp(1));
     rotor.commit_frame(slot, bytes).expect("commit");
 
     let mut reader =

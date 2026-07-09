@@ -13,10 +13,17 @@ use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::mem::MemFs;
 use inf_log::meta::{read_meta, write_meta};
 use inf_log::{
-    DEFAULT_MAX_FRAME_LEN, FrameBuilder, FrameIter, LogError, Lsn, Manifest, NsId, RecordView,
-    SegmentConfig, SegmentId, SegmentRotor, create_cell_dirs, read_manifest, scan_log_dir,
-    segment_file_name, write_manifest,
+    DEFAULT_MAX_FRAME_LEN, FrameBuilder, FrameIter, FrameStamp, LogError, Lsn, Manifest, NsId,
+    RecordView, SegmentConfig, SegmentId, SegmentRotor, create_cell_dirs, read_manifest,
+    scan_log_dir, segment_file_name, write_manifest,
 };
+
+/// Canonical v2 stamp for hand-built test frames (epoch 1, covered 0 —
+/// attests nothing). `seq` matters only where a test builds sequential
+/// frames the recovery policy will walk; readers/scanners ignore it.
+fn stamp(seq: u64) -> FrameStamp {
+    FrameStamp { epoch: 1, seq, covered_lsn: 0 }
+}
 
 const SEGMENT_BYTES: u32 = 4096;
 
@@ -35,7 +42,7 @@ fn append_frame(rotor: &mut SegmentRotor<MemFs>, filler: usize) -> Result<Lsn, L
     builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: &value });
     let slot = rotor.begin_frame(builder.frame_len(), 0)?;
     let first_record_lsn = slot.first_record_lsn();
-    let frame = builder.finalize(first_record_lsn);
+    let frame = builder.finalize(first_record_lsn, stamp(1));
     rotor.commit_frame(slot, frame)
 }
 

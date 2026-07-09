@@ -13,9 +13,9 @@ use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    CkptConfig, FRAME_HEADER_LEN, FrameBuilder, Lsn, Manifest, MutationEffect, NsId, RecordView,
-    SegmentConfig, SegmentId, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs,
-    segment_file_name, write_manifest,
+    CkptConfig, FRAME_HEADER_LEN, FrameBuilder, FrameStamp, Lsn, Manifest, MutationEffect, NsId,
+    RecordView, SegmentConfig, SegmentId, SegmentRotor, StagingConfig, StagingRing,
+    create_cell_dirs, segment_file_name, write_manifest,
 };
 use inf_server::{DurableConfig, open_cell_log};
 use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig, WallAnchor};
@@ -73,12 +73,18 @@ impl LogBuilder {
     }
 
     /// Stage `records` as one frame, flush it, and return the frame's
-    /// (base offset, per-record LSNs).
+    /// (base offset, per-record LSNs). Frames attest like a live `always`
+    /// plane (ADR-0031 D1): each stamps `covered_lsn` = its own base — the
+    /// watermark of a group commit that fsynced every prior frame.
     fn frame(&mut self, records: &[MutationEffect<'_>]) -> (Lsn, Vec<Lsn>) {
         let staged: Vec<_> =
             records.iter().map(|effect| self.ring.stage(effect).expect("stage")).collect();
         self.rotor.maintain(0).expect("maintain");
-        let lease = self.ring.flush_into(&mut self.rotor, 0).expect("flush").expect("frame");
+        let slot = self.rotor.begin_frame(self.ring.pending_frame_len(), 0).expect("reserve");
+        let covered = slot.base().to_u64();
+        let lease = self.ring.seal(slot.first_record_lsn(), covered);
+        let frame = self.ring.leased_frame(&lease).to_vec();
+        self.rotor.commit_frame(slot, &frame).expect("commit");
         let lsns: Vec<Lsn> = staged.iter().map(|&at| lease.lsn_of(at)).collect();
         self.ring.release(lease);
         let first = lsns[0];
@@ -154,8 +160,10 @@ fn resume_over_remnants_then_recover_again_is_clean() {
     assert!(stats.torn_truncated_at.is_some());
 
     // The cell keeps writing over the remnant region through the
-    // recovered rotor (a smaller frame than the remnant).
+    // recovered rotor (a smaller frame than the remnant), under the
+    // recovery-derived life — the assembly wiring ADR-0031 D6 requires.
     let mut ring = StagingRing::new(config.staging);
+    ring.set_frame_epoch(rotor.resume_epoch());
     let at = ring
         .stage(&MutationEffect::StringSet { ns: NS, key: b"post", value: b"torn" })
         .expect("stage");
@@ -257,34 +265,111 @@ fn torn_tail_removes_the_trailing_preallocated_segment() {
     assert_eq!(get(&mut ks, b"b"), None);
 }
 
+/// Byte after the last frame of segment 0, recomputed from a record LSN.
+fn data_end(fs: &MemFs, log: &LogBuilder, lsn: Lsn) -> u32 {
+    let base = lsn.offset - FRAME_HEADER_LEN as u32;
+    let seg = fs.contents(&log.seg_path(lsn.segment)).expect("segment bytes");
+    let frame_len =
+        u32::from_le_bytes(seg[base as usize + 4..base as usize + 8].try_into().unwrap());
+    base + frame_len
+}
+
 #[test]
-fn validating_frame_after_a_zero_gap_refuses_to_start() {
-    // The resurrection hazard: a dropped write left zeros at the tail and
-    // a later write survived beyond them. If recovery resumed at the gap,
-    // a future append landing a frame boundary exactly on the survivor
-    // would replay it *after* newer data — so boot must refuse instead.
+fn attesting_survivor_after_a_zero_gap_refuses_to_start() {
+    // ADR-0031 D4: a surviving frame whose stamp attests fsync coverage
+    // past the data end proves the gap sat in covered territory — the
+    // disk lost covered data, and boot must refuse with that evidence.
     let fs = MemFs::new();
     let config = cfg();
     let mut log = LogBuilder::new(&fs, &config);
     let (_, lsns) = log.set_frame(b"a", b"1");
-    let end = {
-        // Byte after the only frame: recompute from the record LSN.
-        let base = lsns[0].offset - FRAME_HEADER_LEN as u32;
-        let seg = fs.contents(&log.seg_path(lsns[0].segment)).expect("segment bytes");
-        let frame_len =
-            u32::from_le_bytes(seg[base as usize + 4..base as usize + 8].try_into().unwrap());
-        base + frame_len
-    };
-    // A validating frame written for exactly `end + 512`, past a zero gap.
+    let end = data_end(&fs, &log, lsns[0]);
+    // A validating frame written for exactly `end + 512`, past a zero
+    // gap, attesting the gap region was covered when it was sealed.
     let survivor_at = end + 512;
     let mut b = FrameBuilder::new();
     b.append(&RecordView::StringPostImage { ns: NS, key: b"ghost", value: b"stale" });
-    let bytes = b.finalize(Lsn::new(SegmentId(0), survivor_at + FRAME_HEADER_LEN as u32)).to_vec();
+    let stamp =
+        FrameStamp { epoch: 1, seq: 9, covered_lsn: Lsn::new(SegmentId(0), survivor_at).to_u64() };
+    let bytes =
+        b.finalize(Lsn::new(SegmentId(0), survivor_at + FRAME_HEADER_LEN as u32), stamp).to_vec();
     log.poke(SegmentId(0), survivor_at, &bytes);
 
     let mut ks = fresh_keyspace();
-    let err = recover(&fs, &mut ks).expect_err("a survivor beyond a gap is fail-stop");
-    assert!(err.to_string().contains("validating frame follows"), "{}", err.to_string());
+    let err = recover(&fs, &mut ks).expect_err("an attesting survivor beyond a gap is fail-stop");
+    let msg = err.to_string();
+    assert!(msg.contains("validating frame follows"), "{msg}");
+    assert!(msg.contains("attests fsync coverage"), "names the attestation evidence: {msg}");
+}
+
+#[test]
+fn unattested_survivor_after_a_zero_gap_truncates_and_is_counted() {
+    // The retired ADR-0021 D3 refusal (M2.5-S12): the same shape with no
+    // surviving attestation is exactly what a reorder hole in the
+    // un-covered suffix leaves behind — nothing acked is lost, so boot
+    // truncates at the data end, counts the discarded survivor, and the
+    // resumed life's epoch tops the survivor's (it can never re-enter a
+    // replay prefix).
+    let fs = MemFs::new();
+    let config = cfg();
+    let mut log = LogBuilder::new(&fs, &config);
+    let (_, lsns) = log.set_frame(b"a", b"1");
+    let end = data_end(&fs, &log, lsns[0]);
+    let survivor_at = end + 512;
+    let mut b = FrameBuilder::new();
+    b.append(&RecordView::StringPostImage { ns: NS, key: b"ghost", value: b"stale" });
+    let stamp = FrameStamp { epoch: 3, seq: 9, covered_lsn: 0 };
+    let bytes =
+        b.finalize(Lsn::new(SegmentId(0), survivor_at + FRAME_HEADER_LEN as u32), stamp).to_vec();
+    log.poke(SegmentId(0), survivor_at, &bytes);
+
+    let mut ks = fresh_keyspace();
+    let (rotor, stats) = recover(&fs, &mut ks).expect("an un-attested survivor truncates");
+    assert_eq!(get(&mut ks, b"a").as_deref(), Some(&b"1"[..]), "prefix data intact");
+    assert_eq!(get(&mut ks, b"ghost"), None, "the survivor never replays");
+    assert_eq!(stats.beyond_frames_discarded, 1, "counted, never silent");
+    assert_eq!(stats.torn_truncated_at, Some(Lsn::new(SegmentId(0), end)));
+    assert!(rotor.resume_epoch() > 3, "the resumed life tops every observed epoch");
+}
+
+#[test]
+fn v1_survivor_after_a_zero_gap_still_refuses_to_start() {
+    // A format-v1 frame beyond the data end attests nothing — the
+    // conservative pre-ADR-0031 rule holds for mixed-era logs.
+    let fs = MemFs::new();
+    let config = cfg();
+    let mut log = LogBuilder::new(&fs, &config);
+    let (_, lsns) = log.set_frame(b"a", b"1");
+    let end = data_end(&fs, &log, lsns[0]);
+    let survivor_at = end + 512;
+    let bytes = v1_frame_at(SegmentId(0), survivor_at, b"ghost", b"stale");
+    log.poke(SegmentId(0), survivor_at, &bytes);
+
+    let mut ks = fresh_keyspace();
+    let err = recover(&fs, &mut ks).expect_err("a v1 survivor beyond a gap is fail-stop");
+    let msg = err.to_string();
+    assert!(msg.contains("validating frame follows"), "{msg}");
+    assert!(msg.contains("cannot attest"), "names the v1 limitation: {msg}");
+}
+
+/// Hand-built format-v1 frame (magic `IFR1`, 20-byte header, no stamp) for
+/// exactly (`segment`, `offset`) — the legacy writer no code path emits
+/// anymore (ADR-0031 D2).
+fn v1_frame_at(segment: SegmentId, offset: u32, key: &[u8], value: &[u8]) -> Vec<u8> {
+    let record = RecordView::StringPostImage { ns: NS, key, value };
+    let mut body = Vec::new();
+    record.encode_into(&mut body);
+    let frame_len = u32::try_from(20 + body.len() + 4).expect("fits u32");
+    let mut frame = Vec::with_capacity(frame_len as usize);
+    frame.extend_from_slice(b"IFR1");
+    frame.extend_from_slice(&frame_len.to_le_bytes());
+    frame.extend_from_slice(&1u32.to_le_bytes());
+    frame.extend_from_slice(&segment.0.to_le_bytes());
+    frame.extend_from_slice(&(offset + 20).to_le_bytes());
+    frame.extend_from_slice(&body);
+    let crc = inf_simd::crc32c(&frame);
+    frame.extend_from_slice(&crc.to_le_bytes());
+    frame
 }
 
 #[test]

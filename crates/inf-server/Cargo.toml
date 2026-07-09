@@ -22,6 +22,9 @@ workspace = true
 [dev-dependencies]
 # M2-S16: recovery/fault tests arm named points (dev-only unification).
 inf-foundation = { workspace = true, features = ["fault-points"] }
+# M2.5-S12 (ADR-0031): recovery tests hand-build legacy v1 frames (CRC32C)
+# — no shipping code path emits them anymore.
+inf-simd.workspace = true
 # M2-S22: bench-only page-cache cooling (fadvise DONTNEED) for the
 # cold-cache recovery/boot gate rows. The library keeps its no-libc rule.
 libc.workspace = true
