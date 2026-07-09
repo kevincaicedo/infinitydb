@@ -21,9 +21,12 @@ inf-log = ["inf-foundation", "inf-alloc", "inf-simd"]
 # inf-store → inf-log: effect/record vocabulary (`NsId`, `FsyncClass`,
 # `RecordView`) for durable namespaces, the catalog encoding, and
 # `Keyspace::apply_record` replay (ADR-0012 D1 direction, ADR-0015 D7 wiring).
-inf-store = ["inf-foundation", "inf-alloc", "inf-simd", "inf-log"]
+# inf-store -> inf-doc: the M3 engine edge (ADR-0032 D7; M3 plan §3.3).
+inf-store = ["inf-foundation", "inf-alloc", "inf-simd", "inf-log", "inf-doc"]
 inf-stream = ["inf-foundation", "inf-log", "inf-store"]
-inf-doc = ["inf-foundation", "inf-alloc"]
+# inf-doc -> inf-simd: SIMD structural scanning behind safe wrappers
+# (ADR-0032 D7; M3 plan §3.3). Never inf-wire/inf-log/inf-server.
+inf-doc = ["inf-foundation", "inf-alloc", "inf-simd"]
 inf-vector = ["inf-foundation", "inf-simd", "inf-alloc"]
 inf-compute = ["inf-foundation", "inf-store"]
 inf-replica = ["inf-foundation", "inf-log"]
