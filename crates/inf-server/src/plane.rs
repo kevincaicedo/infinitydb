@@ -393,6 +393,13 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// prefetch), then executes the batch in parse order. Off by default
     /// until its binding A/B (`--parse-batch-prefetch`).
     parse_prefetch: Cell<bool>,
+    /// De-async dispatch (M2.5 Phase H, ADR-0030 D4): the pump tries a
+    /// synchronous fast path per command (single-owner remote `Apply`,
+    /// local mirror) before constructing the `dispatch_one` future — the
+    /// send path almost never suspends, so the async machinery is pure
+    /// overhead on the hot arms. Off by default until its binding A/B
+    /// (`--deasync-dispatch`).
+    deasync_dispatch: Cell<bool>,
 }
 
 /// One fabric-origin PUBLISH parked at the owner cell.
@@ -842,6 +849,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 loading: Cell::new(false),
                 apply_prefetch: Cell::new(false),
                 parse_prefetch: Cell::new(false),
+                deasync_dispatch: Cell::new(false),
             }),
             listener,
             started: false,
@@ -1061,6 +1069,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// store lines, then executes in parse order.
     pub fn set_parse_batch_prefetch(&mut self, on: bool) {
         self.shared.parse_prefetch.set(on);
+    }
+
+    /// De-async dispatch (M2.5 Phase H, ADR-0030 D4 lever): the pump
+    /// attempts a synchronous fast path per command before falling back to
+    /// the async `dispatch_one`.
+    pub fn set_deasync_dispatch(&mut self, on: bool) {
+        self.shared.deasync_dispatch.set(on);
     }
 
     /// Live connections (tests, stats).
@@ -2445,6 +2460,132 @@ fn is_conn_state(owned: &OwnedCmd) -> bool {
     })
 }
 
+/// Outcome of the de-async dispatch fast path (ADR-0030 D4).
+enum FastDispatch {
+    /// Handled synchronously; `pending`/`inflight` updated.
+    Handled,
+    /// The connection is gone; the pump exits.
+    ConnGone,
+    /// Not a fast arm (rare shape) or no fabric credit on the first send
+    /// attempt: run the async [`dispatch_one`] — the unchanged slow path.
+    Fallback,
+}
+
+/// The pump's synchronous dispatch fast path (M2.5 Phase H, ADR-0030 D4):
+/// the arms that dominate the natural-routing mix — the single-owner
+/// remote `Apply` and the local mirror — dispatch without constructing
+/// the [`dispatch_one`] future, whose send path suspends only on
+/// fabric-credit exhaustion. Guard order mirrors `dispatch_one`'s match
+/// arms exactly; every other shape falls back to it
+/// (`deasync_dispatch_matches_pump_semantics` pins the equivalence).
+fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    key: ConnKey,
+    owned: &OwnedCmd,
+    pending: &mut VecDeque<PendingReply>,
+    inflight: &mut usize,
+) -> FastDispatch {
+    let argc = owned.argc();
+    if argc > ARGV_INLINE {
+        // Wide argv (MSET…): rare — keep the heap-argv path async.
+        return FastDispatch::Fallback;
+    }
+    let mut argv_inline: [&[u8]; ARGV_INLINE] = [b""; ARGV_INLINE];
+    for (i, slot) in argv_inline[..argc].iter_mut().enumerate() {
+        *slot = owned.arg(i);
+    }
+    let argv: &[&[u8]] = &argv_inline[..argc];
+    let Some((proto, id, db, conn_ns, restricted)) = shared.with_conn(key, |c| {
+        (c.cx.proto, c.cx.id, c.cx.db, c.cx.ns, pubsub::subscriber_restricted(&c.cx))
+    }) else {
+        return FastDispatch::ConnGone;
+    };
+    let origin = ExecOrigin::Conn(key.slot, key.generation);
+    let meta = lookup(argv[0]);
+    let well_formed = meta.is_some_and(|m| arity_ok(m, argv.len()));
+    if let Some(meta) = meta
+        && well_formed
+        && restricted
+        && !pubsub::is_plane_pubsub(meta.id)
+    {
+        pending.push_back(PendingReply::Done(restricted_reply(shared, meta, argv, proto)));
+        return FastDispatch::Handled;
+    }
+    if let Some(m) = meta
+        && well_formed
+    {
+        // The program/rare arms, in dispatch_one's guard order: pub/sub,
+        // NS DDL, ckpt surface, named-namespace dispatch, scatter.
+        if pubsub::is_plane_pubsub(m.id)
+            || (m.id == CommandId::InfNs
+                && argv.get(1).is_some_and(|s| {
+                    s.eq_ignore_ascii_case(b"CREATE") || s.eq_ignore_ascii_case(b"DROP")
+                }))
+            || matches!(m.id, CommandId::InfCkpt | CommandId::Bgsave | CommandId::Lastsave)
+            || (conn_ns.is_some() && !is_conn_state(owned))
+            || (is_scatter(m.id, argv.get(1).copied())
+                && shared.cells > 1
+                && !shared.route_local_only)
+        {
+            return FastDispatch::Fallback;
+        }
+        // One routing pass per command, as in dispatch_one.
+        let mut first_owner = shared.cell;
+        let mut any_remote = false;
+        if !shared.route_local_only {
+            let mut first = true;
+            for k in extract_keys_iter(m, argv) {
+                let owner = shared.router.cell_of(SlotRouter::slot_of(k));
+                if first {
+                    first_owner = owner;
+                    first = false;
+                }
+                if owner != shared.cell {
+                    any_remote = true;
+                    break;
+                }
+            }
+        }
+        if any_remote {
+            let split = matches!(
+                m.id,
+                CommandId::Del
+                    | CommandId::Exists
+                    | CommandId::Unlink
+                    | CommandId::Touch
+                    | CommandId::Mget
+                    | CommandId::Mset
+                    | CommandId::Msetnx
+            );
+            let two_owner =
+                matches!(m.id, CommandId::Rename | CommandId::Renamenx | CommandId::Copy)
+                    && shared.router.cell_of(SlotRouter::slot_of(argv[1]))
+                        != shared.router.cell_of(SlotRouter::slot_of(argv[2]));
+            if split || two_owner {
+                return FastDispatch::Fallback;
+            }
+            // Single-owner remote command: the hot arm.
+            return match try_send_apply(shared, first_owner, proto, db, argv) {
+                SendNow::Sent(waiter) => {
+                    *inflight += 1;
+                    pending.push_back(PendingReply::Remote { waiter, proto });
+                    FastDispatch::Handled
+                }
+                SendNow::Refused(refusal) => {
+                    pending.push_back(PendingReply::Done(refusal));
+                    FastDispatch::Handled
+                }
+                SendNow::NoCredit => FastDispatch::Fallback,
+            };
+        }
+    }
+    if dispatch_mirror(shared, key, owned, argv, origin, proto, id, db, conn_ns, pending) {
+        FastDispatch::Handled
+    } else {
+        FastDispatch::ConnGone
+    }
+}
+
 /// The per-connection pump: dispatch commands in pipeline order with up to
 /// [`REMOTE_WINDOW`] remote ops in flight, emit replies strictly in command
 /// order. Suspends only on the front reply's gate and on fabric credits;
@@ -2474,7 +2615,19 @@ async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 held = Some(cmd);
                 break;
             }
-            if !dispatch_one(&shared, key, &cmd, &mut pending, &mut inflight).await {
+            // De-async fast path (ADR-0030 D4): hot arms dispatch without
+            // constructing the `dispatch_one` future; rare shapes and
+            // credit exhaustion fall back to the async path unchanged.
+            let handled = if shared.deasync_dispatch.get() {
+                match dispatch_one_fast(&shared, key, &cmd, &mut pending, &mut inflight) {
+                    FastDispatch::Handled => true,
+                    FastDispatch::ConnGone => return,
+                    FastDispatch::Fallback => false,
+                }
+            } else {
+                false
+            };
+            if !handled && !dispatch_one(&shared, key, &cmd, &mut pending, &mut inflight).await {
                 return; // connection is gone
             }
             // The command's flat buffer recycles once dispatched (waiters
@@ -2635,24 +2788,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         && restricted
         && !pubsub::is_plane_pubsub(meta.id)
     {
-        let mut reply = shared.take_reply_buf();
-        if meta.id == CommandId::Ping {
-            if argv.len() > 2 {
-                RespWriter::new(&mut reply, proto)
-                    .error("ERR wrong number of arguments for 'ping' command");
-            } else {
-                pubsub::subscriber_ping(argv.get(1).copied(), proto, &mut reply);
-            }
-        } else {
-            let sub = argv.get(1).copied();
-            pubsub::restricted_error(
-                meta.id,
-                meta.name,
-                sub,
-                &mut RespWriter::new(&mut reply, proto),
-            );
-        }
-        pending.push_back(PendingReply::Done(reply));
+        pending.push_back(PendingReply::Done(restricted_reply(shared, meta, argv, proto)));
         return true;
     }
     // One routing pass per command (M2.5 Phase H: was one
@@ -2912,44 +3048,93 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             }
         }
         _ => {
-            let mut reply = shared.take_reply_buf();
-            if is_conn_state(owned) {
-                // Execute under a cx mirroring the live connection, then
-                // write the negotiated protocol back — the M0 pump dropped
-                // HELLO's proto switch on queued pipelines (temp-cx bug,
-                // found extending the surface; ledger entry).
-                let Some(mut live) = shared.with_conn(key, |c| ConnCx {
-                    proto: c.cx.proto,
-                    id: c.cx.id,
-                    db: c.cx.db,
-                    ns: c.cx.ns,
-                    // Cold path: HELLO/SELECT execute under the live
-                    // subscription view (the RESP2 subscriber restriction
-                    // applies to HELLO exactly as in Redis).
-                    sub_channels: c.cx.sub_channels.clone(),
-                    sub_patterns: c.cx.sub_patterns.clone(),
-                    node: Rc::clone(&shared.node),
-                    close_requested: Cell::new(false),
-                }) else {
-                    return false;
-                };
-                let now = shared.now.get();
-                execute_slices(argv, &mut shared.store.borrow_mut(), &mut live, now, &mut reply);
-                shared.observer.borrow_mut().on_execute(shared.cell, origin, argv, &reply, now);
-                shared.with_conn(key, |c| {
-                    c.cx.proto = live.proto;
-                    c.cx.db = live.db;
-                    c.cx.ns = live.ns;
-                });
-            } else {
-                shared.execute_owned_into(origin, argv, proto, id, db, conn_ns, &mut reply);
-                if let Some(dur) = stall_request(argv) {
-                    shared.stall_until.set(shared.now.get().saturating_add(dur));
-                }
-            }
-            pending.push_back(PendingReply::Done(reply));
+            return dispatch_mirror(
+                shared, key, owned, argv, origin, proto, id, db, conn_ns, pending,
+            );
         }
     }
+    true
+}
+
+/// The RESP2 subscriber-restriction reply for a pump-dispatched command
+/// (M1-S10) — shared verbatim by [`dispatch_one`] and the de-async fast
+/// path (ADR-0030 D4): both arms must produce identical bytes.
+fn restricted_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    meta: &'static inf_wire::CommandMeta,
+    argv: &[&[u8]],
+    proto: Protocol,
+) -> Vec<u8> {
+    let mut reply = shared.take_reply_buf();
+    if meta.id == CommandId::Ping {
+        if argv.len() > 2 {
+            RespWriter::new(&mut reply, proto)
+                .error("ERR wrong number of arguments for 'ping' command");
+        } else {
+            pubsub::subscriber_ping(argv.get(1).copied(), proto, &mut reply);
+        }
+    } else {
+        let sub = argv.get(1).copied();
+        pubsub::restricted_error(meta.id, meta.name, sub, &mut RespWriter::new(&mut reply, proto));
+    }
+    reply
+}
+
+/// The pump's local mirror arm: conn-state commands execute under a cx
+/// mirroring the live connection with the negotiated state written back
+/// (HELLO's proto switch must land on the conn — the M0 temp-cx bug);
+/// everything else executes locally. Shared verbatim by [`dispatch_one`]
+/// and the de-async fast path (ADR-0030 D4). Returns `false` when the
+/// connection is gone.
+#[allow(clippy::too_many_arguments)] // internal dispatch funnel
+fn dispatch_mirror<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    key: ConnKey,
+    owned: &OwnedCmd,
+    argv: &[&[u8]],
+    origin: ExecOrigin,
+    proto: Protocol,
+    id: u64,
+    db: u16,
+    conn_ns: Option<NsId>,
+    pending: &mut VecDeque<PendingReply>,
+) -> bool {
+    let mut reply = shared.take_reply_buf();
+    if is_conn_state(owned) {
+        // Execute under a cx mirroring the live connection, then
+        // write the negotiated protocol back — the M0 pump dropped
+        // HELLO's proto switch on queued pipelines (temp-cx bug,
+        // found extending the surface; ledger entry).
+        let Some(mut live) = shared.with_conn(key, |c| ConnCx {
+            proto: c.cx.proto,
+            id: c.cx.id,
+            db: c.cx.db,
+            ns: c.cx.ns,
+            // Cold path: HELLO/SELECT execute under the live
+            // subscription view (the RESP2 subscriber restriction
+            // applies to HELLO exactly as in Redis).
+            sub_channels: c.cx.sub_channels.clone(),
+            sub_patterns: c.cx.sub_patterns.clone(),
+            node: Rc::clone(&shared.node),
+            close_requested: Cell::new(false),
+        }) else {
+            return false;
+        };
+        let now = shared.now.get();
+        execute_slices(argv, &mut shared.store.borrow_mut(), &mut live, now, &mut reply);
+        shared.observer.borrow_mut().on_execute(shared.cell, origin, argv, &reply, now);
+        shared.with_conn(key, |c| {
+            c.cx.proto = live.proto;
+            c.cx.db = live.db;
+            c.cx.ns = live.ns;
+        });
+    } else {
+        shared.execute_owned_into(origin, argv, proto, id, db, conn_ns, &mut reply);
+        if let Some(dur) = stall_request(argv) {
+            shared.stall_until.set(shared.now.get().saturating_add(dur));
+        }
+    }
+    pending.push_back(PendingReply::Done(reply));
     true
 }
 
@@ -4172,6 +4357,60 @@ async fn send_apply_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
         }
     }
     Ok(waiter)
+}
+
+/// Outcome of a synchronous [`try_send_apply`] first attempt (de-async
+/// fast path, ADR-0030 D4).
+enum SendNow {
+    /// Staged on the first attempt; the reply waiter is registered.
+    Sent(GateWait<u64, OwnedOutcome>),
+    /// The argv exceeds the codec's argument cap; carries the refusal.
+    Refused(Vec<u8>),
+    /// No fabric credit on the first attempt — the caller falls back to
+    /// the async path, which waits for credits. The drawn token is
+    /// abandoned: a skipped monotonic value, never registered and never
+    /// sent, so no reply or RTT pairing can ever reference it.
+    NoCredit,
+}
+
+/// Synchronous first-attempt [`send_apply`]: token draw + stage in one
+/// fabric borrow, waiter registered only after a successful stage (safe
+/// for the same reason as `send_apply`'s post-staging registration — the
+/// peer cannot observe the op until FABRIC-OUT publishes it, after this
+/// synchronous stretch).
+fn try_send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    to: CellId,
+    proto: Protocol,
+    db: u16,
+    argv: &[&[u8]],
+) -> SendNow {
+    let Some(args) = ApplyArgs::new(argv) else {
+        let mut reply = Vec::new();
+        RespWriter::new(&mut reply, proto).error("ERR too many arguments for cross-cell execution");
+        return SendNow::Refused(reply);
+    };
+    let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
+    let proto_byte: u8 = match proto {
+        Protocol::Resp3 => 3,
+        Protocol::Resp2 => 2,
+    };
+    debug_assert!(db < 16, "db rides 4 bits of the Apply cmd byte");
+    let cmd_byte = proto_byte | ((db as u8) << 4);
+    let (token, sent) = {
+        let mut fabric = shared.fabric.borrow_mut();
+        let token = fabric.next_token();
+        let sent = fabric.send(to, &Op::Apply { token, slot, cmd: cmd_byte, args });
+        (token, sent)
+    };
+    if sent.is_err() {
+        return SendNow::NoCredit;
+    }
+    let waiter = shared.gate.waiter(token.0);
+    if argv.first().copied() != Some(&b"INF.PUB"[..]) {
+        shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
+    }
+    SendNow::Sent(waiter)
 }
 
 /// Ship `argv` to `to` as an `Apply` and return the reply waiter, waiting

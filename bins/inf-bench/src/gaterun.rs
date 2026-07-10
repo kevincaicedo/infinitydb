@@ -368,6 +368,8 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "no-fabric-apply-prefetch",
         "parse-batch-prefetch",
         "no-parse-batch-prefetch",
+        "deasync-dispatch",
+        "no-deasync-dispatch",
         "skip-comparator",
         "only-always",
     ],
@@ -392,6 +394,8 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "no-fabric-apply-prefetch",
         "parse-batch-prefetch",
         "no-parse-batch-prefetch",
+        "deasync-dispatch",
+        "no-deasync-dispatch",
         "skip-comparator",
         "fill-keys",
         // M1 rows (ignored by the m0 flow):
@@ -499,6 +503,12 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     }
     if flags.bool("no-fabric-apply-prefetch") {
         server_extra.push("--no-fabric-apply-prefetch");
+    }
+    if flags.bool("deasync-dispatch") {
+        server_extra.push("--deasync-dispatch");
+    }
+    if flags.bool("no-deasync-dispatch") {
+        server_extra.push("--no-deasync-dispatch");
     }
     let natural = spawn_infinityd(&infinityd, cells, &server_extra)?;
     let mut pipelined_ops: Vec<f64> = Vec::new();
