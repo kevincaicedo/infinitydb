@@ -87,7 +87,11 @@ impl Node {
     /// Node with the M2.5 Phase-H fabric-apply prefetch enabled (the A/B
     /// lever's on-arm correctness surface).
     fn start_with_apply_prefetch(cells: u16) -> Node {
-        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), true)
+        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), true, false)
+    }
+
+    fn start_with_parse_prefetch(cells: u16) -> Node {
+        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, true)
     }
 
     fn start_full(
@@ -97,7 +101,7 @@ impl Node {
         recover: inf_server::RecoverConfig,
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
     ) -> Node {
-        Node::start_cfg(cells, data_dir, ckpt_interval_bytes, recover, faults, false)
+        Node::start_cfg(cells, data_dir, ckpt_interval_bytes, recover, faults, false, false)
     }
 
     fn start_cfg(
@@ -107,6 +111,7 @@ impl Node {
         recover: inf_server::RecoverConfig,
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
         apply_prefetch: bool,
+        parse_prefetch: bool,
     ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
         // Bind cell 0 first on an ephemeral port, then the rest join it.
@@ -186,6 +191,7 @@ impl Node {
                     false,
                 );
                 plane.set_fabric_apply_prefetch(apply_prefetch);
+                plane.set_parse_batch_prefetch(parse_prefetch);
                 if let Some((cfg, control)) = durable {
                     // Loop-resident recovery (M2-S15): the cell serves
                     // -LOADING while MAINTAIN replays its log.
@@ -376,6 +382,97 @@ fn cross_cell_with_apply_prefetch_matches_inline_semantics() {
     read_exactly(&mut client, b":2\r\n");
     client.write_all(&cmd(&[b"DBSIZE"])).expect("write");
     read_exactly(&mut client, b":1\r\n");
+
+    node.stop();
+}
+
+#[test]
+fn parse_batch_prefetch_matches_inline_semantics() {
+    // M2.5 Phase H (ADR-0029 lever 2): with the parse-batch stage on, every
+    // reply byte must match the inline path — including across the stage's
+    // flush barriers (SELECT/unknown-command/QUIT) and the bounds that force
+    // inline execution (oversized values).
+    let node = Node::start_with_parse_prefetch(1);
+    let mut client = node.connect();
+
+    // A long staged pipeline: order and values byte-exact.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", b"a", b"1"]));
+    pipeline.extend(cmd(&[b"SET", b"b", b"two"]));
+    pipeline.extend(cmd(&[b"GET", b"a"]));
+    pipeline.extend(cmd(&[b"INCR", b"a"]));
+    pipeline.extend(cmd(&[b"GET", b"b"]));
+    pipeline.extend(cmd(&[b"DEL", b"b"]));
+    pipeline.extend(cmd(&[b"GET", b"b"]));
+    pipeline.extend(cmd(&[b"PING"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(
+        &mut client,
+        b"+OK\r\n+OK\r\n$1\r\n1\r\n:2\r\n$3\r\ntwo\r\n:1\r\n$-1\r\n+PONG\r\n",
+    );
+
+    // SELECT is a flush barrier and a live ConnCx mutation: staged commands
+    // before it hit db 0, after it db 1 — in one pipelined buffer.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", b"k", b"db0"]));
+    pipeline.extend(cmd(&[b"SELECT", b"1"]));
+    pipeline.extend(cmd(&[b"GET", b"k"]));
+    pipeline.extend(cmd(&[b"SET", b"k", b"db1"]));
+    pipeline.extend(cmd(&[b"GET", b"k"]));
+    pipeline.extend(cmd(&[b"SELECT", b"0"]));
+    pipeline.extend(cmd(&[b"GET", b"k"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n$-1\r\n+OK\r\n$3\r\ndb1\r\n+OK\r\n$3\r\ndb0\r\n");
+
+    // An unknown command mid-batch is a barrier; its error keeps pipeline
+    // position.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", b"x", b"1"]));
+    pipeline.extend(cmd(&[b"NOSUCHCMD", b"y"]));
+    pipeline.extend(cmd(&[b"GET", b"x"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n");
+    let line = read_line(&mut client);
+    assert!(
+        line.starts_with(b"-ERR unknown command"),
+        "unknown-command error in pipeline position: {}",
+        String::from_utf8_lossy(&line)
+    );
+    read_exactly(&mut client, b"$1\r\n1\r\n");
+
+    // A value past the stage byte bound executes inline (the bound is a
+    // barrier, never a behavior change).
+    let big = vec![b'v'; 4096];
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", b"big", &big]));
+    pipeline.extend(cmd(&[b"STRLEN", b"big"]));
+    pipeline.extend(cmd(&[b"GET", b"a"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n:4096\r\n$1\r\n2\r\n");
+
+    // Expiry-on-read through the staged path: the probe prefetch never
+    // resurrects an expired record.
+    client.write_all(&cmd(&[b"SET", b"soon", b"x", b"PX", b"1"])).expect("write");
+    read_exactly(&mut client, b"+OK\r\n");
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(10));
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"GET", b"soon"]));
+    pipeline.extend(cmd(&[b"GET", b"a"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"$-1\r\n$1\r\n2\r\n");
+
+    // QUIT mid-pipeline: staged commands before it answer, everything after
+    // is discarded (Redis semantics), then the server closes.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", b"q", b"1"]));
+    pipeline.extend(cmd(&[b"QUIT"]));
+    pipeline.extend(cmd(&[b"GET", b"q"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n");
+    let mut rest = Vec::new();
+    client.read_to_end(&mut rest).expect("server closes after QUIT");
+    assert!(rest.is_empty(), "nothing after QUIT's +OK: {rest:?}");
 
     node.stop();
 }
