@@ -253,6 +253,35 @@ impl Node {
         for handle in self.handles.drain(..) {
             handle.join().expect("cell thread");
         }
+        // The control thread is detached (`spawn_control`) and outlives the
+        // join above: delegated unlinks (truncated segments, stale `.ick`s —
+        // ADR-0017) drain asynchronously. A restart on the same data dir
+        // would race that leftover queue against the new node's boot GC —
+        // both remove the same below-floor files, the loser hits ENOENT,
+        // and recovery fail-stops (§8.4). A real node cannot express this
+        // (one process; death takes the control thread with it, and boot GC
+        // then owns the survivors alone), so the harness must quiesce: a
+        // sentinel unlink queued *behind* any leftover work proves the
+        // whole queue drained (single FIFO receiver), after which the old
+        // thread can never touch the data dir again.
+        if let Some(control) = &self.control {
+            let sentinel = std::env::temp_dir().join(format!(
+                "inf-e2e-drain-{}-{}",
+                std::process::id(),
+                self.port
+            ));
+            std::fs::write(&sentinel, b"drain").expect("write drain sentinel");
+            while !control.request_unlink(sentinel.clone()) {
+                #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while sentinel.exists() {
+                assert!(Instant::now() < deadline, "control thread did not drain in 30s");
+                #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
 
