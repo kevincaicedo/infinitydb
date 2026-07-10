@@ -40,11 +40,19 @@
   <div class="card-grid" style="margin-top:44px">
     <a class="card" href="quickstart.html" style="display:block;color:inherit">
       <h3>Quickstart</h3>
-      <p class="muted" style="font-size:14.5px;margin:0">Build from source or build the Docker image from the repo, point <code>redis-cli</code> at it, and create your first durable namespace. Includes the io_uring seccomp note for Docker.</p>
+      <p class="muted" style="font-size:14.5px;margin:0">Build from source or build the Docker image from the repo, point <code>redis-cli</code> at it, and create your first durable namespace. Includes the io_uring seccomp note for Docker and connect-and-run snippets for redis-py, node-redis, go-redis, and Lettuce.</p>
     </a>
     <a class="card" href="durability.html" style="display:block;color:inherit">
       <h3>Namespaces &amp; durability</h3>
       <p class="muted" style="font-size:14.5px;margin:0">Durability classes (<code>memory</code> / <code>everysec</code> / <code>always</code>), ack points, loss windows, checkpoints, recovery behavior, and the fail-stop rules &mdash; stated plainly, with the evidence behind them.</p>
+    </a>
+    <a class="card" href="deployment.html" style="display:block;color:inherit">
+      <h3>Deployment</h3>
+      <p class="muted" style="font-size:14.5px;margin:0">Docker with the io_uring seccomp profile, a systemd unit, the data-directory layout, ports, every server flag, and the on-disk format upgrade rules.</p>
+    </a>
+    <a class="card" href="operations.html" style="display:block;color:inherit">
+      <h3>Operations</h3>
+      <p class="muted" style="font-size:14.5px;margin:0">Recovery and the <code>-LOADING</code> gate, what a fail-stop refusal means (and why there is no <code>--force</code>), the <code>INFO persistence</code> fields, operator tripwires, and the alpha limitation list.</p>
     </a>
     <a class="card" href="architecture.html" style="display:block;color:inherit">
       <h3>Architecture</h3>

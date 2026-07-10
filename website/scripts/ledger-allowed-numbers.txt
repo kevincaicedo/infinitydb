@@ -31,4 +31,5 @@
 
 # --- non-claims (documented) ---------------------------------------------
 16 gb           # config example in the INF.NS docs (MAXMEMORY 16gb) — master plan §4.2 example, not a measurement
-16 mib          # record-format value bound (SETRANGE note) from the generated compat matrix — wire format, not a measurement
+16 mib          # record-format value bound (SETRANGE note in the compat matrix; value bound on the operations limitations list) — wire format, not a measurement
+256 mib         # config defaults (--segment-bytes / --ckpt-interval-bytes) on the deployment page — configuration values, not measurements

@@ -71,8 +71,9 @@ docker run --rm -p 6379:6379 \
 
   <div class="callout">
     <span class="callout-tag"><strong>The <code>--security-opt seccomp=&hellip;</code> flag is required.</strong></span>
-    InfinityDB uses Linux io_uring, and <strong>Docker&rsquo;s default seccomp profile blocks the io_uring syscalls</strong> (<code>io_uring_setup</code> and friends). The bundled profile at <code>deploy/seccomp/infinitydb-seccomp.json</code> re-enables io_uring while still denying the dangerous container-escape syscalls. Alternatives (including a strict allow-list posture and why <code>seccomp=unconfined</code> is development-only) are documented in the repository at <code>infinitydb/docs/deployment.md</code>. If the container exits complaining about io_uring setup, seccomp is the cause.
+    InfinityDB uses Linux io_uring, and <strong>Docker&rsquo;s default seccomp profile blocks the io_uring syscalls</strong> (<code>io_uring_setup</code> and friends). The bundled profile at <code>deploy/seccomp/infinitydb-seccomp.json</code> re-enables io_uring while still denying the dangerous container-escape syscalls. Alternatives (including a strict allow-list posture and why <code>seccomp=unconfined</code> is development-only) are on the <a href="deployment.html">deployment page</a>. If the container exits complaining about io_uring setup, seccomp is the cause.
   </div>
+  <p>Running with a mounted data directory, systemd units, the data-dir layout, and every server flag are on the <a href="deployment.html">deployment page</a>.</p>
 
   <h2>First durable namespace</h2>
   <p>Durability in InfinityDB is a property of the <em>namespace</em>, not the server. A fresh node serves memory-mode namespaces (pure cache semantics). One command creates a durable one:</p>
@@ -81,6 +82,66 @@ inf&gt; INF.NS CREATE orders MODE durable FSYNC always
 inf&gt; SET orders:invoice:1009 "paid"     <span class="c"># the reply arrives only after group-commit fsync</span>
 inf&gt; INF.CKPT WAIT                       <span class="c"># take a fuzzy checkpoint; returns when the MANIFEST is durable</span></code></pre>
   <p>What <code>always</code>, <code>everysec</code>, and <code>memory</code> mean precisely &mdash; ack points, loss windows, crash behavior, recovery &mdash; is specified on the <a href="durability.html">namespaces &amp; durability page</a>. Read it before trusting the durable modes with anything you care about; it is short and unusually honest.</p>
+
+  <h2 id="clients">Client libraries</h2>
+  <p>Any Redis client works &mdash; InfinityDB negotiates RESP2 and RESP3 (<code>HELLO 3</code>) like Redis does. These four libraries are exercised end-to-end in the repository&rsquo;s client-smoke suite (<code>tests/client-smoke/</code> &mdash; connection negotiation, strings, expiry, INFO, SCAN iteration, pub/sub); the snippets below use the same API calls the smoke scripts run.</p>
+
+  <h3>redis-py (Python)</h3>
+<pre><code><span class="c"># pip install redis</span>
+import redis
+
+r = redis.Redis(host="127.0.0.1", port=6379, decode_responses=True)
+assert r.ping() is True
+r.set("greeting", "hello")
+print(r.get("greeting"))        <span class="c"># hello</span>
+r.expire("greeting", 100)
+print(r.ttl("greeting"))        <span class="c"># 100 (or just under)</span></code></pre>
+
+  <h3>node-redis (Node.js)</h3>
+<pre><code><span class="c">// npm install redis</span>
+import { createClient } from "redis";
+
+const client = createClient({ socket: { host: "127.0.0.1", port: 6379 } });
+await client.connect();
+console.log(await client.ping());          <span class="c">// PONG</span>
+await client.set("greeting", "hello");
+console.log(await client.get("greeting")); <span class="c">// hello</span>
+await client.quit();</code></pre>
+
+  <h3>go-redis (Go)</h3>
+<pre><code><span class="c">// go get github.com/redis/go-redis/v9</span>
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/redis/go-redis/v9"
+)
+
+func main() {
+	ctx := context.Background()
+	r := redis.NewClient(&amp;redis.Options{Addr: "127.0.0.1:6379"})
+	fmt.Println(r.Ping(ctx).Val())            <span class="c">// PONG</span>
+	r.Set(ctx, "greeting", "hello", 0)
+	fmt.Println(r.Get(ctx, "greeting").Val()) <span class="c">// hello</span>
+}</code></pre>
+
+  <h3>Lettuce (Java)</h3>
+<pre><code><span class="c">// io.lettuce:lettuce-core</span>
+import io.lettuce.core.RedisClient;
+import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.api.sync.RedisCommands;
+
+RedisClient client = RedisClient.create("redis://127.0.0.1:6379");
+try (StatefulRedisConnection&lt;String, String&gt; conn = client.connect()) {
+    RedisCommands&lt;String, String&gt; r = conn.sync();
+    System.out.println(r.ping());          <span class="c">// PONG</span>
+    r.set("greeting", "hello");
+    System.out.println(r.get("greeting")); <span class="c">// hello</span>
+} finally {
+    client.shutdown();
+}</code></pre>
 
   <h2>Kicking the tires</h2>
 <pre><code><span class="c"># which commands exist, and at what compatibility level?</span>

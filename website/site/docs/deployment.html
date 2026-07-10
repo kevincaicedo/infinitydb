@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deployment — InfinityDB Docs</title>
+<meta name="description" content="Deploying InfinityDB: Docker with the io_uring seccomp profile, a systemd unit, the data directory layout, ports, server flags, and upgrade rules.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='20'%20fill='%23201826'/%3E%3Ctext%20x='50'%20y='71'%20font-size='62'%20text-anchor='middle'%20fill='%23cf7ff5'%20font-family='system-ui'%3E%E2%88%9E%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="../index.html" class="nav-brand">
+      <span class="mark">&infin; InfinityDB</span>
+      <span class="nav-badge">v0.2.0-alpha.1 &middot; IN DEV</span>
+    </a>
+    <span class="nav-spacer"></span>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="nav-links">
+      <a href="../index.html#spine">Architecture</a>
+      <a href="../index.html#workloads">Workloads</a>
+      <a href="roadmap.html">Roadmap</a>
+      <a href="index.html" aria-current="page">Docs</a>
+      <a href="../blog/index.html">Blog</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<main class="doc">
+  <p class="breadcrumb"><a href="index.html">Docs</a> / Deployment</p>
+  <h1 class="page-title">Deployment</h1>
+  <p class="lede">How to run an InfinityDB node beyond a quick trial: Docker with the io_uring seccomp profile, a systemd unit, what the data directory contains, which ports exist, every server flag, and the upgrade rules for the on-disk format. It is an <strong>early alpha</strong> &mdash; read the <a href="operations.html">operations page</a> for what the node does after a crash and the alpha boundary list before trusting it with anything.</p>
+
+  <div class="callout warn">
+    <span class="callout-tag"><strong>Alpha exposure warning:</strong></span>
+    there is no AUTH, no ACL, and no TLS until M7. Bind InfinityDB to localhost or a trusted private network only. Both paths below assume that posture.
+  </div>
+
+  <h2>Docker</h2>
+  <p>Until the first public tag lands there are no published container images (see the <a href="quickstart.html">quickstart&rsquo;s packaging note</a>) &mdash; build the image from the repository. The <code>Dockerfile</code> produces a static musl binary in a <code>scratch</code>-based image: no shell, no libc, minimal CVE surface.</p>
+<pre><code><span class="c"># from the repository root, inside infinitydb/</span>
+docker build -t infinitydb:dev .
+
+docker run --rm -p 6379:6379 \
+  --security-opt seccomp=deploy/seccomp/infinitydb-seccomp.json \
+  -v infinitydb-data:/data \
+  infinitydb:dev --data-dir /data</code></pre>
+  <p>The <code>-v</code> volume and <code>--data-dir /data</code> give the node durable storage; omit both to run a memory-only node (pure cache semantics, nothing survives a restart).</p>
+
+  <h3>The seccomp profile is required</h3>
+  <p>InfinityDB&rsquo;s I/O plane is built on Linux io_uring, and <strong>Docker&rsquo;s default seccomp profile blocks the io_uring syscalls</strong> (<code>io_uring_setup</code>, <code>io_uring_enter</code>, <code>io_uring_register</code>). Under the default profile the node cannot create its reactor and exits immediately with:</p>
+<pre><code>infinityd: cell failed: Operation not permitted (os error 1)</code></pre>
+  <p>Three options, from most to least hardened:</p>
+  <ul>
+    <li><strong>The bundled profile (recommended):</strong> <code>deploy/seccomp/infinitydb-seccomp.json</code> ships in the repository. It allows io_uring while explicitly denying the high-risk container-escape syscalls (<code>mount</code>, <code>pivot_root</code>, kernel-module loading, <code>kexec_load</code>, <code>bpf</code>, <code>ptrace</code>, <code>perf_event_open</code>, keyring and clock-setting calls, and more). The file must be present on the host at the path you pass to <code>--security-opt</code>.</li>
+    <li><strong>Strict allow-list posture:</strong> take Docker&rsquo;s upstream <code>default.json</code> and append the three io_uring syscalls to an <code>SCMP_ACT_ALLOW</code> entry. Keeps the full default deny-list and adds only what InfinityDB needs.</li>
+    <li><strong><code>seccomp=unconfined</code> (development only):</strong> removes all seccomp filtering &mdash; local trusted machines only.</li>
+  </ul>
+  <div class="callout">
+    <span class="callout-tag"><strong>Host runs need none of this.</strong></span>
+    Running <code>infinityd</code> directly on a host is not subject to Docker&rsquo;s seccomp profile. Kubernetes and CI environments differ &mdash; some already permit io_uring, some apply the Docker default. If a containerized node exits with the error above, seccomp is the cause.
+  </div>
+
+  <h2>systemd</h2>
+  <p><code>infinityd</code> runs in the foreground, logs to stderr, and takes no signals &mdash; <code>Type=simple</code> is correct. A minimal hardened unit:</p>
+<pre><code>[Unit]
+Description=InfinityDB node
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/infinityd --port 6379 --data-dir /var/lib/infinitydb
+User=infinitydb
+Group=infinitydb
+StateDirectory=infinitydb
+
+<span class="c"># Fail-stop is deliberate (see the operations page): a recovery refusal or a
+# durable fsync failure is disk-integrity evidence that must reach an operator.
+# Do not turn it into a silent restart loop.</span>
+Restart=no
+
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/infinitydb
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+  <p>Two honesty notes worth reading before you copy that file:</p>
+  <ul>
+    <li><strong><code>Restart=no</code> is a recommendation, not a limitation.</strong> InfinityDB&rsquo;s deliberate exits &mdash; a recovery refusal (exit code 1), a durable fsync failure (exit code 3), a cell panic (exit code 101) &mdash; all mean the same thing: restarting will not help, and a restart loop hides the evidence. The <a href="operations.html">operations page</a> explains each exit and what to do.</li>
+    <li><strong>Stopping the node is a crash, by design.</strong> There is no shutdown handshake: <code>systemctl stop</code> kills the process, and the next boot recovers from the log. That is exactly the crash model the <a href="durability.html">durability classes</a> are specified against &mdash; an <code>always</code> namespace loses nothing (every acknowledged write was fsynced before its ack), an <code>everysec</code> namespace can lose up to its stated one-second window, a <code>memory</code> namespace loses everything. If those windows surprise you, read the durability page before deploying.</li>
+  </ul>
+
+  <h2>The data directory</h2>
+  <p>With <code>--data-dir</code> set, the node owns a directory tree of exactly four kinds of file &mdash; every one CRC-protected, every one swap-published atomically (write-new + fsync + rename + directory-fsync):</p>
+<pre><code>&lt;data-dir&gt;/
+&#9500;&#9472; META                     <span class="c"># node namespace catalog (which namespaces exist, their durability class)</span>
+&#9500;&#9472; shard-0/                 <span class="c"># cell 0 — one directory per cell, recovered independently and in parallel</span>
+&#9474;  &#9500;&#9472; MANIFEST              <span class="c"># the recovery unit: checkpoint id, begin-LSN, live segment set</span>
+&#9474;  &#9500;&#9472; log/
+&#9474;  &#9474;  &#9500;&#9472; seg-000000.ilog    <span class="c"># log segments — sealed at --segment-bytes, then immutable</span>
+&#9474;  &#9474;  &#9492;&#9472; seg-000001.ilog
+&#9474;  &#9492;&#9472; ckpt/
+&#9474;     &#9492;&#9472; ckpt-000001.ick    <span class="c"># fuzzy checkpoint (a materialized log prefix)</span>
+&#9500;&#9472; shard-1/
+&#9492;&#9472; &hellip;                       <span class="c"># one shard directory per --cells</span></code></pre>
+  <ul>
+    <li><strong>The log is the database</strong> (law L2): segments plus the checkpoint they truncate into are the complete durable state. Back up the whole directory; a consistent snapshot of it is a valid recovery unit.</li>
+    <li>Segment count stays bounded in steady state: checkpoints let the MANIFEST truncate older segments (observable as <code>log_segments_live</code> in <code>INFO persistence</code>).</li>
+    <li>Do not edit, rename, or delete files inside the tree. Recovery treats missing or altered named state as corruption and refuses to start &mdash; deliberately (see <a href="operations.html">operations</a>).</li>
+    <li>Byte totals reported during load are file extents <em>including</em> preallocated slack &mdash; a disclosed upper bound, so du-style numbers can exceed live data.</li>
+  </ul>
+
+  <h2>Ports</h2>
+  <p>Exactly one TCP port (default <code>6379</code>). Every cell binds the same port with <code>SO_REUSEPORT</code> and the kernel spreads incoming connections across cells. RESP2 and RESP3 (<code>HELLO 3</code>) are negotiated on the same port. There are no other listeners &mdash; no cluster bus, no gossip, no metrics port: this is a single-node alpha, and observability rides <code>INFO</code> over the same connection.</p>
+
+  <h2>Server flags</h2>
+  <p>Flags only &mdash; no config file (a deliberate anti-goal at this stage). Verified against <code>infinityd --help</code>:</p>
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>--port</code></td><td><code>6379</code></td><td>TCP port to listen on.</td></tr>
+        <tr><td><code>--cells</code></td><td><code>4</code></td><td>Number of shard cells (one thread and one <code>shard-k/</code> directory each). Each cell recovers only its own shard, so treat the value as fixed for the life of a data directory &mdash; do not change it on an existing one.</td></tr>
+        <tr><td><code>--data-dir</code></td><td><em>unset</em></td><td>Durable-plane root. Absent = memory-only node: the durable machinery is not just idle but absent from the hot path (measured, ledger row C15).</td></tr>
+        <tr><td><code>--ckpt-interval-bytes</code></td><td><code>268435456</code> (256 MiB)</td><td>Bytes-appended checkpoint trigger, per cell. <code>0</code> = manual only (<code>INF.CKPT</code> / <code>BGSAVE</code>).</td></tr>
+        <tr><td><code>--segment-bytes</code></td><td><code>268435456</code> (256 MiB)</td><td>Log segment prealloc/seal size.</td></tr>
+        <tr><td><code>--sync-pipeline</code></td><td><code>1</code></td><td>Durability fsyncs in flight per cell: <code>1</code> or <code>2</code>, never a queue. The measured default is 1; 2 is a bounded pipeline kept as an A/B knob.</td></tr>
+        <tr><td><code>--buffers</code> / <code>--buf-size</code></td><td><code>4096</code> / <code>4096</code></td><td>io_uring provided-buffer pool: buffer count and per-buffer bytes.</td></tr>
+        <tr><td><code>--pin-start</code></td><td><em>unset</em></td><td>First core index to pin cells to; cell <em>i</em> pins to <code>pin-start + 2i</code> (every other logical core, leaving SMT siblings free). Unset = no pinning.</td></tr>
+        <tr><td><code>--route-local-only</code></td><td><em>off</em></td><td>Treat every key as local to the accepting cell &mdash; benchmark/diagnostic mode, not for real data.</td></tr>
+        <tr><td><code>--version</code></td><td></td><td>Print version, git SHA, and build target, then exit.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="muted" style="font-size:14px">The remaining flags in <code>--help</code> (the fabric-flush, execute-order, and prefetch toggles) are measured A/B levers whose defaults carry the winning arm &mdash; leave them alone unless you are reproducing an experiment.</p>
+  <p>Runtime configuration uses the Redis <code>CONFIG</code> surface (<code>maxmemory</code>, <code>maxmemory-policy</code>, and friends &mdash; see the <a href="compat.html">compatibility matrix</a>); per-namespace durability and eviction are set at <code>INF.NS CREATE</code> time (see <a href="durability.html">namespaces &amp; durability</a>).</p>
+
+  <h2>Upgrades &amp; downgrades</h2>
+  <p>The on-disk log uses <strong>batch frame format v2</strong> (per-frame sequencing, ADR-0031) as of M2.5. The rules, stated plainly:</p>
+  <ul>
+    <li><strong>Reading is forever:</strong> the v0.2 line reads both frame format v1 and v2. A log written by an older alpha binary remains readable on every later alpha binary.</li>
+    <li><strong>Writing is v2 only</strong> &mdash; there is no write-v1 mode. The first time a v2 binary appends to a log, that log contains v2 frames.</li>
+    <li><strong>No downgrade after the first v2 write:</strong> pre-v2 binaries cannot read v2 frames, so once a v2 binary has appended, rolling back the binary means restoring the data directory from a pre-upgrade backup as well. Recovery additionally treats a v1 frame appearing <em>after</em> a v2 frame as a named refusal &mdash; no honest writer can produce that ordering.</li>
+    <li>Format changes are ADR events, not patches: each one lands with fuzzing of both formats, a crash-matrix re-run, and a fresh simulation sweep (law L9).</li>
+  </ul>
+
+  <div class="doc-footer-nav">
+    <a href="durability.html">&larr; Namespaces &amp; durability</a>
+    <a href="operations.html">Operations &rarr;</a>
+  </div>
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span class="mark">&infin; InfinityDB</span>
+    <span class="meta">APACHE 2.0 &middot; RUST &middot; BEST ON LINUX WITH io_uring</span>
+    <div class="footer-links">
+      <a href="index.html">Docs</a>
+      <a href="../blog/index.html">Blog</a>
+      <a href="roadmap.html">Roadmap</a>
+      <a href="https://github.com/">GitHub &#8599;</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var t = document.querySelector('.nav-toggle');
+  var l = document.querySelector('.nav-links');
+  if (t && l) t.addEventListener('click', function () {
+    var open = l.classList.toggle('open');
+    t.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+})();
+</script>
+</body>
+</html>
