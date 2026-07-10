@@ -387,6 +387,12 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// stages drained applies, prefetches the whole batch's store lines, then
     /// executes. Off by default until its binding A/B (`--fabric-apply-prefetch`).
     apply_prefetch: Cell<bool>,
+    /// Parse-batch staged prefetch (M2.5 Phase H, the ADR-0029 second lever —
+    /// the same ADR-0005 shape on the client parse loop's local fast path):
+    /// PARSE stages fast-path commands (flat copy + hash + probe-line
+    /// prefetch), then executes the batch in parse order. Off by default
+    /// until its binding A/B (`--parse-batch-prefetch`).
+    parse_prefetch: Cell<bool>,
 }
 
 /// One fabric-origin PUBLISH parked at the owner cell.
@@ -725,6 +731,11 @@ pub struct ServerPlane<
     /// Fabric-apply prefetch batch (reused across FABRIC-IN steps).
     apply_stage: Vec<StagedApply>,
     apply_stage_bytes: Vec<u8>,
+    /// Parse-batch prefetch stage (M2.5 Phase H, ADR-0029 lever 2; reused
+    /// across PARSE steps — one connection buffer at a time, flushed at
+    /// every barrier).
+    parse_stage: Vec<StagedParse>,
+    parse_stage_bytes: Vec<u8>,
     /// Reusable FABRIC-IN scratch: replies staged while the fabric is
     /// borrowed by `drain`, sent the moment it ends.
     staged_replies: Vec<(CellId, FabricToken, StagedReply)>,
@@ -830,6 +841,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 ckpt_pub_seen: Cell::new(0),
                 loading: Cell::new(false),
                 apply_prefetch: Cell::new(false),
+                parse_prefetch: Cell::new(false),
             }),
             listener,
             started: false,
@@ -837,6 +849,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             reply_scratch: Vec::new(),
             apply_stage: Vec::new(),
             apply_stage_bytes: Vec::new(),
+            parse_stage: Vec::new(),
+            parse_stage_bytes: Vec::new(),
             staged_replies: Vec::new(),
             park_flags: None,
             expiry_lag: 0,
@@ -1040,6 +1054,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// batch's store lines, then executes in arrival order.
     pub fn set_fabric_apply_prefetch(&mut self, on: bool) {
         self.shared.apply_prefetch.set(on);
+    }
+
+    /// Parse-batch staged prefetch (M2.5 Phase H, ADR-0029 lever 2): the
+    /// parse loop stages local fast-path commands, prefetches the batch's
+    /// store lines, then executes in parse order.
+    pub fn set_parse_batch_prefetch(&mut self, on: bool) {
+        self.shared.parse_prefetch.set(on);
     }
 
     /// Live connections (tests, stats).
@@ -1460,6 +1481,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             return;
         }
 
+        let stage_enabled = self.shared.parse_prefetch.get();
+        let mut stage = core::mem::take(&mut self.parse_stage);
+        let mut stage_bytes = core::mem::take(&mut self.parse_stage_bytes);
         let inbox = core::mem::take(&mut self.inbox);
         for (key, buf, len) in inbox {
             let mut commands: u32 = 0;
@@ -1484,11 +1508,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 // Field split: the parser iterator borrows `conn.parser`
                 // while execution writes `conn.out`/`conn.cx`.
                 let Conn { parser, cx: conn_cx, out, .. } = &mut *conn;
+                let origin = ExecOrigin::Conn(key.slot, key.generation);
                 let mut iter = parser.feed(data);
                 while let Some(parsed) = iter.next() {
                     match parsed {
                         Parsed::Command(argv) | Parsed::Inline(argv) => {
                             commands += 1;
+                            let meta = lookup(argv.arg(0));
                             // M2-S15 `-LOADING` gate: while the node loads,
                             // only LOADING-flagged commands run; the rest
                             // answer exactly Redis's error (oracle capture
@@ -1497,8 +1523,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                             // board re-check serves commands that arrive in
                             // the same iteration the last cell flips ready.
                             if self.shared.loading.get()
-                                && lookup(argv.arg(0))
-                                    .is_some_and(|meta| !meta.flags.contains(CmdFlags::LOADING))
+                                && meta.is_some_and(|meta| !meta.flags.contains(CmdFlags::LOADING))
                             {
                                 if self
                                     .loading_board
@@ -1507,6 +1532,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 {
                                     self.shared.loading.set(false);
                                 } else {
+                                    // The error reply keeps pipeline order:
+                                    // staged commands answer first.
+                                    flush_parse_stage(
+                                        &self.shared,
+                                        &mut stage,
+                                        &mut stage_bytes,
+                                        origin,
+                                        conn_cx,
+                                        out,
+                                    );
                                     let mut w = RespWriter::new(out, conn_cx.proto);
                                     w.error("LOADING Redis is loading the dataset in memory");
                                     continue;
@@ -1522,6 +1557,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 || conn_cx.ns.is_some()
                                 || self.needs_fabric(&argv);
                             if defer {
+                                // Pump replies emit after the fast-path
+                                // replies already in `out` — flush so the
+                                // staged batch keeps its pipeline position.
+                                flush_parse_stage(
+                                    &self.shared,
+                                    &mut stage,
+                                    &mut stage_bytes,
+                                    origin,
+                                    conn_cx,
+                                    out,
+                                );
                                 let owned =
                                     OwnedCmd::from_argv_into(&argv, self.shared.take_cmd_buf());
                                 if pump_was_active || spawn_first.is_some() {
@@ -1529,7 +1575,35 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 } else {
                                     spawn_first = Some(owned);
                                 }
+                            } else if stage_enabled && parse_stageable(meta, &argv) {
+                                // M2.5 Phase H (ADR-0029 lever 2): stage the
+                                // fast-path command — flat argv copy + key
+                                // hash + phase-1 index-line prefetch; the
+                                // batch executes at the next barrier or end
+                                // of buffer with its record lines prefetched.
+                                let (hash, has_key) = match argv.len() >= 2 {
+                                    true => {
+                                        let hash = CellStore::hash_key(argv.arg(1));
+                                        if let Some(store) =
+                                            self.shared.store.borrow().db(usize::from(conn_cx.db))
+                                        {
+                                            store.prefetch(hash);
+                                        }
+                                        (hash, true)
+                                    }
+                                    false => (0, false),
+                                };
+                                let off = stage_argv_block_argv(&mut stage_bytes, &argv);
+                                stage.push(StagedParse { off, hash, has_key });
                             } else {
+                                flush_parse_stage(
+                                    &self.shared,
+                                    &mut stage,
+                                    &mut stage_bytes,
+                                    origin,
+                                    conn_cx,
+                                    out,
+                                );
                                 let argv_slices: Vec<&[u8]> = argv.iter().collect();
                                 let before = out.len();
                                 let now = self.shared.now.get();
@@ -1542,7 +1616,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 );
                                 self.shared.observer.borrow_mut().on_execute(
                                     self.shared.cell,
-                                    ExecOrigin::Conn(key.slot, key.generation),
+                                    origin,
                                     &argv_slices,
                                     &out[before..],
                                     now,
@@ -1562,6 +1636,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                         }
                         Parsed::Incomplete => {}
                         Parsed::ProtocolError(e) => {
+                            flush_parse_stage(
+                                &self.shared,
+                                &mut stage,
+                                &mut stage_bytes,
+                                origin,
+                                conn_cx,
+                                out,
+                            );
                             let mut w = RespWriter::new(out, conn_cx.proto);
                             w.error(&format!("ERR Protocol error: {e:?}"));
                             protocol_error = true;
@@ -1569,6 +1651,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                         }
                     }
                 }
+                // End of buffer: the staged batch executes with its record
+                // lines prefetched (§7.3 phase 2 across the whole batch).
+                flush_parse_stage(&self.shared, &mut stage, &mut stage_bytes, origin, conn_cx, out);
                 drop(iter);
                 let conn = conns.get_mut(key).expect("conn checked above");
                 if protocol_error || quit {
@@ -1589,6 +1674,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 self.spawn_pump(cx, key, first);
             }
         }
+        debug_assert!(stage.is_empty(), "parse stage flushed before buffer release");
+        self.parse_stage = stage;
+        self.parse_stage_bytes = stage_bytes;
     }
 
     fn maintain(&mut self, cx: &mut LoopCx<'_>) {
@@ -2079,6 +2167,115 @@ fn read_argv_block<'b>(bytes: &'b [u8], off: u32, out: &mut [&'b [u8]; MAX_APPLY
         start = end;
     }
     argc
+}
+
+/// One local fast-path command staged by the parse-batch prefetch (M2.5
+/// Phase H, ADR-0029 lever 2 — the ADR-0005 pipeline shape on the batch the
+/// parse loop naturally provides): argv flat-copied into the stage scratch,
+/// key hash computed (and index probe lines prefetched) at stage time.
+/// Execution reads `ConnCx` live at flush, so stage-time state is only ever
+/// a prefetch hint — never an execution input (conn-state mutators are
+/// flush barriers besides).
+struct StagedParse {
+    /// Offset of the flat argv block in the stage scratch.
+    off: u32,
+    /// `CellStore::hash_key(argv[1])` when the command carries a key.
+    hash: u64,
+    has_key: bool,
+}
+
+/// Bounds on what the parse stage accepts (everything has a limit): larger
+/// commands act as flush barriers and execute inline — the flat copy of a
+/// big SET value would cost more than the misses it hides.
+const PARSE_STAGE_MAX_ARGS: usize = 16;
+const PARSE_STAGE_MAX_BYTES: usize = 512;
+
+/// Whether the parse loop may stage this fast-path command. Conn-state
+/// mutators (HELLO/SELECT/INF.NS), QUIT, and DEBUG are barriers: they
+/// mutate `ConnCx`/plane state the inline path handles (close_requested,
+/// stall_request), so they keep the inline path and flush the batch first.
+/// Unknown commands stay inline (their error reply keeps pipeline order).
+fn parse_stageable(meta: Option<&'static inf_wire::CommandMeta>, argv: &ArgvRef<'_>) -> bool {
+    let Some(meta) = meta else { return false };
+    if matches!(
+        meta.id,
+        CommandId::Hello
+            | CommandId::Select
+            | CommandId::InfNs
+            | CommandId::Quit
+            | CommandId::Debug
+    ) {
+        return false;
+    }
+    if argv.len() > PARSE_STAGE_MAX_ARGS {
+        return false;
+    }
+    let mut total = 0usize;
+    for i in 0..argv.len() {
+        total += argv.arg(i).len();
+        if total > PARSE_STAGE_MAX_BYTES {
+            return false;
+        }
+    }
+    true
+}
+
+/// Flat-encode a parsed argv into the stage scratch (the `stage_argv_block`
+/// layout over the `Argv` view instead of slices). Returns the block offset.
+fn stage_argv_block_argv(bytes: &mut Vec<u8>, argv: &ArgvRef<'_>) -> u32 {
+    let off = u32::try_from(bytes.len()).expect("stage scratch fits u32");
+    let argc = argv.len();
+    let head = 4 + 4 * argc;
+    bytes.extend_from_slice(&u32::try_from(argc).expect("argc fits u32").to_le_bytes());
+    let mut end = head;
+    for i in 0..argc {
+        end += argv.arg(i).len();
+        bytes.extend_from_slice(&u32::try_from(end).expect("block fits u32").to_le_bytes());
+    }
+    for i in 0..argc {
+        bytes.extend_from_slice(argv.arg(i));
+    }
+    off
+}
+
+/// Execute the staged parse batch: one record-line prefetch pass over the
+/// whole batch (§7.3 phase 2 — misses overlap across the batch instead of
+/// serializing per command), then execution in parse order through the same
+/// `execute` the inline path uses (the `ConnCx` is read live — replies are
+/// byte-identical by construction, pinned by the node e2e).
+fn flush_parse_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    stage: &mut Vec<StagedParse>,
+    stage_bytes: &mut Vec<u8>,
+    origin: ExecOrigin,
+    conn_cx: &mut ConnCx,
+    out: &mut Vec<u8>,
+) {
+    if stage.is_empty() {
+        return;
+    }
+    {
+        let ks = shared.store.borrow();
+        if let Some(store) = ks.db(usize::from(conn_cx.db)) {
+            for e in stage.iter().filter(|e| e.has_key) {
+                store.probe_prefetch(e.hash);
+            }
+        }
+    }
+    let now = shared.now.get();
+    let mut argv_buf: [&[u8]; PARSE_STAGE_MAX_ARGS] = [b""; PARSE_STAGE_MAX_ARGS];
+    for e in stage.iter() {
+        let argc = read_argv_block(stage_bytes, e.off, &mut argv_buf);
+        let argv = &argv_buf[..argc];
+        let before = out.len();
+        execute(argv, &mut shared.store.borrow_mut(), conn_cx, now, out);
+        shared.observer.borrow_mut().on_execute(shared.cell, origin, argv, &out[before..], now);
+        // QUIT and DEBUG are stage barriers; a staged command can neither
+        // request a close nor a stall.
+        debug_assert!(!conn_cx.close_requested.get(), "QUIT is a parse-stage barrier");
+    }
+    stage.clear();
+    stage_bytes.clear();
 }
 
 /// The FABRIC-IN drain callback with apply-prefetch on: `Apply` ops stage

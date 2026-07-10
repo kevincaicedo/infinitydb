@@ -366,6 +366,8 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "remote-first-execute",
         "fabric-apply-prefetch",
         "no-fabric-apply-prefetch",
+        "parse-batch-prefetch",
+        "no-parse-batch-prefetch",
         "skip-comparator",
         "only-always",
     ],
@@ -388,6 +390,8 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "remote-first-execute",
         "fabric-apply-prefetch",
         "no-fabric-apply-prefetch",
+        "parse-batch-prefetch",
+        "no-parse-batch-prefetch",
         "skip-comparator",
         "fill-keys",
         // M1 rows (ignored by the m0 flow):
@@ -486,6 +490,12 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     }
     if flags.bool("fabric-apply-prefetch") {
         server_extra.push("--fabric-apply-prefetch");
+    }
+    if flags.bool("parse-batch-prefetch") {
+        server_extra.push("--parse-batch-prefetch");
+    }
+    if flags.bool("no-parse-batch-prefetch") {
+        server_extra.push("--no-parse-batch-prefetch");
     }
     if flags.bool("no-fabric-apply-prefetch") {
         server_extra.push("--no-fabric-apply-prefetch");
