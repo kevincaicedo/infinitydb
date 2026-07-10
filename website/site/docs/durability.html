@@ -114,8 +114,8 @@ INF.NS CREATE sessions MODE durable  FSYNC everysec</code></pre>
 
   <div class="evidence">
     <span class="tag">Deterministic durability testing (ledger C12).</span>
-    &ldquo;Durability is deterministically tested: 10,000 simulated power-cut/disk-fault seeds, zero durability-oracle violations &mdash; every <code>always</code>-acked write survives, <code>everysec</code> loses at most one second (simulated time); every seed replays byte-identically.&rdquo; Disclosed alongside: 1.33% of simulated boots legally refuse with a named corruption error (survival-audited).
-    <span class="artifact">artifact: infinitydb/.artifacts/m2/dst-sweep-10k-s22-20260705/</span>
+    &ldquo;Durability is deterministically tested: 10,000 simulated power-cut/disk-fault seeds, zero durability-oracle violations &mdash; every <code>always</code>-acked write survives, <code>everysec</code> loses at most one second (simulated time); every seed replays byte-identically &mdash; and on the frame-v2 tree, zero recovery refusals across the same 10,000 seeds.&rdquo; (Frame format v2 retired the earlier legally-refusing recovery class; the historical numbers live in the artifacts.)
+    <span class="artifact">artifact: infinitydb/.artifacts/m2/dst-sweep-10k-s22-20260705/ &middot; m2.5/s12-frame-seq-20260709/</span>
   </div>
 
   <div class="evidence">
