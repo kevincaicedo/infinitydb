@@ -87,11 +87,17 @@ impl Node {
     /// Node with the M2.5 Phase-H fabric-apply prefetch enabled (the A/B
     /// lever's on-arm correctness surface).
     fn start_with_apply_prefetch(cells: u16) -> Node {
-        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), true, false)
+        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), true, false, false)
     }
 
     fn start_with_parse_prefetch(cells: u16) -> Node {
-        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, true)
+        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, true, false)
+    }
+
+    /// Node with the M2.5 Phase-H de-async dispatch enabled (ADR-0030 D4
+    /// lever): the pump's sync fast path on-arm correctness surface.
+    fn start_with_deasync(cells: u16) -> Node {
+        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, false, true)
     }
 
     fn start_full(
@@ -101,9 +107,10 @@ impl Node {
         recover: inf_server::RecoverConfig,
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
     ) -> Node {
-        Node::start_cfg(cells, data_dir, ckpt_interval_bytes, recover, faults, false, false)
+        Node::start_cfg(cells, data_dir, ckpt_interval_bytes, recover, faults, false, false, false)
     }
 
+    #[allow(clippy::too_many_arguments)] // test harness funnel
     fn start_cfg(
         cells: u16,
         data_dir: Option<std::path::PathBuf>,
@@ -112,6 +119,7 @@ impl Node {
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
         apply_prefetch: bool,
         parse_prefetch: bool,
+        deasync_dispatch: bool,
     ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
         // Bind cell 0 first on an ephemeral port, then the rest join it.
@@ -192,6 +200,7 @@ impl Node {
                 );
                 plane.set_fabric_apply_prefetch(apply_prefetch);
                 plane.set_parse_batch_prefetch(parse_prefetch);
+                plane.set_deasync_dispatch(deasync_dispatch);
                 if let Some((cfg, control)) = durable {
                     // Loop-resident recovery (M2-S15): the cell serves
                     // -LOADING while MAINTAIN replays its log.
@@ -502,6 +511,96 @@ fn parse_batch_prefetch_matches_inline_semantics() {
     let mut rest = Vec::new();
     client.read_to_end(&mut rest).expect("server closes after QUIT");
     assert!(rest.is_empty(), "nothing after QUIT's +OK: {rest:?}");
+
+    node.stop();
+}
+
+/// The de-async dispatch fast path (M2.5 Phase H, `--deasync-dispatch`,
+/// ADR-0030 D4) must be behavior-invisible: same replies, same order —
+/// across the fast arms (single-owner remote Apply, local mirror,
+/// conn-state), the fallback arms interleaved with them (split DEL, MGET
+/// gather, scatter DBSIZE), the restricted-subscriber reply, and
+/// expiry-on-read over the remote path.
+#[test]
+fn deasync_dispatch_matches_pump_semantics() {
+    let node = Node::start_with_deasync(2);
+    let mut client = node.connect();
+
+    let k0 = key_for_cell(2, 0);
+    let k1 = key_for_cell(2, 1);
+
+    // Fast arm + fallback split arm in one pipeline: whichever cell
+    // accepted, one of k0/k1 rides the single-owner remote Apply.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", &k0, b"zero"]));
+    pipeline.extend(cmd(&[b"SET", &k1, b"one"]));
+    pipeline.extend(cmd(&[b"GET", &k0]));
+    pipeline.extend(cmd(&[b"GET", &k1]));
+    pipeline.extend(cmd(&[b"DEL", &k0, &k1, b"missing"]));
+    pipeline.extend(cmd(&[b"GET", &k0]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n$4\r\nzero\r\n$3\r\none\r\n:2\r\n$-1\r\n");
+
+    // Long remote/local interleave: order byte-exact for 100 replies.
+    let mut pipeline = Vec::new();
+    for _ in 0..50 {
+        pipeline.extend(cmd(&[b"INCR", &k0]));
+        pipeline.extend(cmd(&[b"INCR", &k1]));
+    }
+    client.write_all(&pipeline).expect("write");
+    let mut want = Vec::new();
+    for round in 1..=50 {
+        want.extend_from_slice(format!(":{round}\r\n:{round}\r\n").as_bytes());
+    }
+    read_exactly(&mut client, &want);
+
+    // SELECT mid-queue: the conn-state barrier holds its exact pipeline
+    // position between remote ops (mirror arm on the fast path).
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", &k0, b"dbzero"]));
+    pipeline.extend(cmd(&[b"SELECT", b"1"]));
+    pipeline.extend(cmd(&[b"GET", &k0]));
+    pipeline.extend(cmd(&[b"SET", &k0, b"dbone"]));
+    pipeline.extend(cmd(&[b"SELECT", b"0"]));
+    pipeline.extend(cmd(&[b"GET", &k0]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n$-1\r\n+OK\r\n+OK\r\n$6\r\ndbzero\r\n");
+
+    // MGET gather (fallback arm) interleaved with fast-arm writes.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", &k1, b"vone"]));
+    pipeline.extend(cmd(&[b"MGET", &k0, &k1, b"missing"]));
+    pipeline.extend(cmd(&[b"GET", &k1]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n*3\r\n$6\r\ndbzero\r\n$4\r\nvone\r\n$-1\r\n$4\r\nvone\r\n");
+
+    // Scatter DBSIZE (fallback arm): both cells' counts aggregate.
+    client.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut client, b":2\r\n");
+
+    // Expiry-on-read over the remote path: an expired key reads as gone
+    // through the fast arm.
+    client.write_all(&cmd(&[b"SET", &k1, b"soon", b"PX", b"1"])).expect("write");
+    read_exactly(&mut client, b"+OK\r\n");
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(10));
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"GET", &k1]));
+    pipeline.extend(cmd(&[b"GET", &k0]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"$-1\r\n$6\r\ndbzero\r\n");
+
+    // Restricted subscriber: data commands answer the restriction error
+    // through the pump for both local and remote keys.
+    let mut sub = node.connect();
+    sub.write_all(&cmd(&[b"SUBSCRIBE", b"ch"])).expect("write");
+    read_exactly(&mut sub, b"*3\r\n$9\r\nsubscribe\r\n$2\r\nch\r\n:1\r\n");
+    sub.write_all(&cmd(&[b"GET", &k0])).expect("write");
+    let line = read_line(&mut sub);
+    assert!(line.starts_with(b"-ERR"), "restricted error for local-ish key: {line:?}");
+    sub.write_all(&cmd(&[b"GET", &k1])).expect("write");
+    let line = read_line(&mut sub);
+    assert!(line.starts_with(b"-ERR"), "restricted error for remote-ish key: {line:?}");
 
     node.stop();
 }

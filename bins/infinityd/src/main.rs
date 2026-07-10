@@ -62,6 +62,12 @@ struct Args {
     /// overlap; natural flat; anchor intact);
     /// `--no-parse-batch-prefetch` is the A/B off arm.
     parse_batch_prefetch: bool,
+    /// M2.5 Phase-H de-async dispatch (ADR-0030 D4 lever): the pump tries
+    /// a synchronous fast path per command (single-owner remote Apply,
+    /// local mirror) before constructing the `dispatch_one` future. Off
+    /// by default until its binding A/B; `--deasync-dispatch` is the on
+    /// arm.
+    deasync_dispatch: bool,
 }
 
 impl Default for Args {
@@ -82,6 +88,7 @@ impl Default for Args {
             remote_first_execute: false,
             fabric_apply_prefetch: true,
             parse_batch_prefetch: true,
+            deasync_dispatch: false,
         }
     }
 }
@@ -114,6 +121,8 @@ fn parse_args() -> Result<Args, String> {
             "--no-fabric-apply-prefetch" => args.fabric_apply_prefetch = false,
             "--parse-batch-prefetch" => args.parse_batch_prefetch = true,
             "--no-parse-batch-prefetch" => args.parse_batch_prefetch = false,
+            "--deasync-dispatch" => args.deasync_dispatch = true,
+            "--no-deasync-dispatch" => args.deasync_dispatch = false,
             "--park-us" => {
                 args.park_us =
                     Some(take("--park-us")?.parse().map_err(|e| format!("--park-us: {e}"))?);
@@ -148,7 +157,8 @@ fn parse_args() -> Result<Args, String> {
                      [--ckpt-interval-bytes N] [--segment-bytes N] [--sync-pipeline 1|2] \
                      [--early-fabric-flush] [--remote-first-execute] \
                      [--fabric-apply-prefetch|--no-fabric-apply-prefetch] \
-                     [--parse-batch-prefetch|--no-parse-batch-prefetch] [--version]"
+                     [--parse-batch-prefetch|--no-parse-batch-prefetch] \
+                     [--deasync-dispatch|--no-deasync-dispatch] [--version]"
                 );
                 std::process::exit(0);
             }
@@ -407,6 +417,7 @@ fn cell_main(
     plane.set_early_fabric_flush(args.early_fabric_flush);
     plane.set_fabric_apply_prefetch(args.fabric_apply_prefetch);
     plane.set_parse_batch_prefetch(args.parse_batch_prefetch);
+    plane.set_deasync_dispatch(args.deasync_dispatch);
     #[cfg(target_os = "linux")]
     plane.set_park_flags(park_flags);
     #[cfg(not(target_os = "linux"))]
