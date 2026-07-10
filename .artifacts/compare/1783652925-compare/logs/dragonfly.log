@@ -1,0 +1,30 @@
+I0709 23:15:40.312751   99710 init.cc:144] dragonfly running in opt mode.
+                   .--::--.                   
+   :+*=:          =@@@@@@@@=          :+*+:   
+  %@@@@@@%*=.     =@@@@@@@@-     .=*%@@@@@@#  
+  @@@@@@@@@@@@#+-. .%@@@@#. .-+#@@@@@@@@@@@%  
+  -@@@@@@@@@@@@@@@@*:#@@#:*@@@@@@@@@@@@@@@@-  
+    :+*********####-%@%%@%-####********++.    
+   .%@@@@@@@@@@@@@%:@@@@@@:@@@@@@@@@@@@@@%    
+   .@@@@@@@@%*+-:   =@@@@=  .:-+*%@@@@@@@%.   
+     =*+-:           ###*          .:-+*=     
+                     %@@%                     
+                     *@@*                     
+                     +@@=                     
+                     :##:                     
+                     :@@:                     
+                      @@                      
+                      ..                      
+* Logs will be written to the first available of the following paths:
+* For the available flags type dragonfly [--help | --helpfull]
+* Documentation can be found at: https://www.dragonflydb.io/docs
+I0709 23:15:40.312883   99710 dfly_main.cc:1096] Starting dragonfly df-v1.39.0-699862e5da7cb29bf5642a1da422c4c78cefae38
+I0709 23:15:40.313084   99710 dfly_main.cc:1137] Using proactor_threads=4 (overriding cgroup-derived 0)
+W0709 23:15:40.313097   99710 dfly_main.cc:1144] SWAP is enabled. Consider disabling it when running Dragonfly.
+I0709 23:15:40.313114   99710 dfly_main.cc:1169] Max memory limit is: 1.00GiB
+I0709 23:15:40.314284   99712 uring_proactor.cc:263] IORing with 1024 entries, allocated 98368 bytes, cq_entries is 2048
+I0709 23:15:40.314643   99710 proactor_pool.cc:149] Running 4 io threads
+I0709 23:15:40.315545   99710 dragonfly_listener.cc:152] SSL version: OpenSSL 3.4.5 7 Apr 2026
+W0709 23:15:40.315573   99710 dfly_main.cc:350] Protected mode enabled. Binding to localhost only because no password is set. To accept remote connections, set a password with --requirepass or specify a bind address with --bind.
+I0709 23:15:40.316583   99710 server_family.cc:1221] Host OS: Linux 7.0.0-27-generic x86_64 with 4 threads
+I0709 23:15:40.321625   99712 listener_interface.cc:102] sock[11] AcceptServer - listening on 127.0.0.1:7001
