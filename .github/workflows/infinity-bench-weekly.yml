@@ -33,8 +33,22 @@ jobs:
             --duration 10 --replicates 3 \
             --storm-keys 1000000 --flushall-keys 5000000 --fill-keys 10000000 \
             --maxmemory-mb 1024 --subs 2000 --sub-channels 50
+      - name: build inf-compare
+        run: cargo build --release -p inf-compare
+      - name: reduced inf-compare sweep (M2.5-S22, ADR-0025 D3)
+        # The standing comparative instrument beside the in-house rows:
+        # the reduced workload set (set/get/mixed/memory), all present
+        # engines, both generators — the weekly signal between full
+        # campaigns. Requires redis-server, dragonfly, and
+        # memtier_benchmark on the runner (the reference-box profile).
+        run: |
+          ./target/release/inf-compare run --reference-box \
+            --workload set,get,mixed,memory --pipeline 1,16 \
+            --duration 15 --out .artifacts/compare
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: weekly-gate-report
-          path: .artifacts/m1/*-gate-run/report.md
+          path: |
+            .artifacts/m1/*-gate-run/report.md
+            .artifacts/compare/*/report.md
