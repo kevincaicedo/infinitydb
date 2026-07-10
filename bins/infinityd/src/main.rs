@@ -64,9 +64,10 @@ struct Args {
     parse_batch_prefetch: bool,
     /// M2.5 Phase-H de-async dispatch (ADR-0030 D4 lever): the pump tries
     /// a synchronous fast path per command (single-owner remote Apply,
-    /// local mirror) before constructing the `dispatch_one` future. Off
-    /// by default until its binding A/B; `--deasync-dispatch` is the on
-    /// arm.
+    /// local mirror) before constructing the `dispatch_one` future.
+    /// **Rejected by A/B** (2026-07-10, ADR-0034): ~+1.5% natural vs the
+    /// ≥ +4% floor — the async machinery was already near-zero-cost (L6).
+    /// Kept default-off as the A/B instrument for the S19 8-cell re-read.
     deasync_dispatch: bool,
 }
 

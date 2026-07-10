@@ -395,10 +395,11 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     parse_prefetch: Cell<bool>,
     /// De-async dispatch (M2.5 Phase H, ADR-0030 D4): the pump tries a
     /// synchronous fast path per command (single-owner remote `Apply`,
-    /// local mirror) before constructing the `dispatch_one` future — the
-    /// send path almost never suspends, so the async machinery is pure
-    /// overhead on the hot arms. Off by default until its binding A/B
-    /// (`--deasync-dispatch`).
+    /// local mirror) before constructing the `dispatch_one` future.
+    /// Rejected by A/B (2026-07-10, ADR-0034): the machinery it removes
+    /// measured ~2% of the natural mix — the L6 fast path was already
+    /// near-zero-cost. Default off; kept as the A/B instrument for the
+    /// S19 8-cell re-read (`--deasync-dispatch`).
     deasync_dispatch: Cell<bool>,
 }
 

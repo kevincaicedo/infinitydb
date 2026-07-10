@@ -1,0 +1,12 @@
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'cycles'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'instructions'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'cache-misses'
+
+ Performance counter stats for 'CPU(s) 4,6,8,10':
+
+   108,846,374,397      cpu_core/cycles/                                                      
+   227,114,406,671      cpu_core/instructions/                                                
+       332,378,582      cpu_core/cache-misses/                                                
+
+       8.004263967 seconds time elapsed
+
