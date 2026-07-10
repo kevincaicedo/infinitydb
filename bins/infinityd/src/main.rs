@@ -56,10 +56,11 @@ struct Args {
     /// 58.8% -> 54.6-55.7%, anchor 1.61x -> 1.74-1.78x);
     /// `--no-fabric-apply-prefetch` is the A/B off arm.
     fabric_apply_prefetch: bool,
-    /// M2.5 Phase-H parse-batch staged prefetch (ADR-0029 lever 2 — the
-    /// ADR-0005 shape on the parse loop's local fast path). Default OFF
-    /// until its binding A/B verdict; `--parse-batch-prefetch` is the A/B
-    /// on arm.
+    /// M2.5 Phase-H parse-batch staged prefetch (ADR-0029 lever 2 / ADR-0033
+    /// — the ADR-0005 shape on the parse loop's local fast path). Default ON
+    /// (binding A/B: all-local 6.48/6.63M -> 7.98/8.22M, +23-27%, zero arm
+    /// overlap; natural flat; anchor intact);
+    /// `--no-parse-batch-prefetch` is the A/B off arm.
     parse_batch_prefetch: bool,
 }
 
@@ -80,7 +81,7 @@ impl Default for Args {
             early_fabric_flush: false,
             remote_first_execute: false,
             fabric_apply_prefetch: true,
-            parse_batch_prefetch: false,
+            parse_batch_prefetch: true,
         }
     }
 }
