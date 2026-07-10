@@ -8,3 +8,4 @@ crates/inf-fabric/fuzz/corpus/
 crates/inf-log/fuzz/corpus/frame_decode
 crates/inf-log/fuzz/corpus/segment_read
 crates/inf-log/fuzz/corpus/ick_decode
+.claude/
