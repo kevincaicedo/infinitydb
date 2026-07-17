@@ -3,19 +3,61 @@
 //! truncation are always detected, never silently absorbed.
 
 use inf_log::{
-    DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN, FRAME_TRAILER_LEN, FrameBuilder, FrameIter, Lsn, NsId,
-    RecordView, SegmentId, decode_frame,
+    DEFAULT_MAX_FRAME_LEN, DOC_VERSION_MASK, DocLineage, FRAME_HEADER_LEN, FRAME_TRAILER_LEN,
+    FrameBuilder, FrameIter, FrameStamp, Lsn, NsId, RecordView, SegmentId, decode_frame,
 };
 use proptest::prelude::*;
+
+/// Canonical v2 stamp for hand-built test frames (epoch 1, covered 0 —
+/// attests nothing). `seq` matters only where a test builds sequential
+/// frames the recovery policy will walk; readers/scanners ignore it.
+fn stamp(seq: u64) -> FrameStamp {
+    FrameStamp { epoch: 1, seq, covered_lsn: 0 }
+}
 
 /// Owned mirror of `RecordView` for proptest generation.
 #[derive(Clone, Debug)]
 enum OwnedRecord {
-    String { ns: u32, key: Vec<u8>, value: Vec<u8> },
-    Delete { ns: u32, key: Vec<u8> },
-    ExpireAt { ns: u32, at: u64, key: Vec<u8> },
-    NsOp { ns: u32, payload: Vec<u8> },
-    CkptBegin { ns: u32, id: u64 },
+    String {
+        ns: u32,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Delete {
+        ns: u32,
+        key: Vec<u8>,
+    },
+    ExpireAt {
+        ns: u32,
+        at: u64,
+        key: Vec<u8>,
+    },
+    NsOp {
+        ns: u32,
+        payload: Vec<u8>,
+    },
+    CkptBegin {
+        ns: u32,
+        id: u64,
+    },
+    DocDelta {
+        ns: u32,
+        key: Vec<u8>,
+        lineage: u64,
+        base: u32,
+        matches: u32,
+        post_len: u32,
+        opcode: u8,
+        program: Vec<u8>,
+        operand: Vec<u8>,
+    },
+    DocFull {
+        ns: u32,
+        key: Vec<u8>,
+        lineage: u64,
+        version: u32,
+        idoc: Vec<u8>,
+    },
 }
 
 impl OwnedRecord {
@@ -32,6 +74,34 @@ impl OwnedRecord {
             OwnedRecord::CkptBegin { ns, id } => {
                 RecordView::CkptBegin { ns: NsId(*ns), ckpt_id: *id }
             }
+            OwnedRecord::DocDelta {
+                ns,
+                key,
+                lineage,
+                base,
+                matches,
+                post_len,
+                opcode,
+                program,
+                operand,
+            } => RecordView::DocDelta {
+                ns: NsId(*ns),
+                key,
+                lineage: DocLineage::new(*lineage).expect("strategy emits nonzero"),
+                base_version: *base,
+                match_count: *matches,
+                post_len: *post_len,
+                opcode: *opcode,
+                program,
+                operand,
+            },
+            OwnedRecord::DocFull { ns, key, lineage, version, idoc } => RecordView::DocFull {
+                ns: NsId(*ns),
+                key,
+                lineage: DocLineage::new(*lineage).expect("strategy emits nonzero"),
+                version: *version,
+                idoc,
+            },
         }
     }
 }
@@ -52,6 +122,41 @@ fn record_strategy() -> impl Strategy<Value = OwnedRecord> {
         }),
         (any::<u32>(), bytes()).prop_map(|(ns, payload)| OwnedRecord::NsOp { ns, payload }),
         (any::<u32>(), any::<u64>()).prop_map(|(ns, id)| OwnedRecord::CkptBegin { ns, id }),
+        (
+            any::<u32>(),
+            bytes(),
+            1u64..=u64::MAX,
+            0u32..=DOC_VERSION_MASK,
+            1u32..=u32::MAX,
+            1u32..=DOC_VERSION_MASK,
+            any::<u8>(),
+            bytes(),
+            bytes(),
+        )
+            .prop_map(
+                |(ns, key, lineage, base, matches, post_len, opcode, program, operand)| {
+                    OwnedRecord::DocDelta {
+                        ns,
+                        key,
+                        lineage,
+                        base,
+                        matches,
+                        post_len,
+                        opcode,
+                        program,
+                        operand,
+                    }
+                }
+            ),
+        (any::<u32>(), bytes(), 1u64..=u64::MAX, 0u32..=DOC_VERSION_MASK, bytes()).prop_map(
+            |(ns, key, lineage, version, idoc)| OwnedRecord::DocFull {
+                ns,
+                key,
+                lineage,
+                version,
+                idoc,
+            }
+        ),
     ]
 }
 
@@ -68,7 +173,7 @@ fn build_image(
     let mut image = Vec::new();
     let mut expected = Vec::new();
     let mut builder = FrameBuilder::new();
-    for frame in frames {
+    for (index, frame) in frames.iter().enumerate() {
         builder.reset();
         let base = Lsn::new(segment, u32::try_from(image.len()).expect("image fits u32"));
         for record in frame {
@@ -77,7 +182,9 @@ fn build_image(
             expected.push((base.advance(staged as u32), record.clone()));
             builder.append(&record.view());
         }
-        image.extend_from_slice(builder.finalize(base.advance(FRAME_HEADER_LEN as u32)));
+        image.extend_from_slice(
+            builder.finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(index as u64 + 1)),
+        );
     }
     (image, expected)
 }
@@ -131,7 +238,7 @@ proptest! {
             builder.append(&record.view());
         }
         let base = Lsn::new(SegmentId(0), 0);
-        let mut image = builder.finalize(base.advance(FRAME_HEADER_LEN as u32)).to_vec();
+        let mut image = builder.finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(1)).to_vec();
         let at = corrupt.index(image.len());
         image[at] ^= flip;
         match decode_frame(&image, DEFAULT_MAX_FRAME_LEN) {
@@ -155,7 +262,7 @@ proptest! {
             builder.append(&record.view());
         }
         let base = Lsn::new(SegmentId(0), 0);
-        let image = builder.finalize(base.advance(FRAME_HEADER_LEN as u32)).to_vec();
+        let image = builder.finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(1)).to_vec();
         for cut in 0..image.len() {
             prop_assert!(
                 decode_frame(&image[..cut], DEFAULT_MAX_FRAME_LEN).is_err(),
@@ -178,6 +285,34 @@ fn view_to_owned(view: &RecordView<'_>) -> OwnedRecord {
             OwnedRecord::NsOp { ns: ns.0, payload: payload.to_vec() }
         }
         RecordView::CkptBegin { ns, ckpt_id } => OwnedRecord::CkptBegin { ns: ns.0, id: ckpt_id },
+        RecordView::DocDelta {
+            ns,
+            key,
+            lineage,
+            base_version,
+            match_count,
+            post_len,
+            opcode,
+            program,
+            operand,
+        } => OwnedRecord::DocDelta {
+            ns: ns.0,
+            key: key.to_vec(),
+            lineage: lineage.get(),
+            base: base_version,
+            matches: match_count,
+            post_len,
+            opcode,
+            program: program.to_vec(),
+            operand: operand.to_vec(),
+        },
+        RecordView::DocFull { ns, key, lineage, version, idoc } => OwnedRecord::DocFull {
+            ns: ns.0,
+            key: key.to_vec(),
+            lineage: lineage.get(),
+            version,
+            idoc: idoc.to_vec(),
+        },
     }
 }
 
@@ -198,7 +333,7 @@ fn minimal_frame_round_trips() {
     let mut builder = FrameBuilder::new();
     builder.append(&RecordView::Delete { ns: NsId(0), key: b"" });
     let base = Lsn::new(SegmentId(0), 0);
-    let image = builder.finalize(base.advance(FRAME_HEADER_LEN as u32)).to_vec();
+    let image = builder.finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(1)).to_vec();
     let (frame, consumed) = decode_frame(&image, DEFAULT_MAX_FRAME_LEN).expect("decodes");
     assert_eq!(consumed, image.len());
     assert_eq!(frame.record_count(), 1);
@@ -215,12 +350,12 @@ fn builder_reuse_is_clean() {
 
     let mut reused = FrameBuilder::new();
     reused.append(&RecordView::Delete { ns: NsId(1), key: b"first-frame-key" });
-    let _ = reused.finalize(first_lsn);
+    let _ = reused.finalize(first_lsn, stamp(1));
     reused.reset();
     reused.append(&RecordView::NsOp { ns: NsId(2), payload: b"second" });
-    let from_reused = reused.finalize(first_lsn).to_vec();
+    let from_reused = reused.finalize(first_lsn, stamp(2)).to_vec();
 
     let mut fresh = FrameBuilder::new();
     fresh.append(&RecordView::NsOp { ns: NsId(2), payload: b"second" });
-    assert_eq!(fresh.finalize(first_lsn), from_reused.as_slice());
+    assert_eq!(fresh.finalize(first_lsn, stamp(2)), from_reused.as_slice());
 }

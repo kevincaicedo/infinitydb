@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod catalog;
+mod doc;
 mod evict;
 mod index;
 mod keyspace;
@@ -19,19 +20,23 @@ mod wall;
 mod wheel;
 
 pub use catalog::{CatalogError, NsCatalog};
+pub use doc::DocDomain;
+#[cfg(feature = "doc")]
+pub use doc::{JsonLogDecision, JsonRead, JsonScalarPatch, JsonSetOptions, JsonSetOutcome};
 pub use evict::{EvictStats, EvictionPolicy};
 pub use index::Index;
 pub use inf_alloc::ArenaConfig;
 // One import point for the shared store↔log vocabulary (ADR-0015 D2/D5).
 pub use inf_log::{FsyncClass, NsId};
 pub use keyspace::{
-    DEFAULT_DBS, EvictBudget, Keyspace, PressureConfig, ReplayOutcome, StateDigest,
+    DEFAULT_DBS, EvictBudget, Keyspace, PressureConfig, ReplayError, ReplayOutcome, StateDigest,
 };
 pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, valid_ns_name};
 pub use record::{MAX_KEY_LEN, MAX_VAL_LEN, TypeTag};
 pub use router::SlotRouter;
 pub use store::{
-    CellStore, CopyResult, Encoding, ExpireCond, ExpiryBudget, ExpiryStats, MemoryReport, OpError,
-    PostImage, SetCond, SetExpire, SetOptions, SetOutcome, StoreConfig, StoreStats, Ttl, TtlUpdate,
+    CellStore, CheckpointImage, CopyResult, Encoding, ExpireCond, ExpiryBudget, ExpiryStats,
+    LogFullImage, MemoryReport, OpError, PostImage, SetCond, SetExpire, SetOptions, SetOutcome,
+    StoreConfig, StoreStats, Ttl, TtlUpdate,
 };
 pub use wall::WallAnchor;

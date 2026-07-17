@@ -101,12 +101,12 @@ INF.NS CREATE sessions MODE durable  FSYNC everysec</code></pre>
   <p>Recovery is per cell and parallel: each cell loads its named checkpoint (a materialized log prefix in the same record format), then replays its log tail from the checkpoint&rsquo;s position. There is no global log sequence number and no merge step &mdash; cells recover independently.</p>
   <ul>
     <li><strong>While loading,</strong> the node answers exactly like Redis does: non-exempt commands receive <code>-LOADING Redis is loading the dataset in memory</code> (the exempt set is pinned to observed Redis behavior). Loading progress is visible in <code>INFO persistence</code>. The gate is node-scoped: a recovered cell still answers <code>-LOADING</code> while a peer replays.</li>
-    <li><strong>Torn tails are expected physics:</strong> a torn final batch frame (detected by CRC) is truncated, and replay resumes cleanly behind it. That is the one form of damage recovery repairs silently, because it is the defined crash window.</li>
-    <li><strong>Everything else is a refusal, not a guess.</strong> Corruption in the body of the log, a validating frame beyond a segment&rsquo;s recorded end, a MANIFEST that names a checkpoint or segment that is missing or corrupt, an unknown record type or flag &mdash; each is a <em>named</em> error and the boot fail-stops. InfinityDB never silently skips records and never falls back to &ldquo;replay whatever we can find,&rdquo; because a database that boots with quietly missing acknowledged data is worse than one that refuses and says why.</li>
+    <li><strong>Torn tails are expected physics:</strong> a torn final batch frame (detected by CRC) is truncated, and replay resumes cleanly behind it &mdash; the defined crash window. Since frame format v2 (ADR-0031), every frame carries an epoch, a sequence number, and the durability watermark at seal time under its CRC, so recovery can also <em>prove</em> when a crash-window gap in the un-synced tail was never fsync-covered: those gaps truncate too, and the discarded frames are counted in the recovery stats, never silent.</li>
+    <li><strong>Everything else is a refusal, not a guess.</strong> A surviving frame attesting fsync coverage past the point where valid data ends (the log itself proving the disk lost covered bytes), corruption or residue inside sealed segments, a MANIFEST that names a checkpoint or segment that is missing or corrupt, an unknown record type or flag, a frame-format downgrade signature &mdash; each is a <em>named</em> error and the boot fail-stops. InfinityDB never silently skips records and never falls back to &ldquo;replay whatever we can find,&rdquo; because a database that boots with quietly missing acknowledged data is worse than one that refuses and says why.</li>
   </ul>
   <div class="callout">
     <span class="callout-tag"><strong>What a refusal means for you:</strong></span>
-    a refused boot names the corruption class and the file. It means the on-disk state failed an integrity check that <em>could</em> have hidden lost data. The simulation evidence below audits these refusals: in the sweep, every refusal was legal (the fault genuinely destroyed named state) &mdash; refusals are not false alarms, and they are rare.
+    a refused boot names the corruption class and the file. It means the on-disk state failed an integrity check that <em>could</em> have hidden lost data. The simulation evidence below audits these refusals: in the sweep, every refusal was legal (the fault genuinely destroyed named state) &mdash; refusals are not false alarms, and they are rare; frame format v2&rsquo;s per-frame attestations narrowed them further by design (ADR-0031), with the &sect;8.2 promises unchanged. The operator&rsquo;s view &mdash; the exact error shape, exit codes, and what to do next &mdash; is on the <a href="operations.html">operations page</a>.
   </div>
 
   <h2>The evidence</h2>
@@ -114,8 +114,8 @@ INF.NS CREATE sessions MODE durable  FSYNC everysec</code></pre>
 
   <div class="evidence">
     <span class="tag">Deterministic durability testing (ledger C12).</span>
-    &ldquo;Durability is deterministically tested: 10,000 simulated power-cut/disk-fault seeds, zero durability-oracle violations &mdash; every <code>always</code>-acked write survives, <code>everysec</code> loses at most one second (simulated time); every seed replays byte-identically.&rdquo; Disclosed alongside: 1.33% of simulated boots legally refuse with a named corruption error (survival-audited).
-    <span class="artifact">artifact: infinitydb/.artifacts/m2/dst-sweep-10k-s22-20260705/</span>
+    &ldquo;Durability is deterministically tested: 10,000 simulated power-cut/disk-fault seeds, zero durability-oracle violations &mdash; every <code>always</code>-acked write survives, <code>everysec</code> loses at most one second (simulated time); every seed replays byte-identically &mdash; and on the frame-v2 tree, zero recovery refusals across the same 10,000 seeds.&rdquo; (Frame format v2 retired the earlier legally-refusing recovery class; the historical numbers live in the artifacts.)
+    <span class="artifact">artifact: infinitydb/.artifacts/m2/dst-sweep-10k-s22-20260705/ &middot; m2.5/s12-frame-seq-20260709/</span>
   </div>
 
   <div class="evidence">
@@ -152,7 +152,7 @@ INF.NS CREATE sessions MODE durable  FSYNC everysec</code></pre>
 
   <div class="doc-footer-nav">
     <a href="quickstart.html">&larr; Quickstart</a>
-    <a href="architecture.html">Architecture &rarr;</a>
+    <a href="deployment.html">Deployment &rarr;</a>
   </div>
 </main>
 

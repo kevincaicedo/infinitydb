@@ -31,7 +31,16 @@ use crate::admin;
 use crate::clients::ClientRegistry;
 use crate::config::ConfigStore;
 use crate::glob::glob_match;
+#[cfg(feature = "doc")]
+use crate::json;
 use crate::pubsub;
+
+#[cfg(feature = "doc")]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct DocLogAdmission {
+    pub budget: usize,
+    pub record_max: usize,
+}
 
 /// Node-level state surfaced through the command layer (M0-S19 + M1-S03):
 /// the frozen tripwire snapshot, the memory-attribution domains the store
@@ -122,10 +131,86 @@ pub struct NodeInfo {
     pub loading_total_bytes: Cell<u64>,
     pub loading_loaded_bytes: Cell<u64>,
     pub loading_cells_ready: Cell<u64>,
+    /// Node-wide memory board (M3-S25 INFO-attribution fix): set at plane
+    /// assembly when a control plane exists. `None` in bare harnesses,
+    /// where `INFO` renders cell scope and labels it.
+    pub memory_board: RefCell<Option<std::sync::Arc<crate::control::MemoryBoard>>>,
     /// CLIENT registry for this cell's connections (single-threaded).
     pub clients: RefCell<ClientRegistry>,
     /// Typed CONFIG store (M1-S03 freeze: keys + hot-reload classes).
     pub config: RefCell<ConfigStore>,
+    /// Per-cell compiled-path-program cache (M3-S10; ADR-0041 D1) —
+    /// shared by every connection and namespace the cell serves, sized
+    /// by `doc-path-cache-size` at node assembly (default 1024).
+    #[cfg(feature = "doc")]
+    pub path_cache: RefCell<inf_doc::ProgramCache>,
+    /// Per-cell recycled JSON parser (M3-S11): scratch buffers survive
+    /// across commands (the S05 lever-G seam); limits re-point per
+    /// target namespace via `set_limits`.
+    #[cfg(feature = "doc")]
+    pub json_parser: RefCell<inf_doc::JsonParser>,
+    /// Per-cell recycled ingest output buffer (`parse_into`'s half of
+    /// the same seam).
+    #[cfg(feature = "doc")]
+    pub json_ingest_buf: RefCell<Vec<u8>>,
+    /// Present only around an admitted durable JSON write. Presence is the
+    /// capture flag and carries the exact aggregate/single-record limits,
+    /// so stale limits without capture are unrepresentable (ADR-0043 D8).
+    #[cfg(feature = "doc")]
+    pub(crate) doc_log_admission: Cell<Option<DocLogAdmission>>,
+    /// Per-cell recycled document-effect scratch, consumed immediately by
+    /// the durable staging hook after command execution (ADR-0043 D2/D5).
+    #[cfg(feature = "doc")]
+    pub(crate) doc_log: RefCell<json::DocLogScratch>,
+}
+
+/// Fold a keyspace report plus this cell's node-side bytes into the
+/// memory gauges `INFO` renders and the board publishes — one
+/// definition shared by the plane's MAINTAIN publisher and the INFO
+/// render, so the two can never drift.
+pub(crate) fn memory_gauges_of(
+    report: &inf_store::MemoryReport,
+    node: &NodeInfo,
+) -> crate::control::MemoryGauges {
+    crate::control::MemoryGauges {
+        used_bytes: report.attributed_bytes()
+            + node.wire_buffers_bytes.get()
+            + node.conn_state_bytes.get(),
+        docs_live: report.docs_live,
+        doc_tape_bytes: report.doc_tape_bytes,
+        doc_arena_bytes: report.doc_arena_bytes,
+        doc_resident_bytes: report.doc_resident_bytes,
+        doc_intern_bytes: report.doc_intern_bytes,
+        doc_slack_bytes: report.doc_slack_bytes,
+        doc_scratch_bytes: report.doc_scratch_bytes,
+        doc_path_cache_bytes: report.doc_path_cache_bytes,
+    }
+}
+
+impl NodeInfo {
+    /// Publish this cell's memory gauges to the node board and return the
+    /// node-wide fold — `None` without a board (bare harness): the caller
+    /// renders cell scope and labels it (M3-S25 fix).
+    pub(crate) fn publish_and_total_memory(
+        &self,
+        gauges: crate::control::MemoryGauges,
+    ) -> Option<crate::control::MemoryGauges> {
+        let board = self.memory_board.borrow();
+        let board = board.as_ref()?;
+        board.slot(self.cell.get()).publish(gauges);
+        Some(board.totals())
+    }
+
+    /// Add the document pools that are owned once per cell rather than once
+    /// per namespace/store. Called only by tooling/INFO after the keyspace
+    /// report is assembled; never on the command hot path.
+    #[cfg(feature = "doc")]
+    pub(crate) fn add_cell_doc_memory(&self, report: &mut inf_store::MemoryReport) {
+        report.doc_path_cache_bytes = self.path_cache.borrow().bytes() as u64;
+        report.doc_scratch_bytes += self.json_parser.borrow().scratch_bytes() as u64
+            + self.json_ingest_buf.borrow().capacity() as u64
+            + self.doc_log.borrow().bytes() as u64;
+    }
 }
 
 /// Per-connection execution state (protocol negotiated via `HELLO`,
@@ -381,9 +466,10 @@ fn execute_db(
             w.simple("OK");
             cx.close_requested.set(true);
         }
-        CommandId::Get => match store.get(argv.arg(1), now) {
-            Some(value) => w.bulk(value),
-            None => w.null(),
+        CommandId::Get => match store.get_str(argv.arg(1), now) {
+            Ok(Some(value)) => w.bulk(value),
+            Ok(None) => w.null(),
+            Err(e) => op_error(e, &mut w),
         },
         CommandId::Set => set(argv, store, &cx.node, now, &mut w),
         CommandId::Setnx => {
@@ -423,6 +509,11 @@ fn execute_db(
         }
         CommandId::Getdel => match store.getdel(argv.arg(1), now) {
             Some(value) => w.bulk(&value),
+            // The store answers `None` for both missing keys and
+            // non-string records (ADR-0037 D6); the command layer owns
+            // the split (M3-S11 matrix) — the second probe rides the
+            // cold miss path only.
+            None if store.exists(argv.arg(1), now) => op_error(OpError::WrongType, &mut w),
             None => w.null(),
         },
         CommandId::Getex => getex(argv, store, &cx.node, now, &mut w),
@@ -441,7 +532,10 @@ fn execute_db(
             w.int(found);
         }
         CommandId::Type => match store.type_of(argv.arg(1), now) {
-            Some(_) => w.simple("string"),
+            Some(inf_store::TypeTag::String) => w.simple("string"),
+            // RedisJSON's module type name; S11 oracle-pins + allowlists it
+            // in the generic-command interaction matrix.
+            Some(inf_store::TypeTag::JsonDoc) => w.simple("ReJSON-RL"),
             None => w.simple("none"),
         },
         CommandId::Incr => incr(store, argv.arg(1), 1, now, &mut w),
@@ -474,7 +568,10 @@ fn execute_db(
             Ok(len) => w.int(len as i64),
             Err(e) => op_error(e, &mut w),
         },
-        CommandId::Strlen => w.int(store.strlen(argv.arg(1), now) as i64),
+        CommandId::Strlen => match store.strlen(argv.arg(1), now) {
+            Ok(len) => w.int(len as i64),
+            Err(e) => op_error(e, &mut w),
+        },
         // ---- M1-S01 · string family ----
         CommandId::Mget => {
             let keys: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
@@ -490,8 +587,10 @@ fn execute_db(
             let (Ok(start), Ok(end)) = (parse_i64(argv.arg(2)), parse_i64(argv.arg(3))) else {
                 return w.error("ERR value is not an integer or out of range");
             };
-            let slice = store.get_range(argv.arg(1), start, end, now);
-            w.bulk(slice);
+            match store.get_range(argv.arg(1), start, end, now) {
+                Ok(slice) => w.bulk(slice),
+                Err(e) => op_error(e, &mut w),
+            }
         }
         CommandId::Setrange => {
             let Ok(offset) = parse_i64(argv.arg(2)) else {
@@ -589,6 +688,37 @@ fn execute_db(
         // ---- internal fabric-program ops ----
         CommandId::InfTake | CommandId::InfPeek => {
             inf_take_peek(argv, store, meta.id == CommandId::InfTake, now, &mut w);
+        }
+        // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041) ----
+        CommandId::JsonSet
+        | CommandId::JsonGet
+        | CommandId::JsonMget
+        | CommandId::JsonDel
+        | CommandId::JsonForget
+        | CommandId::JsonType
+        | CommandId::JsonNumIncrBy
+        | CommandId::JsonNumMultBy
+        | CommandId::JsonStrAppend
+        | CommandId::JsonStrLen
+        | CommandId::JsonToggle
+        | CommandId::JsonClear
+        | CommandId::JsonArrAppend
+        | CommandId::JsonArrInsert
+        | CommandId::JsonArrIndex
+        | CommandId::JsonArrLen
+        | CommandId::JsonArrPop
+        | CommandId::JsonArrTrim
+        | CommandId::JsonObjKeys
+        | CommandId::JsonObjLen
+        | CommandId::JsonMerge
+        | CommandId::JsonDebug => {
+            #[cfg(feature = "doc")]
+            crate::json::execute_json(meta.id, argv, store, cx, now, &mut w);
+            // Slim builds carry no document code (L11): the registry rows
+            // exist, the capability does not — unknown-command is the
+            // honest answer.
+            #[cfg(not(feature = "doc"))]
+            unknown_command(argv, &mut w);
         }
         CommandId::Select
         | CommandId::Flushdb
@@ -810,6 +940,9 @@ fn getex(
     }
     match store.get_ex(argv.arg(1), update, now) {
         Some(value) => w.bulk(&value),
+        // Missing vs non-string: the command layer owns the split
+        // (ADR-0037 D6 / M3-S11 matrix) — second probe on the cold path.
+        None if store.exists(argv.arg(1), now) => op_error(OpError::WrongType, w),
         None => w.null(),
     }
 }
@@ -1223,7 +1356,7 @@ pub(crate) fn arity_error(name: &str, w: &mut RespWriter<'_>) {
     w.error(&format!("ERR wrong number of arguments for '{}' command", name.to_ascii_lowercase()));
 }
 
-fn op_error(e: OpError, w: &mut RespWriter<'_>) {
+pub(crate) fn op_error(e: OpError, w: &mut RespWriter<'_>) {
     match e {
         OpError::NotInt => w.error("ERR value is not an integer or out of range"),
         OpError::Overflow => w.error("ERR increment or decrement would overflow"),
@@ -1231,6 +1364,9 @@ fn op_error(e: OpError, w: &mut RespWriter<'_>) {
         OpError::NanOrInf => w.error("ERR increment would produce NaN or Infinity"),
         OpError::OutOfMemory => w.error("OOM command not allowed when used memory > 'maxmemory'."),
         OpError::TooLarge => w.error("ERR key or value exceeds InfinityDB M0 record bounds"),
+        OpError::WrongType => {
+            w.error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
     }
 }
 

@@ -9,7 +9,8 @@
 # Regenerate/review this file whenever the ledger changes.
 
 # --- ledger C12 (Allowed): DST durability sweep -------------------------
-1.33 %          # C12 disclosure: fraction of simulated boots that legally refuse
+# (the 1.33% legal-refusal disclosure was retired by frame v2 — ADR-0031;
+#  C12 re-signed at the S19 walk 2026-07-10, site copy updated the same day)
 
 # --- ledger C14 (Allowed): cold-boot recovery ---------------------------
 10 gb           # C14: dataset size of the measured boot
@@ -31,4 +32,5 @@
 
 # --- non-claims (documented) ---------------------------------------------
 16 gb           # config example in the INF.NS docs (MAXMEMORY 16gb) — master plan §4.2 example, not a measurement
-16 mib          # record-format value bound (SETRANGE note) from the generated compat matrix — wire format, not a measurement
+16 mib          # record-format value bound (SETRANGE note in the compat matrix; value bound on the operations limitations list) — wire format, not a measurement
+256 mib         # config defaults (--segment-bytes / --ckpt-interval-bytes) on the deployment page — configuration values, not measurements

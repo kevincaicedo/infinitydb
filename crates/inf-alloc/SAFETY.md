@@ -9,6 +9,7 @@ unit tests under Miri.
 | `arena.rs::map_chunk` (`libc::mmap`) | anonymous private mapping, result checked against `MAP_FAILED` before use | unit tests + Miri (`storm_reconciles_byte_exact`) |
 | `arena.rs::unmap_chunk` / `Drop` (`libc::munmap`) | base/len are exactly one live mapping owned by the arena; entry zeroed after unmap so stale addrs hit the bounds assert, never the dead pointer | `huge_allocations_map_and_unmap`, `stale_huge_addr_panics_not_ub` |
 | `arena.rs::bytes`/`bytes_mut` (`from_raw_parts[_mut]`) | offset+len bounds-checked against the owning chunk's mapped length before the slice is formed; `&self`/`&mut self` provide aliasing discipline; chunk memory lives until unmap/drop | whole arena test suite under Miri |
+| `counting_allocator.rs::GlobalAlloc` (test/feature-only) | every operation delegates the caller's pointer/layout contract unchanged to `System`; the relaxed counter does not alter allocation semantics | `delegates_and_counts_allocations` + `inf-doc/tests/scalar_patch_alloc.rs`; Miri compiles the unit-test arm |
 
 `buffer_pool` remains 100% safe code.
 

@@ -5,7 +5,9 @@ active development; internal interfaces change between milestones. Issues,
 questions, and pull requests are welcome.
 
 - [Ground rules](#ground-rules)
+- [The reading order](#the-reading-order)
 - [Development setup](#development-setup)
+- [Onboarding: prove the toolchain (~30 minutes)](#onboarding-prove-the-toolchain-30-minutes)
 - [The validation ladder](#the-validation-ladder)
 - [Architecture & design laws](#architecture--design-laws)
 - [Unsafe code](#unsafe-code)
@@ -21,6 +23,27 @@ questions, and pull requests are welcome.
   one needs design discussion first.
 - By contributing, you agree your contributions are licensed under the
   project's [Apache-2.0](LICENSE) license.
+
+## The reading order
+
+These are governing documents, not background reading — reviews are run
+against them. Read in this order before your first substantive PR:
+
+1. [`ARCHITECTURE.md`](ARCHITECTURE.md) — the design-decision overview: the
+   problem, the shared-nothing cell model, and why the system is shaped
+   this way. Then [`docs/architecture.md`](docs/architecture.md), the
+   finer-grained single-node walkthrough.
+2. The master plan (design laws L1–L11, gates, and the milestone train —
+   planning repository; ask a maintainer if your change is
+   milestone-scoped).
+3. [`docs/INFINITY_STYLE.md`](docs/INFINITY_STYLE.md) — the **normative**
+   engineering style: what a reviewer will hold your PR to. The
+   [PR checklist](.github/PULL_REQUEST_TEMPLATE.md) is its operational
+   form.
+4. For milestone-scoped work: the owning milestone plan and its review
+   ledger (planning repository) — story lifecycle, budgets, and the
+   definition of done live there; a story is claimed in the ledger
+   before code.
 
 ## Development setup
 
@@ -39,6 +62,35 @@ git clone https://github.com/kevincaicedo/infinitydb
 cd infinitydb
 just check          # the full local ladder (see below)
 cargo run -p infinityd -- --port 6379
+```
+
+## Onboarding: prove the toolchain (~30 minutes)
+
+Day-one exercise (M2.5-S23): run these four steps end-to-end from a fresh
+clone. When they all pass you have proven the entire toolchain — build,
+validation ladder, deterministic simulator, seed replay, and the bench
+harness — and you know the loop every story runs in. If anything here
+fails or a doc step is unclear, that is a bug in the docs: open an issue
+(or fix it in your first PR).
+
+```bash
+# 1. The validation ladder (~5 min): fmt, dep-DAG law, cell deny-list,
+#    fault-point/fsync/panic-policy/safety-inventory greps, clippy, tests.
+just check
+
+# 2. Determinism smoke (~1 min): same seed => byte-identical traces.
+just sim-smoke
+
+# 3. One seeded DST replay (~1 min): the debugging workflow — every sim
+#    failure is a seed; this is how you replay one exactly.
+cargo run --release -p inf-sim -- --scenario m2-durable --seed 0xC0FFEE --verify-determinism
+
+# 4. One dev-tier bench row (~3 min): the measurement loop. Dev-tier
+#    numbers prove your toolchain, never a claim (L10) — only the pinned
+#    reference box backs published numbers.
+cargo run --release -p infinityd -- --port 7777 &
+cargo run --release -p inf-bench -- load --port 7777 --conns 64 --pipeline 16 --fill 100000 --duration 10
+kill %1
 ```
 
 ## The validation ladder
@@ -99,10 +151,14 @@ Mechanical guards you will hit if you cross a line:
   randomness, and I/O are *injected* (L7) so the whole system runs
   deterministically in the simulator.
 
-Coding style follows the Rust API guidelines plus: prefer flat control flow
-(`?`, `let-else`, early returns), make invalid states unrepresentable with the
-type system, keep modules narrow, and prefer static dispatch on hot paths.
-`rustfmt` and `clippy -D warnings` are enforced.
+Coding style is normative, not advisory:
+[`docs/INFINITY_STYLE.md`](docs/INFINITY_STYLE.md) is the document reviews
+are run against. The short form: prefer flat control flow (`?`, `let-else`,
+early returns), make invalid states unrepresentable with the type system,
+keep modules narrow, prefer static dispatch on hot paths, panic only for
+violated internal invariants. `rustfmt` and `clippy -D warnings` are
+enforced mechanically; the rest is enforced in review via the
+[PR checklist](.github/PULL_REQUEST_TEMPLATE.md).
 
 ## Unsafe code
 
@@ -134,6 +190,9 @@ InfinityDB has a strict claim discipline (L10):
 - Keep PRs focused; one logical change per PR.
 - Write clear commit messages (imperative mood, explain the *why*).
 - Run `just check` locally first.
+- Fill in the [PR checklist](.github/PULL_REQUEST_TEMPLATE.md) — the
+  reviewer affirms [INFINITY_STYLE](docs/INFINITY_STYLE.md) conformance as
+  part of the merge, so unchecked boxes block review, they don't skip it.
 - For changes to a crate's behavior, update that crate's docs and the
   compatibility matrix is regenerated automatically — if you add or change a
   command, run `INF_REGEN_MATRIX=1 cargo test -p compat --test matrix_artifact`

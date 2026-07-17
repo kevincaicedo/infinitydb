@@ -1,0 +1,48 @@
+version = 1
+seed = 487333926
+seed_hex = "0x1D0C2026"
+generator = "splitmix64-shape-streams-v1"
+encoding = "UTF-8 minified JSON"
+bytes_checked_in = false
+
+[[shape]]
+name = "small-200B"
+file = "small-200B.json"
+contract = "exactly 200 JSON-text bytes"
+json_bytes = 200
+fnv1a64 = "767cde9076f5d54f"
+
+[[shape]]
+name = "gate-1KiB"
+file = "gate-1KiB.json"
+contract = "exactly 1024 JSON-text bytes; child depth 4"
+json_bytes = 1024
+fnv1a64 = "3ce45137eba97c05"
+
+[[shape]]
+name = "medium-2KiB"
+file = "medium-2KiB.json"
+contract = "exactly 2048 JSON-text bytes; 12 small objects"
+json_bytes = 2048
+fnv1a64 = "2d5af86ae14f5834"
+
+[[shape]]
+name = "large-64KiB"
+file = "large-64KiB.json"
+contract = "exactly 65536 JSON-text bytes; 256 small objects"
+json_bytes = 65536
+fnv1a64 = "3a6318ba7d0c7f29"
+
+[[shape]]
+name = "deep-32"
+file = "deep-32.json"
+contract = "exactly 32 nested object containers"
+json_bytes = 641
+fnv1a64 = "db75f26612cddd2a"
+
+[[shape]]
+name = "wide-array"
+file = "wide-array.json"
+contract = "exactly 10000 small object elements"
+json_bytes = 419277
+fnv1a64 = "79bcaedeb7623b16"

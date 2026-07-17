@@ -16,7 +16,10 @@ site/                          ← the deployable root (upload this to Pages)
   docs/
     index.html                 docs hub + claims/evidence explainer
     quickstart.html            source build + Docker-from-repo + seccomp note
+                               + client snippets (redis-py/node-redis/go-redis/Lettuce, M2.5-S06)
     durability.html            namespaces, durability classes, loss windows, recovery
+    deployment.html            docker/systemd/seccomp, data-dir layout, flags, upgrades (M2.5-S06)
+    operations.html            -LOADING, refusal taxonomy, INFO persistence, alpha limits (M2.5-S06)
     architecture.html          condensed from infinitydb/ARCHITECTURE.md
     compat.html                GENERATED — do not edit (see below)
     roadmap.html               the milestone train, ADR reorders named
@@ -94,10 +97,12 @@ python3 scripts/check-ledger-copy.py --site site \
 
 Current numbers on the site and their coverage: the durability page cites
 ledger rows **C12, C13, C14, C15, C16, C21** (all Allowed) verbatim with
-their artifacts; the blog post cites **C3, C4, C12**. There are **zero**
-throughput/latency/comparison marketing numbers anywhere — the landing page
-keeps the "why there are no benchmark numbers" evidence-policy block
-instead, by design.
+their artifacts; the blog post cites **C3, C4, C12**. The deployment and
+operations pages (M2.5-S06) carry only documented non-claims: the
+`256 MiB` config defaults and the `16 MiB` value bound (allowlisted with
+comments). There are **zero** throughput/latency/comparison marketing
+numbers anywhere — the landing page keeps the "why there are no benchmark
+numbers" evidence-policy block instead, by design.
 
 ## Deploying to GitHub Pages
 

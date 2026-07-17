@@ -18,7 +18,12 @@ inf-fabric = { path = "crates/inf-fabric" }
 inf-runtime = { path = "crates/inf-runtime" }
 inf-wire = { path = "crates/inf-wire" }
 inf-log = { path = "crates/inf-log" }
-inf-store = { path = "crates/inf-store" }
+# default-features = false so members can scope the `doc` engine edge
+# themselves (ADR-0041 D3): inf-server's default `doc` feature re-enables
+# it for every full build via unification; a slim inf-server build then
+# truly carries no document code (L11). inf-store's own tests keep the
+# crate-local default (doc on).
+inf-store = { path = "crates/inf-store", default-features = false }
 inf-stream = { path = "crates/inf-stream" }
 inf-doc = { path = "crates/inf-doc" }
 inf-vector = { path = "crates/inf-vector" }
@@ -27,13 +32,23 @@ inf-replica = { path = "crates/inf-replica" }
 inf-server = { path = "crates/inf-server" }
 infinity-embedded = { path = "crates/infinity-embedded" }
 
-# external — data plane allows libc (kqueue/mmap FFI) and io-uring (Linux) only.
+# external — data plane allows libc (kqueue/mmap FFI), io-uring (Linux),
+# and zmij (M3-S06, ADR-0039: shortest-round-trip f64→text for the JSON
+# serializer — no_std, zero-dep, pure computation; the exact crate
+# serde_json ≥ 1.0.144 formats floats through, so oracle-lineage parity is
+# by construction; an in-house Schubfach port was rejected as risk without
+# evidence).
 libc = "0.2"
 io-uring = "0.7"
+zmij = "1"
 
 # dev/test/tooling only — never on the data plane
 loom = "0.7"
 proptest = "1"
+# test-only JSON value oracle for the M3-S05 differential (plan AC); never
+# a data-plane dependency. preserve_order matches our insertion-order +
+# last-wins duplicate-key model; float_roundtrip makes f64 comparisons exact.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 # default features pull rayon + plotters; benches need neither (rayon is
 # ban-listed — nothing multithreaded belongs anywhere near the data plane).
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }

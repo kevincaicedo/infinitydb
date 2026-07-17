@@ -26,6 +26,55 @@ fn declared_statuses_are_mechanically_enforced() {
     for name in ["SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "PUBLISH", "PUBSUB"] {
         assert!(rows.iter().any(|r| r.name == name), "{name} missing from the matrix");
     }
+    // The M3 §10.1 `JSON.*` surface is declared (M3-S22), so the staleness
+    // gate below demonstrably covers the JSON section: dropping a JSON row
+    // from the registry or the declaration table fails here, and any status/
+    // note/deviation drift fails `generated_matrix_is_current`.
+    for name in [
+        "JSON.SET",
+        "JSON.GET",
+        "JSON.MGET",
+        "JSON.DEL",
+        "JSON.FORGET",
+        "JSON.TYPE",
+        "JSON.NUMINCRBY",
+        "JSON.NUMMULTBY",
+        "JSON.STRAPPEND",
+        "JSON.STRLEN",
+        "JSON.TOGGLE",
+        "JSON.CLEAR",
+        "JSON.ARRAPPEND",
+        "JSON.ARRINSERT",
+        "JSON.ARRINDEX",
+        "JSON.ARRLEN",
+        "JSON.ARRPOP",
+        "JSON.ARRTRIM",
+        "JSON.OBJKEYS",
+        "JSON.OBJLEN",
+        "JSON.MERGE",
+        "JSON.DEBUG",
+    ] {
+        assert!(rows.iter().any(|r| r.name == name), "{name} missing from the matrix");
+    }
+}
+
+/// M3-S22: the rendered artifact carries the whole JSON section — the
+/// RedisJSON oracle pin, per-command RedisJSON deviation entries, and the
+/// `JSON.RESP` absent row (deprecated upstream — M3 plan anti-goals). Byte
+/// equality in `generated_matrix_is_current` then extends the release
+/// pipeline's staleness refusal to the JSON section as a whole.
+#[test]
+fn rendered_matrix_covers_the_json_section() {
+    let rendered = render();
+    for needle in [
+        "redis/redis-stack-server:7.4.0-v8",
+        "| `JSON.SET` |",
+        "RedisJSON RESP2 `",
+        "RedisJSON RESP3 `",
+        "| `JSON.RESP` | Never — deprecated upstream; declared absent per the M3 plan anti-goals |",
+    ] {
+        assert!(rendered.contains(needle), "rendered matrix lost the JSON section: {needle:?}");
+    }
 }
 
 #[test]

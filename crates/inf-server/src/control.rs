@@ -268,6 +268,114 @@ impl CkptBoard {
     }
 }
 
+/// One cell's memory-gauge publication payload — and, field-for-field,
+/// the node-wide fold `MemoryBoard::totals` returns.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryGauges {
+    /// The cell's `used_memory` contribution (attributed keyspace bytes +
+    /// wire buffers + connection state).
+    pub used_bytes: u64,
+    pub docs_live: u64,
+    pub doc_tape_bytes: u64,
+    pub doc_arena_bytes: u64,
+    pub doc_resident_bytes: u64,
+    pub doc_intern_bytes: u64,
+    pub doc_slack_bytes: u64,
+    pub doc_scratch_bytes: u64,
+    pub doc_path_cache_bytes: u64,
+}
+
+/// Per-cell memory publication slot. Same L1 control-plane carve-out
+/// class as the recovery/checkpoint boards: the owning cell writes its
+/// slot (MAINTAIN cadence, plus fresh at its own `INFO` render); readers
+/// fold across slots. Gauges are advisory — a peer's value lags its
+/// publisher by at most one publish period, like every other INFO gauge.
+#[derive(Debug, Default)]
+pub struct MemorySlot {
+    used_bytes: AtomicU64,
+    docs_live: AtomicU64,
+    doc_tape_bytes: AtomicU64,
+    doc_arena_bytes: AtomicU64,
+    doc_resident_bytes: AtomicU64,
+    doc_intern_bytes: AtomicU64,
+    doc_slack_bytes: AtomicU64,
+    doc_scratch_bytes: AtomicU64,
+    doc_path_cache_bytes: AtomicU64,
+}
+
+impl MemorySlot {
+    pub fn publish(&self, g: MemoryGauges) {
+        self.used_bytes.store(g.used_bytes, Ordering::Relaxed);
+        self.docs_live.store(g.docs_live, Ordering::Relaxed);
+        self.doc_tape_bytes.store(g.doc_tape_bytes, Ordering::Relaxed);
+        self.doc_arena_bytes.store(g.doc_arena_bytes, Ordering::Relaxed);
+        self.doc_resident_bytes.store(g.doc_resident_bytes, Ordering::Relaxed);
+        self.doc_intern_bytes.store(g.doc_intern_bytes, Ordering::Relaxed);
+        self.doc_slack_bytes.store(g.doc_slack_bytes, Ordering::Relaxed);
+        self.doc_scratch_bytes.store(g.doc_scratch_bytes, Ordering::Relaxed);
+        self.doc_path_cache_bytes.store(g.doc_path_cache_bytes, Ordering::Relaxed);
+    }
+
+    fn read(&self) -> MemoryGauges {
+        MemoryGauges {
+            used_bytes: self.used_bytes.load(Ordering::Relaxed),
+            docs_live: self.docs_live.load(Ordering::Relaxed),
+            doc_tape_bytes: self.doc_tape_bytes.load(Ordering::Relaxed),
+            doc_arena_bytes: self.doc_arena_bytes.load(Ordering::Relaxed),
+            doc_resident_bytes: self.doc_resident_bytes.load(Ordering::Relaxed),
+            doc_intern_bytes: self.doc_intern_bytes.load(Ordering::Relaxed),
+            doc_slack_bytes: self.doc_slack_bytes.load(Ordering::Relaxed),
+            doc_scratch_bytes: self.doc_scratch_bytes.load(Ordering::Relaxed),
+            doc_path_cache_bytes: self.doc_path_cache_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Node-wide memory board: one slot per cell (M3-S25 finding — `INFO`
+/// rendered the *serving cell's* keyspace attribution beside
+/// *process-wide* RSS, so `docs_live` read 17,801 on a 71,200-document
+/// node and `mem_fragmentation_ratio` mixed scopes. The memory section
+/// now folds this board — §16's "control thread aggregates on scrape").
+#[derive(Debug)]
+pub struct MemoryBoard {
+    cells: Vec<MemorySlot>,
+}
+
+impl MemoryBoard {
+    #[must_use]
+    pub fn new(cells: u16) -> MemoryBoard {
+        MemoryBoard { cells: (0..cells).map(|_| MemorySlot::default()).collect() }
+    }
+
+    /// This cell's slot.
+    ///
+    /// # Panics
+    /// Out-of-range cell id (assembly bug).
+    #[must_use]
+    pub fn slot(&self, cell: u16) -> &MemorySlot {
+        &self.cells[usize::from(cell)]
+    }
+
+    /// Field-wise sum across every cell's last publication.
+    #[must_use]
+    pub fn totals(&self) -> MemoryGauges {
+        let mut t = MemoryGauges::default();
+        for slot in &self.cells {
+            let g = slot.read();
+            t.used_bytes += g.used_bytes;
+            t.docs_live += g.docs_live;
+            t.doc_tape_bytes += g.doc_tape_bytes;
+            t.doc_arena_bytes += g.doc_arena_bytes;
+            t.doc_resident_bytes += g.doc_resident_bytes;
+            t.doc_intern_bytes += g.doc_intern_bytes;
+            t.doc_slack_bytes += g.doc_slack_bytes;
+            t.doc_scratch_bytes += g.doc_scratch_bytes;
+            t.doc_path_cache_bytes += g.doc_path_cache_bytes;
+        }
+        t
+    }
+}
+
 /// One catalog snapshot to persist (the origin cell's post-apply export).
 struct PersistReq {
     catalog: NsCatalog,
@@ -303,6 +411,8 @@ pub struct ControlHandle {
     ckpt_board: Arc<CkptBoard>,
     /// Boot-recovery progress + readiness (M2-S15).
     recovery: Arc<RecoveryBoard>,
+    /// Per-cell memory gauges for node-scope `INFO` (M3-S25 fix).
+    memory_board: Arc<MemoryBoard>,
 }
 
 impl ControlHandle {
@@ -377,6 +487,13 @@ impl ControlHandle {
     #[must_use]
     pub fn recovery_board(&self) -> &Arc<RecoveryBoard> {
         &self.recovery
+    }
+
+    /// The memory board (M3-S25): cells publish their slot from MAINTAIN
+    /// and at their own `INFO` render; the memory section folds it.
+    #[must_use]
+    pub fn memory_board(&self) -> &Arc<MemoryBoard> {
+        &self.memory_board
     }
 }
 
@@ -487,6 +604,7 @@ impl ControlHandle {
                 cells: (0..cells).map(|_| CkptSlot::default()).collect(),
             }),
             recovery: Arc::new(RecoveryBoard::new(cells, start_unix_ms)),
+            memory_board: Arc::new(MemoryBoard::new(cells)),
         });
         (handle, rx)
     }
@@ -512,106 +630,141 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("inf-control".into())
         .spawn(move || {
-            let handle_msg = |msg: ControlMsg| match msg {
-                ControlMsg::Persist(req) => {
-                    // The persisted next_id must always cover the
-                    // allocator so ids never regress across restart,
-                    // even for namespaces whose DDL raced this
-                    // snapshot.
-                    let mut catalog = req.catalog;
-                    catalog.next_id = catalog.next_id.max(allocator.next_ns_id());
-                    let payload = catalog.encode();
-                    if let Err(err) = write_meta(&StdSegmentFs, &data_dir, &payload) {
-                        // §8.4 fail-stop: a DDL was acked against this swap.
-                        panic!("catalog META swap failed (fail-stop): {err}");
-                    }
-                    persisted.store(req.epoch, Ordering::Release);
+            // This thread is detached (the JoinHandle drops below): a
+            // swallowed unwind would leave cells serving with catalog
+            // persistence, checkpoint epochs, and delegated unlinks
+            // silently dead — the ADR-0026 D2 class. Same boundary as
+            // the cell threads (M2.5-S01/S16): panic ⇒ loud process exit.
+            let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                control_main(&data_dir, &allocator, &persisted, &board, &rx, cells);
+            }));
+            if body.is_err() {
+                // The default hook already printed the panic.
+                eprintln!("infinityd: control thread panicked — fail-stop");
+                std::process::exit(101);
+            }
+        })
+        .expect("spawn control thread");
+    handle
+}
+
+/// The control thread's message loop + boot narration (M2-S15/M2.5-S01),
+/// extracted so [`spawn`] can wrap it in the panic fail-stop boundary.
+fn control_main(
+    data_dir: &Path,
+    allocator: &Arc<ControlHandle>,
+    persisted: &Arc<AtomicU64>,
+    board: &Arc<RecoveryBoard>,
+    rx: &mpsc::Receiver<ControlMsg>,
+    cells: u16,
+) {
+    {
+        let handle_msg = |msg: ControlMsg| match msg {
+            ControlMsg::Persist(req) => {
+                // The persisted next_id must always cover the
+                // allocator so ids never regress across restart,
+                // even for namespaces whose DDL raced this
+                // snapshot.
+                let mut catalog = req.catalog;
+                catalog.next_id = catalog.next_id.max(allocator.next_ns_id());
+                let payload = catalog.encode();
+                if let Err(err) = write_meta(&StdSegmentFs, data_dir, &payload) {
+                    // §8.4 fail-stop: a DDL was acked against this
+                    // swap. `process::exit`, never `panic!` — this
+                    // thread is detached (the JoinHandle is dropped),
+                    // so an unwind would kill only the control plane
+                    // and leave cells serving with catalog
+                    // persistence, checkpoint epochs, and delegated
+                    // unlinks silently dead (the ADR-0026 D2
+                    // swallowed-death class; M2.5-S16 audit fix).
+                    eprintln!("FATAL: catalog META swap failed (fail-stop, §8.4): {err}");
+                    std::process::exit(crate::EXIT_DURABLE_FAILSTOP);
                 }
-                ControlMsg::Unlink(path) => {
-                    // Never fatal: the file is outside every recovery
-                    // unit; a survivor is re-collected at boot.
-                    if let Err(err) = std::fs::remove_file(&path)
-                        && err.kind() != std::io::ErrorKind::NotFound
-                    {
-                        eprintln!("control: unlink {} failed: {err}", path.display());
-                    }
+                persisted.store(req.epoch, Ordering::Release);
+            }
+            ControlMsg::Unlink(path) => {
+                // Never fatal: the file is outside every recovery
+                // unit; a survivor is re-collected at boot.
+                if let Err(err) = std::fs::remove_file(&path)
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!("control: unlink {} failed: {err}", path.display());
                 }
-            };
-            // Boot narration (M2-S15): until every cell reports ready,
-            // poll the channel with a timeout and print per-cell ready
-            // lines + a periodic aggregate progress line (segments/bytes/
-            // ETA). Log-line clocks are ambient wall time — control-plane
-            // narration only, never oracle input (those ride the
-            // injected clocks).
-            let mut announced = vec![false; usize::from(cells)];
-            let boot_started = std::time::Instant::now();
-            let mut next_progress = boot_started + Duration::from_secs(1);
-            while !board.all_ready() {
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(msg) => handle_msg(msg),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                }
-                for (cell, seen) in announced.iter_mut().enumerate() {
-                    let slot = board.slot(cell as u16);
-                    if !*seen && slot.ready() {
-                        *seen = true;
-                        let (_, total) = slot.bytes();
-                        let (segs, _) = slot.segments();
-                        let torn = slot.torn_truncated_at().map_or(String::new(), |lsn| {
-                            format!(", torn tail truncated at {lsn} (M2-S14)")
-                        });
-                        eprintln!(
-                            "control: cell {cell} recovered ({segs} segments, {total} bytes, {} records{torn})",
-                            slot.records()
-                        );
-                    }
-                }
-                let now = std::time::Instant::now();
-                if now >= next_progress && !board.all_ready() {
-                    next_progress = now + Duration::from_secs(1);
-                    let (done, total) = board.bytes();
-                    let elapsed = boot_started.elapsed().as_secs_f64();
-                    let eta = if done > 0 {
-                        (elapsed * (total.saturating_sub(done)) as f64 / done as f64).ceil()
-                    } else {
-                        0.0
-                    };
+            }
+        };
+        // Boot narration (M2-S15): until every cell reports ready,
+        // poll the channel with a timeout and print per-cell ready
+        // lines + a periodic aggregate progress line (segments/bytes/
+        // ETA). Log-line clocks are ambient wall time — control-plane
+        // narration only, never oracle input (those ride the
+        // injected clocks).
+        let mut announced = vec![false; usize::from(cells)];
+        let boot_started = std::time::Instant::now();
+        let mut next_progress = boot_started + Duration::from_secs(1);
+        while !board.all_ready() {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(msg) => handle_msg(msg),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            for (cell, seen) in announced.iter_mut().enumerate() {
+                let slot = board.slot(cell as u16);
+                if !*seen && slot.ready() {
+                    *seen = true;
+                    let (_, total) = slot.bytes();
+                    let (segs, _) = slot.segments();
+                    let torn = slot.torn_truncated_at().map_or(String::new(), |lsn| {
+                        format!(", torn tail truncated at {lsn} (M2-S14)")
+                    });
                     eprintln!(
-                        "control: recovery {}/{} cells ready, {done}/{total} bytes ({:.1}%), eta {eta:.0}s",
-                        board.ready_cells(),
-                        board.cell_count(),
-                        if total > 0 { done as f64 * 100.0 / total as f64 } else { 100.0 },
+                        "control: cell {cell} recovered ({segs} segments, {total} bytes, {} records{torn})",
+                        slot.records()
                     );
-                    // Stuck-cell narration (M2.5-S01): after 5 s, name each
-                    // not-ready cell and the phase it published before its
-                    // current step — the ADR-0022 D7 wedge signature was a
-                    // silent cell; a stalled boot must say where it stalled.
-                    if elapsed >= 5.0 {
-                        for cell in 0..cells {
-                            let slot = board.slot(cell);
-                            if !slot.ready() {
-                                let (done, total) = slot.bytes();
-                                eprintln!(
-                                    "control: cell {cell} not ready — in {} ({done}/{total} bytes) for {elapsed:.0}s",
-                                    CellRecoverySlot::phase_name(slot.phase()),
-                                );
-                            }
+                }
+            }
+            let now = std::time::Instant::now();
+            if now >= next_progress && !board.all_ready() {
+                next_progress = now + Duration::from_secs(1);
+                let (done, total) = board.bytes();
+                let elapsed = boot_started.elapsed().as_secs_f64();
+                let eta = if done > 0 {
+                    (elapsed * (total.saturating_sub(done)) as f64 / done as f64).ceil()
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "control: recovery {}/{} cells ready, {done}/{total} bytes ({:.1}%), eta {eta:.0}s",
+                    board.ready_cells(),
+                    board.cell_count(),
+                    if total > 0 { done as f64 * 100.0 / total as f64 } else { 100.0 },
+                );
+                // Stuck-cell narration (M2.5-S01): after 5 s, name each
+                // not-ready cell and the phase it published before its
+                // current step — the ADR-0022 D7 wedge signature was a
+                // silent cell; a stalled boot must say where it stalled.
+                if elapsed >= 5.0 {
+                    for cell in 0..cells {
+                        let slot = board.slot(cell);
+                        if !slot.ready() {
+                            let (done, total) = slot.bytes();
+                            eprintln!(
+                                "control: cell {cell} not ready — in {} ({done}/{total} bytes) for {elapsed:.0}s",
+                                CellRecoverySlot::phase_name(slot.phase()),
+                            );
                         }
                     }
                 }
             }
-            eprintln!(
-                "control: recovery complete — {} cells serving ({} ms)",
-                board.cell_count(),
-                boot_started.elapsed().as_millis()
-            );
-            while let Ok(msg) = rx.recv() {
-                handle_msg(msg);
-            }
-            // Channel closed = node shutdown; nothing to flush (every
-            // acked DDL already persisted before its reply).
-        })
-        .expect("spawn control thread");
-    handle
+        }
+        eprintln!(
+            "control: recovery complete — {} cells serving ({} ms)",
+            board.cell_count(),
+            boot_started.elapsed().as_millis()
+        );
+        while let Ok(msg) = rx.recv() {
+            handle_msg(msg);
+        }
+        // Channel closed = node shutdown; nothing to flush (every
+        // acked DDL already persisted before its reply).
+    }
 }

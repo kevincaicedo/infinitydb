@@ -17,6 +17,8 @@ mod durable;
 mod exec;
 pub mod fault;
 mod glob;
+#[cfg(feature = "doc")]
+mod json;
 mod log_bytes;
 mod plane;
 mod pubsub;
@@ -47,6 +49,8 @@ pub use exec::{ConnCx, NodeInfo, execute, execute_slices, stall_request};
 pub use glob::glob_match;
 pub use inf_log::ckpt::DEFAULT_CKPT_INTERVAL_BYTES;
 pub use inf_log::fs::StdSegmentFs;
+#[cfg(feature = "doc")]
+pub use json::{JSON_REPLY_SHAPES, ReplyShape};
 // M2-S18 (ADR-0020 D6/D7): the sim tier's disk, re-exported for the
 // assembly/simulator tier exactly like `StdSegmentFs` above — bins name
 // `inf-server` only (dep-DAG).

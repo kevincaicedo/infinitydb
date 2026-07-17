@@ -32,6 +32,7 @@ fn main() {
     let mut sweep: Option<u64> = None;
     let mut shard = (0u64, 1u64);
     let mut out_dir: Option<String> = None;
+    let mut replay_canary = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -67,12 +68,14 @@ fn main() {
                     );
                 }
                 "--out" => out_dir = Some(take("--out")?),
+                "--replay-canary" => replay_canary = true,
                 "--help" | "-h" => {
                     println!(
-                        "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m2-combined|boot-storm \
+                        "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m3-document|m2-combined|boot-storm \
                          [--seed N|0xN] [--verify-determinism] \
-                         [--plant lost-wakeup|fsync-lies] [--cells N] [--connections N] \
-                         [--commands N] [--trace-out FILE] [--sweep N [--shard I/K] [--out DIR]]"
+                         [--plant lost-wakeup|fsync-lies] [--replay-canary] [--cells N] \
+                         [--connections N] [--commands N] [--trace-out FILE] \
+                         [--sweep N [--shard I/K] [--out DIR]]"
                     );
                     std::process::exit(0);
                 }
@@ -88,8 +91,17 @@ fn main() {
 
     // The M2-S19 durable scenario has its own runner (power cuts, the
     // durability oracle, the sweep mode).
-    if scenario_name == "m2-durable" {
-        run_m2_durable(seed, plant, verify, sweep, shard, out_dir.as_deref());
+    if matches!(scenario_name.as_str(), "m2-durable" | "m3-document") {
+        run_durable(
+            &scenario_name,
+            seed,
+            plant,
+            replay_canary,
+            verify,
+            sweep,
+            shard,
+            out_dir.as_deref(),
+        );
         return;
     }
     // The M2.5-S14 combined scenario (durable + memory + pub/sub + expiry
@@ -126,7 +138,7 @@ fn main() {
         return;
     }
     if sweep.is_some() {
-        eprintln!("inf-sim: --sweep is an m2-durable / m2-combined mode");
+        eprintln!("inf-sim: --sweep is an m2-durable / m3-document / m2-combined mode");
         std::process::exit(2);
     }
     let mut scenario = match scenario_name.as_str() {
@@ -135,7 +147,7 @@ fn main() {
         other => {
             eprintln!(
                 "inf-sim: unknown scenario {other} (have: m0-smoke, m1-cache, m2-durable, \
-                 m2-combined, boot-storm)"
+                 m3-document, m2-combined, boot-storm)"
             );
             std::process::exit(2);
         }
@@ -198,33 +210,46 @@ fn main() {
     }
 }
 
-/// The m2-durable runner (M2-S19, ADR-0021 D5): one seed, or a sharded
-/// sweep writing per-seed results + a manifest. Any failing seed replays
-/// byte-identically via `--seed`.
-fn run_m2_durable(
+/// Shared durable runner: M2's key/value workload and M3's document
+/// workload differ only in scenario construction. Both write replayable
+/// per-seed results and a sweep manifest.
+#[allow(clippy::too_many_arguments)] // one linear CLI dispatch, like main
+fn run_durable(
+    scenario_name: &str,
     seed: u64,
     plant: Plant,
+    replay_canary: bool,
     verify: bool,
     sweep: Option<u64>,
     (shard_i, shard_k): (u64, u64),
     out_dir: Option<&str>,
 ) {
     let run_one = |seed: u64| -> inf_sim::DurableReport {
-        let mut scenario = DurableScenario::m2_durable(seed);
+        let mut scenario = match scenario_name {
+            "m2-durable" => DurableScenario::m2_durable(seed),
+            "m3-document" => DurableScenario::m3_document(seed),
+            _ => unreachable!("the caller filters durable scenario names"),
+        };
         scenario.plant = plant;
+        scenario.replay_canary = replay_canary;
         run_durable_scenario(&scenario)
     };
 
     let Some(sweep) = sweep else {
         let report = run_one(seed);
         println!(
-            "inf-sim: scenario m2-durable seed {seed:#x}: {} commands, {} steps, {} keys \
-             audited, {} required ops, {} allowed-lost, trace {} bytes, hash {:#018x}",
+            "inf-sim: scenario {scenario_name} seed {seed:#x}: {} commands, {} steps, {} keys \
+             audited, {} required ops, {} allowed-lost, {} equivalence checks, {} documents \
+             compared, {} corpus docs, cut classes {:?}, trace {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
             report.required_ops,
             report.allowed_lost_ops,
+            report.equivalence_checks,
+            report.documents_compared,
+            report.corpus_documents_used,
+            report.cut_classes,
             report.trace.len(),
             report.trace_hash
         );
@@ -260,11 +285,22 @@ fn run_m2_durable(
     let mut refused = 0u64;
     let mut ran = 0u64;
     let mut sim_seconds = 0.0f64;
+    let mut equivalence_checks = 0u64;
+    let mut documents_compared = 0u64;
+    let mut corpus_documents = 0u64;
+    let mut cut_classes: std::collections::BTreeMap<&'static str, u64> =
+        std::collections::BTreeMap::new();
     for i in (shard_i..sweep).step_by(shard_k as usize) {
         let seed = seed.wrapping_add(i);
         let report = run_one(seed);
         ran += 1;
         sim_seconds += report.sim_seconds;
+        equivalence_checks += report.equivalence_checks;
+        documents_compared += report.documents_compared;
+        corpus_documents += report.corpus_documents_used;
+        for class in &report.cut_classes {
+            *cut_classes.entry(class).or_default() += 1;
+        }
         if report.refused_boot && report.ok() {
             // Legal §8.4 refusal (ADR-0018 taxonomy) — disclosed, not a
             // violation.
@@ -279,16 +315,26 @@ fn run_m2_durable(
             eprintln!("inf-sim: seed {seed:#x}: {first}");
         }
     }
+    // Cut-class distribution (ADR-0045 D4): coverage is disclosed in the
+    // manifest, never assumed from the random process.
+    let classes: Vec<String> =
+        cut_classes.iter().map(|(class, count)| format!("{class}:{count}")).collect();
     println!(
-        "inf-sim: m2-durable sweep shard {shard_i}/{shard_k}: {ran} seeds, {violations} \
-         violations, {refused} legal taxonomy refusals"
+        "inf-sim: {scenario_name} sweep shard {shard_i}/{shard_k}: {ran} seeds, {violations} \
+         violations, {refused} legal taxonomy refusals, {equivalence_checks} equivalence \
+         checks, {documents_compared} documents compared, cut classes [{}]",
+        classes.join(" ")
     );
     println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
     if let Some(dir) = out_dir {
         std::fs::create_dir_all(dir).expect("--out dir");
         let manifest = format!(
-            "scenario=m2-durable base_seed={seed:#x} sweep={sweep} shard={shard_i}/{shard_k} \
-             plant={plant:?} seeds_run={ran} violations={violations} refused={refused}\n"
+            "scenario={scenario_name} base_seed={seed:#x} sweep={sweep} shard={shard_i}/{shard_k} \
+             plant={plant:?} replay_canary={replay_canary} seeds_run={ran} \
+             violations={violations} refused={refused} equivalence_checks={equivalence_checks} \
+             documents_compared={documents_compared} corpus_documents={corpus_documents} \
+             cut_classes=[{}]\n",
+            classes.join(" ")
         );
         std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest).expect("manifest");
         std::fs::write(format!("{dir}/results-shard-{shard_i}.txt"), lines.join("\n") + "\n")
@@ -300,7 +346,8 @@ fn run_m2_durable(
 }
 
 /// The M2.5-S14 combined runner: one seed, or a sharded sweep. Mirrors
-/// `run_m2_durable` (per-seed results + a manifest, `violations=0` gate);
+/// the shared durable runner (per-seed results + a manifest,
+/// `violations=0` gate);
 /// any failing seed replays byte-identically via `--seed`.
 fn run_m2_combined(
     seed: u64,

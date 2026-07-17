@@ -85,6 +85,30 @@ jobs:
           done
           exit $fail
 
+      - name: document sweep (M3-S23/S24 — power cuts + replay-equivalence oracle, ADR-0045)
+        run: |
+          base=$(( ${{ github.run_id }} % 0xFFFFFFFF ))
+          echo "document sweep seed base: $base" | tee -a /tmp/fleet.log
+          # 4,000 m3-document seeds nightly (heavier per seed than
+          # m2-durable: merge-heavy workload + three equivalence checks);
+          # the 10k gate-week sweep is `just doc-sweep`. The manifest also
+          # discloses the cut-class distribution (ADR-0045 D4).
+          for i in 0 1 2 3 4 5 6 7; do
+            ./target/release/inf-sim --scenario m3-document --sweep 4000 --seed "$base" \
+              --shard "$i/8" --out /tmp/document-sweep >> /tmp/fleet.log 2>&1 &
+          done
+          wait
+          fail=0
+          for i in 0 1 2 3 4 5 6 7; do
+            grep -q " violations=0 " /tmp/document-sweep/manifest-shard-$i.txt || {
+              echo "document sweep shard $i has violations" | tee -a /tmp/fleet.log
+              grep VIOLATION /tmp/document-sweep/results-shard-$i.txt | head -5 >> /tmp/failures.txt || true
+              fail=1
+            }
+          done
+          cat /tmp/document-sweep/manifest-shard-*.txt | tee -a /tmp/fleet.log
+          exit $fail
+
       - name: combined sweep (M2.5-S14 — durable+memory+pub/sub+expiry, L2 oracles)
         run: |
           base=$(( ${{ github.run_id }} % 0xFFFFFFFF ))

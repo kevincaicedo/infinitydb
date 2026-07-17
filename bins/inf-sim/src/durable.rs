@@ -50,6 +50,15 @@ pub(crate) const EVERYSEC_WINDOW: Nanos = Nanos(1_100_000_000);
 /// Scheduler steps with zero progress before a stall verdict.
 pub(crate) const STALL_STEPS: u64 = 50_000;
 
+/// Command/state vocabulary driven through the same durability machine.
+/// Keeping this as data on the scenario prevents M3 from growing a second
+/// node, disk, ledger, or recovery implementation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DurableWorkload {
+    KeyValue,
+    Document,
+}
+
 /// The everysec-deferral bound (M2.5-S14, virtual time): an `everysec`
 /// write acks on execution (no watermark gate — plane.rs), so its
 /// client-visible latency is bounded by scheduling alone, independent of
@@ -63,6 +72,7 @@ pub(crate) const EVERYSEC_ACK_BOUND: Nanos = Nanos(30_000_000);
 #[derive(Clone, Debug)]
 pub struct DurableScenario {
     pub seed: u64,
+    pub workload: DurableWorkload,
     pub cells: u16,
     /// Writers per namespace class (`always` / `everysec`), plus
     /// default-DB memory writers interleaved (the zero-cost coexistence).
@@ -88,6 +98,10 @@ pub struct DurableScenario {
     /// (the pre-S14 device); `m2_durable` arms the reference stall
     /// device so the fleet sees nonzero fsync latency every night.
     pub stall: Option<StallConfig>,
+    /// M3-S23 canary (ADR-0045 D2): the equivalence oracle's shadow
+    /// replay skips the first `DocDelta` it sees — the planted bug the
+    /// fleet must catch within 100 seeds.
+    pub replay_canary: bool,
 }
 
 /// The S14 reference stall device: ~120 µs base (warm NVMe fdatasync),
@@ -119,6 +133,7 @@ impl DurableScenario {
     pub fn m2_durable(seed: u64) -> DurableScenario {
         DurableScenario {
             seed,
+            workload: DurableWorkload::KeyValue,
             cells: 2,
             always_writers: 3,
             esec_writers: 3,
@@ -136,6 +151,39 @@ impl DurableScenario {
             segment_bytes: 16 << 10,
             ckpt_interval_bytes: 24 << 10,
             stall: Some(m2_stall_config()),
+            replay_canary: false,
+        }
+    }
+
+    /// M3-S18/S23/S24 document workload. It deliberately retains the M2
+    /// disk, scheduling, checkpoint, fsync, and ack machinery; only the
+    /// commands and audit reads change. One key per writer plus ~90
+    /// mutations between root sets crosses the 64-delta covering-full
+    /// cadence in every completed writer stream; the merge-heavy op mix
+    /// and fuzz-corpus subtrees are ADR-0045 D3. Segments are 64 KiB
+    /// (vs the M2 scenario's 16 KiB) so the worst-case group-commit frame
+    /// with ≤ 6 KiB corpus blobs always fits one segment; the checkpoint
+    /// interval stays at 24 KiB, so rotation, truncation, and
+    /// fuzzy-overlap classes remain exercised.
+    #[must_use]
+    pub fn m3_document(seed: u64) -> DurableScenario {
+        DurableScenario {
+            seed,
+            workload: DurableWorkload::Document,
+            cells: 2,
+            always_writers: 3,
+            esec_writers: 2,
+            mem_writers: 0,
+            ops_per_writer: 180,
+            keys_per_writer: 1,
+            value_max: 1,
+            step_ns_max: 2_000_000,
+            double_cut: seed % 8 == 3,
+            plant: Plant::None,
+            segment_bytes: 64 << 10,
+            ckpt_interval_bytes: 24 << 10,
+            stall: Some(m2_stall_config()),
+            replay_canary: false,
         }
     }
 }
@@ -170,6 +218,15 @@ pub struct DurableReport {
     /// on a stall run this should approach an episode length — a stall
     /// fleet whose gated acks never felt the device is a dead oracle.
     pub always_ack_latency_ms_max: u64,
+    /// Equivalence-oracle disclosure (M3-S23): checks that actually ran
+    /// and documents byte-compared — a dead oracle must be visible.
+    pub equivalence_checks: u64,
+    pub documents_compared: u64,
+    /// Fuzz-corpus documents that entered the workload (M3-S24).
+    pub corpus_documents_used: u64,
+    /// Cut-boundary classes observed on the surviving image (ADR-0045
+    /// D4): coverage is disclosed, never assumed.
+    pub cut_classes: Vec<&'static str>,
 }
 
 impl DurableReport {
@@ -292,6 +349,12 @@ pub(crate) struct Writer {
     /// pure-durable scenario.
     pub(crate) tainted: std::collections::BTreeSet<Vec<u8>>,
     pub(crate) pub_seq: Vec<u64>,
+    /// Document-workload model per key (M3-S23/S24): the exact expected
+    /// state the merge-heavy generator maintains. Empty outside the
+    /// document workload.
+    pub(crate) models: BTreeMap<Vec<u8>, crate::document::DocModel>,
+    /// Fuzz-corpus documents this writer embedded (M3-S24 disclosure).
+    pub(crate) corpus_docs_used: u64,
 }
 
 pub(crate) fn encode(argv: &[&[u8]]) -> Vec<u8> {
@@ -341,6 +404,8 @@ impl Writer {
             ledger: Ledger::new(),
             tainted: std::collections::BTreeSet::new(),
             pub_seq: vec![0; channels],
+            models: BTreeMap::new(),
+            corpus_docs_used: 0,
         }
     }
 
@@ -354,6 +419,9 @@ impl Writer {
 
     /// Builds the next command + its exact expected reply.
     pub(crate) fn next_command(&mut self, scenario: &DurableScenario) -> (Vec<u8>, Pending) {
+        if scenario.workload == DurableWorkload::Document {
+            return crate::document::next_document_command(self, scenario);
+        }
         let key = self.key(scenario.keys_per_writer);
         let roll = self.rng.next_below(100);
         if roll < 70 {
@@ -393,7 +461,7 @@ impl Writer {
 
 // ---- one node boot ---------------------------------------------------------
 
-type SimPlane = ServerPlane<TraceObserver, SimDisk>;
+pub(crate) type SimPlane = ServerPlane<TraceObserver, SimDisk>;
 type SimLoop = CellLoop<SimDriver, Rc<VirtualClock>>;
 
 pub(crate) struct Node {
@@ -496,6 +564,12 @@ impl Node {
 
     pub(crate) fn ready(&self) -> bool {
         self.control.recovery_board().all_ready()
+    }
+
+    /// Read-only plane access for the M3-S23 equivalence oracle — used
+    /// only between scheduler steps (the borrow never crosses one).
+    pub(crate) fn plane(&self, cell: usize) -> &SimPlane {
+        &self.cells[cell].1
     }
 
     /// Summed pub/sub registry gauges across cells (combined-scenario
@@ -619,6 +693,10 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         scheduler_steps: 0,
         refused_boot: false,
         always_ack_latency_ms_max: 0,
+        equivalence_checks: 0,
+        documents_compared: 0,
+        corpus_documents_used: 0,
+        cut_classes: Vec::new(),
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -693,14 +771,24 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
     // checkpoint/manifest mid-swap — gets cut across the seed corpus.
     let total_ops: u64 = writers.iter().map(|w| w.quota).sum();
     let cut_step = 200 + rng.next_below(total_ops * 6);
+    // M3-S23: two seeded mid-run equivalence instants. Each quiesces
+    // (drain in-flight, send nothing new), compares live state against a
+    // read-only shadow replay, then resumes. The cut itself is never
+    // quiesced — draining before it would erase the unacked-tail cases
+    // the durability oracle exists for (ADR-0045 D1).
+    let document_workload = scenario.workload == DurableWorkload::Document;
+    let mut equivalence = crate::document::EquivalenceStats::default();
+    let checks_at = [cut_step / 3, cut_step / 3 * 2];
+    let mut next_check = if document_workload { 0 } else { checks_at.len() };
     let mut idle_steps = 0u64;
     let mut last_progress = 0u64;
-    for _step in 0..cut_step {
+    for step in 0..cut_step {
         report.scheduler_steps += 1;
         if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
             fail(&mut report, format!("traffic phase: {err}"));
             return finish(report, &observer, &clock);
         }
+        let quiesce = next_check < checks_at.len() && step >= checks_at[next_check];
         let mut progress = 0u64;
         for writer in &mut writers {
             let mut net = node.nets[writer.cell].borrow_mut();
@@ -767,6 +855,10 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             if writer.setup || writer.inflight.is_some() || writer.sent >= writer.quota {
                 continue;
             }
+            if quiesce {
+                // Mid-run oracle instant: drain, don't send.
+                continue;
+            }
             let (wire, pending) = writer.next_command(scenario);
             if pending.mutates {
                 writer.ledger.entry(pending.key.clone()).or_default().push(OpRec {
@@ -779,6 +871,18 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             net.client_send(writer.fd, &wire);
             writer.sent += 1;
             progress += 1;
+        }
+        if quiesce && writers.iter().all(|w| !w.setup && w.inflight.is_none()) {
+            crate::document::equivalence_check(
+                scenario,
+                &format!("mid-run-{}", next_check + 1),
+                &node,
+                &disk,
+                clock.now(),
+                &mut equivalence,
+                &mut report.violations,
+            );
+            next_check += 1;
         }
         if progress == 0 {
             idle_steps += 1;
@@ -817,6 +921,12 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
     let cut_time = clock.now();
     drop(node); // the process dies: in-flight state vanishes
     disk.power_cut(scenario.seed ^ 0x0FF5_EED0);
+    if document_workload {
+        // M3-S24 (ADR-0045 D4): disclose which record class the surviving
+        // image ends on — cut coverage is measured, never assumed.
+        report.cut_classes =
+            crate::document::classify_cut(&disk, &PathBuf::from("node"), scenario.cells);
+    }
 
     // ---- reboot (+ optional second cut mid-recovery) -------------------
     let mut boots = 0;
@@ -854,7 +964,23 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             // image — audited directly, so an ack-ahead-of-durability
             // bug (the canary) cannot hide behind the refusal.
             if err.to_string().contains("log corruption") {
+                if scenario.workload == DurableWorkload::Document {
+                    fail(
+                        &mut report,
+                        format!(
+                            "DOCUMENT RECOVERY VIOLATION seed {:#x}: honest power-cut image \
+                             refused boot: {err}",
+                            scenario.seed
+                        ),
+                    );
+                    return finish(report, &observer, &clock);
+                }
                 report.refused_boot = true;
+                // Refusals are counted in the sweep manifest; the *class*
+                // must be visible too (§8.4 never-silent, M2.5-S12: the
+                // residual-refusal taxonomy after ADR-0031 is a ledger
+                // observable).
+                eprintln!("refused boot {boots}: {err}");
                 let mut tally = AuditTally::default();
                 survival_audit(scenario, &disk, &writers, cut_time, &mut tally);
                 report.required_ops += tally.required_ops;
@@ -874,6 +1000,25 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         disk.power_cut(scenario.seed ^ 0x0FF5_EED1 ^ boots);
     };
     let mut node = node;
+
+    // ---- the "at end" equivalence check (M3-S23) -----------------------
+    // Runs post-recovery by design: recovered live state must equal an
+    // independent replay of the post-cut disk. Quiescing *before* the cut
+    // instead would erase the unacked-tail durability cases (ADR-0045 D1).
+    if document_workload {
+        crate::document::equivalence_check(
+            scenario,
+            "post-recovery",
+            &node,
+            &disk,
+            clock.now(),
+            &mut equivalence,
+            &mut report.violations,
+        );
+    }
+    report.equivalence_checks = equivalence.checks;
+    report.documents_compared = equivalence.documents_compared;
+    report.corpus_documents_used = writers.iter().map(|w| w.corpus_docs_used).sum();
 
     // ---- audit ----------------------------------------------------------
     let mut audit = MiniClient::connect(&mut node, 0);
@@ -896,13 +1041,17 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                 let required = required_index(class, ops, cut_time);
                 report.required_ops += required.map_or(0, |i| i as u64 + 1);
                 report.allowed_lost_ops += ops.len() as u64 - required.map_or(0, |i| i as u64 + 1);
+                let command: [&[u8]; 2] = match scenario.workload {
+                    DurableWorkload::KeyValue => [b"GET", key],
+                    DurableWorkload::Document => [b"JSON.GET", key],
+                };
                 let reply = match audit.call(
                     &mut node,
                     &mut rng,
                     &clock,
                     &disk,
                     scenario.step_ns_max,
-                    &[b"GET", key],
+                    &command,
                 ) {
                     Ok(Some(reply)) => reply,
                     other => {
@@ -957,6 +1106,7 @@ pub(crate) fn survival_audit(
     cut_time: Nanos,
     tally: &mut AuditTally,
 ) {
+    debug_assert_eq!(scenario.workload, DurableWorkload::KeyValue);
     let data_dir = PathBuf::from("node");
     let catalog = match load_catalog_from(disk, &data_dir) {
         Ok(Some(catalog)) => catalog,

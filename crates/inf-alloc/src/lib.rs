@@ -7,6 +7,10 @@
 
 pub mod arena;
 pub mod buffer_pool;
+#[cfg(any(test, feature = "test-counting-allocator"))]
+mod counting_allocator;
 
 pub use arena::{Arena, ArenaAddr, ArenaConfig, ArenaReport};
 pub use buffer_pool::{BufferId, BufferPool, LeaseKind, LeaseLeak};
+#[cfg(any(test, feature = "test-counting-allocator"))]
+pub use counting_allocator::CountingAllocator;

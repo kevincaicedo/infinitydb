@@ -21,12 +21,20 @@ inf-log = ["inf-foundation", "inf-alloc", "inf-simd"]
 # inf-store → inf-log: effect/record vocabulary (`NsId`, `FsyncClass`,
 # `RecordView`) for durable namespaces, the catalog encoding, and
 # `Keyspace::apply_record` replay (ADR-0012 D1 direction, ADR-0015 D7 wiring).
-inf-store = ["inf-foundation", "inf-alloc", "inf-simd", "inf-log"]
+# inf-store -> inf-doc: the M3 engine edge (ADR-0032 D7; M3 plan §3.3).
+inf-store = ["inf-foundation", "inf-alloc", "inf-simd", "inf-log", "inf-doc"]
 inf-stream = ["inf-foundation", "inf-log", "inf-store"]
-inf-doc = ["inf-foundation", "inf-alloc"]
+# inf-doc -> inf-simd: SIMD structural scanning behind safe wrappers
+# (ADR-0032 D7; M3 plan §3.3). Never inf-wire/inf-log/inf-server.
+inf-doc = ["inf-foundation", "inf-alloc", "inf-simd"]
 inf-vector = ["inf-foundation", "inf-simd", "inf-alloc"]
 inf-compute = ["inf-foundation", "inf-store"]
 inf-replica = ["inf-foundation", "inf-log"]
+# inf-server -> inf-doc: the M3-S11 command-surface edge (ADR-0041 D3) —
+# JSON text at ingest, path compile/eval + the program cache, and reply
+# serialization into wire buffers (the ADR-0039 D1 split). Feature-gated
+# (`doc`); the arrow points down and inf-doc still never sees RESP,
+# records, sockets, or logs (M3 plan §3.3).
 inf-server = [
     "inf-foundation",
     "inf-simd",
@@ -37,6 +45,7 @@ inf-server = [
     "inf-log",
     "inf-store",
     "inf-stream",
+    "inf-doc",
 ]
 infinity-embedded = ["inf-foundation", "inf-server"]
 
@@ -54,8 +63,10 @@ inf = ["inf-foundation", "inf-wire"]
 inf-bench = ["inf-foundation", "inf-wire"]
 # inf-sim → inf-log: the M2-S19 durability oracle's survival audit reads
 # the surviving disk image directly (ADR-0021 — DST tooling, not a kernel
-# boundary).
-inf-sim = ["inf-foundation", "inf-alloc", "inf-fabric", "inf-runtime", "inf-wire", "inf-log", "inf-store", "inf-server"]
+# boundary). inf-sim → inf-doc: the M3-S23 equivalence oracle's canonical
+# comparator + fuzz-corpus canonicalization (ADR-0045 D5 — same tooling
+# class, not a kernel boundary).
+inf-sim = ["inf-foundation", "inf-alloc", "inf-fabric", "inf-runtime", "inf-wire", "inf-log", "inf-store", "inf-server", "inf-doc"]
 
 # test crates — the compat harness (M0-S15) drives the in-process command
 # executor as the diff candidate, so it sees the wire/store/server stack.

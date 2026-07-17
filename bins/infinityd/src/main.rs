@@ -56,6 +56,19 @@ struct Args {
     /// 58.8% -> 54.6-55.7%, anchor 1.61x -> 1.74-1.78x);
     /// `--no-fabric-apply-prefetch` is the A/B off arm.
     fabric_apply_prefetch: bool,
+    /// M2.5 Phase-H parse-batch staged prefetch (ADR-0029 lever 2 / ADR-0033
+    /// — the ADR-0005 shape on the parse loop's local fast path). Default ON
+    /// (binding A/B: all-local 6.48/6.63M -> 7.98/8.22M, +23-27%, zero arm
+    /// overlap; natural flat; anchor intact);
+    /// `--no-parse-batch-prefetch` is the A/B off arm.
+    parse_batch_prefetch: bool,
+    /// M2.5 Phase-H de-async dispatch (ADR-0030 D4 lever): the pump tries
+    /// a synchronous fast path per command (single-owner remote Apply,
+    /// local mirror) before constructing the `dispatch_one` future.
+    /// **Rejected by A/B** (2026-07-10, ADR-0034): ~+1.5% natural vs the
+    /// ≥ +4% floor — the async machinery was already near-zero-cost (L6).
+    /// Kept default-off as the A/B instrument for the S19 8-cell re-read.
+    deasync_dispatch: bool,
 }
 
 impl Default for Args {
@@ -75,6 +88,8 @@ impl Default for Args {
             early_fabric_flush: false,
             remote_first_execute: false,
             fabric_apply_prefetch: true,
+            parse_batch_prefetch: true,
+            deasync_dispatch: false,
         }
     }
 }
@@ -105,6 +120,10 @@ fn parse_args() -> Result<Args, String> {
             "--remote-first-execute" => args.remote_first_execute = true,
             "--fabric-apply-prefetch" => args.fabric_apply_prefetch = true,
             "--no-fabric-apply-prefetch" => args.fabric_apply_prefetch = false,
+            "--parse-batch-prefetch" => args.parse_batch_prefetch = true,
+            "--no-parse-batch-prefetch" => args.parse_batch_prefetch = false,
+            "--deasync-dispatch" => args.deasync_dispatch = true,
+            "--no-deasync-dispatch" => args.deasync_dispatch = false,
             "--park-us" => {
                 args.park_us =
                     Some(take("--park-us")?.parse().map_err(|e| format!("--park-us: {e}"))?);
@@ -138,7 +157,9 @@ fn parse_args() -> Result<Args, String> {
                      [--pin-start CORE] [--route-local-only] [--data-dir PATH] \
                      [--ckpt-interval-bytes N] [--segment-bytes N] [--sync-pipeline 1|2] \
                      [--early-fabric-flush] [--remote-first-execute] \
-                     [--fabric-apply-prefetch|--no-fabric-apply-prefetch] [--version]"
+                     [--fabric-apply-prefetch|--no-fabric-apply-prefetch] \
+                     [--parse-batch-prefetch|--no-parse-batch-prefetch] \
+                     [--deasync-dispatch|--no-deasync-dispatch] [--version]"
                 );
                 std::process::exit(0);
             }
@@ -396,6 +417,8 @@ fn cell_main(
     // board only helps when the driver has a wake watch.
     plane.set_early_fabric_flush(args.early_fabric_flush);
     plane.set_fabric_apply_prefetch(args.fabric_apply_prefetch);
+    plane.set_parse_batch_prefetch(args.parse_batch_prefetch);
+    plane.set_deasync_dispatch(args.deasync_dispatch);
     #[cfg(target_os = "linux")]
     plane.set_park_flags(park_flags);
     #[cfg(not(target_os = "linux"))]

@@ -30,13 +30,23 @@ jobs:
           - { dir: crates/inf-log, target: frame_decode }
           - { dir: crates/inf-log, target: segment_read }
           - { dir: crates/inf-log, target: ick_decode }
+          # M3-S01/S02 (gap caught in S05: the S02 ledger recorded this
+          # accrual but the matrix was never extended) + M3-S05.
+          - { dir: crates/inf-doc, target: idoc_decode }
+          # json_parse seeds from the committed minimized corpus (M3-S07)
+          # so nightly hours never restart coverage from zero.
+          - { dir: crates/inf-doc, target: json_parse, seeds: fuzz/corpora/json }
+          # M3-S08/S09: path text parser + program-byte decoder (ADR-0040).
+          # Seeds the pinned child-len-overflow regression (caught by this
+          # target at 300 s, fixed same session).
+          - { dir: crates/inf-doc, target: path_program, seeds: fuzz/corpora/path_program }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: "fuzz ${{ matrix.target }} (1 h)"
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=3600
+        run: cargo +nightly fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} ${{ matrix.seeds }} -- -max_total_time=3600
         working-directory: ${{ matrix.dir }}
       - name: upload crash artifacts
         if: failure()
