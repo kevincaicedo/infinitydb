@@ -26,16 +26,22 @@
 //!
 //! Boundary rules (milestone §3.3): depends only on `inf-foundation`,
 //! `inf-simd` (from S05), `inf-alloc`; never sees RESP, sockets, records,
-//! or log files; `#![forbid(unsafe_code)]`; every decoder is iterative,
+//! or log files; `deny(unsafe_code)` with exactly one audited exception —
+//! the [`emit`] region (ADR-0049, the ADR-0047 D3 escalation), inventoried
+//! in `SAFETY.md` and Miri-covered; every decoder is iterative,
 //! depth/size-bounded, and fuzzed (`fuzz/fuzz_targets/idoc_decode.rs`).
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod apply;
 pub mod arena;
 mod build;
 pub mod cursor;
 pub mod delta;
+// The ADR-0049 audited unsafe region: reserve-once/write-unchecked emit
+// primitives. SAFETY.md carries the block inventory; everything else in
+// this crate stays deny(unsafe_code).
+#[allow(unsafe_code)]
 mod emit;
 mod error;
 mod header;

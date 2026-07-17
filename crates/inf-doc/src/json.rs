@@ -1,14 +1,20 @@
-//! JSON text → canonical `idoc` tape (M3-S05): stage 2 of the simdjson
-//! technique. Stage 1 (`inf_simd::json_scan_structurals`) yields the
-//! structural index; this module walks it with an iterative grammar
-//! machine and emits canonical bytes directly through the shared
-//! [`emit`](crate::emit) primitives — no intermediate DOM and no second
-//! bookkeeping stack: the grammar machine itself is the invariant
-//! authority (key/value alternation, depth, and the S07 idoc-byte size
-//! guard, enforced incrementally), and separators (`:`/`,`) are consumed
-//! fused with the values they frame instead of costing dispatch round
-//! trips. Width selection lives in `emit` alone, so the tape stays
-//! canonical by construction (L7).
+//! JSON text → canonical `idoc` tape (M3-S05): the simdjson technique,
+//! stage-fused (ADR-0047 D2 item 3). Stage 1's SIMD classification stays
+//! batched (`inf_simd::json_classify_blocks` — raw 32 B masks per 64 B
+//! block, one tight pass), but escape/string resolution and token
+//! consumption stream through `inf_simd::JsonTokenCursor`: the grammar
+//! machine pulls each token offset straight out of the per-block emit
+//! mask in-register, instead of materializing a `Vec<u32>` structural
+//! index and reloading every entry (the two costs the batch shape paid
+//! between stages). The grammar machine walks those tokens and emits
+//! canonical bytes directly through the shared [`emit`](crate::emit)
+//! primitives — no intermediate DOM and no second bookkeeping stack: the
+//! grammar machine itself is the invariant authority (key/value
+//! alternation, depth, and the S07 idoc-byte size guard, enforced
+//! incrementally), and separators (`:`/`,`) are consumed fused with the
+//! values they frame instead of costing dispatch round trips. Width
+//! selection lives in `emit` alone, so the tape stays canonical by
+//! construction (L7).
 //!
 //! Decisions this module pins (oracle-verified at S21 where the local
 //! oracle lacks the JSON module — see the S05 ledger entry):
@@ -160,6 +166,17 @@ struct ObjFrame {
     /// Output offset where this object's body begins.
     body_start: u32,
     dup_found: bool,
+    /// 64-bit key-fingerprint filter: one bit per key hash
+    /// ([`key_fingerprint`]). A clear bit at insert proves the key is new,
+    /// skipping the linear dup scan — the common all-distinct-keys object
+    /// pays one AND per key instead of O(k) prior-entry compares. A set
+    /// bit only means "possible duplicate": the memcmp scan stays the
+    /// authority, so accept/reject behavior is untouched. (A lazier
+    /// variant — count + filter only, entries materialized by body walk
+    /// on demand — lost its A/B on the budget shape across two
+    /// fingerprint designs and is recorded, not merged: stage-fusion
+    /// artifact d4/d5 rows.)
+    fp: u64,
 }
 
 impl ObjFrame {
@@ -167,7 +184,30 @@ impl ObjFrame {
         self.entries.clear();
         self.body_start = body_start;
         self.dup_found = false;
+        self.fp = 0;
     }
+}
+
+/// Key fingerprint for the [`ObjFrame::fp`] filter: length, first and
+/// last byte — the fields distinct sibling keys differ in essentially
+/// always, and all loads the insert path already owns. Equal keys always
+/// fingerprint equal (the filter's correctness half); unequal keys
+/// usually differ (its effectiveness half). Known cheap-by-design
+/// collision: English near-twins (`"name"`/`"note"`) share len/first/
+/// last — they cost one short memcmp scan, which measured cheaper than
+/// every stronger-hash variant tried (d5 rows, same artifact).
+#[inline]
+fn key_fingerprint(key: &[u8]) -> u64 {
+    let (first, last) = match key {
+        [] => (0u32, 0u32),
+        [b] => (u32::from(*b), u32::from(*b)),
+        [first, .., last] => (u32::from(*first), u32::from(*last)),
+    };
+    let h = (key.len() as u32)
+        .wrapping_mul(131)
+        .wrapping_add(first.wrapping_mul(31))
+        .wrapping_add(last.wrapping_mul(7));
+    1u64 << (h & 63)
 }
 
 /// What the grammar machine expects next. `:` and `,` never appear here:
@@ -214,19 +254,60 @@ impl Default for ParseLimits {
     }
 }
 
-/// A reusable JSON parser: one per cell — every scratch buffer (structural
-/// index, container-frame stack, unescape buffer, splice buffer, object
-/// frames) is retained across calls, so the hot ingest path allocates only
-/// the output tape (and [`parse_into`](JsonParser::parse_into) recycles
-/// even that).
+/// A reusable JSON parser: one per cell — every scratch buffer (block
+/// masks, container-frame stack, unescape buffer, splice buffer, object
+/// frames, the scalar tier's structural index) is retained across calls,
+/// so the hot ingest path allocates only the output tape (and
+/// [`parse_into`](JsonParser::parse_into) recycles even that).
 #[derive(Debug)]
 pub struct JsonParser {
+    blocks: Vec<inf_simd::BlockMasks>,
     indices: Vec<u32>,
     frames: Vec<u32>,
     unescape: Vec<u8>,
     rebuild: Vec<u8>,
     obj_frames: Vec<ObjFrame>,
     limits: ParseLimits,
+}
+
+/// The grammar machine's view of stage 1: one-token lookahead over the
+/// structural stream. Two monomorphizations exist — the stage-fused
+/// [`inf_simd::JsonTokenCursor`] (the hot path) and [`IndexTokens`] over
+/// the scalar oracle's batch index (the L4 off arm / portability proof) —
+/// so the grammar machine stays single-homed and the differential suite
+/// exercises both through one code path.
+trait TokenSource {
+    fn peek(&mut self) -> Option<u32>;
+    fn bump(&mut self);
+}
+
+impl TokenSource for inf_simd::JsonTokenCursor<'_> {
+    #[inline]
+    fn peek(&mut self) -> Option<u32> {
+        inf_simd::JsonTokenCursor::peek(self)
+    }
+    #[inline]
+    fn bump(&mut self) {
+        inf_simd::JsonTokenCursor::bump(self)
+    }
+}
+
+/// Batch-index adapter: feeds a pre-materialized structural index through
+/// the [`TokenSource`] interface.
+struct IndexTokens<'a> {
+    indices: &'a [u32],
+    cursor: usize,
+}
+
+impl TokenSource for IndexTokens<'_> {
+    #[inline]
+    fn peek(&mut self) -> Option<u32> {
+        self.indices.get(self.cursor).copied()
+    }
+    #[inline]
+    fn bump(&mut self) {
+        self.cursor += 1;
+    }
 }
 
 impl Default for JsonParser {
@@ -250,6 +331,7 @@ impl JsonParser {
             max_body: limits.max_body.min(DOC_BYTES_MAX),
         };
         JsonParser {
+            blocks: Vec::new(),
             indices: Vec::new(),
             frames: Vec::new(),
             unescape: Vec::new(),
@@ -271,13 +353,15 @@ impl JsonParser {
         };
     }
 
-    /// Bytes of retained scratch (structural index, frame stacks, string
-    /// and splice buffers). The parser is per-cell state and its memory
-    /// belongs to the document domain (L5) — S19 wires this into
-    /// attribution; the S07 pathological suite asserts rejections keep it
-    /// bounded by the text cap, never by the would-be document.
+    /// Bytes of retained scratch (block masks, structural index, frame
+    /// stacks, string and splice buffers). The parser is per-cell state
+    /// and its memory belongs to the document domain (L5) — S19 wires
+    /// this into attribution; the S07 pathological suite asserts
+    /// rejections keep it bounded by the text cap, never by the would-be
+    /// document.
     pub fn scratch_bytes(&self) -> usize {
-        self.indices.capacity() * size_of::<u32>()
+        self.blocks.capacity() * size_of::<inf_simd::BlockMasks>()
+            + self.indices.capacity() * size_of::<u32>()
             + self.frames.capacity() * size_of::<u32>()
             + self.unescape.capacity()
             + self.rebuild.capacity()
@@ -316,24 +400,26 @@ impl JsonParser {
     /// reports `InvalidUtf8` before any grammar error.
     pub fn parse_into(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), JsonParseError> {
         // Text bound first (M3-S07 reject-before-allocate): nothing below
-        // — not UTF-8 validation, not the structural index, not the
+        // — not UTF-8 validation, not the block classification, not the
         // output reserve — runs on an over-cap input.
         if input.len() > self.limits.max_text {
             return err(0, JsonErrorKind::DocumentTooLarge);
         }
         validate_input(input)?;
-        let n = inf_simd::json_scan_structurals(input, &mut self.indices);
+        inf_simd::json_classify_blocks(input, &mut self.blocks);
         // Move the scratch out so `self`'s other buffers stay borrowable.
-        let indices = core::mem::take(&mut self.indices);
+        let blocks = core::mem::take(&mut self.blocks);
         let mut frames = core::mem::take(&mut self.frames);
-        let result = self.parse_indexed(input, &indices[..n], &mut frames, out);
-        self.indices = indices;
+        let mut tokens = inf_simd::JsonTokenCursor::new(&blocks);
+        let result = self.parse_tokens(input, &mut tokens, &mut frames, out);
+        self.blocks = blocks;
         self.frames = frames;
         result
     }
 
     /// Full parse over the scalar stage-1 tier (the portability fallback)
-    /// — the off arm of the L4 SIMD A/B. Bench-only; identical semantics.
+    /// — the off arm of the L4 SIMD A/B, fed through the batch-index
+    /// [`TokenSource`] arm. Bench-only; identical semantics.
     #[doc(hidden)]
     pub fn parse_scalar_stage1(&mut self, input: &[u8]) -> Result<Vec<u8>, JsonParseError> {
         if input.len() > self.limits.max_text {
@@ -344,7 +430,8 @@ impl JsonParser {
         let indices = core::mem::take(&mut self.indices);
         let mut frames = core::mem::take(&mut self.frames);
         let mut out = Vec::new();
-        let result = self.parse_indexed(input, &indices[..n], &mut frames, &mut out);
+        let mut tokens = IndexTokens { indices: &indices[..n], cursor: 0 };
+        let result = self.parse_tokens(input, &mut tokens, &mut frames, &mut out);
         self.indices = indices;
         self.frames = frames;
         result.map(|()| out)
@@ -352,10 +439,10 @@ impl JsonParser {
 
     /// `input` is whole-input UTF-8-validated (`validate_input` at both
     /// callers) — string content slices are valid by construction.
-    fn parse_indexed(
+    fn parse_tokens<T: TokenSource>(
         &mut self,
         input: &[u8],
-        indices: &[u32],
+        tokens: &mut T,
         frames: &mut Vec<u32>,
         out: &mut Vec<u8>,
     ) -> Result<(), JsonParseError> {
@@ -368,12 +455,39 @@ impl JsonParser {
         frames.clear();
         let mut live_obj_frames = 0usize;
         let mut expect = Expect::Value;
-        let mut cursor = 0usize;
+
+        // The closing quote of the string opening at `$open`. By stage-1
+        // mask arithmetic the token after an open quote is ALWAYS an
+        // unescaped quote or nothing: the open flips `in_string`, which
+        // masks every op/scalar bit until the next unescaped quote — the
+        // one byte class whose bits always emit. (Grammar quote parity
+        // and mask parity cannot diverge: every quote token the grammar
+        // consumes is consumed as an open/close pair right here.) So
+        // `None` is exactly "unterminated"; the byte re-check the batch
+        // parser did is a debug assertion now — proven by the same
+        // equivalence proptests, exercised per-parse by the differential
+        // and fuzz suites. Consumes the open quote; the close quote stays
+        // peeked for the post-emit bump.
+        macro_rules! string_close {
+            ($open:expr) => {{
+                tokens.bump();
+                match tokens.peek() {
+                    Some(close) => {
+                        debug_assert_eq!(
+                            input[close as usize], b'"',
+                            "token after an open quote is its close quote"
+                        );
+                        close as usize
+                    }
+                    None => return err($open, JsonErrorKind::UnterminatedString),
+                }
+            }};
+        }
 
         // Dispatch one value-start token: containers push a frame and
         // re-enter the grammar loop; scalars emit and fall through to the
         // code after the macro (the fused entry/element loops, or the
-        // after-value cascade).
+        // after-value cascade). Every arm consumes the token(s) it parsed.
         macro_rules! begin_value {
             ($at:expr, $c:expr, $grammar:lifetime) => {{
                 match $c {
@@ -388,7 +502,7 @@ impl JsonParser {
                         frames.push(len_at | OBJ_BIT);
                         self.open_obj_frame(&mut live_obj_frames, tape.out.len());
                         expect = Expect::KeyOrObjClose;
-                        cursor += 1;
+                        tokens.bump();
                         continue $grammar;
                     }
                     b'[' => {
@@ -401,32 +515,32 @@ impl JsonParser {
                         let len_at = emit::begin(tape.out, TAG_ARR) as u32;
                         frames.push(len_at);
                         expect = Expect::ValueOrArrClose;
-                        cursor += 1;
+                        tokens.bump();
                         continue $grammar;
                     }
                     b'"' => {
-                        let close = self.string_close(input, indices, cursor, $at)?;
+                        let close = string_close!($at);
                         self.emit_string(&mut tape, input, $at, close)?;
-                        cursor += 2;
+                        tokens.bump();
                     }
                     b't' | b'f' | b'n' => {
                         parse_literal(input, $at, &mut tape)?;
-                        cursor += 1;
+                        tokens.bump();
                     }
                     b'-' | b'0'..=b'9' => {
                         parse_number(input, $at, &mut tape)?;
-                        cursor += 1;
+                        tokens.bump();
                     }
                     other => return err($at, JsonErrorKind::UnexpectedCharacter(other)),
                 }
             }};
         }
 
-        // Fetch the structural token at `cursor` into (`$at`, `$c`), or
-        // fail with the end-of-input error.
+        // Fetch the next structural token into (`$at`, `$c`) without
+        // consuming it, or fail with the end-of-input error.
         macro_rules! fetch {
             ($at:ident, $c:ident) => {{
-                let Some(&token) = indices.get(cursor) else {
+                let Some(token) = tokens.peek() else {
                     return err(input.len(), JsonErrorKind::UnexpectedEnd);
                 };
                 $at = token as usize;
@@ -445,7 +559,7 @@ impl JsonParser {
                         // Empty array.
                         let frame = frames.pop().expect("ValueOrArrClose implies an open array");
                         emit::end(tape.out, (frame & LEN_AT_MASK) as usize);
-                        cursor += 1;
+                        tokens.bump();
                     } else {
                         // Fused element loop: `scalar, scalar, …` runs cost
                         // no dispatch round trip — the container kind is
@@ -456,14 +570,14 @@ impl JsonParser {
                             begin_value!(at, c, 'grammar);
                             fetch!(at, c);
                             if c == b',' {
-                                cursor += 1;
+                                tokens.bump();
                                 fetch!(at, c);
                                 continue;
                             }
                             if c == b']' {
                                 let frame = frames.pop().expect("element loop owns an open array");
                                 emit::end(tape.out, (frame & LEN_AT_MASK) as usize);
-                                cursor += 1;
+                                tokens.bump();
                                 break;
                             }
                             return err(at, JsonErrorKind::UnexpectedCharacter(c));
@@ -476,7 +590,7 @@ impl JsonParser {
                         let frame = frames.pop().expect("KeyOrObjClose implies an open object");
                         self.close_obj_frame(&mut live_obj_frames, &mut tape);
                         emit::end(tape.out, (frame & LEN_AT_MASK) as usize);
-                        cursor += 1;
+                        tokens.bump();
                     } else {
                         // Fused entry loop: `key : value ,` in one pass —
                         // separators and the next key cost no dispatch
@@ -486,21 +600,21 @@ impl JsonParser {
                             if c != b'"' {
                                 return err(at, JsonErrorKind::UnexpectedCharacter(c));
                             }
-                            let close = self.string_close(input, indices, cursor, at)?;
+                            let close = string_close!(at);
                             let entry_at = tape.out.len();
                             let key_len = self.emit_string(&mut tape, input, at, close)?;
                             self.note_key(live_obj_frames, tape.out, entry_at, key_len);
-                            cursor += 2;
+                            tokens.bump();
                             fetch!(at, c);
                             if c != b':' {
                                 return err(at, JsonErrorKind::UnexpectedCharacter(c));
                             }
-                            cursor += 1;
+                            tokens.bump();
                             fetch!(at, c);
                             begin_value!(at, c, 'grammar);
                             fetch!(at, c);
                             if c == b',' {
-                                cursor += 1;
+                                tokens.bump();
                                 fetch!(at, c);
                                 continue;
                             }
@@ -508,7 +622,7 @@ impl JsonParser {
                                 let frame = frames.pop().expect("entry loop owns an open object");
                                 self.close_obj_frame(&mut live_obj_frames, &mut tape);
                                 emit::end(tape.out, (frame & LEN_AT_MASK) as usize);
-                                cursor += 1;
+                                tokens.bump();
                                 break;
                             }
                             return err(at, JsonErrorKind::UnexpectedCharacter(c));
@@ -522,7 +636,7 @@ impl JsonParser {
             loop {
                 let Some(&frame) = frames.last() else {
                     // Root complete.
-                    if let Some(&trailing) = indices.get(cursor) {
+                    if let Some(trailing) = tokens.peek() {
                         return err(trailing as usize, JsonErrorKind::TrailingCharacters);
                     }
                     debug_assert_eq!(live_obj_frames, 0);
@@ -530,14 +644,14 @@ impl JsonParser {
                     header::patch(tape.out, 0, body_len);
                     return Ok(());
                 };
-                let Some(&token) = indices.get(cursor) else {
+                let Some(token) = tokens.peek() else {
                     return err(input.len(), JsonErrorKind::UnexpectedEnd);
                 };
                 let at = token as usize;
                 let c = input[at];
                 let is_obj = frame & OBJ_BIT != 0;
                 if c == b',' {
-                    cursor += 1;
+                    tokens.bump();
                     expect = if is_obj { Expect::Key } else { Expect::Value };
                     break;
                 }
@@ -547,32 +661,17 @@ impl JsonParser {
                     // shrink the body the u24 must describe.
                     self.close_obj_frame(&mut live_obj_frames, &mut tape);
                     emit::end(tape.out, (frame & LEN_AT_MASK) as usize);
-                    cursor += 1;
+                    tokens.bump();
                     continue;
                 }
                 if !is_obj && c == b']' {
                     frames.pop();
                     emit::end(tape.out, (frame & LEN_AT_MASK) as usize);
-                    cursor += 1;
+                    tokens.bump();
                     continue;
                 }
                 return err(at, JsonErrorKind::UnexpectedCharacter(c));
             }
-        }
-    }
-
-    /// The closing quote of the string opening at `open` — by stage-1
-    /// construction the very next index, if the string ever closed.
-    fn string_close(
-        &self,
-        input: &[u8],
-        indices: &[u32],
-        cursor: usize,
-        open: usize,
-    ) -> Result<usize, JsonParseError> {
-        match indices.get(cursor + 1) {
-            Some(&close) if input[close as usize] == b'"' => Ok(close as usize),
-            _ => err(open, JsonErrorKind::UnterminatedString),
         }
     }
 
@@ -637,7 +736,7 @@ impl JsonParser {
                     return err(at, JsonErrorKind::DocumentTooLarge);
                 }
                 emit::str_header(tape.out, len);
-                append_from_input(tape.out, input, at + 1, len);
+                emit::append_overlapped(tape.out, input, at + 1, len);
                 Ok(len)
             }
             None => {
@@ -660,8 +759,9 @@ impl JsonParser {
     }
 
     /// Record an emitted key; small objects detect duplicates on insert
-    /// (u16 length prefilter, then memcmp on the recorded spans), large
+    /// (fingerprint filter, then memcmp on the recorded spans), large
     /// ones defer to the close-time sort.
+    #[inline]
     fn note_key(&mut self, live: usize, out: &[u8], entry_at: usize, key_len: usize) {
         // The key bytes sit right after their canonical string header.
         let key_at = (entry_at + emit::str_header_len(key_len)) as u32;
@@ -672,20 +772,27 @@ impl JsonParser {
             && key_len <= u16::MAX as usize
         {
             let key = &out[key_at as usize..key_at as usize + key_len];
+            // Fingerprint filter first: a clear bit proves no prior entry
+            // has this key, so the scan is skipped outright (equal keys
+            // always collide in the filter; see `key_fingerprint`).
+            let bit = key_fingerprint(key);
+            let possible_dup = frame.fp & bit != 0;
+            frame.fp |= bit;
             // First-byte prefilter ahead of the memcmp call: distinct keys
             // usually differ immediately, and the byte is a load the scan
             // already owns — unlike the cached-key-word variant this slice
             // rejected, there is no per-key build cost to amortize.
-            frame.dup_found = frame.entries.iter().any(|e| {
-                if e.key_len != key_len16 {
-                    return false;
-                }
-                if key_len16 == 0 {
-                    return true;
-                }
-                let ka = e.key_at as usize;
-                out[ka] == key[0] && &out[ka..ka + key_len] == key
-            });
+            frame.dup_found = possible_dup
+                && frame.entries.iter().any(|e| {
+                    if e.key_len != key_len16 {
+                        return false;
+                    }
+                    if key_len16 == 0 {
+                        return true;
+                    }
+                    let ka = e.key_at as usize;
+                    out[ka] == key[0] && &out[ka..ka + key_len] == key
+                });
         } else if key_len > u16::MAX as usize {
             // Keys longer than 64 KiB fall back to close-time detection.
             frame.dup_found = true;
@@ -1063,15 +1170,18 @@ fn emit_f64_checked(tape: &mut Tape<'_>, v: f64, at: usize) -> Result<(), JsonPa
     Ok(())
 }
 
-/// Fused scan+copy for fixstr-width (≤ 31-byte) strings: each 8-byte word
-/// is special-tested and stored in the same pass, riding the input's own
-/// slack (words may overrun the content but never the input — the closing
-/// quote guarantees one byte, and the slack check below guarantees the
-/// rest). Hits beyond the content end are masked off, not errors: those
-/// bytes belong to the document, not this string. Returns `false` without
-/// emitting when the fast path cannot decide (special byte → escape walk
-/// or typed error; no word slack; cap exceeded) — the general path is the
-/// single source of errors, so rejection behavior stays byte-identical.
+/// Fused scan+copy for fixstr-width (≤ 31-byte) strings: one 32-byte
+/// AVX2 load/classify/store (ADR-0047 K2 — the kernel call plus its
+/// dispatcher beat every inlined-SWAR variant, including an ADR-0049
+/// `emit::fixstr_swar` attempt that lost −5% on the gate shape:
+/// Rejected and removed, rows in the stage-fusion artifact). Needs 32
+/// readable bytes
+/// from the content start (the closing quote guarantees one; strings
+/// inside the last 31 bytes of the document fall to the general path —
+/// correct, colder). Returns `false` without emitting when the fast path
+/// cannot decide (special byte → escape walk or typed error; no window
+/// slack; cap exceeded) — the general path is the single source of
+/// errors, so rejection behavior stays byte-identical.
 #[inline]
 fn try_fixstr_fast(tape: &mut Tape<'_>, input: &[u8], at: usize, len: usize) -> bool {
     debug_assert!(len <= FIXSTR_MAX_LEN);
@@ -1083,44 +1193,10 @@ fn try_fixstr_fast(tape: &mut Tape<'_>, input: &[u8], at: usize, len: usize) -> 
         tape.out.push(FIXSTR_BASE);
         return true;
     }
-    // The fused kernel classifies and copies one 32-byte window (ADR-0047
-    // K2 — one load/store replaces per-word `Vec` extends); it needs 32
-    // readable bytes from the content start. Strings inside the last 31
-    // bytes of the document fall to the general path (correct, colder).
     if s + 32 > input.len() {
         return false;
     }
-    let start = tape.out.len();
-    tape.out.push(FIXSTR_BASE + len as u8);
-    if inf_simd::json_copy_unescaped_short(&input[s..s + 32], len, tape.out) {
-        true
-    } else {
-        tape.out.truncate(start);
-        false
-    }
-}
-
-/// Append `input[start..start + len]` to `out` in 8-byte words, riding
-/// the source's slack: words may overshoot `len` (one truncate repairs
-/// it) but never read past `input`. Exact-copy fallback when the source
-/// runs out of slack. For the short strings that dominate document keys
-/// this is a couple of inlined loads/stores instead of a memcpy call.
-#[inline]
-fn append_from_input(out: &mut Vec<u8>, input: &[u8], start: usize, len: usize) {
-    let end = start + len;
-    let target = out.len() + len;
-    let mut n = start;
-    while n < end && n + 8 <= input.len() {
-        let word: [u8; 8] = input[n..n + 8].try_into().expect("8-byte chunk");
-        out.extend_from_slice(&word);
-        n += 8;
-    }
-    if n < end {
-        // Source slack exhausted (a string at the very end of the input).
-        out.extend_from_slice(&input[n..end]);
-    } else {
-        out.truncate(target);
-    }
+    inf_simd::json_copy_unescaped_fixstr(&input[s..s + 32], len, FIXSTR_BASE + len as u8, tape.out)
 }
 
 /// Whole-input validation: UTF-8 once, through the `inf-simd` kernel

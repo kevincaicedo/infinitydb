@@ -142,7 +142,9 @@ force multiplier for DST and fuzzing.
 
 Safe Rust is the default; `#![forbid(unsafe_code)]` everywhere except the
 audited leaf crates (`inf-simd`, `inf-alloc`, `inf-fabric`, parts of
-`inf-runtime`). Every unsafe block has a concrete `// SAFETY:` argument, an
+`inf-runtime`) and the single module-scoped emit region `inf_doc::emit`
+(ADR-0049 — crate stays `deny(unsafe_code)` with one module allow).
+Every unsafe block has a concrete `// SAFETY:` argument, an
 entry in the crate's `SAFETY.md` inventory (script-checked), Miri/Loom
 coverage where applicable, and a reviewer who read the argument, not just
 the code. Target: < 2% of LoC. If you can express it safely at equal

@@ -1,0 +1,96 @@
+   Compiling inf-doc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-doc)
+warning: function `word_special` is never used
+   --> crates/inf-doc/src/emit.rs:211:4
+    |
+211 | fn word_special(w: u64) -> u64 {
+    |    ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `fixstr_swar` is never used
+   --> crates/inf-doc/src/emit.rs:236:15
+    |
+236 | pub(crate) fn fixstr_swar(out: &mut Vec<u8>, window: &[u8], len: usize) -> bool {
+    |               ^^^^^^^^^^^
+
+warning: `inf-doc` (lib) generated 2 warnings
+    Finished `bench` profile [optimized + debuginfo] target(s) in 22.09s
+     Running benches/parse.rs (target/release/deps/parse-200be1899b7e2891)
+Benchmarking parse/small-200B
+Benchmarking parse/small-200B: Warming up for 3.0000 s
+Benchmarking parse/small-200B: Collecting 100 samples in estimated 5.0002 s (24M iterations)
+Benchmarking parse/small-200B: Analyzing
+parse/small-200B        time:   [212.24 ns 212.29 ns 212.35 ns]
+                        thrpt:  [898.21 MiB/s 898.45 MiB/s 898.69 MiB/s]
+                 change:
+                        time:   [−8.3408% −8.2318% −8.1336%] (p = 0.00 < 0.05)
+                        thrpt:  [+8.8538% +8.9702% +9.0998%]
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) low mild
+  1 (1.00%) high mild
+Benchmarking parse/gate-1KiB
+Benchmarking parse/gate-1KiB: Warming up for 3.0000 s
+Benchmarking parse/gate-1KiB: Collecting 100 samples in estimated 5.0038 s (6.1M iterations)
+Benchmarking parse/gate-1KiB: Analyzing
+parse/gate-1KiB         time:   [823.39 ns 823.67 ns 823.96 ns]
+                        thrpt:  [1.1574 GiB/s 1.1578 GiB/s 1.1582 GiB/s]
+                 change:
+                        time:   [−5.6779% −5.6287% −5.5842%] (p = 0.00 < 0.05)
+                        thrpt:  [+5.9145% +5.9645% +6.0197%]
+                        Performance has improved.
+Found 7 outliers among 100 measurements (7.00%)
+  4 (4.00%) low mild
+  3 (3.00%) high mild
+Benchmarking parse/medium-2KiB
+Benchmarking parse/medium-2KiB: Warming up for 3.0000 s
+Benchmarking parse/medium-2KiB: Collecting 100 samples in estimated 5.0061 s (3.3M iterations)
+Benchmarking parse/medium-2KiB: Analyzing
+parse/medium-2KiB       time:   [1.5083 µs 1.5086 µs 1.5089 µs]
+                        thrpt:  [1.2640 GiB/s 1.2643 GiB/s 1.2646 GiB/s]
+                 change:
+                        time:   [−9.7922% −9.7374% −9.6843%] (p = 0.00 < 0.05)
+                        thrpt:  [+10.723% +10.788% +10.855%]
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) low mild
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking parse/large-64KiB
+Benchmarking parse/large-64KiB: Warming up for 3.0000 s
+Benchmarking parse/large-64KiB: Collecting 100 samples in estimated 5.0111 s (141k iterations)
+Benchmarking parse/large-64KiB: Analyzing
+parse/large-64KiB       time:   [35.418 µs 35.491 µs 35.611 µs]
+                        thrpt:  [1.7139 GiB/s 1.7197 GiB/s 1.7233 GiB/s]
+                 change:
+                        time:   [−9.7802% −9.6246% −9.3548%] (p = 0.00 < 0.05)
+                        thrpt:  [+10.320% +10.650% +10.840%]
+                        Performance has improved.
+Found 14 outliers among 100 measurements (14.00%)
+  1 (1.00%) low mild
+  11 (11.00%) high mild
+  2 (2.00%) high severe
+Benchmarking parse/deep-32
+Benchmarking parse/deep-32: Warming up for 3.0000 s
+Benchmarking parse/deep-32: Collecting 100 samples in estimated 5.0043 s (3.4M iterations)
+Benchmarking parse/deep-32: Analyzing
+parse/deep-32           time:   [1.4700 µs 1.4716 µs 1.4730 µs]
+                        thrpt:  [415.00 MiB/s 415.40 MiB/s 415.85 MiB/s]
+                 change:
+                        time:   [+4.1607% +4.3057% +4.4379%] (p = 0.00 < 0.05)
+                        thrpt:  [−4.2493% −4.1279% −3.9945%]
+                        Performance has regressed.
+Benchmarking parse/wide-array
+Benchmarking parse/wide-array: Warming up for 3.0000 s
+Benchmarking parse/wide-array: Collecting 100 samples in estimated 8.1017 s (10k iterations)
+Benchmarking parse/wide-array: Analyzing
+parse/wide-array        time:   [802.61 µs 802.92 µs 803.26 µs]
+                        thrpt:  [497.79 MiB/s 498.00 MiB/s 498.19 MiB/s]
+                 change:
+                        time:   [−13.149% −13.112% −13.079%] (p = 0.00 < 0.05)
+                        thrpt:  [+15.047% +15.090% +15.140%]
+                        Performance has improved.
+Found 9 outliers among 100 measurements (9.00%)
+  1 (1.00%) low mild
+  8 (8.00%) high mild
+

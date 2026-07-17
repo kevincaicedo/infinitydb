@@ -25,7 +25,11 @@ for crate_dir in crates/* bins/*; do
     # Files whose unsafe usage survives comment stripping would need a real
     # parser; the token match over-approximates (prose mentioning `unsafe fn`
     # forces an inventory line) — over-approximation errs safe.
-    mapfile -t unsafe_files < <(grep -rlE "$pattern" "$crate_dir/src" 2>/dev/null || true)
+    # Portable read-into-array (macOS bash 3.2 has no `mapfile`).
+    unsafe_files=()
+    while IFS= read -r f; do
+        unsafe_files+=("$f")
+    done < <(grep -rlE "$pattern" "$crate_dir/src" 2>/dev/null || true)
     if [ "${#unsafe_files[@]}" -eq 0 ]; then
         continue
     fi

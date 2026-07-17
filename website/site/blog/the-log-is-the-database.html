@@ -5,43 +5,64 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>The log is the database — how InfinityDB is being built</title>
 <meta name="description" content="The discipline model behind InfinityDB: design laws, STOP gates, deterministic simulation, and an evidence policy that treats unproven numbers as liabilities.">
-<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='20'%20fill='%23201826'/%3E%3Ctext%20x='50'%20y='71'%20font-size='62'%20text-anchor='middle'%20fill='%23cf7ff5'%20font-family='system-ui'%3E%E2%88%9E%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2018'%3E%3Ccircle%20cx='10'%20cy='9'%20r='7'%20fill='none'%20stroke='%237c5cff'%20stroke-width='2.4'/%3E%3Ccircle%20cx='24'%20cy='9'%20r='7'%20fill='none'%20stroke='%233ee6c4'%20stroke-width='2.4'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../assets/site.css">
+<style>
+.post { max-width: 760px; margin: 0 auto; padding: 64px var(--pad-x) 120px; animation: fadeUp 0.4s both; }
+.post-back { font: 500 12px/1 var(--mono); letter-spacing: 0.1em; color: var(--text-muted); }
+.post-back:hover { color: var(--teal); }
+.post-head { margin-top: 32px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.post-pill { font: 700 10px/1 var(--mono); letter-spacing: 0.14em; color: var(--bg); background: var(--teal); border-radius: 99px; padding: 4px 12px; }
+.post-meta { font: 400 11px/1 var(--mono); color: var(--text-faint); letter-spacing: 0.08em; }
+.post h1 { margin: 22px 0 0; font: 800 clamp(32px, 5vw, 44px)/1.1 var(--sans); letter-spacing: -0.025em; text-wrap: balance; }
+.post .lede { margin: 24px 0 0; font-size: 17px; line-height: 1.75; color: var(--text-body); max-width: none; text-wrap: pretty; }
+.post h2 { margin: 52px 0 0; font: 700 clamp(22px, 3vw, 27px)/1.25 var(--sans); letter-spacing: -0.015em; }
+.post p { margin: 18px 0 0; font-size: 16px; line-height: 1.75; color: var(--text-muted); text-wrap: pretty; }
+.post p strong, .post .lede strong { color: var(--text); }
+.post p code, .post .lede code { font-size: 14px; border: 0; background: none; padding: 0; color: var(--violet-soft); }
+.post-ctas { margin-top: 48px; display: flex; gap: 14px; flex-wrap: wrap; }
+</style>
 </head>
 <body>
 
 <nav class="nav">
   <div class="nav-inner">
     <a href="../index.html" class="nav-brand">
-      <span class="mark">&infin; InfinityDB</span>
-      <span class="nav-badge">v0.2.0-alpha.1 &middot; IN DEV</span>
+      <svg class="logo" width="34" height="18" viewBox="0 0 34 18" aria-hidden="true">
+        <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2.4"/>
+        <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2.4"/>
+      </svg>
+      <span class="mark">infinity<b>DB</b></span>
+      <span class="nav-badge neutral">BLOG</span>
     </a>
     <span class="nav-spacer"></span>
     <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
     <div class="nav-links">
-      <a href="../index.html#spine">Architecture</a>
-      <a href="../index.html#workloads">Workloads</a>
-      <a href="../docs/roadmap.html">Roadmap</a>
-      <a href="../docs/index.html">Docs</a>
-      <a href="index.html" aria-current="page">Blog</a>
-      <a class="nav-cta" href="https://github.com/">&#9733; GitHub</a>
+      <a href="../index.html">HOME</a>
+      <a href="../docs/index.html">DOCS</a>
+      <a href="../docs/roadmap.html">ROADMAP</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
     </div>
   </div>
 </nav>
 
-<main class="doc">
-  <p class="breadcrumb"><a href="index.html">Blog</a> / 2026-07-07</p>
-  <h1 class="page-title">The log is the database &mdash; how InfinityDB is being built</h1>
+<article class="post">
+  <a class="post-back" href="index.html">&larr; ALL POSTS</a>
+  <div class="post-head">
+    <span class="post-pill">DISCIPLINE</span>
+    <span class="post-meta">2026-07-07 &middot; 12 MIN READ &middot; THE INFINITYDB TEAM</span>
+  </div>
+  <h1>The log is the database &mdash; how InfinityDB is being built</h1>
   <p class="lede">InfinityDB wants to be five systems in one process: a Redis-compatible cache, a durable key-value store, a JSON document store, a queue, and a vector index. That is an easy sentence to write and a very easy project to fail at. This post is about the discipline model that is supposed to keep us honest &mdash; because the interesting part of this project isn&rsquo;t the feature list, it&rsquo;s the process that decides what gets to ship.</p>
 
   <h2>We already failed once, on purpose the second time</h2>
-  <p>InfinityDB is a full restart of a predecessor called Vortex, and Vortex&rsquo;s post-mortem is constitutional &mdash; it is written into the project&rsquo;s master plan, root cause by root cause, and every design law traces back to one of its failures.</p>
+  <p>InfinityDB is a full restart of a predecessor called Vortex, and <a href="why-vortex-failed.html">Vortex&rsquo;s post-mortem</a> is constitutional &mdash; it is written into the project&rsquo;s master plan, root cause by root cause, and every design law traces back to one of its failures.</p>
   <p>Vortex was not lazy work. It had a SIMD RESP parser, a carefully engineered hash table, typed durability errors with crash-point testing, and a genuinely large concurrency experiment behind its central architectural choice. It still failed: throughput landed at roughly parity with Redis where the targets said multiples, memory came in at multiples of Redis where the target said less, and tail latency had cliffs orders of magnitude over budget. The components were excellent. The system was wrong.</p>
   <p>The post-mortem found the pattern: every major decision had been validated <em>in isolation</em> &mdash; a lock model proven in a lab that measured only the data plane, while the real server spent most of its CPU in I/O completions the lab never saw; an architecture-defining experiment whose result contradicted the published behavior of production systems, and nobody checked. Features were built for months on a foundation whose end-to-end behavior had never been proven.</p>
-  <p>So the restart inverted the order. The first milestone of InfinityDB, M0, contained <strong>no features</strong>. It was an end-to-end skeleton &mdash; reactor, fabric, wire protocol, minimal store, benchmark harness, simulator &mdash; with hard numeric gates, and the rule that no feature work would begin until the architecture proved itself under the wire protocol. That rule has teeth: an M0 gate that came in red is still formally open today, dispositioned in a public architecture decision record and carried into the current milestone&rsquo;s performance work &mdash; not narrowed, not forgotten.</p>
+  <p>So the restart inverted the order. The first milestone of InfinityDB, M0, contained <strong>no features</strong>. It was an end-to-end skeleton &mdash; reactor, fabric, wire protocol, minimal store, benchmark harness, simulator &mdash; with hard numeric gates, and the rule that no feature work would begin until the architecture proved itself under the wire protocol. That rule has teeth: an M0 gate that came in red is still formally open today, dispositioned in a public architecture decision record and carried forward &mdash; not narrowed, not forgotten.</p>
 
   <h2>One primitive</h2>
   <p>The technical thesis is a single sentence: <strong>all five workloads are projections of one primitive &mdash; a per-core, append-only, segmented log.</strong></p>
@@ -51,37 +72,36 @@
 
   <h2>Determinism, or: every failure is a seed</h2>
   <p>That last denylist exists because of the project&rsquo;s favorite feature, which is invisible: the entire node &mdash; all cells, the fabric, the log, recovery &mdash; runs deterministically on one thread inside a simulator, in the FoundationDB/TigerBeetle tradition. Time, randomness, disk, and network are injected effects. Simulated disks lose un-fsynced writes, tear frames, and lie about fsync; power cuts land at chosen log positions; invariant oracles (per-key linearizability, durability-watermark honesty, accounting reconciliation) run continuously inside the simulation.</p>
-  <p>The payoff is that failure is <em>replayable</em>: the ledger-backed claim is that the simulator produces byte-identical traces from the same seed, and the oracles run nightly. When the nightly fleet&rsquo;s very first corpus run caught a real defect in pub/sub reply pairing, the failing seed replayed exactly, was fixed, and joined the regression corpus forever. Two more ledger-backed examples of what this buys, both correctness claims with committed artifacts: ten million TTLs across 48 simulated hours fire exactly &mdash; zero early, zero missed &mdash; and the durability plane survived a sweep of 10,000 simulated power-cut and disk-fault seeds with zero durability-oracle violations: every <code>always</code>-acked write survived, every seed replayed byte-identically. A small, disclosed fraction of those simulated boots refuse to start with a named corruption error &mdash; each refusal audited as legal, because the injected fault genuinely destroyed named state. We think a database that refuses loudly beats one that boots quietly wrong, and we test the refusals too.</p>
+  <p>The payoff is that failure is <em>replayable</em>: the ledger-backed claim is that the simulator produces byte-identical traces from the same seed, and the oracles run nightly. When the nightly fleet&rsquo;s very first corpus run caught a real defect in pub/sub reply pairing, the failing seed replayed exactly, was fixed, and joined the regression corpus forever. Two more ledger-backed examples of what this buys, both correctness claims with committed artifacts: ten million TTLs across 48 simulated hours fire exactly &mdash; zero early, zero missed &mdash; and the durability plane survived a sweep of 10,000 simulated power-cut and disk-fault seeds with zero durability-oracle violations: every <code>always</code>-acked write survived, every seed replayed byte-identically &mdash; and on the current frame-format tree, zero recovery refusals across the same 10,000 seeds. We think a database that refuses loudly beats one that boots quietly wrong, and we test the refusals too.</p>
 
   <h2>STOP gates</h2>
   <p>The roadmap is a train of milestones, each an independently shippable product: cache, then durability, then documents, tiered storage, queries, collections, transactions, streams, vectors, HA, compute. Each milestone ends in <strong>STOP gates</strong> &mdash; hard, numeric, end-to-end acceptance criteria measured on a designated reference machine with a controlled environment. A red gate halts the train. The fix happens at the architecture layer, and if the gate itself was wrong, changing it requires a public architecture decision record with comparator-anchored evidence &mdash; never a quiet edit.</p>
-  <p>This has real consequences. Milestones M1 and M2 produced <em>verdicts</em>, not public releases &mdash; their gate campaigns are why there has never been an InfinityDB release tag, even with the cache and durability planes implemented and tested. The current milestone, M2.5, exists specifically to turn M2&rsquo;s GO verdict into the first public tag (<code>v0.2.0-alpha.1</code>) the hard way: performance debt paid and measured first, soak and simulation campaigns after, evidence closure before announcement. The M2 campaign is also a good advertisement for gates: one of its rows caught a real group-commit defect &mdash; the fsync grouping ratio was a fraction of what the architecture promised &mdash; which was fixed in-campaign and verified by the same harness that caught it. That is what gates are <em>for</em>. A benchmark suite that only ever says yes is decoration.</p>
+  <p>This has real consequences. Milestones M1, M2, and M2.5 produced <em>verdicts</em>, not public releases &mdash; their gate campaigns are why there has never been an InfinityDB release tag, even with the cache and durability planes implemented and tested. By owner decision (ADR-0048), the first public tag is <code>v0.3.0-alpha.1</code>, carried by the JSON-documents milestone now in progress: rather than shipping an alpha its successor would immediately supersede, the release act &mdash; pre-tag binding campaign, ledger re-validation, signed announcement &mdash; moved forward with the milestone that adds the surface. The M2 campaign is also a good advertisement for gates: one of its rows caught a real group-commit defect &mdash; the fsync grouping ratio was a fraction of what the architecture promised &mdash; which was fixed in-campaign and verified by the same harness that caught it. That is what gates are <em>for</em>. A benchmark suite that only ever says yes is decoration.</p>
 
-  <h2>The claim ledger, or: why this site has no benchmark numbers</h2>
+  <h2>The claim ledger, or: why numbers here are rare and cited</h2>
   <p>The strangest artifact in the repository, for most visitors, will be <code>docs/claim-ledger.md</code>. Every number or comparative statement in InfinityDB&rsquo;s public copy &mdash; this site included &mdash; must have a row there marked <strong>Allowed</strong>, citing a validated artifact: replicated runs, clean tree, recorded governor and thermals, load-generator saturation checked, competitors in the same run on the same box, flamegraph and memory attribution attached. Development-box numbers can never back a performance claim. Rows are re-validated per release; a stale artifact flips its row back to pending. A claim absent from the ledger does not exist, and this website is scanned against the ledger in CI.</p>
-  <p>Right now the ledger allows a set of <em>correctness</em> claims &mdash; byte-compatibility counts against a pinned Redis oracle, the simulation and crash-matrix results above, recovery behavior &mdash; and keeps most throughput and latency rows in Evidence-pending or Narrowed states, several gated on hardware the project has named but not yet run. So the honest answer to &ldquo;how fast is it?&rdquo; is: <em>the architecture was built for a specific performance model, the gates that prove it are public, and the numbers will appear when the ledger allows them &mdash; not before.</em> If you find that unsatisfying, good &mdash; so do we, which is why the current milestone&rsquo;s whole purpose is closing evidence. What we will not do is publish a target dressed as a result. That is precisely the failure mode this project was restarted to kill.</p>
+  <p>When this post was first published, the ledger allowed only <em>correctness</em> claims &mdash; byte-compatibility counts against a pinned Redis oracle, the simulation and crash-matrix results above, recovery behavior. Since then, the hardening milestone&rsquo;s closure campaign moved the first performance rows to Allowed &mdash; memory versus Redis in the same run, unpipelined throughput, the comparator-anchored cross-cell result &mdash; and those now appear on the landing page inside evidence blocks, each with its artifact and its disclosures. Everything else &mdash; pipelined peaks, <code>always</code>-mode write rates, absolute tail-latency claims &mdash; remains Narrowed or Evidence-pending and therefore absent. What we will not do is publish a target dressed as a result. That is precisely the failure mode this project was restarted to kill.</p>
 
   <h2>What ships today, and what&rsquo;s next</h2>
-  <p>Today InfinityDB is a Redis-compatible in-memory cache (strings, keys, expiry, eviction, pub/sub &mdash; per-command status in the <a href="../docs/compat.html">generated matrix</a>) plus <a href="../docs/durability.html">durable KV namespaces</a> with <code>always</code>/<code>everysec</code> fsync classes, fork-free checkpoints, and parallel recovery. Single node, no auth or TLS yet, early alpha. Next: the first public tag, then JSON documents.</p>
+  <p>Today InfinityDB is a Redis-compatible in-memory cache (strings, keys, expiry, eviction, pub/sub &mdash; per-command status in the <a href="../docs/compat.html">generated matrix</a>) plus <a href="../docs/durability.html">durable KV namespaces</a> with <code>always</code>/<code>everysec</code> fsync classes, fork-free checkpoints, and parallel recovery. Single node, no auth or TLS yet, early alpha. Next: JSON documents, carrying the first public tag &mdash; <code>v0.3.0-alpha.1</code>.</p>
   <p>If the discipline model appeals to you more than the feature list &mdash; that is the correct reaction, and you should <a href="https://github.com/">follow the build</a>. Read the master plan. Hold us to it.</p>
 
   <p class="mono-note" style="margin-top:48px">EVERY NUMBER IN THIS POST IS BACKED BY AN ALLOWED CLAIM-LEDGER ROW (C3, C4, C12) &middot; docs/claim-ledger.md</p>
 
-  <div class="doc-footer-nav">
-    <a href="index.html">&larr; All posts</a>
-    <a href="../docs/roadmap.html">The roadmap &rarr;</a>
+  <div class="post-ctas">
+    <a class="btn btn-primary" href="../docs/roadmap.html">THE ROADMAP &rarr;</a>
+    <a class="btn btn-ghost" href="index.html">&larr; ALL POSTS</a>
   </div>
-</main>
+</article>
 
 <footer class="footer">
   <div class="footer-inner">
-    <span class="mark">&infin; InfinityDB</span>
-    <span class="meta">APACHE 2.0 &middot; RUST &middot; BEST ON LINUX WITH io_uring</span>
+    <span class="mark">&copy; 2026 INFINITYDB &mdash; APACHE 2.0 &middot; RUST &middot; <b>infinityd</b></span>
     <div class="footer-links">
-      <a href="../docs/index.html">Docs</a>
-      <a href="index.html">Blog</a>
-      <a href="../docs/roadmap.html">Roadmap</a>
-      <a href="https://github.com/">GitHub &#8599;</a>
+      <a href="../docs/index.html">DOCS</a>
+      <a href="index.html">BLOG</a>
+      <a href="../docs/roadmap.html">ROADMAP</a>
+      <a href="https://github.com/">GITHUB &#8599;</a>
     </div>
   </div>
 </footer>

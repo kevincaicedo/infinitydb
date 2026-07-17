@@ -1,0 +1,79 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.04s
+     Running benches/parse.rs (target/release/deps/parse-200be1899b7e2891)
+Benchmarking parse/small-200B
+Benchmarking parse/small-200B: Warming up for 3.0000 s
+Benchmarking parse/small-200B: Collecting 100 samples in estimated 5.0009 s (25M iterations)
+Benchmarking parse/small-200B: Analyzing
+parse/small-200B        time:   [196.98 ns 197.05 ns 197.14 ns]
+                        thrpt:  [967.50 MiB/s 967.95 MiB/s 968.30 MiB/s]
+                 change:
+                        time:   [−2.7726% −2.7276% −2.6820%] (p = 0.00 < 0.05)
+                        thrpt:  [+2.7559% +2.8041% +2.8516%]
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking parse/gate-1KiB
+Benchmarking parse/gate-1KiB: Warming up for 3.0000 s
+Benchmarking parse/gate-1KiB: Collecting 100 samples in estimated 5.0005 s (6.4M iterations)
+Benchmarking parse/gate-1KiB: Analyzing
+parse/gate-1KiB         time:   [772.28 ns 772.55 ns 772.85 ns]
+                        thrpt:  [1.2340 GiB/s 1.2344 GiB/s 1.2349 GiB/s]
+                 change:
+                        time:   [−0.8680% −0.7845% −0.7037%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.7087% +0.7907% +0.8756%]
+                        Change within noise threshold.
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high mild
+Benchmarking parse/medium-2KiB
+Benchmarking parse/medium-2KiB: Warming up for 3.0000 s
+Benchmarking parse/medium-2KiB: Collecting 100 samples in estimated 5.0003 s (3.2M iterations)
+Benchmarking parse/medium-2KiB: Analyzing
+parse/medium-2KiB       time:   [1.4081 µs 1.4087 µs 1.4094 µs]
+                        thrpt:  [1.3533 GiB/s 1.3540 GiB/s 1.3546 GiB/s]
+                 change:
+                        time:   [−1.4577% −1.3941% −1.3347%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.3527% +1.4139% +1.4793%]
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) low mild
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking parse/large-64KiB
+Benchmarking parse/large-64KiB: Warming up for 3.0000 s
+Benchmarking parse/large-64KiB: Collecting 100 samples in estimated 5.0069 s (152k iterations)
+Benchmarking parse/large-64KiB: Analyzing
+parse/large-64KiB       time:   [32.990 µs 32.997 µs 33.004 µs]
+                        thrpt:  [1.8493 GiB/s 1.8497 GiB/s 1.8501 GiB/s]
+                 change:
+                        time:   [−7.2957% −7.0514% −6.8849%] (p = 0.00 < 0.05)
+                        thrpt:  [+7.3940% +7.5864% +7.8698%]
+                        Performance has improved.
+Benchmarking parse/deep-32
+Benchmarking parse/deep-32: Warming up for 3.0000 s
+Benchmarking parse/deep-32: Collecting 100 samples in estimated 5.0012 s (3.7M iterations)
+Benchmarking parse/deep-32: Analyzing
+parse/deep-32           time:   [1.3463 µs 1.3468 µs 1.3474 µs]
+                        thrpt:  [453.71 MiB/s 453.88 MiB/s 454.05 MiB/s]
+                 change:
+                        time:   [−8.5210% −8.4079% −8.2939%] (p = 0.00 < 0.05)
+                        thrpt:  [+9.0440% +9.1797% +9.3147%]
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) low mild
+  2 (2.00%) high mild
+Benchmarking parse/wide-array
+Benchmarking parse/wide-array: Warming up for 3.0000 s
+Benchmarking parse/wide-array: Collecting 100 samples in estimated 7.3077 s (10k iterations)
+Benchmarking parse/wide-array: Analyzing
+parse/wide-array        time:   [723.26 µs 723.37 µs 723.49 µs]
+                        thrpt:  [552.67 MiB/s 552.76 MiB/s 552.85 MiB/s]
+                 change:
+                        time:   [−9.9291% −9.8935% −9.8594%] (p = 0.00 < 0.05)
+                        thrpt:  [+10.938% +10.980% +11.024%]
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) low severe
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+

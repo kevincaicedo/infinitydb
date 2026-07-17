@@ -1,0 +1,19 @@
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 23%,   0 secs]  4 threads 25 conns:     2327981 ops, 2329737 (avg: 2329737) ops/sec, 2.31GB/sec (avg: 2.31GB/sec),  1.37 (avg:  1.37) msec latency[RUN #1 41%,   1 secs]  4 threads 25 conns:     4149460 ops, 1821285 (avg: 2075402) ops/sec, 1.81GB/sec (avg: 2.06GB/sec),  1.75 (avg:  1.54) msec latency[RUN #1 63%,   2 secs]  4 threads 25 conns:     6337607 ops, 2187915 (avg: 2112917) ops/sec, 2.17GB/sec (avg: 2.10GB/sec),  1.46 (avg:  1.51) msec latency[RUN #1 86%,   3 secs]  4 threads 25 conns:     8609109 ops, 2363872 (avg: 2173807) ops/sec, 2.35GB/sec (avg: 2.16GB/sec),  1.35 (avg:  1.47) msec latency[RUN #1 98%,   4 secs]  3 threads 25 conns:     9845474 ops, 2363872 (avg: 2234336) ops/sec, 2.35GB/sec (avg: 2.22GB/sec),  1.35 (avg:  1.43) msec latency[RUN #1 100%,   4 secs]  0 threads 25 conns:    10000000 ops, 2363872 (avg: 2252078) ops/sec, 2.35GB/sec (avg: 2.24GB/sec),  1.35 (avg:  1.42) msec latency
+
+setting requests to 100000
+4         Threads
+25        Connections per thread
+100000    Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      2288509.67          ---          ---         1.41753         1.34300         2.79900         3.69500   2382124.11 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    2288509.67         0.00         0.00         1.41753         1.34300         2.79900         3.69500   2382124.11 

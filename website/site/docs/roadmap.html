@@ -5,10 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Roadmap — InfinityDB Docs</title>
 <meta name="description" content="The InfinityDB milestone train: what is done, what is in progress, and what each milestone ships, with STOP gates and the ADR reorders named.">
-<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='20'%20fill='%23201826'/%3E%3Ctext%20x='50'%20y='71'%20font-size='62'%20text-anchor='middle'%20fill='%23cf7ff5'%20font-family='system-ui'%3E%E2%88%9E%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2018'%3E%3Ccircle%20cx='10'%20cy='9'%20r='7'%20fill='none'%20stroke='%237c5cff'%20stroke-width='2.4'/%3E%3Ccircle%20cx='24'%20cy='9'%20r='7'%20fill='none'%20stroke='%233ee6c4'%20stroke-width='2.4'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../assets/site.css">
 </head>
 <body>
@@ -16,24 +16,43 @@
 <nav class="nav">
   <div class="nav-inner">
     <a href="../index.html" class="nav-brand">
-      <span class="mark">&infin; InfinityDB</span>
-      <span class="nav-badge">v0.2.0-alpha.1 &middot; IN DEV</span>
+      <svg class="logo" width="34" height="18" viewBox="0 0 34 18" aria-hidden="true">
+        <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2.4"/>
+        <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2.4"/>
+      </svg>
+      <span class="mark">infinity<b>DB</b></span>
+      <span class="nav-badge neutral">DOCS</span>
     </a>
     <span class="nav-spacer"></span>
     <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
     <div class="nav-links">
-      <a href="../index.html#spine">Architecture</a>
-      <a href="../index.html#workloads">Workloads</a>
-      <a href="roadmap.html" aria-current="page">Roadmap</a>
-      <a href="index.html">Docs</a>
-      <a href="../blog/index.html">Blog</a>
-      <a class="nav-cta" href="https://github.com/">&#9733; GitHub</a>
+      <a href="../index.html">HOME</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
     </div>
   </div>
 </nav>
 
-<main class="doc">
-  <p class="breadcrumb"><a href="index.html">Docs</a> / Roadmap</p>
+<div class="docs-shell">
+  <aside class="docs-side">
+    <p class="side-h">Getting started</p>
+    <a class="side-link" href="index.html">Docs home</a>
+    <a class="side-link" href="quickstart.html">Quickstart</a>
+    <p class="side-h">Concepts</p>
+    <a class="side-link" href="architecture.html">Architecture</a>
+    <a class="side-link" href="durability.html">Namespaces &amp; durability</a>
+    <p class="side-h">Operations</p>
+    <a class="side-link" href="deployment.html">Deployment</a>
+    <a class="side-link" href="operations.html">Operations</a>
+    <p class="side-h">Reference</p>
+    <a class="side-link" href="compat.html">Command matrix</a>
+    <a class="side-link" href="roadmap.html" aria-current="page">Roadmap</a>
+  </aside>
+
+  <main class="docs-main">
+    <article>
+      <p class="doc-kicker">Reference</p>
   <h1 class="page-title">The milestone train</h1>
   <p class="lede">InfinityDB ships on a release train with <strong>STOP gates</strong>: every milestone ends with hard, numeric, end-to-end acceptance criteria measured on a designated reference box, and a milestone that fails its gate halts feature work &mdash; the fix happens at the architecture layer, not as an optimization pass later. Every milestone is an independently shippable product.</p>
 
@@ -44,7 +63,7 @@
 
   <div class="callout">
     <span class="callout-tag"><strong>The train was reordered &mdash; by ADR, in the open.</strong></span>
-    <strong>ADR-0023</strong> (2026-07-05) reordered the train <em>documents-first</em> and renumbered it (JSON documents moved from sixth position to M3; tiered storage to M4; the collection types to M5; transactions to M6; streams to M7), and inserted <strong>M2.5 &ldquo;Hardening &amp; First Alpha.&rdquo;</strong> <strong>ADR-0024</strong> inserted <strong>M4.5 &ldquo;Indexes &amp; Query&rdquo;</strong> &mdash; typed secondary indexes plus a planner-free PartiQL subset, pre-1.0. <strong>ADR-0025</strong> restructured M2.5 performance-first: the first public tag carries the paid performance debt. Documents dated before 2026-07-05 use the old numbering.
+    <strong>ADR-0023</strong> (2026-07-05) reordered the train <em>documents-first</em> and renumbered it (JSON documents moved from sixth position to M3; tiered storage to M4; the collection types to M5; transactions to M6; streams to M7), and inserted <strong>M2.5 &ldquo;Hardening &amp; First Alpha.&rdquo;</strong> <strong>ADR-0024</strong> inserted <strong>M4.5 &ldquo;Indexes &amp; Query&rdquo;</strong> &mdash; typed secondary indexes plus a planner-free PartiQL subset, pre-1.0. <strong>ADR-0025</strong> restructured M2.5 performance-first: the first public tag carries the paid performance debt. <strong>ADR-0048</strong> (2026-07-16) retired <code>v0.2.0-alpha.1</code> unused and moved the first public tag to M3&rsquo;s <code>v0.3.0-alpha.1</code> &mdash; M2.5&rsquo;s release act folded into M3 rather than shipping an alpha the project would immediately supersede. Documents dated before 2026-07-05 use the old numbering.
   </div>
 
   <h2>Done</h2>
@@ -53,25 +72,25 @@
   <p>The single most important milestone, and deliberately feature-free: an end-to-end vertical &mdash; cell loop on io_uring, the SPSC fabric, the SIMD RESP wire, a minimal store, the benchmark harness with tripwire metrics, and the deterministic simulator&rsquo;s walking skeleton &mdash; measured against hard gates <em>before any feature work was allowed to exist</em>. The predecessor project died because this step never existed. One gate (pipelined node throughput at the spec&rsquo;d cell count) remains formally open, dispositioned by ADR-0029 and carried into M2.5&rsquo;s performance work rather than silently narrowed.</p>
 
   <h3>M1 &mdash; Cache core <span class="pill pill-ship">DONE</span></h3>
-  <p>The full string/key/expiry/server command surface, per-cell TTL wheel with budgeted active expiry, all 8 eviction policies, namespaces v1, pub/sub with RESP3 push, the generated compatibility matrix with its CI staleness gate, oracle byte-diffing against a pinned Redis 8.0.5, Docker/CI release engineering, and the nightly deterministic-simulation fleet. <code>v0.1.0-alpha.1</code> was never tagged &mdash; it was superseded by <code>v0.2.0-alpha.1</code> once M2 landed, so the first public tag ships durability included.</p>
+  <p>The full string/key/expiry/server command surface, per-cell TTL wheel with budgeted active expiry, all 8 eviction policies, namespaces v1, pub/sub with RESP3 push, the generated compatibility matrix with its CI staleness gate, oracle byte-diffing against a pinned Redis 8.0.5, Docker/CI release engineering, and the nightly deterministic-simulation fleet. <code>v0.1.0-alpha.1</code> was never tagged, and <code>v0.2.0-alpha.1</code> was later retired unused (ADR-0048) &mdash; the first public tag, <code>v0.3.0-alpha.1</code>, ships durability and JSON documents included.</p>
 
   <h3>M2 &mdash; Durability <span class="pill pill-ship">DONE &middot; GO VERDICT</span></h3>
-  <p>The log spine complete: segments, batch frames, CRC, group commit, manifest; <code>everysec</code>/<code>always</code> namespaces with watermark-gated acks; fuzzy fork-free checkpoints with truncation; parallel recovery; the fault-point harness and crash matrix; deterministic disk-fault simulation (torn writes, fsync lies, power cuts); <code>INF.CKPT</code>/<code>BGSAVE</code>. The binding campaign ran on the designated reference box: the correctness gates passed (see <a href="durability.html">the durability evidence</a>); several device-bound performance rows were honestly dispositioned as Evidence-pending on Gen4-class hardware rather than narrowed. Verdict: GO for <code>v0.2.0-alpha.1</code>.</p>
+  <p>The log spine complete: segments, batch frames, CRC, group commit, manifest; <code>everysec</code>/<code>always</code> namespaces with watermark-gated acks; fuzzy fork-free checkpoints with truncation; parallel recovery; the fault-point harness and crash matrix; deterministic disk-fault simulation (torn writes, fsync lies, power cuts); <code>INF.CKPT</code>/<code>BGSAVE</code>. The binding campaign ran on the designated reference box: the correctness gates passed (see <a href="durability.html">the durability evidence</a>); several device-bound performance rows were honestly dispositioned as Evidence-pending on Gen4-class hardware rather than narrowed. Verdict: GO &mdash; the release act itself later moved to M3 (ADR-0048).</p>
+
+  <h3>M2.5 &mdash; Hardening &amp; first alpha <span class="pill pill-ship">DONE &middot; RELEASE ACT &rarr; M3</span></h3>
+  <p>No new command surface. The milestone that turned M2&rsquo;s GO verdict into a hardened, evidence-clean core before the feature train resumed &mdash; performance-first per ADR-0025:</p>
+  <ul>
+    <li><strong>Paid the debt:</strong> the boot-wedge stop-item root-caused and fixed; measured performance levers on group formation, recovery read-ahead, and the cross-cell remote-penalty campaign &mdash; each A/B&rsquo;d on the designated box and dispositioned by ADR (losing levers recorded and <em>not merged</em>); the anchored cross-cell gate ratified by ADR-0035.</li>
+    <li><strong>Shipped the instrument:</strong> the first binding comparative campaign with the zero-dependency <code>inf-compare</code> harness, this website and docs v1, and full evidence closure &mdash; zero undispositioned claim-ledger rows (the S19 walk, 2026-07-10).</li>
+    <li><strong>Hardened:</strong> TigerBeetle-grade assertion and soundness audits, deeper simulation fleets, fuzz-hour accumulation, and the documents-first seam-readiness review for M3 (ADR-0032). Per <strong>ADR-0048</strong>, the tag + announcement act folded into M3 &mdash; <code>v0.2.0-alpha.1</code> was retired unused rather than shipping an alpha its successor would immediately supersede.</li>
+  </ul>
 
   <h2>Now</h2>
 
-  <h3>M2.5 &mdash; Hardening &amp; first alpha <span class="pill pill-now">IN PROGRESS &rarr; v0.2.0-alpha.1</span></h3>
-  <p>No new command surface. The milestone that turns M2&rsquo;s GO verdict into a shipped, hardened, evidence-clean product before the feature train resumes &mdash; performance-first per ADR-0025, so the first public tag carries the paid debt:</p>
-  <ul>
-    <li><strong>Pay the debt:</strong> the boot-wedge stop-item root-caused and fixed; live CI (fuzz-nightly, DST-nightly, crash-matrix, release pipeline); measured performance levers on group formation, recovery read-ahead, and the cross-cell remote-penalty campaign &mdash; each A/B&rsquo;d on the designated box and dispositioned by ADR (losing levers are recorded and <em>not merged</em>).</li>
-    <li><strong>Ship:</strong> a 24-hour soak on the lever-bearing tree, the first binding comparative campaign with the project&rsquo;s zero-dependency <code>inf-compare</code> instrument, this website and docs v1, and the tag + announcement &mdash; every number ledger-checked.</li>
-    <li><strong>Harden and close:</strong> TigerBeetle-grade assertion and soundness audits, deeper simulation fleets, fuzz-hour accumulation, the documents-first seam-readiness review for M3, and full evidence closure: zero undispositioned claim-ledger rows is itself a STOP gate.</li>
-  </ul>
+  <h3>M3 &mdash; JSON documents <span class="pill pill-now">IN PROGRESS &rarr; v0.3.0-alpha.1 &middot; FIRST PUBLIC TAG</span></h3>
+  <p>JSON objects as first-class values, not a module: a compact binary document tree (tape-structured for parse-free traversal), the RedisJSON-compatible <code>JSON.*</code> surface with a compiled JSONPath subset, in-place path mutation, delta log records with periodic full-document records to bound replay, and a compat suite with RedisJSON as the oracle. This opens the NoSQL story: entities as documents under designed keys &mdash; and it carries the project&rsquo;s <strong>first public tag</strong>: the release act (pre-tag binding campaign, ledger re-validation, signed announcement, release pipeline) ships here per ADR-0048.</p>
 
   <h2>Next</h2>
-
-  <h3>M3 &mdash; JSON documents <span class="pill pill-plan">v0.3.0-alpha</span></h3>
-  <p>JSON objects as first-class values, not a module: a compact binary document tree (tape-structured for parse-free traversal), the RedisJSON-compatible <code>JSON.*</code> surface with a compiled JSONPath subset, in-place path mutation, delta log records with periodic full-document records to bound replay, and a compat suite with RedisJSON as the oracle. This opens the NoSQL story: entities as documents under designed keys.</p>
 
   <h3>M4 &mdash; Tiered storage <span class="pill pill-plan">v0.4.0-alpha</span></h3>
   <p>Beyond-RAM datasets via the hybrid-log design (Microsoft FASTER lineage): one logical address space per cell spanning disk, read-only RAM, and mutable RAM regions; async cold reads through the executor; compaction in budgeted slices; blob extents. Cache-mode namespaces are the degenerate case and never execute this code.</p>
@@ -107,17 +126,18 @@
     <a href="compat.html">&larr; Compatibility matrix</a>
     <a href="../blog/the-log-is-the-database.html">How it&rsquo;s built &rarr;</a>
   </div>
-</main>
+    </article>
+  </main>
+</div>
 
 <footer class="footer">
   <div class="footer-inner">
-    <span class="mark">&infin; InfinityDB</span>
-    <span class="meta">APACHE 2.0 &middot; RUST &middot; BEST ON LINUX WITH io_uring</span>
+    <span class="mark">&copy; 2026 INFINITYDB &mdash; APACHE 2.0 &middot; RUST &middot; <b>infinityd</b></span>
     <div class="footer-links">
-      <a href="index.html">Docs</a>
-      <a href="../blog/index.html">Blog</a>
-      <a href="roadmap.html">Roadmap</a>
-      <a href="https://github.com/">GitHub &#8599;</a>
+      <a href="index.html">DOCS</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a href="https://github.com/">GITHUB &#8599;</a>
     </div>
   </div>
 </footer>

@@ -107,32 +107,34 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Redis compatibility matrix — InfinityDB Docs</title>
 <meta name="description" content="Per-command Redis compatibility for InfinityDB, byte-diff-verified against Redis 8.0.5. Rendered from the generated repository artifact.">
-<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='20'%20fill='%23201826'/%3E%3Ctext%20x='50'%20y='71'%20font-size='62'%20text-anchor='middle'%20fill='%23cf7ff5'%20font-family='system-ui'%3E%E2%88%9E%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2018'%3E%3Ccircle%20cx='10'%20cy='9'%20r='7'%20fill='none'%20stroke='%237c5cff'%20stroke-width='2.4'/%3E%3Ccircle%20cx='24'%20cy='9'%20r='7'%20fill='none'%20stroke='%233ee6c4'%20stroke-width='2.4'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../assets/site.css">
 <style>
 .stat-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin: 28px 0; }}
-.stat {{ background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: 10px; padding: 14px 16px; }}
-.stat .v {{ font: 600 26px/1.1 var(--sans); letter-spacing: -0.02em; }}
-.stat .l {{ font: 500 10px/1.4 var(--mono); letter-spacing: 0.1em; color: var(--text-faint); text-transform: uppercase; margin-top: 6px; }}
-.st {{ display: inline-block; font: 500 10px/1 var(--mono); letter-spacing: 0.06em; border-radius: 100px; padding: 4px 9px; }}
-.st-full {{ color: oklch(0.75 0.16 150); border: 1px solid oklch(0.75 0.16 150 / 0.4); }}
-.st-partial {{ color: oklch(0.8 0.14 80); border: 1px solid oklch(0.8 0.14 80 / 0.4); }}
+.stat-row .stat {{ background: var(--bg-raise); border: 1px solid var(--border-mid); border-radius: 10px; padding: 14px 16px; }}
+.stat-row .v {{ font: 700 24px/1.1 var(--mono); letter-spacing: -0.01em; color: var(--text); }}
+.stat-row .l {{ font: 500 9.5px/1.4 var(--mono); letter-spacing: 0.1em; color: var(--text-faint); text-transform: uppercase; margin-top: 6px; }}
+.st {{ display: inline-block; font: 500 10px/1 var(--mono); letter-spacing: 0.06em; border-radius: 99px; padding: 4px 9px; }}
+.st-full {{ color: var(--teal); border: 1px solid var(--teal-dim); }}
+.st-partial {{ color: var(--warn); border: 1px solid rgba(255, 196, 92, 0.4); }}
 .st-stub {{ color: var(--text-faint); border: 1px solid var(--border-strong); }}
-.st-ext {{ color: var(--accent); border: 1px solid var(--accent-dim); }}
+.st-ext {{ color: var(--violet-soft); border: 1px solid rgba(124, 92, 255, 0.4); }}
 .st-int {{ color: var(--text-faint); border: 1px dashed var(--border-strong); }}
 .filters {{ display: flex; gap: 8px; flex-wrap: wrap; margin: 18px 0 6px; }}
 .filters button {{
   font: 500 11px/1 var(--mono); letter-spacing: 0.06em; cursor: pointer;
   background: var(--bg-raise); color: var(--text-muted);
-  border: 1px solid var(--border-strong); border-radius: 100px; padding: 8px 14px;
+  border: 1px solid var(--border-strong); border-radius: 99px; padding: 8px 14px;
 }}
-.filters button[aria-pressed="true"] {{ color: var(--accent); border-color: var(--accent-dim); background: var(--accent-wash); }}
-.dev h3 {{ font-size: 16px; margin: 26px 0 8px; font-family: var(--mono); font-weight: 500; }}
+.filters button:hover {{ color: var(--teal); border-color: var(--teal-dim); }}
+.filters button[aria-pressed="true"] {{ color: var(--teal); border-color: var(--teal-dim); background: var(--teal-wash); }}
+.dev h3 {{ font-size: 15px; margin: 26px 0 8px; font-family: var(--mono); font-weight: 500; color: var(--teal); }}
 .dev ul {{ margin: 0 0 0 2px; padding-left: 20px; }}
-.dev li {{ font-size: 14px; color: var(--text-muted); }}
+.dev li {{ font-size: 13.5px; color: var(--text-muted); }}
+#matrix td:first-child {{ color: var(--text); }}
 </style>
 </head>
 <body>
@@ -140,24 +142,43 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <nav class="nav">
   <div class="nav-inner">
     <a href="../index.html" class="nav-brand">
-      <span class="mark">&infin; InfinityDB</span>
-      <span class="nav-badge">v0.2.0-alpha.1 &middot; IN DEV</span>
+      <svg class="logo" width="34" height="18" viewBox="0 0 34 18" aria-hidden="true">
+        <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2.4"/>
+        <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2.4"/>
+      </svg>
+      <span class="mark">infinity<b>DB</b></span>
+      <span class="nav-badge neutral">DOCS</span>
     </a>
     <span class="nav-spacer"></span>
     <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
     <div class="nav-links">
-      <a href="../index.html#spine">Architecture</a>
-      <a href="../index.html#workloads">Workloads</a>
-      <a href="roadmap.html">Roadmap</a>
-      <a href="index.html" aria-current="page">Docs</a>
-      <a href="../blog/index.html">Blog</a>
-      <a class="nav-cta" href="https://github.com/">&#9733; GitHub</a>
+      <a href="../index.html">HOME</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
     </div>
   </div>
 </nav>
 
-<main class="doc-wide">
-  <p class="breadcrumb"><a href="index.html">Docs</a> / Redis compatibility matrix</p>
+<div class="docs-shell">
+  <aside class="docs-side">
+    <p class="side-h">Getting started</p>
+    <a class="side-link" href="index.html">Docs home</a>
+    <a class="side-link" href="quickstart.html">Quickstart</a>
+    <p class="side-h">Concepts</p>
+    <a class="side-link" href="architecture.html">Architecture</a>
+    <a class="side-link" href="durability.html">Namespaces &amp; durability</a>
+    <p class="side-h">Operations</p>
+    <a class="side-link" href="deployment.html">Deployment</a>
+    <a class="side-link" href="operations.html">Operations</a>
+    <p class="side-h">Reference</p>
+    <a class="side-link" href="compat.html" aria-current="page">Command matrix</a>
+    <a class="side-link" href="roadmap.html">Roadmap</a>
+  </aside>
+
+  <main class="docs-main" style="max-width: none;">
+    <article>
+      <p class="doc-kicker">Reference</p>
   <h1 class="page-title">Redis compatibility matrix</h1>
   <p class="lede">Compatibility is declared per command and verified byte-for-byte against a real Redis oracle in CI &mdash; any new deviation fails the build until it is documented. This page is <strong>rendered from the repository&rsquo;s generated artifact</strong>, never written by hand, so it cannot drift from the implementation.</p>
 
@@ -206,17 +227,18 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <a href="architecture.html">&larr; Architecture</a>
     <a href="roadmap.html">Roadmap &rarr;</a>
   </div>
-</main>
+    </article>
+  </main>
+</div>
 
 <footer class="footer">
   <div class="footer-inner">
-    <span class="mark">&infin; InfinityDB</span>
-    <span class="meta">APACHE 2.0 &middot; RUST &middot; BEST ON LINUX WITH io_uring</span>
+    <span class="mark">&copy; 2026 INFINITYDB &mdash; APACHE 2.0 &middot; RUST &middot; <b>infinityd</b></span>
     <div class="footer-links">
-      <a href="index.html">Docs</a>
-      <a href="../blog/index.html">Blog</a>
-      <a href="roadmap.html">Roadmap</a>
-      <a href="https://github.com/">GitHub &#8599;</a>
+      <a href="index.html">DOCS</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a href="https://github.com/">GITHUB &#8599;</a>
     </div>
   </div>
 </footer>

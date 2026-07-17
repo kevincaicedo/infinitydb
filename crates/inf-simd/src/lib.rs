@@ -25,8 +25,10 @@ pub use group16::{
     eq_mask16, high_bit_mask16, prefetch_read, scalar_eq_mask16, scalar_high_bit_mask16,
 };
 pub use json::{
-    json_copy_unescaped, json_copy_unescaped_short, json_scan_structurals,
-    scalar_json_copy_unescaped, scalar_json_copy_unescaped_short, scalar_json_scan_structurals,
+    BlockMasks, JsonTokenCursor, json_classify_blocks, json_copy_unescaped,
+    json_copy_unescaped_fixstr, json_copy_unescaped_short, json_scan_structurals,
+    scalar_json_copy_unescaped, scalar_json_copy_unescaped_fixstr,
+    scalar_json_copy_unescaped_short, scalar_json_scan_structurals,
 };
 pub use swar::swar_parse_int;
 pub use utf8::utf8_is_valid;
