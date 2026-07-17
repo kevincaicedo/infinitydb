@@ -40,9 +40,12 @@ const SIMD_LEVEL_SSE2: u8 = 2;
 
 const BLOCK: usize = 64;
 
-/// One 64-byte block classified into bitmasks (bit i = byte i).
-#[derive(Copy, Clone, Default)]
-struct BlockMasks {
+/// One 64-byte block classified into bitmasks (bit i = byte i). Opaque
+/// outside this crate: consumers hold `Vec<BlockMasks>` scratch for
+/// [`json_classify_blocks`] and read tokens through [`JsonTokenCursor`] —
+/// the mask arithmetic stays single-homed here.
+#[derive(Copy, Clone, Default, Debug)]
+pub struct BlockMasks {
     backslash: u64,
     quote_raw: u64,
     /// `{ } [ ] : ,`
@@ -52,7 +55,7 @@ struct BlockMasks {
 }
 
 /// Carries across blocks.
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Default, Debug)]
 struct ScanState {
     /// Bit 0: the next block's byte 0 is escaped by a trailing odd run.
     prev_escaped: u64,
@@ -170,14 +173,13 @@ fn prefix_xor(x: u64) -> u64 {
     x
 }
 
-/// Finish one classified block: resolve escapes and string spans, then
-/// push the emitted indices. (The simdjson slot-style flatten — eight
-/// unconditional writes per round through a high-water buffer — was
-/// A/B'd in the S05 slice 2 and **lost on the budget shapes**: −1.5%
-/// gate / −2.3% medium against +4–6% on small/large; the push loop's
-/// branch predicts well at real structural densities. Recorded, not
-/// merged — the M0-S14 rule.)
-fn flush_block(base: usize, masks: BlockMasks, state: &mut ScanState, out: &mut Vec<u32>) {
+/// Resolve one classified block against the carried scan state: escapes,
+/// string spans, scalar-run starts — returning the block's **emit mask**
+/// (bit i set ⟺ byte i starts a token). Shared verbatim by the batch
+/// flatten ([`flush_block`]) and the streaming consumer
+/// ([`JsonTokenCursor`]), so the two paths cannot drift.
+#[inline]
+fn resolve_block(masks: BlockMasks, state: &mut ScanState) -> u64 {
     let escaped = find_escaped(masks.backslash, &mut state.prev_escaped);
     let quote = masks.quote_raw & !escaped;
     let in_string = prefix_xor(quote) ^ state.prev_in_string;
@@ -189,7 +191,18 @@ fn flush_block(base: usize, masks: BlockMasks, state: &mut ScanState, out: &mut 
     let follows_nonquote_scalar = (nonquote_scalar << 1) | state.prev_nonquote_scalar;
     state.prev_nonquote_scalar = nonquote_scalar >> 63;
     let scalar_start = nonquote_scalar & !follows_nonquote_scalar & !in_string;
-    let mut emit = (masks.op & !in_string) | quote | scalar_start;
+    (masks.op & !in_string) | quote | scalar_start
+}
+
+/// Finish one classified block: resolve escapes and string spans, then
+/// push the emitted indices. (The simdjson slot-style flatten — eight
+/// unconditional writes per round through a high-water buffer — was
+/// A/B'd in the S05 slice 2 and **lost on the budget shapes**: −1.5%
+/// gate / −2.3% medium against +4–6% on small/large; the push loop's
+/// branch predicts well at real structural densities. Recorded, not
+/// merged — the M0-S14 rule.)
+fn flush_block(base: usize, masks: BlockMasks, state: &mut ScanState, out: &mut Vec<u32>) {
+    let mut emit = resolve_block(masks, state);
     // One reserve covers the block's worst case (64 indices), so the loop
     // writes unchecked — removing a `Vec` growth branch per index while
     // keeping the well-predicted bit-loop shape (ADR-0047 K3; distinct
@@ -234,13 +247,167 @@ fn scan_blocks(input: &[u8], out: &mut Vec<u32>, classify: impl Fn(&[u8]) -> Blo
     out.len()
 }
 
+// ---- stage fusion (ADR-0047 D2 item 3) ---------------------------------------
+
+/// Classify `input` into raw per-block masks (stage 1's first half, kept
+/// batched so the SIMD compare loop stays tight and pipelined), leaving
+/// escape/string resolution and token flattening to the consumer:
+/// [`JsonTokenCursor`] resolves each block on demand and hands tokens out
+/// of the emit mask **in-register** — no `Vec<u32>` index materialization
+/// and no per-token reload, the two costs the batch path pays between
+/// stages. `out` is cleared and refilled; one mask entry per 64-byte
+/// block, the final partial block padded with spaces (inert: whitespace
+/// emits nothing and cannot extend a string or escape).
+pub fn json_classify_blocks(input: &[u8], out: &mut Vec<BlockMasks>) {
+    out.clear();
+    out.reserve(input.len() / BLOCK + 1);
+
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    {
+        if x86_level() == SIMD_LEVEL_AVX2 {
+            // SAFETY: runtime dispatch above guarantees AVX2.
+            unsafe { avx2_classify_blocks(input, out) }
+        } else {
+            classify_blocks_with(input, out, sse2_block);
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    classify_blocks_with(input, out, neon_block);
+
+    // Miri rides the per-byte classifier: the intrinsics above are
+    // outside its model, and the tiers are equivalence-proven anyway.
+    #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(miri))))]
+    classify_blocks_with(input, out, scalar_classify_block);
+}
+
+/// Portable driver for [`json_classify_blocks`]: full blocks through the
+/// tier classifier, the tail space-padded exactly like [`scan_blocks`].
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))] // AVX2 tier hand-rolls its loop
+fn classify_blocks_with(
+    input: &[u8],
+    out: &mut Vec<BlockMasks>,
+    classify: impl Fn(&[u8]) -> BlockMasks,
+) {
+    let mut offset = 0;
+    while offset + BLOCK <= input.len() {
+        out.push(classify(&input[offset..offset + BLOCK]));
+        offset += BLOCK;
+    }
+    let tail = input.len() - offset;
+    if tail > 0 {
+        let mut padded = [b' '; BLOCK];
+        padded[..tail].copy_from_slice(&input[offset..]);
+        out.push(classify(&padded));
+    }
+}
+
+/// Per-byte block classifier — the portability tier of
+/// [`json_classify_blocks`] and the classification oracle for its
+/// equivalence tests (character-class membership, not the SIMD compares).
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+fn scalar_classify_block(block: &[u8]) -> BlockMasks {
+    let mut m = BlockMasks::default();
+    for (i, &b) in block.iter().enumerate() {
+        let bit = 1u64 << i;
+        match b {
+            b'\\' => m.backslash |= bit,
+            b'"' => m.quote_raw |= bit,
+            b'{' | b'}' | b'[' | b']' | b':' | b',' => m.op |= bit,
+            b' ' | b'\t' | b'\n' | b'\r' => m.ws |= bit,
+            _ => {}
+        }
+    }
+    m
+}
+
+/// Sentinel for "stream exhausted" in [`JsonTokenCursor`]. Valid offsets
+/// stay far below it (documents are capped at 16 MiB).
+const NO_TOKEN: u32 = u32::MAX;
+
+/// Streaming consumer of [`json_classify_blocks`] output: yields the same
+/// token offsets, in the same order, as the batch structural index —
+/// proven by the tier-equivalence proptests — but resolves each block's
+/// escape/string state lazily and hands tokens straight out of the emit
+/// mask (`trailing_zeros` + clear-lowest-bit) instead of round-tripping
+/// them through a `Vec<u32>`. One-token lookahead (`peek`/`bump`) is
+/// exactly the access pattern the grammar machine needs; nothing ever
+/// rewinds further, so no other state is kept.
+///
+/// Pull-through shape: the current token is always materialized, so
+/// `peek` is a pure register read (the grammar re-peeks every token at
+/// least once — cascade re-entry makes it several times) and the bit-pop
+/// work happens once per token in `bump`. The first pull happens at
+/// construction.
+#[derive(Debug)]
+pub struct JsonTokenCursor<'a> {
+    blocks: &'a [BlockMasks],
+    next_block: usize,
+    /// Byte offset of the block whose unconsumed bits are in `emit`.
+    base: usize,
+    emit: u64,
+    state: ScanState,
+    /// The current (peekable) token, or [`NO_TOKEN`] past the end.
+    current: u32,
+}
+
+impl<'a> JsonTokenCursor<'a> {
+    pub fn new(blocks: &'a [BlockMasks]) -> JsonTokenCursor<'a> {
+        let mut cursor = JsonTokenCursor {
+            blocks,
+            next_block: 0,
+            base: 0,
+            emit: 0,
+            state: ScanState::default(),
+            current: NO_TOKEN,
+        };
+        cursor.current = cursor.pull();
+        cursor
+    }
+
+    /// The next unconsumed token's byte offset, without consuming it.
+    /// `None` means the input has no further tokens (string interiors
+    /// never emit, so an unterminated string also lands here — the
+    /// grammar owns the typed error).
+    #[inline]
+    pub fn peek(&self) -> Option<u32> {
+        if self.current == NO_TOKEN { None } else { Some(self.current) }
+    }
+
+    /// Consume the current token and pull the next one forward.
+    #[inline]
+    pub fn bump(&mut self) {
+        self.current = self.pull();
+    }
+
+    /// Next token offset out of the mask stream, resolving blocks forward
+    /// as needed; [`NO_TOKEN`] when the stream is exhausted.
+    #[inline]
+    fn pull(&mut self) -> u32 {
+        loop {
+            if self.emit != 0 {
+                let at = (self.base + self.emit.trailing_zeros() as usize) as u32;
+                self.emit &= self.emit - 1;
+                return at;
+            }
+            let Some(&masks) = self.blocks.get(self.next_block) else {
+                return NO_TOKEN;
+            };
+            self.emit = resolve_block(masks, &mut self.state);
+            self.base = self.next_block * BLOCK;
+            self.next_block += 1;
+        }
+    }
+}
+
 // ---- x86-64 tiers -----------------------------------------------------------
 
+/// Cached AVX2/SSE2 tier decision (the `crlf.rs` `AtomicU8` pattern),
+/// shared by the batch scan and the classify-blocks entry.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-fn x86_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
+fn x86_level() -> u8 {
     static SIMD_LEVEL: AtomicU8 = AtomicU8::new(SIMD_LEVEL_UNKNOWN);
-
     let mut level = SIMD_LEVEL.load(Ordering::Relaxed);
     if level == SIMD_LEVEL_UNKNOWN {
         level = if std::arch::is_x86_feature_detected!("avx2") {
@@ -250,8 +417,13 @@ fn x86_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
         };
         SIMD_LEVEL.store(level, Ordering::Relaxed);
     }
+    level
+}
 
-    if level == SIMD_LEVEL_AVX2 {
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn x86_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
+    if x86_level() == SIMD_LEVEL_AVX2 {
         // SAFETY: runtime dispatch above guarantees AVX2 before calling.
         unsafe { avx2_scan(input, out) }
     } else {
@@ -259,61 +431,71 @@ fn x86_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
     }
 }
 
-/// AVX2 block classifier: two 32-byte halves per 64-byte block; 10
-/// compares per half (`|0x20` folds `[`→`{`, `]`→`}` so the six
-/// structural chars need four compares).
+/// One 32-byte half of the AVX2 classification: 10 compares (`|0x20`
+/// folds `[`→`{`, `]`→`}` so the six structural chars need four).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn avx2_half(ptr: *const u8) -> (u32, u32, u32, u32) {
+    // SAFETY: the caller passes `ptr..ptr+32` inside its buffer; unaligned
+    // loads are what `_mm256_loadu_si256` is for.
+    let v = unsafe { _mm256_loadu_si256(ptr.cast::<__m256i>()) };
+    let bs = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\\' as i8))) as u32;
+    let quote = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'"' as i8))) as u32;
+    // Fold case: `[` (0x5B) | 0x20 = `{` (0x7B), `]` | 0x20 = `}`.
+    let folded = _mm256_or_si256(v, _mm256_set1_epi8(0x20));
+    let op = _mm256_movemask_epi8(_mm256_or_si256(
+        _mm256_or_si256(
+            _mm256_cmpeq_epi8(folded, _mm256_set1_epi8(b'{' as i8)),
+            _mm256_cmpeq_epi8(folded, _mm256_set1_epi8(b'}' as i8)),
+        ),
+        _mm256_or_si256(
+            _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b':' as i8)),
+            _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b',' as i8)),
+        ),
+    )) as u32;
+    let ws = _mm256_movemask_epi8(_mm256_or_si256(
+        _mm256_or_si256(
+            _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b' ' as i8)),
+            _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\t' as i8)),
+        ),
+        _mm256_or_si256(
+            _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8)),
+            _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\r' as i8)),
+        ),
+    )) as u32;
+    (bs, quote, op, ws)
+}
+
+/// AVX2 64-byte block classifier (two halves).
+///
+/// SAFETY contract: `ptr..ptr + 64` must be readable.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn avx2_block(ptr: *const u8) -> BlockMasks {
+    // SAFETY: caller guarantees 64 readable bytes; each half reads 32.
+    let (bs0, q0, op0, ws0) = unsafe { avx2_half(ptr) };
+    // SAFETY: as above — the second half ends exactly at ptr + 64.
+    let (bs1, q1, op1, ws1) = unsafe { avx2_half(ptr.add(32)) };
+    BlockMasks {
+        backslash: (bs0 as u64) | ((bs1 as u64) << 32),
+        quote_raw: (q0 as u64) | ((q1 as u64) << 32),
+        op: (op0 as u64) | ((op1 as u64) << 32),
+        ws: (ws0 as u64) | ((ws1 as u64) << 32),
+    }
+}
+
+/// AVX2 tier of the batch scan.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    unsafe fn half(ptr: *const u8) -> (u32, u32, u32, u32) {
-        // SAFETY: the caller passes `ptr..ptr+32` inside the input slice
-        // (the `offset + BLOCK <= len` loop bound); unaligned loads are
-        // what `_mm256_loadu_si256` is for.
-        let v = unsafe { _mm256_loadu_si256(ptr.cast::<__m256i>()) };
-        let bs = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\\' as i8))) as u32;
-        let quote = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'"' as i8))) as u32;
-        // Fold case: `[` (0x5B) | 0x20 = `{` (0x7B), `]` | 0x20 = `}`.
-        let folded = _mm256_or_si256(v, _mm256_set1_epi8(0x20));
-        let op = _mm256_movemask_epi8(_mm256_or_si256(
-            _mm256_or_si256(
-                _mm256_cmpeq_epi8(folded, _mm256_set1_epi8(b'{' as i8)),
-                _mm256_cmpeq_epi8(folded, _mm256_set1_epi8(b'}' as i8)),
-            ),
-            _mm256_or_si256(
-                _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b':' as i8)),
-                _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b',' as i8)),
-            ),
-        )) as u32;
-        let ws = _mm256_movemask_epi8(_mm256_or_si256(
-            _mm256_or_si256(
-                _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b' ' as i8)),
-                _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\t' as i8)),
-            ),
-            _mm256_or_si256(
-                _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8)),
-                _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\r' as i8)),
-            ),
-        )) as u32;
-        (bs, quote, op, ws)
-    }
-
     let mut state = ScanState::default();
     let mut offset = 0;
     let ptr = input.as_ptr();
     while offset + BLOCK <= input.len() {
-        // SAFETY: `offset + 64 <= len`, so both 32-byte unaligned loads
-        // stay inside the slice.
-        let (bs0, q0, op0, ws0) = unsafe { half(ptr.add(offset)) };
-        // SAFETY: as above — the second half ends exactly at offset + 64.
-        let (bs1, q1, op1, ws1) = unsafe { half(ptr.add(offset + 32)) };
-        let masks = BlockMasks {
-            backslash: (bs0 as u64) | ((bs1 as u64) << 32),
-            quote_raw: (q0 as u64) | ((q1 as u64) << 32),
-            op: (op0 as u64) | ((op1 as u64) << 32),
-            ws: (ws0 as u64) | ((ws1 as u64) << 32),
-        };
+        // SAFETY: `offset + 64 <= len` bounds the block inside the slice.
+        let masks = unsafe { avx2_block(ptr.add(offset)) };
         flush_block(offset, masks, &mut state, out);
         offset += BLOCK;
     }
@@ -322,78 +504,117 @@ unsafe fn avx2_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
         let mut padded = [b' '; BLOCK];
         padded[..tail].copy_from_slice(&input[offset..]);
         // The padded tail rides the same AVX2 classifier as full blocks.
-        // SAFETY: `padded` is a 64-byte stack array; both halves in bounds.
-        let (bs0, q0, op0, ws0) = unsafe { half(padded.as_ptr()) };
-        // SAFETY: as above.
-        let (bs1, q1, op1, ws1) = unsafe { half(padded.as_ptr().add(32)) };
-        let masks = BlockMasks {
-            backslash: (bs0 as u64) | ((bs1 as u64) << 32),
-            quote_raw: (q0 as u64) | ((q1 as u64) << 32),
-            op: (op0 as u64) | ((op1 as u64) << 32),
-            ws: (ws0 as u64) | ((ws1 as u64) << 32),
-        };
+        // SAFETY: `padded` is a 64-byte stack array.
+        let masks = unsafe { avx2_block(padded.as_ptr()) };
         flush_block(offset, masks, &mut state, out);
     }
     out.len()
 }
 
+/// AVX2 tier of [`json_classify_blocks`]: the same tight classify loop as
+/// [`avx2_scan`], storing raw 32 B masks per block instead of flattening
+/// to indices — escape/string resolution moves to the consumer
+/// ([`JsonTokenCursor`]), which is the ADR-0047 D2-item-3 stage fusion.
+/// The store goes through a raw cursor over one up-front reservation:
+/// `Vec::push` per block made LLVM SLP-vectorize the mask combining
+/// across iterations into a `vpinsrb` storm (~4× the whole batch scan,
+/// perf-annotated in the stage-fusion artifact) — the ptr-write shape
+/// keeps the movemask results scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_classify_blocks(input: &[u8], out: &mut Vec<BlockMasks>) {
+    let n_blocks = input.len().div_ceil(BLOCK);
+    out.reserve(n_blocks);
+    let dst = out.as_mut_ptr();
+    let ptr = input.as_ptr();
+    let mut i = 0;
+    let mut offset = 0;
+    while offset + BLOCK <= input.len() {
+        // SAFETY: `offset + 64 <= len` bounds the block inside the slice;
+        // `i < n_blocks` entries fit the reservation above.
+        unsafe { dst.add(i).write(avx2_block(ptr.add(offset))) };
+        i += 1;
+        offset += BLOCK;
+    }
+    let tail = input.len() - offset;
+    if tail > 0 {
+        let mut padded = [b' '; BLOCK];
+        padded[..tail].copy_from_slice(&input[offset..]);
+        // SAFETY: `padded` is a 64-byte stack array; the write is the
+        // `n_blocks`-th entry of the reservation.
+        unsafe { dst.add(i).write(avx2_block(padded.as_ptr())) };
+        i += 1;
+    }
+    // SAFETY: exactly `i <= n_blocks` entries were initialized above.
+    unsafe { out.set_len(i) };
+}
+
+/// One 16-byte quarter of the SSE2 classification.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn sse2_quarter(chunk: &[u8]) -> (u16, u16, u16, u16) {
+    debug_assert_eq!(chunk.len(), 16);
+    // SAFETY: SSE2 is baseline on x86-64; the load reads exactly the
+    // 16 bytes of `chunk` (length asserted above).
+    unsafe {
+        let v = _mm_loadu_si128(chunk.as_ptr().cast::<__m128i>());
+        let bs = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(b'\\' as i8))) as u16;
+        let quote = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(b'"' as i8))) as u16;
+        let folded = _mm_or_si128(v, _mm_set1_epi8(0x20));
+        let op = _mm_movemask_epi8(_mm_or_si128(
+            _mm_or_si128(
+                _mm_cmpeq_epi8(folded, _mm_set1_epi8(b'{' as i8)),
+                _mm_cmpeq_epi8(folded, _mm_set1_epi8(b'}' as i8)),
+            ),
+            _mm_or_si128(
+                _mm_cmpeq_epi8(v, _mm_set1_epi8(b':' as i8)),
+                _mm_cmpeq_epi8(v, _mm_set1_epi8(b',' as i8)),
+            ),
+        )) as u16;
+        let ws = _mm_movemask_epi8(_mm_or_si128(
+            _mm_or_si128(
+                _mm_cmpeq_epi8(v, _mm_set1_epi8(b' ' as i8)),
+                _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\t' as i8)),
+            ),
+            _mm_or_si128(
+                _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\n' as i8)),
+                _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\r' as i8)),
+            ),
+        )) as u16;
+        (bs, quote, op, ws)
+    }
+}
+
+/// SSE2 64-byte block classifier (four quarters).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn sse2_block(block: &[u8]) -> BlockMasks {
+    let mut m = BlockMasks::default();
+    for (i, chunk) in block.chunks_exact(16).enumerate() {
+        let (bs, q, op, ws) = sse2_quarter(chunk);
+        let shift = i * 16;
+        m.backslash |= (bs as u64) << shift;
+        m.quote_raw |= (q as u64) << shift;
+        m.op |= (op as u64) << shift;
+        m.ws |= (ws as u64) << shift;
+    }
+    m
+}
+
 /// SSE2 baseline: four 16-byte quarters per block, same classification.
 #[cfg(target_arch = "x86_64")]
 fn sse2_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
-    #[inline]
-    fn quarter(chunk: &[u8]) -> (u16, u16, u16, u16) {
-        debug_assert_eq!(chunk.len(), 16);
-        // SAFETY: SSE2 is baseline on x86-64; the load reads exactly the
-        // 16 bytes of `chunk` (length asserted above).
-        unsafe {
-            let v = _mm_loadu_si128(chunk.as_ptr().cast::<__m128i>());
-            let bs = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(b'\\' as i8))) as u16;
-            let quote = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(b'"' as i8))) as u16;
-            let folded = _mm_or_si128(v, _mm_set1_epi8(0x20));
-            let op = _mm_movemask_epi8(_mm_or_si128(
-                _mm_or_si128(
-                    _mm_cmpeq_epi8(folded, _mm_set1_epi8(b'{' as i8)),
-                    _mm_cmpeq_epi8(folded, _mm_set1_epi8(b'}' as i8)),
-                ),
-                _mm_or_si128(
-                    _mm_cmpeq_epi8(v, _mm_set1_epi8(b':' as i8)),
-                    _mm_cmpeq_epi8(v, _mm_set1_epi8(b',' as i8)),
-                ),
-            )) as u16;
-            let ws = _mm_movemask_epi8(_mm_or_si128(
-                _mm_or_si128(
-                    _mm_cmpeq_epi8(v, _mm_set1_epi8(b' ' as i8)),
-                    _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\t' as i8)),
-                ),
-                _mm_or_si128(
-                    _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\n' as i8)),
-                    _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\r' as i8)),
-                ),
-            )) as u16;
-            (bs, quote, op, ws)
-        }
-    }
-
-    scan_blocks(input, out, |block| {
-        let mut m = BlockMasks::default();
-        for (i, chunk) in block.chunks_exact(16).enumerate() {
-            let (bs, q, op, ws) = quarter(chunk);
-            let shift = i * 16;
-            m.backslash |= (bs as u64) << shift;
-            m.quote_raw |= (q as u64) << shift;
-            m.op |= (op as u64) << shift;
-            m.ws |= (ws as u64) << shift;
-        }
-        m
-    })
+    scan_blocks(input, out, sse2_block)
 }
 
 // ---- aarch64 tier -----------------------------------------------------------
 
-/// NEON: 16-lane compares collapsed with the `vshrn` nibble-movemask idiom
-/// (one nibble per lane), exactly as `crlf.rs` does.
+/// NEON 64-byte block classifier: 16-lane compares collapsed with the
+/// `vshrn` nibble-movemask idiom (one nibble per lane), exactly as
+/// `crlf.rs` does.
 #[cfg(target_arch = "aarch64")]
-fn neon_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
+#[inline]
+fn neon_block(block: &[u8]) -> BlockMasks {
     use core::arch::aarch64::{
         uint8x16_t, vceqq_u8, vdupq_n_u8, vget_lane_u64, vld1q_u8, vorrq_u8, vreinterpret_u64_u8,
         vreinterpretq_u16_u8, vshrn_n_u16,
@@ -417,35 +638,39 @@ fn neon_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
         bits
     }
 
-    scan_blocks(input, out, |block| {
-        let mut m = BlockMasks::default();
-        for (i, chunk) in block.chunks_exact(16).enumerate() {
-            // SAFETY: `chunk` is exactly 16 bytes; NEON is baseline.
-            let (bs, q, op, ws) = unsafe {
-                let v = vld1q_u8(chunk.as_ptr());
-                let bs = to_bits(vceqq_u8(v, vdupq_n_u8(b'\\')));
-                let q = to_bits(vceqq_u8(v, vdupq_n_u8(b'"')));
-                let op = to_bits(vorrq_u8(
-                    vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'{')), vceqq_u8(v, vdupq_n_u8(b'}'))),
-                    vorrq_u8(
-                        vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'[')), vceqq_u8(v, vdupq_n_u8(b']'))),
-                        vorrq_u8(vceqq_u8(v, vdupq_n_u8(b':')), vceqq_u8(v, vdupq_n_u8(b','))),
-                    ),
-                ));
-                let ws = to_bits(vorrq_u8(
-                    vorrq_u8(vceqq_u8(v, vdupq_n_u8(b' ')), vceqq_u8(v, vdupq_n_u8(b'\t'))),
-                    vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'\n')), vceqq_u8(v, vdupq_n_u8(b'\r'))),
-                ));
-                (bs, q, op, ws)
-            };
-            let shift = i * 16;
-            m.backslash |= (bs as u64) << shift;
-            m.quote_raw |= (q as u64) << shift;
-            m.op |= (op as u64) << shift;
-            m.ws |= (ws as u64) << shift;
-        }
-        m
-    });
+    let mut m = BlockMasks::default();
+    for (i, chunk) in block.chunks_exact(16).enumerate() {
+        // SAFETY: `chunk` is exactly 16 bytes; NEON is baseline.
+        let (bs, q, op, ws) = unsafe {
+            let v = vld1q_u8(chunk.as_ptr());
+            let bs = to_bits(vceqq_u8(v, vdupq_n_u8(b'\\')));
+            let q = to_bits(vceqq_u8(v, vdupq_n_u8(b'"')));
+            let op = to_bits(vorrq_u8(
+                vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'{')), vceqq_u8(v, vdupq_n_u8(b'}'))),
+                vorrq_u8(
+                    vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'[')), vceqq_u8(v, vdupq_n_u8(b']'))),
+                    vorrq_u8(vceqq_u8(v, vdupq_n_u8(b':')), vceqq_u8(v, vdupq_n_u8(b','))),
+                ),
+            ));
+            let ws = to_bits(vorrq_u8(
+                vorrq_u8(vceqq_u8(v, vdupq_n_u8(b' ')), vceqq_u8(v, vdupq_n_u8(b'\t'))),
+                vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'\n')), vceqq_u8(v, vdupq_n_u8(b'\r'))),
+            ));
+            (bs, q, op, ws)
+        };
+        let shift = i * 16;
+        m.backslash |= (bs as u64) << shift;
+        m.quote_raw |= (q as u64) << shift;
+        m.op |= (op as u64) << shift;
+        m.ws |= (ws as u64) << shift;
+    }
+    m
+}
+
+/// NEON tier of the batch scan.
+#[cfg(target_arch = "aarch64")]
+fn neon_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
+    scan_blocks(input, out, neon_block)
 }
 
 // ---- fused string-content copy (ADR-0047 K1) --------------------------------
@@ -544,6 +769,81 @@ pub fn json_copy_unescaped_short(window: &[u8], len: usize, out: &mut Vec<u8>) -
         }
     }
     scalar_json_copy_unescaped_short(window, len, out)
+}
+
+/// [`json_copy_unescaped_short`] with the caller's one-byte header fused
+/// in: `lead` + payload land through a single reservation, so the fixstr
+/// emit path pays no separate tag push (a `Vec` capacity branch per
+/// string — measured at the 0.6898-vs-0.70 wire margin, stage-fusion
+/// slice). Same contract otherwise: `false` leaves `out` logically
+/// unchanged.
+#[inline]
+pub fn json_copy_unescaped_fixstr(window: &[u8], len: usize, lead: u8, out: &mut Vec<u8>) -> bool {
+    assert!(window.len() >= 32, "caller guarantees 32 bytes of window");
+    assert!((1..=31).contains(&len), "fixstr payload length");
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    {
+        if x86_level() == SIMD_LEVEL_AVX2 {
+            // SAFETY: runtime dispatch above guarantees AVX2; the length
+            // preconditions were asserted at entry.
+            return unsafe { avx2_copy_unescaped_fixstr(window, len, lead, out) };
+        }
+    }
+    scalar_json_copy_unescaped_fixstr(window, len, lead, out)
+}
+
+/// Safe tier of [`json_copy_unescaped_fixstr`] (and the Miri path):
+/// header push + the SWAR short copy, rolled back together on a special.
+pub fn scalar_json_copy_unescaped_fixstr(
+    window: &[u8],
+    len: usize,
+    lead: u8,
+    out: &mut Vec<u8>,
+) -> bool {
+    let base = out.len();
+    out.push(lead);
+    if scalar_json_copy_unescaped_short(window, len, out) {
+        true
+    } else {
+        out.truncate(base);
+        false
+    }
+}
+
+/// AVX2 tier of [`json_copy_unescaped_fixstr`]: one load, one masked
+/// classify, one header byte + one 32-byte store through one reservation.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_copy_unescaped_fixstr(
+    window: &[u8],
+    len: usize,
+    lead: u8,
+    out: &mut Vec<u8>,
+) -> bool {
+    use core::arch::x86_64::_mm256_min_epu8;
+    debug_assert!(window.len() >= 32);
+    debug_assert!((1..=31).contains(&len));
+    // SAFETY: `window.len() >= 32` (asserted by the dispatcher).
+    let v = unsafe { _mm256_loadu_si256(window.as_ptr().cast::<__m256i>()) };
+    let backslash = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\\' as i8));
+    let control = _mm256_cmpeq_epi8(_mm256_min_epu8(v, _mm256_set1_epi8(0x1F)), v);
+    let special = _mm256_movemask_epi8(_mm256_or_si256(backslash, control)) as u32;
+    if special & ((1u32 << len) - 1) != 0 {
+        return false;
+    }
+    let base = out.len();
+    out.reserve(33);
+    // SAFETY: `reserve(33)` guarantees the header byte + 32-byte store fit
+    // in spare capacity; `set_len(base + 1 + len)` exposes the header plus
+    // the first `len` payload bytes, all initialized by the stores (the
+    // tail stays spare capacity).
+    unsafe {
+        let p = out.as_mut_ptr().add(base);
+        p.write(lead);
+        _mm256_storeu_si256(p.add(1).cast::<__m256i>(), v);
+        out.set_len(base + 1 + len);
+    }
+    true
 }
 
 /// Safe SWAR tier of [`json_copy_unescaped_short`] (and the Miri path).
@@ -738,9 +1038,33 @@ mod tests {
         assert!(scan(b" \t\r\n  ").is_empty());
     }
 
+    /// Collect every token the streaming cursor yields over the given
+    /// block classification — the stage-fusion consumption path.
+    fn drain_cursor(blocks: &[BlockMasks]) -> Vec<u32> {
+        let mut cur = JsonTokenCursor::new(blocks);
+        let mut out = Vec::new();
+        while let Some(at) = cur.peek() {
+            // Peek must be idempotent until bumped.
+            assert_eq!(cur.peek(), Some(at));
+            out.push(at);
+            cur.bump();
+        }
+        assert_eq!(cur.peek(), None, "exhausted cursor stays exhausted");
+        out
+    }
+
+    #[test]
+    fn cursor_streams_the_batch_index() {
+        let doc = br#"{"a":12, "b":[true,null], "k\"ey": "{}[]:,"}"#;
+        let mut blocks = Vec::new();
+        json_classify_blocks(doc, &mut blocks);
+        assert_eq!(drain_cursor(&blocks), scan(doc));
+    }
+
     /// Every tier must emit identical indices for arbitrary bytes — the
-    /// crlf.rs equivalence-suite pattern. JSON-ish inputs weight the
-    /// interesting characters; raw bytes cover the rest.
+    /// crlf.rs equivalence-suite pattern, extended to the stage-fusion
+    /// cursor (dispatched and scalar-classified). JSON-ish inputs weight
+    /// the interesting characters; raw bytes cover the rest.
     mod equivalence {
         use super::*;
         use proptest::prelude::*;
@@ -752,13 +1076,22 @@ mod tests {
             let mut scalar = Vec::new();
             let n = scalar_json_scan_structurals(input, &mut scalar);
             scalar.truncate(n);
-            let mut tiers = vec![dispatched, scalar];
+            let mut blocks = Vec::new();
+            json_classify_blocks(input, &mut blocks);
+            let streamed = drain_cursor(&blocks);
+            blocks.clear();
+            super::super::classify_blocks_with(input, &mut blocks, scalar_classify_block);
+            let streamed_scalar_classify = drain_cursor(&blocks);
+            let mut tiers = vec![dispatched, scalar, streamed, streamed_scalar_classify];
             #[cfg(target_arch = "x86_64")]
             {
                 let mut sse2 = Vec::new();
                 let n = super::super::sse2_scan(input, &mut sse2);
                 sse2.truncate(n);
                 tiers.push(sse2);
+                let mut blocks = Vec::new();
+                super::super::classify_blocks_with(input, &mut blocks, sse2_block);
+                tiers.push(drain_cursor(&blocks));
             }
             tiers
         }
@@ -842,10 +1175,12 @@ mod tests {
 
         /// Short-kernel sweep: every `len`, every special position inside
         /// and *outside* the live length (outside must not veto), both
-        /// tiers vs the oracle.
+        /// tiers vs the oracle — and the header-fused variant, whose
+        /// output must be exactly `lead` + the plain kernel's payload.
         #[test]
         fn short_kernel_matches_the_oracle_with_masked_tail() {
             let tiers = [json_copy_unescaped_short, scalar_json_copy_unescaped_short];
+            let fixstr_tiers = [json_copy_unescaped_fixstr, scalar_json_copy_unescaped_fixstr];
             for len in 1..=31usize {
                 let mut window = [0u8; 40];
                 for (i, b) in window.iter_mut().enumerate() {
@@ -862,6 +1197,18 @@ mod tests {
                         if ok {
                             assert_eq!(&out[..3], b"pre");
                             assert_eq!(&out[3..], &w[..len]);
+                        } else {
+                            assert_eq!(out, b"pre");
+                        }
+                    }
+                    for tier in fixstr_tiers {
+                        let mut out = b"pre".to_vec();
+                        let ok = tier(&w[..40], len, 0x8Eu8, &mut out);
+                        assert_eq!(ok, expect, "fixstr len {len}, special at {special_at}");
+                        if ok {
+                            assert_eq!(&out[..3], b"pre");
+                            assert_eq!(out[3], 0x8E);
+                            assert_eq!(&out[4..], &w[..len]);
                         } else {
                             assert_eq!(out, b"pre");
                         }

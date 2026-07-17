@@ -81,11 +81,25 @@ All unsafe code is platform intrinsics in `crlf.rs`, `group16.rs`, and
   `reserve(32)` spare capacity and `set_len(base + len)` exposes only the
   `len` initialized bytes. Exhaustive sweep test: every length × every
   special position inside and outside the live window, both tiers.
+- **K2b `json_copy_unescaped_fixstr`** (header-fused K2, stage-fusion
+  slice): identical load/mask discipline to K2; `reserve(33)` covers the
+  one header byte plus the 32-byte store, and `set_len(base + 1 + len)`
+  exposes the header plus the `len` initialized payload bytes. The
+  `false` return runs before any store bookkeeping, leaving `out`
+  untouched. Covered by the same exhaustive sweep (header byte + payload
+  equality asserted per tier).
 - **K3 `flush_block` unchecked index writes**: `reserve(64)` precedes the
   bit-loop (a 64-bit emit mask can set at most 64 bits), every write
   lands at `out.len() + k`, `k < 64`, and `set_len` exposes exactly the
   written prefix. The existing tier-equivalence proptests (dispatched,
   forced-SSE2, scalar oracle) cover it on arbitrary and JSON-ish bytes.
+- **Stage fusion (`avx2_classify_blocks`, slice 2)**: the per-block
+  64-byte reads follow the same `offset + 64 <= len` bound as
+  `avx2_scan` (padded stack tail identical); mask stores go through a
+  raw cursor over one `reserve(div_ceil(len, 64))` reservation with
+  `set_len` exposing exactly the blocks written (a `Vec::push` loop
+  variant was repaired out after LLVM SLP-vectorized it into a
+  `vpinsrb` storm — see the stage-fusion artifact).
 
 ## `utf8.rs` — UTF-8 validation kernel (M3-S05 slice 3)
 

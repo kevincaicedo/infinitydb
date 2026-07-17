@@ -3,279 +3,184 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>InfinityDB — One engine for the cache, the ledger, the queue, the document, and the vector</title>
+<title>InfinityDB — One engine for the cache, the ledger, the document, the queue, and the vector</title>
 <meta name="description" content="InfinityDB is an extensible Redis-compatible key/value engine kernel in Rust: durable KV today, documents, queues, and vector search on a gated milestone train.">
-<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='20'%20fill='%23201826'/%3E%3Ctext%20x='50'%20y='71'%20font-size='62'%20text-anchor='middle'%20fill='%23cf7ff5'%20font-family='system-ui'%3E%E2%88%9E%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2018'%3E%3Ccircle%20cx='10'%20cy='9'%20r='7'%20fill='none'%20stroke='%237c5cff'%20stroke-width='2.4'/%3E%3Ccircle%20cx='24'%20cy='9'%20r='7'%20fill='none'%20stroke='%233ee6c4'%20stroke-width='2.4'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="assets/site.css">
 <style>
 /* ---- landing-only styles ---- */
 .hero { position: relative; overflow: hidden; }
-.hero-glow { position: absolute; inset: 0; background: radial-gradient(720px 460px at 38% -8%, oklch(0.7 0.2 310 / 0.15), transparent 70%); pointer-events: none; }
-.hero-dots {
+.hero-grid-bg {
   position: absolute; inset: 0; pointer-events: none;
-  background-image: radial-gradient(oklch(0.94 0.004 310 / 0.06) 1px, transparent 1px);
-  background-size: 26px 26px;
-  -webkit-mask-image: linear-gradient(to bottom, black, transparent 78%);
-  mask-image: linear-gradient(to bottom, black, transparent 78%);
+  background-image: linear-gradient(rgba(139,144,168,0.055) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(139,144,168,0.055) 1px, transparent 1px);
+  background-size: 48px 48px;
+  -webkit-mask-image: linear-gradient(to bottom, black 20%, transparent 95%);
+  mask-image: linear-gradient(to bottom, black 20%, transparent 95%);
 }
-.hero-inner { position: relative; max-width: var(--container); margin: 0 auto; padding: clamp(56px, 9vw, 96px) var(--pad-x) clamp(64px, 10vw, 104px); }
-.hero-grid { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr); gap: clamp(36px, 5vw, 72px); align-items: center; }
-@media (max-width: 980px) { .hero-grid { grid-template-columns: minmax(0, 1fr); } }
-.hero-grid > * { min-width: 0; }
+.hero-glow-v { position: absolute; top: -180px; left: -140px; width: 560px; height: 560px; pointer-events: none; background: radial-gradient(circle, rgba(124,92,255,0.16) 0%, transparent 65%); }
+.hero-glow-t { position: absolute; top: 40px; right: -160px; width: 620px; height: 620px; pointer-events: none; background: radial-gradient(circle, rgba(62,230,196,0.10) 0%, transparent 65%); }
+.hero-inner {
+  position: relative; max-width: var(--container); margin: 0 auto;
+  padding: clamp(56px, 8vw, 88px) var(--pad-x) 64px;
+  display: grid; grid-template-columns: minmax(0, 460px) minmax(0, 1fr);
+  gap: clamp(36px, 5vw, 56px); align-items: center;
+}
+@media (max-width: 980px) { .hero-inner { grid-template-columns: minmax(0, 1fr); } }
+.hero-kicker { font: 500 12px/1.5 var(--mono); letter-spacing: 0.18em; color: var(--teal); }
 .hero h1 {
-  font-size: clamp(34px, 4.6vw, 56px); font-weight: 700; letter-spacing: -0.035em;
-  line-height: 1.06; margin: 0 0 24px; text-wrap: balance;
+  margin: 20px 0 0; font: 800 clamp(36px, 4.6vw, 52px)/1.04 var(--sans);
+  letter-spacing: -0.025em; color: var(--text); text-wrap: balance;
 }
-.hero h1 .hl { box-shadow: inset 0 -0.16em oklch(0.7 0.2 310 / 0.55); }
-.hero .sub { font-size: clamp(16px, 2vw, 18px); line-height: 1.65; color: var(--text-muted); max-width: 60ch; margin: 0 0 32px; }
-.hero-ctas { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-.hero-tape { font: 400 11px/1.9 var(--mono); letter-spacing: 0.1em; color: var(--text-faint); margin: 30px 0 0; }
-.hero .terminal { max-width: none; margin: 0; }
-.terminal-body .line, .terminal-body .line * { font-size: 12.5px; }
+.hero h1 .grad {
+  background: linear-gradient(90deg, #7c5cff, #3ee6c4);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.hero .sub { margin: 22px 0 0; font-size: 16px; line-height: 1.65; color: var(--text-muted); max-width: 46ch; text-wrap: pretty; }
+.hero .sub code { font-size: 14px; border: 0; background: none; padding: 0; color: var(--text); }
+.install-bar {
+  display: flex; align-items: center; border: 1px solid rgba(124,92,255,0.45);
+  border-radius: 10px; background: var(--bg-raise); overflow: hidden; margin-top: 30px;
+}
+.install-bar .cmd {
+  flex: 1; padding: 14px 18px; font: 400 13px/1 var(--mono); color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.install-bar .cmd .s { color: var(--teal); }
+.install-bar button {
+  border: 0; border-left: 1px solid rgba(124,92,255,0.35); background: rgba(124,92,255,0.12);
+  color: var(--violet-soft); font: 500 11px/1 var(--mono); letter-spacing: 0.12em;
+  padding: 16px 18px; cursor: pointer;
+}
+.install-bar button:hover { background: rgba(124,92,255,0.28); color: var(--text); }
+.hero-note { margin: 10px 0 0; font: 400 10.5px/1.7 var(--mono); letter-spacing: 0.04em; color: var(--text-faint); }
+.hero-ctas { display: flex; gap: 14px; margin-top: 16px; flex-wrap: wrap; }
+.hero-chips { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 30px; }
+.hero-chip {
+  font: 400 10.5px/1 var(--mono); letter-spacing: 0.06em; color: var(--text-muted);
+  border: 1px solid rgba(139,144,168,0.22); border-radius: 99px; padding: 6px 12px; white-space: nowrap;
+}
+.hero-chip .t { color: var(--teal); }
+.hero-chip .p { color: var(--violet-soft); }
+.spine-svg text { font-family: 'JetBrains Mono', ui-monospace, monospace; }
 
 .status-strip {
-  display: flex; gap: 0; flex-wrap: wrap; margin: 60px auto 0; max-width: 1010px;
-  border: 1px solid var(--border-strong); border-radius: 12px; overflow: hidden;
+  position: relative; display: flex; gap: 0; flex-wrap: wrap;
+  max-width: var(--container); margin: 0 auto; padding: 0 var(--pad-x) 56px;
+}
+.status-strip .strip-box {
+  display: flex; gap: 0; flex-wrap: wrap; width: 100%;
+  border: 1px solid rgba(139,144,168,0.22); border-radius: 14px; overflow: hidden;
   background: var(--bg-raise);
 }
-.status-strip > div { flex: 1 1 260px; padding: 18px 22px; }
-.status-strip > div + div { border-left: 1px solid var(--border); }
+.status-strip .cellp { flex: 1 1 260px; padding: 18px 22px; }
+.status-strip .cellp + .cellp { border-left: 1px solid var(--border); }
 .status-strip .label { font: 500 10px/1 var(--mono); letter-spacing: 0.14em; margin: 0 0 10px; }
 .status-strip p { font-size: 13.5px; line-height: 1.6; color: var(--text-muted); margin: 0; }
-@media (max-width: 620px) { .status-strip > div + div { border-left: 0; border-top: 1px solid var(--border); } }
+@media (max-width: 620px) { .status-strip .cellp + .cellp { border-left: 0; border-top: 1px solid var(--border); } }
 
-.step-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 36px; }
-.step { border-top: 1px solid var(--border-strong); padding-top: 24px; }
-.step .n { font: 500 12px/1 var(--mono); color: var(--text-faint); margin: 0 0 14px; }
-.step h3 { font-size: 21px; margin: 0 0 10px; }
-.step p { font-size: 15px; line-height: 1.65; color: var(--text-muted); margin: 0; }
+/* workloads grid */
+.wl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 44px; }
+.wl-card {
+  background: var(--bg-raise); border: 1px solid rgba(139,144,168,0.18); border-radius: 14px;
+  padding: 26px; transition: border-color 0.2s, transform 0.2s;
+}
+.wl-card:hover { border-color: rgba(124,92,255,0.6); transform: translateY(-3px); }
+.wl-card .idx { font: 500 11px/1 var(--mono); color: var(--violet); }
+.wl-card h3 { margin: 12px 0 0; font: 700 20px/1.2 var(--sans); color: var(--text); }
+.wl-card h3 .pill { margin-left: 8px; }
+.wl-card .tagline { margin-top: 6px; font: 500 9.5px/1.5 var(--mono); letter-spacing: 0.1em; color: var(--text-faint); text-transform: uppercase; }
+.wl-card p { margin: 14px 0 0; font-size: 13.5px; line-height: 1.6; color: var(--text-muted); }
+.wl-card p code { font-size: 12px; border: 0; background: none; padding: 0; color: var(--teal); }
+.wl-card.plus {
+  background: linear-gradient(135deg, rgba(124,92,255,0.14), rgba(62,230,196,0.08));
+  border-color: rgba(62,230,196,0.45);
+}
+.wl-card.plus:hover { border-color: rgba(62,230,196,0.7); }
+.wl-card.plus .idx { color: var(--teal); }
 
-/* ---- spine diagram: the append→project machine, animated ---- */
-.spine-layout { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: clamp(32px, 5vw, 72px); align-items: start; }
-@media (max-width: 880px) { .spine-layout { grid-template-columns: 1fr; } }
-.spine-steps { display: flex; flex-direction: column; gap: 26px; margin-top: 26px; }
-.spine-step .k { font: 500 12px/1 var(--mono); color: var(--accent); margin: 0 0 10px; letter-spacing: 0.06em; }
-.spine-step p { font-size: 16px; line-height: 1.7; color: var(--text-body); margin: 0; }
-.spine-diagram { display: grid; grid-template-columns: auto 1fr; gap: 0 clamp(18px, 3vw, 40px); }
-.spine-log {
-  border: 1px solid var(--border-strong); border-radius: 8px; background: var(--bg-raise);
-  padding: 12px 10px 14px; display: flex; flex-direction: column; gap: 8px; align-self: start;
+.thesis {
+  margin-top: 48px; background: var(--bg-raise); border: 1px solid rgba(139,144,168,0.18);
+  border-radius: 14px; padding: 30px 34px;
 }
-.spine-log .file { font: 400 9px/1.3 var(--mono); letter-spacing: 0.06em; color: var(--text-faint); margin: 0 0 4px; text-align: center; }
-.spine-rec {
-  min-width: 76px; text-align: center; background: oklch(0.22 0.018 310);
-  border: 1px solid oklch(0.32 0.02 310); border-radius: 4px; padding: 8px 8px;
-  font: 500 10px/1 var(--mono); color: oklch(0.8 0.01 310);
-}
-.spine-rec.dim { opacity: 0.45; border-style: dashed; }
-.spine-log .arrow { font: 400 12px/1 var(--mono); color: var(--accent); text-align: center; padding-top: 2px; }
-.spine-projs { display: flex; flex-direction: column; gap: 14px; }
-.spine-proj {
-  position: relative; background: var(--bg-panel); border: 1px solid var(--border-strong);
-  border-radius: 8px; padding: 14px 16px;
-}
-.spine-proj::before {
-  content: ""; position: absolute; left: calc(-1 * clamp(18px, 3vw, 40px)); top: 50%;
-  width: clamp(18px, 3vw, 40px); height: 2px;
-  background: linear-gradient(to right, var(--accent), oklch(0.34 0.02 310));
-}
-.spine-proj .t { font: 500 11px/1 var(--mono); letter-spacing: 0.1em; color: var(--text); margin: 0 0 7px; }
-.spine-proj .t .pill { margin-left: 8px; }
-.spine-proj p { font-size: 12.5px; line-height: 1.55; color: var(--text-muted); margin: 0; }
+.thesis .h { font: 500 10.5px/1 var(--mono); letter-spacing: 0.16em; color: var(--text-faint); margin-bottom: 18px; }
+.thesis-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px 32px; font: 400 13.5px/1.5 var(--mono); }
+.thesis-grid .k { color: var(--violet-soft); }
+.thesis-grid .eq { color: var(--text-faint); }
+.thesis-grid .v { color: var(--text); }
+.thesis-grid .a { color: var(--teal); }
+
+/* split feature sections */
+.split { max-width: var(--container); margin: 0 auto; padding: var(--sp-7) var(--pad-x); display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 460px); gap: clamp(36px, 6vw, 64px); align-items: center; }
+.split.rev { grid-template-columns: minmax(0, 460px) minmax(0, 1fr); }
+@media (max-width: 880px) { .split, .split.rev { grid-template-columns: minmax(0, 1fr); } }
+.split h2 { margin: 14px 0 0; }
+.split .lede { margin: 18px 0 0; font-size: 15.5px; }
+.split .lede code { font-size: 13px; border: 0; background: none; padding: 0; color: var(--violet-soft); }
+.arrow-list { margin-top: 26px; display: flex; flex-direction: column; gap: 14px; }
+.arrow-list > div { display: flex; gap: 14px; align-items: baseline; }
+.arrow-list .a { font: 400 11px/1 var(--mono); color: var(--violet); flex: none; }
+.arrow-list .txt { font-size: 14px; line-height: 1.55; color: var(--text-body); }
+.mini-stats { margin-top: 26px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 480px) { .mini-stats { grid-template-columns: 1fr; } }
+.mini-stats .stat { padding: 16px; }
+.mini-stats .v { font-size: 19px; }
+
+/* measured band */
+.band { background: var(--bg-raise); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.band .stat { background: var(--bg); }
+.bench-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 40px; margin-top: 48px; }
+.bench-h { font: 500 10.5px/1.5 var(--mono); letter-spacing: 0.14em; color: var(--text-faint); margin-bottom: 16px; text-transform: uppercase; }
+.bench-svg text { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+.bench-note { margin-top: 28px; font: 400 10.5px/1.9 var(--mono); letter-spacing: 0.06em; color: var(--text-faint); }
+.bench-note a { letter-spacing: 0; }
+
+/* terminal section */
+.session { max-width: var(--container); margin: 0 auto; padding: var(--sp-7) var(--pad-x); display: grid; grid-template-columns: minmax(0, 400px) minmax(0, 1fr); gap: clamp(36px, 6vw, 64px); align-items: start; }
+@media (max-width: 880px) { .session { grid-template-columns: minmax(0, 1fr); } }
+.session .sticky { position: sticky; top: 96px; }
+@media (max-width: 880px) { .session .sticky { position: static; } }
+.session h2 { margin: 14px 0 0; }
+.session .lede { margin: 18px 0 0; font-size: 15.5px; }
+.session .fine { margin: 14px 0 0; font-size: 13.5px; line-height: 1.6; color: var(--text-faint); }
+.session .terminal { max-width: none; margin: 0; }
+
+/* cta band */
+.cta-band { position: relative; border-top: 1px solid var(--border); overflow: hidden; }
+.cta-band .glow { position: absolute; bottom: -260px; left: 50%; transform: translateX(-50%); width: 900px; height: 520px; pointer-events: none; background: radial-gradient(ellipse, rgba(124,92,255,0.18) 0%, transparent 65%); }
+.cta-band .inner { position: relative; max-width: var(--container); margin: 0 auto; padding: 112px var(--pad-x) 96px; text-align: center; }
+.cta-band h2 { margin: 0; font: 800 clamp(34px, 5vw, 48px)/1.1 var(--sans); letter-spacing: -0.025em; }
+.cta-band p { margin: 18px auto 0; color: var(--text-muted); font-size: 16px; line-height: 1.65; max-width: 520px; text-wrap: pretty; }
+.cta-band .ctas { display: flex; justify-content: center; gap: 14px; margin-top: 34px; flex-wrap: wrap; }
+
+/* hero entrance + terminal typing */
 @media (prefers-reduced-motion: no-preference) {
-  /* a new record lands at the head of the log every cycle */
-  @keyframes recLand { 0% { opacity: 0; transform: translateY(-12px); } 7% { opacity: 1; transform: none; } 100% { opacity: 1; transform: none; } }
-  .spine-rec.land { animation: recLand 7s infinite; }
-  /* the replay pulse sweeps each projection connector, staggered
-     (sweep layer on top, base line beneath) */
-  @keyframes sweep {
-    0%, 55% { background-position: -80% 0, 0 0; }
-    85%, 100% { background-position: 180% 0, 0 0; }
-  }
-  .spine-proj::before {
-    background: linear-gradient(90deg, transparent 15%, var(--accent) 50%, transparent 85%),
-                linear-gradient(to right, oklch(0.34 0.02 310), oklch(0.34 0.02 310));
-    background-size: 60% 100%, 100% 100%; background-repeat: no-repeat, no-repeat;
-    animation: sweep 7s infinite;
-  }
-  @keyframes projPing {
-    0%, 78% { border-color: var(--border-strong); box-shadow: none; }
-    84% { border-color: var(--accent-dim); box-shadow: 0 0 0 3px oklch(0.7 0.2 310 / 0.10); }
-    100% { border-color: var(--border-strong); box-shadow: none; }
-  }
-  .spine-proj { animation: projPing 7s infinite; }
-  .spine-proj:nth-child(1), .spine-proj:nth-child(1)::before { animation-delay: 0s; }
-  .spine-proj:nth-child(2), .spine-proj:nth-child(2)::before { animation-delay: 0.35s; }
-  .spine-proj:nth-child(3), .spine-proj:nth-child(3)::before { animation-delay: 0.7s; }
-  .spine-proj:nth-child(4), .spine-proj:nth-child(4)::before { animation-delay: 1.05s; }
-}
-
-/* ---- the fabric scene: cells + point-to-point rings, packets in flight ---- */
-.fabric-scene-wrap {
-  border: 1px solid var(--border-strong); border-radius: 12px; background: var(--bg-raise);
-  padding: clamp(10px, 2vw, 22px); position: relative; overflow: hidden;
-}
-.fabric-scene-wrap::before {
-  content: ""; position: absolute; inset: 0; pointer-events: none;
-  background: radial-gradient(420px 260px at 50% 52%, oklch(0.7 0.2 310 / 0.07), transparent 70%);
-}
-.fabric-scene { display: block; width: 100%; height: auto; }
-.fabric-scene .cellbox { fill: var(--bg-panel); stroke: var(--border-strong); }
-.fabric-scene .cellhead { font: 500 11px var(--mono); letter-spacing: 0.1em; fill: var(--accent); }
-.fabric-scene .cellline { font: 400 10.5px var(--mono); fill: oklch(0.68 0.015 310); }
-.fabric-scene .seamline { stroke: var(--border); }
-.fabric-scene .link { stroke: oklch(0.30 0.02 310); stroke-width: 1.5; }
-.fabric-scene .hublabel { font: 500 10.5px var(--mono); letter-spacing: 0.14em; fill: oklch(0.85 0.05 310); }
-.fabric-scene .hubnote { font: 400 9.5px var(--mono); letter-spacing: 0.1em; fill: var(--text-faint); }
-.fabric-scene .pkt { fill: var(--accent); }
-.fabric-scene .ring { fill: none; stroke: var(--accent); opacity: 0; transform-box: fill-box; transform-origin: center; }
-.fabric-scene .logtick { fill: oklch(0.32 0.02 310); }
-@media (max-width: 660px) { .fabric-scene .cellline { display: none; } }
-@media (prefers-reduced-motion: no-preference) {
-  @keyframes pktTravel {
-    0% { offset-distance: 0%; opacity: 0; }
-    6% { opacity: 1; }
-    44% { opacity: 1; }
-    50% { offset-distance: 100%; opacity: 0; }
-    100% { offset-distance: 100%; opacity: 0; }
-  }
-  .fabric-scene .pkt { offset-rotate: 0deg; animation: pktTravel var(--dur, 4.2s) infinite; animation-delay: var(--del, 0s); }
-  @keyframes doorbell {
-    0%, 55% { opacity: 0; transform: scale(0.4); }
-    60% { opacity: 0.7; }
-    78% { opacity: 0; transform: scale(1.5); }
-    100% { opacity: 0; transform: scale(0.4); }
-  }
-  .fabric-scene .ring { animation: doorbell var(--dur, 4.2s) infinite; animation-delay: var(--del, 0s); }
-  @keyframes logPulse { 0%, 88% { fill: oklch(0.32 0.02 310); } 94% { fill: var(--accent); } 100% { fill: oklch(0.32 0.02 310); } }
-  .fabric-scene .logtick { animation: logPulse 2.8s infinite; }
-  .fabric-scene .logtick.t2 { animation-delay: 0.7s; }
-  .fabric-scene .logtick.t3 { animation-delay: 1.4s; }
-  .fabric-scene .logtick.t4 { animation-delay: 2.1s; }
+  .fx-1 { animation: fadeUp 0.7s 0.05s both; }
+  .fx-2 { animation: fadeUp 0.7s 0.15s both; }
+  .fx-3 { animation: fadeUp 0.7s 0.25s both; }
+  .fx-4 { animation: fadeUp 0.7s 0.35s both; }
+  .fx-5 { animation: fadeUp 0.7s 0.45s both; }
+  .fx-6 { animation: fadeUp 0.9s 0.3s both; }
+  @keyframes typeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .terminal-body .line { animation: typeIn 0.4s both; }
+  .terminal-body .line:nth-child(1) { animation-delay: 0.3s; }
+  .terminal-body .line:nth-child(2) { animation-delay: 0.6s; }
+  .terminal-body .line:nth-child(3) { animation-delay: 0.9s; }
+  .terminal-body .line:nth-child(4) { animation-delay: 1.2s; }
+  .terminal-body .line:nth-child(5) { animation-delay: 1.5s; }
+  .terminal-body .line:nth-child(6) { animation-delay: 1.8s; }
+  .terminal-body .line:nth-child(7) { animation-delay: 2.05s; }
+  .terminal-body .line:nth-child(8) { animation-delay: 2.3s; }
+  .terminal-body .line:nth-child(9) { animation-delay: 2.55s; }
+  .terminal-body .line:nth-child(10) { animation-delay: 2.8s; }
+  .terminal-body .line:nth-child(11) { animation-delay: 3.05s; }
+  .terminal-body .line:nth-child(12) { animation-delay: 3.3s; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .fabric-scene .pkt { offset-distance: 30%; }
-  .fabric-scene .ring { opacity: 0; }
-}
-.plane-strips { display: flex; gap: 14px; margin-top: 14px; flex-wrap: wrap; }
-.plane-strips > div {
-  flex: 1 1 300px; border: 1px dashed var(--border-strong); border-radius: 10px;
-  padding: 13px 20px; font: 400 10.5px/1.6 var(--mono); color: var(--text-faint);
-}
-
-/* ---- workloads ---- */
-.workload { display: grid; grid-template-columns: 56px 1fr 300px; gap: 24px; align-items: baseline; border-top: 1px solid var(--border); padding: 26px 0; }
-.workload:last-of-type { border-bottom: 1px solid var(--border); }
-.workload .n { font: 400 13px/1 var(--mono); color: var(--text-faint); }
-.workload h3 { font-size: 22px; margin: 0 0 7px; }
-.workload h3 .pill { margin-left: 10px; }
-.workload p { font-size: 14.5px; line-height: 1.6; color: var(--text-muted); margin: 0; max-width: 560px; }
-.workload .r { font: 400 10.5px/1.8 var(--mono); letter-spacing: 0.06em; color: var(--text-faint); text-align: right; }
-.workload.plus { border-top: 1px solid var(--accent-dim); border-bottom: 1px solid var(--accent-dim); background: oklch(0.7 0.2 310 / 0.05); }
-.workload.plus .n, .workload.plus .r { color: var(--accent); }
-@media (max-width: 820px) {
-  .workload { grid-template-columns: 40px 1fr; }
-  .workload .r { grid-column: 2; text-align: left; }
-}
-
-/* ---- the evidence pipeline ---- */
-.pipeline { display: flex; align-items: stretch; gap: 0; margin: 40px 0 10px; flex-wrap: wrap; }
-.pipe-node {
-  flex: 1 1 170px; background: var(--bg-raise); border: 1px solid var(--border-strong);
-  border-radius: 10px; padding: 16px 18px; position: relative; min-width: 170px;
-}
-.pipe-node .t { font: 500 10.5px/1 var(--mono); letter-spacing: 0.12em; color: var(--text); margin: 0 0 8px; }
-.pipe-node p { font-size: 12.5px; line-height: 1.55; color: var(--text-muted); margin: 0; }
-.pipe-link { flex: 0 0 clamp(20px, 3vw, 46px); position: relative; align-self: center; height: 2px; background: oklch(0.30 0.02 310); }
-.pipe-link::after {
-  content: ""; position: absolute; top: -2.5px; left: 0; width: 7px; height: 7px; border-radius: 50%;
-  background: var(--accent); opacity: 0;
-}
-@media (prefers-reduced-motion: no-preference) {
-  @keyframes pipeDot { 0% { left: 0; opacity: 0; } 10% { opacity: 1; } 90% { opacity: 1; } 100% { left: calc(100% - 7px); opacity: 0; } }
-  .pipe-link::after { animation: pipeDot 1.6s infinite; }
-  .pipe-link.l2::after { animation-delay: 1.6s; }
-  .pipe-link.l3::after { animation-delay: 3.2s; }
-  @keyframes nodeGlow { 0%, 82% { border-color: var(--border-strong); } 90% { border-color: var(--accent-dim); } 100% { border-color: var(--border-strong); } }
-  .pipe-node.n2 { animation: nodeGlow 4.8s infinite; animation-delay: 1.4s; }
-  .pipe-node.n3 { animation: nodeGlow 4.8s infinite; animation-delay: 3.0s; }
-  .pipe-node.n4 { animation: nodeGlow 4.8s infinite; animation-delay: 4.6s; }
-}
-.pipe-reject {
-  margin-top: 14px; font: 400 11px/1.8 var(--mono); letter-spacing: 0.06em; color: var(--text-faint);
-}
-.pipe-reject .x { color: var(--warn); }
-@media (max-width: 760px) {
-  .pipeline { flex-direction: column; }
-  .pipe-link { flex-basis: 22px; width: 2px; height: 22px; margin-left: 28px; align-self: flex-start; }
-  .pipe-link::after { display: none; }
-}
-
-/* ---- roadmap rail ---- */
-.rail { position: relative; margin-top: 24px; }
-.rail-track { display: grid; grid-template-columns: repeat(14, minmax(64px, 1fr)); gap: 0; overflow-x: auto; padding-bottom: 8px; position: relative; }
-.rail-stop { position: relative; padding-top: 0; min-width: 64px; }
-.rail-stop::before {
-  content: ""; position: absolute; top: 6px; left: 14px; right: 0; height: 2px;
-  background: oklch(0.28 0.02 310);
-}
-.rail-stop:last-child::before { display: none; }
-.rail-stop.done::before { background: var(--accent); }
-.rail-dot { width: 14px; height: 14px; border-radius: 50%; background: var(--bg); border: 2px solid oklch(0.35 0.02 310); position: relative; z-index: 1; }
-.rail-stop.done .rail-dot { background: var(--accent); border-color: var(--accent); }
-.rail-stop.now .rail-dot { background: var(--accent); border-color: var(--accent); animation: pulse 2s infinite; }
-.rail-stop.ga .rail-dot { border-color: var(--accent-dim); }
-.rail-stop .m { font: 500 10px/1.5 var(--mono); color: oklch(0.8 0.01 310); margin: 12px 0 2px; }
-.rail-stop.now .m { color: var(--accent); }
-.rail-stop .d { font: 400 10px/1.4 var(--mono); color: var(--text-faint); margin: 0; padding-right: 8px; }
-@keyframes pulse {
-  0% { box-shadow: 0 0 0 0 oklch(0.7 0.2 310 / 0.5); }
-  70% { box-shadow: 0 0 0 12px oklch(0.7 0.2 310 / 0); }
-  100% { box-shadow: 0 0 0 0 oklch(0.7 0.2 310 / 0); }
-}
-
-.cta-band { border-top: 1px solid var(--border); position: relative; overflow: hidden; }
-.cta-band .glow { position: absolute; inset: 0; background: radial-gradient(640px 380px at 50% 120%, oklch(0.7 0.2 310 / 0.14), transparent 70%); pointer-events: none; }
-.cta-band .inner { position: relative; max-width: var(--container); margin: 0 auto; padding: var(--sp-7) var(--pad-x); text-align: center; }
-.cta-band h2 { font-size: clamp(34px, 5vw, 52px); font-weight: 700; letter-spacing: -0.03em; line-height: 1.08; margin: 0 0 18px; }
-.cta-band p { font-size: 17px; line-height: 1.65; color: var(--text-muted); max-width: 560px; margin: 0 auto 36px; }
-.cta-band .ctas { display: flex; align-items: center; justify-content: center; gap: 14px; flex-wrap: wrap; }
-
-/* Scroll-driven enhancement: static by default, animated only where supported. */
-@supports (animation-timeline: view()) {
-  @media (prefers-reduced-motion: no-preference) {
-    @keyframes rev { from { opacity: 0; transform: translateY(26px); } to { opacity: 1; transform: none; } }
-    @keyframes popIn { from { opacity: 0; transform: translateY(10px) scale(0.97); } to { opacity: 1; transform: none; } }
-    .reveal { animation: rev 0.8s both; animation-timeline: view(); animation-range: entry 0% entry 40%; }
-    .reveal-pop { animation: popIn 0.8s both; animation-timeline: view(); animation-range: entry 0% entry 42%; }
-  }
-}
-@media (prefers-reduced-motion: no-preference) {
-  @keyframes typeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
-  @keyframes fadeUp { from { opacity: 0; transform: translateY(26px); } to { opacity: 1; transform: none; } }
-  @keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
-  .hero .fx-1 { animation: fadeUp 0.7s both; }
-  .hero .fx-2 { animation: fadeUp 0.8s 0.08s both; }
-  .hero .fx-3 { animation: fadeUp 0.8s 0.16s both; }
-  .hero .fx-4 { animation: fadeUp 0.8s 0.24s both; }
-  .hero .fx-5 { animation: fadeUp 0.8s 0.3s both; }
-  .hero .fx-6 { animation: fadeUp 0.9s 0.35s both; }
-  .terminal-body .line { animation: typeIn 0.4s both; }
-  .terminal-body .line:nth-child(1) { animation-delay: 0.6s; }
-  .terminal-body .line:nth-child(2) { animation-delay: 0.95s; }
-  .terminal-body .line:nth-child(3) { animation-delay: 1.3s; }
-  .terminal-body .line:nth-child(4) { animation-delay: 1.65s; }
-  .terminal-body .line:nth-child(5) { animation-delay: 2.0s; }
-  .terminal-body .line:nth-child(6) { animation-delay: 2.35s; }
-  .terminal-body .line:nth-child(7) { animation-delay: 2.6s; }
-  .terminal-body .line:nth-child(8) { animation-delay: 2.85s; }
-  .terminal-body .line:nth-child(9) { animation-delay: 3.1s; }
-  .terminal-body .line:nth-child(10) { animation-delay: 3.35s; }
-  .terminal-body .line:nth-child(11) { animation-delay: 3.6s; }
-  .cursor { display: inline-block; width: 8px; height: 15px; background: var(--accent); vertical-align: -2px; animation: blink 1.1s step-end infinite; }
+  .anim-dot { display: none; }
 }
 </style>
 </head>
@@ -284,445 +189,548 @@
 <nav class="nav">
   <div class="nav-inner">
     <a href="index.html" class="nav-brand">
-      <span class="mark">&infin; InfinityDB</span>
-      <span class="nav-badge">v0.2.0-alpha.1 &middot; IN DEV</span>
+      <svg class="logo" width="34" height="18" viewBox="0 0 34 18" aria-hidden="true">
+        <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2.4"/>
+        <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2.4"/>
+      </svg>
+      <span class="mark">infinity<b>DB</b></span>
+      <span class="nav-badge">v0.3.0-alpha.1 &middot; IN DEV</span>
     </a>
     <span class="nav-spacer"></span>
     <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
     <div class="nav-links">
-      <a href="#spine">Architecture</a>
-      <a href="#workloads">Workloads</a>
-      <a href="#evidence">Evidence</a>
-      <a href="docs/roadmap.html">Roadmap</a>
-      <a href="docs/index.html">Docs</a>
-      <a href="blog/index.html">Blog</a>
-      <a class="nav-cta" href="https://github.com/">&#9733; GitHub</a>
+      <a href="docs/index.html">DOCS</a>
+      <a href="blog/index.html">BLOG</a>
+      <a href="#roadmap">ROADMAP</a>
+      <a href="docs/quickstart.html">QUICKSTART</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
     </div>
   </div>
 </nav>
 
 <header id="top" class="hero">
-  <div class="hero-glow"></div>
-  <div class="hero-dots"></div>
+  <div class="hero-grid-bg"></div>
+  <div class="hero-glow-v"></div>
+  <div class="hero-glow-t"></div>
+
   <div class="hero-inner">
-    <div class="hero-grid">
-      <div>
-        <p class="kicker fx-1">Open source &middot; Apache 2.0 &middot; Written in Rust</p>
-        <h1 class="fx-2"><span class="hl">One engine</span> for the cache, the ledger, the queue, the document, and the vector.</h1>
-        <p class="sub fx-3">An extensible key/value engine kernel &mdash; Redis-compatible on the wire, durable like a system of record, designed to grow documents, queues, and vector search from one primitive: a per-core, append-only log. Built in the open behind hard evidence gates.</p>
-        <div class="hero-ctas fx-4">
-          <a class="btn btn-primary" href="https://github.com/">&#9733; Star on GitHub</a>
-          <a class="btn btn-ghost" href="#spine">Read the architecture &darr;</a>
+    <div>
+      <p class="hero-kicker fx-1">// REDIS-COMPATIBLE &middot; RUST &middot; SHARED-NOTHING</p>
+      <h1 class="fx-2"><span class="grad">One engine</span> for the cache, the ledger, the document, the queue, and the vector.</h1>
+      <p class="sub fx-3">Every workload is a projection of one per-core append-only log. Durable KV ships today; documents, queues, and vector search arrive on a gated milestone train &mdash; and it speaks fluent Redis. Keep <code>redis-cli</code>. Keep every SDK. Adopt one namespace at a time.</p>
+      <div id="install" class="fx-4">
+        <div class="install-bar">
+          <div class="cmd"><span class="s">$</span> cargo build --release -p infinityd</div>
+          <button type="button" data-copy="cargo build --release -p infinityd">COPY</button>
         </div>
-        <p class="hero-tape fx-5">RESP2/3 DROP-IN &middot; PORT 6379 &middot; KEEP redis-cli &middot; KEEP EVERY SDK &middot; LINUX io_uring</p>
-      </div>
-      <div class="terminal fx-6">
-        <div class="terminal-bar">
-          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-          <span class="title">one engine &middot; one session</span>
-        </div>
-        <div class="terminal-body">
-          <div class="line"><span class="c">$</span> redis-cli <span class="c"># your CLI, unchanged</span></div>
-          <div class="line"><span class="p">inf&gt;</span> SET cart:{u42} "lens &times;3" <span class="c"># cache-speed</span></div>
-          <div class="line"><span class="p">inf&gt;</span> INF.NS CREATE orders MODE durable FSYNC always</div>
-          <div class="line"><span class="p">inf&gt;</span> SET orders:{u42}:1009 "paid" <span class="c"># acked after fsync</span></div>
-          <div class="line"><span class="p">inf&gt;</span> INF.CKPT WAIT <span class="c"># fork-free checkpoint</span></div>
-          <div class="terminal-divider">ROADMAP SURFACE &mdash; SAME SESSION, LATER MILESTONES</div>
-          <div class="line dim"><span class="p">inf&gt;</span> JSON.SET catalog:{sku9} $ '{&hellip;}' <span class="c"># M3</span></div>
-          <div class="line dim"><span class="p">inf&gt;</span> INF.QL "SELECT &hellip; WHERE price &lt; 5000" <span class="c"># M4.5</span></div>
-          <div class="line dim"><span class="p">inf&gt;</span> XREADGROUP GROUP billing c1 &hellip; <span class="c"># M7</span></div>
-          <div class="line dim"><span class="p">inf&gt;</span> VSIM catalog:emb 10 VECTOR &hellip; <span class="c"># M8</span></div>
-          <div class="line"><span class="p">inf&gt;</span> <span class="cursor"></span></div>
+        <p class="hero-note"># builds from source &mdash; binaries + Docker image ship with v0.3.0-alpha.1 &middot; <a href="docs/quickstart.html">full quickstart &rarr;</a></p>
+        <div class="hero-ctas">
+          <a class="btn btn-primary" href="https://github.com/">&#9733; STAR ON GITHUB</a>
+          <a class="btn btn-ghost" href="blog/why-vortex-failed.html">WHY VORTEX DIED &rarr;</a>
         </div>
       </div>
+      <div class="hero-chips fx-5">
+        <span class="hero-chip"><span class="t">0.61&times; Redis RSS</span> &mdash; measured</span>
+        <span class="hero-chip"><span class="t">3.21&times; Redis</span> &mdash; unpipelined, in-run</span>
+        <span class="hero-chip"><span class="p">10,000 seeds</span> &mdash; 0 durability violations</span>
+        <span class="hero-chip"><span class="p">port 6379</span> &mdash; drop-in</span>
+      </div>
+      <p class="hero-note fx-5">// measured rows cite the <a href="docs/index.html#claims">claim ledger</a> &mdash; i7-13700KF &middot; 4 cells &middot; turbo off &middot; competitors in-run</p>
     </div>
 
-    <div class="status-strip fx-6">
-      <div>
-        <p class="label" style="color:var(--ok)">SHIPPING TODAY</p>
-        <p>A Redis-compatible in-memory cache (strings, keys, expiry, all 8 eviction policies, pub/sub) plus <strong>durable KV namespaces</strong> &mdash; per-namespace <code>always</code>/<code>everysec</code> fsync, fork-free checkpoints, parallel crash recovery.</p>
+    <!-- HERO VISUAL: the log spine -->
+    <div class="fx-6">
+      <svg class="spine-svg" viewBox="0 0 660 560" role="img" aria-label="Commands append to a per-cell log; the log projects into cache, durable KV, documents, streams, and vectors.">
+        <!-- input command labels -->
+        <text x="90" y="170" text-anchor="end" fill="#b9a8ff" font-size="13">SET</text>
+        <text x="90" y="250" text-anchor="end" fill="#b9a8ff" font-size="13">JSON.SET</text>
+        <text x="90" y="330" text-anchor="end" fill="#b9a8ff" font-size="13">XADD</text>
+        <text x="90" y="410" text-anchor="end" fill="#b9a8ff" font-size="13">VADD</text>
+        <!-- input paths -->
+        <path id="in1" d="M 100 166 C 170 166 200 200 254 200" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="in2" d="M 100 246 C 170 246 200 250 254 250" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="in3" d="M 100 326 C 170 326 200 300 254 300" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="in4" d="M 100 406 C 170 406 200 350 254 350" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <!-- the log -->
+        <rect x="260" y="140" width="92" height="300" rx="10" fill="rgba(124,92,255,0.07)" stroke="rgba(124,92,255,0.5)" stroke-width="1.4"/>
+        <rect x="272" y="154" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="186" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="218" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="250" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="282" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="314" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="346" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="378" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="410" width="68" height="20" rx="4" fill="#3ee6c4" opacity="0.9">
+          <animate attributeName="opacity" values="0.9;0.3;0.9" dur="1.6s" repeatCount="indefinite"/>
+        </rect>
+        <text x="306" y="466" text-anchor="middle" fill="#9096ae" font-size="10" letter-spacing="1.4">PER-CELL APPEND-ONLY LOG</text>
+        <text x="306" y="484" text-anchor="middle" fill="#5c6178" font-size="9.5" letter-spacing="0.8">one primitive &middot; five projections</text>
+        <!-- output paths -->
+        <path id="out1" d="M 356 180 C 410 180 420 110 466 110" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="out2" d="M 356 235 C 410 235 420 200 466 200" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="out3" d="M 356 290 C 412 290 420 290 466 290" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="out4" d="M 356 345 C 410 345 420 380 466 380" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="out5" d="M 356 400 C 410 400 420 470 466 470" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <!-- projection nodes -->
+        <rect x="470" y="84" width="168" height="52" rx="10" fill="#0b0e19" stroke="rgba(62,230,196,0.4)"/>
+        <text x="486" y="106" fill="#e8e9f2" font-size="12" font-weight="700" letter-spacing="1">CACHE</text>
+        <text x="486" y="124" fill="#3ee6c4" font-size="9" letter-spacing="0.4">SHIPPING &middot; redis-class</text>
+        <rect x="470" y="174" width="168" height="52" rx="10" fill="#0b0e19" stroke="rgba(62,230,196,0.4)"/>
+        <text x="486" y="196" fill="#e8e9f2" font-size="12" font-weight="700" letter-spacing="1">DURABLE KV</text>
+        <text x="486" y="214" fill="#3ee6c4" font-size="9" letter-spacing="0.4">SHIPPING &middot; dynamodb-class</text>
+        <rect x="470" y="264" width="168" height="52" rx="10" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+        <text x="486" y="286" fill="#e8e9f2" font-size="12" font-weight="700" letter-spacing="1">DOCUMENTS</text>
+        <text x="486" y="304" fill="#b9a8ff" font-size="9" letter-spacing="0.4">M3 &middot; IN DEV &middot; JSON.*</text>
+        <rect x="470" y="354" width="168" height="52" rx="10" fill="#0b0e19" stroke="rgba(139,144,168,0.25)"/>
+        <text x="486" y="376" fill="#e8e9f2" font-size="12" font-weight="700" letter-spacing="1">STREAMS</text>
+        <text x="486" y="394" fill="#5c6178" font-size="9" letter-spacing="0.4">M7 &middot; kafka-core class</text>
+        <rect x="470" y="444" width="168" height="52" rx="10" fill="#0b0e19" stroke="rgba(139,144,168,0.25)"/>
+        <text x="486" y="466" fill="#e8e9f2" font-size="12" font-weight="700" letter-spacing="1">VECTORS</text>
+        <text x="486" y="484" fill="#5c6178" font-size="9" letter-spacing="0.4">M8 &middot; HNSW &middot; SIMD</text>
+        <!-- moving records: in (violet = in motion) -->
+        <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.4s" begin="0s" repeatCount="indefinite"><mpath href="#in1"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.4s" begin="0.6s" repeatCount="indefinite"><mpath href="#in2"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.4s" begin="1.2s" repeatCount="indefinite"><mpath href="#in3"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.4s" begin="1.8s" repeatCount="indefinite"><mpath href="#in4"/></animateMotion></circle>
+        <!-- moving records: out (teal = served) -->
+        <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.8s" begin="0s" repeatCount="indefinite"><mpath href="#out1"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.8s" begin="0.5s" repeatCount="indefinite"><mpath href="#out2"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.8s" begin="1s" repeatCount="indefinite"><mpath href="#out3"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.8s" begin="1.5s" repeatCount="indefinite"><mpath href="#out4"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.8s" begin="2s" repeatCount="indefinite"><mpath href="#out5"/></animateMotion></circle>
+      </svg>
+    </div>
+  </div>
+
+  <div class="status-strip fx-5">
+    <div class="strip-box">
+      <div class="cellp">
+        <p class="label" style="color:var(--teal)">SHIPPING TODAY</p>
+        <p>A Redis-compatible in-memory cache (strings, keys, expiry, all 8 eviction policies, pub/sub) plus <strong style="color:var(--text)">durable KV namespaces</strong> &mdash; per-namespace <code>always</code>/<code>everysec</code> fsync, fork-free checkpoints, parallel crash recovery.</p>
       </div>
-      <div>
-        <p class="label" style="color:var(--accent)">IN PROGRESS &middot; M2.5</p>
-        <p>Hardening the durable core for the first public tag, <code>v0.2.0-alpha.1</code>: soak, crash-matrix and simulation campaigns, evidence closure &mdash; performance debt paid before the tag.</p>
+      <div class="cellp">
+        <p class="label" style="color:var(--violet-soft)">IN PROGRESS &middot; M3</p>
+        <p>JSON documents &mdash; <code>JSON.*</code> + JSONPath over a compact binary tree &mdash; closing on the first public tag, <code>v0.3.0-alpha.1</code> (ADR-0048): pre-tag campaign, ledger re-validation, release pipeline.</p>
       </div>
-      <div>
+      <div class="cellp">
         <p class="label" style="color:var(--text-faint)">ON THE TRAIN</p>
-        <p>JSON documents (M3), tiered storage (M4), indexes + PartiQL subset (M4.5), collections (M5), transactions (M6), streams (M7), vectors (M8), HA (M9), WASM compute (M10). <a href="docs/roadmap.html">The full train &rarr;</a></p>
+        <p>Tiered storage (M4), indexes + PartiQL subset (M4.5), collections (M5), transactions (M6), streams (M7), vectors (M8), HA (M9), WASM compute (M10). <a href="docs/roadmap.html">The full train &rarr;</a></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- marquee -->
+  <div class="marquee" aria-hidden="false">
+    <div class="marquee-track">
+      <div class="marquee-run">
+        <span>DROP-IN ON PORT 6379</span><span class="tv">&#10038;</span>
+        <span>KEEP redis-cli</span><span class="vv">&#10038;</span>
+        <span>KEEP EVERY SDK</span><span class="tv">&#10038;</span>
+        <span>ADOPT ONE NAMESPACE AT A TIME</span><span class="vv">&#10038;</span>
+        <span>APACHE 2.0</span><span class="tv">&#10038;</span>
+        <span>ONE BINARY &mdash; infinityd</span><span class="vv">&#10038;</span>
+        <span>16,384 SLOTS FROM DAY ONE</span><span class="tv">&#10038;</span>
+      </div>
+      <div class="marquee-run" aria-hidden="true">
+        <span>DROP-IN ON PORT 6379</span><span class="tv">&#10038;</span>
+        <span>KEEP redis-cli</span><span class="vv">&#10038;</span>
+        <span>KEEP EVERY SDK</span><span class="tv">&#10038;</span>
+        <span>ADOPT ONE NAMESPACE AT A TIME</span><span class="vv">&#10038;</span>
+        <span>APACHE 2.0</span><span class="tv">&#10038;</span>
+        <span>ONE BINARY &mdash; infinityd</span><span class="vv">&#10038;</span>
+        <span>16,384 SLOTS FROM DAY ONE</span><span class="tv">&#10038;</span>
       </div>
     </div>
   </div>
 </header>
 
-<section id="wedge" class="section">
-  <div class="section-inner">
-    <h2 class="reveal" style="margin-top:0;max-width:780px">Keep redis-cli. Keep every SDK.<br>Adopt progressively.</h2>
-    <p class="lede reveal" style="margin-bottom:64px">Redis compatibility is the wedge, not the ceiling. You replace systems one namespace at a time &mdash; never one migration at a time.</p>
-    <div class="step-grid">
-      <div class="step reveal">
-        <p class="n">STEP 1 &middot; TODAY</p>
-        <h3>Point your client at it</h3>
-        <p>RESP2/RESP3 on port 6379, with per-command compatibility declared in a <a href="docs/compat.html">generated, byte-diff-verified matrix</a> &mdash; never a breadth claim. Day one, nothing about your stack changes.</p>
-      </div>
-      <div class="step reveal">
-        <p class="n">STEP 2 &middot; TODAY</p>
-        <h3>Turn on durability</h3>
-        <p>Durability is a property of the <em>namespace</em>, not the server. One command turns a cache namespace into an fsync-gated system of record &mdash; <a href="docs/durability.html">classes and loss windows documented precisely</a>.</p>
-      </div>
-      <div class="step reveal">
-        <p class="n">STEP 3 &middot; ROADMAP</p>
-        <h3>Retire adjacent systems</h3>
-        <p>Model entities as JSON documents (M3), query them without a planner (M4.5), move queues onto topics (M7), add vector search (M8) &mdash; same client libraries, same node, same operational surface.</p>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="spine" class="section">
-  <div class="section-inner">
-    <div class="spine-layout">
-      <div>
-        <p class="kicker reveal">The primitive</p>
-        <h2 class="reveal" style="margin-top:0">Everything is a projection of the log.</h2>
-        <div class="spine-steps">
-          <div class="spine-step reveal">
-            <p class="k">APPEND</p>
-            <p>Every durable fact is an append to a per-core, append-only log &mdash; before it is anything else.</p>
-          </div>
-          <div class="spine-step reveal">
-            <p class="k">PROJECT</p>
-            <p>The hash index, checkpoints, tiered storage: derived projections &mdash; rebuildable from the log by replay.</p>
-          </div>
-          <div class="spine-step reveal">
-            <p class="k">CONSUME</p>
-            <p>Topics and consumer groups read the same log forward. The queue isn&rsquo;t bolted on &mdash; it&rsquo;s the spine, exposed.</p>
-          </div>
-          <div class="spine-step reveal">
-            <p class="k">SHIP</p>
-            <p>Replication ships the log to a follower. CDC hands it to a subscriber. Point-in-time recovery replays it.</p>
-          </div>
-          <div class="spine-step reveal">
-            <p class="k">ONE PRIMITIVE</p>
-            <p>A cache is just the log with durability off. <span style="color:var(--text)">One mechanism to make correct &mdash; not five.</span></p>
-          </div>
-        </div>
-      </div>
-      <div class="spine-diagram reveal-pop">
-        <div>
-          <p class="mono-note" style="margin:0 0 8px;text-align:center">shard-3/log/<br>seg-000017.ilog</p>
-          <div class="spine-log">
-            <div class="spine-rec land">SET</div>
-            <div class="spine-rec">EXPIRE</div>
-            <div class="spine-rec">DEL</div>
-            <div class="spine-rec dim">JSON.SET</div>
-            <div class="spine-rec dim">XADD</div>
-            <div class="spine-rec dim">VADD</div>
-            <div class="arrow">&#9660;</div>
-            <p class="file">append-only</p>
-          </div>
-        </div>
-        <div class="spine-projs">
-          <div class="spine-proj">
-            <p class="t">DURABLE KV <span class="pill pill-ship">SHIPPING</span></p>
-            <p>index + checkpoints, replayed in parallel after a crash</p>
-          </div>
-          <div class="spine-proj">
-            <p class="t">QUEUES &amp; STREAMS <span class="pill pill-plan">M7</span></p>
-            <p>consumer groups read the log forward &mdash; Kafka&rsquo;s storage model, minus the JVM</p>
-          </div>
-          <div class="spine-proj">
-            <p class="t">REPLICAS <span class="pill pill-plan">M9</span></p>
-            <p>sealed segments + live tail, shipped per cell to followers</p>
-          </div>
-          <div class="spine-proj">
-            <p class="t">CDC / SUBSCRIBERS <span class="pill pill-plan">M9+</span></p>
-            <p>change data capture is the log, handed to a subscriber</p>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="arch" class="section">
-  <div class="section-inner">
-    <h2 class="reveal" style="margin-top:0;max-width:760px">One core, one shard, one owner.</h2>
-    <p class="lede reveal" style="margin-bottom:48px">Every key, partition, and log segment is owned by exactly one core. Each shard cell is a complete miniature database &mdash; no locks on the hot path. Cells talk only through a batched, credit-controlled fabric of SPSC ring pairs: the packets you see below are whole batches, never single ops.</p>
-
-    <div class="fabric-scene-wrap reveal-pop">
-      <svg class="fabric-scene" viewBox="0 0 880 470" role="img" aria-label="Four shard cells exchanging batched messages over point-to-point SPSC ring pairs; each cell owns its keyspace slice and its own log.">
-        <!-- point-to-point links (drawn under cells) -->
-        <path class="link" d="M220 100 L660 100"/>
-        <path class="link" d="M220 340 L660 340"/>
-        <path class="link" d="M130 160 L130 280"/>
-        <path class="link" d="M750 160 L750 280"/>
-        <path class="link" d="M210 150 L670 295"/>
-        <path class="link" d="M210 295 L670 150"/>
-
-        <!-- packets: triplets = one batched pack per hop -->
-        <g>
-          <circle class="pkt" r="3.4" style="offset-path: path('M220 100 L660 100'); --dur: 4.6s; --del: 0s"/>
-          <circle class="pkt" r="3.4" style="offset-path: path('M220 100 L660 100'); --dur: 4.6s; --del: 0.12s"/>
-          <circle class="pkt" r="3.4" style="offset-path: path('M220 100 L660 100'); --dur: 4.6s; --del: 0.24s"/>
-          <circle class="pkt" r="3.4" style="offset-path: path('M660 340 L220 340'); --dur: 4.6s; --del: 1.3s"/>
-          <circle class="pkt" r="3.4" style="offset-path: path('M660 340 L220 340'); --dur: 4.6s; --del: 1.42s"/>
-          <circle class="pkt" r="3.4" style="offset-path: path('M660 340 L220 340'); --dur: 4.6s; --del: 1.54s"/>
-          <circle class="pkt" r="3.4" style="offset-path: path('M130 280 L130 160'); --dur: 5.4s; --del: 0.7s"/>
-          <circle class="pkt" r="3.4" style="offset-path: path('M130 280 L130 160'); --dur: 5.4s; --del: 0.82s"/>
-          <circle class="pkt" r="3.4" style="offset-path: path('M750 160 L750 280'); --dur: 5.4s; --del: 2.4s"/>
-          <circle class="pkt" r="3.4" style="offset-path: path('M750 160 L750 280'); --dur: 5.4s; --del: 2.52s"/>
-          <circle class="pkt" r="3.4" style="offset-path: path('M210 150 L670 295'); --dur: 5.8s; --del: 3.1s"/>
-          <circle class="pkt" r="3.4" style="offset-path: path('M210 150 L670 295'); --dur: 5.8s; --del: 3.22s"/>
-          <circle class="pkt" r="3.4" style="offset-path: path('M670 150 L210 295'); --dur: 5.8s; --del: 1.9s"/>
-          <circle class="pkt" r="3.4" style="offset-path: path('M670 150 L210 295'); --dur: 5.8s; --del: 2.02s"/>
-        </g>
-
-        <!-- doorbell rings at receiving cells (staggered to read as arrivals) -->
-        <circle class="ring" cx="660" cy="100" r="9" stroke-width="1.5" style="--dur: 4.6s; --del: 0s"/>
-        <circle class="ring" cx="220" cy="340" r="9" stroke-width="1.5" style="--dur: 4.6s; --del: 1.3s"/>
-        <circle class="ring" cx="130" cy="160" r="9" stroke-width="1.5" style="--dur: 5.4s; --del: 0.7s"/>
-        <circle class="ring" cx="750" cy="280" r="9" stroke-width="1.5" style="--dur: 5.4s; --del: 2.4s"/>
-
-        <!-- cells -->
-        <g>
-          <rect class="cellbox" x="40" y="30" width="180" height="130" rx="10"/>
-          <text class="cellhead" x="58" y="56">CELL 0 &middot; CORE 0</text>
-          <line class="seamline" x1="58" y1="66" x2="202" y2="66"/>
-          <text class="cellline" x="58" y="88">reactor &middot; io_uring</text>
-          <text class="cellline" x="58" y="108">parser &middot; executor</text>
-          <text class="cellline" x="58" y="128">keyspace slice</text>
-          <text class="cellline" x="58" y="148">log <tspan class="logtick t1">&#9646;&#9646;&#9646;</tspan></text>
-        </g>
-        <g>
-          <rect class="cellbox" x="660" y="30" width="180" height="130" rx="10"/>
-          <text class="cellhead" x="678" y="56">CELL 1 &middot; CORE 1</text>
-          <line class="seamline" x1="678" y1="66" x2="822" y2="66"/>
-          <text class="cellline" x="678" y="88">reactor &middot; io_uring</text>
-          <text class="cellline" x="678" y="108">parser &middot; executor</text>
-          <text class="cellline" x="678" y="128">keyspace slice</text>
-          <text class="cellline" x="678" y="148">log <tspan class="logtick t2">&#9646;&#9646;&#9646;</tspan></text>
-        </g>
-        <g>
-          <rect class="cellbox" x="40" y="280" width="180" height="130" rx="10"/>
-          <text class="cellhead" x="58" y="306">CELL 2 &middot; CORE 2</text>
-          <line class="seamline" x1="58" y1="316" x2="202" y2="316"/>
-          <text class="cellline" x="58" y="338">reactor &middot; io_uring</text>
-          <text class="cellline" x="58" y="358">parser &middot; executor</text>
-          <text class="cellline" x="58" y="378">keyspace slice</text>
-          <text class="cellline" x="58" y="398">log <tspan class="logtick t3">&#9646;&#9646;&#9646;</tspan></text>
-        </g>
-        <g>
-          <rect class="cellbox" x="660" y="280" width="180" height="130" rx="10"/>
-          <text class="cellhead" x="678" y="306">CELL N &middot; CORE N</text>
-          <line class="seamline" x1="678" y1="316" x2="822" y2="316"/>
-          <text class="cellline" x="678" y="338">reactor &middot; io_uring</text>
-          <text class="cellline" x="678" y="358">parser &middot; executor</text>
-          <text class="cellline" x="678" y="378">keyspace slice</text>
-          <text class="cellline" x="678" y="398">log <tspan class="logtick t4">&#9646;&#9646;&#9646;</tspan></text>
-        </g>
-
-        <!-- fabric label -->
-        <text class="hublabel" x="440" y="212" text-anchor="middle">FABRIC &mdash; N&times;(N&minus;1) SPSC RING PAIRS</text>
-        <text class="hubnote" x="440" y="232" text-anchor="middle">BATCHED &middot; CREDIT-BASED FLOW CONTROL &middot; ZERO SYSCALLS &middot; ZERO LOCKS</text>
-
-        <!-- storage strip -->
-        <text class="hubnote" x="440" y="448" text-anchor="middle">PER-CELL OWNED FILES &mdash; seg-*.ilog &middot; ckpt-*.ick &middot; MANIFEST &mdash; NO SHARING &middot; PARALLEL REPLAY</text>
-      </svg>
-    </div>
-
-    <div class="plane-strips reveal">
-      <div>STORAGE &middot; per-shard owned files &mdash; seg-*.ilog &middot; ckpt-*.ick &middot; MANIFEST &mdash; no sharing, parallel replay</div>
-      <div>CONTROL THREAD &middot; config &middot; topology &middot; stats &middot; checkpoint scheduling &middot; (M9) Raft &mdash; never on the data path</div>
-    </div>
-
-    <div class="step-grid" style="margin-top:72px">
-      <div class="step reveal">
-        <h3 style="font-size:19px">Batch every boundary</h3>
-        <p style="font-size:14.5px">Syscalls, fabric hops, fsyncs, and cache misses are paid per batch, never per operation. One submission per reactor iteration, by construction &mdash; and the batching metrics are CI-gated tripwires, not dashboards.</p>
-      </div>
-      <div class="step reveal">
-        <h3 style="font-size:19px">Commands that suspend</h3>
-        <p style="font-size:14.5px">Every command is a resumable state machine: disk reads, cross-shard hops, and fsync-gated acks suspend without blocking the core. The fast path never suspends &mdash; and pays nothing for the capability.</p>
-      </div>
-      <div class="step reveal">
-        <h3 style="font-size:19px">Deterministic by design</h3>
-        <p style="font-size:14.5px">Time, randomness, and I/O are injected. The whole node runs deterministically in simulation &mdash; every failure is a replayable seed, FoundationDB-style. Simulated disks tear writes and lie about fsync; oracles check every ack survived.</p>
-      </div>
-    </div>
-  </div>
-</section>
-
+<!-- ============ 01 WORKLOADS ============ -->
 <section id="workloads" class="section">
   <div class="section-inner">
-    <h2 class="reveal" style="margin-top:0;margin-bottom:16px;max-width:760px">Five systems. One operational surface.</h2>
-    <p class="lede reveal" style="margin-bottom:56px">Each workload is a projection of the same kernel &mdash; and each arrives on the train with its milestone named. Two ship today; the rest are design, not claims.</p>
+    <p class="kicker">01 &middot; ONE ENGINE, FIVE WORKLOADS</p>
+    <h2 style="margin-top:0">Stop running five databases.</h2>
+    <p class="lede" style="max-width:620px">A kernel, not a monolith: a small core &mdash; runtime, fabric, log, store &mdash; with versioned seams. Every engine below is an extension of the kernel, arriving on the train with its milestone named. Build cache-only, or build everything.</p>
 
-    <div>
-      <div class="workload reveal">
-        <span class="n">01</span>
-        <div>
-          <h3>In-memory cache <span class="pill pill-ship">SHIPPING</span></h3>
-          <p>RESP2/3, the string/key/expiry command families, all 8 eviction policies, pub/sub. Memory-only namespaces never touch the log. Collections (hashes, lists, sets, zsets) arrive at M5.</p>
-        </div>
-        <span class="r">TARGETS REDIS &middot; VALKEY &middot; DRAGONFLY WORKLOADS</span>
+    <div class="wl-grid">
+      <div class="wl-card">
+        <div class="idx">/01</div>
+        <h3>Cache <span class="pill pill-ship">SHIPPING</span></h3>
+        <div class="tagline">TARGETS REDIS &middot; VALKEY &middot; DRAGONFLY</div>
+        <p>RESP2/3, the string/key/expiry command families, all eight eviction policies, pub/sub. Memory-only namespaces never touch the log. Per-command compat is declared in a <a href="docs/compat.html">generated, byte-diff-verified matrix</a>.</p>
       </div>
-      <div class="workload reveal">
-        <span class="n">02</span>
-        <div>
-          <h3>Durable key-value <span class="pill pill-ship">SHIPPING</span></h3>
-          <p>Per-namespace fsync classes, fuzzy fork-free checkpoints, parallel recovery. Acks gated on the durability watermark. Larger-than-RAM tiered storage arrives at M4.</p>
-        </div>
-        <span class="r">TARGETS DYNAMODB-CLASS KV (SINGLE REGION)</span>
+      <div class="wl-card">
+        <div class="idx">/02</div>
+        <h3>Durable KV <span class="pill pill-ship">SHIPPING</span></h3>
+        <div class="tagline">TARGETS DYNAMODB-CLASS STORES</div>
+        <p>Per-namespace durability &mdash; <code>always</code>, <code>everysec</code>, <code>memory</code> &mdash; group-commit fsync, fuzzy fork-free checkpoints, parallel recovery. Larger-than-RAM tiering arrives at M4.</p>
       </div>
-      <div class="workload reveal">
-        <span class="n">03</span>
-        <div>
-          <h3>JSON documents <span class="pill pill-plan">M3 &middot; NEXT</span></h3>
-          <p>RedisJSON-compatible JSON.* with JSONPath over a compact binary document tree. Mutated by path, durable by delta. Typed secondary indexes and a planner-free PartiQL subset follow at M4.5.</p>
-        </div>
-        <span class="r">TARGETS DOCUMENT-STORE WORKLOADS</span>
+      <div class="wl-card">
+        <div class="idx">/03</div>
+        <h3>Documents <span class="pill pill-now">M3 &middot; IN DEV</span></h3>
+        <div class="tagline">REDISJSON-COMPATIBLE NOSQL</div>
+        <p>JSON as a first-class value: <code>JSON.*</code> + JSONPath over a compact binary tree, mutated by path, durable by default. Typed secondary indexes and a planner-free PartiQL subset follow at M4.5.</p>
       </div>
-      <div class="workload reveal">
-        <span class="n">04</span>
-        <div>
-          <h3>Streams &amp; queues <span class="pill pill-plan">M7</span></h3>
-          <p>Kafka-model topics and consumer groups on the log spine, full Redis Streams API, plus DLQs, delays, redelivery, idempotent producers.</p>
-        </div>
-        <span class="r">TARGETS KAFKA-CORE &middot; RABBITMQ-CORE</span>
+      <div class="wl-card">
+        <div class="idx">/04</div>
+        <h3>Streams &amp; Queues <span class="pill pill-plan">M7</span></h3>
+        <div class="tagline">TARGETS KAFKA-CORE &middot; RABBITMQ-CORE</div>
+        <p>Topics and consumer groups built directly on the write-ahead log. Full Redis Streams API, dead-letter queues, delays, idempotent producers.</p>
       </div>
-      <div class="workload reveal">
-        <span class="n">05</span>
-        <div>
-          <h3>Vector search <span class="pill pill-plan">M8</span></h3>
-          <p>Per-core HNSW with quantization and SIMD distance kernels. Vectors are ordinary durable records &mdash; replicated and tiered like everything else.</p>
-        </div>
-        <span class="r">TARGETS DEDICATED VECTOR DBS</span>
+      <div class="wl-card">
+        <div class="idx">/05</div>
+        <h3>Vectors <span class="pill pill-plan">M8</span></h3>
+        <div class="tagline">THE AI-ERA LAYER &mdash; IN 1.0</div>
+        <p>Per-shard HNSW + SQ8 quantization, SIMD distance kernels. Vectors are ordinary durable records &mdash; replicated, tiered, checkpointed.</p>
       </div>
-      <div class="workload plus reveal">
-        <span class="n">+1</span>
-        <div>
-          <h3>In-database compute <span class="pill pill-plan">M10</span></h3>
-          <p>Sandboxed WASM reducers execute inside the process, on the core that owns the data &mdash; zero network, zero serialization, transactional. Plus embedded and shared-memory modes.</p>
-        </div>
-        <span class="r">NONE OF THOSE SYSTEMS OFFER THIS</span>
+      <div class="wl-card plus">
+        <div class="idx">/plus</div>
+        <h3>In-database compute <span class="pill pill-plan">M10</span></h3>
+        <div class="tagline">NOBODY ELSE SHIPS THIS NATIVELY</div>
+        <p>WASM reducers run <em>inside</em> the database, on the core that owns the data. Zero network. Zero serialization. Sandboxed, fuel-metered, transactional.</p>
       </div>
     </div>
 
-    <div class="card-grid" style="margin-top:72px">
-      <div class="card reveal">
-        <p class="kicker" style="margin-bottom:14px;font-size:11px">A kernel, not a monolith</p>
-        <p style="font-size:15px;line-height:1.7;margin:0">Documents, streams, vectors, and compute are engines attached to versioned seams &mdash; feature-gated crates, not special cases. A cache-only build compiles none of the rest: smaller binary, smaller attack surface, nothing cold in the icache. You compose what you run.</p>
-      </div>
-      <div class="card reveal">
-        <p class="kicker" style="margin-bottom:14px;font-size:11px">Move code to data</p>
-        <p style="font-size:15px;line-height:1.7;margin:0">The same seams first-party engines use are the programmability surface: WASM reducers (M10), an embedded Rust crate and shm IPC for co-located services &mdash; and a stabilized native extension SDK after 1.0.</p>
+    <div class="thesis">
+      <div class="h">// THE THESIS &mdash; EVERYTHING IS THE LOG</div>
+      <div class="thesis-grid">
+        <div><span class="k">cache</span> <span class="eq">=</span> <span class="v">log(durability: <span class="a">off</span>)</span></div>
+        <div><span class="k">kv</span> <span class="eq">=</span> <span class="v">log + index + ckpt</span></div>
+        <div><span class="k">queue</span> <span class="eq">=</span> <span class="v">log.read_forward(<span class="a">group</span>)</span></div>
+        <div><span class="k">replica</span> <span class="eq">=</span> <span class="v">log.ship(<span class="a">follower</span>)</span></div>
+        <div><span class="k">cdc</span> <span class="eq">=</span> <span class="v">log.subscribe()</span></div>
+        <div><span class="k">vector</span> <span class="eq">=</span> <span class="v">hnsw(log)</span></div>
       </div>
     </div>
   </div>
 </section>
 
-<section id="evidence" class="section">
-  <div class="section-inner">
-    <p class="kicker reveal">The discipline</p>
-    <h2 class="reveal" style="margin-top:0;max-width:820px">No number ships without a receipt.</h2>
-    <p class="lede reveal" style="margin-bottom:8px">Every public claim runs the same pipeline &mdash; and the pipeline is CI-enforced on this very page: copy with a number that has no ledger row fails the build.</p>
+<!-- ============ 02 SHARD CELL ============ -->
+<section id="arch" class="split">
+  <div>
+    <svg viewBox="0 0 520 520" style="width:100%;max-width:520px;display:block;font-family:'JetBrains Mono',ui-monospace,monospace" role="img" aria-label="The shard cell reactor loop: reap, parse, execute, log, respond, submit — one syscall per iteration.">
+      <path id="orbitPath" d="M 260 90 A 170 170 0 1 1 259.9 90" fill="none" stroke="rgba(139,144,168,0.22)" stroke-width="1.2" stroke-dasharray="3 7"/>
+      <circle cx="260" cy="260" r="126" fill="none" stroke="rgba(124,92,255,0.16)" stroke-width="1"/>
+      <circle cx="260" cy="90" r="5" fill="#06070d" stroke="#7c5cff" stroke-width="2"/>
+      <circle cx="407" cy="175" r="5" fill="#06070d" stroke="#7c5cff" stroke-width="2"/>
+      <circle cx="407" cy="345" r="5" fill="#06070d" stroke="#7c5cff" stroke-width="2"/>
+      <circle cx="260" cy="430" r="5" fill="#06070d" stroke="#7c5cff" stroke-width="2"/>
+      <circle cx="113" cy="345" r="5" fill="#06070d" stroke="#7c5cff" stroke-width="2"/>
+      <circle cx="113" cy="175" r="5" fill="#06070d" stroke="#7c5cff" stroke-width="2"/>
+      <text x="260" y="68" text-anchor="middle" fill="#9096ae" font-size="11" letter-spacing="1.3">REAP</text>
+      <text x="421" y="172" text-anchor="start" fill="#9096ae" font-size="11" letter-spacing="1.3">PARSE</text>
+      <text x="421" y="356" text-anchor="start" fill="#9096ae" font-size="11" letter-spacing="1.3">EXECUTE</text>
+      <text x="260" y="460" text-anchor="middle" fill="#9096ae" font-size="11" letter-spacing="1.3">LOG</text>
+      <text x="99" y="356" text-anchor="end" fill="#9096ae" font-size="11" letter-spacing="1.3">RESPOND</text>
+      <text x="99" y="172" text-anchor="end" fill="#9096ae" font-size="11" letter-spacing="1.3">SUBMIT</text>
+      <circle class="anim-dot" r="5" fill="#3ee6c4"><animateMotion dur="5s" repeatCount="indefinite"><mpath href="#orbitPath"/></animateMotion></circle>
+      <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="5s" begin="-2.5s" repeatCount="indefinite"><mpath href="#orbitPath"/></animateMotion></circle>
+      <text x="260" y="248" text-anchor="middle" fill="#3ee6c4" font-size="22" font-weight="700" letter-spacing="1.8">1 SYSCALL</text>
+      <text x="260" y="272" text-anchor="middle" fill="#9096ae" font-size="11" letter-spacing="1.8">PER ITERATION</text>
+      <text x="260" y="296" text-anchor="middle" fill="#5c6178" font-size="9.5" letter-spacing="0.8">pinned &middot; lock-free &middot; budgeted</text>
+    </svg>
+  </div>
+  <div>
+    <p class="kicker" style="margin-bottom:0">02 &middot; THE SHARD CELL</p>
+    <h2>One core. One shard. One owner.</h2>
+    <p class="lede">Each core runs a complete miniature database &mdash; reactor, parser, executor, keyspace slice, log writer, allocator. No other thread ever touches its data.</p>
+    <div class="arrow-list">
+      <div><span class="a">&rarr;</span><span class="txt">Every command is a resumable state machine &mdash; the fast path completes synchronously and never pays for the capability.</span></div>
+      <div><span class="a">&rarr;</span><span class="txt">Batch every boundary: syscalls, fsyncs, fabric hops, and cache misses are paid per batch, never per op &mdash; and the batching metrics are CI-gated tripwires, not dashboards.</span></div>
+      <div><span class="a">&rarr;</span><span class="txt">Expiry, eviction, checkpoints, and compaction run under deficit-weighted budgets &mdash; tail latency is protected by construction.</span></div>
+      <div><span class="a">&rarr;</span><span class="txt">Deterministic by design: the whole node replays under simulation from a seed &mdash; every failure is reproducible.</span></div>
+    </div>
+  </div>
+</section>
 
-    <div class="pipeline reveal">
-      <div class="pipe-node n1">
-        <p class="t" style="color:var(--accent)">STOP GATE</p>
-        <p>A milestone exits only past hard gates: crash matrices, simulation sweeps, replicated benchmark campaigns on a pinned box.</p>
+<!-- ============ 03 FABRIC ============ -->
+<section id="fabric" class="split rev">
+  <div>
+    <p class="kicker" style="margin-bottom:0">03 &middot; THE FABRIC</p>
+    <h2>Shared-nothing, without the sharp edges.</h2>
+    <p class="lede">Cells communicate only through a full mesh of lock-free SPSC ring pairs &mdash; batched, poll-integrated, credit-controlled. Cross-slot operations that fail on Redis Cluster just work here; they pay a fabric hop instead of returning <code>CROSSSLOT</code>.</p>
+    <div class="mini-stats">
+      <div class="stat">
+        <div class="v t">1.72&times;</div>
+        <div class="l">DRAGONFLY, CROSS-CELL, IN-RUN &mdash; MEASURED, 4 CELLS</div>
       </div>
-      <div class="pipe-link"></div>
-      <div class="pipe-node n2">
-        <p class="t">ARTIFACT</p>
-        <p>Every run leaves a committed artifact &mdash; environment, replicates, tripwires &mdash; or it never happened.</p>
+      <div class="stat">
+        <div class="v p">0 locks</div>
+        <div class="l">ON THE DATA PLANE, ANYWHERE</div>
       </div>
-      <div class="pipe-link l2"></div>
-      <div class="pipe-node n3">
-        <p class="t">LEDGER ROW</p>
-        <p>The claim ledger binds each public statement to its artifact: <span style="color:var(--text)">Allowed, Narrowed, or Rejected</span> &mdash; wording included.</p>
+      <div class="stat">
+        <div class="v p">16,384</div>
+        <div class="l">SLOTS &mdash; CLUSTER-COMPATIBLE HASH TAGS</div>
       </div>
-      <div class="pipe-link l3"></div>
-      <div class="pipe-node n4">
-        <p class="t" style="color:var(--ok)">PUBLIC COPY</p>
-        <p>Announcements and this website cite Allowed rows only, checked in CI against the ledger snapshot.</p>
+      <div class="stat">
+        <div class="v t">0 wakes</div>
+        <div class="l">PER MESSAGE &mdash; POLLED, BATCHED, CREDITED</div>
       </div>
     </div>
-    <p class="pipe-reject reveal"><span class="x">&#10005;</span> NO ARTIFACT &rarr; THE CLAIM DOES NOT EXIST &mdash; THAT INCLUDES EVERY BENCHMARK NUMBER THIS PAGE ISN&rsquo;T SHOWING YOU</p>
+  </div>
+  <div>
+    <svg viewBox="0 0 640 480" style="width:100%;display:block;font-family:'JetBrains Mono',ui-monospace,monospace" role="img" aria-label="Six shard cells exchanging batched messages over a full mesh of SPSC ring pairs.">
+      <line x1="320" y1="70" x2="467" y2="155" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="320" y1="70" x2="467" y2="325" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="320" y1="70" x2="320" y2="410" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="320" y1="70" x2="173" y2="325" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="320" y1="70" x2="173" y2="155" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="155" x2="467" y2="325" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="155" x2="320" y2="410" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="155" x2="173" y2="325" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="155" x2="173" y2="155" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="325" x2="320" y2="410" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="325" x2="173" y2="325" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="325" x2="173" y2="155" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="320" y1="410" x2="173" y2="325" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="320" y1="410" x2="173" y2="155" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="173" y1="325" x2="173" y2="155" stroke="rgba(139,144,168,0.1)"/>
+      <path id="m1" d="M320 70 L467 325" fill="none"/>
+      <path id="m2" d="M467 155 L173 325" fill="none"/>
+      <path id="m3" d="M320 410 L173 155" fill="none"/>
+      <path id="m4" d="M173 325 L467 155" fill="none"/>
+      <path id="m5" d="M320 410 L320 70" fill="none"/>
+      <path id="m6" d="M173 155 L467 325" fill="none"/>
+      <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="1.9s" begin="0s" repeatCount="indefinite"><mpath href="#m1"/></animateMotion></circle>
+      <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.3s" begin="0.4s" repeatCount="indefinite"><mpath href="#m2"/></animateMotion></circle>
+      <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.1s" begin="0.9s" repeatCount="indefinite"><mpath href="#m3"/></animateMotion></circle>
+      <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.5s" begin="1.3s" repeatCount="indefinite"><mpath href="#m4"/></animateMotion></circle>
+      <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.2s" begin="1.7s" repeatCount="indefinite"><mpath href="#m5"/></animateMotion></circle>
+      <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.4s" begin="2.1s" repeatCount="indefinite"><mpath href="#m6"/></animateMotion></circle>
+      <rect x="278" y="49" width="84" height="42" rx="9" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+      <text x="320" y="74" text-anchor="middle" fill="#e8e9f2" font-size="11" letter-spacing="1.1">CELL 0</text>
+      <rect x="425" y="134" width="84" height="42" rx="9" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+      <text x="467" y="159" text-anchor="middle" fill="#e8e9f2" font-size="11" letter-spacing="1.1">CELL 1</text>
+      <rect x="425" y="304" width="84" height="42" rx="9" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+      <text x="467" y="329" text-anchor="middle" fill="#e8e9f2" font-size="11" letter-spacing="1.1">CELL 2</text>
+      <rect x="278" y="389" width="84" height="42" rx="9" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+      <text x="320" y="414" text-anchor="middle" fill="#e8e9f2" font-size="11" letter-spacing="1.1">CELL 3</text>
+      <rect x="131" y="304" width="84" height="42" rx="9" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+      <text x="173" y="329" text-anchor="middle" fill="#e8e9f2" font-size="11" letter-spacing="1.1">CELL 4</text>
+      <rect x="131" y="134" width="84" height="42" rx="9" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+      <text x="173" y="159" text-anchor="middle" fill="#e8e9f2" font-size="11" letter-spacing="1.1">CELL 5</text>
+      <rect x="238" y="222" width="164" height="34" rx="8" fill="#06070d" stroke="rgba(62,230,196,0.35)"/>
+      <text x="320" y="243" text-anchor="middle" fill="#3ee6c4" font-size="10.5" letter-spacing="1.3">N&times;(N&minus;1) SPSC RINGS</text>
+    </svg>
+  </div>
+</section>
+
+<!-- ============ 04 MEASURED ============ -->
+<section id="evidence" class="band">
+  <div class="section-inner">
+    <p class="kicker">04 &middot; MEASURED, NOT PROMISED</p>
+    <h2 style="margin-top:0">Numbers with receipts.</h2>
+    <p class="lede" style="max-width:640px">Every public number is gated by the evidence ledger: replicated runs, clean tree, competitors in the same run on the same box, flamegraph attached &mdash; or the claim does not exist. Everything below cites an <strong style="color:var(--text)">Allowed</strong> ledger row.</p>
+
+    <div class="bench-grid">
+      <div>
+        <div class="bench-h">UNPIPELINED GET/SET &middot; 512 CONNS &middot; SAME RUN, SAME BOX</div>
+        <svg class="bench-svg" viewBox="0 0 560 130" style="width:100%;display:block" data-bench>
+          <defs>
+            <linearGradient id="bgrad1" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0" stop-color="#7c5cff"/>
+              <stop offset="1" stop-color="#3ee6c4"/>
+            </linearGradient>
+          </defs>
+          <text x="0" y="36" fill="#e8e9f2" font-size="12" font-weight="700">INFINITYDB</text>
+          <rect x="128" y="22" width="400" height="22" rx="4" fill="url(#bgrad1)">
+            <animate attributeName="width" from="0" to="400" dur="1.2s" begin="indefinite" fill="freeze" calcMode="spline" keySplines="0.22 1 0.36 1" keyTimes="0;1" data-bar-anim/>
+          </rect>
+          <text x="128" y="60" fill="#3ee6c4" font-size="10" letter-spacing="0.6">3.21&times; REDIS &mdash; MEASURED, IN-RUN</text>
+          <text x="0" y="106" fill="#9096ae" font-size="12">REDIS 8.x</text>
+          <rect x="128" y="92" width="125" height="22" rx="4" fill="rgba(139,144,168,0.35)">
+            <animate attributeName="width" from="0" to="125" dur="0.9s" begin="indefinite" fill="freeze" calcMode="spline" keySplines="0.22 1 0.36 1" keyTimes="0;1" data-bar-anim/>
+          </rect>
+          <text x="264" y="107" fill="#5c6178" font-size="10">1.0&times; baseline</text>
+        </svg>
+      </div>
+      <div>
+        <div class="bench-h">RSS AT 10M KEYS &times; (16 B, 64 B) &mdash; LOWER IS BETTER</div>
+        <svg class="bench-svg" viewBox="0 0 560 190" style="width:100%;display:block" data-bench>
+          <defs>
+            <linearGradient id="bgrad2" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0" stop-color="#7c5cff"/>
+              <stop offset="1" stop-color="#3ee6c4"/>
+            </linearGradient>
+          </defs>
+          <text x="0" y="36" fill="#e8e9f2" font-size="12" font-weight="700">INFINITYDB</text>
+          <rect x="128" y="22" width="98" height="22" rx="4" fill="url(#bgrad2)">
+            <animate attributeName="width" from="0" to="98" dur="0.9s" begin="indefinite" fill="freeze" calcMode="spline" keySplines="0.22 1 0.36 1" keyTimes="0;1" data-bar-anim/>
+          </rect>
+          <text x="236" y="37" fill="#3ee6c4" font-size="10" letter-spacing="0.6">0.61&times; &mdash; MEASURED, SAME RUN</text>
+          <text x="0" y="106" fill="#9096ae" font-size="12">REDIS 8.x</text>
+          <rect x="128" y="92" width="160" height="22" rx="4" fill="rgba(139,144,168,0.35)">
+            <animate attributeName="width" from="0" to="160" dur="1s" begin="indefinite" fill="freeze" calcMode="spline" keySplines="0.22 1 0.36 1" keyTimes="0;1" data-bar-anim/>
+          </rect>
+          <text x="298" y="107" fill="#5c6178" font-size="10">1.0&times; baseline</text>
+          <text x="0" y="166" fill="#9096ae" font-size="12">VORTEX &dagger;</text>
+          <rect x="128" y="152" width="400" height="22" rx="4" fill="rgba(255,92,120,0.28)">
+            <animate attributeName="width" from="0" to="400" dur="1.3s" begin="indefinite" fill="freeze" calcMode="spline" keySplines="0.22 1 0.36 1" keyTimes="0;1" data-bar-anim/>
+          </rect>
+          <text x="330" y="167" fill="#5c6178" font-size="10">2&ndash;3&times; &mdash; why it died: see the blog</text>
+        </svg>
+      </div>
+    </div>
+
+    <div class="stat-grid" style="margin-top:52px">
+      <div class="stat">
+        <div class="v">9.8 s</div>
+        <div class="l">10 GB NODE COLD-BOOTS TO SERVING &mdash; 15 s GATE</div>
+      </div>
+      <div class="stat">
+        <div class="v">10,000</div>
+        <div class="l">POWER-CUT SEEDS &mdash; ZERO DURABILITY-ORACLE VIOLATIONS</div>
+      </div>
+      <div class="stat">
+        <div class="v">14.4 MiB</div>
+        <div class="l">CHECKPOINT PEAK-RSS OVERHEAD &mdash; FORK-FREE, VS CONTROL</div>
+      </div>
+      <div class="stat">
+        <div class="v">96.19%</div>
+        <div class="l">LFU HIT-RATE &mdash; EXACT PARITY WITH REDIS, SAME TRACE</div>
+      </div>
+    </div>
 
     <div class="card-grid" style="margin-top:44px">
-      <div class="evidence reveal" style="margin:0">
+      <div class="evidence" style="margin:0">
         <span class="tag">C12 &middot; Allowed</span> &mdash; Durability is deterministically tested: 10,000 simulated power-cut/disk-fault seeds, zero durability-oracle violations &mdash; every <code>always</code>-acked write survives, <code>everysec</code> loses at most one second (simulated time); every seed replays byte-identically.
         <span class="artifact">.artifacts/dst-sweep-10k &middot; regenerated per release &middot; frame-format v2: 0 refusals at the same 10k seeds</span>
       </div>
-      <div class="callout reveal" style="margin:0">
-        <span class="callout-tag"><strong>Why there are no benchmark numbers here:</strong></span>
-        the evidence policy forbids publishing a number before a validated, replicated artifact exists &mdash; and comparative numbers additionally require the competitor in the same run on the same box. Every public number lives in the <a href="docs/index.html#claims">claim ledger</a> with its artifact, or it does not exist. When the ledger allows one, it appears here &mdash; not before.
+      <div class="callout" style="margin:0">
+        <span class="callout-tag"><strong>What you don&rsquo;t see here:</strong></span>
+        pipelined throughput peaks, <code>always</code>-mode write rates, tail latencies. Those ledger rows are <em>Narrowed</em> or <em>Evidence-pending</em>, so they don&rsquo;t ship &mdash; design targets never appear as numbers on this site. Every allowed claim lives in the <a href="docs/index.html#claims">claim ledger</a> with its artifact, or it does not exist.
       </div>
+    </div>
+
+    <p class="bench-note">// reference box: i7-13700KF &middot; pinned P-cores &middot; performance governor &middot; turbo off &middot; competitors in-run &middot; 3&ndash;5 replicates &mdash; ledger rows C5, C7, C8, C12, C14, C16 &middot; &dagger; vortex was our predecessor engine; the post-mortem is <a href="blog/why-vortex-failed.html">on the blog</a></p>
+  </div>
+</section>
+
+<!-- ============ 05 ONE SESSION ============ -->
+<section id="session" class="session">
+  <div class="sticky">
+    <p class="kicker" style="margin-bottom:0">05 &middot; ONE SESSION</p>
+    <h2>Five workloads. One connection.</h2>
+    <p class="lede">A cache write, an fsync-gated durable write, a JSON document mutation, a query, a stream read &mdash; on one node, over the Redis protocol you already speak. What ships is live; what&rsquo;s coming is labeled with its milestone.</p>
+    <p class="fine">Durability is a property of the namespace, not the server. The loss window is a config knob.</p>
+  </div>
+  <div class="terminal">
+    <div class="terminal-bar">
+      <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="title">infinity &mdash; unified session</span>
+    </div>
+    <div class="terminal-body">
+      <div class="line"><span class="s">$</span> redis-cli <span class="c"># your CLI, unchanged</span></div>
+      <div class="line"><span class="p">inf&gt;</span> INF.NS CREATE cart   MODE <span class="s">memory</span>  EVICTION allkeys-lfu</div>
+      <div class="line"><span class="p">inf&gt;</span> INF.NS CREATE orders MODE <span class="s">durable</span> FSYNC always</div>
+      <div class="line"><span class="p">inf&gt;</span> SET cart:{u42}:items "lens &times;3" <span class="c"># cache-speed</span></div>
+      <div class="line"><span class="p">inf&gt;</span> SET orders:{u42}:1009 "paid" <span class="c"># acked after fsync</span></div>
+      <div class="line"><span class="p">inf&gt;</span> INF.CKPT WAIT <span class="c"># fork-free checkpoint</span></div>
+      <div class="terminal-divider">ROADMAP SURFACE &mdash; SAME SESSION, LATER MILESTONES</div>
+      <div class="line dim"><span class="p">inf&gt;</span> JSON.SET catalog:{sku9} $ '{"name":"Lens"}' <span class="c"># M3 &middot; in dev</span></div>
+      <div class="line dim"><span class="p">inf&gt;</span> INF.QL "SELECT &hellip; WHERE price &lt; 5000" <span class="c"># M4.5</span></div>
+      <div class="line dim"><span class="p">inf&gt;</span> XREADGROUP GROUP billing c1 &hellip; <span class="c"># M7</span></div>
+      <div class="line dim"><span class="p">inf&gt;</span> VSIM catalog:emb 10 VECTOR &hellip; <span class="c"># M8</span></div>
+      <div class="line dim"><span class="p">inf&gt;</span> INF.CALL pricing.reprice u42 <span class="c"># M10 &middot; runs where {u42} lives</span></div>
+      <div class="line"><span class="p">inf&gt;</span> <span class="cursor"></span></div>
     </div>
   </div>
 </section>
 
+<!-- ============ 06 ROADMAP ============ -->
 <section id="roadmap" class="section">
-  <div class="section-inner">
-    <h2 class="reveal" style="margin-top:0;max-width:760px">Where it actually is.</h2>
-    <p class="lede reveal" style="margin-bottom:22px">InfinityDB is in development, built milestone by milestone behind hard STOP gates &mdash; a milestone that fails its gate halts feature work. M0 (architecture proof), M1 (cache core), and M2 (durability) are complete; M2.5 is hardening the durable core into the first public tag, <code>v0.2.0-alpha.1</code>.</p>
+  <div class="section-inner" style="padding-top:0">
+    <p class="kicker">06 &middot; THE ROAD TO 1.0</p>
+    <h2 style="margin-top:0">Shippable at every stop.</h2>
+    <p class="lede" style="max-width:620px">Every milestone has STOP gates &mdash; failing one halts the train and the fix happens at the architecture layer. M0&ndash;M2.5 exited on verdicts; M3 carries the first public tag, <code>v0.3.0-alpha.1</code>.</p>
 
-    <div class="rail reveal">
+    <div class="rail">
       <div class="rail-track">
-        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M0</p><p class="d">skeleton &#10003;</p></div>
-        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M1</p><p class="d">cache core &#10003;</p></div>
-        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M2</p><p class="d">durability &#10003;</p></div>
-        <div class="rail-stop now"><div class="rail-dot"></div><p class="m">M2.5 &middot; NOW</p><p class="d">hardening &middot; &alpha; tag</p></div>
-        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M3</p><p class="d">json docs</p></div>
-        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M4</p><p class="d">tiered</p></div>
-        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M4.5</p><p class="d">indexes &middot; query</p></div>
-        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M5</p><p class="d">data types</p></div>
-        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M6</p><p class="d">txns &middot; lua</p></div>
-        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M7 &middot; &beta;</p><p class="d">streams</p></div>
-        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M8</p><p class="d">vectors</p></div>
-        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M9</p><p class="d">replication</p></div>
-        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M10</p><p class="d">compute</p></div>
-        <div class="rail-stop ga"><div class="rail-dot"></div><p class="m">1.0.0</p><p class="d">GA</p></div>
+        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M0</p><p class="d">skeleton</p><p class="s">GO &middot; ADR-0004</p></div>
+        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M1</p><p class="d">cache core</p><p class="s">DONE</p></div>
+        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M2</p><p class="d">durability</p><p class="s">DONE</p></div>
+        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M2.5</p><p class="d">hardening</p><p class="s">DONE</p></div>
+        <div class="rail-stop now"><div class="rail-dot"></div><p class="m">M3</p><p class="d">json docs</p><p class="s">NOW &middot; &alpha; TAG</p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M4</p><p class="d">tiered</p><p class="s"></p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M4.5</p><p class="d">indexes &middot; query</p><p class="s"></p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M5</p><p class="d">data types</p><p class="s"></p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M6</p><p class="d">txns &middot; lua</p><p class="s"></p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M7</p><p class="d">streams</p><p class="s">FIRST &beta;</p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M8</p><p class="d">vectors</p><p class="s"></p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M9</p><p class="d">replication</p><p class="s"></p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M10</p><p class="d">compute</p><p class="s"></p></div>
+        <div class="rail-stop ga"><div class="rail-dot"></div><p class="m">1.0</p><p class="d">GA</p><p class="s"></p></div>
       </div>
     </div>
-    <p class="mono-note reveal" style="margin-top:26px">TRAIN REORDERED DOCUMENTS-FIRST BY ADR-0023 &middot; M4.5 INSERTED BY ADR-0024 &middot; M2.5 RESTRUCTURED PERFORMANCE-FIRST BY ADR-0025 &mdash; <a href="docs/roadmap.html" style="letter-spacing:0">milestone-by-milestone detail &rarr;</a></p>
+    <p class="mono-note" style="margin-top:26px">TRAIN REORDERED DOCUMENTS-FIRST BY ADR-0023 &middot; M4.5 INSERTED BY ADR-0024 &middot; FIRST PUBLIC TAG MOVED TO M3 BY ADR-0048 &mdash; <a href="docs/roadmap.html" style="letter-spacing:0">milestone-by-milestone detail &rarr;</a></p>
   </div>
 </section>
 
+<!-- ============ CTA + FOOTER ============ -->
 <section class="cta-band">
   <div class="glow"></div>
   <div class="inner">
-    <h2 class="reveal">Follow the build.</h2>
-    <p class="reveal">Gates before features. Evidence before claims. Watch the milestones land &mdash; or read the master plan and hold us to it.</p>
-    <div class="ctas reveal">
-      <a class="btn btn-primary" href="https://github.com/">&#9733; Star on GitHub</a>
-      <a class="btn btn-ghost" href="blog/the-log-is-the-database.html">Read how it&rsquo;s built &rarr;</a>
+    <svg width="56" height="30" viewBox="0 0 34 18" style="display:block;margin:0 auto 24px" aria-hidden="true">
+      <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2"/>
+      <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2"/>
+    </svg>
+    <h2>One binary. One port. One log.</h2>
+    <p>Start as a faster Redis. End up replacing the stack around it &mdash; one namespace at a time. Gates before features; evidence before claims.</p>
+    <div class="ctas">
+      <a class="btn btn-primary" href="https://github.com/">&#9733; STAR ON GITHUB</a>
+      <a class="btn btn-ghost" href="docs/quickstart.html">QUICKSTART &rarr;</a>
     </div>
   </div>
 </section>
 
-<footer class="footer">
+<footer class="footer" style="margin-top:0">
   <div class="footer-inner">
-    <span class="mark">&infin; InfinityDB</span>
-    <span class="meta">APACHE 2.0 &middot; RUST &middot; BEST ON LINUX WITH io_uring</span>
+    <span class="mark">&copy; 2026 INFINITYDB &mdash; APACHE 2.0 &middot; RUST &middot; <b>infinityd</b></span>
     <div class="footer-links">
-      <a href="docs/index.html">Docs</a>
-      <a href="blog/index.html">Blog</a>
-      <a href="docs/roadmap.html">Roadmap</a>
-      <a href="https://github.com/">GitHub &#8599;</a>
+      <a href="docs/index.html">DOCS</a>
+      <a href="blog/index.html">BLOG</a>
+      <a href="docs/roadmap.html">ROADMAP</a>
+      <a href="https://github.com/">GITHUB &#8599;</a>
     </div>
   </div>
 </footer>
 
 <script>
 (function () {
+  // mobile nav
   var t = document.querySelector('.nav-toggle');
   var l = document.querySelector('.nav-links');
   if (t && l) t.addEventListener('click', function () {
     var open = l.classList.toggle('open');
     t.setAttribute('aria-expanded', open ? 'true' : 'false');
   });
+
+  // copy-to-clipboard on the install bar
+  document.querySelectorAll('[data-copy]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      try { navigator.clipboard.writeText(btn.getAttribute('data-copy')); } catch (err) {}
+      var prev = btn.textContent;
+      btn.textContent = 'COPIED ✓';
+      clearTimeout(btn._t);
+      btn._t = setTimeout(function () { btn.textContent = prev; }, 1600);
+    });
+  });
+
+  // benchmark bars grow when scrolled into view (bars are full-width by
+  // default, so content is never gated on the animation firing)
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!reduce && 'IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (!entry.isIntersecting) return;
+        entry.target.querySelectorAll('[data-bar-anim]').forEach(function (anim) {
+          try { anim.beginElement(); } catch (err) {}
+        });
+        io.unobserve(entry.target);
+      });
+    }, { threshold: 0.35 });
+    document.querySelectorAll('[data-bench]').forEach(function (el) { io.observe(el); });
+  }
 })();
 </script>
 </body>

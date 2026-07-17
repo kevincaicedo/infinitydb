@@ -16,7 +16,9 @@ PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 6379
 
 
 def main() -> None:
-    r = redis.Redis(host=HOST, port=PORT, decode_responses=True)
+    # socket_timeout: redis-py has no default command timeout — a lost
+    # reply would park the smoke forever (same hang discipline as smoke.mjs).
+    r = redis.Redis(host=HOST, port=PORT, decode_responses=True, socket_timeout=30)
     assert r.ping() is True
 
     # Strings + expiry.

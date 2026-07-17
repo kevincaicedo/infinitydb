@@ -30,6 +30,20 @@
 1.1 %           # C21: sum(domains) vs RSS divergence
 1 gb            # C21: durable fill size of the measured row
 
+# --- ledger C8 (Allowed): LFU hit-rate parity ---------------------------
+96.19 %         # C8: "96.19% vs 96.19% (+0.00 pp)" — landing-page stat tile cites the allowed wording
+
+# --- historical Vortex post-mortem facts (master plan §2) ----------------
+# These describe the RETIRED predecessor engine (and, for RC-4, published
+# third-party systems), quoted verbatim from the constitutional post-mortem
+# in docs/infinity-master-plan.md §2. They are not InfinityDB claims; the
+# blog post carries an explicit disclaimer note saying exactly that.
+966 ms          # §2 preamble (RC context): Vortex p99.9 cliffs under load
+75 %            # §2 RC-1: Vortex CPU share in io_uring completion handling
+25 μs           # §2 RC-4: the invalid POC's measured cross-shard hop cost
+45 μs           # §2 RC-4: upper bound of the same invalid POC measurement
+2 μs            # §2 RC-4: published batched cross-core hop range of production thread-per-core systems (Seastar/Dragonfly/Redpanda)
+
 # --- non-claims (documented) ---------------------------------------------
 16 gb           # config example in the INF.NS docs (MAXMEMORY 16gb) — master plan §4.2 example, not a measurement
 16 mib          # record-format value bound (SETRANGE note in the compat matrix; value bound on the operations limitations list) — wire format, not a measurement

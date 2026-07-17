@@ -22,6 +22,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -51,6 +52,7 @@ jobs:
 
   cargo-deny:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -60,6 +62,7 @@ jobs:
   miri:
     # Scoped to the unsafe leaf crates (verification ladder §17.2).
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -72,6 +75,7 @@ jobs:
 
   loom:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -86,6 +90,7 @@ jobs:
   fuzz-smoke:
     # 10-minute smoke per PR (M0-S02); 1 h corpus run is the nightly job.
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -130,6 +135,7 @@ jobs:
     # version drift would silently move the compatibility claim. Harnesses
     # connect by explicit address instead of spawning from PATH.
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -167,6 +173,7 @@ jobs:
     # of the box (INFO fields, CLIENT surface, pub/sub, SCAN). One job per
     # library would waste runners; one server serves all four sequentially.
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -175,15 +182,28 @@ jobs:
       - name: build infinityd (release)
         run: cargo build --release -p infinityd
       - name: start infinityd
+        # infinityd speaks RESP arrays only (no inline commands), so the
+        # probe sends real RESP bytes — `echo PING | nc` never gets a PONG
+        # and silently burned the full retry budget. The loop now also
+        # hard-fails if the server never comes up instead of letting the
+        # smokes run against a dead port.
         run: |
           ./target/release/infinityd --port 6379 &
+          ready=0
           for i in $(seq 1 100); do
-            (echo PING | timeout 1 nc 127.0.0.1 6379 | grep -q PONG) && break || sleep 0.2
+            if printf '*1\r\n$4\r\nPING\r\n' | timeout 1 nc 127.0.0.1 6379 | grep -q PONG; then
+              ready=1; break
+            fi
+            sleep 0.2
           done
+          test "$ready" = 1 || { echo "infinityd never answered PING"; exit 1; }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Per-step timeouts: a client library with no command timeout parks
+      # forever on a lost reply; bound each smoke to minutes, not the job.
       - name: redis-py smoke
+        timeout-minutes: 5
         run: |
           pip install 'redis>=5,<7'
           python tests/client-smoke/smoke.py
@@ -191,6 +211,7 @@ jobs:
         with:
           node-version: "22"
       - name: node-redis smoke
+        timeout-minutes: 5
         run: |
           npm install --no-save redis@^4
           node smoke.mjs
@@ -199,6 +220,7 @@ jobs:
         with:
           go-version: "1.23"
       - name: go-redis smoke
+        timeout-minutes: 5
         run: go mod tidy && go run .
         working-directory: tests/client-smoke/go
       - uses: actions/setup-java@v4
@@ -206,6 +228,7 @@ jobs:
           distribution: temurin
           java-version: "21"
       - name: lettuce smoke
+        timeout-minutes: 10
         run: mvn -q -B compile exec:java -Dexec.mainClass=Smoke
         working-directory: tests/client-smoke/java
 
@@ -213,6 +236,7 @@ jobs:
     # M0-S20: deterministic simulator — smoke scenario twice with trace
     # comparison, plus the in-process determinism/oracle/planted-bug tests.
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -229,6 +253,7 @@ jobs:
     # kernel; older-kernel behavior is exercised via probe-forcing env vars
     # until a self-hosted matrix box exists. PENDING LINUX VALIDATION.
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

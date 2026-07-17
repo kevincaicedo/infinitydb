@@ -5,10 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Operations — InfinityDB Docs</title>
 <meta name="description" content="Operating InfinityDB: recovery and the -LOADING gate, what a fail-stop refusal means, the INFO persistence fields, operator tripwires, and the alpha limitation list.">
-<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='20'%20fill='%23201826'/%3E%3Ctext%20x='50'%20y='71'%20font-size='62'%20text-anchor='middle'%20fill='%23cf7ff5'%20font-family='system-ui'%3E%E2%88%9E%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2018'%3E%3Ccircle%20cx='10'%20cy='9'%20r='7'%20fill='none'%20stroke='%237c5cff'%20stroke-width='2.4'/%3E%3Ccircle%20cx='24'%20cy='9'%20r='7'%20fill='none'%20stroke='%233ee6c4'%20stroke-width='2.4'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../assets/site.css">
 </head>
 <body>
@@ -16,24 +16,43 @@
 <nav class="nav">
   <div class="nav-inner">
     <a href="../index.html" class="nav-brand">
-      <span class="mark">&infin; InfinityDB</span>
-      <span class="nav-badge">v0.2.0-alpha.1 &middot; IN DEV</span>
+      <svg class="logo" width="34" height="18" viewBox="0 0 34 18" aria-hidden="true">
+        <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2.4"/>
+        <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2.4"/>
+      </svg>
+      <span class="mark">infinity<b>DB</b></span>
+      <span class="nav-badge neutral">DOCS</span>
     </a>
     <span class="nav-spacer"></span>
     <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
     <div class="nav-links">
-      <a href="../index.html#spine">Architecture</a>
-      <a href="../index.html#workloads">Workloads</a>
-      <a href="roadmap.html">Roadmap</a>
-      <a href="index.html" aria-current="page">Docs</a>
-      <a href="../blog/index.html">Blog</a>
-      <a class="nav-cta" href="https://github.com/">&#9733; GitHub</a>
+      <a href="../index.html">HOME</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
     </div>
   </div>
 </nav>
 
-<main class="doc">
-  <p class="breadcrumb"><a href="index.html">Docs</a> / Operations</p>
+<div class="docs-shell">
+  <aside class="docs-side">
+    <p class="side-h">Getting started</p>
+    <a class="side-link" href="index.html">Docs home</a>
+    <a class="side-link" href="quickstart.html">Quickstart</a>
+    <p class="side-h">Concepts</p>
+    <a class="side-link" href="architecture.html">Architecture</a>
+    <a class="side-link" href="durability.html">Namespaces &amp; durability</a>
+    <p class="side-h">Operations</p>
+    <a class="side-link" href="deployment.html">Deployment</a>
+    <a class="side-link" href="operations.html" aria-current="page">Operations</a>
+    <p class="side-h">Reference</p>
+    <a class="side-link" href="compat.html">Command matrix</a>
+    <a class="side-link" href="roadmap.html">Roadmap</a>
+  </aside>
+
+  <main class="docs-main">
+    <article>
+      <p class="doc-kicker">Operations</p>
   <h1 class="page-title">Operations</h1>
   <p class="lede">What the node does after a crash, exactly which commands answer while it loads, what a refusal to boot means (and why there is no <code>--force</code> flag), what to watch in <code>INFO persistence</code>, and the honest list of what this alpha does not do. The semantic contract behind all of it &mdash; ack points and loss windows &mdash; is on the <a href="durability.html">namespaces &amp; durability page</a>.</p>
 
@@ -179,17 +198,18 @@ offset 0x40000 &mdash; interior data would be lost by truncation, refusing to st
     <a href="deployment.html">&larr; Deployment</a>
     <a href="architecture.html">Architecture &rarr;</a>
   </div>
-</main>
+    </article>
+  </main>
+</div>
 
 <footer class="footer">
   <div class="footer-inner">
-    <span class="mark">&infin; InfinityDB</span>
-    <span class="meta">APACHE 2.0 &middot; RUST &middot; BEST ON LINUX WITH io_uring</span>
+    <span class="mark">&copy; 2026 INFINITYDB &mdash; APACHE 2.0 &middot; RUST &middot; <b>infinityd</b></span>
     <div class="footer-links">
-      <a href="index.html">Docs</a>
-      <a href="../blog/index.html">Blog</a>
-      <a href="roadmap.html">Roadmap</a>
-      <a href="https://github.com/">GitHub &#8599;</a>
+      <a href="index.html">DOCS</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a href="https://github.com/">GITHUB &#8599;</a>
     </div>
   </div>
 </footer>

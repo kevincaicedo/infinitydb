@@ -1,10 +1,13 @@
-# InfinityDB website v1 (M2.5-S05)
+# InfinityDB website v2 (design refresh, 2026-07-17)
 
 Fully static, multi-page project website for GitHub Pages. Plain HTML/CSS +
 minimal vanilla JS — no framework, no build step for pages. The only
-generated page is the compat matrix (see below). Evolved from the design
-prototype `assests/InfinityDB Landing A.dc.html` (the "unification" hero
-variant), with all `sc-if`/`x-dc`/`support.js` scaffolding removed.
+generated page is the compat matrix (see below). v2 ports the approved
+dual-accent design prototypes `assests/Landing.dc.html` / `Docs.dc.html` /
+`Blog.dc.html` (violet #7c5cff + teal #3ee6c4 on #06070d — see DESIGN.md,
+"Two Lamps on Near-Black"), with all `sc-if`/`x-dc`/`support.js`
+scaffolding replaced by vanilla equivalents (copy button,
+IntersectionObserver bar triggers, nav toggle).
 
 ## Layout
 
@@ -25,6 +28,7 @@ site/                          ← the deployable root (upload this to Pages)
     roadmap.html               the milestone train, ADR reorders named
   blog/
     index.html
+    why-vortex-failed.html         featured post-mortem (master plan §2, adapted)
     the-log-is-the-database.html   inaugural post (discipline model)
 scripts/
   gen-compat-page.py           renders compat.html from the repo artifact
@@ -95,14 +99,19 @@ python3 scripts/check-ledger-copy.py --site site \
 - The check is a tripwire, not a replacement for the release-manager
   checklist in the ledger (it checks numbers, not wording).
 
-Current numbers on the site and their coverage: the durability page cites
-ledger rows **C12, C13, C14, C15, C16, C21** (all Allowed) verbatim with
-their artifacts; the blog post cites **C3, C4, C12**. The deployment and
-operations pages (M2.5-S06) carry only documented non-claims: the
-`256 MiB` config defaults and the `16 MiB` value bound (allowlisted with
-comments). There are **zero** throughput/latency/comparison marketing
-numbers anywhere — the landing page keeps the "why there are no benchmark
-numbers" evidence-policy block instead, by design.
+Current numbers on the site and their coverage: the landing page shows
+the first Allowed measured rows — **C5** (unpipelined 3.21× Redis +
+the 1.72× Dragonfly cross-cell anchor, disclosures in the mono footnote),
+**C7** (0.61× RSS), **C8** (96.19% LFU parity), **C12** (10k-seed sweep),
+**C14** (9.8 s cold boot), **C16** (14.4 MiB checkpoint overhead) — in
+evidence blocks and stat tiles; the durability page cites **C12–C16,
+C21** verbatim with artifacts; the blog cites **C3, C4, C12** plus the
+historical Vortex post-mortem facts (master plan §2 — allowlisted as
+documented non-claims with an in-post disclaimer). Deployment/operations
+carry only config non-claims (`256 MiB` defaults, `16 MiB` bound).
+Pipelined peaks, `always`-mode write rates, and absolute tail-latency
+claims remain absent — Narrowed/Evidence-pending rows never render, and
+the landing's "what you don't see here" callout says so explicitly.
 
 ## Deploying to GitHub Pages
 
@@ -134,14 +143,16 @@ numbers" evidence-policy block instead, by design.
 ## Honesty invariants baked into the copy (keep them when editing)
 
 - Shipping today = Redis-compatible in-memory cache + durable KV
-  namespaces. Documents/queries/collections/streams/vectors/compute/HA are
-  roadmap items and every mention carries its milestone label.
-- Version badge = `v0.2.0-alpha.1 · IN DEV` (M2.5 is hardening toward the
-  first public tag; nothing has been tagged yet — the README's old
-  `v0.1.0-alpha` docker/binaries instructions were deliberately NOT
-  reproduced because that release never shipped).
-- The roadmap page mirrors master plan §21–22 including the ADR-0023/0024
-  reorders and M4.5; "M1 · NOW" from the prototype was stale and is gone.
+  namespaces (JSON documents are M3 · IN DEV). Queries/collections/
+  streams/vectors/compute/HA are roadmap items and every mention carries
+  its milestone label — including terminal commands and diagram nodes.
+- Version badge = `v0.3.0-alpha.1 · IN DEV` (ADR-0048, 2026-07-16:
+  `v0.2.0-alpha.1` retired unused; the first public tag is M3's
+  `v0.3.0-alpha.1`, release act in M3-S26; nothing has been tagged yet).
+- The roadmap page mirrors master plan §21–22 including the
+  ADR-0023/0024 reorders, M4.5, and the ADR-0048 first-tag move; the
+  design prototypes' stale train (old numbering, "M1 · NOW") was
+  corrected during the port, not reproduced.
 - The Docker quickstart builds from the repo and keeps the io_uring seccomp
   requirement front and center.
 - The `wait-replica` durability row is labeled M9 (not shipped).

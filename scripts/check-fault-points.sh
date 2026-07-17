@@ -11,7 +11,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-mapfile -t DECLS < <(ls crates/*/src/fault.rs 2>/dev/null)
+# Portable (macOS bash 3.2 has no `mapfile`; BSD grep has no `-P`).
+DECLS=()
+for decl in crates/*/src/fault.rs; do
+    [ -e "$decl" ] && DECLS+=("$decl")
+done
 if [ "${#DECLS[@]}" -eq 0 ]; then
     echo "no fault-point declaration modules found (crates/*/src/fault.rs)"
     exit 1
@@ -21,7 +25,9 @@ fi
 # module (each ALL inventory is built from the same consts).
 POINTS=()
 for decl in "${DECLS[@]}"; do
-    mapfile -t -O "${#POINTS[@]}" POINTS < <(grep -oP 'pub const [A-Z_]+: &str = "\K[a-z_]+' "$decl")
+    while IFS= read -r point; do
+        POINTS+=("$point")
+    done < <(sed -E -n 's/.*pub const [A-Z_]+: &str = "([a-z_]+)".*/\1/p' "$decl")
 done
 if [ "${#POINTS[@]}" -eq 0 ]; then
     echo "no fault points declared in: ${DECLS[*]}"

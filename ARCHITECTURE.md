@@ -241,7 +241,8 @@ our invariants into compile errors, `!Send` futures encode "this never
 leaves its core" in the signature, and the ecosystem supplies audited
 foundations for the edges (wasmtime for reducers, mlua for scripting)
 without touching the zero-dependency core. Stable toolchain, pinned
-version; `unsafe` confined to audited leaf crates under Miri and Loom.
+version; `unsafe` confined to audited leaf crates under Miri and Loom,
+plus one module-scoped emit region (`inf_doc::emit`, ADR-0049).
 
 ## References
 
