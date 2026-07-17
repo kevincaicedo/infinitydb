@@ -26,7 +26,7 @@ use inf_log::{
     SegmentRotor, StagingConfig, StagingRing,
 };
 use inf_runtime::{CompletionToken, IoOp, LoopCx, TokenClass, WaitList, WatermarkGate};
-use inf_store::{Keyspace, WallAnchor};
+use inf_store::{CheckpointImage, Keyspace, WallAnchor};
 
 use crate::ckpt::{
     CkptCell, CkptPhase, CkptStats, MAX_TRUNC_PER_SLICE_ADAPTIVE, MAX_UNLINKS_PER_SLICE,
@@ -40,6 +40,10 @@ pub(crate) const EVERYSEC_TIMER_KEY: u64 = 0xE5EC_0001;
 /// POSIX `EIO` (this crate carries no libc dep): the errno the
 /// `durable_fsync_eio` fault point injects (M2-S17).
 const EIO: i32 = 5;
+
+/// Pinned retryable reply for aggregate staging backpressure. Early
+/// admission and late exact document admission must stay byte-identical.
+pub(crate) const STAGING_BUSY_ERROR: &str = "BUSY durable log staging is full, retry";
 
 /// Durable-path configuration one cell receives from the node assembly.
 /// Absent config means a memory-only cell: durable DDL is refused with a
@@ -166,8 +170,12 @@ impl<F: SegmentFs> DurableCell<F> {
         ckpt: CkptCell<F>,
         manifest: ManifestCell<F>,
     ) -> DurableCell<F> {
+        // ADR-0031 D5/D6: frames sealed here stamp the recovery-derived
+        // log life (1 on fresh logs).
+        let mut staging = StagingRing::new(staging);
+        staging.set_frame_epoch(rotor.resume_epoch());
         DurableCell {
-            staging: StagingRing::new(staging),
+            staging,
             rotor,
             commit: GroupCommit::with_sync_pipeline(usize::from(sync_pipeline)),
             ack_gate: WatermarkGate::new(),
@@ -218,6 +226,14 @@ impl<F: SegmentFs> DurableCell<F> {
     /// conservative byte estimate). `false` = park on [`Self::drained`].
     pub fn would_fit(&self, bytes: usize) -> bool {
         self.staging.would_fit(bytes)
+    }
+
+    /// Current aggregate append budget and the absolute single-record
+    /// ceiling. Durable document handlers use both before committing an
+    /// exact planned full image (ADR-0043 D8).
+    #[cfg(feature = "doc")]
+    pub fn staging_limits(&self) -> (usize, usize) {
+        (self.staging.remaining_capacity() as usize, self.staging.max_record_len() as usize)
     }
 
     /// Stage one effect. Admission was checked via [`Self::would_fit`]
@@ -294,7 +310,8 @@ impl<F: SegmentFs> DurableCell<F> {
                 cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
             }
             let end = slot.base().advance(frame_len);
-            let lease = self.staging.seal(slot.first_record_lsn());
+            let covered = self.commit.watermark().map_or(0, |lsn| lsn.to_u64());
+            let lease = self.staging.seal(slot.first_record_lsn(), covered);
             // A pending ckpt-begin marker rides this frame: its LSN is now
             // real (ADR-0016 D3).
             self.ckpt.on_frame_sealed(&lease);
@@ -552,12 +569,20 @@ impl<F: SegmentFs> DurableCell<F> {
                     }
                     Some(store) => {
                         let bytes = &mut emitted;
-                        let next = store.scan_post_images(
+                        let next = store.scan_checkpoint_images(
                             *cursor,
                             SCAN_CHUNK_ENTRIES,
                             cx.now,
-                            |key, value, expire_ms| {
-                                let rec = RecordView::StringPostImage { ns, key, value };
+                            |key, image, expire_ms| {
+                                let rec = match image {
+                                    CheckpointImage::String(value) => {
+                                        RecordView::StringPostImage { ns, key, value }
+                                    }
+                                    #[cfg(feature = "doc")]
+                                    CheckpointImage::JsonDoc { lineage, version, idoc } => {
+                                        RecordView::DocFull { ns, key, lineage, version, idoc }
+                                    }
+                                };
                                 *bytes = bytes.saturating_add(rec.encoded_len() as u32);
                                 stream.stage_record(&rec);
                                 if let Some(ms) = expire_ms {

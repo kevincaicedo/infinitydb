@@ -1,13 +1,18 @@
 //! M2-S18 integration smoke: seeded power-cut states from the sim disk
 //! (`inf_log::fs::sim::SimDisk`) feed the real recovery machine
 //! (`open_cell_log` is generic over `SegmentFs` — ADR-0018/ADR-0020).
-//! Every surviving image must resolve per the M2-S14 taxonomy: recovery
-//! either succeeds (torn tail truncated, resume at or past the last
-//! fsync-covered byte, digest equal to a reference replay of the
-//! surviving log, deterministic across re-boots) or fail-stops with the
-//! named `LogCorruption` (a validating frame beyond lost interior bytes —
-//! reorder physics the kill-tier crash matrix cannot produce). Silent
-//! loss is unrepresentable: the sweep asserts both outcomes appear.
+//! Every surviving image must resolve per the M2-S14 taxonomy as amended
+//! by M2.5-S12 (ADR-0031): on honest power-cut physics recovery
+//! **succeeds on every seed** — torn tail truncated, resume at or past
+//! the last fsync-covered byte, digest equal to a reference replay of the
+//! surviving log, deterministic across re-boots. The reorder shape that
+//! used to fail-stop (a validating frame beyond lost un-covered bytes —
+//! the ADR-0021 D3 refusal) now truncates with stamp evidence and is
+//! counted in `beyond_frames_discarded`; the sweep asserts the shape
+//! still appears, so the retirement is exercised, not vacuous. Refusals
+//! remain for shapes honest physics cannot produce (attested coverage
+//! past the data end, v1 frames) — pinned by `recover_torn.rs` and
+//! `recover_stamp.rs`.
 //!
 //! This is the composition proof, not the campaign: the durability
 //! oracle over the ack stream and the 10k-seed sweep bind at M2-S19.
@@ -85,7 +90,14 @@ fn build_and_cut(disk: &SimDisk, seed: u64) -> Lsn {
         pending += 1;
         if pending > rng.next_below(5) as usize || op + 1 == ops {
             rotor.maintain(0).expect("maintain");
-            if let Some(lease) = ring.flush_into(&mut rotor, 0).expect("flush") {
+            if !ring.is_empty() {
+                // Seal like the live plane (ADR-0031 D1): the stamp
+                // attests the watermark — here, the last explicit
+                // fdatasync's coverage.
+                let slot = rotor.begin_frame(ring.pending_frame_len(), 0).expect("reserve");
+                let lease = ring.seal(slot.first_record_lsn(), synced_end.to_u64());
+                let frame = ring.leased_frame(&lease).to_vec();
+                rotor.commit_frame(slot, &frame).expect("commit");
                 ring.release(lease);
             }
             pending = 0;
@@ -134,52 +146,49 @@ fn reference_replay(disk: &SimDisk) -> StateDigest {
 #[test]
 fn power_cut_states_recover_or_fail_stop_per_the_taxonomy() {
     let mut recovered = 0u32;
-    let mut fail_stopped = 0u32;
+    let mut beyond_discarded = 0u64;
     for seed in 0..64u64 {
         let disk = SimDisk::new();
         let synced_end = build_and_cut(&disk, 0x5EED_0000 ^ (seed << 3) ^ 1);
         let reference = reference_replay(&disk);
 
         let mut ks = fresh_keyspace();
-        match open_cell_log(disk.clone(), &mut ks, CELL, &cfg(), anchor(), now()) {
-            Ok((rotor, _stats, _unit)) => {
-                let resume = Lsn::new(rotor.active_segment(), rotor.active_written());
-                assert!(
-                    resume >= synced_end,
-                    "seed {seed}: recovery resumed at {resume}, below the fsync-covered end \
-                     {synced_end} — covered bytes were lost"
-                );
-                assert_eq!(
-                    ks.state_digest(now()),
-                    reference,
-                    "seed {seed}: recovery diverged from the surviving log's reference replay"
-                );
-                drop(rotor);
-                // Determinism across re-boots of the same surviving image.
-                let mut ks2 = fresh_keyspace();
-                let (_r2, _s2, _u2) =
-                    open_cell_log(disk.clone(), &mut ks2, CELL, &cfg(), anchor(), now())
-                        .expect("second boot of a recovered image");
-                assert_eq!(ks2.state_digest(now()), reference, "seed {seed}: re-recovery diverged");
-                recovered += 1;
-            }
-            Err(err) => {
-                // The only legal refusal for a tail-only image: interior
-                // data beyond lost bytes (reorder physics) — the named
-                // LogCorruption, never a silent skip.
-                let message = err.to_string();
-                assert!(
-                    message.contains("log corruption"),
-                    "seed {seed}: fail-stop outside the taxonomy: {message}"
-                );
-                fail_stopped += 1;
-            }
-        }
+        // ADR-0031: honest power-cut physics always recovers — the gap +
+        // validating-beyond-frame shape that used to refuse is provably
+        // un-covered (no surviving attestation reaches it) and truncates,
+        // counted. A refusal here would be a policy regression.
+        let (rotor, stats, _unit) =
+            open_cell_log(disk.clone(), &mut ks, CELL, &cfg(), anchor(), now()).unwrap_or_else(
+                |err| panic!("seed {seed}: honest power-cut image refused to recover: {err}"),
+            );
+        let resume = Lsn::new(rotor.active_segment(), rotor.active_written());
+        assert!(
+            resume >= synced_end,
+            "seed {seed}: recovery resumed at {resume}, below the fsync-covered end \
+             {synced_end} — covered bytes were lost"
+        );
+        assert_eq!(
+            ks.state_digest(now()),
+            reference,
+            "seed {seed}: recovery diverged from the surviving log's reference replay"
+        );
+        beyond_discarded += stats.beyond_frames_discarded;
+        drop(rotor);
+        // Determinism across re-boots of the same surviving image.
+        let mut ks2 = fresh_keyspace();
+        let (_r2, _s2, _u2) = open_cell_log(disk.clone(), &mut ks2, CELL, &cfg(), anchor(), now())
+            .expect("second boot of a recovered image");
+        assert_eq!(ks2.state_digest(now()), reference, "seed {seed}: re-recovery diverged");
+        recovered += 1;
     }
-    assert!(recovered > 0, "no seed recovered — the sweep is degenerate");
+    assert_eq!(recovered, 64, "every honest power-cut image recovers");
     assert!(
-        fail_stopped > 0,
-        "no seed produced interior corruption — reorder physics never exercised"
+        beyond_discarded > 0,
+        "no seed produced the gap + validating-beyond-frame shape — the retired refusal \
+         (ADR-0031 D4) was never exercised by this sweep"
     );
-    eprintln!("power-cut smoke: {recovered} recovered, {fail_stopped} refused (both per taxonomy)");
+    eprintln!(
+        "power-cut smoke: {recovered} recovered, {beyond_discarded} un-covered beyond-frames \
+         discarded with evidence (the retired ADR-0021 D3 refusals)"
+    );
 }

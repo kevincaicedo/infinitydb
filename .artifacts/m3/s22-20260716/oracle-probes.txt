@@ -1,0 +1,115 @@
+M3-S22 compat-matrix JSON.* status audit — oracle probe transcript
+====================================================================
+
+date: 2026-07-16
+oracle: redis/redis-stack-server:7.4.0-v8
+  @sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
+module: ReJSON/20809 (2.8.9) — same pin as tests/compat/src/json_oracle.rs
+client: redis-cli 8.0.5 (RESP2), local docker, port 6391
+
+Decision rule applied (from matrixgen.rs module vocabulary + the S22
+audit charter): a row is `full` only if it has byte-compared corpus
+cases under BOTH RESP2 and RESP3, zero deviation-allowlist entries
+attributable to it, and no semantic difference (atomicity windows,
+snapshot semantics, counting, precision, attribution, accepted-vs-
+rejected forms). Module-specific error-text wording is NOT in the
+representational list (ordering, identity payloads, opaque cursors/art),
+so error-text deviations keep a row `partial`. Probes below settle the
+declaration notes whose RedisJSON arm was not pinned by the S21 corpus.
+
+Probe 1 — string lengths are bytes (JSON.STRLEN / JSON.STRAPPEND)
+  JSON.SET s1 $ '{"s":"héllo"}'   -> OK        (é = 2 UTF-8 bytes)
+  JSON.STRLEN s1 $.s              -> 6         (bytes, not 5 chars)
+  JSON.STRAPPEND s1 $.s '"é"'     -> 8         (6 + 2 bytes)
+  => RedisJSON reports byte lengths; InfinityDB's "lengths in bytes"
+     note is a MATCH, not a deviation.
+
+Probe 2 — STRAPPEND implicit root + STRLEN 2-arg root
+  JSON.SET r1 $ '"ab"'            -> OK
+  JSON.STRAPPEND r1 '"cd"'        -> 4
+  JSON.STRLEN r1                  -> 4
+  => pathless forms accepted at the root on both sides. MATCH.
+
+Probe 3 — JSON.CLEAR skip-uncounted rule
+  JSON.SET c1 $ '{"e":[],"n":0,"x":5,"s":"a"}' -> OK
+  JSON.CLEAR c1 $.*               -> 1          (only x; e/n skipped)
+  JSON.GET c1                     -> {"e":[],"n":0,"x":0,"s":"a"}
+  => already-empty containers and zero numbers uncounted on both. MATCH.
+
+Probe 4 — JSON.TOGGLE non-boolean split
+  JSON.SET t1 $ '{"b":true,"n":5}' -> OK
+  JSON.TOGGLE t1 $.*              -> [0, nil]   (skip as null)
+  JSON.TOGGLE t1 .n               -> ERR Path '$.n' does not exist or not a bool
+  => modern skips non-booleans as null, legacy errors — both sides. MATCH.
+
+Probe 5 — JSON.OBJKEYS insertion order
+  JSON.SET o1 $ '{"z":1,"a":2}'   -> OK
+  JSON.OBJKEYS o1                 -> z, a       (insertion order)
+  JSON.OBJLEN o1                  -> 2
+  => MATCH (ordering is also representational per the vocabulary).
+
+Probe 6 — JSON.SET root replace preserves TTL
+  JSON.SET ttl1 $ '{"a":1}' ; EXPIRE ttl1 1000 ; JSON.SET ttl1 $ '{"a":2}'
+  PTTL ttl1                       -> 999992
+  => RedisJSON preserves TTL across a root set too. MATCH (note stays
+     informative, not a deviation).
+
+Probe 7 — JSON.ARRAPPEND pathless 3-arg form                 [DIVERGES]
+  JSON.SET a1 $ '[1]'             -> OK
+  JSON.ARRAPPEND a1 2             -> ERR wrong number of arguments for
+                                     'json.arrappend' command
+  => the pinned RedisJSON REJECTS the pathless form; InfinityDB (arity
+     -3) accepts it and appends at the legacy root. Accepted-vs-rejected
+     surface difference => JSON.ARRAPPEND stays `partial`.
+
+Probe 8 — JSON.NUMINCRBY i64 overflow                        [DIVERGES]
+  JSON.SET n1 $ '{"m":9223372036854775807}' -> OK
+  JSON.NUMINCRBY n1 $.m 1         -> [-9223372036854775808]  (WRAPS)
+  JSON.SET n2 $ '{"a":1,"m":9223372036854775807}' -> OK
+  JSON.NUMINCRBY n2 $.* 1         -> [2,-9223372036854775808]
+  => RedisJSON wraps i64 overflow to i64::MIN and succeeds; InfinityDB
+     errors atomically ("arithmetic overflows a 64-bit integer",
+     inf-server tests/json_commands.rs numincrby_overflow_is_atomic).
+     Semantic difference => JSON.NUMINCRBY / JSON.NUMMULTBY stay
+     `partial`. (The prior note's "RedisJSON arm verified" claim held
+     only for the non-finite arm — corrected by this probe.)
+
+Probe 9 — non-finite result (NUMMULTBY)
+  JSON.SET n3 $ '{"m":1e308}'     -> OK
+  JSON.NUMMULTBY n3 $.m 10        -> ERR result is not a number
+  => both sides error; the non-finite arm MATCHES.
+
+Probe 10 — JSON.ARRPOP clamps + empty array
+  JSON.SET p1 $ '{"e":[]}' ; JSON.ARRPOP p1 $.e -> [nil]
+  JSON.ARRPOP p1 .e               -> nil
+  JSON.SET p2 $ '[1,2,3]'
+  JSON.ARRPOP p2 $ 99             -> 3          (clamp to last)
+  JSON.ARRPOP p2 $ -99            -> 1          (clamp to first)
+  => clamp and empty-null behavior MATCH.
+
+Probe 11 — JSON.ARRPOP large-exponent value echo             [DIVERGES]
+  JSON.SET x1 $ '[3e72]'          -> OK
+  JSON.ARRPOP x1 $                -> 2.9999999999999996e72
+  => the popped-value echo rides the same divergent number parse/print
+     pipeline recorded at the JSON.GET `fuzz-exp-get` allowlist entry
+     (InfinityDB parses/prints 3e72 canonically). Precision-class
+     semantic difference on a value-echoing read => JSON.ARRPOP stays
+     `partial` (and JSON.NUMINCRBY/NUMMULTBY value echoes share it).
+
+Probe 12 — JSON.FORGET recursive-overlap count               [DIVERGES]
+  JSON.SET f1 $ '{"a":{"a":1},"x":{"a":2}}' -> OK
+  JSON.FORGET f1 $..a             -> 2
+  JSON.GET f1                     -> {"x":{}}
+  => FORGET is the same engine path as JSON.DEL and inherits its
+     recorded counting deviation (InfinityDB reports 3 raw matches on
+     this shape — allowlist `edge-del-overlap`). Alias inherits the
+     aliased command's status => JSON.FORGET stays `partial`.
+
+Resulting statuses (rendered into docs/compat-matrix.md by matrixgen):
+  full    (7): JSON.TYPE, JSON.STRAPPEND, JSON.STRLEN, JSON.TOGGLE,
+               JSON.CLEAR, JSON.OBJKEYS, JSON.OBJLEN
+  partial (15): JSON.SET, JSON.GET, JSON.MGET, JSON.DEL, JSON.FORGET,
+               JSON.NUMINCRBY, JSON.NUMMULTBY, JSON.ARRAPPEND,
+               JSON.ARRINSERT, JSON.ARRINDEX, JSON.ARRLEN, JSON.ARRPOP,
+               JSON.ARRTRIM, JSON.MERGE, JSON.DEBUG
+  absent: JSON.RESP (deprecated upstream — M3 plan anti-goals)

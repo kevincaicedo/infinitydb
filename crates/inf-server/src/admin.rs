@@ -142,20 +142,32 @@ pub(crate) fn info(
         push(&mut text, &format!("total_connections_received:{}", node.total_connections.get()));
         text.push_str("\r\n");
     }
+    #[cfg(feature = "doc")]
+    let report = {
+        let mut report = ks.report();
+        node.add_cell_doc_memory(&mut report);
+        report
+    };
+    #[cfg(not(feature = "doc"))]
     let report = ks.report();
     if wants("memory") {
-        let used = report.records_live_bytes
-            + report.records_slack_bytes
-            + report.index_bytes
-            + report.wheel_bytes
-            + report.evict_bytes
-            + node.wire_buffers_bytes.get()
-            + node.conn_state_bytes.get();
+        // M3-S25 attribution fix: `used_memory_rss` is process-wide, so
+        // the byte gauges beside it must be node-wide too. The serving
+        // cell publishes its fresh gauges and folds the board (peers lag
+        // their MAINTAIN publish by at most one period); without a board
+        // (bare harness) the section renders cell scope and says so.
+        let local = crate::exec::memory_gauges_of(&report, node);
+        let (scope, g) = match node.publish_and_total_memory(local) {
+            Some(totals) => ("node", totals),
+            None => ("cell", local),
+        };
+        let used = g.used_bytes;
         let rss = process_rss_bytes();
         push(&mut text, "# Memory");
         push(&mut text, &format!("used_memory:{used}"));
         push(&mut text, &format!("used_memory_human:{}", human_bytes(used)));
         push(&mut text, &format!("used_memory_rss:{rss}"));
+        push(&mut text, &format!("memory_scope:{scope}"));
         let cfg = node.config.borrow();
         push(&mut text, &format!("maxmemory:{}", cfg.get("maxmemory").unwrap_or("0")));
         push(
@@ -166,6 +178,14 @@ pub(crate) fn info(
         let frag = if used > 0 { rss as f64 / used as f64 } else { 0.0 };
         push(&mut text, &format!("mem_fragmentation_ratio:{frag:.2}"));
         push(&mut text, "mem_allocator:inf-arena");
+        push(&mut text, &format!("doc_tape_bytes:{}", g.doc_tape_bytes));
+        push(&mut text, &format!("doc_arena_bytes:{}", g.doc_arena_bytes));
+        push(&mut text, &format!("doc_resident_bytes:{}", g.doc_resident_bytes));
+        push(&mut text, &format!("doc_intern_bytes:{}", g.doc_intern_bytes));
+        push(&mut text, &format!("doc_slack_bytes:{}", g.doc_slack_bytes));
+        push(&mut text, &format!("doc_scratch_bytes:{}", g.doc_scratch_bytes));
+        push(&mut text, &format!("doc_path_cache_bytes:{}", g.doc_path_cache_bytes));
+        push(&mut text, &format!("docs_live:{}", g.docs_live));
         text.push_str("\r\n");
     }
     if wants("persistence") {
@@ -260,6 +280,14 @@ pub(crate) fn info(
         push(&mut text, &format!("evicted_keys:{}", stats.evicted_keys));
         push(&mut text, &format!("keyspace_hits:{}", stats.keyspace_hits));
         push(&mut text, &format!("keyspace_misses:{}", stats.keyspace_misses));
+        // M3-S10: per-cell path-program cache (extension fields).
+        #[cfg(feature = "doc")]
+        {
+            let cache = node.path_cache.borrow();
+            push(&mut text, &format!("path_cache_hits:{}", cache.hits()));
+            push(&mut text, &format!("path_cache_misses:{}", cache.misses()));
+            push(&mut text, &format!("path_cache_evictions:{}", cache.evictions()));
+        }
         push(&mut text, &format!("pubsub_channels:{}", node.pubsub_channels.get()));
         push(&mut text, &format!("pubsub_patterns:{}", node.pubsub_patterns.get()));
         push(
@@ -307,8 +335,15 @@ pub(crate) fn info(
         push(&mut text, &format!("{}:{}", tw::RECORDS_SLACK_BYTES, report.records_slack_bytes));
         push(&mut text, &format!("records_resident_bytes:{}", report.records_resident_bytes));
         push(&mut text, &format!("{}:{}", tw::INDEX_BYTES, report.index_bytes));
-        push(&mut text, &format!("wheel_bytes:{}", report.wheel_bytes));
-        push(&mut text, &format!("evict_bytes:{}", report.evict_bytes));
+        push(&mut text, &format!("{}:{}", tw::WHEEL_BYTES, report.wheel_bytes));
+        push(&mut text, &format!("{}:{}", tw::EVICT_BYTES, report.evict_bytes));
+        push(&mut text, &format!("{}:{}", tw::DOC_TAPE_BYTES, report.doc_tape_bytes));
+        push(&mut text, &format!("{}:{}", tw::DOC_ARENA_BYTES, report.doc_arena_bytes));
+        push(&mut text, &format!("{}:{}", tw::DOC_RESIDENT_BYTES, report.doc_resident_bytes));
+        push(&mut text, &format!("{}:{}", tw::DOC_INTERN_BYTES, report.doc_intern_bytes));
+        push(&mut text, &format!("{}:{}", tw::DOC_SLACK_BYTES, report.doc_slack_bytes));
+        push(&mut text, &format!("{}:{}", tw::DOC_SCRATCH_BYTES, report.doc_scratch_bytes));
+        push(&mut text, &format!("{}:{}", tw::DOC_PATH_CACHE_BYTES, report.doc_path_cache_bytes));
         push(&mut text, &format!("wheel_fallback:{}", stats.wheel_fallback));
         push(&mut text, &format!("wheel_stale:{}", stats.wheel_stale));
         push(&mut text, &format!("evicted_keys:{}", stats.evicted_keys));
@@ -955,7 +990,10 @@ pub(crate) fn debug(
         let Some((encoding, _)) = store.object_encoding(key, now) else {
             return w.error("ERR no such key");
         };
-        let len = store.strlen(key, now);
+        // DEBUG OBJECT is string-only introspection today; a document key
+        // reports length 0 rather than erroring (documented deviation —
+        // the S11 matrix pins the JSON arms elsewhere).
+        let len = store.strlen(key, now).unwrap_or(0);
         w.simple(&format!(
             "Value at:0x0 refcount:1 encoding:{} serializedlength:{} lru:0 lru_seconds_idle:0",
             encoding.name(),
@@ -1049,6 +1087,66 @@ mod tests {
             String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"server"])).expect("ascii");
         assert!(server_only.contains("# Server"));
         assert!(!server_only.contains("# Memory"), "{server_only}");
+    }
+
+    #[cfg(feature = "doc")]
+    #[test]
+    fn info_exposes_every_document_and_tripwire_domain() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        assert_eq!(
+            run(&mut cx, &mut store, &[b"JSON.SET", b"doc", b"$", br#"{"pad":"xxxxxxxx"}"#],),
+            b"+OK\r\n"
+        );
+        let memory =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"memory"])).expect("ascii");
+        for name in [
+            "doc_tape_bytes",
+            "doc_arena_bytes",
+            "doc_resident_bytes",
+            "doc_intern_bytes",
+            "doc_slack_bytes",
+            "doc_scratch_bytes",
+            "doc_path_cache_bytes",
+            "docs_live",
+        ] {
+            assert!(memory.contains(&format!("{name}:")), "missing {name}: {memory}");
+        }
+        let tripwires =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tripwires"])).expect("ascii");
+        for name in inf_foundation::tripwire::ALL {
+            assert!(tripwires.contains(&format!("{name}:")), "missing {name}: {tripwires}");
+        }
+    }
+
+    /// M3-S25 attribution fix: with a memory board wired, the memory
+    /// section folds every cell's publication (`memory_scope:node`) — the
+    /// serving cell fresh, peers from their last publish. Without one
+    /// (bare harness), it renders and labels cell scope.
+    #[test]
+    fn info_memory_aggregates_across_cells_via_the_board() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        let bare =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"memory"])).expect("ascii");
+        assert!(bare.contains("memory_scope:cell"), "{bare}");
+
+        let board = std::sync::Arc::new(crate::control::MemoryBoard::new(2));
+        board.slot(1).publish(crate::control::MemoryGauges {
+            used_bytes: 1_000,
+            docs_live: 41,
+            ..Default::default()
+        });
+        cx.node.cell.set(0);
+        *cx.node.memory_board.borrow_mut() = Some(std::sync::Arc::clone(&board));
+        let noded =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"memory"])).expect("ascii");
+        assert!(noded.contains("memory_scope:node"), "{noded}");
+        assert!(noded.contains("docs_live:41"), "peer docs fold into the total: {noded}");
+        // The serving cell published its own slot at render time: the
+        // totals now exceed the peer's contribution alone.
+        assert!(board.totals().used_bytes > 1_000, "serving cell published its slot");
     }
 
     #[test]

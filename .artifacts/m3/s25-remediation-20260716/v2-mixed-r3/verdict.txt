@@ -1,0 +1,4 @@
+mixed-r3: serialized=207450429 inf=212627456 stack=567730176
+  inf/serialized = 1.025  (gate <= 1.5)
+  inf/stack      = 0.375  (gate <= 0.7)
+verification: expected_docs=71200 inf_dbsize=71200 stack_dbsize=71200

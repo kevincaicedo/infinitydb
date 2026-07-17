@@ -366,6 +366,10 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "remote-first-execute",
         "fabric-apply-prefetch",
         "no-fabric-apply-prefetch",
+        "parse-batch-prefetch",
+        "no-parse-batch-prefetch",
+        "deasync-dispatch",
+        "no-deasync-dispatch",
         "skip-comparator",
         "only-always",
     ],
@@ -388,6 +392,10 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "remote-first-execute",
         "fabric-apply-prefetch",
         "no-fabric-apply-prefetch",
+        "parse-batch-prefetch",
+        "no-parse-batch-prefetch",
+        "deasync-dispatch",
+        "no-deasync-dispatch",
         "skip-comparator",
         "fill-keys",
         // M1 rows (ignored by the m0 flow):
@@ -487,8 +495,20 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     if flags.bool("fabric-apply-prefetch") {
         server_extra.push("--fabric-apply-prefetch");
     }
+    if flags.bool("parse-batch-prefetch") {
+        server_extra.push("--parse-batch-prefetch");
+    }
+    if flags.bool("no-parse-batch-prefetch") {
+        server_extra.push("--no-parse-batch-prefetch");
+    }
     if flags.bool("no-fabric-apply-prefetch") {
         server_extra.push("--no-fabric-apply-prefetch");
+    }
+    if flags.bool("deasync-dispatch") {
+        server_extra.push("--deasync-dispatch");
+    }
+    if flags.bool("no-deasync-dispatch") {
+        server_extra.push("--no-deasync-dispatch");
     }
     let natural = spawn_infinityd(&infinityd, cells, &server_extra)?;
     let mut pipelined_ops: Vec<f64> = Vec::new();
@@ -640,12 +660,19 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         let infos = scrape_cells(ours.port, cells)?;
         let domains = sum_field(&infos, "records_resident_bytes")
             + sum_field(&infos, "index_bytes")
+            + sum_field(&infos, "doc_resident_bytes")
+            + sum_field(&infos, "doc_scratch_bytes")
+            + sum_field(&infos, "doc_path_cache_bytes")
             + sum_field(&infos, "wire_buffers_bytes")
             + sum_field(&infos, "conn_state_bytes");
+        let doc_domains = sum_field(&infos, "doc_resident_bytes")
+            + sum_field(&infos, "doc_scratch_bytes")
+            + sum_field(&infos, "doc_path_cache_bytes");
         let divergence = ((our_rss as f64 - domains as f64) / our_rss as f64 * 100.0).abs();
         m.set("attribution_divergence_pct", divergence);
         m.note(format!(
-            "attribution: domains {domains} B vs VmRSS {our_rss} B ({divergence:.1}% divergence)"
+            "attribution: domains {domains} B (document {doc_domains} B) vs VmRSS {our_rss} B \
+             ({divergence:.1}% divergence)"
         ));
         drop(ours);
 

@@ -26,9 +26,7 @@ use core::fmt;
 use std::io;
 use std::path::Path;
 
-use crate::frame::{
-    FRAME_HEADER_LEN, FRAME_MAGIC, FrameDecodeError, FrameRef, MIN_FRAME_LEN, decode_frame,
-};
+use crate::frame::{FRAME_HEADER_LEN, FrameDecodeError, FrameRef, decode_frame, frame_shape};
 use crate::fs::{SegmentFile, SegmentFs};
 use crate::lsn::{Lsn, SegmentId};
 use crate::segment::segment_file_name;
@@ -184,17 +182,16 @@ fn peek(window: &[u8], max_frame_len: u32) -> Peek {
         return Peek::NeedMore(4);
     }
     let magic: [u8; 4] = window[0..4].try_into().expect("4-byte slice");
-    if magic == [0; 4] {
-        return Peek::ZeroTail;
-    }
-    if magic != FRAME_MAGIC {
-        return Peek::Bad(FrameDecodeError::BadMagic { found: magic });
-    }
-    if window.len() < FRAME_HEADER_LEN {
-        return Peek::NeedMore(FRAME_HEADER_LEN);
+    let shape = match frame_shape(magic) {
+        Ok(None) => return Peek::ZeroTail,
+        Ok(Some(shape)) => shape,
+        Err(error) => return Peek::Bad(error),
+    };
+    if window.len() < shape.header_len {
+        return Peek::NeedMore(shape.header_len);
     }
     let frame_len = u32::from_le_bytes(window[4..8].try_into().expect("4-byte slice"));
-    if frame_len < MIN_FRAME_LEN || frame_len > max_frame_len {
+    if frame_len < shape.min_frame_len || frame_len > max_frame_len {
         return Peek::Bad(FrameDecodeError::BadLength { len: frame_len });
     }
     let frame_len = frame_len as usize;
@@ -313,7 +310,7 @@ impl<File: SegmentFile> SegmentReader<File> {
         match decode_frame(window, self.cfg.max_frame_len) {
             Ok((frame, consumed)) => {
                 debug_assert_eq!(consumed, frame_len, "peek and decode_frame disagree");
-                let expected = Lsn::new(self.segment, at + FRAME_HEADER_LEN as u32);
+                let expected = Lsn::new(self.segment, at + frame.header_len() as u32);
                 if frame.first_lsn() != expected {
                     self.failed = true;
                     return Err(ReadError::LsnMismatch {

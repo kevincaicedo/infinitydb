@@ -1,0 +1,17 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.04s
+     Running benches/parse.rs (target/release/deps/parse-c3274eca77934232)
+Benchmarking parse/large-64KiB
+Benchmarking parse/large-64KiB: Warming up for 3.0000 s
+Benchmarking parse/large-64KiB: Collecting 100 samples in estimated 5.2763 s (45k iterations)
+Benchmarking parse/large-64KiB: Analyzing
+parse/large-64KiB       time:   [116.09 µs 116.16 µs 116.23 µs]
+                        thrpt:  [352.91 MiB/s 353.11 MiB/s 353.32 MiB/s]
+                 change:
+                        time:   [−1.3687% −1.2231% −1.0755%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.0872% +1.2382% +1.3877%]
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  3 (3.00%) low mild
+  3 (3.00%) high mild
+  2 (2.00%) high severe
+

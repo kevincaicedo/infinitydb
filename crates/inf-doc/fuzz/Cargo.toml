@@ -1,0 +1,52 @@
+# cargo-fuzz crate for inf-doc (M3-S01/S02 AC: idoc decoder fuzz, CI smoke
+# + nightly hour — L9). Standalone workspace — built only by
+# `cargo +nightly fuzz`.
+[package]
+name = "inf-doc-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# doc-intern-keys always on: the fuzz surface must cover the interned arm.
+inf-doc = { path = "..", features = ["doc-intern-keys"] }
+inf-alloc = { path = "../../inf-alloc" }
+inf-store = { path = "../../inf-store", features = ["doc"] }
+inf-log = { path = "../../inf-log" }
+inf-foundation = { path = "../../inf-foundation" }
+# Fuzz-side value oracle for json_parse (matches the differential test's
+# configuration; never linked into shipping code).
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+
+[[bin]]
+name = "idoc_decode"
+path = "fuzz_targets/idoc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_parse"
+path = "fuzz_targets/json_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "path_program"
+path = "fuzz_targets/path_program.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_delta_apply"
+path = "fuzz_targets/fuzz_delta_apply.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

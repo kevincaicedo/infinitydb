@@ -1,0 +1,60 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.03s
+     Running benches/intern.rs (target/release/deps/intern-510e6f6350fc1b6a)
+shape           plain   interned    delta  (intern on-vs-off stored bytes)
+small-200B        191    (plain)    0.0%
+gate-1KiB         707        664    -6.1%
+medium-2KiB      1182       1143    -3.3%
+large-64KiB     35401      24212   -31.6%
+deep-32          1396       1148   -17.8%
+wide-array     300454     270467   -10.0%
+Benchmarking depth4_leaf_fetch_intern/plain
+Benchmarking depth4_leaf_fetch_intern/plain: Warming up for 3.0000 s
+Benchmarking depth4_leaf_fetch_intern/plain: Collecting 100 samples in estimated 5.0007 s (21M iterations)
+Benchmarking depth4_leaf_fetch_intern/plain: Analyzing
+depth4_leaf_fetch_intern/plain
+                        time:   [236.37 ns 236.47 ns 236.57 ns]
+                        change: [−0.0542% −0.0087% +0.0380%] (p = 0.71 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking depth4_leaf_fetch_intern/interned
+Benchmarking depth4_leaf_fetch_intern/interned: Warming up for 3.0000 s
+Benchmarking depth4_leaf_fetch_intern/interned: Collecting 100 samples in estimated 5.0011 s (20M iterations)
+Benchmarking depth4_leaf_fetch_intern/interned: Analyzing
+depth4_leaf_fetch_intern/interned
+                        time:   [246.04 ns 246.39 ns 246.77 ns]
+                        change: [−0.0620% +0.0951% +0.2474%] (p = 0.24 > 0.05)
+                        No change in performance detected.
+
+Benchmarking wide_probe/plain
+Benchmarking wide_probe/plain: Warming up for 3.0000 s
+Benchmarking wide_probe/plain: Collecting 100 samples in estimated 5.0238 s (278k iterations)
+Benchmarking wide_probe/plain: Analyzing
+wide_probe/plain        time:   [18.069 µs 18.070 µs 18.071 µs]
+                        change: [−0.1219% −0.1010% −0.0722%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+Benchmarking wide_probe/interned
+Benchmarking wide_probe/interned: Warming up for 3.0000 s
+Benchmarking wide_probe/interned: Collecting 100 samples in estimated 5.0133 s (293k iterations)
+Benchmarking wide_probe/interned: Analyzing
+wide_probe/interned     time:   [17.098 µs 17.099 µs 17.100 µs]
+                        change: [−0.1806% −0.1687% −0.1573%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 5 outliers among 100 measurements (5.00%)
+  1 (1.00%) low mild
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking intern_transform_1kib
+Benchmarking intern_transform_1kib: Warming up for 3.0000 s
+Benchmarking intern_transform_1kib: Collecting 100 samples in estimated 5.0142 s (1.3M iterations)
+Benchmarking intern_transform_1kib: Analyzing
+intern_transform_1kib   time:   [3.5958 µs 3.5966 µs 3.5975 µs]
+                        change: [−1.2637% −1.2220% −1.1768%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) low mild
+  1 (1.00%) high severe
+

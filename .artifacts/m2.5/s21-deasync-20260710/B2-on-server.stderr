@@ -1,0 +1,4 @@
+infinityd 38c278d (git 38c278d17fa5, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 6401, backend io_uring, route natural
+infinityd: listening on 6401
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: false, single_issuer: true, defer_taskrun: true, performance_tier: true }

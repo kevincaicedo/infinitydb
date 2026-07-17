@@ -10,6 +10,7 @@ CELL_CRATES=(
     crates/inf-wire/src
     crates/inf-store/src
     crates/inf-alloc/src
+    crates/inf-doc/src
     crates/inf-server/src/cell
 )
 

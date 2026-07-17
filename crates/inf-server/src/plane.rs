@@ -43,6 +43,8 @@ use inf_fabric::{
 };
 use inf_foundation::time::Nanos;
 use inf_foundation::{CellId, LogHistogram};
+#[cfg(feature = "doc")]
+use inf_log::DocLineage;
 use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{FsyncClass, MutationEffect, SegmentRotor};
 use inf_runtime::GroupClass;
@@ -50,8 +52,11 @@ use inf_runtime::{
     CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoOp, LoopCx,
     RawFd, TokenClass, WaitList,
 };
+#[cfg(feature = "doc")]
+use inf_store::JsonLogDecision;
 use inf_store::{
-    CellStore, EvictBudget, ExpiryBudget, Keyspace, NsId, NsMode, SlotRouter, WallAnchor,
+    CellStore, EvictBudget, ExpiryBudget, Keyspace, LogFullImage, NsId, NsMode, SlotRouter,
+    WallAnchor,
 };
 use inf_wire::{
     ArgvRef, CmdFlags, CommandId, ConnParser, Parsed, ParserLimits, Protocol, RespWriter, arity_ok,
@@ -60,6 +65,8 @@ use inf_wire::{
 
 use crate::control::{ControlHandle, RecoveryBoard};
 use crate::durable::{DurableCell, DurableConfig, EVERYSEC_TIMER_KEY};
+#[cfg(feature = "doc")]
+use crate::exec::DocLogAdmission;
 use crate::exec::{ConnCx, NodeInfo, execute, execute_slices, stall_request};
 use crate::pubsub::{self, PubSubCell, SubKind};
 use crate::recover::{Recovery, RecoveryProgress};
@@ -387,6 +394,20 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// stages drained applies, prefetches the whole batch's store lines, then
     /// executes. Off by default until its binding A/B (`--fabric-apply-prefetch`).
     apply_prefetch: Cell<bool>,
+    /// Parse-batch staged prefetch (M2.5 Phase H, the ADR-0029 second lever —
+    /// the same ADR-0005 shape on the client parse loop's local fast path):
+    /// PARSE stages fast-path commands (flat copy + hash + probe-line
+    /// prefetch), then executes the batch in parse order. Off by default
+    /// until its binding A/B (`--parse-batch-prefetch`).
+    parse_prefetch: Cell<bool>,
+    /// De-async dispatch (M2.5 Phase H, ADR-0030 D4): the pump tries a
+    /// synchronous fast path per command (single-owner remote `Apply`,
+    /// local mirror) before constructing the `dispatch_one` future.
+    /// Rejected by A/B (2026-07-10, ADR-0034): the machinery it removes
+    /// measured ~2% of the natural mix — the L6 fast path was already
+    /// near-zero-cost. Default off; kept as the A/B instrument for the
+    /// S19 8-cell re-read (`--deasync-dispatch`).
+    deasync_dispatch: Cell<bool>,
 }
 
 /// One fabric-origin PUBLISH parked at the owner cell.
@@ -429,7 +450,21 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
             close_requested: Cell::new(false),
         };
         let now = self.now.get();
+        #[cfg(feature = "doc")]
+        let capture_doc_log = lookup(argv[0])
+            .is_some_and(|meta| crate::json::is_json_write(meta.id))
+            && self.node.doc_log_admission.get().is_some();
+        #[cfg(feature = "doc")]
+        {
+            if capture_doc_log {
+                self.node.doc_log.borrow_mut().clear();
+            } else {
+                self.node.doc_log_admission.set(None);
+            }
+        }
         execute_slices(argv, &mut self.store.borrow_mut(), &mut cx, now, out);
+        #[cfg(feature = "doc")]
+        self.node.doc_log_admission.set(None);
         self.observer.borrow_mut().on_execute(self.cell, origin, argv, &out[before..], now);
     }
 
@@ -515,15 +550,49 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         let ks = self.store.borrow();
         let now = self.now.get();
         let arg_bytes: usize = argv.iter().map(|a| a.len()).sum();
-        let mut est = 64 + arg_bytes;
+        // Canonical idoc can expand JSON text by at most the scalar-f64
+        // case (9 bytes for a minimum 3-byte token); ×4 also covers the
+        // fixed idoc header and container framing. Existing bytes are
+        // added separately below. This is admission, so conservatism wins.
+        #[cfg(feature = "doc")]
+        let arg_reserve = if crate::json::is_json_write(meta.id) {
+            arg_bytes.saturating_mul(4)
+        } else {
+            arg_bytes
+        };
+        #[cfg(not(feature = "doc"))]
+        let arg_reserve = arg_bytes;
+        let mut est = 64usize.saturating_add(arg_reserve);
         let store = ks.ns_store(ns);
         for key in extract_keys_slices(meta, argv) {
-            est += key.len() + 96;
+            est = est.saturating_add(key.len() + 96);
             if let Some(store) = store {
-                est += store.post_image(key, now).map_or(0, |img| img.value.len());
+                est = est.saturating_add(store.log_image_bytes(key, now).unwrap_or(0));
             }
         }
         est
+    }
+
+    #[cfg(feature = "doc")]
+    #[allow(clippy::too_many_arguments)]
+    fn stage_doc_full(
+        cell: &mut DurableCell<F>,
+        ns: NsId,
+        key: &[u8],
+        lineage: DocLineage,
+        version: u32,
+        idoc: &[u8],
+        expire_at_ms: Option<u64>,
+        class: FsyncClass,
+        anchor: WallAnchor,
+    ) -> u64 {
+        let mut last =
+            cell.stage(&MutationEffect::DocFull { ns, key, lineage, version, idoc }, class);
+        if let Some(ms) = expire_at_ms {
+            let at_unix_ms = anchor.unix_from_internal(Nanos::from_millis(ms));
+            last = cell.stage(&MutationEffect::ExpireAt { ns, at_unix_ms, key }, class);
+        }
+        last
     }
 
     /// Post-execution effect emission (ADR-0015 D5): per written key, the
@@ -537,16 +606,124 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         argv: &[&[u8]],
         class: FsyncClass,
     ) -> Option<u64> {
-        let ks = self.store.borrow();
+        let mut ks = self.store.borrow_mut();
         let mut durable = self.durable.borrow_mut();
         let cell = durable.as_mut().expect("emission requires the durable plane");
-        let store = ks.ns_store(ns)?;
+        let store = ks.ns_store_mut(ns)?;
         let now = self.now.get();
         let anchor = self.wall_anchor();
         let mut last = None;
-        for key in extract_keys_slices(meta, argv) {
-            match store.post_image(key, now) {
-                Some(img) => {
+
+        #[cfg(feature = "doc")]
+        if crate::json::is_json_write(meta.id) {
+            let keys = extract_keys_slices(meta, argv);
+            let key = *keys.first()?;
+            let scratch = self.node.doc_log.borrow();
+            match &scratch.intent {
+                crate::json::DocLogIntent::None => {}
+                crate::json::DocLogIntent::Delete => {
+                    last = Some(cell.stage(&MutationEffect::Delete { ns, key }, class));
+                }
+                crate::json::DocLogIntent::Full => {
+                    let decision = store
+                        .json_log_full(key, now)
+                        .expect("captured full key remains a live document until staging");
+                    let JsonLogDecision::Full { lineage, version, idoc, expire_at_ms } = decision
+                    else {
+                        unreachable!("json_log_full always chooses a full image")
+                    };
+                    last = Some(Self::stage_doc_full(
+                        cell,
+                        ns,
+                        key,
+                        lineage,
+                        version,
+                        &idoc,
+                        expire_at_ms,
+                        class,
+                        anchor,
+                    ));
+                }
+                crate::json::DocLogIntent::Delta { program, opcode, match_count } => {
+                    let candidate = MutationEffect::DocDelta {
+                        ns,
+                        key,
+                        lineage: DocLineage::FIRST,
+                        base_version: 0,
+                        match_count: *match_count,
+                        post_len: 1,
+                        opcode: *opcode as u8,
+                        program: program.as_bytes(),
+                        operand: &scratch.operand,
+                    };
+                    let decision = store.json_log_delta_decision(
+                        key,
+                        candidate.encoded_len(),
+                        scratch.operand.len(),
+                        now,
+                    );
+                    match decision {
+                        Some(JsonLogDecision::Delta { lineage, base_version, post_len }) => {
+                            let effect = MutationEffect::DocDelta {
+                                ns,
+                                key,
+                                lineage,
+                                base_version,
+                                match_count: *match_count,
+                                post_len,
+                                opcode: *opcode as u8,
+                                program: program.as_bytes(),
+                                operand: &scratch.operand,
+                            };
+                            last = Some(cell.stage(&effect, class));
+                        }
+                        Some(JsonLogDecision::Full { lineage, version, idoc, expire_at_ms }) => {
+                            last = Some(Self::stage_doc_full(
+                                cell,
+                                ns,
+                                key,
+                                lineage,
+                                version,
+                                &idoc,
+                                expire_at_ms,
+                                class,
+                                anchor,
+                            ));
+                        }
+                        None => panic!("captured delta key remains a live document until staging"),
+                    }
+                }
+            }
+            return last;
+        }
+
+        let keys = extract_keys_slices(meta, argv);
+        for key in &keys {
+            match store.log_full_image(key, now) {
+                #[cfg(feature = "doc")]
+                Some(LogFullImage::JsonDoc(JsonLogDecision::Full {
+                    lineage,
+                    version,
+                    idoc,
+                    expire_at_ms,
+                })) => {
+                    last = Some(Self::stage_doc_full(
+                        cell,
+                        ns,
+                        key,
+                        lineage,
+                        version,
+                        &idoc,
+                        expire_at_ms,
+                        class,
+                        anchor,
+                    ));
+                }
+                #[cfg(feature = "doc")]
+                Some(LogFullImage::JsonDoc(JsonLogDecision::Delta { .. })) => {
+                    unreachable!("full-image probe never returns a delta")
+                }
+                Some(LogFullImage::String(img)) => {
                     let set = MutationEffect::StringSet { ns, key, value: img.value };
                     last = Some(cell.stage(&set, class));
                     if let Some(ms) = img.expire_at_ms {
@@ -619,8 +796,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         }
         drop(durable);
         let est = self.estimate_effect_bytes(ns, meta, argv);
-        if !self.durable.borrow().as_ref().expect("checked above").would_fit(est) {
-            return Some("BUSY durable log staging is full, retry");
+        let durable = self.durable.borrow();
+        let cell = durable.as_ref().expect("checked above");
+        if !cell.would_fit(est) {
+            return Some(crate::durable::STAGING_BUSY_ERROR);
+        }
+        #[cfg(feature = "doc")]
+        if crate::json::is_json_write(meta.id) {
+            let (budget, record_max) = cell.staging_limits();
+            self.node.doc_log_admission.set(Some(DocLogAdmission { budget, record_max }));
         }
         None
     }
@@ -725,6 +909,11 @@ pub struct ServerPlane<
     /// Fabric-apply prefetch batch (reused across FABRIC-IN steps).
     apply_stage: Vec<StagedApply>,
     apply_stage_bytes: Vec<u8>,
+    /// Parse-batch prefetch stage (M2.5 Phase H, ADR-0029 lever 2; reused
+    /// across PARSE steps — one connection buffer at a time, flushed at
+    /// every barrier).
+    parse_stage: Vec<StagedParse>,
+    parse_stage_bytes: Vec<u8>,
     /// Reusable FABRIC-IN scratch: replies staged while the fabric is
     /// borrowed by `drain`, sent the moment it ends.
     staged_replies: Vec<(CellId, FabricToken, StagedReply)>,
@@ -757,6 +946,10 @@ pub struct ServerPlane<
     /// Node recovery board while any cell is still loading (M2-S15);
     /// dropped once `all_ready` is observed.
     loading_board: Option<Arc<RecoveryBoard>>,
+    /// MAINTAIN countdown for the memory-board publication (M3-S25): the
+    /// keyspace-report walk is cheap but not free, so peers' `INFO`
+    /// totals refresh on a coarse cadence instead of every iteration.
+    memory_publish_in: u32,
 }
 
 /// One cell's loop-resident boot recovery (M2-S15): the [`Recovery`]
@@ -798,6 +991,19 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     ) -> ServerPlane<O, F> {
         node.cell.set(cell.0);
         node.cells.set(cells);
+        // M3-S10: size the per-cell program cache from the boot config
+        // (`doc-path-cache-size` is BootOnly — assembly time IS its
+        // application point).
+        #[cfg(feature = "doc")]
+        {
+            let size = node
+                .config
+                .borrow()
+                .get("doc-path-cache-size")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(inf_doc::path::PROGRAM_CACHE_DEFAULT_ENTRIES);
+            node.path_cache.replace(inf_doc::ProgramCache::new(size));
+        }
         ServerPlane {
             shared: Rc::new(Shared {
                 cell,
@@ -830,6 +1036,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 ckpt_pub_seen: Cell::new(0),
                 loading: Cell::new(false),
                 apply_prefetch: Cell::new(false),
+                parse_prefetch: Cell::new(false),
+                deasync_dispatch: Cell::new(false),
             }),
             listener,
             started: false,
@@ -837,6 +1045,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             reply_scratch: Vec::new(),
             apply_stage: Vec::new(),
             apply_stage_bytes: Vec::new(),
+            parse_stage: Vec::new(),
+            parse_stage_bytes: Vec::new(),
             staged_replies: Vec::new(),
             park_flags: None,
             expiry_lag: 0,
@@ -848,6 +1058,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             boot: None,
             boot_error: None,
             loading_board: None,
+            memory_publish_in: 1,
         }
     }
 
@@ -1013,8 +1224,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 
     /// Wires the node control-thread handle (DDL id allocation + catalog
-    /// persistence — ADR-0015 D2/D3).
+    /// persistence — ADR-0015 D2/D3). Also hands `INFO` the node-wide
+    /// memory board (M3-S25 attribution fix).
     pub fn set_control(&mut self, control: Arc<ControlHandle>) {
+        *self.shared.node.memory_board.borrow_mut() = Some(Arc::clone(control.memory_board()));
         *self.shared.control.borrow_mut() = Some(control);
     }
 
@@ -1042,6 +1255,20 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.shared.apply_prefetch.set(on);
     }
 
+    /// Parse-batch staged prefetch (M2.5 Phase H, ADR-0029 lever 2): the
+    /// parse loop stages local fast-path commands, prefetches the batch's
+    /// store lines, then executes in parse order.
+    pub fn set_parse_batch_prefetch(&mut self, on: bool) {
+        self.shared.parse_prefetch.set(on);
+    }
+
+    /// De-async dispatch (M2.5 Phase H, ADR-0030 D4 lever): the pump
+    /// attempts a synchronous fast path per command before falling back to
+    /// the async `dispatch_one`.
+    pub fn set_deasync_dispatch(&mut self, on: bool) {
+        self.shared.deasync_dispatch.set(on);
+    }
+
     /// Live connections (tests, stats).
     pub fn connections(&self) -> usize {
         self.shared.conns.borrow().live
@@ -1057,6 +1284,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// oracle, tooling — never the data plane).
     pub fn keyspace_report(&self) -> inf_store::MemoryReport {
         self.shared.store.borrow().report()
+    }
+
+    /// Read-only keyspace access for DST oracles (M3-S23, ADR-0045 D5):
+    /// the equivalence oracle compares live state against an independent
+    /// log replay. Borrowed only between scheduler iterations — never
+    /// across one (the suspension custody rule binds the harness too).
+    pub fn keyspace(&self) -> core::cell::Ref<'_, Keyspace> {
+        self.shared.store.borrow()
     }
 
     /// Pub/sub registry gauges `(owned channels, patterns, state bytes)` —
@@ -1460,6 +1695,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             return;
         }
 
+        let stage_enabled = self.shared.parse_prefetch.get();
+        let mut stage = core::mem::take(&mut self.parse_stage);
+        let mut stage_bytes = core::mem::take(&mut self.parse_stage_bytes);
         let inbox = core::mem::take(&mut self.inbox);
         for (key, buf, len) in inbox {
             let mut commands: u32 = 0;
@@ -1484,11 +1722,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 // Field split: the parser iterator borrows `conn.parser`
                 // while execution writes `conn.out`/`conn.cx`.
                 let Conn { parser, cx: conn_cx, out, .. } = &mut *conn;
+                let origin = ExecOrigin::Conn(key.slot, key.generation);
                 let mut iter = parser.feed(data);
                 while let Some(parsed) = iter.next() {
                     match parsed {
                         Parsed::Command(argv) | Parsed::Inline(argv) => {
                             commands += 1;
+                            let meta = lookup(argv.arg(0));
                             // M2-S15 `-LOADING` gate: while the node loads,
                             // only LOADING-flagged commands run; the rest
                             // answer exactly Redis's error (oracle capture
@@ -1497,8 +1737,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                             // board re-check serves commands that arrive in
                             // the same iteration the last cell flips ready.
                             if self.shared.loading.get()
-                                && lookup(argv.arg(0))
-                                    .is_some_and(|meta| !meta.flags.contains(CmdFlags::LOADING))
+                                && meta.is_some_and(|meta| !meta.flags.contains(CmdFlags::LOADING))
                             {
                                 if self
                                     .loading_board
@@ -1507,6 +1746,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 {
                                     self.shared.loading.set(false);
                                 } else {
+                                    // The error reply keeps pipeline order:
+                                    // staged commands answer first.
+                                    flush_parse_stage(
+                                        &self.shared,
+                                        &mut stage,
+                                        &mut stage_bytes,
+                                        origin,
+                                        conn_cx,
+                                        out,
+                                    );
                                     let mut w = RespWriter::new(out, conn_cx.proto);
                                     w.error("LOADING Redis is loading the dataset in memory");
                                     continue;
@@ -1522,6 +1771,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 || conn_cx.ns.is_some()
                                 || self.needs_fabric(&argv);
                             if defer {
+                                // Pump replies emit after the fast-path
+                                // replies already in `out` — flush so the
+                                // staged batch keeps its pipeline position.
+                                flush_parse_stage(
+                                    &self.shared,
+                                    &mut stage,
+                                    &mut stage_bytes,
+                                    origin,
+                                    conn_cx,
+                                    out,
+                                );
                                 let owned =
                                     OwnedCmd::from_argv_into(&argv, self.shared.take_cmd_buf());
                                 if pump_was_active || spawn_first.is_some() {
@@ -1529,7 +1789,35 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 } else {
                                     spawn_first = Some(owned);
                                 }
+                            } else if stage_enabled && parse_stageable(meta, &argv) {
+                                // M2.5 Phase H (ADR-0029 lever 2): stage the
+                                // fast-path command — flat argv copy + key
+                                // hash + phase-1 index-line prefetch; the
+                                // batch executes at the next barrier or end
+                                // of buffer with its record lines prefetched.
+                                let (hash, has_key) = match argv.len() >= 2 {
+                                    true => {
+                                        let hash = CellStore::hash_key(argv.arg(1));
+                                        if let Some(store) =
+                                            self.shared.store.borrow().db(usize::from(conn_cx.db))
+                                        {
+                                            store.prefetch(hash);
+                                        }
+                                        (hash, true)
+                                    }
+                                    false => (0, false),
+                                };
+                                let off = stage_argv_block_argv(&mut stage_bytes, &argv);
+                                stage.push(StagedParse { off, hash, has_key });
                             } else {
+                                flush_parse_stage(
+                                    &self.shared,
+                                    &mut stage,
+                                    &mut stage_bytes,
+                                    origin,
+                                    conn_cx,
+                                    out,
+                                );
                                 let argv_slices: Vec<&[u8]> = argv.iter().collect();
                                 let before = out.len();
                                 let now = self.shared.now.get();
@@ -1542,7 +1830,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 );
                                 self.shared.observer.borrow_mut().on_execute(
                                     self.shared.cell,
-                                    ExecOrigin::Conn(key.slot, key.generation),
+                                    origin,
                                     &argv_slices,
                                     &out[before..],
                                     now,
@@ -1562,6 +1850,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                         }
                         Parsed::Incomplete => {}
                         Parsed::ProtocolError(e) => {
+                            flush_parse_stage(
+                                &self.shared,
+                                &mut stage,
+                                &mut stage_bytes,
+                                origin,
+                                conn_cx,
+                                out,
+                            );
                             let mut w = RespWriter::new(out, conn_cx.proto);
                             w.error(&format!("ERR Protocol error: {e:?}"));
                             protocol_error = true;
@@ -1569,6 +1865,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                         }
                     }
                 }
+                // End of buffer: the staged batch executes with its record
+                // lines prefetched (§7.3 phase 2 across the whole batch).
+                flush_parse_stage(&self.shared, &mut stage, &mut stage_bytes, origin, conn_cx, out);
                 drop(iter);
                 let conn = conns.get_mut(key).expect("conn checked above");
                 if protocol_error || quit {
@@ -1589,6 +1888,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 self.spawn_pump(cx, key, first);
             }
         }
+        debug_assert!(stage.is_empty(), "parse stage flushed before buffer release");
+        self.parse_stage = stage;
+        self.parse_stage_bytes = stage_bytes;
     }
 
     fn maintain(&mut self, cx: &mut LoopCx<'_>) {
@@ -1613,6 +1915,24 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         // cell answers -LOADING; enable_durable fires on completion.
         if self.boot.is_some() {
             self.drive_recovery(cx);
+        }
+        // ---- node memory board (M3-S25): publish this cell's gauges on
+        // a coarse cadence so every cell's INFO renders fresh node-wide
+        // totals (the serving cell re-publishes its own slot at render
+        // time; this keeps the *peer* slots current).
+        self.memory_publish_in -= 1;
+        if self.memory_publish_in == 0 {
+            self.memory_publish_in = 64;
+            let node = &self.shared.node;
+            if let Some(board) = node.memory_board.borrow().as_ref() {
+                #[cfg_attr(not(feature = "doc"), allow(unused_mut))]
+                let mut report = self.shared.store.borrow().report();
+                #[cfg(feature = "doc")]
+                node.add_cell_doc_memory(&mut report);
+                board
+                    .slot(self.shared.cell.0)
+                    .publish(crate::exec::memory_gauges_of(&report, node));
+            }
         }
         if let Some(board) = &self.loading_board {
             let node = &self.shared.node;
@@ -2081,6 +2401,119 @@ fn read_argv_block<'b>(bytes: &'b [u8], off: u32, out: &mut [&'b [u8]; MAX_APPLY
     argc
 }
 
+/// One local fast-path command staged by the parse-batch prefetch (M2.5
+/// Phase H, ADR-0029 lever 2 — the ADR-0005 pipeline shape on the batch the
+/// parse loop naturally provides): argv flat-copied into the stage scratch,
+/// key hash computed (and index probe lines prefetched) at stage time.
+/// Execution reads `ConnCx` live at flush, so stage-time state is only ever
+/// a prefetch hint — never an execution input (conn-state mutators are
+/// flush barriers besides).
+struct StagedParse {
+    /// Offset of the flat argv block in the stage scratch.
+    off: u32,
+    /// `CellStore::hash_key(argv[1])` when the command carries a key.
+    hash: u64,
+    has_key: bool,
+}
+
+/// Bounds on what the parse stage accepts (everything has a limit): larger
+/// commands act as flush barriers and execute inline — the flat copy of a
+/// big SET value would cost more than the misses it hides.
+const PARSE_STAGE_MAX_ARGS: usize = 16;
+const PARSE_STAGE_MAX_BYTES: usize = 512;
+
+/// Whether the parse loop may stage this fast-path command. Conn-state
+/// mutators (HELLO/SELECT/INF.NS), QUIT, and DEBUG are barriers: they
+/// mutate `ConnCx`/plane state the inline path handles (close_requested,
+/// stall_request), so they keep the inline path and flush the batch first.
+/// Unknown commands stay inline (their error reply keeps pipeline order).
+fn parse_stageable(meta: Option<&'static inf_wire::CommandMeta>, argv: &ArgvRef<'_>) -> bool {
+    let Some(meta) = meta else { return false };
+    if matches!(
+        meta.id,
+        CommandId::Hello
+            | CommandId::Select
+            | CommandId::InfNs
+            | CommandId::Quit
+            | CommandId::Debug
+    ) {
+        return false;
+    }
+    if argv.len() > PARSE_STAGE_MAX_ARGS {
+        return false;
+    }
+    let mut total = 0usize;
+    for i in 0..argv.len() {
+        total += argv.arg(i).len();
+        if total > PARSE_STAGE_MAX_BYTES {
+            return false;
+        }
+    }
+    true
+}
+
+/// Flat-encode a parsed argv into the stage scratch (the `stage_argv_block`
+/// layout over the `Argv` view instead of slices). Returns the block offset.
+fn stage_argv_block_argv(bytes: &mut Vec<u8>, argv: &ArgvRef<'_>) -> u32 {
+    let off = u32::try_from(bytes.len()).expect("stage scratch fits u32");
+    let argc = argv.len();
+    let head = 4 + 4 * argc;
+    bytes.extend_from_slice(&u32::try_from(argc).expect("argc fits u32").to_le_bytes());
+    let mut end = head;
+    for i in 0..argc {
+        end += argv.arg(i).len();
+        bytes.extend_from_slice(&u32::try_from(end).expect("block fits u32").to_le_bytes());
+    }
+    for i in 0..argc {
+        bytes.extend_from_slice(argv.arg(i));
+    }
+    off
+}
+
+/// Execute the staged parse batch: one record-line prefetch pass and one
+/// document-root pass over the whole batch (§7.3 + ADR-0044 — dependent
+/// misses overlap across the batch instead of serializing per command),
+/// then execution in parse order through the same
+/// `execute` the inline path uses (the `ConnCx` is read live — replies are
+/// byte-identical by construction, pinned by the node e2e).
+fn flush_parse_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    stage: &mut Vec<StagedParse>,
+    stage_bytes: &mut Vec<u8>,
+    origin: ExecOrigin,
+    conn_cx: &mut ConnCx,
+    out: &mut Vec<u8>,
+) {
+    if stage.is_empty() {
+        return;
+    }
+    {
+        let ks = shared.store.borrow();
+        if let Some(store) = ks.db(usize::from(conn_cx.db)) {
+            for e in stage.iter().filter(|e| e.has_key) {
+                store.probe_prefetch(e.hash);
+            }
+            for e in stage.iter().filter(|e| e.has_key) {
+                store.prefetch_doc_root(e.hash);
+            }
+        }
+    }
+    let now = shared.now.get();
+    let mut argv_buf: [&[u8]; PARSE_STAGE_MAX_ARGS] = [b""; PARSE_STAGE_MAX_ARGS];
+    for e in stage.iter() {
+        let argc = read_argv_block(stage_bytes, e.off, &mut argv_buf);
+        let argv = &argv_buf[..argc];
+        let before = out.len();
+        execute(argv, &mut shared.store.borrow_mut(), conn_cx, now, out);
+        shared.observer.borrow_mut().on_execute(shared.cell, origin, argv, &out[before..], now);
+        // QUIT and DEBUG are stage barriers; a staged command can neither
+        // request a close nor a stall.
+        debug_assert!(!conn_cx.close_requested.get(), "QUIT is a parse-stage barrier");
+    }
+    stage.clear();
+    stage_bytes.clear();
+}
+
 /// The FABRIC-IN drain callback with apply-prefetch on: `Apply` ops stage
 /// (copy + hash + index-line prefetch) instead of executing inline; any
 /// other op flushes the stage first — an order barrier, so execution and
@@ -2142,9 +2575,10 @@ fn stage_or_handle<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     }
 }
 
-/// Execute the staged applies: one record-line prefetch pass over the whole
-/// batch (§7.3 phase 2 — the misses overlap across the batch instead of
-/// serializing per op), then execution in arrival order.
+/// Execute the staged applies: one record-line pass and one document-root
+/// pass over the whole batch (§7.3 + ADR-0044 — dependent misses overlap
+/// across the batch instead of serializing per op), then execution in
+/// arrival order.
 fn flush_apply_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
     stage: &mut Vec<StagedApply>,
@@ -2163,6 +2597,11 @@ fn flush_apply_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
                 store.probe_prefetch(e.hash);
             }
         }
+        for e in stage.iter().filter(|e| e.has_key) {
+            if let Some(store) = ks.db(usize::from(e.db)) {
+                store.prefetch_doc_root(e.hash);
+            }
+        }
     }
     let mut argv_buf: [&[u8]; MAX_APPLY_ARGS] = [b""; MAX_APPLY_ARGS];
     for e in stage.iter() {
@@ -2179,6 +2618,20 @@ enum GatherPart {
     Wait(GateWait<u64, OwnedOutcome>),
 }
 
+/// Strip the `*1\r\n` header off a single-key `JSON.MGET` sub-reply,
+/// leaving the bare element (M3-S11 gather; ADR-0041 D9). Error replies
+/// (fabric refusals) pass through untouched — an error is a legal RESP
+/// array element.
+fn strip_single_element(bytes: &[u8]) -> &[u8] {
+    match bytes.strip_prefix(b"*1\r\n") {
+        Some(element) => element,
+        None => {
+            debug_assert_eq!(bytes.first(), Some(&b'-'), "sub-replies are *1 arrays or errors");
+            bytes
+        }
+    }
+}
+
 /// A reply slot awaiting its in-order turn on the wire.
 enum PendingReply {
     /// Executed (locally or refused) at dispatch; bytes wait their turn.
@@ -2189,8 +2642,11 @@ enum PendingReply {
     /// Split DEL/UNLINK/EXISTS/TOUCH (and scattered DBSIZE): locally-counted
     /// contributions in `acc`, remote per-key contributions in flight.
     Counted { waiters: Vec<GateWait<u64, OwnedOutcome>>, acc: i64, proto: Protocol },
-    /// Split MGET: per-key replies reassemble into one array in argv order.
-    Gather { parts: Vec<GatherPart>, proto: Protocol },
+    /// Split MGET / JSON.MGET: per-key replies reassemble into one array
+    /// in argv order. `unwrap_single` marks JSON.MGET's shape: each
+    /// sub-reply is a single-key `*1` array whose element joins the outer
+    /// array (ADR-0041 D9).
+    Gather { parts: Vec<GatherPart>, proto: Protocol, unwrap_single: bool },
     /// Fanned MSET / scattered FLUSH: all legs must come back `+OK` (the
     /// first error leg wins the reply otherwise).
     AllOk { waiters: Vec<GateWait<u64, OwnedOutcome>>, proto: Protocol },
@@ -2248,6 +2704,132 @@ fn is_conn_state(owned: &OwnedCmd) -> bool {
     })
 }
 
+/// Outcome of the de-async dispatch fast path (ADR-0030 D4).
+enum FastDispatch {
+    /// Handled synchronously; `pending`/`inflight` updated.
+    Handled,
+    /// The connection is gone; the pump exits.
+    ConnGone,
+    /// Not a fast arm (rare shape) or no fabric credit on the first send
+    /// attempt: run the async [`dispatch_one`] — the unchanged slow path.
+    Fallback,
+}
+
+/// The pump's synchronous dispatch fast path (M2.5 Phase H, ADR-0030 D4):
+/// the arms that dominate the natural-routing mix — the single-owner
+/// remote `Apply` and the local mirror — dispatch without constructing
+/// the [`dispatch_one`] future, whose send path suspends only on
+/// fabric-credit exhaustion. Guard order mirrors `dispatch_one`'s match
+/// arms exactly; every other shape falls back to it
+/// (`deasync_dispatch_matches_pump_semantics` pins the equivalence).
+fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    key: ConnKey,
+    owned: &OwnedCmd,
+    pending: &mut VecDeque<PendingReply>,
+    inflight: &mut usize,
+) -> FastDispatch {
+    let argc = owned.argc();
+    if argc > ARGV_INLINE {
+        // Wide argv (MSET…): rare — keep the heap-argv path async.
+        return FastDispatch::Fallback;
+    }
+    let mut argv_inline: [&[u8]; ARGV_INLINE] = [b""; ARGV_INLINE];
+    for (i, slot) in argv_inline[..argc].iter_mut().enumerate() {
+        *slot = owned.arg(i);
+    }
+    let argv: &[&[u8]] = &argv_inline[..argc];
+    let Some((proto, id, db, conn_ns, restricted)) = shared.with_conn(key, |c| {
+        (c.cx.proto, c.cx.id, c.cx.db, c.cx.ns, pubsub::subscriber_restricted(&c.cx))
+    }) else {
+        return FastDispatch::ConnGone;
+    };
+    let origin = ExecOrigin::Conn(key.slot, key.generation);
+    let meta = lookup(argv[0]);
+    let well_formed = meta.is_some_and(|m| arity_ok(m, argv.len()));
+    if let Some(meta) = meta
+        && well_formed
+        && restricted
+        && !pubsub::is_plane_pubsub(meta.id)
+    {
+        pending.push_back(PendingReply::Done(restricted_reply(shared, meta, argv, proto)));
+        return FastDispatch::Handled;
+    }
+    if let Some(m) = meta
+        && well_formed
+    {
+        // The program/rare arms, in dispatch_one's guard order: pub/sub,
+        // NS DDL, ckpt surface, named-namespace dispatch, scatter.
+        if pubsub::is_plane_pubsub(m.id)
+            || (m.id == CommandId::InfNs
+                && argv.get(1).is_some_and(|s| {
+                    s.eq_ignore_ascii_case(b"CREATE") || s.eq_ignore_ascii_case(b"DROP")
+                }))
+            || matches!(m.id, CommandId::InfCkpt | CommandId::Bgsave | CommandId::Lastsave)
+            || (conn_ns.is_some() && !is_conn_state(owned))
+            || (is_scatter(m.id, argv.get(1).copied())
+                && shared.cells > 1
+                && !shared.route_local_only)
+        {
+            return FastDispatch::Fallback;
+        }
+        // One routing pass per command, as in dispatch_one.
+        let mut first_owner = shared.cell;
+        let mut any_remote = false;
+        if !shared.route_local_only {
+            let mut first = true;
+            for k in extract_keys_iter(m, argv) {
+                let owner = shared.router.cell_of(SlotRouter::slot_of(k));
+                if first {
+                    first_owner = owner;
+                    first = false;
+                }
+                if owner != shared.cell {
+                    any_remote = true;
+                    break;
+                }
+            }
+        }
+        if any_remote {
+            let split = matches!(
+                m.id,
+                CommandId::Del
+                    | CommandId::Exists
+                    | CommandId::Unlink
+                    | CommandId::Touch
+                    | CommandId::Mget
+                    | CommandId::Mset
+                    | CommandId::Msetnx
+            );
+            let two_owner =
+                matches!(m.id, CommandId::Rename | CommandId::Renamenx | CommandId::Copy)
+                    && shared.router.cell_of(SlotRouter::slot_of(argv[1]))
+                        != shared.router.cell_of(SlotRouter::slot_of(argv[2]));
+            if split || two_owner {
+                return FastDispatch::Fallback;
+            }
+            // Single-owner remote command: the hot arm.
+            return match try_send_apply(shared, first_owner, proto, db, argv) {
+                SendNow::Sent(waiter) => {
+                    *inflight += 1;
+                    pending.push_back(PendingReply::Remote { waiter, proto });
+                    FastDispatch::Handled
+                }
+                SendNow::Refused(refusal) => {
+                    pending.push_back(PendingReply::Done(refusal));
+                    FastDispatch::Handled
+                }
+                SendNow::NoCredit => FastDispatch::Fallback,
+            };
+        }
+    }
+    if dispatch_mirror(shared, key, owned, argv, origin, proto, id, db, conn_ns, pending) {
+        FastDispatch::Handled
+    } else {
+        FastDispatch::ConnGone
+    }
+}
+
 /// The per-connection pump: dispatch commands in pipeline order with up to
 /// [`REMOTE_WINDOW`] remote ops in flight, emit replies strictly in command
 /// order. Suspends only on the front reply's gate and on fabric credits;
@@ -2277,7 +2859,19 @@ async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 held = Some(cmd);
                 break;
             }
-            if !dispatch_one(&shared, key, &cmd, &mut pending, &mut inflight).await {
+            // De-async fast path (ADR-0030 D4): hot arms dispatch without
+            // constructing the `dispatch_one` future; rare shapes and
+            // credit exhaustion fall back to the async path unchanged.
+            let handled = if shared.deasync_dispatch.get() {
+                match dispatch_one_fast(&shared, key, &cmd, &mut pending, &mut inflight) {
+                    FastDispatch::Handled => true,
+                    FastDispatch::ConnGone => return,
+                    FastDispatch::Fallback => false,
+                }
+            } else {
+                false
+            };
+            if !handled && !dispatch_one(&shared, key, &cmd, &mut pending, &mut inflight).await {
                 return; // connection is gone
             }
             // The command's flat buffer recycles once dispatched (waiters
@@ -2311,13 +2905,15 @@ async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 RespWriter::new(&mut reply, proto).int(acc);
                 reply
             }
-            PendingReply::Gather { parts, proto } => {
+            PendingReply::Gather { parts, proto, unwrap_single } => {
                 let mut reply = shared.take_reply_buf();
                 RespWriter::new(&mut reply, proto).array_header(parts.len());
                 for part in parts {
                     match part {
                         GatherPart::Done(bytes) => {
-                            reply.extend_from_slice(&bytes);
+                            let element =
+                                if unwrap_single { strip_single_element(&bytes) } else { &bytes };
+                            reply.extend_from_slice(element);
                             shared.recycle_reply_buf(bytes);
                         }
                         GatherPart::Wait(waiter) => {
@@ -2325,7 +2921,12 @@ async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                             inflight -= 1;
                             match outcome {
                                 OwnedOutcome::Bytes(bytes) => {
-                                    reply.extend_from_slice(&bytes);
+                                    let element = if unwrap_single {
+                                        strip_single_element(&bytes)
+                                    } else {
+                                        &bytes
+                                    };
+                                    reply.extend_from_slice(element);
                                     shared.recycle_reply_buf(bytes);
                                 }
                                 _ => RespWriter::new(&mut reply, proto).null(),
@@ -2438,24 +3039,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         && restricted
         && !pubsub::is_plane_pubsub(meta.id)
     {
-        let mut reply = shared.take_reply_buf();
-        if meta.id == CommandId::Ping {
-            if argv.len() > 2 {
-                RespWriter::new(&mut reply, proto)
-                    .error("ERR wrong number of arguments for 'ping' command");
-            } else {
-                pubsub::subscriber_ping(argv.get(1).copied(), proto, &mut reply);
-            }
-        } else {
-            let sub = argv.get(1).copied();
-            pubsub::restricted_error(
-                meta.id,
-                meta.name,
-                sub,
-                &mut RespWriter::new(&mut reply, proto),
-            );
-        }
-        pending.push_back(PendingReply::Done(reply));
+        pending.push_back(PendingReply::Done(restricted_reply(shared, meta, argv, proto)));
         return true;
     }
     // One routing pass per command (M2.5 Phase H: was one
@@ -2627,7 +3211,34 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                     }
                 }
             }
-            pending.push_back(PendingReply::Gather { parts, proto });
+            pending.push_back(PendingReply::Gather { parts, proto, unwrap_single: false });
+        }
+        #[cfg(feature = "doc")]
+        Some(meta) if well_formed && meta.id == CommandId::JsonMget && has_remote_key(meta) => {
+            // JSON.MGET gather (M3-S11; ADR-0041 D9): the MGET shape with
+            // single-key `JSON.MGET k path` sub-ops — each sub-reply is a
+            // `*1` array whose element joins the outer array in argv
+            // order. The path (final argument) rides every sub-op.
+            let path = argv[argv.len() - 1];
+            let mut parts = Vec::with_capacity(argv.len() - 2);
+            for k in &argv[1..argv.len() - 1] {
+                if shared.router.is_local(k, shared.cell) {
+                    let mut buf = shared.take_reply_buf();
+                    let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
+                    shared.execute_owned_into(origin, &sub, proto, id, db, None, &mut buf);
+                    parts.push(GatherPart::Done(buf));
+                } else {
+                    let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
+                    match send_apply(shared, owner_of(k), proto, db, &sub).await {
+                        Ok(waiter) => {
+                            parts.push(GatherPart::Wait(waiter));
+                            *inflight += 1;
+                        }
+                        Err(refusal) => parts.push(GatherPart::Done(refusal)),
+                    }
+                }
+            }
+            pending.push_back(PendingReply::Gather { parts, proto, unwrap_single: true });
         }
         Some(meta) if well_formed && meta.id == CommandId::Mset && has_remote_key(meta) => {
             if argv.len().is_multiple_of(2) {
@@ -2715,44 +3326,93 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             }
         }
         _ => {
-            let mut reply = shared.take_reply_buf();
-            if is_conn_state(owned) {
-                // Execute under a cx mirroring the live connection, then
-                // write the negotiated protocol back — the M0 pump dropped
-                // HELLO's proto switch on queued pipelines (temp-cx bug,
-                // found extending the surface; ledger entry).
-                let Some(mut live) = shared.with_conn(key, |c| ConnCx {
-                    proto: c.cx.proto,
-                    id: c.cx.id,
-                    db: c.cx.db,
-                    ns: c.cx.ns,
-                    // Cold path: HELLO/SELECT execute under the live
-                    // subscription view (the RESP2 subscriber restriction
-                    // applies to HELLO exactly as in Redis).
-                    sub_channels: c.cx.sub_channels.clone(),
-                    sub_patterns: c.cx.sub_patterns.clone(),
-                    node: Rc::clone(&shared.node),
-                    close_requested: Cell::new(false),
-                }) else {
-                    return false;
-                };
-                let now = shared.now.get();
-                execute_slices(argv, &mut shared.store.borrow_mut(), &mut live, now, &mut reply);
-                shared.observer.borrow_mut().on_execute(shared.cell, origin, argv, &reply, now);
-                shared.with_conn(key, |c| {
-                    c.cx.proto = live.proto;
-                    c.cx.db = live.db;
-                    c.cx.ns = live.ns;
-                });
-            } else {
-                shared.execute_owned_into(origin, argv, proto, id, db, conn_ns, &mut reply);
-                if let Some(dur) = stall_request(argv) {
-                    shared.stall_until.set(shared.now.get().saturating_add(dur));
-                }
-            }
-            pending.push_back(PendingReply::Done(reply));
+            return dispatch_mirror(
+                shared, key, owned, argv, origin, proto, id, db, conn_ns, pending,
+            );
         }
     }
+    true
+}
+
+/// The RESP2 subscriber-restriction reply for a pump-dispatched command
+/// (M1-S10) — shared verbatim by [`dispatch_one`] and the de-async fast
+/// path (ADR-0030 D4): both arms must produce identical bytes.
+fn restricted_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    meta: &'static inf_wire::CommandMeta,
+    argv: &[&[u8]],
+    proto: Protocol,
+) -> Vec<u8> {
+    let mut reply = shared.take_reply_buf();
+    if meta.id == CommandId::Ping {
+        if argv.len() > 2 {
+            RespWriter::new(&mut reply, proto)
+                .error("ERR wrong number of arguments for 'ping' command");
+        } else {
+            pubsub::subscriber_ping(argv.get(1).copied(), proto, &mut reply);
+        }
+    } else {
+        let sub = argv.get(1).copied();
+        pubsub::restricted_error(meta.id, meta.name, sub, &mut RespWriter::new(&mut reply, proto));
+    }
+    reply
+}
+
+/// The pump's local mirror arm: conn-state commands execute under a cx
+/// mirroring the live connection with the negotiated state written back
+/// (HELLO's proto switch must land on the conn — the M0 temp-cx bug);
+/// everything else executes locally. Shared verbatim by [`dispatch_one`]
+/// and the de-async fast path (ADR-0030 D4). Returns `false` when the
+/// connection is gone.
+#[allow(clippy::too_many_arguments)] // internal dispatch funnel
+fn dispatch_mirror<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    key: ConnKey,
+    owned: &OwnedCmd,
+    argv: &[&[u8]],
+    origin: ExecOrigin,
+    proto: Protocol,
+    id: u64,
+    db: u16,
+    conn_ns: Option<NsId>,
+    pending: &mut VecDeque<PendingReply>,
+) -> bool {
+    let mut reply = shared.take_reply_buf();
+    if is_conn_state(owned) {
+        // Execute under a cx mirroring the live connection, then
+        // write the negotiated protocol back — the M0 pump dropped
+        // HELLO's proto switch on queued pipelines (temp-cx bug,
+        // found extending the surface; ledger entry).
+        let Some(mut live) = shared.with_conn(key, |c| ConnCx {
+            proto: c.cx.proto,
+            id: c.cx.id,
+            db: c.cx.db,
+            ns: c.cx.ns,
+            // Cold path: HELLO/SELECT execute under the live
+            // subscription view (the RESP2 subscriber restriction
+            // applies to HELLO exactly as in Redis).
+            sub_channels: c.cx.sub_channels.clone(),
+            sub_patterns: c.cx.sub_patterns.clone(),
+            node: Rc::clone(&shared.node),
+            close_requested: Cell::new(false),
+        }) else {
+            return false;
+        };
+        let now = shared.now.get();
+        execute_slices(argv, &mut shared.store.borrow_mut(), &mut live, now, &mut reply);
+        shared.observer.borrow_mut().on_execute(shared.cell, origin, argv, &reply, now);
+        shared.with_conn(key, |c| {
+            c.cx.proto = live.proto;
+            c.cx.db = live.db;
+            c.cx.ns = live.ns;
+        });
+    } else {
+        shared.execute_owned_into(origin, argv, proto, id, db, conn_ns, &mut reply);
+        if let Some(dur) = stall_request(argv) {
+            shared.stall_until.set(shared.now.get().saturating_add(dur));
+        }
+    }
+    pending.push_back(PendingReply::Done(reply));
     true
 }
 
@@ -3708,6 +4368,33 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     if !keys.is_empty() && !shared.route_local_only {
         let owner = owner_of(keys[0]);
         if keys[1..].iter().any(|k| owner_of(k) != owner) {
+            // M3-S11: the JSON surface binds the named-ns multi-key
+            // programs (exactly the ADR-0032 D5 plan) — the MGET gather
+            // with ns-aware sub-ops. The generic refusal below stays for
+            // every other command until M5.
+            #[cfg(feature = "doc")]
+            if meta.id == CommandId::JsonMget {
+                let path = argv[argv.len() - 1];
+                let mut parts = Vec::with_capacity(argv.len() - 2);
+                for k in &argv[1..argv.len() - 1] {
+                    let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
+                    if shared.router.is_local(k, shared.cell) {
+                        let mut buf = shared.take_reply_buf();
+                        shared.execute_owned_into(origin, &sub, proto, id, db, Some(ns), &mut buf);
+                        parts.push(GatherPart::Done(buf));
+                    } else {
+                        match send_apply_ns(shared, owner_of(k), proto, ns, &sub).await {
+                            Ok(waiter) => {
+                                parts.push(GatherPart::Wait(waiter));
+                                *inflight += 1;
+                            }
+                            Err(refusal) => parts.push(GatherPart::Done(refusal)),
+                        }
+                    }
+                }
+                pending.push_back(PendingReply::Gather { parts, proto, unwrap_single: true });
+                return true;
+            }
             // Recorded M2 limitation (ADR-0015 deviations): multi-key
             // commands spanning cells bind with the M3 named-ns programs.
             pending.push_back(PendingReply::Done(error_reply(
@@ -3975,6 +4662,60 @@ async fn send_apply_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
         }
     }
     Ok(waiter)
+}
+
+/// Outcome of a synchronous [`try_send_apply`] first attempt (de-async
+/// fast path, ADR-0030 D4).
+enum SendNow {
+    /// Staged on the first attempt; the reply waiter is registered.
+    Sent(GateWait<u64, OwnedOutcome>),
+    /// The argv exceeds the codec's argument cap; carries the refusal.
+    Refused(Vec<u8>),
+    /// No fabric credit on the first attempt — the caller falls back to
+    /// the async path, which waits for credits. The drawn token is
+    /// abandoned: a skipped monotonic value, never registered and never
+    /// sent, so no reply or RTT pairing can ever reference it.
+    NoCredit,
+}
+
+/// Synchronous first-attempt [`send_apply`]: token draw + stage in one
+/// fabric borrow, waiter registered only after a successful stage (safe
+/// for the same reason as `send_apply`'s post-staging registration — the
+/// peer cannot observe the op until FABRIC-OUT publishes it, after this
+/// synchronous stretch).
+fn try_send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    to: CellId,
+    proto: Protocol,
+    db: u16,
+    argv: &[&[u8]],
+) -> SendNow {
+    let Some(args) = ApplyArgs::new(argv) else {
+        let mut reply = Vec::new();
+        RespWriter::new(&mut reply, proto).error("ERR too many arguments for cross-cell execution");
+        return SendNow::Refused(reply);
+    };
+    let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
+    let proto_byte: u8 = match proto {
+        Protocol::Resp3 => 3,
+        Protocol::Resp2 => 2,
+    };
+    debug_assert!(db < 16, "db rides 4 bits of the Apply cmd byte");
+    let cmd_byte = proto_byte | ((db as u8) << 4);
+    let (token, sent) = {
+        let mut fabric = shared.fabric.borrow_mut();
+        let token = fabric.next_token();
+        let sent = fabric.send(to, &Op::Apply { token, slot, cmd: cmd_byte, args });
+        (token, sent)
+    };
+    if sent.is_err() {
+        return SendNow::NoCredit;
+    }
+    let waiter = shared.gate.waiter(token.0);
+    if argv.first().copied() != Some(&b"INF.PUB"[..]) {
+        shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
+    }
+    SendNow::Sent(waiter)
 }
 
 /// Ship `argv` to `to` as an `Apply` and return the reply waiter, waiting

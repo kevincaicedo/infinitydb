@@ -1,0 +1,46 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.03s
+     Running benches/json_cmd.rs (target/release/deps/json_cmd-cad56dcbce659a40)
+Benchmarking json_cmd_1kib/set_plain
+Benchmarking json_cmd_1kib/set_plain: Warming up for 3.0000 s
+Benchmarking json_cmd_1kib/set_plain: Collecting 100 samples in estimated 5.0001 s (94M iterations)
+Benchmarking json_cmd_1kib/set_plain: Analyzing
+json_cmd_1kib/set_plain time:   [53.435 ns 53.455 ns 53.476 ns]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+Benchmarking json_cmd_1kib/set_json_root
+Benchmarking json_cmd_1kib/set_json_root: Warming up for 3.0000 s
+Benchmarking json_cmd_1kib/set_json_root: Collecting 100 samples in estimated 5.0046 s (3.7M iterations)
+Benchmarking json_cmd_1kib/set_json_root: Analyzing
+json_cmd_1kib/set_json_root
+                        time:   [1.3551 µs 1.3560 µs 1.3569 µs]
+Benchmarking json_cmd_1kib/get_plain
+Benchmarking json_cmd_1kib/get_plain: Warming up for 3.0000 s
+Benchmarking json_cmd_1kib/get_plain: Collecting 100 samples in estimated 5.0001 s (124M iterations)
+Benchmarking json_cmd_1kib/get_plain: Analyzing
+json_cmd_1kib/get_plain time:   [40.406 ns 40.421 ns 40.437 ns]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) low mild
+  3 (3.00%) high mild
+Benchmarking json_cmd_1kib/get_json_path
+Benchmarking json_cmd_1kib/get_json_path: Warming up for 3.0000 s
+Benchmarking json_cmd_1kib/get_json_path: Collecting 100 samples in estimated 5.0061 s (3.3M iterations)
+Benchmarking json_cmd_1kib/get_json_path: Analyzing
+json_cmd_1kib/get_json_path
+                        time:   [1.5132 µs 1.5166 µs 1.5206 µs]
+Found 16 outliers among 100 measurements (16.00%)
+  16 (16.00%) high mild
+Benchmarking json_cmd_1kib/get_json_root
+Benchmarking json_cmd_1kib/get_json_root: Warming up for 3.0000 s
+Benchmarking json_cmd_1kib/get_json_root: Collecting 100 samples in estimated 5.0066 s (1.8M iterations)
+Benchmarking json_cmd_1kib/get_json_root: Analyzing
+json_cmd_1kib/get_json_root
+                        time:   [2.7440 µs 2.7503 µs 2.7561 µs]
+Benchmarking json_cmd_1kib/numincrby_json
+Benchmarking json_cmd_1kib/numincrby_json: Warming up for 3.0000 s
+Benchmarking json_cmd_1kib/numincrby_json: Collecting 100 samples in estimated 5.0023 s (9.5M iterations)
+Benchmarking json_cmd_1kib/numincrby_json: Analyzing
+json_cmd_1kib/numincrby_json
+                        time:   [530.44 ns 530.74 ns 530.99 ns]
+
+path_cache: hits=35073359 misses=4 evictions=0 bytes=8498 hit_rate=1.0000

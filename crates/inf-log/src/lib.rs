@@ -37,16 +37,18 @@ pub use ckpt::{CkptConfig, IckStream, IckSummary, SectionLease};
 pub use commit::{CommitStats, FsyncClass, FsyncTicket, GroupCommit, SyncReason};
 pub use effect::MutationEffect;
 pub use frame::{
-    DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_TRAILER_LEN, FrameBuilder,
-    FrameDecodeError, FrameIter, FrameRecordError, FrameRef, MIN_FRAME_LEN, RecordIter,
-    decode_frame,
+    DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN, FRAME_HEADER_LEN_V1, FRAME_MAGIC, FRAME_MAGIC_V1,
+    FRAME_TRAILER_LEN, FrameBuilder, FrameDecodeError, FrameIter, FrameRecordError, FrameRef,
+    FrameStamp, MIN_FRAME_LEN, MIN_FRAME_LEN_V1, RecordIter, decode_frame, frame_header_len,
 };
 pub use lsn::{Lsn, SegmentId};
 pub use manifest::{
     Manifest, ManifestDecodeError, manifest_envelope, read_manifest, write_manifest,
 };
 pub use reader::{ApplyError, DEFAULT_READ_CHUNK, ReadEnd, ReadError, ReaderConfig, SegmentReader};
-pub use record::{NsId, RecordDecodeError, RecordType, RecordView, decode_record};
+pub use record::{
+    DOC_VERSION_MASK, DocLineage, NsId, RecordDecodeError, RecordType, RecordView, decode_record,
+};
 pub use scan::{
     CellDirs, ScanError, ScanOutcome, SegmentScan, create_cell_dirs, create_cell_dirs_deferred,
     scan_log_dir, scan_log_dir_from,
@@ -60,4 +62,4 @@ pub use staging::{
     DEFAULT_STAGING_BYTES, FrameLease, StagedAt, StagingConfig, StagingFull, StagingRing,
     StagingStats,
 };
-pub use tail::{LogCorruption, RegionScan, scan_region};
+pub use tail::{LogCorruption, RegionEvidence, RegionScan, scan_region, scan_region_evidence};

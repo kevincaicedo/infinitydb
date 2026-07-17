@@ -107,6 +107,33 @@ pub enum CommandId {
     InfTake,
     /// Internal cross-cell program op: atomically read value+TTL (COPY).
     InfPeek,
+    // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041) ----
+    JsonSet,
+    JsonGet,
+    JsonMget,
+    JsonDel,
+    /// Alias of `JSON.DEL` (RedisJSON heritage).
+    JsonForget,
+    JsonType,
+    JsonNumIncrBy,
+    JsonNumMultBy,
+    JsonStrAppend,
+    JsonStrLen,
+    JsonToggle,
+    JsonClear,
+    // ---- M3-S13/S14 · array + object ops, MERGE (ADR-0042) ----
+    JsonArrAppend,
+    JsonArrInsert,
+    JsonArrIndex,
+    JsonArrLen,
+    JsonArrPop,
+    JsonArrTrim,
+    JsonObjKeys,
+    JsonObjLen,
+    JsonMerge,
+    /// `JSON.DEBUG MEMORY key` — attributed document bytes (M3-S19,
+    /// intentionally partial vs RedisJSON allocator-specific numbers).
+    JsonDebug,
 }
 
 /// Command behavior flags (wire-independent bitset).
@@ -163,6 +190,9 @@ impl KeySpec {
     pub const ONE: KeySpec = KeySpec { first: 1, last: 1, step: 1 };
     /// Keys from argv[1] through the final argument (DEL, EXISTS, MGET).
     pub const ALL_TRAILING: KeySpec = KeySpec { first: 1, last: -1, step: 1 };
+    /// Keys from argv[1] through the second-to-last argument
+    /// (JSON.MGET: `key [key …] path`).
+    pub const ALL_BUT_LAST: KeySpec = KeySpec { first: 1, last: -2, step: 1 };
     /// Two keys at argv[1..=2] (RENAME, COPY).
     pub const TWO: KeySpec = KeySpec { first: 1, last: 2, step: 1 };
     /// Key/value pairs from argv[1] (MSET, MSETNX): every second argument.
@@ -196,7 +226,7 @@ const LOADING_ADMIN: CmdFlags = CmdFlags::ADMIN.union(CmdFlags::LOADING);
 const LOADING_RO_FAST: CmdFlags = CmdFlags::READONLY.union(CmdFlags::FAST).union(CmdFlags::LOADING);
 const W_FAST_OOM: CmdFlags = W_FAST.union(CmdFlags::DENYOOM);
 
-/// One registry row (the array below stays readable at 58 entries).
+/// One registry row (the array below stays readable at 90 entries).
 const fn cmd(
     id: CommandId,
     name: &'static str,
@@ -209,7 +239,7 @@ const fn cmd(
 
 /// The registry. M1+ append here (and only here) — the hash table below is
 /// derived mechanically at compile time.
-pub static COMMANDS: [CommandMeta; 68] = [
+pub static COMMANDS: [CommandMeta; 90] = [
     cmd(CommandId::Ping, "PING", -1, CmdFlags::FAST, KeySpec::NONE),
     cmd(CommandId::Echo, "ECHO", 2, LOADING_FAST, KeySpec::NONE),
     cmd(CommandId::Hello, "HELLO", -1, LOADING_FAST, KeySpec::NONE),
@@ -297,22 +327,55 @@ pub static COMMANDS: [CommandMeta; 68] = [
     // ---- internal fabric-program ops (INF.* extension namespace) ----
     cmd(CommandId::InfTake, "INF.TAKE", 2, W_FAST, KeySpec::ONE),
     cmd(CommandId::InfPeek, "INF.PEEK", 2, RO_FAST, KeySpec::ONE),
+    // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041 D6–D9).
+    // DENYOOM membership mirrors the RedisJSON module declarations:
+    // memory-growing writes deny under OOM; DEL/FORGET/CLEAR free.
+    cmd(CommandId::JsonSet, "JSON.SET", -4, W_OOM, KeySpec::ONE),
+    cmd(CommandId::JsonGet, "JSON.GET", -2, CmdFlags::READONLY, KeySpec::ONE),
+    cmd(CommandId::JsonMget, "JSON.MGET", -3, CmdFlags::READONLY, KeySpec::ALL_BUT_LAST),
+    cmd(CommandId::JsonDel, "JSON.DEL", -2, CmdFlags::WRITE, KeySpec::ONE),
+    cmd(CommandId::JsonForget, "JSON.FORGET", -2, CmdFlags::WRITE, KeySpec::ONE),
+    cmd(CommandId::JsonType, "JSON.TYPE", -2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::JsonNumIncrBy, "JSON.NUMINCRBY", 4, W_OOM, KeySpec::ONE),
+    cmd(CommandId::JsonNumMultBy, "JSON.NUMMULTBY", 4, W_OOM, KeySpec::ONE),
+    cmd(CommandId::JsonStrAppend, "JSON.STRAPPEND", -3, W_OOM, KeySpec::ONE),
+    cmd(CommandId::JsonStrLen, "JSON.STRLEN", -2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::JsonToggle, "JSON.TOGGLE", -2, W_FAST, KeySpec::ONE),
+    cmd(CommandId::JsonClear, "JSON.CLEAR", -2, CmdFlags::WRITE, KeySpec::ONE),
+    // ---- M3-S13/S14 · array + object ops, MERGE (ADR-0042 D7). Same
+    // DENYOOM rule: growth denies under OOM; POP/TRIM free. ARRAPPEND
+    // keeps the RedisJSON optional-path quirk (argv == 3 ⇒ legacy root),
+    // so its arity floor is 3 like STRAPPEND.
+    cmd(CommandId::JsonArrAppend, "JSON.ARRAPPEND", -3, W_OOM, KeySpec::ONE),
+    cmd(CommandId::JsonArrInsert, "JSON.ARRINSERT", -5, W_OOM, KeySpec::ONE),
+    cmd(CommandId::JsonArrIndex, "JSON.ARRINDEX", -4, CmdFlags::READONLY, KeySpec::ONE),
+    cmd(CommandId::JsonArrLen, "JSON.ARRLEN", -2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::JsonArrPop, "JSON.ARRPOP", -2, CmdFlags::WRITE, KeySpec::ONE),
+    cmd(CommandId::JsonArrTrim, "JSON.ARRTRIM", 5, CmdFlags::WRITE, KeySpec::ONE),
+    cmd(CommandId::JsonObjKeys, "JSON.OBJKEYS", -2, CmdFlags::READONLY, KeySpec::ONE),
+    cmd(CommandId::JsonObjLen, "JSON.OBJLEN", -2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::JsonMerge, "JSON.MERGE", 4, W_OOM, KeySpec::ONE),
+    cmd(CommandId::JsonDebug, "JSON.DEBUG", 3, RO_FAST, KeySpec::SECOND),
 ];
 
 // ---- Compile-time perfect hash ---------------------------------------------
 
-const BUCKET_BITS: u32 = 8;
+const BUCKET_BITS: u32 = 9;
 const BUCKETS: usize = 1 << BUCKET_BITS;
 /// Longest command name in the registry (verified in `build_table`).
 const MAX_NAME_LEN: usize = 16;
 /// Multiply-mix constants found offline over the packed name word pairs; the
 /// const builder below proves them collision-free at compile time, so a new
 /// command that breaks them fails the build (re-search the constants then —
-/// `(w0·M1 ^ w1·M2) >> 56` over random odd pairs; the M1-E5 pub/sub growth
-/// to 64 names re-searched in ~1k attempts; the M2-S20 growth to 68 in
-/// ~9k).
-const HASH_MULTIPLIER_LO: u64 = 0xD3DC_D685_F6E9_CA63;
-const HASH_MULTIPLIER_HI: u64 = 0x15EB_AA73_4AD2_E425;
+/// `(w0·M1 ^ w1·M2) >> (64 − BUCKET_BITS)` over random odd pairs; the M1-E5
+/// pub/sub growth to 64 names re-searched in ~1k attempts; the M2-S20 growth
+/// to 68 in ~9k; the M3-S11 `JSON.*` growth to 80 in ~936k at 256 buckets —
+/// exhausted, as that entry recorded; the M3-S13/S14 growth to 89 bumped
+/// `BUCKET_BITS` to 9 (ADR-0042 D7 — the table is cold 8 KiB; probe count
+/// unchanged); M3-S19's 90th row re-searched in 1,619 deterministic
+/// splitmix attempts).
+const HASH_MULTIPLIER_LO: u64 = 0x4C19_0974_F5FB_1CA9;
+const HASH_MULTIPLIER_HI: u64 = 0x0AD3_0175_CBB3_C0C5;
 /// Word-wide ASCII case fold (`a-z` → `A-Z`); zero padding stays zero.
 /// Non-letters map somewhere harmless — the verify word-compare against the
 /// canonical name rejects any non-command byte sequence.

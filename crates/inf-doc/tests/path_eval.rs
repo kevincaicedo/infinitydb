@@ -1,0 +1,434 @@
+//! M3-S09 evaluator suite: differential against an independent naive
+//! reference interpreter (nodelist-at-a-time over `model::Value` — a
+//! deliberately different algorithm from the frame-stack DFS), the
+//! determinism and form-agnosticism properties, the §3.4 R5 overlap
+//! corpus, and the budget/yield/resume contract (ADR-0040 D4–D6).
+//!
+//! RedisJSON reply parity for these shapes is S21's (oracle-pending, the
+//! recorded blocker); this suite pins *our* frozen semantics.
+
+use inf_alloc::arena::{Arena, ArenaConfig};
+use inf_doc::model::{self, Value};
+use inf_doc::path::{
+    self, EvalLimits, EvalStep, Matches, Member, PathAst, Segment, SliceSpec, compile, eval,
+    eval_budgeted, resolve,
+};
+use inf_doc::{ArenaDoc, DocValue, TapeDoc};
+use proptest::prelude::*;
+
+// ---------------------------------------------------------------------
+// Reference interpreter (test-only: recursion + materialized nodelists
+// are fine off the data plane).
+
+fn ref_eval(ast: &PathAst, root: &Value) -> Vec<Vec<u32>> {
+    let mut list: Vec<(Vec<u32>, &Value)> = vec![(Vec::new(), root)];
+    for segment in &ast.segments {
+        let mut next = Vec::new();
+        for (steps, node) in &list {
+            ref_select(segment, steps, node, &mut next);
+        }
+        list = next;
+    }
+    list.into_iter().map(|(steps, _)| steps).collect()
+}
+
+fn ref_select<'v>(
+    segment: &Segment,
+    steps: &[u32],
+    node: &'v Value,
+    out: &mut Vec<(Vec<u32>, &'v Value)>,
+) {
+    let child = |steps: &[u32], ord: u32| {
+        let mut s = steps.to_vec();
+        s.push(ord);
+        s
+    };
+    match segment {
+        Segment::Child(name) => {
+            if let Value::Obj(entries) = node
+                && let Some((ord, (_, value))) =
+                    entries.iter().enumerate().find(|(_, (k, _))| k.as_bytes() == &name[..])
+            {
+                out.push((child(steps, ord as u32), value));
+            }
+        }
+        Segment::ChildAny => match node {
+            Value::Obj(entries) => {
+                for (ord, (_, value)) in entries.iter().enumerate() {
+                    out.push((child(steps, ord as u32), value));
+                }
+            }
+            Value::Arr(items) => {
+                for (ord, value) in items.iter().enumerate() {
+                    out.push((child(steps, ord as u32), value));
+                }
+            }
+            _ => {}
+        },
+        Segment::Index(i) => {
+            if let Value::Arr(items) = node {
+                let resolved = if *i < 0 { *i + items.len() as i64 } else { *i };
+                if (0..items.len() as i64).contains(&resolved) {
+                    out.push((child(steps, resolved as u32), &items[resolved as usize]));
+                }
+            }
+        }
+        Segment::Slice(spec) => {
+            if let Value::Arr(items) = node {
+                for ord in ref_slice_indices(spec, items.len() as i64) {
+                    out.push((child(steps, ord as u32), &items[ord as usize]));
+                }
+            }
+        }
+        Segment::Union(members) => {
+            for member in members {
+                let as_segment = match member {
+                    Member::Name(n) => Segment::Child(n.clone()),
+                    Member::Index(i) => Segment::Index(*i),
+                    Member::Slice(s) => Segment::Slice(*s),
+                };
+                ref_select(&as_segment, steps, node, out);
+            }
+        }
+        Segment::Descend(inner) => {
+            // Pre-order: the node itself, then descendants in document
+            // order (grammar §3; ADR-0040 D4).
+            ref_select(inner, steps, node, out);
+            match node {
+                Value::Obj(entries) => {
+                    for (ord, (_, value)) in entries.iter().enumerate() {
+                        ref_select(segment, &child(steps, ord as u32), value, out);
+                    }
+                }
+                Value::Arr(items) => {
+                    for (ord, value) in items.iter().enumerate() {
+                        ref_select(segment, &child(steps, ord as u32), value, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Python slice indices — independently re-derived (grammar §4).
+fn ref_slice_indices(spec: &SliceSpec, len: i64) -> Vec<i64> {
+    let step = spec.step.unwrap_or(1);
+    assert_ne!(step, 0);
+    let resolve = |v: i64| if v < 0 { v + len } else { v };
+    let mut out = Vec::new();
+    if step > 0 {
+        let start = spec.start.map(resolve).unwrap_or(0).clamp(0, len);
+        let stop = spec.end.map(resolve).unwrap_or(len).clamp(0, len);
+        let mut i = start;
+        while i < stop {
+            out.push(i);
+            i += step;
+        }
+    } else {
+        let start = spec.start.map(resolve).unwrap_or(len - 1).clamp(-1, len - 1);
+        let stop = spec.end.map(resolve).unwrap_or(-1).clamp(-1, len - 1);
+        let mut i = start;
+        while i > stop {
+            out.push(i);
+            i += step;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// Harness helpers.
+
+fn matches_as_vecs(matches: &Matches) -> Vec<Vec<u32>> {
+    matches.iter().map(|s| s.to_vec()).collect()
+}
+
+/// Evaluate a path text against a model doc on BOTH physical forms;
+/// asserts they agree and returns the (tape-derived) raw match paths.
+fn eval_both_forms(text: &str, value: &Value) -> Vec<Vec<u32>> {
+    let program = compile(text.as_bytes()).expect("path compiles");
+    let bytes = model::encode(value).expect("doc encodes");
+    let doc = TapeDoc::from_bytes(&bytes).expect("validates");
+    let tape_matches =
+        eval(&program, DocValue::from(doc.root()), &EvalLimits::default()).expect("eval");
+    let mut arena = Arena::new(ArenaConfig::default());
+    let adoc = ArenaDoc::from_tape(&doc, &mut arena).expect("morphs");
+    let arena_matches =
+        eval(&program, adoc.root_value(&arena), &EvalLimits::default()).expect("eval");
+    assert_eq!(tape_matches, arena_matches, "tape ≡ arena for {text:?} (ADR-0040 D5)");
+    adoc.free(&mut arena);
+    matches_as_vecs(&tape_matches)
+}
+
+fn store() -> Value {
+    Value::Obj(vec![
+        (
+            "store".into(),
+            Value::Obj(vec![
+                (
+                    "book".into(),
+                    Value::Arr(vec![
+                        Value::Obj(vec![
+                            ("title".into(), Value::Str("Sayings".into())),
+                            ("price".into(), Value::F64(8.95)),
+                        ]),
+                        Value::Obj(vec![
+                            ("title".into(), Value::Str("Sword".into())),
+                            ("price".into(), Value::F64(12.99)),
+                        ]),
+                        Value::Obj(vec![
+                            ("title".into(), Value::Str("Moby".into())),
+                            ("isbn".into(), Value::Str("0-553-21311-3".into())),
+                        ]),
+                    ]),
+                ),
+                ("bicycle".into(), Value::Obj(vec![("price".into(), Value::F64(19.95))])),
+            ]),
+        ),
+        ("expensive".into(), Value::I64(10)),
+    ])
+}
+
+// ---------------------------------------------------------------------
+// Fixed-shape semantics (each row also proves tape ≡ arena).
+
+#[test]
+fn selector_semantics_on_the_store_doc() {
+    let doc = store();
+    // (path, expected raw match paths)
+    let cases: &[(&str, &[&[u32]])] = &[
+        ("$", &[&[]]),
+        ("$.expensive", &[&[1]]),
+        ("$.store.bicycle.price", &[&[0, 1, 0]]),
+        ("$.missing", &[]),
+        ("$.store.book[0].title", &[&[0, 0, 0, 0]]),
+        ("$.store.book[-1].title", &[&[0, 0, 2, 0]]),
+        ("$.store.book[3]", &[]),
+        ("$.store.book[-4]", &[]),
+        ("$.store.book[*].title", &[&[0, 0, 0, 0], &[0, 0, 1, 0], &[0, 0, 2, 0]]),
+        ("$.store.*", &[&[0, 0], &[0, 1]]),
+        ("$.store.book[1:]", &[&[0, 0, 1], &[0, 0, 2]]),
+        ("$.store.book[::-1]", &[&[0, 0, 2], &[0, 0, 1], &[0, 0, 0]]),
+        ("$.store.book[0:3:2]", &[&[0, 0, 0], &[0, 0, 2]]),
+        ("$.store.book[2,0]", &[&[0, 0, 2], &[0, 0, 0]]), // member order, not doc order
+        ("$.store.book[0,0]", &[&[0, 0, 0], &[0, 0, 0]]), // duplicates preserved (raw)
+        ("$..price", &[&[0, 0, 0, 1], &[0, 0, 1, 1], &[0, 1, 0]]),
+        ("$..isbn", &[&[0, 0, 2, 1]]),
+        ("$..book[0]", &[&[0, 0, 0]]),
+        (
+            "$.store.book[*]['title','price']",
+            &[&[0, 0, 0, 0], &[0, 0, 0, 1], &[0, 0, 1, 0], &[0, 0, 1, 1], &[0, 0, 2, 0]],
+        ),
+        // Type mismatches select nothing, silently (grammar §3).
+        ("$.expensive[0]", &[]),
+        ("$.expensive.*", &[]),
+        ("$.store.book.title", &[]),
+    ];
+    for (text, want) in cases {
+        let got = eval_both_forms(text, &doc);
+        let want: Vec<Vec<u32>> = want.iter().map(|s| s.to_vec()).collect();
+        assert_eq!(got, want, "raw matches for {text:?}");
+    }
+}
+
+/// `$..price` order note pinned: descend is pre-order (self before
+/// children), so `store.bicycle.price` ([0,1,0]) arrives after the book
+/// prices — raw order is program order, canonical order re-sorts.
+#[test]
+fn overlap_corpus_ancestor_descendant() {
+    // {"a": {"a": {"a": 1}}, "b": [{"a": 2}]}
+    let doc = Value::Obj(vec![
+        ("a".into(), Value::Obj(vec![("a".into(), Value::Obj(vec![("a".into(), Value::I64(1))]))])),
+        ("b".into(), Value::Arr(vec![Value::Obj(vec![("a".into(), Value::I64(2))])])),
+    ]);
+    let program = compile(b"$..a").expect("compiles");
+    let bytes = model::encode(&doc).expect("encodes");
+    let tape = TapeDoc::from_bytes(&bytes).expect("validates");
+    let matches = eval(&program, DocValue::from(tape.root()), &EvalLimits::default()).expect("ok");
+    // Raw: pre-order self-first — root.a, then inside it a.a, a.a.a,
+    // then the array element's a.
+    assert_eq!(matches_as_vecs(&matches), vec![vec![0], vec![0, 0], vec![0, 0, 0], vec![1, 0, 0]]);
+    let canonical = matches.canonical();
+    assert!(canonical.any_overlap, "ancestor+descendant matches must be flagged (§3.4 R5)");
+    let ordered: Vec<&[u32]> = canonical.ids.iter().map(|&id| matches.get(id as usize)).collect();
+    assert_eq!(ordered, vec![&[0][..], &[0, 0], &[0, 0, 0], &[1, 0, 0]], "document order");
+
+    // Disjoint matches carry no overlap flag.
+    let program = compile(b"$.*").expect("compiles");
+    let matches = eval(&program, DocValue::from(tape.root()), &EvalLimits::default()).expect("ok");
+    assert!(!matches.canonical().any_overlap);
+
+    // Union duplicates dedup in the canonical view, keep raw arity.
+    let program = compile(b"$['a','a']").expect("compiles");
+    let matches = eval(&program, DocValue::from(tape.root()), &EvalLimits::default()).expect("ok");
+    assert_eq!(matches.len(), 2);
+    assert_eq!(matches.canonical().ids.len(), 1);
+}
+
+#[test]
+fn resolve_walks_location_paths() {
+    let doc = store();
+    let bytes = model::encode(&doc).expect("encodes");
+    let tape = TapeDoc::from_bytes(&bytes).expect("validates");
+    let root = DocValue::from(tape.root());
+    let program = compile(b"$..isbn").expect("compiles");
+    let matches = eval(&program, root, &EvalLimits::default()).expect("ok");
+    assert_eq!(matches.len(), 1);
+    let Some(DocValue::Str(s)) = resolve(root, matches.get(0)) else {
+        panic!("isbn resolves to a string");
+    };
+    assert_eq!(s.as_bytes(), b"0-553-21311-3");
+    assert!(resolve(root, &[9, 9]).is_none());
+}
+
+#[test]
+fn match_cap_is_a_typed_error() {
+    let doc = Value::Arr((0..64).map(Value::I64).collect());
+    let bytes = model::encode(&doc).expect("encodes");
+    let tape = TapeDoc::from_bytes(&bytes).expect("validates");
+    let program = compile(b"$[*]").expect("compiles");
+    let err = eval(&program, DocValue::from(tape.root()), &EvalLimits { max_matches: 63 })
+        .expect_err("caps");
+    assert_eq!(err, path::EvalError::TooManyMatches);
+}
+
+/// The §4.1 budget row: `Descend` yields every M nodes; resume completes
+/// with matches identical to the unbudgeted run, and the yielded state
+/// is owned (no document borrows — it outlives this scope trivially).
+#[test]
+fn budgeted_descend_yields_and_resumes() {
+    let doc = store();
+    let bytes = model::encode(&doc).expect("encodes");
+    let tape = TapeDoc::from_bytes(&bytes).expect("validates");
+    let root = DocValue::from(tape.root());
+    let program = compile(b"$..*").expect("compiles");
+    let unbudgeted = eval(&program, root, &EvalLimits::default()).expect("ok");
+    for budget in 1..=8u64 {
+        let mut state = None;
+        let mut rounds = 0usize;
+        let matches = loop {
+            match eval_budgeted(&program, root, &EvalLimits::default(), budget, state.take())
+                .expect("ok")
+            {
+                EvalStep::Done(m) => break m,
+                EvalStep::Yield(s) => {
+                    state = Some(s);
+                    rounds += 1;
+                    assert!(rounds < 10_000, "budgeted eval must terminate");
+                }
+            }
+        };
+        assert!(rounds > 0, "budget {budget} must yield at least once on $..*");
+        assert_eq!(matches, unbudgeted, "resume ≡ straight run at budget {budget}");
+    }
+}
+
+// ---------------------------------------------------------------------
+// Differential property: 10⁵ (doc × path) pairs in the release AC run.
+
+fn arb_value() -> impl Strategy<Value = Value> {
+    let key = prop_oneof![Just("a"), Just("b"), Just("k"), Just("z9")].prop_map(String::from);
+    let leaf = prop_oneof![
+        Just(Value::Null),
+        any::<bool>().prop_map(Value::Bool),
+        (-1000i64..1000).prop_map(Value::I64),
+        Just(Value::Str("s".into())),
+    ];
+    leaf.prop_recursive(4, 64, 5, move |inner| {
+        prop_oneof![
+            proptest::collection::vec(inner.clone(), 0..5).prop_map(Value::Arr),
+            proptest::collection::vec((key.clone(), inner), 0..5).prop_map(|entries| {
+                // Unique keys: canonical documents (the parser enforces
+                // last-wins upstream; the model here must be canonical).
+                let mut seen = std::collections::BTreeSet::new();
+                Value::Obj(entries.into_iter().filter(|(k, _)| seen.insert(k.clone())).collect())
+            }),
+        ]
+    })
+}
+
+fn arb_path_ast() -> impl Strategy<Value = PathAst> {
+    let name = prop_oneof![Just("a"), Just("b"), Just("k"), Just("z9"), Just("q")]
+        .prop_map(|s| s.as_bytes().to_vec());
+    let slice = (
+        proptest::option::of(-6i64..6),
+        proptest::option::of(-6i64..6),
+        proptest::option::of(prop_oneof![(-3i64..0), (1i64..3)]),
+    )
+        .prop_map(|(start, end, step)| SliceSpec { start, end, step });
+    let member = prop_oneof![
+        name.clone().prop_map(Member::Name),
+        (-6i64..6).prop_map(Member::Index),
+        slice.clone().prop_map(Member::Slice),
+    ];
+    let selector = prop_oneof![
+        4 => name.prop_map(Segment::Child),
+        2 => Just(Segment::ChildAny),
+        2 => (-6i64..6).prop_map(Segment::Index),
+        1 => slice.prop_map(Segment::Slice),
+        1 => proptest::collection::vec(member, 2..4).prop_map(Segment::Union),
+    ];
+    let segment = prop_oneof![
+        3 => selector.clone(),
+        1 => selector.prop_map(|s| Segment::Descend(Box::new(s))),
+    ];
+    (any::<bool>(), proptest::collection::vec(segment, 0..5))
+        .prop_map(|(legacy, segments)| PathAst { legacy, segments })
+}
+
+proptest! {
+    /// The S09 differential AC: identical match sets and order vs the
+    /// reference interpreter, on both physical forms.
+    #[test]
+    fn differential_vs_reference(value in arb_value(), ast in arb_path_ast()) {
+        let text = path::ast::print(&ast);
+        let expected = ref_eval(&ast, &value);
+        let got = eval_both_forms(&text, &value);
+        prop_assert_eq!(&got, &expected, "path {} over {:?}", text, value);
+    }
+
+    /// Determinism (L7): two evaluations agree — beyond the debug-build
+    /// double-run inside `eval`, this pins release behavior too.
+    #[test]
+    fn evaluation_is_deterministic(value in arb_value(), ast in arb_path_ast()) {
+        let text = path::ast::print(&ast);
+        let program = compile(text.as_bytes()).expect("compiles");
+        let bytes = model::encode(&value).expect("encodes");
+        let tape = TapeDoc::from_bytes(&bytes).expect("validates");
+        let root = DocValue::from(tape.root());
+        let first = eval(&program, root, &EvalLimits::default()).expect("ok");
+        let second = eval(&program, root, &EvalLimits::default()).expect("ok");
+        prop_assert_eq!(first, second);
+    }
+
+    /// Budgeted evaluation converges to the straight run for any budget.
+    #[test]
+    fn budgeted_eval_matches_unbudgeted(
+        value in arb_value(),
+        ast in arb_path_ast(),
+        budget in 1u64..16,
+    ) {
+        let text = path::ast::print(&ast);
+        let program = compile(text.as_bytes()).expect("compiles");
+        let bytes = model::encode(&value).expect("encodes");
+        let tape = TapeDoc::from_bytes(&bytes).expect("validates");
+        let root = DocValue::from(tape.root());
+        let unbudgeted = eval(&program, root, &EvalLimits::default()).expect("ok");
+        let mut state = None;
+        let mut rounds = 0usize;
+        let resumed = loop {
+            match eval_budgeted(&program, root, &EvalLimits::default(), budget, state.take())
+                .expect("ok")
+            {
+                EvalStep::Done(m) => break m,
+                EvalStep::Yield(s) => {
+                    state = Some(s);
+                    rounds += 1;
+                    prop_assert!(rounds < 100_000, "must terminate");
+                }
+            }
+        };
+        prop_assert_eq!(resumed, unbudgeted);
+    }
+}

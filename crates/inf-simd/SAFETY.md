@@ -28,6 +28,88 @@ All unsafe code is platform intrinsics in `crlf.rs`, `group16.rs`, and
   any pointer value (the safe wrapper is therefore sound for arbitrary
   pointers); the aarch64 body is a no-op (intrinsics unstable).
 
+## `json.rs` — JSON stage-1 structural scan (M3-S05)
+
+- **Bounds**: the AVX2 path's two unaligned 32-byte loads per block are
+  guarded by the enclosing `offset + 64 <= input.len()` loop bound; the
+  SSE2 quarter load reads exactly the 16 bytes of a `chunks_exact(16)`
+  slice (length debug-asserted); the tail is copied into a stack
+  `[u8; 64]` padded with spaces and classified bytewise (no vector load).
+- **Feature availability**: SSE2/NEON are baseline; the AVX2 path is
+  reachable only behind cached `is_x86_feature_detected!("avx2")` (the
+  crlf.rs AtomicU8 pattern) and is annotated `#[target_feature]`.
+- **No aliasing games**: intrinsics read the input slice only; all
+  results land in plain `u64` masks; the escape/string-span arithmetic is
+  fully safe integer code shared by every tier.
+- **Oracle**: `scalar_json_scan_structurals` is an independent per-byte
+  state machine (not the bit tricks); the equivalence proptests drive all
+  tiers (dispatched, forced-SSE2, scalar) over JSON-ish and arbitrary
+  bytes and require identical output — including deliberately invalid
+  inputs, so the context-free escape semantics match exactly.
+
+## `json.rs` — fused string-content copies + index writes (ADR-0047 K1/K2/K3)
+
+- **Bounds (loads)**: full-block loads are guarded by `i + 32 <= len`;
+  the final block loads `len - 32 .. len`, in bounds because the
+  dispatcher sends the AVX2 tier only `src.len() >= 32` (debug-asserted
+  again in the tier).
+- **Bounds (stores + `set_len`)**: `out.reserve(len)` runs before any
+  raw write; every `_mm256_storeu_si256` lands inside
+  `[out.len(), out.len() + len)` of that reservation. `set_len(base +
+  len)` executes only on the no-special path, where the full-block
+  stores plus the backward-overlapped tail store have initialized
+  exactly those `len` bytes. On the `Some` return, `set_len` never runs
+  — the partially written bytes remain spare capacity and are never
+  exposed.
+- **Overlap argument**: the final block re-covers `len - 32 .. i`; those
+  bytes were already classified clean by earlier full blocks (same bytes,
+  same predicate), so the first set mask bit is at or past `i`
+  (debug-asserted). Re-storing the clean prefix rewrites identical bytes.
+- **Feature availability**: AVX2 behind the cached
+  `is_x86_feature_detected!` AtomicU8 pattern, `#[target_feature]`
+  annotated; the portability tier (`scalar_json_copy_unescaped`) is
+  fully safe SWAR and is also the Miri path (`cfg(not(miri))` on the
+  dispatch arm).
+- **Oracle**: an independent per-byte `position` scan; the boundary
+  sweep plants every special at every position across word/block
+  boundaries, and the proptests drive arbitrary + string-ish bytes
+  through every tier requiring verdict *and* appended-byte equality.
+- **K2 `json_copy_unescaped_short`** (fixstr companion, `1 <= len <= 31`):
+  the single 32-byte load is guarded by the entry `assert!(window.len()
+  >= 32)`; the special mask is ANDed with `(1 << len) - 1`, so bytes past
+  the live length can never veto; the 32-byte store goes into
+  `reserve(32)` spare capacity and `set_len(base + len)` exposes only the
+  `len` initialized bytes. Exhaustive sweep test: every length × every
+  special position inside and outside the live window, both tiers.
+- **K3 `flush_block` unchecked index writes**: `reserve(64)` precedes the
+  bit-loop (a 64-bit emit mask can set at most 64 bits), every write
+  lands at `out.len() + k`, `k < 64`, and `set_len` exposes exactly the
+  written prefix. The existing tier-equivalence proptests (dispatched,
+  forced-SSE2, scalar oracle) cover it on arbitrary and JSON-ish bytes.
+
+## `utf8.rs` — UTF-8 validation kernel (M3-S05 slice 3)
+
+- **Bounds**: the AVX2 path's one unaligned 32-byte load per block reads a
+  `chunks_exact(32)` slice (length guaranteed); the trailing partial block
+  is copied into a zero-padded stack `[u8; 32]` and loaded from there —
+  no vector load ever touches past the input.
+- **Feature availability**: the AVX2 path is reachable only behind cached
+  `is_x86_feature_detected!("avx2")` (the crlf.rs AtomicU8 pattern); every
+  helper is `#[target_feature(enable = "avx2")] unsafe fn`. There is no
+  SSE2/NEON tier — the fallback is `std::str::from_utf8` itself.
+- **No aliasing games**: intrinsics read the input slice only; all state
+  lives in `__m256i` locals.
+- **Verdict-only contract**: the kernel returns a boolean; callers derive
+  error offsets by re-running std on the reject path and defer to std's
+  verdict there, so a kernel false-negative cannot produce a wrong answer.
+  The false-accept direction is property-tested (below) and cross-checked
+  by the `json_parse` fuzz differential (serde_json validates UTF-8).
+- **Oracle**: `std::str::from_utf8` — the equivalence proptests drive
+  arbitrary bytes and boundary-mutated valid text of every width class,
+  plus a fixed corpus of every error class (overlongs, surrogates,
+  truncations, > U+10FFFF, stray continuations) shifted across the 32-byte
+  block boundary and to end-of-input.
+
 ## `crc32c.rs` — CRC32C kernel (M2-S01)
 
 - **No memory unsafety at all**: both hardware paths feed the CRC

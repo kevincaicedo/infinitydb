@@ -1,0 +1,6 @@
+pipe_version = 2
+seed_hex = "0x1D0C2026"
+shape.large-64KiB = { documents = 2000, serialized_bytes = 131072000 }
+documents_total = 2000
+serialized_bytes_total = 131072000
+pipe_fnv1a64 = "8892066a7ddf0968"

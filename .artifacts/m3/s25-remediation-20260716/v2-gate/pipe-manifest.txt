@@ -1,0 +1,6 @@
+pipe_version = 2
+seed_hex = "0x1D0C2026"
+shape.gate-1KiB = { documents = 40000, serialized_bytes = 40960000 }
+documents_total = 40000
+serialized_bytes_total = 40960000
+pipe_fnv1a64 = "fbcc9d60840c6f4d"

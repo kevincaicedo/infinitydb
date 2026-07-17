@@ -1,0 +1,25 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+inf-sim: m3-document sweep shard 1/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 3750 equivalence checks, 18750 documents compared, cut classes [ckpt-begin:28 doc-delta:804 doc-full:1055]
+inf-sim: sim_seconds=3754.053405 published=0 delivered=0
+inf-sim: m3-document sweep shard 7/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 3750 equivalence checks, 18750 documents compared, cut classes [ckpt-begin:17 doc-delta:769 doc-full:1059]
+inf-sim: sim_seconds=3757.588413 published=0 delivered=0
+inf-sim: m3-document sweep shard 0/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 3750 equivalence checks, 18750 documents compared, cut classes [ckpt-begin:18 doc-delta:803 doc-full:1049]
+inf-sim: sim_seconds=3621.763806 published=0 delivered=0
+inf-sim: m3-document sweep shard 2/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 3750 equivalence checks, 18750 documents compared, cut classes [ckpt-begin:17 doc-delta:819 doc-full:1049]
+inf-sim: sim_seconds=3729.442034 published=0 delivered=0
+inf-sim: m3-document sweep shard 3/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 3750 equivalence checks, 18750 documents compared, cut classes [ckpt-begin:15 doc-delta:791 doc-full:1068]
+inf-sim: sim_seconds=3674.585584 published=0 delivered=0
+inf-sim: m3-document sweep shard 6/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 3750 equivalence checks, 18750 documents compared, cut classes [ckpt-begin:18 doc-delta:778 doc-full:1065]
+inf-sim: sim_seconds=3747.559155 published=0 delivered=0
+inf-sim: m3-document sweep shard 4/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 3750 equivalence checks, 18750 documents compared, cut classes [ckpt-begin:18 doc-delta:794 doc-full:1022]
+inf-sim: sim_seconds=3675.352163 published=0 delivered=0
+inf-sim: m3-document sweep shard 5/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 3750 equivalence checks, 18750 documents compared, cut classes [ckpt-begin:12 doc-delta:786 doc-full:1069]
+inf-sim: sim_seconds=3677.239166 published=0 delivered=0
+scenario=m3-document base_seed=0xd0c24000 sweep=10000 shard=0/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=3750 documents_compared=18750 corpus_documents=13357 cut_classes=[ckpt-begin:18 doc-delta:803 doc-full:1049]
+scenario=m3-document base_seed=0xd0c24000 sweep=10000 shard=1/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=3750 documents_compared=18750 corpus_documents=13263 cut_classes=[ckpt-begin:28 doc-delta:804 doc-full:1055]
+scenario=m3-document base_seed=0xd0c24000 sweep=10000 shard=2/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=3750 documents_compared=18750 corpus_documents=13358 cut_classes=[ckpt-begin:17 doc-delta:819 doc-full:1049]
+scenario=m3-document base_seed=0xd0c24000 sweep=10000 shard=3/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=3750 documents_compared=18750 corpus_documents=13309 cut_classes=[ckpt-begin:15 doc-delta:791 doc-full:1068]
+scenario=m3-document base_seed=0xd0c24000 sweep=10000 shard=4/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=3750 documents_compared=18750 corpus_documents=13132 cut_classes=[ckpt-begin:18 doc-delta:794 doc-full:1022]
+scenario=m3-document base_seed=0xd0c24000 sweep=10000 shard=5/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=3750 documents_compared=18750 corpus_documents=13313 cut_classes=[ckpt-begin:12 doc-delta:786 doc-full:1069]
+scenario=m3-document base_seed=0xd0c24000 sweep=10000 shard=6/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=3750 documents_compared=18750 corpus_documents=13298 cut_classes=[ckpt-begin:18 doc-delta:778 doc-full:1065]
+scenario=m3-document base_seed=0xd0c24000 sweep=10000 shard=7/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=3750 documents_compared=18750 corpus_documents=13339 cut_classes=[ckpt-begin:17 doc-delta:769 doc-full:1059]

@@ -1,0 +1,24 @@
+generator: bins/inf-bench/src/doc_corpus.rs
+checked_manifest: bins/inf-bench/m3-doc-corpus.toml
+command: cargo run -p inf-bench -- doc-corpus --seed 0x1D0C2026
+seed: 0x1D0C2026 (487333926)
+rng: splitmix64-shape-streams-v1; shape-local streams; fixed-width wrapping arithmetic
+generated_bytes_checked_in: false
+
+small-200B   json_bytes=200    fnv1a64=767cde9076f5d54f
+gate-1KiB    json_bytes=1024   fnv1a64=3ce45137eba97c05 child_depth=4
+medium-2KiB  json_bytes=2048   fnv1a64=2d5af86ae14f5834 objects=12
+large-64KiB  json_bytes=65536  fnv1a64=3a6318ba7d0c7f29 objects=256
+deep-32      json_bytes=641    fnv1a64=db75f26612cddd2a container_depth=32
+wide-array   json_bytes=419277 fnv1a64=79bcaedeb7623b16 objects=10000
+
+mechanical checks:
+- two generations from the canonical seed compare byte-for-byte equal;
+- the rendered manifest must equal the checked file exactly;
+- exact shape sizes/depth/element counts are asserted;
+- M3 parse/traverse/intern/server/store benches and density/slack/attribution
+  tests include this one dependency-free generator source.
+
+density aggregate on the final corpus:
+- idoc / MessagePack: 1.093x (gate <= 1.15x)
+- idoc / compact JSON: 0.794x (gate <= 0.85x)

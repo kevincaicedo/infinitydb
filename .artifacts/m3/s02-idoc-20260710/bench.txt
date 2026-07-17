@@ -1,0 +1,5 @@
+depth4_leaf_fetch/tape  time:   [217.41 ns 217.66 ns 217.99 ns]
+depth4_leaf_fetch/arena time:   [197.83 ns 198.46 ns 199.05 ns]
+build_from_model_1kib   time:   [786.37 ns 787.01 ns 787.64 ns]
+morph_1kib              time:   [2.4262 µs 2.4296 µs 2.4333 µs]
+freeze_1kib             time:   [1.2953 µs 1.2958 µs 1.2962 µs]

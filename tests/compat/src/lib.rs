@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 
 pub mod candidate;
+pub mod json_oracle;
 pub mod matrix;
 pub mod matrixgen;
+pub mod replyshapes;
 pub mod resp;

@@ -28,7 +28,9 @@
 use core::fmt;
 
 use crate::effect::MutationEffect;
-use crate::frame::{DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN, FRAME_TRAILER_LEN, FrameBuilder};
+use crate::frame::{
+    DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN, FRAME_TRAILER_LEN, FrameBuilder, FrameStamp,
+};
 use crate::fs::SegmentFs;
 use crate::lsn::Lsn;
 use crate::segment::{LogError, SegmentRotor};
@@ -171,6 +173,12 @@ pub struct StagingRing {
     /// Generation of the buffer currently accepting appends; bumped at
     /// every seal so tokens and leases cannot cross iterations silently.
     generation: u64,
+    /// The log life every sealed frame is stamped with (ADR-0031 D6):
+    /// 1 for fresh logs and pre-recovery tiers; recovery-derived otherwise
+    /// (`SegmentRotor::resume_epoch`, wired at cell assembly).
+    frame_epoch: u32,
+    /// Next frame ordinal within `frame_epoch` (from 1, +1 per seal).
+    next_frame_seq: u64,
     capacity_bytes: u32,
     stats: StagingStats,
 }
@@ -212,9 +220,26 @@ impl StagingRing {
             staging: 0,
             in_flight: None,
             generation: 0,
+            frame_epoch: 1,
+            next_frame_seq: 1,
             capacity_bytes: cfg.capacity_bytes,
             stats: StagingStats::default(),
         }
+    }
+
+    /// Adopt the recovery-derived log life (ADR-0031 D5/D6): every frame
+    /// sealed from here on stamps `epoch`, with `seq` restarting at 1.
+    /// Boot wiring only — before the first seal.
+    ///
+    /// # Panics
+    /// If a frame was already sealed under the construction-default epoch
+    /// (mixing lives within one ring is an assembly bug), or `epoch == 0`
+    /// (reserved).
+    pub fn set_frame_epoch(&mut self, epoch: u32) {
+        assert!(epoch > 0, "frame epoch 0 is reserved (ADR-0031 D1)");
+        assert_eq!(self.stats.seals, 0, "set_frame_epoch after a seal (boot wiring only)");
+        self.frame_epoch = epoch;
+        self.next_frame_seq = 1;
     }
 
     /// Append one effect's record in place (EXECUTE step). Refuses with
@@ -317,25 +342,30 @@ impl StagingRing {
     }
 
     /// Seal the pending records into a frame at `first_record_lsn` (from
-    /// the rotor's reserved slot) and swap staging to the free buffer.
-    /// The sealed frame stays resident under the returned lease until
+    /// the rotor's reserved slot), stamped with the current epoch/seq and
+    /// `covered_lsn` — the group-commit durability watermark at this LOG
+    /// step (`Lsn::to_u64`; 0 when nothing is covered yet — the ADR-0031
+    /// D1 attestation). Swaps staging to the free buffer. The sealed frame
+    /// stays resident under the returned lease until
     /// [`release`](Self::release).
     ///
     /// # Panics
     /// If nothing is staged or the previous lease is unreleased — LOG-step
     /// invariants; callers check [`can_seal`](Self::can_seal).
-    pub fn seal(&mut self, first_record_lsn: Lsn) -> FrameLease {
+    pub fn seal(&mut self, first_record_lsn: Lsn, covered_lsn: u64) -> FrameLease {
         assert!(!self.is_empty(), "seal with no staged records");
         assert!(self.in_flight.is_none(), "seal while a frame lease is outstanding");
         let sealed = self.staging;
         let generation = self.generation;
+        let stamp = FrameStamp { epoch: self.frame_epoch, seq: self.next_frame_seq, covered_lsn };
         let builder = &mut self.bufs[sealed];
         let record_count = builder.record_count();
-        builder.finalize(first_record_lsn);
+        builder.finalize(first_record_lsn, stamp);
         let frame_len = u32::try_from(builder.sealed_frame().len()).expect("frame fits u32");
         self.in_flight = Some(InFlight { buf: sealed, generation });
         self.staging = 1 - sealed;
         self.generation += 1;
+        self.next_frame_seq += 1;
         self.stats.seals += 1;
         FrameLease { generation, first_record_lsn, frame_len, record_count }
     }
@@ -363,6 +393,8 @@ impl StagingRing {
     /// recovery tooling): reserve → seal → write through the rotor. The
     /// caller resolves LSNs via the returned lease, then releases it.
     /// Returns `Ok(None)` on an empty iteration (no frame is emitted).
+    /// Frames stamp `covered_lsn = 0` — the synchronous tiers run no
+    /// group commit, and 0 attests nothing (conservative — ADR-0031 D6).
     ///
     /// On rotor errors the staged records stay intact: a failed
     /// reservation (`NoSpace`, seal-fsync) leaves staging untouched for
@@ -380,7 +412,7 @@ impl StagingRing {
             return Ok(None);
         }
         let slot = rotor.begin_frame(self.pending_frame_len(), now_ms)?;
-        let lease = self.seal(slot.first_record_lsn());
+        let lease = self.seal(slot.first_record_lsn(), 0);
         rotor.commit_frame(slot, self.leased_frame(&lease))?;
         Ok(Some(lease))
     }

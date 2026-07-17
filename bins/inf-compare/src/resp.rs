@@ -26,6 +26,56 @@ pub fn command(host: &str, port: u16, argv: &[&[u8]]) -> Result<Vec<u8>, String>
     Ok(reply)
 }
 
+/// Preload every key of the JSON lanes' keyspace with `doc` via one
+/// pipelined connection (`JSON.SET k:<i> $ <doc>`) — the read lane then
+/// never measures misses. Replies are drained in bulk and each must be
+/// `+OK`; the first error fails the fill loudly (e.g. an engine whose
+/// JSON surface was mis-detected).
+pub fn json_fill(host: &str, port: u16, keyspace: u64, doc: &str) -> Result<(), String> {
+    let mut stream = connect(host, port)?;
+    let mut batch = Vec::with_capacity(64 * (doc.len() + 64));
+    let mut pending = 0usize;
+    for i in 0..keyspace {
+        let key = format!("k:{i}");
+        batch.extend_from_slice(&encode(&[b"JSON.SET", key.as_bytes(), b"$", doc.as_bytes()]));
+        pending += 1;
+        // Bounded batches: flush + drain replies every 512 commands so
+        // neither side buffers unboundedly (L3 batching, explicit cap).
+        if pending == 512 || i + 1 == keyspace {
+            stream.write_all(&batch).map_err(|e| format!("json fill write: {e}"))?;
+            batch.clear();
+            drain_ok(&mut stream, pending)?;
+            pending = 0;
+        }
+    }
+    Ok(())
+}
+
+/// Read exactly `count` simple replies, requiring `+OK` for each.
+fn drain_ok(stream: &mut TcpStream, count: usize) -> Result<(), String> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16384];
+    let mut seen = 0usize;
+    let mut at = 0usize;
+    while seen < count {
+        if let Some(end) = frame(&buf, at) {
+            if !buf[at..].starts_with(b"+OK") {
+                let line = String::from_utf8_lossy(&buf[at..end]);
+                return Err(format!("json fill reply: {}", line.trim()));
+            }
+            at = end;
+            seen += 1;
+            continue;
+        }
+        let n = stream.read(&mut chunk).map_err(|e| format!("json fill read: {e}"))?;
+        if n == 0 {
+            return Err("connection closed mid-fill".into());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(())
+}
+
 fn connect(host: &str, port: u16) -> Result<TcpStream, String> {
     let stream =
         TcpStream::connect((host, port)).map_err(|e| format!("connect {host}:{port}: {e}"))?;

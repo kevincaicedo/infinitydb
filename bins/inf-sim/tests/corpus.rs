@@ -25,10 +25,16 @@ fn corpus_seeds_replay_green() {
         }
         let (name, seed_text) = line.split_once(' ').expect("`<scenario> <seed>` per line");
         let seed = parse_seed(seed_text.trim());
-        // The M2-S19 durable scenario has its own runner + verdict shape
-        // (taxonomy refusals are legal; the survival audit still runs).
-        if name == "m2-durable" {
-            let report = run_durable_scenario(&DurableScenario::m2_durable(seed));
+        // Durable scenarios share the real disk/recovery runner. M2 can
+        // surface a legal taxonomy refusal; M3 honest document cuts may
+        // not, and its scenario turns one into a violation.
+        if matches!(name, "m2-durable" | "m3-document") {
+            let scenario = match name {
+                "m2-durable" => DurableScenario::m2_durable(seed),
+                "m3-document" => DurableScenario::m3_document(seed),
+                _ => unreachable!(),
+            };
+            let report = run_durable_scenario(&scenario);
             assert!(
                 report.ok(),
                 "corpus seed {line} regressed: stalled={} violations={:?}",

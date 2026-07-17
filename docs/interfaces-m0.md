@@ -388,6 +388,10 @@ pub enum ExpireCond { Always, IfNoExpiry, IfHasExpiry, IfGreater, IfLess } // EX
 // missed on the bare-loop bench: +12.5%; end-to-end retest at S21).
 impl CellStore {
     pub fn prefetch(&self, key_hash: u64);
+    // M3-S20 / ADR-0044 additive extension: after record-line prefetch,
+    // hint the first tape lines of a live JsonDoc fingerprint candidate.
+    // Hint-only: exact-key verification remains in EXECUTE.
+    pub fn prefetch_doc_root(&self, key_hash: u64);
     pub fn hash_key(key: &[u8]) -> u64;
     pub fn get_with_hash(&mut self, key: &[u8], hash: u64, now: Nanos) -> Option<&[u8]>;
     pub fn get_many(&mut self, keys: &[&[u8]], now: Nanos, out: impl FnMut(usize, Option<&[u8]>));

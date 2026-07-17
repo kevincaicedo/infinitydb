@@ -28,7 +28,9 @@ use inf_log::{FsyncClass, NsId, RecordView as LogRecordView};
 use crate::catalog::NsCatalog;
 use crate::evict::{EvictStats, EvictionPolicy};
 use crate::ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsRegistry, NsSpec};
-use crate::store::{CellStore, ExpiryStats, MemoryReport, OpError, StoreConfig, StoreStats};
+use crate::store::{
+    CellStore, CheckpointImage, ExpiryStats, MemoryReport, OpError, StoreConfig, StoreStats,
+};
 use crate::wall::WallAnchor;
 use crate::wheel::ExpiryBudget;
 
@@ -142,7 +144,15 @@ impl Keyspace {
             index_bytes: 0,
             wheel_bytes: 0,
             evict_bytes: 0,
+            doc_tape_bytes: 0,
+            doc_arena_bytes: 0,
+            doc_resident_bytes: 0,
+            doc_intern_bytes: 0,
+            doc_slack_bytes: 0,
+            doc_scratch_bytes: 0,
+            doc_path_cache_bytes: 0,
             live_records: 0,
+            docs_live: 0,
         };
         for store in self.all_stores() {
             let r = store.report();
@@ -152,7 +162,15 @@ impl Keyspace {
             total.index_bytes += r.index_bytes;
             total.wheel_bytes += r.wheel_bytes;
             total.evict_bytes += r.evict_bytes;
+            total.doc_tape_bytes += r.doc_tape_bytes;
+            total.doc_arena_bytes += r.doc_arena_bytes;
+            total.doc_resident_bytes += r.doc_resident_bytes;
+            total.doc_intern_bytes += r.doc_intern_bytes;
+            total.doc_slack_bytes += r.doc_slack_bytes;
+            total.doc_scratch_bytes += r.doc_scratch_bytes;
+            total.doc_path_cache_bytes += r.doc_path_cache_bytes;
             total.live_records += r.live_records;
+            total.docs_live += r.docs_live;
         }
         total
     }
@@ -484,13 +502,13 @@ impl Keyspace {
         rec: &LogRecordView<'_>,
         now: Nanos,
         anchor: WallAnchor,
-    ) -> Result<ReplayOutcome, OpError> {
+    ) -> Result<ReplayOutcome, ReplayError> {
         match *rec {
             LogRecordView::StringPostImage { ns, key, value } => {
                 let Some(store) = self.replay_store(ns) else {
                     return Ok(ReplayOutcome::SkippedUnknownNs);
                 };
-                store.replay_set(key, value, now)?;
+                store.replay_set(key, value, now).map_err(ReplayError::Store)?;
                 Ok(ReplayOutcome::Applied)
             }
             LogRecordView::Delete { ns, key } => {
@@ -514,6 +532,79 @@ impl Keyspace {
             // Checkpoint marker (M2-S10, ADR-0016 D3): carries no state —
             // S13's recovery orchestration consumes its LSN, not replay.
             LogRecordView::CkptBegin { .. } => Ok(ReplayOutcome::SkippedMarker),
+            LogRecordView::DocFull { ns, key, lineage, version, idoc } => {
+                let Some(store) = self.replay_store(ns) else {
+                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                };
+                #[cfg(feature = "doc")]
+                {
+                    store.replay_json_full(key, lineage, version, idoc, now)?;
+                    Ok(ReplayOutcome::Applied)
+                }
+                #[cfg(not(feature = "doc"))]
+                {
+                    let _ = (store, key, lineage, version, idoc, now);
+                    Err(ReplayError::DocumentUnsupported)
+                }
+            }
+            LogRecordView::DocDelta {
+                ns,
+                key,
+                lineage,
+                base_version,
+                match_count,
+                post_len,
+                opcode,
+                program,
+                operand,
+            } => {
+                let Some(store) = self.replay_store(ns) else {
+                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                };
+                #[cfg(feature = "doc")]
+                {
+                    let program = inf_doc::PathProgram::from_bytes(program)
+                        .map_err(ReplayError::InvalidPathProgram)?;
+                    let op = inf_doc::decode_apply_op(opcode, operand)
+                        .map_err(ReplayError::InvalidDelta)?;
+                    match store.replay_json_delta(
+                        key,
+                        crate::doc::DocDeltaWitness {
+                            lineage,
+                            base_version,
+                            match_count,
+                            post_len,
+                        },
+                        &program,
+                        &op,
+                        now,
+                    )? {
+                        crate::doc::DocReplayOutcome::Applied => Ok(ReplayOutcome::Applied),
+                        crate::doc::DocReplayOutcome::SkippedStale => {
+                            Ok(ReplayOutcome::SkippedDocDeltaStale)
+                        }
+                        crate::doc::DocReplayOutcome::SkippedMissing => {
+                            Ok(ReplayOutcome::SkippedDocDeltaMissing)
+                        }
+                    }
+                }
+                #[cfg(not(feature = "doc"))]
+                {
+                    let _ = (
+                        store,
+                        key,
+                        lineage,
+                        base_version,
+                        match_count,
+                        post_len,
+                        opcode,
+                        program,
+                        operand,
+                        now,
+                    );
+                    Err(ReplayError::DocumentUnsupported)
+                }
+            }
         }
     }
 
@@ -598,9 +689,17 @@ const DIGEST_SEED: u64 = 0xD16E_57A7_E5EE_D001;
 fn fold_store(acc: &mut StateDigest, store: &CellStore, tag: u64, now: Nanos) {
     let mut cursor = 0u64;
     loop {
-        cursor = store.digest_post_images(cursor, 1024, now, |key, value, expire_at_ms| {
+        cursor = store.digest_checkpoint_images(cursor, 1024, now, |key, image, expire_at_ms| {
             let hk = hash64(key, DIGEST_SEED ^ tag);
-            let hv = hash64(value, hk);
+            let hv = match image {
+                CheckpointImage::String(value) => hash64(value, hk),
+                #[cfg(feature = "doc")]
+                CheckpointImage::JsonDoc { lineage, version, idoc } => {
+                    let version = version.to_le_bytes();
+                    let lineage = lineage.get().to_le_bytes();
+                    hash64(&version, hash64(&lineage, hash64(idoc, hk ^ 0xD0C0_F011_D0C0_F011)))
+                }
+            };
             let mut exp = [0u8; 9];
             if let Some(ms) = expire_at_ms {
                 exp[0] = 1;
@@ -627,6 +726,27 @@ pub enum ReplayOutcome {
     /// A checkpoint-begin marker (M2-S10): expected in every log with
     /// checkpoints, counted separately from foreign skips.
     SkippedMarker,
+    /// A fuzzy checkpoint/DocFull already includes this delta (R1).
+    SkippedDocDeltaStale,
+    /// The fuzzy walker captured the later delete/expiry (R2).
+    SkippedDocDeltaMissing,
+}
+
+/// Replay failures are durability-input failures, never client command
+/// errors. Recovery maps every variant to fail-stop `InvalidData`.
+#[derive(Debug)]
+pub enum ReplayError {
+    Store(OpError),
+    DocumentUnsupported,
+    #[cfg(feature = "doc")]
+    InvalidDocument(inf_doc::DocError),
+    #[cfg(feature = "doc")]
+    InvalidPathProgram(inf_doc::PathError),
+    #[cfg(feature = "doc")]
+    InvalidDelta(inf_doc::DeltaDecodeError),
+    #[cfg(feature = "doc")]
+    InvalidMutation(inf_doc::ApplyError),
+    CorruptDocument(&'static str),
 }
 
 #[cfg(test)]

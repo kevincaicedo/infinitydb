@@ -1,0 +1,2 @@
+large-64KiB: serialized=131072000 inf=134586368 stack=72802304 inf/serialized=1.027 inf/stack=1.849
+verification: expected_docs=2000 inf_dbsize=2000 stack_dbsize=2000

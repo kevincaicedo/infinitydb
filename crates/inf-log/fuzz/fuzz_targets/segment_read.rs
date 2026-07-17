@@ -14,10 +14,7 @@ use std::path::Path;
 
 use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
-use inf_log::{
-    DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN, FrameIter, Lsn, ReaderConfig, SegmentId,
-    SegmentReader,
-};
+use inf_log::{DEFAULT_MAX_FRAME_LEN, FrameIter, Lsn, ReaderConfig, SegmentId, SegmentReader};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: (u16, &[u8])| {
@@ -40,7 +37,8 @@ fuzz_target!(|input: (u16, &[u8])| {
     let mut reference: Vec<Lsn> = Vec::new();
     for item in FrameIter::new(data, DEFAULT_MAX_FRAME_LEN) {
         let Ok((offset, frame)) = item else { break };
-        let expected = Lsn::new(SegmentId(0), (offset + FRAME_HEADER_LEN) as u32);
+        // Header length is version-dependent (v1 = 20, v2 = 40 — ADR-0031).
+        let expected = Lsn::new(SegmentId(0), (offset + frame.header_len()) as u32);
         if frame.first_lsn() != expected {
             break;
         }

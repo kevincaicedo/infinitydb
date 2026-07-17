@@ -1,0 +1,5 @@
+Done 104234089 runs in 301 second(s)
+=== FRAME_DECODE DONE ===
+Done 722837 runs in 301 second(s)
+=== SEGMENT_READ DONE ===
+frame_decode: 104,234,089 runs / 301 s, 0 findings (both formats). segment_read: 722,837 runs / 301 s, 0 findings (v1+v2 self-location oracle).

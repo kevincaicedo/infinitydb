@@ -1,0 +1,3 @@
+depth4_leaf_fetch/tape  time:   [217.34 ns 217.58 ns 217.84 ns]
+depth4_leaf_fetch/tape  time:   [217.85 ns 218.05 ns 218.22 ns]
+depth4_leaf_fetch/tape  time:   [217.96 ns 218.39 ns 218.92 ns]

@@ -1,0 +1,39 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.05s
+     Running benches/doc_ingest.rs (target/release/deps/doc_ingest-173d62003836ed8c)
+Benchmarking doc_ingest_1kib/parse
+Benchmarking doc_ingest_1kib/parse: Warming up for 3.0000 s
+Benchmarking doc_ingest_1kib/parse: Collecting 100 samples in estimated 5.0118 s (2.1M iterations)
+Benchmarking doc_ingest_1kib/parse: Analyzing
+doc_ingest_1kib/parse   time:   [2.4380 µs 2.4400 µs 2.4418 µs]
+                        thrpt:  [320.65 MiB/s 320.89 MiB/s 321.15 MiB/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking doc_ingest_1kib/store_set
+Benchmarking doc_ingest_1kib/store_set: Warming up for 3.0000 s
+Benchmarking doc_ingest_1kib/store_set: Collecting 100 samples in estimated 5.0001 s (106M iterations)
+Benchmarking doc_ingest_1kib/store_set: Analyzing
+doc_ingest_1kib/store_set
+                        time:   [47.625 ns 47.763 ns 47.919 ns]
+                        thrpt:  [15.957 GiB/s 16.009 GiB/s 16.055 GiB/s]
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high severe
+Benchmarking doc_ingest_1kib/json_set_prebuilt
+Benchmarking doc_ingest_1kib/json_set_prebuilt: Warming up for 3.0000 s
+Benchmarking doc_ingest_1kib/json_set_prebuilt: Collecting 100 samples in estimated 5.0001 s (75M iterations)
+Benchmarking doc_ingest_1kib/json_set_prebuilt: Analyzing
+doc_ingest_1kib/json_set_prebuilt
+                        time:   [63.580 ns 63.764 ns 63.967 ns]
+                        thrpt:  [11.953 GiB/s 11.991 GiB/s 12.026 GiB/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking doc_ingest_1kib/parse_plus_json_set
+Benchmarking doc_ingest_1kib/parse_plus_json_set: Warming up for 3.0000 s
+Benchmarking doc_ingest_1kib/parse_plus_json_set: Collecting 100 samples in estimated 5.0100 s (2.0M iterations)
+Benchmarking doc_ingest_1kib/parse_plus_json_set: Analyzing
+doc_ingest_1kib/parse_plus_json_set
+                        time:   [2.5250 µs 2.5262 µs 2.5274 µs]
+                        thrpt:  [309.79 MiB/s 309.94 MiB/s 310.09 MiB/s]
+Found 5 outliers among 100 measurements (5.00%)
+  1 (1.00%) high mild
+  4 (4.00%) high severe
+

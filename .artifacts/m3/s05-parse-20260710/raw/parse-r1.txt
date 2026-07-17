@@ -1,0 +1,129 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.04s
+     Running benches/parse.rs (target/release/deps/parse-c3274eca77934232)
+Benchmarking parse/small-200B
+Benchmarking parse/small-200B: Warming up for 3.0000 s
+Benchmarking parse/small-200B: Collecting 100 samples in estimated 5.0030 s (7.3M iterations)
+Benchmarking parse/small-200B: Analyzing
+parse/small-200B        time:   [681.47 ns 682.60 ns 683.80 ns]
+                        thrpt:  [294.27 MiB/s 294.79 MiB/s 295.28 MiB/s]
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+Benchmarking parse/gate-1KiB
+Benchmarking parse/gate-1KiB: Warming up for 3.0000 s
+Benchmarking parse/gate-1KiB: Collecting 100 samples in estimated 5.0038 s (2.1M iterations)
+Benchmarking parse/gate-1KiB: Analyzing
+parse/gate-1KiB         time:   [2.3729 µs 2.3744 µs 2.3759 µs]
+                        thrpt:  [329.55 MiB/s 329.75 MiB/s 329.96 MiB/s]
+Found 6 outliers among 100 measurements (6.00%)
+  2 (2.00%) low mild
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+Benchmarking parse/medium-2KiB
+Benchmarking parse/medium-2KiB: Warming up for 3.0000 s
+Benchmarking parse/medium-2KiB: Collecting 100 samples in estimated 5.0118 s (1.3M iterations)
+Benchmarking parse/medium-2KiB: Analyzing
+parse/medium-2KiB       time:   [3.9888 µs 3.9917 µs 3.9943 µs]
+                        thrpt:  [332.59 MiB/s 332.81 MiB/s 333.05 MiB/s]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+Benchmarking parse/large-64KiB
+Benchmarking parse/large-64KiB: Warming up for 3.0000 s
+Benchmarking parse/large-64KiB: Collecting 100 samples in estimated 5.0105 s (30k iterations)
+Benchmarking parse/large-64KiB: Analyzing
+parse/large-64KiB       time:   [164.38 µs 164.52 µs 164.68 µs]
+                        thrpt:  [249.07 MiB/s 249.31 MiB/s 249.52 MiB/s]
+Found 6 outliers among 100 measurements (6.00%)
+  6 (6.00%) high mild
+Benchmarking parse/deep-32
+Benchmarking parse/deep-32: Warming up for 3.0000 s
+Benchmarking parse/deep-32: Collecting 100 samples in estimated 5.0063 s (970k iterations)
+Benchmarking parse/deep-32: Analyzing
+parse/deep-32           time:   [5.1936 µs 5.2004 µs 5.2068 µs]
+                        thrpt:  [304.60 MiB/s 304.97 MiB/s 305.37 MiB/s]
+Benchmarking parse/wide-array
+Benchmarking parse/wide-array: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 7.5s, enable flat sampling, or reduce sample count to 50.
+Benchmarking parse/wide-array: Collecting 100 samples in estimated 7.4875 s (5050 iterations)
+Benchmarking parse/wide-array: Analyzing
+parse/wide-array        time:   [1.4822 ms 1.4851 ms 1.4878 ms]
+                        thrpt:  [254.38 MiB/s 254.85 MiB/s 255.33 MiB/s]
+
+Benchmarking parse_scalar_stage1/small-200B
+Benchmarking parse_scalar_stage1/small-200B: Warming up for 3.0000 s
+Benchmarking parse_scalar_stage1/small-200B: Collecting 100 samples in estimated 5.0023 s (4.5M iterations)
+Benchmarking parse_scalar_stage1/small-200B: Analyzing
+parse_scalar_stage1/small-200B
+                        time:   [1.1053 µs 1.1071 µs 1.1092 µs]
+                        thrpt:  [181.41 MiB/s 181.75 MiB/s 182.06 MiB/s]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) low mild
+  1 (1.00%) high mild
+Benchmarking parse_scalar_stage1/gate-1KiB
+Benchmarking parse_scalar_stage1/gate-1KiB: Warming up for 3.0000 s
+Benchmarking parse_scalar_stage1/gate-1KiB: Collecting 100 samples in estimated 5.0012 s (1.3M iterations)
+Benchmarking parse_scalar_stage1/gate-1KiB: Analyzing
+parse_scalar_stage1/gate-1KiB
+                        time:   [3.9630 µs 3.9673 µs 3.9718 µs]
+                        thrpt:  [197.13 MiB/s 197.36 MiB/s 197.57 MiB/s]
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+Benchmarking parse_scalar_stage1/medium-2KiB
+Benchmarking parse_scalar_stage1/medium-2KiB: Warming up for 3.0000 s
+Benchmarking parse_scalar_stage1/medium-2KiB: Collecting 100 samples in estimated 5.0351 s (707k iterations)
+Benchmarking parse_scalar_stage1/medium-2KiB: Analyzing
+parse_scalar_stage1/medium-2KiB
+                        time:   [7.1269 µs 7.1425 µs 7.1591 µs]
+                        thrpt:  [185.56 MiB/s 185.99 MiB/s 186.40 MiB/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking parse_scalar_stage1/large-64KiB
+Benchmarking parse_scalar_stage1/large-64KiB: Warming up for 3.0000 s
+Benchmarking parse_scalar_stage1/large-64KiB: Collecting 100 samples in estimated 5.6380 s (20k iterations)
+Benchmarking parse_scalar_stage1/large-64KiB: Analyzing
+parse_scalar_stage1/large-64KiB
+                        time:   [277.95 µs 278.57 µs 279.31 µs]
+                        thrpt:  [146.85 MiB/s 147.24 MiB/s 147.57 MiB/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking parse_scalar_stage1/deep-32
+Benchmarking parse_scalar_stage1/deep-32: Warming up for 3.0000 s
+Benchmarking parse_scalar_stage1/deep-32: Collecting 100 samples in estimated 5.0139 s (571k iterations)
+Benchmarking parse_scalar_stage1/deep-32: Analyzing
+parse_scalar_stage1/deep-32
+                        time:   [8.7218 µs 8.7377 µs 8.7545 µs]
+                        thrpt:  [181.16 MiB/s 181.51 MiB/s 181.84 MiB/s]
+Benchmarking parse_scalar_stage1/wide-array
+Benchmarking parse_scalar_stage1/wide-array: Warming up for 3.0000 s
+Benchmarking parse_scalar_stage1/wide-array: Collecting 100 samples in estimated 5.1694 s (2300 iterations)
+Benchmarking parse_scalar_stage1/wide-array: Analyzing
+parse_scalar_stage1/wide-array
+                        time:   [2.2487 ms 2.2516 ms 2.2551 ms]
+                        thrpt:  [167.82 MiB/s 168.09 MiB/s 168.30 MiB/s]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking scan/simd
+Benchmarking scan/simd: Warming up for 3.0000 s
+Benchmarking scan/simd: Collecting 100 samples in estimated 5.0007 s (11M iterations)
+Benchmarking scan/simd: Analyzing
+scan/simd               time:   [437.45 ns 438.05 ns 438.66 ns]
+                        thrpt:  [2.9575 GiB/s 2.9616 GiB/s 2.9657 GiB/s]
+Found 6 outliers among 100 measurements (6.00%)
+  5 (5.00%) high mild
+  1 (1.00%) high severe
+Benchmarking scan/scalar
+Benchmarking scan/scalar: Warming up for 3.0000 s
+Benchmarking scan/scalar: Collecting 100 samples in estimated 5.0127 s (1.6M iterations)
+Benchmarking scan/scalar: Analyzing
+scan/scalar             time:   [3.1174 µs 3.1303 µs 3.1420 µs]
+                        thrpt:  [422.81 MiB/s 424.39 MiB/s 426.15 MiB/s]
+Found 5 outliers among 100 measurements (5.00%)
+  2 (2.00%) low mild
+  3 (3.00%) high mild
+

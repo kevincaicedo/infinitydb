@@ -1,0 +1,60 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.04s
+     Running benches/json_cmd.rs (target/release/deps/json_cmd-cad56dcbce659a40)
+Benchmarking json_cmd_1kib/set_plain
+Benchmarking json_cmd_1kib/set_plain: Warming up for 3.0000 s
+Benchmarking json_cmd_1kib/set_plain: Collecting 100 samples in estimated 5.0002 s (94M iterations)
+Benchmarking json_cmd_1kib/set_plain: Analyzing
+json_cmd_1kib/set_plain time:   [53.469 ns 53.501 ns 53.537 ns]
+                        change: [−0.2006% −0.0869% +0.0331%] (p = 0.14 > 0.05)
+                        No change in performance detected.
+Found 8 outliers among 100 measurements (8.00%)
+  1 (1.00%) low mild
+  5 (5.00%) high mild
+  2 (2.00%) high severe
+Benchmarking json_cmd_1kib/set_json_root
+Benchmarking json_cmd_1kib/set_json_root: Warming up for 3.0000 s
+Benchmarking json_cmd_1kib/set_json_root: Collecting 100 samples in estimated 5.0019 s (3.7M iterations)
+Benchmarking json_cmd_1kib/set_json_root: Analyzing
+json_cmd_1kib/set_json_root
+                        time:   [1.3559 µs 1.3567 µs 1.3575 µs]
+                        change: [−0.4664% −0.3595% −0.2627%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) low mild
+Benchmarking json_cmd_1kib/get_plain
+Benchmarking json_cmd_1kib/get_plain: Warming up for 3.0000 s
+Benchmarking json_cmd_1kib/get_plain: Collecting 100 samples in estimated 5.0001 s (124M iterations)
+Benchmarking json_cmd_1kib/get_plain: Analyzing
+json_cmd_1kib/get_plain time:   [40.393 ns 40.410 ns 40.429 ns]
+                        change: [−0.0485% +0.0122% +0.0736%] (p = 0.68 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking json_cmd_1kib/get_json_path
+Benchmarking json_cmd_1kib/get_json_path: Warming up for 3.0000 s
+Benchmarking json_cmd_1kib/get_json_path: Collecting 100 samples in estimated 5.0029 s (3.3M iterations)
+Benchmarking json_cmd_1kib/get_json_path: Analyzing
+json_cmd_1kib/get_json_path
+                        time:   [1.5278 µs 1.5302 µs 1.5325 µs]
+                        change: [+0.4392% +0.6478% +0.8531%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Benchmarking json_cmd_1kib/get_json_root
+Benchmarking json_cmd_1kib/get_json_root: Warming up for 3.0000 s
+Benchmarking json_cmd_1kib/get_json_root: Collecting 100 samples in estimated 5.0048 s (1.8M iterations)
+Benchmarking json_cmd_1kib/get_json_root: Analyzing
+json_cmd_1kib/get_json_root
+                        time:   [2.7493 µs 2.7547 µs 2.7595 µs]
+                        change: [−2.6504% −1.7988% −0.9828%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Benchmarking json_cmd_1kib/numincrby_json
+Benchmarking json_cmd_1kib/numincrby_json: Warming up for 3.0000 s
+Benchmarking json_cmd_1kib/numincrby_json: Collecting 100 samples in estimated 5.0026 s (9.5M iterations)
+Benchmarking json_cmd_1kib/numincrby_json: Analyzing
+json_cmd_1kib/numincrby_json
+                        time:   [529.25 ns 529.37 ns 529.49 ns]
+                        change: [−2.7502% −2.6427% −2.5328%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) low mild
+
+path_cache: hits=35048109 misses=4 evictions=0 bytes=8498 hit_rate=1.0000

@@ -1,0 +1,7 @@
+serialized_json_bytes=207171400
+infinitydb_rss_kb_base=74792 rss_kb_loaded=510876
+redis_stack_rss_kb_base=22196 rss_kb_loaded=481732
+infinitydb_incremental_bytes=446550016
+redis_stack_incremental_bytes=470564864
+rss_over_serialized=2.1555  (gate <= 1.5)
+rss_vs_redis_stack=0.9490  (gate <= 0.7)

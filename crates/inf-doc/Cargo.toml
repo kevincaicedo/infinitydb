@@ -6,5 +6,37 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[dependencies]
+inf-foundation.workspace = true
+inf-alloc.workspace = true
+inf-simd.workspace = true
+# f64 -> shortest-round-trip JSON text (M3-S06 serializer, ADR-0039).
+zmij.workspace = true
+
+[features]
+# Repeated-key interning experiment (M3-S04, ADR-0038): the interned tape
+# form, its transforms, and the 0xA9 cursor arm. Default-off - the M3
+# release ships without it enabled (plan section 2 cut line).
+doc-intern-keys = []
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+serde_json.workspace = true
+inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
+
+[[bench]]
+name = "traverse"
+harness = false
+
+[[bench]]
+name = "intern"
+harness = false
+required-features = ["doc-intern-keys"]
+
+[[bench]]
+name = "parse"
+harness = false
+
 [lints]
 workspace = true

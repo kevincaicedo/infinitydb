@@ -27,6 +27,10 @@ inf-server.workspace = true
 # surviving disk image directly (manifest -> ick -> tail prefix) when a
 # boot legally refuses — dep-DAG edge recorded.
 inf-log.workspace = true
+# M3-S23 (ADR-0045 D5): the replay-equivalence oracle's canonical
+# comparator (`serialize_canonical_into`) and the fuzz-corpus loader's
+# parse + canonical text — dep-DAG edge recorded.
+inf-doc.workspace = true
 libc.workspace = true
 
 [lints]

@@ -3,8 +3,8 @@
 //! layer describes *what became true* (a value was set, a key deleted, an
 //! expiry armed); [`effect_record`](MutationEffect::record) is the encoder
 //! registry that maps each effect onto the record-v1 vocabulary. M3 adds
-//! collection-op variants and M6 adds doc deltas here — new effects, new
-//! record tags, zero changes to the frame spine (L2).
+//! document full/delta variants here — new effects, new record tags, zero
+//! changes to the frame spine (L2).
 //!
 //! Placement (recorded in ADR-0012): the enum lives in `inf-log`, not
 //! `inf-store`, because the log spine is the *consumer* of the seam
@@ -13,7 +13,7 @@
 //! into the mutation path. `inf-log` still never sees keyspace semantics:
 //! an effect is bytes, a namespace id, and a deadline.
 
-use crate::record::{NsId, RecordView};
+use crate::record::{DocLineage, NsId, RecordView};
 
 /// One durable fact emitted by the mutation path during EXECUTE, borrowing
 /// the caller's bytes — staging encodes it in place, no intermediate copy.
@@ -38,6 +38,21 @@ pub enum MutationEffect<'a> {
     /// one-frame-per-iteration rule holds and its LSN resolves through the
     /// ordinary `FrameLease::lsn_of` path. Cell-scoped (records as ns 0).
     CkptBegin { ckpt_id: u64 },
+    /// Version-guarded document path mutation (ADR-0043 D3). Fields are
+    /// encoded directly into staging; `inf-log` does not interpret them.
+    DocDelta {
+        ns: NsId,
+        key: &'a [u8],
+        lineage: DocLineage,
+        base_version: u32,
+        match_count: u32,
+        post_len: u32,
+        opcode: u8,
+        program: &'a [u8],
+        operand: &'a [u8],
+    },
+    /// Canonical full-document post-image.
+    DocFull { ns: NsId, key: &'a [u8], lineage: DocLineage, version: u32, idoc: &'a [u8] },
 }
 
 impl<'a> MutationEffect<'a> {
@@ -55,6 +70,30 @@ impl<'a> MutationEffect<'a> {
             }
             MutationEffect::NsOp { ns, payload } => RecordView::NsOp { ns, payload },
             MutationEffect::CkptBegin { ckpt_id } => RecordView::CkptBegin { ns: NsId(0), ckpt_id },
+            MutationEffect::DocDelta {
+                ns,
+                key,
+                lineage,
+                base_version,
+                match_count,
+                post_len,
+                opcode,
+                program,
+                operand,
+            } => RecordView::DocDelta {
+                ns,
+                key,
+                lineage,
+                base_version,
+                match_count,
+                post_len,
+                opcode,
+                program,
+                operand,
+            },
+            MutationEffect::DocFull { ns, key, lineage, version, idoc } => {
+                RecordView::DocFull { ns, key, lineage, version, idoc }
+            }
         }
     }
 
@@ -79,6 +118,24 @@ mod tests {
             MutationEffect::ExpireAt { ns: NsId(9), at_unix_ms: 1_780_000_000_123, key: b"s" },
             MutationEffect::NsOp { ns: NsId(1), payload: b"create" },
             MutationEffect::CkptBegin { ckpt_id: 42 },
+            MutationEffect::DocDelta {
+                ns: NsId(7),
+                key: b"doc",
+                lineage: DocLineage::FIRST,
+                base_version: 9,
+                match_count: 1,
+                post_len: 64,
+                opcode: 4,
+                program: b"program",
+                operand: b"operand",
+            },
+            MutationEffect::DocFull {
+                ns: NsId(7),
+                key: b"doc",
+                lineage: DocLineage::FIRST,
+                version: 10,
+                idoc: b"idoc",
+            },
         ];
         for effect in effects {
             let record = effect.record();

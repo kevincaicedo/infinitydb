@@ -2,10 +2,12 @@
 
 `inf-runtime` is one of the four crates allowed `unsafe` (milestone M0
 §3.3). Every unsafe block carries a `// SAFETY:` comment (clippy
-`undocumented_unsafe_blocks = deny`); this file records the three audited
-areas and the invariants they rest on.
+`undocumented_unsafe_blocks = deny`); this file records the audited areas
+and the invariants they rest on. Inventory-vs-code agreement is
+script-checked (`scripts/check-safety-inventory.sh`, M2.5-S16): every
+src file using unsafe must be named here.
 
-## 1. Backend FFI (`kqueue.rs`, `uring.rs`)
+## 1. Backend FFI (`kqueue.rs`, `uring.rs`, `net.rs`)
 
 Plain syscall surface: `kqueue/kevent`, `accept/read/write/close/fcntl`,
 `uname`, and the `io-uring` crate's unsafe SQ push / buffer registration.
@@ -28,6 +30,38 @@ Invariants:
   ownership always unwinds before the consumer forgets the fd.
 - `kevent` changelists/eventlists point into live `Vec` storage with exact
   lengths; timeout pointers live on the calling frame.
+- `net.rs` (M2.5-S16 inventory addition — the sites predate it): plain
+  socket FFI — `socket`/`setsockopt`/`bind`/`listen` on a locally created
+  fd converted once via `from_raw_fd` (single ownership transfer),
+  `eventfd` creation with the same single-`OwnedFd` pattern, and the
+  doorbell `write` of one stack `u64` (pointer + length name the same
+  8-byte local). No borrowed memory outlives a call.
+
+## 1b. Stable byte ranges (`driver.rs::StableBytes`)
+
+`StableBytes::new` is the **one unsafe constructor the durable plane rests
+on** (ADR-0013 D1): it erases the lifetime of a byte slice handed to a
+driver op (`LogWrite`, checkpoint section writes). The caller contract —
+bytes stay live, stable, and unmodified until the op's *terminal*
+completion — is discharged by lease custody, never by inspection:
+
+- the staging `FrameLease` (frame buffers never reallocate; reset only on
+  release at the write's terminal CQE) — constructed in
+  `inf-server::log_bytes` (that crate's SAFETY.md);
+- the checkpoint `SectionLease` (same pattern, `.ick` section pair);
+- the sim driver reads them strictly before terminal completion
+  (`bins/inf-sim/SAFETY.md`).
+
+The constructor itself only records `(ptr, len)`; every dereference lives
+with the custody proof at the consuming site.
+
+## 1c. Thread affinity (`affinity.rs`)
+
+`sched_setaffinity` FFI over a zeroed, fully-populated stack `cpu_set_t`
+(pin at cell boot; `unpin_current_thread` added by M2.5-S08 for the
+boot-scoped read-ahead worker). The kernel copies the mask; no caller
+memory is retained. tid 0 = the calling thread; a full mask is intersected
+with the online set by the kernel, so no error path depends on topology.
 
 ## 2. Rc waker vtable (`executor.rs`)
 

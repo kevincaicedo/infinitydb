@@ -87,7 +87,17 @@ impl Node {
     /// Node with the M2.5 Phase-H fabric-apply prefetch enabled (the A/B
     /// lever's on-arm correctness surface).
     fn start_with_apply_prefetch(cells: u16) -> Node {
-        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), true)
+        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), true, false, false)
+    }
+
+    fn start_with_parse_prefetch(cells: u16) -> Node {
+        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, true, false)
+    }
+
+    /// Node with the M2.5 Phase-H de-async dispatch enabled (ADR-0030 D4
+    /// lever): the pump's sync fast path on-arm correctness surface.
+    fn start_with_deasync(cells: u16) -> Node {
+        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, false, true)
     }
 
     fn start_full(
@@ -97,9 +107,10 @@ impl Node {
         recover: inf_server::RecoverConfig,
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
     ) -> Node {
-        Node::start_cfg(cells, data_dir, ckpt_interval_bytes, recover, faults, false)
+        Node::start_cfg(cells, data_dir, ckpt_interval_bytes, recover, faults, false, false, false)
     }
 
+    #[allow(clippy::too_many_arguments)] // test harness funnel
     fn start_cfg(
         cells: u16,
         data_dir: Option<std::path::PathBuf>,
@@ -107,6 +118,8 @@ impl Node {
         recover: inf_server::RecoverConfig,
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
         apply_prefetch: bool,
+        parse_prefetch: bool,
+        deasync_dispatch: bool,
     ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
         // Bind cell 0 first on an ephemeral port, then the rest join it.
@@ -186,6 +199,8 @@ impl Node {
                     false,
                 );
                 plane.set_fabric_apply_prefetch(apply_prefetch);
+                plane.set_parse_batch_prefetch(parse_prefetch);
+                plane.set_deasync_dispatch(deasync_dispatch);
                 if let Some((cfg, control)) = durable {
                     // Loop-resident recovery (M2-S15): the cell serves
                     // -LOADING while MAINTAIN replays its log.
@@ -246,6 +261,35 @@ impl Node {
         self.stop.store(true, Ordering::Relaxed);
         for handle in self.handles.drain(..) {
             handle.join().expect("cell thread");
+        }
+        // The control thread is detached (`spawn_control`) and outlives the
+        // join above: delegated unlinks (truncated segments, stale `.ick`s —
+        // ADR-0017) drain asynchronously. A restart on the same data dir
+        // would race that leftover queue against the new node's boot GC —
+        // both remove the same below-floor files, the loser hits ENOENT,
+        // and recovery fail-stops (§8.4). A real node cannot express this
+        // (one process; death takes the control thread with it, and boot GC
+        // then owns the survivors alone), so the harness must quiesce: a
+        // sentinel unlink queued *behind* any leftover work proves the
+        // whole queue drained (single FIFO receiver), after which the old
+        // thread can never touch the data dir again.
+        if let Some(control) = &self.control {
+            let sentinel = std::env::temp_dir().join(format!(
+                "inf-e2e-drain-{}-{}",
+                std::process::id(),
+                self.port
+            ));
+            std::fs::write(&sentinel, b"drain").expect("write drain sentinel");
+            while !control.request_unlink(sentinel.clone()) {
+                #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while sentinel.exists() {
+                assert!(Instant::now() < deadline, "control thread did not drain in 30s");
+                #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 }
@@ -376,6 +420,187 @@ fn cross_cell_with_apply_prefetch_matches_inline_semantics() {
     read_exactly(&mut client, b":2\r\n");
     client.write_all(&cmd(&[b"DBSIZE"])).expect("write");
     read_exactly(&mut client, b":1\r\n");
+
+    node.stop();
+}
+
+#[test]
+fn parse_batch_prefetch_matches_inline_semantics() {
+    // M2.5 Phase H (ADR-0029 lever 2): with the parse-batch stage on, every
+    // reply byte must match the inline path — including across the stage's
+    // flush barriers (SELECT/unknown-command/QUIT) and the bounds that force
+    // inline execution (oversized values).
+    let node = Node::start_with_parse_prefetch(1);
+    let mut client = node.connect();
+
+    // A long staged pipeline: order and values byte-exact.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", b"a", b"1"]));
+    pipeline.extend(cmd(&[b"SET", b"b", b"two"]));
+    pipeline.extend(cmd(&[b"GET", b"a"]));
+    pipeline.extend(cmd(&[b"INCR", b"a"]));
+    pipeline.extend(cmd(&[b"GET", b"b"]));
+    pipeline.extend(cmd(&[b"DEL", b"b"]));
+    pipeline.extend(cmd(&[b"GET", b"b"]));
+    pipeline.extend(cmd(&[b"PING"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(
+        &mut client,
+        b"+OK\r\n+OK\r\n$1\r\n1\r\n:2\r\n$3\r\ntwo\r\n:1\r\n$-1\r\n+PONG\r\n",
+    );
+
+    // SELECT is a flush barrier and a live ConnCx mutation: staged commands
+    // before it hit db 0, after it db 1 — in one pipelined buffer.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", b"k", b"db0"]));
+    pipeline.extend(cmd(&[b"SELECT", b"1"]));
+    pipeline.extend(cmd(&[b"GET", b"k"]));
+    pipeline.extend(cmd(&[b"SET", b"k", b"db1"]));
+    pipeline.extend(cmd(&[b"GET", b"k"]));
+    pipeline.extend(cmd(&[b"SELECT", b"0"]));
+    pipeline.extend(cmd(&[b"GET", b"k"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n$-1\r\n+OK\r\n$3\r\ndb1\r\n+OK\r\n$3\r\ndb0\r\n");
+
+    // An unknown command mid-batch is a barrier; its error keeps pipeline
+    // position.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", b"x", b"1"]));
+    pipeline.extend(cmd(&[b"NOSUCHCMD", b"y"]));
+    pipeline.extend(cmd(&[b"GET", b"x"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n");
+    let line = read_line(&mut client);
+    assert!(
+        line.starts_with(b"-ERR unknown command"),
+        "unknown-command error in pipeline position: {}",
+        String::from_utf8_lossy(&line)
+    );
+    read_exactly(&mut client, b"$1\r\n1\r\n");
+
+    // A value past the stage byte bound executes inline (the bound is a
+    // barrier, never a behavior change).
+    let big = vec![b'v'; 4096];
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", b"big", &big]));
+    pipeline.extend(cmd(&[b"STRLEN", b"big"]));
+    pipeline.extend(cmd(&[b"GET", b"a"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n:4096\r\n$1\r\n2\r\n");
+
+    // Expiry-on-read through the staged path: the probe prefetch never
+    // resurrects an expired record.
+    client.write_all(&cmd(&[b"SET", b"soon", b"x", b"PX", b"1"])).expect("write");
+    read_exactly(&mut client, b"+OK\r\n");
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(10));
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"GET", b"soon"]));
+    pipeline.extend(cmd(&[b"GET", b"a"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"$-1\r\n$1\r\n2\r\n");
+
+    // QUIT mid-pipeline: staged commands before it answer, everything after
+    // is discarded (Redis semantics), then the server closes.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", b"q", b"1"]));
+    pipeline.extend(cmd(&[b"QUIT"]));
+    pipeline.extend(cmd(&[b"GET", b"q"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n");
+    let mut rest = Vec::new();
+    client.read_to_end(&mut rest).expect("server closes after QUIT");
+    assert!(rest.is_empty(), "nothing after QUIT's +OK: {rest:?}");
+
+    node.stop();
+}
+
+/// The de-async dispatch fast path (M2.5 Phase H, `--deasync-dispatch`,
+/// ADR-0030 D4) must be behavior-invisible: same replies, same order —
+/// across the fast arms (single-owner remote Apply, local mirror,
+/// conn-state), the fallback arms interleaved with them (split DEL, MGET
+/// gather, scatter DBSIZE), the restricted-subscriber reply, and
+/// expiry-on-read over the remote path.
+#[test]
+fn deasync_dispatch_matches_pump_semantics() {
+    let node = Node::start_with_deasync(2);
+    let mut client = node.connect();
+
+    let k0 = key_for_cell(2, 0);
+    let k1 = key_for_cell(2, 1);
+
+    // Fast arm + fallback split arm in one pipeline: whichever cell
+    // accepted, one of k0/k1 rides the single-owner remote Apply.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", &k0, b"zero"]));
+    pipeline.extend(cmd(&[b"SET", &k1, b"one"]));
+    pipeline.extend(cmd(&[b"GET", &k0]));
+    pipeline.extend(cmd(&[b"GET", &k1]));
+    pipeline.extend(cmd(&[b"DEL", &k0, &k1, b"missing"]));
+    pipeline.extend(cmd(&[b"GET", &k0]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n$4\r\nzero\r\n$3\r\none\r\n:2\r\n$-1\r\n");
+
+    // Long remote/local interleave: order byte-exact for 100 replies.
+    let mut pipeline = Vec::new();
+    for _ in 0..50 {
+        pipeline.extend(cmd(&[b"INCR", &k0]));
+        pipeline.extend(cmd(&[b"INCR", &k1]));
+    }
+    client.write_all(&pipeline).expect("write");
+    let mut want = Vec::new();
+    for round in 1..=50 {
+        want.extend_from_slice(format!(":{round}\r\n:{round}\r\n").as_bytes());
+    }
+    read_exactly(&mut client, &want);
+
+    // SELECT mid-queue: the conn-state barrier holds its exact pipeline
+    // position between remote ops (mirror arm on the fast path).
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", &k0, b"dbzero"]));
+    pipeline.extend(cmd(&[b"SELECT", b"1"]));
+    pipeline.extend(cmd(&[b"GET", &k0]));
+    pipeline.extend(cmd(&[b"SET", &k0, b"dbone"]));
+    pipeline.extend(cmd(&[b"SELECT", b"0"]));
+    pipeline.extend(cmd(&[b"GET", &k0]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n$-1\r\n+OK\r\n+OK\r\n$6\r\ndbzero\r\n");
+
+    // MGET gather (fallback arm) interleaved with fast-arm writes.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", &k1, b"vone"]));
+    pipeline.extend(cmd(&[b"MGET", &k0, &k1, b"missing"]));
+    pipeline.extend(cmd(&[b"GET", &k1]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n*3\r\n$6\r\ndbzero\r\n$4\r\nvone\r\n$-1\r\n$4\r\nvone\r\n");
+
+    // Scatter DBSIZE (fallback arm): both cells' counts aggregate.
+    client.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut client, b":2\r\n");
+
+    // Expiry-on-read over the remote path: an expired key reads as gone
+    // through the fast arm.
+    client.write_all(&cmd(&[b"SET", &k1, b"soon", b"PX", b"1"])).expect("write");
+    read_exactly(&mut client, b"+OK\r\n");
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(10));
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"GET", &k1]));
+    pipeline.extend(cmd(&[b"GET", &k0]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"$-1\r\n$6\r\ndbzero\r\n");
+
+    // Restricted subscriber: data commands answer the restriction error
+    // through the pump for both local and remote keys.
+    let mut sub = node.connect();
+    sub.write_all(&cmd(&[b"SUBSCRIBE", b"ch"])).expect("write");
+    read_exactly(&mut sub, b"*3\r\n$9\r\nsubscribe\r\n$2\r\nch\r\n:1\r\n");
+    sub.write_all(&cmd(&[b"GET", &k0])).expect("write");
+    let line = read_line(&mut sub);
+    assert!(line.starts_with(b"-ERR"), "restricted error for local-ish key: {line:?}");
+    sub.write_all(&cmd(&[b"GET", &k1])).expect("write");
+    let line = read_line(&mut sub);
+    assert!(line.starts_with(b"-ERR"), "restricted error for remote-ish key: {line:?}");
 
     node.stop();
 }
@@ -871,6 +1096,23 @@ fn fuzzy_checkpoint_streams_under_live_writes() {
     }
     c.write_all(&cmd(&[b"SET", b"book:ttl", b"loan", b"EX", b"5000"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
+    #[cfg(feature = "doc")]
+    {
+        c.write_all(&cmd(&[
+            b"JSON.SET",
+            b"book:doc",
+            b"$",
+            br#"{"n":40,"a":[1],"values":[1,1],"pad":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}"#,
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"JSON.NUMINCRBY", b"book:doc", b".n", b"2"])).expect("write");
+        read_exactly(&mut c, b"$2\r\n42\r\n");
+        c.write_all(&cmd(&[b"JSON.ARRAPPEND", b"book:doc", b".a", b"2"])).expect("write");
+        read_exactly(&mut c, b":2\r\n");
+        c.write_all(&cmd(&[b"JSON.NUMINCRBY", b"book:doc", b"$.values[*]", b"1"])).expect("write");
+        read_exactly(&mut c, b"$5\r\n[2,2]\r\n");
+    }
 
     // Manual trigger (the surface INF.CKPT rides at S20), then keep
     // writing while the walker streams — the dirty-under-checkpoint shape
@@ -897,9 +1139,44 @@ fn fuzzy_checkpoint_streams_under_live_writes() {
     drop(c);
     node.stop();
 
+    #[cfg(feature = "doc")]
+    {
+        let log_dir = dir.join("shard-0").join("log");
+        let scan = inf_log::scan_log_dir(&inf_log::fs::StdSegmentFs, &log_dir).expect("scan log");
+        let mut fulls = 0u64;
+        let mut deltas = 0u64;
+        let mut multi_match_deltas = 0u64;
+        for &segment in scan.segments() {
+            let mut reader = inf_log::SegmentReader::open(
+                &inf_log::fs::StdSegmentFs,
+                &log_dir,
+                segment,
+                inf_log::ReaderConfig::default(),
+            )
+            .expect("open segment");
+            while let Some(frame) = reader.next_frame().expect("valid frame") {
+                for record in frame.records() {
+                    let (_, view) = record.expect("valid record");
+                    fulls += u64::from(matches!(view, inf_log::RecordView::DocFull { .. }));
+                    if let inf_log::RecordView::DocDelta { match_count, .. } = view {
+                        deltas += 1;
+                        multi_match_deltas += u64::from(match_count == 2);
+                    }
+                }
+            }
+        }
+        assert!(fulls >= 1, "root JSON.SET staged DocFull");
+        assert!(deltas >= 3, "path mutations staged DocDelta records");
+        assert_eq!(
+            multi_match_deltas, 1,
+            "one two-match command emits one structural document record"
+        );
+    }
+
     // The published .ick validates end to end and covers the seed writes.
     let ick = dir.join("shard-0").join("ckpt").join("ckpt-000001.ick");
     let mut post_images = 0u64;
+    let mut doc_fulls = 0u64;
     let (ick_info, audit) = inf_log::ckpt::read_ick(
         &inf_log::fs::StdSegmentFs,
         &ick,
@@ -907,6 +1184,9 @@ fn fuzzy_checkpoint_streams_under_live_writes() {
         |view| {
             if matches!(view, inf_log::RecordView::StringPostImage { .. }) {
                 post_images += 1;
+            }
+            if matches!(view, inf_log::RecordView::DocFull { .. }) {
+                doc_fulls += 1;
             }
             Ok::<(), ()>(())
         },
@@ -916,6 +1196,8 @@ fn fuzzy_checkpoint_streams_under_live_writes() {
     assert_eq!(ick_info.ckpt_id, 1);
     assert!(ick_info.begin_lsn.to_u64() > 0, "begin LSN recorded");
     assert!(post_images >= 401, "walk covered the pre-trigger writes: {post_images}");
+    #[cfg(feature = "doc")]
+    assert_eq!(doc_fulls, 1, "the live document checkpoints as one DocFull");
     assert_eq!(audit.entries_per_ns.len(), 1, "one durable namespace walked");
 
     // Restart on the same dir: replay (which now crosses the begin
@@ -926,6 +1208,13 @@ fn fuzzy_checkpoint_streams_under_live_writes() {
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"GET", b"book:0000"])).expect("write");
     read_exactly(&mut c, b"$7\r\ntitle-0\r\n");
+    #[cfg(feature = "doc")]
+    {
+        c.write_all(&cmd(&[b"JSON.GET", b"book:doc", b".n"])).expect("write");
+        read_exactly(&mut c, b"$2\r\n42\r\n");
+        c.write_all(&cmd(&[b"JSON.GET", b"book:doc", b".a"])).expect("write");
+        read_exactly(&mut c, b"$5\r\n[1,2]\r\n");
+    }
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
@@ -1501,17 +1790,17 @@ fn memory_namespace_serves_while_durable_plane_is_exhausted() {
     let dir = temp_data_dir("enospc-live");
 
     // Seed one durable key on a healthy node, then restart exhausted.
+    // FSYNC always: the +OK gates on the fsync watermark, so the seeded
+    // frame is provably in the segment before `stop()`. An everysec ack
+    // promises nothing at the harness stop (crash-equivalent: no drain,
+    // the ring dies with the frame write still queued) — the seed was
+    // occasionally lost and recovery replayed zero records (the ~1/8
+    // full-suite flake this test carried).
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
         c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
-            b"led",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"everysec",
+            b"INF.NS", b"CREATE", b"led", b"MODE", b"durable", b"FSYNC", b"always",
         ]))
         .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
@@ -1664,4 +1953,52 @@ fn inf_ckpt_cell_targets_one_cell() {
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M3-S11 cross-cell `JSON.MGET` (ADR-0041 D9): the gather splits per
+/// key with single-key sub-ops whose `*1` elements reassemble in argv
+/// order — over the default db, and over a **named** namespace, which is
+/// exactly the ADR-0032 D5 binding this story executes (`send_apply_ns`
+/// per remote position; the generic multi-key refusal stays for
+/// everything else). Single-key remote JSON commands ride the ordinary
+/// fast arm alongside.
+#[test]
+fn json_mget_gathers_across_cells() {
+    // A durable node shape: namespace DDL needs the control plane. The
+    // JSON namespace itself is memory-class (durable JSON writes refuse
+    // until M3-S17 — covered by the command suite).
+    let dir = temp_data_dir("jsonmget");
+    let node = Node::start_durable(2, &dir);
+    let mut client = node.connect();
+    let k0 = key_for_cell(2, 0);
+    let k1 = key_for_cell(2, 1);
+
+    // Default-db gather: one of k0/k1 is remote from the accepting cell.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"JSON.SET", &k0, b"$", br#"{"n":1}"#]));
+    pipeline.extend(cmd(&[b"JSON.SET", &k1, b"$", br#"{"n":2}"#]));
+    pipeline.extend(cmd(&[b"JSON.MGET", &k0, &k1, b"missing", b"$.n"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n*3\r\n$3\r\n[1]\r\n$3\r\n[2]\r\n$-1\r\n");
+
+    // Single-key JSON mutation on the remote key rides the fast arm.
+    client.write_all(&cmd(&[b"JSON.NUMINCRBY", &k0, b"$.n", b"1"])).expect("write");
+    read_exactly(&mut client, b"$3\r\n[2]\r\n");
+
+    // Named-namespace binding (memory class — durable JSON writes refuse
+    // until M3-S17): the same gather rides `send_apply_ns`.
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"INF.NS", b"CREATE", b"docs", b"MODE", b"memory"]));
+    pipeline.extend(cmd(&[b"INF.NS", b"USE", b"docs"]));
+    pipeline.extend(cmd(&[b"JSON.SET", &k0, b"$", br#"{"n":10}"#]));
+    pipeline.extend(cmd(&[b"JSON.SET", &k1, b"$", br#"{"n":20}"#]));
+    pipeline.extend(cmd(&[b"JSON.MGET", &k0, &k1, b"$.n"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n+OK\r\n+OK\r\n*2\r\n$4\r\n[10]\r\n$4\r\n[20]\r\n");
+
+    // The generic named-ns multi-key refusal is untouched (ADR-0032 D5
+    // scope: only the JSON surface binds at M3).
+    client.write_all(&cmd(&[b"MGET", &k0, &k1])).expect("write");
+    let line = read_line(&mut client);
+    assert!(line.starts_with(b"-ERR multi-key commands"), "refusal stays: {line:?}");
 }

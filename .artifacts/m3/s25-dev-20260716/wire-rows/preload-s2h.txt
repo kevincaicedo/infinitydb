@@ -1,0 +1,19 @@
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 40%,   0 secs]  4 threads 25 conns:     4038740 ops, 4040825 (avg: 4040825) ops/sec, 928.29MB/sec (avg: 928.29MB/sec),  0.79 (avg:  0.79) msec latency[RUN #1 78%,   1 secs]  4 threads 25 conns:     7838125 ops, 4100859 (avg: 4069704) ops/sec, 942.08MB/sec (avg: 934.93MB/sec),  0.78 (avg:  0.78) msec latency[RUN #1 100%,   2 secs]  0 threads 25 conns:    10000000 ops, 4100859 (avg: 4311785) ops/sec, 942.08MB/sec (avg: 990.54MB/sec),  0.78 (avg:  0.74) msec latency
+
+setting requests to 100000
+4         Threads
+25        Connections per thread
+100000    Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      5166951.97          ---          ---         0.73794         0.70300         1.53500         1.92700   1215485.29 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    5166951.97         0.00         0.00         0.73794         0.70300         1.53500         1.92700   1215485.29 

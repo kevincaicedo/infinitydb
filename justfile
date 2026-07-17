@@ -9,8 +9,14 @@ check:
     ./scripts/check-fault-points.sh
     ./scripts/check-fsync-fail-stop.sh
     ./scripts/check-panic-policy.sh
+    ./scripts/check-safety-inventory.sh
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
+    cargo clippy -p inf-doc -p inf-store --all-targets --features doc-intern-keys -- -D warnings
+    cargo test -p inf-doc -p inf-store --features doc-intern-keys
+    # Slim-build lane (L11, ADR-0041 D3): a docless server carries zero
+    # document/path code and must keep compiling that way.
+    cargo check -p inf-server -p inf-store --no-default-features
 
 build:
     cargo build --workspace
@@ -48,6 +54,20 @@ durable-sweep seeds="10000" base="0xD5EE0000":
     out=$(mktemp -d)
     for i in 0 1 2 3 4 5 6 7; do
         ./target/release/inf-sim --scenario m2-durable --sweep {{seeds}} --seed {{base}} \
+            --shard "$i/8" --out "$out" & done
+    wait
+    cat "$out"/manifest-shard-*.txt
+
+# M3-S24 document power-cut + replay-equivalence sweep (the M3 §7 crash
+# and replay-equivalence gate shape; ADR-0045). Usage:
+#   just doc-sweep [seeds] [base]
+doc-sweep seeds="10000" base="0xD0C24000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --bin inf-sim
+    out=$(mktemp -d)
+    for i in 0 1 2 3 4 5 6 7; do
+        ./target/release/inf-sim --scenario m3-document --sweep {{seeds}} --seed {{base}} \
             --shard "$i/8" --out "$out" & done
     wait
     cat "$out"/manifest-shard-*.txt

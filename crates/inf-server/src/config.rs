@@ -90,6 +90,9 @@ impl Default for ConfigStore {
                     "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60",
                 ),
                 e("databases", ReloadClass::BootOnly, Kind::Int, "16"),
+                // M3-S10 (ADR-0041 D2): per-cell compiled-path-program
+                // cache entries; 0 disables. Applied at plane assembly.
+                e("doc-path-cache-size", ReloadClass::BootOnly, Kind::Int, "1024"),
                 e("maxclients", ReloadClass::BootOnly, Kind::Int, "10000"),
                 e("maxmemory", ReloadClass::HotPerCell, Kind::Memory, "0"),
                 e(

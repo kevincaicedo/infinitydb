@@ -1,0 +1,19 @@
+Json file /tmp/claude-1000/-home-kcaicedo-Documents-Projects-databases/f7c996e7-230c-45c8-80f1-979984910087/scratchpad/wire-rows/jget-2h-rep2.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 10%,   0 secs]  4 threads 25 conns:     3487072 ops, 3488240 (avg: 3488240) ops/sec, 185.85MB/sec (avg: 185.85MB/sec),  0.46 (avg:  0.46) msec latency[RUN #1 20%,   1 secs]  4 threads 25 conns:     7001748 ops, 3514331 (avg: 3501288) ops/sec, 187.16MB/sec (avg: 186.50MB/sec),  0.45 (avg:  0.45) msec latency[RUN #1 30%,   2 secs]  4 threads 25 conns:    10512589 ops, 3510514 (avg: 3504364) ops/sec, 186.99MB/sec (avg: 186.67MB/sec),  0.45 (avg:  0.45) msec latency[RUN #1 40%,   3 secs]  4 threads 25 conns:    14022759 ops, 3509850 (avg: 3505736) ops/sec, 187.00MB/sec (avg: 186.75MB/sec),  0.45 (avg:  0.45) msec latency[RUN #1 50%,   5 secs]  4 threads 25 conns:    17531483 ops, 3508401 (avg: 3506269) ops/sec, 186.89MB/sec (avg: 186.78MB/sec),  0.45 (avg:  0.45) msec latency[RUN #1 60%,   6 secs]  4 threads 25 conns:    20736371 ops, 3204602 (avg: 3455988) ops/sec, 171.16MB/sec (avg: 184.17MB/sec),  0.50 (avg:  0.46) msec latency[RUN #1 70%,   7 secs]  4 threads 25 conns:    23940679 ops, 3204035 (avg: 3419992) ops/sec, 171.13MB/sec (avg: 182.31MB/sec),  0.50 (avg:  0.46) msec latency[RUN #1 80%,   8 secs]  4 threads 25 conns:    27154627 ops, 3213658 (avg: 3394199) ops/sec, 171.52MB/sec (avg: 180.96MB/sec),  0.49 (avg:  0.47) msec latency[RUN #1 90%,   9 secs]  4 threads 25 conns:    30357485 ops, 3202572 (avg: 3372906) ops/sec, 171.03MB/sec (avg: 179.86MB/sec),  0.50 (avg:  0.47) msec latency[RUN #1 100%,  10 secs]  4 threads 25 conns:    33566071 ops, 3208454 (avg: 3356461) ops/sec, 171.37MB/sec (avg: 179.01MB/sec),  0.49 (avg:  0.47) msec latency[RUN #1 100%,  10 secs]  0 threads 25 conns:    33567496 ops, 3208454 (avg: 3355893) ops/sec, 171.37MB/sec (avg: 178.98MB/sec),  0.49 (avg:  0.47) msec latency
+
+Saving JSON output file: /tmp/claude-1000/-home-kcaicedo-Documents-Projects-databases/f7c996e7-230c-45c8-80f1-979984910087/scratchpad/wire-rows/jget-2h-rep2.json
+Json file closed.
+4         Threads
+25        Connections per thread
+10        Seconds
+
+
+ALL STATS
+==============================================================================================================================
+Type           Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+------------------------------------------------------------------------------------------------------------------------------
+Json.gets   3355766.55         0.00         0.00         0.47396         0.45500         0.88700         0.99900    183266.43 
+Totals      3355766.55         0.00         0.00         0.47396         0.45500         0.88700         0.99900    366532.86 

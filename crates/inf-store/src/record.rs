@@ -51,17 +51,46 @@ pub(crate) const MAX_EXPIRE_MS: u64 = (1 << 40) - 1;
 /// Versions live in 24 bits (see the module deviation note).
 pub(crate) const VERSION_MASK: u32 = (1 << 24) - 1;
 
-/// Value type, 4 bits in the header. M3 adds the collection types; the
+/// Value type, 4 bits in the header. M5 adds the collection types; the
 /// registry of type tags is an L11 seam (record-type registry).
+/// `JsonDoc = 2` was reserved by ADR-0032 D1 and is bound by ADR-0037.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum TypeTag {
     String = 1,
+    JsonDoc = 2,
 }
 
 impl TypeTag {
     fn from_bits(bits: u8) -> Option<TypeTag> {
-        (bits == 1).then_some(TypeTag::String)
+        match bits {
+            1 => Some(TypeTag::String),
+            2 => Some(TypeTag::JsonDoc),
+            _ => None,
+        }
+    }
+}
+
+/// What kind of value a record holds — the type tag plus its type-specific
+/// flag state. An enum so invalid combinations (a raw-flagged document)
+/// are unrepresentable (ADR-0037 D1).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum RecordKind {
+    /// Plain string; `raw` carries [`FLAG_RAW`] (`OBJECT ENCODING`
+    /// honesty, M1-S02).
+    String { raw: bool },
+    /// A document (ADR-0037): value = form byte + inline tape / doc-arena
+    /// handle.
+    JsonDoc,
+}
+
+impl RecordKind {
+    #[inline]
+    pub fn type_tag(self) -> TypeTag {
+        match self {
+            RecordKind::String { .. } => TypeTag::String,
+            RecordKind::JsonDoc => TypeTag::JsonDoc,
+        }
     }
 }
 
@@ -73,8 +102,7 @@ pub(crate) struct RecordSpec<'a> {
     pub version: u32,
     /// Absolute deadline on the injected clock, milliseconds.
     pub expire_at_ms: Option<u64>,
-    /// Carries [`FLAG_RAW`] (`OBJECT ENCODING` honesty, M1-S02).
-    pub raw: bool,
+    pub kind: RecordKind,
 }
 
 impl RecordSpec<'_> {
@@ -96,9 +124,10 @@ impl RecordSpec<'_> {
         assert!(self.key.len() <= MAX_KEY_LEN, "key exceeds u8 length");
         assert!(self.value.len() <= MAX_VAL_LEN, "value exceeds u24 length");
         assert_eq!(buf.len(), self.encoded_len(), "buffer must be exact");
-        let flags = if self.expire_at_ms.is_some() { FLAG_TTL } else { 0 }
-            | if self.raw { FLAG_RAW } else { 0 };
-        buf[0] = ((TypeTag::String as u8) << 4) | flags;
+        let raw = matches!(self.kind, RecordKind::String { raw: true });
+        let flags =
+            if self.expire_at_ms.is_some() { FLAG_TTL } else { 0 } | if raw { FLAG_RAW } else { 0 };
+        buf[0] = ((self.kind.type_tag() as u8) << 4) | flags;
         buf[1] = self.key.len() as u8;
         let vlen = (self.value.len() as u32).to_le_bytes();
         buf[2..5].copy_from_slice(&vlen[..3]);
@@ -137,6 +166,19 @@ pub(crate) fn flags_ref_write(flags: u8) -> u8 {
 pub(crate) fn flags_ref_decrement(flags: u8) -> u8 {
     let level = (flags & REF_MASK) >> REF_SHIFT;
     (flags & !REF_MASK) | (level.saturating_sub(1) << REF_SHIFT)
+}
+
+/// Bumps the u24 version field of an encoded record in place (wrapping) —
+/// how handle-form document mutations version without a record rewrite
+/// (ADR-0037 D4). `bytes` is the full record slice.
+#[cfg(feature = "doc")]
+#[inline]
+pub(crate) fn bump_version_in_place(bytes: &mut [u8]) {
+    debug_assert!(bytes.len() >= HEADER_LEN);
+    let mut raw = [0u8; 4];
+    raw[..3].copy_from_slice(&bytes[5..8]);
+    let next = (u32::from_le_bytes(raw).wrapping_add(1) & VERSION_MASK).to_le_bytes();
+    bytes[5..8].copy_from_slice(&next[..3]);
 }
 
 /// Computes a record's full encoded length from its fixed header alone —
@@ -231,9 +273,27 @@ impl<'a> RecordView<'a> {
         self.expire_at_ms().is_some_and(|at| now.0 / 1_000_000 >= at)
     }
 
+    /// The record's kind: type tag plus type-specific flag state.
+    #[inline]
+    pub fn kind(self) -> RecordKind {
+        match self.type_tag() {
+            TypeTag::String => RecordKind::String { raw: self.is_raw() },
+            TypeTag::JsonDoc => RecordKind::JsonDoc,
+        }
+    }
+
     #[inline]
     fn key_at(self) -> usize {
         HEADER_LEN + if self.has_ttl() { TTL_EXT_LEN } else { 0 }
+    }
+
+    /// Byte offset of the value region inside the record slice — where the
+    /// document form byte and handle fields live for in-place patching
+    /// (ADR-0037 D4).
+    #[cfg(feature = "doc")]
+    #[inline]
+    pub fn value_offset(self) -> usize {
+        self.key_at() + self.klen()
     }
 
     #[inline]
@@ -279,11 +339,21 @@ mod tests {
 
     #[test]
     fn header_is_eight_bytes_plus_optional_ttl() {
-        let plain =
-            RecordSpec { key: b"k", value: b"v", version: 1, expire_at_ms: None, raw: false };
+        let plain = RecordSpec {
+            key: b"k",
+            value: b"v",
+            version: 1,
+            expire_at_ms: None,
+            kind: RecordKind::String { raw: false },
+        };
         assert_eq!(plain.encoded_len(), 8 + 1 + 1);
-        let ttl =
-            RecordSpec { key: b"k", value: b"v", version: 1, expire_at_ms: Some(5), raw: false };
+        let ttl = RecordSpec {
+            key: b"k",
+            value: b"v",
+            version: 1,
+            expire_at_ms: Some(5),
+            kind: RecordKind::String { raw: false },
+        };
         assert_eq!(ttl.encoded_len(), 8 + 5 + 1 + 1);
     }
 
@@ -295,7 +365,7 @@ mod tests {
             value: &[b'v'; 64],
             version: 1,
             expire_at_ms: None,
-            raw: false,
+            kind: RecordKind::String { raw: false },
         };
         assert_eq!(spec.encoded_len(), 88);
     }
@@ -307,7 +377,7 @@ mod tests {
             value: &[0xAB; 300],
             version: 0xAD_BEEF,
             expire_at_ms: Some(MAX_EXPIRE_MS),
-            raw: false,
+            kind: RecordKind::String { raw: false },
         };
         let buf = roundtrip(spec);
         let view = RecordView::new(&buf);
@@ -326,7 +396,7 @@ mod tests {
             value: b"v",
             version: u32::MAX,
             expire_at_ms: None,
-            raw: false,
+            kind: RecordKind::String { raw: false },
         };
         let buf = roundtrip(spec);
         assert_eq!(RecordView::new(&buf).version(), VERSION_MASK);
@@ -334,8 +404,13 @@ mod tests {
 
     #[test]
     fn expiry_is_inclusive_at_the_millisecond() {
-        let spec =
-            RecordSpec { key: b"k", value: b"", version: 0, expire_at_ms: Some(10), raw: false };
+        let spec = RecordSpec {
+            key: b"k",
+            value: b"",
+            version: 0,
+            expire_at_ms: Some(10),
+            kind: RecordKind::String { raw: false },
+        };
         let buf = roundtrip(spec);
         let view = RecordView::new(&buf);
         assert!(!view.is_expired(Nanos(9_999_999)));
@@ -344,15 +419,26 @@ mod tests {
 
     #[test]
     fn no_ttl_never_expires() {
-        let spec =
-            RecordSpec { key: b"k", value: b"v", version: 0, expire_at_ms: None, raw: false };
+        let spec = RecordSpec {
+            key: b"k",
+            value: b"v",
+            version: 0,
+            expire_at_ms: None,
+            kind: RecordKind::String { raw: false },
+        };
         let buf = roundtrip(spec);
         assert!(!RecordView::new(&buf).is_expired(Nanos(u64::MAX)));
     }
 
     #[test]
     fn empty_key_and_value_are_representable() {
-        let spec = RecordSpec { key: b"", value: b"", version: 7, expire_at_ms: None, raw: false };
+        let spec = RecordSpec {
+            key: b"",
+            value: b"",
+            version: 7,
+            expire_at_ms: None,
+            kind: RecordKind::String { raw: false },
+        };
         let buf = roundtrip(spec);
         let view = RecordView::new(&buf);
         assert_eq!((view.key(), view.value(), view.version()), (&b""[..], &b""[..], 7));
@@ -367,7 +453,7 @@ mod tests {
             value: &value,
             version: VERSION_MASK,
             expire_at_ms: None,
-            raw: false,
+            kind: RecordKind::String { raw: false },
         };
         let buf = roundtrip(spec);
         let view = RecordView::new(&buf);

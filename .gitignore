@@ -8,3 +8,8 @@ crates/inf-fabric/fuzz/corpus/
 crates/inf-log/fuzz/corpus/frame_decode
 crates/inf-log/fuzz/corpus/segment_read
 crates/inf-log/fuzz/corpus/ick_decode
+.claude/
+crates/inf-doc/fuzz/corpus/idoc_decode
+crates/inf-doc/fuzz/corpus/json_parse
+.artifacts/m3/s25-remediation-20260716/shape-large-64KiB/load.resp
+.artifacts/m3/s25-remediation-20260716/wire-control/preload-docs.resp

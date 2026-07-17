@@ -115,6 +115,7 @@ const VALUE_FLAGS: &[&str] = &[
     "port-base",
     "pin-start",
     "redis-image",
+    "redis-stack-image",
     "dragonfly-image",
     "infinitydb-image",
     "seccomp",
@@ -146,6 +147,11 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let attach = parse_attach(flags.get("attach"))?;
     let images = Images {
         redis: flags.str_or("redis-image", "redis:8.0.5"),
+        // Mirrors the pinned M3 compat oracle (tests/compat json_oracle.rs).
+        redis_stack: flags.str_or(
+            "redis-stack-image",
+            "redis/redis-stack-server@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a",
+        ),
         dragonfly: flags.str_or("dragonfly-image", "docker.dragonflydb.io/dragonflydb/dragonfly"),
         infinitydb: flags.str_or("infinitydb-image", "infinitydb:dev"),
         seccomp: PathBuf::from(flags.str_or("seccomp", "deploy/seccomp/infinitydb-seccomp.json")),
@@ -348,6 +354,12 @@ fn bench_engine(
     let mut cells = Vec::new();
     let mut mems = Vec::new();
     for wl in workloads {
+        if wl.requires_json && !target.kind.has_json() {
+            // Visible in the run log; the report simply carries no row for
+            // this engine × lane (an absent row is not a zero).
+            eprintln!("inf-compare:   {label} {} SKIPPED (no JSON.* surface)", wl.name);
+            continue;
+        }
         if matches!(wl.kind, Kind::Memory) {
             eprintln!("inf-compare:   {label} memory (fill {mem_fill_secs}s + DBSIZE)");
             mems.push(measure_memory(target, &mt_plan, mem_fill_secs, lp.data_size)?);
@@ -355,7 +367,12 @@ fn bench_engine(
         }
         for &pipeline in pipelines {
             engine::flushall(target)?;
-            if wl.needs_fill {
+            if wl.needs_fill && wl.requires_json {
+                // Document preload: every key in the keyspace holds the
+                // lane document, so the read lane never measures misses.
+                eprintln!("inf-compare:   {label} {} document preload", wl.name);
+                resp::json_fill(&target.host, target.port, lp.keyspace, workload::JSON_DOC_1K)?;
+            } else if wl.needs_fill {
                 eprintln!("inf-compare:   {label} {} populate ({fill_secs}s)", wl.name);
                 memtier::fill(&mt_plan, fill_secs)?;
             }
@@ -505,6 +522,7 @@ fn resolve_engines(
 fn image_for(kind: EngineKind, images: &Images) -> &str {
     match kind {
         EngineKind::Redis => &images.redis,
+        EngineKind::RedisStack => &images.redis_stack,
         EngineKind::Dragonfly => &images.dragonfly,
         EngineKind::InfinityDb => &images.infinitydb,
     }

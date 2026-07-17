@@ -242,6 +242,13 @@ pub struct SegmentRotor<F: SegmentFs> {
     next: Option<(SegmentId, F::File)>,
     sealed: Vec<SegmentId>,
     space_exhausted: bool,
+    /// The log life frames appended through this rotor belong to
+    /// (ADR-0031 D5): 1 on fresh logs; recovery derives max-observed + 1
+    /// and stamps it via [`set_resume_epoch`](Self::set_resume_epoch).
+    /// Carried here (the log writer's segment state) so cell assembly can
+    /// wire `StagingRing::set_frame_epoch` without recovery signature
+    /// churn.
+    resume_epoch: u32,
     stats: RotorStats,
 }
 
@@ -272,6 +279,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
             next: None,
             sealed: Vec::new(),
             space_exhausted: false,
+            resume_epoch: 1,
             stats: RotorStats::default(),
         })
     }
@@ -298,6 +306,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
             next: None,
             sealed: Vec::new(),
             space_exhausted: false,
+            resume_epoch: 1,
             stats: RotorStats::default(),
         })
     }
@@ -308,6 +317,21 @@ impl<F: SegmentFs> SegmentRotor<F> {
     #[must_use]
     pub fn append_cursor(&self) -> Lsn {
         Lsn::new(self.active.id, self.active.written)
+    }
+
+    /// Recovery hands the derived log life here (max epoch observed across
+    /// the valid prefix and every validating beyond-frame, + 1 — ADR-0031
+    /// D5) so cell assembly can wire `StagingRing::set_frame_epoch`.
+    pub fn set_resume_epoch(&mut self, epoch: u32) {
+        assert!(epoch > 0, "frame epoch 0 is reserved (ADR-0031 D1)");
+        self.resume_epoch = epoch;
+    }
+
+    /// The log life frames appended through this rotor must stamp
+    /// (1 unless recovery derived a later one).
+    #[must_use]
+    pub fn resume_epoch(&self) -> u32 {
+        self.resume_epoch
     }
 
     /// Reopen after a boot scan: the highest-numbered segment is the tail;
@@ -340,6 +364,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
             next: None,
             sealed,
             space_exhausted: false,
+            resume_epoch: 1,
             stats: RotorStats::default(),
         })
     }

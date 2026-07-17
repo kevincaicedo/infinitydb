@@ -1,0 +1,1343 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 63K of event 'cpu_core/cycles/P'
+# Event count (approx.): 108264339053
+#
+# Overhead  Command          Shared Object     Symbol                                                                                                                                                                   
+# ........  ...............  ................  .........................................................................................................................................................................
+#
+     1.47%  cell-1           libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.35%  cell-1           infinityd         [.] inf_server::plane::dispatch_one::{{closure}}
+     1.33%  cell-3           libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.30%  cell-2           libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.29%  cell-2           infinityd         [.] inf_server::plane::dispatch_one::{{closure}}
+     1.26%  cell-1           infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     1.23%  cell-3           infinityd         [.] inf_server::plane::dispatch_one::{{closure}}
+     1.23%  cell-2           infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     1.15%  cell-3           infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     1.14%  cell-0           libc.so.6         [.] __memmove_avx_unaligned_erms
+            |
+            ---__memmove_avx_unaligned_erms
+
+     1.05%  cell-0           infinityd         [.] inf_server::plane::dispatch_one::{{closure}}
+     0.99%  cell-0           infinityd         [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     0.95%  cell-0           infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     0.67%  cell-1           infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.67%  cell-1           infinityd         [.] inf_server::plane::send_apply::{{closure}}
+     0.64%  cell-2           infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.64%  cell-3           infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.63%  cell-2           infinityd         [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     0.63%  cell-0           infinityd         [.] <inf_server::plane::ServerPlane<O,F> as inf_runtime::reactor::CellPlane>::maintain
+     0.63%  cell-3           infinityd         [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     0.63%  cell-2           infinityd         [.] inf_server::plane::send_apply::{{closure}}
+     0.59%  cell-3           infinityd         [.] inf_server::plane::send_apply::{{closure}}
+     0.57%  cell-1           infinityd         [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     0.54%  cell-1           infinityd         [.] inf_fabric::codec::decode_frame
+     0.50%  cell-0           infinityd         [.] inf_server::plane::send_apply::{{closure}}
+     0.50%  cell-2           infinityd         [.] inf_fabric::codec::decode_frame
+     0.50%  cell-3           infinityd         [.] inf_fabric::codec::decode_frame
+     0.45%  cell-1           infinityd         [.] inf_wire::parser::FrameIter::next
+     0.44%  cell-2           infinityd         [.] inf_wire::parser::FrameIter::next
+     0.43%  cell-0           infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.40%  cell-0           infinityd         [.] inf_fabric::codec::decode_frame
+     0.39%  cell-3           infinityd         [.] inf_wire::parser::FrameIter::next
+     0.39%  cell-1           infinityd         [.] inf_wire::parser::parse_count_line
+     0.38%  cell-0           infinityd         [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap
+     0.38%  cell-1           infinityd         [.] <inf_runtime::gate::GateWait<K,V> as core::future::future::Future>::poll
+     0.38%  cell-3           infinityd         [.] inf_server::plane::OwnedCmd::from_argv_into
+     0.35%  cell-1           infinityd         [.] inf_server::plane::OwnedCmd::from_argv_into
+     0.34%  cell-3           infinityd         [.] inf_wire::parser::parse_count_line
+     0.34%  cell-2           infinityd         [.] inf_wire::parser::parse_count_line
+     0.34%  cell-2           infinityd         [.] <inf_runtime::gate::GateWait<K,V> as core::future::future::Future>::poll
+     0.33%  cell-0           infinityd         [.] inf_wire::parser::FrameIter::next
+     0.33%  cell-3           infinityd         [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap
+     0.32%  cell-2           infinityd         [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap
+     0.32%  cell-3           infinityd         [.] inf_server::plane::handle_fabric_op
+     0.32%  cell-3           infinityd         [.] <inf_runtime::gate::GateWait<K,V> as core::future::future::Future>::poll
+     0.31%  cell-1           infinityd         [.] inf_server::plane::handle_fabric_op
+     0.30%  cell-2           infinityd         [.] inf_server::plane::handle_fabric_op
+     0.29%  cell-2           infinityd         [.] inf_server::plane::OwnedCmd::from_argv_into
+     0.28%  cell-0           infinityd         [.] inf_wire::parser::parse_count_line
+     0.28%  cell-0           infinityd         [.] <inf_runtime::gate::GateWait<K,V> as core::future::future::Future>::poll
+     0.27%  cell-0           libc.so.6         [.] _int_malloc
+            |          
+             --0.26%--_int_malloc
+                       |          
+                       |--0.14%--__libc_malloc2
+                       |          
+                        --0.12%--_int_realloc
+                                  __libc_realloc (inlined)
+
+     0.27%  cell-0           infinityd         [.] inf_server::plane::stage_or_handle
+     0.26%  cell-1           infinityd         [.] inf_server::plane::stage_or_handle
+     0.26%  cell-0           infinityd         [.] inf_server::plane::handle_fabric_op
+     0.26%  cell-3           infinityd         [.] inf_server::plane::stage_or_handle
+     0.25%  cell-1           infinityd         [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap
+     0.25%  cell-0           infinityd         [.] inf_server::plane::Conn::state_bytes
+     0.25%  cell-2           infinityd         [.] inf_server::plane::stage_or_handle
+     0.24%  cell-0           libc.so.6         [.] realloc
+            |          
+             --0.22%--__libc_realloc (inlined)
+
+     0.24%  cell-1           infinityd         [.] inf_wire::command::lookup
+     0.23%  cell-0           infinityd         [.] inf_server::plane::OwnedCmd::from_argv_into
+     0.21%  cell-1           infinityd         [.] inf_wire::command::lookup
+     0.21%  cell-3           infinityd         [.] inf_store::store::CellStore::probe_prefetch
+     0.21%  cell-1           [unknown]         [k] 0xffffffff90cd5951
+            |
+            ---0xffffffff90cd5953
+               0xffffffff913eba72
+               0xffffffff913ebc7b
+               0xffffffff913ebe53
+               0xffffffff91509c94
+               0xffffffff9150b101
+               0xffffffff9155af4f
+               0xffffffff913ca596
+               0xffffffff90ca2137
+               0xffffffff90c7ba91
+               0xffffffff90c7fff1
+               0xffffffff90c8b0db
+               0xffffffff90c8b41b
+               0xffffffff90c8c4a7
+               0xffffffff90c8c7a7
+               |          
+                --0.18%--0xffffffff90c8cf98
+                          0xffffffff90c81311
+                          0xffffffff90c813a2
+                          0xffffffff90347750
+                          0xffffffff91712b65
+                          0xffffffff9000012b
+
+     0.21%  cell-1           libc.so.6         [.] _int_malloc
+     0.20%  cell-3           libc.so.6         [.] _int_malloc
+     0.20%  cell-3           infinityd         [.] inf_wire::command::lookup
+     0.20%  cell-3           infinityd         [.] inf_wire::command::lookup
+     0.20%  cell-2           infinityd         [.] inf_fabric::codec::encode
+     0.19%  cell-3           [unknown]         [k] 0xffffffff90cd5951
+            |
+            ---0xffffffff90cd5953
+               0xffffffff913eba72
+               0xffffffff913ebc7b
+               0xffffffff913ebe53
+               0xffffffff91509c94
+               0xffffffff9150b101
+               0xffffffff9155af4f
+               0xffffffff913ca596
+               0xffffffff90ca2137
+               0xffffffff90c7ba91
+               0xffffffff90c7fff1
+               0xffffffff90c8b0db
+               0xffffffff90c8b41b
+               0xffffffff90c8c4a7
+               0xffffffff90c8c7a7
+               |          
+                --0.15%--0xffffffff90c8cf98
+                          0xffffffff90c81311
+                          0xffffffff90c813a2
+                          0xffffffff90347750
+                          0xffffffff91712b65
+                          0xffffffff9000012b
+
+     0.19%  cell-2           libc.so.6         [.] _int_malloc
+     0.19%  cell-2           infinityd         [.] inf_wire::command::lookup
+     0.19%  cell-1           infinityd         [.] inf_fabric::codec::encode
+     0.19%  cell-0           [unknown]         [k] 0xffffffff90cd5951
+            |
+            ---0xffffffff90cd5953
+               0xffffffff913eba72
+               0xffffffff913ebc7b
+               0xffffffff913ebe53
+               0xffffffff91509c94
+               0xffffffff9150b101
+               0xffffffff9155af4f
+               0xffffffff913ca596
+               0xffffffff90ca2137
+               0xffffffff90c7ba91
+               0xffffffff90c7fff1
+               0xffffffff90c8b0db
+               0xffffffff90c8b41b
+               0xffffffff90c8c4a7
+               |          
+                --0.18%--0xffffffff90c8c7a7
+                          |          
+                           --0.15%--0xffffffff90c8cf98
+                                     0xffffffff90c81311
+                                     0xffffffff90c813a2
+                                     0xffffffff90347750
+                                     0xffffffff91712b65
+                                     0xffffffff9000012b
+                                     syscall
+
+     0.18%  cell-2           [unknown]         [k] 0xffffffff90cd5951
+            |
+            ---0xffffffff90cd5953
+               0xffffffff913eba72
+               0xffffffff913ebc7b
+               0xffffffff913ebe53
+               0xffffffff91509c94
+               0xffffffff9150b101
+               0xffffffff9155af4f
+               0xffffffff913ca596
+               0xffffffff90ca2137
+               0xffffffff90c7ba91
+               0xffffffff90c7fff1
+               0xffffffff90c8b0db
+               0xffffffff90c8b41b
+               0xffffffff90c8c4a7
+               0xffffffff90c8c7a7
+               |          
+                --0.15%--0xffffffff90c8cf98
+                          0xffffffff90c81311
+                          0xffffffff90c813a2
+                          0xffffffff90347750
+                          0xffffffff91712b65
+                          0xffffffff9000012b
+
+     0.18%  cell-3           infinityd         [.] inf_fabric::codec::encode
+     0.17%  cell-2           infinityd         [.] inf_wire::command::lookup
+     0.17%  cell-0           infinityd         [.] inf_store::store::CellStore::probe_prefetch
+     0.17%  cell-0           libc.so.6         [.] _int_free_merge_chunk
+     0.17%  cell-3           infinityd         [.] inf_server::exec::execute_slices
+     0.16%  cell-0           infinityd         [.] inf_fabric::mesh::CellFabric::flush
+     0.16%  cell-0           infinityd         [.] inf_wire::command::lookup
+     0.16%  cell-2           infinityd         [.] inf_store::store::CellStore::probe_prefetch
+     0.16%  cell-0           infinityd         [.] inf_fabric::codec::encode
+     0.16%  cell-3           [unknown]         [k] 0xffffffff9172d857
+            |
+            ---0xffffffff9172d85b
+
+     0.15%  cell-3           infinityd         [.] inf_runtime::uring::UringDriver::alloc_id
+     0.15%  cell-3           [unknown]         [k] 0xffffffff90cdc8c3
+            |
+            ---0xffffffff90cdc8c6
+               |          
+                --0.13%--0xffffffff90c8cf98
+                          0xffffffff90c81311
+                          0xffffffff90c813a2
+                          0xffffffff90347750
+                          0xffffffff91712b65
+                          0xffffffff9000012b
+
+     0.15%  cell-2           [unknown]         [k] 0xffffffff9172d857
+            |
+            ---0xffffffff9172d85b
+
+     0.15%  cell-1           infinityd         [.] inf_store::store::CellStore::probe_prefetch
+     0.15%  cell-3           [unknown]         [k] 0xffffffffc2b90d5c
+            |
+            ---0xffffffffc2b90d61
+               0xffffffffc2b912db
+               0xffffffffc2b9156d
+               0xffffffffc2b957e8
+               0xffffffff914df308
+               0xffffffff914f50a9
+               0xffffffff914f513e
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.15%  cell-1           [unknown]         [k] 0xffffffff91513085
+            |
+            ---0xffffffff91513089
+               0xffffffff91519a27
+               0xffffffff9151c86b
+               0xffffffff9153193a
+               0xffffffff91533c9a
+               0xffffffff914eda26
+               0xffffffff914edc96
+               0xffffffff914edd95
+               0xffffffff914ee43d
+               0xffffffff9140c4ad
+               0xffffffff9140c536
+               0xffffffff9140c7e0
+               0xffffffff9140cfa4
+               0xffffffff9140d377
+               0xffffffff9044cb71
+               0xffffffff9172ed90
+               0xffffffff9044c49f
+               0xffffffff9044cf9a
+               0xffffffff9140a1a1
+               0xffffffff914f178f
+               0xffffffff914f47d8
+               0xffffffff914f4b61
+               0xffffffff914f4ca6
+               0xffffffff914f4e41
+               0xffffffff914f5181
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.15%  cell-0           [unknown]         [k] 0xffffffff905006a7
+            |
+            ---0xffffffff905006ab
+               0xffffffff9172d01e
+
+     0.15%  cell-2           [unknown]         [k] 0xffffffffc2b90d5c
+            |
+            ---0xffffffffc2b90d61
+               0xffffffffc2b912db
+               0xffffffffc2b9156d
+               0xffffffffc2b957e8
+               0xffffffff914df308
+               0xffffffff914f50a9
+               0xffffffff914f513e
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.14%  cell-2           infinityd         [.] inf_server::exec::execute_slices
+     0.14%  cell-0           infinityd         [.] inf_server::plane::stage_argv_block
+     0.14%  cell-0           infinityd         [.] inf_wire::command::lookup
+     0.14%  cell-2           infinityd         [.] inf_fabric::mesh::CellFabric::flush
+     0.14%  cell-3           libc.so.6         [.] realloc
+     0.14%  cell-3           infinityd         [.] inf_fabric::codec::encode_bytes
+     0.14%  cell-2           [unknown]         [k] 0xffffffff91513085
+            |
+            ---0xffffffff91513089
+               0xffffffff91519a27
+               0xffffffff9151c86b
+               0xffffffff9153193a
+               0xffffffff91533c9a
+               0xffffffff914eda26
+               0xffffffff914edc96
+               0xffffffff914edd95
+               0xffffffff914ee43d
+               0xffffffff9140c4ad
+               0xffffffff9140c536
+               0xffffffff9140c7e0
+               0xffffffff9140cfa4
+               0xffffffff9140d377
+               0xffffffff9044cb71
+               0xffffffff9172ed90
+               0xffffffff9044c49f
+               0xffffffff9044cf9a
+               0xffffffff9140a1a1
+               0xffffffff914f178f
+               0xffffffff914f47d8
+               0xffffffff914f4b61
+               0xffffffff914f4ca6
+               0xffffffff914f4e41
+               0xffffffff914f5181
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.14%  cell-2           libc.so.6         [.] realloc
+     0.14%  cell-1           [unknown]         [k] 0xffffffff913ebb97
+            |
+            ---0xffffffff913ebb9b
+               0xffffffff913ebe53
+               0xffffffff91509c94
+               0xffffffff9150b101
+               0xffffffff9155af4f
+               0xffffffff913ca596
+               0xffffffff90ca2137
+               0xffffffff90c7ba91
+               0xffffffff90c7fff1
+               0xffffffff90c8b0db
+               0xffffffff90c8b41b
+               0xffffffff90c8c4a7
+               0xffffffff90c8c7a7
+               |          
+                --0.12%--0xffffffff90c8cf98
+                          0xffffffff90c81311
+                          0xffffffff90c813a2
+                          0xffffffff90347750
+                          0xffffffff91712b65
+                          0xffffffff9000012b
+
+     0.14%  cell-0           infinityd         [.] inf_server::exec::execute_slices
+     0.14%  cell-2           [unknown]         [k] 0xffffffff905006a7
+            |
+            ---0xffffffff905006ab
+               0xffffffff9172d01e
+
+     0.13%  cell-2           infinityd         [.] inf_runtime::uring::UringDriver::alloc_id
+     0.13%  cell-1           infinityd         [.] inf_server::exec::execute_slices
+     0.13%  cell-2           [unknown]         [k] 0xffffffff913ebb97
+            |
+            ---0xffffffff913ebb9b
+               0xffffffff913ebe53
+               0xffffffff91509c94
+               0xffffffff9150b101
+               0xffffffff9155af4f
+               0xffffffff913ca596
+               0xffffffff90ca2137
+               0xffffffff90c7ba91
+               0xffffffff90c7fff1
+               0xffffffff90c8b0db
+               0xffffffff90c8b41b
+               0xffffffff90c8c4a7
+               0xffffffff90c8c7a7
+               |          
+                --0.11%--0xffffffff90c8cf98
+                          0xffffffff90c81311
+                          0xffffffff90c813a2
+                          0xffffffff90347750
+                          0xffffffff91712b65
+                          0xffffffff9000012b
+
+     0.13%  cell-0           libc.so.6         [.] _int_free_chunk
+            |
+            ---_int_free_chunk
+
+     0.13%  cell-1           [unknown]         [k] 0xffffffff9172d857
+            |
+            ---0xffffffff9172d85b
+
+     0.13%  cell-3           [unknown]         [k] 0xffffffff91513085
+            |
+            ---0xffffffff91513089
+               0xffffffff91519a27
+               0xffffffff9151c86b
+               0xffffffff9153193a
+               0xffffffff91533c9a
+               0xffffffff914eda26
+               0xffffffff914edc96
+               0xffffffff914edd95
+               0xffffffff914ee43d
+               0xffffffff9140c4ad
+               0xffffffff9140c536
+               0xffffffff9140c7e0
+               0xffffffff9140cfa4
+               0xffffffff9140d377
+               0xffffffff9044cb71
+               0xffffffff9172ed90
+               0xffffffff9044c49f
+               0xffffffff9044cf9a
+               0xffffffff9140a1a1
+               0xffffffff914f178f
+               0xffffffff914f47d8
+               0xffffffff914f4b61
+               0xffffffff914f4ca6
+               0xffffffff914f4e41
+               0xffffffff914f5181
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.13%  cell-3           infinityd         [.] inf_fabric::mesh::CellFabric::flush
+     0.13%  cell-0           [unknown]         [k] 0xffffffffc2b90d5c
+            |
+            ---0xffffffffc2b90d61
+               0xffffffffc2b912db
+               0xffffffffc2b9156d
+               0xffffffffc2b957e8
+               0xffffffff914df308
+               0xffffffff914f50a9
+               0xffffffff914f513e
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+               syscall
+
+     0.13%  cell-0           [unknown]         [k] 0xffffffff90001268
+     0.13%  cell-3           [unknown]         [k] 0xffffffff913ebb97
+            |
+            ---0xffffffff913ebb9b
+               0xffffffff913ebe53
+               0xffffffff91509c94
+               0xffffffff9150b101
+               0xffffffff9155af4f
+               0xffffffff913ca596
+               0xffffffff90ca2137
+               0xffffffff90c7ba91
+               0xffffffff90c7fff1
+               0xffffffff90c8b0db
+               0xffffffff90c8b41b
+               0xffffffff90c8c4a7
+               0xffffffff90c8c7a7
+               |          
+                --0.11%--0xffffffff90c8cf98
+                          0xffffffff90c81311
+                          0xffffffff90c813a2
+                          0xffffffff90347750
+                          0xffffffff91712b65
+                          0xffffffff9000012b
+
+     0.13%  cell-1           infinityd         [.] inf_runtime::gate::KeyedGate<K,V>::waiter
+     0.13%  cell-1           [unknown]         [k] 0xffffffffc2b90d5c
+            |
+            ---0xffffffffc2b90d61
+               0xffffffffc2b912db
+               0xffffffffc2b9156d
+               0xffffffffc2b957e8
+               0xffffffff914df308
+               0xffffffff914f50a9
+               0xffffffff914f513e
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.13%  cell-2           [unknown]         [k] 0xffffffff904e8aa9
+            |
+            ---0xffffffff904e8aac
+               0xffffffff904f1750
+               0xffffffff913d2226
+               0xffffffff9151b4c9
+               0xffffffff9151c8ff
+               0xffffffff9153193a
+               0xffffffff91533c9a
+               0xffffffff914eda26
+               0xffffffff914edc96
+               0xffffffff914edd95
+               0xffffffff914ee43d
+               0xffffffff9140c4ad
+               0xffffffff9140c536
+               0xffffffff9140c7e0
+               0xffffffff9140cfa4
+               0xffffffff9140d377
+               0xffffffff9044cb71
+               0xffffffff9172ed90
+               0xffffffff9044c49f
+               0xffffffff9044cf9a
+               0xffffffff9140a1a1
+               0xffffffff914f178f
+               0xffffffff914f47d8
+               0xffffffff914f4b61
+               0xffffffff914f4ca6
+               0xffffffff914f4e41
+               0xffffffff914f5181
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.13%  cell-0           [unknown]         [k] 0xffffffff9040843b
+            |
+            ---0xffffffff9040843d
+
+     0.13%  cell-1           infinityd         [.] inf_runtime::uring::UringDriver::alloc_id
+     0.12%  cell-0           libc.so.6         [.] malloc
+     0.12%  cell-0           infinityd         [.] inf_fabric::codec::Reader::bytes
+     0.12%  cell-1           [unknown]         [k] 0xffffffff904e8aa9
+            |
+            ---0xffffffff904e8aac
+               0xffffffff904f1750
+               0xffffffff913d2226
+               0xffffffff9151b4c9
+               0xffffffff9151c8ff
+               0xffffffff9153193a
+               0xffffffff91533c9a
+               0xffffffff914eda26
+               0xffffffff914edc96
+               0xffffffff914edd95
+               0xffffffff914ee43d
+               0xffffffff9140c4ad
+               0xffffffff9140c536
+               0xffffffff9140c7e0
+               0xffffffff9140cfa4
+               0xffffffff9140d377
+               0xffffffff9044cb71
+               0xffffffff9172ed90
+               0xffffffff9044c49f
+               0xffffffff9044cf9a
+               0xffffffff9140a1a1
+               0xffffffff914f178f
+               0xffffffff914f47d8
+               0xffffffff914f4b61
+               0xffffffff914f4ca6
+               0xffffffff914f4e41
+               0xffffffff914f5181
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.12%  cell-3           [unknown]         [k] 0xffffffff913fbd10
+            |
+            ---0xffffffff913fbd13
+               0xffffffff9140d2e1
+               0xffffffff9044cb71
+               0xffffffff9172ed90
+               0xffffffff9044c49f
+               0xffffffff9044cf9a
+               0xffffffff9140a1a1
+               0xffffffff914f178f
+               0xffffffff914f47d8
+               0xffffffff914f4b61
+               0xffffffff914f4ca6
+               0xffffffff914f4e41
+               0xffffffff914f5181
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.12%  cell-3           [unknown]         [k] 0xffffffff908d3df9
+            |
+            ---0xffffffff908d3dfd
+               0xffffffff908d3fd6
+               0xffffffff913eba5e
+               0xffffffff913ebc7b
+               0xffffffff913ebe53
+               0xffffffff91509c94
+               0xffffffff9150b101
+               0xffffffff9155af4f
+               0xffffffff913ca596
+               0xffffffff90ca2137
+               0xffffffff90c7ba91
+               0xffffffff90c7fff1
+               0xffffffff90c8b0db
+               0xffffffff90c8b41b
+               0xffffffff90c8c4a7
+               0xffffffff90c8c7a7
+               |          
+                --0.10%--0xffffffff90c8cf98
+                          0xffffffff90c81311
+                          0xffffffff90c813a2
+                          0xffffffff90347750
+                          0xffffffff91712b65
+                          0xffffffff9000012b
+
+     0.12%  cell-2           [unknown]         [k] 0xffffffff913fbd10
+            |
+            ---0xffffffff913fbd13
+               0xffffffff9140d2e1
+               0xffffffff9044cb71
+               0xffffffff9172ed90
+               0xffffffff9044c49f
+               0xffffffff9044cf9a
+               0xffffffff9140a1a1
+               0xffffffff914f178f
+               0xffffffff914f47d8
+               0xffffffff914f4b61
+               0xffffffff914f4ca6
+               0xffffffff914f4e41
+               0xffffffff914f5181
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.12%  cell-1           [unknown]         [k] 0xffffffff905006a7
+            |
+            ---0xffffffff905006ab
+               0xffffffff9172d01e
+
+     0.12%  cell-3           [unknown]         [k] 0xffffffff905006a7
+            |
+            ---0xffffffff905006ab
+               0xffffffff9172d01e
+
+     0.12%  cell-1           [unknown]         [k] 0xffffffff904acd4f
+            |
+            ---0xffffffff904acd53
+
+     0.12%  cell-3           libc.so.6         [.] _int_free_merge_chunk
+     0.12%  cell-2           infinityd         [.] inf_runtime::gate::KeyedGate<K,V>::waiter
+     0.11%  cell-1           infinityd         [.] inf_fabric::codec::encode_bytes
+     0.11%  cell-1           libc.so.6         [.] _int_free_chunk
+     0.11%  cell-1           libc.so.6         [.] realloc
+     0.11%  cell-0           libc.so.6         [.] cfree@GLIBC_2.2.5
+     0.11%  cell-0           [unknown]         [k] 0xffffffff9172d857
+            |
+            ---0xffffffff9172d85b
+
+     0.11%  cell-3           infinityd         [.] inf_runtime::gate::KeyedGate<K,V>::waiter
+     0.11%  cell-3           infinityd         [.] inf_fabric::codec::Reader::bytes
+     0.11%  cell-2           libc.so.6         [.] _int_free_merge_chunk
+     0.11%  cell-1           [unknown]         [k] 0xffffffff9172db28
+            |
+            ---0xffffffff9172db2a
+               |          
+                --0.11%--0xffffffff9049be21
+                          |          
+                           --0.11%--0xffffffff904a7c24
+                                     0xffffffff904a80fa
+                                     0xffffffff904eb607
+                                     0xffffffff904e8af1
+                                     0xffffffff904f1750
+                                     0xffffffff913d2226
+                                     0xffffffff9151b4c9
+                                     0xffffffff9151c8ff
+                                     0xffffffff9153193a
+                                     0xffffffff91533c9a
+                                     0xffffffff914eda26
+                                     0xffffffff914edc96
+                                     0xffffffff914edd95
+                                     0xffffffff914ee43d
+                                     0xffffffff9140c4ad
+                                     0xffffffff9140c536
+                                     0xffffffff9140c7e0
+                                     0xffffffff9140cfa4
+                                     0xffffffff9140d377
+                                     0xffffffff9044cb71
+                                     0xffffffff9172ed90
+                                     0xffffffff9044c49f
+                                     0xffffffff9044cf9a
+                                     0xffffffff9140a1a1
+                                     0xffffffff914f178f
+                                     0xffffffff914f47d8
+                                     0xffffffff914f4b61
+                                     0xffffffff914f4ca6
+                                     0xffffffff914f4e41
+                                     0xffffffff914f5181
+                                     0xffffffff914f5328
+                                     0xffffffff914f5665
+                                     0xffffffff91524435
+                                     0xffffffff9152677d
+                                     0xffffffff91526dc9
+                                     0xffffffff915068dd
+                                     0xffffffff91507868
+                                     0xffffffff915084f0
+                                     0xffffffff9155aea6
+                                     0xffffffff913cb025
+                                     0xffffffff90ca13f9
+                                     0xffffffff90c7ba91
+                                     0xffffffff90c8035d
+                                     0xffffffff90c806bd
+                                     0xffffffff90c80d8e
+                                     0xffffffff90c8114c
+                                     0xffffffff90c813a2
+                                     0xffffffff90347750
+                                     0xffffffff91712b65
+                                     0xffffffff9000012b
+
+     0.11%  cell-3           infinityd         [.] inf_server::plane::stage_argv_block
+     0.11%  cell-0           infinityd         [.] inf_runtime::uring::UringDriver::alloc_id
+     0.11%  cell-2           libc.so.6         [.] _int_free_chunk
+     0.11%  cell-1           [unknown]         [k] 0xffffffff913fbd10
+            |
+            ---0xffffffff913fbd13
+               0xffffffff9140d2e1
+               0xffffffff9044cb71
+               0xffffffff9172ed90
+               0xffffffff9044c49f
+               0xffffffff9044cf9a
+               0xffffffff9140a1a1
+               0xffffffff914f178f
+               0xffffffff914f47d8
+               0xffffffff914f4b61
+               0xffffffff914f4ca6
+               0xffffffff914f4e41
+               0xffffffff914f5181
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.11%  cell-3           [unknown]         [k] 0xffffffff904e8aa9
+            |
+            ---0xffffffff904e8aac
+               0xffffffff904f1750
+               0xffffffff913d2226
+               0xffffffff9151b4c9
+               0xffffffff9151c8ff
+               0xffffffff9153193a
+               0xffffffff91533c9a
+               0xffffffff914eda26
+               0xffffffff914edc96
+               0xffffffff914edd95
+               0xffffffff914ee43d
+               0xffffffff9140c4ad
+               0xffffffff9140c536
+               0xffffffff9140c7e0
+               0xffffffff9140cfa4
+               0xffffffff9140d377
+               0xffffffff9044cb71
+               0xffffffff9172ed90
+               0xffffffff9044c49f
+               0xffffffff9044cf9a
+               0xffffffff9140a1a1
+               0xffffffff914f178f
+               0xffffffff914f47d8
+               0xffffffff914f4b61
+               0xffffffff914f4ca6
+               0xffffffff914f4e41
+               0xffffffff914f5181
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.11%  cell-3           [unknown]         [k] 0xffffffff904acd4f
+            |
+            ---0xffffffff904acd53
+
+     0.11%  cell-2           infinityd         [.] inf_fabric::codec::encode_bytes
+     0.11%  cell-2           infinityd         [.] inf_server::plane::is_conn_state
+     0.11%  cell-0           libc.so.6         [.] getenv
+            |
+            ---getenv
+
+     0.11%  cell-0           [unknown]         [k] 0xffffffff90cdc8c3
+            |
+            ---0xffffffff90cdc8c6
+
+     0.11%  cell-0           infinityd         [.] inf_runtime::gate::KeyedGate<K,V>::waiter
+     0.11%  cell-0           [unknown]         [k] 0xffffffff903ae860
+            |
+            ---0xffffffff903ae863
+
+     0.11%  cell-2           [unknown]         [k] 0xffffffff914fb8ae
+            |
+            ---0xffffffff914fb8b1
+               0xffffffff91533728
+               0xffffffff914eda26
+               0xffffffff914edc96
+               0xffffffff914edd95
+               0xffffffff914ee43d
+               0xffffffff9140c4ad
+               0xffffffff9140c536
+               0xffffffff9140c7e0
+               0xffffffff9140cfa4
+               0xffffffff9140d377
+               0xffffffff9044cb71
+               0xffffffff9172ed90
+               0xffffffff9044c49f
+               0xffffffff9044cf9a
+               0xffffffff9140a1a1
+               0xffffffff914f178f
+               0xffffffff914f47d8
+               0xffffffff914f4b61
+               0xffffffff914f4ca6
+               0xffffffff914f4e41
+               0xffffffff914f5181
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.11%  cell-3           infinityd         [.] inf_server::plane::is_conn_state
+     0.11%  cell-1           infinityd         [.] inf_fabric::codec::Reader::bytes
+     0.10%  cell-2           [unknown]         [k] 0xffffffff913dd063
+            |
+            ---0xffffffff913dd06b
+               |          
+                --0.10%--0xffffffff913eb83b
+                          0xffffffff913fbd20
+                          0xffffffff9140d2e1
+                          0xffffffff9044cb71
+                          0xffffffff9172ed90
+                          0xffffffff9044c49f
+                          0xffffffff9044cf9a
+                          0xffffffff9140a1a1
+                          0xffffffff914f178f
+                          0xffffffff914f47d8
+                          0xffffffff914f4b61
+                          0xffffffff914f4ca6
+                          0xffffffff914f4e41
+                          0xffffffff914f5181
+                          0xffffffff914f5328
+                          0xffffffff914f5665
+                          0xffffffff91524435
+                          0xffffffff9152677d
+                          0xffffffff91526dc9
+                          0xffffffff915068dd
+                          0xffffffff91507868
+                          0xffffffff915084f0
+                          0xffffffff9155aea6
+                          0xffffffff913cb025
+                          0xffffffff90ca13f9
+                          0xffffffff90c7ba91
+                          0xffffffff90c8035d
+                          0xffffffff90c806bd
+                          0xffffffff90c80d8e
+                          0xffffffff90c8114c
+                          0xffffffff90c813a2
+                          0xffffffff90347750
+                          0xffffffff91712b65
+                          0xffffffff9000012b
+
+     0.10%  cell-3           infinityd         [.] inf_fabric::mesh::CellFabric::reply
+     0.10%  cell-0           [unknown]         [k] 0xffffffff913ebb97
+            |
+            ---0xffffffff913ebb9b
+               0xffffffff913ebe53
+               0xffffffff91509c94
+               0xffffffff9150b101
+               0xffffffff9155af4f
+               0xffffffff913ca596
+               0xffffffff90ca2137
+               0xffffffff90c7ba91
+               0xffffffff90c7fff1
+               0xffffffff90c8b0db
+               0xffffffff90c8b41b
+               0xffffffff90c8c4a7
+               0xffffffff90c8c7a7
+
+     0.10%  cell-0           [unknown]         [k] 0xffffffff91513085
+            |
+            ---0xffffffff91513089
+               0xffffffff91519a27
+               0xffffffff9151c86b
+               0xffffffff9153193a
+               0xffffffff91533c9a
+               0xffffffff914eda26
+               0xffffffff914edc96
+               0xffffffff914edd95
+               0xffffffff914ee43d
+               0xffffffff9140c4ad
+               0xffffffff9140c536
+               0xffffffff9140c7e0
+               0xffffffff9140cfa4
+               0xffffffff9140d377
+               0xffffffff9044cb71
+               0xffffffff9172ed90
+               0xffffffff9044c49f
+               0xffffffff9044cf9a
+               0xffffffff9140a1a1
+               0xffffffff914f178f
+               0xffffffff914f47d8
+               0xffffffff914f4b61
+               0xffffffff914f4ca6
+               0xffffffff914f4e41
+               0xffffffff914f5181
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+               syscall
+
+     0.10%  cell-1           [unknown]         [k] 0xffffffff913dfccf
+            |
+            ---0xffffffff913dfcd3
+               0xffffffff91506a7a
+               0xffffffff91507661
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.10%  cell-1           [unknown]         [k] 0xffffffff90cdc8c3
+            |
+            ---0xffffffff90cdc8c6
+
+     0.10%  cell-3           libc.so.6         [.] _int_free_chunk
+     0.10%  cell-1           infinityd         [.] inf_server::plane::stage_argv_block
+     0.10%  cell-2           infinityd         [.] inf_fabric::mesh::CellFabric::send
+     0.10%  cell-3           [unknown]         [k] 0xffffffff913dd063
+            |
+            ---0xffffffff913dd06b
+
+     0.10%  cell-0           [unknown]         [k] 0xffffffff904e8aa9
+            |
+            ---0xffffffff904e8aac
+               0xffffffff904f1750
+               0xffffffff913d2226
+               0xffffffff9151b4c9
+               0xffffffff9151c8ff
+               0xffffffff9153193a
+               0xffffffff91533c9a
+               0xffffffff914eda26
+               0xffffffff914edc96
+               0xffffffff914edd95
+               0xffffffff914ee43d
+               0xffffffff9140c4ad
+               0xffffffff9140c536
+               0xffffffff9140c7e0
+               0xffffffff9140cfa4
+               0xffffffff9140d377
+               0xffffffff9044cb71
+               0xffffffff9172ed90
+               0xffffffff9044c49f
+               0xffffffff9044cf9a
+               0xffffffff9140a1a1
+               0xffffffff914f178f
+               0xffffffff914f47d8
+               0xffffffff914f4b61
+               0xffffffff914f4ca6
+               0xffffffff914f4e41
+               0xffffffff914f5181
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+               syscall
+
+     0.10%  cell-2           [unknown]         [k] 0xffffffff9151c8a4
+            |
+            ---0xffffffff9151c8aa
+               0xffffffff9153193a
+               0xffffffff91533c9a
+               0xffffffff914eda26
+               0xffffffff914edc96
+               0xffffffff914edd95
+               0xffffffff914ee43d
+               0xffffffff9140c4ad
+               0xffffffff9140c536
+               0xffffffff9140c7e0
+               0xffffffff9140cfa4
+               0xffffffff9140d377
+               0xffffffff9044cb71
+               0xffffffff9172ed90
+               0xffffffff9044c49f
+               0xffffffff9044cf9a
+               0xffffffff9140a1a1
+               0xffffffff914f178f
+               0xffffffff914f47d8
+               0xffffffff914f4b61
+               0xffffffff914f4ca6
+               0xffffffff914f4e41
+               0xffffffff914f5181
+               0xffffffff914f5328
+               0xffffffff914f5665
+               0xffffffff91524435
+               0xffffffff9152677d
+               0xffffffff91526dc9
+               0xffffffff915068dd
+               0xffffffff91507868
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.10%  cell-1           [unknown]         [k] 0xffffffff91516912
+            |
+            ---0xffffffff91516918
+               0xffffffff91509876
+               0xffffffff9150b101
+               0xffffffff9155af4f
+               0xffffffff913ca596
+               0xffffffff90ca2137
+               0xffffffff90c7ba91
+               0xffffffff90c7fff1
+               0xffffffff90c8b0db
+               0xffffffff90c8b41b
+               0xffffffff90c8c4a7
+               0xffffffff90c8c7a7
+
+     0.10%  cell-0           [unknown]         [k] 0xffffffff91516912
+            |
+            ---0xffffffff91516918
+               0xffffffff91509876
+               0xffffffff9150b101
+               0xffffffff9155af4f
+               0xffffffff913ca596
+               0xffffffff90ca2137
+               0xffffffff90c7ba91
+               0xffffffff90c7fff1
+               0xffffffff90c8b0db
+               0xffffffff90c8b41b
+               0xffffffff90c8c4a7
+               0xffffffff90c8c7a7
+
+     0.10%  cell-2           infinityd         [.] inf_server::plane::stage_argv_block
+     0.10%  cell-1           [unknown]         [k] 0xffffffff9150812b
+            |
+            ---0xffffffff9150812f
+               0xffffffff915084f0
+               0xffffffff9155aea6
+               0xffffffff913cb025
+               0xffffffff90ca13f9
+               0xffffffff90c7ba91
+               0xffffffff90c8035d
+               0xffffffff90c806bd
+               0xffffffff90c80d8e
+               0xffffffff90c8114c
+               0xffffffff90c813a2
+               0xffffffff90347750
+               0xffffffff91712b65
+               0xffffffff9000012b
+
+     0.10%  cell-0           infinityd         [.] inf_fabric::codec::encode_bytes
+     0.10%  cell-1           [unknown]         [k] 0xffffffff908d3df9
+            |
+            ---0xffffffff908d3dfd
+               0xffffffff908d3fd6
+               0xffffffff913eba5e
+               0xffffffff913ebc7b
+               0xffffffff913ebe53
+               0xffffffff91509c94
+               0xffffffff9150b101
+               0xffffffff9155af4f
+               0xffffffff913ca596
+               0xffffffff90ca2137
+               0xffffffff90c7ba91
+               0xffffffff90c7fff1
+               0xffffffff90c8b0db
+               0xffffffff90c8b41b
+               0xffffffff90c8c4a7
+               0xffffffff90c8c7a7
+
+     0.10%  cell-1           infinityd         [.] inf_server::plane::is_conn_state
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

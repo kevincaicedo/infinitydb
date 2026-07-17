@@ -1,0 +1,4 @@
+small: serialized=8000000 inf=11771904 stack=22020096
+  inf/serialized = 1.471  (gate <= 1.5)
+  inf/stack      = 0.535  (gate <= 0.7)
+verification: expected_docs=40000 inf_dbsize=40000 stack_dbsize=40000

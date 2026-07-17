@@ -18,6 +18,7 @@
 //! replaying a newer log on an older binary must refuse, not corrupt).
 
 use core::fmt;
+use core::num::NonZeroU64;
 
 use inf_foundation::varint;
 
@@ -26,8 +27,33 @@ use inf_foundation::varint;
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct NsId(pub u32);
 
+/// Per-cell document-incarnation identity (ADR-0043 D6 amendment).
+/// Versions order mutations within one incarnation; this token prevents a
+/// fuzzy-checkpoint tail delta from binding to a delete+recreate of the
+/// same key. Zero is never encoded, so uninitialized lineage is
+/// unrepresentable after decode.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct DocLineage(NonZeroU64);
+
+impl DocLineage {
+    pub const FIRST: DocLineage = DocLineage(NonZeroU64::MIN);
+
+    #[must_use]
+    pub const fn new(raw: u64) -> Option<DocLineage> {
+        match NonZeroU64::new(raw) {
+            Some(raw) => Some(DocLineage(raw)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 /// Record type tags, v1. Discriminants are wire format — never reuse or
-/// renumber (the registry only grows: M3 collection ops claim tag 6 onward).
+/// renumber (the registry only grows: M3 documents claim tags 6 and 7).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum RecordType {
@@ -45,6 +71,10 @@ pub enum RecordType {
     /// entry the fuzzy walker missed or observed early. Replay treats it
     /// as a marker (skip + count), never state.
     CkptBegin = 5,
+    /// Version-guarded document path mutation (M3-S17, ADR-0043).
+    DocDelta = 6,
+    /// Canonical full-document post-image (M3-S17, ADR-0043).
+    DocFull = 7,
 }
 
 impl RecordType {
@@ -56,6 +86,8 @@ impl RecordType {
             3 => RecordType::ExpireAt,
             4 => RecordType::NsOp,
             5 => RecordType::CkptBegin,
+            6 => RecordType::DocDelta,
+            7 => RecordType::DocFull,
             _ => return None,
         })
     }
@@ -64,6 +96,9 @@ impl RecordType {
 /// v1 defines no flag bits; the byte is reserved wire space. Encoders write
 /// zero, decoders reject anything else (one value, one encoding).
 const RECORD_FLAGS_V1: u8 = 0;
+/// Store record versions are u24; document log records reproduce them
+/// exactly (ADR-0043 D3/D6).
+pub const DOC_VERSION_MASK: u32 = 0xFF_FFFF;
 
 /// A decoded record, borrowing payload bytes from the frame body —
 /// zero-copy on the replay path. Field invariants (flags == 0, known type)
@@ -94,6 +129,24 @@ pub enum RecordView<'a> {
         ns: NsId,
         ckpt_id: u64,
     },
+    DocDelta {
+        ns: NsId,
+        key: &'a [u8],
+        lineage: DocLineage,
+        base_version: u32,
+        match_count: u32,
+        post_len: u32,
+        opcode: u8,
+        program: &'a [u8],
+        operand: &'a [u8],
+    },
+    DocFull {
+        ns: NsId,
+        key: &'a [u8],
+        lineage: DocLineage,
+        version: u32,
+        idoc: &'a [u8],
+    },
 }
 
 impl RecordView<'_> {
@@ -119,6 +172,27 @@ impl RecordView<'_> {
             RecordView::NsOp { ns, payload } => varint_len(u64::from(ns.0)) + payload.len(),
             RecordView::CkptBegin { ns, ckpt_id } => {
                 varint_len(u64::from(ns.0)) + varint_len(ckpt_id)
+            }
+            RecordView::DocDelta { ns, key, program, operand, .. } => {
+                varint_len(u64::from(ns.0))
+                    + varint_len(key.len() as u64)
+                    + key.len()
+                    + 8
+                    + 3
+                    + 4
+                    + 3
+                    + 1
+                    + varint_len(program.len() as u64)
+                    + program.len()
+                    + operand.len()
+            }
+            RecordView::DocFull { ns, key, idoc, .. } => {
+                varint_len(u64::from(ns.0))
+                    + varint_len(key.len() as u64)
+                    + key.len()
+                    + 8
+                    + 3
+                    + idoc.len()
             }
         }
     }
@@ -161,6 +235,45 @@ impl RecordView<'_> {
                 varint::encode_u64(u64::from(ns.0), out);
                 varint::encode_u64(ckpt_id, out);
             }
+            RecordView::DocDelta {
+                ns,
+                key,
+                lineage,
+                base_version,
+                match_count,
+                post_len,
+                opcode,
+                program,
+                operand,
+            } => {
+                debug_assert_eq!(base_version & !DOC_VERSION_MASK, 0);
+                debug_assert!(match_count > 0 && post_len > 0);
+                debug_assert_eq!(post_len & !DOC_VERSION_MASK, 0);
+                out.push(RecordType::DocDelta as u8);
+                out.push(RECORD_FLAGS_V1);
+                varint::encode_u64(u64::from(ns.0), out);
+                varint::encode_u64(key.len() as u64, out);
+                out.extend_from_slice(key);
+                out.extend_from_slice(&lineage.get().to_le_bytes());
+                out.extend_from_slice(&base_version.to_le_bytes()[..3]);
+                out.extend_from_slice(&match_count.to_le_bytes());
+                out.extend_from_slice(&post_len.to_le_bytes()[..3]);
+                out.push(opcode);
+                varint::encode_u64(program.len() as u64, out);
+                out.extend_from_slice(program);
+                out.extend_from_slice(operand);
+            }
+            RecordView::DocFull { ns, key, lineage, version, idoc } => {
+                debug_assert_eq!(version & !DOC_VERSION_MASK, 0);
+                out.push(RecordType::DocFull as u8);
+                out.push(RECORD_FLAGS_V1);
+                varint::encode_u64(u64::from(ns.0), out);
+                varint::encode_u64(key.len() as u64, out);
+                out.extend_from_slice(key);
+                out.extend_from_slice(&lineage.get().to_le_bytes());
+                out.extend_from_slice(&version.to_le_bytes()[..3]);
+                out.extend_from_slice(idoc);
+            }
         }
     }
 }
@@ -182,6 +295,12 @@ pub enum RecordDecodeError {
     NsOutOfRange(u64),
     /// A declared key length overruns the record body.
     KeyOverrun,
+    /// A declared path-program length overruns a document-delta body.
+    ProgramOverrun,
+    /// Document lineage zero is reserved for uninitialized state.
+    InvalidDocLineage,
+    /// A document delta declares an impossible zero match/image bound.
+    InvalidDocBounds,
     /// Bytes remain after a fixed-width payload (`CkptBegin` is the first
     /// type where trailing garbage is representable — one value, one
     /// encoding, so it is rejected).
@@ -199,6 +318,13 @@ impl fmt::Display for RecordDecodeError {
             }
             RecordDecodeError::NsOutOfRange(ns) => write!(f, "namespace id {ns} out of range"),
             RecordDecodeError::KeyOverrun => write!(f, "key length overruns record body"),
+            RecordDecodeError::ProgramOverrun => {
+                write!(f, "path program length overruns document delta body")
+            }
+            RecordDecodeError::InvalidDocLineage => write!(f, "document lineage is zero"),
+            RecordDecodeError::InvalidDocBounds => {
+                write!(f, "document delta carries a zero replay bound")
+            }
             RecordDecodeError::TrailingBytes => write!(f, "trailing bytes after record payload"),
         }
     }
@@ -237,17 +363,7 @@ pub fn decode_record(buf: &[u8]) -> Result<(RecordView<'_>, usize), RecordDecode
 
     let view = match record_type {
         RecordType::StringPostImage => {
-            let (klen, klen_len) = varint::decode_u64(payload).ok_or(if payload.is_empty() {
-                RecordDecodeError::Truncated
-            } else {
-                RecordDecodeError::Varint
-            })?;
-            let klen = usize::try_from(klen).map_err(|_| RecordDecodeError::KeyOverrun)?;
-            let rest = &payload[klen_len..];
-            if klen > rest.len() {
-                return Err(RecordDecodeError::KeyOverrun);
-            }
-            let (key, value) = rest.split_at(klen);
+            let (key, value) = decode_key(payload)?;
             RecordView::StringPostImage { ns, key, value }
         }
         RecordType::Delete => RecordView::Delete { ns, key: payload },
@@ -272,8 +388,77 @@ pub fn decode_record(buf: &[u8]) -> Result<(RecordView<'_>, usize), RecordDecode
             }
             RecordView::CkptBegin { ns, ckpt_id }
         }
+        RecordType::DocDelta => {
+            let (key, rest) = decode_key(payload)?;
+            let lineage = decode_doc_lineage(rest)?;
+            let version = decode_u24(&rest[8..]).ok_or(RecordDecodeError::Truncated)?;
+            let match_count = u32::from_le_bytes(
+                rest.get(11..15)
+                    .ok_or(RecordDecodeError::Truncated)?
+                    .try_into()
+                    .expect("4-byte field"),
+            );
+            let post_len = decode_u24(&rest[15..]).ok_or(RecordDecodeError::Truncated)?;
+            if match_count == 0 || post_len == 0 {
+                return Err(RecordDecodeError::InvalidDocBounds);
+            }
+            let opcode = *rest.get(18).ok_or(RecordDecodeError::Truncated)?;
+            let fields = &rest[19..];
+            let (program_len, used) = varint::decode_u64(fields).ok_or(if fields.is_empty() {
+                RecordDecodeError::Truncated
+            } else {
+                RecordDecodeError::Varint
+            })?;
+            let program_len =
+                usize::try_from(program_len).map_err(|_| RecordDecodeError::ProgramOverrun)?;
+            let program_end =
+                used.checked_add(program_len).ok_or(RecordDecodeError::ProgramOverrun)?;
+            let program = fields.get(used..program_end).ok_or(RecordDecodeError::ProgramOverrun)?;
+            let operand = &fields[program_end..];
+            RecordView::DocDelta {
+                ns,
+                key,
+                lineage,
+                base_version: version,
+                match_count,
+                post_len,
+                opcode,
+                program,
+                operand,
+            }
+        }
+        RecordType::DocFull => {
+            let (key, rest) = decode_key(payload)?;
+            let lineage = decode_doc_lineage(rest)?;
+            let version = decode_u24(&rest[8..]).ok_or(RecordDecodeError::Truncated)?;
+            RecordView::DocFull { ns, key, lineage, version, idoc: &rest[11..] }
+        }
     };
     Ok((view, prefix_len + body_len))
+}
+
+fn decode_key(payload: &[u8]) -> Result<(&[u8], &[u8]), RecordDecodeError> {
+    let (key_len, used) = varint::decode_u64(payload).ok_or(if payload.is_empty() {
+        RecordDecodeError::Truncated
+    } else {
+        RecordDecodeError::Varint
+    })?;
+    let key_len = usize::try_from(key_len).map_err(|_| RecordDecodeError::KeyOverrun)?;
+    let key_end = used.checked_add(key_len).ok_or(RecordDecodeError::KeyOverrun)?;
+    let key = payload.get(used..key_end).ok_or(RecordDecodeError::KeyOverrun)?;
+    Ok((key, &payload[key_end..]))
+}
+
+fn decode_u24(bytes: &[u8]) -> Option<u32> {
+    let raw = bytes.get(..3)?;
+    Some(u32::from_le_bytes([raw[0], raw[1], raw[2], 0]))
+}
+
+fn decode_doc_lineage(bytes: &[u8]) -> Result<DocLineage, RecordDecodeError> {
+    let raw = u64::from_le_bytes(
+        bytes.get(..8).ok_or(RecordDecodeError::Truncated)?.try_into().expect("8-byte field"),
+    );
+    DocLineage::new(raw).ok_or(RecordDecodeError::InvalidDocLineage)
 }
 
 /// Byte length of the canonical LEB128 encoding of `v`.

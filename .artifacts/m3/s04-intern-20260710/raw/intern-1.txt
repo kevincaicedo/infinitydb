@@ -1,0 +1,48 @@
+   Compiling inf-doc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-doc)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 19.04s
+     Running benches/intern.rs (target/release/deps/intern-510e6f6350fc1b6a)
+shape           plain   interned    delta  (intern on-vs-off stored bytes)
+small-200B        191    (plain)    0.0%
+gate-1KiB         707        664    -6.1%
+medium-2KiB      1182       1143    -3.3%
+large-64KiB     35401      24212   -31.6%
+deep-32          1396       1148   -17.8%
+wide-array     300454     270467   -10.0%
+Benchmarking depth4_leaf_fetch_intern/plain
+Benchmarking depth4_leaf_fetch_intern/plain: Warming up for 3.0000 s
+Benchmarking depth4_leaf_fetch_intern/plain: Collecting 100 samples in estimated 5.0006 s (21M iterations)
+Benchmarking depth4_leaf_fetch_intern/plain: Analyzing
+depth4_leaf_fetch_intern/plain
+                        time:   [236.36 ns 236.46 ns 236.56 ns]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking depth4_leaf_fetch_intern/interned
+Benchmarking depth4_leaf_fetch_intern/interned: Warming up for 3.0000 s
+Benchmarking depth4_leaf_fetch_intern/interned: Collecting 100 samples in estimated 5.0005 s (20M iterations)
+Benchmarking depth4_leaf_fetch_intern/interned: Analyzing
+depth4_leaf_fetch_intern/interned
+                        time:   [246.07 ns 246.42 ns 246.79 ns]
+
+Benchmarking wide_probe/plain
+Benchmarking wide_probe/plain: Warming up for 3.0000 s
+Benchmarking wide_probe/plain: Collecting 100 samples in estimated 5.0256 s (278k iterations)
+Benchmarking wide_probe/plain: Analyzing
+wide_probe/plain        time:   [18.092 µs 18.094 µs 18.096 µs]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking wide_probe/interned
+Benchmarking wide_probe/interned: Warming up for 3.0000 s
+Benchmarking wide_probe/interned: Collecting 100 samples in estimated 5.0137 s (293k iterations)
+Benchmarking wide_probe/interned: Analyzing
+wide_probe/interned     time:   [17.120 µs 17.121 µs 17.123 µs]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) low mild
+  1 (1.00%) high mild
+
+Benchmarking intern_transform_1kib
+Benchmarking intern_transform_1kib: Warming up for 3.0000 s
+Benchmarking intern_transform_1kib: Collecting 100 samples in estimated 5.0074 s (1.4M iterations)
+Benchmarking intern_transform_1kib: Analyzing
+intern_transform_1kib   time:   [3.6645 µs 3.6657 µs 3.6667 µs]
+

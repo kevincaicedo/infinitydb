@@ -1,7 +1,7 @@
-//! M2-S17 crash-matrix harness (ADR-0020 D1/D2): the matrix definition
-//! lives in `m2.toml` as reviewable data; this crate supplies the schema
-//! reader, the seeded workload builders (per fault point × fsync policy ×
-//! workload shape), and the kill-and-recover oracle.
+//! Durability crash-matrix harness. M2 fault-point coverage lives in
+//! `m2.toml`; M3 document record/checkpoint cuts live in `m3.toml`.
+//! Both are reviewable data, while this crate supplies the shared schema
+//! reader and the M2 seeded kill-and-recover oracle.
 //!
 //! **Crash physics at this tier are process KILL** (MemFs: every
 //! completed write survives — the page cache outlives the process). The

@@ -1,0 +1,14 @@
+Focused validation completed before story closure:
+- cargo fmt --all -- --check
+- cargo clippy -p compat -p inf-server --all-targets -- -D warnings
+- cargo test -p inf-server --test json_commands (34 passed)
+- cargo test -p compat --lib (12 passed)
+- INF_COMPAT_JSON_ORACLE_ADDR=127.0.0.1:6391 cargo test -p compat --test json_diff -- --nocapture (168 executions; 148 exact; 20 allowed; 0 failures)
+- cargo test -p compat --test matrix_artifact --test reply_shapes_artifact (4 passed)
+- focused inf-doc/inf-store/inf-server corpus, document-record, and staged-batch tests (green)
+
+Final workspace validation:
+- just check: green (fmt, dep-DAG, denylist/inventory greps, workspace clippy
+  -D warnings, workspace tests, doc-intern feature lane, docless slim build)
+- cargo deny check: green (advisories, bans, licenses, sources); only the
+  standing unmatched-license-allowance warnings

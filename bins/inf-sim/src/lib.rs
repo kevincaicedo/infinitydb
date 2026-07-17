@@ -14,6 +14,7 @@
 
 pub mod bootstorm;
 pub mod combined;
+mod document;
 pub mod durable;
 pub mod harness;
 pub mod net;

@@ -10,11 +10,13 @@ Formats defined by ADR-0011 unless noted.
 | Interface | Crate | Status |
 |-----------|-------|--------|
 | Log record format v1 | `inf-log` | implemented (M2-S01) |
-| Batch frame layout v1 | `inf-log` | implemented (M2-S01) |
+| Batch frame layout v1 | `inf-log` | implemented (M2-S01); **read-only since M2.5-S12** (ADR-0031 — v2 is the written format; v1 accepted forever on the alpha line) |
+| Batch frame layout v2 (per-frame sequencing) | `inf-log` | implemented (M2.5-S12, ADR-0031 — epoch · seq · covered-LSN stamp under the CRC; the tail-scan attestation taxonomy consumes it) |
 | LSN addressing | `inf-log` | implemented (M2-S01) |
 | Segment naming + lifecycle | `inf-log` | implemented (M2-S02) |
 | `SegmentFs` injection seam | `inf-log` | implemented (M2-S02; extended by S05/S11/S16; sim-disk tier at S18) |
 | `MutationEffect` → record seam | `inf-store` → `inf-log` | implemented (M2-S03/S08, ADR-0012/0015; dep edge + command-layer post-image emission live) |
+| Document record classes + replay contract | `inf-doc`/`inf-store`/`inf-log` | implemented (M3-S17, ADR-0043 — tags 6/7, incarnation lineage, recorded replay witnesses, static opcode registry, modular-u24 replay, checkpoint full images) |
 | Log staging domain (`StagingRing`) | `inf-log` | implemented (M2-S03; reactor wiring at S05) |
 | Sequential read path (`SegmentReader`) | `inf-log` | implemented (M2-S04; `BackendDriver` reads at S05; S14 tail policy implemented — ADR-0018) |
 | Durability watermark contract | `inf-log`/`inf-runtime` | implemented (M2-S05/S06/S08, ADR-0013/0015; live on `ServerPlane` — acks seq-keyed, semantics unchanged; sim disk at S18) |
@@ -49,14 +51,24 @@ body   := type: u8 · flags: u8 · varint(ns) · payload
   `1 StringPostImage {varint klen · key · value}` ·
   `2 Delete {key}` ·
   `3 ExpireAt {varint unix-ms · key}` (absolute time) ·
-  `4 NsOp {opaque payload}` (vocabulary owned by M2-S08).
-  Tags 5+ reserved: `ckpt-begin` (S10), M3 collection ops.
+  `4 NsOp {opaque payload}` (vocabulary owned by M2-S08) ·
+  `5 CkptBegin {varint ckpt-id}` (cell-scoped; outer `ns = 0`) ·
+  `6 DocDelta {varint klen · key · lineage:u64 LE ·
+  base-version:u24 LE · match-count:u32 LE · post-len:u24 LE ·
+  opcode:u8 · varint program-len · program · operand}` ·
+  `7 DocFull {varint klen · key · lineage:u64 LE · version:u24 LE ·
+  idoc}`.
+  The outer record carries `ns` for tags 6/7. Document opcodes 1–13 and
+  operand canonicality are owned by `inf-doc::delta`, not the log spine
+  (ADR-0043 D3/D4). `lineage` is nonzero. Delta `match-count` and
+  `post-len` are nonzero exact live-acceptance witnesses; zero is a typed
+  decode error.
 - `flags`: reserved, v1 defines no bits. Unknown flags and unknown types
   are **fail-stop** decode errors — replay refuses, never skips (§8.4).
 - Public surface: `RecordView<'_>` (borrowing views; invalid records are
   unrepresentable), `RecordView::encode_into(&mut Vec<u8>)` /
   `encoded_len()`, `decode_record(&[u8]) -> (RecordView, consumed)`,
-  `NsId(u32)`, `RecordDecodeError`.
+  `NsId(u32)`, `DocLineage(NonZeroU64)`, `RecordDecodeError`.
 
 ## Batch frame layout v1 (`inf-log::frame`)
 
@@ -74,12 +86,54 @@ len-4  4    CRC32C(header·body): u32 LE   (kernel: inf-simd::crc32c)
   applies per frame; record-level errors inside a CRC-valid frame are
   corruption-or-bug and fail-stop.
 - Public surface: `FrameBuilder` (reusable buffer; `append(&RecordView)`,
-  `frame_len()`, `finalize(first_record_lsn) -> &[u8]`, `sealed_frame()`
-  (post-finalize re-access for the leased in-flight write), `reset()`),
-  `decode_frame(&[u8], max_frame_len)`, `FrameRef::records()` yielding
-  `(Lsn, RecordView)`, `FrameIter` (validate-then-yield; stops at zero
-  magic; `offset()` = bytes consumed — the tail-scan input for S04/S14),
-  `FrameDecodeError`, `FrameRecordError`.
+  `frame_len()`, `finalize(first_record_lsn, stamp) -> &[u8]`,
+  `sealed_frame()` (post-finalize re-access for the leased in-flight
+  write), `reset()`), `decode_frame(&[u8], max_frame_len)` (both formats),
+  `FrameRef::records()` yielding `(Lsn, RecordView)`, `FrameRef::stamp()`,
+  `FrameIter` (validate-then-yield; stops at zero magic; `offset()` =
+  bytes consumed — the tail-scan input for S04/S14), `FrameDecodeError`,
+  `FrameRecordError`.
+
+## Batch frame layout v2 (`inf-log::frame`, M2.5-S12 — ADR-0031)
+
+```text
+offset size field
+0      4    magic = "IFR2"        (all-zero magic ⇒ preallocated tail; "IFR1" ⇒ v1, read-only)
+4      4    frame_len: u32 LE     (total: header+body+trailer; ≥ 48)
+8      4    record_count: u32 LE  (≥ 1)
+12     8    first_lsn: segment u32 LE · offset u32 LE   (first RECORD's LSN — base + 40)
+20     4    epoch: u32 LE         (log life; ≥ 1 — 0 is a decode error)
+24     8    seq: u64 LE           (frame ordinal within the epoch, from 1; 0 is a decode error)
+32     8    covered_lsn: u64 LE   (Lsn::to_u64 of the durability watermark at seal;
+                                   > first_lsn is a decode error — the watermark never
+                                   leads the append cursor)
+40     …    body: records
+len-4  4    CRC32C(header·body): u32 LE
+```
+
+- The stamp is what recovery's evidence taxonomy consumes (ADR-0031
+  D3–D5): prefix continuity (epoch nondecreasing; seq +1 within an epoch
+  and within a segment; seq 1 at an epoch step; `covered_lsn`
+  nondecreasing within a run), the beyond-the-data-end **attestation
+  rule** (a surviving frame attesting coverage past the data end → named
+  refusal; otherwise the gap is provably un-covered and truncates — the
+  retired ADR-0021 D3 refusal class, counted in
+  `RecoverStats::beyond_frames_discarded`), the **cross-segment
+  attestation check** (coverage claims must lie within earlier segments'
+  surviving data), and **epoch residue** (a lower-epoch frame ends replay
+  — discarded-life residue never re-enters a prefix;
+  `RecoverStats::epoch_residue_stops`).
+- Epoch derivation: every recovery-for-append resumes at 1 + max(epoch
+  over the valid prefix and every validating beyond-frame); fresh logs
+  start at 1. Carried on `SegmentRotor::{set_,}resume_epoch`; the cell
+  assembly wires `StagingRing::set_frame_epoch` (seq restarts at 1).
+- Writer surface: `StagingRing::seal(first_record_lsn, covered_lsn)` —
+  the plane passes `GroupCommit::watermark()`; the synchronous tiers
+  (`flush_into`) stamp `covered_lsn = 0` (attests nothing, conservative).
+- v1 frames decode with `stamp() == None`, attest nothing, and keep the
+  conservative pre-ADR-0031 refusal beyond a gap; a v1 frame *after* a v2
+  frame in a replay prefix is a named refusal (append order — no
+  downgrade after the first v2 frame).
 
 ## LSN addressing (`inf-log::lsn`)
 
@@ -144,15 +198,36 @@ enum MutationEffect<'a> {
     Delete    { ns: NsId, key: &'a [u8] },                   // → tag 2
     ExpireAt  { ns: NsId, at_unix_ms: u64, key: &'a [u8] },  // → tag 3 (absolute)
     NsOp      { ns: NsId, payload: &'a [u8] },               // → tag 4
+    CkptBegin { ckpt_id: u64 },                               // → tag 5, ns 0
+    DocDelta  { ns: NsId, key: &'a [u8], lineage: DocLineage,
+                base_version: u32, match_count: u32, post_len: u32,
+                opcode: u8, program: &'a [u8], operand: &'a [u8] }, // → tag 6
+    DocFull   { ns: NsId, key: &'a [u8], lineage: DocLineage,
+                version: u32, idoc: &'a [u8] },              // → tag 7
 }
 ```
 
-- `record() -> RecordView<'a>` is the encoder registry: M3 collection ops
-  and M6 doc deltas add variants + record tags here without touching the
-  frame spine. `encoded_len()` is exact (admission + accounting input).
+- `record() -> RecordView<'a>` is the encoder registry. Document variants
+  are borrowed field views and add no composed payload buffer or
+  document-aware frame branch. `encoded_len()` is exact (admission +
+  accounting input).
 - Defined in `inf-log` (the seam's consumer — §3.3); `inf-store` imports
   it when S08 wires durable namespaces (the dep-DAG edge lands there,
   direction fixed by ADR-0012).
+- `DocFull` replay is a blind idempotent upsert after validating canonical
+  idoc bytes and installs its exact nonzero lineage plus u24 version.
+  `DocDelta` validates the path program and opcode operand, then orders by
+  lineage before version: an absent/expired key counts
+  `SkippedDocDeltaMissing`; a non-document key or document with newer
+  lineage counts `SkippedDocDeltaStale`; an older document lineage is
+  corruption. Equal lineage uses
+  `distance = (current - base) mod 2^24`: zero applies through the same
+  `inf-doc::apply` semantics and bumps once; `0 < distance < 2^23` is a
+  counted stale skip; the other half-range is corruption. Replay uses the
+  record's exact `match_count` and `post_len`, not current boot limits,
+  and fail-stops if the result count or canonical output length disagrees.
+  This is ADR-0043 D6 / M3 §3.4 R1–R3, including recreation and version
+  wrap.
 
 ## Log staging domain (`inf-log::staging`, M2-S03)
 
@@ -336,9 +411,13 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
 ```
 
 - **The checkpoint is a materialized log prefix** (ADR-0016 D1): section
-  bodies are ordinary record-v1 encodings (post-image + expire-at per live
-  entry), replayed by `Keyspace::apply_record` — the same upsert the tail
-  uses. M3+ record tags flow into checkpoints with zero format changes.
+  bodies are ordinary record-v1 encodings, replayed by
+  `Keyspace::apply_record` — the same upsert the tail uses. Strings emit
+  `StringPostImage`; documents emit `DocFull` with canonical idoc bytes,
+  exact lineage, and exact record version; either may be followed by
+  `ExpireAt`.
+  The checkpoint container stays v1 because only its extensible record
+  vocabulary grew (M3-S17, ADR-0043 D7).
 - `digest` = chained `inf_foundation::hash64` over the header CRC and each
   section CRC in order (seeded; part of the v1 wire contract). Recorded
   deviation from the plan's "xxh3" (ADR-0016 D6); the version field is the
@@ -347,7 +426,9 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   `read_ick_counts` (M2-S13, ADR-0018 D6): a header-hop footer peek (counts
   under the footer's own CRC; the streaming pass still runs the full audit)
   feeding `Keyspace::reserve_ns` before the bulk apply (measured: the
-  doubling-rehash storm cost ~15% of replay throughput).
+  doubling-rehash storm cost ~15% of replay throughput). Both the stream
+  writer and footer-audit count `StringPostImage | DocFull` as namespace
+  entries; metadata records do not inflate the presize count.
 - Writer tiers: `IckStream` (double-buffered section pair, `SectionLease`
   custody — the reactor tier rides `IoOp::LogWrite`/`Fdatasync` on the
   `.ick` fd with `TokenClass::CkptWrite/CkptSync`) and `SyncIckWriter`
@@ -361,6 +442,12 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   (counts + digest + no trailing bytes); every structural error is typed
   and fail-stop for recovery. Fuzz target `ick_decode` (per-PR smoke +
   nightly hour).
+- The document walker borrows tape images and freezes arena trees through
+  per-store recycled output/walk/frame scratch. No per-entry allocation is
+  introduced by a document-heavy checkpoint. The layout-independent state
+  digest folds canonical idoc bytes, nonzero document lineage, **and the
+  u24 document version**; physical form, cadence counters, addresses, and
+  slack are excluded.
 - `ckpt-begin` = record tag 5 (`RecordView::CkptBegin{ns: 0, ckpt_id}`),
   staged through the ordinary ring as `MutationEffect::CkptBegin` — its
   LSN resolves via `FrameLease::lsn_of` at LOG; replay counts it as
@@ -499,6 +586,9 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   (the S12-measured foreground cliff).
 - Counters: `manifests_published`, `segments_truncated`,
   `log_segments_live` join `INFO persistence` (S21 vocabulary).
+  M3-S17 adds `doc_deltas_skipped_stale` and
+  `doc_deltas_skipped_missing`; fuzzy-checkpoint overlap skips are
+  observable facts, never silent replay drops.
 - M2-S22 additions to `INFO persistence` (additive, campaign observables):
   `log_frames_queued` (cumulative frames handed to the LOG writev — the
   `log_writes_per_iter` tripwire numerator over `raw_iterations`) and

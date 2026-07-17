@@ -7,6 +7,7 @@
 //! - `gate-run m0` — replicate runner + gate-report generator against
 //!   `docs/milestones/m0-gates.toml` (M0-S18/S19 scaffold).
 //! - `zipfian` — zipfian LFU hit-rate parity vs Redis (M1 `hit_rate_parity`).
+//! - `doc-corpus` — seeded M3 JSON reference-corpus generator (M3-S20).
 //!
 //! Tooling tier: `std::thread` and blocking sockets are fine here; this
 //! binary never runs on the data plane. It deliberately does not depend on
@@ -16,6 +17,7 @@
 
 mod bootstorm;
 mod cli;
+mod doc_corpus;
 mod envcheck;
 mod gaterun;
 mod gates;
@@ -51,6 +53,11 @@ USAGE:
                    [--maxmemory-mb N] [--value-size BYTES] [--cells N] [--window N]
                    [--threshold-pp F] [--infinityd-bin PATH] [--redis-bin PATH]
                    [--artifacts-root DIR] [--reference-box]
+    inf-bench doc-corpus --seed N [--out DIR]
+                   [--pipe FILE --counts shape=N[,shape=N...]]
+                   (--pipe emits a RESP JSON.SET load file with per-index
+                    unique documents — corpus v2, ADR-0046 D3; the RSS
+                    gate binds on this form)
 
 See bins/inf-bench/README.md for what runs on macOS vs what is Linux-pending.";
 
@@ -67,6 +74,7 @@ fn main() -> ExitCode {
         "gate-run" => gaterun::cmd_gate_run(rest),
         "boot-storm" => bootstorm::cmd_boot_storm(rest),
         "zipfian" => zipfian::cmd_zipfian(rest),
+        "doc-corpus" => doc_corpus::cmd_doc_corpus(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())

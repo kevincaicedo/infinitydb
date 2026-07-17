@@ -1,0 +1,29 @@
+   Compiling inf-doc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-doc)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 20.60s
+     Running benches/parse.rs (target/release/deps/parse-c3274eca77934232)
+Benchmarking parse/gate-1KiB
+Benchmarking parse/gate-1KiB: Warming up for 3.0000 s
+Benchmarking parse/gate-1KiB: Collecting 100 samples in estimated 5.0045 s (3.4M iterations)
+Benchmarking parse/gate-1KiB: Analyzing
+parse/gate-1KiB         time:   [1.4869 µs 1.4877 µs 1.4885 µs]
+                        thrpt:  [526.01 MiB/s 526.30 MiB/s 526.56 MiB/s]
+                 change:
+                        time:   [−2.3092% −2.0578% −1.8246%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.8586% +2.1010% +2.3637%]
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+Benchmarking parse/medium-2KiB
+Benchmarking parse/medium-2KiB: Warming up for 3.0000 s
+Benchmarking parse/medium-2KiB: Collecting 100 samples in estimated 5.0116 s (2.0M iterations)
+Benchmarking parse/medium-2KiB: Analyzing
+parse/medium-2KiB       time:   [2.5572 µs 2.5583 µs 2.5596 µs]
+                        thrpt:  [519.02 MiB/s 519.27 MiB/s 519.50 MiB/s]
+                 change:
+                        time:   [−1.1555% −1.0816% −1.0025%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.0126% +1.0934% +1.1690%]
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+

@@ -281,7 +281,7 @@ impl IckStream {
         }
         view.encode_into(buf);
         self.staged_records += 1;
-        if let RecordView::StringPostImage { ns, .. } = view {
+        if let RecordView::StringPostImage { ns, .. } | RecordView::DocFull { ns, .. } = view {
             match self.entries_per_ns.iter_mut().find(|(id, _)| *id == ns.0) {
                 Some((_, n)) => *n += 1,
                 None => self.entries_per_ns.push((ns.0, 1)),
@@ -891,7 +891,9 @@ impl<File: SegmentFile> IckReader<File> {
                 while !body.is_empty() {
                     let (view, consumed) = decode_record(body)
                         .map_err(|error| IckReadError::Record { section: self.sections, error })?;
-                    if let RecordView::StringPostImage { ns, .. } = view {
+                    if let RecordView::StringPostImage { ns, .. } | RecordView::DocFull { ns, .. } =
+                        view
+                    {
                         match self.entries_seen.iter_mut().find(|(id, _)| *id == ns.0) {
                             Some((_, n)) => *n += 1,
                             None => self.entries_seen.push((ns.0, 1)),
