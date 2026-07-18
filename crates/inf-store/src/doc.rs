@@ -1212,6 +1212,58 @@ impl CellStore {
                 self.docs.domain.docs_live += 1;
                 Ok(())
             } else {
+                // A same-size-class overwrite of an existing tape blob
+                // rewrites the blob bytes in place instead of paying
+                // alloc + copy + release + double accounting per op —
+                // the SET path already reuses record slots this way, and
+                // the asymmetry was the measured jset-only churn
+                // (A/B: .artifacts/m3/jset-server-20260717/). Ordering:
+                // the record write commits before blob bytes change, so
+                // a refused write leaves the old document fully intact
+                // (ADR-0037 D3); the class-local resize is reversible.
+                if let Some((record_addr, record_len)) = existing
+                    && let DocPayload::Blob { addr: blob_addr, len: blob_len } =
+                        payload_of(&self.arena, record_addr, record_len)
+                {
+                    let old_blob_len = blob_len as usize;
+                    let old_dict_len = dict_len_of(self.docs.arena.bytes(blob_addr, old_blob_len));
+                    if self.docs.arena.resize_in_place(blob_addr, old_blob_len, stored.len()) {
+                        let handle =
+                            encode_tape_handle(blob_addr, stored.len() as u32, cadence, lineage);
+                        let spec = RecordSpec {
+                            key,
+                            value: &handle,
+                            version,
+                            expire_at_ms,
+                            kind: RecordKind::JsonDoc,
+                        };
+                        return match self.write_record_carrying(key, existing, spec) {
+                            Ok(()) => {
+                                self.docs
+                                    .arena
+                                    .bytes_mut(blob_addr, stored.len())
+                                    .copy_from_slice(stored);
+                                shift(&mut self.docs.domain.tape_bytes, old_blob_len, stored.len());
+                                shift(
+                                    &mut self.docs.domain.intern_bytes,
+                                    old_dict_len as usize,
+                                    dict_len as usize,
+                                );
+                                // One live document before and after: docs_live unchanged.
+                                Ok(())
+                            }
+                            Err(e) => {
+                                let restored = self.docs.arena.resize_in_place(
+                                    blob_addr,
+                                    stored.len(),
+                                    old_blob_len,
+                                );
+                                debug_assert!(restored, "same-class blob resize is reversible");
+                                Err(e)
+                            }
+                        };
+                    }
+                }
                 let blob = self.docs.arena.alloc(stored.len()).ok_or(OpError::OutOfMemory)?;
                 self.docs.arena.bytes_mut(blob, stored.len()).copy_from_slice(stored);
                 let handle = encode_tape_handle(blob, stored.len() as u32, cadence, lineage);
