@@ -1,0 +1,328 @@
+# InfinityDB CI — full suite (on-demand).
+#
+# Runs the slow / broad jobs that the fast PR lane (infinity-ci.yml) leaves
+# out: the full 3-OS build matrix, full strict-provenance Miri (the M0-S02
+# acceptance gate), the all-target fuzz smoke, client-smoke, kernel-matrix,
+# and a benchmark COMPILE smoke.
+#
+# Triggers:
+#   • pull_request labeled `ci-full` — add the label to a PR to run the full
+#     suite. `pull_request` uses the workflow file from the PR branch, so this
+#     is the path that works for PR #1 (before this file is on `main`).
+#   • issue_comment `/ci-full` on a PR, from a maintainer (author_association
+#     OWNER / MEMBER / COLLABORATOR). GitHub loads comment-triggered workflows
+#     from the DEFAULT branch, so `/ci-full` (and the "Run workflow" button)
+#     activate only once this file is merged to `main`.
+#   • workflow_dispatch — the Actions "Run workflow" button (also requires the
+#     file on `main`).
+#
+# Real benchmark *numbers* never come from CI (shared runners; L10 / §19).
+# The bench job here is a compile + run-once smoke only; gate numbers come
+# from the reference-box campaign (M3 plan H6: inf-bench gate-run
+# --reference-box, inf-compare).
+name: infinity-ci-full
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled] # add the `ci-full` label to run the suite on a PR
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: infinity-ci-full-${{ github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  authorize:
+    # Gate the suite, acknowledge the command, and resolve the commit to test.
+    #   - workflow_dispatch: always runs, tests the dispatched branch head.
+    #   - issue_comment: runs only for a `/ci-full` comment on a PR from a
+    #     maintainer; tests the PR head SHA.
+    #   - random issue comments: this `if` is false, so the job (and every
+    #     job that `needs` it) is skipped — no runner is spent.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.label.name == 'ci-full') ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '/ci-full') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: acknowledge the /ci-full command
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket',
+            });
+      - name: resolve commit to test
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (context.eventName === 'issue_comment') {
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+              });
+              core.setOutput('sha', pr.data.head.sha);
+            } else if (context.eventName === 'pull_request') {
+              core.setOutput('sha', context.payload.pull_request.head.sha);
+            } else {
+              core.setOutput('sha', context.sha);
+            }
+
+  build-test-matrix:
+    needs: authorize
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: dep-DAG law
+        run: ./scripts/check-dep-dag.sh
+      - name: cell deny-list
+        run: ./scripts/check-cell-denylist.sh
+      - name: fault-point inventory (M2-S16)
+        run: ./scripts/check-fault-points.sh
+      - name: fsync fail-stop grep (M2-S17, §8.4)
+        run: ./scripts/check-fsync-fail-stop.sh
+      - name: panic-policy grep (M2.5-S13)
+        run: ./scripts/check-panic-policy.sh
+      - name: SAFETY.md inventory (M2.5-S16, §17.3)
+        run: ./scripts/check-safety-inventory.sh
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: build
+        run: cargo build --workspace
+      - name: test
+        run: cargo test --workspace
+
+  miri:
+    # Full M0-S02 gate: strict-provenance Miri on both unsafe leaves.
+    needs: authorize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: miri (inf-alloc, inf-fabric) strict provenance
+        run: cargo +nightly miri test -p inf-alloc -p inf-fabric
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+
+  fuzz-smoke:
+    # Full 11-target smoke, 300 s each. The json_parse / path_program targets
+    # take an explicit writable corpus dir that is gitignored; create it so a
+    # fresh checkout does not fail with "required directory ... does not exist"
+    # (the run #9 fuzz-smoke failure). The committed seed corpora
+    # (fuzz/corpora/*) already exist.
+    needs: authorize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: fuzz RESP parser (smoke)
+        run: cargo +nightly fuzz run resp_parse -- -max_total_time=300
+        working-directory: crates/inf-wire
+      - name: fuzz fabric codec (smoke)
+        run: cargo +nightly fuzz run fabric_codec -- -max_total_time=300
+        working-directory: crates/inf-fabric
+      - name: fuzz glob matcher (smoke, M1 §5)
+        run: cargo +nightly fuzz run glob_match -- -max_total_time=300
+        working-directory: crates/inf-server
+      - name: fuzz SCAN cursor (smoke, M1 §5)
+        run: cargo +nightly fuzz run scan_cursor -- -max_total_time=300
+        working-directory: crates/inf-server
+      - name: fuzz log frame decoder (smoke, M2-S01)
+        run: cargo +nightly fuzz run frame_decode -- -max_total_time=300
+        working-directory: crates/inf-log
+      - name: fuzz segment reader (smoke, M2-S04)
+        run: cargo +nightly fuzz run segment_read -- -max_total_time=300
+        working-directory: crates/inf-log
+      - name: fuzz .ick loader (smoke, M2-S10)
+        run: cargo +nightly fuzz run ick_decode -- -max_total_time=300
+        working-directory: crates/inf-log
+      - name: fuzz idoc decoder (smoke, M3-S01/S02)
+        run: cargo +nightly fuzz run idoc_decode -- -max_total_time=300
+        working-directory: crates/inf-doc
+      - name: fuzz JSON parser (smoke, M3-S05; seeded from the committed minimized corpus, M3-S07)
+        run: |
+          mkdir -p fuzz/corpus/json_parse
+          cargo +nightly fuzz run json_parse fuzz/corpus/json_parse fuzz/corpora/json -- -max_total_time=300
+        working-directory: crates/inf-doc
+      - name: fuzz path programs (smoke, M3-S08/S09; seeded from the pinned child-len-overflow regression)
+        run: |
+          mkdir -p fuzz/corpus/path_program
+          cargo +nightly fuzz run path_program fuzz/corpus/path_program fuzz/corpora/path_program -- -max_total_time=300
+        working-directory: crates/inf-doc
+
+  client-smoke:
+    # M1-S03/S14: major Redis client libraries work against infinityd out of
+    # the box. One server serves all four sequentially.
+    needs: authorize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: build infinityd (release)
+        run: cargo build --release -p infinityd
+      - name: start infinityd
+        run: |
+          ./target/release/infinityd --port 6379 &
+          ready=0
+          for i in $(seq 1 100); do
+            if printf '*1\r\n$4\r\nPING\r\n' | timeout 1 nc 127.0.0.1 6379 | grep -q PONG; then
+              ready=1; break
+            fi
+            sleep 0.2
+          done
+          test "$ready" = 1 || { echo "infinityd never answered PING"; exit 1; }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: redis-py smoke
+        timeout-minutes: 5
+        run: |
+          pip install 'redis>=5,<7'
+          python tests/client-smoke/smoke.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: node-redis smoke
+        timeout-minutes: 5
+        run: |
+          npm install --no-save redis@^4
+          node smoke.mjs
+        working-directory: tests/client-smoke
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: go-redis smoke
+        timeout-minutes: 5
+        run: go mod tidy && go run .
+        working-directory: tests/client-smoke/go
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: lettuce smoke
+        timeout-minutes: 10
+        run: mvn -q -B compile exec:java -Dexec.mainClass=Smoke
+        working-directory: tests/client-smoke/java
+
+  kernel-matrix:
+    # io_uring feature-probe fallback across kernels (M0-S02).
+    needs: authorize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: uring suite, probed features
+        run: cargo test -p inf-runtime --features uring
+      - name: uring suite, forced-degraded (oneshot recv, no provided buffers)
+        run: cargo test -p inf-runtime --features uring
+        env:
+          INF_URING_FORCE_DEGRADED: "1"
+
+  bench-build:
+    # Benchmark COMPILE smoke only — verifies the campaign harnesses and the
+    # criterion benches build in release. NO measurements: CI runners never
+    # back a number (L10 / §19). Real gate numbers come from the reference
+    # box (inf-bench gate-run --reference-box, inf-compare).
+    needs: authorize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: campaign harnesses build (release)
+        run: cargo build --release -p inf-bench -p inf-compare -p inf-sim
+      - name: criterion benches compile (no run)
+        run: cargo bench --workspace --no-run
+
+  report:
+    # Post the outcome back to the PR when invoked via /ci-full.
+    needs: [authorize, build-test-matrix, miri, fuzz-smoke, client-smoke, kernel-matrix, bench-build]
+    # always() so the outcome posts even when a heavy job fails; the
+    # authorize guard stops an unauthorized comment (authorize skipped)
+    # from ever posting a report.
+    if: always() && needs.authorize.result != 'skipped' && github.event_name == 'issue_comment'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const r = ${{ toJSON(needs) }};
+            const order = ['build-test-matrix','miri','fuzz-smoke','client-smoke','kernel-matrix','bench-build'];
+            const icon = s => s === 'success' ? '✅' : s === 'skipped' ? '⏭️' : '❌';
+            const lines = order.map(k => `- ${icon(r[k] && r[k].result)} ${k}: ${r[k] ? r[k].result : 'n/a'}`);
+            const anyFail = order.some(k => r[k] && r[k].result !== 'success' && r[k].result !== 'skipped');
+            const body = [
+              `### infinity-ci-full ${anyFail ? '❌ failed' : '✅ passed'}`,
+              '',
+              ...lines,
+              '',
+              `[Full run log](${url})`,
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });

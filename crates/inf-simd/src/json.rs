@@ -1082,6 +1082,13 @@ mod tests {
             blocks.clear();
             super::super::classify_blocks_with(input, &mut blocks, scalar_classify_block);
             let streamed_scalar_classify = drain_cursor(&blocks);
+            // `tiers` is only mutated on x86_64 (the SSE2 tiers pushed in the
+            // cfg block below). On other arches (aarch64 CI: ubuntu-arm,
+            // macos-15) that block is compiled out, so the binding is not
+            // mutated and `-D warnings` trips `unused_mut`. Scope the allow to
+            // the arches where it is genuinely unused rather than blanket-
+            // allowing, so the x86_64 lint stays live.
+            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
             let mut tiers = vec![dispatched, scalar, streamed, streamed_scalar_classify];
             #[cfg(target_arch = "x86_64")]
             {
