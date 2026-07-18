@@ -13,7 +13,7 @@ use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_runtime::{
     BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken, IoOp, RawFd,
-    StableBytes, SubmitStats, Wait,
+    StableBytes, StableBytesMut, SubmitStats, Wait,
 };
 use inf_server::SimDisk;
 
@@ -197,14 +197,29 @@ impl SimDriver {
     }
 }
 
-/// The one audited unsafe in `inf-sim` (see `SAFETY.md`): a backend
-/// driver executing an op reads its `StableBytes` payload.
+/// Audited unsafe (see `SAFETY.md`): a backend driver executing an op
+/// reads its `StableBytes` payload.
 fn stable_slice(data: &StableBytes) -> &[u8] {
     // SAFETY: the plane holds the staging `FrameLease` until this op's
     // terminal completion (the `StableBytes::new` contract, ADR-0013);
     // we are inside `submit_and_reap`, strictly before that completion
     // is delivered, so the bytes are live, at this address, unmodified.
     unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len() as usize) }
+}
+
+/// Audited unsafe (see `SAFETY.md`): a backend driver executing a
+/// `TierRead` fills its `StableBytesMut` target (M4-S04). The mut-from-
+/// ref shape is the point: `StableBytesMut` is a `Copy` raw-pointer
+/// capability whose exclusivity comes from its constructor's contract,
+/// not from the borrow — exactly what the uring tier hands the kernel.
+#[allow(clippy::mut_from_ref)]
+fn stable_mut_slice(buf: &StableBytesMut) -> &mut [u8] {
+    // SAFETY: the issuing command holds the aligned-pool lease and does
+    // not touch the buffer until this op's terminal completion (the
+    // `StableBytesMut::new` contract); we are inside `submit_and_reap`,
+    // strictly before that completion is delivered, so the bytes are
+    // live, at this address, and unaliased.
+    unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len() as usize) }
 }
 
 impl BackendDriver for SimDriver {
@@ -342,6 +357,20 @@ impl BackendDriver for SimDriver {
                             }
                         }
                     }
+                }
+                IoOp::TierRead { fd, offset, buf, token } => {
+                    let disk = self
+                        .disk
+                        .as_ref()
+                        .expect("tiered sim scenarios construct SimDriver::with_disk (M4-S04)");
+                    let dest = stable_mut_slice(&buf);
+                    // The op contract: `TierRead` means the buffer is
+                    // FULL; EOF inside the flushed range is corruption.
+                    let result = match disk.driver_read_at(fd, offset, dest) {
+                        Ok(n) if n == dest.len() => CompletionResult::TierRead,
+                        Ok(_) | Err(_) => CompletionResult::Error { errno: libc::EIO, buf: None },
+                    };
+                    out.push(Completion { token, result });
                 }
                 IoOp::Fdatasync { fd, token } => {
                     let disk = self

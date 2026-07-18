@@ -419,6 +419,8 @@ dependencies = [
  "criterion",
  "inf-alloc",
  "inf-foundation",
+ "inf-log",
+ "inf-store",
  "io-uring",
  "libc",
  "proptest",

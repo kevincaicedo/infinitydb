@@ -25,7 +25,7 @@ use inf_foundation::hash64;
 use inf_foundation::time::Nanos;
 use inf_log::{FsyncClass, NsId, RecordView as LogRecordView};
 
-use crate::address_space::TieringCounters;
+use crate::address_space::{AddressSpaceConfig, TieringCounters};
 use crate::catalog::NsCatalog;
 use crate::evict::{EvictStats, EvictionPolicy};
 use crate::ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsRegistry, NsSpec};
@@ -187,6 +187,33 @@ impl Keyspace {
     /// steel thread materializes one).
     pub fn tiered_tables(&self) -> usize {
         self.tiered_stores.len()
+    }
+
+    /// Materializes the tiered record table for namespace `ns` (M4-S04 —
+    /// the first `tiered_stores` entry). `false` when the ring
+    /// reservation fails or the table already exists — namespace creation
+    /// surfaces both typed. Command routing to tiered tables joins with
+    /// the E2/E3 stories; until then the flush/demotion drivers and the
+    /// steel thread reach the table through
+    /// [`tiered_store_mut`](Self::tiered_store_mut).
+    pub fn materialize_tiered(
+        &mut self,
+        ns: NsId,
+        config: AddressSpaceConfig,
+        initial_keys: usize,
+    ) -> bool {
+        if self.tiered_stores.iter().any(|(nid, _)| *nid == ns) {
+            return false;
+        }
+        let Some(table) = TieredTable::new(config, initial_keys) else { return false };
+        self.tiered_stores.push((ns, Box::new(table)));
+        true
+    }
+
+    /// The tiered table for namespace `ns`, if materialized.
+    pub fn tiered_store_mut(&mut self, ns: NsId) -> Option<&mut TieredTable> {
+        let i = self.tiered_stores.iter().position(|(nid, _)| *nid == ns)?;
+        Some(self.tiered_stores[i].1.as_mut())
     }
 
     /// Aggregated tiering code-path counters across every tiered table on

@@ -498,6 +498,31 @@ impl SimDisk {
         Ok(())
     }
 
+    /// Driver tier (M4-S04): execute a `TierRead` against a fake file fd
+    /// — reads the OS (page-cache) view, exactly what a live kernel
+    /// serves. Returns the bytes copied; a read past EOF returns the
+    /// available prefix (pread(2) semantics — the driver's op contract
+    /// turns an incomplete fill into `EIO`).
+    ///
+    /// # Errors
+    /// As [`Self::driver_write_at`].
+    pub fn driver_read_at(&self, fd: i32, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let mut state = self.state.borrow_mut();
+        state.tick_op()?;
+        let ino = file_fd_ino(fd)?;
+        let inode = state
+            .inodes
+            .get(&ino)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
+        let offset = usize::try_from(offset).expect("offset fits usize");
+        if offset >= inode.os.len() {
+            return Ok(0);
+        }
+        let n = buf.len().min(inode.os.len() - offset);
+        buf[..n].copy_from_slice(&inode.os[offset..offset + n]);
+        Ok(n)
+    }
+
     /// Driver tier: execute an `Fdatasync` against a fake fd — a file
     /// fd flushes the inode; a dir fd is the dir barrier.
     ///

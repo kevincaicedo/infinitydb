@@ -32,6 +32,7 @@ mod scan;
 mod segment;
 mod staging;
 mod tail;
+pub mod tier;
 
 pub use ckpt::{CkptConfig, IckStream, IckSummary, SectionLease};
 pub use commit::{CommitStats, FsyncClass, FsyncTicket, GroupCommit, SyncReason};
@@ -63,3 +64,7 @@ pub use staging::{
     StagingStats,
 };
 pub use tail::{LogCorruption, RegionEvidence, RegionScan, scan_region, scan_region_evidence};
+pub use tier::{
+    TIER_FRAME_BYTES, TIER_FRAME_DATA, TIER_HEADER_BYTES, TierCorruption, TierWriter, tier_extract,
+    tier_file_name, tier_frame_offset, tier_frame_span,
+};

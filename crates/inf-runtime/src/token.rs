@@ -31,6 +31,10 @@ pub enum TokenClass {
     /// fsync-class steps ride the driver so publication never stalls the
     /// loop; at most one is in flight per cell.
     ManifestSync = 9,
+    /// Cold-tier positional file read (M4-S04 steel thread; hardened by
+    /// M4-S08). The first consumer of the `IoGate` seam M0 built — a
+    /// command suspends on this token while NVMe works (L6).
+    TierRead = 10,
 }
 
 impl TokenClass {
@@ -46,6 +50,7 @@ impl TokenClass {
             7 => Some(TokenClass::CkptWrite),
             8 => Some(TokenClass::CkptSync),
             9 => Some(TokenClass::ManifestSync),
+            10 => Some(TokenClass::TierRead),
             _ => None,
         }
     }
@@ -122,6 +127,7 @@ mod tests {
             TokenClass::CkptWrite,
             TokenClass::CkptSync,
             TokenClass::ManifestSync,
+            TokenClass::TierRead,
         ] {
             for (slot, generation) in
                 [(0, 0), (1, u32::MAX), (MAX_SLOT, 7u32), (0xAB_CDEF, 0xDEAD_BEEF)]

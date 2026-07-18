@@ -37,6 +37,11 @@ harness = false
 test = false
 
 [[bench]]
+name = "mutation"
+harness = false
+test = false
+
+[[bench]]
 name = "doc_ingest"
 harness = false
 test = false

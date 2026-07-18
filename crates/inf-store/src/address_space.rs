@@ -350,11 +350,17 @@ impl AddressSpace {
         }
     }
 
-    /// Dead-byte attribution hook: the S06 copy-to-tail repoint and the
-    /// delete path charge the displaced record's bytes here at the moment
-    /// the index stops pointing at them (the S14 live-set input — named
-    /// per the M4 plan so refcounts (S17) ride the same site).
-    pub fn note_dead_bytes(&mut self, len: u64) {
+    /// Dead-byte attribution hook (M4-S06): the copy-to-tail repoint and
+    /// the delete path charge the displaced record's bytes here at the
+    /// moment the index stops pointing at them — never later (attributing
+    /// at compaction-read time would make S14's counters lazy-wrong
+    /// forever, per the plan's pitfall note). The address names the
+    /// containing range: S14 keys these bytes per tier file from exactly
+    /// this coordinate, and S17's blob refcounts ride the same site.
+    pub fn note_dead_bytes(&mut self, addr: LogicalAddr, len: u64) {
+        let a = addr.to_raw();
+        debug_assert!(a >= self.life_origin, "dead range below this life");
+        debug_assert!(a + len <= self.tail, "dead range past tail");
         self.dead_bytes += len;
         debug_assert!(self.dead_bytes <= self.tail - self.life_origin, "dead exceeds allocated");
     }

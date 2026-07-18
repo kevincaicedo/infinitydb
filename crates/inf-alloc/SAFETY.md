@@ -14,6 +14,9 @@ unit tests under Miri.
 | `region.rs::protect_read_write` / `release_and_protect_none` (`mprotect`/`madvise`) | page-aligned range inside the live reservation, asserted against the per-page commit bitmap by the callers; DONTNEED/FREE only on committed private anonymous pages; return codes asserted (a failed protect is a violated invariant, not an operating error) | Linux unit tests (`decommit_then_recommit_reuses_pages`); elided under Miri (unsupported shims — the bitmap asserts still run) |
 | `region.rs::bytes`/`bytes_mut` (`from_raw_parts[_mut]`) | offset+len bounds-checked against the reservation; touched pages committed (debug-asserted per page; release builds rely on the owner's watermark discipline, M4-S01); `&self`/`&mut self` provide aliasing discipline; mapping outlives the region | whole region test suite under Miri |
 | `region.rs::Drop` (`libc::munmap`) | base/len are exactly the one live mapping created in `map_reservation`, owned for the region's lifetime | every region test's drop |
+| `aligned.rs::AlignedPool::new` / `AlignedBox::new` (`alloc_zeroed`) | non-zero layout asserted before the call; result null-checked; zeroed so a never-filled buffer reads initialized bytes, never uninit | aligned unit tests under Miri |
+| `aligned.rs::bytes`/`bytes_mut` (both types, `from_raw_parts[_mut]`) | id/len bounds-checked always-on before the offset is formed; allocation lives for the owner's lifetime; `&self`/`&mut self` provide aliasing discipline | aligned unit tests under Miri (`every_buffer_is_aligned_and_disjoint`) |
+| `aligned.rs::Drop` (both types, `dealloc`) | ptr/layout are exactly the live allocation made in `new`, owned for the value's lifetime | every aligned test's drop |
 
 `buffer_pool` remains 100% safe code.
 

@@ -29,6 +29,10 @@ proptest.workspace = true
 criterion.workspace = true
 # Conformance tests poke sockets (setsockopt) directly.
 libc.workspace = true
+# M4-S04 steel thread: the integration vertical crosses store/log/alloc.
+# Dev-only — tests may cross layers (dep-dag exemption).
+inf-store.workspace = true
+inf-log.workspace = true
 
 [[bench]]
 name = "executor"

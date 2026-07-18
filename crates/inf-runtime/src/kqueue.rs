@@ -22,7 +22,7 @@ use inf_alloc::{BufferId, BufferPool, LeaseKind};
 
 use crate::driver::{
     BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
-    SubmitStats, Wait,
+    StableBytesMut, SubmitStats, Wait,
 };
 use crate::token::CompletionToken;
 
@@ -189,6 +189,15 @@ impl KqueueDriver {
                 }
                 IoOp::Fdatasync { fd, token } => {
                     out.push(sync_file(fd, token, &mut self.stats));
+                }
+                IoOp::TierRead { fd, offset, buf, token } => {
+                    out.push(Completion {
+                        token,
+                        result: match tier_pread_all(fd, offset, buf, &mut self.stats) {
+                            Ok(()) => CompletionResult::TierRead,
+                            Err(errno) => CompletionResult::Error { errno, buf: None },
+                        },
+                    });
                 }
             }
         }
@@ -527,6 +536,46 @@ fn log_pwrite_all(
         stats.syscalls += 1;
         if n > 0 {
             written += n as u32;
+            continue;
+        }
+        if n == 0 {
+            return Err(libc::EIO);
+        }
+        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        if errno == libc::EINTR {
+            continue;
+        }
+        return Err(errno);
+    }
+    Ok(())
+}
+
+/// Synchronous positional read of the whole range (M4-S04; short reads
+/// retried in place — the readiness tier has no async file I/O). EOF
+/// before the buffer fills is `EIO`: tier reads are always within the
+/// flushed range, so a short file is corruption, not a condition.
+fn tier_pread_all(
+    fd: RawFd,
+    offset: u64,
+    buf: StableBytesMut,
+    stats: &mut SubmitStats,
+) -> Result<(), i32> {
+    let mut got: u32 = 0;
+    while got < buf.len() {
+        // SAFETY: `buf` upholds the StableBytesMut contract (live, stable,
+        // unaliased for the duration of the op); `got` never exceeds
+        // `buf.len()`.
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf.as_mut_ptr().add(got as usize).cast(),
+                (buf.len() - got) as usize,
+                (offset + u64::from(got)) as libc::off_t,
+            )
+        };
+        stats.syscalls += 1;
+        if n > 0 {
+            got += n as u32;
             continue;
         }
         if n == 0 {

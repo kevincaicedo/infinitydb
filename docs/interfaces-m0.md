@@ -103,6 +103,15 @@ impl Arena {
 > gains `LogWrite`/`Fdatasync`, `CompletionResult` gains
 > `LogWritten`/`Synced`, `TokenClass` gains `LogWrite = 5`/`Fsync = 6`.
 > Layouts unchanged; the new surface is documented in `interfaces-m2.md`.
+>
+> **Extended at M4-S04 under the same discipline:** `IoOp` gains
+> `TierRead { fd, offset, buf: StableBytesMut, token }` (positional
+> cold-tier read; short reads resubmitted internally — the completion
+> means the buffer is FULL), `CompletionResult` gains `TierRead`,
+> `TokenClass` gains `TierRead = 10`, and `StableBytesMut` joins
+> `StableBytes` as the writable stable-range handoff. Layouts unchanged.
+> The first real consumer of the `IoGate` seam; the cold-read path
+> freezes at M4 exit (M4 plan §3.2) after S08 hardens it.
 
 ```rust
 pub struct CompletionToken(u64);           // {class:8, slot:24, gen:32}

@@ -1,0 +1,7 @@
+--- M4-S05 mutation budget bench (within 1% of the M3 arena path) ---
+in-place rewrite  32K records (cache-hot) arena   4.73 ns/op | tiered   4.74 ns/op (delta +0.01)
+scalar patch      32K records (cache-hot) arena   2.99 ns/op | tiered   3.12 ns/op (delta +0.12)
+relocate          32K records (cache-hot) arena  16.14 ns/op | tiered  44.88 ns/op (delta +28.73)
+in-place rewrite  1M records (miss-bound) arena  14.50 ns/op | tiered  13.91 ns/op (delta -0.59)
+scalar patch      1M records (miss-bound) arena  12.61 ns/op | tiered  12.78 ns/op (delta +0.17)
+relocate          1M records (miss-bound) arena  55.88 ns/op | tiered  93.17 ns/op (delta +37.29)

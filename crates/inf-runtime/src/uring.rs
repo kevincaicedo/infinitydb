@@ -44,7 +44,7 @@ type DriverMap<K, V> = HashMap<K, V, BuildIntHasher>;
 
 use crate::driver::{
     BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
-    SubmitStats, Wait,
+    StableBytesMut, SubmitStats, Wait,
 };
 use crate::token::CompletionToken;
 
@@ -112,6 +112,16 @@ enum OpState {
     LogFsync {
         token: CompletionToken,
         superseded: bool,
+    },
+    /// Positional cold-tier read (M4-S04). Short reads resubmit the
+    /// remainder in place — `TierRead` is delivered only when the buffer
+    /// is full (the `LogWrite` discipline mirrored on the read side).
+    TierRead {
+        fd: RawFd,
+        token: CompletionToken,
+        buf: StableBytesMut,
+        offset: u64,
+        got: u32,
     },
 }
 
@@ -309,6 +319,29 @@ impl UringDriver {
             self.stats.sqes += needed as u64;
         }
         Ok(())
+    }
+
+    /// Arm a positional cold-tier read (M4-S04). `got` > 0 is the
+    /// short-read resubmission path: the remainder reads into the same
+    /// stable buffer at its fill point.
+    fn arm_tier_read(
+        &mut self,
+        fd: RawFd,
+        offset: u64,
+        buf: StableBytesMut,
+        token: CompletionToken,
+        got: u32,
+    ) {
+        let id = self.alloc_id(OpState::TierRead { fd, token, buf, offset, got });
+        // SAFETY: `buf` upholds the StableBytesMut contract (live, stable,
+        // unaliased until terminal completion); `got` never exceeds
+        // `buf.len()`.
+        let ptr = unsafe { buf.as_mut_ptr().add(got as usize) };
+        let entry = opcode::Read::new(Fd(fd), ptr, buf.len() - got)
+            .offset(offset + u64::from(got))
+            .build()
+            .user_data(id);
+        self.push_sqe(entry);
     }
 
     /// Arm a positional log-frame write, optionally with a linked fdatasync
@@ -529,6 +562,9 @@ impl UringDriver {
                         .build()
                         .user_data(id);
                     self.push_sqe(entry);
+                }
+                IoOp::TierRead { fd, offset, buf, token } => {
+                    self.arm_tier_read(fd, offset, buf, token, 0);
                 }
             }
         }
@@ -806,6 +842,30 @@ impl UringDriver {
                     out.push(Completion { token, result: CompletionResult::Synced });
                 } else {
                     let errno = if result == -libc::ECANCELED { libc::ECANCELED } else { -result };
+                    out.push(Completion {
+                        token,
+                        result: CompletionResult::Error { errno, buf: None },
+                    });
+                }
+            }
+            OpState::TierRead { fd, token, buf, offset, got } => {
+                if result > 0 {
+                    let got = got + result as u32;
+                    if got < buf.len() {
+                        // Short read: resubmit the remainder in place.
+                        self.arm_tier_read(fd, offset, buf, token, got);
+                        return;
+                    }
+                    out.push(Completion { token, result: CompletionResult::TierRead });
+                } else {
+                    // result == 0 is EOF inside the flushed range — tier
+                    // reads never overrun the file, so a short file is
+                    // corruption, not a condition (the op contract).
+                    let errno = match result {
+                        0 => libc::EIO,
+                        r if r == -libc::ECANCELED => libc::ECANCELED,
+                        r => -r,
+                    };
                     out.push(Completion {
                         token,
                         result: CompletionResult::Error { errno, buf: None },

@@ -1518,6 +1518,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     cell.on_synced(cx, c.token);
                 }
             }
+            CompletionResult::TierRead => {
+                // The plane issues no TierRead until cold reads wire into
+                // the command path (M4-E3) — routing one here is a bug,
+                // not load (the S03 zero-counter posture, enforced).
+                unreachable!("TierRead completion without a tiered read path (M4-S08 wires it)");
+            }
         }
     }
 
