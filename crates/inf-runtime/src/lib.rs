@@ -30,7 +30,7 @@ mod uring;
 pub use affinity::unpin_current_thread;
 pub use driver::{
     BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
-    SubmitStats, Wait,
+    StableBytesMut, SubmitStats, Wait,
 };
 pub use executor::{CellExecutor, PollImmediate, TaskId};
 pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate, WatermarkWait};

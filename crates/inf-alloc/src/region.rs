@@ -12,9 +12,9 @@
 //!   pages materialize on first touch);
 //! - decommit: `madvise(DONTNEED)` **then** `mprotect(PROT_NONE)` — pages
 //!   go back to the OS immediately (RSS tells the truth in the same
-//!   sample the accounting does, L5) and any stale access to released
-//!   bytes faults deterministically instead of reading garbage (the
-//!   assertion culture applied to the MMU).
+//!   sample the accounting does, L5). Access faults while a page is
+//!   decommitted; after a ring offset is recommitted, Rust borrow/custody
+//!   and owner-side re-resolution — not the MMU — prevent stale access.
 //!
 //! Under Miri the reservation is mapped `READ | WRITE` up front and the
 //! protection calls are elided (Miri models anonymous mmap/munmap but not
@@ -259,7 +259,7 @@ fn release_and_protect_none(base: *mut u8, offset: usize, len: usize) {
     // committed pages, which is exactly the contract of decommit.
     let rc = unsafe { libc::madvise(base.add(offset).cast(), len, ADVICE) };
     assert!(rc == 0, "madvise(decommit) failed: {}", std::io::Error::last_os_error());
-    // SAFETY: same range; PROT_NONE makes stale access fault.
+    // SAFETY: same range; PROT_NONE makes access fault until recommit.
     let rc = unsafe { libc::mprotect(base.add(offset).cast(), len, libc::PROT_NONE) };
     assert!(rc == 0, "mprotect(decommit) failed: {}", std::io::Error::last_os_error());
 }

@@ -71,6 +71,52 @@ impl StableBytes {
     }
 }
 
+/// A writable byte range whose stability outlives the borrow it was made
+/// from — the handoff shape for cold-tier reads (M4-S04). The canonical
+/// stability proof is an `inf-alloc` aligned-pool lease: the buffer's
+/// address is stable for the pool's lifetime and the lease is released
+/// only after the op's terminal completion (`TierRead` or `Error`).
+#[derive(Copy, Clone, Debug)]
+pub struct StableBytesMut {
+    ptr: *mut u8,
+    len: u32,
+}
+
+impl StableBytesMut {
+    /// Capture `bytes` as a read target for a driver op that outlives
+    /// this borrow.
+    ///
+    /// # Safety
+    /// The caller must guarantee the bytes stay live, at this address,
+    /// and **unaliased** (no other reader or writer touches them) until
+    /// the op carrying them reaches its terminal completion. Holding an
+    /// aligned-pool lease until that completion — and not reading the
+    /// buffer until it arrives — satisfies this.
+    #[must_use]
+    pub unsafe fn new(bytes: &mut [u8]) -> StableBytesMut {
+        StableBytesMut {
+            ptr: bytes.as_mut_ptr(),
+            len: u32::try_from(bytes.len()).expect("stable byte range fits u32"),
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Address for the backend syscall/SQE (see [`StableBytes::as_ptr`]).
+    #[must_use]
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+}
+
 /// Operations a cell may queue. `push` never performs a syscall — everything
 /// goes out in the single `submit_and_reap` per loop iteration (L3).
 #[derive(Debug)]
@@ -113,6 +159,17 @@ pub enum IoOp {
     /// Standalone fdatasync-class barrier (everysec tick, segment seal —
     /// M2-S05). `Synced` on completion is the durability fact (L2).
     Fdatasync { fd: RawFd, token: CompletionToken },
+    /// Positional cold-tier file read of exactly `buf.len()` bytes
+    /// (M4-S04). Short reads are resubmitted internally: `TierRead` means
+    /// the buffer is FULL. The issuing command holds the buffer's
+    /// aligned-pool lease across its suspension (the lease id is plain
+    /// data, not a borrow — the M0 custody rule) and releases it after
+    /// the terminal completion, on success and on `Error` alike; no
+    /// `BufferId` rides the completion because the recv pool is not
+    /// involved. A read past EOF that cannot fill the buffer completes
+    /// `Error{EIO}` — tier reads are always within the flushed range, so
+    /// a short file is corruption, not a condition.
+    TierRead { fd: RawFd, offset: u64, buf: StableBytesMut, token: CompletionToken },
 }
 
 /// One reaped completion: the token that was armed plus the outcome.
@@ -148,6 +205,10 @@ pub enum CompletionResult {
     /// An fdatasync completed: everything it covers is durable. The ONLY
     /// event that may advance the durability watermark (§8.2, ADR-0013).
     Synced,
+    /// A `TierRead` filled its whole buffer (M4-S04). The issuing command
+    /// resumes, **re-resolves the address**, and only then deserializes —
+    /// never a pre-suspension pointer (the M0 custody rule).
+    TierRead,
     Closed,
     /// Terminal failure. Any buffer the op still held ALWAYS comes back
     /// here; `None` means no consumer-owned buffer was involved.

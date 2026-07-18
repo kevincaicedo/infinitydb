@@ -112,6 +112,32 @@ fn main() {
         run_m2_combined(seed, verify, sweep, shard, out_dir.as_deref());
         return;
     }
+    // The M4-S04 steel-thread scenario (tiered lifecycle + cold reads
+    // through suspension + the S06 crash/replay content oracle).
+    if scenario_name == "m4-steel" {
+        let scenario = inf_sim::SteelScenario::m4_steel(seed);
+        let report = inf_sim::run_steel_scenario(&scenario);
+        println!(
+            "inf-sim: scenario m4-steel seed {seed:#x}: {} cold reads, {} promotions, \
+             hash {:#018x}",
+            report.cold_reads, report.promotions, report.trace_hash
+        );
+        if verify {
+            let second = inf_sim::run_steel_scenario(&scenario);
+            assert_eq!(
+                report.trace_hash, second.trace_hash,
+                "m4-steel determinism: second run diverged"
+            );
+            println!("inf-sim: determinism verified — second run hash-identical");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
     // The M2.5-S01 boot-storm scenario (wedge-class oracle).
     if scenario_name == "boot-storm" {
         let scenario = inf_sim::BootStormScenario::m2_boot_storm(seed);
@@ -147,7 +173,7 @@ fn main() {
         other => {
             eprintln!(
                 "inf-sim: unknown scenario {other} (have: m0-smoke, m1-cache, m2-durable, \
-                 m3-document, m2-combined, boot-storm)"
+                 m3-document, m2-combined, boot-storm, m4-steel)"
             );
             std::process::exit(2);
         }

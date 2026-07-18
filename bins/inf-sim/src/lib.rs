@@ -19,8 +19,10 @@ pub mod durable;
 pub mod harness;
 pub mod net;
 pub mod resp;
+pub mod steel;
 
 pub use bootstorm::{BootStormReport, BootStormScenario, run_boot_storm_scenario};
 pub use combined::{CombinedReport, CombinedScenario, run_combined_scenario};
 pub use durable::{DurableReport, DurableScenario, run_durable_scenario};
 pub use harness::{Scenario, SimReport, run_scenario};
+pub use steel::{SteelReport, SteelScenario, run_steel_scenario};

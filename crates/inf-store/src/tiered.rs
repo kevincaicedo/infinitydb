@@ -14,10 +14,10 @@
 //! addresses, so the resumed command re-resolves by contract (the M0
 //! custody rule).
 //!
-//! Mutation surface in S02 is the index+space contract only — insert /
-//! overwrite (copy-to-tail, the S06 shape) / delete. In-place mutable-
-//! region updates are M4-S05; TTL, eviction pressure, and WAL wiring
-//! arrive with the stories that own them.
+//! Mutation surface (S02 + S05/S06): insert / [`update`] (the routed
+//! entry — in-place above the ro-boundary, copy-to-tail below) /
+//! overwrite (copy-to-tail mechanism) / delete. TTL, eviction pressure,
+//! and WAL wiring arrive with the stories that own them (S07, S11).
 
 use inf_foundation::{LogicalAddr, hash64};
 
@@ -150,6 +150,23 @@ impl TieredTable {
         RecordParts::of(RecordView::new(bytes))
     }
 
+    /// Number of bytes the record's fixed header is (the cold-read
+    /// first-window size — S04/S08 read at least this much before they
+    /// can size the full fetch).
+    pub const RECORD_HEADER_LEN: usize = crate::record::HEADER_LEN;
+
+    /// Sizes a full record from its fixed header alone (the cold-read
+    /// two-round contract: a first aligned window covers at least the
+    /// header; if the record overruns the window, the exact remainder is
+    /// fetched in one more read — S08 replaces the second round with
+    /// bounded chunked staging).
+    ///
+    /// # Panics
+    /// Debug-panics when `head` is shorter than the fixed header.
+    pub fn record_len_from_header(head: &[u8]) -> usize {
+        crate::record::encoded_len_from_header(head)
+    }
+
     /// Inserts a record for an absent key (the caller looked up first —
     /// the memory-mode `write_record` precondition, kept).
     pub fn insert(&mut self, key: &[u8], value: &[u8], hash: u64) -> Result<LogicalAddr, OpError> {
@@ -172,6 +189,44 @@ impl TieredTable {
         Ok(addr)
     }
 
+    /// Routed mutation for a present key (M4-S05): an exact-fit new record
+    /// image for an address still in the **mutable region** rewrites in
+    /// place — same bytes footprint, version bumped, index and accounting
+    /// untouched. Everything else (size change, or the record is sealed/
+    /// cold) routes to [`overwrite`](Self::overwrite) — copy-to-tail, the
+    /// emergent hot/cold filter (§9).
+    ///
+    /// The in-place rule is the M1 `Arena::resize_in_place` rule under
+    /// exact bump allocation: the region has no size classes, so "same
+    /// class" degenerates to "same encoded length". The boundary decision
+    /// is the resolver's `Mutable` classification (one compare beyond the
+    /// tail check), and [`AddressSpace::bytes_mut`] structurally refuses
+    /// addresses below the ro-boundary even if routing here were wrong —
+    /// the §3.1 corollary is enforced twice, not reviewed for.
+    pub fn update(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        hash: u64,
+        old: LogicalAddr,
+        old_len: usize,
+        old_version: u32,
+    ) -> Result<LogicalAddr, OpError> {
+        debug_assert_eq!(hash, Self::hash_key(key));
+        let spec = RecordSpec {
+            key,
+            value,
+            version: old_version.wrapping_add(1),
+            expire_at_ms: None,
+            kind: RecordKind::String { raw: false },
+        };
+        if spec.encoded_len() == old_len && self.space.resolve(old) == AddrClass::Mutable {
+            spec.write(self.space.bytes_mut(old, old_len));
+            return Ok(old);
+        }
+        self.overwrite(key, value, hash, old, old_len, old_version)
+    }
+
     /// Overwrites the record at `old` (key-verified by the caller's
     /// lookup): copy-to-tail + index repoint + version bump — the S06
     /// shape, address never rewritten in place (§3.1). `old_len` and
@@ -189,9 +244,9 @@ impl TieredTable {
     ) -> Result<LogicalAddr, OpError> {
         let new_addr = self.append(key, value, old_version.wrapping_add(1))?;
         self.index.replace(hash, old, new_addr);
-        // Dead-byte attribution at the repoint moment (the S14 live-set
-        // hook site — S06 formalizes per-range accounting on it).
-        self.space.note_dead_bytes(old_len as u64);
+        // Dead-byte attribution at the repoint moment, keyed by the dead
+        // record's own address (M4-S06 — the S14 live-set hook site).
+        self.space.note_dead_bytes(old, old_len as u64);
         self.live_bytes -= old_len as u64;
         Ok(new_addr)
     }
@@ -201,7 +256,7 @@ impl TieredTable {
     /// never a cold read (§3.3).
     pub fn delete(&mut self, hash: u64, addr: LogicalAddr, len: usize) {
         self.index.remove(hash, addr);
-        self.space.note_dead_bytes(len as u64);
+        self.space.note_dead_bytes(addr, len as u64);
         self.live_bytes -= len as u64;
     }
 
@@ -277,5 +332,108 @@ impl core::fmt::Debug for TieredTable {
             .field("live_bytes", &self.live_bytes)
             .field("space", &self.space)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table() -> TieredTable {
+        TieredTable::new(
+            AddressSpaceConfig {
+                reserve_bytes: 1 << 16,
+                page_bytes: 1 << 12,
+                life_origin: LogicalAddr::ZERO,
+            },
+            64,
+        )
+        .expect("reservation")
+    }
+
+    fn find(table: &TieredTable, key: &[u8]) -> (LogicalAddr, usize, u32) {
+        let hash = TieredTable::hash_key(key);
+        match table.lookup(key, hash, &[]) {
+            TieredLookup::Ram(addr) => {
+                let parts = table.record(addr);
+                (addr, parts.encoded_len, parts.version)
+            }
+            other => panic!("expected RAM hit, got {other:?}"),
+        }
+    }
+
+    /// M4-S05: an exact-fit update of a mutable-region record rewrites in
+    /// place — same address, version bumped, no accounting movement.
+    #[test]
+    fn update_in_place_when_mutable_and_exact_fit() {
+        let mut t = table();
+        let hash = TieredTable::hash_key(b"k");
+        let addr = t.insert(b"k", b"aaaa", hash).expect("fits");
+        let (_, len, version) = find(&t, b"k");
+        let dead_before = t.space().report().dead_bytes;
+        let placed = t.update(b"k", b"bbbb", hash, addr, len, version).expect("fits");
+        assert_eq!(placed, addr, "exact fit stays in place");
+        let (_, _, new_version) = find(&t, b"k");
+        assert_eq!(new_version, version.wrapping_add(1));
+        assert_eq!(t.record(addr).value, b"bbbb");
+        assert_eq!(t.space().report().dead_bytes, dead_before, "in place moves no accounting");
+    }
+
+    /// M4-S05/S06: a size-changing update relocates — copy-to-tail, index
+    /// repoint, old bytes attributed dead at the repoint moment.
+    #[test]
+    fn update_relocates_on_size_change() {
+        let mut t = table();
+        let hash = TieredTable::hash_key(b"k");
+        let addr = t.insert(b"k", b"aaaa", hash).expect("fits");
+        let (_, len, version) = find(&t, b"k");
+        let dead_before = t.space().report().dead_bytes;
+        let placed = t.update(b"k", b"longer-value", hash, addr, len, version).expect("fits");
+        assert_ne!(placed, addr, "size change copies to tail");
+        assert_eq!(t.space().report().dead_bytes, dead_before + len as u64);
+        let (found, _, new_version) = find(&t, b"k");
+        assert_eq!(found, placed);
+        assert_eq!(new_version, version.wrapping_add(1));
+        assert_eq!(t.record(placed).value, b"longer-value");
+    }
+
+    /// M4-S06: a sealed (read-only) record copies to the tail even on an
+    /// exact fit — the §3.1 corollary the routing must never violate.
+    #[test]
+    fn update_of_sealed_record_copies_to_tail() {
+        let mut t = table();
+        let hash = TieredTable::hash_key(b"k");
+        let addr = t.insert(b"k", b"aaaa", hash).expect("fits");
+        let (_, len, version) = find(&t, b"k");
+        let tail = t.space().tail();
+        t.space_mut().advance_ro_boundary(tail);
+        let placed = t.update(b"k", b"bbbb", hash, addr, len, version).expect("fits");
+        assert_ne!(placed, addr, "sealed record never rewrites in place");
+        assert_eq!(t.space().resolve(placed), AddrClass::Mutable, "the copy is hot again");
+        assert_eq!(t.record(placed).value, b"bbbb");
+        assert_eq!(t.record(placed).version, version.wrapping_add(1));
+        assert_eq!(t.space().report().dead_bytes, len as u64);
+    }
+
+    /// M4-S05: the M3 document in-place mutation shape above the boundary
+    /// — value-byte surgery plus a version bump through `bytes_mut`, no
+    /// record rewrite (ADR-0037 D4 / ADR-0043 over the address space; the
+    /// below-boundary refusal is `write_below_ro_boundary_panics` in
+    /// `address_space.rs`).
+    #[cfg(feature = "doc")]
+    #[test]
+    fn doc_shape_in_place_patch_above_boundary() {
+        let mut t = table();
+        let hash = TieredTable::hash_key(b"doc");
+        let addr = t.insert(b"doc", b"01234567", hash).expect("fits");
+        let (_, len, version) = find(&t, b"doc");
+        let record = t.space_mut().bytes_mut(addr, len);
+        let view = RecordView::new(record);
+        let value_at = view.value_offset();
+        record[value_at..value_at + 2].copy_from_slice(b"98");
+        crate::record::bump_version_in_place(record);
+        let parts = t.record(addr);
+        assert_eq!(parts.value, b"98234567");
+        assert_eq!(parts.version, version.wrapping_add(1));
     }
 }

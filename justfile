@@ -41,9 +41,12 @@ loom:
 compat:
     cargo test -p compat -- --nocapture
 
-# Deterministic simulator smoke scenario, twice, comparing traces.
+# Deterministic simulator smoke scenarios, each twice, comparing traces.
+# m4-steel is the M4-S04 steel-thread twin (tiered lifecycle + cold reads
+# through suspension + the S06 crash/replay content oracle).
 sim-smoke:
     cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
+    cargo run --release --bin inf-sim -- --scenario m4-steel --seed 0xC0FFEE --verify-determinism
 
 # M2-S19 durability sweep (the §6 dst_sweep gate shape). Usage:
 #   just durable-sweep [seeds] [base]
