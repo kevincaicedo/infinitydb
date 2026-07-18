@@ -7,6 +7,7 @@
 //! opens a file.
 #![forbid(unsafe_code)]
 
+mod address_space;
 mod catalog;
 mod doc;
 mod evict;
@@ -16,17 +17,22 @@ mod ns;
 mod record;
 mod router;
 mod store;
+mod tiered;
 mod wall;
 mod wheel;
 
+pub use address_space::{
+    AddrClass, AddressSpace, AddressSpaceConfig, AddressSpaceReport, TieringCounters,
+};
 pub use catalog::{CatalogError, NsCatalog};
 pub use doc::DocDomain;
 #[cfg(feature = "doc")]
 pub use doc::{JsonLogDecision, JsonRead, JsonScalarPatch, JsonSetOptions, JsonSetOutcome};
 pub use evict::{EvictStats, EvictionPolicy};
-pub use index::Index;
+pub use index::{Index, MemoryMode, SlotMode, TieredMode};
 pub use inf_alloc::ArenaConfig;
 // One import point for the shared store↔log vocabulary (ADR-0015 D2/D5).
+pub use inf_foundation::LogicalAddr;
 pub use inf_log::{FsyncClass, NsId};
 pub use keyspace::{
     DEFAULT_DBS, EvictBudget, Keyspace, PressureConfig, ReplayError, ReplayOutcome, StateDigest,
@@ -39,4 +45,5 @@ pub use store::{
     LogFullImage, MemoryReport, OpError, PostImage, SetCond, SetExpire, SetOptions, SetOutcome,
     StoreConfig, StoreStats, Ttl, TtlUpdate,
 };
+pub use tiered::{RecordParts, TieredLookup, TieredTable};
 pub use wall::WallAnchor;

@@ -34,7 +34,7 @@ pub use crate::wheel::ExpiryBudget;
 
 /// Stable hash seed: deterministic across runs and cells (L7; DST oracles
 /// rely on reproducible placement).
-const HASH_SEED: u64 = 0x1AF1_D8A5_0DB5_EED1;
+pub(crate) const HASH_SEED: u64 = 0x1AF1_D8A5_0DB5_EED1;
 
 /// Configuration for [`CellStore::new`].
 #[derive(Copy, Clone, Debug)]
@@ -1875,7 +1875,7 @@ impl CellStore {
             None => {
                 if self.index.needs_grow() {
                     let arena = &self.arena;
-                    self.index.grow(|addr| Self::hash_key(record_at(arena, addr).key()));
+                    self.index.grow(|addr, _| Self::hash_key(record_at(arena, addr).key()));
                 }
                 let new_addr = self.arena.alloc(new_len).ok_or(OpError::OutOfMemory)?;
                 spec.write(self.arena.bytes_mut(new_addr, new_len));

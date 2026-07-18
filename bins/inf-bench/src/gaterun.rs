@@ -445,7 +445,8 @@ pub fn cmd_gate_run(args: &[String]) -> Result<(), String> {
         "m0" => cmd_gate_run_m0(&flags),
         "m1" => crate::m1rows::cmd_gate_run_m1(&flags),
         "m2" => crate::m2rows::cmd_gate_run_m2(&flags),
-        other => Err(format!("unknown milestone {other} (have: m0, m1, m2)")),
+        "m4" => crate::m4rows::cmd_gate_run_m4(&flags),
+        other => Err(format!("unknown milestone {other} (have: m0, m1, m2, m4)")),
     }
 }
 

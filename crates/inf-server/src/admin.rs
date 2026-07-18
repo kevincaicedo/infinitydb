@@ -67,6 +67,7 @@ const SECTIONS: &[&str] = &[
     "clients",
     "memory",
     "persistence",
+    "tiering",
     "stats",
     "replication",
     "cpu",
@@ -264,6 +265,27 @@ pub(crate) fn info(
         push(&mut text, &format!("manifests_aborted:{}", node.manifests_aborted.get()));
         push(&mut text, &format!("segments_truncated:{}", node.segments_truncated.get()));
         push(&mut text, &format!("log_segments_live:{}", node.log_segments_live.get()));
+        text.push_str("\r\n");
+    }
+    if wants("tiering") {
+        // M4-S03: tiering code-path counters (this cell's slice). On a
+        // node without durable-tiered namespaces every field is
+        // identically zero — the degenerate-case A/B report and the
+        // cache-profile CI runs assert exactly that (§3.3 "provably
+        // unexecuted" made mechanical). S13 grows this section into the
+        // full operator surface (watermarks, budgets, write-amp).
+        let tiering = ks.tiering_counters();
+        push(&mut text, "# Tiering");
+        push(&mut text, &format!("tiering_tables:{}", ks.tiered_tables()));
+        push(&mut text, &format!("tiering_tail_allocs:{}", tiering.tail_allocs));
+        push(&mut text, &format!("tiering_seal_holes:{}", tiering.seal_holes));
+        push(&mut text, &format!("tiering_seal_hole_bytes:{}", tiering.seal_hole_bytes));
+        push(&mut text, &format!("tiering_region_commit_pages:{}", tiering.region_commit_pages));
+        push(
+            &mut text,
+            &format!("tiering_region_decommit_pages:{}", tiering.region_decommit_pages),
+        );
+        push(&mut text, &format!("tiering_cold_resolves:{}", tiering.cold_resolves));
         text.push_str("\r\n");
     }
     let stats = ks.stats();
