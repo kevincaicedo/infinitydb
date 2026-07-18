@@ -265,7 +265,10 @@ mod tests {
         assert_eq!(reg.get_by_id(NsId(0)), None, "defaults are implicit, never registered");
     }
 
+    // Only debug builds assert here (release answers `Exists`), so the
+    // should-panic expectation holds only under debug_assertions.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "never reused")]
     fn duplicate_id_is_a_caller_bug() {
         let mut reg = NsRegistry::default();

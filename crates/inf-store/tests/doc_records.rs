@@ -531,3 +531,44 @@ fn ttl_semantics_ride_json_set_options() {
     assert_eq!(s.json_set(b"k", &doc, clear, now()).expect("clear"), JsonSetOutcome::Applied);
     assert!(s.json_get(b"k", Nanos::from_millis(600)).expect("ok").is_some(), "TTL cleared");
 }
+
+/// The in-place blob overwrite (jset-server-20260717 slice): a root set
+/// over an existing tape blob of the same size class rewrites the blob
+/// bytes without alloc/free churn, preserving version-chain, lineage,
+/// TTL, and exact accounting; a cross-class overwrite still relocates.
+#[test]
+fn same_class_blob_overwrite_rewrites_in_place() {
+    let mut s = store();
+    let first = doc_of_size(1024);
+    set(&mut s, b"doc", &first);
+    assert!(s.expire(b"doc", Some(Nanos::from_millis(1_000)), ExpireCond::Always, now()));
+    let before = s.doc_domain();
+    assert_eq!((before.docs_live, before.inline_docs), (1, 0), "blob tier");
+    let version_before = s.json_get(b"doc", now()).expect("ok").expect("present").version;
+
+    // Same size class: slightly different length, same content family.
+    let second = doc_of_size(1000);
+    let keep = JsonSetOptions { expire: SetExpire::Keep, ..JsonSetOptions::default() };
+    assert_eq!(s.json_set(b"doc", &second, keep, now()).expect("set"), JsonSetOutcome::Applied);
+    let after = s.doc_domain();
+    assert_eq!(after.docs_live, 1, "overwrite is not a create");
+    assert_eq!(after.tape_bytes, second.len() as u64, "blob bytes shift by the length delta");
+    assert_eq!(s.doc_live_bytes(), after.tape_bytes, "arena books agree");
+    reconcile(&s);
+    let read = s.json_get(b"doc", now()).expect("ok").expect("present");
+    assert_eq!(read.version, version_before + 1, "one bump per logical mutation");
+    assert!(s.json_get(b"doc", Nanos::from_millis(1_500)).expect("ok").is_none(), "TTL kept");
+
+    // Cross-class overwrite falls through to relocate and stays exact.
+    set(&mut s, b"doc", &doc_of_size(1024));
+    let huge = doc_of_size(64 * 1024);
+    assert_eq!(
+        s.json_set(b"doc", &huge, JsonSetOptions::default(), now()).expect("set"),
+        JsonSetOutcome::Applied
+    );
+    let after = s.doc_domain();
+    assert_eq!(after.tape_bytes, huge.len() as u64, "old blob released, new attributed");
+    assert_eq!(after.docs_live, 1);
+    reconcile(&s);
+    assert_eq!(s.json_freeze(b"doc", now()).expect("ok").expect("present"), huge);
+}

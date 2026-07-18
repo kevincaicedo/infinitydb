@@ -1,0 +1,29 @@
+     2.06%  cell-2           libc.so.6                       [.] __memmove_avx_unaligned_erms
+     1.86%  cell-1           libc.so.6                       [.] __memmove_avx_unaligned_erms
+     1.86%  cell-3           libc.so.6                       [.] __memmove_avx_unaligned_erms
+     1.85%  cell-0           libc.so.6                       [.] __memmove_avx_unaligned_erms
+     0.89%  cell-1           [unknown]                       [k] 0xffffffffa44d7991
+     0.89%  cell-3           [unknown]                       [k] 0xffffffffa44d7991
+     0.87%  cell-2           infinityd                       [.] inf_store::store::CellStore::resolve_hashed
+     0.84%  cell-0           [unknown]                       [k] 0xffffffffa44d7991
+     0.83%  cell-2           [unknown]                       [k] 0xffffffffa44d7991
+     0.81%  cell-3           infinityd                       [.] inf_store::store::CellStore::resolve_hashed
+     0.79%  cell-1           infinityd                       [.] inf_store::store::CellStore::resolve_hashed
+     0.72%  cell-0           infinityd                       [.] inf_store::store::CellStore::resolve_hashed
+     0.71%  cell-0           infinityd                       [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     0.65%  cell-1           infinityd                       [.] inf_server::plane::send_apply::{{closure}}
+     0.64%  cell-3           infinityd                       [.] inf_server::plane::send_apply::{{closure}}
+     0.63%  cell-3           infinityd                       [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     0.60%  cell-2           infinityd                       [.] inf_server::plane::send_apply::{{closure}}
+     0.60%  cell-1           infinityd                       [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     0.60%  cell-0           infinityd                       [.] inf_server::plane::send_apply::{{closure}}
+     0.56%  cell-0           libc.so.6                       [.] _int_malloc
+     0.56%  cell-2           infinityd                       [.] inf_server::plane::dispatch_one::{{closure}}
+     0.55%  cell-1           infinityd                       [.] inf_server::plane::dispatch_one::{{closure}}
+     0.54%  cell-3           libc.so.6                       [.] _int_malloc
+     0.52%  cell-3           infinityd                       [.] inf_server::plane::dispatch_one::{{closure}}
+     0.52%  cell-2           libc.so.6                       [.] _int_malloc
+     0.51%  cell-1           libc.so.6                       [.] _int_malloc
+     0.51%  cell-2           infinityd                       [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+
+

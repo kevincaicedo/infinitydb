@@ -1,0 +1,86 @@
+ 14.01% [.] inf_doc::json::JsonParser::parse_into - - 
+ 5.03% [.] __memmove_avx_unaligned_erms - - 
+ 2.99% [.] inf_doc::json::parse_number_value - - 
+ 2.84% [.] inf_simd::json::avx2_copy_unescaped_fixstr - - 
+ 2.44% [.] inf_simd::json::avx2_classify_blocks - - 
+ 2.36% [k] 0xffffffffa44d7991 - - 
+ 1.90% [.] inf_store::store::CellStore::resolve_hashed - - 
+ 1.74% [.] inf_server::plane::send_apply::{{closure}} - - 
+ 1.62% [.] inf_server::plane::dispatch_one::{{closure}} - - 
+ 1.62% [.] inf_wire::parser::parse_count_line - - 
+ 1.35% [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration - - 
+ 1.25% [.] inf_wire::parser::FrameIter::next - - 
+ 1.22% [.] _int_malloc - - 
+ 1.08% [.] inf_server::plane::pump::{{closure}} - - 
+ 1.05% [.] inf_store::doc::<impl inf_store::store::CellStore>::json_write_value - - 
+ 1.02% [k] 0xffffffffa4f329b7 - - 
+ 0.99% [.] inf_doc::json::parse_number - - 
+ 0.97% [.] inf_fabric::codec::decode_frame - - 
+ 0.88% [.] inf_server::plane::OwnedCmd::from_argv_into - - 
+ 0.76% [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap - - 
+ 0.76% [k] 0xffffffffa3d01ba7 - - 
+ 0.72% [.] inf_simd::utf8::avx2_utf8_is_valid - - 
+ 0.67% [.] <inf_runtime::gate::GateWait<K,V> as core::future::future::Future>::poll - - 
+ 0.62% [k] 0xffffffffa4bda132 - - 
+ 0.60% [.] __libc_malloc2 - - 
+ 0.60% [.] inf_server::plane::handle_fabric_op - - 
+ 0.59% [.] __memcmp_avx2_movbe - - 
+ 0.55% [.] inf_simd::json::avx2_copy_unescaped - - 
+ 0.54% [.] inf_server::plane::stage_or_handle - - 
+ 0.52% [.] inf_store::store::CellStore::prefetch_doc_root - - 
+ 0.52% [.] realloc - - 
+ 0.51% [.] _int_free_chunk - - 
+ 0.43% [k] 0xffffffffa4c0e1e3 - - 
+ 0.42% [.] inf_fabric::codec::encode_bytes - - 
+ 0.39% [.] _int_free_merge_chunk - - 
+ 0.38% [.] inf_fabric::codec::encode - - 
+ 0.38% [.] inf_fabric::codec::Reader::bytes - - 
+ 0.38% [k] 0xffffffffa4d2a755 - - 
+ 0.38% [.] inf_store::doc::<impl inf_store::store::CellStore>::json_set - - 
+ 0.37% [.] inf_wire::command::lookup - - 
+ 0.36% [.] inf_doc::json::parse_literal - - 
+ 0.34% [.] inf_runtime::gate::KeyedGate<K,V>::waiter - - 
+ 0.34% [.] unlink_chunk.isra.0 - - 
+ 0.34% [.] inf_fabric::mesh::CellFabric::flush - - 
+ 0.33% [k] 0xffffffffa4be6c15 - - 
+ 0.33% [k] 0xffffffffa3bafa20 - - 
+ 0.32% [.] inf_runtime::uring::UringDriver::alloc_id - - 
+ 0.32% [k] 0xffffffffa416c983 - - 
+ 0.31% [.] inf_server::plane::stage_argv_block - - 
+ 0.29% [.] inf_store::doc::DocStore::release - - 
+ 0.29% [.] inf_store::store::CellStore::probe_prefetch - - 
+ 0.28% [k] 0xffffffffa4be0ec3 - - 
+ 0.27% [.] <inf_simd::json::JsonTokenCursor as inf_doc::json::TokenSource>::bump - - 
+ 0.26% [.] inf_foundation::hash::hash64 - - 
+ 0.26% [.] inf_doc::json::JsonParser::close_obj_frame - - 
+ 0.25% [k] 0xffffffffa4bffb30 - - 
+ 0.24% [.] inf_alloc::arena::Arena::free - - 
+ 0.24% [.] inf_simd::json::JsonTokenCursor::new - - 
+ 0.24% [k] 0xffffffffa4cffcae - - 
+ 0.23% [.] inf_server::json::execute_json - - 
+ 0.23% [k] 0xffffffffa4483b8f - - 
+ 0.23% [.] inf_wire::command::lookup - - 
+ 0.22% [.] inf_server::plane::OwnedCmd::arg - - 
+ 0.21% [.] inf_doc::json::JsonParser::emit_string_general - - 
+ 0.21% [.] inf_alloc::arena::Arena::alloc - - 
+ 0.20% [k] 0xffffffffa416cba3 - - 
+ 0.20% [k] 0xffffffffa4be5491 - - 
+ 0.20% [k] 0xffffffffa4d1ad52 - - 
+ 0.20% [.] inf_server::plane::read_argv_block - - 
+ 0.20% [k] 0xffffffffa4c1c7a5 - - 
+ 0.19% [k] 0xffffffffa4cf1536 - - 
+ 0.18% [.] inf_server::exec::execute_slices - - 
+ 0.18% [k] 0xffffffffa3ce9f69 - - 
+ 0.17% [.] inf_runtime::uring::UringDriver::handle_recv_payload - - 
+ 0.17% [.] inf_server::plane::is_conn_state - - 
+ 0.17% [k] 0xffffffffa4be5516 - - 
+ 0.17% [k] 0xffffffffa4be5475 - - 
+ 0.16% [.] inf_server::plane::Conn::state_bytes - - 
+ 0.16% [k] 0xffffffffa4be553d - - 
+ 0.16% [k] 0xffffffffa4cffc5d - - 
+ 0.16% [.] inf_server::plane::dispatch_mirror - - 
+ 0.16% [k] 0xffffffffa4be3b2f - - 
+ 0.16% [.] inf_doc::json::JsonParser::open_obj_frame - - 
+ 0.15% [k] 0xffffffffa4d174af - - 
+
+

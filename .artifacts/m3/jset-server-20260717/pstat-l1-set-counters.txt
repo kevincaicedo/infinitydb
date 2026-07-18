@@ -1,0 +1,10 @@
+# started on Fri Jul 17 20:32:12 2026
+
+
+ Performance counter stats for 'CPU(s) 0-7':
+
+   260,478,357,866      cpu_core/instructions/                                                
+   138,228,207,075      cpu_core/cycles/                                                      
+
+      10.004242391 seconds time elapsed
+

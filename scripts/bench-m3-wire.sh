@@ -27,8 +27,16 @@ SRV=$!
 trap 'kill $SRV 2>/dev/null || true' EXIT
 for _ in $(seq 1 100); do redis-cli -p "$PORT" ping 2>/dev/null | grep -q PONG && break; sleep 0.2; done
 
+# One discarded warm-up leg per lane before the counted reps: fresh
+# server first legs read 2-6% low and depress whichever lane runs first
+# (measured: .artifacts/m3/jset-server-20260717/PROFILE.md). The warm-up
+# output is kept (`-warm.txt`) but never enters the summary.
 mt() {
     local name=$1; shift
+    taskset -c "$LOAD_CPUS" memtier_benchmark -p "$PORT" --hide-histogram \
+        --threads 4 --clients 25 --pipeline 16 --test-time "$SECS" \
+        --key-maximum $KEYMAX --distinct-client-seed "$@" \
+        >"$OUT/$name-warm.txt" 2>&1
     for rep in $(seq 1 "$REPS"); do
         taskset -c "$LOAD_CPUS" memtier_benchmark -p "$PORT" --hide-histogram \
             --threads 4 --clients 25 --pipeline 16 --test-time "$SECS" \

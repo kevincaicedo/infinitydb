@@ -1844,8 +1844,9 @@ impl CellStore {
     /// else alloc-copy-free with an index address swap. **Carries** any
     /// document payload referenced by both old and new value bytes: no
     /// release happens here — TTL rewrites move handle bytes verbatim
-    /// (ADR-0037 D3's RENAME/EXPIRE transfer rule).
-    fn write_record_carrying(
+    /// (ADR-0037 D3's RENAME/EXPIRE transfer rule; the in-place blob
+    /// overwrite in `doc::json_write_value` relies on the same contract).
+    pub(crate) fn write_record_carrying(
         &mut self,
         key: &[u8],
         existing: Option<(ArenaAddr, usize)>,
