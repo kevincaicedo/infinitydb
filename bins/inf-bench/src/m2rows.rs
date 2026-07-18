@@ -31,14 +31,14 @@ struct RowKeys {
 }
 
 /// Relative spread of a replicate set: (max − min) / median, in percent.
-fn rel_spread_pct(values: &mut [f64]) -> f64 {
+pub(crate) fn rel_spread_pct(values: &mut [f64]) -> f64 {
     let med = median(values);
     let (min, max) = (values[0], values[values.len() - 1]); // median() sorted them
     if med == 0.0 { 0.0 } else { (max - min) / med * 100.0 }
 }
 
 /// Signed delta (b − a) / a in percent.
-fn delta_pct(a: f64, b: f64) -> f64 {
+pub(crate) fn delta_pct(a: f64, b: f64) -> f64 {
     if a == 0.0 { 0.0 } else { (b - a) / a * 100.0 }
 }
 

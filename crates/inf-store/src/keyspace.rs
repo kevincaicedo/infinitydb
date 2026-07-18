@@ -25,12 +25,14 @@ use inf_foundation::hash64;
 use inf_foundation::time::Nanos;
 use inf_log::{FsyncClass, NsId, RecordView as LogRecordView};
 
+use crate::address_space::TieringCounters;
 use crate::catalog::NsCatalog;
 use crate::evict::{EvictStats, EvictionPolicy};
 use crate::ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsRegistry, NsSpec};
 use crate::store::{
     CellStore, CheckpointImage, ExpiryStats, MemoryReport, OpError, StoreConfig, StoreStats,
 };
+use crate::tiered::TieredTable;
 use crate::wall::WallAnchor;
 use crate::wheel::ExpiryBudget;
 
@@ -80,6 +82,11 @@ pub struct Keyspace {
     /// Linear scan by id — a node has few named namespaces, and the id is
     /// resolved once per command, not per key.
     named_stores: Vec<(NsId, Box<CellStore>)>,
+    /// Durable-tiered record tables (M4-S02 landing site; the S04 steel
+    /// thread materializes the first entry). Empty on memory/durable-arena
+    /// nodes — which is exactly what the S03 degenerate-case zero-counter
+    /// assertion observes through [`tiering_counters`](Self::tiering_counters).
+    tiered_stores: Vec<(NsId, Box<TieredTable>)>,
     pressure: PressureConfig,
     /// Cached `used > limit` (the M1-S07 one-branch write-path flag).
     over_limit: bool,
@@ -96,6 +103,7 @@ impl Keyspace {
             cfg,
             named: NsRegistry::default(),
             named_stores: Vec::new(),
+            tiered_stores: Vec::new(),
             pressure: PressureConfig::default(),
             over_limit: false,
             hand_db: 0,
@@ -171,6 +179,30 @@ impl Keyspace {
             total.doc_path_cache_bytes += r.doc_path_cache_bytes;
             total.live_records += r.live_records;
             total.docs_live += r.docs_live;
+        }
+        total
+    }
+
+    /// Number of durable-tiered tables on this cell (0 until the M4-S04
+    /// steel thread materializes one).
+    pub fn tiered_tables(&self) -> usize {
+        self.tiered_stores.len()
+    }
+
+    /// Aggregated tiering code-path counters across every tiered table on
+    /// this cell (M4-S03): identically zero unless tiering code executed —
+    /// the §3.3 "provably unexecuted" rule as a scrapeable fact, asserted
+    /// by the degenerate-case A/B report and cache-profile CI runs.
+    pub fn tiering_counters(&self) -> TieringCounters {
+        let mut total = TieringCounters::default();
+        for (_, table) in &self.tiered_stores {
+            let counters = table.space().counters();
+            total.tail_allocs += counters.tail_allocs;
+            total.seal_holes += counters.seal_holes;
+            total.seal_hole_bytes += counters.seal_hole_bytes;
+            total.region_commit_pages += counters.region_commit_pages;
+            total.region_decommit_pages += counters.region_decommit_pages;
+            total.cold_resolves += counters.cold_resolves;
         }
         total
     }

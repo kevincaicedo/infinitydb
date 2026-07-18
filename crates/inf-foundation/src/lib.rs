@@ -5,6 +5,7 @@
 //! tripwire counter names. This crate is dependency-free and fully safe.
 #![forbid(unsafe_code)]
 
+mod addr;
 mod crc;
 pub mod fault;
 mod hash;
@@ -16,6 +17,7 @@ pub mod time;
 pub mod tripwire;
 pub mod varint;
 
+pub use addr::LogicalAddr;
 pub use crc::{crc16, hashtag};
 pub use hash::{BuildIntHasher, IntHasher, hash64};
 pub use hist::LogHistogram;

@@ -1,0 +1,3 @@
+--- M4-S01 resolver budget bench (≤ 2 ns added on RAM addresses) ---
+32K records (cache-hot)    arena   0.97 ns/op | resolve+read   1.07 ns/op (delta +0.10) | resolve-only  0.19 ns/op
+4M records (miss-bound)    arena   8.60 ns/op | resolve+read   9.17 ns/op (delta +0.57) | resolve-only  0.36 ns/op

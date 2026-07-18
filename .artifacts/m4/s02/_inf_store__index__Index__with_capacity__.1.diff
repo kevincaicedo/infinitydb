@@ -1,0 +1,10 @@
+--- /tmp/tmp.UqNoH1TUi5/base/_inf_store__index__Index__with_capacity__.1	2026-07-18 02:07:23.848887046 -0400
++++ /tmp/tmp.UqNoH1TUi5/m4/_inf_store__index__Index__with_capacity__.1	2026-07-18 02:07:23.869605813 -0400
+@@ -62,7 +62,6 @@
+ 	mov    %r14,0x20(%rbx)
+ 	xorps  %xmm0,%xmm0
+ 	movups %xmm0,0x28(%rbx)
+-	mov    %rbx,%rax
+ 	pop    %rbx
+ 	pop    %r12
+ 	pop    %r13
