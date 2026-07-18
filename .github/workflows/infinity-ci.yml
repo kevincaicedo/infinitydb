@@ -1,18 +1,17 @@
-# InfinityDB CI — fast pull-request lane (verification ladder, M0-S02).
+# InfinityDB CI — pull-request lane (verification ladder, M0-S02).
 #
 # Layout: this repository's root IS the Cargo workspace (crates/, bins/,
 # tests/ at the top level). Jobs run from the repo root; there is no nested
 # `infinitydb/` directory on the runner.
 #
-# Split (2026-07-17): this workflow is the ~15-minute PR gate — the
-# correctness-critical, fast jobs on Linux/x86_64. The slow / broad jobs
-# (full 3-OS build matrix, full strict-provenance Miri, the 11-target fuzz
-# smoke, client-smoke, kernel-matrix, benchmark compile-smoke) moved to
-# `infinity-ci-full.yml`, run on demand after review with a `/ci-full` PR
-# comment or the Actions "Run workflow" button. Rationale: run #9 spent
-# 45 min in Miri (timed out) and ~42 min in the 11-target fuzz smoke;
-# neither belongs on every push. compat-diff stays here — it is fast
-# (~30 s) and guards the headline JSON-compat claim (C23).
+# Split (2026-07-17): only the two slow jobs were the problem — `miri`
+# (45-min timeout) and the 11-target `fuzz-smoke` (~42 min). Those are
+# REDUCED here (a strict-provenance canary on inf-alloc, and a single 60-s
+# fuzz smoke) and run in FULL in `infinity-ci-full.yml` (label `ci-full` /
+# `/ci-full` comment / dispatch), together with the benchmark compile. Every
+# other job — the full 3-OS build matrix, client-smoke, compat-diff,
+# kernel-matrix, loom, sim-smoke — stays here: each runs in a few minutes and
+# they run in parallel, so they cost little wall-clock but keep PR coverage.
 name: infinity-ci
 
 on:
@@ -34,11 +33,11 @@ env:
 
 jobs:
   build-test:
-    # Fast lane: Linux/x86_64 only. The ubuntu-arm + macos-15 legs (both
-    # aarch64) run in infinity-ci-full — they catch arch-specific issues
-    # (e.g. the inf-simd cfg(x86_64) tiers) that x86_64 cannot, at 3x the
-    # runner cost, so they gate the merge, not every push.
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
@@ -78,11 +77,11 @@ jobs:
           manifest-path: Cargo.toml
 
   miri-canary:
-    # Fast PR canary: strict-provenance Miri on the smallest unsafe leaf
-    # (inf-alloc) only. The FULL Miri (inf-alloc + inf-fabric, all tests) is
-    # the M0-S02 acceptance gate and runs in infinity-ci-full — that is the
-    # job that was timing out at 45 min on PRs. If inf-alloc alone ever
-    # approaches this budget, scope it further to specific tests.
+    # REDUCED: strict-provenance Miri on the smallest unsafe leaf (inf-alloc)
+    # only. The FULL Miri (inf-alloc + inf-fabric, all tests) is the M0-S02
+    # acceptance gate and runs in infinity-ci-full — that is the job that was
+    # timing out at 45 min here. If inf-alloc alone approaches this budget,
+    # scope it to specific tests.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -97,8 +96,6 @@ jobs:
           MIRIFLAGS: -Zmiri-strict-provenance
 
   loom:
-    # SPSC ring model — required for inf-fabric PRs (AGENTS.md). Small model,
-    # ~1 min in practice (run #9: 57 s); kept on the PR lane.
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -114,8 +111,6 @@ jobs:
           LOOM_MAX_PREEMPTIONS: "3"
 
   sim-smoke:
-    # M0-S20: deterministic simulator — smoke scenario twice with trace
-    # comparison, plus the in-process determinism/oracle/planted-bug tests.
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -130,9 +125,9 @@ jobs:
         run: cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
 
   fuzz-smoke:
-    # PR canary: one decoder, 60 s, to catch gross breakage fast. cargo-fuzz
+    # REDUCED: one decoder, 60 s, to catch gross breakage fast. cargo-fuzz
     # auto-creates fuzz/corpus/resp_parse, so no seed dir is needed here. The
-    # full 11-target smoke (300 s each, ~42 min) runs in infinity-ci-full.
+    # full 11-target smoke (300 s each) runs in infinity-ci-full.
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -147,11 +142,9 @@ jobs:
 
   compat-diff:
     # M0-S15 / M1-S14 / M3-S21: declared command x edge-case matrix
-    # byte-identical to pinned Redis + RedisJSON oracles. Fast (~30 s) and
-    # guards C23, so it stays on the PR lane. Harnesses connect by explicit
-    # address instead of spawning from PATH.
+    # byte-identical to pinned Redis + RedisJSON oracles.
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -184,3 +177,77 @@ jobs:
         env:
           INF_COMPAT_ORACLE_ADDR: 127.0.0.1:6390
           INF_COMPAT_JSON_ORACLE_ADDR: 127.0.0.1:6391
+
+  client-smoke:
+    # M1-S03/S14: major Redis client libraries work against infinityd out of
+    # the box. One server serves all four sequentially. Fast (~1-2 min).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: build infinityd (release)
+        run: cargo build --release -p infinityd
+      - name: start infinityd
+        run: |
+          ./target/release/infinityd --port 6379 &
+          ready=0
+          for i in $(seq 1 100); do
+            if printf '*1\r\n$4\r\nPING\r\n' | timeout 1 nc 127.0.0.1 6379 | grep -q PONG; then
+              ready=1; break
+            fi
+            sleep 0.2
+          done
+          test "$ready" = 1 || { echo "infinityd never answered PING"; exit 1; }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: redis-py smoke
+        timeout-minutes: 5
+        run: |
+          pip install 'redis>=5,<7'
+          python tests/client-smoke/smoke.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: node-redis smoke
+        timeout-minutes: 5
+        run: |
+          npm install --no-save redis@^4
+          node smoke.mjs
+        working-directory: tests/client-smoke
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: go-redis smoke
+        timeout-minutes: 5
+        run: go mod tidy && go run .
+        working-directory: tests/client-smoke/go
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: lettuce smoke
+        timeout-minutes: 10
+        run: mvn -q -B compile exec:java -Dexec.mainClass=Smoke
+        working-directory: tests/client-smoke/java
+
+  kernel-matrix:
+    # io_uring feature-probe fallback across kernels (M0-S02). Fast.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: uring suite, probed features
+        run: cargo test -p inf-runtime --features uring
+      - name: uring suite, forced-degraded (oneshot recv, no provided buffers)
+        run: cargo test -p inf-runtime --features uring
+        env:
+          INF_URING_FORCE_DEGRADED: "1"
