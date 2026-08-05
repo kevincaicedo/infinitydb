@@ -32,7 +32,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 
-use inf_alloc::{BufferId, BufferPool, LeaseKind};
+use inf_alloc::{AlignedPool, BufferId, BufferPool, LeaseKind};
 use inf_foundation::BuildIntHasher;
 use io_uring::types::Fd;
 use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
@@ -167,7 +167,35 @@ pub struct UringDriver {
     provided: DriverMap<u16, BufferId>,
     /// Wake eventfd watched via `PollAdd` (see [`OpState::WakeWatch`]).
     wake_fd: Option<std::os::fd::OwnedFd>,
+    /// Registered cold-read pool geometry (M4-S08): set by
+    /// `register_tier_pool`, consumed by `arm_tier_read` to upgrade
+    /// in-range reads to the fixed-buffer opcode.
+    tier_fixed: Option<TierFixed>,
     stats: SubmitStats,
+}
+
+/// Geometry of the registered aligned pool: buffer `i` occupies
+/// `[base + i·buf_size, base + (i+1)·buf_size)` and iovec index `i`.
+struct TierFixed {
+    base: usize,
+    buf_size: usize,
+    count: usize,
+}
+
+impl TierFixed {
+    /// The fixed-buffer index serving `[start, start+len)`, when the
+    /// range sits inside exactly one registered buffer starting at its
+    /// base (the `ColdReads::issue` shape). Anything else reads via the
+    /// plain positional opcode — correctness never depends on the
+    /// registration.
+    fn index_of(&self, start: usize, len: usize) -> Option<u16> {
+        let offset = start.checked_sub(self.base)?;
+        let index = offset / self.buf_size;
+        if index >= self.count || offset % self.buf_size != 0 || len > self.buf_size {
+            return None;
+        }
+        Some(index as u16)
+    }
 }
 
 impl UringDriver {
@@ -238,6 +266,7 @@ impl UringDriver {
             closing: DriverMap::default(),
             provided: DriverMap::default(),
             wake_fd: None,
+            tier_fixed: None,
             stats: SubmitStats::default(),
         })
     }
@@ -321,9 +350,9 @@ impl UringDriver {
         Ok(())
     }
 
-    /// Arm a positional cold-tier read (M4-S04). `got` > 0 is the
-    /// short-read resubmission path: the remainder reads into the same
-    /// stable buffer at its fill point.
+    /// Arm a positional cold-tier read (M4-S04; fixed-buffer upgrade
+    /// M4-S08). `got` > 0 is the short-read resubmission path: the
+    /// remainder reads into the same stable buffer at its fill point.
     fn arm_tier_read(
         &mut self,
         fd: RawFd,
@@ -332,15 +361,28 @@ impl UringDriver {
         token: CompletionToken,
         got: u32,
     ) {
+        // Registered-pool reads ride the fixed-buffer opcode (M4-S08 —
+        // no per-op page pinning); anything else (tests, one-off
+        // buffers) stays on the plain positional read.
+        let fixed = self
+            .tier_fixed
+            .as_ref()
+            .and_then(|t| t.index_of(buf.as_mut_ptr() as usize, buf.len() as usize));
         let id = self.alloc_id(OpState::TierRead { fd, token, buf, offset, got });
         // SAFETY: `buf` upholds the StableBytesMut contract (live, stable,
         // unaliased until terminal completion); `got` never exceeds
         // `buf.len()`.
         let ptr = unsafe { buf.as_mut_ptr().add(got as usize) };
-        let entry = opcode::Read::new(Fd(fd), ptr, buf.len() - got)
-            .offset(offset + u64::from(got))
-            .build()
-            .user_data(id);
+        let entry = match fixed {
+            Some(index) => opcode::ReadFixed::new(Fd(fd), ptr, buf.len() - got, index)
+                .offset(offset + u64::from(got))
+                .build()
+                .user_data(id),
+            None => opcode::Read::new(Fd(fd), ptr, buf.len() - got)
+                .offset(offset + u64::from(got))
+                .build()
+                .user_data(id),
+        };
         self.push_sqe(entry);
     }
 
@@ -1025,6 +1067,45 @@ impl BackendDriver for UringDriver {
         // Send/Recv at M0 either way (fixed-buffer data path is an A3-tier
         // measured follow-up).
         self.caps.fixed_buffers = registered.is_ok();
+        Ok(())
+    }
+
+    fn register_tier_pool(&mut self, pool: &mut AlignedPool) -> io::Result<()> {
+        // The recv-pool registration above is a capability probe (no op
+        // consumes fixed send/recv buffers); io_uring has ONE registered-
+        // buffer table, so the cold-read pool takes it over (M4-S08).
+        if self.caps.fixed_buffers {
+            let _ = self.ring.submitter().unregister_buffers();
+        }
+        let buf_size = pool.buf_size();
+        let count = pool.capacity();
+        assert!(count <= usize::from(u16::MAX), "fixed-buffer indices are u16");
+        let mut base = 0usize;
+        let mut iovecs = Vec::with_capacity(count);
+        for (i, bytes) in pool.buffers_mut().enumerate() {
+            if i == 0 {
+                base = bytes.as_ptr() as usize;
+            }
+            iovecs.push(libc::iovec { iov_base: bytes.as_mut_ptr().cast(), iov_len: bytes.len() });
+        }
+        // SAFETY: iovecs describe the pool's single live allocation,
+        // address-stable for the pool's lifetime (inf-alloc invariant);
+        // the kernel reads/writes them only through TierRead ops whose
+        // buffers the in-flight table keeps leased until terminal
+        // completion.
+        let registered = unsafe { self.ring.submitter().register_buffers(&iovecs) };
+        match registered {
+            Ok(()) => {
+                self.tier_fixed = Some(TierFixed { base, buf_size, count });
+                self.caps.fixed_buffers = true;
+            }
+            Err(_) => {
+                // Degrade (RLIMIT_MEMLOCK, old kernel): plain positional
+                // reads stay correct; the probe table is gone either way.
+                self.tier_fixed = None;
+                self.caps.fixed_buffers = false;
+            }
+        }
         Ok(())
     }
 

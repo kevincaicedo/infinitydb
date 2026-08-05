@@ -1,0 +1,14 @@
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+    Finished `release` profile [optimized + debuginfo] target(s) in 4.37s
+     Running tests/tiered_blob_reclaim.rs (target/release/deps/tiered_blob_reclaim-df1f4e41b06e1b6a)
+
+running 4 tests
+test blob_leak_cycles_return_disk_to_baseline ... leak test: cycles=1000000 created=687454 reclaimed=687454 reclaim_slices=15626
+ok
+test compaction_relocates_references_never_blob_bytes ... ok
+test reclaim_and_compaction_share_the_round_without_starvation ... ok
+test statvfs_confirms_blob_reclaim_returns_disk_to_the_os ... statvfs leg: cycles=768 created=591 reclaimed=591 peak_blob_bytes=7012352 avail_start=16451178496 avail_end=16451162112
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 85.70s
+

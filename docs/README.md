@@ -10,6 +10,9 @@ Public documentation for InfinityDB. Start with the
   diagrams.
 - **[Deployment](deployment.md)** — running with Docker (and the `io_uring` /
   seccomp requirement), prebuilt binaries, server options, and configuration.
+- **[Operating tiered storage](ops-tiered-storage.md)** — datasets larger than
+  RAM: the address space and its watermarks, memory budgets, the `INFO
+  tiering` fields, what to alarm on, and the write-amplification baseline.
 - **[Roadmap](roadmap.md)** — the milestone train and what lands when.
 - **[Contributing](../CONTRIBUTING.md)** — development setup, the validation
   ladder, and the design laws contributors must respect.

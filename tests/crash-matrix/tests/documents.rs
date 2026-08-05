@@ -53,6 +53,7 @@ fn keyspace() -> Keyspace {
         fsync: Some(FsyncClass::Always),
         policy: None,
         maxmemory: None,
+        tier: None,
     })
     .expect("namespace");
     ks
@@ -194,8 +195,12 @@ fn publish_checkpoint<F: SegmentFs + Clone>(
     }
     writer.finish().expect("checkpoint publish");
     let segments = (begin.segment.0..=active.0).map(SegmentId).collect();
-    write_manifest(fs, Path::new(SHARD_DIR), &Manifest { ckpt_id: 1, begin_lsn: begin, segments })
-        .expect("manifest publish");
+    write_manifest(
+        fs,
+        Path::new(SHARD_DIR),
+        &Manifest { ckpt_id: 1, begin_lsn: begin, segments, tiers: Vec::new() },
+    )
+    .expect("manifest publish");
 }
 
 fn delta_before_fsync(seeds: u64) {

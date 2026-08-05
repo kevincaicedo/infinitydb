@@ -138,6 +138,32 @@ pub enum OpError {
     /// document edit in a non-editable physical form. Maps to Redis
     /// `WRONGTYPE` at the command layer.
     WrongType,
+    /// Disk admission refused a tiered placement (M4-S21, ADR-0063 D1):
+    /// the namespace's disk budget is exhausted or the device is.
+    /// Refusal mutates nothing; reads, deletes, expiry, and in-place
+    /// updates proceed. Maps to the `DISKFULL` extension error at the
+    /// command layer.
+    DiskFull(DiskFullCause),
+}
+
+/// Why disk admission refused (ADR-0063 D1) — the error payload carries
+/// the numbers the operator needs, the `TierVaLimitExceeded` structured
+/// precedent.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum DiskFullCause {
+    /// `DISK-BUDGET` exhausted: the admission projection reached
+    /// `budget − reserve`. Snapshot values from the last admission
+    /// refresh (ADR-0063 D2 — the cached-verdict cadence).
+    Budget {
+        /// `disk_used` at the last refresh (tier files + extents).
+        used: u64,
+        /// The configured `DISK-BUDGET`.
+        budget: u64,
+    },
+    /// The device itself refused a tier write with ENOSPC (the latched
+    /// leg — cleared automatically by the next successful flush
+    /// barrier).
+    Device,
 }
 
 /// `SET` condition (NX/XX shapes).
@@ -866,6 +892,11 @@ impl CellStore {
                 #[cfg(not(feature = "doc"))]
                 unreachable!("JsonDoc records cannot exist without the doc feature")
             }
+            // Written only by TieredTable (M4-S17, ADR-0061 D2) — one in
+            // a memory-mode arena is a record-lifecycle bug.
+            TypeTag::StringExtent => {
+                unreachable!("StringExtent records exist only in tiered namespaces")
+            }
         }
     }
 
@@ -889,6 +920,9 @@ impl CellStore {
                     value: view.value(),
                     expire_at_ms: view.expire_at_ms(),
                 }))
+            }
+            TypeTag::StringExtent => {
+                unreachable!("StringExtent records exist only in tiered namespaces")
             }
             TypeTag::JsonDoc => {
                 #[cfg(feature = "doc")]
@@ -1471,6 +1505,9 @@ impl CellStore {
                             view.expire_at_ms(),
                         );
                     }
+                    TypeTag::StringExtent => {
+                        unreachable!("StringExtent records exist only in tiered namespaces")
+                    }
                     TypeTag::JsonDoc => {
                         #[cfg(feature = "doc")]
                         {
@@ -1568,6 +1605,9 @@ impl CellStore {
                             CheckpointImage::String(view.value()),
                             view.expire_at_ms(),
                         ),
+                        TypeTag::StringExtent => {
+                            unreachable!("StringExtent records exist only in tiered namespaces")
+                        }
                         TypeTag::JsonDoc => {
                             #[cfg(feature = "doc")]
                             {
@@ -1915,7 +1955,7 @@ fn wheel_cursor(wheel: &TtlWheel) -> u64 {
 /// power-of-two group space: high bits advance first, so groups split by a
 /// doubling are visited adjacently and never missed.
 #[inline]
-fn next_rev_cursor(cursor: u64, mask: u64) -> u64 {
+pub(crate) fn next_rev_cursor(cursor: u64, mask: u64) -> u64 {
     let mut v = cursor | !mask;
     v = v.reverse_bits();
     v = v.wrapping_add(1);

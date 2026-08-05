@@ -555,6 +555,8 @@ fn record_class(record: &RecordView<'_>) -> &'static str {
         RecordView::CkptBegin { .. } => "ckpt-begin",
         RecordView::DocDelta { .. } => "doc-delta",
         RecordView::DocFull { .. } => "doc-full",
+        RecordView::ColdDisplace { .. } => "cold-displace",
+        RecordView::StringExtentRef { .. } => "string-extent-ref",
     }
 }
 

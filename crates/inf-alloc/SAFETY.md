@@ -17,6 +17,7 @@ unit tests under Miri.
 | `aligned.rs::AlignedPool::new` / `AlignedBox::new` (`alloc_zeroed`) | non-zero layout asserted before the call; result null-checked; zeroed so a never-filled buffer reads initialized bytes, never uninit | aligned unit tests under Miri |
 | `aligned.rs::bytes`/`bytes_mut` (both types, `from_raw_parts[_mut]`) | id/len bounds-checked always-on before the offset is formed; allocation lives for the owner's lifetime; `&self`/`&mut self` provide aliasing discipline | aligned unit tests under Miri (`every_buffer_is_aligned_and_disjoint`) |
 | `aligned.rs::Drop` (both types, `dealloc`) | ptr/layout are exactly the live allocation made in `new`, owned for the value's lifetime | every aligned test's drop |
+| `aligned.rs::buffers_mut` (`from_raw_parts_mut`, M4-S08 registration pass) | base/total are exactly the live allocation made in `new`; `&mut self` makes the iterator the only borrow of any buffer; `chunks_exact_mut` yields disjoint slices | `buffers_mut_yields_disjoint_registration_slices` under Miri |
 
 `buffer_pool` remains 100% safe code.
 

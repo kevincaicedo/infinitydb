@@ -556,6 +556,17 @@ pub static MATRIX: &[Case] = &[
     skip(&["INF.NS", "LIST"], "InfinityDB extension"),
     skip(&["INF.NS", "INFO", "cache"], "InfinityDB extension"),
     skip(&["INF.NS", "DROP", "cache"], "InfinityDB extension"),
+    // --- INF.NS tiering keys (M4-S19, ADR-0062 — extension) ---
+    skip(
+        &["INF.NS", "CREATE", "hot", "MODE", "durable", "MEM-BUDGET", "64mb"],
+        "InfinityDB extension (M4-S19, ADR-0062): MEM-BUDGET declares a durable-tiered \
+         namespace; the planeless compat candidate answers its documented no-runtime error",
+    ),
+    skip(
+        &["INF.NS", "SET", "hot", "MUTABLE-FRACTION", "300"],
+        "InfinityDB extension (M4-S19, ADR-0062 D3): per-namespace hot-reload; CreateOnly \
+         keys (TIER-IO-MODE, COLD-READ-QD) refuse typed",
+    ),
     // --- terminal cleanup ---
     c(&["FLUSHALL"]),
 ];

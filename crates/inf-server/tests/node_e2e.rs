@@ -961,6 +961,83 @@ fn durable_namespace_survives_restart() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// M4-S19 (ADR-0062): the tiered-namespace lifecycle over TCP — CREATE
+/// with budget keys rides the DDL program (9-arg NSFAN, AllOk fan,
+/// catalog persist-then-ack) and materializes per-cell tables under the
+/// D4 admission bound; `INFO tiering` reports them; `SET` hot-reloads a
+/// Hot key; the catalog **v2** tier block survives restart; `USE`
+/// refuses typed (D8 — the data plane is not wired); `DROP` tears down
+/// to the §3.3 zero contract.
+#[test]
+fn tiered_namespace_lifecycle_survives_restart() {
+    let dir = temp_data_dir("tiered-lifecycle");
+    // Two cells so the NSFAN peer fan is real, not a no-op.
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"hot",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"8mb",
+        b"DISK-BUDGET",
+        b"64mb",
+        b"MUTABLE-FRACTION",
+        b"100",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // This connection's cell materialized its table; the +OK above is
+    // the AllOk proof the peer did too (a peer failure surfaces as the
+    // first error leg).
+    let tiering = info_text(&mut c, b"tiering");
+    assert!(tiering.contains("tiering_tables:1"), "{tiering}");
+    assert!(tiering.contains("budget_bytes=8388608"), "{tiering}");
+    assert!(tiering.contains("disk_budget_bytes=67108864"), "{tiering}");
+    // The D8 refusal: no command can silently serve from an unrouted store.
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"hot"])).expect("write");
+    let refusal = read_line(&mut c);
+    assert!(
+        refusal.starts_with(b"-ERR tiered namespaces are not command-addressable"),
+        "{refusal:?}"
+    );
+    // Hot-reload rides the same DDL program (fan + persist-then-ack).
+    c.write_all(&cmd(&[b"INF.NS", b"SET", b"hot", b"MUTABLE-FRACTION", b"300"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // CreateOnly keys refuse.
+    c.write_all(&cmd(&[b"INF.NS", b"SET", b"hot", b"TIER-IO-MODE", b"buffered"])).expect("write");
+    let refusal = read_line(&mut c);
+    assert!(refusal.starts_with(b"-ERR TIER-IO-MODE is create-only"), "{refusal:?}");
+    drop(c);
+    node.stop();
+
+    // Restart: the catalog v2 tier block re-seeds and re-materializes,
+    // reloaded value included.
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    let tiering = info_text(&mut c, b"tiering");
+    assert!(tiering.contains("tiering_tables:1"), "re-materialized at boot: {tiering}");
+    assert!(tiering.contains("mutable_permille=300"), "the reload persisted: {tiering}");
+    c.write_all(&cmd(&[b"INF.NS", b"INFO", b"hot"])).expect("write");
+    let mut buf = vec![0u8; 1024];
+    let n = c.read(&mut buf).expect("read info");
+    let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+    assert!(info.contains("mem-budget"), "{info}");
+    assert!(info.contains("8388608"), "{info}");
+    // Teardown: DROP removes the tables on every cell; the zero
+    // contract holds again.
+    c.write_all(&cmd(&[b"INF.NS", b"DROP", b"hot"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let tiering = info_text(&mut c, b"tiering");
+    assert!(tiering.contains("tiering_tables:0"), "{tiering}");
+    assert!(tiering.contains("tiering_reserved_bytes:0"), "the ring returned: {tiering}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Mixed classes interleaved on one cell (§8.2 semantics table): `memory`,
 /// `everysec`, and `always` namespaces each honor their ack point, and the
 /// memory namespace appends zero log records (the L2 null-log case,

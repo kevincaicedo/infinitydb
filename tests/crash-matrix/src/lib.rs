@@ -207,6 +207,7 @@ pub fn fresh_keyspace(policy: FsyncClass) -> Keyspace {
         fsync: Some(policy),
         policy: None,
         maxmemory: None,
+        tier: None,
     })
     .expect("ns");
     ks
@@ -500,7 +501,7 @@ fn publish(
     write_manifest(
         fs,
         Path::new("data/shard-0"),
-        &Manifest { ckpt_id: u64::from(id), begin_lsn: begin, segments },
+        &Manifest { ckpt_id: u64::from(id), begin_lsn: begin, segments, tiers: Vec::new() },
     )
     .map_err(|e| e.to_string())
 }

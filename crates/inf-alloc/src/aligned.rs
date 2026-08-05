@@ -151,6 +151,18 @@ impl AlignedPool {
     pub fn reconcile(&self) -> Result<(), AlignedLeak> {
         if self.leased_count == 0 { Ok(()) } else { Err(AlignedLeak { leased: self.leased_count }) }
     }
+
+    /// Every buffer's full slice, in id order — the fixed-buffer
+    /// registration pass (M4-S08): the driver builds one iovec per
+    /// buffer from exactly these slices. Requires `&mut self` (no lease
+    /// may be observed through it) and touches no lease state.
+    pub fn buffers_mut(&mut self) -> impl Iterator<Item = &mut [u8]> {
+        let total = self.leased.len() * self.buf_size;
+        // SAFETY: base/total are exactly the live allocation made in
+        // `new`; `&mut self` makes this the only borrow of any buffer.
+        let all = unsafe { core::slice::from_raw_parts_mut(self.base, total) };
+        all.chunks_exact_mut(self.buf_size)
+    }
 }
 
 impl Drop for AlignedPool {
@@ -267,6 +279,29 @@ mod tests {
             assert!(pool.bytes(id).iter().all(|&b| b == i as u8 + 1), "buffers are disjoint");
         }
         assert_eq!(pool.reconcile(), Err(AlignedLeak { leased: 3 }));
+    }
+
+    /// M4-S08: the registration pass yields every buffer exactly once,
+    /// disjoint and in id order — the fixed-buffer iovec source.
+    #[test]
+    fn buffers_mut_yields_disjoint_registration_slices() {
+        let mut pool = AlignedPool::new(3, TIER_READ_ALIGN);
+        let mut count = 0usize;
+        let mut prev_end: Option<usize> = None;
+        for (i, bytes) in pool.buffers_mut().enumerate() {
+            assert_eq!(bytes.len(), TIER_READ_ALIGN);
+            assert_eq!(bytes.as_ptr() as usize % TIER_READ_ALIGN, 0, "aligned");
+            if let Some(end) = prev_end {
+                assert_eq!(bytes.as_ptr() as usize, end, "contiguous, disjoint, id order");
+            }
+            prev_end = Some(bytes.as_ptr() as usize + bytes.len());
+            bytes.fill(i as u8 + 1);
+            count += 1;
+        }
+        assert_eq!(count, 3);
+        // The pass touched no lease state and the writes landed per id.
+        let id = pool.try_lease().expect("fresh pool");
+        assert!(pool.bytes(id).iter().all(|&b| b == 1), "buffer 0 leased first");
     }
 
     #[test]

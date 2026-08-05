@@ -646,6 +646,27 @@ impl SegmentFile for SimFile {
         }
     }
 
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        let mut state = self.state.borrow_mut();
+        state.tick_op()?;
+        match &self.target {
+            Target::Ino(ino) => {
+                let inode = state.inodes.get_mut(ino).expect("open handle pins its inode");
+                let len = usize::try_from(len).expect("length fits usize");
+                // OS view honors the new length immediately; the durable
+                // image keeps the old tail until the next sync, and
+                // retained pending writes may resurrect bytes beyond the
+                // cut at power-cut time — real ftruncate physics, which
+                // is why ADR-0056 D5 syncs before any new flush.
+                inode.os.resize(len, 0);
+                Ok(())
+            }
+            Target::Dir(dir, _) => {
+                Err(io::Error::other(format!("truncate on dir handle {}", dir.display())))
+            }
+        }
+    }
+
     fn sync_data(&mut self) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;

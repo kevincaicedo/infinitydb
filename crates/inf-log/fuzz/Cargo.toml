@@ -43,3 +43,17 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "fuzz_tierfile_decode"
+path = "fuzz_targets/fuzz_tierfile_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extent_decode"
+path = "fuzz_targets/extent_decode.rs"
+test = false
+doc = false
+bench = false

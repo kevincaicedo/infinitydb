@@ -53,6 +53,12 @@ pub enum MutationEffect<'a> {
     },
     /// Canonical full-document post-image.
     DocFull { ns: NsId, key: &'a [u8], lineage: DocLineage, version: u32, idoc: &'a [u8] },
+    /// A string key now holds a value stored out of line in a blob
+    /// extent (M4-S17, ADR-0061 D2/D3). Constructed only from a
+    /// [`SealedExtent`](crate::SealedExtent) — the extent's fdatasync
+    /// preceded this effect's existence, so "extent durable before the
+    /// referencing ack" holds by construction.
+    StringSetExtent { ns: NsId, key: &'a [u8], extent_id: u64, offset: u64, len: u64 },
 }
 
 impl<'a> MutationEffect<'a> {
@@ -93,6 +99,9 @@ impl<'a> MutationEffect<'a> {
             },
             MutationEffect::DocFull { ns, key, lineage, version, idoc } => {
                 RecordView::DocFull { ns, key, lineage, version, idoc }
+            }
+            MutationEffect::StringSetExtent { ns, key, extent_id, offset, len } => {
+                RecordView::StringExtentRef { ns, key, extent_id, offset, len }
             }
         }
     }
@@ -135,6 +144,13 @@ mod tests {
                 lineage: DocLineage::FIRST,
                 version: 10,
                 idoc: b"idoc",
+            },
+            MutationEffect::StringSetExtent {
+                ns: NsId(5),
+                key: b"big",
+                extent_id: 42,
+                offset: 0,
+                len: 1 << 30,
             },
         ];
         for effect in effects {

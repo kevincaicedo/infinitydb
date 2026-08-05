@@ -9,7 +9,9 @@
 //! so client libraries parse it (the M1-S03 client-smoke AC).
 
 use inf_foundation::time::Nanos;
-use inf_store::{CellStore, EvictionPolicy, Keyspace, NsError, NsMode, NsSpec, PressureConfig};
+use inf_store::{
+    CellStore, EvictionPolicy, Keyspace, NsError, NsMode, NsSpec, PressureConfig, TierSpec,
+};
 use inf_wire::{CmdFlags, Protocol, RespWriter};
 
 use crate::clients::{format_client_line, valid_client_name};
@@ -268,25 +270,7 @@ pub(crate) fn info(
         text.push_str("\r\n");
     }
     if wants("tiering") {
-        // M4-S03: tiering code-path counters (this cell's slice). On a
-        // node without durable-tiered namespaces every field is
-        // identically zero — the degenerate-case A/B report and the
-        // cache-profile CI runs assert exactly that (§3.3 "provably
-        // unexecuted" made mechanical). S13 grows this section into the
-        // full operator surface (watermarks, budgets, write-amp).
-        let tiering = ks.tiering_counters();
-        push(&mut text, "# Tiering");
-        push(&mut text, &format!("tiering_tables:{}", ks.tiered_tables()));
-        push(&mut text, &format!("tiering_tail_allocs:{}", tiering.tail_allocs));
-        push(&mut text, &format!("tiering_seal_holes:{}", tiering.seal_holes));
-        push(&mut text, &format!("tiering_seal_hole_bytes:{}", tiering.seal_hole_bytes));
-        push(&mut text, &format!("tiering_region_commit_pages:{}", tiering.region_commit_pages));
-        push(
-            &mut text,
-            &format!("tiering_region_decommit_pages:{}", tiering.region_decommit_pages),
-        );
-        push(&mut text, &format!("tiering_cold_resolves:{}", tiering.cold_resolves));
-        text.push_str("\r\n");
+        tiering_section(ks, &mut text);
     }
     let stats = ks.stats();
     if wants("stats") {
@@ -400,6 +384,157 @@ pub(crate) fn info(
         text.truncate(text.len() - 2);
     }
     w.verbatim(b"txt", text.as_bytes());
+}
+
+/// `INFO tiering` — this cell's slice of the M4 tiered-storage surface.
+///
+/// Two shapes, deliberately: cell-aggregate `tiering_*` fields (the
+/// §3.3 degenerate-case contract — on a node with no durable-tiered
+/// namespace **every one of them is identically zero**, which the
+/// `inf-bench` m4 rows assert as a release blocker), and one
+/// `tiering_ns<id>:` line per tiered namespace carrying the watermarks,
+/// the budget, the M4-S13 write counters, and the M4-S16 write
+/// amplification. Per-namespace is not a nicety: a blended node-wide
+/// number hides a runaway tiered namespace behind a quiet one, which is
+/// why the ratio is per namespace and the only aggregate of it is a
+/// maximum.
+///
+/// The operator's reading of every field is
+/// `infinitydb/docs/ops-tiered-storage.md` — that chapter and this
+/// function are edited together.
+fn tiering_section(ks: &Keyspace, text: &mut String) {
+    let push = |text: &mut String, line: &str| {
+        text.push_str(line);
+        text.push_str("\r\n");
+    };
+    // M4-S03: tiering code-path counters (this cell's slice).
+    let tiering = ks.tiering_counters();
+    push(text, "# Tiering");
+    push(text, &format!("tiering_tables:{}", ks.tiered_tables()));
+    push(text, &format!("tiering_tail_allocs:{}", tiering.tail_allocs));
+    push(text, &format!("tiering_seal_holes:{}", tiering.seal_holes));
+    push(text, &format!("tiering_seal_hole_bytes:{}", tiering.seal_hole_bytes));
+    push(text, &format!("tiering_region_commit_pages:{}", tiering.region_commit_pages));
+    push(text, &format!("tiering_region_decommit_pages:{}", tiering.region_decommit_pages));
+    push(text, &format!("tiering_cold_resolves:{}", tiering.cold_resolves));
+    // M4-S07: demotion + backpressure counters and the L5 usage
+    // attribution — same zero-in-memory-mode contract as above.
+    push(text, &format!("tiering_tail_alloc_stalls:{}", tiering.tail_alloc_stalls));
+    push(text, &format!("tiering_demote_slices:{}", tiering.demote_slices));
+    push(text, &format!("tiering_demote_sealed_bytes:{}", tiering.demote_sealed_bytes));
+    // M4-S11: flush-pipeline counters — same zero contract.
+    push(text, &format!("tiering_flush_slices:{}", tiering.flush_slices));
+    push(text, &format!("tiering_flush_confirmed_bytes:{}", tiering.flush_confirmed_bytes));
+    // M4-S15: copy-forward slices — same zero contract.
+    push(text, &format!("tiering_compact_slices:{}", tiering.compact_slices));
+    let usage = ks.tiering_usage();
+    push(text, &format!("tiering_reserved_bytes:{}", usage.reserved_bytes));
+    push(text, &format!("tiering_committed_bytes:{}", usage.committed_bytes));
+    push(text, &format!("tiering_allocated_bytes:{}", usage.allocated_bytes));
+    push(text, &format!("tiering_dead_bytes:{}", usage.dead_bytes));
+    push(text, &format!("tiering_live_bytes:{}", usage.live_bytes));
+    push(text, &format!("tiering_index_bytes:{}", usage.index_bytes));
+    // M4-S13 write-path accounting: cell totals, then the per-namespace
+    // lines they are the exact field-wise sum of. `written_bytes` is the
+    // write-amp numerator (WAL + flush — M4-S16/ADR-0060 D2: the
+    // relocation volume in `compaction_bytes` reaches the device through
+    // the flush leg and is not added again).
+    let write = ks.tiering_write_accounting();
+    push(text, &format!("tiering_user_bytes:{}", write.user_bytes));
+    push(text, &format!("tiering_wal_bytes:{}", write.wal_bytes));
+    push(text, &format!("tiering_flush_bytes:{}", write.flush_bytes));
+    push(text, &format!("tiering_compaction_bytes:{}", write.compaction_bytes));
+    push(text, &format!("tiering_written_bytes:{}", write.written_bytes()));
+    // M4-S16 write amplification: the **worst** namespace, plus the count
+    // of namespaces that wrote bytes while admitting none (unbounded — a
+    // gate must not read those as a pass, and no maximum over the others
+    // describes them). Never a blended cell-wide ratio: that is the shape
+    // that hides one runaway namespace behind a quiet one.
+    let amp = ks.tiering_write_amp();
+    push(text, &format!("tiering_write_amp_milli_max:{}", amp.milli_max));
+    push(text, &format!("tiering_write_amp_undefined_ns:{}", amp.unbounded_namespaces));
+    // M4-S17 blob extents (ADR-0061 D8): the disjoint device leg and the
+    // extent lifecycle observables — same zero contract.
+    push(text, &format!("tiering_blob_user_bytes:{}", write.blob_user_bytes));
+    push(text, &format!("tiering_blob_bytes:{}", write.blob_bytes));
+    // M4-S18: the blob leg's own worst-namespace ratio — never blended
+    // into the record ratio above (a byte is written once and counted in
+    // exactly one leg), and never blended across namespaces either.
+    let blob_amp = ks.tiering_blob_write_amp();
+    push(text, &format!("tiering_blob_write_amp_milli_max:{}", blob_amp.milli_max));
+    push(text, &format!("tiering_blob_write_amp_undefined_ns:{}", blob_amp.unbounded_namespaces));
+    let extents = ks.tiering_extent_stats();
+    push(text, &format!("tiering_blob_extents_live:{}", extents.live));
+    push(text, &format!("tiering_blob_extent_bytes_live:{}", extents.live_bytes));
+    push(text, &format!("tiering_blob_extents_created:{}", extents.created));
+    push(text, &format!("tiering_blob_extents_reclaimed:{}", extents.reclaimed));
+    // M4-S18 reclaim visibility: the standing backlog (parked + stamped +
+    // handed out) and the non-fatal unlink deferrals — both zero at
+    // quiescence, which is exactly what the leak test asserts.
+    push(text, &format!("tiering_blob_reclaimable:{}", extents.reclaimable));
+    push(text, &format!("tiering_blob_reclaim_deferred:{}", extents.reclaim_deferred));
+    push(text, &format!("tiering_blob_reclaim_slices:{}", extents.reclaim_slices));
+    push(text, &format!("tiering_blob_rmw_ops:{}", extents.rmw_ops));
+    // M4-S19 (ADR-0062 D5): extent device bytes on disk right now — the
+    // blob half of every namespace's disk usage (the tier-file half is
+    // plane state and joins with the wiring).
+    push(text, &format!("tiering_blob_disk_bytes:{}", extents.disk_bytes));
+    // M4-S21 (ADR-0063 D5): disk-admission observables — namespaces
+    // currently refusing, typed refusals issued, the
+    // nothing-compactable-under-pressure alarm, and the enforced
+    // `disk_used` snapshots. Same zero contract.
+    let disk = ks.tiering_disk_admission();
+    push(text, &format!("tiering_diskfull_ns:{}", disk.full_namespaces));
+    push(text, &format!("tiering_diskfull_refusals:{}", disk.refusals));
+    push(text, &format!("tiering_compact_idle_pressure:{}", disk.compact_idle_pressure));
+    push(text, &format!("tiering_disk_used_bytes:{}", disk.used_bytes));
+    for (ns, table) in ks.tiered_namespaces() {
+        let space = table.space();
+        let report = space.report();
+        let write = table.write_accounting();
+        push(
+            text,
+            &format!(
+                "tiering_ns{}:head={},flushed={},ro_boundary={},tail={},committed_bytes={},\
+                 budget_bytes={},disk_budget_bytes={},mutable_permille={},live_bytes={},\
+                 dead_bytes={},user_bytes={},wal_bytes={},flush_bytes={},compaction_bytes={},\
+                 write_amp_milli={},blob_user_bytes={},blob_bytes={},blob_write_amp_milli={},\
+                 blob_extents_live={},blob_disk_bytes={},disk_used_bytes={},disk_full={},\
+                 diskfull_refusals={},compact_idle_pressure={}",
+                ns.0,
+                space.head().to_raw(),
+                space.flushed().to_raw(),
+                space.ro_boundary().to_raw(),
+                space.tail().to_raw(),
+                report.committed_bytes,
+                table.demotion().mem_budget_bytes,
+                table.disk_budget(),
+                table.demotion().mutable_permille,
+                table.live_bytes(),
+                report.dead_bytes,
+                write.user_bytes,
+                write.wal_bytes,
+                write.flush_bytes,
+                write.compaction_bytes,
+                write.write_amplification(),
+                write.blob_user_bytes,
+                write.blob_bytes,
+                write.blob_write_amplification(),
+                table.extent_stats().live,
+                table.extent_stats().disk_bytes,
+                table.disk_admission_used(),
+                // M4-S21 (ADR-0063 D5): which admission leg is refusing.
+                match table.disk_full() {
+                    None => "none",
+                    Some(inf_store::DiskFullCause::Budget { .. }) => "budget",
+                    Some(inf_store::DiskFullCause::Device) => "device",
+                },
+                table.diskfull_refusals(),
+                table.compact_idle_pressure(),
+            ),
+        );
+    }
+    text.push_str("\r\n");
 }
 
 /// VmRSS from procfs (Linux); 0 where unavailable.
@@ -626,18 +761,30 @@ pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
         .and_then(EvictionPolicy::parse)
         .unwrap_or(EvictionPolicy::NoEviction);
     let samples: u32 = cfg.get("maxmemory-samples").and_then(|v| v.parse().ok()).unwrap_or(5);
+    // M4-S19 (ADR-0062 D4): the reserved-VA admission bound rides the
+    // same hot-per-cell sweep and the same per-cell division argument —
+    // cells are symmetric, so the shares preserve the node bound.
+    let va_limit: u64 = cfg
+        .get("tiered-reserved-va-limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(inf_store::TIERED_VA_LIMIT_DEFAULT);
     drop(cfg);
     let cells = u64::from(node.cells.get().max(1));
     ks.set_pressure(PressureConfig { limit_bytes: maxmemory / cells, policy, samples });
+    ks.set_tiered_va_limit(va_limit / cells);
 }
 
 // ---- INF.NS (M1-S08) -----------------------------------------------------------
 
 /// `INF.NS CREATE name [MODE memory|durable|topic] [EVICTION policy]
-/// [MAXMEMORY bytes] | LIST | INFO name | DROP name` — the namespace
-/// registry surface (master plan §4.2). Counters in INFO are this cell's
-/// slice (same documented scope as `INFO` until the control plane
-/// aggregates).
+/// [MAXMEMORY bytes] [MEM-BUDGET b] [DISK-BUDGET b] [MUTABLE-FRACTION ‰]
+/// [MAINTAIN-SLICE b] [COLD-READ-QD n] [COMPACTION-DEAD-RATIO pct]
+/// [COMPACTION-SLICE b] [BLOB-THRESHOLD b] [TIER-IO-MODE direct|buffered]
+/// [TAIL-STALL-TIMEOUT ms] | SET name KEY value [KEY value ...] | LIST |
+/// INFO name | DROP name` — the namespace registry surface (master plan
+/// §4.2; the tiering keys are M4-S19, ADR-0062). Counters in INFO are
+/// this cell's slice (same documented scope as `INFO` until the control
+/// plane aggregates).
 pub(crate) fn inf_ns(
     argv: &(impl Argv + ?Sized),
     ks: &mut Keyspace,
@@ -684,8 +831,28 @@ pub(crate) fn inf_ns(
         if spec.mode == NsMode::Topic {
             return w.error("ERR topic namespaces are not addressable before M5");
         }
+        // M4-S19 (ADR-0062 D8): the tiered data plane is not wired —
+        // refusing USE keeps any command from silently serving out of a
+        // store the router does not route to.
+        if spec.tier.is_some() {
+            return w.error(
+                "ERR tiered namespaces are not command-addressable yet (M4 command wiring)",
+            );
+        }
         cx.ns = Some(spec.id);
         w.simple("OK")
+    } else if sub.eq_ignore_ascii_case(b"SET") {
+        // Planeless arm (unit tests, embedded); on a node the pump's DDL
+        // program owns SET — hot-reload persists the catalog like any
+        // DDL (M4-S19, ADR-0062 D3).
+        let (name, tier) = match parse_ns_set(argv, ks) {
+            Ok(parsed) => parsed,
+            Err(msg) => return w.error(&msg),
+        };
+        match ks.ns_set_tier(&name, tier) {
+            Ok(()) => w.simple("OK"),
+            Err(e) => ns_error(e, w),
+        }
     } else if sub.eq_ignore_ascii_case(b"DROP") {
         if argv.len() != 3 {
             return arity_error("INF.NS|DROP", w);
@@ -751,8 +918,7 @@ pub(crate) fn inf_ns(
             Some(store) => (store.len(), store.stats().ttl_live),
             None => (0, 0),
         };
-        w.map_header(8);
-        for (k, v) in [
+        let mut pairs = vec![
             ("name", String::from_utf8_lossy(&spec.name).into_owned()),
             ("id", spec.id.0.to_string()),
             ("mode", spec.mode.name().to_string()),
@@ -761,16 +927,79 @@ pub(crate) fn inf_ns(
             ("maxmemory", maxmemory),
             ("keys", keys.to_string()),
             ("expires", expires.to_string()),
-        ] {
+        ];
+        // The tier block, key-for-key (M4-S19 — the ADR-0062 D2 table
+        // read back; `INFO tiering` carries the live counters).
+        if let Some(tier) = &spec.tier {
+            pairs.push(("mem-budget", tier.mem_budget_bytes.to_string()));
+            pairs.push(("disk-budget", tier.disk_budget_bytes.to_string()));
+            pairs.push(("mutable-fraction", tier.mutable_permille.to_string()));
+            pairs.push(("maintain-slice", tier.maintain_slice_bytes.to_string()));
+            pairs.push(("cold-read-qd", tier.cold_read_qd.to_string()));
+            pairs.push(("compaction-dead-ratio", tier.compaction_dead_ratio_pct.to_string()));
+            pairs.push(("compaction-slice", tier.compaction_slice_bytes.to_string()));
+            pairs.push(("blob-threshold", tier.blob_threshold_bytes.to_string()));
+            pairs.push((
+                "tier-io-mode",
+                match tier.tier_io_mode {
+                    inf_log::fs::TierIoMode::Direct => "direct".to_string(),
+                    inf_log::fs::TierIoMode::Buffered => "buffered".to_string(),
+                },
+            ));
+            pairs.push(("tail-stall-timeout", tier.tail_stall_timeout_ms.to_string()));
+        }
+        w.map_header(pairs.len());
+        for (k, v) in pairs {
             w.bulk(k.as_bytes());
             w.bulk(v.as_bytes());
         }
     } else {
         w.error(&format!(
-            "ERR Unknown subcommand or wrong number of arguments for '{}'. Try INF.NS CREATE|USE|LIST|INFO|DROP.",
+            "ERR Unknown subcommand or wrong number of arguments for '{}'. Try INF.NS CREATE|SET|USE|LIST|INFO|DROP.",
             String::from_utf8_lossy(sub)
         ));
     }
+}
+
+/// Parses `INF.NS SET name KEY value [KEY value ...]` against the
+/// namespace's current tier spec (M4-S19, ADR-0062 D3): Hot keys apply
+/// as overrides; CreateOnly keys (`TIER-IO-MODE`, `COLD-READ-QD`) refuse
+/// typed — a hot-reload that would be a silent no-op is worse than a
+/// refusal. All-or-nothing: the first invalid pair fails the call before
+/// anything mutates.
+pub(crate) fn parse_ns_set(
+    argv: &(impl Argv + ?Sized),
+    ks: &Keyspace,
+) -> Result<(Vec<u8>, TierSpec), String> {
+    if argv.len() < 5 || !(argv.len() - 3).is_multiple_of(2) {
+        return Err("ERR wrong number of arguments for 'INF.NS|SET'".to_string());
+    }
+    let name = argv.arg(2).to_vec();
+    let spec = ks
+        .ns_get(&name)
+        .ok_or_else(|| format!("ERR namespace '{}' not found", String::from_utf8_lossy(&name)))?;
+    let Some(current) = spec.tier else {
+        return Err("ERR not a tiered namespace — tiering is set at CREATE with MEM-BUDGET \
+                    (drop and recreate to add it, ADR-0062 D3)"
+            .to_string());
+    };
+    let mut tier = Some(current);
+    let mut i = 3;
+    while i < argv.len() {
+        let opt = argv.arg(i);
+        let value = argv.arg(i + 1);
+        if opt.eq_ignore_ascii_case(b"TIER-IO-MODE") || opt.eq_ignore_ascii_case(b"COLD-READ-QD") {
+            return Err(format!(
+                "ERR {} is create-only (ADR-0062 D3 — drop and recreate to change it)",
+                String::from_utf8_lossy(opt).to_uppercase()
+            ));
+        }
+        if parse_tier_key(&mut tier, opt, value)?.is_none() {
+            return Err("ERR syntax error".to_string());
+        }
+        i += 2;
+    }
+    Ok((name, tier.expect("seeded from the current spec")))
 }
 
 /// `dbN` for N in 0..16.
@@ -800,6 +1029,21 @@ pub(crate) fn ns_error(e: NsError, w: &mut RespWriter<'_>) {
         NsError::EvictionNotAllowedDurable => w.error(
             "ERR durable namespaces do not evict (M2, ADR-0015); EVICTION applies to MODE memory",
         ),
+        NsError::TierRequiresDurable => w.error(
+            "ERR tiering keys (MEM-BUDGET ...) apply to MODE durable namespaces only (ADR-0062)",
+        ),
+        NsError::InvalidTierConfig(reason) => w.error(&format!("ERR {reason}")),
+        NsError::TierVaLimitExceeded { requested_bytes, admitted_bytes, limit_bytes } => {
+            w.error(&format!(
+                "ERR tiered namespace would exceed the node's reserved-VA limit \
+                 (requested {requested_bytes}, admitted {admitted_bytes}, limit {limit_bytes} \
+                 bytes per cell — CONFIG SET tiered-reserved-va-limit, ADR-0062 D4)"
+            ))
+        }
+        NsError::NotTiered => w.error(
+            "ERR not a tiered namespace — tiering is set at CREATE with MEM-BUDGET \
+             (drop and recreate to add it, ADR-0062 D3)",
+        ),
     }
 }
 
@@ -811,6 +1055,7 @@ pub(crate) struct NsSpecDraft {
     pub fsync: Option<inf_store::FsyncClass>,
     pub policy: Option<EvictionPolicy>,
     pub maxmemory: Option<u64>,
+    pub tier: Option<TierSpec>,
 }
 
 impl NsSpecDraft {
@@ -822,13 +1067,17 @@ impl NsSpecDraft {
             fsync: self.fsync,
             policy: self.policy,
             maxmemory: self.maxmemory,
+            tier: self.tier,
         }
     }
 }
 
 /// Parses `INF.NS CREATE name [MODE m] [FSYNC always|everysec]
-/// [EVICTION p] [MAXMEMORY b]` — shared by the planeless arm and the
-/// pump's DDL program (registry rules validate after id assignment).
+/// [EVICTION p] [MAXMEMORY b] [<tier keys> ...]` — shared by the
+/// planeless arm and the pump's DDL program (registry rules validate
+/// after id assignment). Tier keys (M4-S19, ADR-0062 D1/D2) accumulate
+/// into a [`TierSpec`]; `MEM-BUDGET` is the tiered discriminator, so a
+/// tier key without it fails typed at the end of the loop.
 pub(crate) fn parse_ns_create(argv: &(impl Argv + ?Sized)) -> Result<NsSpecDraft, String> {
     if argv.len() < 3 {
         return Err("ERR wrong number of arguments for 'INF.NS|CREATE'".to_string());
@@ -839,7 +1088,9 @@ pub(crate) fn parse_ns_create(argv: &(impl Argv + ?Sized)) -> Result<NsSpecDraft
         fsync: None,
         policy: None,
         maxmemory: None,
+        tier: None,
     };
+    let mut saw_mem_budget = false;
     let mut i = 3;
     while i < argv.len() {
         let opt = argv.arg(i);
@@ -872,12 +1123,94 @@ pub(crate) fn parse_ns_create(argv: &(impl Argv + ?Sized)) -> Result<NsSpecDraft
                     .and_then(crate::config::parse_memory)
                     .ok_or("ERR invalid MAXMEMORY value")?,
             );
+        } else if let Some(applied) = parse_tier_key(&mut draft.tier, opt, value)? {
+            saw_mem_budget |= applied;
         } else {
             return Err("ERR syntax error".to_string());
         }
         i += 2;
     }
+    if draft.tier.is_some() && !saw_mem_budget {
+        return Err("ERR tiering keys require MEM-BUDGET (the tiered discriminator — \
+                    ADR-0062 D1)"
+            .to_string());
+    }
     Ok(draft)
+}
+
+/// One tier key applied onto an accumulating [`TierSpec`] (ADR-0062 D2
+/// vocabulary; ranges validate at registration through
+/// `TierSpec::validate` — one gauntlet, not two). Returns `Ok(None)` for
+/// a non-tier key, `Ok(Some(is_mem_budget))` when applied.
+fn parse_tier_key(
+    tier: &mut Option<TierSpec>,
+    opt: &[u8],
+    value: &[u8],
+) -> Result<Option<bool>, String> {
+    let memory = |value: &[u8], key: &str| {
+        core::str::from_utf8(value)
+            .ok()
+            .and_then(crate::config::parse_memory)
+            .ok_or(format!("ERR invalid {key} value"))
+    };
+    let int = |value: &[u8], key: &str| {
+        core::str::from_utf8(value)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or(format!("ERR invalid {key} value"))
+    };
+    let key = opt.to_ascii_uppercase();
+    let spec = match key.as_slice() {
+        b"MEM-BUDGET"
+        | b"DISK-BUDGET"
+        | b"MUTABLE-FRACTION"
+        | b"MAINTAIN-SLICE"
+        | b"COLD-READ-QD"
+        | b"COMPACTION-DEAD-RATIO"
+        | b"COMPACTION-SLICE"
+        | b"BLOB-THRESHOLD"
+        | b"TIER-IO-MODE"
+        | b"TAIL-STALL-TIMEOUT" => tier.get_or_insert_with(|| TierSpec::for_budget(0)),
+        _ => return Ok(None),
+    };
+    match key.as_slice() {
+        b"MEM-BUDGET" => {
+            spec.mem_budget_bytes = memory(value, "MEM-BUDGET")?;
+            return Ok(Some(true));
+        }
+        b"DISK-BUDGET" => spec.disk_budget_bytes = memory(value, "DISK-BUDGET")?,
+        b"MUTABLE-FRACTION" => {
+            spec.mutable_permille = u32::try_from(int(value, "MUTABLE-FRACTION")?)
+                .map_err(|_| "ERR invalid MUTABLE-FRACTION value")?;
+        }
+        b"MAINTAIN-SLICE" => spec.maintain_slice_bytes = memory(value, "MAINTAIN-SLICE")?,
+        b"COLD-READ-QD" => {
+            spec.cold_read_qd = u16::try_from(int(value, "COLD-READ-QD")?)
+                .map_err(|_| "ERR invalid COLD-READ-QD value")?;
+        }
+        b"COMPACTION-DEAD-RATIO" => {
+            spec.compaction_dead_ratio_pct = u8::try_from(int(value, "COMPACTION-DEAD-RATIO")?)
+                .map_err(|_| "ERR invalid COMPACTION-DEAD-RATIO value")?;
+        }
+        b"COMPACTION-SLICE" => spec.compaction_slice_bytes = memory(value, "COMPACTION-SLICE")?,
+        b"BLOB-THRESHOLD" => {
+            spec.blob_threshold_bytes = u32::try_from(memory(value, "BLOB-THRESHOLD")?)
+                .map_err(|_| "ERR invalid BLOB-THRESHOLD value")?;
+        }
+        b"TIER-IO-MODE" => {
+            spec.tier_io_mode = match value.to_ascii_lowercase().as_slice() {
+                b"direct" => inf_log::fs::TierIoMode::Direct,
+                b"buffered" => inf_log::fs::TierIoMode::Buffered,
+                _ => return Err("ERR unknown TIER-IO-MODE (direct|buffered)".to_string()),
+            };
+        }
+        b"TAIL-STALL-TIMEOUT" => {
+            spec.tail_stall_timeout_ms = u32::try_from(int(value, "TAIL-STALL-TIMEOUT")?)
+                .map_err(|_| "ERR invalid TAIL-STALL-TIMEOUT value")?;
+        }
+        _ => unreachable!("membership matched above"),
+    }
+    Ok(Some(false))
 }
 
 /// Planeless-tier id allocation: past the registered maximum, floor 16.
@@ -1169,6 +1502,325 @@ mod tests {
         // The serving cell published its own slot at render time: the
         // totals now exceed the peer's contribution alone.
         assert!(board.totals().used_bytes > 1_000, "serving cell published its slot");
+    }
+
+    /// M4-S03/S13 degenerate-case contract, as an operator sees it: on a
+    /// memory-mode node the section renders in full and **every**
+    /// `tiering_*` field is identically zero, with no per-namespace line
+    /// at all. This is the shape `inf-bench`'s m4 rows assert as a
+    /// release blocker; breaking it here breaks the gate there.
+    #[test]
+    fn info_tiering_is_all_zero_without_a_tiered_namespace() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        run(&mut cx, &mut store, &[b"SET", b"k", b"v"]);
+        let text =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tiering"])).expect("ascii");
+        assert!(text.contains("# Tiering"), "{text}");
+        for line in text.lines().filter(|l| l.starts_with("tiering_")) {
+            let (name, value) = line.split_once(':').expect("key:value shape");
+            assert_eq!(value, "0", "{name} must be identically zero on a memory-mode node");
+        }
+        for name in [
+            "tiering_user_bytes",
+            "tiering_wal_bytes",
+            "tiering_flush_bytes",
+            "tiering_compaction_bytes",
+            "tiering_written_bytes",
+            // M4-S16: a cell with no tiered namespace has no ratio to
+            // report and nothing that cannot answer — both read zero for
+            // the same structural reason as the counters.
+            "tiering_write_amp_milli_max",
+            "tiering_write_amp_undefined_ns",
+            // M4-S17 (ADR-0061 D8): no table, no extents — the blob leg
+            // reads zero for the same structural reason.
+            "tiering_blob_user_bytes",
+            "tiering_blob_bytes",
+            "tiering_blob_extents_live",
+            "tiering_blob_extents_created",
+            "tiering_blob_extents_reclaimed",
+            "tiering_blob_reclaim_slices",
+            "tiering_blob_rmw_ops",
+            // M4-S18: the blob ratio aggregates and the reclaim backlog
+            // observables — zero without a table, zero at quiescence.
+            "tiering_blob_write_amp_milli_max",
+            "tiering_blob_write_amp_undefined_ns",
+            "tiering_blob_reclaimable",
+            "tiering_blob_reclaim_deferred",
+        ] {
+            assert!(text.contains(&format!("{name}:0")), "missing {name}: {text}");
+        }
+    }
+
+    /// M4-S13: a tiered namespace publishes its watermarks, its budget,
+    /// and its four write counters on one `tiering_ns<id>:` line, and the
+    /// cell aggregate is the exact sum of those lines.
+    #[test]
+    fn info_tiering_renders_per_namespace_watermarks_and_write_counters() {
+        use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId, TieredTable};
+
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let ns = NsId(17);
+        let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
+        assert!(
+            store
+                .materialize_tiered(
+                    ns,
+                    AddressSpaceConfig {
+                        reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
+                        page_bytes: 4 << 10,
+                        life_origin: LogicalAddr::ZERO,
+                    },
+                    demote,
+                    64,
+                )
+                .is_ok()
+        );
+        let table = store.tiered_store_mut(ns).expect("materialized");
+        table.insert(b"key", b"value", TieredTable::hash_key(b"key")).expect("fits");
+
+        let text =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tiering"])).expect("ascii");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("tiering_ns17:"))
+            .expect("the tiered namespace has a line");
+        for field in
+            ["head=", "flushed=", "ro_boundary=", "tail=", "committed_bytes=", "budget_bytes="]
+        {
+            assert!(line.contains(field), "missing {field}: {line}");
+        }
+        // `key` + `value` = 8 user bytes, charged at the record boundary
+        // — not the encoded record length, not the wire bytes.
+        assert!(line.contains("user_bytes=8"), "{line}");
+        assert!(line.contains("wal_bytes=0"), "no WAL record was staged: {line}");
+        assert!(text.contains("tiering_user_bytes:8"), "the aggregate sums the lines: {text}");
+        assert!(text.contains("tiering_tables:1"), "{text}");
+    }
+
+    /// M4-S16: the per-namespace line carries the write-amplification
+    /// ratio in milli-units, the cell aggregate is the **maximum** of
+    /// those (never a blend), and a namespace that wrote bytes while
+    /// admitting none says `undefined` and is counted rather than
+    /// averaged away.
+    #[test]
+    fn info_tiering_reports_write_amplification_per_namespace() {
+        use inf_log::{MutationEffect, StagingConfig, StagingRing};
+        use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId, TieredTable};
+
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let mut ring = StagingRing::new(StagingConfig::default());
+        for id in [7u32, 9u32] {
+            let ns = NsId(id);
+            let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
+            assert!(
+                store
+                    .materialize_tiered(
+                        ns,
+                        AddressSpaceConfig {
+                            reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
+                            page_bytes: 4 << 10,
+                            life_origin: LogicalAddr::ZERO,
+                        },
+                        demote,
+                        64,
+                    )
+                    .is_ok()
+            );
+        }
+        // ns 7 admits user bytes and stages their WAL records: a measured
+        // ratio. ns 9 stages a delete's WAL record and admits nothing:
+        // unbounded, which is the arm a blended average would erase.
+        let table = store.tiered_store_mut(NsId(7)).expect("materialized");
+        let value = [0x41u8; 64];
+        for i in 0..4u32 {
+            let key = format!("k{i}");
+            let effect =
+                MutationEffect::StringSet { ns: NsId(7), key: key.as_bytes(), value: &value };
+            table.stage_wal(&mut ring, &effect).expect("frame has room");
+            table
+                .insert(key.as_bytes(), &value, TieredTable::hash_key(key.as_bytes()))
+                .expect("fits");
+        }
+        let measured = table.write_accounting();
+        let expect_milli =
+            measured.write_amplification().milli().expect("user bytes were admitted");
+        let table = store.tiered_store_mut(NsId(9)).expect("materialized");
+        table
+            .stage_wal(&mut ring, &MutationEffect::Delete { ns: NsId(9), key: b"gone" })
+            .expect("frame has room");
+
+        let text =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tiering"])).expect("ascii");
+        let ns7 = text.lines().find(|l| l.starts_with("tiering_ns7:")).expect("ns 7 line");
+        let ns9 = text.lines().find(|l| l.starts_with("tiering_ns9:")).expect("ns 9 line");
+        assert!(expect_milli > 1_000, "WAL bytes exceed user bytes: {expect_milli}");
+        assert!(ns7.contains(&format!("write_amp_milli={expect_milli}")), "{ns7}");
+        assert!(ns9.contains("write_amp_milli=undefined"), "no denominator: {ns9}");
+        assert!(
+            text.contains(&format!("tiering_write_amp_milli_max:{expect_milli}")),
+            "the aggregate is the worst measured namespace: {text}"
+        );
+        assert!(
+            text.contains("tiering_write_amp_undefined_ns:1"),
+            "the unbounded namespace is counted, not averaged: {text}"
+        );
+    }
+
+    /// M4-S19 (ADR-0062): the `INF.NS` tiering surface — the D1 rule
+    /// (tier keys require MODE durable + MEM-BUDGET), the D8 `USE`
+    /// refusal, `SET` hot-reload with the CreateOnly refusals, and the
+    /// tier block read back through `INF.NS INFO`.
+    #[test]
+    fn inf_ns_tiering_surface() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        // Tier keys without MEM-BUDGET refuse typed (the discriminator).
+        let r = run(
+            &mut cx,
+            &mut store,
+            &[b"INF.NS", b"CREATE", b"t", b"MODE", b"durable", b"DISK-BUDGET", b"1gb"],
+        );
+        assert!(r.starts_with(b"-ERR tiering keys require MEM-BUDGET"), "{r:?}");
+        // MEM-BUDGET on MODE memory hits the D1 registry rule.
+        let r = run(&mut cx, &mut store, &[b"INF.NS", b"CREATE", b"t", b"MEM-BUDGET", b"64mb"]);
+        assert!(
+            r.starts_with(b"-ERR tiering keys (MEM-BUDGET ...) apply to MODE durable"),
+            "{r:?}"
+        );
+        // A tiered durable create parses, then hits the planeless
+        // durable refusal — the node runtime owns real creation.
+        let r = run(
+            &mut cx,
+            &mut store,
+            &[b"INF.NS", b"CREATE", b"t", b"MODE", b"durable", b"MEM-BUDGET", b"64mb"],
+        );
+        assert!(r.starts_with(b"-ERR durable namespaces need the node runtime"), "{r:?}");
+
+        // Materialize through the spec path (the node path's effect) and
+        // drive the rest of the surface against it.
+        let tier = TierSpec::for_budget(8 << 20);
+        store
+            .ns_create(NsSpec {
+                id: inf_store::NsId(16),
+                name: b"tiered".to_vec(),
+                mode: NsMode::Durable,
+                fsync: None,
+                policy: None,
+                maxmemory: None,
+                tier: Some(tier),
+            })
+            .expect("create");
+        let r = run(&mut cx, &mut store, &[b"INF.NS", b"USE", b"tiered"]);
+        assert!(r.starts_with(b"-ERR tiered namespaces are not command-addressable"), "{r:?}");
+        let r =
+            run(&mut cx, &mut store, &[b"INF.NS", b"SET", b"tiered", b"MUTABLE-FRACTION", b"300"]);
+        assert_eq!(r, b"+OK\r\n");
+        assert_eq!(
+            store.tiered_store_mut(inf_store::NsId(16)).expect("table").demotion().mutable_permille,
+            300,
+            "hot reload reached the table"
+        );
+        let r =
+            run(&mut cx, &mut store, &[b"INF.NS", b"SET", b"tiered", b"TIER-IO-MODE", b"buffered"]);
+        assert!(r.starts_with(b"-ERR TIER-IO-MODE is create-only"), "{r:?}");
+        let r = run(
+            &mut cx,
+            &mut store,
+            &[b"INF.NS", b"SET", b"tiered", b"COMPACTION-DEAD-RATIO", b"10"],
+        );
+        assert!(r.starts_with(b"-ERR COMPACTION-DEAD-RATIO is 50..=100"), "{r:?}");
+        // INFO reads the whole tier block back, key for key.
+        let r = run(&mut cx, &mut store, &[b"INF.NS", b"INFO", b"tiered"]);
+        let text = String::from_utf8_lossy(&r);
+        for field in [
+            "mem-budget",
+            "disk-budget",
+            "mutable-fraction",
+            "cold-read-qd",
+            "compaction-dead-ratio",
+            "blob-threshold",
+            "tier-io-mode",
+            "tail-stall-timeout",
+        ] {
+            assert!(text.contains(field), "missing {field}: {text}");
+        }
+        assert!(text.contains("300"), "the reloaded fraction renders: {text}");
+    }
+
+    /// M4-S18 (ADR-0061 D8): the per-namespace line splits the blob leg
+    /// out as its own ratio — `blob_bytes / blob_user_bytes`, ≈ 1× by
+    /// construction — and the cell aggregate is that ratio's maximum,
+    /// never a fold into the record ratio (a byte written once is
+    /// counted in exactly one leg).
+    #[test]
+    fn info_tiering_splits_the_blob_write_amplification_leg() {
+        use std::path::Path;
+
+        use inf_log::TierIoMode;
+        use inf_log::blob::{ExtentId, ExtentWriter};
+        use inf_log::fs::mem::MemFs;
+        use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId, TieredTable};
+
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let ns = NsId(21);
+        let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
+        assert!(
+            store
+                .materialize_tiered(
+                    ns,
+                    AddressSpaceConfig {
+                        reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
+                        page_bytes: 4 << 10,
+                        life_origin: LogicalAddr::ZERO,
+                    },
+                    demote,
+                    64,
+                )
+                .is_ok()
+        );
+        let fs = MemFs::new();
+        let value = vec![0x42u8; 9_000];
+        let mut w = ExtentWriter::create(
+            &fs,
+            Path::new("shard-0"),
+            ExtentId(1),
+            0,
+            ns,
+            value.len() as u64,
+            TierIoMode::Buffered,
+        )
+        .expect("create extent");
+        w.append_chunk(&value).expect("chunk");
+        let sealed = w.finish().expect("finish");
+        let table = store.tiered_store_mut(ns).expect("materialized");
+        table.note_blob_bytes(sealed.device_bytes());
+        table
+            .insert_extent(b"blob-key", TieredTable::hash_key(b"blob-key"), &sealed)
+            .expect("fits");
+        let expect_milli = table
+            .write_accounting()
+            .blob_write_amplification()
+            .milli()
+            .expect("blob bytes were admitted");
+        assert!(expect_milli > 1_000, "device bytes exceed value bytes: {expect_milli}");
+
+        let text =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tiering"])).expect("ascii");
+        let line = text.lines().find(|l| l.starts_with("tiering_ns21:")).expect("ns line");
+        assert!(line.contains("blob_user_bytes=9000"), "{line}");
+        assert!(line.contains(&format!("blob_write_amp_milli={expect_milli}")), "{line}");
+        assert!(
+            text.contains(&format!("tiering_blob_write_amp_milli_max:{expect_milli}")),
+            "the aggregate is the worst blob namespace: {text}"
+        );
+        assert!(
+            text.contains("tiering_blob_write_amp_undefined_ns:0"),
+            "a namespace with blob activity has a denominator: {text}"
+        );
     }
 
     #[test]

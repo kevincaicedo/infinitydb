@@ -1,0 +1,4 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m4-cold --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m4-cold seed 0xc0ffee: 6668 gets (3503 cold, 10 chunked, 0 restarts, 101 cancelled), 355 unlinks (50 deferrals), hash 0x6f05f50d8178dfbe
+inf-sim: determinism verified — second run hash-identical

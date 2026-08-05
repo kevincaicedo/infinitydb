@@ -1,0 +1,20 @@
+--- M4-S07 demotion storm (dev tier; MemFs flush substrate, disclosed) ---
+ops 400000 (+ maintain slices) | cold candidates 30 | demote slices 3243 | sealed 13283553 B | stalls 0
+committed 8392704 B (budget 33554432 B + slice 4096 B) | demoted-to-disk head 13283368
+foreground+slice latency: p50 63 ns | p99 1790 ns | p99.9 5364 ns | max 75562 ns
+===
+--- M4-S07 demotion storm (dev tier; MemFs flush substrate, disclosed) ---
+ops 400000 (+ maintain slices) | cold candidates 30 | demote slices 3243 | sealed 13283553 B | stalls 0
+committed 8392704 B (budget 33554432 B + slice 4096 B) | demoted-to-disk head 13283368
+foreground+slice latency: p50 62 ns | p99 1768 ns | p99.9 4702 ns | max 50483 ns
+===
+--- M4-S07 demotion storm (dev tier; MemFs flush substrate, disclosed) ---
+ops 400000 (+ maintain slices) | cold candidates 30 | demote slices 3243 | sealed 13283553 B | stalls 0
+committed 8392704 B (budget 33554432 B + slice 4096 B) | demoted-to-disk head 13283368
+foreground+slice latency: p50 63 ns | p99 1804 ns | p99.9 5280 ns | max 51259 ns
+===
+
+env: 2026-07-18 dev box (linux-devbox profile, dev-tier evidence only)
+governor: performance / EPP: performance
+pinned: taskset -c 4; binary: cargo bench (release); substrate: MemFs flush leg (ADR-0053 D6 disclosure)
+verdict row: foreground+slice p99.9 well under the 2 ms gate at dev tier; reference box owns the binding artifact (S22/S24)

@@ -159,3 +159,7 @@ supported and any documented deviations.
 - **`MULTI`/`EXEC`** return "not yet supported" errors.
 
 See the [roadmap](roadmap.md) for what lands when.
+
+For running a dataset larger than RAM (durable-tiered namespaces, from
+`v0.4.0-alpha`), see **[Operating tiered storage](ops-tiered-storage.md)** —
+watermarks, memory budgets, the `INFO tiering` fields, and what to alarm on.

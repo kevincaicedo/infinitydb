@@ -1,0 +1,2 @@
+inf-sim: scenario m4-pressure seed 0xc0ffee: 400 stalls (p50 6000 µs, p99 250000 µs), 8 timeouts, peak committed 266240 B, hash 0x5450c7c5f6822249
+inf-sim: determinism verified — second run hash-identical

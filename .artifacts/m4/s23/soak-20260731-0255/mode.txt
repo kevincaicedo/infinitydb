@@ -1,0 +1,1 @@
+soak: tiered data plane unwired (`ERR tiered namespaces are not command-addressable yet (M4 command wiring)`) — running the honest subset

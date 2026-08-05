@@ -532,7 +532,11 @@ fn execute_db(
             w.int(found);
         }
         CommandId::Type => match store.type_of(argv.arg(1), now) {
-            Some(inf_store::TypeTag::String) => w.simple("string"),
+            // An out-of-line string is a string to the client (M4-S17) —
+            // storage placement is never wire-visible.
+            Some(inf_store::TypeTag::String | inf_store::TypeTag::StringExtent) => {
+                w.simple("string")
+            }
             // RedisJSON's module type name; S11 oracle-pins + allowlists it
             // in the generic-command interaction matrix.
             Some(inf_store::TypeTag::JsonDoc) => w.simple("ReJSON-RL"),
@@ -1367,6 +1371,17 @@ pub(crate) fn op_error(e: OpError, w: &mut RespWriter<'_>) {
         OpError::WrongType => {
             w.error("WRONGTYPE Operation against a key holding the wrong kind of value")
         }
+        // M4-S21 (ADR-0063 D1): the DISKFULL extension class — no Redis
+        // analog; first-word error class like OOM/NOSPACE. Byte shape
+        // pinned by `diskfull_error_shapes`; the compat matrix documents
+        // it as an extension. Reads, deletes, expiry, and in-place
+        // updates never produce this — only new-tier-byte placements.
+        OpError::DiskFull(inf_store::DiskFullCause::Budget { used, budget }) => w.error(&format!(
+            "DISKFULL tiered namespace disk budget exhausted (used={used} budget={budget})"
+        )),
+        OpError::DiskFull(inf_store::DiskFullCause::Device) => {
+            w.error("DISKFULL tier device out of space (ENOSPC)")
+        }
     }
 }
 
@@ -1468,6 +1483,39 @@ mod tests {
     use super::*;
     use inf_store::StoreConfig;
     use inf_wire::{ConnParser, Parsed, ParserLimits};
+
+    /// M4-S21 (ADR-0063 D1): the `DISKFULL` extension error's wire
+    /// shapes, byte-pinned — the compat register's shape source until
+    /// command wiring makes the refusal reachable over TCP (the
+    /// deviation the ledger records). Both RESP protocols render error
+    /// lines identically.
+    #[test]
+    fn diskfull_error_shapes() {
+        use inf_store::DiskFullCause;
+        for proto in [inf_wire::Protocol::Resp2, inf_wire::Protocol::Resp3] {
+            let mut out = Vec::new();
+            let mut w = RespWriter::new(&mut out, proto);
+            op_error(
+                OpError::DiskFull(DiskFullCause::Budget { used: 16_252_928, budget: 16_777_216 }),
+                &mut w,
+            );
+            assert_eq!(
+                out,
+                b"-DISKFULL tiered namespace disk budget exhausted (used=16252928 \
+                  budget=16777216)\r\n"
+                    .to_vec(),
+                "{proto:?}"
+            );
+            let mut out = Vec::new();
+            let mut w = RespWriter::new(&mut out, proto);
+            op_error(OpError::DiskFull(DiskFullCause::Device), &mut w);
+            assert_eq!(
+                out,
+                b"-DISKFULL tier device out of space (ENOSPC)\r\n".to_vec(),
+                "{proto:?}"
+            );
+        }
+    }
 
     fn run_at(cx: &mut ConnCx, store: &mut Keyspace, now: Nanos, parts: &[&[u8]]) -> Vec<u8> {
         let mut wire = format!("*{}\r\n", parts.len()).into_bytes();

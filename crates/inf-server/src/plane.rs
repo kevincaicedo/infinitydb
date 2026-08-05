@@ -859,7 +859,11 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     if argv.len() == 3 && argv[1].eq_ignore_ascii_case(b"DROP") {
         return shared.store.borrow_mut().ns_drop(argv[2]);
     }
-    if argv.len() != 8 || !argv[1].eq_ignore_ascii_case(b"CREATE") {
+    if argv.len() == 4 && argv[1].eq_ignore_ascii_case(b"SET") {
+        let tier = tier_from_fan(argv[3])?.ok_or(malformed)?;
+        return shared.store.borrow_mut().ns_set_tier(argv[2], tier);
+    }
+    if argv.len() != 9 || !argv[1].eq_ignore_ascii_case(b"CREATE") {
         return Err(malformed);
     }
     fn parse_str(b: &[u8]) -> Result<&str, inf_store::NsError> {
@@ -883,6 +887,7 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         b => Some(parse_str(b)?.parse::<u64>().map_err(|_| malformed.clone())?),
     };
     let id: u32 = parse_str(argv[7])?.parse().map_err(|_| malformed.clone())?;
+    let tier = tier_from_fan(argv[8])?;
     shared.store.borrow_mut().ns_create(inf_store::NsSpec {
         id: NsId(id),
         name: argv[2].to_vec(),
@@ -890,7 +895,67 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         fsync,
         policy,
         maxmemory,
+        tier,
     })
+}
+
+/// Serializes a tier spec for the `INF.NSFAN` vector (M4-S19): `-` for
+/// absent, else ten colon-joined fields in ADR-0062 D2 table order. An
+/// internal wire between symmetric binaries — the decoder still runs the
+/// full range gauntlet (defense against a foreign or torn fan).
+fn tier_to_fan(tier: Option<&inf_store::TierSpec>) -> Vec<u8> {
+    let Some(t) = tier else { return b"-".to_vec() };
+    let io = match t.tier_io_mode {
+        inf_log::fs::TierIoMode::Buffered => "buffered",
+        inf_log::fs::TierIoMode::Direct => "direct",
+    };
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        t.mem_budget_bytes,
+        t.disk_budget_bytes,
+        t.mutable_permille,
+        t.maintain_slice_bytes,
+        t.cold_read_qd,
+        t.compaction_dead_ratio_pct,
+        t.compaction_slice_bytes,
+        t.blob_threshold_bytes,
+        io,
+        t.tail_stall_timeout_ms,
+    )
+    .into_bytes()
+}
+
+/// Decodes [`tier_to_fan`]'s encoding; `Ok(None)` for `-`.
+fn tier_from_fan(bytes: &[u8]) -> Result<Option<inf_store::TierSpec>, inf_store::NsError> {
+    use inf_store::NsError;
+    if bytes == b"-" {
+        return Ok(None);
+    }
+    let malformed = NsError::InvalidName; // internal vocabulary, as above
+    let text = core::str::from_utf8(bytes).map_err(|_| malformed.clone())?;
+    let fields: Vec<&str> = text.split(':').collect();
+    if fields.len() != 10 {
+        return Err(malformed);
+    }
+    let int = |s: &str| s.parse::<u64>().map_err(|_| malformed.clone());
+    let tier = inf_store::TierSpec {
+        mem_budget_bytes: int(fields[0])?,
+        disk_budget_bytes: int(fields[1])?,
+        mutable_permille: u32::try_from(int(fields[2])?).map_err(|_| malformed.clone())?,
+        maintain_slice_bytes: int(fields[3])?,
+        cold_read_qd: u16::try_from(int(fields[4])?).map_err(|_| malformed.clone())?,
+        compaction_dead_ratio_pct: u8::try_from(int(fields[5])?).map_err(|_| malformed.clone())?,
+        compaction_slice_bytes: int(fields[6])?,
+        blob_threshold_bytes: u32::try_from(int(fields[7])?).map_err(|_| malformed.clone())?,
+        tier_io_mode: match fields[8] {
+            "buffered" => inf_log::fs::TierIoMode::Buffered,
+            "direct" => inf_log::fs::TierIoMode::Direct,
+            _ => return Err(malformed),
+        },
+        tail_stall_timeout_ms: u32::try_from(int(fields[9])?).map_err(|_| malformed.clone())?,
+    };
+    tier.validate().map_err(NsError::InvalidTierConfig)?;
+    Ok(Some(tier))
 }
 
 /// One cell's data plane. Construct per cell, drive with
@@ -2767,10 +2832,7 @@ fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         // The program/rare arms, in dispatch_one's guard order: pub/sub,
         // NS DDL, ckpt surface, named-namespace dispatch, scatter.
         if pubsub::is_plane_pubsub(m.id)
-            || (m.id == CommandId::InfNs
-                && argv.get(1).is_some_and(|s| {
-                    s.eq_ignore_ascii_case(b"CREATE") || s.eq_ignore_ascii_case(b"DROP")
-                }))
+            || (m.id == CommandId::InfNs && is_ns_ddl_sub(argv.get(1).copied()))
             || matches!(m.id, CommandId::InfCkpt | CommandId::Bgsave | CommandId::Lastsave)
             || (conn_ns.is_some() && !is_conn_state(owned))
             || (is_scatter(m.id, argv.get(1).copied())
@@ -2992,10 +3054,20 @@ fn is_scatter(id: CommandId, sub: Option<&[u8]>) -> bool {
         CommandId::Config => sub.is_some_and(|s| {
             s.eq_ignore_ascii_case(b"SET") || s.eq_ignore_ascii_case(b"RESETSTAT")
         }),
-        CommandId::InfNs => sub
-            .is_some_and(|s| s.eq_ignore_ascii_case(b"CREATE") || s.eq_ignore_ascii_case(b"DROP")),
+        CommandId::InfNs => is_ns_ddl_sub(sub),
         _ => false,
     }
+}
+
+/// `INF.NS` subcommands that ride the pump's DDL program: CREATE/DROP
+/// since M2-S08; SET since M4-S19 (hot-reload mutates registries on
+/// every cell and persists the catalog — DDL semantics exactly).
+fn is_ns_ddl_sub(sub: Option<&[u8]>) -> bool {
+    sub.is_some_and(|s| {
+        s.eq_ignore_ascii_case(b"CREATE")
+            || s.eq_ignore_ascii_case(b"DROP")
+            || s.eq_ignore_ascii_case(b"SET")
+    })
 }
 
 /// Dispatch one command: execute locally into a `Done` slot, or ship its
@@ -3085,9 +3157,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         Some(meta)
             if well_formed
                 && meta.id == CommandId::InfNs
-                && argv.get(1).is_some_and(|s| {
-                    s.eq_ignore_ascii_case(b"CREATE") || s.eq_ignore_ascii_case(b"DROP")
-                }) =>
+                && is_ns_ddl_sub(argv.get(1).copied()) =>
         {
             let reply = program_ns_ddl(shared, origin, proto, id, db, argv).await;
             pending.push_back(PendingReply::Done(reply));
@@ -4597,7 +4667,24 @@ async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             policy.as_bytes().to_vec(),
             maxmemory.into_bytes(),
             ns_id.to_string().into_bytes(),
+            tier_to_fan(spec.tier.as_ref()),
         ]
+    } else if argv[1].eq_ignore_ascii_case(b"SET") {
+        // M4-S19 (ADR-0062 D3): hot-reload is DDL — registry + table
+        // update locally, fan to peers, catalog persist-then-ack.
+        let (name, tier) = {
+            let store = shared.store.borrow();
+            match crate::admin::parse_ns_set(argv, &store) {
+                Ok(parsed) => parsed,
+                Err(msg) => return error_reply(shared, proto, &msg),
+            }
+        };
+        if let Err(e) = shared.store.borrow_mut().ns_set_tier(&name, tier) {
+            let mut reply = shared.take_reply_buf();
+            crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
+            return reply;
+        }
+        vec![b"INF.NSFAN".to_vec(), b"SET".to_vec(), name, tier_to_fan(Some(&tier))]
     } else {
         if argv.len() != 3 {
             return error_reply(shared, proto, "ERR wrong number of arguments for 'INF.NS|DROP'");

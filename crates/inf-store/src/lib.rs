@@ -9,26 +9,36 @@
 
 mod address_space;
 mod catalog;
+mod demote;
 mod doc;
 mod evict;
+mod extents;
 mod index;
 mod keyspace;
+mod live_set;
 mod ns;
 mod record;
 mod router;
 mod store;
 mod tiered;
+mod tiered_recover;
 mod wall;
 mod wheel;
+mod write_accounting;
 
 pub use address_space::{
     AddrClass, AddressSpace, AddressSpaceConfig, AddressSpaceReport, TieringCounters,
 };
 pub use catalog::{CatalogError, NsCatalog};
+pub use demote::{DemoteStats, DemotionConfig, EvictionPressure, MUTABLE_PERMILLE_DEFAULT};
 pub use doc::DocDomain;
 #[cfg(feature = "doc")]
 pub use doc::{JsonLogDecision, JsonRead, JsonScalarPatch, JsonSetOptions, JsonSetOutcome};
 pub use evict::{EvictStats, EvictionPolicy};
+pub use extents::{
+    BLOB_MAX_BYTES_DEFAULT, BLOB_RECLAIM_PER_SLICE_DEFAULT, BLOB_THRESHOLD_DEFAULT, BlobConfig,
+    ExtentRefs, ExtentStats,
+};
 pub use index::{Index, MemoryMode, SlotMode, TieredMode};
 pub use inf_alloc::ArenaConfig;
 // One import point for the shared store↔log vocabulary (ADR-0015 D2/D5).
@@ -36,14 +46,24 @@ pub use inf_foundation::LogicalAddr;
 pub use inf_log::{FsyncClass, NsId};
 pub use keyspace::{
     DEFAULT_DBS, EvictBudget, Keyspace, PressureConfig, ReplayError, ReplayOutcome, StateDigest,
+    TIERED_VA_LIMIT_DEFAULT, TieredCreateError, TieredUsage,
 };
-pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, valid_ns_name};
-pub use record::{MAX_KEY_LEN, MAX_VAL_LEN, TypeTag};
+pub use live_set::{FileLiveSet, LiveSet};
+pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, valid_ns_name};
+pub use record::{EXTENT_REF_LEN, ExtentRef, MAX_KEY_LEN, MAX_VAL_LEN, TypeTag};
 pub use router::SlotRouter;
 pub use store::{
-    CellStore, CheckpointImage, CopyResult, Encoding, ExpireCond, ExpiryBudget, ExpiryStats,
-    LogFullImage, MemoryReport, OpError, PostImage, SetCond, SetExpire, SetOptions, SetOutcome,
-    StoreConfig, StoreStats, Ttl, TtlUpdate,
+    CellStore, CheckpointImage, CopyResult, DiskFullCause, Encoding, ExpireCond, ExpiryBudget,
+    ExpiryStats, LogFullImage, MemoryReport, OpError, PostImage, SetCond, SetExpire, SetOptions,
+    SetOutcome, StoreConfig, StoreStats, Ttl, TtlUpdate,
 };
+pub use tiered::compact::{CompactionApplied, CompactionConfig, CompactionWork};
 pub use tiered::{RecordParts, TieredLookup, TieredTable};
+pub use tiered_recover::{
+    RecoveredTier, TierRecoverStats, apply_blob_ref_section, apply_live_set_section,
+    apply_ref_section, recover_tiered_ns,
+};
 pub use wall::WallAnchor;
+pub use write_accounting::{
+    WriteAccounting, WriteAccountingTotals, WriteAmpSummary, WriteAmplification,
+};

@@ -1,0 +1,15 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.02s
+     Running tests/tiered_compaction.rs (target/release/deps/tiered_compaction-7af4c4d8b62ec5c1)
+
+running 8 tests
+test relocation_origin_markers_are_load_bearing ... ok
+test pressure_widens_the_trigger ... ok
+test stalled_relocation_resumes_after_window_progress ... ok
+test retirement_requires_a_covering_checkpoint_and_survives_abort ... ok
+test copy_forward_relocates_live_verbatim_and_finalizes ... ok
+test relocation_origin_markers_replay_exactly ... ok
+test endurance_slice_disk_oscillates_and_statvfs_reclaims ... ok
+test oversized_record_scans_via_need ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+

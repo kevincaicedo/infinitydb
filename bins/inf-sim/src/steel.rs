@@ -27,16 +27,18 @@ use inf_alloc::{AlignedBufId, AlignedPool, BufferPool};
 use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_log::fs::sim::SimDisk;
+use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    TIER_FRAME_BYTES, TIER_FRAME_DATA, TierWriter, tier_extract, tier_frame_offset, tier_frame_span,
+    TIER_FILE_CAPACITY_DEFAULT, TIER_FRAME_BYTES, TIER_FRAME_DATA, TierFlush, TierFlushConfig,
+    TierIoMode, tier_extract, tier_frame_offset, tier_frame_span,
 };
 use inf_runtime::{
     BackendDriver, CellExecutor, CompletionResult, CompletionToken, GateWait, IoGate, IoOp,
     PollImmediate, RawFd, StableBytesMut, TokenClass, Wait,
 };
 use inf_store::{
-    AddrClass, AddressSpaceConfig, Keyspace, LogicalAddr, NsId, StoreConfig, TieredLookup,
-    TieredTable,
+    AddrClass, AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsId, StoreConfig,
+    TieredLookup, TieredTable,
 };
 
 use crate::net::{CellNet, Plant, SimDriver};
@@ -84,14 +86,23 @@ struct Expect {
     version: u32,
 }
 
+/// One sealed tier file's read-side mapping (M4-S11: the flush fleet is
+/// multi-file; the resolver's `base + delta` arithmetic is per file).
+struct TierRead {
+    base: u64,
+    len: u64,
+    frames: u64,
+    fd: RawFd,
+}
+
 struct Ctx {
     ks: Keyspace,
     pool: AlignedPool,
     driver: SimDriver,
     gate: IoGate,
-    tier_fd: RawFd,
-    tier_base: u64,
-    tier_frames: u64,
+    tiers: Vec<TierRead>,
+    /// Keeps the read fds alive for the scenario's lifetime.
+    _tier_handles: Vec<<SimDisk as inf_log::fs::SegmentFs>::File>,
     next_token: u32,
 }
 
@@ -127,10 +138,17 @@ fn plan(ctx: &Rc<RefCell<Ctx>>, key: &[u8], hash: u64, exclude: &[LogicalAddr]) 
         }
         TieredLookup::Miss => Planned::Done(None),
         TieredLookup::Cold(addr) => {
-            let delta = addr.to_raw() - ctx.tier_base;
+            let a = addr.to_raw();
+            let tier = ctx
+                .tiers
+                .iter()
+                .find(|t| a >= t.base && a < t.base + t.len)
+                .expect("cold address inside a sealed tier file (a record never spans files)");
+            let delta = a - tier.base;
             let (first_frame, _, skip) = tier_frame_span(delta, TieredTable::RECORD_HEADER_LEN);
             let window_frames = (ctx.pool.buf_size() / TIER_FRAME_BYTES) as u64;
-            let frame_count = window_frames.min(ctx.tier_frames - first_frame) as usize;
+            let frame_count = window_frames.min(tier.frames - first_frame) as usize;
+            let fd = tier.fd;
             let buf = ctx.pool.try_lease().expect("scenario pool is sized");
             let token = ctx.mint_token();
             let dest = &mut ctx.pool.bytes_mut(buf)[..frame_count * TIER_FRAME_BYTES];
@@ -139,7 +157,7 @@ fn plan(ctx: &Rc<RefCell<Ctx>>, key: &[u8], hash: u64, exclude: &[LogicalAddr]) 
             // terminal completion resumes us.
             let stable = unsafe { StableBytesMut::new(dest) };
             ctx.driver.push(IoOp::TierRead {
-                fd: ctx.tier_fd,
+                fd,
                 offset: tier_frame_offset(first_frame),
                 buf: stable,
                 token,
@@ -260,67 +278,79 @@ fn run_life(
     ledger: &[(Vec<u8>, Vec<u8>)],
     updates_from: Option<UpdateLeg<'_>>,
     report: &mut SteelReport,
-) -> LogicalAddr {
+) -> (LogicalAddr, u32) {
     // Replay the ledger into a fresh life (the harness plays the WAL).
     let mut ks = Keyspace::new(StoreConfig::default());
-    assert!(ks.materialize_tiered(
-        NS,
-        AddressSpaceConfig { reserve_bytes: RING, page_bytes: PAGE, life_origin },
-        64,
-    ));
+    assert!(
+        ks.materialize_tiered(
+            NS,
+            AddressSpaceConfig { reserve_bytes: RING, page_bytes: PAGE, life_origin },
+            DemotionConfig::for_budget(RING as u64, PAGE as u64),
+            64,
+        )
+        .is_ok()
+    );
     let mut model: std::collections::BTreeMap<Vec<u8>, Expect> = std::collections::BTreeMap::new();
-    let mut log: Vec<(LogicalAddr, usize)> = Vec::new();
     {
         let table = ks.tiered_store_mut(NS).expect("materialized");
         for (key, value) in ledger {
             let hash = TieredTable::hash_key(key);
-            let (placed, fresh_alloc) = match table.lookup(key, hash, &[]) {
+            let placed = match table.lookup(key, hash, &[]) {
                 TieredLookup::Ram(old) => {
                     let (old_len, old_version) = {
                         let parts = table.record(old);
                         (parts.encoded_len, parts.version)
                     };
-                    let placed =
-                        table.update(key, value, hash, old, old_len, old_version).expect("fits");
-                    (placed, placed != old) // in place ⇒ already in the log
+                    table.update(key, value, hash, old, old_len, old_version).expect("fits")
                 }
-                TieredLookup::Miss => (table.insert(key, value, hash).expect("fits"), true),
+                TieredLookup::Miss => table.insert(key, value, hash).expect("fits"),
                 TieredLookup::Cold(_) => unreachable!("nothing is cold during replay"),
             };
             let parts = table.record(placed);
             model.insert(key.clone(), Expect { value: value.clone(), version: parts.version });
-            if fresh_alloc {
-                log.push((placed, parts.encoded_len));
-            }
         }
     }
-    // Seal → flush (fdatasync on the sim disk) → demote.
+    // Seal → flush through the S11 pipeline (rotation, gaps, footer,
+    // fdatasync, watermark confirmation — the harness leg retired) →
+    // release.
     let table = ks.tiered_store_mut(NS).expect("materialized");
     let tail = table.space().tail();
     table.space_mut().advance_ro_boundary(tail);
-    let base = table.space().head();
-    let mut writer =
-        TierWriter::create(disk, shard_dir, tier_file_id, 0, NS, base).expect("tier file");
-    // The file is a byte range, not a record list: every allocated range
-    // appends in address order — dead copies (replay relocations) flush
-    // as the raw bytes they still occupy, keeping the range contiguous.
-    for (addr, len) in &log {
-        let bytes = table.record_bytes(*addr, *len).to_vec();
-        writer.append(*addr, &bytes).expect("append");
-    }
-    writer.sync().expect("fdatasync before the watermark advances");
-    table.space_mut().advance_flushed(tail);
+    let mut flush = TierFlush::new(
+        disk.clone(),
+        TierFlushConfig {
+            shard_dir: shard_dir.to_path_buf(),
+            cell: 0,
+            ns: NS,
+            mode: TierIoMode::Buffered,
+            file_capacity: TIER_FILE_CAPACITY_DEFAULT,
+            slice_bytes: PAGE as u64,
+        },
+        tier_file_id,
+    );
+    table.flush_drain(&mut flush).expect("flush drain");
+    assert_eq!(table.space().flushed(), tail, "drain confirms the whole sealed range");
     table.space_mut().advance_head(tail);
 
-    let tier_frames = writer.data_len().div_ceil(TIER_FRAME_DATA as u64);
+    let mut tiers = Vec::new();
+    let mut handles = Vec::new();
+    for meta in flush.sealed() {
+        let file = disk.open_read(&meta.path).expect("sealed tier file exists");
+        tiers.push(TierRead {
+            base: meta.base.to_raw(),
+            len: meta.data_len,
+            frames: meta.data_len.div_ceil(TIER_FRAME_DATA as u64),
+            fd: file.raw_fd().expect("sim files carry fake fds"),
+        });
+        handles.push(file);
+    }
     let ctx = Rc::new(RefCell::new(Ctx {
         ks,
         pool: AlignedPool::new(2, POOL_BUF),
         driver: SimDriver::with_disk(CellNet::new(0, 0xD15C_0000, Plant::None), disk.clone()),
         gate: IoGate::new(),
-        tier_fd: writer.raw_fd().expect("sim files carry fake fds"),
-        tier_base: base.to_raw(),
-        tier_frames,
+        tiers,
+        _tier_handles: handles,
         next_token: 1,
     }));
     let mut ex = CellExecutor::new(8);
@@ -412,7 +442,7 @@ fn run_life(
     if ctx.pool.reconcile().is_err() {
         report.violations.push("aligned-pool lease leak".into());
     }
-    tail
+    (tail, flush.next_file_id())
 }
 
 /// Runs the scenario once. Deterministic from `scenario.seed` (L7).
@@ -433,7 +463,7 @@ pub fn run_steel_scenario(scenario: &SteelScenario) -> SteelReport {
     }
 
     // Life 1: write → flush → demote → cold reads → promotions.
-    let tail = run_life(
+    let (tail, next_file_id) = run_life(
         &disk,
         &shard_dir,
         0,
@@ -448,6 +478,6 @@ pub fn run_steel_scenario(scenario: &SteelScenario) -> SteelReport {
     disk.power_cut(scenario.seed ^ 0x0FF5_EED0);
     let origin = LogicalAddr::from_raw(tail.to_raw().next_multiple_of(PAGE as u64))
         .expect("origin fits 48 bits");
-    run_life(&disk, &shard_dir, 1, origin, &ledger, None, &mut report);
+    run_life(&disk, &shard_dir, next_file_id, origin, &ledger, None, &mut report);
     report
 }

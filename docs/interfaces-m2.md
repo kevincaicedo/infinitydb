@@ -190,6 +190,22 @@ those driver ops against the same `SimDisk`.
   namespace catalog, single-written by `inf-server::control`; S11's
   MANIFEST reuses the protocol.
 
+### M4-S09/S11 additions (ADR-0054, ADR-0056)
+
+- `SegmentFs::create_tier(path, mode)` (M4-S09, ADR-0054 D1) and
+  `SegmentFs::open_tier(path, mode)` (M4-S11, ADR-0056 D5) — tier files
+  carry a per-file I/O mode ({`Buffered`, `Direct`}, fixed at open,
+  verified on `StdSegmentFs`, never a silent fallback). Defaults
+  delegate to `create_segment`/`open_write` (mode-equivalent on the
+  in-memory/sim tiers); **wrappers must forward both explicitly**
+  (`inf-server::ReadAheadFs` does — falling into the default drops the
+  flag).
+- `SegmentFile::truncate(len)` (M4-S11, ADR-0056 D5) — `ftruncate`
+  semantics; sole caller is the tier recovery pre-flush rule
+  (un-manifested tier bytes are dead-life garbage). Durable only after
+  a following `sync_data`; the sim tier models the un-synced window
+  honestly (a power cut may resurrect the old tail).
+
 ## `MutationEffect` → record seam (`inf-log::effect`, ADR-0012)
 
 ```rust
@@ -453,6 +469,65 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   LSN resolves via `FrameLease::lsn_of` at LOG; replay counts it as
   `ReplayOutcome::SkippedMarker`. Decode rejects trailing payload bytes
   (`RecordDecodeError::TrailingBytes` — first fixed-width record payload).
+- **M4-S12 amendment (ADR-0057 D3/D4) — `.ick` v2 + tag 8.** Cells owning
+  tiered namespaces write header `version = 2`; tierless cells stay v1
+  byte-identically (degenerate = absence). v2 adds block tag **0x03 —
+  addr-ref section**: `tag · body_len u32 · entry_count u32 · ns u32 ·
+  walk_watermark u64 · entry_count × (sidecar hash u64 · addr u48 LE) ·
+  crc u32` — same {tag, body_len, count} header shape as 0x01, so the
+  counts probe hops both; footer stays last and unchanged; per-ns entry
+  counts include refs; the digest chain folds 0x03 CRCs in order. Decode
+  audits shape + every `addr < walk_watermark` before the applier sees an
+  entry; a records-only loader refuses hybrid files typed
+  (`RefSectionUnsupported`). v2 tag registry, coordinated: 0x01 images ·
+  0x02 footer · 0x03 addr-refs · 0x04 reserved (S14 live-set counters) ·
+  0x05+ reserved (M4.5 index sidecars). Readers: `read_ick_hybrid` /
+  `IckReader::next_step_hybrid` (per-section `IckRefSection` dispatch);
+  writers: `IckStream::new_v2` + `stage_addr_ref`, `SyncIckWriter::
+  create_v2` + `append_ref` (sections homogeneous by class, sealed at
+  class/ns/watermark boundaries). Record tag **8 = `ColdDisplace {ns,
+  old_addr: u48}`**: stages immediately before a tiered-namespace
+  mutation that displaced a record; replay removes exactly the slot
+  `(hash, old_addr)` then applies the mutation (zero disk reads — the
+  hash-repoint and deferred-reconcile alternatives are rejected in the
+  ADR); the walker never emits it; `Keyspace::apply_record` counts it
+  `SkippedReserved` (tiered replay routes through `TieredTable::apply_*`
+  until command wiring). Fuzz: `ick_decode` extended over the v2 arm.
+- **M4-S14 amendment (ADR-0058 D3) — tag 0x04 activated.** v2 adds block
+  tag **0x04 — live-set section**: `tag · body_len u32 · entry_count u32
+  · ns u32 · entry_count × (file_id u32 · data_len u64 · dead_bytes u64
+  · flags u8) · crc u32` — same header shape, so the counts probe hops
+  it; one section per tiered namespace, emitted after that namespace's
+  record/ref emission (counters cover attributions up to walk end).
+  `flags` bit0 = byte-exact; unknown flag bits and `dead > len` are
+  fail-stop at decode (`LiveSetSectionMalformed`). Entries count into
+  `records_total` but **not** the per-ns presize counts (file entries
+  are not index entries — both writer and audit agree). Loaders without
+  the arm refuse typed (`LiveSetSectionUnsupported`). Readers:
+  `read_ick_hybrid`/`next_step_hybrid` grew the third handler
+  (`IckLiveSetSection` → `LiveSetFileEntry`); writers:
+  `IckStream::stage_live_set`, `SyncIckWriter::append_live_set`. Restore
+  clamps per ADR-0058 D5 (length-match or nothing; byte-exact only when
+  fully dead) — dead bytes only ever under-count across recovery.
+  Also under this amendment: `Index::position_of` now enforces the D4
+  exact-pair discipline against the **full sidecar hash** for tiered
+  tables (addresses are per-life, so `(tag, addr)` alone collides
+  cross-key after recovery — the S14 sweep found the S12-era
+  never-none violation and ADR-0058 D6 records the fix; memory-mode
+  codegen unchanged). Fuzz: `ick_decode` extended over the 0x04 arm.
+- **M4-S15 amendment (ADR-0059 D9) — displace replay is a bounded
+  list.** Compaction relocations are unlogged, so a relocated record's
+  WAL image can replay against a checkpoint that still refs the *old*
+  address; `ColdDisplace`'s exact-slot removal would miss and the image
+  would re-insert a stale twin. The next displacement of a relocated
+  record therefore stages **one `ColdDisplace` per origin address**
+  (from the table's bounded relocation-origin map, cap 3 per record;
+  the compaction scan defers relocating a record already at cap) ahead
+  of the ordinary marker, and replay's pending-displace register widens
+  from a single slot to a bounded list (≤ 4 = origins + ordinary; the
+  bound is a release assert). No format change — tag 8's shape is
+  untouched; only the marker count per mutation and the replay register
+  changed. Origin entries drop at covering swaps by walk stamp.
 - Checkpoint I/O failure **aborts the checkpoint, never the process**
   (milestone risk-table rule; deliberately narrower than §8.4 — nothing
   was acked against the checkpoint and the log stays authoritative).
@@ -596,6 +671,176 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   by construction — the L5 attribution term the S22 durable fill leg sums).
 - Fuzz: `manifest_decode` (envelope + payload, canonicality oracle) —
   per-PR smoke + nightly hour alongside the other decoders.
+- **M4-S12 amendment (ADR-0057 D5/D6) — epoch 2 tier sections.** The
+  `epoch` field bumps to 2 when tier sections are present; tierless cells
+  keep writing epoch-1 payloads byte-identically, and the v2 reader
+  accepts both (v1 readers refuse epoch 2 typed). v2 appends
+  `tier_ns_count u32` + per-namespace `{ns u32, flushed u64 (48-bit),
+  file_count u32, file_count × {id u32, base u64, durable_len u64}}` —
+  canonical: namespaces and file ids/bases strictly ascending,
+  `durable_len ≥ 1`, ranges non-overlapping and tiling inside
+  `[0, flushed)` (ring-top gaps and a trailing gap legal). The manifest
+  names **logical durable ranges**, not physical files: a sealed file's
+  physical excess (the capacity-seal edge) is inert; recovery truncates
+  only unsealed files. `flushed` is the next boot life's origin;
+  `ckpt_id` doubles as S15's deletion-stamp sequence. Recovery:
+  `inf_store::recover_tiered_ns` (probe sealed fast-path via
+  `probe_tier_file` — two block reads, frames verify lazily on read;
+  unsealed → `recover_seal_existing` at the manifested length; un-named
+  cold files deleted) + `apply_ref_section` (walk-watermark ≤ manifested
+  flushed cross-check). Writer input: `TieredTable::tier_manifest`
+  (catalog clamped to `flushed`; zero-confirmed files not named).
+  `TierFlush::with_catalog` seeds a recovered pipeline. Fuzz:
+  `manifest_decode` extended over epoch 2 with the tiling invariants.
+- **M4-S15 amendment (ADR-0059) — retirement + unlink lifecycle.** The
+  §3.1 deletion conjunction made mechanical, staged around the MANIFEST
+  swap: `TieredTable::begin_ckpt_walk(ckpt_id: u64)` (signature grew
+  the id — it stamps the live set's `ckpt_begun`) → walk → `retire_scan
+  (ckpt_id, flush)` marks files `retiring` when `is_dead ∧ unref_stamp
+  < ckpt_id ∧ sealed` (`unref_stamp` records the last-begun walk at
+  **every** slot-removal naming the file — relocations and user deaths
+  alike) → `tier_manifest` **excludes** retiring files from the new
+  unit → swap success ⇒ `commit_retirement() -> Vec<u32>` / failure ⇒
+  `abort_retirement()` (marks roll back; nothing unlinks). Unlink is
+  plane-layer: `TierFlush::detach_sealed(id) -> Option<TierFileMeta>` +
+  `inf_log::flush::unlink_tier_file(fs, &meta)` (fault point
+  `tier_unlink_fail`, **non-fatal** — reclaim defers and the ADR-0057
+  D6-1 boot GC redrives it: any cold file the resolved manifest does
+  not name is deleted at recovery). Read pins (`ColdReads::inflight_on`)
+  additionally defer the physical unlink. ADR-0057's tiling language is
+  amended by ADR-0059 D5: retired interior files leave **legal gaps**
+  in the manifest unit (ranges stay non-overlapping and ascending — no
+  format change; epoch stays 2). The reclaim coordinate is the **cold
+  floor** (lowest surviving file's base, `TieredTable::cold_floor()`)
+  — derived, not a fifth watermark. `recover_tiered_ns` grew a
+  `boot_ckpt_id` parameter seeding recovered files' stamps.
+- **M4-S16 amendment (ADR-0060) — the write-amplification numerator, and
+  a third bound on the flush chunk.** Two changes to already-frozen
+  vocabulary:
+  1. `WriteAccounting::written_bytes()` is `wal_bytes + flush_bytes` (was
+     `+ compaction_bytes`), and `compaction_bytes` is **relocation
+     volume**, not a device-byte leg: ADR-0059 D2's relocation is a
+     verbatim placement into the RAM tail, so those bytes reach the
+     device through the ordinary flush leg where `flush_bytes` counts
+     them. Settled by the block layer (ADR-0060 D2): with compaction
+     active the accepted numerator reconciles at −2.27% while the
+     three-leg sum misses by +13.15%. New API:
+     `WriteAccounting::write_amplification() -> WriteAmplification`
+     (`Measured { milli }` | `Undefined { written_bytes }`; milli-units,
+     ceiling-rounded, saturating upward — a reported figure never
+     understates), `Keyspace::tiering_write_amp() -> WriteAmpSummary`
+     (worst namespace + unbounded count), and
+     `Keyspace::tiering_write_accounting()` now returns
+     `WriteAccountingTotals` — a **ratio-free** aggregate type, so a
+     blended node-wide figure is unrepresentable rather than merely
+     discouraged. `INFO tiering` gained `tiering_write_amp_milli_max`,
+     `tiering_write_amp_undefined_ns`, and `write_amp_milli=` per
+     namespace line (`undefined` when a namespace admitted no user byte).
+  2. **`AddressSpace::next_flush_chunk` chunks are additionally bounded
+     by the RAM ring top** (ADR-0056 D3's contract had hole start, seal
+     cut, and ro-boundary). A record ending *exactly* on the ring top
+     creates no seal hole (ADR-0052 D2 seals only a record that would
+     straddle), so nothing marked the wrap and a chunk could span it —
+     `bytes()` returns one contiguous slice out of a wrapping ring
+     (panic in a ring-sized region; wrong-end-of-ring bytes into a tier
+     file under a valid CRC with region slack). The bound is free: the
+     ring top is a record boundary in exactly that case, and the next
+     call resumes there. Pinned by
+     `flush_chunks_stop_at_an_exactly_filled_ring_top`.
+- **M4-S17 amendment (ADR-0061) — blob extents: a second on-disk
+  artifact class, one ordering rule, one new record tag, one new `.ick`
+  section.**
+  1. **Extent files** (`inf_log::blob`): one extent = one
+     `blob-NNNNNN.iblob` in the per-cell `cold/` dir — 4 KiB header
+     {`IBX0`, version u32 = 1, cell u32, ns u32, extent_id u64,
+     data_len u64, header_crc} + tier-discipline CRC frames
+     (4092 + 4), **no footer**: the referencing WAL frame's
+     group-commit ack is the extent's commit record. `ExtentWriter`
+     (chunked appends, 256-frame batched device writes, staging bounded
+     by one batch window + one tail frame) → `finish()` fdatasyncs and
+     is the **only** constructor of `SealedExtent` — reference position
+     (`TieredTable::insert_extent`/`update_extent`,
+     `MutationEffect::StringSetExtent`) requires the token, so "extent
+     durable before referencing ack" is structural on the sync tier
+     (the reactor tier's coverage-neutral `GroupCommit` ledger barrier
+     is command wiring's named obligation). Extent **fsync failure is a
+     typed abort** (extent abandoned, id quarantined, never retried —
+     the one ADR-audited narrower §8.4 posture; the module is
+     allowlisted in `check-fsync-fail-stop.sh`); fault points
+     `blob_short_write` / `blob_fsync_err` / `blob_unlink_fail`
+     (non-fatal; absent-is-success — a replayed death legitimately
+     re-offers a prior-life unlink). Reads: `ExtentReader::read`
+     verifies-and-**appends** per frame (streamed chunks compose; one
+     window of resident staging). Decoder: `parse_extent_header` +
+     `inspect_extent_bytes`, fuzzed by `extent_decode`.
+  2. **Record vocabulary**: store `TypeTag::StringExtent = 3` — value
+     bytes are the 24-byte `ExtentRef {extent_id u64, offset u64 (0 in
+     v1), len u64}`; WAL/image `RecordType::StringExtentRef = 9` (no
+     version field — the `StringPostImage` rule). Resident extent
+     records image as tag-9 records in ordinary 0x01 sections;
+     references move verbatim through WAL, flush, checkpoint, and
+     compaction relocation — blob bytes never flow through any of them.
+  3. **`.ick` v2 tag 0x05 — blob-reference section** (registry
+     re-coordinated: M4.5 index sidecars move to 0x06+): `ns u32 ·
+     count × (addr u48 LE · extent_id u64 · len u64)`, entries strictly
+     ascending by address, `len > 0`, never empty — the reference map's
+     cold entries, emitted at walk end per tiered namespace. Decode
+     audits shape/order/lengths fail-stop; records-only and no-arm
+     loaders refuse typed (`BlobRefSectionUnsupported`). The hybrid
+     reader (`next_step_hybrid`/`read_ick_hybrid`) grew a fourth
+     handler; `apply_blob_ref_section` joins the recovery appliers.
+     Counted in `records_total`, excluded from per-ns presize hints (a
+     cold blob record's slot was counted by its 0x03 ref).
+  4. **Reclaim gates on death durability, never checkpoints** (the
+     asymmetry: deaths are logged, relocations are not) — refcount 0 ∧
+     killing record's staging epoch ≤ the plane-supplied durable epoch
+     ∧ plane read pins; extents therefore **never join the MANIFEST**
+     (ADR-0057 D5's anticipated blob clause resolved to no schema
+     change), and the tier boot-GC's "unmanifested ⇒ garbage" rule
+     deliberately does not extend to `.iblob` — liveness is the
+     post-replay refcounts (`recover_tiered_ns` lists extent names in
+     its existing directory pass; `RecoveredTier::extents_listed` seeds
+     `TieredTable::extent_sweep_seed`, drained by MAINTAIN slices).
+     A park latched at a transient replay zero **revokes at
+     re-registration** (`ExtentRefs::register`) — the ADR-0057 D4
+     at-least-once physics applied to the reclaim queue (found by the
+     DST sweep; ADR-0061 D5).
+- **M4-S19 amendment (ADR-0062) — namespace catalog v2 + the `INF.NS`
+  tiering surface.**
+  1. **Catalog v2** (`inf-store::catalog`): `CATALOG_VERSION = 2` — the
+     entry gains `tier: u8` (0|1) after `maxmemory`, followed (when 1)
+     by the fixed 46-byte tier block `{mem_budget u64, disk_budget u64,
+     mutable_permille u16, maintain_slice u64, cold_read_qd u16,
+     compaction_dead_ratio u8, compaction_slice u64, blob_threshold
+     u32, tier_io_mode u8 (0 buffered, 1 direct), tail_stall_timeout_ms
+     u32}`; `name_len · name` stays last. **v1 decodes forever** (the
+     v0.3.0-alpha upgrade path — every entry tier-absent); versions > 2
+     fail-stop; the strict truncation/trailing/invalid-byte taxonomy
+     extends over the block, and a decoded block re-runs
+     `TierSpec::validate` (one range gauntlet — parse, registry, and
+     decode cannot drift). The decoder keeps the M2-S08 posture: the
+     exhaustive strict-decode unit matrix behind `inf-log`'s
+     CRC-checked `META` envelope (no fuzz target — the standing
+     precedent, disclosed).
+  2. **`INF.NSFAN` v2**: `CREATE` grows to 9 positional args (the 9th =
+     `-` or the ten tier fields colon-joined, decoder re-validating);
+     new verb `SET name tier-tuple` — `INF.NS SET` rides the same DDL
+     program (fan AllOk, catalog persist-then-ack). `is_ns_ddl_sub`
+     gates {CREATE, DROP, SET} into `program_ns_ddl` on every node
+     shape.
+  3. **Admission + teardown** (`inf-store::keyspace`):
+     `materialize_tiered` is fallible-typed (`TieredCreateError` —
+     `Exists | Unrepresentable | VaLimitExceeded{...}`), checked against
+     the per-cell share of `tiered-reserved-va-limit` (CONFIG, Memory
+     kind, HotPerCell; default 256 GiB) **before** any mmap;
+     `ns_create` registers + materializes together or rolls back;
+     `ns_drop` prunes `tiered_stores` (the `Region` unmaps — reserved
+     VA returns structurally); `seed_catalog` re-materializes tiered
+     entries through the same `ns_create` path. `ns_set_tier` +
+     `TieredTable::set_demotion` (ring-bounded — growth past the
+     reservation refuses typed) carry the D3 hot-reload;
+     `TierSpec::{demotion,compaction,blob}_config` derive every table
+     config from one validated block.
 
 ---
 

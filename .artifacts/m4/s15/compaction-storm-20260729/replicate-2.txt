@@ -1,0 +1,4 @@
+--- M4-S15 compaction storm (MemFs substrate, disclosed) ---
+ops 400000 (+ maintain rounds) | cold candidates 13933 | compact slices 13 | relocated 1415 records / 250507 B | files retired 3 | unlinked 3 | cold floor 12574730
+committed 8396800 B (budget 33554432 B) | stalls 0 | flush slices 3208 | demote slices 3247
+foreground+slice latency: p50 43 ns | p99 1518 ns | p99.9 2976 ns | max 838506 ns

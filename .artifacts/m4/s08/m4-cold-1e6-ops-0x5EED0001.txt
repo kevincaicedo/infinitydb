@@ -1,0 +1,3 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m4-cold --seed 0x5EED0001 --ops 1000000`
+inf-sim: scenario m4-cold seed 0x5eed0001: 333336 gets (192577 cold, 1004 chunked, 0 restarts, 5965 cancelled), 20906 unlinks (2509 deferrals), hash 0x68ac68e2bb172a3d

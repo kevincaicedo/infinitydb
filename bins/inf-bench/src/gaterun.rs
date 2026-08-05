@@ -229,15 +229,48 @@ pub(crate) fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
+/// One workload row's write-amplification obligation (M4-S16). Opened by
+/// the row, filled after it; a row that reaches
+/// [`finish_report`] unfilled is an invalid row and fails the run.
+struct RowWriteAmp {
+    name: String,
+    disposition: Option<String>,
+}
+
 pub(crate) struct Measurements {
     pub(crate) values: BTreeMap<&'static str, f64>,
     pub(crate) notes: Vec<String>,
     pub(crate) raw: String,
+    rows: Vec<RowWriteAmp>,
 }
 
 impl Measurements {
     pub(crate) fn new() -> Measurements {
-        Measurements { values: BTreeMap::new(), notes: Vec::new(), raw: String::new() }
+        Measurements {
+            values: BTreeMap::new(),
+            notes: Vec::new(),
+            raw: String::new(),
+            rows: Vec::new(),
+        }
+    }
+
+    /// Declares a workload row. From M4-S16 on, every declared row owes a
+    /// write-amplification disposition ([`row_write_amp`](Self::row_write_amp))
+    /// — declaring is what makes the debt visible, so a row added later
+    /// cannot quietly ship without the number.
+    pub(crate) fn row_open(&mut self, name: &str) {
+        self.rows.push(RowWriteAmp { name: name.to_string(), disposition: None });
+    }
+
+    /// Records the open row's write-amplification disposition.
+    ///
+    /// # Panics
+    /// Panics when no row is open: the call order is the caller's own
+    /// program text, so getting it wrong is a programmer error, not an
+    /// operating condition.
+    pub(crate) fn row_write_amp(&mut self, disposition: &str) {
+        let row = self.rows.last_mut().expect("row_write_amp without an open row");
+        row.disposition = Some(disposition.to_string());
     }
 
     pub(crate) fn set(&mut self, key: &'static str, value: f64) {
@@ -284,7 +317,10 @@ pub(crate) fn env_gate(flags: &Flags) -> Result<bool, String> {
 }
 
 /// Per-gate verdicts + the report file (shared epilogue). Errs when any
-/// binding gate failed.
+/// binding gate failed, or when a declared workload row never reported its
+/// write amplification (M4-S16: a row missing WA is an invalid row — the
+/// generator refuses it rather than publishing a report whose silence
+/// reads like a good number).
 pub(crate) fn finish_report(
     milestone: &str,
     gates_list: &[gates::Gate],
@@ -294,6 +330,18 @@ pub(crate) fn finish_report(
     artifacts_root: &str,
     header_facts: &str,
 ) -> Result<(), String> {
+    // The row obligation is checked *before* anything is written: an
+    // invalid run must not leave a report file behind to be cited later.
+    let unreported: Vec<&str> =
+        m.rows.iter().filter(|r| r.disposition.is_none()).map(|r| r.name.as_str()).collect();
+    if !unreported.is_empty() {
+        return Err(format!(
+            "row(s) [{}] finished without a write-amplification disposition — an M4 report row \
+             without WA is an invalid row (M4-S16); measure it or name why there is none",
+            unreported.join(", ")
+        ));
+    }
+
     let stamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("clock after epoch")
@@ -339,6 +387,17 @@ pub(crate) fn finish_report(
             "| {} | {} {} {} | {} | {} |\n",
             gate.name, gate.comparator, gate.threshold, gate.unit, measured_text, verdict
         ));
+    }
+    if !m.rows.is_empty() {
+        report.push_str(
+            "\n## write amplification by row\n\n\
+             Per namespace, worst first — never a node-wide blend (M4-S16).\n\n\
+             | row | write amplification |\n|---|---|\n",
+        );
+        for row in &m.rows {
+            let disposition = row.disposition.as_deref().unwrap_or("MISSING");
+            report.push_str(&format!("| {} | {} |\n", row.name, disposition));
+        }
     }
     report.push_str(&m.raw);
 
@@ -432,6 +491,23 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "crash-failures",
         "m0m1-pct",
         "campaign-note",
+        // M4-S16: an externally measured write-amplification figure in
+        // milli-units (the store-side harness measures it; this flag binds
+        // the gate row and demands --campaign-note for provenance).
+        "write-amp-milli",
+        // M4-S24 campaign carriers for §7 rows measured by external
+        // tooling (mixed-audit, soak-m4 verdict, M3 gate set, storm
+        // artifacts; --campaign-note mandatory for every one).
+        "mixed-attribution-pct",
+        "cache-isolation-pct",
+        "m3-regression-pct",
+        "foreground-p999-ms",
+        "endurance-rss-slope-pct",
+        "endurance-crashes",
+        "hot-set-p50-pct",
+        "hot-set-p99-pct",
+        "hot-set-p999-pct",
+        "cold-read-p99-ms",
     ],
 );
 
@@ -701,4 +777,45 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         &artifacts_root,
         &format!("cells: {cells} · replicates: {replicates} · duration: {duration}s"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_gate() -> Vec<gates::Gate> {
+        vec![gates::Gate {
+            id: "probe".into(),
+            name: "probe".into(),
+            threshold: 1.0,
+            comparator: "<=".into(),
+            unit: "x".into(),
+            tier: "any".into(),
+            source: "probe:value".into(),
+            informational: false,
+        }]
+    }
+
+    /// M4-S16: a declared row that never reported its write amplification
+    /// makes the whole report invalid — and the refusal happens *before*
+    /// any file is written, so no unreported report can be cited later.
+    #[test]
+    fn a_row_without_write_amplification_refuses_the_report() {
+        let dir = std::env::temp_dir().join(format!("inf-bench-wa-{}", std::process::id()));
+        let root = dir.to_str().expect("utf-8 temp path");
+        let mut m = Measurements::new();
+        m.set("probe:value", 0.5);
+        m.row_open("silent row");
+        let err = finish_report("m4", &one_gate(), &m, true, false, root, "unit test")
+            .expect_err("an unreported row is refused");
+        assert!(err.contains("silent row"), "{err}");
+        assert!(err.contains("invalid row"), "{err}");
+        assert!(!dir.exists(), "the refusal must not leave a report directory behind");
+
+        // The same run with the disposition filled writes its report.
+        m.row_write_amp("n/a (no tiered namespace)");
+        finish_report("m4", &one_gate(), &m, true, false, root, "unit test").expect("reported");
+        assert!(dir.exists(), "the reported run wrote its artifact");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

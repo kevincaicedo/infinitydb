@@ -12,6 +12,9 @@ workspace = true
 [dependencies]
 inf-foundation.workspace = true
 inf-simd.workspace = true
+# ADR-0054 D3: the arch-dependent O_DIRECT constant only (fdinfo flag
+# verification is a safe procfs read — no unsafe enters this crate).
+libc.workspace = true
 
 [dev-dependencies]
 # M2-S16: tests arm named fault points; the feature reaches this crate's
@@ -25,8 +28,15 @@ criterion.workspace = true
 # inf-runtime meet in the plane (inf-server from M2-S08).
 inf-runtime.workspace = true
 inf-alloc.workspace = true
-libc.workspace = true
 
 [[bench]]
 name = "reader_seq"
+harness = false
+
+[[bench]]
+name = "tier_flush"
+harness = false
+
+[[bench]]
+name = "blob_roundtrip"
 harness = false

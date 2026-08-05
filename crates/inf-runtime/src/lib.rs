@@ -13,6 +13,7 @@
 //! [`BackendDriver`].
 
 mod affinity;
+mod cold;
 mod driver;
 mod executor;
 pub mod gate;
@@ -28,6 +29,10 @@ mod kqueue;
 mod uring;
 
 pub use affinity::unpin_current_thread;
+pub use cold::{
+    ColdDone, ColdLeak, ColdReadConfig, ColdReadCounters, ColdReads, ColdRefused, ColdWait,
+    ReadClass, TierFileId,
+};
 pub use driver::{
     BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
     StableBytesMut, SubmitStats, Wait,

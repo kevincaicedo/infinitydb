@@ -1,0 +1,1 @@
+scenario=m4-recovery base_seed=0x517b10b sweep=3000 shard=0/1 seeds_run=3000 violations=0 refs=1152496 images=4938515 cut_before_publish=2263 flush_lag_lives=3061 live_set_entries=14868 relocations=465593 files_retired=705 files_unlinked=445 unlinks_boot_gc=260 blobs=1233233 blob_orphans=120006 blob_reclaims=1260334

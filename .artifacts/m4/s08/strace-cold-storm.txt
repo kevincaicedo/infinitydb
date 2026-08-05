@@ -1,0 +1,6 @@
+# M4-S08 strace artifact — cold storms on real io_uring
+# binary: target/debug/deps/cold_hardened-b4238ab6b9d6eae0
+# date: 2026-07-18T20:13:29Z  (dev tier; the §3.3 grep + this run are box-independent)
+# pre-main loader preads (ELF phdrs, excluded from the verdict): 2
+storm pread-class syscalls: 0 (gate: 0)
+storm io_uring_enter calls: 12 (positive control: > 0)

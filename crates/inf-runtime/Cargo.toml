@@ -63,3 +63,17 @@ name = "log_io_tier"
 harness = false
 test = false
 required-features = ["uring"]
+
+# M4-S09 tier-file I/O mode A/B (ADR-0054; Linux + uring only).
+[[bench]]
+name = "tier_io_mode"
+harness = false
+test = false
+required-features = ["uring"]
+
+# M4-S10 cold-read shaping: coalescing A/B + saturation (ADR-0055).
+[[bench]]
+name = "cold_shaping"
+harness = false
+test = false
+required-features = ["uring"]

@@ -6,6 +6,7 @@
 //! ```
 #![forbid(unsafe_code)]
 
+use inf_sim::RecoveryScenario;
 use inf_sim::net::Plant;
 use inf_sim::{
     CombinedScenario, DurableScenario, Scenario, run_combined_scenario, run_durable_scenario,
@@ -33,6 +34,7 @@ fn main() {
     let mut shard = (0u64, 1u64);
     let mut out_dir: Option<String> = None;
     let mut replay_canary = false;
+    let mut ops_override: Option<u64> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -69,6 +71,11 @@ fn main() {
                 }
                 "--out" => out_dir = Some(take("--out")?),
                 "--replay-canary" => replay_canary = true,
+                // m4-cold: total op count (the AC's 10⁶ run sets it; the
+                // smoke default is lighter).
+                "--ops" => {
+                    ops_override = Some(take("--ops")?.parse().map_err(|e| format!("--ops: {e}"))?);
+                }
                 "--help" | "-h" => {
                     println!(
                         "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m3-document|m2-combined|boot-storm \
@@ -138,6 +145,227 @@ fn main() {
         }
         return;
     }
+    // The M4-S21 disk-budget admission scenario (typed DISKFULL, refusal
+    // purity, the compaction reserve, automatic recovery — ADR-0063).
+    if scenario_name == "m4-diskfull" {
+        let scenario = inf_sim::DiskfullScenario::m4_diskfull(seed);
+        let report = inf_sim::run_diskfull_scenario(&scenario);
+        println!(
+            "inf-sim: scenario m4-diskfull seed {seed:#x}: {} refusals, {} reopens, \
+             {} B relocated, {} files retired, peak disk {} B, {} keys verified, hash {:#018x}",
+            report.refusals,
+            report.reopens,
+            report.relocated_bytes,
+            report.retired_files,
+            report.peak_disk_used,
+            report.keys_verified,
+            report.trace_hash
+        );
+        if verify {
+            let second = inf_sim::run_diskfull_scenario(&scenario);
+            assert_eq!(
+                report.trace_hash, second.trace_hash,
+                "m4-diskfull determinism: second run diverged"
+            );
+            println!("inf-sim: determinism verified — second run hash-identical");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+    // The M4-S07 throttled-device backpressure scenario (budget bound,
+    // typed stall timeouts, deadlock freedom — ADR-0053).
+    if scenario_name == "m4-pressure" {
+        let scenario = inf_sim::PressureScenario::m4_pressure(seed);
+        let report = inf_sim::run_pressure_scenario(&scenario);
+        println!(
+            "inf-sim: scenario m4-pressure seed {seed:#x}: {} stalls (p50 {} µs, p99 {} µs), \
+             {} timeouts, peak committed {} B, hash {:#018x}",
+            report.stalls,
+            report.stall_p50_ns / 1_000,
+            report.stall_p99_ns / 1_000,
+            report.stall_timeouts,
+            report.peak_committed_bytes,
+            report.trace_hash
+        );
+        if verify {
+            let second = inf_sim::run_pressure_scenario(&scenario);
+            assert_eq!(
+                report.trace_hash, second.trace_hash,
+                "m4-pressure determinism: second run diverged"
+            );
+            println!("inf-sim: determinism verified — second run hash-identical");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+    // The M4-S08 cold-read storm (placement, relocation races, chunked
+    // staging, cancellation, pin-deferred unlinks).
+    if scenario_name == "m4-recovery" {
+        let run_one = |seed: u64| {
+            let scenario = RecoveryScenario::m4_recovery(seed);
+            inf_sim::run_recovery_scenario(&scenario)
+        };
+        if let Some(sweep) = sweep {
+            let (shard_i, shard_k) = shard;
+            assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+            let mut lines = Vec::new();
+            let mut violations = 0u64;
+            let mut ran = 0u64;
+            let mut refs = 0u64;
+            let mut images = 0u64;
+            let mut cuts_before = 0u64;
+            let mut flush_lag = 0u64;
+            let mut live_entries = 0u64;
+            let mut relocations = 0u64;
+            let mut files_retired = 0u64;
+            let mut files_unlinked = 0u64;
+            let mut boot_gc = 0u64;
+            let mut blobs = 0u64;
+            let mut blob_orphans = 0u64;
+            let mut blob_reclaims = 0u64;
+            for i in (shard_i..sweep).step_by(shard_k as usize) {
+                let seed = seed.wrapping_add(i);
+                let report = run_one(seed);
+                ran += 1;
+                refs += report.refs_emitted;
+                images += report.images_emitted;
+                cuts_before += report.cut_before_publish;
+                flush_lag += report.flush_lag_lives;
+                live_entries += report.live_entries_emitted;
+                relocations += report.relocations;
+                files_retired += report.files_retired;
+                files_unlinked += report.files_unlinked;
+                boot_gc += report.unlinks_left_to_boot_gc;
+                blobs += report.blobs_written;
+                blob_orphans += report.blob_orphans_planted;
+                blob_reclaims += report.blob_extents_reclaimed;
+                if report.ok() {
+                    lines.push(format!("{seed:#x} ok"));
+                } else {
+                    violations += 1;
+                    let first = report.violations.first().map_or("?", |v| v.as_str());
+                    lines.push(format!("{seed:#x} VIOLATION {first}"));
+                    eprintln!("inf-sim: seed {seed:#x}: {first}");
+                }
+            }
+            // Coverage disclosed, never assumed (ADR-0045 D4): the seed
+            // classes must actually occur across the shard.
+            println!(
+                "inf-sim: m4-recovery sweep shard {shard_i}/{shard_k}: {ran} seeds, \
+                 {violations} violations, {refs} refs, {images} images, \
+                 {cuts_before} cut-before-publish lives, {flush_lag} flush-lag lives, \
+                 {live_entries} live-set entries, {relocations} relocations, \
+                 {files_retired} retired, {files_unlinked} unlinked, \
+                 {boot_gc} left-to-boot-gc, {blobs} blobs, {blob_orphans} orphans-planted, \
+                 {blob_reclaims} blob-reclaims"
+            );
+            if let Some(dir) = out_dir {
+                std::fs::create_dir_all(&dir).expect("--out dir");
+                let manifest = format!(
+                    "scenario=m4-recovery base_seed={seed:#x} sweep={sweep} \
+                     shard={shard_i}/{shard_k} seeds_run={ran} violations={violations} \
+                     refs={refs} images={images} cut_before_publish={cuts_before} \
+                     flush_lag_lives={flush_lag} live_set_entries={live_entries} \
+                     relocations={relocations} files_retired={files_retired} \
+                     files_unlinked={files_unlinked} unlinks_boot_gc={boot_gc} \
+                     blobs={blobs} blob_orphans={blob_orphans} blob_reclaims={blob_reclaims}\n"
+                );
+                std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
+                    .expect("manifest");
+                std::fs::write(
+                    format!("{dir}/results-shard-{shard_i}.txt"),
+                    lines.join("\n") + "\n",
+                )
+                .expect("results");
+            }
+            std::process::exit(if violations > 0 { 1 } else { 0 });
+        }
+        let report = run_one(seed);
+        println!(
+            "inf-sim: m4-recovery seed {seed:#x}: {} lives, {} refs, {} images, {} tail \
+             records, {} cut-before-publish, {} flush-lag, {} keys audited, {} live-set \
+             entries, {} relocations, {} retired, {} unlinked, {} left-to-boot-gc, \
+             {} blobs, {} orphans-planted, {} blob-reclaims, trace {:#x}",
+            report.lives,
+            report.refs_emitted,
+            report.images_emitted,
+            report.tail_records,
+            report.cut_before_publish,
+            report.flush_lag_lives,
+            report.keys_audited,
+            report.live_entries_emitted,
+            report.relocations,
+            report.files_retired,
+            report.files_unlinked,
+            report.unlinks_left_to_boot_gc,
+            report.blobs_written,
+            report.blob_orphans_planted,
+            report.blob_extents_reclaimed,
+            report.trace_hash
+        );
+        if verify {
+            let twin = run_one(seed);
+            assert_eq!(report.trace_hash, twin.trace_hash, "determinism violated (L7)");
+            println!("inf-sim: determinism verified (two runs, identical traces)");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if scenario_name == "m4-cold" {
+        let mut scenario = inf_sim::ColdStormScenario::m4_cold(seed);
+        if let Some(ops) = ops_override {
+            scenario.ops = ops;
+        }
+        let report = inf_sim::run_cold_storm_scenario(&scenario);
+        println!(
+            "inf-sim: scenario m4-cold seed {seed:#x}: {} gets ({} cold, {} chunked, {} \
+             restarts, {} cancelled [{} early / {} late]), {} merged waiters (queue hw {}), \
+             {} unlinks ({} deferrals), hash {:#018x}",
+            report.gets,
+            report.cold_served,
+            report.chunked_reads,
+            report.restarts,
+            report.cancelled,
+            report.cancelled_early,
+            report.cancelled_late,
+            report.merged_waiters,
+            report.queue_high_water,
+            report.unlinks,
+            report.unlink_deferrals,
+            report.trace_hash
+        );
+        if verify {
+            let second = inf_sim::run_cold_storm_scenario(&scenario);
+            assert_eq!(
+                report.trace_hash, second.trace_hash,
+                "m4-cold determinism: second run diverged"
+            );
+            println!("inf-sim: determinism verified — second run hash-identical");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
     // The M2.5-S01 boot-storm scenario (wedge-class oracle).
     if scenario_name == "boot-storm" {
         let scenario = inf_sim::BootStormScenario::m2_boot_storm(seed);
@@ -173,7 +401,8 @@ fn main() {
         other => {
             eprintln!(
                 "inf-sim: unknown scenario {other} (have: m0-smoke, m1-cache, m2-durable, \
-                 m3-document, m2-combined, boot-storm, m4-steel)"
+                 m3-document, m2-combined, boot-storm, m4-steel, m4-pressure, m4-cold, \
+                 m4-recovery, m4-diskfull)"
             );
             std::process::exit(2);
         }

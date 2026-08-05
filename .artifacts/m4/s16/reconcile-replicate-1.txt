@@ -1,0 +1,45 @@
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 5.45s
+     Running benches/write_accounting.rs (target/release/deps/write_accounting-97e5274b9755d1c1)
+--- M4-S13 write accounting vs the block layer ---
+dir /home/kcaicedo/.cache/inf-bench-acct/acct-67394 · device 259:3 · 512 MiB user bytes
+idle noise floor: 126976 B in 3 s (42324 B/s)
+warm-up: 16131 records, accounted 8484906 B
+
+=== insert-only (S13 leg: no dead bytes, no compaction) ===
+records 1032444 in 2.1 s
+user_bytes             536903324
+wal_bytes              543097988  (records only)
+flush_bytes            530038784  (tier device bytes, relocations included)
+compaction_bytes               0  (relocation volume — not a numerator leg)
+written_bytes         1073136772  = the write-amp numerator (wal + flush)
+write amplification 1.999×  (INFO: write_amp_milli)
+
+WAL frame envelope         44396  (frame header/trailer, not pro-rated)
+device (diskstats)    1088323584
+divergence                -1.40%  (counters alone; gate ±10%)
+divergence                -1.39%  (counters + named envelope term)
+divergence                -1.40%  (REJECTED numerator, + compaction_bytes)
+
+INFO tiering, per-namespace fields:
+tiering_ns31:head=526385232,flushed=527433840,ro_boundary=527433840,tail=545163516,committed_bytes=18874368,budget_bytes=67108864,live_bytes=545162876,dead_bytes=640,user_bytes=536903324,wal_bytes=543097988,flush_bytes=530038784,compaction_bytes=0,write_amp_milli=1999
+
+=== overwrite churn (S16 leg: copy-forward running) ===
+records 1032444 in 2.7 s
+user_bytes             536870880
+wal_bytes              543065544  (records only)
+flush_bytes            385630208  (tier device bytes, relocations included)
+compaction_bytes       146470896  (relocation volume — not a numerator leg)
+written_bytes          928695752  = the write-amp numerator (wal + flush)
+write amplification 1.730×  (INFO: write_amp_milli)
+
+WAL frame envelope         44396  (frame header/trailer, not pro-rated)
+device (diskstats)     950013952
+divergence                -2.24%  (counters alone; gate ±10%)
+divergence                -2.24%  (counters + named envelope term)
+divergence               +13.17%  (REJECTED numerator, + compaction_bytes)
+
+INFO tiering, per-namespace fields:
+tiering_ns31:head=381681952,flushed=382730560,ro_boundary=382730560,tail=399844096,committed_bytes=18874368,budget_bytes=67108864,live_bytes=68141040,dead_bytes=331703056,user_bytes=536870880,wal_bytes=543065544,flush_bytes=385630208,compaction_bytes=146470896,write_amp_milli=1730
+
+PASS: both legs within the ±10% AC (worst -2.24%).

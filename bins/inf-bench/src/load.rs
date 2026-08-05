@@ -71,6 +71,10 @@ impl Default for LoadSpec {
 pub struct LoadReport {
     pub ops: u64,
     pub errors: u64,
+    /// RESP nil replies (`$-1`) — client-side GET misses (M4-S20: the
+    /// cache-leg hit-rate proxy that no INFO scrape can mix up across
+    /// concurrently loaded namespaces).
+    pub nils: u64,
     pub elapsed_s: f64,
     pub ops_per_sec: f64,
     pub p50_us: u64,
@@ -83,10 +87,11 @@ pub struct LoadReport {
 struct ConnResult {
     ops: u64,
     errors: u64,
+    nils: u64,
     hist_us: LogHistogram,
 }
 
-fn make_key(spec: &LoadSpec, index: u64) -> Vec<u8> {
+pub(crate) fn make_key(spec: &LoadSpec, index: u64) -> Vec<u8> {
     let digits = spec.key_size.saturating_sub(spec.key_prefix.len()).max(1);
     format!("{}{:0digits$}", spec.key_prefix, index, digits = digits).into_bytes()
 }
@@ -111,7 +116,7 @@ fn run_conn(
     }
     let mut rng = SplitMix64::new(spec.seed ^ (0xB0A7 + conn_index as u64));
     let value = vec![0xABu8; spec.value_size];
-    let mut result = ConnResult { ops: 0, errors: 0, hist_us: LogHistogram::new() };
+    let mut result = ConnResult { ops: 0, errors: 0, nils: 0, hist_us: LogHistogram::new() };
 
     // Fill mode: a partitioned range, exactly once, pipelined.
     let mut fill_range = spec.fill.map(|total| {
@@ -200,6 +205,9 @@ fn run_conn(
                 let micros = sent.elapsed().as_micros() as u64;
                 result.hist_us.record(micros);
                 result.ops += 1;
+                if rx[rx_at..].starts_with(b"$-1") {
+                    result.nils += 1;
+                }
             }
             if rx[rx_at] == b'-' {
                 result.errors += 1;
@@ -237,6 +245,7 @@ pub fn run(spec: &LoadSpec) -> Result<LoadReport, String> {
         let conn = result?;
         report.ops += conn.ops;
         report.errors += conn.errors;
+        report.nils += conn.nils;
         hist.merge(&conn.hist_us);
     }
     report.ops_per_sec = report.ops as f64 / report.elapsed_s;

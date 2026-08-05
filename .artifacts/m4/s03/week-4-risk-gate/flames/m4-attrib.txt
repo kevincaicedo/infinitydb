@@ -1,0 +1,12 @@
+    14.23%  [k] 0xffffffff94d22a8e                                                                        -      -            
+     3.87%  [k] 0xffffffffc1546459                                                                        -      -            
+     1.18%  [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration                                        -      -            
+     1.05%  [k] 0xffffffff94d22a77                                                                        -      -            
+     0.95%  [k] 0xffffffff93b01ba7                                                                        -      -            
+     0.84%  [k] 0xffffffff94d2197a                                                                        -      -            
+     0.79%  [.] <inf_server::plane::ServerPlane<O,F> as inf_runtime::reactor::CellPlane>::maintain        -      -            
+     0.71%  [k] 0xffffffff93601268                                                                        -      -            
+     0.68%  [k] 0xffffffff94d32943                                                                        -      -            
+     0.67%  [.] 0x000000000448af9c                                                                        -      -            
+     0.53%  [.] 0x000000000448af65                                                                        -      -            
+     0.52%  [.] 0x0000000002e5a1ef                                                                        -      -            

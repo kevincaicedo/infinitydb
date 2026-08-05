@@ -4,7 +4,10 @@
 //! ```text
 //! [0]      type:4 (high) | flags:4 (low)
 //! [1]      klen: u8
-//! [2..5]   vlen: u24 LE          (≤ 16 MiB − 1 inline; blob ext is M7)
+//! [2..5]   vlen: u24 LE          (≤ 16 MiB − 1 inline; larger values
+//!                                 store out of line — `StringExtent`
+//!                                 carries a 24-byte extent reference as
+//!                                 its value, M4-S17, ADR-0061 D2)
 //! [5..8]   version: u24 LE       (WATCH/lease/CAS epoch, wraps mod 2^24)
 //! [8..13]  expire_at_ms: u40 LE  (present iff FLAG_TTL)
 //! [..]     key bytes, then value bytes (packed, no padding)
@@ -53,12 +56,17 @@ pub(crate) const VERSION_MASK: u32 = (1 << 24) - 1;
 
 /// Value type, 4 bits in the header. M5 adds the collection types; the
 /// registry of type tags is an L11 seam (record-type registry).
-/// `JsonDoc = 2` was reserved by ADR-0032 D1 and is bound by ADR-0037.
+/// `JsonDoc = 2` was reserved by ADR-0032 D1 and is bound by ADR-0037;
+/// `StringExtent = 3` is bound by ADR-0061 (the §7.2 sketch's "ext flag"
+/// revised to a type tag — the flags nibble is fully allocated).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum TypeTag {
     String = 1,
     JsonDoc = 2,
+    /// A string whose value lives out of line in a blob extent — the
+    /// record's value bytes are the 24-byte [`ExtentRef`] (M4-S17).
+    StringExtent = 3,
 }
 
 impl TypeTag {
@@ -66,6 +74,7 @@ impl TypeTag {
         match bits {
             1 => Some(TypeTag::String),
             2 => Some(TypeTag::JsonDoc),
+            3 => Some(TypeTag::StringExtent),
             _ => None,
         }
     }
@@ -82,6 +91,9 @@ pub(crate) enum RecordKind {
     /// A document (ADR-0037): value = form byte + inline tape / doc-arena
     /// handle.
     JsonDoc,
+    /// A string stored out of line (ADR-0061 D2): value = 24-byte
+    /// extent reference, never the value bytes.
+    StringExtent,
 }
 
 impl RecordKind {
@@ -90,6 +102,57 @@ impl RecordKind {
         match self {
             RecordKind::String { .. } => TypeTag::String,
             RecordKind::JsonDoc => TypeTag::JsonDoc,
+            RecordKind::StringExtent => TypeTag::StringExtent,
+        }
+    }
+}
+
+/// The out-of-line value reference a [`TypeTag::StringExtent`] record
+/// carries as its value bytes (master plan §7.2 "ext header"; frozen at
+/// M4 exit — plan §3.2). `offset` is 0 in v1 (frozen wire space).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct ExtentRef {
+    /// The blob extent holding the value (`blob-NNNNNN.iblob`).
+    pub extent_id: u64,
+    /// Byte offset of the value inside the extent (0 in v1, asserted).
+    pub offset: u64,
+    /// Exact value byte length.
+    pub len: u64,
+}
+
+/// Encoded [`ExtentRef`] length — the `vlen` of every extent record.
+pub const EXTENT_REF_LEN: usize = 24;
+
+impl ExtentRef {
+    /// Serializes into exactly [`EXTENT_REF_LEN`] bytes (LE, explicitly
+    /// sized — this is record content and flows through WAL frames,
+    /// checkpoint images, and tier files verbatim).
+    #[inline]
+    #[must_use]
+    pub fn encode(&self) -> [u8; EXTENT_REF_LEN] {
+        debug_assert_eq!(self.offset, 0, "v1 extent references start at offset 0");
+        debug_assert!(self.len > 0, "an extent reference names at least one byte");
+        let mut out = [0u8; EXTENT_REF_LEN];
+        out[0..8].copy_from_slice(&self.extent_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.offset.to_le_bytes());
+        out[16..24].copy_from_slice(&self.len.to_le_bytes());
+        out
+    }
+
+    /// Decodes a [`TypeTag::StringExtent`] record's value bytes.
+    ///
+    /// # Panics
+    /// Panics when `value` is not exactly [`EXTENT_REF_LEN`] bytes —
+    /// extent records are written only by this crate, so a wrong length
+    /// is a record-lifecycle bug, not input.
+    #[inline]
+    #[must_use]
+    pub fn decode(value: &[u8]) -> ExtentRef {
+        assert_eq!(value.len(), EXTENT_REF_LEN, "extent reference is exactly 24 bytes");
+        ExtentRef {
+            extent_id: u64::from_le_bytes(value[0..8].try_into().expect("8 bytes")),
+            offset: u64::from_le_bytes(value[8..16].try_into().expect("8 bytes")),
+            len: u64::from_le_bytes(value[16..24].try_into().expect("8 bytes")),
         }
     }
 }
@@ -279,6 +342,7 @@ impl<'a> RecordView<'a> {
         match self.type_tag() {
             TypeTag::String => RecordKind::String { raw: self.is_raw() },
             TypeTag::JsonDoc => RecordKind::JsonDoc,
+            TypeTag::StringExtent => RecordKind::StringExtent,
         }
     }
 

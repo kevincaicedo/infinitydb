@@ -14,9 +14,23 @@ can never accidentally agree because they share a bug.
 ```
 inf-bench env-check [--allow-dirty]
 inf-bench load --host H --port P [--threads N] [--pipeline P] [--duration S] ...
-inf-bench gate-run m0|m1 [flags]
+inf-bench gate-run m0|m1|m2|m4 [flags]
 inf-bench zipfian [flags]
+inf-bench mixed-audit [flags]          # M4-S20 coexistence audit
+inf-bench ycsb [flags]                 # M4-S22 YCSB rows, split latency reporting
 ```
+
+### `ycsb` (M4-S22)
+
+YCSB-style workloads A–F (E adapted to cursor-scan slices — documented in
+every report preamble) at dataset = N× a namespace memory budget, scrambled
+zipfian θ=0.99 or uniform, with memory-hit and cold-read percentiles
+reported **separately** (§18/§19 — the combined number is context, never
+the headline). Deterministic from `--seed` (op-stream checksums +
+`--verify-seed` assert + a DBSIZE-integrity loader). Until command wiring
+(M4-S26) lifts the D8 refusal, runs drop to harness-validation mode with
+the tiered split named-absent; `--attach-port`/`--ns`/`--skip-fill` drive
+an already-running node (the `scripts/soak-m4.sh` legs).
 
 ### `env-check`
 

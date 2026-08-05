@@ -63,6 +63,7 @@ fn fresh_keyspace() -> Keyspace {
         fsync: Some(FsyncClass::Always),
         policy: None,
         maxmemory: None,
+        tier: None,
     })
     .expect("ns");
     ks
@@ -198,7 +199,12 @@ fn build_crashed_image(fs: &MemFs, seed: u64, ops: usize, ckpts: u32, tear: bool
             write_manifest(
                 fs,
                 Path::new("data/shard-0"),
-                &Manifest { ckpt_id: u64::from(published), begin_lsn: begin, segments },
+                &Manifest {
+                    ckpt_id: u64::from(published),
+                    begin_lsn: begin,
+                    segments,
+                    tiers: Vec::new(),
+                },
             )
             .expect("manifest swap");
         }

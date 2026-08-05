@@ -18,7 +18,9 @@
 
 use std::collections::HashMap;
 
-use inf_store::{AddrClass, AddressSpaceConfig, LogicalAddr, OpError, TieredLookup, TieredTable};
+use inf_store::{
+    AddrClass, AddressSpaceConfig, DemotionConfig, LogicalAddr, OpError, TieredLookup, TieredTable,
+};
 use proptest::prelude::*;
 
 const RING: u64 = 1 << 20;
@@ -66,6 +68,7 @@ impl Harness {
                     page_bytes: PAGE as usize,
                     life_origin,
                 },
+                DemotionConfig::for_budget(RING, PAGE),
                 64,
             )
             .expect("reservation"),

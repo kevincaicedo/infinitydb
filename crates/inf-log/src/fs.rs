@@ -24,6 +24,22 @@ use std::path::Path;
 
 pub mod sim;
 
+/// Tier-file I/O mode (ADR-0054): `Buffered` rides the kernel page cache;
+/// `Direct` bypasses it (`O_DIRECT`) for deterministic memory accounting
+/// (L5 — page-cache bytes holding tier contents belong to no allocation
+/// domain). A per-*file* decision fixed at creation: the cold-read fd is
+/// the writer's fd, and mixing modes on one file is the `open(2)`
+/// coherence hazard the per-file shape removes structurally. Durability
+/// is mode-independent: `O_DIRECT` bypasses the page cache, not the
+/// device write cache — the fdatasync barrier stands either way (D7).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TierIoMode {
+    /// Kernel page cache (the pre-S09 behavior; the config fallback).
+    Buffered,
+    /// `O_DIRECT`, verified at open — never a silent fallback (D3).
+    Direct,
+}
+
 /// One open segment file. Offsets are absolute; the caller (the rotor)
 /// owns position bookkeeping.
 pub trait SegmentFile {
@@ -34,6 +50,13 @@ pub trait SegmentFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
     /// Current file length in bytes.
     fn file_size(&self) -> io::Result<u64>;
+    /// Sets the file length (`ftruncate` semantics: shrink drops bytes,
+    /// grow zero-fills). M4-S11's recovery pre-flush rule (ADR-0056 D5)
+    /// is the only caller: un-manifested tier-file bytes are dead-life
+    /// garbage, truncated before any new flush. Durable only after a
+    /// following [`sync_data`](Self::sync_data) — the sim tier's power
+    /// cut may resurrect the old tail until then (real physics).
+    fn truncate(&mut self, len: u64) -> io::Result<()>;
     /// Durably flush file *data* (fdatasync class). A failure here is
     /// fatal to the cell (§8.4 fsyncgate rule) — callers map it to
     /// [`FsyncFailed`](crate::FsyncFailed) and never retry.
@@ -74,6 +97,28 @@ pub trait SegmentFs {
     /// ENOSPC discipline seam: it must surface *before* any write needs
     /// the space (M2-S02).
     fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File>;
+    /// Create a tier file in `mode` (M4-S09, ADR-0054 D1). The default
+    /// delegates to [`create_segment`](Self::create_segment) ignoring the
+    /// mode — honest **by construction** on the in-memory/sim tiers, whose
+    /// byte-visibility model has no page cache to bypass (`Buffered ≡
+    /// Direct` there), never a silent fallback on a real filesystem:
+    /// [`StdSegmentFs`] implements the real thing and refuses typed when
+    /// `Direct` does not take effect (D3). Wrappers must forward this
+    /// explicitly (falling into the default would drop the flag).
+    fn create_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
+        let _ = mode;
+        self.create_segment(path, 0)
+    }
+    /// Open an **existing** tier file in `mode` (M4-S11, ADR-0056 D5 —
+    /// the recovery reopen). Same honesty contract as
+    /// [`create_tier`](Self::create_tier): the default delegates to
+    /// [`open_write`](Self::open_write) (mode-equivalent on
+    /// in-memory/sim tiers), [`StdSegmentFs`] applies and verifies
+    /// `O_DIRECT`, and wrappers must forward explicitly.
+    fn open_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
+        let _ = mode;
+        self.open_write(path)
+    }
     /// [`create_segment`](Self::create_segment) with **no durability side
     /// effects** (M2.5-S01 boot barriers): the caller owns making the file
     /// and its directory entry durable — driver-ridden fdatasync barriers
@@ -132,6 +177,10 @@ impl SegmentFile for StdSegmentFile {
         Ok(self.0.metadata()?.len())
     }
 
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        self.0.set_len(len)
+    }
+
     fn sync_data(&mut self) -> io::Result<()> {
         self.0.sync_data()
     }
@@ -179,6 +228,52 @@ impl SegmentFs for StdSegmentFs {
         Ok(StdSegmentFile(file))
     }
 
+    fn create_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
+        match mode {
+            TierIoMode::Buffered => self.create_segment(path, 0),
+            #[cfg(target_os = "linux")]
+            TierIoMode::Direct => {
+                use std::os::unix::fs::OpenOptionsExt;
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(path)?;
+                verify_o_direct(&file, path)?;
+                file.sync_all()?;
+                Ok(StdSegmentFile(file))
+            }
+            #[cfg(not(target_os = "linux"))]
+            TierIoMode::Direct => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "O_DIRECT tier files are Linux-only (ADR-0054 D6); configure Buffered",
+            )),
+        }
+    }
+
+    fn open_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
+        match mode {
+            TierIoMode::Buffered => self.open_write(path),
+            #[cfg(target_os = "linux")]
+            TierIoMode::Direct => {
+                use std::os::unix::fs::OpenOptionsExt;
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(path)?;
+                verify_o_direct(&file, path)?;
+                Ok(StdSegmentFile(file))
+            }
+            #[cfg(not(target_os = "linux"))]
+            TierIoMode::Direct => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "O_DIRECT tier files are Linux-only (ADR-0054 D6); configure Buffered",
+            )),
+        }
+    }
+
     fn create_meta(&self, path: &Path) -> io::Result<Self::File> {
         let file =
             std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
@@ -204,6 +299,36 @@ impl SegmentFs for StdSegmentFs {
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
     }
+}
+
+/// Asserts the `Direct` open took effect (ADR-0054 D3): `open(2)` can
+/// accept and then ignore `O_DIRECT` on some filesystems/kernels, and a
+/// buffered file wearing a direct label defeats the L5 accounting the
+/// mode exists for. Flags are re-read from `/proc/self/fdinfo` — a safe
+/// procfs read; this crate forbids unsafe, so no `fcntl` — and absence
+/// of the flag is a typed `Unsupported` refusal, never a downgrade.
+#[cfg(target_os = "linux")]
+fn verify_o_direct(file: &std::fs::File, path: &Path) -> io::Result<()> {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(file);
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
+    let flags = info
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:"))
+        .map(str::trim)
+        .and_then(|octal| i32::from_str_radix(octal, 8).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "fdinfo flags unreadable for O_DIRECT verify",
+            )
+        })?;
+    if flags & libc::O_DIRECT == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("O_DIRECT requested but not in effect on {} (ADR-0054 D3)", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 pub mod mem {
@@ -341,6 +466,13 @@ pub mod mem {
 
         fn file_size(&self) -> io::Result<u64> {
             Ok(self.data.borrow().len() as u64)
+        }
+
+        fn truncate(&mut self, len: u64) -> io::Result<()> {
+            self.fs.borrow_mut().tick_op()?;
+            let len = usize::try_from(len).expect("length fits usize");
+            self.data.borrow_mut().resize(len, 0);
+            Ok(())
         }
 
         fn sync_data(&mut self) -> io::Result<()> {

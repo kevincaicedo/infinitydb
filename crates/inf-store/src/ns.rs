@@ -16,9 +16,13 @@
 //! replicate per cell via the `INF.NS` scatter program (L1: no shared
 //! registry, every cell owns its copy).
 
+use inf_log::fs::TierIoMode;
 use inf_log::{FsyncClass, NsId};
 
+use crate::demote::{DemotionConfig, MUTABLE_PERMILLE_DEFAULT};
 use crate::evict::EvictionPolicy;
+use crate::extents::{BLOB_THRESHOLD_DEFAULT, BlobConfig};
+use crate::tiered::compact::CompactionConfig;
 
 /// First id available to named namespaces. Ids `0..16` are the implicit
 /// default namespaces (`db0`..`db15`, always `memory`) and never appear in
@@ -54,8 +58,141 @@ impl NsMode {
     }
 }
 
+/// Per-namespace tiering configuration (M4-S19, ADR-0062 D1/D2): the
+/// `INF.NS` key vocabulary as typed state. Present ⇔ the namespace is
+/// durable-**tiered** — `MEM-BUDGET` is the discriminator, never a
+/// fourth mode (§9: "configurations, not codepaths"). Every field is a
+/// key from the ADR-0062 D2 table; [`validate`](Self::validate) is the
+/// one range gauntlet both the command parser and the catalog decoder
+/// stand on.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct TierSpec {
+    /// `MEM-BUDGET`: the committed ring window this namespace may hold
+    /// (ADR-0053 D1 — resident bytes, not live bytes). Required; > 0.
+    pub mem_budget_bytes: u64,
+    /// `DISK-BUDGET`: tier files + extents bound (ADR-0062 D5).
+    /// `0` = unbounded (the honest default until S21 lands enforcement).
+    pub disk_budget_bytes: u64,
+    /// `MUTABLE-FRACTION` in permille (ADR-0053 D2; default 250).
+    pub mutable_permille: u32,
+    /// `MAINTAIN-SLICE`: the seal/flush/release quantum (ADR-0053 D3).
+    /// Floors at 64 KiB — the S13 finding measured a slice near the
+    /// frame size paying for most frames twice.
+    pub maintain_slice_bytes: u64,
+    /// `COLD-READ-QD` (ADR-0055 D2; CreateOnly — construction parameter
+    /// of the cell's cold-read machinery).
+    pub cold_read_qd: u16,
+    /// `COMPACTION-DEAD-RATIO` percent (ADR-0059 D1). Clamped to
+    /// 50..=100 at validation — the ADR-0060 D6 obligation: below 50%
+    /// copy-forward moves more than it reclaims and the steady-state
+    /// model breaches the 3× gate under pure churn (8.318× measured at
+    /// a 10% trigger, the S16 canary).
+    pub compaction_dead_ratio_pct: u8,
+    /// `COMPACTION-SLICE` (ADR-0059 D6).
+    pub compaction_slice_bytes: u64,
+    /// `BLOB-THRESHOLD` (ADR-0061 D1). Ceilinged at 16 MiB — values
+    /// above the u24 inline bound cannot be inline records, so a higher
+    /// threshold would promise a routing the format cannot deliver.
+    pub blob_threshold_bytes: u32,
+    /// `TIER-IO-MODE` (ADR-0054; CreateOnly — per-file at open).
+    pub tier_io_mode: TierIoMode,
+    /// `TAIL-STALL-TIMEOUT` in milliseconds (ADR-0053 D4).
+    pub tail_stall_timeout_ms: u32,
+}
+
+impl TierSpec {
+    /// The defaults for a given memory budget — every other key at its
+    /// owning ADR's default.
+    #[must_use]
+    pub fn for_budget(mem_budget_bytes: u64) -> TierSpec {
+        TierSpec {
+            mem_budget_bytes,
+            disk_budget_bytes: 0,
+            mutable_permille: MUTABLE_PERMILLE_DEFAULT,
+            maintain_slice_bytes: 1 << 20,
+            cold_read_qd: 64,
+            compaction_dead_ratio_pct: 50,
+            compaction_slice_bytes: 1 << 20,
+            blob_threshold_bytes: BLOB_THRESHOLD_DEFAULT,
+            tier_io_mode: TierIoMode::Direct,
+            tail_stall_timeout_ms: 1_000,
+        }
+    }
+
+    /// The ADR-0062 D2 range gauntlet. One place, shared by the command
+    /// parser, the catalog decoder, and `INF.NS SET` — a spec that
+    /// passes here is constructible everywhere downstream.
+    ///
+    /// # Errors
+    /// A static reason naming the violated range (the command layer
+    /// wraps it into the reply string).
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.mem_budget_bytes == 0 {
+            return Err("MEM-BUDGET must be > 0");
+        }
+        if self.demotion_config().ring_reserve_bytes().is_none() {
+            return Err("MEM-BUDGET + MAINTAIN-SLICE has no representable ring reservation");
+        }
+        if self.disk_budget_bytes != 0 && self.disk_budget_bytes < (1 << 20) {
+            return Err("DISK-BUDGET is 0 (unbounded) or >= 1mb");
+        }
+        if self.mutable_permille == 0 || self.mutable_permille > 999 {
+            return Err("MUTABLE-FRACTION is 1..=999 permille");
+        }
+        if !(64 << 10..=64 << 20).contains(&self.maintain_slice_bytes) {
+            return Err("MAINTAIN-SLICE is 64kb..=64mb");
+        }
+        if self.cold_read_qd == 0 || self.cold_read_qd > 4096 {
+            return Err("COLD-READ-QD is 1..=4096");
+        }
+        if !(50..=100).contains(&self.compaction_dead_ratio_pct) {
+            return Err("COMPACTION-DEAD-RATIO is 50..=100 (below 50 the write-amplification \
+                        gate is at risk by construction — ADR-0062 D2)");
+        }
+        if !(64 << 10..=64 << 20).contains(&self.compaction_slice_bytes) {
+            return Err("COMPACTION-SLICE is 64kb..=64mb");
+        }
+        if !(4 << 10..=1 << 24).contains(&self.blob_threshold_bytes) {
+            return Err("BLOB-THRESHOLD is 4kb..=16mb");
+        }
+        if self.tail_stall_timeout_ms == 0 || self.tail_stall_timeout_ms > 60_000 {
+            return Err("TAIL-STALL-TIMEOUT is 1..=60000 milliseconds");
+        }
+        Ok(())
+    }
+
+    /// The demotion configuration this spec derives (ADR-0053 shape:
+    /// budget, fraction, slice).
+    #[must_use]
+    pub fn demotion_config(&self) -> DemotionConfig {
+        DemotionConfig {
+            mem_budget_bytes: self.mem_budget_bytes,
+            mutable_permille: self.mutable_permille,
+            slice_bytes: self.maintain_slice_bytes,
+        }
+    }
+
+    /// The compaction configuration this spec derives (ADR-0059 D1/D6).
+    #[must_use]
+    pub fn compaction_config(&self) -> CompactionConfig {
+        CompactionConfig {
+            dead_ratio_pct: self.compaction_dead_ratio_pct,
+            slice_bytes: self.compaction_slice_bytes,
+        }
+    }
+
+    /// The blob routing configuration this spec derives (ADR-0061 D1).
+    /// The per-value hard cap stays the ADR default — it bounds one
+    /// value, not the namespace, and has no `INF.NS` key.
+    #[must_use]
+    pub fn blob_config(&self) -> BlobConfig {
+        BlobConfig { threshold_bytes: self.blob_threshold_bytes, ..BlobConfig::default() }
+    }
+}
+
 /// One named-namespace registry entry (the §3.2 freeze: id/name, mode,
-/// fsync class, eviction policy, memory budget).
+/// fsync class, eviction policy, memory budget; M4-S19 adds the tier
+/// block).
 ///
 /// Named-namespace ids start at [`FIRST_NAMED_NS_ID`] (16); ids `0..16` are
 /// the implicit defaults (`db0`..`db15`) and are never registered here
@@ -76,6 +213,9 @@ pub struct NsSpec {
     pub policy: Option<EvictionPolicy>,
     /// Node-wide budget in bytes; `None` inherits the server `maxmemory`.
     pub maxmemory: Option<u64>,
+    /// Tiering configuration (M4-S19, ADR-0062 D1): `Some` ⇔ the
+    /// namespace is durable-tiered. Requires `mode == Durable`.
+    pub tier: Option<TierSpec>,
 }
 
 /// Typed registry failures (the command layer maps these to reply strings).
@@ -93,6 +233,23 @@ pub enum NsError {
     /// `EVICTION` given on a durable namespace (durable namespaces do not
     /// evict in M2 — ADR-0015 D5).
     EvictionNotAllowedDurable,
+    /// A tiering key given on a non-durable mode (M4-S19, ADR-0062 D1:
+    /// tiered is a configuration of `MODE durable`).
+    TierRequiresDurable,
+    /// A tiering key outside its ADR-0062 D2 range; the reason names the
+    /// range.
+    InvalidTierConfig(&'static str),
+    /// Tiered materialization refused by the aggregate reserved-VA
+    /// admission bound (ADR-0062 D4) — checked before any mmap.
+    TierVaLimitExceeded {
+        requested_bytes: u64,
+        admitted_bytes: u64,
+        limit_bytes: u64,
+    },
+    /// `INF.NS SET` with tiering keys on a namespace created without
+    /// `MEM-BUDGET` — adding tiering post-hoc is a create-time decision
+    /// (drop + recreate), not a reload.
+    NotTiered,
 }
 
 /// Valid namespace names: 1..=128 bytes of `[a-zA-Z0-9_.-]`, not colliding
@@ -146,6 +303,12 @@ impl NsRegistry {
         if spec.policy.is_some() && spec.mode == NsMode::Durable {
             return Err(NsError::EvictionNotAllowedDurable);
         }
+        if let Some(tier) = &spec.tier {
+            if spec.mode != NsMode::Durable {
+                return Err(NsError::TierRequiresDurable);
+            }
+            tier.validate().map_err(NsError::InvalidTierConfig)?;
+        }
         if self.get(&spec.name).is_some() {
             return Err(NsError::Exists);
         }
@@ -168,6 +331,22 @@ impl NsRegistry {
         }
         let at = self.named.iter().position(|s| s.name == name).ok_or(NsError::Unknown)?;
         self.named.remove(at);
+        Ok(())
+    }
+
+    /// Replaces a tiered entry's tier block (M4-S19 hot-reload; the
+    /// caller — [`Keyspace::ns_set_tier`](crate::Keyspace::ns_set_tier)
+    /// — validated the block and applied it to the table first).
+    ///
+    /// # Errors
+    /// `Unknown` for an unregistered name; `NotTiered` when the entry
+    /// was created without `MEM-BUDGET` (tiering is create-time — D1).
+    pub fn set_tier(&mut self, name: &[u8], tier: TierSpec) -> Result<(), NsError> {
+        let spec = self.named.iter_mut().find(|s| s.name == name).ok_or(NsError::Unknown)?;
+        if spec.tier.is_none() {
+            return Err(NsError::NotTiered);
+        }
+        spec.tier = Some(tier);
         Ok(())
     }
 
@@ -198,6 +377,7 @@ mod tests {
             fsync: None,
             policy: None,
             maxmemory: None,
+            tier: None,
         }
     }
 
@@ -295,5 +475,52 @@ mod tests {
         assert!(!valid_ns_name(b""));
         assert!(!valid_ns_name(b"has space"));
         assert!(!valid_ns_name(&[b'x'; 129]));
+    }
+
+    /// M4-S19 (ADR-0062 D1): tiering is a configuration of `MODE
+    /// durable` — a tier block on any other mode refuses typed, and a
+    /// valid tiered spec registers with its config intact.
+    #[test]
+    fn tier_requires_durable_and_registers_on_durable() {
+        let mut reg = NsRegistry::default();
+        let tier = TierSpec::for_budget(64 << 20);
+        let bad = NsSpec { tier: Some(tier), ..spec(16, b"cache", NsMode::Memory) };
+        assert_eq!(reg.create(bad), Err(NsError::TierRequiresDurable));
+        let good = NsSpec { tier: Some(tier), ..spec(16, b"ledger", NsMode::Durable) };
+        reg.create(good).expect("tiered durable registers");
+        assert_eq!(reg.get(b"ledger").expect("registered").tier, Some(tier));
+    }
+
+    /// The ADR-0062 D2 ranges are typed refusals at registration — one
+    /// probe per clamp, including the D6 dead-ratio guardrail (the S16
+    /// canary's 10% must be unrepresentable through configuration).
+    #[test]
+    fn tier_ranges_are_enforced() {
+        let base = TierSpec::for_budget(64 << 20);
+        assert!(base.validate().is_ok());
+        for (bad, what) in [
+            (TierSpec { mem_budget_bytes: 0, ..base }, "zero budget"),
+            (TierSpec { disk_budget_bytes: 1 << 10, ..base }, "sub-1mb disk budget"),
+            (TierSpec { mutable_permille: 0, ..base }, "zero fraction"),
+            (TierSpec { mutable_permille: 1_000, ..base }, "fraction above 999"),
+            (TierSpec { maintain_slice_bytes: 4 << 10, ..base }, "frame-scale slice (S13)"),
+            (TierSpec { cold_read_qd: 0, ..base }, "zero qd"),
+            (TierSpec { compaction_dead_ratio_pct: 10, ..base }, "the S16 canary trigger"),
+            (TierSpec { compaction_slice_bytes: 1 << 30, ..base }, "oversized slice"),
+            (TierSpec { blob_threshold_bytes: 1 << 25, ..base }, "threshold above u24"),
+            (TierSpec { tail_stall_timeout_ms: 0, ..base }, "zero timeout"),
+        ] {
+            assert!(bad.validate().is_err(), "{what} must refuse");
+        }
+        let mut reg = NsRegistry::default();
+        let bad = NsSpec {
+            tier: Some(TierSpec { compaction_dead_ratio_pct: 10, ..base }),
+            ..spec(16, b"ledger", NsMode::Durable)
+        };
+        assert!(
+            matches!(reg.create(bad), Err(NsError::InvalidTierConfig(_))),
+            "registration runs the same gauntlet"
+        );
+        assert_eq!(reg.iter().count(), 0);
     }
 }

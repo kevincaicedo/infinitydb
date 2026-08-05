@@ -58,6 +58,17 @@ enum OwnedRecord {
         version: u32,
         idoc: Vec<u8>,
     },
+    ColdDisplace {
+        ns: u32,
+        old_addr: u64,
+    },
+    StringExtentRef {
+        ns: u32,
+        key: Vec<u8>,
+        extent_id: u64,
+        offset: u64,
+        len: u64,
+    },
 }
 
 impl OwnedRecord {
@@ -102,6 +113,18 @@ impl OwnedRecord {
                 version: *version,
                 idoc,
             },
+            OwnedRecord::ColdDisplace { ns, old_addr } => {
+                RecordView::ColdDisplace { ns: NsId(*ns), old_addr: *old_addr }
+            }
+            OwnedRecord::StringExtentRef { ns, key, extent_id, offset, len } => {
+                RecordView::StringExtentRef {
+                    ns: NsId(*ns),
+                    key,
+                    extent_id: *extent_id,
+                    offset: *offset,
+                    len: *len,
+                }
+            }
         }
     }
 }
@@ -155,6 +178,19 @@ fn record_strategy() -> impl Strategy<Value = OwnedRecord> {
                 lineage,
                 version,
                 idoc,
+            }
+        ),
+        // M4-S12 (ADR-0057 D4): the displacement marker, 48-bit address.
+        (any::<u32>(), 0u64..(1 << 48))
+            .prop_map(|(ns, old_addr)| OwnedRecord::ColdDisplace { ns, old_addr }),
+        // M4-S17 (ADR-0061 D2): the out-of-line reference, nonzero length.
+        (any::<u32>(), bytes(), any::<u64>(), any::<u64>(), 1u64..=u64::MAX).prop_map(
+            |(ns, key, extent_id, offset, len)| OwnedRecord::StringExtentRef {
+                ns,
+                key,
+                extent_id,
+                offset,
+                len,
             }
         ),
     ]
@@ -313,6 +349,12 @@ fn view_to_owned(view: &RecordView<'_>) -> OwnedRecord {
             version,
             idoc: idoc.to_vec(),
         },
+        RecordView::ColdDisplace { ns, old_addr } => {
+            OwnedRecord::ColdDisplace { ns: ns.0, old_addr }
+        }
+        RecordView::StringExtentRef { ns, key, extent_id, offset, len } => {
+            OwnedRecord::StringExtentRef { ns: ns.0, key: key.to_vec(), extent_id, offset, len }
+        }
     }
 }
 

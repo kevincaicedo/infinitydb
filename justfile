@@ -43,10 +43,20 @@ compat:
 
 # Deterministic simulator smoke scenarios, each twice, comparing traces.
 # m4-steel is the M4-S04 steel-thread twin (tiered lifecycle + cold reads
-# through suspension + the S06 crash/replay content oracle).
+# through suspension + the S06 crash/replay content oracle); m4-pressure
+# is the M4-S07 throttled-device backpressure scenario (budget bound,
+# typed stall timeouts, deadlock freedom); m4-cold is the M4-S08
+# cold-read storm (relocation races, chunked staging, cancellation,
+# pin-deferred unlinks — the 10⁶-op AC run passes --ops 1000000);
+# m4-recovery is the M4-S12 unified-recovery power-cut chain (hybrid
+# checkpoints, MANIFEST v2, D4 tail replay, never-none oracle).
 sim-smoke:
     cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m4-steel --seed 0xC0FFEE --verify-determinism
+    cargo run --release --bin inf-sim -- --scenario m4-pressure --seed 0xC0FFEE --verify-determinism
+    cargo run --release --bin inf-sim -- --scenario m4-cold --seed 0xC0FFEE --verify-determinism
+    cargo run --release --bin inf-sim -- --scenario m4-recovery --seed 0xC0FFEE --verify-determinism
+    cargo run --release --bin inf-sim -- --scenario m4-diskfull --seed 0xC0FFEE --verify-determinism
 
 # M2-S19 durability sweep (the §6 dst_sweep gate shape). Usage:
 #   just durable-sweep [seeds] [base]
