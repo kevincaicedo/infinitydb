@@ -1,0 +1,134 @@
+# M3 exit gates (STOP) — machine-readable encoding of the M3 milestone plan
+# §7 (internal). Values are fixed by the project master plan §22 (M3,
+# internal); changing a threshold here is a master-plan amendment, not an
+# edit (L10: a gate may not be passed by narrowing it).
+#
+# This file is the single authority for the M3 gate values: it lives in
+# this repository because the M3 harness scripts + `inf-bench` are its only
+# consumers, and nothing in this workspace may resolve a path outside the
+# checkout.
+#
+# Measurement instrument (S25, plan-sanctioned blessing): the M3 wire and
+# RSS rows are produced by the maintained scripts under `scripts/`
+# (`bench-m3-wire.sh`, `bench-m3-rss.sh` — the hand-run harness blessed in
+# the S25 ledger entry), labeled per §19, with the `inf-compare` `json`
+# lanes as the independent-generator cross-check beside them. external:*
+# rows come from campaign tooling (DST sweeps, crash matrix, fuzz reports,
+# soak) and are supplied as artifacts. The RSS gate binds on corpus v2
+# (ADR-0046 D3: per-index-unique documents, seed 0x1D0C2026, count vector
+# small=20000,gate=20000,medium=10000,large=1000,deep=20000,wide=200);
+# per-shape rows are diagnostics. tier = "linux-reference-box" verdicts
+# bind only on the reference box.
+
+schema = 1
+milestone = "m3"
+
+[[gate]]
+id = "doc_read_p50_ratio_1k"
+name = "Document read latency: JSON.GET $.path p50 vs GET (1 KiB)"
+threshold = 1.5
+comparator = "<="
+unit = "x plain GET p50, same run, equal-size strings"
+tier = "linux-reference-box"
+source = "external:bench-m3-wire jget-1k/get-1k p50 ratio"
+measured_by = "scripts/bench-m3-wire.sh (memtier, 3-5 replicates); dev-tier 2026-07-17 blessed-protocol run: 1.2169 (2026-07-16: 1.089)"
+
+[[gate]]
+id = "doc_read_p50_ratio_200b"
+name = "Document read latency: JSON.GET $.path p50 vs GET (200 B)"
+threshold = 1.5
+comparator = "<="
+unit = "x plain GET p50, same run"
+tier = "linux-reference-box"
+source = "external:bench-m3-wire jget-2h/get-2h p50 ratio"
+measured_by = "scripts/bench-m3-wire.sh; dev-tier 2026-07-17 blessed-protocol run: 1.2397 (2026-07-16 pre-campaign: 1.066)"
+
+[[gate]]
+id = "doc_write_throughput_ratio"
+name = "Document write throughput: JSON.SET vs SET (pipelined, memory-mode ns)"
+threshold = 0.70
+comparator = ">="
+unit = "x plain SET ops/s, same box/run config"
+tier = "linux-reference-box"
+source = "external:bench-m3-wire jset-1k/set-1k ops ratio"
+measured_by = "scripts/bench-m3-wire.sh; dev-tier 2026-07-17 after ADR-0049 emit region + jset-server L1: blessed-protocol run 0.7252 as measured, 0.6985 excluding one collapsed SET rep — ON THE 0.70 LINE inside the dev box's noise band (trajectory 0.6020 -> 0.6234 -> 0.6556 -> 0.6900 -> ~0.70); parse staging AND server-side pool both exhausted with full attribution (.artifacts/m3/jset-server-20260717/); the reference box owns the verdict"
+
+[[gate]]
+id = "doc_rss_vs_serialized"
+name = "Document memory: RSS vs serialized JSON bytes (corpus v2 mixed)"
+threshold = 1.5
+comparator = "<="
+unit = "x serialized bytes, write-once load (scope disclosed per ADR-0046 D3)"
+tier = "linux-reference-box"
+source = "external:bench-m3-rss mixed inf/serialized"
+measured_by = "scripts/bench-m3-rss.sh (both engines, DBSIZE+used_memory verified); dev-tier 2026-07-16: 1.025-1.043 (3 replicates)"
+
+[[gate]]
+id = "doc_rss_vs_redisjson"
+name = "Document memory: RSS vs pinned RedisJSON (corpus v2 mixed)"
+threshold = 0.70
+comparator = "<="
+unit = "x redis-stack incremental RSS, identical load"
+tier = "linux-reference-box"
+source = "external:bench-m3-rss mixed inf/stack"
+measured_by = "scripts/bench-m3-rss.sh vs redis/redis-stack-server:7.4.0-v8@sha256:798ab84d...; dev-tier 2026-07-16: 0.375-0.381"
+
+[[gate]]
+id = "doc_crash_atomicity"
+name = "Crash atomicity: path-mutation crash rows + document power-cut fleet"
+threshold = 0
+comparator = "<="
+unit = "violations (S18 matrix + S24 10k-seed sweep)"
+tier = "linux-reference-box"
+source = "external:crash-matrix + inf-sim m3 sweep"
+measured_by = "S18 matrix green; S24 sweep 10k seeds, 0 violations (2026-07-16)"
+
+[[gate]]
+id = "doc_compat_oracle"
+name = "Compat: declared JSON.* surface green vs the pinned oracle"
+threshold = 0
+comparator = "<="
+unit = "failures (allowlisted deviations excluded, justified per case)"
+tier = "any"
+source = "external:compat json_diff (RESP2 + RESP3)"
+measured_by = "CI oracle diff; S21/S22: 168 executions, 0 failures, 7 full / 15 partial"
+
+[[gate]]
+id = "regression_m0_m2_5"
+name = "Regression: M0-M2.5 gates within 5%"
+threshold = 5
+comparator = "<="
+unit = "% vs the M2.5 baseline artifact, same harness"
+tier = "linux-reference-box"
+source = "external:gate-run m0|m1|m2 vs baseline"
+measured_by = "dev-tier 2026-07-16 tree-vs-tree control: -2.0% pipelined"
+
+[[gate]]
+id = "doc_replay_equivalence"
+name = "Replay equivalence: replayed state byte-exact vs live"
+threshold = 0
+comparator = "<="
+unit = "violations (S23 oracle, canonical-byte comparison)"
+tier = "any"
+source = "external:inf-sim m3 equivalence sweep"
+measured_by = "S23 oracle: 30k checks, 150k documents compared, 0 violations"
+
+[[gate]]
+id = "doc_fuzz_hours"
+name = "Decoder safety: four fuzz targets at cumulative hours"
+threshold = 24
+comparator = ">="
+unit = "h per target (json_parse, idoc_decode, path_program, fuzz_delta_apply), zero crashes"
+tier = "any"
+source = "external:nightly fuzz accumulation (M2.5-S02 runner)"
+measured_by = "infinity-fuzz-nightly.yml dashboards; OPEN until the live runner accumulates"
+
+[[gate]]
+id = "doc_soak_24h"
+name = "Stability: 24 h document-workload soak"
+threshold = 0.5
+comparator = "<"
+unit = "% RSS slope per 24 h, zero crashes, tripwires green"
+tier = "linux-reference-box"
+source = "external:scripts/soak-m3.sh verdict"
+measured_by = "scripts/soak-m3.sh (document mix: ingest + path reads + scalar mutations)"

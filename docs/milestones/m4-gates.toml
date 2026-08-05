@@ -1,0 +1,311 @@
+# M4 exit gates (STOP) — machine-readable encoding of the M4 milestone plan
+# §7 (internal). Values are fixed by the project master plan §22 (M4,
+# internal); changing a threshold here is a master-plan amendment, not an
+# edit (L10: a gate may not be passed by narrowing it).
+#
+# This file is the single authority for the M4 gate values: it lives in
+# this repository because `inf-bench` is its only consumer, and nothing in
+# this workspace may resolve a path outside the checkout (the macOS/CI
+# failure that forced the move — `bins/inf-bench/../../../docs/` does not
+# exist on a runner that checks out this repo alone).
+#
+# Consumed by `inf-bench gate-run m4` and `inf-bench ycsb`. **Coverage
+# (S22/S24): the full §7 table.** Rows whose producer cannot run yet render
+# `PENDING (tooling)` in every report — a visible gap, never a passed gate:
+# the tiered rows (hot-set split, cold p99, endurance) produce values only
+# once command wiring (M4-S26) lifts the ADR-0062 D8 `USE` refusal, and the
+# campaign-carried rows (recovery, M3 regression, DST/crash, foreground,
+# endurance) bind through `gate-run m4` external-value flags that demand
+# `--campaign-note` provenance (the M2-S22 pattern, L10).
+#
+# The §7 "Tripwires" gate is deliberately NOT a static row here: the S10
+# cold tripwires (`cold_read_qd_p99`, `coalesce_ratio`) get their bound
+# calibrated by S22 on the wired plane (ADR-0055 D2/D3); until then the
+# §19 rule stands process-side — a cited run renders its tripwires in the
+# report and a red tripwire invalidates the run by definition.
+#
+# tier = "linux-reference-box" verdicts bind only on the reference box;
+# tier = "any" rows (the zero tripwires) bind on every box.
+
+schema = 1
+milestone = "m4"
+
+[[gate]]
+id = "degenerate_pipelined_ops"
+name = "Degenerate A/B: pipelined ops regression"
+threshold = 1.0
+comparator = "<="
+unit = "% vs M3 baseline"
+tier = "linux-reference-box"
+source = "ab:degenerate_pipelined_ops_delta_pct"
+measured_by = "gate-run m4 ABBA row (M0 gate mix), median of replicates"
+
+[[gate]]
+id = "degenerate_pipelined_p999"
+name = "Degenerate A/B: pipelined p99.9 regression"
+threshold = 1.0
+comparator = "<="
+unit = "% vs M3 baseline (LogHistogram ~3% buckets: nonzero spans >= 1 bucket)"
+tier = "linux-reference-box"
+source = "ab:degenerate_pipelined_p999_delta_pct"
+measured_by = "gate-run m4 ABBA row (M0 gate mix)"
+
+[[gate]]
+id = "degenerate_unpipelined_ops"
+name = "Degenerate A/B: unpipelined ops regression"
+threshold = 1.0
+comparator = "<="
+unit = "% vs M3 baseline"
+tier = "linux-reference-box"
+source = "ab:degenerate_unpipelined_ops_delta_pct"
+measured_by = "gate-run m4 ABBA row (512-conn M0 gate mix)"
+
+[[gate]]
+id = "degenerate_unpipelined_p999"
+name = "Degenerate A/B: unpipelined p99.9 regression"
+threshold = 1.0
+comparator = "<="
+unit = "% vs M3 baseline"
+tier = "linux-reference-box"
+source = "ab:degenerate_unpipelined_p999_delta_pct"
+measured_by = "gate-run m4 ABBA row (512-conn M0 gate mix)"
+
+[[gate]]
+id = "degenerate_ttl_ops"
+name = "Degenerate A/B: ttl-heavy ops regression"
+threshold = 1.0
+comparator = "<="
+unit = "% vs M3 baseline"
+tier = "linux-reference-box"
+source = "ab:degenerate_ttl_ops_delta_pct"
+measured_by = "gate-run m4 ABBA row (M1 gate mix)"
+
+[[gate]]
+id = "degenerate_ttl_p999"
+name = "Degenerate A/B: ttl-heavy p99.9 regression"
+threshold = 1.0
+comparator = "<="
+unit = "% vs M3 baseline"
+tier = "linux-reference-box"
+source = "ab:degenerate_ttl_p999_delta_pct"
+measured_by = "gate-run m4 ABBA row (M1 gate mix)"
+
+[[gate]]
+id = "degenerate_rss"
+name = "Degenerate A/B: peak-RSS regression (worst row)"
+threshold = 1.0
+comparator = "<="
+unit = "% vs M3 baseline"
+tier = "linux-reference-box"
+source = "ab:degenerate_rss_delta_pct"
+measured_by = "gate-run m4: max signed peak-RSS delta across the three rows"
+
+[[gate]]
+id = "tiering_tables_zero"
+name = "Memory-mode node constructs zero tiered tables"
+threshold = 0
+comparator = "<="
+unit = "tables"
+tier = "any"
+source = "tripwire:tiering_tables"
+measured_by = "INFO tiering scrape on the M4 leg after every row (abort on nonzero)"
+
+[[gate]]
+id = "tiering_counters_zero"
+name = "Tiering code-path counters identically zero"
+threshold = 0
+comparator = "<="
+unit = "counter sum"
+tier = "any"
+source = "tripwire:tiering_counter_total"
+measured_by = "INFO tiering scrape on the M4 leg after every row (abort on nonzero — §3.3)"
+
+[[gate]]
+id = "write_amplification"
+name = "Write amplification, worst tiered namespace"
+# §7: "< 3x reported". The measured value is (wal_bytes + flush_bytes) /
+# user_bytes for the worst namespace in the run — per namespace, never a
+# node-wide blend, and never averaged over a namespace with no denominator
+# (ADR-0060 D2/D4). `tier = "any"`: this is a ratio of counters, not a
+# timing, so a breach is a breach on any box — what the reference box
+# settles is the *workload*, not the arithmetic. Read it against the
+# configured MAINTAIN slice and compaction dead-ratio (the S13 slice
+# finding and the S16 steady-state finding: WA ~ wal/user + 1 + (1-t)/t).
+threshold = 3.0
+comparator = "<"
+unit = "x user bytes (wal + flush)"
+tier = "any"
+source = "wa:write_amp_max"
+measured_by = "gate-run m4: per-namespace INFO scrape recomputed by the harness; until a tiered namespace can be created on a live node (S19), supplied via --write-amp-milli with --campaign-note from `cargo test -p inf-store --test tiered_write_amp`"
+
+[[gate]]
+id = "mem_only_log_records"
+name = "Memory-only rows append zero log records (M2 posture carried)"
+threshold = 0
+comparator = "<="
+unit = "records"
+tier = "any"
+source = "tripwire:mem_only_log_records_appended"
+measured_by = "INFO persistence scrape on the M4 leg after every row"
+
+[[gate]]
+id = "mixed_attribution"
+name = "Mixed-node attribution divergence (M4-S20)"
+# §7 memory-honesty extended over the coexistence audit: sum(domains) vs
+# RSS throughout the mixed run — the 12 M2 domains plus the RSS-resident
+# tiering terms (committed ring pages + tiered index; reserved VA is not
+# resident and is excluded). `tier = "any"`: an attribution identity, not
+# a timing. Worst continuous sample binds, not a hand-picked instant.
+threshold = 10
+comparator = "<="
+unit = "pct, worst continuous sample"
+tier = "any"
+source = "mixed_attribution_divergence_pct"
+measured_by = "inf-bench mixed-audit sampler (RSS 100 ms, domains ~1 s, all cells); joins gate-run via the S24 campaign"
+
+[[gate]]
+id = "cache_isolation_p99"
+name = "Cache-namespace p99 isolation under the mixed node (M4-S20)"
+# The §4.3 unified-profile promise: the cache namespace's p99 within 10%
+# of its same-campaign solo baseline while the other namespaces serve.
+# Until command wiring + S22 land the tiered leg, the mixed side is
+# cache + document with the tiered namespace standing (budgets admitted,
+# zero data traffic — the audit report names the absent leg); the full
+# three-workload form binds at the S24 re-audit.
+threshold = 10
+comparator = "<="
+unit = "pct vs same-campaign solo baseline"
+tier = "linux-reference-box"
+source = "cache_isolation_p99_delta_pct"
+measured_by = "inf-bench mixed-audit solo/mixed legs, same box, same config, one campaign (§19)"
+
+# ---------------------------------------------------------------------------
+# §7 rows added with S22/S24 (2026-07-31). Producers named per row.
+# ---------------------------------------------------------------------------
+
+[[gate]]
+id = "hot_set_p50"
+name = "Hot set at memory speed: memory-hit p50 delta"
+# §7: hot-set split percentiles within 10% of the identical workload on a
+# memory-only namespace. S22 interpretation (recorded in the plan): the
+# reference leg is the same workload through the SAME instrument on a
+# fully-RAM-resident namespace (`ycsb --dataset-multiple 1`) — a service
+# histogram on the memory-mode path would violate the S03 zero-cost
+# contract, so "memory-only" means memory-resident, not memory-mode.
+threshold = 10
+comparator = "<="
+unit = "pct vs RAM-resident reference leg, memory-hit split"
+tier = "linux-reference-box"
+source = "ycsb:hot_set_p50_delta_pct"
+measured_by = "inf-bench ycsb tiered leg vs --dataset-multiple 1 reference leg, same campaign (blocked on M4-S26 wiring)"
+
+[[gate]]
+id = "hot_set_p99"
+name = "Hot set at memory speed: memory-hit p99 delta"
+threshold = 10
+comparator = "<="
+unit = "pct vs RAM-resident reference leg, memory-hit split"
+tier = "linux-reference-box"
+source = "ycsb:hot_set_p99_delta_pct"
+measured_by = "inf-bench ycsb split histograms (blocked on M4-S26 wiring)"
+
+[[gate]]
+id = "hot_set_p999"
+name = "Hot set at memory speed: memory-hit p99.9 delta"
+threshold = 10
+comparator = "<="
+unit = "pct vs RAM-resident reference leg, memory-hit split (LogHistogram ~3% buckets)"
+tier = "linux-reference-box"
+source = "ycsb:hot_set_p999_delta_pct"
+measured_by = "inf-bench ycsb split histograms (blocked on M4-S26 wiring)"
+
+[[gate]]
+id = "cold_read_p99"
+name = "Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows"
+# Loaded rows, never idle drains (§7). Worst loaded YCSB row binds.
+threshold = 1.5
+comparator = "<"
+unit = "ms, cold-read split histogram, worst loaded row"
+tier = "linux-reference-box"
+source = "ycsb:cold_read_p99_ms"
+measured_by = "inf-bench ycsb tiered rows, INFO tiering cold split scrape (blocked on M4-S26 wiring)"
+
+[[gate]]
+id = "endurance_rss_slope"
+name = "Memory honesty: RSS slope over the 24 h endurance run"
+threshold = 0.5
+comparator = "<"
+unit = "pct per 24 h (storm-resistant first/last-5% medians)"
+tier = "linux-reference-box"
+source = "endurance:rss_slope_pct_per_24h"
+measured_by = "scripts/soak-m4.sh verdict; carried into gate-run m4 via --endurance-rss-slope-pct + --campaign-note"
+
+[[gate]]
+id = "endurance_crashes"
+name = "Endurance: zero crashes over the full 24 h run"
+threshold = 0
+comparator = "<="
+unit = "crashes"
+tier = "any"
+source = "endurance:crashes"
+measured_by = "scripts/soak-m4.sh verdict; carried via --endurance-crashes + --campaign-note"
+
+[[gate]]
+id = "m3_regression_worst"
+name = "M3 regression: worst M3 gate delta on memory-mode namespaces"
+threshold = 5
+comparator = "<="
+unit = "pct vs M3 baseline artifact, worst gate"
+tier = "linux-reference-box"
+source = "m3:regression_worst_pct"
+measured_by = "M3 gate set re-run on the tiering build (same harness, A/B vs the M3 baseline); carried via --m3-regression-pct + --campaign-note"
+
+[[gate]]
+id = "recovery_tiered_gbps"
+name = "Recovery with tiering on: replay throughput per cell"
+threshold = 1.0
+comparator = ">="
+unit = "GB/s/cell"
+tier = "linux-reference-box"
+source = "recovery:tiered_gbps_per_cell"
+measured_by = "M2 recovery gate re-run with tiering on (S12 shape); carried via --recovery-gbps-per-cell + --campaign-note"
+
+[[gate]]
+id = "recovery_tiered_boot"
+name = "Recovery with tiering on: 10 GB boot"
+threshold = 15
+comparator = "<"
+unit = "s"
+tier = "linux-reference-box"
+source = "recovery:tiered_10gb_boot_s"
+measured_by = "M2 recovery gate re-run with tiering on; carried via --recovery-boot-s + --campaign-note"
+
+[[gate]]
+id = "dst_never_none"
+name = "Never-none invariant: zero violations in the 10k-seed DST sweep"
+threshold = 0
+comparator = "<="
+unit = "violations"
+tier = "any"
+source = "dst:never_none_violations"
+measured_by = "inf-sim m4 scenario sweeps (m4-recovery / m4-diskfull / m4-pressure / m4-cold at 10k seeds); carried via --dst-violations + --campaign-note"
+
+[[gate]]
+id = "crash_matrix"
+name = "Crash + ENOSPC matrices: all fault points green"
+threshold = 0
+comparator = "<="
+unit = "failing rows"
+tier = "any"
+source = "crash:matrix_failures"
+measured_by = "tests/crash-matrix m4.toml rows (flush/manifest/truncation/tier-CRC/blob/ENOSPC); carried via --crash-failures + --campaign-note"
+
+[[gate]]
+id = "foreground_p999_storms"
+name = "Foreground protection: p99.9 during demotion + compaction storms"
+threshold = 2
+comparator = "<"
+unit = "ms"
+tier = "linux-reference-box"
+source = "storm:foreground_p999_ms"
+measured_by = "S07/S15 storm artifacts re-run on-device (S11 storm shape); carried via --foreground-p999-ms + --campaign-note"

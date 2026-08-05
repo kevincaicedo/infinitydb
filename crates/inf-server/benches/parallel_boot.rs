@@ -54,6 +54,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
 /// M2-S22 cold-cache rows: evict every file under `root` from the page
 /// cache — sync (dirty pages don't drop) then fadvise(DONTNEED). No
 /// root privileges needed; the artifact discloses the method.
+#[cfg(target_os = "linux")]
 fn cool_tree(root: &Path) {
     let Ok(entries) = std::fs::read_dir(root) else { return };
     for entry in entries.flatten() {
@@ -67,6 +68,20 @@ fn cool_tree(root: &Path) {
             unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
         }
     }
+}
+
+/// Non-Linux: `posix_fadvise` is Linux-only (macOS/BSD `F_NOCACHE`
+/// suppresses *future* caching and does not evict what is already
+/// resident), so there is no honest cold row here. Refuse rather than
+/// measure a warm tree under a COLD label (ADR-0025 D3, no silent
+/// workload substitution); the reference box is Linux (ADR-0022 D1).
+#[cfg(not(target_os = "linux"))]
+fn cool_tree(_root: &Path) {
+    panic!(
+        "INF_BENCH_COOL=1 is Linux-only: posix_fadvise(DONTNEED) has no \
+         page-cache-evicting equivalent on this platform, and a warm run \
+         labelled COLD is not a measurement"
+    );
 }
 
 fn key_of(i: u64) -> [u8; 12] {
