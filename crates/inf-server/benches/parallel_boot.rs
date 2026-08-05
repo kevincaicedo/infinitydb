@@ -161,8 +161,12 @@ fn build_cell_image(root: &Path, cfg: &DurableConfig, cell: u16, records: u64) -
     let scan = scan_log_dir(&fs, &dirs.log).expect("scan");
     let segments: Vec<SegmentId> =
         scan.segments().iter().copied().filter(|id| *id >= floor).collect();
-    write_manifest(&fs, &shard, &Manifest { ckpt_id: 1, begin_lsn: begin, segments })
-        .expect("manifest");
+    write_manifest(
+        &fs,
+        &shard,
+        &Manifest { ckpt_id: 1, begin_lsn: begin, segments, tiers: Vec::new() },
+    )
+    .expect("manifest");
     for &id in scan.segments().iter().filter(|id| **id < floor) {
         std::fs::remove_file(dirs.log.join(segment_file_name(id))).expect("truncate");
     }
@@ -199,6 +203,7 @@ fn drive_cell<F: inf_log::fs::SegmentFs + Clone + 'static>(
         fsync: Some(FsyncClass::Always),
         policy: None,
         maxmemory: None,
+        tier: None,
     })
     .expect("ns");
     let mut plane = ServerPlane::new(

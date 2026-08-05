@@ -106,6 +106,7 @@ fn fresh_keyspace() -> Keyspace {
         fsync: Some(FsyncClass::Always),
         policy: None,
         maxmemory: None,
+        tier: None,
     })
     .expect("ns");
     ks
@@ -186,8 +187,12 @@ fn build_image(root: &Path, cfg: &DurableConfig, records: u64, ckpt_at: Option<u
         let scan = scan_log_dir(&fs, &dirs.log).expect("scan");
         let segments: Vec<SegmentId> =
             scan.segments().iter().copied().filter(|id| *id >= floor).collect();
-        write_manifest(&fs, &shard, &Manifest { ckpt_id: 1, begin_lsn: begin, segments })
-            .expect("manifest");
+        write_manifest(
+            &fs,
+            &shard,
+            &Manifest { ckpt_id: 1, begin_lsn: begin, segments, tiers: Vec::new() },
+        )
+        .expect("manifest");
         // The truncation slice already ran: covered prefix segments gone.
         for &id in scan.segments().iter().filter(|id| **id < floor) {
             std::fs::remove_file(dirs.log.join(segment_file_name(id))).expect("truncate");

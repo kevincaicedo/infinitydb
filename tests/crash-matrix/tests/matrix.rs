@@ -34,13 +34,18 @@ fn seed_count(default: u64) -> u64 {
 /// check), and node-tier rows must name the test that carries them.
 #[test]
 fn every_declared_point_has_a_matrix_row() {
-    let def = load_matrix(&matrix_path());
+    let mut def = load_matrix(&matrix_path());
+    // M4-S11 tier rows live in m4.toml (carried by tests/tier.rs) —
+    // coverage spans both files, so a declared-but-rowless point fails
+    // regardless of which milestone owns it.
+    let m4 = load_matrix(&Path::new(env!("CARGO_MANIFEST_DIR")).join("m4.toml"));
+    def.rows.extend(m4.rows);
     let declared: Vec<&str> =
         inf_log::fault::ALL.iter().chain(inf_server::fault::ALL).copied().collect();
     for point in declared {
         assert!(
             def.rows.iter().any(|row| row.point == point),
-            "fault point {point:?} has no crash-matrix row (tests/crash-matrix/m2.toml)"
+            "fault point {point:?} has no crash-matrix row (tests/crash-matrix/m2.toml + m4.toml)"
         );
     }
     for row in &def.rows {

@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use inf_log::fs::{SegmentFile, SegmentFs};
+use inf_log::fs::{SegmentFile, SegmentFs, TierIoMode};
 
 /// Prefetch granularity: matches the reader's default window so one
 /// advise = one pread.
@@ -151,6 +151,10 @@ impl<File: SegmentFile> SegmentFile for ReadAheadFile<File> {
         self.inner.file_size()
     }
 
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        self.inner.truncate(len)
+    }
+
     fn sync_data(&mut self) -> io::Result<()> {
         self.inner.sync_data()
     }
@@ -187,6 +191,18 @@ impl<F: SegmentFs> SegmentFs for ReadAheadFs<F> {
 
     fn create_segment_unsynced(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
         self.inner.create_segment_unsynced(path, prealloc_bytes).map(ReadAheadFile::plain)
+    }
+
+    fn create_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
+        // Explicit forward (ADR-0054 D1): the trait default would delegate
+        // to this *wrapper's* create_segment and silently drop the mode.
+        self.inner.create_tier(path, mode).map(ReadAheadFile::plain)
+    }
+
+    fn open_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
+        // Explicit forward (ADR-0056 D5): the trait default would delegate
+        // to this *wrapper's* open_write and silently drop the mode.
+        self.inner.open_tier(path, mode).map(ReadAheadFile::plain)
     }
 
     fn create_meta(&self, path: &Path) -> io::Result<Self::File> {

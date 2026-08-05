@@ -17,10 +17,12 @@
 //! `BackendDriver` from M2-S05.
 #![forbid(unsafe_code)]
 
+pub mod blob;
 pub mod ckpt;
 mod commit;
 mod effect;
 pub mod fault;
+pub mod flush;
 mod frame;
 pub mod fs;
 mod lsn;
@@ -34,17 +36,31 @@ mod staging;
 mod tail;
 pub mod tier;
 
-pub use ckpt::{CkptConfig, IckStream, IckSummary, SectionLease};
+pub use blob::{
+    BLOB_CHUNK_BYTES, BLOB_HEADER_BYTES, ExtentHeaderV1, ExtentId, ExtentReader, ExtentSummary,
+    ExtentWriteFailure, ExtentWriter, SealedExtent, extent_file_name, extent_frame_offset,
+    inspect_extent_bytes, list_extent_ids, open_extent, parse_extent_file_name,
+    parse_extent_header, probe_extent_file, unlink_extent_file,
+};
+pub use ckpt::{
+    BlobRefEntry, CkptConfig, IckBlobRefSection, IckLiveSetSection, IckRefSection, IckStream,
+    IckSummary, LiveSetFileEntry, SectionLease, SyncIckWriter, read_ick, read_ick_hybrid,
+};
 pub use commit::{CommitStats, FsyncClass, FsyncTicket, GroupCommit, SyncReason};
 pub use effect::MutationEffect;
+pub use flush::{
+    TIER_FILE_CAPACITY_DEFAULT, TierFileMeta, TierFlush, TierFlushConfig, TierFlushError,
+};
 pub use frame::{
     DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN, FRAME_HEADER_LEN_V1, FRAME_MAGIC, FRAME_MAGIC_V1,
     FRAME_TRAILER_LEN, FrameBuilder, FrameDecodeError, FrameIter, FrameRecordError, FrameRef,
     FrameStamp, MIN_FRAME_LEN, MIN_FRAME_LEN_V1, RecordIter, decode_frame, frame_header_len,
 };
+pub use fs::TierIoMode;
 pub use lsn::{Lsn, SegmentId};
 pub use manifest::{
-    Manifest, ManifestDecodeError, manifest_envelope, read_manifest, write_manifest,
+    Manifest, ManifestDecodeError, TierFileRange, TierNsManifest, manifest_envelope, read_manifest,
+    write_manifest,
 };
 pub use reader::{ApplyError, DEFAULT_READ_CHUNK, ReadEnd, ReadError, ReaderConfig, SegmentReader};
 pub use record::{
@@ -65,6 +81,9 @@ pub use staging::{
 };
 pub use tail::{LogCorruption, RegionEvidence, RegionScan, scan_region, scan_region_evidence};
 pub use tier::{
-    TIER_FRAME_BYTES, TIER_FRAME_DATA, TIER_HEADER_BYTES, TierCorruption, TierWriter, tier_extract,
-    tier_file_name, tier_frame_offset, tier_frame_span,
+    SealOutcome, SealReason, TIER_FOOTER_BYTES, TIER_FRAME_BYTES, TIER_FRAME_DATA,
+    TIER_HEADER_BYTES, TierCorruption, TierDecodeError, TierFooterV1, TierHeaderV1, TierIdentity,
+    TierSummary, TierWriteFailure, TierWriter, inspect_tier_bytes, parse_tier_file_name,
+    parse_tier_footer, parse_tier_header, probe_tier_file, tier_extract, tier_file_name,
+    tier_frame_offset, tier_frame_span,
 };

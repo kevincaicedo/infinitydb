@@ -218,7 +218,14 @@ pub static DECLARED: &[Declared] = &[
         "M1",
         "SHARDCHANNELS / SHARDNUMSUB arrive with sharded pub/sub (M3 cut line)",
     ),
-    d("INF.NS", Status::Extension, "M1", "namespace registry v1 — the M2 durability seam"),
+    d(
+        "INF.NS",
+        Status::Extension,
+        "M1",
+        "namespace registry (M2 durability seam; M4-S19 adds SET + the ADR-0062 tiering keys; \
+         M4-S21/ADR-0063 reserves the `DISKFULL` extension error class — tiered-namespace \
+         writes at disk budget or device-full refuse typed, wire-observable at command wiring)",
+    ),
     d(
         "INF.CKPT",
         Status::Extension,

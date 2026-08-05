@@ -48,6 +48,7 @@ fn keyspace() -> Keyspace {
         fsync: Some(FsyncClass::Always),
         policy: None,
         maxmemory: None,
+        tier: None,
     })
     .expect("namespace");
     ks
@@ -163,7 +164,7 @@ fn fuzzy_checkpoint_overlap_counts_stale_and_missing_deltas() {
     write_manifest(
         &fs,
         Path::new("data/shard-0"),
-        &Manifest { ckpt_id: 1, begin_lsn, segments: vec![SegmentId(0)] },
+        &Manifest { ckpt_id: 1, begin_lsn, segments: vec![SegmentId(0)], tiers: Vec::new() },
     )
     .expect("manifest");
     drop(rotor);

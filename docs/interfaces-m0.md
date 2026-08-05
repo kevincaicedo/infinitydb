@@ -112,6 +112,33 @@ impl Arena {
 > `StableBytes` as the writable stable-range handoff. Layouts unchanged.
 > The first real consumer of the `IoGate` seam; the cold-read path
 > freezes at M4 exit (M4 plan §3.2) after S08 hardens it.
+>
+> **Extended at M4-S08 under the same discipline:** `BackendDriver`
+> gains `register_tier_pool(&mut self, pool: &mut AlignedPool)` (default
+> no-op — readiness/sim backends serve `TierRead` positionally either
+> way). On io_uring the aligned pool's buffers become the ring's
+> registered-buffer table (the M0 recv-pool registration was a
+> capability probe with no consumer, and io_uring has one table);
+> in-range `TierRead` ops upgrade to the fixed-buffer read opcode
+> transparently, and registration failure degrades
+> `Capabilities::fixed_buffers` instead of failing boot. The custody
+> vocabulary above it — `ColdReads` / `ColdDone` / `TierFileId` in
+> `inf_runtime::cold` — is the §3.2 cold-read-path freeze content
+> (aligned-pool contract, `IoToken` usage, per-file pins, and the
+> `inflight_total` concurrency-limit hook S10 consumes).
+>
+> **Reshaped at M4-S10 (pre-freeze — the cold-read path freezes at M4
+> exit, ADR-0055):** `ColdReads::issue` (eager lease + op build) is
+> replaced by `enqueue(fd, file, offset, len, ReadClass, now_us) →
+> ColdWait` + `drain(push) → issued` — bounded per-class intent FIFOs,
+> per-cell device-QD cap, 3:1 foreground:maintain deficit, and
+> adjacent/overlapping same-file coalescing with shared-window `ColdDone`
+> fan-out (last drop releases the lease). `on_completion` gains the
+> injected `now_us` and returns the delivered-waiter count. The driver
+> contract is untouched: a merged read is one ordinary `TierRead` whose
+> window fits one registered pool buffer (`ReadFixed` upgrade preserved).
+> `KeyedGate` gains `has_waiter` (drain-side stale-intent skip). No
+> `IoOp`/`CompletionResult`/`TokenClass` layout change.
 
 ```rust
 pub struct CompletionToken(u64);           // {class:8, slot:24, gen:32}

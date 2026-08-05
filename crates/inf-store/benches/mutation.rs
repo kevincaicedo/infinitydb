@@ -26,7 +26,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use inf_alloc::{Arena, ArenaAddr, ArenaConfig};
-use inf_store::{AddressSpace, AddressSpaceConfig, LogicalAddr, TieredTable};
+use inf_store::{AddressSpace, AddressSpaceConfig, DemotionConfig, LogicalAddr, TieredTable};
 
 const KEY_LEN: usize = 16;
 const VAL_LEN: usize = 64;
@@ -238,6 +238,7 @@ fn bench_relocate(n: usize, label: &str) {
             page_bytes: 1 << 20,
             life_origin: LogicalAddr::ZERO,
         },
+        DemotionConfig::for_budget(ring as u64, 1 << 20),
         n * 2,
     )
     .expect("reservation");
@@ -292,6 +293,7 @@ fn main() {
             page_bytes: 1 << 12,
             life_origin: LogicalAddr::ZERO,
         },
+        DemotionConfig::for_budget(1 << 16, 1 << 12),
         64,
     )
     .expect("reservation");

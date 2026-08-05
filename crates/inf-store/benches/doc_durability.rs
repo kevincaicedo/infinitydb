@@ -69,6 +69,7 @@ fn keyspace(documents: usize) -> Keyspace {
         fsync: Some(FsyncClass::Always),
         policy: None,
         maxmemory: None,
+        tier: None,
     })
     .expect("namespace");
     ks

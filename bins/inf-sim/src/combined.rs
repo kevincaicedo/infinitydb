@@ -788,7 +788,9 @@ fn l2_log_scan(scenario: &CombinedScenario, disk: &SimDisk, violations: &mut Vec
                                 | RecordView::ExpireAt { ns, .. }
                                 | RecordView::NsOp { ns, .. }
                                 | RecordView::DocDelta { ns, .. }
-                                | RecordView::DocFull { ns, .. } => ns,
+                                | RecordView::DocFull { ns, .. }
+                                | RecordView::ColdDisplace { ns, .. }
+                                | RecordView::StringExtentRef { ns, .. } => ns,
                                 RecordView::CkptBegin { .. } => continue,
                             };
                             if !durable_ns.contains(&ns.0) {

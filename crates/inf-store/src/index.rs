@@ -61,6 +61,17 @@ pub trait SlotMode {
     /// The stored hash for `pos` (grow's re-placement source). Memory
     /// mode has none — callers pass the record-derived hash instead.
     fn ext_hash(store: &Self::ExtStore, pos: usize) -> u64;
+    /// Whether the slot at `pos` may belong to `hash`, beyond the
+    /// ctrl-tag filter — the exact-pair discipline `position_of` stands
+    /// on (ADR-0057 D4, enforced since M4-S14). Tiered tables compare
+    /// the full sidecar hash: addresses are per-life (§3.1), so after a
+    /// recovery a `(tag, addr)` match alone can name a *different key's*
+    /// slot — a displacement replay would then remove a live key
+    /// (never-none violation, found by the m4-recovery sweep). Memory
+    /// tables have no sidecar and no cross-life addresses (arena offsets
+    /// are unique among live records), so tag + addr stays exact there
+    /// and this compiles to `true` (the S02 identity untouched).
+    fn ext_matches(store: &Self::ExtStore, pos: usize, hash: u64) -> bool;
 }
 
 /// Memory-mode tables: the 48-bit field is an [`ArenaAddr`] (M0 freeze).
@@ -90,6 +101,11 @@ impl SlotMode for MemoryMode {
     #[inline]
     fn ext_hash(_store: &(), _pos: usize) -> u64 {
         0 // never consulted: memory-mode grow hashes the record's key
+    }
+
+    #[inline]
+    fn ext_matches(_store: &(), _pos: usize, _hash: u64) -> bool {
+        true // no sidecar: tag + addr is already exact within one life
     }
 }
 
@@ -126,6 +142,11 @@ impl SlotMode for TieredMode {
     #[inline]
     fn ext_hash(store: &Box<[u64]>, pos: usize) -> u64 {
         store[pos]
+    }
+
+    #[inline]
+    fn ext_matches(store: &Box<[u64]>, pos: usize, hash: u64) -> bool {
+        store[pos] == hash
     }
 }
 
@@ -350,9 +371,33 @@ impl<M: SlotMode> Index<M> {
         self.slots[pos] = Slot::new(M::addr_to_raw(new), fp15(hash));
     }
 
+    /// True when the exact `(hash, addr)` pair is slotted — the M4-S12
+    /// ref-apply idempotency probe (ADR-0057 D4: the walker's at-least-
+    /// once re-emission may duplicate a ref; a duplicated slot would
+    /// outlive the single displacement removal and serve stale bytes).
+    #[must_use]
+    pub fn contains_pair(&self, hash: u64, addr: M::Addr) -> bool {
+        self.position_of(hash, addr).is_some()
+    }
+
+    /// Removes the entry holding `addr` if present; false when absent.
+    /// The M4-S12 displacement-replay primitive (ADR-0057 D4): a
+    /// `ColdDisplace` names an old-life address that may or may not have
+    /// been re-slotted by a checkpoint ref — absence is a legal
+    /// interleaving (walked-late image), never a desync.
+    pub fn remove_if_present(&mut self, hash: u64, addr: M::Addr) -> bool {
+        let Some(pos) = self.position_of(hash, addr) else { return false };
+        self.remove_at(pos);
+        true
+    }
+
     /// Removes the entry holding `addr`. Panics if absent (desync).
     pub fn remove(&mut self, hash: u64, addr: M::Addr) {
         let pos = self.position_of(hash, addr).expect("remove target present");
+        self.remove_at(pos);
+    }
+
+    fn remove_at(&mut self, pos: usize) {
         // If the slot's group has an empty, no probe chain passes THROUGH
         // this group — the slot can return to EMPTY instead of tombstoning.
         let group = pos / GROUP;
@@ -365,6 +410,40 @@ impl<M: SlotMode> Index<M> {
         }
         self.slots[pos] = Slot::default();
         self.live -= 1;
+    }
+
+    /// Home-group scan emitting `(addr, full hash)` from the sidecar —
+    /// the M4-S12 checkpoint walker's enumeration primitive (ADR-0057
+    /// D1): identical guarantee to [`scan_home_group`]
+    /// (Self::scan_home_group), but no closure ever touches a record, so
+    /// the cold majority walks at index speed with zero cold reads. Only
+    /// meaningful for modes with a real sidecar ([`TieredMode`]); memory
+    /// tables keep the record-hashing walk.
+    pub fn scan_home_group_ext(&self, group: usize, mut emit: impl FnMut(M::Addr, u64)) {
+        let mask = self.group_mask();
+        let home = group & mask;
+        let mut group = home;
+        let mut stride = 0;
+        loop {
+            let ctrl = self.ctrl_group(group);
+            for (i, &c) in ctrl.iter().enumerate() {
+                if c & 0x80 == 0 {
+                    let pos = group * GROUP + i;
+                    let hash = M::ext_hash(&self.ext, pos);
+                    if (hash as usize) & mask == home {
+                        emit(M::addr_from_raw(self.slots[pos].addr_raw()), hash);
+                    }
+                }
+            }
+            if eq_mask16(ctrl, CTRL_EMPTY) != 0 {
+                return;
+            }
+            stride += 1;
+            if stride > mask {
+                return;
+            }
+            group = (group + stride) & mask;
+        }
     }
 
     fn position_of(&self, hash: u64, addr: M::Addr) -> Option<usize> {
@@ -380,7 +459,7 @@ impl<M: SlotMode> Index<M> {
                 let i = candidates.trailing_zeros() as usize;
                 candidates &= candidates - 1;
                 let pos = group * GROUP + i;
-                if self.slots[pos].addr_raw() == raw {
+                if self.slots[pos].addr_raw() == raw && M::ext_matches(&self.ext, pos, hash) {
                     return Some(pos);
                 }
             }

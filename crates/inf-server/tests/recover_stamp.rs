@@ -51,6 +51,7 @@ fn fresh_keyspace() -> Keyspace {
         fsync: Some(FsyncClass::Always),
         policy: None,
         maxmemory: None,
+        tier: None,
     })
     .expect("ns");
     ks

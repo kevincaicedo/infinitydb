@@ -35,6 +35,7 @@ fn durable_keyspace() -> Keyspace {
             fsync: Some(FsyncClass::Everysec),
             policy: None,
             maxmemory: None,
+            tier: None,
         }],
     };
     ks.seed_catalog(&catalog).expect("seed");

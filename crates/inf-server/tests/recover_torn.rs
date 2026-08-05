@@ -51,6 +51,7 @@ fn fresh_keyspace() -> Keyspace {
         fsync: Some(FsyncClass::Always),
         policy: None,
         maxmemory: None,
+        tier: None,
     })
     .expect("ns");
     ks
@@ -436,7 +437,12 @@ fn torn_tail_below_the_manifest_begin_lsn_refuses_to_start() {
     write_manifest(
         &fs,
         Path::new("data/shard-0"),
-        &Manifest { ckpt_id: 1, begin_lsn: begin, segments: vec![begin.segment] },
+        &Manifest {
+            ckpt_id: 1,
+            begin_lsn: begin,
+            segments: vec![begin.segment],
+            tiers: Vec::new(),
+        },
     )
     .expect("manifest");
     log.poke(torn_base.segment, torn_base.offset + FRAME_HEADER_LEN as u32, &[0x99]);
@@ -469,7 +475,12 @@ fn torn_tail_above_begin_recovers_checkpoint_plus_tail() {
     write_manifest(
         &fs,
         Path::new("data/shard-0"),
-        &Manifest { ckpt_id: 1, begin_lsn: begin, segments: vec![begin.segment] },
+        &Manifest {
+            ckpt_id: 1,
+            begin_lsn: begin,
+            segments: vec![begin.segment],
+            tiers: Vec::new(),
+        },
     )
     .expect("manifest");
     // Tear the last frame — strictly above begin.

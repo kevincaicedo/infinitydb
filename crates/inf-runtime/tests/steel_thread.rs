@@ -21,15 +21,16 @@ use std::rc::Rc;
 use inf_alloc::{AlignedBox, AlignedBufId, AlignedPool, BufferPool};
 use inf_log::fs::StdSegmentFs;
 use inf_log::{
-    TIER_FRAME_BYTES, TIER_FRAME_DATA, TierWriter, tier_extract, tier_frame_offset, tier_frame_span,
+    TIER_FRAME_BYTES, TIER_FRAME_DATA, TierIoMode, TierWriter, tier_extract, tier_frame_offset,
+    tier_frame_span,
 };
 use inf_runtime::{
     BackendDriver, CellExecutor, CompletionResult, CompletionToken, GateWait, IoGate, IoOp,
     PollImmediate, RawFd, StableBytesMut, TokenClass, UringDriver, Wait,
 };
 use inf_store::{
-    AddrClass, AddressSpaceConfig, Keyspace, LogicalAddr, NsId, StoreConfig, TieredLookup,
-    TieredTable,
+    AddrClass, AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsId, StoreConfig,
+    TieredLookup, TieredTable,
 };
 
 const NS: NsId = NsId(42);
@@ -342,15 +343,19 @@ fn build_demoted_corpus(
     dir: &std::path::Path,
 ) -> (Rc<RefCell<Ctx>>, Corpus, TierWriter<StdSegmentFs>) {
     let mut ks = Keyspace::new(StoreConfig::default());
-    assert!(ks.materialize_tiered(
-        NS,
-        AddressSpaceConfig {
-            reserve_bytes: RING,
-            page_bytes: PAGE,
-            life_origin: LogicalAddr::ZERO
-        },
-        64,
-    ));
+    assert!(
+        ks.materialize_tiered(
+            NS,
+            AddressSpaceConfig {
+                reserve_bytes: RING,
+                page_bytes: PAGE,
+                life_origin: LogicalAddr::ZERO
+            },
+            DemotionConfig::for_budget(RING as u64, PAGE as u64),
+            64,
+        )
+        .is_ok()
+    );
     assert_eq!(ks.tiered_tables(), 1, "the S04 landing-site entry exists");
 
     let mut corpus = Corpus {
@@ -383,7 +388,8 @@ fn build_demoted_corpus(
     let tail = table.space().tail();
     table.space_mut().advance_ro_boundary(tail);
     let base = table.space().head();
-    let mut writer = TierWriter::create(&fs, dir, 0, 0, NS, base).expect("tier file");
+    let mut writer =
+        TierWriter::create(&fs, dir, 0, 0, NS, base, TierIoMode::Buffered).expect("tier file");
     for (addr, len) in &log {
         let bytes = table.record_bytes(*addr, *len).to_vec();
         writer.append(*addr, &bytes).expect("append");

@@ -17,7 +17,7 @@
 use std::io;
 use std::time::Duration;
 
-use inf_alloc::{BufferId, BufferPool};
+use inf_alloc::{AlignedPool, BufferId, BufferPool};
 
 use crate::token::CompletionToken;
 
@@ -293,6 +293,23 @@ pub trait BackendDriver {
     /// (e.g. no provided-buffer support) degrade silently into
     /// [`Capabilities`] instead of erroring.
     fn register_pool(&mut self, pool: &mut BufferPool) -> io::Result<()>;
+
+    /// Register the cold-read aligned pool with the backend (M4-S08,
+    /// extending the frozen contract under the M2 discipline — recorded
+    /// in `interfaces-m0.md`): on io_uring the pool's buffers become the
+    /// ring's registered-buffer table and `TierRead` ops on them upgrade
+    /// to the fixed-buffer read opcode transparently; readiness and sim
+    /// backends no-op (their `TierRead` path is already positional).
+    /// Call once at cell boot, after [`register_pool`](Self::register_pool);
+    /// registration failure degrades [`Capabilities::fixed_buffers`]
+    /// rather than failing boot (plain reads remain correct).
+    ///
+    /// # Errors
+    /// Backend-fatal conditions only.
+    fn register_tier_pool(&mut self, pool: &mut AlignedPool) -> io::Result<()> {
+        let _ = pool;
+        Ok(())
+    }
 
     /// The boot-time feature probe result.
     fn capabilities(&self) -> Capabilities;

@@ -11,7 +11,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Audited fail-stop sites (reviewed at M2-S17, ADR-0020 D4):
+# Audited fail-stop sites (reviewed at M2-S17, ADR-0020 D4; tier rows
+# added at M4-S11, ADR-0056 D4):
 #   inf-log/segment.rs   — type definitions + the only constructions
 #                          (seal fsync, dir-fsync barriers)
 #   inf-log/commit.rs    — GroupCommit::on_fsync_error: freezes the
@@ -20,6 +21,21 @@ cd "$(dirname "$0")/.."
 #   inf-log/lib.rs       — re-export
 #   inf-log/fs.rs        — trait doc naming the contract
 #   inf-log/fault.rs     — fault-point inventory doc
+#   inf-log/tier.rs      — TierWriteFailure::Fsync: the only tier-level
+#                          constructions (sync/seal barriers); propagated,
+#                          never handled (M4-S11 review)
+#   inf-log/flush.rs     — TierFlushError::Fsync: classification only —
+#                          the flushed watermark freezes by construction
+#                          (no advance happens past a failed barrier) and
+#                          the error propagates to the terminal handler
+#                          (M4-S11 review)
+#   inf-log/blob.rs      — ExtentWriteFailure::Fsync: the ADR-0061 D3
+#                          typed **abort** — the one ADR-defined narrower
+#                          behavior: at barrier time nothing durable
+#                          references the extent, the file is abandoned
+#                          (never retried — the fsyncgate poison is
+#                          structurally absent) and the write fails typed
+#                          (M4-S17 review)
 #   inf-server/durable.rs — on_log_error/fail_stop: eprintln + exit(3),
 #                          the terminal handler
 ALLOW=(
@@ -28,6 +44,9 @@ ALLOW=(
     crates/inf-log/src/lib.rs
     crates/inf-log/src/fs.rs
     crates/inf-log/src/fault.rs
+    crates/inf-log/src/tier.rs
+    crates/inf-log/src/flush.rs
+    crates/inf-log/src/blob.rs
     crates/inf-server/src/durable.rs
 )
 
@@ -42,7 +61,7 @@ while IFS= read -r hit; do
         echo "UNAUDITED fsync-error handling: $hit"
         fail=1
     fi
-done < <(grep -rn --include='*.rs' -e 'LogError::Fsync' -e 'FsyncFailed' -e 'on_fsync_error' crates/*/src bins/*/src)
+done < <(grep -rn --include='*.rs' -e 'LogError::Fsync' -e 'FsyncFailed' -e 'on_fsync_error' -e 'TierWriteFailure::Fsync' -e 'TierFlushError::Fsync' -e 'ExtentWriteFailure::Fsync' crates/*/src bins/*/src)
 
 if [ "$fail" -ne 0 ]; then
     echo "fsync fail-stop grep FAILED: fsync errors are fail-stop (§8.4);"

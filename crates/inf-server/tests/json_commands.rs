@@ -445,6 +445,7 @@ fn durable_namespace_json_surface_is_reachable_after_s17() {
         fsync: Some(FsyncClass::Everysec),
         policy: None,
         maxmemory: None,
+        tier: None,
     };
     db.ks.ns_create(spec).expect("namespace registers");
     db.cx.ns = Some(inf_store::NsId(inf_store::FIRST_NAMED_NS_ID));
@@ -721,6 +722,7 @@ fn new_write_commands_run_in_durable_namespaces_after_s17() {
         fsync: Some(FsyncClass::Everysec),
         policy: None,
         maxmemory: None,
+        tier: None,
     };
     db.ks.ns_create(spec).expect("namespace registers");
     db.cx.ns = Some(inf_store::NsId(inf_store::FIRST_NAMED_NS_ID));

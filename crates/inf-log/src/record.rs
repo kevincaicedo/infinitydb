@@ -75,6 +75,24 @@ pub enum RecordType {
     DocDelta = 6,
     /// Canonical full-document post-image (M3-S17, ADR-0043).
     DocFull = 7,
+    /// Cold-displacement marker (M4-S12, ADR-0057 D4): stages in the same
+    /// frame immediately before a tiered-namespace mutation that displaced
+    /// (overwrote or deleted) a record, naming the displaced record's
+    /// logical address. Replay removes exactly the slot `(hash, old_addr)`
+    /// — killing a checkpoint addr-ref for the old life's copy without a
+    /// key read — then applies the paired mutation. The checkpoint walker
+    /// never emits it; replay without a following mutation is a decode-
+    /// stream error at the applier.
+    ColdDisplace = 8,
+    /// A string key now holds a value stored out of line in a blob
+    /// extent (M4-S17, ADR-0061 D2): the record carries the reference
+    /// `{extent_id, offset, len}` — never the value bytes. Staged only
+    /// with a [`SealedExtent`](crate::SealedExtent) in hand, so the
+    /// extent is durable before this record can ack (the D3 ordering
+    /// rule). Replay re-creates the referencing store record; the
+    /// checkpoint walker emits it for RAM-resident extent records
+    /// exactly as it emits `StringPostImage` for plain strings.
+    StringExtentRef = 9,
 }
 
 impl RecordType {
@@ -88,6 +106,8 @@ impl RecordType {
             5 => RecordType::CkptBegin,
             6 => RecordType::DocDelta,
             7 => RecordType::DocFull,
+            8 => RecordType::ColdDisplace,
+            9 => RecordType::StringExtentRef,
             _ => return None,
         })
     }
@@ -147,6 +167,22 @@ pub enum RecordView<'a> {
         version: u32,
         idoc: &'a [u8],
     },
+    /// Cold-displacement marker (M4-S12, ADR-0057 D4) — pairs with the
+    /// next record in the stream; `old_addr` is a 48-bit logical address.
+    ColdDisplace {
+        ns: NsId,
+        old_addr: u64,
+    },
+    /// Out-of-line string post-image (M4-S17, ADR-0061 D2): the value
+    /// lives in blob extent `extent_id` at `[offset, offset + len)`.
+    /// `offset` is 0 in v1 (the field is frozen wire space — plan §3.2).
+    StringExtentRef {
+        ns: NsId,
+        key: &'a [u8],
+        extent_id: u64,
+        offset: u64,
+        len: u64,
+    },
 }
 
 impl RecordView<'_> {
@@ -193,6 +229,10 @@ impl RecordView<'_> {
                     + 8
                     + 3
                     + idoc.len()
+            }
+            RecordView::ColdDisplace { ns, .. } => varint_len(u64::from(ns.0)) + 6,
+            RecordView::StringExtentRef { ns, key, .. } => {
+                varint_len(u64::from(ns.0)) + varint_len(key.len() as u64) + key.len() + 24
             }
         }
     }
@@ -274,6 +314,24 @@ impl RecordView<'_> {
                 out.extend_from_slice(&version.to_le_bytes()[..3]);
                 out.extend_from_slice(idoc);
             }
+            RecordView::ColdDisplace { ns, old_addr } => {
+                debug_assert!(old_addr < (1 << 48), "logical addresses are 48-bit");
+                out.push(RecordType::ColdDisplace as u8);
+                out.push(RECORD_FLAGS_V1);
+                varint::encode_u64(u64::from(ns.0), out);
+                out.extend_from_slice(&old_addr.to_le_bytes()[..6]);
+            }
+            RecordView::StringExtentRef { ns, key, extent_id, offset, len } => {
+                debug_assert!(len > 0, "an extent reference names at least one byte");
+                out.push(RecordType::StringExtentRef as u8);
+                out.push(RECORD_FLAGS_V1);
+                varint::encode_u64(u64::from(ns.0), out);
+                varint::encode_u64(key.len() as u64, out);
+                out.extend_from_slice(key);
+                out.extend_from_slice(&extent_id.to_le_bytes());
+                out.extend_from_slice(&offset.to_le_bytes());
+                out.extend_from_slice(&len.to_le_bytes());
+            }
         }
     }
 }
@@ -301,6 +359,8 @@ pub enum RecordDecodeError {
     InvalidDocLineage,
     /// A document delta declares an impossible zero match/image bound.
     InvalidDocBounds,
+    /// An extent reference names zero bytes (no extent holds none).
+    InvalidExtentBounds,
     /// Bytes remain after a fixed-width payload (`CkptBegin` is the first
     /// type where trailing garbage is representable — one value, one
     /// encoding, so it is rejected).
@@ -324,6 +384,9 @@ impl fmt::Display for RecordDecodeError {
             RecordDecodeError::InvalidDocLineage => write!(f, "document lineage is zero"),
             RecordDecodeError::InvalidDocBounds => {
                 write!(f, "document delta carries a zero replay bound")
+            }
+            RecordDecodeError::InvalidExtentBounds => {
+                write!(f, "extent reference names zero bytes")
             }
             RecordDecodeError::TrailingBytes => write!(f, "trailing bytes after record payload"),
         }
@@ -433,6 +496,35 @@ pub fn decode_record(buf: &[u8]) -> Result<(RecordView<'_>, usize), RecordDecode
             let version = decode_u24(&rest[8..]).ok_or(RecordDecodeError::Truncated)?;
             RecordView::DocFull { ns, key, lineage, version, idoc: &rest[11..] }
         }
+        RecordType::ColdDisplace => {
+            if payload.len() != 6 {
+                return Err(if payload.len() < 6 {
+                    RecordDecodeError::Truncated
+                } else {
+                    RecordDecodeError::TrailingBytes
+                });
+            }
+            let mut addr = [0u8; 8];
+            addr[..6].copy_from_slice(payload);
+            RecordView::ColdDisplace { ns, old_addr: u64::from_le_bytes(addr) }
+        }
+        RecordType::StringExtentRef => {
+            let (key, rest) = decode_key(payload)?;
+            if rest.len() != 24 {
+                return Err(if rest.len() < 24 {
+                    RecordDecodeError::Truncated
+                } else {
+                    RecordDecodeError::TrailingBytes
+                });
+            }
+            let extent_id = u64::from_le_bytes(rest[0..8].try_into().expect("8 bytes"));
+            let offset = u64::from_le_bytes(rest[8..16].try_into().expect("8 bytes"));
+            let len = u64::from_le_bytes(rest[16..24].try_into().expect("8 bytes"));
+            if len == 0 {
+                return Err(RecordDecodeError::InvalidExtentBounds);
+            }
+            RecordView::StringExtentRef { ns, key, extent_id, offset, len }
+        }
     };
     Ok((view, prefix_len + body_len))
 }
@@ -503,6 +595,33 @@ mod tests {
         buf.push(0x00); // trailing garbage inside a lengthened body
         buf[0] += 1; // grow the declared body_len to cover it
         assert_eq!(decode_record(&buf), Err(RecordDecodeError::TrailingBytes));
+    }
+
+    /// M4-S12 (ADR-0057 D4): the displacement marker round-trips exactly,
+    /// carries a 48-bit address in 6 bytes, and rejects any body that is
+    /// not exactly `ns + 6` (one value, one encoding).
+    #[test]
+    fn cold_displace_round_trips_canonically() {
+        let view = RecordView::ColdDisplace { ns: NsId(16), old_addr: (1 << 48) - 1 };
+        let mut buf = Vec::new();
+        view.encode_into(&mut buf);
+        assert_eq!(buf.len(), view.encoded_len());
+        let (decoded, consumed) = decode_record(&buf).expect("valid");
+        assert_eq!(consumed, buf.len());
+        assert_eq!(decoded, view);
+        let mut again = Vec::new();
+        decoded.encode_into(&mut again);
+        assert_eq!(again, buf, "decode → encode identity");
+
+        let mut long = buf.clone();
+        long.push(0x00);
+        long[0] += 1; // grow the declared body_len to cover the garbage
+        assert_eq!(decode_record(&long), Err(RecordDecodeError::TrailingBytes));
+
+        let mut short = buf.clone();
+        short.pop();
+        short[0] -= 1;
+        assert_eq!(decode_record(&short), Err(RecordDecodeError::Truncated));
     }
 
     #[test]

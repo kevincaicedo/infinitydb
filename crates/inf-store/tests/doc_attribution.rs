@@ -45,6 +45,7 @@ fn keyspace_report_is_the_per_namespace_field_sum() {
         fsync: Some(FsyncClass::Always),
         policy: None,
         maxmemory: None,
+        tier: None,
     })
     .expect("namespace");
 

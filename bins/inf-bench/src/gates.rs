@@ -132,6 +132,27 @@ mod tests {
         );
     }
 
+    /// M4-S16: the write-amplification row exists, bites at exactly 3×,
+    /// and binds on every box (a counter ratio has no box dependence — the
+    /// reference box settles the workload, not the arithmetic).
+    #[test]
+    fn parses_the_m4_gates_file() {
+        // Repo root, not `infinitydb/docs/` — that is where the M4 gates
+        // file lives and what `load_gates`' first candidate resolves to at
+        // runtime. (The m0–m2 tests above read older in-tree copies; the
+        // two locations are pre-existing drift, recorded in the S16 ledger
+        // entry rather than silently forked further.)
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../docs/milestones/m4-gates.toml");
+        let gates = load(path).expect("m4 gates file parses");
+        let wa = gates.iter().find(|g| g.id == "write_amplification").expect("WA row");
+        assert!(wa.passes(2.999), "under the gate passes");
+        assert!(!wa.passes(3.0), "the §7 bar is `< 3×`, not `≤`");
+        assert_eq!(wa.tier, "any", "a counter ratio binds on every box");
+        assert!(!wa.informational, "write amplification is a STOP gate, not a dashboard");
+        let zero = gates.iter().find(|g| g.id == "tiering_counters_zero").expect("zero tripwire");
+        assert!(zero.passes(0.0) && !zero.passes(1.0));
+    }
+
     #[test]
     fn parses_the_m1_gates_file() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/milestones/m1-gates.toml");

@@ -57,6 +57,7 @@ fn shard_with_old_unit(fs: &MemFs, shard: &Path) {
             ckpt_id: 1,
             begin_lsn: begin(1, 16),
             segments: vec![SegmentId(1), SegmentId(2)],
+            tiers: Vec::new(),
         },
     )
     .expect("old manifest");
@@ -83,7 +84,12 @@ fn publish_new_unit(fs: &MemFs, shard: &Path) -> io::Result<()> {
     write_manifest(
         fs,
         shard,
-        &Manifest { ckpt_id: 2, begin_lsn: begin(2, 32), segments: vec![SegmentId(2)] },
+        &Manifest {
+            ckpt_id: 2,
+            begin_lsn: begin(2, 32),
+            segments: vec![SegmentId(2)],
+            tiers: Vec::new(),
+        },
     )
 }
 
@@ -198,7 +204,12 @@ fn old_unit_survives_until_the_new_manifest_is_durable() {
     let err = write_manifest(
         &fs,
         shard,
-        &Manifest { ckpt_id: 2, begin_lsn: begin(2, 32), segments: vec![SegmentId(2)] },
+        &Manifest {
+            ckpt_id: 2,
+            begin_lsn: begin(2, 32),
+            segments: vec![SegmentId(2)],
+            tiers: Vec::new(),
+        },
     );
     assert!(err.is_err(), "swap crashed at step 0");
     fs.clear_op_fault();

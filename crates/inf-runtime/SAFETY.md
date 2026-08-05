@@ -55,6 +55,23 @@ completion — is discharged by lease custody, never by inspection:
 The constructor itself only records `(ptr, len)`; every dereference lives
 with the custody proof at the consuming site.
 
+## 1b-tier. Cold-read custody (`cold.rs`, M4-S08)
+
+`ColdReads::issue` constructs the one `StableBytesMut` on the cold-read
+path, over an `inf_alloc::AlignedPool` buffer. The stability contract is
+discharged **structurally, not by the issuing future**: the lease is held
+by the cell-local in-flight table from issue until the terminal
+completion, where custody transfers into the delivered `ColdDone` guard
+(released exactly once by its `Drop` — resumed, cancelled, or unclaimed
+alike; the three interleavings are unit-tested). No `&mut` to the buffer
+is materialized between issue and completion — `ColdDone::bytes` is the
+first reader and runs strictly after kernel ownership ends. The pool's
+addresses are stable for its lifetime (that crate's invariant), so
+fixed-buffer registration (`uring.rs::register_tier_pool`, iovecs over
+`AlignedPool::buffers_mut`) rests on the same proof. The test-module
+helper that plays the driver writes through the same handle under the
+same in-flight custody.
+
 ## 1c. Thread affinity (`affinity.rs`)
 
 `sched_setaffinity` FFI over a zeroed, fully-populated stack `cpu_set_t`

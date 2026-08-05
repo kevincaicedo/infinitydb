@@ -25,6 +25,11 @@ doc-intern-keys = ["doc", "inf-doc/doc-intern-keys"]
 [dev-dependencies]
 proptest.workspace = true
 criterion.workspace = true
+# statvfs for the M4-S15 endurance test's real-filesystem reclaim assert.
+libc.workspace = true
+# M4-S21: the `*_nospace` injection legs in `tiered_diskfull.rs` — the
+# same dev-dependency feature unification the inf-log tests ride.
+inf-foundation = { workspace = true, features = ["fault-points"] }
 
 [[bench]]
 name = "store"
@@ -38,6 +43,26 @@ test = false
 
 [[bench]]
 name = "mutation"
+harness = false
+test = false
+
+[[bench]]
+name = "demotion_storm"
+harness = false
+test = false
+
+[[bench]]
+name = "compaction_storm"
+harness = false
+test = false
+
+[[bench]]
+name = "recovery_gate"
+harness = false
+test = false
+
+[[bench]]
+name = "write_accounting"
 harness = false
 test = false
 

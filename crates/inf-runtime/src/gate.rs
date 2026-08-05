@@ -106,6 +106,14 @@ impl<K: Eq + Hash + Copy, V> KeyedGate<K, V> {
     pub fn pending(&self) -> usize {
         self.slots.borrow().len()
     }
+
+    /// Whether `key` still has a live, undelivered waiter (M4-S10): the
+    /// cold-read drain consults this to skip intents whose command was
+    /// cancelled while queued — a dead command must not spend device
+    /// bandwidth. `Delivered` counts as consumed (no live *waiter*).
+    pub fn has_waiter(&self, key: &K) -> bool {
+        matches!(self.slots.borrow().get(key), Some(SlotState::Registered | SlotState::Waiting(_)))
+    }
 }
 
 impl<K: Eq + Hash + Copy, V> Clone for KeyedGate<K, V> {

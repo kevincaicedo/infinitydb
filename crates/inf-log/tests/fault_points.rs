@@ -233,6 +233,7 @@ fn manifest_rename_fail_leaves_the_old_unit_authoritative() {
         ckpt_id: 1,
         begin_lsn: Lsn::new(SegmentId(0), 64),
         segments: vec![SegmentId(0)],
+        tiers: Vec::new(),
     };
     write_manifest(&fs, &shard, &old).expect("first manifest");
 
@@ -241,6 +242,7 @@ fn manifest_rename_fail_leaves_the_old_unit_authoritative() {
         ckpt_id: 2,
         begin_lsn: Lsn::new(SegmentId(1), 64),
         segments: vec![SegmentId(1)],
+        tiers: Vec::new(),
     };
     let err = write_manifest(&fs, &shard, &newer).expect_err("rename refused");
     assert!(err.to_string().contains("injected fault: manifest_rename_fail"), "{err}");

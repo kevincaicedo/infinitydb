@@ -583,6 +583,9 @@ impl<F: SegmentFs> ManifestCell<F> {
                     ckpt_id: pending.ckpt_id,
                     begin_lsn: pending.begin_lsn,
                     segments: (floor.0..=active.0).map(SegmentId).collect(),
+                    // Tier sections join when command wiring materializes tiered
+                    // namespaces on this path (ADR-0057 D5; epoch 1 until then).
+                    tiers: Vec::new(),
                 };
                 let staged_write = self.fs.create_meta(&staged).and_then(|mut file| {
                     file.write_at(0, &inf_log::manifest_envelope(&manifest))?;

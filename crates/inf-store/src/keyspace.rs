@@ -25,8 +25,11 @@ use inf_foundation::hash64;
 use inf_foundation::time::Nanos;
 use inf_log::{FsyncClass, NsId, RecordView as LogRecordView};
 
+use inf_foundation::LogicalAddr;
+
 use crate::address_space::{AddressSpaceConfig, TieringCounters};
 use crate::catalog::NsCatalog;
+use crate::demote::{DemoteStats, DemotionConfig, EvictionPressure};
 use crate::evict::{EvictStats, EvictionPolicy};
 use crate::ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsRegistry, NsSpec};
 use crate::store::{
@@ -35,6 +38,7 @@ use crate::store::{
 use crate::tiered::TieredTable;
 use crate::wall::WallAnchor;
 use crate::wheel::ExpiryBudget;
+use crate::write_accounting::{WriteAccountingTotals, WriteAmpSummary};
 
 /// Redis default database count (`SELECT 0..15`; CONFIG `databases`).
 pub const DEFAULT_DBS: usize = 16;
@@ -59,6 +63,29 @@ pub struct PressureConfig {
     pub policy: EvictionPolicy,
     /// Candidates examined per victim selection (`maxmemory-samples`).
     pub samples: u32,
+}
+
+/// Per-cell default for the aggregate reserved-Region-VA admission bound
+/// (M4-S19, ADR-0062 D4 — the ADR-0051 accepted debt, retired): an
+/// explicit bounded default, never an inferred host maximum. The node
+/// key `tiered-reserved-va-limit` divides by cell count exactly like
+/// `maxmemory` (cells are symmetric), and the CONFIG sweep pushes the
+/// share via [`Keyspace::set_tiered_va_limit`].
+pub const TIERED_VA_LIMIT_DEFAULT: u64 = 256 << 30;
+
+/// Why a tiered-table materialization was refused (M4-S19, ADR-0062 D4).
+/// Refusal mutates nothing: no `Region` is constructed, no entry is left
+/// behind — the S01 refusal contract at DDL scale.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TieredCreateError {
+    /// A table for this namespace already exists on the cell.
+    Exists,
+    /// The ring reservation or budget window is unrepresentable
+    /// (`TieredTable::new` refused — nonsense configuration).
+    Unrepresentable,
+    /// The aggregate reserved-VA admission bound would be exceeded —
+    /// checked **before** any mmap.
+    VaLimitExceeded { requested_bytes: u64, admitted_bytes: u64, limit_bytes: u64 },
 }
 
 /// Budget for one eviction MAINTAIN slice.
@@ -92,6 +119,10 @@ pub struct Keyspace {
     over_limit: bool,
     /// Eviction rotation cursor across populated dbs.
     hand_db: usize,
+    /// This cell's share of the node's reserved-VA admission bound
+    /// (M4-S19, ADR-0062 D4). Admission-only: lowering it under standing
+    /// reservations refuses new creations, never evicts.
+    tiered_va_limit_bytes: u64,
 }
 
 impl Keyspace {
@@ -107,6 +138,7 @@ impl Keyspace {
             pressure: PressureConfig::default(),
             over_limit: false,
             hand_db: 0,
+            tiered_va_limit_bytes: TIERED_VA_LIMIT_DEFAULT,
         };
         // db0 is eager: it serves every connection that never SELECTs.
         let _ = ks.db_mut(0);
@@ -190,24 +222,187 @@ impl Keyspace {
     }
 
     /// Materializes the tiered record table for namespace `ns` (M4-S04 —
-    /// the first `tiered_stores` entry). `false` when the ring
-    /// reservation fails or the table already exists — namespace creation
-    /// surfaces both typed. Command routing to tiered tables joins with
-    /// the E2/E3 stories; until then the flush/demotion drivers and the
-    /// steel thread reach the table through
-    /// [`tiered_store_mut`](Self::tiered_store_mut).
+    /// the first `tiered_stores` entry; M4-S07 adds the demotion
+    /// configuration; M4-S19 adds the aggregate reserved-VA admission
+    /// bound, checked **before** any mmap — ADR-0062 D4). Command
+    /// routing to tiered tables remains the standing wiring obligation;
+    /// the flush/demotion drivers and the harnesses reach the table
+    /// through [`tiered_store_mut`](Self::tiered_store_mut).
+    ///
+    /// # Errors
+    /// [`TieredCreateError`] — refusal mutates nothing.
     pub fn materialize_tiered(
         &mut self,
         ns: NsId,
         config: AddressSpaceConfig,
+        demote: DemotionConfig,
         initial_keys: usize,
-    ) -> bool {
+    ) -> Result<(), TieredCreateError> {
         if self.tiered_stores.iter().any(|(nid, _)| *nid == ns) {
-            return false;
+            return Err(TieredCreateError::Exists);
         }
-        let Some(table) = TieredTable::new(config, initial_keys) else { return false };
+        let requested_bytes = config.reserve_bytes as u64;
+        let admitted_bytes = self.tiering_usage().reserved_bytes;
+        let limit_bytes = self.tiered_va_limit_bytes;
+        // Checked arithmetic, refused before the Region exists: the
+        // reservation is the VA truth this bound counts, so the check
+        // and the mmap can never disagree.
+        if admitted_bytes.checked_add(requested_bytes).is_none_or(|total| total > limit_bytes) {
+            return Err(TieredCreateError::VaLimitExceeded {
+                requested_bytes,
+                admitted_bytes,
+                limit_bytes,
+            });
+        }
+        let table = TieredTable::new(config, demote, initial_keys)
+            .ok_or(TieredCreateError::Unrepresentable)?;
         self.tiered_stores.push((ns, Box::new(table)));
-        true
+        Ok(())
+    }
+
+    /// Materializes a tiered table from a registered spec's tier block
+    /// (M4-S19): derives the ring from the spec's budget + slice, applies
+    /// every derived config, and enforces the D4 admission bound. Fresh
+    /// life at origin zero — recovery-time re-materialization supplies
+    /// its own origin through the recovery path.
+    ///
+    /// # Errors
+    /// [`TieredCreateError`] — refusal mutates nothing.
+    pub fn materialize_tiered_spec(
+        &mut self,
+        ns: NsId,
+        tier: &crate::ns::TierSpec,
+    ) -> Result<(), TieredCreateError> {
+        let demote = tier.demotion_config();
+        let reserve_bytes =
+            demote.ring_reserve_bytes().ok_or(TieredCreateError::Unrepresentable)?;
+        let config = AddressSpaceConfig {
+            reserve_bytes,
+            page_bytes: inf_alloc::REGION_PAGE_BYTES,
+            life_origin: LogicalAddr::ZERO,
+        };
+        // Index presize: tables grow; a fixed hint keeps creation O(1).
+        self.materialize_tiered(ns, config, demote, 1024)?;
+        let table = self.tiered_store_mut(ns).expect("materialized above");
+        table.set_compaction_config(tier.compaction_config());
+        table.set_blob_config(tier.blob_config());
+        table.set_disk_budget(tier.disk_budget_bytes);
+        Ok(())
+    }
+
+    /// This cell's share of the node reserved-VA limit (ADR-0062 D4).
+    #[must_use]
+    pub fn tiered_va_limit(&self) -> u64 {
+        self.tiered_va_limit_bytes
+    }
+
+    /// Pushes the cell's VA-limit share (the CONFIG sweep — Hot class,
+    /// admission-only: standing reservations are never evicted).
+    pub fn set_tiered_va_limit(&mut self, bytes: u64) {
+        self.tiered_va_limit_bytes = bytes;
+    }
+
+    /// EvictionPressure v2 (M4-S07, §3.2): how namespace `ns` answers
+    /// memory pressure. Table-granular, never per-op — cache namespaces
+    /// keep the M1 eviction path instruction-identical (ADR-0053 D5).
+    pub fn pressure_response(&self, ns: NsId) -> EvictionPressure {
+        if self.tiered_stores.iter().any(|(nid, _)| *nid == ns) {
+            EvictionPressure::Demote
+        } else {
+            EvictionPressure::Evict
+        }
+    }
+
+    /// One demotion MAINTAIN round (M4-S07, ADR-0053): per tiered table,
+    /// one seal step toward the mutable-fraction target and one release
+    /// step below the flushed watermark — each bounded by the table's
+    /// `slice_bytes`. The flush leg between them (`flushed` advancement
+    /// after fdatasync) is the S11 pipeline's; its confirmation call
+    /// sites are `advance_flushed` on each table's space (ADR-0053 D6).
+    /// On a node with no tiered namespaces this iterates an empty Vec —
+    /// the degenerate case executes nothing and counts nothing (S03).
+    pub fn demote_tick(&mut self) -> DemoteStats {
+        let mut stats = DemoteStats::default();
+        for (_, table) in &mut self.tiered_stores {
+            let sealed = table.seal_slice();
+            let released = table.release_slice();
+            if sealed > 0 || released > 0 {
+                stats.sealed_bytes += sealed;
+                stats.released_bytes += released;
+                stats.tables_active += 1;
+            }
+        }
+        stats
+    }
+
+    /// Aggregated tiered-table memory attribution (L5): reserved and
+    /// committed ring bytes, live/dead record bytes, and index bytes
+    /// across every tiered table on this cell. All-zero on memory-mode
+    /// nodes (no table exists — the S03 degenerate case).
+    pub fn tiering_usage(&self) -> TieredUsage {
+        let mut usage = TieredUsage::default();
+        for (_, table) in &self.tiered_stores {
+            let report = table.space().report();
+            usage.reserved_bytes += report.reserved_bytes;
+            usage.committed_bytes += report.committed_bytes;
+            usage.allocated_bytes += report.allocated_bytes;
+            usage.dead_bytes += report.dead_bytes;
+            usage.live_bytes += table.live_bytes();
+            usage.index_bytes += table.index_bytes();
+        }
+        usage
+    }
+
+    /// Aggregated write-path byte counters across this cell's tiered
+    /// namespaces (M4-S13): the `INFO tiering` totals. Exactly the
+    /// field-wise sum of the per-namespace lines rendered beside it, so
+    /// the two can never disagree — and identically zero on a
+    /// memory-mode node, where no `TieredTable` exists to hold them.
+    ///
+    /// Node-wide write amplification is deliberately **not** derivable
+    /// from this value: blending namespaces hides a runaway tiered
+    /// namespace behind a quiet one, so the return type carries totals
+    /// only and [`tiering_write_amp`](Self::tiering_write_amp) reports the
+    /// worst namespace instead (M4-S16, ADR-0060 D4).
+    pub fn tiering_write_accounting(&self) -> WriteAccountingTotals {
+        let mut totals = WriteAccountingTotals::default();
+        for (_, table) in &self.tiered_stores {
+            totals.add(table.write_accounting());
+        }
+        totals
+    }
+
+    /// This cell's write-amplification summary (M4-S16): the worst
+    /// per-namespace ratio and how many namespaces have no denominator.
+    /// Zero on a memory-mode node for the same structural reason the
+    /// counters are — there is no tiered namespace to ask.
+    pub fn tiering_write_amp(&self) -> WriteAmpSummary {
+        let mut summary = WriteAmpSummary::default();
+        for (_, table) in &self.tiered_stores {
+            summary.add(table.write_accounting().write_amplification());
+        }
+        summary
+    }
+
+    /// This cell's blob write-amplification summary (M4-S18, ADR-0061
+    /// D8): the worst per-namespace `blob_bytes / blob_user_bytes` ratio
+    /// and how many namespaces wrote extent bytes without a blob
+    /// denominator. The same worst-not-blend rule as
+    /// [`tiering_write_amp`](Self::tiering_write_amp), on the disjoint
+    /// device leg — and the same structural zero on memory-mode nodes.
+    pub fn tiering_blob_write_amp(&self) -> WriteAmpSummary {
+        let mut summary = WriteAmpSummary::default();
+        for (_, table) in &self.tiered_stores {
+            summary.add(table.write_accounting().blob_write_amplification());
+        }
+        summary
+    }
+
+    /// This cell's tiered namespaces in materialization order — the
+    /// per-namespace `INFO tiering` lines (watermarks + write counters)
+    /// and any future per-namespace reporting walk this.
+    pub fn tiered_namespaces(&self) -> impl Iterator<Item = (NsId, &TieredTable)> {
+        self.tiered_stores.iter().map(|(ns, table)| (*ns, table.as_ref()))
     }
 
     /// The tiered table for namespace `ns`, if materialized.
@@ -230,6 +425,48 @@ impl Keyspace {
             total.region_commit_pages += counters.region_commit_pages;
             total.region_decommit_pages += counters.region_decommit_pages;
             total.cold_resolves += counters.cold_resolves;
+            total.tail_alloc_stalls += counters.tail_alloc_stalls;
+            total.demote_slices += counters.demote_slices;
+            total.demote_sealed_bytes += counters.demote_sealed_bytes;
+            total.flush_slices += counters.flush_slices;
+            total.flush_confirmed_bytes += counters.flush_confirmed_bytes;
+            total.compact_slices += counters.compact_slices;
+        }
+        total
+    }
+
+    /// Aggregated blob-extent observables across every tiered table on
+    /// this cell (M4-S17, ADR-0061 D8) — identically zero on a
+    /// memory-mode node (no table, no extents; the §3.3 zero contract).
+    pub fn tiering_extent_stats(&self) -> crate::extents::ExtentStats {
+        let mut total = crate::extents::ExtentStats::default();
+        for (_, table) in &self.tiered_stores {
+            let stats = table.extent_stats();
+            total.live += stats.live;
+            total.live_bytes += stats.live_bytes;
+            total.created += stats.created;
+            total.reclaimed += stats.reclaimed;
+            total.reclaimable += stats.reclaimable;
+            total.reclaim_slices += stats.reclaim_slices;
+            total.reclaim_deferred += stats.reclaim_deferred;
+            total.rmw_ops += stats.rmw_ops;
+            total.disk_bytes += stats.disk_bytes;
+        }
+        total
+    }
+
+    /// Aggregated disk-admission observables across every tiered table
+    /// on this cell (M4-S21, ADR-0063 D5) — identically zero on a
+    /// memory-mode node (the §3.3 zero contract).
+    pub fn tiering_disk_admission(&self) -> DiskAdmissionTotals {
+        let mut total = DiskAdmissionTotals::default();
+        for (_, table) in &self.tiered_stores {
+            if table.disk_full().is_some() {
+                total.full_namespaces += 1;
+            }
+            total.refusals += table.diskfull_refusals();
+            total.compact_idle_pressure += table.compact_idle_pressure();
+            total.used_bytes += table.disk_admission_used();
         }
         total
     }
@@ -443,20 +680,72 @@ impl Keyspace {
 
     // ---- named namespaces (M1-S08 registry; M2-S08 stores + catalog) ----
 
+    /// Registers `spec` and, for a tiered spec (M4-S19), materializes the
+    /// cell's `TieredTable` under the D4 admission bound. Registration
+    /// and materialization succeed or fail together — an admission
+    /// refusal rolls the registry entry back, leaving nothing behind.
     pub fn ns_create(&mut self, spec: NsSpec) -> Result<(), NsError> {
-        self.named.create(spec)
+        let tier = spec.tier;
+        let (id, name) = (spec.id, spec.name.clone());
+        self.named.create(spec)?;
+        if let Some(tier) = tier
+            && let Err(e) = self.materialize_tiered_spec(id, &tier)
+        {
+            self.named.drop_ns(&name).expect("just created");
+            return Err(match e {
+                TieredCreateError::Exists => NsError::Exists,
+                TieredCreateError::Unrepresentable => NsError::InvalidTierConfig(
+                    "MEM-BUDGET + MAINTAIN-SLICE has no representable ring reservation",
+                ),
+                TieredCreateError::VaLimitExceeded {
+                    requested_bytes,
+                    admitted_bytes,
+                    limit_bytes,
+                } => NsError::TierVaLimitExceeded { requested_bytes, admitted_bytes, limit_bytes },
+            });
+        }
+        Ok(())
     }
 
     /// Drops the registry entry **and** its store (with all its data). The
     /// id is never reused; log records naming it are skipped on replay.
+    /// A tiered namespace's table drops with it (M4-S19, ADR-0062 D7):
+    /// the `Region` unmaps on drop, returning exactly its ring to the D4
+    /// admitted sum — structurally, not by bookkeeping. The plane owns
+    /// the file half of the teardown (tier + blob unlinks after pin
+    /// drain — `inf-store` never does I/O, §3.3).
     pub fn ns_drop(&mut self, name: &[u8]) -> Result<(), NsError> {
         let id = self.named.get(name).map(|s| s.id);
         self.named.drop_ns(name)?;
         if let Some(id) = id {
             self.named_stores.retain(|(nid, _)| *nid != id);
+            self.tiered_stores.retain(|(nid, _)| *nid != id);
             self.refresh_pressure();
         }
         Ok(())
+    }
+
+    /// Hot-reloads a tiered namespace's spec (M4-S19, ADR-0062 D3): the
+    /// registry entry and the materialized table update together, or
+    /// neither does. CreateOnly keys are the command layer's refusal;
+    /// this applies what it is given after re-running the range gauntlet
+    /// and the ring bound.
+    pub fn ns_set_tier(&mut self, name: &[u8], tier: crate::ns::TierSpec) -> Result<(), NsError> {
+        tier.validate().map_err(NsError::InvalidTierConfig)?;
+        let spec = self.named.get(name).ok_or(NsError::Unknown)?;
+        if spec.tier.is_none() {
+            return Err(NsError::NotTiered);
+        }
+        let id = spec.id;
+        // Apply to the table first (it can refuse on the ring bound);
+        // the registry write follows only on success.
+        if let Some(table) = self.tiered_store_mut(id) {
+            table.set_demotion(tier.demotion_config()).map_err(NsError::InvalidTierConfig)?;
+            table.set_compaction_config(tier.compaction_config());
+            table.set_blob_config(tier.blob_config());
+            table.set_disk_budget(tier.disk_budget_bytes);
+        }
+        self.named.set_tier(name, tier)
     }
 
     pub fn ns_get(&self, name: &[u8]) -> Option<&NsSpec> {
@@ -522,16 +811,23 @@ impl Keyspace {
 
     /// Boot-time catalog seed (ADR-0015 D3): replaces the registry with the
     /// persisted entries. Runs before the cell replays or serves; any
-    /// existing named stores are dropped with their data.
+    /// existing named stores are dropped with their data. Tiered entries
+    /// (M4-S19) re-materialize their tables — fresh life at origin zero;
+    /// the tiered recovery path (tier files, checkpoint restore) is the
+    /// standing wiring obligation, and no live-node write can predate it
+    /// (the D8 `USE` refusal keeps the data plane unreachable).
     ///
     /// # Errors
-    /// The first registry-rule violation — a failing catalog is a
-    /// fail-stop at boot, never a partial seed.
+    /// The first registry-rule or admission violation — a failing catalog
+    /// is a fail-stop at boot, never a partial seed.
     pub fn seed_catalog(&mut self, cat: &NsCatalog) -> Result<(), NsError> {
         self.named = NsRegistry::default();
         self.named_stores.clear();
+        self.tiered_stores.clear();
         for spec in &cat.entries {
-            self.named.create(spec.clone())?;
+            // `ns_create` materializes tiered entries under the D4 bound
+            // — seeding and DDL share one path, so they cannot drift.
+            self.ns_create(spec.clone())?;
         }
         Ok(())
     }
@@ -588,6 +884,17 @@ impl Keyspace {
             // Reserved in M2: the catalog is META-owned; no NsOp records
             // are emitted (ADR-0015 D7).
             LogRecordView::NsOp { .. } => Ok(ReplayOutcome::SkippedReserved),
+            // Tiered-namespace displacement marker (M4-S12, ADR-0057 D4):
+            // pairs with the next mutation in the tiered replay applier
+            // (`TieredTable::apply_displace`). Tiered namespaces are not
+            // routed through this path until command wiring — a marker
+            // reaching a CellStore replay names no CellStore state.
+            LogRecordView::ColdDisplace { .. } => Ok(ReplayOutcome::SkippedReserved),
+            // Out-of-line reference (M4-S17, ADR-0061 D2): a tiered-only
+            // record — memory-mode namespaces have no extents, so the
+            // tiered replay applier (`TieredTable::apply_extent_image`)
+            // owns it and nothing here can apply it.
+            LogRecordView::StringExtentRef { .. } => Ok(ReplayOutcome::SkippedReserved),
             // Checkpoint marker (M2-S10, ADR-0016 D3): carries no state —
             // S13's recovery orchestration consumes its LSN, not replay.
             LogRecordView::CkptBegin { .. } => Ok(ReplayOutcome::SkippedMarker),
@@ -722,6 +1029,43 @@ impl Keyspace {
             .filter_map(|s| s.as_deref())
             .chain(self.named_stores.iter().map(|(_, s)| s.as_ref()))
     }
+}
+
+/// Aggregated tiered-table memory attribution (M4-S07, L5). Rendered in
+/// `INFO tiering`; every field is identically zero on memory-mode nodes
+/// and joins the S03 zero-assert set.
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+pub struct TieredUsage {
+    /// Reserved ring virtual bytes (sum of `R` across tables).
+    pub reserved_bytes: u64,
+    /// Committed ring bytes — the RAM-residency figure `MEM-BUDGET`
+    /// bounds (ADR-0053 D1).
+    pub committed_bytes: u64,
+    /// Bytes allocated this life (`tail − life_origin`, summed).
+    pub allocated_bytes: u64,
+    /// Dead bytes (relocations, deletes, seal holes — S14's input).
+    pub dead_bytes: u64,
+    /// Live record bytes.
+    pub live_bytes: u64,
+    /// Index bytes (incl. the tiered hash sidecar).
+    pub index_bytes: u64,
+}
+
+/// Aggregated disk-admission observables (M4-S21, ADR-0063 D5).
+/// Rendered in `INFO tiering`; identically zero on memory-mode nodes
+/// (no table exists) and joins the S03 zero-assert set.
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+pub struct DiskAdmissionTotals {
+    /// Namespaces currently refusing (budget or device leg).
+    pub full_namespaces: u64,
+    /// Typed `DISKFULL` refusals issued (sum).
+    pub refusals: u64,
+    /// `nothing_compactable`-under-pressure rounds (sum) — the "full of
+    /// live data" operator alarm.
+    pub compact_idle_pressure: u64,
+    /// `disk_used` at each table's last admission recompute (sum) — the
+    /// enforced snapshots, not a live `statvfs`.
+    pub used_bytes: u64,
 }
 
 /// A deterministic, layout-independent summary of live logical state
@@ -966,6 +1310,7 @@ mod tests {
             fsync: Some(FsyncClass::Always),
             policy: None,
             maxmemory: None,
+            tier: None,
         }
     }
 

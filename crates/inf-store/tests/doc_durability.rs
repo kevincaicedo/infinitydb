@@ -40,6 +40,7 @@ fn durable_keyspace() -> Keyspace {
         fsync: Some(FsyncClass::Always),
         policy: None,
         maxmemory: None,
+        tier: None,
     })
     .expect("namespace");
     ks
@@ -278,6 +279,7 @@ fn replay_uses_recorded_bounds_not_lowered_boot_config() {
         fsync: Some(FsyncClass::Always),
         policy: None,
         maxmemory: None,
+        tier: None,
     })
     .expect("namespace");
     ks.apply_record(

@@ -105,6 +105,17 @@ impl Default for ConfigStore {
                 e("proto-max-bulk-len", ReloadClass::Hot, Kind::Memory, "536870912"),
                 e("save", ReloadClass::Hot, Kind::Str, "3600 1 300 100 60 10000"),
                 e("tcp-keepalive", ReloadClass::Hot, Kind::Int, "300"),
+                // M4-S19 (ADR-0062 D4): the node bound on aggregate
+                // reserved tiered-Region VA — an explicit bounded
+                // default, never an inferred host maximum. Divided per
+                // cell like `maxmemory`; admission-only (lowering it
+                // never evicts standing reservations).
+                e(
+                    "tiered-reserved-va-limit",
+                    ReloadClass::HotPerCell,
+                    Kind::Memory,
+                    "274877906944",
+                ),
                 e("timeout", ReloadClass::Hot, Kind::Int, "0"),
             ],
         }

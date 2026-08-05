@@ -25,7 +25,10 @@ mod load;
 mod m1rows;
 mod m2rows;
 mod m4rows;
+mod mixedaudit;
 mod resp;
+mod writeamp;
+mod ycsb;
 mod zipfian;
 
 use std::process::ExitCode;
@@ -62,6 +65,28 @@ USAGE:
                    (--pipe emits a RESP JSON.SET load file with per-index
                     unique documents — corpus v2, ADR-0046 D3; the RSS
                     gate binds on this form)
+    inf-bench mixed-audit [--duration SECS] [--cells N] [--pin-start N]
+                   [--infinityd-bin PATH] [--artifacts-root DIR] [--seed N]
+                   [--data-root DIR] [--allow-dirty] [--unsafe-env]
+                   [--reference-box]
+                   (M4-S20 coexistence audit: cache + document legs solo
+                    then mixed on one durable node with a standing tiered
+                    namespace; continuous sum(domains)-vs-RSS; the tiered
+                    data leg is a named-absent row until command wiring +
+                    S22. Run the binary under `taskset -c <loadgen cpus>`
+                    so the generators stay off the server cells)
+    inf-bench ycsb [--workloads a,b,c,d,e,f] [--distribution zipfian|uniform|both]
+                   [--theta 0.99] [--mem-budget-mb 64] [--dataset-multiple 10]
+                   [--value-size 1024] [--duration SECS] [--conns N] [--pipeline P]
+                   [--cells N] [--pin-start N] [--seed N] [--data-root DIR]
+                   [--infinityd-bin PATH] [--artifacts-root DIR] [--gates FILE]
+                   [--verify-seed] [--allow-dirty] [--unsafe-env] [--reference-box]
+                   (M4-S22 YCSB-style rows with split latency reporting:
+                    memory-hit and cold-read percentiles separately, never
+                    blended. Tiered rows require command wiring (M4-S26);
+                    until then the run drops to harness-validation mode
+                    against a memory namespace with named-absent tiered
+                    figures. Run under `taskset -c <loadgen cpus>`)
 
 See bins/inf-bench/README.md for what runs on macOS vs what is Linux-pending.";
 
@@ -79,6 +104,8 @@ fn main() -> ExitCode {
         "boot-storm" => bootstorm::cmd_boot_storm(rest),
         "zipfian" => zipfian::cmd_zipfian(rest),
         "doc-corpus" => doc_corpus::cmd_doc_corpus(rest),
+        "mixed-audit" => mixedaudit::cmd_mixed_audit(rest),
+        "ycsb" => ycsb::cmd_ycsb(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())

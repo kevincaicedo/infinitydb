@@ -10,7 +10,7 @@ Oracles: **Redis 8.0.5** for the core surface; RedisJSON uses
 Every covered behavior is byte-diffed under its declared protocol; any new or
 stale deviation fails CI (L8 — honesty is total).
 
-**Corpus:** 546 byte-compared executions · 56 documented deviations · 0 tolerated failures.
+**Corpus:** 546 byte-compared executions · 58 documented deviations · 0 tolerated failures.
 **Surface:** 90 commands — 54 full · 32 partial · 0 stub · 2 extension · 2 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
@@ -85,7 +85,7 @@ program primitives, not a client surface.
 | `PUNSUBSCRIBE` | full | M1 | fast | -1 | 3 | same bare-form ordering note as UNSUBSCRIBE |
 | `PUBLISH` | full | M1 | fast | 3 | 4 | a publisher subscribed to its own channel via a remote owner cell may receive its frame before the publish reply (local owners match Redis order) |
 | `PUBSUB` | partial | M1 | readonly | -2 | 8 | SHARDCHANNELS / SHARDNUMSUB arrive with sharded pub/sub (M3 cut line) |
-| `INF.NS` | extension | M1 | admin | -2 | 0 | namespace registry v1 — the M2 durability seam |
+| `INF.NS` | extension | M1 | admin | -2 | 0 | namespace registry (M2 durability seam; M4-S19 adds SET + the ADR-0062 tiering keys; M4-S21/ADR-0063 reserves the `DISKFULL` extension error class — tiered-namespace writes at disk budget or device-full refuse typed, wire-observable at command wiring) |
 | `INF.CKPT` | extension | M2 | admin | -1 | 0 | checkpoint operator surface (M2-S20): [CELL k] [WAIT]; WAIT returns after the new MANIFEST is durable — no fork, per-cell timing (ADR-0021) |
 | `BGSAVE` | partial | M2 | admin | -1 | 0 | maps onto INF.CKPT (fuzzy checkpoint, no fork, no RDB file); SCHEDULE accepted and moot; reply byte-identical; memory-only nodes answer a documented error |
 | `LASTSAVE` | partial | M2 | readonly fast | 1 | 0 | unix seconds of the newest durable MANIFEST publication; 0 before the first (Redis reports process-start time); loading flag docs-derived, not capture-verified |
@@ -184,6 +184,8 @@ bytes or post-state differ by an understood, reviewed design decision.
 - InfinityDB extension
 - InfinityDB extension; durable live since M2-S08 (node tier — the planeless compat candidate answers its documented no-runtime error)
 - InfinityDB extension (M2-S08): named-namespace selection, SELECT-class conn state; durable-mode deviations documented in ADR-0015
+- InfinityDB extension (M4-S19, ADR-0062): MEM-BUDGET declares a durable-tiered namespace; the planeless compat candidate answers its documented no-runtime error
+- InfinityDB extension (M4-S19, ADR-0062 D3): per-namespace hot-reload; CreateOnly keys (TIER-IO-MODE, COLD-READ-QD) refuse typed
 
 ### `INF.CKPT`
 
