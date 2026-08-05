@@ -20,6 +20,7 @@ use inf_log::{
 /// cost (~ms) is included in the measured pass and disclosed. Pair with
 /// `INF_BENCH_DIR` on a real filesystem (the default temp dir is often
 /// tmpfs, where "cold" is meaningless).
+#[cfg(target_os = "linux")]
 fn cool_file(path: &Path) {
     if let Ok(file) = std::fs::File::open(path) {
         use std::os::fd::AsRawFd;
@@ -27,6 +28,21 @@ fn cool_file(path: &Path) {
         // SAFETY: fadvise on a live fd; offset 0 + len 0 = whole file.
         unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
     }
+}
+
+/// Non-Linux: `posix_fadvise` is Linux-only (macOS/BSD `F_NOCACHE`
+/// suppresses *future* caching and does not evict what is already
+/// resident), so the cold row cannot be produced honestly here. Refuse
+/// rather than time a page-cache-warm pass under a COLD label — the same
+/// no-silent-substitution rule the tmpfs refusal in `tier_flush` enforces
+/// (ADR-0025 D3); the reference box is Linux (ADR-0022 D1).
+#[cfg(not(target_os = "linux"))]
+fn cool_file(_path: &Path) {
+    panic!(
+        "INF_BENCH_COOL=1 is Linux-only: posix_fadvise(DONTNEED) has no \
+         page-cache-evicting equivalent on this platform, and a warm pass \
+         labelled COLD is not a measurement"
+    );
 }
 
 /// Deterministic pseudo-random payload (SplitMix64) — no `rand` dependency.

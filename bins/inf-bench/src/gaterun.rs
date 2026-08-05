@@ -287,11 +287,18 @@ impl Measurements {
 }
 
 /// Loads a milestone gates file via the usual relative-path candidates.
+///
+/// Every candidate stays **inside this checkout**: `docs/milestones/` is
+/// the single authority for gate values, and the `../` forms only walk up
+/// from a crate/bin subdirectory back to the workspace root. A candidate
+/// that escaped the repo (`../docs/…` used to lead the list) resolved to a
+/// second, silently drifting copy of the same file on the box where this
+/// repo is nested inside the planning repo, and to nothing at all on CI.
 pub(crate) fn load_gates(flags: &Flags, milestone: &str) -> Result<Vec<gates::Gate>, String> {
-    let default = format!("../docs/milestones/{milestone}-gates.toml");
+    let default = format!("docs/milestones/{milestone}-gates.toml");
     let gates_path = flags.str_or("gates", &default);
     gates::load(&gates_path)
-        .or_else(|_| gates::load(&format!("docs/milestones/{milestone}-gates.toml")))
+        .or_else(|_| gates::load(&format!("../docs/milestones/{milestone}-gates.toml")))
         .or_else(|_| gates::load(&format!("../../docs/milestones/{milestone}-gates.toml")))
 }
 
