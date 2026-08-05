@@ -517,11 +517,30 @@ mod tests {
         assert!(!arena.resize_in_place(addr, 58, 40), "class 48 is a move");
     }
 
+    /// The byte ranges a storm fill/verify touches: the whole allocation
+    /// natively, head + tail probes under Miri (second range empty when the
+    /// probes would meet).
+    ///
+    /// Rationale (2026-08-05, ADR-0065 D5 — the PR-lane Miri budget): a
+    /// full-width byte loop has no Miri shim, and the storm's rare size
+    /// tier is half a megabyte, so a few dozen huge frees dominate the
+    /// whole job — this one test measured **> 7.4 min** alone on the dev
+    /// box against a 15-min budget for all 31 tests. What Miri is here to
+    /// prove is the pointer math and provenance of `bytes`/`bytes_mut`,
+    /// and both still construct the **full-width** slice on every call;
+    /// a torn range shows at one end or the other. Full-width tear
+    /// detection is the native 10⁶-op run's job and runs in every
+    /// `cargo test`.
+    fn probe_ranges(len: usize) -> [core::ops::Range<usize>; 2] {
+        let probe = if cfg!(miri) { len.min(64) } else { len };
+        if probe * 2 >= len { [0..len, 0..0] } else { [0..probe, len - probe..len] }
+    }
+
     /// M0-S13 AC: alloc/free storm — accounting reconciles to zero drift,
     /// byte-exact, after 10⁶ random ops (deterministic xorshift; Miri runs a
-    /// scaled-down storm). Data integrity is verified per allocation with a
-    /// fill pattern; live ranges are implicitly disjoint or the patterns
-    /// would tear.
+    /// scaled-down storm, see [`probe_ranges`]). Data integrity is verified
+    /// per allocation with a fill pattern; live ranges are implicitly disjoint
+    /// or the patterns would tear.
     #[test]
     fn storm_reconciles_byte_exact() {
         let ops: usize = if cfg!(miri) { 4_000 } else { 1_000_000 };
@@ -535,6 +554,9 @@ mod tests {
             x ^= x << 17;
             x
         };
+        let verify = |slice: &[u8], fill: u8| {
+            probe_ranges(slice.len()).into_iter().all(|r| slice[r].iter().all(|&b| b == fill))
+        };
         for op in 0..ops {
             if rand() & 1 == 0 || live.is_empty() {
                 // Size mix: mostly small records, some tier-B, rare huge.
@@ -545,17 +567,17 @@ mod tests {
                 };
                 let Some(addr) = arena.alloc(len) else { panic!("unbudgeted alloc failed") };
                 let fill = (rand() & 0xFF) as u8;
-                arena.bytes_mut(addr, len).fill(fill);
+                let slice = arena.bytes_mut(addr, len);
+                for r in probe_ranges(len) {
+                    slice[r].fill(fill);
+                }
                 live.push((addr, len, fill));
                 expected_live += len as u64;
             } else {
                 let idx = (rand() as usize) % live.len();
                 let (addr, len, fill) = live.swap_remove(idx);
                 let slice = arena.bytes(addr, len);
-                assert!(
-                    slice.iter().all(|&b| b == fill),
-                    "op {op}: allocation torn (overlap or stale reuse)"
-                );
+                assert!(verify(slice, fill), "op {op}: allocation torn (overlap or stale reuse)");
                 arena.free(addr, len);
                 expected_live -= len as u64;
             }
@@ -563,7 +585,7 @@ mod tests {
         }
         assert_eq!(arena.report().live_bytes, expected_live);
         for (addr, len, fill) in live.drain(..) {
-            assert!(arena.bytes(addr, len).iter().all(|&b| b == fill));
+            assert!(verify(arena.bytes(addr, len), fill));
             arena.free(addr, len);
         }
         let r = arena.report();

@@ -100,6 +100,11 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
+        with:
+          # `cargo miri setup` rebuilds a Miri-instrumented std into
+          # ~/.cache/miri, which rust-cache does not cover by default.
+          cache-directories: "~/.cache/miri"
+          key: miri-full
       - name: miri (inf-alloc, inf-fabric) strict provenance
         run: cargo +nightly miri test -p inf-alloc -p inf-fabric
         env:

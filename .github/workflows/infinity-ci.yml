@@ -80,16 +80,31 @@ jobs:
     # REDUCED: strict-provenance Miri on the smallest unsafe leaf (inf-alloc)
     # only. The FULL Miri (inf-alloc + inf-fabric, all tests) is the M0-S02
     # acceptance gate and runs in infinity-ci-full — that is the job that was
-    # timing out at 45 min here. If inf-alloc alone approaches this budget,
-    # scope it to specific tests.
+    # timing out at 45 min here.
+    #
+    # 2026-08-05 (ADR-0065 D5): inf-alloc alone then blew this budget too —
+    # cancelled at 15 min with 14 of 31 tests done. Two causes, both fixed
+    # rather than papered over with a bigger timeout:
+    #   * the arena alloc/free storm verified every byte of every live range
+    #     through an interpreted loop, and its rare size tier is half a
+    #     megabyte — that ONE test measured > 7.4 min on the dev box. It now
+    #     probes range ends under Miri (full width still runs natively).
+    #   * the buffer-pool lease/release storm had no Miri guard at all
+    #     (100k interpreted iterations); it scales down like the others.
+    # `cargo miri setup` also rebuilds a Miri-instrumented std into
+    # ~/.cache/miri on every cold run — cached below, since rust-cache does
+    # not cover it by default.
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: "~/.cache/miri"
+          key: miri-canary
       - name: miri canary (inf-alloc, strict provenance)
         run: cargo +nightly miri test -p inf-alloc
         env:
