@@ -63,6 +63,8 @@ use inf_wire::{
     extract_keys, lookup,
 };
 
+mod tiered;
+
 use crate::control::{ControlHandle, RecoveryBoard};
 use crate::durable::{DurableCell, DurableConfig, EVERYSEC_TIMER_KEY};
 #[cfg(feature = "doc")]
@@ -375,6 +377,20 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// The durable plane (M2-S08, ADR-0015): `None` = memory-only cell —
     /// the zero-cost branch every memory-path check reduces to (M2-S09).
     durable: RefCell<Option<DurableCell<F>>>,
+    /// The tiered plane half (M4-S26): flush pipelines, cold-read
+    /// custody, MAINTAIN drivers. `None` until the durable plane exists
+    /// (a tiered namespace is a configuration of `MODE durable` —
+    /// ADR-0062 D1); inner state stays empty until one materializes.
+    tier: RefCell<Option<crate::tier_cell::TierCell<F>>>,
+    /// Fabric-origin tiered applies (M4-S26): per-origin FIFO queues. A
+    /// tiered apply can suspend on a cold read, so it cannot run inside
+    /// the synchronous FABRIC-IN drain — each origin's applies run on
+    /// one FIFO pump future. Per-connection command order is preserved
+    /// (the fabric delivers per-pair FIFO; the pump applies in arrival
+    /// order); cross-origin applies interleave freely. Recorded bound:
+    /// fabric-origin cold-read concurrency is `cells − 1` per owner.
+    tier_applies: RefCell<Vec<VecDeque<TierApply>>>,
+    tier_pump_active: RefCell<Vec<bool>>,
     /// Node control-thread handle (id allocation + catalog persistence).
     control: RefCell<Option<Arc<ControlHandle>>>,
     /// DDL pumps parked on catalog persistence (ADR-0015 D3).
@@ -408,6 +424,15 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// near-zero-cost. Default off; kept as the A/B instrument for the
     /// S19 8-cell re-read (`--deasync-dispatch`).
     deasync_dispatch: Cell<bool>,
+}
+
+/// One fabric-origin tiered apply parked for its origin's FIFO pump
+/// (M4-S26 — the suspension-capable sibling of the gated-reply future).
+struct TierApply {
+    token: FabricToken,
+    ns: NsId,
+    proto: Protocol,
+    args: Vec<Vec<u8>>,
 }
 
 /// One fabric-origin PUBLISH parked at the owner cell.
@@ -1094,6 +1119,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 pub_pump_active: Cell::new(false),
                 cob_pubsub: Cell::new((0, 0, 0)),
                 durable: RefCell::new(None),
+                tier: RefCell::new(None),
+                tier_applies: RefCell::new((0..cells).map(|_| VecDeque::new()).collect::<Vec<_>>()),
+                tier_pump_active: RefCell::new(vec![false; usize::from(cells)]),
                 control: RefCell::new(None),
                 ddl_waiters: WaitList::new(),
                 ckpt_waiters: WaitList::new(),
@@ -1262,6 +1290,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let shard_dir = cfg.data_dir.join(format!("shard-{cell_id}"));
         let ckpt_dir = shard_dir.join("ckpt");
         let ckpt = crate::ckpt::CkptCell::new(fs.clone(), ckpt_dir.clone(), cell_id, cfg.ckpt)?;
+        *self.shared.tier.borrow_mut() = Some(crate::tier_cell::TierCell::new(
+            fs.clone(),
+            u32::from(cell_id),
+            shard_dir.clone(),
+        ));
         let manifest = crate::ckpt::ManifestCell::new(
             fs,
             shard_dir,
@@ -1275,6 +1308,90 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         *self.shared.durable.borrow_mut() =
             Some(DurableCell::new(cfg.staging, cfg.sync_pipeline, rotor, ckpt, manifest));
         Ok(())
+    }
+
+    /// The tiered MAINTAIN half (M4-S26): reconcile the namespace set,
+    /// run the per-namespace drivers (demote → flush → release,
+    /// admission cadence, extent reclaim, retirement unlink), spawn
+    /// compaction read chains, tear down dropped namespaces, and drain
+    /// queued cold-read intents into `IoOp::TierRead`s — once per
+    /// reactor iteration (the S10 admission rule). Zero-cost when no
+    /// tiered namespace was ever created: one `None` check.
+    fn tier_maintain(&mut self, cx: &mut LoopCx<'_>) {
+        let mut compact_reads: Vec<crate::tier_cell::CompactRead> = Vec::new();
+        let cold = {
+            let mut tier_slot = self.shared.tier.borrow_mut();
+            let Some(tier) = tier_slot.as_mut() else { return };
+            tier.sync_namespaces(&self.shared.store.borrow());
+            if tier.namespaces.is_empty() && tier.cold.is_none() {
+                return;
+            }
+            let durable_mark = self
+                .shared
+                .durable
+                .borrow()
+                .as_ref()
+                .map(|cell| (cell.stats().records_appended, cell.ack_gate.watermark()));
+            let mut ks = self.shared.store.borrow_mut();
+            let mut units = 0u32;
+            let mut fatal: Option<String> = None;
+            for at in 0..tier.namespaces.len() {
+                match tier.maintain_ns(&mut ks, at, durable_mark) {
+                    Ok((used, work)) => {
+                        units += used;
+                        compact_reads.extend(work);
+                    }
+                    // Tier fsync failure is fatal-by-default (§8.4,
+                    // ADR-0056 D4); typed I/O refusals already latched
+                    // the device-full state inside the flush slice.
+                    Err(err) if err.is_fatal() => {
+                        fatal = Some(err.to_string());
+                        break;
+                    }
+                    Err(_) => {}
+                }
+            }
+            units += tier.maintain_teardown();
+            if units > 0 {
+                cx.charge(GroupClass::Maintenance, units);
+            }
+            if let Some(detail) = fatal {
+                drop(ks);
+                let mut durable = self.shared.durable.borrow_mut();
+                let cell = durable.as_mut().expect("tiered namespaces require the durable plane");
+                cell.fail_stop("tier flush", &detail);
+            }
+            tier.cold.clone()
+        };
+        for read in compact_reads {
+            let shared = Rc::clone(&self.shared);
+            let _ = cx.executor.poll_immediate(compact_pump(shared, read));
+        }
+        if let Some(cold) = cold {
+            cold.drain(|op| cx.push(op));
+            // The ADR-0064 D3 split scrape + ADR-0055 cold counters,
+            // flushed into per-cell gauges (`INFO tiering` renders them;
+            // the worst cell binds harness-side).
+            let tier = self.shared.tier.borrow();
+            let tier = tier.as_ref().expect("cold engine implies tier state");
+            let counters = cold.counters();
+            let coalesce_milli = counters.enqueued.saturating_mul(1000) / counters.issued.max(1);
+            self.shared.node.tiering_split.set([
+                tier.ram_hit_us.percentile(50.0),
+                tier.ram_hit_us.percentile(99.0),
+                tier.ram_hit_us.percentile(99.9),
+                tier.cold_us.percentile(50.0),
+                tier.cold_us.percentile(99.0),
+                tier.cold_us.percentile(99.9),
+                cold.qd_percentile(99.0),
+                coalesce_milli,
+                cold.inflight_total() as u64,
+                cold.queue_depth() as u64,
+                cold.latency_percentile_us(99.0),
+                counters.issued,
+                counters.enqueued,
+            ]);
+        }
     }
 
     /// Checkpoint gauges for tests/stats (`None` = memory-only cell).
@@ -1547,6 +1664,22 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     cell.on_manifest_error(errno);
                     return;
                 }
+                // Cold-read failure (M4-S26): custody must release —
+                // waiters observe the typed errno and the command layer
+                // answers a typed error, never a crash (operating error).
+                if c.token.class() == TokenClass::TierRead {
+                    let tier = self.shared.tier.borrow();
+                    let cold = tier
+                        .as_ref()
+                        .and_then(|t| t.cold.as_ref())
+                        .expect("TierRead completion implies a live cold-read engine");
+                    cold.on_completion(
+                        c.token,
+                        CompletionResult::Error { buf: None, errno },
+                        cx.now.as_micros(),
+                    );
+                    return;
+                }
                 let key = Self::key_of(c.token);
                 let live = self
                     .shared
@@ -1584,10 +1717,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 }
             }
             CompletionResult::TierRead => {
-                // The plane issues no TierRead until cold reads wire into
-                // the command path (M4-E3) — routing one here is a bug,
-                // not load (the S03 zero-counter posture, enforced).
-                unreachable!("TierRead completion without a tiered read path (M4-S08 wires it)");
+                // M4-S26: route into the custody table — waiters wake and
+                // their futures run in this iteration's EXECUTE slice.
+                let tier = self.shared.tier.borrow();
+                let cold = tier
+                    .as_ref()
+                    .and_then(|t| t.cold.as_ref())
+                    .expect("TierRead completion implies a live cold-read engine");
+                cold.on_completion(c.token, CompletionResult::TierRead, cx.now.as_micros());
             }
         }
     }
@@ -1732,6 +1869,20 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 waiter.await;
                 shared.fabric.borrow_mut().reply(g.to, g.token, &Outcome::Bytes(&g.reply));
             });
+        }
+        // Tiered fabric applies (M4-S26): wake each origin's FIFO pump.
+        let tier_pending: Vec<u16> = {
+            let queues = self.shared.tier_applies.borrow();
+            let active = self.shared.tier_pump_active.borrow();
+            (0..queues.len())
+                .filter(|&i| !queues[i].is_empty() && !active[i])
+                .map(|i| i as u16)
+                .collect()
+        };
+        for origin in tier_pending {
+            self.shared.tier_pump_active.borrow_mut()[usize::from(origin)] = true;
+            let shared = Rc::clone(&self.shared);
+            let _ = cx.executor.poll_immediate(tier_apply_pump(shared, origin));
         }
         // Fabric-origin PUBLISHes fan out on this cell's owner pump (one
         // long-lived FIFO future — arrival order is delivery order). The
@@ -2144,6 +2295,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.ckpt_last_begin_lsn.set(ckpt.last_begin_lsn);
             node.ckpt_buffer_bytes.set(ckpt.buffer_bytes);
         }
+        // ---- tiered plane half (M4-S26): namespace sync, the four
+        // drivers, the cold-read drain (once per iteration — S10).
+        self.tier_maintain(cx);
         // ---- DDL persist wakes (ADR-0015 D3): one relaxed load per
         // MAINTAIN; parked DDL pumps wake on epoch edges.
         if let Some(control) = self.shared.control.borrow().as_ref() {
@@ -2332,6 +2486,18 @@ fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             // semantics authoritatively (never trusting the origin).
             let argv = args.as_slice();
             let proto = if cmd & 0x0F == 3 { Protocol::Resp3 } else { Protocol::Resp2 };
+            // A tiered apply can suspend on a cold read — it defers to
+            // the origin's FIFO pump instead of the synchronous drain
+            // (M4-S26); `fabric_in` wakes the pump after this batch.
+            if shared.store.borrow().is_tiered(NsId(ns)) {
+                shared.tier_applies.borrow_mut()[usize::from(from.0)].push_back(TierApply {
+                    token,
+                    ns: NsId(ns),
+                    proto,
+                    args: argv.iter().map(|a| a.to_vec()).collect(),
+                });
+                return;
+            }
             let start = scratch.len();
             match shared.execute_ns_owned(from, argv, proto, NsId(ns), scratch) {
                 NsApplyOutcome::Reply => {
@@ -4409,6 +4575,156 @@ fn extract_keys_iter<'v, 'a>(
     (start..=last).step_by(usize::from(spec.step).max(1)).map_while(move |i| argv.get(i).copied())
 }
 
+/// One origin cell's tiered-apply pump (M4-S26): applies arrive in
+/// fabric FIFO order and execute strictly in that order — a suspended
+/// cold read holds the queue behind it, which is exactly what preserves
+/// the origin's per-connection command ordering. Deactivates when its
+/// queue drains (the flag and the emptiness check share one borrow, so
+/// a concurrent enqueue always observes a live pump or respawns one).
+async fn tier_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: Rc<Shared<O, F>>,
+    origin: u16,
+) {
+    loop {
+        let next = {
+            let mut queues = shared.tier_applies.borrow_mut();
+            let item = queues[usize::from(origin)].pop_front();
+            if item.is_none() {
+                shared.tier_pump_active.borrow_mut()[usize::from(origin)] = false;
+            }
+            item
+        };
+        let Some(item) = next else { return };
+        let argv: Vec<&[u8]> = item.args.iter().map(Vec::as_slice).collect();
+        let reply = apply_tiered_one(&shared, origin, item.ns, &argv, item.proto).await;
+        shared.fabric.borrow_mut().reply(CellId(origin), item.token, &Outcome::Bytes(&reply));
+        shared.recycle_reply_buf(reply);
+    }
+}
+
+/// One fabric-origin tiered apply: validate, execute through the tiered
+/// arm, and for `always` writes hold the reply behind the ack gate
+/// (§8.2 — the client-visible ack never precedes the owner's fsync).
+async fn apply_tiered_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    origin: u16,
+    ns: NsId,
+    argv: &[&[u8]],
+    proto: Protocol,
+) -> Vec<u8> {
+    let Some(meta) = lookup(argv[0]) else {
+        return error_reply(shared, proto, "ERR unknown command");
+    };
+    if !arity_ok(meta, argv.len()) {
+        return error_reply(shared, proto, "ERR wrong number of arguments");
+    }
+    let class = shared.store.borrow().ns_fsync_class(ns);
+    let origin_cell = ExecOrigin::Fabric(CellId(origin));
+    match tiered::dispatch_tiered(shared, origin_cell, ns, meta, argv, proto, class).await {
+        tiered::TieredReply::Done(reply) => reply,
+        tiered::TieredReply::Gated { reply, seq } => {
+            let waiter = {
+                let mut durable = shared.durable.borrow_mut();
+                let cell = durable.as_mut().expect("tiered implies the durable plane");
+                cell.note_gated_ack();
+                cell.ack_gate.waiter(seq)
+            };
+            waiter.await;
+            reply
+        }
+    }
+}
+
+/// One compaction read chain (M4-S26 driving ADR-0059 D2): chunked cold
+/// reads of the candidate through `ColdReads` (`ReadClass::Maintain`),
+/// each chunk fed to `TieredTable::compaction_apply` at the exact scan
+/// cursor. The chain ends on slice exhaustion, a tail stall, scan
+/// completion, a pinned walk (relocating mid-walk is the D9-1 duplicate
+/// hazard), or a read refusal/error — the cursor persists and the next
+/// MAINTAIN resumes it. No borrow is held across an await (§3.3).
+async fn compact_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: Rc<Shared<O, F>>,
+    read: crate::tier_cell::CompactRead,
+) {
+    let mut cursor = read.addr.to_raw();
+    let mut budget = read.len;
+    // Oversized-record assembly target (0 = one pool window).
+    let mut need: usize = 0;
+    'chain: while budget > 0 {
+        let mut chunk: Vec<u8> = Vec::new();
+        loop {
+            let (wait, frames, skip) = {
+                let tier = shared.tier.borrow();
+                let Some(t) = tier.as_ref().and_then(|t| t.ns(read.ns)) else { break 'chain };
+                let Some(cold) = tier.as_ref().and_then(|t| t.cold.clone()) else { break 'chain };
+                let at = cursor + chunk.len() as u64;
+                let want = if need > 0 { need - chunk.len() } else { 1 };
+                let Some(addr) = inf_store::LogicalAddr::from_raw(at) else { break 'chain };
+                // A retired-file miss re-resolves next round, never errors.
+                let Some((fd, file, offset, frames, skip)) = t.plan_cold_read(addr, want) else {
+                    break 'chain;
+                };
+                let len = frames as usize * inf_log::TIER_FRAME_BYTES;
+                match cold.enqueue(fd, file, offset, len, inf_runtime::ReadClass::Maintain, 0) {
+                    Ok(wait) => (wait, frames, skip),
+                    Err(_) => break 'chain, // queue full: back off to the next round
+                }
+            };
+            let done = wait.await;
+            if done.outcome().is_err() {
+                break 'chain; // typed read failure: cursor persists, retried
+            }
+            let extracted = done.bytes(|window| {
+                let window_data = frames as usize * inf_log::TIER_FRAME_DATA - skip;
+                let take = if need > 0 { window_data.min(need - chunk.len()) } else { window_data };
+                let mut piece = Vec::new();
+                inf_log::tier_extract(window, skip, take, &mut piece).ok().map(|()| piece)
+            });
+            drop(done);
+            match extracted {
+                Some(piece) => chunk.extend_from_slice(&piece),
+                None => break 'chain, // frame CRC failure: foreground reads surface it typed
+            }
+            if need == 0 || chunk.len() >= need {
+                break;
+            }
+        }
+        let applied = {
+            let mut ks = shared.store.borrow_mut();
+            let Some(table) = ks.tiered_store_mut(read.ns) else { break 'chain };
+            // A walk pinned itself between chunks: relocating now would
+            // let one walk emit a ref and an image for the same key
+            // (ADR-0059 D9-1) — pause; the cursor resumes post-walk.
+            if table.space().walk_watermark().is_some() {
+                break 'chain;
+            }
+            let Some(addr) = inf_store::LogicalAddr::from_raw(cursor) else { break 'chain };
+            table.compaction_apply(read.file_id, addr, &chunk)
+        };
+        if applied.consumed > 0 {
+            cursor += applied.consumed;
+            budget = budget.saturating_sub(applied.consumed);
+            need = 0;
+        }
+        if applied.file_scanned || applied.stalled {
+            break 'chain;
+        }
+        if applied.need > 0 {
+            need = usize::try_from(applied.need).expect("record sizes fit usize");
+            continue;
+        }
+        if applied.consumed == 0 {
+            debug_assert!(false, "compaction_apply made no progress without a verdict");
+            break 'chain;
+        }
+    }
+    if let Some(tier) = shared.tier.borrow_mut().as_mut()
+        && let Some(t) = tier.ns_mut(read.ns)
+    {
+        t.compact_inflight = false;
+    }
+}
+
 /// One named-namespace command on the pump (M2-S08). Returns `false` when
 /// the connection is gone.
 #[allow(clippy::too_many_arguments)] // the pump dispatch context
@@ -4490,6 +4806,23 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
             }
             return true;
         }
+    }
+    // Tiered namespaces execute through the async tiered arm (M4-S26):
+    // suspension-capable resolution with its own admission + staging.
+    if shared.store.borrow().is_tiered(ns) {
+        match tiered::dispatch_tiered(shared, origin, ns, meta, argv, proto, class).await {
+            tiered::TieredReply::Done(reply) => pending.push_back(PendingReply::Done(reply)),
+            tiered::TieredReply::Gated { reply, seq } => {
+                let waiter = {
+                    let mut durable = shared.durable.borrow_mut();
+                    let cell = durable.as_mut().expect("tiered implies the durable plane");
+                    cell.note_gated_ack();
+                    cell.ack_gate.waiter(seq)
+                };
+                pending.push_back(PendingReply::Durable { waiter, reply });
+            }
+        }
+        return true;
     }
     // Local path: durable admission parks on the drain waitlist instead of
     // erroring (bounded-everything; the owner-side refusal is fabric-only).

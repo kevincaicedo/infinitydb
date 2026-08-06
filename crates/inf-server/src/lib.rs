@@ -24,6 +24,7 @@ mod plane;
 mod pubsub;
 mod readahead;
 mod recover;
+mod tier_cell;
 
 /// Process exit code for a durable-path fail-stop (§8.4, the fsyncgate
 /// rule): an fsync/log-write error freezes the watermark — no ack for the

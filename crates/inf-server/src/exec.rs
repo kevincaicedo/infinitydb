@@ -53,6 +53,14 @@ pub struct NodeInfo {
     /// Frozen order: sqes_per_submit, cqes_per_reap, cmds_per_iter,
     /// fabric_msgs_per_batch (each ×1000), loop_iter_p999_us.
     pub tripwires: Cell<[u64; 5]>,
+    /// M4-S26 split-service + cold-read scrape (ADR-0064 D3 + the five
+    /// ADR-0055 counters), flushed by the tiered MAINTAIN. Frozen
+    /// order: ram_hit_p{50,99,999}_us, cold_p{50,99,999}_us,
+    /// cold_read_qd_p99, coalesce_ratio_milli, cold_reads_inflight,
+    /// cold_queue_depth, cold_read_p99_us, cold_reads_issued,
+    /// cold_reads_enqueued. Identically zero on nodes that never
+    /// created a tiered namespace (the D8/S03 posture).
+    pub tiering_split: Cell<[u64; 13]>,
     /// Raw lifetime counters (submits, sqes, cqes, iterations, commands,
     /// fabric_msgs) — scrapers diff two snapshots for under-load ratios.
     pub raw_counters: Cell<[u64; 6]>,
@@ -406,6 +414,14 @@ pub fn execute(
         }
         _ => {
             if let Some(id) = cx.ns {
+                // Tiered namespaces are plane-resident (M4-S26): their
+                // command path needs the reactor (cold-read suspension,
+                // WAL staging), so the planeless fallback refuses rather
+                // than silently serving the empty CellStore shell.
+                if ks.is_tiered(id) {
+                    let mut w = RespWriter::new(out, cx.proto);
+                    return w.error("ERR tiered namespaces require the server plane (M4-S26)");
+                }
                 // Named-namespace path (M2-S08): resolve by id — the
                 // registry is authoritative, so a namespace dropped after
                 // `INF.NS USE` answers a typed error, never a ghost store.
