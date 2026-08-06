@@ -168,6 +168,24 @@ pub(crate) struct CompactRead {
     pub len: u64,
 }
 
+impl<F: SegmentFs> TierNs<F> {
+    /// Queues one detached (retirement-committed) file for the
+    /// pin-gated unlink (ADR-0059 D3 phases 2-3; §3.3).
+    pub fn note_retired(&mut self, meta: TierFileMeta) {
+        self.retired.push(meta);
+    }
+}
+
+impl<F: SegmentFs> TierCell<F> {
+    pub fn ns(&self, ns: NsId) -> Option<&TierNs<F>> {
+        self.namespaces.iter().find(|t| t.ns == ns)
+    }
+
+    pub fn ns_mut(&mut self, ns: NsId) -> Option<&mut TierNs<F>> {
+        self.namespaces.iter_mut().find(|t| t.ns == ns)
+    }
+}
+
 impl<F: SegmentFs + Clone> TierCell<F> {
     pub fn new(fs: F, cell: u32, shard_dir: PathBuf) -> TierCell<F> {
         TierCell {
@@ -180,14 +198,6 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             cold_us: LogHistogram::new(),
             teardown: Vec::new(),
         }
-    }
-
-    pub fn ns(&self, ns: NsId) -> Option<&TierNs<F>> {
-        self.namespaces.iter().find(|t| t.ns == ns)
-    }
-
-    pub fn ns_mut(&mut self, ns: NsId) -> Option<&mut TierNs<F>> {
-        self.namespaces.iter_mut().find(|t| t.ns == ns)
     }
 
     /// Reconciles plane state with the keyspace's tiered set (runs each
@@ -296,6 +306,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         ks: &mut Keyspace,
         at: usize,
         durable_mark: Option<(u64, u64)>,
+        transition_idle: bool,
     ) -> Result<(u32, Option<CompactRead>), TierFlushError> {
         let cold = self.cold.clone();
         let t = &mut self.namespaces[at];
@@ -303,6 +314,18 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             return Ok((0, None)); // dropped this tick; sync_namespaces reconciles next
         };
         let mut units = 0u32;
+
+        // Aborted-transition reconciliation (M4-S26): with no checkpoint
+        // streaming and no swap pending, a pinned walk means the
+        // checkpoint aborted mid-walk (release debt would otherwise
+        // never drain), and stamped retirement candidates lost their
+        // covering swap — re-offer them (ADR-0059 D3 abort leg).
+        if transition_idle {
+            if table.space().walk_watermark().is_some() {
+                table.end_ckpt_walk();
+            }
+            table.abort_retirement();
+        }
 
         // ---- demote leg: seal → flush → release (§3.1 slice order).
         let sealed = if table.demote_due() { table.seal_slice() } else { 0 };

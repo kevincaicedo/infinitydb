@@ -20,6 +20,7 @@ use inf_log::ckpt::{ick_file_name, ick_staging_file_name, parse_ick_file_name};
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{CkptConfig, IckStream, Lsn, Manifest, SectionLease, SegmentId, StagedAt};
 use inf_runtime::{CompletionToken, TokenClass};
+use inf_store::Keyspace;
 
 /// Entries pulled from the store per walk call: keeps the byte-budget
 /// overshoot bounded by one call's emissions (the staging buffer absorbs
@@ -67,6 +68,11 @@ pub(crate) struct Streaming<File: SegmentFile> {
     pub ns_ids: Vec<u32>,
     pub ns_idx: usize,
     pub cursor: u64,
+    /// Tiered-namespace walk sub-pass (M4-S26, ADR-0057 D1/D3): 0 =
+    /// address refs, 1 = RAM images, 2 = live-set + blob-ref sections +
+    /// walk end + retirement scan. Section classes never mix inside a
+    /// pass, so class seals happen only at pass boundaries.
+    pub tier_pass: u8,
     pub walk_done: bool,
     pub footer_staged: bool,
     pub sync_issued: bool,
@@ -178,9 +184,15 @@ impl<F: SegmentFs> CkptCell<F> {
         id: u64,
         begin_lsn: Lsn,
         ns_ids: Vec<u32>,
+        tiered_present: bool,
         now: inf_foundation::time::Nanos,
     ) -> io::Result<()> {
-        let mut stream = IckStream::new(&self.cfg);
+        // v2 opens the ADR-0057 D3 vocabulary (address refs, live-set,
+        // blob refs) — emitted only when a tiered namespace exists, so
+        // memory-durable nodes keep producing v1 files byte-identically
+        // (M4-S26; the S03 zero-change posture).
+        let mut stream =
+            if tiered_present { IckStream::new_v2(&self.cfg) } else { IckStream::new(&self.cfg) };
         let file = self.fs.create_meta(&self.dir.join(ick_staging_file_name(id)))?;
         let fd = file.raw_fd().ok_or_else(|| io::Error::other("std segment tier has fds"))?;
         let lease = stream.begin(self.cell, id, begin_lsn, &ns_ids);
@@ -195,6 +207,7 @@ impl<F: SegmentFs> CkptCell<F> {
             ns_ids,
             ns_idx: 0,
             cursor: 0,
+            tier_pass: 0,
             walk_done: false,
             footer_staged: false,
             sync_issued: false,
@@ -517,7 +530,10 @@ impl<F: SegmentFs> ManifestCell<F> {
         cx: &mut inf_runtime::LoopCx<'_>,
         watermark: Option<u64>,
         active: SegmentId,
+        ks: &mut Keyspace,
+        tier: Option<&mut crate::tier_cell::TierCell<F>>,
     ) -> u32 {
+        let mut tier = tier;
         match std::mem::replace(&mut self.phase, SwapPhase::Idle) {
             SwapPhase::Idle => 0,
             SwapPhase::Backoff { pending, slices } => {
@@ -579,13 +595,23 @@ impl<F: SegmentFs> ManifestCell<F> {
                     }
                 }
                 let floor = pending.begin_lsn.segment;
+                // Tier sections (M4-S26; ADR-0057 D5): one per tiered
+                // namespace — retiring files excluded (ADR-0059 D3/D5,
+                // the walk that fed this swap emitted no reference into
+                // them). Encoding stays epoch 1 when the set is empty.
+                let mut tiers = Vec::new();
+                if let Some(tc) = tier.as_deref_mut() {
+                    for t in &tc.namespaces {
+                        if let Some(table) = ks.tiered_store(t.ns) {
+                            tiers.push(table.tier_manifest(t.ns.0, &t.flush));
+                        }
+                    }
+                }
                 let manifest = Manifest {
                     ckpt_id: pending.ckpt_id,
                     begin_lsn: pending.begin_lsn,
                     segments: (floor.0..=active.0).map(SegmentId).collect(),
-                    // Tier sections join when command wiring materializes tiered
-                    // namespaces on this path (ADR-0057 D5; epoch 1 until then).
-                    tiers: Vec::new(),
+                    tiers,
                 };
                 let staged_write = self.fs.create_meta(&staged).and_then(|mut file| {
                     file.write_at(0, &inf_log::manifest_envelope(&manifest))?;
@@ -651,7 +677,21 @@ impl<F: SegmentFs> ManifestCell<F> {
                 }
             }
             SwapPhase::DirSynced { manifest } => {
-                // Commit: the new recovery unit is fully durable.
+                // Commit: the new recovery unit is fully durable. Files
+                // this swap's checkpoint retired are now unreferenced by
+                // every durable artifact — commit their retirement; the
+                // pin-gated unlink runs in the tiered MAINTAIN (M4-S26,
+                // ADR-0059 D3 phases 2-3).
+                if let Some(tc) = tier {
+                    for t in &mut tc.namespaces {
+                        let Some(table) = ks.tiered_store_mut(t.ns) else { continue };
+                        for id in table.commit_retirement() {
+                            if let Some(meta) = t.flush.detach_sealed(id) {
+                                t.note_retired(meta);
+                            }
+                        }
+                    }
+                }
                 self.floor = Some(manifest.floor());
                 self.named_ckpt = Some(manifest.ckpt_id);
                 self.stats.published += 1;

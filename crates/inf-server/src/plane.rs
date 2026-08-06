@@ -1326,17 +1326,19 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             if tier.namespaces.is_empty() && tier.cold.is_none() {
                 return;
             }
-            let durable_mark = self
-                .shared
-                .durable
-                .borrow()
-                .as_ref()
-                .map(|cell| (cell.stats().records_appended, cell.ack_gate.watermark()));
+            let (durable_mark, transition_idle) = {
+                let durable = self.shared.durable.borrow();
+                let mark = durable
+                    .as_ref()
+                    .map(|cell| (cell.stats().records_appended, cell.ack_gate.watermark()));
+                let idle = durable.as_ref().is_some_and(DurableCell::ckpt_transition_idle);
+                (mark, idle)
+            };
             let mut ks = self.shared.store.borrow_mut();
             let mut units = 0u32;
             let mut fatal: Option<String> = None;
             for at in 0..tier.namespaces.len() {
-                match tier.maintain_ns(&mut ks, at, durable_mark) {
+                match tier.maintain_ns(&mut ks, at, durable_mark, transition_idle) {
                     Ok((used, work)) => {
                         units += used;
                         compact_reads.extend(work);
@@ -2243,8 +2245,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             let ckpt_budget = cx.budget(GroupClass::Checkpoint);
             if ckpt_budget > 0 {
                 let anchor = self.shared.wall_anchor();
-                let used =
-                    cell.ckpt_slice(&mut self.shared.store.borrow_mut(), cx, ckpt_budget, anchor);
+                let mut tier = self.shared.tier.borrow_mut();
+                let used = cell.ckpt_slice(
+                    &mut self.shared.store.borrow_mut(),
+                    tier.as_mut(),
+                    cx,
+                    ckpt_budget,
+                    anchor,
+                );
+                drop(tier);
                 if used > 0 {
                     cx.charge(GroupClass::Checkpoint, used);
                 }
@@ -2255,7 +2264,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             // thread), orphan GC — charged to Maintenance.
             let control = self.shared.control.borrow();
             let unix_now_ms = self.shared.wall_anchor().unix_from_internal(cx.now);
-            let manifest_units = cell.manifest_slice(cx, control.as_deref(), unix_now_ms);
+            let mut tier = self.shared.tier.borrow_mut();
+            let manifest_units = cell.manifest_slice(
+                cx,
+                control.as_deref(),
+                unix_now_ms,
+                &mut self.shared.store.borrow_mut(),
+                tier.as_mut(),
+            );
+            drop(tier);
             drop(control);
             if manifest_units > 0 {
                 cx.charge(GroupClass::Maintenance, manifest_units);
