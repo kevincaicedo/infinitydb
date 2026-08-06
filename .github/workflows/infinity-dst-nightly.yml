@@ -137,7 +137,7 @@ jobs:
               | tee -a /tmp/fleet.log
           done
 
-      - name: fresh-seed fleet (replayable: seeds derive from the run id)
+      - name: "fresh-seed fleet (replayable: seeds derive from the run id)"
         run: |
           base=$(( ${{ github.run_id }} % 0xFFFFFFFF ))
           echo "fleet seed base: $base (run id ${{ github.run_id }})" | tee -a /tmp/fleet.log
