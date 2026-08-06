@@ -1095,6 +1095,7 @@ fn tiered_data_plane_serves_and_survives_restart() {
                 demoted = true;
                 break;
             }
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(demoted, "demotion never flushed past 1 MiB");
