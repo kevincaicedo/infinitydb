@@ -32,6 +32,7 @@ use crate::catalog::NsCatalog;
 use crate::demote::{DemoteStats, DemotionConfig, EvictionPressure};
 use crate::evict::{EvictStats, EvictionPolicy};
 use crate::ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsRegistry, NsSpec};
+use crate::record::ExtentRef;
 use crate::store::{
     CellStore, CheckpointImage, ExpiryStats, MemoryReport, OpError, StoreConfig, StoreStats,
 };
@@ -53,6 +54,10 @@ const INLINE_MAX_EVICTIONS: u32 = 512;
 /// Zero-yield eviction steps tolerated across the db rotation before the
 /// sweep concludes nothing is evictable (each step examines ≤ 256 slots).
 const DRY_STEP_LIMIT: u32 = 2 * DEFAULT_DBS as u32;
+/// Replay displacement-register bound (ADR-0059 D9): one displacing
+/// mutation stages at most `RELOC_ORIGIN_CAP + 1` markers, so a longer
+/// run inside one pairing is corrupt input, not load.
+const DISPLACE_REGISTER_CAP: usize = 4;
 
 /// Per-cell pressure configuration (pushed from the typed CONFIG store
 /// within one MAINTAIN round — the M1-S03 `hot-per-cell` class).
@@ -123,6 +128,12 @@ pub struct Keyspace {
     /// (M4-S19, ADR-0062 D4). Admission-only: lowering it under standing
     /// reservations refuses new creations, never evicts.
     tiered_va_limit_bytes: u64,
+    /// Replay displacement register (ADR-0057 D4, widened to a bounded
+    /// list by ADR-0059 D9): `ColdDisplace` markers park here until the
+    /// paired mutation record — the very next record, same namespace —
+    /// drains them. Non-empty at end-of-log is a decode error the
+    /// recovery driver checks via [`displace_register_len`](Self::displace_register_len).
+    pending_displace: Vec<(NsId, u64)>,
 }
 
 impl Keyspace {
@@ -139,6 +150,7 @@ impl Keyspace {
             over_limit: false,
             hand_db: 0,
             tiered_va_limit_bytes: TIERED_VA_LIMIT_DEFAULT,
+            pending_displace: Vec::new(),
         };
         // db0 is eager: it serves every connection that never SELECTs.
         let _ = ks.db_mut(0);
@@ -858,6 +870,14 @@ impl Keyspace {
         now: Nanos,
         anchor: WallAnchor,
     ) -> Result<ReplayOutcome, ReplayError> {
+        // Tiered namespaces own their records' replay (ADR-0057 D4,
+        // routed by M4-S26) — intercepted before the CellStore arms
+        // because a tiered namespace also materializes a named CellStore
+        // shell, and applying a tiered record there would build state the
+        // tiered index never serves (invisible until the first restart).
+        if let Some(outcome) = self.apply_record_tiered(rec)? {
+            return Ok(outcome);
+        }
         match *rec {
             LogRecordView::StringPostImage { ns, key, value } => {
                 let Some(store) = self.replay_store(ns) else {
@@ -884,16 +904,16 @@ impl Keyspace {
             // Reserved in M2: the catalog is META-owned; no NsOp records
             // are emitted (ADR-0015 D7).
             LogRecordView::NsOp { .. } => Ok(ReplayOutcome::SkippedReserved),
-            // Tiered-namespace displacement marker (M4-S12, ADR-0057 D4):
-            // pairs with the next mutation in the tiered replay applier
-            // (`TieredTable::apply_displace`). Tiered namespaces are not
-            // routed through this path until command wiring — a marker
-            // reaching a CellStore replay names no CellStore state.
-            LogRecordView::ColdDisplace { .. } => Ok(ReplayOutcome::SkippedReserved),
-            // Out-of-line reference (M4-S17, ADR-0061 D2): a tiered-only
-            // record — memory-mode namespaces have no extents, so the
-            // tiered replay applier (`TieredTable::apply_extent_image`)
-            // owns it and nothing here can apply it.
+            // Every ColdDisplace record resolves in the tiered
+            // pre-dispatch above; this arm exists for exhaustiveness.
+            LogRecordView::ColdDisplace { .. } => {
+                debug_assert!(false, "ColdDisplace is intercepted by apply_record_tiered");
+                Ok(ReplayOutcome::SkippedReserved)
+            }
+            // Out-of-line reference (M4-S17, ADR-0061 D2) naming a
+            // namespace that is not tiered here (dropped, or a foreign
+            // log) — memory-mode namespaces have no extents, so nothing
+            // in a CellStore can apply it.
             LogRecordView::StringExtentRef { .. } => Ok(ReplayOutcome::SkippedReserved),
             // Checkpoint marker (M2-S10, ADR-0016 D3): carries no state —
             // S13's recovery orchestration consumes its LSN, not replay.
@@ -972,6 +992,123 @@ impl Keyspace {
                 }
             }
         }
+    }
+
+    /// The tiered replay arms (ADR-0057 D4 rules 1–3; register bound by
+    /// ADR-0059 D9). Returns `None` when the record is not tiered-routed
+    /// — the caller's CellStore arms own it.
+    ///
+    /// # Errors
+    /// Register overflow, marker adjacency violations, and store space
+    /// refusals — all recovery fail-stop at the caller.
+    fn apply_record_tiered(
+        &mut self,
+        rec: &LogRecordView<'_>,
+    ) -> Result<Option<ReplayOutcome>, ReplayError> {
+        // Strict marker adjacency (ADR-0057 D4: markers stage in the same
+        // frame immediately before their mutation): while the register is
+        // armed, only further markers or the paired mutation — all in the
+        // marker's namespace — are legal.
+        if let Some(&(pending_ns, _)) = self.pending_displace.first() {
+            let legal = match *rec {
+                LogRecordView::ColdDisplace { ns, .. }
+                | LogRecordView::StringPostImage { ns, .. }
+                | LogRecordView::Delete { ns, .. }
+                | LogRecordView::StringExtentRef { ns, .. } => ns == pending_ns,
+                _ => false,
+            };
+            if !legal {
+                return Err(ReplayError::Displacement(
+                    "displacement marker not followed by its paired mutation",
+                ));
+            }
+        }
+        match *rec {
+            LogRecordView::ColdDisplace { ns, old_addr } => {
+                if !self.is_tiered(ns) {
+                    // Dropped namespace or a foreign log: the paired
+                    // mutation skips the same way — no register entry.
+                    return Ok(Some(ReplayOutcome::SkippedUnknownNs));
+                }
+                if self.pending_displace.len() >= DISPLACE_REGISTER_CAP {
+                    return Err(ReplayError::Displacement(
+                        "displacement register overflow (ADR-0059 D9 bounds markers at 4)",
+                    ));
+                }
+                self.pending_displace.push((ns, old_addr));
+                Ok(Some(ReplayOutcome::Applied))
+            }
+            LogRecordView::StringPostImage { ns, key, value } if self.is_tiered(ns) => {
+                let hash = TieredTable::hash_key(key);
+                self.drain_displace(ns, hash)?;
+                let table = self.tiered_store_mut(ns).expect("is_tiered checked");
+                table.apply_image(key, value, hash).map_err(ReplayError::Store)?;
+                Ok(Some(ReplayOutcome::Applied))
+            }
+            LogRecordView::Delete { ns, key } if self.is_tiered(ns) => {
+                let hash = TieredTable::hash_key(key);
+                self.drain_displace(ns, hash)?;
+                let table = self.tiered_store_mut(ns).expect("is_tiered checked");
+                table.apply_delete(key, hash);
+                Ok(Some(ReplayOutcome::Applied))
+            }
+            LogRecordView::StringExtentRef { ns, key, extent_id, offset, len }
+                if self.is_tiered(ns) =>
+            {
+                let hash = TieredTable::hash_key(key);
+                self.drain_displace(ns, hash)?;
+                let table = self.tiered_store_mut(ns).expect("is_tiered checked");
+                table
+                    .apply_extent_image(key, hash, ExtentRef { extent_id, offset, len })
+                    .map_err(ReplayError::Store)?;
+                Ok(Some(ReplayOutcome::Applied))
+            }
+            // Tiered namespaces carry no expiry and no documents in M4
+            // (commands refuse; only a foreign log can contain these) —
+            // skipped so they never build CellStore-shell state.
+            LogRecordView::ExpireAt { ns, .. }
+            | LogRecordView::DocFull { ns, .. }
+            | LogRecordView::DocDelta { ns, .. }
+                if self.is_tiered(ns) =>
+            {
+                Ok(Some(ReplayOutcome::SkippedReserved))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Applies every parked marker with the paired mutation's key hash
+    /// (D4 rule 1): exact `(hash, old_addr)` removal, zero disk reads.
+    fn drain_displace(&mut self, ns: NsId, hash: u64) -> Result<(), ReplayError> {
+        if self.pending_displace.is_empty() {
+            return Ok(());
+        }
+        let pending = core::mem::take(&mut self.pending_displace);
+        let table = self.tiered_store_mut(ns).expect("caller checked tiered");
+        for &(marker_ns, old_addr) in &pending {
+            debug_assert_eq!(marker_ns, ns, "adjacency check pinned the namespace");
+            let Some(addr) = LogicalAddr::from_raw(old_addr) else {
+                return Err(ReplayError::Displacement(
+                    "displacement address exceeds the 48-bit logical space",
+                ));
+            };
+            table.apply_displace(hash, addr);
+        }
+        Ok(())
+    }
+
+    /// Parked displacement markers awaiting their paired mutation — the
+    /// end-of-log check (ADR-0057 D4): recovery fail-stops when this is
+    /// non-zero after the last replayed record.
+    #[must_use]
+    pub fn displace_register_len(&self) -> usize {
+        self.pending_displace.len()
+    }
+
+    /// Whether `ns` names a materialized tiered table on this cell.
+    #[must_use]
+    pub fn is_tiered(&self, ns: NsId) -> bool {
+        self.tiered_stores.iter().any(|(id, _)| *id == ns)
     }
 
     fn replay_store(&mut self, ns: NsId) -> Option<&mut CellStore> {
@@ -1140,6 +1277,9 @@ pub enum ReplayOutcome {
 #[derive(Debug)]
 pub enum ReplayError {
     Store(OpError),
+    /// Displacement-marker stream violation (ADR-0057 D4 pairing /
+    /// ADR-0059 D9 bound) — corrupt or truncated tiered replay input.
+    Displacement(&'static str),
     DocumentUnsupported,
     #[cfg(feature = "doc")]
     InvalidDocument(inf_doc::DocError),

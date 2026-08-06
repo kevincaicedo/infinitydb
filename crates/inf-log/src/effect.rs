@@ -59,6 +59,13 @@ pub enum MutationEffect<'a> {
     /// preceded this effect's existence, so "extent durable before the
     /// referencing ack" holds by construction.
     StringSetExtent { ns: NsId, key: &'a [u8], extent_id: u64, offset: u64, len: u64 },
+    /// Cold-displacement marker (ADR-0057 D4, staged by M4-S26 command
+    /// wiring): names one logical address an un-superseded recovery unit
+    /// may still reference the displaced record by. Staged — one per
+    /// relocation origin, bounded by ADR-0059 D9 — in the same frame
+    /// immediately **before** the displacing mutation's own record;
+    /// replay removes exactly the slot `(mutation key hash, old_addr)`.
+    ColdDisplace { ns: NsId, old_addr: u64 },
 }
 
 impl<'a> MutationEffect<'a> {
@@ -102,6 +109,9 @@ impl<'a> MutationEffect<'a> {
             }
             MutationEffect::StringSetExtent { ns, key, extent_id, offset, len } => {
                 RecordView::StringExtentRef { ns, key, extent_id, offset, len }
+            }
+            MutationEffect::ColdDisplace { ns, old_addr } => {
+                RecordView::ColdDisplace { ns, old_addr }
             }
         }
     }
@@ -152,6 +162,7 @@ mod tests {
                 offset: 0,
                 len: 1 << 30,
             },
+            MutationEffect::ColdDisplace { ns: NsId(5), old_addr: (1 << 48) - 1 },
         ];
         for effect in effects {
             let record = effect.record();
