@@ -212,9 +212,7 @@ impl<F: SegmentFs> TierCell<F> {
         ns: NsId,
         extent_id: u64,
     ) -> std::io::Result<inf_log::blob::ExtentReader<F::File>> {
-        let t = self
-            .ns(ns)
-            .ok_or_else(|| std::io::Error::other("namespace dropped"))?;
+        let t = self.ns(ns).ok_or_else(|| std::io::Error::other("namespace dropped"))?;
         inf_log::blob::open_extent(&self.fs, &t.dir, ExtentId(extent_id), t.io_mode)
     }
 

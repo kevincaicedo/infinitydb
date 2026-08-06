@@ -223,8 +223,13 @@ pub static DECLARED: &[Declared] = &[
         Status::Extension,
         "M1",
         "namespace registry (M2 durability seam; M4-S19 adds SET + the ADR-0062 tiering keys; \
-         M4-S21/ADR-0063 reserves the `DISKFULL` extension error class — tiered-namespace \
-         writes at disk budget or device-full refuse typed, wire-observable at command wiring)",
+         M4-S26 lifts the D8 `USE` refusal — the string family, `SCAN`, and `DBSIZE` serve \
+         tiered namespaces; two extension error classes are live on their writes: `DISKFULL …` \
+         (ADR-0063 — disk budget or device full; new-tier-byte placements only) and \
+         `STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)` \
+         (ADR-0053 D4 — retryable). Deviations on tiered namespaces: no expiry (the `EXPIRE` \
+         family + `SET` expiry options refuse typed; `TTL` = -1 for live keys), non-string \
+         families refuse typed, multi-key ops resolve sequentially",
     ),
     d(
         "INF.CKPT",

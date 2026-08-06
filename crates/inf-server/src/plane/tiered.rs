@@ -453,9 +453,7 @@ async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                         let ext = inf_store::ExtentRef::decode(parts.value);
                         let (version, encoded_len) = (parts.version, parts.encoded_len);
                         return match fetch_extent(shared, ns, ext).await {
-                            Some(value) => {
-                                Resolved::Extent { addr, value, version, encoded_len }
-                            }
+                            Some(value) => Resolved::Extent { addr, value, version, encoded_len },
                             None => Resolved::Fail(ERR_BLOB_READ),
                         };
                     }
@@ -617,8 +615,7 @@ fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         // The failed extent is abandoned (never referenced, id never
         // reused); the orphan sweep reclaims the file (ADR-0061 D3).
         Err(err) => {
-            let reply = if err.to_string().contains("StorageFull")
-                || err.raw_os_error() == Some(28)
+            let reply = if err.to_string().contains("StorageFull") || err.raw_os_error() == Some(28)
             {
                 diskfull_bytes(shared, proto, inf_store::DiskFullCause::Device)
             } else {
