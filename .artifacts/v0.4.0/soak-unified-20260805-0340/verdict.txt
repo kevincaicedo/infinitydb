@@ -1,0 +1,10 @@
+rss slope +0.848%/24h (first-5% median 598456 kB -> last-5% median 603528 kB, 8565 samples)
+tiering disk max 0 bytes (budget 2684354560)
+write-amp milli max 0 (gate < 3000)
+diskfull refusals 0
+docs_live 14224 -> 14240 (document plane live throughout: yes)
+checkpoints completed 0 -> 269355 (delta 269355)
+FAIL (TIER-MECHANICS-ONLY: tiered namespace stands but serves no traffic — M4-S26)
+  discharges: M2.5 stability soak, M3 §7 doc soak
+  does NOT discharge: M4 §7 memory honesty (needs the wired tiered leg)
+  - RSS slope +0.848%/24h >= 0.5%/24h

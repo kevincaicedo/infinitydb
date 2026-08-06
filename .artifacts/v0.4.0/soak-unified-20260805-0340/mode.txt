@@ -1,0 +1,1 @@
+soak-unified: tiered data plane unwired (`ERR tiered namespaces are not command-addressable yet (M4 command wiring)`) — tiered namespace stands but serves no traffic (M4-S26)

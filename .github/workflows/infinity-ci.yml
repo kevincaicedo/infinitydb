@@ -5,7 +5,7 @@
 # `infinitydb/` directory on the runner.
 #
 # Split (2026-07-17): only the two slow jobs were the problem — `miri`
-# (45-min timeout) and the 11-target `fuzz-smoke` (~42 min). Those are
+# (45-min timeout) and the 14-target `fuzz-smoke` (~70 min). Those are
 # REDUCED here (a strict-provenance canary on inf-alloc, and a single 60-s
 # fuzz smoke) and run in FULL in `infinity-ci-full.yml` (label `ci-full` /
 # `/ci-full` comment / dispatch), together with the benchmark compile. Every
@@ -142,7 +142,7 @@ jobs:
   fuzz-smoke:
     # REDUCED: one decoder, 60 s, to catch gross breakage fast. cargo-fuzz
     # auto-creates fuzz/corpus/resp_parse, so no seed dir is needed here. The
-    # full 11-target smoke (300 s each) runs in infinity-ci-full.
+    # full 14-target smoke (300 s each) runs in infinity-ci-full.
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

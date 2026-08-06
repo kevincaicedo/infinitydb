@@ -30,6 +30,12 @@ jobs:
           - { dir: crates/inf-log, target: frame_decode }
           - { dir: crates/inf-log, target: segment_read }
           - { dir: crates/inf-log, target: ick_decode }
+          # M2/M4 on-disk decoders (readiness F2: targets existed, nightly
+          # accrual was not wired — L9 requires the hours, not the file).
+          - { dir: crates/inf-log, target: manifest_decode }
+          - { dir: crates/inf-log, target: extent_decode }
+          # M4-S11 tier-file decoder — the M4 §6 plan requires it nightly.
+          - { dir: crates/inf-log, target: fuzz_tierfile_decode }
           # M3-S01/S02 (gap caught in S05: the S02 ledger recorded this
           # accrual but the matrix was never extended) + M3-S05.
           - { dir: crates/inf-doc, target: idoc_decode }
@@ -40,6 +46,8 @@ jobs:
           # Seeds the pinned child-len-overflow regression (caught by this
           # target at 300 s, fixed same session).
           - { dir: crates/inf-doc, target: path_program, seeds: fuzz/corpora/path_program }
+          # M3 delta-apply decoder (readiness F2).
+          - { dir: crates/inf-doc, target: fuzz_delta_apply }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

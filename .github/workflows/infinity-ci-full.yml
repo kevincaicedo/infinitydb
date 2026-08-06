@@ -148,6 +148,15 @@ jobs:
       - name: fuzz .ick loader (smoke, M2-S10)
         run: cargo +nightly fuzz run ick_decode -- -max_total_time=300
         working-directory: crates/inf-log
+      - name: fuzz manifest decoder (smoke, M2/M4 — readiness F2)
+        run: cargo +nightly fuzz run manifest_decode -- -max_total_time=300
+        working-directory: crates/inf-log
+      - name: fuzz extent decoder (smoke, M4-S17 — readiness F2)
+        run: cargo +nightly fuzz run extent_decode -- -max_total_time=300
+        working-directory: crates/inf-log
+      - name: fuzz tier-file decoder (smoke, M4-S11 — M4 §6 requires nightly accrual)
+        run: cargo +nightly fuzz run fuzz_tierfile_decode -- -max_total_time=300
+        working-directory: crates/inf-log
       - name: fuzz idoc decoder (smoke, M3-S01/S02)
         run: cargo +nightly fuzz run idoc_decode -- -max_total_time=300
         working-directory: crates/inf-doc
@@ -160,6 +169,9 @@ jobs:
         run: |
           mkdir -p fuzz/corpus/path_program
           cargo +nightly fuzz run path_program fuzz/corpus/path_program fuzz/corpora/path_program -- -max_total_time=300
+        working-directory: crates/inf-doc
+      - name: fuzz delta apply (smoke, M3 — readiness F2)
+        run: cargo +nightly fuzz run fuzz_delta_apply -- -max_total_time=300
         working-directory: crates/inf-doc
 
   bench-build:
