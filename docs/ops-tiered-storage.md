@@ -1,11 +1,11 @@
 # Operating tiered storage
 
 > [!WARNING]
-> Tiered storage lands in **`v0.4.0-alpha`** and is under construction:
-> tiered namespaces can be created, configured, and dropped on a live
-> node (M4-S19), but data commands cannot reach them yet — the remaining
-> gaps are marked where they occur rather than describing a system that
-> does not exist. Nothing here
+> Tiered storage lands in **`v0.4.0-alpha`**. The data plane is wired
+> (M4-S26): string-family commands, `SCAN`, and `DBSIZE` serve tiered
+> namespaces over TCP; the remaining gaps (blob writes, expiry) are
+> marked where they occur rather than describing a system that does not
+> exist. Nothing here
 > is a performance claim — measured figures name their box and their tier,
 > and the published numbers live in
 > [`docs/claim-ledger.md`](../../docs/claim-ledger.md).
@@ -97,10 +97,19 @@ A namespace is durable-**tiered** when its `INF.NS CREATE … MODE
 durable` carries `MEM-BUDGET` — tiering is a configuration, not a mode
 (ADR-0062 D1). `INF.NS SET <name> KEY value …` hot-reloads the keys
 marked hot above; `INF.NS INFO <name>` reads the whole block back.
-Until the command wiring lands, `INF.NS USE` of a tiered namespace
-refuses typed — you can create, observe, reconfigure, and drop one, but
-no data command can reach it yet (stated here so nobody debugs a
-"missing" GET).
+`INF.NS USE` selects it for the connection (M4-S26); the string family,
+`SCAN`, and `DBSIZE` serve it. Three deliberate refusals, stated here so
+nobody debugs a "missing" feature: expiry (`SET … EX`, the `EXPIRE`
+family) refuses typed — tiered namespaces carry no TTL wheel in M4;
+values at or above `BLOB-THRESHOLD` refuse until the blob write leg
+lands; and every other command family answers
+`ERR this command is not supported on tiered namespaces in M4`.
+A write that outruns flush progress parks on the tail-stall gate and,
+after `TAIL-STALL-TIMEOUT`, fails typed with `STALLED` — retryable,
+bounded, never a hang. A cold `DEL` fetches and verifies its record
+first (one NVMe read): the reply count is exact and the per-file
+dead-byte accounting stays byte-exact — the TTL wheel and eviction, by
+contrast, never issue cold reads (§3.3).
 
 The memory budget is a bound on **resident** bytes, not live bytes: it
 counts the committed ring window, which is what the operating system
@@ -394,12 +403,12 @@ fsync failure abandons that extent typed.
 
 Named so their absence is visible rather than mysterious:
 
-- **Data commands on tiered namespaces** — `INF.NS CREATE … MEM-BUDGET`
-  creates one on a live node (M4-S19), `INFO tiering` reports it, `SET`
-  reconfigures it, `DROP` tears it down; but `INF.NS USE` refuses typed
-  until the command wiring lands, so no GET/SET can reach it yet — and
-  the `DISKFULL` refusal above becomes wire-observable at the same
-  moment (its byte shape is already pinned by test).
+- **Blob writes over the wire** — values at or above `BLOB-THRESHOLD`
+  refuse typed until the blob write leg of M4-S26 lands (the extent
+  machinery below is built and store-tier proven; the ledger-barrier
+  wiring is the open half).
+- **Expiry on tiered namespaces** — no TTL wheel in M4; the `EXPIRE`
+  family refuses typed and `TTL` answers `-1` for live keys.
 - **The per-file tier capacity knob** — still a construction parameter.
 
 ## Blob extents (M4-S17)
