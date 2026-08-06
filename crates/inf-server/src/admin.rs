@@ -270,7 +270,7 @@ pub(crate) fn info(
         text.push_str("\r\n");
     }
     if wants("tiering") {
-        tiering_section(ks, &mut text);
+        tiering_section(ks, node, &mut text);
     }
     let stats = ks.stats();
     if wants("stats") {
@@ -402,7 +402,7 @@ pub(crate) fn info(
 /// The operator's reading of every field is
 /// `infinitydb/docs/ops-tiered-storage.md` — that chapter and this
 /// function are edited together.
-fn tiering_section(ks: &Keyspace, text: &mut String) {
+fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     let push = |text: &mut String, line: &str| {
         text.push_str(line);
         text.push_str("\r\n");
@@ -411,6 +411,24 @@ fn tiering_section(ks: &Keyspace, text: &mut String) {
     let tiering = ks.tiering_counters();
     push(text, "# Tiering");
     push(text, &format!("tiering_tables:{}", ks.tiered_tables()));
+    // M4-S26 (ADR-0064 D3): the pinned `SPLIT_FIELDS` contract — the
+    // resolver-tagged service percentiles the S22 harness scrapes — plus
+    // the five ADR-0055 cold-read counters. Flushed by the tiered
+    // MAINTAIN; identically zero on nodes with no tiered namespace.
+    let split = node.tiering_split.get();
+    push(text, &format!("tiering_ram_hit_p50_us:{}", split[0]));
+    push(text, &format!("tiering_ram_hit_p99_us:{}", split[1]));
+    push(text, &format!("tiering_ram_hit_p999_us:{}", split[2]));
+    push(text, &format!("tiering_cold_p50_us:{}", split[3]));
+    push(text, &format!("tiering_cold_p99_us:{}", split[4]));
+    push(text, &format!("tiering_cold_p999_us:{}", split[5]));
+    push(text, &format!("cold_read_qd_p99:{}", split[6]));
+    push(text, &format!("coalesce_ratio_milli:{}", split[7]));
+    push(text, &format!("cold_reads_inflight:{}", split[8]));
+    push(text, &format!("cold_queue_depth:{}", split[9]));
+    push(text, &format!("cold_read_p99_us:{}", split[10]));
+    push(text, &format!("cold_reads_issued:{}", split[11]));
+    push(text, &format!("cold_reads_enqueued:{}", split[12]));
     push(text, &format!("tiering_tail_allocs:{}", tiering.tail_allocs));
     push(text, &format!("tiering_seal_holes:{}", tiering.seal_holes));
     push(text, &format!("tiering_seal_hole_bytes:{}", tiering.seal_hole_bytes));

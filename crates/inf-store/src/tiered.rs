@@ -1306,6 +1306,34 @@ impl TieredTable {
         }
     }
 
+    /// One bounded SCAN slice over the index (M4-S26): resize-stable
+    /// home-group enumeration emitting `{hash, addr}` — the plane
+    /// resolves keys (RAM slots directly; cold slots fetch + decode,
+    /// which is what a beyond-RAM enumeration inherently costs).
+    /// Inherits the SCAN guarantee: entries present the whole scan emit
+    /// at least once; mid-scan mutations may duplicate. Returns the
+    /// next cursor (0 = done).
+    pub fn scan_slots(
+        &self,
+        cursor: u64,
+        count: usize,
+        mut emit: impl FnMut(u64, LogicalAddr),
+    ) -> u64 {
+        let mask = self.index.group_count() as u64 - 1;
+        let mut cursor = cursor & mask;
+        let mut emitted = 0usize;
+        loop {
+            self.index.scan_home_group_ext(cursor as usize, |addr, hash| {
+                emit(hash, addr);
+                emitted += 1;
+            });
+            cursor = crate::store::next_rev_cursor(cursor, mask);
+            if cursor == 0 || emitted >= count {
+                return cursor;
+            }
+        }
+    }
+
     // ---- recovery replay appliers (M4-S12, ADR-0057 D4) ----
 
     /// Applies one checkpoint address reference — idempotent by the

@@ -1111,6 +1111,13 @@ impl Keyspace {
         self.tiered_stores.iter().any(|(id, _)| *id == ns)
     }
 
+    /// Shared view of a tiered table (the command layer's lookup path —
+    /// M4-S26; mutation goes through [`tiered_store_mut`](Self::tiered_store_mut)).
+    #[must_use]
+    pub fn tiered_store(&self, ns: NsId) -> Option<&TieredTable> {
+        self.tiered_stores.iter().find(|(id, _)| *id == ns).map(|(_, t)| t.as_ref())
+    }
+
     fn replay_store(&mut self, ns: NsId) -> Option<&mut CellStore> {
         // Defaults never log (memory namespaces have a null log — L2);
         // an id below the named floor in a real log is foreign data.

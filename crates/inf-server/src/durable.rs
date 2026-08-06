@@ -248,6 +248,26 @@ impl<F: SegmentFs> DurableCell<F> {
         self.last_seq
     }
 
+    /// Stage one tiered-namespace effect through the table's accounting
+    /// funnel (M4-S26): [`inf_store::TieredTable::stage_wal`] charges the
+    /// namespace's `wal_bytes` and stamps the extent reclaim epoch —
+    /// exactly what a bare [`stage`](Self::stage) would silently skip.
+    /// Seq and commit-ledger bookkeeping match [`stage`](Self::stage).
+    pub fn stage_tiered(
+        &mut self,
+        table: &mut inf_store::TieredTable,
+        effect: &MutationEffect<'_>,
+        class: FsyncClass,
+    ) -> u64 {
+        assert!(!self.failed, "staging into a failed durable cell");
+        let _at =
+            table.stage_wal(&mut self.staging, effect).expect("admission pre-checked by would_fit");
+        self.commit.note_staged(class);
+        self.records_appended += 1;
+        self.last_seq += 1;
+        self.last_seq
+    }
+
     /// Registers one gated `always` ack (counter only; the waiter itself
     /// is `ack_gate.waiter(seq)` at the dispatch site).
     pub fn note_gated_ack(&mut self) {
