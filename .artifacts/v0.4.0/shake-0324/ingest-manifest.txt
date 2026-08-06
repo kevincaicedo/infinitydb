@@ -1,0 +1,11 @@
+pipe_version = 2
+seed_hex = "0x1D0C2026"
+shape.small-200B = { documents = 2000, serialized_bytes = 400000 }
+shape.gate-1KiB = { documents = 2000, serialized_bytes = 2048000 }
+shape.medium-2KiB = { documents = 1000, serialized_bytes = 2048000 }
+shape.large-64KiB = { documents = 100, serialized_bytes = 6553600 }
+shape.deep-32 = { documents = 2000, serialized_bytes = 1308240 }
+shape.wide-array = { documents = 20, serialized_bytes = 8387288 }
+documents_total = 7120
+serialized_bytes_total = 20745128
+pipe_fnv1a64 = "0a0a428f9c72a2c7"

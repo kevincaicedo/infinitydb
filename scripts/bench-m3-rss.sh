@@ -14,7 +14,7 @@
 set -euo pipefail
 COUNTS="${1:-small-200B=20000,gate-1KiB=20000,medium-2KiB=10000,large-64KiB=1000,deep-32=20000,wide-array=200}"
 LABEL="${2:-mixed}"
-OUT="${3:-.artifacts/m3/rss-$(date +%Y%m%d-%H%M)/$LABEL}"
+OUT="${3:-.artifacts/m3/rss-$(date +%Y%m%d-%H%M%S)/$LABEL}"
 PORT_INF="${PORT_INF:-6401}"
 PORT_STACK="${PORT_STACK:-6402}"
 SEED=0x1D0C2026

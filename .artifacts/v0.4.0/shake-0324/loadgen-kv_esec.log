@@ -1,0 +1,11 @@
+ops = 159439113
+errors = 113205
+elapsed_s = 300.000
+ops_per_sec = 531463
+p50_us = 175
+p99_us = 863
+p999_us = 6143
+p9999_us = 18943
+max_us = 1688662
+inf-bench: 113205 error replies under load
+inf-bench: server closed connection under load
