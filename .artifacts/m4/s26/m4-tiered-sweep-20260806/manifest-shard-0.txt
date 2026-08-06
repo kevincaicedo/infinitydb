@@ -1,0 +1,1 @@
+scenario=m4-tiered base_seed=0x5eed0000 sweep=200 shard=0/1 seeds_run=200 violations=0 refused=0 commands=871914 keys_audited=28602 flushed_pre_cut=50407430 cold_resolves=22583 blob_sets=87412 diskfull_refusals=200 drop_values=707 drop_other=5293

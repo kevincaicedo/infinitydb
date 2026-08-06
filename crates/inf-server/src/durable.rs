@@ -319,6 +319,17 @@ impl<F: SegmentFs> DurableCell<F> {
             return;
         }
         if self.staging.can_seal() {
+            // ADR-0061 D3 (amended 2026-08-06): a pending extent-seal
+            // barrier holds this frame. The staged frame may carry the
+            // barrier's referencing record, and a durable record naming
+            // torn extent bytes replays as a dangling reference — the
+            // ledger barrier fences the ack, never the device order.
+            // The barrier's fdatasync rode this iteration's MAINTAIN
+            // push, so the hold is one device sync; the frame waits
+            // exactly like the ENOSPC branch below.
+            if self.commit.extent_barrier_pending() {
+                return;
+            }
             let frame_len = self.staging.pending_frame_len();
             let deferred = match self.rotor.begin_frame_deferred(frame_len, cx.now.as_millis()) {
                 Ok(deferred) => deferred,

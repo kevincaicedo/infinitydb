@@ -1,0 +1,4 @@
+m4-tiered 200-seed dev-box sweep, post frame-gate fix (2026-08-06).
+Pre-fix run (same base seed 0x5EED0000) violated on 0x5eed000c + 0x5eed003a
+(dangling blob extent reference after cut - see ADR-0061 amendment).
+Both replay green post-fix, determinism-verified.
