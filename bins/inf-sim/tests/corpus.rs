@@ -3,8 +3,9 @@
 //! at full scenario size via the CLI.
 
 use inf_sim::{
-    BootStormScenario, CombinedScenario, DurableScenario, Scenario, run_boot_storm_scenario,
-    run_combined_scenario, run_durable_scenario, run_scenario,
+    BootStormScenario, CombinedScenario, DurableScenario, Scenario, TieredScenario,
+    run_boot_storm_scenario, run_combined_scenario, run_durable_scenario, run_scenario,
+    run_tiered_scenario,
 };
 
 fn parse_seed(text: &str) -> u64 {
@@ -48,6 +49,20 @@ fn corpus_seeds_replay_green() {
         // combined L2/pub-sub oracles; the boot-storm ready-path oracle).
         if name == "m2-combined" {
             let report = run_combined_scenario(&CombinedScenario::m2_combined(seed));
+            assert!(
+                report.ok(),
+                "corpus seed {line} regressed: stalled={} violations={:?}",
+                report.stalled,
+                report.violations
+            );
+            ran += 1;
+            continue;
+        }
+        // M4-S26: the command-driven tiered node (its own runner — the
+        // §8.2 command audit, flush liveness, DISKFULL, drop race). A
+        // legal ADR-0018 taxonomy refusal ends the run early and ok().
+        if name == "m4-tiered" {
+            let report = run_tiered_scenario(&TieredScenario::m4_tiered(seed));
             assert!(
                 report.ok(),
                 "corpus seed {line} regressed: stalled={} violations={:?}",

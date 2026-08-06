@@ -128,6 +128,31 @@ jobs:
           done
           exit $fail
 
+      - name: tiered command sweep (M4-S26 — the wired data plane under power cuts, drop races, DISKFULL)
+        run: |
+          base=$(( ${{ github.run_id }} % 0xFFFFFFFF ))
+          echo "tiered sweep seed base: $base" | tee -a /tmp/fleet.log
+          # 4,000 m4-tiered seeds nightly (~0.2 s/seed): the command-driven
+          # tiered node — RESP through the sim net against the wired plane,
+          # seeded cut → recovery → §8.2 command audit → re-pressure flush
+          # liveness → DISKFULL clamp/reopen → the S19 drop race. The
+          # manifest discloses demotion/cold/blob/refusal coverage.
+          for i in 0 1 2 3 4 5 6 7; do
+            ./target/release/inf-sim --scenario m4-tiered --sweep 4000 --seed "$base" \
+              --shard "$i/8" --out /tmp/tiered-sweep >> /tmp/fleet.log 2>&1 &
+          done
+          wait
+          fail=0
+          for i in 0 1 2 3 4 5 6 7; do
+            grep -q " violations=0 " /tmp/tiered-sweep/manifest-shard-$i.txt || {
+              echo "tiered sweep shard $i has violations" | tee -a /tmp/fleet.log
+              grep VIOLATION /tmp/tiered-sweep/results-shard-$i.txt | head -5 >> /tmp/failures.txt || true
+              fail=1
+            }
+          done
+          cat /tmp/tiered-sweep/manifest-shard-*.txt | tee -a /tmp/fleet.log
+          exit $fail
+
       - name: corpus replay (full size)
         run: |
           grep -v '^#' bins/inf-sim/seeds/corpus.txt | grep -v '^$' | \
