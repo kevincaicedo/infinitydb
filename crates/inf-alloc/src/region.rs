@@ -21,6 +21,16 @@
 //! mprotect/madvise — the arena precedent); the commit bitmap and every
 //! bounds/state assert run identically, so Miri still checks the API
 //! contract and slice provenance.
+//!
+//! When the host page exceeds the region page (16 KiB Apple Silicon vs
+//! the 4 KiB test geometry), the syscall range is rounded to host pages:
+//! commit widens to the enclosing host-page envelope, decommit shrinks to
+//! the fully-covered host pages (partially-covered edges stay resident
+//! and writable). The commit bitmap remains the logical authority for
+//! every assert; only the MMU fault guard and RSS return are conservative
+//! on such hosts — a dev-tier concession, RSS honesty is gated on Linux
+//! (ADR-0052 D3), where host pages divide every region page and the
+//! rounding is the identity.
 
 use core::fmt;
 
@@ -233,12 +243,33 @@ fn map_reservation(len: usize) -> Option<*mut u8> {
     Some(base.cast())
 }
 
+/// Host page size. mprotect/madvise demand host-page alignment; region
+/// pages may be smaller than the host page (4 KiB test geometry on a
+/// 16 KiB Apple Silicon host), so the syscall helpers round to it.
+#[cfg(not(miri))]
+fn host_page_bytes() -> usize {
+    // SAFETY: sysconf has no preconditions; the result is checked.
+    let sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    assert!(sz > 0, "sysconf(_SC_PAGESIZE) failed");
+    let sz = sz as usize;
+    assert!(sz.is_power_of_two(), "host page size {sz} not a power of two");
+    sz
+}
+
 #[cfg(not(miri))]
 fn protect_read_write(base: *mut u8, offset: usize, len: usize) {
-    // SAFETY: [offset, offset+len) is page-aligned and inside the live
-    // reservation (asserted by the caller against the page bitmap).
-    let rc =
-        unsafe { libc::mprotect(base.add(offset).cast(), len, libc::PROT_READ | libc::PROT_WRITE) };
+    // Widen to the enclosing host-page envelope: re-protecting the edge
+    // bytes of a neighboring region page READ|WRITE is idempotent, and
+    // the commit bitmap — not the MMU — is the double-commit authority.
+    let host = host_page_bytes();
+    let start = offset & !(host - 1);
+    let end = (offset + len).div_ceil(host) * host;
+    // SAFETY: [start, end) is host-page-aligned and inside the live
+    // reservation's mapping (offset+len is caller-asserted against the
+    // page bitmap; mmap lengths round up to host pages).
+    let rc = unsafe {
+        libc::mprotect(base.add(start).cast(), end - start, libc::PROT_READ | libc::PROT_WRITE)
+    };
     assert!(rc == 0, "mprotect(commit) failed: {}", std::io::Error::last_os_error());
 }
 
@@ -254,13 +285,25 @@ fn release_and_protect_none(base: *mut u8, offset: usize, len: usize) {
     const ADVICE: libc::c_int = libc::MADV_DONTNEED;
     #[cfg(not(target_os = "linux"))]
     const ADVICE: libc::c_int = libc::MADV_FREE;
-    // SAFETY: page-aligned range inside the live reservation (caller-
-    // asserted); DONTNEED/FREE on private anonymous memory discards
-    // committed pages, which is exactly the contract of decommit.
-    let rc = unsafe { libc::madvise(base.add(offset).cast(), len, ADVICE) };
+    // Shrink to the fully-covered host pages: a host page shared with a
+    // still-committed neighbor must stay resident and writable. When the
+    // range covers no whole host page the decommit is bookkeeping only
+    // (dev-tier hosts; on Linux gates region pages are host multiples
+    // and start/end are exactly offset/offset+len).
+    let host = host_page_bytes();
+    let start = offset.div_ceil(host) * host;
+    let end = (offset + len) & !(host - 1);
+    if start >= end {
+        return;
+    }
+    // SAFETY: host-page-aligned range inside the live reservation
+    // (caller-asserted); DONTNEED/FREE on private anonymous memory
+    // discards committed pages, which is exactly the contract of
+    // decommit.
+    let rc = unsafe { libc::madvise(base.add(start).cast(), end - start, ADVICE) };
     assert!(rc == 0, "madvise(decommit) failed: {}", std::io::Error::last_os_error());
     // SAFETY: same range; PROT_NONE makes access fault until recommit.
-    let rc = unsafe { libc::mprotect(base.add(offset).cast(), len, libc::PROT_NONE) };
+    let rc = unsafe { libc::mprotect(base.add(start).cast(), end - start, libc::PROT_NONE) };
     assert!(rc == 0, "mprotect(decommit) failed: {}", std::io::Error::last_os_error());
 }
 
@@ -309,6 +352,22 @@ mod tests {
         // Fresh pages read as zero on Linux after DONTNEED; under Miri the
         // pages were never dropped. Either way the API allows access again.
         let _ = region.bytes(0, 2 * 4096);
+    }
+
+    #[test]
+    fn commit_decommit_at_host_page_interior_offsets() {
+        // 4 KiB region pages on a 16 KiB-page host (Apple Silicon) put
+        // these offsets inside a host page; the syscall envelope rounds
+        // instead of returning EINVAL (the macos-15 crash-matrix
+        // failure). On 4 KiB hosts this is the exact-range path.
+        let mut region = small();
+        region.commit_pages(1, 3);
+        region.bytes_mut(4096, 3 * 4096).fill(0xCD);
+        region.decommit_pages(1, 1);
+        region.decommit_pages(2, 2);
+        assert_eq!(region.report().committed_bytes, 0);
+        region.commit_pages(0, 16);
+        assert_eq!(region.bytes(0, 1 << 16).len(), 1 << 16);
     }
 
     #[test]

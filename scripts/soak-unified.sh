@@ -184,6 +184,7 @@ sample_line() {
   awk -F: -v ts="$(date +%s)" -v rss="$rss" '
     $1 == "docs_live"                   { if ($2 + 0 > docs) docs = $2 + 0 }
     $1 == "doc_resident_bytes"          { if ($2 + 0 > dres) dres = $2 + 0 }
+    $1 == "used_memory"                 { if ($2 + 0 > um)   um   = $2 + 0 }
     $1 == "tiering_disk_used_bytes"     { disk += $2 }
     $1 == "tiering_write_amp_milli_max" { if ($2 + 0 > wam) wam = $2 + 0 }
     $1 == "tiering_diskfull_refusals"   { ref  += $2 }
@@ -192,9 +193,9 @@ sample_line() {
     $1 == "log_segments_live"           { segs += $2 }
     $1 == "raw_submits"                 { subs += $2 }
     $1 == "raw_sqes"                    { sqes += $2 }
-    END { printf "%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%.1f\n",
+    END { printf "%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%.1f,%d\n",
           ts, rss, docs, dres, disk, wam, ref, ck, mf, segs,
-          (subs > 0 ? sqes / subs : 0) }
+          (subs > 0 ? sqes / subs : 0), int(um / 1024) }
   ' <<<"$info"
 }
 
@@ -205,7 +206,11 @@ alert() {
 }
 
 (
-  echo "unix_s,vmrss_kb,docs_live,doc_resident_bytes,disk_used_bytes,wa_milli_max,diskfull_refusals,ckpts,manifests,segs_live,sqes_per_submit" >"$OUT/samples.csv"
+  # used_memory_kb (accounted, node-wide fold — max across cells like
+  # docs_live) trails so no positional consumer shifts. It exists so a
+  # failing RSS slope decomposes into accounted vs unaccounted growth
+  # (the 20260805 FAIL could not be attributed without it — readiness F9).
+  echo "unix_s,vmrss_kb,docs_live,doc_resident_bytes,disk_used_bytes,wa_milli_max,diskfull_refusals,ckpts,manifests,segs_live,sqes_per_submit,used_memory_kb" >"$OUT/samples.csv"
   : >"$OUT/alerts.log"
   n=0
   while kill -0 $SERVER_PID 2>/dev/null && [ $n -lt $MAX_SAMPLES ]; do
@@ -326,6 +331,15 @@ else:
     print(f"rss slope {slope:+.3f}%/24h (first-5% median {first} kB -> last-5% median {last} kB, {len(rows)} samples)")
     if slope >= 0.5:
         fails.append(f"RSS slope {slope:+.3f}%/24h >= 0.5%/24h")
+    # Diagnostic only (readiness F9) — accounted-memory slope beside the
+    # RSS gate, so a failing slope decomposes into accounted growth
+    # (data structures / high-water) vs unaccounted (leak). Older CSVs
+    # lack the column; the gate above is unchanged either way.
+    if "used_memory_kb" in rows[0] and int(rows[-1]["used_memory_kb"]) > 0:
+        um_first = med([int(r["used_memory_kb"]) for r in rows[:k]])
+        um_last = med([int(r["used_memory_kb"]) for r in rows[-k:]])
+        um_slope = (um_last - um_first) / max(um_first, 1) * 100 / (hours / 24)
+        print(f"accounted slope {um_slope:+.3f}%/24h (used_memory first-5% median {um_first} kB -> last-5% {um_last} kB; diagnostic, not a gate)")
     disk_max = max(int(r["disk_used_bytes"]) for r in rows)
     print(f"tiering disk max {disk_max} bytes (budget {budget})")
     if disk_max > budget:
