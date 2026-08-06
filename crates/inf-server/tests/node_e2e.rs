@@ -1307,16 +1307,8 @@ fn drop_races_inflight_cold_reads() {
     let dir = temp_data_dir("tiered-drop-race");
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[
-        b"INF.NS",
-        b"CREATE",
-        b"r",
-        b"MODE",
-        b"durable",
-        b"MEM-BUDGET",
-        b"3mb",
-    ]))
-    .expect("write");
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"r", b"MODE", b"durable", b"MEM-BUDGET", b"3mb"]))
+        .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"r"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
