@@ -147,6 +147,12 @@ pub struct TierFlush<F: SegmentFs> {
     /// zero: the counter is per boot life, exactly like every other
     /// tiering counter (§3.1 "addresses are per-life").
     sealed_device_bytes: u64,
+    /// Open handles of files sealed since the last
+    /// [`take_sealed_handles`](Self::take_sealed_handles) — the plane's
+    /// cold-read table drains these each MAINTAIN so cold reads reuse
+    /// the creation-mode fd instead of reopening (ADR-0054; M4-S26).
+    /// Undrained handles simply close when the pipeline drops.
+    sealed_handles: Vec<(u32, F::File)>,
 }
 
 impl<F: SegmentFs> TierFlush<F> {
@@ -193,7 +199,23 @@ impl<F: SegmentFs> TierFlush<F> {
             sealed,
             active_id: 0,
             sealed_device_bytes: 0,
+            sealed_handles: Vec::new(),
         }
+    }
+
+    /// Drains the open handles of files sealed since the last drain
+    /// (M4-S26): the caller owns them from here — the plane parks them
+    /// in its cold-read file table; dropping one closes the fd.
+    pub fn take_sealed_handles(&mut self) -> Vec<(u32, F::File)> {
+        core::mem::take(&mut self.sealed_handles)
+    }
+
+    /// The active file's raw fd, when one is open and the tier has real
+    /// fds — the cold-read path for addresses already released beneath
+    /// `flushed` inside the active file (M4-S26).
+    #[must_use]
+    pub fn active_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.writer.as_ref().and_then(TierWriter::raw_fd)
     }
 
     /// The per-slice byte budget (the drive loop's bound).
@@ -407,8 +429,10 @@ impl<F: SegmentFs> TierFlush<F> {
         let writer = self.writer.take().expect("caller checked an active file exists");
         let base = writer.base();
         let path_hint = writer.path().to_path_buf();
-        let sealed = writer.seal(reason).map_err(|failure| classify(failure, path_hint))?;
+        let (sealed, handle) =
+            writer.seal(reason).map_err(|failure| classify(failure, path_hint))?;
         self.sealed_device_bytes += sealed.device_bytes;
+        self.sealed_handles.push((self.active_id, handle));
         self.sealed.push(TierFileMeta {
             id: self.active_id,
             base,
@@ -543,6 +567,24 @@ mod tests {
         flush.append_range(LogicalAddr::ZERO, &[0x11; 64]).expect("append");
         let skip = LogicalAddr::from_raw(1000).expect("fits");
         let _ = flush.append_range(skip, &[0x22; 64]);
+    }
+
+    /// Seals hand their open file handles to the cold-read table
+    /// (M4-S26): one handle per seal, drained exactly once, ids matching
+    /// the sealed catalog in seal order.
+    #[test]
+    fn sealed_handles_drain_once_in_seal_order() {
+        let fs = MemFs::new();
+        let mut flush = pipeline(&fs, 1000);
+        flush.append_range(LogicalAddr::ZERO, &[0xA0; 600]).expect("append");
+        let a1 = LogicalAddr::ZERO.advanced(600).expect("fits");
+        flush.append_range(a1, &[0xA1; 600]).expect("append"); // capacity seal of file 0
+        flush.seal_for_gap().expect("gap seal of file 1");
+        let handles = flush.take_sealed_handles();
+        let ids: Vec<u32> = handles.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0, 1], "one handle per seal, in seal order");
+        assert!(flush.take_sealed_handles().is_empty(), "drained exactly once");
+        assert!(flush.active_raw_fd().is_none(), "no active file after a gap seal");
     }
 
     /// The fatal fsync class classifies as `Fsync` (§8.4) and
