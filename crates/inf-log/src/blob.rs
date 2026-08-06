@@ -380,6 +380,41 @@ impl<F: SegmentFs> ExtentWriter<F> {
         })
     }
 
+    /// [`finish`](Self::finish) with the fdatasync deferred to the
+    /// commit ledger (M4-S26 realizing ADR-0061 D3): writes the tail
+    /// frame and returns the durability token **plus the open handle**.
+    /// The caller MUST register the handle as a coverage-neutral ledger
+    /// barrier (`GroupCommit::register_extent_barrier`) before staging
+    /// the referencing record, in one synchronous block — the
+    /// done-prefix rule then fences the referencing ack behind the
+    /// extent's fdatasync, and a barrier failure freezes the durable
+    /// plane (`on_fsync_error` — the ADR's failure half).
+    ///
+    /// # Errors
+    /// Write failures (the fdatasync itself rides the driver).
+    pub fn finish_deferred(mut self) -> Result<(SealedExtent, F::File), ExtentWriteFailure> {
+        assert_eq!(self.written, self.data_len, "an extent finishes at its declared length");
+        self.flush_batch().map_err(ExtentWriteFailure::Write)?;
+        if self.tail_fill > 0 {
+            let frame_index = (self.written - 1) / TIER_FRAME_DATA as u64;
+            let offset = extent_frame_offset(frame_index);
+            let frame = self.staging.frame_mut();
+            frame.fill(0);
+            frame[..self.tail_fill].copy_from_slice(&self.tail[..self.tail_fill]);
+            let crc = crc32c(&frame[..TIER_FRAME_DATA]);
+            frame[TIER_FRAME_DATA..].copy_from_slice(&crc.to_le_bytes());
+            device_write(&mut self.file, offset, frame).map_err(ExtentWriteFailure::Write)?;
+            self.device_bytes += TIER_FRAME_BYTES as u64;
+        }
+        let sealed = SealedExtent {
+            ns: self.ns,
+            extent_id: self.extent_id,
+            data_len: self.data_len,
+            device_bytes: self.device_bytes,
+        };
+        Ok((sealed, self.file))
+    }
+
     /// Bytes handed to the device so far (header + frames) — the
     /// `blob_bytes` accounting input (ADR-0061 D8).
     #[must_use]
@@ -549,6 +584,14 @@ impl<File: SegmentFile> ExtentReader<File> {
     /// happens at [`read`](Self::read) bounds).
     pub fn new(file: File, data_len: u64) -> ExtentReader<File> {
         ExtentReader { file, data_len, window: Vec::new() }
+    }
+
+    /// The underlying raw fd, when the tier has real fds — the plane's
+    /// async blob-read path targets it with `IoOp::TierRead` while this
+    /// reader (held across the await) keeps the handle open (M4-S26).
+    #[must_use]
+    pub fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.file.raw_fd()
     }
 
     /// Reads `[offset, offset + len)` of the value into `out`

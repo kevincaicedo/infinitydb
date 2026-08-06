@@ -1051,7 +1051,7 @@ fn advance_pass(cursor: &mut u64, tier_pass: &mut u8, next: u64) {
 
 // ---- ticket ↔ token packing (plane-side detail; inf-log never sees tokens) --
 
-fn fsync_token(ticket: FsyncTicket) -> CompletionToken {
+pub(crate) fn fsync_token(ticket: FsyncTicket) -> CompletionToken {
     let raw = ticket.as_u64();
     assert!(raw < 1 << 56, "ticket fits slot+gen");
     CompletionToken::new(TokenClass::Fsync, (raw & 0xFF_FFFF) as u32, (raw >> 24) as u32)

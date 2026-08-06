@@ -96,6 +96,11 @@ pub enum SyncReason {
     /// into the new segment are fenced behind its directory entry being
     /// durable — without a blocking sync_dir on the reactor.
     PreallocBarrier,
+    /// Blob-extent seal barrier (M4-S17/S26, ADR-0061 D3): the extent's
+    /// fdatasync registered **before** the referencing frame's linked
+    /// fsync — the done-prefix watermark rule then fences the ack
+    /// mechanically; `on_fsync_error`'s freeze covers the failure half.
+    ExtentSeal,
 }
 
 /// Ledger key for one submitted fsync. The plane maps tickets onto
@@ -148,6 +153,10 @@ enum HeldHandle<File> {
     /// Boot-barrier directory handle (M2.5-S01): the fd the barrier
     /// fdatasync targets must stay open until its `Synced` arrives.
     Dir(File),
+    /// Sealed blob extent's file handle (ADR-0061 D3): held open until
+    /// the barrier's `Synced` — the token was constructed deferred, so
+    /// this fdatasync is the extent's durability act.
+    Extent(File),
 }
 
 struct PendingFsync<File> {
@@ -399,6 +408,31 @@ impl<File: SegmentFile> GroupCommit<File> {
             now,
             SyncReason::PreallocBarrier,
             HeldHandle::Dir(dir),
+        )
+    }
+
+    /// Registers a sealed blob extent's fdatasync as a coverage-neutral
+    /// ledger barrier (M4-S26 realizing ADR-0061 D3): call **before**
+    /// staging the referencing record, so this barrier's ledger position
+    /// precedes the frame's linked fsync and the done-prefix rule fences
+    /// the referencing ack behind extent durability. The handle stays
+    /// held until the `Synced` completion.
+    pub fn register_extent_barrier(&mut self, extent: File, now: Nanos) -> FsyncTicket {
+        let (covers_up_to, covers_bytes) = self.pending.back().map_or_else(
+            || {
+                (
+                    self.durable_up_to.unwrap_or(Lsn::new(crate::lsn::SegmentId(0), 0)),
+                    self.durable_bytes,
+                )
+            },
+            |tail| (tail.covers_up_to, tail.covers_bytes),
+        );
+        self.push_pending(
+            covers_up_to,
+            covers_bytes,
+            now,
+            SyncReason::ExtentSeal,
+            HeldHandle::Extent(extent),
         )
     }
 

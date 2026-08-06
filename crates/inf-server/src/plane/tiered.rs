@@ -37,8 +37,8 @@ const ERR_COLD_BUSY: &str = "BUSY cold-read queue saturated, try again";
 const ERR_STALLED: &str =
     "STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)";
 const ERR_FAILED: &str = "ERR durable plane failed (fail-stop)";
-const ERR_BLOB_PENDING: &str =
-    "ERR value meets BLOB-THRESHOLD; the blob path is not wired yet (M4-S26)";
+const ERR_BLOB_READ: &str = "ERR blob extent read failed (tier I/O error)";
+const ERR_TOO_LARGE: &str = "ERR value exceeds BLOB-MAX for this namespace";
 const ERR_OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
 
 /// Outcome of one tiered command.
@@ -62,6 +62,24 @@ enum Resolved {
     Cold {
         addr: LogicalAddr,
         value: Vec<u8>,
+        version: u32,
+        encoded_len: usize,
+    },
+    /// Blob-resident record: the value fetched from its extent (M4-S17
+    /// wired by M4-S26). `encoded_len` is the 24-byte-reference record's
+    /// length — the displacement/accounting unit, never the value's.
+    Extent {
+        addr: LogicalAddr,
+        value: Vec<u8>,
+        version: u32,
+        encoded_len: usize,
+    },
+    /// Intermediate: a cold-fetched, key-verified extent record whose
+    /// value fetch still has to run (the decode happens inside a borrow;
+    /// the fetch awaits after it).
+    ColdExtent {
+        addr: LogicalAddr,
+        ext: inf_store::ExtentRef,
         version: u32,
         encoded_len: usize,
     },
@@ -268,7 +286,29 @@ async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let mut replans: u8 = 0;
     'attempt: loop {
         let plan = match probe(shared, ns, key, hash, &exclude, 0, TieredTable::RECORD_HEADER_LEN) {
-            Probe::Ram(addr) => return Resolved::Ram(addr),
+            Probe::Ram(addr) => {
+                // Blob-resident RAM records carry a 24-byte reference —
+                // fetch the value from the extent (chunked async reads).
+                let ext = {
+                    let ks = shared.store.borrow();
+                    let table = ks.tiered_store(ns).expect("resolved on this table");
+                    let parts = table.record(addr);
+                    (parts.type_tag == inf_store::TypeTag::StringExtent).then(|| {
+                        (
+                            inf_store::ExtentRef::decode(parts.value),
+                            parts.version,
+                            parts.encoded_len,
+                        )
+                    })
+                };
+                let Some((ext, version, encoded_len)) = ext else {
+                    return Resolved::Ram(addr);
+                };
+                return match fetch_extent(shared, ns, ext).await {
+                    Some(value) => Resolved::Extent { addr, value, version, encoded_len },
+                    None => Resolved::Fail(ERR_BLOB_READ),
+                };
+            }
             Probe::Miss => return Resolved::Miss,
             Probe::Fail("__replan") => {
                 replans += 1;
@@ -322,12 +362,21 @@ async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                         }
                         let parts = TieredTable::decode_record(&record);
                         if parts.key == key {
-                            After::Serve(Resolved::Cold {
-                                addr,
-                                value: parts.value.to_vec(),
-                                version: parts.version,
-                                encoded_len: parts.encoded_len,
-                            })
+                            if parts.type_tag == inf_store::TypeTag::StringExtent {
+                                After::Serve(Resolved::ColdExtent {
+                                    addr,
+                                    ext: inf_store::ExtentRef::decode(parts.value),
+                                    version: parts.version,
+                                    encoded_len: parts.encoded_len,
+                                })
+                            } else {
+                                After::Serve(Resolved::Cold {
+                                    addr,
+                                    value: parts.value.to_vec(),
+                                    version: parts.version,
+                                    encoded_len: parts.encoded_len,
+                                })
+                            }
                         } else {
                             After::Retry
                         }
@@ -344,6 +393,12 @@ async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         };
         drop(done); // custody home before any further await
         match after {
+            After::Serve(Resolved::ColdExtent { addr, ext, version, encoded_len }) => {
+                return match fetch_extent(shared, ns, ext).await {
+                    Some(value) => Resolved::Extent { addr, value, version, encoded_len },
+                    None => Resolved::Fail(ERR_BLOB_READ),
+                };
+            }
             After::Serve(resolved) => return resolved,
             After::Retry => {
                 if !exclude.contains(&addr) {
@@ -394,6 +449,16 @@ async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 }
                 let parts = TieredTable::decode_record(&assembled);
                 if parts.key == key {
+                    if parts.type_tag == inf_store::TypeTag::StringExtent {
+                        let ext = inf_store::ExtentRef::decode(parts.value);
+                        let (version, encoded_len) = (parts.version, parts.encoded_len);
+                        return match fetch_extent(shared, ns, ext).await {
+                            Some(value) => {
+                                Resolved::Extent { addr, value, version, encoded_len }
+                            }
+                            None => Resolved::Fail(ERR_BLOB_READ),
+                        };
+                    }
                     return Resolved::Cold {
                         addr,
                         value: parts.value.to_vec(),
@@ -411,13 +476,6 @@ async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 }
 
 // ---- the write funnel ----
-
-/// Worst-case staged bytes for one displacing mutation: the ADR-0059 D9
-/// origin markers (≤ 3) + the current-address marker + the post-image.
-fn worst_staged_bytes(ns: NsId, key: &[u8], value: &[u8]) -> usize {
-    let marker = MutationEffect::ColdDisplace { ns, old_addr: (1u64 << 48) - 1 }.encoded_len();
-    4 * marker + MutationEffect::StringSet { ns, key, value }.encoded_len()
-}
 
 /// One synchronous write attempt: admission → apply → take origins →
 /// stage markers-then-record (ADR-0057 D4 order). Returns the staged
@@ -442,9 +500,6 @@ fn try_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     if cell.failed {
         return Err(WriteBlock::Reply(error_bytes(shared, proto, ERR_FAILED)));
     }
-    if !cell.would_fit(worst_staged_bytes(ns, key, value)) {
-        return Err(WriteBlock::StagingFull);
-    }
     let Some(table) = ks.tiered_store_mut(ns) else {
         return Err(WriteBlock::Reply(error_bytes(
             shared,
@@ -452,17 +507,36 @@ fn try_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             "ERR the selected namespace was dropped (INF.NS USE again)",
         )));
     };
-    // Blob routing (ADR-0061): the threshold is a plane decision; the
-    // store refuses misrouted values typed. The blob leg is not wired
-    // yet — refuse loudly (behind the D8 refusal either way).
-    if value.len() >= table.blob_config().threshold_bytes as usize {
-        return Err(WriteBlock::Reply(error_bytes(shared, proto, ERR_BLOB_PENDING)));
+    // Blob routing (ADR-0061 D1): the threshold is a plane decision; the
+    // store refuses misrouted values typed.
+    let blob = value.len() >= table.blob_config().threshold_bytes as usize;
+    if blob && value.len() as u64 > table.blob_config().max_bytes {
+        return Err(WriteBlock::Reply(error_bytes(shared, proto, ERR_TOO_LARGE)));
+    }
+    // Admission worst-fit: the staged record for a blob write is the
+    // 24-byte reference, never the value bytes.
+    let staged_len = if blob {
+        MutationEffect::StringSetExtent { ns, key, extent_id: u64::MAX, offset: 0, len: u64::MAX }
+            .encoded_len()
+    } else {
+        MutationEffect::StringSet { ns, key, value }.encoded_len()
+    };
+    let marker = MutationEffect::ColdDisplace { ns, old_addr: (1u64 << 48) - 1 }.encoded_len();
+    if !cell.would_fit(4 * marker + staged_len) {
+        return Err(WriteBlock::StagingFull);
     }
     // ADR-0063 D2: admission consults the cached verdict before any
-    // new-byte placement reaches `stage_wal`.
+    // new-byte placement reaches `stage_wal` — and before
+    // `ExtentWriter::create`, so a full device is never probed with a
+    // doomed file creation per blob attempt.
     if let Some(cause) = table.disk_full() {
         return Err(WriteBlock::Reply(diskfull_bytes(shared, proto, cause)));
     }
+    let class = class.expect("tiered namespaces always carry a durability class");
+    if blob {
+        return write_blob(shared, ns, class, key, hash, value, old, proto, &mut ks, cell);
+    }
+    let table = ks.tiered_store_mut(ns).expect("resolved above");
     let applied = match old {
         None => table.insert(key, value, hash),
         Some((addr, len, version)) => table.update(key, value, hash, addr, len, version),
@@ -470,7 +544,20 @@ fn try_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     if let Err(err) = applied {
         return Err(write_block_of(shared, table, key, value, err, proto));
     }
-    let class = class.expect("tiered namespaces always carry a durability class");
+    stage_displacements(cell, table, ns, hash, old, class);
+    Ok(cell.stage_tiered(table, &MutationEffect::StringSet { ns, key, value }, class))
+}
+
+/// Stages the ADR-0059 D9 origin markers + the ADR-0057 D4 current-
+/// address marker, in that order, ahead of the mutation record.
+fn stage_displacements<F: SegmentFs>(
+    cell: &mut DurableCell<F>,
+    table: &mut TieredTable,
+    ns: NsId,
+    hash: u64,
+    old: Displaced,
+    class: FsyncClass,
+) {
     if let Some((addr, _, _)) = old {
         for (origin_addr, _stamp) in table.take_displacement_origins(hash, addr) {
             let marker = MutationEffect::ColdDisplace { ns, old_addr: origin_addr };
@@ -479,7 +566,94 @@ fn try_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         let marker = MutationEffect::ColdDisplace { ns, old_addr: addr.to_raw() };
         let _ = cell.stage_tiered(table, &marker, class);
     }
-    Ok(cell.stage_tiered(table, &MutationEffect::StringSet { ns, key, value }, class))
+}
+
+/// The blob write path (M4-S17 wired by M4-S26): extent create + chunk
+/// writes (blocking, bounded by the value — the ADR-0061 cost the plan
+/// accepts), `finish_deferred`, the coverage-neutral ledger barrier
+/// registered **before** the referencing record stages (D3 — the
+/// done-prefix rule fences the ack behind extent durability; the
+/// fdatasync op itself rides the next MAINTAIN), then markers + the
+/// `StringSetExtent` record. A typed apply failure abandons the extent
+/// file to the orphan sweep — the D3 quarantine rule.
+#[allow(clippy::too_many_arguments)] // the write funnel's blob half
+fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    class: FsyncClass,
+    key: &[u8],
+    hash: u64,
+    value: &[u8],
+    old: Displaced,
+    proto: Protocol,
+    ks: &mut Keyspace,
+    cell: &mut DurableCell<F>,
+) -> Result<u64, WriteBlock> {
+    let mut tier_slot = shared.tier.borrow_mut();
+    let Some(tier) = tier_slot.as_mut() else {
+        return Err(WriteBlock::Reply(error_bytes(shared, proto, ERR_FAILED)));
+    };
+    let table = ks.tiered_store_mut(ns).expect("caller resolved the table");
+    let extent_id = table.allocate_extent_id();
+    let (cell_index, dir, mode) = {
+        let t = tier.ns(ns).expect("tiered namespace has plane state");
+        (tier.cell_index(), t.dir.clone(), t.io_mode)
+    };
+    let sealed = inf_log::blob::ExtentWriter::create(
+        tier.fs(),
+        &dir,
+        inf_log::blob::ExtentId(extent_id),
+        cell_index,
+        ns,
+        value.len() as u64,
+        mode,
+    )
+    .and_then(|mut writer| {
+        writer.append_chunk(value).map_err(std::io::Error::other)?;
+        writer.finish_deferred().map_err(std::io::Error::other)
+    });
+    let (sealed, handle) = match sealed {
+        Ok(pair) => pair,
+        // The failed extent is abandoned (never referenced, id never
+        // reused); the orphan sweep reclaims the file (ADR-0061 D3).
+        Err(err) => {
+            let reply = if err.to_string().contains("StorageFull")
+                || err.raw_os_error() == Some(28)
+            {
+                diskfull_bytes(shared, proto, inf_store::DiskFullCause::Device)
+            } else {
+                error_bytes(shared, proto, ERR_BLOB_READ)
+            };
+            return Err(WriteBlock::Reply(reply));
+        }
+    };
+    let applied = match old {
+        None => table.insert_extent(key, hash, &sealed),
+        Some((addr, len, version)) => table.update_extent(key, hash, &sealed, addr, len, version),
+    };
+    if let Err(err) = applied {
+        // Abandon: the extent is durable-referenced by nothing; the
+        // sweep reclaims it. The handle just closes.
+        drop(handle);
+        return Err(write_block_of(shared, table, key, value, err, proto));
+    }
+    // D3 ordering: the barrier's ledger position precedes this
+    // iteration's linked frame fsync (seal_log registers later in the
+    // same iteration) — the ack is fenced mechanically.
+    let fd = inf_log::fs::SegmentFile::raw_fd(&handle);
+    let ticket = cell.commit.register_extent_barrier(handle, shared.now.get());
+    if let Some(fd) = fd {
+        tier.queue_extent_sync(fd, ticket);
+    }
+    stage_displacements(cell, table, ns, hash, old, class);
+    let effect = MutationEffect::StringSetExtent {
+        ns,
+        key,
+        extent_id: sealed.extent_id().0,
+        offset: 0,
+        len: sealed.data_len(),
+    };
+    Ok(cell.stage_tiered(table, &effect, class))
 }
 
 /// Maps a typed apply failure onto park-or-reply.
@@ -568,9 +742,11 @@ async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
                     let parts = table.record(addr);
                     (Some((addr, parts.encoded_len, parts.version)), Some(parts.value.to_vec()))
                 }
-                Resolved::Cold { addr, value, version, encoded_len } => {
+                Resolved::Cold { addr, value, version, encoded_len }
+                | Resolved::Extent { addr, value, version, encoded_len } => {
                     (Some((addr, encoded_len, version)), Some(value))
                 }
+                Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
                 Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
             };
         let value = compute(old_value.as_deref(), old.map(|(_, _, v)| v))?;
@@ -633,14 +809,10 @@ async fn read_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         Resolved::Ram(addr) => {
             let ks = shared.store.borrow();
             let table = ks.tiered_store(ns).expect("resolved on this table");
-            let parts = table.record(addr);
-            if parts.type_tag == inf_store::TypeTag::StringExtent {
-                w.error(ERR_BLOB_PENDING);
-            } else {
-                w.bulk(parts.value);
-            }
+            w.bulk(table.record(addr).value);
         }
-        Resolved::Cold { value, .. } => w.bulk(&value),
+        Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => w.bulk(&value),
+        Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
         Resolved::Fail(message) => w.error(message),
     }
     TieredReply::Done(reply)
@@ -661,14 +833,9 @@ async fn mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             Resolved::Ram(addr) => {
                 let ks = shared.store.borrow();
                 let table = ks.tiered_store(ns).expect("resolved on this table");
-                let parts = table.record(addr);
-                if parts.type_tag == inf_store::TypeTag::StringExtent {
-                    w.null();
-                } else {
-                    w.bulk(parts.value);
-                }
+                w.bulk(table.record(addr).value);
             }
-            Resolved::Cold { value, .. } => w.bulk(&value),
+            Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => w.bulk(&value),
             _ => w.null(),
         }
     }
@@ -685,7 +852,7 @@ async fn exists<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     for key in &argv[1..] {
         let hash = TieredTable::hash_key(key);
         match resolve(shared, ns, key, hash).await {
-            Resolved::Ram(_) | Resolved::Cold { .. } => count += 1,
+            Resolved::Ram(_) | Resolved::Cold { .. } | Resolved::Extent { .. } => count += 1,
             _ => {}
         }
     }
@@ -710,7 +877,10 @@ async fn strlen<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             let table = ks.tiered_store(ns).expect("resolved on this table");
             w.int(table.record(addr).value.len() as i64);
         }
-        Resolved::Cold { value, .. } => w.int(value.len() as i64),
+        Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => {
+            w.int(value.len() as i64);
+        }
+        Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
         Resolved::Fail(message) => w.error(message),
     }
     TieredReply::Done(reply)
@@ -726,7 +896,8 @@ async fn type_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let mut reply = shared.take_reply_buf();
     let mut w = RespWriter::new(&mut reply, proto);
     match resolve(shared, ns, key, hash).await {
-        Resolved::Ram(_) | Resolved::Cold { .. } => w.simple("string"),
+        Resolved::Ram(_) | Resolved::Cold { .. } | Resolved::Extent { .. } => w.simple("string"),
+        Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
         Resolved::Miss => w.simple("none"),
         Resolved::Fail(message) => w.error(message),
     }
@@ -744,7 +915,8 @@ async fn ttl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let mut w = RespWriter::new(&mut reply, proto);
     match resolve(shared, ns, key, hash).await {
         // No expiry on tiered namespaces in M4: live keys never expire.
-        Resolved::Ram(_) | Resolved::Cold { .. } => w.int(-1),
+        Resolved::Ram(_) | Resolved::Cold { .. } | Resolved::Extent { .. } => w.int(-1),
+        Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
         Resolved::Miss => w.int(-2),
         Resolved::Fail(message) => w.error(message),
     }
@@ -781,7 +953,8 @@ async fn getrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             let table = ks.tiered_store(ns).expect("resolved on this table");
             slice_of(table.record(addr).value, &mut w);
         }
-        Resolved::Cold { value, .. } => slice_of(&value, &mut w),
+        Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => slice_of(&value, &mut w),
+        Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
         Resolved::Fail(message) => w.error(message),
     }
     TieredReply::Done(reply)
@@ -894,6 +1067,61 @@ async fn fetch_key<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     })
 }
 
+/// Fetches a blob-resident value from its extent (M4-S26 wiring the
+/// M4-S17 read path): chunked `ColdReads` windows against the extent's
+/// creation-mode fd — the reader owns the handle across the awaits, so
+/// a concurrent reclaim's unlink cannot invalidate the reads (POSIX
+/// keeps the inode; the S08 cancellation test's contract). Pins ride a
+/// synthetic high-bit `TierFileId` so extent reads never alias a tier
+/// file's retirement gate.
+async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    ext: inf_store::ExtentRef,
+) -> Option<Vec<u8>> {
+    debug_assert_eq!(ext.offset, 0, "v1 extent references start at 0");
+    let reader = {
+        let tier = shared.tier.borrow();
+        tier.as_ref()?.open_extent_reader(ns, ext.extent_id).ok()?
+    };
+    let fd = reader.raw_fd()?;
+    let file = inf_runtime::TierFileId::new(0x8000_0000 | (ext.extent_id as u32 & 0x7FFF_FFFF));
+    let total_frames = ext.len.div_ceil(inf_log::TIER_FRAME_DATA as u64);
+    let window_frames_cap = (crate::tier_cell::COLD_POOL_BUF / inf_log::TIER_FRAME_BYTES) as u64;
+    let mut out: Vec<u8> = Vec::with_capacity(ext.len as usize);
+    while (out.len() as u64) < ext.len {
+        let offset = out.len() as u64;
+        let remaining = (ext.len - offset) as usize;
+        let (first, _, skip) = inf_log::tier_frame_span(offset, remaining);
+        let frames = window_frames_cap.min(total_frames - first);
+        let wait = {
+            let tier = shared.tier.borrow();
+            let cold = tier.as_ref().and_then(|t| t.cold.clone())?;
+            cold.enqueue(
+                fd,
+                file,
+                inf_log::blob::extent_frame_offset(first),
+                frames as usize * inf_log::TIER_FRAME_BYTES,
+                inf_runtime::ReadClass::Foreground,
+                0,
+            )
+            .ok()?
+        };
+        let done = wait.await;
+        done.outcome().ok()?;
+        let ok = done.bytes(|window| {
+            let take = remaining.min(frames as usize * inf_log::TIER_FRAME_DATA - skip);
+            inf_log::tier_extract(window, skip, take, &mut out).is_ok()
+        });
+        drop(done);
+        if !ok {
+            return None;
+        }
+    }
+    drop(reader); // the fd stayed open across every read
+    Some(out)
+}
+
 // ---- write commands ----
 
 async fn set_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -973,9 +1201,11 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
                     let parts = table.record(addr);
                     (Some((addr, parts.encoded_len, parts.version)), Some(parts.value.to_vec()))
                 }
-                Resolved::Cold { addr, value, version, encoded_len } => {
+                Resolved::Cold { addr, value, version, encoded_len }
+                | Resolved::Extent { addr, value, version, encoded_len } => {
                     (Some((addr, encoded_len, version)), Some(value))
                 }
+                Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
                 Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
             };
         if (nx && old.is_some()) || (xx && old.is_none()) {
@@ -1231,14 +1461,16 @@ async fn getdel<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 ) -> TieredReply {
     let key = argv.arg(1);
     match delete_one(shared, ns, class, key, proto, true).await {
-        Ok((seq, old_value)) => {
+        Ok(deleted) => {
             let mut reply = shared.take_reply_buf();
             let mut w = RespWriter::new(&mut reply, proto);
-            match &old_value {
-                Some(v) => w.bulk(v),
-                None => w.null(),
+            match &deleted {
+                Some((_, Some(v))) => w.bulk(v),
+                _ => w.null(),
             }
-            if old_value.is_some() && class == Some(FsyncClass::Always) {
+            if let Some((seq, _)) = deleted
+                && class == Some(FsyncClass::Always)
+            {
                 TieredReply::Gated { reply, seq }
             } else {
                 TieredReply::Done(reply)
@@ -1259,11 +1491,11 @@ async fn del<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let mut last_seq = 0;
     for key in &argv[1..] {
         match delete_one(shared, ns, class, key, proto, false).await {
-            Ok((seq, Some(_))) => {
+            Ok(Some((seq, _))) => {
                 removed += 1;
                 last_seq = seq;
             }
-            Ok(_) => {}
+            Ok(None) => {}
             Err(err) => return TieredReply::Done(err),
         }
     }
@@ -1277,8 +1509,9 @@ async fn del<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 }
 
 /// One key's deletion: resolve (cold verifies — the recorded S26
-/// policy) → stage markers + `Delete` → apply. `want_value` returns the
-/// old value (GETDEL).
+/// policy) → stage markers + `Delete` → apply. `Ok(None)` = the key was
+/// absent; `Ok(Some((seq, value)))` = deleted (`want_value` carries the
+/// old value out for GETDEL).
 async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
@@ -1286,12 +1519,12 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     key: &[u8],
     proto: Protocol,
     want_value: bool,
-) -> Result<(u64, Option<Vec<u8>>), Vec<u8>> {
+) -> Result<Option<(u64, Option<Vec<u8>>)>, Vec<u8>> {
     let hash = TieredTable::hash_key(key);
     loop {
         let (old, old_value): (Displaced, Option<Vec<u8>>) =
             match resolve(shared, ns, key, hash).await {
-                Resolved::Miss => return Ok((0, None)),
+                Resolved::Miss => return Ok(None),
                 Resolved::Ram(addr) => {
                     let ks = shared.store.borrow();
                     let table = ks.tiered_store(ns).expect("resolved on this table");
@@ -1299,12 +1532,14 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                     let value = want_value.then(|| parts.value.to_vec());
                     (Some((addr, parts.encoded_len, parts.version)), value)
                 }
-                Resolved::Cold { addr, value, version, encoded_len } => {
+                Resolved::Cold { addr, value, version, encoded_len }
+                | Resolved::Extent { addr, value, version, encoded_len } => {
                     (Some((addr, encoded_len, version)), Some(value))
                 }
+                Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
                 Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
             };
-        let Some((addr, len, _)) = old else { return Ok((0, None)) };
+        let Some((addr, len, _)) = old else { return Ok(None) };
         // Atomic block: fit check → apply → markers + Delete record.
         let staged = {
             let mut ks = shared.store.borrow_mut();
@@ -1350,7 +1585,7 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             }
         };
         match staged {
-            Some(Some(seq)) => return Ok((seq, old_value)),
+            Some(Some(seq)) => return Ok(Some((seq, old_value))),
             Some(None) => continue,
             None => {
                 let wait = {
