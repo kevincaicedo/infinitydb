@@ -33,7 +33,7 @@ use inf_store::{Keyspace, LogicalAddr, TierSpec};
 /// Cold-read pool window: 4 tier frames (16 KiB) per buffer — covers a
 /// typical record in one read; oversized records stage through chunked
 /// continuation windows (the S08 `cold_hardened` shape).
-const COLD_POOL_BUF: usize = 4 * inf_log::TIER_FRAME_BYTES;
+pub(crate) const COLD_POOL_BUF: usize = 4 * inf_log::TIER_FRAME_BYTES;
 
 /// Extent-reclaim candidates examined per MAINTAIN slice (ADR-0061 D5
 /// — reclaim is a background sweep, never a burst).
@@ -55,6 +55,9 @@ pub(crate) struct TierNs<F: SegmentFs> {
     retired: Vec<TierFileMeta>,
     /// `TAIL-STALL-TIMEOUT` (ADR-0053 D4), consumed at construction.
     pub tail_stall_timeout_ms: u32,
+    /// `TIER-IO-MODE` (ADR-0054), consumed at construction — extent
+    /// reads open in the same mode the writes used.
+    pub io_mode: inf_log::TierIoMode,
     /// Writers parked on tail-allocation stalls. Woken on **head
     /// advancement** (the release leg) — never on flush confirmation
     /// (the recorded 0xA4C01D07 class: flush-keyed wakes wedge when
@@ -149,6 +152,11 @@ pub(crate) struct TierCell<F: SegmentFs> {
     pub cold_us: LogHistogram,
     /// Dropped namespaces' teardown queues (pins drain before unlink).
     teardown: Vec<TeardownNs>,
+    /// Extent-seal fdatasyncs awaiting the driver (ADR-0061 D3): the
+    /// ledger barrier registered at stage time; the op itself rides the
+    /// next MAINTAIN's push (ordering lives in the ledger, not the
+    /// submission queue).
+    pending_syncs: Vec<(std::os::fd::RawFd, inf_log::FsyncTicket)>,
 }
 
 /// A dropped namespace's file half, unlinked in bounded slices
@@ -181,6 +189,45 @@ impl<F: SegmentFs> TierCell<F> {
         self.namespaces.iter().find(|t| t.ns == ns)
     }
 
+    /// Queues one registered extent-seal barrier's fdatasync for the
+    /// next MAINTAIN drain (ADR-0061 D3 — M4-S26).
+    pub fn queue_extent_sync(&mut self, fd: std::os::fd::RawFd, ticket: inf_log::FsyncTicket) {
+        self.pending_syncs.push((fd, ticket));
+    }
+
+    /// Drains the queued extent-seal fdatasyncs (the plane pushes them
+    /// as driver ops each MAINTAIN).
+    pub fn take_pending_syncs(&mut self) -> Vec<(std::os::fd::RawFd, inf_log::FsyncTicket)> {
+        core::mem::take(&mut self.pending_syncs)
+    }
+
+    /// Opens a blob extent for reading in the namespace's creation
+    /// I/O mode (M4-S26 blob reads; the §3.3 open is metadata-cheap and
+    /// the returned reader owns the fd across the chunked reads).
+    ///
+    /// # Errors
+    /// Open/probe failures — the command layer answers typed.
+    pub fn open_extent_reader(
+        &self,
+        ns: NsId,
+        extent_id: u64,
+    ) -> std::io::Result<inf_log::blob::ExtentReader<F::File>> {
+        let t = self
+            .ns(ns)
+            .ok_or_else(|| std::io::Error::other("namespace dropped"))?;
+        inf_log::blob::open_extent(&self.fs, &t.dir, ExtentId(extent_id), t.io_mode)
+    }
+
+    /// The owning cell index (extent headers carry it).
+    pub fn cell_index(&self) -> u32 {
+        self.cell
+    }
+
+    /// The injected filesystem seam (extent creation on the write path).
+    pub fn fs(&self) -> &F {
+        &self.fs
+    }
+
     pub fn ns_mut(&mut self, ns: NsId) -> Option<&mut TierNs<F>> {
         self.namespaces.iter_mut().find(|t| t.ns == ns)
     }
@@ -197,6 +244,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             ram_hit_us: LogHistogram::new(),
             cold_us: LogHistogram::new(),
             teardown: Vec::new(),
+            pending_syncs: Vec::new(),
         }
     }
 
@@ -267,6 +315,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             files: Vec::new(),
             retired: Vec::new(),
             tail_stall_timeout_ms: spec.tail_stall_timeout_ms,
+            io_mode: spec.tier_io_mode,
             stall_waiters: WaitList::new(),
             epoch_marks: VecDeque::new(),
             durable_epoch: 0,

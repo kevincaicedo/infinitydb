@@ -1386,6 +1386,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let shared = Rc::clone(&self.shared);
             let _ = cx.executor.poll_immediate(compact_pump(shared, read));
         }
+        // Extent-seal fdatasyncs (ADR-0061 D3): the barrier is already
+        // in the ledger; the op rides the driver now.
+        let pending_syncs = self
+            .shared
+            .tier
+            .borrow_mut()
+            .as_mut()
+            .map(crate::tier_cell::TierCell::take_pending_syncs)
+            .unwrap_or_default();
+        for (fd, ticket) in pending_syncs {
+            cx.push(IoOp::Fdatasync { fd, token: crate::durable::fsync_token(ticket) });
+        }
         if let Some(cold) = cold {
             cold.drain(|op| cx.push(op));
             // The ADR-0064 D3 split scrape + ADR-0055 cold counters,

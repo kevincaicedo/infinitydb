@@ -1163,6 +1163,218 @@ fn tiered_data_plane_serves_and_survives_restart() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// M4-S17 wired by M4-S26: blob-resident values round-trip over TCP. A
+/// `SET` at or above `BLOB-THRESHOLD` stores out of line (extent file +
+/// 24-byte reference; the extent's fdatasync rides the ADR-0061 D3
+/// ledger barrier, so the ack is fenced behind extent durability), `GET`
+/// fetches it back byte-exact through chunked extent reads, an
+/// overwrite displaces the old extent, `DEL` kills a reference, and a
+/// restart recovers the surviving blob content-exactly (tag-9 records +
+/// the checkpoint 0x05 reference map).
+#[test]
+fn blob_values_round_trip_and_survive_restart() {
+    let dir = temp_data_dir("tiered-blob");
+    let blob_of = |tag: u8| vec![tag; 8 << 10]; // 8 KiB ≥ the 4 KiB threshold
+    let bulk_of = |value: &[u8]| {
+        let mut expect = format!("${}\r\n", value.len()).into_bytes();
+        expect.extend_from_slice(value);
+        expect.extend_from_slice(b"\r\n");
+        expect
+    };
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"b",
+            b"MODE",
+            b"durable",
+            b"FSYNC",
+            b"everysec",
+            b"MEM-BUDGET",
+            b"3mb",
+            b"BLOB-THRESHOLD",
+            b"4kb",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"SET", b"big:1", &blob_of(0xA1)])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"GET", b"big:1"])).expect("write");
+        read_exactly(&mut c, &bulk_of(&blob_of(0xA1)));
+        // Overwrite: the old extent's reference dies (reclaimed by
+        // MAINTAIN once the death is fsync-durable), the new one serves.
+        c.write_all(&cmd(&[b"SET", b"big:1", &blob_of(0xB2)])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"GET", b"big:1"])).expect("write");
+        read_exactly(&mut c, &bulk_of(&blob_of(0xB2)));
+        c.write_all(&cmd(&[b"STRLEN", b"big:1"])).expect("write");
+        read_exactly(&mut c, format!(":{}\r\n", 8 << 10).as_bytes());
+        c.write_all(&cmd(&[b"SET", b"big:2", &blob_of(0xC3)])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"DEL", b"big:2"])).expect("write");
+        read_exactly(&mut c, b":1\r\n");
+        c.write_all(&cmd(&[b"GET", b"big:2"])).expect("write");
+        read_exactly(&mut c, b"$-1\r\n");
+        // Checkpoint: tag-9 images + the 0x05 extent map.
+        c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        drop(c);
+        node.stop();
+    }
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"big:1"])).expect("write");
+    read_exactly(&mut c, &bulk_of(&blob_of(0xB2)));
+    c.write_all(&cmd(&[b"GET", b"big:2"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0063 over the wire (the shape `m4-diskfull` proves at store/DST
+/// tier, replayed through real commands): a `DISK-BUDGET`-bounded
+/// namespace fills to admission refusal — the typed `DISKFULL` reply
+/// whose byte shape was pinned by test before wiring — while reads and
+/// deletes (no new tier bytes) keep proceeding.
+#[test]
+fn diskfull_admission_refuses_typed_over_tcp() {
+    let dir = temp_data_dir("tiered-diskfull");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"d",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"3mb",
+        b"DISK-BUDGET",
+        b"1mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"d"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // The admission projection counts unflushed RAM bytes (ADR-0063
+    // D2), so a 1 MiB disk budget closes within ~1 MiB of writes.
+    let value = vec![0xD5u8; 8 << 10];
+    let mut refusal: Option<Vec<u8>> = None;
+    let mut accepted = 0usize;
+    for i in 0..400 {
+        c.write_all(&cmd(&[b"SET", format!("k:{i:04}").as_bytes(), &value])).expect("write");
+        let reply = read_line(&mut c);
+        if reply.starts_with(b"-DISKFULL") {
+            refusal = Some(reply);
+            break;
+        }
+        assert_eq!(reply, b"+OK\r\n", "unexpected fill reply");
+        accepted += 1;
+    }
+    let refusal = refusal.expect("the disk budget never refused");
+    assert!(
+        refusal.starts_with(b"-DISKFULL tiered namespace disk budget exhausted (used="),
+        "{refusal:?}"
+    );
+    assert!(accepted > 0, "some writes must land before the budget closes");
+    // Refusal scope is exactly the new-byte placements (ADR-0063 D1):
+    // reads and deletes proceed at the cap.
+    c.write_all(&cmd(&[b"GET", b"k:0000"])).expect("write");
+    let mut expect = format!("${}\r\n", value.len()).into_bytes();
+    expect.extend_from_slice(&value);
+    expect.extend_from_slice(b"\r\n");
+    read_exactly(&mut c, &expect);
+    c.write_all(&cmd(&[b"DEL", b"k:0000"])).expect("write");
+    read_exactly(&mut c, b":1\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The S19 drop-race shape through the wire (§3.3): `INF.NS DROP` races
+/// pipelined cold reads. Every in-flight read answers typed (its value
+/// or the dropped-namespace error), the node stays live, and teardown's
+/// pin-gated unlinks drain without a wedge.
+#[test]
+fn drop_races_inflight_cold_reads() {
+    let dir = temp_data_dir("tiered-drop-race");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"r",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"3mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"r"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let value = vec![0x5Eu8; 8 << 10];
+    for i in 0..600 {
+        c.write_all(&cmd(&[b"SET", format!("k:{i:04}").as_bytes(), &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    // Wait for demotion so the low keys are genuinely cold.
+    let mut demoted = false;
+    for _ in 0..300 {
+        let tiering = info_text(&mut c, b"tiering");
+        let flushed = tiering
+            .lines()
+            .find_map(|l| l.strip_prefix("tiering_flush_confirmed_bytes:"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if flushed > 1 << 20 {
+            demoted = true;
+            break;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(demoted, "demotion never flushed past 1 MiB");
+    // Pipeline 50 cold GETs without reading replies, then DROP from a
+    // second connection while they are in flight.
+    let mut batch = Vec::new();
+    for i in 0..50 {
+        batch.extend_from_slice(&cmd(&[b"GET", format!("k:{i:04}").as_bytes()]));
+    }
+    c.write_all(&batch).expect("write");
+    let mut c2 = node.connect();
+    c2.write_all(&cmd(&[b"INF.NS", b"DROP", b"r"])).expect("write");
+    read_exactly(&mut c2, b"+OK\r\n");
+    // Every pipelined reply is typed: the value (read won the race) or
+    // the dropped-namespace error (drop won) — never a hang or a crash.
+    for _ in 0..50 {
+        let reply = read_line(&mut c);
+        assert!(
+            reply.starts_with(b"$") || reply.starts_with(b"-ERR"),
+            "untyped drop-race reply: {reply:?}"
+        );
+        if reply.starts_with(b"$8192") {
+            // Consume the bulk payload + CRLF.
+            let mut payload = vec![0u8; (8 << 10) + 2];
+            c.read_exact(&mut payload).expect("bulk payload");
+        }
+    }
+    // The node stays live.
+    c2.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut c2, b"+PONG\r\n");
+    drop(c);
+    drop(c2);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Mixed classes interleaved on one cell (§8.2 semantics table): `memory`,
 /// `everysec`, and `always` namespaces each honor their ack point, and the
 /// memory namespace appends zero log records (the L2 null-log case,
