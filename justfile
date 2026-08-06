@@ -49,7 +49,10 @@ compat:
 # cold-read storm (relocation races, chunked staging, cancellation,
 # pin-deferred unlinks — the 10⁶-op AC run passes --ops 1000000);
 # m4-recovery is the M4-S12 unified-recovery power-cut chain (hybrid
-# checkpoints, MANIFEST v2, D4 tail replay, never-none oracle).
+# checkpoints, MANIFEST v2, D4 tail replay, never-none oracle);
+# m4-tiered is the M4-S26 command-driven tiered node (RESP over the sim
+# net against the wired plane: cut → recover → §8.2 command audit →
+# re-pressure flush liveness → DISKFULL clamp → the S19 drop race).
 sim-smoke:
     cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m4-steel --seed 0xC0FFEE --verify-determinism
@@ -57,6 +60,7 @@ sim-smoke:
     cargo run --release --bin inf-sim -- --scenario m4-cold --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m4-recovery --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m4-diskfull --seed 0xC0FFEE --verify-determinism
+    cargo run --release --bin inf-sim -- --scenario m4-tiered --seed 0xC0FFEE --verify-determinism
 
 # M2-S19 durability sweep (the §6 dst_sweep gate shape). Usage:
 #   just durable-sweep [seeds] [base]

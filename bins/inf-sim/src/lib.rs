@@ -24,6 +24,7 @@ pub mod pressure;
 pub mod recovery;
 pub mod resp;
 pub mod steel;
+pub mod tiered;
 
 pub use bootstorm::{BootStormReport, BootStormScenario, run_boot_storm_scenario};
 pub use coldstorm::{ColdStormReport, ColdStormScenario, run_cold_storm_scenario};
@@ -34,3 +35,4 @@ pub use harness::{Scenario, SimReport, run_scenario};
 pub use pressure::{PressureReport, PressureScenario, run_pressure_scenario};
 pub use recovery::{RecoveryReport, RecoveryScenario, run_recovery_scenario};
 pub use steel::{SteelReport, SteelScenario, run_steel_scenario};
+pub use tiered::{TieredNodeReport, TieredScenario, run_tiered_scenario};

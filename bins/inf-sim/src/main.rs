@@ -327,6 +327,134 @@ fn main() {
         return;
     }
 
+    // The M4-S26 command-driven tiered node (RESP over the sim net
+    // against the wired plane: cut → recover → audit → re-pressure →
+    // DISKFULL clamp → drop race). Sweep mode mirrors m4-recovery.
+    if scenario_name == "m4-tiered" {
+        let run_one = |seed: u64| {
+            let scenario = inf_sim::TieredScenario::m4_tiered(seed);
+            inf_sim::run_tiered_scenario(&scenario)
+        };
+        if let Some(sweep) = sweep {
+            let (shard_i, shard_k) = shard;
+            assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+            let mut lines = Vec::new();
+            let mut violations = 0u64;
+            let mut refused = 0u64;
+            let mut ran = 0u64;
+            let mut sim_seconds = 0.0f64;
+            let mut commands = 0u64;
+            let mut audited = 0u64;
+            let mut flushed_pre_cut = 0u64;
+            let mut cold_resolves = 0u64;
+            let mut blob_sets = 0u64;
+            let mut diskfull_refusals = 0u64;
+            let mut drop_values = 0u64;
+            let mut drop_other = 0u64;
+            for i in (shard_i..sweep).step_by(shard_k as usize) {
+                let seed = seed.wrapping_add(i);
+                let report = run_one(seed);
+                ran += 1;
+                sim_seconds += report.sim_seconds;
+                commands += report.commands_done;
+                audited += report.audited_keys;
+                flushed_pre_cut += report.flushed_pre_cut_bytes;
+                cold_resolves += report.cold_resolves;
+                blob_sets += report.blob_sets;
+                diskfull_refusals += report.diskfull_refusals;
+                drop_values += report.drop_replies_value;
+                drop_other += report.drop_replies_other;
+                if report.refused_boot && report.ok() {
+                    refused += 1;
+                    lines.push(format!("{seed:#x} refused (taxonomy fail-stop)"));
+                } else if report.ok() {
+                    lines.push(format!("{seed:#x} ok"));
+                } else {
+                    violations += 1;
+                    let first = report.violations.first().map_or("stall", |v| v.as_str());
+                    lines.push(format!("{seed:#x} VIOLATION {first}"));
+                    eprintln!("inf-sim: seed {seed:#x}: {first}");
+                }
+            }
+            // Coverage disclosed, never assumed (ADR-0045 D4): demotion,
+            // cold reads, blobs, refusals, and both drop-race outcomes
+            // must actually occur across the shard.
+            println!(
+                "inf-sim: m4-tiered sweep shard {shard_i}/{shard_k}: {ran} seeds, {violations} \
+                 violations, {refused} legal taxonomy refusals, {commands} commands, {audited} \
+                 keys audited, {flushed_pre_cut} B flushed pre-cut, {cold_resolves} cold \
+                 resolves, {blob_sets} blob sets, {diskfull_refusals} DISKFULL refusals, \
+                 drop-race {drop_values} values / {drop_other} typed-other"
+            );
+            println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
+            if let Some(dir) = out_dir {
+                std::fs::create_dir_all(&dir).expect("--out dir");
+                let manifest = format!(
+                    "scenario=m4-tiered base_seed={seed:#x} sweep={sweep} \
+                     shard={shard_i}/{shard_k} seeds_run={ran} violations={violations} \
+                     refused={refused} commands={commands} keys_audited={audited} \
+                     flushed_pre_cut={flushed_pre_cut} cold_resolves={cold_resolves} \
+                     blob_sets={blob_sets} diskfull_refusals={diskfull_refusals} \
+                     drop_values={drop_values} drop_other={drop_other}\n"
+                );
+                std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
+                    .expect("manifest");
+                std::fs::write(
+                    format!("{dir}/results-shard-{shard_i}.txt"),
+                    lines.join("\n") + "\n",
+                )
+                .expect("results");
+            }
+            std::process::exit(if violations > 0 { 1 } else { 0 });
+        }
+        let report = run_one(seed);
+        println!(
+            "inf-sim: m4-tiered seed {seed:#x}: {} commands, {} steps, {} keys audited, {} \
+             required ops, {} allowed-lost, {} B flushed pre-cut, {} B flushed final, {} cold \
+             resolves, {} blob sets, {} DISKFULL refusals (reopened: {}), drop-race {} values / \
+             {} typed-other, refused-boot {}, trace {} bytes, hash {:#018x}",
+            report.commands_done,
+            report.scheduler_steps,
+            report.audited_keys,
+            report.required_ops,
+            report.allowed_lost_ops,
+            report.flushed_pre_cut_bytes,
+            report.flushed_final_bytes,
+            report.cold_resolves,
+            report.blob_sets,
+            report.diskfull_refusals,
+            report.diskfull_reopened,
+            report.drop_replies_value,
+            report.drop_replies_other,
+            report.refused_boot,
+            report.trace.len(),
+            report.trace_hash
+        );
+        println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+        if verify {
+            let second = run_one(seed);
+            if second.trace != report.trace {
+                eprintln!(
+                    "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs \
+                     {:#x})",
+                    report.trace.len(),
+                    second.trace.len(),
+                    report.trace_hash,
+                    second.trace_hash
+                );
+                std::process::exit(1);
+            }
+            println!("inf-sim: determinism verified — second run trace byte-identical");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if scenario_name == "m4-cold" {
         let mut scenario = inf_sim::ColdStormScenario::m4_cold(seed);
         if let Some(ops) = ops_override {
@@ -402,7 +530,7 @@ fn main() {
             eprintln!(
                 "inf-sim: unknown scenario {other} (have: m0-smoke, m1-cache, m2-durable, \
                  m3-document, m2-combined, boot-storm, m4-steel, m4-pressure, m4-cold, \
-                 m4-recovery, m4-diskfull)"
+                 m4-recovery, m4-diskfull, m4-tiered)"
             );
             std::process::exit(2);
         }

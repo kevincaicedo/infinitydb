@@ -25,3 +25,7 @@ m2-combined 0xC0FFEE
 m2-combined 0x5EED0003
 boot-storm 0xB007
 boot-storm 0x5EED0003
+# M4-S26: the command-driven tiered node — 0x5EED0003 is a double-cut
+# seed whose phase-2 traffic completes with pre-cut flushed tier bytes
+# (recovery composes MANIFEST v2 → tier files → checkpoint → WAL tail).
+m4-tiered 0x5EED0003
