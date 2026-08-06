@@ -268,6 +268,14 @@ impl<F: SegmentFs> DurableCell<F> {
         self.last_seq
     }
 
+    /// True when no checkpoint is streaming and no MANIFEST swap is
+    /// pending — the tiered MAINTAIN's reconciliation signal (M4-S26):
+    /// in this state a still-pinned walk or a stamped-but-uncommitted
+    /// retirement can only mean the transition aborted.
+    pub fn ckpt_transition_idle(&self) -> bool {
+        matches!(self.ckpt.phase, CkptPhase::Idle) && self.manifest.idle()
+    }
+
     /// Registers one gated `always` ack (counter only; the waiter itself
     /// is `ack_gate.waiter(seq)` at the dispatch site).
     pub fn note_gated_ack(&mut self) {
@@ -447,10 +455,12 @@ impl<F: SegmentFs> DurableCell<F> {
     pub fn ckpt_slice(
         &mut self,
         ks: &mut Keyspace,
+        tier: Option<&mut crate::tier_cell::TierCell<F>>,
         cx: &mut LoopCx<'_>,
         budget_units: u32,
         anchor: WallAnchor,
     ) -> u32 {
+        let mut tier = tier;
         if self.failed {
             return 0;
         }
@@ -489,7 +499,8 @@ impl<F: SegmentFs> DurableCell<F> {
         // Begun: create the .ick.new file + queue the header write.
         if let CkptPhase::Begun { id, begin_lsn } = self.ckpt.phase {
             let ns_ids = ks.durable_ns_ids();
-            if let Err(err) = self.ckpt.open_stream(id, begin_lsn, ns_ids, cx.now) {
+            let tiered_present = ns_ids.iter().any(|&raw| ks.is_tiered(NsId(raw)));
+            if let Err(err) = self.ckpt.open_stream(id, begin_lsn, ns_ids, tiered_present, cx.now) {
                 self.ckpt.abort("create", &err.to_string());
                 return 1;
             }
@@ -528,11 +539,13 @@ impl<F: SegmentFs> DurableCell<F> {
         let CkptPhase::Stream(st) = &mut self.ckpt.phase else { return 0 };
         // One deref, split fields (borrow splitting doesn't cross `Box`).
         let crate::ckpt::Streaming {
+            id,
             stream,
             fd,
             ns_ids,
             ns_idx,
             cursor,
+            tier_pass,
             walk_done,
             footer_staged,
             sync_issued,
@@ -573,14 +586,51 @@ impl<F: SegmentFs> DurableCell<F> {
         // Fill: pull post-images under the byte budget (the walker — the
         // resize-stable SCAN cursor, ADR-0016 D2).
         let mut emitted: u32 = 0;
+        let mut force_seal = false;
         if !*walk_done {
             let slice_cap = cfg.slice_bytes.min(budget_units.saturating_mul(1024)).max(1);
-            while emitted < slice_cap && !*walk_done && !stream.section_full() {
+            while emitted < slice_cap && !*walk_done && !stream.section_full() && !force_seal {
                 let Some(&ns_raw) = ns_ids.get(*ns_idx) else {
                     *walk_done = true;
                     break;
                 };
                 let ns = NsId(ns_raw);
+                // Tiered namespaces walk the ADR-0057 hybrid (M4-S26):
+                // refs, images, live-set + blob sections, retirement scan.
+                if ks.is_tiered(ns) {
+                    let step = match (ks.tiered_store_mut(ns), tier.as_deref_mut()) {
+                        (Some(table), Some(tc)) => match tc.ns_mut(ns) {
+                            Some(t) => tier_walk_step(
+                                stream,
+                                table,
+                                t,
+                                ns,
+                                *id,
+                                cursor,
+                                tier_pass,
+                                slice_cap,
+                                &mut emitted,
+                            ),
+                            None => TierStep::NsDone,
+                        },
+                        // Dropped mid-walk (or a plane without tier state
+                        // — unreachable when tiered namespaces exist).
+                        _ => TierStep::NsDone,
+                    };
+                    match step {
+                        TierStep::Progress => {}
+                        TierStep::SealFirst => force_seal = true,
+                        TierStep::NsDone => {
+                            *ns_idx += 1;
+                            *cursor = 0;
+                            *tier_pass = 0;
+                            if *ns_idx == ns_ids.len() {
+                                *walk_done = true;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 match ks.ns_store_mut(ns) {
                     // Dropped mid-walk: its records replay as skips anyway.
                     None => {
@@ -628,8 +678,12 @@ impl<F: SegmentFs> DurableCell<F> {
             }
         }
         // Queue at most one block per slice: a full (or final partial)
-        // section, or — once everything drained — the footer.
-        if stream.section_full() || (*walk_done && stream.can_seal()) {
+        // section, a class-boundary seal (M4-S26 tiered passes), or —
+        // once everything drained — the footer.
+        if stream.section_full()
+            || (force_seal && stream.can_seal())
+            || (*walk_done && stream.can_seal())
+        {
             let lease = stream.seal_section();
             *write_seq += 1;
             cx.push(IoOp::LogWrite {
@@ -709,12 +763,15 @@ impl<F: SegmentFs> DurableCell<F> {
         cx: &mut LoopCx<'_>,
         control: Option<&crate::ControlHandle>,
         unix_now_ms: u64,
+        ks: &mut Keyspace,
+        tier: Option<&mut crate::tier_cell::TierCell<F>>,
     ) -> u32 {
         if self.failed {
             return 0;
         }
         let watermark = self.commit.watermark().map(|l| l.to_u64());
-        let mut units = self.manifest.swap_slice(cx, watermark, self.rotor.active_segment());
+        let mut units =
+            self.manifest.swap_slice(cx, watermark, self.rotor.active_segment(), ks, tier);
         // A MANIFEST just committed (dir-fsync durable): publish the
         // control-board slot — the `INF.CKPT WAIT`/`LASTSAVE` observable
         // (M2-S20, ADR-0021 D6).
@@ -832,6 +889,163 @@ impl<F: SegmentFs> DurableCell<F> {
     /// (ENOSPC — degrade loudly, never corrupt).
     pub fn space_exhausted(&self) -> bool {
         self.rotor.space_exhausted()
+    }
+}
+
+// ---- tiered checkpoint walk (M4-S26; ADR-0057 D1/D3, ADR-0059 D3) ----
+
+/// One tiered walk step's verdict.
+enum TierStep {
+    /// Staged entries (or budget/section bounds hit) — continue.
+    Progress,
+    /// A pending section of another class must seal before this pass
+    /// stages — the caller queues the block now (class purity).
+    SealFirst,
+    /// This namespace's walk is complete (retirement scan included).
+    NsDone,
+}
+
+/// Entries pulled per `ckpt_walk_slice` call (home-group granular).
+const TIER_WALK_CHUNK: usize = 256;
+
+/// One bounded step of a tiered namespace's hybrid walk. Passes: 0 =
+/// address refs (cold majority, zero record touches), 1 = RAM images,
+/// 2 = per-file live-set entries, 3 = cold blob references, 4 = end
+/// walk + retirement scan (ADR-0059 D3 phase 1 — between walk end and
+/// the manifest). Section classes never mix inside a pass, so seals
+/// happen only at pass boundaries.
+#[allow(clippy::too_many_arguments)] // the fill loop's split fields
+fn tier_walk_step<F: SegmentFs>(
+    stream: &mut inf_log::IckStream,
+    table: &mut inf_store::TieredTable,
+    tier_ns: &mut crate::tier_cell::TierNs<F>,
+    ns: NsId,
+    ckpt_id: u64,
+    cursor: &mut u64,
+    tier_pass: &mut u8,
+    slice_cap: u32,
+    emitted: &mut u32,
+) -> TierStep {
+    // Pass boundaries: seal any pending section before a class change.
+    if *cursor == 0 && stream.can_seal() {
+        return TierStep::SealFirst;
+    }
+    match *tier_pass {
+        0 => {
+            if table.space().walk_watermark().is_none() {
+                table.begin_ckpt_walk(ckpt_id);
+            }
+            let w = table.space().walk_watermark().expect("begun above").to_raw();
+            let next = table.ckpt_walk_slice(
+                *cursor,
+                TIER_WALK_CHUNK,
+                |hash, addr| {
+                    stream.stage_addr_ref(ns.0, w, hash, addr.to_raw());
+                    *emitted = emitted.saturating_add(24);
+                },
+                |_image| {},
+            );
+            advance_pass(cursor, tier_pass, next);
+            TierStep::Progress
+        }
+        1 => {
+            let next = table.ckpt_walk_slice(
+                *cursor,
+                TIER_WALK_CHUNK,
+                |_hash, _addr| {},
+                |parts| {
+                    let rec = match parts.type_tag {
+                        inf_store::TypeTag::String => {
+                            RecordView::StringPostImage { ns, key: parts.key, value: parts.value }
+                        }
+                        inf_store::TypeTag::StringExtent => {
+                            let ext = inf_store::ExtentRef::decode(parts.value);
+                            RecordView::StringExtentRef {
+                                ns,
+                                key: parts.key,
+                                extent_id: ext.extent_id,
+                                offset: ext.offset,
+                                len: ext.len,
+                            }
+                        }
+                        // Documents are not command-reachable on tiered
+                        // namespaces in M4 — a doc image here is a bug.
+                        other => {
+                            debug_assert!(false, "tiered walk met a {other:?} record");
+                            return;
+                        }
+                    };
+                    *emitted = emitted.saturating_add(rec.encoded_len() as u32);
+                    stream.stage_record(&rec);
+                },
+            );
+            advance_pass(cursor, tier_pass, next);
+            TierStep::Progress
+        }
+        2 => {
+            let files: Vec<_> = table
+                .live_set()
+                .files()
+                .iter()
+                .skip(*cursor as usize)
+                .take(TIER_WALK_CHUNK)
+                .map(|f| (f.id, f.data_len, f.dead_bytes, f.byte_exact))
+                .collect();
+            if files.is_empty() {
+                *cursor = 0;
+                *tier_pass = 3;
+                return TierStep::Progress;
+            }
+            let mut staged = 0u64;
+            for (file_id, data_len, dead_bytes, byte_exact) in &files {
+                stream.stage_live_set(ns.0, *file_id, *data_len, *dead_bytes, *byte_exact);
+                *emitted = emitted.saturating_add(24);
+                staged += 1;
+                if stream.section_full() || *emitted >= slice_cap {
+                    break;
+                }
+            }
+            *cursor += staged;
+            TierStep::Progress
+        }
+        3 => {
+            let entries: Vec<(u64, u64, u64)> =
+                table.extent_ckpt_entries().skip(*cursor as usize).take(TIER_WALK_CHUNK).collect();
+            if entries.is_empty() {
+                *cursor = 0;
+                *tier_pass = 4;
+                return TierStep::Progress;
+            }
+            let mut staged = 0u64;
+            for (addr, extent_id, len) in &entries {
+                stream.stage_blob_ref(ns.0, *addr, *extent_id, *len);
+                *emitted = emitted.saturating_add(24);
+                staged += 1;
+                if stream.section_full() || *emitted >= slice_cap {
+                    break;
+                }
+            }
+            *cursor += staged;
+            TierStep::Progress
+        }
+        _ => {
+            // End the walk (release debt drains next MAINTAIN), then the
+            // retirement scan stamps fully-dead candidates against this
+            // checkpoint (ADR-0059 D3 phase 1).
+            table.end_ckpt_walk();
+            let _ = table.retire_scan(ckpt_id, &tier_ns.flush);
+            TierStep::NsDone
+        }
+    }
+}
+
+/// Walk-slice cursor bookkeeping: 0 = this pass finished.
+fn advance_pass(cursor: &mut u64, tier_pass: &mut u8, next: u64) {
+    if next == 0 {
+        *cursor = 0;
+        *tier_pass += 1;
+    } else {
+        *cursor = next;
     }
 }
 
