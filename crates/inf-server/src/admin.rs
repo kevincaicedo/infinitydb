@@ -849,14 +849,10 @@ pub(crate) fn inf_ns(
         if spec.mode == NsMode::Topic {
             return w.error("ERR topic namespaces are not addressable before M5");
         }
-        // M4-S19 (ADR-0062 D8): the tiered data plane is not wired —
-        // refusing USE keeps any command from silently serving out of a
-        // store the router does not route to.
-        if spec.tier.is_some() {
-            return w.error(
-                "ERR tiered namespaces are not command-addressable yet (M4 command wiring)",
-            );
-        }
+        // M4-S26: the ADR-0062 D8 refusal is lifted — the tiered data
+        // plane is wired (exec routing, cold-read suspension, WAL
+        // staging with displacement origins, recovery composition).
+        // `USE` of a tiered namespace now routes to the tiered arm.
         cx.ns = Some(spec.id);
         w.simple("OK")
     } else if sub.eq_ignore_ascii_case(b"SET") {
@@ -1731,8 +1727,11 @@ mod tests {
                 tier: Some(tier),
             })
             .expect("create");
+        // M4-S26: the D8 refusal is lifted — USE succeeds; the planeless
+        // exec fallback still refuses data commands (plane-resident).
         let r = run(&mut cx, &mut store, &[b"INF.NS", b"USE", b"tiered"]);
-        assert!(r.starts_with(b"-ERR tiered namespaces are not command-addressable"), "{r:?}");
+        assert_eq!(r, b"+OK\r\n");
+        cx.ns = None;
         let r =
             run(&mut cx, &mut store, &[b"INF.NS", b"SET", b"tiered", b"MUTABLE-FRACTION", b"300"]);
         assert_eq!(r, b"+OK\r\n");

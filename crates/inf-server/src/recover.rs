@@ -137,7 +137,7 @@ pub struct RecoveredManifest {
 /// (M2-S14 — a validating frame beyond a corrupt region fail-stops; only
 /// a torn *final* write is truncated and survived), read errors, store
 /// apply failures, and rotor open failures — all fail-stop at boot (§8.4).
-pub fn open_cell_log<F: SegmentFs>(
+pub fn open_cell_log<F: SegmentFs + Clone>(
     fs: F,
     ks: &mut Keyspace,
     cell: u16,
@@ -259,9 +259,25 @@ pub struct Recovery<F: SegmentFs> {
     /// opens (every segment's end is known by then).
     last_data: usize,
     finished: Option<(SegmentRotor<F>, Option<RecoveredManifest>)>,
+    /// Recovered tiered namespaces' plane half (M4-S26, ADR-0057 D6):
+    /// flush pipeline + open sealed-file handles + the extent sweep
+    /// seed — installed into the plane's tier state at completion.
+    recovered_tiers: Vec<RecoveredTierNs<F>>,
+    /// End-of-replay tiered checks ran (once, on entering the audit).
+    tier_replay_checked: bool,
 }
 
-impl<F: SegmentFs> Recovery<F> {
+/// One recovered tiered namespace's plane-side pieces (M4-S26).
+pub(crate) struct RecoveredTierNs<F: SegmentFs> {
+    pub ns: inf_log::NsId,
+    pub flush: inf_log::TierFlush<F>,
+    /// Creation-mode fds for the manifested files (ADR-0054: one fd,
+    /// one mode) — the cold-read table inherits them.
+    pub files: Vec<(u32, F::File)>,
+    pub extents_listed: Vec<u64>,
+}
+
+impl<F: SegmentFs + Clone> Recovery<F> {
     /// Prepares recovery for cell `cell` under `cfg.data_dir`. No I/O
     /// happens here — the first [`step`](Self::step) does.
     #[must_use]
@@ -301,6 +317,8 @@ impl<F: SegmentFs> Recovery<F> {
             resume_evidence_anchor: None,
             last_data: 0,
             finished: None,
+            recovered_tiers: Vec::new(),
+            tier_replay_checked: false,
         }
     }
 
@@ -395,7 +413,12 @@ impl<F: SegmentFs> Recovery<F> {
             Phase::Start => self.step_start(ks),
             Phase::Ick { reader } => self.step_ick(ks, reader, budget_bytes),
             Phase::Replay { idx, reader } => self.step_replay(ks, idx, reader, budget_bytes),
-            Phase::Audit { idx } => self.step_audit(idx),
+            Phase::Audit { idx } => {
+                if !self.tier_replay_checked {
+                    self.finish_tier_replay(ks)?;
+                }
+                self.step_audit(idx)
+            }
             Phase::Finish => self.step_finish(),
             Phase::Complete => Ok(RecoveryProgress::Complete),
         }
@@ -463,6 +486,12 @@ impl<F: SegmentFs> Recovery<F> {
                     "MANIFEST lists segment {last_listed} but the log ends at {tail}"
                 )));
             }
+            // Tiered namespaces recover first (M4-S26; ADR-0057 D6
+            // steps 1-2): map manifested files, seed the new life at the
+            // manifested flushed watermark, and swap the recovered table
+            // in — checkpoint entries and tail records then apply onto
+            // the recovered life, never the fresh one.
+            self.recover_tiers(ks, &manifest)?;
             let ick_path = self.ckpt_dir.join(ick_file_name(manifest.ckpt_id));
             // Presize from the footer counts before streaming (M2-S13):
             // the bulk apply must not pay a doubling-rehash storm.
@@ -515,20 +544,146 @@ impl<F: SegmentFs> Recovery<F> {
         Ok(RecoveryProgress::Working)
     }
 
+    /// Recovers every manifested tiered namespace (M4-S26, ADR-0057
+    /// D6): map + verify tier files, seed the new life at the
+    /// manifested flushed watermark, install the recovered table, and
+    /// retain creation-mode fds for the plane's cold-read table.
+    fn recover_tiers(&mut self, ks: &mut Keyspace, manifest: &Manifest) -> io::Result<()> {
+        for tier in &manifest.tiers {
+            let ns = inf_log::NsId(tier.ns);
+            let Some(spec) = ks.ns_get_by_id(ns).and_then(|spec| spec.tier) else {
+                return Err(io_msg(format!(
+                    "MANIFEST carries a tier section for ns {} the catalog does not know",
+                    tier.ns
+                )));
+            };
+            let demote = spec.demotion_config();
+            let reserve_bytes = demote
+                .ring_reserve_bytes()
+                .ok_or_else(|| io_msg("tier spec ring reservation unrepresentable".into()))?;
+            let recovered = inf_store::recover_tiered_ns(
+                self.fs().clone(),
+                tier,
+                manifest.ckpt_id,
+                inf_log::TierFlushConfig {
+                    shard_dir: self.shard_dir.join(format!("ns-{}", tier.ns)),
+                    cell: u32::from(self.cell),
+                    ns,
+                    mode: spec.tier_io_mode,
+                    file_capacity: inf_log::flush::TIER_FILE_CAPACITY_DEFAULT,
+                    slice_bytes: spec.maintain_slice_bytes,
+                },
+                inf_store::AddressSpaceConfig {
+                    reserve_bytes,
+                    page_bytes: inf_alloc::REGION_PAGE_BYTES,
+                    life_origin: inf_store::LogicalAddr::ZERO, // overridden by the manifest
+                },
+                demote,
+                1024,
+            )?;
+            ks.install_recovered_tiered(ns, recovered.table);
+            let mut files = Vec::with_capacity(recovered.flush.sealed().len());
+            for meta in recovered.flush.sealed() {
+                let handle = self.fs().open_tier(&meta.path, spec.tier_io_mode)?;
+                files.push((meta.id, handle));
+            }
+            self.recovered_tiers.push(RecoveredTierNs {
+                ns,
+                flush: recovered.flush,
+                files,
+                extents_listed: recovered.extents_listed,
+            });
+        }
+        Ok(())
+    }
+
+    /// End-of-replay tiered checks (M4-S26), run once when replay hands
+    /// to the audit: a non-empty displacement register means the log
+    /// ended between a marker and its paired mutation — corrupt input
+    /// by the ADR-0057 D4 same-frame rule (fail-stop, never a skip);
+    /// then the extent orphan sweep seeds from the boot listing
+    /// (ADR-0061 D6 — liveness is post-replay refcount truth).
+    fn finish_tier_replay(&mut self, ks: &mut Keyspace) -> io::Result<()> {
+        self.tier_replay_checked = true;
+        if ks.displace_register_len() > 0 {
+            return Err(io_msg(format!(
+                "log ends with {} unpaired displacement marker(s) (ADR-0057 D4)",
+                ks.displace_register_len()
+            )));
+        }
+        for tier in &self.recovered_tiers {
+            if let Some(table) = ks.tiered_store_mut(tier.ns) {
+                table.extent_sweep_seed(&tier.extents_listed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Hands the recovered tiered plane halves to the caller (the plane
+    /// installs them into its tier state at completion — M4-S26).
+    pub(crate) fn take_recovered_tiers(&mut self) -> Vec<RecoveredTierNs<F>> {
+        std::mem::take(&mut self.recovered_tiers)
+    }
+
     fn step_ick(
         &mut self,
         ks: &mut Keyspace,
         mut reader: Box<IckReader<F::File>>,
         budget_bytes: u64,
     ) -> io::Result<RecoveryProgress> {
-        let ick_path =
-            self.ckpt_dir.join(ick_file_name(self.manifest.as_ref().expect("ick phase").ckpt_id));
+        let manifest = self.manifest.as_ref().expect("ick phase");
+        let ick_path = self.ckpt_dir.join(ick_file_name(manifest.ckpt_id));
+        // Tiered section routing (M4-S26; ADR-0057 D3/D6): the per-ns
+        // manifested flushed watermark cross-checks every ref section.
+        let tier_flushed: Vec<(u32, u64)> =
+            manifest.tiers.iter().map(|t| (t.ns, t.flushed)).collect();
+        let flushed_of = |ns: u32| tier_flushed.iter().find(|(id, _)| *id == ns).map(|(_, f)| *f);
+        let (now, anchor) = (self.now, self.anchor);
+        // One mutable keyspace, four exclusive callbacks: the reader
+        // invokes exactly one at a time, which the borrow checker cannot
+        // see — a RefCell makes the exclusivity dynamic (single-threaded,
+        // non-reentrant by construction).
+        let ks = std::cell::RefCell::new(ks);
         let mut spent = 0u64;
         loop {
             let step = reader
-                .next_step(|record| {
-                    ks.apply_record(&record, self.now, self.anchor).map(|_| ()).map_err(io_invalid)
-                })
+                .next_step_hybrid(
+                    |record| {
+                        ks.borrow_mut()
+                            .apply_record(&record, now, anchor)
+                            .map(|_| ())
+                            .map_err(io_invalid)
+                    },
+                    |refs| {
+                        let flushed = flushed_of(refs.ns).ok_or_else(|| {
+                            io_msg(format!("ref section for unmanifested tier ns {}", refs.ns))
+                        })?;
+                        let mut ks = ks.borrow_mut();
+                        let table =
+                            ks.tiered_store_mut(inf_log::NsId(refs.ns)).ok_or_else(|| {
+                                io_msg(format!("ref section for unknown tier ns {}", refs.ns))
+                            })?;
+                        inf_store::apply_ref_section(table, &refs, flushed)
+                    },
+                    |live| {
+                        let mut ks = ks.borrow_mut();
+                        let table =
+                            ks.tiered_store_mut(inf_log::NsId(live.ns)).ok_or_else(|| {
+                                io_msg(format!("live-set section for unknown ns {}", live.ns))
+                            })?;
+                        inf_store::apply_live_set_section(table, &live);
+                        Ok(())
+                    },
+                    |blob| {
+                        let mut ks = ks.borrow_mut();
+                        let table =
+                            ks.tiered_store_mut(inf_log::NsId(blob.ns)).ok_or_else(|| {
+                                io_msg(format!("blob-ref section for unknown ns {}", blob.ns))
+                            })?;
+                        inf_store::apply_blob_ref_section(table, &blob);
+                        Ok(())
+                    },
+                )
                 .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
             match step {
                 IckStep::Section { bytes } => {

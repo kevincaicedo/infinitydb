@@ -232,7 +232,7 @@ struct RepResult {
     digest: u64,
 }
 
-fn timed_recover<F: inf_log::fs::SegmentFs>(
+fn timed_recover<F: inf_log::fs::SegmentFs + Clone>(
     fs: F,
     ks: &mut Keyspace,
     cfg: &DurableConfig,
