@@ -302,6 +302,31 @@ impl Keyspace {
         Ok(())
     }
 
+    /// Replaces a namespace's fresh-at-origin-zero table with the
+    /// recovered one (M4-S26; ADR-0057 D6 step 2 — `seed_catalog`
+    /// materializes fresh, boot recovery swaps the recovered life in
+    /// before any checkpoint entry or tail record applies). The spec's
+    /// derived knobs re-apply on the recovered table.
+    ///
+    /// # Panics
+    /// Panics when the namespace is not a registered tiered namespace —
+    /// the recovery driver only recovers manifested tiered sections.
+    pub fn install_recovered_tiered(&mut self, ns: NsId, table: TieredTable) {
+        let tier = self
+            .ns_get_by_id(ns)
+            .and_then(|spec| spec.tier)
+            .expect("recovered namespace carries a tier block");
+        let entry = self
+            .tiered_stores
+            .iter_mut()
+            .find(|(id, _)| *id == ns)
+            .expect("seed_catalog materialized the namespace");
+        *entry.1 = table;
+        entry.1.set_compaction_config(tier.compaction_config());
+        entry.1.set_blob_config(tier.blob_config());
+        entry.1.set_disk_budget(tier.disk_budget_bytes);
+    }
+
     /// This cell's share of the node reserved-VA limit (ADR-0062 D4).
     #[must_use]
     pub fn tiered_va_limit(&self) -> u64 {
@@ -1133,6 +1158,12 @@ impl Keyspace {
     /// count must not materialize state the catalog doesn't know.
     pub fn reserve_ns(&mut self, ns: NsId, entries: u64) {
         if ns.0 < FIRST_NAMED_NS_ID {
+            return;
+        }
+        // A tiered namespace's entries live in its table, not the named
+        // CellStore shell — presizing the shell would allocate a dataset-
+        // sized index nothing ever touches (M4-S26).
+        if self.is_tiered(ns) {
             return;
         }
         if let Some(store) = self.ns_store_mut(ns) {

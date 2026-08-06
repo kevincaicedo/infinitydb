@@ -996,13 +996,15 @@ fn tiered_namespace_lifecycle_survives_restart() {
     assert!(tiering.contains("tiering_tables:1"), "{tiering}");
     assert!(tiering.contains("budget_bytes=8388608"), "{tiering}");
     assert!(tiering.contains("disk_budget_bytes=67108864"), "{tiering}");
-    // The D8 refusal: no command can silently serve from an unrouted store.
+    // M4-S26: the D8 refusal is lifted — USE routes to the tiered arm.
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"hot"])).expect("write");
-    let refusal = read_line(&mut c);
-    assert!(
-        refusal.starts_with(b"-ERR tiered namespaces are not command-addressable"),
-        "{refusal:?}"
-    );
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"probe", b"v1"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"probe"])).expect("write");
+    read_exactly(&mut c, b"$2\r\nv1\r\n");
+    c.write_all(&cmd(&[b"SELECT", b"0"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
     // Hot-reload rides the same DDL program (fan + persist-then-ack).
     c.write_all(&cmd(&[b"INF.NS", b"SET", b"hot", b"MUTABLE-FRACTION", b"300"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -1033,6 +1035,128 @@ fn tiered_namespace_lifecycle_survives_restart() {
     let tiering = info_text(&mut c, b"tiering");
     assert!(tiering.contains("tiering_tables:0"), "{tiering}");
     assert!(tiering.contains("tiering_reserved_bytes:0"), "the ring returned: {tiering}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M4-S26: the tiered data plane end to end, then the §3.1 never-none
+/// proof at node scale. String commands serve a tiered namespace over
+/// TCP; a fill past `MEM-BUDGET` demotes (seal → flush → release), so
+/// low keys go cold and later reads take the `IoToken` suspension path;
+/// overwrites and deletes of cold keys stage displacement markers; a
+/// checkpoint walks the hybrid (refs + images + live-set); a restart
+/// recovers content-exactly through MANIFEST v2 → tier files →
+/// checkpoint → WAL tail (content compared, never addresses).
+#[test]
+fn tiered_data_plane_serves_and_survives_restart() {
+    let dir = temp_data_dir("tiered-data");
+    let keys = 600usize;
+    let value_of = |i: usize, generation: u32| {
+        format!("g{generation}:{i:04}:").into_bytes().repeat(1024) // ~8 KiB
+    };
+    let key_of = |i: usize| format!("k:{i:04}").into_bytes();
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"t",
+            b"MODE",
+            b"durable",
+            b"FSYNC",
+            b"everysec",
+            b"MEM-BUDGET",
+            b"3mb",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        // Fill ~4.8 MiB against a 3 MiB budget: demotion must engage.
+        for i in 0..keys {
+            c.write_all(&cmd(&[b"SET", &key_of(i), &value_of(i, 0)])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+        read_exactly(&mut c, format!(":{keys}\r\n").as_bytes());
+        // Demotion progress is MAINTAIN-driven: poll until bytes flushed
+        // and the head advanced (cold records exist).
+        let mut demoted = false;
+        for _ in 0..300 {
+            let tiering = info_text(&mut c, b"tiering");
+            let flushed = tiering
+                .lines()
+                .find_map(|l| l.strip_prefix("tiering_flush_confirmed_bytes:"))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            if flushed > 1 << 20 {
+                demoted = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(demoted, "demotion never flushed past 1 MiB");
+        // Cold reads serve exact bytes (fetch + verify + suspension).
+        for i in [0usize, 3, 7] {
+            c.write_all(&cmd(&[b"GET", &key_of(i)])).expect("write");
+            let value = value_of(i, 0);
+            let mut expect = format!("${}\r\n", value.len()).into_bytes();
+            expect.extend_from_slice(&value);
+            expect.extend_from_slice(b"\r\n");
+            read_exactly(&mut c, &expect);
+        }
+        // Overwrites displace (cold candidates fetch-verify first); the
+        // markers stage ahead of the mutation records (ADR-0057 D4).
+        for i in 0..40 {
+            c.write_all(&cmd(&[b"SET", &key_of(i), &value_of(i, 1)])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        // Cold DEL verifies, then kills by exact address (S26 policy).
+        for i in 40..60 {
+            c.write_all(&cmd(&[b"DEL", &key_of(i)])).expect("write");
+            read_exactly(&mut c, b":1\r\n");
+        }
+        // A checkpoint walks the hybrid: refs below the walk watermark,
+        // RAM images above, live-set sections, manifest v2 tier ranges.
+        c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        // Post-checkpoint tail: these records replay from the WAL.
+        for i in 60..80 {
+            c.write_all(&cmd(&[b"SET", &key_of(i), &value_of(i, 2)])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        drop(c);
+        node.stop();
+    }
+
+    // Restart: MANIFEST v2 → tier files → checkpoint (refs idempotent,
+    // displacements exact) → WAL tail. Every surviving key serves its
+    // exact bytes; deleted keys stay dead (no ref-slot resurrection).
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", keys - 20).as_bytes());
+    for i in 0..keys {
+        c.write_all(&cmd(&[b"GET", &key_of(i)])).expect("write");
+        if (40..60).contains(&i) {
+            read_exactly(&mut c, b"$-1\r\n");
+            continue;
+        }
+        let generation = match i {
+            _ if i < 40 => 1,
+            _ if (60..80).contains(&i) => 2,
+            _ => 0,
+        };
+        let value = value_of(i, generation);
+        let mut expect = format!("${}\r\n", value.len()).into_bytes();
+        expect.extend_from_slice(&value);
+        expect.extend_from_slice(b"\r\n");
+        read_exactly(&mut c, &expect);
+    }
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();

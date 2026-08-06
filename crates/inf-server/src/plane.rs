@@ -1242,9 +1242,26 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 let mut boot = self.boot.take().expect("boot present");
                 let fs = boot.fs;
                 let barrier_dirs = boot.rec.take_boot_barrier_dirs();
+                let recovered_tiers = boot.rec.take_recovered_tiers();
                 let (rotor, stats, seed) = boot.rec.finish();
                 match self.enable_durable(fs, &boot.cfg, boot.cell_id, rotor, seed) {
                     Ok(()) => {
+                        // Recovered tiered namespaces' plane half
+                        // (M4-S26; ADR-0057 D6): the flush pipeline
+                        // resumes with the manifested catalog and the
+                        // cold-read table inherits the boot-opened fds.
+                        if !recovered_tiers.is_empty() {
+                            let ks = self.shared.store.borrow();
+                            let mut tier = self.shared.tier.borrow_mut();
+                            let tier = tier.as_mut().expect("enable_durable built tier state");
+                            for rt in recovered_tiers {
+                                let spec = ks
+                                    .ns_get_by_id(rt.ns)
+                                    .and_then(|spec| spec.tier)
+                                    .expect("recovered namespace carries a tier block");
+                                tier.install_recovered(rt.ns, &spec, rt.flush, rt.files);
+                            }
+                        }
                         // Boot-metadata durability rides driver barriers at
                         // the head of the commit ledger (M2.5-S01): every
                         // durable ack is fenced behind them by the
@@ -4826,7 +4843,26 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     }
     // Tiered namespaces execute through the async tiered arm (M4-S26):
     // suspension-capable resolution with its own admission + staging.
-    if shared.store.borrow().is_tiered(ns) {
+    // Keyspace-level commands (INFO, CONFIG, INF.NS, SELECT, pub/sub)
+    // stay on the ordinary path — `execute` owns them regardless of the
+    // selected namespace.
+    let keyspace_level = matches!(
+        meta.id,
+        CommandId::Select
+            | CommandId::Flushall
+            | CommandId::Flushdb
+            | CommandId::Copy
+            | CommandId::Info
+            | CommandId::Config
+            | CommandId::InfNs
+            | CommandId::Subscribe
+            | CommandId::Unsubscribe
+            | CommandId::Psubscribe
+            | CommandId::Punsubscribe
+            | CommandId::Publish
+            | CommandId::Pubsub
+    );
+    if !keyspace_level && shared.store.borrow().is_tiered(ns) {
         match tiered::dispatch_tiered(shared, origin, ns, meta, argv, proto, class).await {
             tiered::TieredReply::Done(reply) => pending.push_back(PendingReply::Done(reply)),
             tiered::TieredReply::Gated { reply, seq } => {
