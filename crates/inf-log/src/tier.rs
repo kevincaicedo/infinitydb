@@ -685,13 +685,16 @@ impl<F: SegmentFs> TierWriter<F> {
     /// one fdatasync. A sealed file is terminal — no rewrite ever
     /// follows, so its full `data_len` becomes claimable. Returns the
     /// exact data length (= the file's logical range length), the path,
-    /// and the file's lifetime device bytes (M4-S13).
+    /// the file's lifetime device bytes (M4-S13) — and the open file
+    /// handle, so the plane's cold-read table inherits the fd in its
+    /// creation-time I/O mode instead of reopening (ADR-0054: one fd,
+    /// one mode; M4-S26). Callers that drop the handle just close it.
     ///
     /// # Errors
     /// As [`sync`](Self::sync); a failure mid-seal leaves the file
     /// unsealed on disk (no footer or a torn one) — recovery treats it
     /// per the manifested watermark (D5), the seal is redone by rule.
-    pub fn seal(mut self, reason: SealReason) -> Result<SealOutcome, TierWriteFailure> {
+    pub fn seal(mut self, reason: SealReason) -> Result<(SealOutcome, F::File), TierWriteFailure> {
         self.flush_batch().map_err(TierWriteFailure::Write)?;
         if self.tail_fill > 0 {
             self.write_tail_frame().map_err(TierWriteFailure::Write)?;
@@ -721,11 +724,12 @@ impl<F: SegmentFs> TierWriter<F> {
             )));
         }
         self.file.sync_data().map_err(TierWriteFailure::Fsync)?;
-        Ok(SealOutcome {
+        let outcome = SealOutcome {
             data_len: self.data_len,
             path: self.path,
             device_bytes: self.device_bytes,
-        })
+        };
+        Ok((outcome, self.file))
     }
 
     /// Writes the current tail frame at its disk slot (full frames land
@@ -1163,7 +1167,7 @@ mod tests {
             TIER_FRAME_DATA as u64,
             "partial tail frame held back until seal (ADR-0056 D5)"
         );
-        let sealed = writer.seal(SealReason::Capacity).expect("seal");
+        let (sealed, _handle) = writer.seal(SealReason::Capacity).expect("seal");
         assert_eq!(sealed.data_len, payload.len() as u64);
         // M4-S13: the device saw header + three frame writes for two
         // frames (the partial tail is rewritten — once at `sync`, once
@@ -1308,7 +1312,7 @@ mod tests {
         )
         .expect("create");
         writer.append(LogicalAddr::ZERO, &[0x44; 64]).expect("append");
-        let sealed = writer.seal(SealReason::Shutdown).expect("seal");
+        let (sealed, _handle) = writer.seal(SealReason::Shutdown).expect("seal");
         let mut image = fs.contents(&sealed.path).expect("file exists");
         // Corrupt the footer CRC: probe fails typed.
         let at = image.len() - TIER_FOOTER_BYTES + 24;
