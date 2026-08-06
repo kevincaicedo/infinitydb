@@ -631,6 +631,20 @@ impl<File: SegmentFile> GroupCommit<File> {
         self.queued_up_to
     }
 
+    /// True while any extent-seal barrier (ADR-0061 D3) still awaits its
+    /// `Synced`. `seal_log` holds the next frame behind it: that frame
+    /// may carry the referencing record, and the frame's durability must
+    /// never precede the extent's — record durable ⇒ extent durable, the
+    /// D9 "reverse assert" at reactor tier. The ledger barrier alone
+    /// fences only the *ack* (done-prefix); the device is free to
+    /// complete the frame's linked fsync before the extent's fdatasync,
+    /// and a cut in that window replays a dangling reference (caught by
+    /// the `m4-tiered` DST audit, seeds 0x5eed000c/0x5eed003a).
+    #[must_use]
+    pub fn extent_barrier_pending(&self) -> bool {
+        self.pending.iter().any(|p| p.reason == SyncReason::ExtentSeal && !p.done)
+    }
+
     /// Frame bytes queued but not yet fsync-covered (`pending_log_bytes`).
     #[must_use]
     pub fn pending_log_bytes(&self) -> u64 {
