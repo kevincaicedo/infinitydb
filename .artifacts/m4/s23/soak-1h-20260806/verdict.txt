@@ -1,0 +1,6 @@
+rss slope +455.741%/24h (first-5% median 226992 kB -> last-5% median 270096 kB, 356 samples)
+disk max 1541976064 bytes (budget 2684354560)
+write-amp milli max 1915 (gate < 3000)
+wa flatness: q2 mean 1648 -> q4 mean 1649 milli
+FAIL
+  - RSS slope +455.741%/24h >= 0.5%/24h
