@@ -102,6 +102,10 @@ pub enum CatalogError {
     /// Tier block violates a cross-field or range rule; the reason names
     /// it (the same gauntlet the command parser runs — one vocabulary).
     InvalidTierConfig(&'static str),
+    /// A tiered entry carries `MAXMEMORY` (M4-S27, ADR-0068 D1): one
+    /// budget authority per namespace — the parser refuses it, so a
+    /// catalog holding it is corrupt or foreign.
+    TierOwnsBudget(u32),
 }
 
 impl fmt::Display for CatalogError {
@@ -118,6 +122,12 @@ impl fmt::Display for CatalogError {
             CatalogError::DuplicateId(id) => write!(f, "duplicate namespace id {id}"),
             CatalogError::InvalidTierByte(b) => write!(f, "invalid tier presence byte {b}"),
             CatalogError::InvalidTierConfig(reason) => write!(f, "invalid tier config: {reason}"),
+            CatalogError::TierOwnsBudget(id) => {
+                write!(
+                    f,
+                    "tiered namespace id {id} carries MAXMEMORY (MEM-BUDGET is its one budget authority)"
+                )
+            }
         }
     }
 }
@@ -210,6 +220,11 @@ fn decode_entry(r: &mut Cursor<'_>, version: u8) -> Result<NsSpec, CatalogError>
     } else {
         None
     };
+    if tier.is_some() && maxmemory.is_some() {
+        // The same rule the command parser enforces (ADR-0068 D1): a
+        // tiered namespace's budget authority is MEM-BUDGET alone.
+        return Err(CatalogError::TierOwnsBudget(id));
+    }
     let name_len = r.u16_le()?;
     let name = r.bytes(usize::from(name_len))?.to_vec();
     if !valid_ns_name(&name) || is_default_name(&name) {
@@ -593,6 +608,21 @@ mod tests {
     fn reserved_ids_are_rejected() {
         let cat = NsCatalog { next_id: 16, entries: vec![entry(3, b"sneaky", NsMode::Memory)] };
         assert_eq!(NsCatalog::decode(&cat.encode()), Err(CatalogError::ReservedId(3)));
+    }
+
+    /// M4-S27 (ADR-0068 D1): a tiered entry carrying `MAXMEMORY` is
+    /// refused by the decoder like it is by the parser — the registry can
+    /// never hold it, so bytes claiming it are corrupt or foreign.
+    #[test]
+    fn tiered_entry_with_maxmemory_is_rejected() {
+        let bad = NsSpec {
+            maxmemory: Some(1 << 20),
+            fsync: Some(FsyncClass::Everysec),
+            tier: Some(TierSpec::for_budget(64 << 20)),
+            ..entry(16, b"hot", NsMode::Durable)
+        };
+        let cat = NsCatalog { next_id: 17, entries: vec![bad] };
+        assert_eq!(NsCatalog::decode(&cat.encode()), Err(CatalogError::TierOwnsBudget(16)));
     }
 
     #[test]

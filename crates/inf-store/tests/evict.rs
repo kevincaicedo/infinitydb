@@ -6,8 +6,8 @@
 
 use inf_foundation::time::Nanos;
 use inf_store::{
-    EvictBudget, EvictionPolicy, Keyspace, OpError, PressureConfig, SetExpire, SetOptions,
-    StoreConfig,
+    EvictBudget, EvictionPolicy, Keyspace, NsId, NsMode, NsSpec, OpError, PressureConfig,
+    SetExpire, SetOptions, StoreConfig,
 };
 
 const NOW: Nanos = Nanos(1_000_000_000); // 1 s
@@ -245,6 +245,246 @@ fn lfu_beats_random_on_skewed_trace() {
         lfu > random + 0.03,
         "allkeys-lfu hit rate {lfu:.3} must beat allkeys-random {random:.3} on a skewed trace"
     );
+}
+
+// ---- M4-S27 (ADR-0068): named memory-namespace enforcement --------------------
+
+fn memory_ns(id: u32, name: &[u8], policy: Option<EvictionPolicy>) -> NsSpec {
+    NsSpec {
+        id: NsId(id),
+        name: name.to_vec(),
+        mode: NsMode::Memory,
+        fsync: None,
+        policy,
+        maxmemory: None,
+        tier: None,
+    }
+}
+
+fn ns_set(ks: &mut Keyspace, id: u32, key: &str, len: usize) {
+    ks.ns_store_mut(NsId(id))
+        .expect("registered")
+        .set(key.as_bytes(), &vec![0u8; len], SetOptions::default(), NOW)
+        .expect("set");
+    ks.refresh_pressure();
+}
+
+/// Emulates the exec layer's namespace-scoped DENYOOM gate (ADR-0068 D4)
+/// for one write into a budgeted named memory namespace.
+fn ns_gated_set(ks: &mut Keyspace, id: u32, key: &str, len: usize) -> Result<(), OpError> {
+    if let Some(verdict) = ks.ns_free_for_write(NsId(id), NOW) {
+        verdict?;
+    }
+    ns_set(ks, id, key, len);
+    Ok(())
+}
+
+/// The M1-S05/S07 write storm re-targeted at a named memory namespace
+/// (ADR-0068 D2 budget leg): under a sustained gated storm the namespace
+/// never exceeds its own budget + one-write slack, reclaims from its own
+/// keys only, and the numbered dbs are never disturbed — with **no**
+/// node-level `maxmemory` set at all.
+#[test]
+fn named_ns_storm_holds_its_own_budget_and_leaves_db0_alone() {
+    let mut ks = fresh();
+    for i in 0..100 {
+        set(&mut ks, &format!("db0:{i}"), 128);
+    }
+    const VALUE: usize = 256;
+    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysRandom))).expect("create");
+    for i in 0..200 {
+        ns_set(&mut ks, 16, &format!("seed:{i}"), VALUE);
+    }
+    let budget = ks.ns_store(NsId(16)).expect("live").used_bytes();
+    ks.ns_set_memory(b"cache", Some(EvictionPolicy::AllKeysRandom), Some(budget)).expect("hot");
+    let slack = (VALUE + 64) as u64;
+    for i in 0..2_000 {
+        ns_gated_set(&mut ks, 16, &format!("storm:{i}"), VALUE).unwrap_or_else(|e| {
+            panic!(
+                "step {i}: {e:?} used={} budget={budget}",
+                ks.ns_store(NsId(16)).expect("live").used_bytes()
+            )
+        });
+        let used = ks.ns_store(NsId(16)).expect("live").used_bytes();
+        assert!(used <= budget + slack, "step {i}: used {used} exceeds budget {budget} + slack");
+    }
+    assert!(
+        ks.ns_store(NsId(16)).expect("live").stats().evicted_keys >= 1_000,
+        "the storm must have evicted heavily from its own keys"
+    );
+    for i in 0..100 {
+        assert!(
+            ks.db_mut(0).exists(format!("db0:{i}").as_bytes(), NOW),
+            "db0:{i} was evicted for a namespace's own growth (the S20 collateral bug)"
+        );
+    }
+}
+
+/// The inheritance leg (ADR-0068 D2): a named memory store without its
+/// own budget joins the global eviction hand, so pressure driven by its
+/// growth resolves by reclaiming **its** bytes — before S27 this exact
+/// shape evicted the numbered dbs dry and then answered OOM.
+#[test]
+fn inheriting_named_ns_joins_the_global_hand() {
+    let mut ks = fresh();
+    ks.ns_create(memory_ns(16, b"grower", None)).expect("create");
+    pressure(&mut ks, EvictionPolicy::AllKeysRandom, 0);
+    for i in 0..50 {
+        set(&mut ks, &format!("db0:{i}"), 64);
+    }
+    for i in 0..400 {
+        ns_set(&mut ks, 16, &format!("grow:{i}"), 256);
+    }
+    let limit = ks.used_bytes() * 3 / 4;
+    pressure(&mut ks, EvictionPolicy::AllKeysRandom, limit);
+    assert!(ks.over_limit());
+    assert_eq!(
+        ks.free_for_write(NOW),
+        Ok(()),
+        "the hand must reach the named store's bytes instead of answering OOM"
+    );
+    assert!(ks.used_bytes() <= limit);
+    assert!(
+        ks.ns_store(NsId(16)).expect("live").stats().evicted_keys > 0,
+        "reclaim must come from the growing namespace"
+    );
+}
+
+/// Durable named stores never evict, whatever the node policy does
+/// (ADR-0015 D5, scoped by ADR-0068 D1): the policy push skips them, the
+/// hand skips them, and every durable key survives global pressure.
+#[test]
+fn durable_named_store_never_joins_any_hand() {
+    let mut ks = fresh();
+    let durable = NsSpec {
+        id: NsId(16),
+        name: b"ledger".to_vec(),
+        mode: NsMode::Durable,
+        fsync: None,
+        policy: None,
+        maxmemory: None,
+        tier: None,
+    };
+    ks.ns_create(durable).expect("create");
+    for i in 0..100 {
+        ns_set(&mut ks, 16, &format!("keep:{i}"), 256);
+    }
+    for i in 0..20 {
+        set(&mut ks, &format!("db0:{i}"), 64);
+    }
+    let limit = ks.used_bytes() / 2;
+    pressure(&mut ks, EvictionPolicy::AllKeysRandom, limit);
+    assert_eq!(
+        ks.ns_store(NsId(16)).expect("live").eviction_policy(),
+        EvictionPolicy::NoEviction,
+        "the policy push must not reach durable stores"
+    );
+    // The hand can only reach db0's few keys; the verdict is honest OOM —
+    // never an eviction from the durable store.
+    assert_eq!(ks.free_for_write(NOW), Err(OpError::OutOfMemory));
+    for i in 0..100 {
+        assert!(
+            ks.ns_store_mut(NsId(16)).expect("live").exists(format!("keep:{i}").as_bytes(), NOW),
+            "durable key keep:{i} was evicted"
+        );
+    }
+    assert_eq!(ks.ns_store(NsId(16)).expect("live").stats().evicted_keys, 0);
+}
+
+/// The proactive half of the budget leg (M1-S03 shape): a hot-reloaded
+/// per-namespace budget takes observable effect through MAINTAIN slices
+/// alone — no writes arrive, and the store settles at its low watermark.
+#[test]
+fn maintain_drives_budgeted_ns_to_its_low_watermark() {
+    let mut ks = fresh();
+    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysLru))).expect("create");
+    for i in 0..500 {
+        ns_set(&mut ks, 16, &format!("fill:{i}"), 200);
+    }
+    let used = ks.ns_store(NsId(16)).expect("live").used_bytes();
+    let live = ks.ns_store(NsId(16)).expect("live").report().records_live_bytes;
+    let budget = used - live + live / 2;
+    ks.ns_set_memory(b"cache", Some(EvictionPolicy::AllKeysLru), Some(budget)).expect("hot");
+    assert!(ks.ns_over_limit(NsId(16)), "budget flag visible immediately after hot-reload");
+    // Tick to fixpoint, as the plane's MAINTAIN loop does (it never stops
+    // at the flag — the pass drives past it to the watermark, hysteresis).
+    let mut slices = 0;
+    loop {
+        let before = ks.ns_store(NsId(16)).expect("live").used_bytes();
+        ks.evict_tick(NOW, EvictBudget::default());
+        slices += 1;
+        assert!(slices < 10_000, "maintain must converge");
+        if ks.ns_store(NsId(16)).expect("live").used_bytes() == before {
+            break;
+        }
+    }
+    assert!(!ks.ns_over_limit(NsId(16)), "the budget flag must have cleared");
+    let settled = ks.ns_store(NsId(16)).expect("live").used_bytes();
+    assert!(settled <= budget, "maintain must reach the namespace budget");
+    assert!(
+        settled <= budget - budget / 16 + 512,
+        "and settle near the low watermark (hysteresis): {settled} vs budget {budget}"
+    );
+    assert_eq!(ks.db_mut(0).len(), 0, "nothing else was touched");
+}
+
+/// `CONFIG SET maxmemory-policy` pushes to inheriting named memory stores
+/// only — an explicit per-namespace `EVICTION` beats inherited
+/// (ADR-0068 D3).
+#[test]
+fn node_policy_push_reaches_inheriting_stores_only() {
+    let mut ks = fresh();
+    ks.ns_create(memory_ns(16, b"inheriting", None)).expect("create");
+    ks.ns_create(memory_ns(17, b"explicit", Some(EvictionPolicy::AllKeysLfu))).expect("create");
+    ns_set(&mut ks, 16, "k", 8);
+    ns_set(&mut ks, 17, "k", 8);
+    pressure(&mut ks, EvictionPolicy::AllKeysLru, 0);
+    assert_eq!(ks.ns_store(NsId(16)).expect("live").eviction_policy(), EvictionPolicy::AllKeysLru);
+    assert_eq!(ks.ns_store(NsId(17)).expect("live").eviction_policy(), EvictionPolicy::AllKeysLfu);
+    pressure(&mut ks, EvictionPolicy::NoEviction, 0);
+    assert_eq!(ks.ns_store(NsId(16)).expect("live").eviction_policy(), EvictionPolicy::NoEviction);
+    assert_eq!(ks.ns_store(NsId(17)).expect("live").eviction_policy(), EvictionPolicy::AllKeysLfu);
+}
+
+/// The eviction-accounting oracle extended to named stores (the S27 test
+/// obligation): after storms across db0, a budgeted namespace, and an
+/// inheriting namespace, the aggregate counters are exactly the field-wise
+/// per-store sums and `used_bytes` reconciles — accounting stays L5-exact
+/// under every enforcement leg at once.
+#[test]
+fn eviction_accounting_reconciles_across_named_stores() {
+    let mut ks = fresh();
+    ks.ns_create(memory_ns(16, b"budgeted", Some(EvictionPolicy::AllKeysRandom))).expect("create");
+    ks.ns_create(memory_ns(17, b"inheriting", None)).expect("create");
+    pressure(&mut ks, EvictionPolicy::AllKeysRandom, 0);
+    for i in 0..150 {
+        set(&mut ks, &format!("db0:{i}"), 128);
+        ns_set(&mut ks, 16, &format!("b:{i}"), 128);
+        ns_set(&mut ks, 17, &format!("i:{i}"), 128);
+    }
+    let budget = ks.ns_store(NsId(16)).expect("live").used_bytes() / 2;
+    ks.ns_set_memory(b"budgeted", Some(EvictionPolicy::AllKeysRandom), Some(budget)).expect("hot");
+    let limit = ks.used_bytes() * 3 / 4;
+    pressure(&mut ks, EvictionPolicy::AllKeysRandom, limit);
+    for i in 0..300 {
+        let _ = gated_set(&mut ks, &format!("storm:{i}"), 128);
+        let _ = ns_gated_set(&mut ks, 16, &format!("bs:{i}"), 128);
+    }
+    let mut slices = 0;
+    while (ks.over_limit() || ks.ns_over_limit(NsId(16))) && slices < 10_000 {
+        ks.evict_tick(NOW, EvictBudget::default());
+        slices += 1;
+    }
+    let by_hand: u64 = ks.dbs().map(|(_, s)| s.stats().evicted_keys).sum::<u64>()
+        + [16, 17]
+            .iter()
+            .map(|id| ks.ns_store(NsId(*id)).expect("live").stats().evicted_keys)
+            .sum::<u64>();
+    assert_eq!(ks.stats().evicted_keys, by_hand, "aggregate counters are field-wise sums");
+    assert!(by_hand > 0, "the storms must have evicted");
+    let used_by_hand: u64 = ks.dbs().map(|(_, s)| s.used_bytes()).sum::<u64>()
+        + [16, 17].iter().map(|id| ks.ns_store(NsId(*id)).expect("live").used_bytes()).sum::<u64>();
+    assert_eq!(ks.used_bytes(), used_by_hand, "used_bytes reconciles (L5)");
 }
 
 /// Evicting a TTL'd key leaves its wheel entry stale-tolerant (M1-S04

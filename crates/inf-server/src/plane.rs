@@ -888,6 +888,29 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         let tier = tier_from_fan(argv[3])?.ok_or(malformed)?;
         return shared.store.borrow_mut().ns_set_tier(argv[2], tier);
     }
+    // Memory-namespace pressure keys (M4-S27, ADR-0068 D3): the MEMCFG
+    // tag disambiguates from the tier-SET arm above.
+    if argv.len() == 6 && argv[1].eq_ignore_ascii_case(b"SET") && argv[3] == b"MEMCFG" {
+        let policy = match argv[4] {
+            b"-" => None,
+            p => Some(
+                core::str::from_utf8(p)
+                    .ok()
+                    .and_then(inf_store::EvictionPolicy::parse)
+                    .ok_or_else(|| malformed.clone())?,
+            ),
+        };
+        let maxmemory = match argv[5] {
+            b"-" => None,
+            b => Some(
+                core::str::from_utf8(b)
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .ok_or_else(|| malformed.clone())?,
+            ),
+        };
+        return shared.store.borrow_mut().ns_set_memory(argv[2], policy, maxmemory);
+    }
     if argv.len() != 9 || !argv[1].eq_ignore_ascii_case(b"CREATE") {
         return Err(malformed);
     }
@@ -5068,21 +5091,32 @@ async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             tier_to_fan(spec.tier.as_ref()),
         ]
     } else if argv[1].eq_ignore_ascii_case(b"SET") {
-        // M4-S19 (ADR-0062 D3): hot-reload is DDL — registry + table
-        // update locally, fan to peers, catalog persist-then-ack.
-        let (name, tier) = {
+        // M4-S19 (ADR-0062 D3) / M4-S27 (ADR-0068 D3): hot-reload is DDL
+        // — registry + store update locally, fan to peers, catalog
+        // persist-then-ack.
+        let (name, update) = {
             let store = shared.store.borrow();
             match crate::admin::parse_ns_set(argv, &store) {
                 Ok(parsed) => parsed,
                 Err(msg) => return error_reply(shared, proto, &msg),
             }
         };
-        if let Err(e) = shared.store.borrow_mut().ns_set_tier(&name, tier) {
+        let fan_tail = match &update {
+            crate::admin::NsSetUpdate::Tier(tier) => vec![tier_to_fan(Some(tier))],
+            crate::admin::NsSetUpdate::MemoryPressure { policy, maxmemory } => vec![
+                b"MEMCFG".to_vec(),
+                policy.map_or_else(|| b"-".to_vec(), |p| p.name().as_bytes().to_vec()),
+                maxmemory.map_or_else(|| b"-".to_vec(), |b| b.to_string().into_bytes()),
+            ],
+        };
+        if let Err(e) = crate::admin::apply_ns_set(&mut shared.store.borrow_mut(), &name, update) {
             let mut reply = shared.take_reply_buf();
             crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
             return reply;
         }
-        vec![b"INF.NSFAN".to_vec(), b"SET".to_vec(), name, tier_to_fan(Some(&tier))]
+        let mut fan = vec![b"INF.NSFAN".to_vec(), b"SET".to_vec(), name];
+        fan.extend(fan_tail);
+        fan
     } else {
         if argv.len() != 3 {
             return error_reply(shared, proto, "ERR wrong number of arguments for 'INF.NS|DROP'");
