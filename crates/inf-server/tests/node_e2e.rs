@@ -1040,6 +1040,84 @@ fn tiered_namespace_lifecycle_survives_restart() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// M4-S27 (ADR-0068): the named memory-namespace pressure lifecycle over
+/// TCP — CREATE and the `MAXMEMORY`/`EVICTION` hot-reload ride the DDL
+/// program (the `MEMCFG` fan leg, AllOk, catalog persist-then-ack); the
+/// DENYOOM verdict is scoped to the namespace (its budget refuses while
+/// db0 keeps writing — the D4 gate on the wire); removing the budget
+/// disarms the gate; the knobs survive restart as enforcement.
+#[test]
+fn named_memory_ns_pressure_enforced_and_survives_restart() {
+    let dir = temp_data_dir("memns-pressure");
+    // Two cells so the MEMCFG peer fan is real, not a no-op.
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"cache", b"EVICTION", b"allkeys-random"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // Hot-reload: a 1-byte budget with the policy returned to inherit
+    // (the node default `noeviction`) — the namespace becomes unfreeable
+    // at its own budget after one write.
+    c.write_all(&cmd(&[b"INF.NS", b"SET", b"cache", b"MAXMEMORY", b"1", b"EVICTION", b"inherit"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"cache"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"k", b"v1"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"k", b"v2"])).expect("write");
+    read_exactly(&mut c, b"-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    // The scope is the namespace: reads inside it and writes to db0 land.
+    c.write_all(&cmd(&[b"GET", b"k"])).expect("write");
+    read_exactly(&mut c, b"$2\r\nv1\r\n");
+    c.write_all(&cmd(&[b"SELECT", b"0"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"free", b"v"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // A real budget with an explicit policy re-arms serving; the values
+    // are what restart must preserve.
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"SET",
+        b"cache",
+        b"MAXMEMORY",
+        b"1gb",
+        b"EVICTION",
+        b"allkeys-lfu",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"cache"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"k", b"v3"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // Refusal pins on the wire: tier keys on a memory namespace, and the
+    // pressure keys on a durable namespace.
+    c.write_all(&cmd(&[b"INF.NS", b"SET", b"cache", b"MEM-BUDGET", b"8mb"])).expect("write");
+    let refusal = read_line(&mut c);
+    assert!(refusal.starts_with(b"-ERR not a tiered namespace"), "{refusal:?}");
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"SET", b"ledger", b"MAXMEMORY", b"1mb"])).expect("write");
+    let refusal = read_line(&mut c);
+    assert!(refusal.starts_with(b"-ERR durable namespaces do not evict"), "{refusal:?}");
+    drop(c);
+    node.stop();
+
+    // Restart: the catalog reseeds the knobs as enforcement, not display.
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"INFO", b"cache"])).expect("write");
+    let mut buf = vec![0u8; 1024];
+    let n = c.read(&mut buf).expect("read info");
+    let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+    assert!(info.contains("allkeys-lfu"), "policy survived restart: {info}");
+    assert!(info.contains("1073741824"), "budget survived restart: {info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// M4-S26: the tiered data plane end to end, then the §3.1 never-none
 /// proof at node scale. String commands serve a tiered namespace over
 /// TCP; a fill past `MEM-BUDGET` demotes (seal → flush → release), so

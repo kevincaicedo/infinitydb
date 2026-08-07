@@ -320,14 +320,26 @@ pub fn execute(
         return arity_error(meta.name, &mut w);
     }
     // M1-S07 OOM gate: DENYOOM commands enter through metadata, never
-    // per-handler checks (kernel rule). The first test is one branch on the
-    // keyspace's cached flag; only genuine pressure pays the inline
-    // eviction escalation, and `noeviction`/unfreeable pressure answers
-    // the Redis-exact OOM error.
-    if meta.flags.contains(CmdFlags::DENYOOM) && ks.over_limit() && ks.free_for_write(now).is_err()
-    {
-        let mut w = RespWriter::new(out, cx.proto);
-        return w.error("OOM command not allowed when used memory > 'maxmemory'.");
+    // per-handler checks (kernel rule). The first test is one branch on a
+    // cached flag; only genuine pressure pays the inline eviction
+    // escalation, and `noeviction`/unfreeable pressure answers the
+    // Redis-exact OOM error. A connection on a named memory namespace
+    // with its own MAXMEMORY consults that namespace's flag *instead of*
+    // the global one (M4-S27, ADR-0068 D4) — the match dispatches on
+    // `cx.ns`, state this path already resolved, so the numbered-DB arm
+    // executes the M1 instructions unchanged (A/B: .artifacts/m4/s27/).
+    if meta.flags.contains(CmdFlags::DENYOOM) {
+        let refused = match cx.ns {
+            Some(ns) => match ks.ns_free_for_write(ns, now) {
+                Some(verdict) => verdict.is_err(),
+                None => ks.over_limit() && ks.free_for_write(now).is_err(),
+            },
+            None => ks.over_limit() && ks.free_for_write(now).is_err(),
+        };
+        if refused {
+            let mut w = RespWriter::new(out, cx.proto);
+            return w.error("OOM command not allowed when used memory > 'maxmemory'.");
+        }
     }
     // M1-S10: a RESP2 subscriber may only run the subscribe family + PING
     // (Redis `processCommand` order: after the OOM gate). RESP3 lifts this.
@@ -1936,6 +1948,70 @@ mod tests {
         // Lifting the limit recovers immediately (hot-per-cell push at SET).
         run(&mut cx, &mut ks, &[b"CONFIG", b"SET", b"maxmemory", b"0"]);
         assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"x", b"y"]), b"+OK\r\n");
+    }
+
+    /// M4-S27 (ADR-0068 D4): the DENYOOM gate is namespace-scoped — a
+    /// connection on a named memory namespace with its own MAXMEMORY
+    /// answers OOM at *its* budget (the Redis-exact error shape) while
+    /// numbered-db connections on the same keyspace keep writing; lifting
+    /// the budget recovers; with an eviction policy the namespace frees
+    /// its own keys inline instead of refusing.
+    #[test]
+    fn per_ns_budget_gate_scopes_oom_to_the_namespace() {
+        let mut cx = ConnCx::default();
+        let mut ks = Keyspace::new(StoreConfig::default());
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"cache", b"MAXMEMORY", b"1"]),
+            b"+OK\r\n"
+        );
+        assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"USE", b"cache"]), b"+OK\r\n");
+        // First write lands (the gate reads the cached flag, refreshed
+        // after mutations); the second answers the namespace's honest OOM
+        // — the effective policy inherits the node default `noeviction`.
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"v1"]), b"+OK\r\n");
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"SET", b"k", b"v2"]),
+            b"-OOM command not allowed when used memory > 'maxmemory'.\r\n"
+        );
+        // Reads and freeing writes stay allowed inside the namespace.
+        assert_eq!(run(&mut cx, &mut ks, &[b"GET", b"k"]), b"$2\r\nv1\r\n");
+        // The scope is the namespace, not the node: db0 keeps writing.
+        assert_eq!(run(&mut cx, &mut ks, &[b"SELECT", b"0"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"free", b"v"]), b"+OK\r\n");
+        // Back on the namespace: a real budget plus an eviction policy
+        // hot-reload keeps the namespace serving (the inline-reclaim storm
+        // itself is proven in inf-store's evict suite).
+        assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"USE", b"cache"]), b"+OK\r\n");
+        assert_eq!(
+            run(
+                &mut cx,
+                &mut ks,
+                &[
+                    b"INF.NS",
+                    b"SET",
+                    b"cache",
+                    b"MAXMEMORY",
+                    b"1mb",
+                    b"EVICTION",
+                    b"allkeys-random"
+                ],
+            ),
+            b"+OK\r\n"
+        );
+        for i in 0..50 {
+            let key = format!("grow:{i}");
+            assert_eq!(
+                run(&mut cx, &mut ks, &[b"SET", key.as_bytes(), &[0x61; 512]]),
+                b"+OK\r\n",
+                "writes under an evicting per-ns budget must keep landing"
+            );
+        }
+        // Removing the budget disarms the per-ns gate entirely.
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"INF.NS", b"SET", b"cache", b"MAXMEMORY", b"0"]),
+            b"+OK\r\n"
+        );
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"v3"]), b"+OK\r\n");
     }
 
     #[test]

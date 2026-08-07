@@ -209,9 +209,15 @@ pub struct NsSpec {
     /// (`Everysec`), so registered durable entries always have `Some`.
     pub fsync: Option<FsyncClass>,
     /// `None` inherits the server `maxmemory-policy`. Must be `None` on
-    /// durable namespaces — they do not evict in M2 (ADR-0015 D5).
+    /// durable namespaces — they do not evict (ADR-0015 D5, scoped to
+    /// durable by ADR-0068). Enforced on memory namespaces since M4-S27.
     pub policy: Option<EvictionPolicy>,
-    /// Node-wide budget in bytes; `None` inherits the server `maxmemory`.
+    /// Node-wide budget in bytes; `None` inherits the server `maxmemory`
+    /// (the store joins the global eviction hand). `Some` on a memory
+    /// namespace is enforced per-namespace since M4-S27 (ADR-0068 D2);
+    /// refused on tiered namespaces (`MEM-BUDGET` owns their memory —
+    /// ADR-0062); registry-carried but unenforced on durable namespaces
+    /// (reserved — a durable budget story would need refusal semantics).
     pub maxmemory: Option<u64>,
     /// Tiering configuration (M4-S19, ADR-0062 D1): `Some` ⇔ the
     /// namespace is durable-tiered. Requires `mode == Durable`.
@@ -233,6 +239,14 @@ pub enum NsError {
     /// `EVICTION` given on a durable namespace (durable namespaces do not
     /// evict in M2 — ADR-0015 D5).
     EvictionNotAllowedDurable,
+    /// `MAXMEMORY` given on a tiered namespace (M4-S27, ADR-0068 D1):
+    /// `MEM-BUDGET` is a tiered namespace's one budget authority — a
+    /// second budget would silently fight demotion with key death.
+    MaxmemoryNotAllowedTiered,
+    /// `MAXMEMORY`/`EVICTION` hot-reload attempted on a durable namespace
+    /// (M4-S27, ADR-0068 D3): durable namespaces never evict, so the keys
+    /// have nothing to reload.
+    PressureKeysNotHotDurable,
     /// A tiering key given on a non-durable mode (M4-S19, ADR-0062 D1:
     /// tiered is a configuration of `MODE durable`).
     TierRequiresDurable,
@@ -307,6 +321,13 @@ impl NsRegistry {
             if spec.mode != NsMode::Durable {
                 return Err(NsError::TierRequiresDurable);
             }
+            if spec.maxmemory.is_some() {
+                // One budget authority per namespace (ADR-0068 D1):
+                // MEM-BUDGET bounds a tiered namespace's memory by
+                // demotion; a MAXMEMORY beside it would kill keys that
+                // demotion would have preserved.
+                return Err(NsError::MaxmemoryNotAllowedTiered);
+            }
             tier.validate().map_err(NsError::InvalidTierConfig)?;
         }
         if self.get(&spec.name).is_some() {
@@ -331,6 +352,34 @@ impl NsRegistry {
         }
         let at = self.named.iter().position(|s| s.name == name).ok_or(NsError::Unknown)?;
         self.named.remove(at);
+        Ok(())
+    }
+
+    /// Replaces a memory namespace's pressure knobs (M4-S27 hot-reload,
+    /// ADR-0068 D3; the caller —
+    /// [`Keyspace::ns_set_memory`](crate::Keyspace::ns_set_memory) —
+    /// pushes the result into the materialized store). `None` values
+    /// return a knob to inheriting the node config.
+    ///
+    /// # Errors
+    /// `Unknown` for an unregistered name; typed refusals for tiered
+    /// (`MEM-BUDGET` owns the budget — D1) and durable (never evicts)
+    /// namespaces.
+    pub fn set_memory_pressure(
+        &mut self,
+        name: &[u8],
+        policy: Option<EvictionPolicy>,
+        maxmemory: Option<u64>,
+    ) -> Result<(), NsError> {
+        let spec = self.named.iter_mut().find(|s| s.name == name).ok_or(NsError::Unknown)?;
+        if spec.tier.is_some() {
+            return Err(NsError::MaxmemoryNotAllowedTiered);
+        }
+        if spec.mode != NsMode::Memory {
+            return Err(NsError::PressureKeysNotHotDurable);
+        }
+        spec.policy = policy;
+        spec.maxmemory = maxmemory;
         Ok(())
     }
 
@@ -433,6 +482,49 @@ mod tests {
         };
         assert_eq!(reg.create(bad), Err(NsError::EvictionNotAllowedDurable));
         assert_eq!(reg.iter().count(), 0);
+    }
+
+    /// ADR-0068 D1: a tiered spec carrying `MAXMEMORY` refuses typed —
+    /// `MEM-BUDGET` is a tiered namespace's one budget authority.
+    #[test]
+    fn maxmemory_on_tiered_is_rejected() {
+        let mut reg = NsRegistry::default();
+        let bad = NsSpec {
+            maxmemory: Some(1 << 20),
+            tier: Some(TierSpec::for_budget(64 << 20)),
+            ..spec(16, b"hot", NsMode::Durable)
+        };
+        assert_eq!(reg.create(bad), Err(NsError::MaxmemoryNotAllowedTiered));
+        assert_eq!(reg.iter().count(), 0);
+    }
+
+    /// ADR-0068 D3: the memory-pressure hot-reload applies to memory
+    /// namespaces only — durable and tiered entries answer typed
+    /// refusals, and a successful reload replaces both knobs.
+    #[test]
+    fn memory_pressure_reload_scopes_by_mode() {
+        let mut reg = NsRegistry::default();
+        reg.create(spec(16, b"cache", NsMode::Memory)).expect("create");
+        reg.create(spec(17, b"ledger", NsMode::Durable)).expect("create");
+        reg.create(NsSpec {
+            tier: Some(TierSpec::for_budget(64 << 20)),
+            ..spec(18, b"hot", NsMode::Durable)
+        })
+        .expect("create");
+        reg.set_memory_pressure(b"cache", Some(EvictionPolicy::AllKeysLru), Some(1 << 20))
+            .expect("memory reloads");
+        let spec = reg.get(b"cache").expect("registered");
+        assert_eq!(spec.policy, Some(EvictionPolicy::AllKeysLru));
+        assert_eq!(spec.maxmemory, Some(1 << 20));
+        assert_eq!(
+            reg.set_memory_pressure(b"ledger", None, Some(1 << 20)),
+            Err(NsError::PressureKeysNotHotDurable)
+        );
+        assert_eq!(
+            reg.set_memory_pressure(b"hot", None, Some(1 << 20)),
+            Err(NsError::MaxmemoryNotAllowedTiered)
+        );
+        assert_eq!(reg.set_memory_pressure(b"missing", None, None), Err(NsError::Unknown));
     }
 
     #[test]

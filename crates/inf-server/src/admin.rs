@@ -788,6 +788,10 @@ pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
         .unwrap_or(inf_store::TIERED_VA_LIMIT_DEFAULT);
     drop(cfg);
     let cells = u64::from(node.cells.get().max(1));
+    // Per-namespace MAXMEMORY shares divide by the same symmetric cell
+    // count (M4-S27, ADR-0068 D2) — pushed before the pressure config so
+    // the flag recompute inside `set_pressure` sees current shares.
+    ks.set_budget_shares(cells);
     ks.set_pressure(PressureConfig { limit_bytes: maxmemory / cells, policy, samples });
     ks.set_tiered_va_limit(va_limit / cells);
 }
@@ -858,12 +862,13 @@ pub(crate) fn inf_ns(
     } else if sub.eq_ignore_ascii_case(b"SET") {
         // Planeless arm (unit tests, embedded); on a node the pump's DDL
         // program owns SET — hot-reload persists the catalog like any
-        // DDL (M4-S19, ADR-0062 D3).
-        let (name, tier) = match parse_ns_set(argv, ks) {
+        // DDL (M4-S19, ADR-0062 D3; memory pressure keys M4-S27,
+        // ADR-0068 D3).
+        let (name, update) = match parse_ns_set(argv, ks) {
             Ok(parsed) => parsed,
             Err(msg) => return w.error(&msg),
         };
-        match ks.ns_set_tier(&name, tier) {
+        match apply_ns_set(ks, &name, update) {
             Ok(()) => w.simple("OK"),
             Err(e) => ns_error(e, w),
         }
@@ -975,16 +980,48 @@ pub(crate) fn inf_ns(
     }
 }
 
+/// What one `INF.NS SET` call updates — decided by the target namespace's
+/// shape (M4-S19 tiered keys; M4-S27 memory pressure keys, ADR-0068 D3).
+pub(crate) enum NsSetUpdate {
+    Tier(TierSpec),
+    /// Final states for a memory namespace's pressure knobs (`None` =
+    /// inherit the node config), seeded from the current spec so an
+    /// unmentioned key passes through unchanged.
+    MemoryPressure {
+        policy: Option<EvictionPolicy>,
+        maxmemory: Option<u64>,
+    },
+}
+
+/// Applies a parsed `INF.NS SET` update — shared by the planeless arm and
+/// the pump's DDL program (which fans and persists around it).
+pub(crate) fn apply_ns_set(
+    ks: &mut Keyspace,
+    name: &[u8],
+    update: NsSetUpdate,
+) -> Result<(), NsError> {
+    match update {
+        NsSetUpdate::Tier(tier) => ks.ns_set_tier(name, tier),
+        NsSetUpdate::MemoryPressure { policy, maxmemory } => {
+            ks.ns_set_memory(name, policy, maxmemory)
+        }
+    }
+}
+
 /// Parses `INF.NS SET name KEY value [KEY value ...]` against the
-/// namespace's current tier spec (M4-S19, ADR-0062 D3): Hot keys apply
-/// as overrides; CreateOnly keys (`TIER-IO-MODE`, `COLD-READ-QD`) refuse
-/// typed — a hot-reload that would be a silent no-op is worse than a
-/// refusal. All-or-nothing: the first invalid pair fails the call before
-/// anything mutates.
+/// namespace's current spec. Tiered namespaces take the ADR-0062 D3 tier
+/// keys: Hot keys apply as overrides; CreateOnly keys (`TIER-IO-MODE`,
+/// `COLD-READ-QD`) refuse typed — a hot-reload that would be a silent
+/// no-op is worse than a refusal — and `MAXMEMORY`/`EVICTION` refuse with
+/// the one-budget-authority error (ADR-0068 D1). Memory namespaces take
+/// exactly `MAXMEMORY`/`EVICTION` (Hot — ADR-0068 D3; the value `inherit`
+/// returns a knob to the node config, as `INF.NS INFO` displays it).
+/// Durable namespaces refuse both key families typed. All-or-nothing: the
+/// first invalid pair fails the call before anything mutates.
 pub(crate) fn parse_ns_set(
     argv: &(impl Argv + ?Sized),
     ks: &Keyspace,
-) -> Result<(Vec<u8>, TierSpec), String> {
+) -> Result<(Vec<u8>, NsSetUpdate), String> {
     if argv.len() < 5 || !(argv.len() - 3).is_multiple_of(2) {
         return Err("ERR wrong number of arguments for 'INF.NS|SET'".to_string());
     }
@@ -992,11 +1029,25 @@ pub(crate) fn parse_ns_set(
     let spec = ks
         .ns_get(&name)
         .ok_or_else(|| format!("ERR namespace '{}' not found", String::from_utf8_lossy(&name)))?;
-    let Some(current) = spec.tier else {
-        return Err("ERR not a tiered namespace — tiering is set at CREATE with MEM-BUDGET \
-                    (drop and recreate to add it, ADR-0062 D3)"
-            .to_string());
-    };
+    if let Some(current) = spec.tier {
+        let update = parse_ns_set_tier(argv, current)?;
+        return Ok((name, update));
+    }
+    if spec.mode == NsMode::Memory {
+        let update = parse_ns_set_memory(argv, spec)?;
+        return Ok((name, update));
+    }
+    // Durable, non-tiered: neither key family reloads (ADR-0068 D3).
+    Err("ERR durable namespaces do not evict (ADR-0015 D5/ADR-0068) — \
+         MAXMEMORY/EVICTION hot-reload applies to MODE memory namespaces"
+        .to_string())
+}
+
+/// The tiered half of `INF.NS SET` (M4-S19, ADR-0062 D3).
+fn parse_ns_set_tier(
+    argv: &(impl Argv + ?Sized),
+    current: TierSpec,
+) -> Result<NsSetUpdate, String> {
     let mut tier = Some(current);
     let mut i = 3;
     while i < argv.len() {
@@ -1008,12 +1059,64 @@ pub(crate) fn parse_ns_set(
                 String::from_utf8_lossy(opt).to_uppercase()
             ));
         }
+        if opt.eq_ignore_ascii_case(b"MAXMEMORY") || opt.eq_ignore_ascii_case(b"EVICTION") {
+            return Err(format!(
+                "ERR {} does not apply to tiered namespaces — MEM-BUDGET is their one budget \
+                 authority (ADR-0062/ADR-0068)",
+                String::from_utf8_lossy(opt).to_uppercase()
+            ));
+        }
         if parse_tier_key(&mut tier, opt, value)?.is_none() {
             return Err("ERR syntax error".to_string());
         }
         i += 2;
     }
-    Ok((name, tier.expect("seeded from the current spec")))
+    Ok(NsSetUpdate::Tier(tier.expect("seeded from the current spec")))
+}
+
+/// The memory half of `INF.NS SET` (M4-S27, ADR-0068 D3): only the two
+/// Hot pressure keys; a tier key here answers the create-time refusal.
+fn parse_ns_set_memory(argv: &(impl Argv + ?Sized), spec: &NsSpec) -> Result<NsSetUpdate, String> {
+    let (mut policy, mut maxmemory) = (spec.policy, spec.maxmemory);
+    let mut i = 3;
+    while i < argv.len() {
+        let opt = argv.arg(i);
+        let value = argv.arg(i + 1);
+        if opt.eq_ignore_ascii_case(b"EVICTION") {
+            policy = if value.eq_ignore_ascii_case(b"inherit") {
+                None
+            } else {
+                Some(
+                    core::str::from_utf8(value)
+                        .ok()
+                        .and_then(|v| EvictionPolicy::parse(&v.to_lowercase()))
+                        .ok_or("ERR unknown eviction policy")?,
+                )
+            };
+        } else if opt.eq_ignore_ascii_case(b"MAXMEMORY") {
+            maxmemory = if value.eq_ignore_ascii_case(b"inherit") {
+                None
+            } else {
+                match core::str::from_utf8(value)
+                    .ok()
+                    .and_then(crate::config::parse_memory)
+                    .ok_or("ERR invalid MAXMEMORY value")?
+                {
+                    // 0 = no per-namespace budget, matching the node key's
+                    // `maxmemory 0` vocabulary.
+                    0 => None,
+                    bytes => Some(bytes),
+                }
+            };
+        } else {
+            return Err("ERR not a tiered namespace — tiering is set at CREATE with MEM-BUDGET \
+                        (drop and recreate to add it, ADR-0062 D3); memory namespaces hot-reload \
+                        MAXMEMORY and EVICTION only (ADR-0068 D3)"
+                .to_string());
+        }
+        i += 2;
+    }
+    Ok(NsSetUpdate::MemoryPressure { policy, maxmemory })
 }
 
 /// `dbN` for N in 0..16.
@@ -1042,6 +1145,14 @@ pub(crate) fn ns_error(e: NsError, w: &mut RespWriter<'_>) {
         }
         NsError::EvictionNotAllowedDurable => w.error(
             "ERR durable namespaces do not evict (M2, ADR-0015); EVICTION applies to MODE memory",
+        ),
+        NsError::MaxmemoryNotAllowedTiered => w.error(
+            "ERR MAXMEMORY/EVICTION do not apply to tiered namespaces — MEM-BUDGET is their one \
+             budget authority (ADR-0062/ADR-0068)",
+        ),
+        NsError::PressureKeysNotHotDurable => w.error(
+            "ERR durable namespaces do not evict (ADR-0015 D5/ADR-0068) — MAXMEMORY/EVICTION \
+             hot-reload applies to MODE memory namespaces",
         ),
         NsError::TierRequiresDurable => w.error(
             "ERR tiering keys (MEM-BUDGET ...) apply to MODE durable namespaces only (ADR-0062)",
@@ -1765,6 +1876,68 @@ mod tests {
             assert!(text.contains(field), "missing {field}: {text}");
         }
         assert!(text.contains("300"), "the reloaded fraction renders: {text}");
+        // ADR-0068 D1: the pressure keys refuse on a tiered namespace with
+        // the one-budget-authority error, at SET like at CREATE.
+        let r = run(&mut cx, &mut store, &[b"INF.NS", b"SET", b"tiered", b"MAXMEMORY", b"1mb"]);
+        assert!(r.starts_with(b"-ERR MAXMEMORY does not apply to tiered namespaces"), "{r:?}");
+    }
+
+    /// M4-S27 (ADR-0068 D3): the `INF.NS` memory-pressure surface —
+    /// `MAXMEMORY`/`EVICTION` hot-reload on memory namespaces (with the
+    /// `inherit`/`0` reset vocabulary `INF.NS INFO` displays), typed
+    /// refusals on durable namespaces and for tier keys on memory ones.
+    #[test]
+    fn inf_ns_memory_pressure_surface() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let r = run(
+            &mut cx,
+            &mut store,
+            &[b"INF.NS", b"CREATE", b"cache", b"EVICTION", b"allkeys-random"],
+        );
+        assert_eq!(r, b"+OK\r\n");
+        let r = run(
+            &mut cx,
+            &mut store,
+            &[b"INF.NS", b"SET", b"cache", b"MAXMEMORY", b"1mb", b"EVICTION", b"allkeys-lru"],
+        );
+        assert_eq!(r, b"+OK\r\n");
+        let r = run(&mut cx, &mut store, &[b"INF.NS", b"INFO", b"cache"]);
+        let text = String::from_utf8_lossy(&r).into_owned();
+        assert!(text.contains("allkeys-lru"), "{text}");
+        assert!(text.contains("1048576"), "{text}");
+        let ns = store.ns_get(b"cache").expect("registered").id;
+        let _ = store.ns_store_mut(ns);
+        assert!(store.ns_free_for_write(ns, Nanos(1)).is_some(), "budget gate armed");
+        // `inherit` / `0` return the knobs to the node config.
+        let r = run(
+            &mut cx,
+            &mut store,
+            &[b"INF.NS", b"SET", b"cache", b"MAXMEMORY", b"0", b"EVICTION", b"inherit"],
+        );
+        assert_eq!(r, b"+OK\r\n");
+        assert!(store.ns_free_for_write(ns, Nanos(1)).is_none(), "budget gate disarmed");
+        let r = run(&mut cx, &mut store, &[b"INF.NS", b"INFO", b"cache"]);
+        let text = String::from_utf8_lossy(&r).into_owned();
+        assert!(text.contains("inherit"), "{text}");
+        // Tier keys on a memory namespace answer the create-time rule.
+        let r = run(&mut cx, &mut store, &[b"INF.NS", b"SET", b"cache", b"MEM-BUDGET", b"8mb"]);
+        assert!(r.starts_with(b"-ERR not a tiered namespace"), "{r:?}");
+        // Durable namespaces refuse both keys typed (planeless memory-only
+        // CREATE means the durable entry registers directly).
+        store
+            .ns_create(NsSpec {
+                id: inf_store::NsId(31),
+                name: b"ledger".to_vec(),
+                mode: NsMode::Durable,
+                fsync: None,
+                policy: None,
+                maxmemory: None,
+                tier: None,
+            })
+            .expect("create");
+        let r = run(&mut cx, &mut store, &[b"INF.NS", b"SET", b"ledger", b"MAXMEMORY", b"1mb"]);
+        assert!(r.starts_with(b"-ERR durable namespaces do not evict"), "{r:?}");
     }
 
     /// M4-S18 (ADR-0061 D8): the per-namespace line splits the blob leg

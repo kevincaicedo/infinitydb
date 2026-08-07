@@ -3,14 +3,22 @@
 //! [`CellStore`]s, the named-namespace registry, and the memory-pressure
 //! driver that turns `maxmemory`/`maxmemory-policy` into bounded eviction.
 //!
-//! ## Pressure model (M1-S07)
+//! ## Pressure model (M1-S07; per-namespace legs M4-S27, ADR-0068)
 //!
 //! `maxmemory` is the node-wide budget (Redis semantics); the server layer
 //! hands each cell `maxmemory / cells` — cells are symmetric by contiguous
 //! slot ranges, so per-cell division preserves the global bound without any
 //! shared state (L1). The default databases share the budget exactly like
-//! Redis databases share the instance budget; named namespaces carry their
-//! own (dormant until M2 makes them addressable — see `ns.rs`).
+//! Redis databases share the instance budget. Named **memory** namespaces
+//! are enforced per ADR-0068: a store without its own `MAXMEMORY` inherits
+//! the node policy and joins the global eviction hand; a store with its own
+//! budget carries a cached per-store `over_limit` flag and reclaims through
+//! its own step-limited pass — never through the global hand, so a
+//! namespace at its budget cannot disturb the numbered dbs (structural
+//! isolation, not tuning). Durable named namespaces stay hard-`NoEviction`
+//! (ADR-0015 D5 — eviction without `Delete` records resurrects keys on
+//! replay); tiered namespaces refuse the knobs outright (ADR-0062 owns
+//! their budget — one authority per namespace, never two).
 //!
 //! The write path pays **one branch on a cached flag** (`over_limit`): the
 //! flag is recomputed after mutations and after eviction slices, never
@@ -51,9 +59,16 @@ pub const DEFAULT_DBS: usize = 16;
 /// the MAINTAIN slice drains to the watermark — the bounded-everything
 /// trade (Redis evicts unboundedly inline; recorded deviation).
 const INLINE_MAX_EVICTIONS: u32 = 512;
-/// Zero-yield eviction steps tolerated across the db rotation before the
-/// sweep concludes nothing is evictable (each step examines ≤ 256 slots).
-const DRY_STEP_LIMIT: u32 = 2 * DEFAULT_DBS as u32;
+/// Zero-yield eviction steps tolerated per rotation member before the
+/// global sweep concludes nothing is evictable (each step examines ≤ 256
+/// slots). The effective limit scales with the rotation set — ADR-0068 D2:
+/// `2 × (DEFAULT_DBS + eligible named stores)`.
+const DRY_STEPS_PER_MEMBER: u32 = 2;
+/// Zero-yield steps tolerated by one namespace's own budget pass before it
+/// concludes nothing qualifies this slice (8 × 256 = 2 Ki slots examined).
+/// The store's hand persists across passes, so successive MAINTAIN slices
+/// cover the whole table even when each pass gives up early.
+const NS_DRY_STEP_LIMIT: u32 = 8;
 /// Replay displacement-register bound (ADR-0059 D9): one displacing
 /// mutation stages at most `RELOC_ORIGIN_CAP + 1` markers, so a longer
 /// run inside one pairing is corrupt input, not load.
@@ -105,6 +120,21 @@ impl Default for EvictBudget {
     }
 }
 
+/// One materialized named-namespace store with its per-namespace pressure
+/// state (M4-S27, ADR-0068 D2 budget leg).
+struct NamedStore {
+    id: NsId,
+    store: Box<CellStore>,
+    /// This cell's share of the spec's `MAXMEMORY` (`maxmemory /
+    /// budget_shares`, floored at 1 so a sub-cell-count budget stays a
+    /// budget); 0 = no per-namespace budget (the inheritance leg).
+    budget_share: u64,
+    /// Cached `used > budget_share` — the same one-branch write-path
+    /// pattern as the global `over_limit`, recomputed at the same touch
+    /// points ([`Keyspace::refresh_pressure`]).
+    over_limit: bool,
+}
+
 /// One cell's keyspace: default dbs + named-namespace registry + pressure.
 pub struct Keyspace {
     dbs: [Option<Box<CellStore>>; DEFAULT_DBS],
@@ -113,16 +143,22 @@ pub struct Keyspace {
     /// Named-namespace stores, materialized on first touch (M2-S08).
     /// Linear scan by id — a node has few named namespaces, and the id is
     /// resolved once per command, not per key.
-    named_stores: Vec<(NsId, Box<CellStore>)>,
+    named_stores: Vec<NamedStore>,
     /// Durable-tiered record tables (M4-S02 landing site; the S04 steel
     /// thread materializes the first entry). Empty on memory/durable-arena
     /// nodes — which is exactly what the S03 degenerate-case zero-counter
     /// assertion observes through [`tiering_counters`](Self::tiering_counters).
     tiered_stores: Vec<(NsId, Box<TieredTable>)>,
     pressure: PressureConfig,
+    /// Divisor for per-namespace `MAXMEMORY` shares (the node's cell
+    /// count, pushed with the CONFIG sweep — same symmetric-cells
+    /// argument as `maxmemory / cells`; 1 on planeless/embedded tiers).
+    budget_shares: u64,
     /// Cached `used > limit` (the M1-S07 one-branch write-path flag).
     over_limit: bool,
-    /// Eviction rotation cursor across populated dbs.
+    /// Eviction rotation cursor across the global hand's rotation set:
+    /// `0..DEFAULT_DBS` are the numbered dbs, `DEFAULT_DBS..` index into
+    /// `named_stores` (ADR-0068 D2 inheritance leg).
     hand_db: usize,
     /// This cell's share of the node's reserved-VA admission bound
     /// (M4-S19, ADR-0062 D4). Admission-only: lowering it under standing
@@ -147,6 +183,7 @@ impl Keyspace {
             named_stores: Vec::new(),
             tiered_stores: Vec::new(),
             pressure: PressureConfig::default(),
+            budget_shares: 1,
             over_limit: false,
             hand_db: 0,
             tiered_va_limit_bytes: TIERED_VA_LIMIT_DEFAULT,
@@ -530,8 +567,8 @@ impl Keyspace {
         for store in self.dbs.iter_mut().flatten() {
             store.reset_stats();
         }
-        for (_, store) in &mut self.named_stores {
-            store.reset_stats();
+        for entry in &mut self.named_stores {
+            entry.store.reset_stats();
         }
     }
 
@@ -544,9 +581,9 @@ impl Keyspace {
         for store in self.dbs.iter_mut().flatten() {
             store.flush(now);
         }
-        for (id, store) in &mut self.named_stores {
-            if self.named.get_by_id(*id).is_none_or(|s| s.mode == NsMode::Memory) {
-                store.flush(now);
+        for entry in &mut self.named_stores {
+            if self.named.get_by_id(entry.id).is_none_or(|s| s.mode == NsMode::Memory) {
+                entry.store.flush(now);
             }
         }
         self.refresh_pressure();
@@ -560,7 +597,7 @@ impl Keyspace {
     pub fn expire_tick(&mut self, now: Nanos, budget: ExpiryBudget) -> ExpiryStats {
         let mut total = ExpiryStats::default();
         let mut left = budget;
-        let named = self.named_stores.iter_mut().map(|(_, s)| s.as_mut());
+        let named = self.named_stores.iter_mut().map(|e| e.store.as_mut());
         for store in self.dbs.iter_mut().flatten().map(Box::as_mut).chain(named) {
             if left.max_fires == 0 || left.max_steps == 0 {
                 break;
@@ -584,11 +621,37 @@ impl Keyspace {
     // ---- pressure (M1-S07) ----
 
     /// Applies pressure config (per-cell share) and pushes the policy into
-    /// every materialized db (tracking mode + CMS lifecycle).
+    /// every materialized db (tracking mode + CMS lifecycle) and into every
+    /// **inheriting** named memory store — one with its own `EVICTION`
+    /// keeps it: explicit beats inherited (ADR-0068 D3).
     pub fn set_pressure(&mut self, pressure: PressureConfig) {
         self.pressure = pressure;
         for store in self.dbs.iter_mut().flatten() {
             store.set_eviction_policy(pressure.policy);
+        }
+        for i in 0..self.named_stores.len() {
+            let spec = self.named.get_by_id(self.named_stores[i].id);
+            if spec.is_some_and(|s| s.mode == NsMode::Memory && s.policy.is_none()) {
+                self.named_stores[i].store.set_eviction_policy(pressure.policy);
+            }
+        }
+        self.refresh_pressure();
+    }
+
+    /// Pushes the per-namespace budget divisor (the node's cell count —
+    /// the CONFIG sweep calls this beside [`set_pressure`](Self::set_pressure)).
+    /// Every materialized store's cached share and flag recompute here, so
+    /// a cell-count change can never leave a stale share behind.
+    pub fn set_budget_shares(&mut self, shares: u64) {
+        self.budget_shares = shares.max(1);
+        for i in 0..self.named_stores.len() {
+            let spec = self.named.get_by_id(self.named_stores[i].id);
+            self.named_stores[i].budget_share = match spec {
+                Some(s) if s.mode == NsMode::Memory => {
+                    ns_budget_share(s.maxmemory, self.budget_shares)
+                }
+                _ => 0,
+            };
         }
         self.refresh_pressure();
     }
@@ -605,85 +668,200 @@ impl Keyspace {
     }
 
     /// Logical used bytes across dbs and named stores (the `maxmemory`
-    /// comparable). Named stores count toward pressure but never join the
-    /// eviction hand (M2-S08 — see `ns_store_mut`), so sustained pressure
-    /// from a named namespace resolves as honest OOM refusals, not silent
-    /// eviction of durable data.
+    /// comparable). Every named store counts toward the global flag — L5
+    /// attribution truth (ADR-0068 D5) — but reclaim authority differs:
+    /// budget-less memory stores join the global hand, budgeted ones own
+    /// their per-namespace pass, and durable/tiered stores never evict, so
+    /// their sustained pressure resolves as honest OOM refusals.
     pub fn used_bytes(&self) -> u64 {
-        let named: u64 = self.named_stores.iter().map(|(_, s)| s.used_bytes()).sum();
+        let named: u64 = self.named_stores.iter().map(|e| e.store.used_bytes()).sum();
         self.dbs().map(|(_, s)| s.used_bytes()).sum::<u64>() + named
     }
 
-    /// Recomputes the cached pressure flag. Called after mutations (cheap:
-    /// a few loads per materialized db; short-circuits when no limit).
+    /// Recomputes the cached pressure flags — global and per-namespace
+    /// (ADR-0068 D5: the per-ns flags cache at the same touch points).
+    /// Called after mutations (cheap: a few loads per materialized store;
+    /// the global half short-circuits when no limit is set).
     #[inline]
     pub fn refresh_pressure(&mut self) {
         self.over_limit =
             self.pressure.limit_bytes != 0 && self.used_bytes() > self.pressure.limit_bytes;
+        for entry in &mut self.named_stores {
+            entry.over_limit =
+                entry.budget_share != 0 && entry.store.used_bytes() > entry.budget_share;
+        }
     }
 
     /// The write-path OOM gate (M1-S07): callers reach this only for
-    /// DENYOOM commands when `over_limit` is already set. `noeviction`
-    /// answers OOM immediately; eviction policies escalate inline — free
-    /// bounded victims now, re-check, and only then issue the honest OOM.
+    /// DENYOOM commands when `over_limit` is already set. Unfreeable
+    /// pressure answers OOM immediately (nothing in the rotation set
+    /// evicts); otherwise the escalation is inline and bounded — free
+    /// victims now, re-check, and only then issue the honest OOM.
     pub fn free_for_write(&mut self, now: Nanos) -> Result<(), OpError> {
         if !self.over_limit {
             return Ok(());
-        }
-        if self.pressure.policy == EvictionPolicy::NoEviction {
-            return Err(OpError::OutOfMemory);
         }
         self.evict_toward(self.pressure.limit_bytes, INLINE_MAX_EVICTIONS, now);
         self.refresh_pressure();
         if self.over_limit { Err(OpError::OutOfMemory) } else { Ok(()) }
     }
 
-    /// One eviction MAINTAIN slice: drive usage to the low watermark
-    /// (`limit − limit/16`) under `budget`, plus periodic CMS decay.
-    /// Proactive — CONFIG SET maxmemory shows observable effect within one
-    /// MAINTAIN round even with no writes arriving (M1-S03 AC).
+    /// The namespace-scoped write-path OOM gate (M4-S27, ADR-0068 D4):
+    /// `None` when `ns` is not a named memory namespace with its own
+    /// `MAXMEMORY` — the caller falls back to the global gate (numbered
+    /// dbs, inheriting memory stores, durable, tiered). Otherwise the
+    /// namespace's own verdict: one branch on its cached flag, then the
+    /// bounded inline pass over **its own keys only**, then honest OOM.
+    pub fn ns_free_for_write(&mut self, ns: NsId, now: Nanos) -> Option<Result<(), OpError>> {
+        let spec = self.named.get_by_id(ns)?;
+        if spec.mode != NsMode::Memory || spec.maxmemory.is_none() {
+            return None;
+        }
+        // Materialize so the first write to a budgeted namespace is gated
+        // by its own budget, never the global flag (D4 scope).
+        self.ns_store_mut(ns)?;
+        let i = self.named_stores.iter().position(|e| e.id == ns).expect("materialized above");
+        if !self.named_stores[i].over_limit {
+            return Some(Ok(()));
+        }
+        let target = self.named_stores[i].budget_share;
+        self.evict_ns_toward(i, target, INLINE_MAX_EVICTIONS, now);
+        self.refresh_pressure();
+        Some(if self.named_stores[i].over_limit { Err(OpError::OutOfMemory) } else { Ok(()) })
+    }
+
+    /// The cached per-namespace budget flag (test/introspection surface;
+    /// the write path goes through [`ns_free_for_write`](Self::ns_free_for_write)).
+    #[must_use]
+    pub fn ns_over_limit(&self, ns: NsId) -> bool {
+        self.named_stores.iter().any(|e| e.id == ns && e.over_limit)
+    }
+
+    /// One eviction MAINTAIN slice: CMS decay everywhere it is armed, the
+    /// global leg toward the node low watermark (`limit − limit/16`), then
+    /// each budgeted named store toward its own low watermark under what
+    /// remains of the slice budget (shared like the expiry slice — later
+    /// stores see what earlier ones left, so one namespace cannot multiply
+    /// the slice). Proactive — a config change shows observable effect
+    /// within one MAINTAIN round even with no writes arriving (M1-S03 AC).
     pub fn evict_tick(&mut self, now: Nanos, budget: EvictBudget) -> EvictStats {
         for store in self.dbs.iter_mut().flatten() {
             store.evict_maintain(now);
         }
-        let limit = self.pressure.limit_bytes;
-        if limit == 0 || self.pressure.policy == EvictionPolicy::NoEviction {
-            self.refresh_pressure();
-            return EvictStats::default();
+        for entry in &mut self.named_stores {
+            entry.store.evict_maintain(now);
         }
-        let low_watermark = limit - limit / 16;
-        let stats = self.evict_toward(low_watermark, budget.max_evictions, now);
+        let mut stats = EvictStats::default();
+        let mut left = budget.max_evictions;
+        let limit = self.pressure.limit_bytes;
+        if limit != 0 {
+            let step = self.evict_toward(limit - limit / 16, left, now);
+            left -= (step.evicted as u32).min(left);
+            stats.absorb(step);
+        }
+        let mut i = 0;
+        while i < self.named_stores.len() && left > 0 {
+            let share = self.named_stores[i].budget_share;
+            if share != 0 {
+                let step = self.evict_ns_toward(i, share - share / 16, left, now);
+                left -= (step.evicted as u32).min(left);
+                stats.absorb(step);
+            }
+            i += 1;
+        }
         self.refresh_pressure();
         stats
     }
 
-    /// Bounded eviction loop: rotate the hand across materialized dbs,
-    /// evicting one victim per step, until usage reaches `target`, the
-    /// eviction budget is spent, or a full dry rotation proves nothing
-    /// qualifies (sparse windows get [`DRY_STEP_LIMIT`] chances).
+    /// Bounded eviction loop over the global rotation set (ADR-0068 D2):
+    /// the materialized dbs (under the node policy) plus every named
+    /// memory store **without** its own budget whose effective policy
+    /// evicts. One victim per step until usage reaches `target`, the
+    /// budget is spent, or a dry rotation proves nothing qualifies —
+    /// [`DRY_STEPS_PER_MEMBER`] chances per rotation member.
     fn evict_toward(&mut self, target: u64, max_evictions: u32, now: Nanos) -> EvictStats {
         let mut stats = EvictStats::default();
-        let (samples, policy) = (self.pressure.samples, self.pressure.policy);
-        if policy == EvictionPolicy::NoEviction {
+        let samples = self.pressure.samples;
+        let node_evicts = self.pressure.policy != EvictionPolicy::NoEviction;
+        let eligible_named = self.named_stores.iter().filter(|e| named_in_hand(e)).count() as u32;
+        if !node_evicts && eligible_named == 0 {
+            // Nothing in the rotation set may evict — the honest OOM path.
+            return stats;
+        }
+        let dry_limit = DRY_STEPS_PER_MEMBER * (DEFAULT_DBS as u32 + eligible_named);
+        let rotation = DEFAULT_DBS + self.named_stores.len();
+        let mut evicted = 0u32;
+        let mut dry_steps = 0u32;
+        while self.used_bytes() > target && evicted < max_evictions && dry_steps < dry_limit {
+            // Rotate to the next hand member without spending dry budget
+            // on holes and out-of-hand stores (at least one member is
+            // eligible — checked above — so this terminates); only real
+            // sweep attempts may conclude "nothing evictable".
+            self.hand_db %= rotation;
+            while !self.hand_member(node_evicts, self.hand_db) {
+                self.hand_db = (self.hand_db + 1) % rotation;
+            }
+            let at = self.hand_db;
+            let step = if at < DEFAULT_DBS {
+                match self.dbs[at].as_mut() {
+                    Some(store) if !store.is_empty() => store.evict_step(samples, now),
+                    _ => EvictStats::default(),
+                }
+            } else {
+                let store = &mut self.named_stores[at - DEFAULT_DBS].store;
+                if store.is_empty() {
+                    EvictStats::default()
+                } else {
+                    store.evict_step(samples, now)
+                }
+            };
+            if step.evicted == 0 && step.freed_bytes == 0 {
+                dry_steps += 1;
+                self.hand_db = (self.hand_db + 1) % rotation;
+            } else {
+                dry_steps = 0;
+                evicted += step.evicted as u32;
+            }
+            stats.absorb(step);
+        }
+        stats
+    }
+
+    /// Whether rotation position `at` is in the global hand right now.
+    fn hand_member(&self, node_evicts: bool, at: usize) -> bool {
+        if at < DEFAULT_DBS {
+            node_evicts && self.dbs[at].is_some()
+        } else {
+            named_in_hand(&self.named_stores[at - DEFAULT_DBS])
+        }
+    }
+
+    /// One namespace's own budget pass (ADR-0068 D2): evict from **this
+    /// store only** toward `target`, bounded by `max_evictions` and
+    /// [`NS_DRY_STEP_LIMIT`]. Isolation is structural — no other store's
+    /// keys and no global dry-step accounting are touched.
+    fn evict_ns_toward(
+        &mut self,
+        i: usize,
+        target: u64,
+        max_evictions: u32,
+        now: Nanos,
+    ) -> EvictStats {
+        let samples = self.pressure.samples;
+        let entry = &mut self.named_stores[i];
+        let mut stats = EvictStats::default();
+        if entry.store.eviction_policy() == EvictionPolicy::NoEviction {
             return stats;
         }
         let mut evicted = 0u32;
         let mut dry_steps = 0u32;
-        while self.used_bytes() > target && evicted < max_evictions && dry_steps < DRY_STEP_LIMIT {
-            // Rotate to the next materialized db without spending dry
-            // budget on the holes (db0 always exists, so this terminates) —
-            // only real sweep attempts may conclude "nothing evictable".
-            while self.dbs[self.hand_db].is_none() {
-                self.hand_db = (self.hand_db + 1) % DEFAULT_DBS;
-            }
-            let db = self.hand_db;
-            let step = match self.dbs[db].as_mut() {
-                Some(store) if !store.is_empty() => store.evict_step(samples, now),
-                _ => EvictStats::default(),
-            };
+        while entry.store.used_bytes() > target
+            && evicted < max_evictions
+            && dry_steps < NS_DRY_STEP_LIMIT
+        {
+            let step = entry.store.evict_step(samples, now);
             if step.evicted == 0 && step.freed_bytes == 0 {
                 dry_steps += 1;
-                self.hand_db = (self.hand_db + 1) % DEFAULT_DBS;
             } else {
                 dry_steps = 0;
                 evicted += step.evicted as u32;
@@ -744,6 +922,33 @@ impl Keyspace {
         Ok(())
     }
 
+    /// Hot-reloads a memory namespace's pressure knobs (M4-S27, ADR-0068
+    /// D3): the registry entry, the materialized store's policy, and the
+    /// cached budget share update together. `policy = None` returns the
+    /// store to inheriting the node policy; `maxmemory = None` removes the
+    /// per-namespace budget (the store rejoins the global hand).
+    ///
+    /// # Errors
+    /// Typed refusals for unknown, durable, and tiered namespaces (D1:
+    /// durable never evicts; tiered budgets belong to ADR-0062).
+    pub fn ns_set_memory(
+        &mut self,
+        name: &[u8],
+        policy: Option<EvictionPolicy>,
+        maxmemory: Option<u64>,
+    ) -> Result<(), NsError> {
+        self.named.set_memory_pressure(name, policy, maxmemory)?;
+        let spec = self.named.get(name).expect("just updated");
+        let (id, effective) = (spec.id, spec.policy.unwrap_or(self.pressure.policy));
+        let share = ns_budget_share(spec.maxmemory, self.budget_shares);
+        if let Some(entry) = self.named_stores.iter_mut().find(|e| e.id == id) {
+            entry.store.set_eviction_policy(effective);
+            entry.budget_share = share;
+        }
+        self.refresh_pressure();
+        Ok(())
+    }
+
     /// Drops the registry entry **and** its store (with all its data). The
     /// id is never reused; log records naming it are skipped on replay.
     /// A tiered namespace's table drops with it (M4-S19, ADR-0062 D7):
@@ -755,7 +960,7 @@ impl Keyspace {
         let id = self.named.get(name).map(|s| s.id);
         self.named.drop_ns(name)?;
         if let Some(id) = id {
-            self.named_stores.retain(|(nid, _)| *nid != id);
+            self.named_stores.retain(|e| e.id != id);
             self.tiered_stores.retain(|(nid, _)| *nid != id);
             self.refresh_pressure();
         }
@@ -800,28 +1005,36 @@ impl Keyspace {
     /// The store behind named namespace `id`, materializing it on first
     /// touch; `None` when the id isn't registered (unknown or dropped).
     ///
-    /// Named stores never join the eviction hand regardless of the server
-    /// policy: durable namespaces must not evict (ADR-0015 D5 — eviction
-    /// without `Delete` records resurrects keys on replay), and per-ns
-    /// eviction for named *memory* namespaces is a recorded M2 limitation
-    /// (their `EVICTION`/`MAXMEMORY` config is honored as registry state,
-    /// enforced post-M2).
+    /// Materialization applies the spec's pressure semantics (M4-S27,
+    /// ADR-0068): a **memory** store carries its own `EVICTION` (or
+    /// inherits the node policy) and its `MAXMEMORY` share; durable stores
+    /// — including tiered shells — stay pinned `NoEviction` (ADR-0015 D5:
+    /// eviction without `Delete` records resurrects keys on replay). Only
+    /// memory-mode stores can ever carry an evicting policy — the global
+    /// hand's eligibility test stands on that invariant.
     pub fn ns_store_mut(&mut self, id: NsId) -> Option<&mut CellStore> {
-        self.named.get_by_id(id)?;
-        if let Some(i) = self.named_stores.iter().position(|(nid, _)| *nid == id) {
-            return Some(self.named_stores[i].1.as_mut());
+        let spec = self.named.get_by_id(id)?;
+        if let Some(i) = self.named_stores.iter().position(|e| e.id == id) {
+            return Some(self.named_stores[i].store.as_mut());
         }
+        let (policy, budget_share) = match spec.mode {
+            NsMode::Memory => (
+                spec.policy.unwrap_or(self.pressure.policy),
+                ns_budget_share(spec.maxmemory, self.budget_shares),
+            ),
+            _ => (EvictionPolicy::NoEviction, 0),
+        };
         let mut cfg = self.cfg;
         cfg.evict_seed = self.cfg.evict_seed ^ u64::from(id.0).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mut store = Box::new(CellStore::new(cfg));
-        store.set_eviction_policy(EvictionPolicy::NoEviction);
-        self.named_stores.push((id, store));
-        Some(self.named_stores.last_mut().expect("pushed above").1.as_mut())
+        store.set_eviction_policy(policy);
+        self.named_stores.push(NamedStore { id, store, budget_share, over_limit: false });
+        Some(self.named_stores.last_mut().expect("pushed above").store.as_mut())
     }
 
     /// Read-only view of named namespace `id` when materialized.
     pub fn ns_store(&self, id: NsId) -> Option<&CellStore> {
-        self.named_stores.iter().find(|(nid, _)| *nid == id).map(|(_, s)| s.as_ref())
+        self.named_stores.iter().find(|e| e.id == id).map(|e| e.store.as_ref())
     }
 
     /// The durability class of namespace `id`: `None` for memory (default
@@ -1190,8 +1403,8 @@ impl Keyspace {
         for (db, store) in self.dbs() {
             fold_store(&mut acc, store, db as u64, now);
         }
-        for (ns, store) in &self.named_stores {
-            fold_store(&mut acc, store, NAMED_TAG | u64::from(ns.0), now);
+        for entry in &self.named_stores {
+            fold_store(&mut acc, &entry.store, NAMED_TAG | u64::from(entry.id.0), now);
         }
         acc
     }
@@ -1202,8 +1415,25 @@ impl Keyspace {
         self.dbs
             .iter()
             .filter_map(|s| s.as_deref())
-            .chain(self.named_stores.iter().map(|(_, s)| s.as_ref()))
+            .chain(self.named_stores.iter().map(|e| e.store.as_ref()))
     }
+}
+
+/// This cell's share of a per-namespace `MAXMEMORY` (ADR-0068 D2): the
+/// node-wide budget divides by the symmetric cell count exactly like the
+/// node `maxmemory`. `0` means "no budget" (the inheritance leg), so a
+/// budget smaller than the cell count floors at 1 byte per cell — a
+/// nonsense-tiny budget stays a budget, never accidentally unlimited.
+fn ns_budget_share(maxmemory: Option<u64>, shares: u64) -> u64 {
+    maxmemory.map_or(0, |bytes| (bytes / shares.max(1)).max(1))
+}
+
+/// Whether a named store belongs to the global eviction hand (ADR-0068 D2
+/// inheritance leg): no budget of its own and an effective policy that
+/// evicts. Durable and tiered-shell stores are excluded by construction —
+/// their policy is pinned `NoEviction` at materialization.
+fn named_in_hand(entry: &NamedStore) -> bool {
+    entry.budget_share == 0 && entry.store.eviction_policy() != EvictionPolicy::NoEviction
 }
 
 /// Aggregated tiered-table memory attribution (M4-S07, L5). Rendered in
@@ -1519,6 +1749,102 @@ mod tests {
         fresh.seed_catalog(&cat).expect("seed");
         assert_eq!(fresh.export_catalog(17), cat);
         assert!(fresh.ns_store_mut(NsId(16)).is_some());
+    }
+
+    /// M4-S27 (ADR-0068): a memory namespace's persisted pressure knobs
+    /// survive the catalog round trip **as enforcement**, not display —
+    /// the reseeded store materializes with the explicit policy and its
+    /// own budget gate armed.
+    #[test]
+    fn catalog_round_trip_preserves_memory_pressure_enforcement() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        let spec = NsSpec {
+            id: NsId(16),
+            name: b"cache".to_vec(),
+            mode: NsMode::Memory,
+            fsync: None,
+            policy: Some(crate::EvictionPolicy::AllKeysRandom),
+            maxmemory: Some(1 << 20),
+            tier: None,
+        };
+        ks.ns_create(spec).expect("create");
+        let cat = ks.export_catalog(17);
+        let mut fresh = Keyspace::new(StoreConfig::default());
+        fresh.seed_catalog(&cat).expect("seed");
+        let store = fresh.ns_store_mut(NsId(16)).expect("live");
+        assert_eq!(store.eviction_policy(), crate::EvictionPolicy::AllKeysRandom);
+        assert!(
+            fresh.ns_free_for_write(NsId(16), now()).is_some(),
+            "the per-namespace budget gate must be armed from the catalog"
+        );
+        // An inheriting store without a budget answers through the global
+        // gate instead.
+        let mut ks = Keyspace::new(StoreConfig::default());
+        ks.ns_create(NsSpec {
+            id: NsId(16),
+            name: b"plain".to_vec(),
+            mode: NsMode::Memory,
+            fsync: None,
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        })
+        .expect("create");
+        assert!(ks.ns_free_for_write(NsId(16), now()).is_none());
+    }
+
+    /// ADR-0068 D1: `MAXMEMORY` on a tiered spec refuses typed — one
+    /// budget authority per namespace (`MEM-BUDGET` owns tiered memory).
+    #[test]
+    fn tiered_spec_with_maxmemory_is_refused() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        let spec = NsSpec {
+            maxmemory: Some(1 << 20),
+            tier: Some(crate::TierSpec::for_budget(64 << 20)),
+            ..durable_spec(16, b"hot")
+        };
+        assert_eq!(ks.ns_create(spec), Err(NsError::MaxmemoryNotAllowedTiered));
+        assert_eq!(ks.ns_iter().count(), 0, "refusal mutates nothing");
+    }
+
+    /// ADR-0068 D3 scope pins: the memory hot-reload path refuses durable
+    /// and tiered namespaces typed and applies to memory namespaces —
+    /// including the already-materialized store's policy and budget.
+    #[test]
+    fn ns_set_memory_scopes_and_applies_hot() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(NsSpec {
+            id: NsId(17),
+            name: b"cache".to_vec(),
+            mode: NsMode::Memory,
+            fsync: None,
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        })
+        .expect("create");
+        assert_eq!(
+            ks.ns_set_memory(b"ledger", None, Some(1 << 20)),
+            Err(NsError::PressureKeysNotHotDurable)
+        );
+        assert_eq!(ks.ns_set_memory(b"missing", None, None), Err(NsError::Unknown));
+        // Materialize first, then hot-reload: the live store follows.
+        let _ = ks.ns_store_mut(NsId(17)).expect("live");
+        ks.ns_set_memory(b"cache", Some(crate::EvictionPolicy::AllKeysLru), Some(1 << 20))
+            .expect("hot");
+        assert_eq!(
+            ks.ns_store(NsId(17)).expect("live").eviction_policy(),
+            crate::EvictionPolicy::AllKeysLru
+        );
+        assert!(ks.ns_free_for_write(NsId(17), now()).is_some(), "budget gate armed");
+        ks.ns_set_memory(b"cache", None, None).expect("hot");
+        assert!(ks.ns_free_for_write(NsId(17), now()).is_none(), "budget gate disarmed");
+        assert_eq!(
+            ks.ns_store(NsId(17)).expect("live").eviction_policy(),
+            EvictionPolicy::NoEviction,
+            "policy returns to inheriting the (default noeviction) node policy"
+        );
     }
 
     #[test]
