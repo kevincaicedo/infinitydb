@@ -183,8 +183,12 @@ impl TimerWheel {
 
     /// Place a ref in the lowest level whose horizon covers the deadline.
     fn place(&mut self, r: TimerRef, deadline_tick: u64) {
+        debug_assert!(deadline_tick >= self.now_tick, "placing a timer in the past");
+        // `delta == 0` is legal: a cascade landing exactly on the deadline
+        // tick re-places the entry into level 0's current slot, which fires
+        // later in this same `advance` tick (found by the M2-S05 everysec
+        // sweep — deadlines on 64-tick boundaries hit this).
         let delta = deadline_tick - self.now_tick;
-        debug_assert!(delta > 0);
         for level in 0..LEVELS {
             let horizon = 1u64 << (SLOT_BITS * (level as u32 + 1));
             if delta < horizon || level == LEVELS - 1 {

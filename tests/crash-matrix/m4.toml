@@ -1,0 +1,193 @@
+# M4-S11 tier-file crash rows (ADR-0056 D6) + M4-S12 recovery-unit rows
+# (ADR-0057 D8): {fault point} × inject → crash → recover → verify
+# against the manifested watermark / the surviving MANIFEST. S11 rows
+# are carried by `tests/tier.rs`, S12 rows by `tests/recovery_v2.rs`
+# (the runner vocabulary here is tier flush + manifest v2 + recovery,
+# not the m2 WAL machinery — rows use the carried-by-named-test tier).
+# The m2 coverage test (`every_declared_point_has_a_matrix_row`) reads
+# this file alongside `m2.toml`, so a declared-but-rowless tier point
+# fails the build.
+#
+# expect vocabulary (verified by the carrying tests):
+#   append-fails-typed  — a short device write surfaces as a typed I/O
+#                         error; the range is treated as never appended,
+#                         the watermark does not move
+#   reseal-at-watermark — after the crash, recovery truncates to the
+#                         manifested watermark, verifies every retained
+#                         frame, and seals `Recovered`; bytes beyond the
+#                         watermark are gone (torn or clean alike)
+#   fail-stop           — a failed fdatasync surfaces as the fatal typed
+#                         class; the flushed watermark freezes exactly at
+#                         the last good barrier
+#   unit-resolves       — the surviving manifest (old on an aborted
+#                         swap, old-or-new on a dir-fsync crash) names a
+#                         complete recovery unit: manifested tier bytes
+#                         read back exactly, un-manifested state is gone
+#   serves-from-prior-unit — the covering swap aborted after copy-forward
+#                         emptied a file: the old unit — which still
+#                         names the file — recovers, and every one of
+#                         its manifested ranges (the emptied file
+#                         included) reads back exactly (the row that
+#                         catches premature unlink — M4-S15, ADR-0059)
+#   reclaim-deferred-nonfatal — a failed unlink (tier file or blob
+#                         extent) is a typed, counted, non-fatal error:
+#                         the durable truth already excludes the file,
+#                         nothing else changes, and the retry / boot
+#                         GC / sweep re-drive it (M4-S15 ADR-0059 D3;
+#                         M4-S17 ADR-0061 D5)
+#   blob-write-fails-typed — a failed extent device write or fdatasync
+#                         surfaces typed and the extent is ABANDONED:
+#                         never referenced, id quarantined, file left
+#                         for the orphan sweep. Deliberately not
+#                         fail-stop — the ADR-0061 D3 narrower behavior:
+#                         nothing durable references the extent at
+#                         barrier time, and the fsyncgate poison (retry
+#                         and trust a later success) is structurally
+#                         absent (the file is never retried)
+#   orphan-reclaimed-never-served — the M4-S17 AC1 cut: extent bytes
+#                         durable, crash before the referencing WAL
+#                         frame — recovery restores no reference to it,
+#                         the sweep unlinks the orphan, and no read
+#                         path ever resolves it; the referenced twin
+#                         written the same way serves byte-exact
+#                         (ADR-0061 D3/D6 — both halves of the
+#                         ordering rule)
+#   diskfull-typed-then-automatic-recovery — a `StorageFull` device
+#                         write refusal (M4-S21, ADR-0063 D4): the
+#                         slice fails typed non-fatal, the watermark
+#                         freezes at the last good barrier, foreground
+#                         admission latches `DISKFULL (Device)`, and
+#                         once space frees the ordinary MAINTAIN retry
+#                         relands the retained backlog, clears the
+#                         latch, and admission resumes — no operator
+#                         step, zero corruption (the retained-batch +
+#                         append-rewind discipline: nothing claimable
+#                         was dropped, nothing misaligned)
+
+schema = 1
+milestone = "m4"
+seeds = 3
+
+[[row]]
+point = "tier_short_write"
+tier = "node"
+test = "tier.rs"
+expect = "append-fails-typed"
+
+[[row]]
+point = "tier_torn_frame"
+tier = "node"
+test = "tier.rs"
+expect = "reseal-at-watermark"
+
+[[row]]
+point = "tier_fsync_err"
+tier = "node"
+test = "tier.rs"
+expect = "fail-stop"
+
+[[row]]
+point = "tier_footer_torn"
+tier = "node"
+test = "tier.rs"
+expect = "reseal-at-watermark"
+
+# ---- M4-S12 recovery-unit windows (ADR-0057 D8) ----
+
+[[row]]
+point = "manifest_rename_fail"
+tier = "node"
+test = "recovery_v2.rs"
+expect = "unit-resolves"
+
+[[row]]
+point = "dir_fsync_fail"
+tier = "node"
+test = "recovery_v2.rs"
+expect = "unit-resolves"
+
+[[row]]
+point = "tier_torn_frame"
+tier = "node"
+test = "recovery_v2.rs"
+expect = "reseal-at-watermark"
+
+[[row]]
+point = "tier_fsync_err"
+tier = "node"
+test = "recovery_v2.rs"
+expect = "fail-stop"
+
+# ---- M4-S15 copy-forward windows (ADR-0057 D8's sixth window +
+# ADR-0059 D3/D7) ----
+
+[[row]]
+point = "manifest_rename_fail"
+tier = "node"
+test = "recovery_v2.rs"
+expect = "serves-from-prior-unit"
+
+[[row]]
+point = "dir_fsync_fail"
+tier = "node"
+test = "recovery_v2.rs"
+expect = "unit-resolves"
+
+[[row]]
+point = "tier_unlink_fail"
+tier = "node"
+test = "recovery_v2.rs"
+expect = "reclaim-deferred-nonfatal"
+
+# ---- M4-S17 blob-extent windows (ADR-0061 D3/D5/D9) ----
+
+[[row]]
+point = "blob_short_write"
+tier = "node"
+test = "blob.rs"
+expect = "blob-write-fails-typed"
+
+[[row]]
+point = "blob_fsync_err"
+tier = "node"
+test = "blob.rs"
+expect = "blob-write-fails-typed"
+
+# The AC1 ordering cut rides the fsync-abort point's row pair: the
+# carrying test drives both orphan shapes — the injected abort (extent
+# on disk, unfsynced, abandoned) and the pure cut (extent fdatasync'd,
+# process dies before the referencing frame) — to the same verdict.
+[[row]]
+point = "blob_fsync_err"
+tier = "node"
+test = "blob.rs"
+expect = "orphan-reclaimed-never-served"
+
+[[row]]
+point = "blob_unlink_fail"
+tier = "node"
+test = "blob.rs"
+expect = "reclaim-deferred-nonfatal"
+
+# ---- M4-S21 ENOSPC windows (ADR-0063 D4) ----
+
+[[row]]
+point = "tier_write_nospace"
+tier = "node"
+test = "tier.rs"
+expect = "diskfull-typed-then-automatic-recovery"
+
+# Kill mid-exhaustion: the file recovers valid exactly to the
+# manifested watermark — ENOSPC adds no new crash shape (nothing the
+# refusal touched was ever claimable).
+[[row]]
+point = "tier_write_nospace"
+tier = "node"
+test = "tier.rs"
+expect = "reseal-at-watermark"
+
+[[row]]
+point = "blob_write_nospace"
+tier = "node"
+test = "blob.rs"
+expect = "blob-write-fails-typed"

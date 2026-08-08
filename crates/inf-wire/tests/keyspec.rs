@@ -30,6 +30,9 @@ fn oracle_key_indices(id: CommandId, argc: usize) -> Vec<usize> {
         | CommandId::Client
         | CommandId::Lolwut
         | CommandId::InfNs
+        | CommandId::InfCkpt
+        | CommandId::Bgsave
+        | CommandId::Lastsave
         // Pub/sub channels and patterns are not keys (M1-E5): ownership is
         // the plane's slot(channel) mapping, never the key router.
         | CommandId::Subscribe
@@ -86,13 +89,40 @@ fn oracle_key_indices(id: CommandId, argc: usize) -> Vec<usize> {
         | CommandId::Pttl
         | CommandId::Persist
         | CommandId::InfTake
-        | CommandId::InfPeek => {
+        | CommandId::InfPeek
+        // M3-S11/S12: every JSON command addresses one document key…
+        | CommandId::JsonSet
+        | CommandId::JsonGet
+        | CommandId::JsonDel
+        | CommandId::JsonForget
+        | CommandId::JsonType
+        | CommandId::JsonNumIncrBy
+        | CommandId::JsonNumMultBy
+        | CommandId::JsonStrAppend
+        | CommandId::JsonStrLen
+        | CommandId::JsonToggle
+        | CommandId::JsonClear
+        // M3-S13/S14 (ADR-0042): the array/object/merge family too.
+        | CommandId::JsonArrAppend
+        | CommandId::JsonArrInsert
+        | CommandId::JsonArrIndex
+        | CommandId::JsonArrLen
+        | CommandId::JsonArrPop
+        | CommandId::JsonArrTrim
+        | CommandId::JsonObjKeys
+        | CommandId::JsonObjLen
+        | CommandId::JsonMerge => {
             if argc > 1 {
                 vec![1]
             } else {
                 Vec::new()
             }
         }
+        // …except JSON.MGET: `key [key …] path` — the final argument is
+        // the path, never a key.
+        CommandId::JsonMget => (1..argc.saturating_sub(1)).collect(),
+        // JSON.DEBUG MEMORY key uses the subcommand shape.
+        CommandId::JsonDebug => (argc > 2).then_some(2).into_iter().collect(),
     }
 }
 

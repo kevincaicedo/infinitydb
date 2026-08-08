@@ -21,7 +21,8 @@ use std::time::Duration;
 use inf_alloc::{BufferId, BufferPool, LeaseKind};
 
 use crate::driver::{
-    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, SubmitStats, Wait,
+    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
+    StableBytesMut, SubmitStats, Wait,
 };
 use crate::token::CompletionToken;
 
@@ -153,6 +154,48 @@ impl KqueueDriver {
                                 errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
                                 buf: None,
                             }
+                        },
+                    });
+                }
+                // File ops (M2-S05, ADR-0013): regular files are always
+                // "ready" — the readiness tier executes them synchronously
+                // at submit, delivering the same completion contract as the
+                // uring tier (fsync only after the full write; a failed
+                // write cancels the chained sync).
+                IoOp::LogWrite { fd, offset, data, token, fsync_token } => {
+                    match log_pwrite_all(fd, offset, data, &mut self.stats) {
+                        Ok(()) => {
+                            out.push(Completion { token, result: CompletionResult::LogWritten });
+                            if let Some(ft) = fsync_token {
+                                out.push(sync_file(fd, ft, &mut self.stats));
+                            }
+                        }
+                        Err(errno) => {
+                            out.push(Completion {
+                                token,
+                                result: CompletionResult::Error { errno, buf: None },
+                            });
+                            if let Some(ft) = fsync_token {
+                                out.push(Completion {
+                                    token: ft,
+                                    result: CompletionResult::Error {
+                                        errno: libc::ECANCELED,
+                                        buf: None,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                IoOp::Fdatasync { fd, token } => {
+                    out.push(sync_file(fd, token, &mut self.stats));
+                }
+                IoOp::TierRead { fd, offset, buf, token } => {
+                    out.push(Completion {
+                        token,
+                        result: match tier_pread_all(fd, offset, buf, &mut self.stats) {
+                            Ok(()) => CompletionResult::TierRead,
+                            Err(errno) => CompletionResult::Error { errno, buf: None },
                         },
                     });
                 }
@@ -466,6 +509,104 @@ fn set_nonblocking(fd: RawFd) {
             (&raw const one).cast(),
             size_of::<libc::c_int>() as libc::socklen_t,
         );
+    }
+}
+
+/// Synchronous positional write of the whole range (short writes retried in
+/// place — the readiness tier has no async file I/O). Returns errno on
+/// terminal failure; zero-progress writes surface as `EIO`.
+fn log_pwrite_all(
+    fd: RawFd,
+    offset: u64,
+    data: StableBytes,
+    stats: &mut SubmitStats,
+) -> Result<(), i32> {
+    let mut written: u32 = 0;
+    while written < data.len() {
+        // SAFETY: `data` upholds the StableBytes contract (live and stable
+        // for the duration of the op); `written` never exceeds `data.len()`.
+        let n = unsafe {
+            libc::pwrite(
+                fd,
+                data.as_ptr().add(written as usize).cast(),
+                (data.len() - written) as usize,
+                (offset + u64::from(written)) as libc::off_t,
+            )
+        };
+        stats.syscalls += 1;
+        if n > 0 {
+            written += n as u32;
+            continue;
+        }
+        if n == 0 {
+            return Err(libc::EIO);
+        }
+        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        if errno == libc::EINTR {
+            continue;
+        }
+        return Err(errno);
+    }
+    Ok(())
+}
+
+/// Synchronous positional read of the whole range (M4-S04; short reads
+/// retried in place — the readiness tier has no async file I/O). EOF
+/// before the buffer fills is `EIO`: tier reads are always within the
+/// flushed range, so a short file is corruption, not a condition.
+fn tier_pread_all(
+    fd: RawFd,
+    offset: u64,
+    buf: StableBytesMut,
+    stats: &mut SubmitStats,
+) -> Result<(), i32> {
+    let mut got: u32 = 0;
+    while got < buf.len() {
+        // SAFETY: `buf` upholds the StableBytesMut contract (live, stable,
+        // unaliased for the duration of the op); `got` never exceeds
+        // `buf.len()`.
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf.as_mut_ptr().add(got as usize).cast(),
+                (buf.len() - got) as usize,
+                (offset + u64::from(got)) as libc::off_t,
+            )
+        };
+        stats.syscalls += 1;
+        if n > 0 {
+            got += n as u32;
+            continue;
+        }
+        if n == 0 {
+            return Err(libc::EIO);
+        }
+        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        if errno == libc::EINTR {
+            continue;
+        }
+        return Err(errno);
+    }
+    Ok(())
+}
+
+/// Durably flush file data. macOS has no fdatasync in the stable syscall
+/// surface; plain `fsync` is the stronger stand-in on this correctness-only
+/// dev tier (never a performance claim — `performance_tier == false`).
+fn sync_file(fd: RawFd, token: CompletionToken, stats: &mut SubmitStats) -> Completion {
+    // SAFETY: plain syscall on a live fd, no pointers.
+    let rc = unsafe { libc::fsync(fd) };
+    stats.syscalls += 1;
+    Completion {
+        token,
+        result: if rc == 0 {
+            CompletionResult::Synced
+        } else {
+            CompletionResult::Error {
+                errno: io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO),
+                buf: None,
+            }
+        },
     }
 }
 

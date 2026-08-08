@@ -12,6 +12,8 @@
 //! simulator driver implemented in `inf-sim` (M0-S20) against
 //! [`BackendDriver`].
 
+mod affinity;
+mod cold;
 mod driver;
 mod executor;
 pub mod gate;
@@ -26,11 +28,17 @@ mod kqueue;
 #[cfg(all(target_os = "linux", feature = "uring"))]
 mod uring;
 
+pub use affinity::unpin_current_thread;
+pub use cold::{
+    ColdDone, ColdLeak, ColdReadConfig, ColdReadCounters, ColdReads, ColdRefused, ColdWait,
+    ReadClass, TierFileId,
+};
 pub use driver::{
-    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, SubmitStats, Wait,
+    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
+    StableBytesMut, SubmitStats, Wait,
 };
 pub use executor::{CellExecutor, PollImmediate, TaskId};
-pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate};
+pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate, WatermarkWait};
 pub use reactor::{CellLoop, CellPlane, IterStats, LoopConfig, LoopCx};
 pub use sched::{GroupClass, GroupScheduler};
 pub use timer::{TimerId, TimerWheel};

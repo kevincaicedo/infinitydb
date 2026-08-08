@@ -1,0 +1,1195 @@
+//! Boot-time per-cell log recovery (M2-S08/S11/S13/S14, ADR-0015 D7 +
+//! ADR-0017 + ADR-0018): read `MANIFEST` (the atomic recovery-unit name),
+//! load the checkpoint it names through the same `Keyspace::apply_record`
+//! blind idempotent upsert as tail frames (ADR-0016 D1), replay the log
+//! tail from `begin-LSN`, classify whatever lies beyond the last valid
+//! frame (M2-S14), and reopen the tail segment for appending. Boot-time
+//! blocking file I/O is the sanctioned exception to the cell denylist
+//! (§3.3) and rides the injected `SegmentFs` seam for DST.
+//!
+//! Recovery-unit resolution (§8.4 — old or new, never neither, never
+//! both-partial):
+//! - No `MANIFEST` → replay the whole retained log (pre-checkpoint boots,
+//!   fresh cells).
+//! - `MANIFEST` present → it is the only authority: the named `.ick` must
+//!   load (digest-verified) and the floor segment must exist — anything
+//!   less is corruption and fail-stop, never a silent fallback to full
+//!   replay (the segments below the floor may already be gone).
+//! - Stale prefix segments (crash mid-truncation) and unnamed
+//!   `.ick`/`.ick.new` orphans (crash between checkpoint publication and
+//!   the MANIFEST swap) are garbage-collected here, before the cell
+//!   serves.
+//!
+//! End-of-log policy (M2-S14, ADR-0018): after replay, every segment's
+//! slack — the bytes beyond its last valid frame — is scanned. A
+//! validating, self-located frame there means interior data would be
+//! silently lost (a gap the replay skipped, or a survivor a future append
+//! could resurrect out of order): fail-stop with a named
+//! [`inf_log::LogCorruption`]. In the resume region (the last data-bearing
+//! segment and everything after it — where future appends flow), torn
+//! remnants or a failed final frame classify as a torn tail: the tail
+//! *pointer* is
+//! truncated to the last valid frame (bytes are never rewritten), trailing
+//! segments — verified frame-free — are removed to restore the pristine
+//! prealloc invariant, and the cell continues. In sealed slack behind the
+//! resume point, non-validating remnants are the inert residue of an
+//! earlier torn-tail resume: tolerated and counted, never fatal. A torn
+//! tail may never truncate below the manifest's `begin-LSN`: everything
+//! the manifest names was durable at publication, so a shorter log is
+//! disk lying.
+//!
+//! In the floor segment, records below `begin-LSN` are skipped: the
+//! checkpoint already holds their final state, and replaying an older
+//! post-image over it would regress entries whose last mutation preceded
+//! `begin`. Recovery *throughput* gates bind at M2-S13/S22.
+//!
+//! M2-S15: recovery is a **resumable state machine** ([`Recovery`]) — the
+//! plane drives it in bounded MAINTAIN steps so the cell answers
+//! `-LOADING` while it replays (L6: boot is a budgeted task, not a
+//! stop-the-world phase). [`open_cell_log`] is the same machine run to
+//! completion in one call (tests, benches, MemFs tiers) — one code path,
+//! so the S13 determinism sweep and the S14 taxonomy suite prove the
+//! stepped machine too.
+
+use std::io;
+use std::path::PathBuf;
+
+use inf_foundation::time::Nanos;
+use inf_log::ckpt::{
+    IckReader, IckReaderConfig, IckStep, ick_file_name, parse_ick_file_name, read_ick_counts,
+};
+use inf_log::fs::{SegmentFile, SegmentFs};
+use inf_log::{
+    FrameStamp, LogCorruption, Lsn, Manifest, ReadError, ReaderConfig, RegionEvidence, RegionScan,
+    SegmentId, SegmentReader, SegmentRotor, SegmentScan, create_cell_dirs,
+    create_cell_dirs_deferred, read_manifest, scan_log_dir_from, scan_region, scan_region_evidence,
+    segment_file_name,
+};
+use inf_store::{Keyspace, ReplayOutcome, WallAnchor};
+
+use crate::durable::DurableConfig;
+
+/// What one cell's recovery did (log lines + `INFO persistence` inputs).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct RecoverStats {
+    pub segments: u64,
+    pub frames: u64,
+    pub records_applied: u64,
+    pub records_skipped: u64,
+    /// Tail deltas already represented by a fuzzy checkpoint/full image
+    /// (ADR-0043 R1). Separate from foreign-record skips.
+    pub doc_deltas_skipped_stale: u64,
+    /// Tail deltas whose key is absent because the fuzzy checkpoint
+    /// captured a later delete/expiry (ADR-0043 R2).
+    pub doc_deltas_skipped_missing: u64,
+    /// Checkpoint-begin markers seen in the tail (counted so recovery
+    /// output stays honest about them).
+    pub markers: u64,
+    /// Records loaded from the manifest-named checkpoint (M2-S11).
+    pub ckpt_records: u64,
+    /// Tail records below `begin-LSN` in the floor segment, skipped (the
+    /// checkpoint supersedes them).
+    pub records_pre_begin: u64,
+    /// Boot GC: stale below-floor segments + unnamed `.ick`/`.ick.new`
+    /// orphans removed.
+    pub stale_files_removed: u64,
+    /// M2-S14: `Some` when a torn final write was truncated — the (segment,
+    /// offset) the log resumes at. The dropped bytes were never covered by
+    /// a completed fsync, so nothing acked is lost (§8.2); callers log it.
+    pub torn_truncated_at: Option<Lsn>,
+    /// Trailing segments removed with a torn tail (each verified to hold
+    /// no validating frame before deletion).
+    pub torn_segments_removed: u64,
+    /// Sealed segments with non-validating remnant bytes behind their data
+    /// end — the inert residue of an earlier torn-tail resume (the reader
+    /// never crosses a segment's data end, so they can never replay).
+    /// Tolerated, but counted: never silent (§8.4).
+    pub sealed_slack_remnants: u64,
+    /// M2.5-S12 (ADR-0031 D4): validating frames beyond the data end that
+    /// the stamp evidence proved un-covered (no surviving attestation
+    /// reaches them) — discarded with the torn tail instead of refusing.
+    /// The retired ADR-0021 D3 refusal class, counted, never silent.
+    pub beyond_frames_discarded: u64,
+    /// Epoch-regressed frames ending replay early (discarded-life residue
+    /// resurfacing at the data end — ADR-0031 D3/D5). Counted per boot.
+    pub epoch_residue_stops: u64,
+}
+
+/// The recovered manifest — hands the recovery-time floor + named
+/// checkpoint to [`ServerPlane::enable_durable`](crate::ServerPlane) so
+/// the truncation slice resumes where the last boot left off.
+#[derive(Copy, Clone, Debug)]
+pub struct RecoveredManifest {
+    pub ckpt_id: u64,
+    pub begin_lsn: Lsn,
+}
+
+/// Opens (or creates) cell `cell`'s log under the node data dir, loading
+/// the manifest-named checkpoint (if any) and replaying the tail into
+/// `ks`. Returns the rotor positioned at the tail, ready for
+/// `begin_frame_deferred`, plus the recovered manifest seed.
+///
+/// `fs` is the injected filesystem seam (§3.3): `StdSegmentFs` on the
+/// node, `MemFs` in the recovery test tiers, the sim disk at M2-S18.
+///
+/// # Errors
+/// Scan errors, manifest/checkpoint corruption, interior log corruption
+/// (M2-S14 — a validating frame beyond a corrupt region fail-stops; only
+/// a torn *final* write is truncated and survived), read errors, store
+/// apply failures, and rotor open failures — all fail-stop at boot (§8.4).
+pub fn open_cell_log<F: SegmentFs + Clone>(
+    fs: F,
+    ks: &mut Keyspace,
+    cell: u16,
+    cfg: &DurableConfig,
+    anchor: WallAnchor,
+    now: Nanos,
+) -> io::Result<(SegmentRotor<F>, RecoverStats, Option<RecoveredManifest>)> {
+    let mut recovery = Recovery::new(fs, cell, cfg, anchor, now);
+    while recovery.step(ks, u64::MAX)? == RecoveryProgress::Working {}
+    Ok(recovery.finish())
+}
+
+/// Continuity verdict for one validating frame's stamp (ADR-0031 D3).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum StampVerdict {
+    /// Continuity holds — apply the frame's records.
+    Replay,
+    /// Epoch regressed: discarded-life residue at the data end — replay
+    /// ends here, the audit owns the rest.
+    ResidueStop,
+}
+
+/// What one [`Recovery::step`] call reports.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryProgress {
+    /// More work remains — call `step` again.
+    Working,
+    /// Recovery is complete: call [`Recovery::finish`].
+    Complete,
+}
+
+/// Recovery phase (each `step` performs one bounded unit of the phase).
+enum Phase<File: SegmentFile> {
+    /// Dirs, MANIFEST, scan, floor checks, checkpoint open + presize —
+    /// bounded by directory-entry counts, one step.
+    Start,
+    /// Checkpoint sections streamed under the step budget.
+    Ick {
+        reader: Box<IckReader<File>>,
+    },
+    /// Tail frames replayed under the step budget, one segment at a time.
+    Replay {
+        idx: usize,
+        reader: Option<Box<SegmentReader<File>>>,
+    },
+    /// M2-S14 slack audit, one segment per step.
+    Audit {
+        idx: usize,
+    },
+    /// Torn-tail resolution, begin guard, boot GC, rotor reopen.
+    Finish,
+    Complete,
+}
+
+/// Boot recovery as a resumable state machine (M2-S15). Construction is
+/// cheap; every I/O happens inside [`step`](Self::step), each call bounded
+/// by `budget_bytes` (plus one frame/section overshoot). The phases and
+/// their semantics are exactly [`open_cell_log`]'s documented pipeline —
+/// that function *is* this machine run to completion.
+pub struct Recovery<F: SegmentFs> {
+    fs: Option<F>,
+    cell: u16,
+    cfg: DurableConfig,
+    anchor: WallAnchor,
+    now: Nanos,
+    phase: Phase<F::File>,
+    stats: RecoverStats,
+    shard_dir: PathBuf,
+    log_dir: PathBuf,
+    ckpt_dir: PathBuf,
+    manifest: Option<Manifest>,
+    begin_lsn: Option<Lsn>,
+    floor: SegmentId,
+    scan: Option<SegmentScan>,
+    stale: Vec<SegmentId>,
+    segments: Vec<SegmentId>,
+    /// Data extent per segment (file size — sparse prealloc makes this an
+    /// upper bound; progress credits the slack when a segment completes).
+    seg_sizes: Vec<u64>,
+    ends: Vec<(u32, Option<ReadError>)>,
+    residue: Vec<bool>,
+    bytes_total: u64,
+    bytes_done: u64,
+    /// Bytes actually read+validated (frames, checkpoint blocks) — the
+    /// throttle currency. `bytes_done` additionally credits skipped
+    /// prealloc slack, which is bookkeeping, not I/O.
+    bytes_consumed: u64,
+    /// M2.5-S01: loop-resident boots defer every boot-metadata fsync off
+    /// the ready path — dir creation and the fresh segment happen
+    /// unsynced, and the open dir handles below become driver-ridden
+    /// boot barriers at the head of the group-commit ledger. The
+    /// synchronous tier ([`open_cell_log`]) keeps blocking syncs: it has
+    /// no driver to ride.
+    defer_boot_sync: bool,
+    barrier_dirs: Vec<F::File>,
+    /// Checkpoint bytes already credited to `bytes_done` (section blocks);
+    /// the header/footer remainder is credited when the footer validates.
+    ick_credited: u64,
+    /// M2.5-S12 (ADR-0031 D3): the last v2 stamp replayed — the prefix
+    /// continuity state (epoch monotone; seq +1 within an epoch, 1 at an
+    /// epoch step; covered_lsn nondecreasing within an epoch).
+    prev_stamp: Option<FrameStamp>,
+    /// A v2 frame was replayed: a later v1 frame in the prefix is a named
+    /// refusal (append order makes it unreachable — ADR-0031 D2).
+    saw_v2: bool,
+    /// Replay ended at an epoch-regressed frame (discarded-life residue —
+    /// ADR-0031 D5): remaining segments are residue, never replayed.
+    residue_stop: bool,
+    /// Highest epoch observed in the valid prefix (the ADR-0031 D5
+    /// derivation input, joined with the audit's beyond-frame evidence).
+    max_prefix_epoch: u32,
+    /// Aggregate stamp evidence over the resume region's slack (tail
+    /// segment + trailing segments), gathered by the audit (ADR-0031 D4).
+    resume_evidence: RegionEvidence,
+    /// First validating beyond-frame in the resume region — the refusal
+    /// message anchor.
+    resume_evidence_anchor: Option<(SegmentId, u32)>,
+    /// Index of the last data-bearing segment, fixed when the audit phase
+    /// opens (every segment's end is known by then).
+    last_data: usize,
+    finished: Option<(SegmentRotor<F>, Option<RecoveredManifest>)>,
+    /// Recovered tiered namespaces' plane half (M4-S26, ADR-0057 D6):
+    /// flush pipeline + open sealed-file handles + the extent sweep
+    /// seed — installed into the plane's tier state at completion.
+    recovered_tiers: Vec<RecoveredTierNs<F>>,
+    /// End-of-replay tiered checks ran (once, on entering the audit).
+    tier_replay_checked: bool,
+}
+
+/// One recovered tiered namespace's plane-side pieces (M4-S26).
+pub(crate) struct RecoveredTierNs<F: SegmentFs> {
+    pub ns: inf_log::NsId,
+    pub flush: inf_log::TierFlush<F>,
+    /// Creation-mode fds for the manifested files (ADR-0054: one fd,
+    /// one mode) — the cold-read table inherits them.
+    pub files: Vec<(u32, F::File)>,
+    pub extents_listed: Vec<u64>,
+}
+
+impl<F: SegmentFs + Clone> Recovery<F> {
+    /// Prepares recovery for cell `cell` under `cfg.data_dir`. No I/O
+    /// happens here — the first [`step`](Self::step) does.
+    #[must_use]
+    pub fn new(fs: F, cell: u16, cfg: &DurableConfig, anchor: WallAnchor, now: Nanos) -> Self {
+        let shard_dir = cfg.data_dir.join(format!("shard-{cell}"));
+        Recovery {
+            fs: Some(fs),
+            cell,
+            cfg: cfg.clone(),
+            anchor,
+            now,
+            phase: Phase::Start,
+            stats: RecoverStats::default(),
+            log_dir: shard_dir.join("log"),
+            ckpt_dir: shard_dir.join("ckpt"),
+            shard_dir,
+            manifest: None,
+            begin_lsn: None,
+            floor: SegmentId(0),
+            scan: None,
+            stale: Vec::new(),
+            segments: Vec::new(),
+            seg_sizes: Vec::new(),
+            ends: Vec::new(),
+            residue: Vec::new(),
+            bytes_total: 0,
+            bytes_done: 0,
+            bytes_consumed: 0,
+            defer_boot_sync: false,
+            barrier_dirs: Vec::new(),
+            ick_credited: 0,
+            prev_stamp: None,
+            saw_v2: false,
+            residue_stop: false,
+            max_prefix_epoch: 0,
+            resume_evidence: RegionEvidence::default(),
+            resume_evidence_anchor: None,
+            last_data: 0,
+            finished: None,
+            recovered_tiers: Vec::new(),
+            tier_replay_checked: false,
+        }
+    }
+
+    /// Switch this machine to deferred boot-metadata durability
+    /// (M2.5-S01): no blocking fsync runs on the ready path; the caller
+    /// takes [`take_boot_barrier_dirs`](Self::take_boot_barrier_dirs)
+    /// after `Complete` and registers the barriers. Loop-resident boots
+    /// only — a synchronous run-to-completion has no driver for barriers.
+    #[must_use]
+    pub fn deferred_boot_sync(mut self) -> Self {
+        self.defer_boot_sync = true;
+        self
+    }
+
+    /// The boot directory handles whose driver-ridden fdatasyncs are the
+    /// boot barriers (empty unless
+    /// [`deferred_boot_sync`](Self::deferred_boot_sync) was set). Take
+    /// them after `Complete`, before [`finish`](Self::finish).
+    pub fn take_boot_barrier_dirs(&mut self) -> Vec<F::File> {
+        core::mem::take(&mut self.barrier_dirs)
+    }
+
+    /// Code of the phase the next [`step`](Self::step) will run — the
+    /// RecoveryBoard's stuck-cell observable (M2.5-S01: published
+    /// *before* the step so a stalled step is visible from outside).
+    /// 1 = start, 2 = checkpoint, 3 = replay, 4 = audit, 5 = finish,
+    /// 6 = complete.
+    #[must_use]
+    pub fn phase_code(&self) -> u8 {
+        match &self.phase {
+            Phase::Start => 1,
+            Phase::Ick { .. } => 2,
+            Phase::Replay { .. } => 3,
+            Phase::Audit { .. } => 4,
+            Phase::Finish => 5,
+            Phase::Complete => 6,
+        }
+    }
+
+    /// Progress numerator: bytes validated + applied so far (checkpoint
+    /// blocks + replayed frames; a completed segment credits its slack).
+    #[must_use]
+    pub fn bytes_done(&self) -> u64 {
+        self.bytes_done
+    }
+
+    /// Progress denominator: checkpoint file size + segment file extents
+    /// (includes preallocated slack — an upper bound, disclosed).
+    #[must_use]
+    pub fn bytes_total(&self) -> u64 {
+        self.bytes_total
+    }
+
+    /// Bytes actually read + validated so far (excludes the slack credits
+    /// in [`bytes_done`](Self::bytes_done)) — what pacing should meter.
+    #[must_use]
+    pub fn bytes_consumed(&self) -> u64 {
+        self.bytes_consumed
+    }
+
+    /// Segments fully replayed / total (0/0 before the scan phase runs).
+    #[must_use]
+    pub fn segments_progress(&self) -> (u64, u64) {
+        let done = match &self.phase {
+            Phase::Start | Phase::Ick { .. } => 0,
+            Phase::Replay { idx, .. } => *idx as u64,
+            Phase::Audit { .. } | Phase::Finish | Phase::Complete => self.segments.len() as u64,
+        };
+        (done, self.segments.len() as u64)
+    }
+
+    /// Stats so far (complete once [`finish`](Self::finish) is reachable).
+    #[must_use]
+    pub fn stats(&self) -> &RecoverStats {
+        &self.stats
+    }
+
+    fn fs(&self) -> &F {
+        self.fs.as_ref().expect("fs present until finish")
+    }
+
+    /// Runs one bounded recovery step: at most ~`budget_bytes` of
+    /// checkpoint/replay input (one whole-frame/section overshoot), or one
+    /// audit/GC unit. Returns [`RecoveryProgress::Complete`] when
+    /// [`finish`](Self::finish) may be called.
+    ///
+    /// # Errors
+    /// Exactly [`open_cell_log`]'s fail-stop taxonomy; a failed machine
+    /// must not be stepped again.
+    pub fn step(&mut self, ks: &mut Keyspace, budget_bytes: u64) -> io::Result<RecoveryProgress> {
+        match core::mem::replace(&mut self.phase, Phase::Complete) {
+            Phase::Start => self.step_start(ks),
+            Phase::Ick { reader } => self.step_ick(ks, reader, budget_bytes),
+            Phase::Replay { idx, reader } => self.step_replay(ks, idx, reader, budget_bytes),
+            Phase::Audit { idx } => {
+                if !self.tier_replay_checked {
+                    self.finish_tier_replay(ks)?;
+                }
+                self.step_audit(idx)
+            }
+            Phase::Finish => self.step_finish(),
+            Phase::Complete => Ok(RecoveryProgress::Complete),
+        }
+    }
+
+    /// The recovered rotor + stats + manifest seed.
+    ///
+    /// # Panics
+    /// If recovery has not reported [`RecoveryProgress::Complete`].
+    #[must_use]
+    pub fn finish(self) -> (SegmentRotor<F>, RecoverStats, Option<RecoveredManifest>) {
+        let (rotor, seed) = self.finished.expect("recovery complete before finish()");
+        (rotor, self.stats, seed)
+    }
+
+    fn step_start(&mut self, ks: &mut Keyspace) -> io::Result<RecoveryProgress> {
+        // M2.5-S01: on the loop-resident tier a blocking dir-fsync here
+        // can stall the reactor for minutes behind foreign journal
+        // writeback (the captured cell-2 wedge) — ready must not wait on
+        // the device; the handles become ledger-fronted driver barriers.
+        let dirs = if self.defer_boot_sync {
+            let (dirs, handles) = create_cell_dirs_deferred(self.fs(), &self.shard_dir)?;
+            self.barrier_dirs = handles;
+            dirs
+        } else {
+            create_cell_dirs(self.fs(), &self.shard_dir)?
+        };
+        debug_assert_eq!(dirs.log, self.log_dir);
+        let manifest = read_manifest(self.fs(), &self.shard_dir)?;
+
+        // The manifest names the recovery unit; without one, the whole
+        // retained log is the unit.
+        self.floor = manifest.as_ref().map_or(SegmentId(0), Manifest::floor);
+        let outcome =
+            scan_log_dir_from(self.fs(), &self.log_dir, self.floor).map_err(io_invalid)?;
+        let scan = outcome.scan;
+        self.stale = outcome.stale;
+        self.segments = scan.segments().to_vec();
+        for &segment in &self.segments {
+            let file = self
+                .fs()
+                .open_read(&self.log_dir.join(segment_file_name(segment)))
+                .map_err(io_invalid)?;
+            self.seg_sizes.push(file.file_size().map_err(io_invalid)?);
+        }
+        self.bytes_total = self.seg_sizes.iter().sum();
+
+        let next = if let Some(manifest) = manifest {
+            // The floor segment holds the begin marker and is never
+            // truncated: its absence means the disk lost named state —
+            // fail-stop.
+            if scan.segments().first() != Some(&self.floor) {
+                return Err(io_msg(format!(
+                    "MANIFEST names ckpt {} with floor {} but the floor segment is missing \
+                     (present: {:?})",
+                    manifest.ckpt_id,
+                    self.floor,
+                    scan.segments()
+                )));
+            }
+            if let (Some(last_listed), Some(tail)) = (manifest.segments.last(), scan.tail())
+                && *last_listed > tail
+            {
+                return Err(io_msg(format!(
+                    "MANIFEST lists segment {last_listed} but the log ends at {tail}"
+                )));
+            }
+            // Tiered namespaces recover first (M4-S26; ADR-0057 D6
+            // steps 1-2): map manifested files, seed the new life at the
+            // manifested flushed watermark, and swap the recovered table
+            // in — checkpoint entries and tail records then apply onto
+            // the recovered life, never the fresh one.
+            self.recover_tiers(ks, &manifest)?;
+            let ick_path = self.ckpt_dir.join(ick_file_name(manifest.ckpt_id));
+            // Presize from the footer counts before streaming (M2-S13):
+            // the bulk apply must not pay a doubling-rehash storm.
+            let counts = read_ick_counts(self.fs(), &ick_path, IckReaderConfig::default())
+                .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
+            for &(ns, entries) in &counts {
+                ks.reserve_ns(inf_log::NsId(ns), entries);
+            }
+            let reader = IckReader::open(self.fs(), &ick_path, IckReaderConfig::default())
+                .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
+            let info = reader.info();
+            if info.ckpt_id != manifest.ckpt_id
+                || info.begin_lsn != manifest.begin_lsn
+                || info.cell != self.cell
+            {
+                return Err(io_msg(format!(
+                    "checkpoint header disagrees with MANIFEST: ick {{id {}, begin {}, cell \
+                     {}}} vs manifest {{id {}, begin {}, cell {}}}",
+                    info.ckpt_id,
+                    info.begin_lsn,
+                    info.cell,
+                    manifest.ckpt_id,
+                    manifest.begin_lsn,
+                    self.cell
+                )));
+            }
+            self.bytes_total += reader.file_size();
+            self.begin_lsn = Some(manifest.begin_lsn);
+            self.manifest = Some(manifest);
+            Phase::Ick { reader: Box::new(reader) }
+        } else if scan.is_empty() {
+            // Fresh cell: nothing to replay, nothing to audit.
+            let fs = self.fs.take().expect("fs present");
+            let rotor = if self.defer_boot_sync {
+                SegmentRotor::create_fresh_deferred(fs, self.log_dir.clone(), self.cfg.segment)
+                    .map_err(io_invalid)?
+            } else {
+                SegmentRotor::create_fresh(fs, self.log_dir.clone(), self.cfg.segment)
+                    .map_err(io_invalid)?
+            };
+            self.finished = Some((rotor, None));
+            self.scan = Some(scan);
+            self.phase = Phase::Complete;
+            return Ok(RecoveryProgress::Complete);
+        } else {
+            Phase::Replay { idx: 0, reader: None }
+        };
+        self.scan = Some(scan);
+        self.phase = next;
+        Ok(RecoveryProgress::Working)
+    }
+
+    /// Recovers every manifested tiered namespace (M4-S26, ADR-0057
+    /// D6): map + verify tier files, seed the new life at the
+    /// manifested flushed watermark, install the recovered table, and
+    /// retain creation-mode fds for the plane's cold-read table.
+    fn recover_tiers(&mut self, ks: &mut Keyspace, manifest: &Manifest) -> io::Result<()> {
+        for tier in &manifest.tiers {
+            let ns = inf_log::NsId(tier.ns);
+            let Some(spec) = ks.ns_get_by_id(ns).and_then(|spec| spec.tier) else {
+                return Err(io_msg(format!(
+                    "MANIFEST carries a tier section for ns {} the catalog does not know",
+                    tier.ns
+                )));
+            };
+            let demote = spec.demotion_config();
+            let reserve_bytes = demote
+                .ring_reserve_bytes()
+                .ok_or_else(|| io_msg("tier spec ring reservation unrepresentable".into()))?;
+            let recovered = inf_store::recover_tiered_ns(
+                self.fs().clone(),
+                tier,
+                manifest.ckpt_id,
+                inf_log::TierFlushConfig {
+                    shard_dir: self.shard_dir.join(format!("ns-{}", tier.ns)),
+                    cell: u32::from(self.cell),
+                    ns,
+                    mode: spec.tier_io_mode,
+                    file_capacity: inf_log::flush::TIER_FILE_CAPACITY_DEFAULT,
+                    slice_bytes: spec.maintain_slice_bytes,
+                },
+                inf_store::AddressSpaceConfig {
+                    reserve_bytes,
+                    page_bytes: inf_alloc::REGION_PAGE_BYTES,
+                    life_origin: inf_store::LogicalAddr::ZERO, // overridden by the manifest
+                },
+                demote,
+                1024,
+            )?;
+            ks.install_recovered_tiered(ns, recovered.table);
+            let mut files = Vec::with_capacity(recovered.flush.sealed().len());
+            for meta in recovered.flush.sealed() {
+                let handle = self.fs().open_tier(&meta.path, spec.tier_io_mode)?;
+                files.push((meta.id, handle));
+            }
+            self.recovered_tiers.push(RecoveredTierNs {
+                ns,
+                flush: recovered.flush,
+                files,
+                extents_listed: recovered.extents_listed,
+            });
+        }
+        Ok(())
+    }
+
+    /// End-of-replay tiered checks (M4-S26), run once when replay hands
+    /// to the audit: a non-empty displacement register means the log
+    /// ended between a marker and its paired mutation — corrupt input
+    /// by the ADR-0057 D4 same-frame rule (fail-stop, never a skip);
+    /// then the extent orphan sweep seeds from the boot listing
+    /// (ADR-0061 D6 — liveness is post-replay refcount truth).
+    fn finish_tier_replay(&mut self, ks: &mut Keyspace) -> io::Result<()> {
+        self.tier_replay_checked = true;
+        if ks.displace_register_len() > 0 {
+            return Err(io_msg(format!(
+                "log ends with {} unpaired displacement marker(s) (ADR-0057 D4)",
+                ks.displace_register_len()
+            )));
+        }
+        for tier in &self.recovered_tiers {
+            if let Some(table) = ks.tiered_store_mut(tier.ns) {
+                table.extent_sweep_seed(&tier.extents_listed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Hands the recovered tiered plane halves to the caller (the plane
+    /// installs them into its tier state at completion — M4-S26).
+    pub(crate) fn take_recovered_tiers(&mut self) -> Vec<RecoveredTierNs<F>> {
+        std::mem::take(&mut self.recovered_tiers)
+    }
+
+    fn step_ick(
+        &mut self,
+        ks: &mut Keyspace,
+        mut reader: Box<IckReader<F::File>>,
+        budget_bytes: u64,
+    ) -> io::Result<RecoveryProgress> {
+        let manifest = self.manifest.as_ref().expect("ick phase");
+        let ick_path = self.ckpt_dir.join(ick_file_name(manifest.ckpt_id));
+        // Tiered section routing (M4-S26; ADR-0057 D3/D6): the per-ns
+        // manifested flushed watermark cross-checks every ref section.
+        let tier_flushed: Vec<(u32, u64)> =
+            manifest.tiers.iter().map(|t| (t.ns, t.flushed)).collect();
+        let flushed_of = |ns: u32| tier_flushed.iter().find(|(id, _)| *id == ns).map(|(_, f)| *f);
+        let (now, anchor) = (self.now, self.anchor);
+        // One mutable keyspace, four exclusive callbacks: the reader
+        // invokes exactly one at a time, which the borrow checker cannot
+        // see — a RefCell makes the exclusivity dynamic (single-threaded,
+        // non-reentrant by construction).
+        let ks = std::cell::RefCell::new(ks);
+        let mut spent = 0u64;
+        loop {
+            let step = reader
+                .next_step_hybrid(
+                    |record| {
+                        ks.borrow_mut()
+                            .apply_record(&record, now, anchor)
+                            .map(|_| ())
+                            .map_err(io_invalid)
+                    },
+                    |refs| {
+                        let flushed = flushed_of(refs.ns).ok_or_else(|| {
+                            io_msg(format!("ref section for unmanifested tier ns {}", refs.ns))
+                        })?;
+                        let mut ks = ks.borrow_mut();
+                        let table =
+                            ks.tiered_store_mut(inf_log::NsId(refs.ns)).ok_or_else(|| {
+                                io_msg(format!("ref section for unknown tier ns {}", refs.ns))
+                            })?;
+                        inf_store::apply_ref_section(table, &refs, flushed)
+                    },
+                    |live| {
+                        let mut ks = ks.borrow_mut();
+                        let table =
+                            ks.tiered_store_mut(inf_log::NsId(live.ns)).ok_or_else(|| {
+                                io_msg(format!("live-set section for unknown ns {}", live.ns))
+                            })?;
+                        inf_store::apply_live_set_section(table, &live);
+                        Ok(())
+                    },
+                    |blob| {
+                        let mut ks = ks.borrow_mut();
+                        let table =
+                            ks.tiered_store_mut(inf_log::NsId(blob.ns)).ok_or_else(|| {
+                                io_msg(format!("blob-ref section for unknown ns {}", blob.ns))
+                            })?;
+                        inf_store::apply_blob_ref_section(table, &blob);
+                        Ok(())
+                    },
+                )
+                .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
+            match step {
+                IckStep::Section { bytes } => {
+                    spent += bytes;
+                    self.ick_credited += bytes;
+                    self.bytes_done += bytes;
+                    self.bytes_consumed += bytes;
+                    if spent >= budget_bytes {
+                        self.phase = Phase::Ick { reader };
+                        return Ok(RecoveryProgress::Working);
+                    }
+                }
+                IckStep::Done(summary) => {
+                    self.stats.ckpt_records = summary.records;
+                    // Header + footer bytes complete the file's credit.
+                    let rest = reader.file_size().saturating_sub(self.ick_credited);
+                    self.bytes_done += rest;
+                    self.bytes_consumed += rest;
+                    self.phase = Phase::Replay { idx: 0, reader: None };
+                    return Ok(RecoveryProgress::Working);
+                }
+            }
+        }
+    }
+
+    fn step_replay(
+        &mut self,
+        ks: &mut Keyspace,
+        mut idx: usize,
+        reader: Option<Box<SegmentReader<F::File>>>,
+        budget_bytes: u64,
+    ) -> io::Result<RecoveryProgress> {
+        // ADR-0031 D5: replay already ended at an epoch-regressed frame —
+        // every later segment is discarded-life residue. Record an empty
+        // end (offset 0) so the audit scans it whole as slack evidence.
+        if self.residue_stop {
+            self.stats.segments += 1;
+            self.ends.push((0, None));
+            self.bytes_done += self.seg_sizes[idx];
+            idx += 1;
+            self.phase = if idx == self.segments.len() {
+                Phase::Audit { idx: 0 }
+            } else {
+                Phase::Replay { idx, reader: None }
+            };
+            return Ok(RecoveryProgress::Working);
+        }
+        let mut reader = match reader {
+            Some(reader) => reader,
+            None => Box::new(
+                SegmentReader::open(
+                    self.fs(),
+                    &self.log_dir,
+                    self.segments[idx],
+                    ReaderConfig::default(),
+                )
+                .map_err(io_invalid)?,
+            ),
+        };
+        let start_offset = u64::from(reader.offset());
+        // Replay this segment's frames, recording where its valid data
+        // ends. A frame-level failure marks the data end at the failed
+        // frame's base and replay continues with the next segment: whether
+        // those bytes were a torn tail, inert residue, or interior
+        // corruption is decided by the slack scans (Audit phase) — on
+        // evidence, not on which code path noticed them (M2-S14,
+        // ADR-0018). Store failures and read I/O errors fail-stop as-is.
+        // v2 stamp continuity (ADR-0031 D3) is checked before any record
+        // of the frame applies.
+        loop {
+            match reader.next_frame() {
+                Ok(Some(frame)) => {
+                    let frame_base =
+                        frame.first_lsn().offset - u32::try_from(frame.header_len()).expect("40");
+                    let verdict = self.classify_stamp(
+                        frame.stamp(),
+                        self.segments[idx],
+                        frame_base,
+                        frame.first_lsn(),
+                    )?;
+                    match verdict {
+                        StampVerdict::Replay => {}
+                        StampVerdict::ResidueStop => {
+                            // The frame validates but belongs to a
+                            // discarded life: end this segment's data here
+                            // and stop replay — the audit scans the rest.
+                            self.residue_stop = true;
+                            self.stats.epoch_residue_stops += 1;
+                            self.stats.segments += 1;
+                            self.ends.push((frame_base, None));
+                            let consumed = u64::from(frame_base).saturating_sub(start_offset);
+                            self.bytes_done += consumed;
+                            self.bytes_consumed += consumed;
+                            self.bytes_done +=
+                                self.seg_sizes[idx].saturating_sub(u64::from(frame_base));
+                            idx += 1;
+                            self.phase = if idx == self.segments.len() {
+                                Phase::Audit { idx: 0 }
+                            } else {
+                                Phase::Replay { idx, reader: None }
+                            };
+                            return Ok(RecoveryProgress::Working);
+                        }
+                    }
+                    self.stats.frames += 1;
+                    let at = frame.first_lsn();
+                    for record in frame.records() {
+                        let (lsn, record) = record
+                            .map_err(io_invalid)
+                            .map_err(|error| replay_apply_failed(at, &error))?;
+                        // Floor-segment records below begin are superseded
+                        // by the checkpoint (module docs) — only the floor
+                        // segment can hold any (earlier segments were
+                        // truncated or are stale, never replayed).
+                        if self.begin_lsn.is_some_and(|begin| lsn < begin) {
+                            self.stats.records_pre_begin += 1;
+                            continue;
+                        }
+                        let outcome = ks
+                            .apply_record(&record, self.now, self.anchor)
+                            .map_err(io_invalid)
+                            .map_err(|error| replay_apply_failed(at, &error))?;
+                        match outcome {
+                            ReplayOutcome::Applied => self.stats.records_applied += 1,
+                            ReplayOutcome::SkippedUnknownNs | ReplayOutcome::SkippedReserved => {
+                                self.stats.records_skipped += 1;
+                            }
+                            ReplayOutcome::SkippedMarker => self.stats.markers += 1,
+                            ReplayOutcome::SkippedDocDeltaStale => {
+                                self.stats.doc_deltas_skipped_stale += 1;
+                            }
+                            ReplayOutcome::SkippedDocDeltaMissing => {
+                                self.stats.doc_deltas_skipped_missing += 1;
+                            }
+                        }
+                    }
+                    let consumed = u64::from(reader.offset()) - start_offset;
+                    if consumed >= budget_bytes {
+                        self.bytes_done += consumed;
+                        self.bytes_consumed += consumed;
+                        self.phase = Phase::Replay { idx, reader: Some(reader) };
+                        return Ok(RecoveryProgress::Working);
+                    }
+                }
+                Ok(None) => {
+                    let end = reader.read_end().expect("clean exhaustion records an end");
+                    // Continuity never spans a segment boundary (ADR-0031
+                    // D3): a torn rotation-tail frame leaves the same
+                    // clean-end shape as ordinary prealloc slack, so a seq
+                    // step across segments is legal physics, not
+                    // malformation. Epoch monotonicity and the
+                    // cross-segment attestation check still span.
+                    self.prev_stamp = None;
+                    self.stats.segments += 1;
+                    self.ends.push((end.at(), None));
+                    // Credit the consumed bytes plus the segment's slack
+                    // (progress only — slack is skipped, not read).
+                    let consumed = u64::from(reader.offset()) - start_offset;
+                    self.bytes_done += consumed;
+                    self.bytes_consumed += consumed;
+                    self.bytes_done +=
+                        self.seg_sizes[idx].saturating_sub(u64::from(reader.offset()));
+                    idx += 1;
+                    self.phase = if idx == self.segments.len() {
+                        Phase::Audit { idx: 0 }
+                    } else {
+                        Phase::Replay { idx, reader: None }
+                    };
+                    return Ok(RecoveryProgress::Working);
+                }
+                Err(err @ ReadError::Io { .. }) => return Err(io_invalid(err)),
+                Err(err) => {
+                    let offset = match &err {
+                        ReadError::Frame { offset, .. } | ReadError::LsnMismatch { offset, .. } => {
+                            *offset
+                        }
+                        ReadError::Io { .. } => unreachable!("Io read errors fail-stop above"),
+                    };
+                    // The contiguity run breaks here (ADR-0031 D3): frames
+                    // in later segments are a fresh baseline — the audit
+                    // owns everything at and beyond this break. Epoch
+                    // monotonicity still spans breaks (`max_prefix_epoch`).
+                    self.prev_stamp = None;
+                    self.stats.segments += 1;
+                    self.ends.push((offset, Some(err)));
+                    let consumed = u64::from(reader.offset()) - start_offset;
+                    self.bytes_done += consumed;
+                    self.bytes_consumed += consumed;
+                    self.bytes_done += self.seg_sizes[idx].saturating_sub(u64::from(offset));
+                    idx += 1;
+                    self.phase = if idx == self.segments.len() {
+                        Phase::Audit { idx: 0 }
+                    } else {
+                        Phase::Replay { idx, reader: None }
+                    };
+                    return Ok(RecoveryProgress::Working);
+                }
+            }
+        }
+    }
+
+    /// M2.5-S12 (ADR-0031 D3): pre-apply continuity verdict for one
+    /// validating frame's stamp against the prefix state. `Replay` admits
+    /// the frame; `ResidueStop` ends replay at a discarded-life frame;
+    /// malformed continuity between byte-adjacent validating frames is a
+    /// named fail-stop (no honest writer emits it).
+    fn classify_stamp(
+        &mut self,
+        stamp: Option<FrameStamp>,
+        segment: SegmentId,
+        frame_base: u32,
+        first_lsn: Lsn,
+    ) -> io::Result<StampVerdict> {
+        let corruption = |detail: String| {
+            io_msg(
+                LogCorruption {
+                    segment,
+                    offset: frame_base,
+                    evidence_segment: segment,
+                    evidence_offset: frame_base,
+                    detail,
+                }
+                .to_string(),
+            )
+        };
+        let Some(stamp) = stamp else {
+            if self.saw_v2 {
+                return Err(corruption(
+                    "a format-v1 frame follows a v2 frame in the replay prefix — append order \
+                     makes this unreachable by any honest writer (ADR-0031 D2)"
+                        .to_owned(),
+                ));
+            }
+            return Ok(StampVerdict::Replay);
+        };
+        debug_assert!(
+            stamp.covered_lsn <= first_lsn.to_u64(),
+            "decode_frame admits covered_lsn <= first_lsn only (BadStamp)"
+        );
+        // Epochs only grow in append order, across segment rotations and
+        // replay breaks alike: a lower-epoch frame anywhere later is
+        // discarded-life residue (ADR-0031 D5).
+        if stamp.epoch < self.max_prefix_epoch {
+            return Ok(StampVerdict::ResidueStop);
+        }
+        // Cross-segment attestation (ADR-0031 D4): coverage is a prefix,
+        // so a claim reaching into an earlier segment must lie within
+        // that segment's surviving data — anything past it is proof the
+        // disk lost covered bytes (a lie format v1 could not even see).
+        // Claims below the manifest floor are pre-checkpoint history.
+        let covered = Lsn::from_u64(stamp.covered_lsn);
+        if covered.segment < segment
+            && let Ok(idx) = self.segments.binary_search(&covered.segment)
+            && covered.offset > self.ends[idx].0
+        {
+            return Err(corruption(format!(
+                "frame attests fsync coverage up to {}, past segment {}'s surviving data end \
+                 {:#x} — covered data was lost (ADR-0031 D4)",
+                covered, covered.segment, self.ends[idx].0
+            )));
+        }
+        if let Some(prev) = self.prev_stamp {
+            if stamp.epoch == prev.epoch {
+                if stamp.seq != prev.seq + 1 {
+                    return Err(corruption(format!(
+                        "frame seq {} follows seq {} within epoch {} — adjacent validating \
+                         frames must be seq-contiguous (ADR-0031 D3)",
+                        stamp.seq, prev.seq, stamp.epoch
+                    )));
+                }
+                if stamp.covered_lsn < prev.covered_lsn {
+                    return Err(corruption(format!(
+                        "frame attestation regressed ({:#x} after {:#x}) within epoch {} — \
+                         the watermark is monotone (ADR-0031 D3)",
+                        stamp.covered_lsn, prev.covered_lsn, stamp.epoch
+                    )));
+                }
+            } else if stamp.seq != 1 {
+                return Err(corruption(format!(
+                    "epoch stepped {} → {} but seq is {} — a new life stamps seq 1 \
+                     (ADR-0031 D3)",
+                    prev.epoch, stamp.epoch, stamp.seq
+                )));
+            }
+        }
+        self.saw_v2 = true;
+        self.max_prefix_epoch = self.max_prefix_epoch.max(stamp.epoch);
+        self.prev_stamp = Some(stamp);
+        Ok(StampVerdict::Replay)
+    }
+
+    fn step_audit(&mut self, idx: usize) -> io::Result<RecoveryProgress> {
+        // M2-S14 slack scan, ADR-0031 D4 evidence rules: beyond a *sealed*
+        // segment's data end (behind the resume region), a validating
+        // self-located frame is unreachable interior data — fail-stop
+        // (seals fsync, so that slack is covered territory). In the
+        // *resume region* (the last data-bearing segment and everything
+        // after it), validating frames are aggregated as stamp evidence:
+        // the Finish phase refuses if any attests coverage past the data
+        // end (or cannot attest — v1), and truncates them with the torn
+        // tail otherwise. Every other residue classifies by position as
+        // before: torn final write in the resume region, tolerated inert
+        // remnants behind it — treating those as corruption would poison
+        // every boot after a benign torn tail seals.
+        if idx == 0 {
+            let ends = &self.ends;
+            self.last_data = (0..ends.len()).rev().find(|&i| ends[i].0 > 0).unwrap_or(0);
+        }
+        let segment = self.segments[idx];
+        let (end, failed) = &self.ends[idx];
+        if idx < self.last_data {
+            match scan_region(self.fs(), &self.log_dir, segment, *end, ReaderConfig::default())? {
+                RegionScan::ValidFrame { offset } => {
+                    return Err(io_msg(
+                        LogCorruption {
+                            segment,
+                            offset: *end,
+                            evidence_segment: segment,
+                            evidence_offset: offset,
+                            detail: failed.as_ref().map_or_else(
+                                || {
+                                    "sealed slack holds real log data — a dropped-write gap or \
+                                     torn remnants precede it"
+                                        .to_owned()
+                                },
+                                ToString::to_string,
+                            ),
+                        }
+                        .to_string(),
+                    ));
+                }
+                RegionScan::Garbage { .. } => self.residue.push(true),
+                RegionScan::AllZero => self.residue.push(failed.is_some()),
+            }
+        } else {
+            let evidence = scan_region_evidence(
+                self.fs(),
+                &self.log_dir,
+                segment,
+                *end,
+                ReaderConfig::default(),
+            )?;
+            if self.resume_evidence_anchor.is_none()
+                && let Some(offset) = evidence.first_valid
+            {
+                self.resume_evidence_anchor = Some((segment, offset));
+            }
+            self.resume_evidence.absorb(&evidence);
+            match evidence.summary() {
+                RegionScan::ValidFrame { .. } | RegionScan::Garbage { .. } => {
+                    self.residue.push(true);
+                }
+                RegionScan::AllZero => self.residue.push(failed.is_some()),
+            }
+        }
+        self.phase = if idx + 1 == self.segments.len() {
+            Phase::Finish
+        } else {
+            Phase::Audit { idx: idx + 1 }
+        };
+        Ok(RecoveryProgress::Working)
+    }
+
+    fn step_finish(&mut self) -> io::Result<RecoveryProgress> {
+        let ends = &self.ends;
+        let last_data = self.last_data;
+        let torn = self.residue[last_data..].iter().any(|&r| r);
+        self.stats.sealed_slack_remnants =
+            self.residue[..last_data].iter().filter(|&&r| r).count() as u64;
+
+        let scan = self.scan.as_ref().expect("scan set in start");
+        let (resume_segment, resume_offset) = if torn {
+            (self.segments[last_data], ends[last_data].0)
+        } else {
+            (scan.tail().expect("non-empty scan"), ends.last().expect("non-empty scan").0)
+        };
+        let resume = Lsn::new(resume_segment, resume_offset);
+        // ADR-0031 D4: validating frames beyond the data end are refused
+        // when they cannot be proven un-covered — a v1 frame attests
+        // nothing, and a surviving attestation at or past the data end is
+        // proof the gap sat in covered territory. Otherwise they are the
+        // legal remainder of a reorder hole in the un-covered suffix and
+        // truncate with the torn tail (the retired ADR-0021 D3 refusal).
+        if self.resume_evidence.valid_frames > 0 {
+            let (evidence_segment, evidence_offset) =
+                self.resume_evidence_anchor.expect("evidence anchor set with a valid frame");
+            let corruption = |detail: String| {
+                io_msg(
+                    LogCorruption {
+                        segment: resume_segment,
+                        offset: resume_offset,
+                        evidence_segment,
+                        evidence_offset,
+                        detail,
+                    }
+                    .to_string(),
+                )
+            };
+            if self.resume_evidence.any_v1 {
+                return Err(corruption(
+                    "a format-v1 frame beyond the data end cannot attest whether the gap \
+                     before it was fsync-covered (ADR-0031 D4)"
+                        .to_owned(),
+                ));
+            }
+            if self.resume_evidence.max_covered_lsn > resume.to_u64() {
+                return Err(corruption(format!(
+                    "a surviving frame attests fsync coverage up to {:#x}, past the valid \
+                     data end {} — covered data was lost (ADR-0031 D4)",
+                    self.resume_evidence.max_covered_lsn, resume
+                )));
+            }
+            debug_assert!(torn, "beyond-frame evidence implies resume-region residue");
+            self.stats.beyond_frames_discarded = self.resume_evidence.valid_frames;
+        }
+        // Everything the manifest names was durable at publication (the
+        // watermark-≥-begin staging guard): a log ending below begin is
+        // lost covered state, never a torn un-synced tail.
+        if let Some(begin) = self.begin_lsn
+            && resume < begin
+        {
+            return Err(io_msg(format!(
+                "the log's valid data ends at {resume}, below the MANIFEST begin-LSN {begin}: \
+                 fsync-covered bytes are missing — refusing to start (§8.4)"
+            )));
+        }
+        if torn {
+            self.stats.torn_truncated_at = Some(resume);
+            // Trailing segments hold no validating frame (the audit) —
+            // remove them so appends resume in the truncated segment with
+            // the pristine-prealloc invariant restored.
+            for &trailing in &self.segments[last_data + 1..] {
+                self.fs().remove_file(&self.log_dir.join(segment_file_name(trailing)))?;
+                self.stats.torn_segments_removed += 1;
+            }
+            if self.stats.torn_segments_removed > 0 {
+                self.scan = Some(
+                    scan_log_dir_from(self.fs(), &self.log_dir, self.floor)
+                        .map_err(io_invalid)?
+                        .scan,
+                );
+            }
+        }
+        let tail_offset = resume_offset;
+
+        // Boot GC: stale below-floor segments (crash mid-truncation) and
+        // checkpoint-dir orphans (unnamed `.ick` from a crash before the
+        // MANIFEST swap; `.ick.new` from a crashed walk). All are garbage
+        // the named recovery unit fully covers; removal is safe in any
+        // order and needs no dir-fsync (resurrection re-collects next
+        // boot).
+        for i in 0..self.stale.len() {
+            let stale = self.stale[i];
+            self.fs().remove_file(&self.log_dir.join(segment_file_name(stale)))?;
+            self.stats.stale_files_removed += 1;
+        }
+        let named = self.manifest.as_ref().map(|m| m.ckpt_id);
+        for name in self.fs().list_dir(&self.ckpt_dir)? {
+            let stale_ick = parse_ick_file_name(&name).is_some_and(|id| Some(id) != named);
+            if stale_ick || name.ends_with(".ick.new") {
+                self.fs().remove_file(&self.ckpt_dir.join(name))?;
+                self.stats.stale_files_removed += 1;
+            }
+        }
+
+        let fs = self.fs.take().expect("fs present");
+        let scan = self.scan.as_ref().expect("scan set");
+        let mut rotor = SegmentRotor::open_existing(
+            fs,
+            self.log_dir.clone(),
+            self.cfg.segment,
+            scan,
+            tail_offset,
+        )
+        .map_err(io_invalid)?;
+        // ADR-0031 D5: the resumed life's epoch tops every epoch observed
+        // this boot — the valid prefix and every validating beyond-frame
+        // (anything capable of resurrecting was durably whole, so the
+        // audit saw it). Discarded-life residue that later resurfaces at
+        // the new data end then fails the prefix's epoch-monotonicity rule
+        // instead of replaying.
+        let observed = self.max_prefix_epoch.max(self.resume_evidence.max_epoch);
+        let epoch = observed.checked_add(1).ok_or_else(|| {
+            io_msg(format!("log epoch space exhausted at {observed} — refusing to start"))
+        })?;
+        rotor.set_resume_epoch(epoch);
+        let seed = self
+            .manifest
+            .as_ref()
+            .map(|m| RecoveredManifest { ckpt_id: m.ckpt_id, begin_lsn: m.begin_lsn });
+        self.finished = Some((rotor, seed));
+        self.phase = Phase::Complete;
+        Ok(RecoveryProgress::Complete)
+    }
+}
+
+/// The `open_cell_log` replay-failure message (kept byte-compatible with
+/// the pre-S15 `ApplyError::Apply` surface the S13/S14 suites pin).
+fn replay_apply_failed(at: Lsn, error: &io::Error) -> io::Error {
+    io_msg(format!("replay apply failed at {at}: {error}"))
+}
+
+fn io_invalid(err: impl std::fmt::Debug) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
+}
+
+fn io_msg(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}

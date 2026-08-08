@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roadmap — InfinityDB Docs</title>
+<meta name="description" content="The InfinityDB milestone train: what is done, what is in progress, and what each milestone ships, with STOP gates and the ADR reorders named.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2018'%3E%3Ccircle%20cx='10'%20cy='9'%20r='7'%20fill='none'%20stroke='%237c5cff'%20stroke-width='2.4'/%3E%3Ccircle%20cx='24'%20cy='9'%20r='7'%20fill='none'%20stroke='%233ee6c4'%20stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="../index.html" class="nav-brand">
+      <svg class="logo" width="34" height="18" viewBox="0 0 34 18" aria-hidden="true">
+        <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2.4"/>
+        <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2.4"/>
+      </svg>
+      <span class="mark">infinity<b>DB</b></span>
+      <span class="nav-badge neutral">DOCS</span>
+    </a>
+    <span class="nav-spacer"></span>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="nav-links">
+      <a href="../index.html">HOME</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
+    </div>
+  </div>
+</nav>
+
+<div class="docs-shell">
+  <aside class="docs-side">
+    <p class="side-h">Getting started</p>
+    <a class="side-link" href="index.html">Docs home</a>
+    <a class="side-link" href="quickstart.html">Quickstart</a>
+    <p class="side-h">Concepts</p>
+    <a class="side-link" href="architecture.html">Architecture</a>
+    <a class="side-link" href="durability.html">Namespaces &amp; durability</a>
+    <p class="side-h">Operations</p>
+    <a class="side-link" href="deployment.html">Deployment</a>
+    <a class="side-link" href="operations.html">Operations</a>
+    <p class="side-h">Reference</p>
+    <a class="side-link" href="compat.html">Command matrix</a>
+    <a class="side-link" href="roadmap.html" aria-current="page">Roadmap</a>
+  </aside>
+
+  <main class="docs-main">
+    <article>
+      <p class="doc-kicker">Reference</p>
+  <h1 class="page-title">The milestone train</h1>
+  <p class="lede">InfinityDB ships on a release train with <strong>STOP gates</strong>: every milestone ends with hard, numeric, end-to-end acceptance criteria measured on a designated reference box, and a milestone that fails its gate halts feature work &mdash; the fix happens at the architecture layer, not as an optimization pass later. Every milestone is an independently shippable product.</p>
+
+  <div class="callout">
+    <span class="callout-tag"><strong>How to read this page:</strong></span>
+    statuses are honest. &ldquo;Done&rdquo; means the milestone&rsquo;s verdict was reached with its evidence recorded; durations are estimates from the plan, not promises; and none of the numeric gate targets are reproduced here, because targets are not achievements &mdash; the project&rsquo;s claim ledger governs which numbers may be published. The authoritative document is <code>docs/infinity-master-plan.md</code> &sect;21&ndash;22.
+  </div>
+
+  <div class="callout">
+    <span class="callout-tag"><strong>The train was reordered &mdash; by ADR, in the open.</strong></span>
+    <strong>ADR-0023</strong> (2026-07-05) reordered the train <em>documents-first</em> and renumbered it (JSON documents moved from sixth position to M3; tiered storage to M4; the collection types to M5; transactions to M6; streams to M7), and inserted <strong>M2.5 &ldquo;Hardening &amp; First Alpha.&rdquo;</strong> <strong>ADR-0024</strong> inserted <strong>M4.5 &ldquo;Indexes &amp; Query&rdquo;</strong> &mdash; typed secondary indexes plus a planner-free PartiQL subset, pre-1.0. <strong>ADR-0025</strong> restructured M2.5 performance-first: the first public tag carries the paid performance debt. <strong>ADR-0048</strong> (2026-07-16) retired <code>v0.2.0-alpha.1</code> unused and moved the first public tag to M3&rsquo;s <code>v0.3.0-alpha.1</code> &mdash; M2.5&rsquo;s release act folded into M3 rather than shipping an alpha the project would immediately supersede. Documents dated before 2026-07-05 use the old numbering.
+  </div>
+
+  <h2>Done</h2>
+
+  <h3>M0 &mdash; Skeleton: proof of architecture <span class="pill pill-ship">DONE &middot; VERDICT, NO RELEASE</span></h3>
+  <p>The single most important milestone, and deliberately feature-free: an end-to-end vertical &mdash; cell loop on io_uring, the SPSC fabric, the SIMD RESP wire, a minimal store, the benchmark harness with tripwire metrics, and the deterministic simulator&rsquo;s walking skeleton &mdash; measured against hard gates <em>before any feature work was allowed to exist</em>. The predecessor project died because this step never existed. One gate (pipelined node throughput at the spec&rsquo;d cell count) remains formally open, dispositioned by ADR-0029 and carried into M2.5&rsquo;s performance work rather than silently narrowed.</p>
+
+  <h3>M1 &mdash; Cache core <span class="pill pill-ship">DONE</span></h3>
+  <p>The full string/key/expiry/server command surface, per-cell TTL wheel with budgeted active expiry, all 8 eviction policies, namespaces v1, pub/sub with RESP3 push, the generated compatibility matrix with its CI staleness gate, oracle byte-diffing against a pinned Redis 8.0.5, Docker/CI release engineering, and the nightly deterministic-simulation fleet. <code>v0.1.0-alpha.1</code> was never tagged, and <code>v0.2.0-alpha.1</code> was later retired unused (ADR-0048) &mdash; the first public tag, <code>v0.3.0-alpha.1</code>, ships durability and JSON documents included.</p>
+
+  <h3>M2 &mdash; Durability <span class="pill pill-ship">DONE &middot; GO VERDICT</span></h3>
+  <p>The log spine complete: segments, batch frames, CRC, group commit, manifest; <code>everysec</code>/<code>always</code> namespaces with watermark-gated acks; fuzzy fork-free checkpoints with truncation; parallel recovery; the fault-point harness and crash matrix; deterministic disk-fault simulation (torn writes, fsync lies, power cuts); <code>INF.CKPT</code>/<code>BGSAVE</code>. The binding campaign ran on the designated reference box: the correctness gates passed (see <a href="durability.html">the durability evidence</a>); several device-bound performance rows were honestly dispositioned as Evidence-pending on Gen4-class hardware rather than narrowed. Verdict: GO &mdash; the release act itself later moved to M3 (ADR-0048).</p>
+
+  <h3>M2.5 &mdash; Hardening &amp; first alpha <span class="pill pill-ship">DONE &middot; RELEASE ACT &rarr; M3</span></h3>
+  <p>No new command surface. The milestone that turned M2&rsquo;s GO verdict into a hardened, evidence-clean core before the feature train resumed &mdash; performance-first per ADR-0025:</p>
+  <ul>
+    <li><strong>Paid the debt:</strong> the boot-wedge stop-item root-caused and fixed; measured performance levers on group formation, recovery read-ahead, and the cross-cell remote-penalty campaign &mdash; each A/B&rsquo;d on the designated box and dispositioned by ADR (losing levers recorded and <em>not merged</em>); the anchored cross-cell gate ratified by ADR-0035.</li>
+    <li><strong>Shipped the instrument:</strong> the first binding comparative campaign with the zero-dependency <code>inf-compare</code> harness, this website and docs v1, and full evidence closure &mdash; zero undispositioned claim-ledger rows (the S19 walk, 2026-07-10).</li>
+    <li><strong>Hardened:</strong> TigerBeetle-grade assertion and soundness audits, deeper simulation fleets, fuzz-hour accumulation, and the documents-first seam-readiness review for M3 (ADR-0032). Per <strong>ADR-0048</strong>, the tag + announcement act folded into M3 &mdash; <code>v0.2.0-alpha.1</code> was retired unused rather than shipping an alpha its successor would immediately supersede.</li>
+  </ul>
+
+  <h2>Now</h2>
+
+  <h3>M3 &mdash; JSON documents <span class="pill pill-now">IN PROGRESS &rarr; v0.3.0-alpha.1 &middot; FIRST PUBLIC TAG</span></h3>
+  <p>JSON objects as first-class values, not a module: a compact binary document tree (tape-structured for parse-free traversal), the RedisJSON-compatible <code>JSON.*</code> surface with a compiled JSONPath subset, in-place path mutation, delta log records with periodic full-document records to bound replay, and a compat suite with RedisJSON as the oracle. This opens the NoSQL story: entities as documents under designed keys &mdash; and it carries the project&rsquo;s <strong>first public tag</strong>: the release act (pre-tag binding campaign, ledger re-validation, signed announcement, release pipeline) ships here per ADR-0048.</p>
+
+  <h2>Next</h2>
+
+  <h3>M4 &mdash; Tiered storage <span class="pill pill-plan">v0.4.0-alpha</span></h3>
+  <p>Beyond-RAM datasets via the hybrid-log design (Microsoft FASTER lineage): one logical address space per cell spanning disk, read-only RAM, and mutable RAM regions; async cold reads through the executor; compaction in budgeted slices; blob extents. Cache-mode namespaces are the degenerate case and never execute this code.</p>
+
+  <h3>M4.5 &mdash; Indexes &amp; query <span class="pill pill-plan">v0.4.5-alpha &middot; ADR-0024</span></h3>
+  <p>Typed secondary indexes over document paths (<code>INF.IDX</code>) on the per-cell ordered key-range projection, plus a <strong>planner-free PartiQL subset</strong> over RESP (<code>INF.QL</code> + <code>EXPLAIN</code>): one access path per statement, grammar-driven compilation, residual filters on a predicate VM, no cost model, no joins &mdash; anything outside the subset is rejected with a documented error. The DynamoDB discipline: access paths are keys and <em>declared</em> indexes, never a planner&rsquo;s guess.</p>
+
+  <h3>M5 &mdash; Data types <span class="pill pill-plan">v0.5.0-alpha</span></h3>
+  <p>Hashes, lists, sets, sorted sets, bitmaps, bitfield, HyperLogLog; small&rarr;large encoding morphs with measured thresholds; the SCAN family; keyspace notifications; the compat matrix grows to roughly the full conventional Redis surface.</p>
+
+  <h3>M6 &mdash; Transactions &amp; scripting <span class="pill pill-plan">v0.6.0-alpha</span></h3>
+  <p><code>MULTI</code>/<code>EXEC</code>/<code>WATCH</code> (single-cell inline; cross-cell via deterministic two-phase intent locking, the Dragonfly-proven shape), Lua with declared keys, a <code>FUNCTION</code> subset.</p>
+
+  <h3>M7 &mdash; Streams &amp; queues <span class="pill pill-plan">v0.7.0-beta.1 &middot; FIRST BETA</span></h3>
+  <p>Topics and partitions directly on the log spine; the full Redis Streams surface; Kafka-style offset consumption, producer idempotence, DLQs, delayed delivery; retention; client tracking and client-side caching; <strong>AUTH + TLS</strong> (beta means people deploy it); RDB import for migration.</p>
+
+  <h3>M8 &mdash; Vectors <span class="pill pill-plan">v0.8.0-beta</span></h3>
+  <p>Redis-8-compatible vector sets plus <code>INF.VEC</code> collections: per-cell HNSW graphs, SQ8 quantization with rescoring, scatter-gather k-NN over the fabric, filter predicates. Vectors are ordinary durable records &mdash; replicated and tiered like everything else.</p>
+
+  <h3>M9 &mdash; Replication &amp; HA <span class="pill pill-plan">v0.9.0-beta</span></h3>
+  <p>Per-cell log shipping to replicas, <code>wait-replica</code> ack gating, read-from-replica with session watermarks, a Raft control plane for election and failover (data never flows through Raft), object-storage backups with point-in-time recovery, live migration by posing as a Redis replica &mdash; verified by Jepsen-style harnesses and simulated cluster scenarios before any HA claim.</p>
+
+  <h3>M10 &mdash; Compute &amp; enterprise <span class="pill pill-plan">v0.10.0-rc.1</span></h3>
+  <p>The WASM reducer host: sandboxed modules running inside the process on the core that owns their data &mdash; fuel-metered, memory-capped, capability-scoped, transactional. Plus the embedded Rust crate, shared-memory IPC transport, full ACLs, and the documented seam inventory the post-1.0 extension SDK stabilizes against.</p>
+
+  <h3>M11 &mdash; GA hardening <span class="pill pill-plan">1.0.0</span></h3>
+  <p>No features: long mixed-profile soaks, fuzz-corpus expansion, a full performance re-baseline with claim-ledger re-validation, the compatibility matrix frozen and published, the extension-seam freeze, and a third-party security audit. 1.0.0 means: single-node and replicated InfinityDB serving cache, durable KV, JSON documents (memory-exceeding), streams/queues, and vector search over RESP, with WASM reducers and embedded/IPC modes &mdash; every public number evidence-backed.</p>
+
+  <h2>Post-1.0 horizon <span class="pill pill-plan">COMMITTED DIRECTION, UNCOMMITTED DATES</span></h2>
+  <p>Cluster mode (slot migration &mdash; the 16,384-slot space was designed for it from day one); the native extension SDK; live queries/subscriptions over RESP3 push; protocol gateways in priority order &mdash; DynamoDB-compatible HTTP, native HTTP/JSON + WebSocket, PartiQL over those gateways, a Kafka wire-protocol gateway. A MongoDB wire listener is evaluated, not committed. Scope fences hold until then: no SQL planner, no multi-region active-active, no Redis modules ABI.</p>
+
+  <div class="doc-footer-nav">
+    <a href="compat.html">&larr; Compatibility matrix</a>
+    <a href="../blog/the-log-is-the-database.html">How it&rsquo;s built &rarr;</a>
+  </div>
+    </article>
+  </main>
+</div>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span class="mark">&copy; 2026 INFINITYDB &mdash; APACHE 2.0 &middot; RUST &middot; <b>infinityd</b></span>
+    <div class="footer-links">
+      <a href="index.html">DOCS</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a href="https://github.com/">GITHUB &#8599;</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var t = document.querySelector('.nav-toggle');
+  var l = document.querySelector('.nav-links');
+  if (t && l) t.addEventListener('click', function () {
+    var open = l.classList.toggle('open');
+    t.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+})();
+</script>
+</body>
+</html>

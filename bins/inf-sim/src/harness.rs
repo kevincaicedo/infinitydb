@@ -321,7 +321,7 @@ impl SimClient {
 // ---- simulated subscribers (M1-S15) ------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum SubPlan {
+pub(crate) enum SubPlan {
     /// Subscribed to these channel indexes via SUBSCRIBE.
     Channels(Vec<u64>),
     /// PSUBSCRIBE chan:* — receives every publish as pmessage.
@@ -329,7 +329,7 @@ enum SubPlan {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SubState {
+pub(crate) enum SubState {
     /// Waiting for N confirmation frames.
     Subscribing(usize),
     Listening,
@@ -338,28 +338,28 @@ enum SubState {
     Closed,
 }
 
-struct SimSubscriber {
-    index: usize,
-    cell: usize,
-    fd: RawFd,
-    plan: SubPlan,
-    state: SubState,
-    rx: Vec<u8>,
+pub(crate) struct SimSubscriber {
+    pub(crate) index: usize,
+    pub(crate) cell: usize,
+    pub(crate) fd: RawFd,
+    pub(crate) plan: SubPlan,
+    pub(crate) state: SubState,
+    pub(crate) rx: Vec<u8>,
     /// Messages received, total and per (channel, publisher) with the last
     /// sequence seen (per-publisher FIFO check).
-    received: u64,
-    last_seq: BTreeMap<(u64, usize), u64>,
+    pub(crate) received: u64,
+    pub(crate) last_seq: BTreeMap<(u64, usize), u64>,
 }
 
 impl SimSubscriber {
-    fn watches(&self, chan: u64) -> bool {
+    pub(crate) fn watches(&self, chan: u64) -> bool {
         match &self.plan {
             SubPlan::Channels(set) => set.contains(&chan),
             SubPlan::Pattern => true,
         }
     }
 
-    fn subscribe_wire(&self) -> Vec<u8> {
+    pub(crate) fn subscribe_wire(&self) -> Vec<u8> {
         match &self.plan {
             SubPlan::Channels(set) => {
                 let mut argv = vec![b"SUBSCRIBE".to_vec()];
@@ -370,14 +370,14 @@ impl SimSubscriber {
         }
     }
 
-    fn subscriptions(&self) -> usize {
+    pub(crate) fn subscriptions(&self) -> usize {
         match &self.plan {
             SubPlan::Channels(set) => set.len(),
             SubPlan::Pattern => 1,
         }
     }
 
-    fn unsubscribe_wire(&self) -> Vec<u8> {
+    pub(crate) fn unsubscribe_wire(&self) -> Vec<u8> {
         match &self.plan {
             SubPlan::Channels(_) => encode(&[b"UNSUBSCRIBE".to_vec()]),
             SubPlan::Pattern => encode(&[b"PUNSUBSCRIBE".to_vec()]),
@@ -387,7 +387,7 @@ impl SimSubscriber {
     /// Feeds one delivery, checking channel membership, payload shape, and
     /// the per-(channel, publisher) sequence. Violations describe the seed's
     /// finding precisely.
-    fn deliver(&mut self, channel: &[u8], payload: &[u8], violations: &mut Vec<String>) {
+    pub(crate) fn deliver(&mut self, channel: &[u8], payload: &[u8], violations: &mut Vec<String>) {
         self.received += 1;
         let chan: u64 = match channel.strip_prefix(b"chan:") {
             Some(digits) => core::str::from_utf8(digits).ok().and_then(|s| s.parse().ok()),
@@ -432,7 +432,7 @@ impl SimSubscriber {
 
 /// Deterministic subscription plan: every 4th subscriber watches the
 /// pattern, the rest watch two adjacent channels.
-fn subscription_plan(index: usize, channels: u64) -> SubPlan {
+pub(crate) fn subscription_plan(index: usize, channels: u64) -> SubPlan {
     if index % 4 == 3 {
         return SubPlan::Pattern;
     }
@@ -471,7 +471,9 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         // deterministic; the RANDOMKEY stream is seeded from the scenario.
         let node = Rc::new(NodeInfo::default());
         node.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
-        let plane = ServerPlane::new(
+        // Memory-only scenarios never enable the durable tier; pin the
+        // defaulted filesystem parameter (M2-S19).
+        let plane = ServerPlane::<_, inf_server::StdSegmentFs>::new(
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),

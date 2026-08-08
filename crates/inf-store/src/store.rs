@@ -21,11 +21,12 @@ use inf_alloc::{Arena, ArenaAddr, ArenaConfig};
 use inf_foundation::hash64;
 use inf_foundation::time::Nanos;
 
+use crate::doc::{self, DocStore};
 use crate::evict::{self, EvictState, EvictStats, EvictionPolicy, Tracking};
 use crate::index::Index;
 use crate::record::{
-    HEADER_LEN, MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN, RecordSpec, RecordView, TypeTag,
-    flags_ref_decrement, flags_ref_saturate, flags_ref_write,
+    HEADER_LEN, MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN, RecordKind, RecordSpec, RecordView,
+    TypeTag, flags_ref_decrement, flags_ref_saturate, flags_ref_write,
 };
 use crate::wheel::{ArmOutcome, TtlWheel};
 
@@ -33,10 +34,10 @@ pub use crate::wheel::ExpiryBudget;
 
 /// Stable hash seed: deterministic across runs and cells (L7; DST oracles
 /// rely on reproducible placement).
-const HASH_SEED: u64 = 0x1AF1_D8A5_0DB5_EED1;
+pub(crate) const HASH_SEED: u64 = 0x1AF1_D8A5_0DB5_EED1;
 
 /// Configuration for [`CellStore::new`].
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug)]
 pub struct StoreConfig {
     /// Record arena settings (chunk size, resident budget).
     pub arena: ArenaConfig,
@@ -45,7 +46,77 @@ pub struct StoreConfig {
     /// Seed for the eviction RNG stream (Morris rolls, random-policy slots).
     /// Injected (L7); `Keyspace` derives a per-db stream from the node seed.
     pub evict_seed: u64,
+    /// Document arena settings (ADR-0037; unused without the `doc` feature).
+    pub doc_arena: ArenaConfig,
+    /// Documents at or below this many idoc bytes live inline in the record
+    /// value (ADR-0037 D2 — **Proposed** default, measured at S20).
+    pub doc_inline_bytes_max: usize,
+    /// Eligibility floor (idoc bytes) for tree-form residency. Since
+    /// ADR-0046 ingest never auto-morphs (default `usize::MAX`): documents
+    /// reside as tape at every size, because the mutation engine is
+    /// tape-native and the tree form costs 1.85–4.3× tape RSS. Lowering
+    /// this restores the pre-ADR-0046 ingest morph (forced-form A/B arms,
+    /// forced-tree tests); `json_morph` remains the explicit seam.
+    pub doc_morph_bytes_min: usize,
+    /// Repeated-key interning experiment (ADR-0038) — default off, and off
+    /// for the M3 release regardless of the A/B (plan §2 cut line).
+    pub doc_intern_keys: bool,
+    /// Maximum JSON nesting depth accepted at document ingest (M3-S07;
+    /// RedisJSON-parity default 128). Configurable downward only — the
+    /// format ceiling (`inf_doc::limits::DEPTH_MAX`) clamps it. Per-
+    /// namespace override rides the S11 command surface (the parser is
+    /// constructed with the namespace's resolved limits there).
+    pub doc_max_depth: usize,
+    /// Maximum document size at ingest (M3-S07), applied to **both** axes
+    /// of the dual bound: input text bytes (reject before the structural
+    /// index allocates) and encoded idoc bytes (incremental during stage 2
+    /// — small-token documents can encode larger than their text). Default
+    /// = the 16 MiB − 1 format ceiling (record `vlen`, u24 skip lengths);
+    /// configurable downward only.
+    pub doc_max_bytes: usize,
+    /// Maximum JSONPath text bytes per command (M3-S11; ADR-0040 D6's
+    /// `doc_max_path_bytes`). The S10 program cache enforces it before
+    /// the lookup so lower-capped namespaces never hit an over-cap cached
+    /// program; the 64 KiB format ceiling clamps upward drift.
+    pub doc_max_path_bytes: usize,
+    /// Maximum path-evaluation match set per command (M3-S11 wires the
+    /// key ADR-0040 D6 named): a declared product limit — the
+    /// pathological `$..*` mutation otherwise plans unboundedly.
+    pub doc_max_path_matches: u32,
 }
+
+impl Default for StoreConfig {
+    fn default() -> StoreConfig {
+        StoreConfig {
+            arena: ArenaConfig::default(),
+            initial_keys: 0,
+            evict_seed: 0,
+            doc_arena: ArenaConfig::default(),
+            doc_inline_bytes_max: 512,
+            doc_morph_bytes_min: usize::MAX,
+            doc_intern_keys: false,
+            doc_max_depth: DOC_MAX_DEPTH_DEFAULT,
+            doc_max_bytes: DOC_MAX_BYTES_DEFAULT,
+            doc_max_path_bytes: DOC_MAX_PATH_BYTES_DEFAULT,
+            doc_max_path_matches: DOC_MAX_PATH_MATCHES_DEFAULT,
+        }
+    }
+}
+
+/// M3-S07/S11 limit defaults as literals — slim builds have no `inf_doc`
+/// to name the ceilings; the doc-feature assert below makes drift a
+/// compile error.
+const DOC_MAX_DEPTH_DEFAULT: usize = 128;
+const DOC_MAX_BYTES_DEFAULT: usize = 0xFF_FFFF;
+const DOC_MAX_PATH_BYTES_DEFAULT: usize = 4096;
+const DOC_MAX_PATH_MATCHES_DEFAULT: u32 = 65_536;
+
+#[cfg(feature = "doc")]
+const _: () = {
+    assert!(DOC_MAX_DEPTH_DEFAULT == inf_doc::limits::DEPTH_MAX);
+    assert!(DOC_MAX_BYTES_DEFAULT == inf_doc::limits::DOC_BYTES_MAX);
+    assert!(DOC_MAX_PATH_BYTES_DEFAULT == inf_doc::path::PATH_BYTES_DEFAULT);
+};
 
 /// Typed operation failure surfaced to the command layer.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -62,6 +133,37 @@ pub enum OpError {
     OutOfMemory,
     /// Key or value exceeds the v0 record bounds.
     TooLarge,
+    /// The record's type does not admit this operation (ADR-0037 D6): a
+    /// string mutation on a document, a `json_*` call on a string, or a
+    /// document edit in a non-editable physical form. Maps to Redis
+    /// `WRONGTYPE` at the command layer.
+    WrongType,
+    /// Disk admission refused a tiered placement (M4-S21, ADR-0063 D1):
+    /// the namespace's disk budget is exhausted or the device is.
+    /// Refusal mutates nothing; reads, deletes, expiry, and in-place
+    /// updates proceed. Maps to the `DISKFULL` extension error at the
+    /// command layer.
+    DiskFull(DiskFullCause),
+}
+
+/// Why disk admission refused (ADR-0063 D1) — the error payload carries
+/// the numbers the operator needs, the `TierVaLimitExceeded` structured
+/// precedent.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum DiskFullCause {
+    /// `DISK-BUDGET` exhausted: the admission projection reached
+    /// `budget − reserve`. Snapshot values from the last admission
+    /// refresh (ADR-0063 D2 — the cached-verdict cadence).
+    Budget {
+        /// `disk_used` at the last refresh (tier files + extents).
+        used: u64,
+        /// The configured `DISK-BUDGET`.
+        budget: u64,
+    },
+    /// The device itself refused a tier write with ENOSPC (the latched
+    /// leg — cleared automatically by the next successful flush
+    /// barrier).
+    Device,
 }
 
 /// `SET` condition (NX/XX shapes).
@@ -102,6 +204,37 @@ pub struct SetOptions {
 pub enum SetOutcome {
     Applied { old: Option<Vec<u8>> },
     Skipped { old: Option<Vec<u8>> },
+}
+
+/// Post-mutation view of one key for durable effect emission (M2-S08):
+/// borrowed value bytes plus the store's absolute internal deadline in
+/// milliseconds (`None` = no TTL). See [`CellStore::post_image`].
+#[derive(Copy, Clone, Debug)]
+pub struct PostImage<'a> {
+    pub value: &'a [u8],
+    pub expire_at_ms: Option<u64>,
+}
+
+/// Canonical value emitted by the fuzzy-checkpoint/digest walker. Store
+/// handles and cadence bytes never escape this boundary (ADR-0043 D7).
+#[derive(Copy, Clone, Debug)]
+pub enum CheckpointImage<'a> {
+    String(&'a [u8]),
+    #[cfg(feature = "doc")]
+    JsonDoc {
+        lineage: inf_log::DocLineage,
+        version: u32,
+        idoc: &'a [u8],
+    },
+}
+
+/// One post-command durable full image, resolved exactly once. The string
+/// arm borrows store bytes; the document arm owns canonical idoc because
+/// tree freeze/key uninterning crosses the store-local representation seam.
+pub enum LogFullImage<'a> {
+    String(PostImage<'a>),
+    #[cfg(feature = "doc")]
+    JsonDoc(crate::doc::JsonLogDecision),
 }
 
 /// `EXPIRE` condition flags (NX/XX/GT/LT).
@@ -159,12 +292,13 @@ impl Encoding {
     }
 }
 
-/// A record exported for cross-db COPY (M1-S08).
+/// A record exported for cross-db COPY (M1-S08). Document exports carry
+/// canonical frozen tape bytes as `value` (ADR-0037 D3).
 #[derive(Clone, Debug)]
 pub(crate) struct ExportedRecord {
     pub value: Vec<u8>,
     pub expire_at_ms: Option<u64>,
-    pub raw: bool,
+    pub kind: RecordKind,
 }
 
 /// `COPY` outcome (M1-S02).
@@ -213,8 +347,11 @@ pub struct StoreStats {
     pub evicted_keys: u64,
 }
 
-/// Frozen memory attribution domains (tripwire names, M0 §3.2; `wheel_bytes`
-/// joins in M1-S04 — the ≤ 16 B/TTL'd-key budget is verified against it).
+/// Frozen memory attribution domains (tripwire names, M0 §3.2; document
+/// fields join additively at M3-S19). Logical document partitions and
+/// overlays are exposed for diagnosis; [`MemoryReport::attributed_bytes`]
+/// sums resident partitions only, so intern/tree slack are never counted
+/// twice against RSS.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct MemoryReport {
     pub records_live_bytes: u64,
@@ -225,7 +362,39 @@ pub struct MemoryReport {
     /// Eviction-engine footprint: the 8 KiB CMS while an LFU policy is
     /// selected, 0 otherwise (M1-S06 L5 domain).
     pub evict_bytes: u64,
+    /// Live doc-arena tape blobs (partition with `doc_arena_bytes`).
+    pub doc_tape_bytes: u64,
+    /// Live doc-arena tree storage, including tree growth slack.
+    pub doc_arena_bytes: u64,
+    /// Mapped bytes of the document arena (RSS-side partition).
+    pub doc_resident_bytes: u64,
+    /// Intern dictionaries within tape bytes (diagnostic overlay).
+    pub doc_intern_bytes: u64,
+    /// Unused tree capacity within `doc_arena_bytes` (diagnostic overlay).
+    pub doc_slack_bytes: u64,
+    /// Retained parser/ingest/freeze/effect scratch owned by this report's
+    /// store or cell. `CellStore::report` contributes store-local scratch;
+    /// the command plane adds its one-per-cell buffers.
+    pub doc_scratch_bytes: u64,
+    /// One bounded path-program cache per cell; zero in a store-only report.
+    pub doc_path_cache_bytes: u64,
     pub live_records: u64,
+    pub docs_live: u64,
+}
+
+impl MemoryReport {
+    /// RSS-side sum of disjoint resident domains. Logical partitions and
+    /// overlays remain visible fields but deliberately do not join this sum.
+    #[must_use]
+    pub fn attributed_bytes(&self) -> u64 {
+        self.records_resident_bytes
+            + self.index_bytes
+            + self.wheel_bytes
+            + self.evict_bytes
+            + self.doc_resident_bytes
+            + self.doc_scratch_bytes
+            + self.doc_path_cache_bytes
+    }
 }
 
 /// One cell's keyspace slice. Single-threaded by construction (owns a
@@ -236,7 +405,9 @@ pub struct CellStore {
     wheel: TtlWheel,
     pub(crate) stats: StoreStats,
     pub(crate) evict: EvictState,
-    cfg: StoreConfig,
+    /// Document arena + domain counters (ADR-0037; no-op without `doc`).
+    pub(crate) docs: DocStore,
+    pub(crate) cfg: StoreConfig,
 }
 
 impl CellStore {
@@ -249,6 +420,7 @@ impl CellStore {
             wheel: TtlWheel::new(0),
             stats: StoreStats::default(),
             evict,
+            docs: DocStore::new(&cfg),
             cfg,
         }
     }
@@ -264,6 +436,32 @@ impl CellStore {
     #[inline]
     pub fn prefetch(&self, key_hash: u64) {
         self.index.prefetch(key_hash);
+    }
+
+    /// Unverified-probe record prefetch — §7.3 phase 2 as a standalone step
+    /// (the fabric-apply staged batch, M2.5 Phase H / ADR-0005 shape): find
+    /// the first fingerprint candidate and prefetch its record head lines.
+    /// The caller executes the exact path afterwards, so a fingerprint
+    /// collision (≈2⁻²²) or a reap between prefetch and execute costs
+    /// nothing but the wasted lines.
+    #[inline]
+    pub fn probe_prefetch(&self, key_hash: u64) {
+        if let Some(addr) = self.index.find(key_hash, |_| true) {
+            let head = self.arena.bytes(addr, HEADER_LEN).as_ptr();
+            inf_simd::prefetch_read(head);
+            inf_simd::prefetch_read(head.wrapping_add(64));
+        }
+    }
+
+    /// Document-root prefetch — ADR-0044 phase 3. Revisit the same
+    /// fingerprint candidate after its record lines had a full batch pass
+    /// to arrive, then hint the first tape lines. This is non-semantic: the
+    /// exact execution path still verifies the key and handles expiry.
+    #[inline]
+    pub fn prefetch_doc_root(&self, key_hash: u64) {
+        if let Some(addr) = self.index.find(key_hash, |_| true) {
+            self.docs.prefetch_root(record_at(&self.arena, addr));
+        }
     }
 
     /// Live key count (post-expiry keys may still be counted until read or
@@ -294,6 +492,7 @@ impl CellStore {
     /// Byte-exact attribution snapshot (L5).
     pub fn report(&self) -> MemoryReport {
         let arena = self.arena.report();
+        let docs = self.docs.report();
         MemoryReport {
             records_live_bytes: arena.live_bytes,
             records_slack_bytes: arena.slack_bytes,
@@ -301,7 +500,15 @@ impl CellStore {
             index_bytes: self.index.memory_bytes() as u64,
             wheel_bytes: (self.wheel.pool_bytes() + self.wheel.table_bytes()) as u64,
             evict_bytes: self.evict.bytes() as u64,
+            doc_tape_bytes: docs.domain.tape_bytes,
+            doc_arena_bytes: docs.domain.arena_bytes,
+            doc_resident_bytes: docs.resident_bytes,
+            doc_intern_bytes: docs.domain.intern_bytes,
+            doc_slack_bytes: docs.domain.slack_bytes,
+            doc_scratch_bytes: docs.scratch_bytes,
+            doc_path_cache_bytes: 0,
             live_records: arena.live_allocs,
+            docs_live: docs.domain.docs_live,
         }
     }
 
@@ -323,6 +530,24 @@ impl CellStore {
         };
         self.stats.keyspace_hits += 1;
         Some(RecordView::new(self.arena.bytes(addr, len)).value())
+    }
+
+    /// `GET` at the command layer (M3-S11 generic-command matrix): the
+    /// string read that refuses documents. [`get`](Self::get) stays the
+    /// raw store-layer read (gather internals, tests); Redis `GET` on a
+    /// document key is `WRONGTYPE`, and the branch costs one compare on
+    /// the already-loaded header.
+    pub fn get_str(&mut self, key: &[u8], now: Nanos) -> Result<Option<&[u8]>, OpError> {
+        let Some((addr, len)) = self.resolve(key, now) else {
+            self.stats.keyspace_misses += 1;
+            return Ok(None);
+        };
+        self.stats.keyspace_hits += 1;
+        let view = RecordView::new(self.arena.bytes(addr, len));
+        if view.type_tag() != TypeTag::String {
+            return Err(OpError::WrongType);
+        }
+        Ok(Some(view.value()))
     }
 
     /// Diagnostics: index groups visited to terminate a probe for `key`
@@ -384,10 +609,15 @@ impl CellStore {
                         let view = record_at(&self.arena, addr);
                         if view.key() != key {
                             true // fingerprint collision (≈2⁻²²)
+                        } else if view.type_tag() != TypeTag::String {
+                            // MGET answers nil for non-string keys (Redis
+                            // semantics; the S11 matrix pins documents).
+                            self.stats.keyspace_hits += 1;
+                            out(base + i, None);
+                            continue;
                         } else if view.is_expired(now) {
                             let len = view.encoded_len();
-                            self.index.remove(hashes[i], addr);
-                            self.arena.free(addr, len);
+                            self.free_record(hashes[i], addr, len);
                             self.note_reap_lazy();
                             mark_stale(&mut redo, &candidates, i, addr);
                             self.stats.keyspace_misses += 1;
@@ -406,7 +636,8 @@ impl CellStore {
                     Some((addr, len)) => {
                         let view = RecordView::new(self.arena.bytes(addr, len));
                         self.stats.keyspace_hits += 1;
-                        out(base + i, Some(view.value()));
+                        let value = (view.type_tag() == TypeTag::String).then(|| view.value());
+                        out(base + i, value);
                     }
                     None => {
                         // The exact path may itself have reaped an expired
@@ -440,11 +671,18 @@ impl CellStore {
         self.resolve(key, now).is_some()
     }
 
-    /// `STRLEN`. Missing keys are length 0 (Redis semantics).
-    pub fn strlen(&mut self, key: &[u8], now: Nanos) -> u64 {
+    /// `STRLEN`. Missing keys are length 0; non-string records are
+    /// `WrongType` (M3-S11 generic-command matrix).
+    pub fn strlen(&mut self, key: &[u8], now: Nanos) -> Result<u64, OpError> {
         match self.resolve(key, now) {
-            Some((addr, len)) => RecordView::new(self.arena.bytes(addr, len)).vlen() as u64,
-            None => 0,
+            Some((addr, len)) => {
+                let view = RecordView::new(self.arena.bytes(addr, len));
+                if view.type_tag() != TypeTag::String {
+                    return Err(OpError::WrongType);
+                }
+                Ok(view.vlen() as u64)
+            }
+            None => Ok(0),
         }
     }
 
@@ -482,20 +720,30 @@ impl CellStore {
 
     /// `GETRANGE`/`SUBSTR` — Redis index semantics (negatives count from the
     /// end, ranges clamp, inverted ranges are empty).
-    pub fn get_range(&mut self, key: &[u8], start: i64, end: i64, now: Nanos) -> &[u8] {
+    pub fn get_range(
+        &mut self,
+        key: &[u8],
+        start: i64,
+        end: i64,
+        now: Nanos,
+    ) -> Result<&[u8], OpError> {
         let Some((addr, len)) = self.resolve(key, now) else {
             self.stats.keyspace_misses += 1;
-            return b"";
+            return Ok(b"");
         };
         self.stats.keyspace_hits += 1;
-        let value = RecordView::new(self.arena.bytes(addr, len)).value();
+        let view = RecordView::new(self.arena.bytes(addr, len));
+        if view.type_tag() != TypeTag::String {
+            return Err(OpError::WrongType);
+        }
+        let value = view.value();
         let n = value.len() as i64;
         let from = if start < 0 { (n + start).max(0) } else { start };
         let to = if end < 0 { (n + end).max(0) } else { end }.min(n - 1);
         if n == 0 || from > to || from >= n {
-            return b"";
+            return Ok(b"");
         }
-        &value[from as usize..=to as usize]
+        Ok(&value[from as usize..=to as usize])
     }
 
     /// `OBJECT ENCODING` view: the encoding plus the parsed integer when
@@ -528,6 +776,12 @@ impl CellStore {
         check_bounds(key, value)?;
         let existing = self.resolve(key, now);
         let old_view = existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
+        // Plain SET is a universal overwrite (ADR-0037 D6), but the GET
+        // arm (GETSET / SET…GET) reads the old value *as a string* —
+        // Redis errors WRONGTYPE before writing, and so do we.
+        if opts.get_old && old_view.is_some_and(|v| v.type_tag() != TypeTag::String) {
+            return Err(OpError::WrongType);
+        }
         let old_deadline = old_view.and_then(|v| v.expire_at_ms());
         let old_value = if opts.get_old { old_view.map(|v| v.value().to_vec()) } else { None };
         let applies = match opts.cond {
@@ -544,7 +798,13 @@ impl CellStore {
             SetExpire::Keep => old_deadline,
             SetExpire::At(at) => Some((at.0 / 1_000_000).min(MAX_EXPIRE_MS)),
         };
-        let spec = RecordSpec { key, value, version, expire_at_ms, raw: false };
+        let spec = RecordSpec {
+            key,
+            value,
+            version,
+            expire_at_ms,
+            kind: RecordKind::String { raw: false },
+        };
         self.write_record(key, existing, spec)?;
         self.note_ttl(old_deadline.is_some(), expire_at_ms.is_some());
         if let Some(ms) = expire_at_ms
@@ -560,8 +820,7 @@ impl CellStore {
         match self.resolve(key, now) {
             Some((addr, len)) => {
                 let had_ttl = RecordView::new(self.arena.bytes(addr, len)).expire_at_ms().is_some();
-                self.index.remove(Self::hash_key(key), addr);
-                self.arena.free(addr, len);
+                self.free_record(Self::hash_key(key), addr, len);
                 self.note_ttl(had_ttl, false);
                 true
             }
@@ -569,16 +828,135 @@ impl CellStore {
         }
     }
 
-    /// `GETDEL`: the value, removing the key.
+    /// `GETDEL`: the value, removing the key. String records only — a
+    /// document's value bytes are a physical handle, never a reply
+    /// (ADR-0037 D6); the command layer maps the `None`-vs-error split.
     pub fn getdel(&mut self, key: &[u8], now: Nanos) -> Option<Vec<u8>> {
         let (addr, len) = self.resolve(key, now)?;
         let view = RecordView::new(self.arena.bytes(addr, len));
+        if view.type_tag() != TypeTag::String {
+            return None;
+        }
         let value = view.value().to_vec();
         let had_ttl = view.expire_at_ms().is_some();
-        self.index.remove(Self::hash_key(key), addr);
-        self.arena.free(addr, len);
+        self.free_record(Self::hash_key(key), addr, len);
         self.note_ttl(had_ttl, false);
         Some(value)
+    }
+
+    // ---- durable-namespace hooks (M2-S08, ADR-0015 D5/D7) ----
+
+    /// Post-mutation snapshot of one key for durable effect emission: the
+    /// live value bytes plus the store's absolute internal deadline, read
+    /// **without** access-tracking or expire-on-read side effects (staging
+    /// a log record must not perturb LRU/LFU the way a client read does).
+    /// An expired-but-unreaped key reads as absent — correct for emission:
+    /// its deadline already passed, so the post-image is "gone".
+    pub fn post_image(&self, key: &[u8], now: Nanos) -> Option<PostImage<'_>> {
+        let hash = Self::hash_key(key);
+        let arena = &self.arena;
+        let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
+        let view = record_at(arena, addr);
+        if view.is_expired(now) {
+            return None;
+        }
+        // Documents emit DocFull through the typed checkpoint/log-image
+        // path (ADR-0043 D7) — a handle is a per-boot artifact, never a
+        // durable post-image. The tripwire keeps that wiring impossible to
+        // bypass through the string effect seam.
+        debug_assert_eq!(
+            view.type_tag(),
+            TypeTag::String,
+            "document post-images freeze at the walker (M3-S17)"
+        );
+        Some(PostImage { value: view.value(), expire_at_ms: view.expire_at_ms() })
+    }
+
+    /// Exact canonical value bytes a full durable image would carry,
+    /// resolved once and without access tracking. Used only for admission.
+    pub fn log_image_bytes(&self, key: &[u8], now: Nanos) -> Option<usize> {
+        let hash = Self::hash_key(key);
+        let arena = &self.arena;
+        let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
+        let view = record_at(arena, addr);
+        if view.is_expired(now) {
+            return None;
+        }
+        match view.type_tag() {
+            TypeTag::String => Some(view.value().len()),
+            TypeTag::JsonDoc => {
+                #[cfg(feature = "doc")]
+                {
+                    Some(self.json_canonical_len(view) as usize)
+                }
+                #[cfg(not(feature = "doc"))]
+                unreachable!("JsonDoc records cannot exist without the doc feature")
+            }
+            // Written only by TieredTable (M4-S17, ADR-0061 D2) — one in
+            // a memory-mode arena is a record-lifecycle bug.
+            TypeTag::StringExtent => {
+                unreachable!("StringExtent records exist only in tiered namespaces")
+            }
+        }
+    }
+
+    /// Resolve and materialize the post-command full image once. Document
+    /// cadence resets as part of consuming this image for the log.
+    pub fn log_full_image(&mut self, key: &[u8], now: Nanos) -> Option<LogFullImage<'_>> {
+        let hash = Self::hash_key(key);
+        let arena = &self.arena;
+        let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
+        let (_encoded_len, kind, expired) = {
+            let view = record_at(&self.arena, addr);
+            (view.encoded_len(), view.type_tag(), view.is_expired(now))
+        };
+        if expired {
+            return None;
+        }
+        match kind {
+            TypeTag::String => {
+                let view = record_at(&self.arena, addr);
+                Some(LogFullImage::String(PostImage {
+                    value: view.value(),
+                    expire_at_ms: view.expire_at_ms(),
+                }))
+            }
+            TypeTag::StringExtent => {
+                unreachable!("StringExtent records exist only in tiered namespaces")
+            }
+            TypeTag::JsonDoc => {
+                #[cfg(feature = "doc")]
+                {
+                    self.json_log_full_resolved(addr, _encoded_len).map(LogFullImage::JsonDoc)
+                }
+                #[cfg(not(feature = "doc"))]
+                unreachable!("JsonDoc records cannot exist without the doc feature")
+            }
+        }
+    }
+
+    /// Replay upsert (blind idempotent post-image apply — ADR-0011 D4).
+    /// Clears any TTL; a following `ExpireAt` record re-arms it, exactly
+    /// mirroring emission order. Never consults eviction pressure: the OOM
+    /// gate is a Keyspace-level DENYOOM concern and replay must not be
+    /// refused by `maxmemory` (recovery degrades loudly on real allocation
+    /// failure instead).
+    ///
+    /// # Errors
+    /// Arena/bounds failures only (`OpError::TooLarge`/`OutOfMemory`).
+    pub fn replay_set(&mut self, key: &[u8], value: &[u8], now: Nanos) -> Result<(), OpError> {
+        self.set(key, value, SetOptions::default(), now).map(|_| ())
+    }
+
+    /// Replay delete. Absent keys are a no-op (idempotent re-apply).
+    pub fn replay_del(&mut self, key: &[u8], now: Nanos) {
+        let _ = self.del(key, now);
+    }
+
+    /// Replay TTL arm at an absolute internal deadline. Absent keys are a
+    /// no-op (idempotent re-apply of a delete-then-expire suffix).
+    pub fn replay_expire_at(&mut self, key: &[u8], at: Nanos, now: Nanos) {
+        let _ = self.expire(key, Some(at), ExpireCond::Always, now);
     }
 
     /// `GETEX`: the value, with an optional TTL side effect (M1-S01). A
@@ -589,8 +967,14 @@ impl CellStore {
                 self.stats.keyspace_misses += 1;
                 return None;
             };
+            let view = RecordView::new(self.arena.bytes(addr, len));
+            if view.type_tag() != TypeTag::String {
+                // Documents never answer through the string read API
+                // (ADR-0037 D6); the command layer owns WRONGTYPE replies.
+                return None;
+            }
             self.stats.keyspace_hits += 1;
-            RecordView::new(self.arena.bytes(addr, len)).value().to_vec()
+            view.value().to_vec()
         };
         match update {
             TtlUpdate::Keep => {}
@@ -610,6 +994,9 @@ impl CellStore {
         let (current, version, expire_at_ms) = match existing {
             Some((addr, len)) => {
                 let view = RecordView::new(self.arena.bytes(addr, len));
+                if view.type_tag() != TypeTag::String {
+                    return Err(OpError::WrongType);
+                }
                 (parse_int(view.value())?, view.version().wrapping_add(1), view.expire_at_ms())
             }
             None => (0, 1, None),
@@ -617,7 +1004,13 @@ impl CellStore {
         let next = current.checked_add(delta).ok_or(OpError::Overflow)?;
         let mut buf = [0u8; 20];
         let value = fmt_i64(&mut buf, next);
-        let spec = RecordSpec { key, value, version, expire_at_ms, raw: false };
+        let spec = RecordSpec {
+            key,
+            value,
+            version,
+            expire_at_ms,
+            kind: RecordKind::String { raw: false },
+        };
         self.write_record(key, existing, spec)?;
         Ok(next)
     }
@@ -633,6 +1026,9 @@ impl CellStore {
         let (current, version, expire_at_ms) = match existing {
             Some((addr, len)) => {
                 let view = RecordView::new(self.arena.bytes(addr, len));
+                if view.type_tag() != TypeTag::String {
+                    return Err(OpError::WrongType);
+                }
                 (parse_float(view.value())?, view.version().wrapping_add(1), view.expire_at_ms())
             }
             None => (0.0, 1, None),
@@ -646,7 +1042,13 @@ impl CellStore {
         // (Recorded deviation: Redis computes in 80-bit long double, so
         // extreme-precision tails can differ — compat-matrix entry.)
         let text = format!("{next}").into_bytes();
-        let spec = RecordSpec { key, value: &text, version, expire_at_ms, raw: false };
+        let spec = RecordSpec {
+            key,
+            value: &text,
+            version,
+            expire_at_ms,
+            kind: RecordKind::String { raw: false },
+        };
         self.write_record(key, existing, spec)?;
         Ok(text)
     }
@@ -659,6 +1061,9 @@ impl CellStore {
         let (mut value, version, expire_at_ms) = match existing {
             Some((addr, len)) => {
                 let view = RecordView::new(self.arena.bytes(addr, len));
+                if view.type_tag() != TypeTag::String {
+                    return Err(OpError::WrongType);
+                }
                 (view.value().to_vec(), view.version().wrapping_add(1), view.expire_at_ms())
             }
             None => (Vec::new(), 1, None),
@@ -667,7 +1072,13 @@ impl CellStore {
         check_bounds(key, &value)?;
         let new_len = value.len() as u64;
         let raw = existing.is_some();
-        let spec = RecordSpec { key, value: &value, version, expire_at_ms, raw };
+        let spec = RecordSpec {
+            key,
+            value: &value,
+            version,
+            expire_at_ms,
+            kind: RecordKind::String { raw },
+        };
         self.write_record(key, existing, spec)?;
         Ok(new_len)
     }
@@ -695,6 +1106,9 @@ impl CellStore {
         let (mut value, version, expire_at_ms) = match existing {
             Some((addr, len)) => {
                 let view = RecordView::new(self.arena.bytes(addr, len));
+                if view.type_tag() != TypeTag::String {
+                    return Err(OpError::WrongType);
+                }
                 (view.value().to_vec(), view.version().wrapping_add(1), view.expire_at_ms())
             }
             None => (Vec::new(), 1, None),
@@ -704,14 +1118,23 @@ impl CellStore {
         }
         value[offset..end].copy_from_slice(patch);
         let new_len = value.len() as u64;
-        let spec = RecordSpec { key, value: &value, version, expire_at_ms, raw: true };
+        let spec = RecordSpec {
+            key,
+            value: &value,
+            version,
+            expire_at_ms,
+            kind: RecordKind::String { raw: true },
+        };
         self.write_record(key, existing, spec)?;
         Ok(new_len)
     }
 
     /// `RENAME` (single cell): value, TTL, and encoding move; the source is
     /// removed. `Ok(false)` = source missing. The destination write happens
-    /// first so OOM leaves the source intact.
+    /// first so OOM leaves the source intact. Document handles **transfer**:
+    /// the value bytes move verbatim and the source record frees without a
+    /// payload release (ADR-0037 D3) — the one deliberate `free_record`
+    /// bypass in the store.
     pub fn rename(&mut self, src: &[u8], dst: &[u8], now: Nanos) -> Result<bool, OpError> {
         if src == dst {
             return Ok(self.exists(src, now));
@@ -721,17 +1144,29 @@ impl CellStore {
         };
         let view = RecordView::new(self.arena.bytes(src_addr, src_len));
         let value = view.value().to_vec();
+        #[cfg(feature = "doc")]
+        let mut value = value;
         let deadline = view.expire_at_ms();
-        let raw = view.is_raw();
+        let kind = view.kind();
         check_bounds(dst, &value)?;
         let dst_existing = self.resolve(dst, now);
         let dst_old = dst_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
         let version = dst_old.map_or(1, |v| v.version().wrapping_add(1));
+        #[cfg(feature = "doc")]
+        if matches!(kind, RecordKind::JsonDoc) {
+            let lineage = dst_old
+                .filter(|view| view.type_tag() == TypeTag::JsonDoc)
+                .map_or_else(|| self.docs.allocate_lineage(), doc::lineage_of_record);
+            doc::write_lineage(&mut value, lineage);
+        }
         let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
-        let spec = RecordSpec { key: dst, value: &value, version, expire_at_ms: deadline, raw };
-        self.write_record(dst, dst_existing, spec)?;
+        let spec = RecordSpec { key: dst, value: &value, version, expire_at_ms: deadline, kind };
+        // Releasing: the DESTINATION's old payload dies; the carried source
+        // handle inside `value` is untouched by the release.
+        self.write_record_releasing(dst, dst_existing, spec)?;
         self.note_ttl(dst_had_ttl, deadline.is_some());
-        // Source removal: the dst write never moves the src record.
+        // Source removal: the dst write never moves the src record, and the
+        // payload now belongs to dst — no release.
         let src_had_ttl = deadline.is_some();
         self.index.remove(Self::hash_key(src), src_addr);
         self.arena.free(src_addr, src_len);
@@ -742,7 +1177,9 @@ impl CellStore {
         Ok(true)
     }
 
-    /// `COPY` (single cell): duplicates value, TTL, and encoding.
+    /// `COPY` (single cell): duplicates value, TTL, and encoding. Documents
+    /// deep-copy through their canonical frozen bytes and re-tier at the
+    /// destination (ADR-0037 D3) — handles are never duplicated.
     pub fn copy(
         &mut self,
         src: &[u8],
@@ -754,6 +1191,12 @@ impl CellStore {
             return Ok(CopyResult::SourceMissing);
         };
         let view = RecordView::new(self.arena.bytes(src_addr, src_len));
+        #[cfg(feature = "doc")]
+        if view.type_tag() == TypeTag::JsonDoc {
+            let deadline = view.expire_at_ms();
+            let plain = self.frozen_bytes_of(view)?;
+            return self.copy_doc_to(dst, &plain, deadline, replace, now);
+        }
         let value = view.value().to_vec();
         let deadline = view.expire_at_ms();
         let raw = view.is_raw();
@@ -765,7 +1208,13 @@ impl CellStore {
         let dst_old = dst_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
         let version = dst_old.map_or(1, |v| v.version().wrapping_add(1));
         let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
-        let spec = RecordSpec { key: dst, value: &value, version, expire_at_ms: deadline, raw };
+        let spec = RecordSpec {
+            key: dst,
+            value: &value,
+            version,
+            expire_at_ms: deadline,
+            kind: RecordKind::String { raw },
+        };
         self.write_record(dst, dst_existing, spec)?;
         self.note_ttl(dst_had_ttl, deadline.is_some());
         if let Some(ms) = deadline {
@@ -774,14 +1223,66 @@ impl CellStore {
         Ok(CopyResult::Copied)
     }
 
+    /// Destination half of a document COPY: `plain` is the source's frozen
+    /// canonical tape; placement re-tiers in THIS store's document arena.
+    #[cfg(feature = "doc")]
+    fn copy_doc_to(
+        &mut self,
+        dst: &[u8],
+        plain: &[u8],
+        deadline: Option<u64>,
+        replace: bool,
+        now: Nanos,
+    ) -> Result<CopyResult, OpError> {
+        if dst.len() > MAX_KEY_LEN {
+            return Err(OpError::TooLarge);
+        }
+        let dst_existing = self.resolve(dst, now);
+        if dst_existing.is_some() && !replace {
+            return Ok(CopyResult::DestinationExists);
+        }
+        let dst_old = dst_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
+        let version = dst_old.map_or(1, |v| v.version().wrapping_add(1));
+        let lineage = dst_old
+            .filter(|view| view.type_tag() == TypeTag::JsonDoc)
+            .map_or_else(|| self.docs.allocate_lineage(), doc::lineage_of_record);
+        let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
+        self.json_write_value(
+            dst,
+            dst_existing,
+            plain,
+            doc::DocWriteMeta {
+                lineage,
+                version,
+                expire_at_ms: deadline,
+                cadence: doc::DocCadence::default(),
+            },
+        )?;
+        self.note_ttl(dst_had_ttl, deadline.is_some());
+        if let Some(ms) = deadline {
+            self.arm_wheel(Self::hash_key(dst), ms);
+        }
+        Ok(CopyResult::Copied)
+    }
+
     /// Cross-db `COPY` export (M1-S08): value, TTL, and encoding state.
+    /// Documents export their canonical frozen bytes (never a handle —
+    /// handles are meaningless in another store's arena, ADR-0037 D3).
     pub(crate) fn copy_out(&mut self, key: &[u8], now: Nanos) -> Option<ExportedRecord> {
         let (addr, len) = self.resolve(key, now)?;
         let view = RecordView::new(self.arena.bytes(addr, len));
+        #[cfg(feature = "doc")]
+        if view.type_tag() == TypeTag::JsonDoc {
+            return Some(ExportedRecord {
+                value: self.frozen_bytes_of(view).ok()?,
+                expire_at_ms: view.expire_at_ms(),
+                kind: RecordKind::JsonDoc,
+            });
+        }
         Some(ExportedRecord {
             value: view.value().to_vec(),
             expire_at_ms: view.expire_at_ms(),
-            raw: view.is_raw(),
+            kind: RecordKind::String { raw: view.is_raw() },
         })
     }
 
@@ -795,6 +1296,11 @@ impl CellStore {
         now: Nanos,
     ) -> Result<CopyResult, OpError> {
         check_bounds(dst, &rec.value)?;
+        #[cfg(feature = "doc")]
+        if rec.kind == RecordKind::JsonDoc {
+            // Exported documents carry canonical tape bytes; re-tier here.
+            return self.copy_doc_to(dst, &rec.value, rec.expire_at_ms, replace, now);
+        }
         let dst_existing = self.resolve(dst, now);
         if dst_existing.is_some() && !replace {
             return Ok(CopyResult::DestinationExists);
@@ -807,7 +1313,7 @@ impl CellStore {
             value: &rec.value,
             version,
             expire_at_ms: rec.expire_at_ms,
-            raw: rec.raw,
+            kind: rec.kind,
         };
         self.write_record(dst, dst_existing, spec)?;
         self.note_ttl(dst_had_ttl, rec.expire_at_ms.is_some());
@@ -849,8 +1355,7 @@ impl CellStore {
         if let Some(ms) = new_ms
             && ms <= now.0 / 1_000_000
         {
-            self.index.remove(Self::hash_key(key), addr);
-            self.arena.free(addr, len);
+            self.free_record(Self::hash_key(key), addr, len);
             self.note_ttl(current.is_some(), false);
             return true;
         }
@@ -861,10 +1366,17 @@ impl CellStore {
         let key_owned = view.key().to_vec();
         let value_owned = view.value().to_vec();
         let version = view.version().wrapping_add(1);
-        let raw = view.is_raw();
-        let spec =
-            RecordSpec { key: &key_owned, value: &value_owned, version, expire_at_ms: new_ms, raw };
-        if self.write_record_at(key, Some((addr, len)), spec).is_err() {
+        let kind = view.kind();
+        let spec = RecordSpec {
+            key: &key_owned,
+            value: &value_owned,
+            version,
+            expire_at_ms: new_ms,
+            kind,
+        };
+        // Carrying, not releasing: the value bytes (a document handle
+        // included) move verbatim into the rewritten record (ADR-0037 D3).
+        if self.write_record_carrying(key, Some((addr, len)), spec).is_err() {
             return false;
         }
         self.note_ttl(current.is_some(), new_ms.is_some());
@@ -911,14 +1423,214 @@ impl CellStore {
                 let view = record_at(&self.arena, addr);
                 if view.is_expired(now) {
                     let (hash, len) = (Self::hash_key(view.key()), view.encoded_len());
-                    self.index.remove(hash, addr);
-                    self.arena.free(addr, len);
+                    self.free_record(hash, addr, len);
                     self.note_reap_lazy();
                 } else {
                     emit(view.key());
                     emitted += 1;
                 }
             }
+            cursor = next_rev_cursor(cursor, mask);
+            if cursor == 0 || emitted >= count {
+                return cursor;
+            }
+        }
+    }
+
+    /// The fuzzy-checkpoint walk (M2-S10, ADR-0016 D2): the same
+    /// resize-stable home-group enumeration as [`scan`](Self::scan), but
+    /// emitting each live entry's post-image `(key, value, expire_at_ms)`
+    /// instead of the key — expiry deadline in *internal* ms (the caller
+    /// converts through its `WallAnchor` when encoding records). Inherits
+    /// the SCAN guarantee: every entry present for the whole walk is
+    /// emitted at least once across doublings and tombstone rehashes;
+    /// entries written mid-walk may appear zero or more times (harmless —
+    /// checkpoint replay is a blind idempotent upsert and the log tail
+    /// from `ckpt-begin` re-covers them). Expired records encountered are
+    /// reaped, never emitted. No access-tracking side effects on emitted
+    /// entries. Returns the next cursor (0 = done).
+    pub fn scan_post_images(
+        &mut self,
+        cursor: u64,
+        count: usize,
+        now: Nanos,
+        mut emit: impl FnMut(&[u8], &[u8], Option<u64>),
+    ) -> u64 {
+        self.scan_checkpoint_images(cursor, count, now, |key, image, expire_at_ms| match image {
+            CheckpointImage::String(value) => emit(key, value, expire_at_ms),
+            #[cfg(feature = "doc")]
+            CheckpointImage::JsonDoc { .. } => {
+                panic!("string-only post-image walker encountered a document")
+            }
+        })
+    }
+
+    /// Type-aware fuzzy-checkpoint walk. It has the same resize/expiry
+    /// guarantees as [`scan_post_images`](Self::scan_post_images), but
+    /// freezes documents into canonical idoc bytes at the store boundary.
+    pub fn scan_checkpoint_images(
+        &mut self,
+        cursor: u64,
+        count: usize,
+        now: Nanos,
+        mut emit: impl FnMut(&[u8], CheckpointImage<'_>, Option<u64>),
+    ) -> u64 {
+        let mask = self.index.group_count() as u64 - 1;
+        let mut cursor = cursor & mask;
+        let mut emitted = 0usize;
+        let mut batch: Vec<ArenaAddr> = Vec::new();
+        loop {
+            batch.clear();
+            {
+                let arena = &self.arena;
+                self.index.scan_home_group(
+                    cursor as usize,
+                    |addr| Self::hash_key(record_at(arena, addr).key()),
+                    |addr| batch.push(addr),
+                );
+            }
+            for &addr in &batch {
+                let view = record_at(&self.arena, addr);
+                if view.is_expired(now) {
+                    let (hash, len) = (Self::hash_key(view.key()), view.encoded_len());
+                    self.free_record(hash, addr, len);
+                    self.note_reap_lazy();
+                    continue;
+                }
+                match view.type_tag() {
+                    TypeTag::String => {
+                        emit(
+                            view.key(),
+                            CheckpointImage::String(view.value()),
+                            view.expire_at_ms(),
+                        );
+                    }
+                    TypeTag::StringExtent => {
+                        unreachable!("StringExtent records exist only in tiered namespaces")
+                    }
+                    TypeTag::JsonDoc => {
+                        #[cfg(feature = "doc")]
+                        {
+                            let idoc = doc::checkpoint_idoc(&mut self.docs, view)
+                                .expect("store-owned document freezes within its format bound");
+                            emit(
+                                view.key(),
+                                CheckpointImage::JsonDoc {
+                                    lineage: doc::lineage_of_record(view),
+                                    version: view.version(),
+                                    idoc,
+                                },
+                                view.expire_at_ms(),
+                            );
+                        }
+                        #[cfg(not(feature = "doc"))]
+                        unreachable!("JsonDoc records cannot exist without the doc feature");
+                    }
+                }
+                emitted += 1;
+            }
+            cursor = next_rev_cursor(cursor, mask);
+            if cursor == 0 || emitted >= count {
+                return cursor;
+            }
+        }
+    }
+
+    /// M2-S13: presize the index for `keys` live entries — recovery's
+    /// hint from the `.ick` footer's per-ns counts, applied before the
+    /// bulk replay so it avoids the doubling-rehash storm (each doubling
+    /// is a stop-and-copy over the whole table). Only effective while the
+    /// store is empty; a populated index keeps its geometry (growth on
+    /// insert remains correct either way). The hint is clamped defensively
+    /// — it may come from a damaged file, and a wrong hint may only cost
+    /// memory geometry, never correctness.
+    pub fn reserve_keys(&mut self, keys: usize) {
+        const MAX_RESERVE: usize = 1 << 28;
+        if self.is_empty() && keys > 64 {
+            self.index = Index::with_capacity(keys.min(MAX_RESERVE));
+        }
+    }
+
+    /// M2-S13 (ADR-0018): read-only sibling of
+    /// [`scan_post_images`](Self::scan_post_images) for the recovery state
+    /// digest — emits each live entry's `(key, value, expire_at_ms)`
+    /// **without reaping** expired entries, so the walk performs no
+    /// structural mutation and a full cursor sweep emits every live entry
+    /// exactly once (the digest oracle needs exactly-once; the mutating
+    /// walk guarantees only at-least-once across rehashes). Expired
+    /// entries are skipped: they are logically dead at `now` whatever
+    /// their physical residue.
+    pub fn digest_post_images(
+        &self,
+        cursor: u64,
+        count: usize,
+        now: Nanos,
+        mut emit: impl FnMut(&[u8], &[u8], Option<u64>),
+    ) -> u64 {
+        self.digest_checkpoint_images(cursor, count, now, |key, image, expire_at_ms| match image {
+            CheckpointImage::String(value) => emit(key, value, expire_at_ms),
+            #[cfg(feature = "doc")]
+            CheckpointImage::JsonDoc { .. } => {
+                panic!("string-only digest walker encountered a document")
+            }
+        })
+    }
+
+    /// Type-aware, read-only state-digest walk. Documents contribute
+    /// canonical idoc bytes and their exact logical version; physical form
+    /// and volatile cadence state are intentionally absent.
+    pub fn digest_checkpoint_images(
+        &self,
+        cursor: u64,
+        count: usize,
+        now: Nanos,
+        mut emit: impl FnMut(&[u8], CheckpointImage<'_>, Option<u64>),
+    ) -> u64 {
+        let mask = self.index.group_count() as u64 - 1;
+        let mut cursor = cursor & mask;
+        let mut emitted = 0usize;
+        loop {
+            let arena = &self.arena;
+            self.index.scan_home_group(
+                cursor as usize,
+                |addr| Self::hash_key(record_at(arena, addr).key()),
+                |addr| {
+                    let view = record_at(arena, addr);
+                    if view.is_expired(now) {
+                        return;
+                    }
+                    match view.type_tag() {
+                        TypeTag::String => emit(
+                            view.key(),
+                            CheckpointImage::String(view.value()),
+                            view.expire_at_ms(),
+                        ),
+                        TypeTag::StringExtent => {
+                            unreachable!("StringExtent records exist only in tiered namespaces")
+                        }
+                        TypeTag::JsonDoc => {
+                            #[cfg(feature = "doc")]
+                            {
+                                let idoc = self
+                                    .frozen_bytes_of(view)
+                                    .expect("store-owned document freezes within its format bound");
+                                emit(
+                                    view.key(),
+                                    CheckpointImage::JsonDoc {
+                                        lineage: doc::lineage_of_record(view),
+                                        version: view.version(),
+                                        idoc: &idoc,
+                                    },
+                                    view.expire_at_ms(),
+                                );
+                            }
+                            #[cfg(not(feature = "doc"))]
+                            unreachable!("JsonDoc records cannot exist without the doc feature");
+                        }
+                    }
+                    emitted += 1;
+                },
+            );
             cursor = next_rev_cursor(cursor, mask);
             if cursor == 0 || emitted >= count {
                 return cursor;
@@ -937,8 +1649,7 @@ impl CellStore {
                 return Some(view.key().to_vec());
             }
             let (hash, len) = (Self::hash_key(view.key()), view.encoded_len());
-            self.index.remove(hash, addr);
-            self.arena.free(addr, len);
+            self.free_record(hash, addr, len);
             self.note_reap_lazy();
         }
     }
@@ -949,6 +1660,7 @@ impl CellStore {
         self.arena = Arena::new(self.cfg.arena);
         self.index = Index::with_capacity(self.cfg.initial_keys.max(64));
         self.wheel = TtlWheel::new(now.0 / 1_000_000);
+        self.docs.reset(&self.cfg);
         self.stats.ttl_live = 0;
         self.evict.hand = 0;
     }
@@ -962,7 +1674,7 @@ impl CellStore {
     /// cursor steps so a 1M-same-second storm cannot cliff the loop.
     pub fn expire_tick(&mut self, now: Nanos, budget: ExpiryBudget) -> ExpiryStats {
         let now_ms = now.0 / 1_000_000;
-        let CellStore { arena, index, wheel, stats, .. } = self;
+        let CellStore { arena, index, wheel, stats, docs, .. } = self;
         let mut out = ExpiryStats::default();
         let tick = wheel.tick(now_ms, budget, |hash, _deadline| {
             // Reap any record on this hash's probe path that is genuinely
@@ -976,8 +1688,10 @@ impl CellStore {
             match found {
                 Some(addr) => {
                     let len = record_at(arena, addr).encoded_len();
+                    let payload = doc::payload_of(arena, addr, len);
                     index.remove(hash, addr);
                     arena.free(addr, len);
+                    docs.release(payload);
                     stats.expired_active += 1;
                     stats.ttl_live = stats.ttl_live.saturating_sub(1);
                     out.reaped += 1;
@@ -1016,7 +1730,12 @@ impl CellStore {
     /// M1-S07 pressure test and gated on the reference box.
     pub fn used_bytes(&self) -> u64 {
         let r = self.report();
-        r.records_live_bytes + r.index_bytes + r.wheel_bytes + r.evict_bytes
+        r.records_live_bytes
+            + r.index_bytes
+            + r.wheel_bytes
+            + r.evict_bytes
+            + r.doc_tape_bytes
+            + r.doc_arena_bytes
     }
 
     /// Evicts at most one victim under the active policy (bounded candidate
@@ -1047,22 +1766,31 @@ impl CellStore {
 
     /// Reaps a record the eviction sweep found already expired.
     pub(crate) fn reap_expired_at(&mut self, hash: u64, addr: ArenaAddr, len: usize) {
-        self.index.remove(hash, addr);
-        self.arena.free(addr, len);
+        self.free_record(hash, addr, len);
         self.note_reap_lazy();
     }
 
     /// Removes an eviction victim (counted separately from expirations).
     pub(crate) fn evict_record(&mut self, hash: u64, addr: ArenaAddr, len: usize, had_ttl: bool) {
-        self.index.remove(hash, addr);
-        self.arena.free(addr, len);
+        self.free_record(hash, addr, len);
         self.note_ttl(had_ttl, false);
         self.stats.evicted_keys += 1;
     }
 
     // ---- internals ----
 
-    fn arm_wheel(&mut self, hash: u64, deadline_ms: u64) {
+    /// Free one record completely: index entry, record bytes, and any
+    /// document payload behind it (the ADR-0037 D3 choke point). Every
+    /// reap/delete/evict site funnels here; the only deliberate bypass is
+    /// RENAME's source removal (the handle transferred to the destination).
+    pub(crate) fn free_record(&mut self, hash: u64, addr: ArenaAddr, len: usize) {
+        let payload = doc::payload_of(&self.arena, addr, len);
+        self.index.remove(hash, addr);
+        self.arena.free(addr, len);
+        self.docs.release(payload);
+    }
+
+    pub(crate) fn arm_wheel(&mut self, hash: u64, deadline_ms: u64) {
         if self.wheel.arm(hash, deadline_ms) == ArmOutcome::PoolFull {
             self.stats.wheel_fallback += 1;
         }
@@ -1070,7 +1798,7 @@ impl CellStore {
 
     /// TTL-record census transition (`INFO keyspace` `expires=`).
     #[inline]
-    fn note_ttl(&mut self, old: bool, new: bool) {
+    pub(crate) fn note_ttl(&mut self, old: bool, new: bool) {
         match (old, new) {
             (false, true) => self.stats.ttl_live += 1,
             (true, false) => self.stats.ttl_live = self.stats.ttl_live.saturating_sub(1),
@@ -1086,7 +1814,7 @@ impl CellStore {
 
     /// Index lookup + expire-on-read: returns the live record's address and
     /// encoded length, reaping it if its deadline passed.
-    fn resolve(&mut self, key: &[u8], now: Nanos) -> Option<(ArenaAddr, usize)> {
+    pub(crate) fn resolve(&mut self, key: &[u8], now: Nanos) -> Option<(ArenaAddr, usize)> {
         self.resolve_hashed(key, Self::hash_key(key), now)
     }
 
@@ -1096,8 +1824,7 @@ impl CellStore {
         let view = record_at(arena, addr);
         let len = view.encoded_len();
         if view.is_expired(now) {
-            self.index.remove(hash, addr);
-            self.arena.free(addr, len);
+            self.free_record(hash, addr, len);
             self.note_reap_lazy();
             return None;
         }
@@ -1132,12 +1859,34 @@ impl CellStore {
         existing: Option<(ArenaAddr, usize)>,
         spec: RecordSpec<'_>,
     ) -> Result<(), OpError> {
-        self.write_record_at(key, existing, spec)
+        self.write_record_releasing(key, existing, spec)
+    }
+
+    /// [`write_record_carrying`](Self::write_record_carrying) plus the
+    /// ADR-0037 D3 overwrite rule: any document payload behind `existing`
+    /// is captured first and released only after the write succeeds — a
+    /// failed write leaves the old record and its payload untouched.
+    pub(crate) fn write_record_releasing(
+        &mut self,
+        key: &[u8],
+        existing: Option<(ArenaAddr, usize)>,
+        spec: RecordSpec<'_>,
+    ) -> Result<(), OpError> {
+        let old_payload = existing.map(|(addr, len)| doc::payload_of(&self.arena, addr, len));
+        self.write_record_carrying(key, existing, spec)?;
+        if let Some(payload) = old_payload {
+            self.docs.release(payload);
+        }
+        Ok(())
     }
 
     /// Writes `spec`, reusing `existing`'s slot when the size class allows,
-    /// else alloc-copy-free with an index address swap.
-    fn write_record_at(
+    /// else alloc-copy-free with an index address swap. **Carries** any
+    /// document payload referenced by both old and new value bytes: no
+    /// release happens here — TTL rewrites move handle bytes verbatim
+    /// (ADR-0037 D3's RENAME/EXPIRE transfer rule; the in-place blob
+    /// overwrite in `doc::json_write_value` relies on the same contract).
+    pub(crate) fn write_record_carrying(
         &mut self,
         key: &[u8],
         existing: Option<(ArenaAddr, usize)>,
@@ -1166,7 +1915,7 @@ impl CellStore {
             None => {
                 if self.index.needs_grow() {
                     let arena = &self.arena;
-                    self.index.grow(|addr| Self::hash_key(record_at(arena, addr).key()));
+                    self.index.grow(|addr, _| Self::hash_key(record_at(arena, addr).key()));
                 }
                 let new_addr = self.arena.alloc(new_len).ok_or(OpError::OutOfMemory)?;
                 spec.write(self.arena.bytes_mut(new_addr, new_len));
@@ -1206,7 +1955,7 @@ fn wheel_cursor(wheel: &TtlWheel) -> u64 {
 /// power-of-two group space: high bits advance first, so groups split by a
 /// doubling are visited adjacently and never missed.
 #[inline]
-fn next_rev_cursor(cursor: u64, mask: u64) -> u64 {
+pub(crate) fn next_rev_cursor(cursor: u64, mask: u64) -> u64 {
     let mut v = cursor | !mask;
     v = v.reverse_bits();
     v = v.wrapping_add(1);

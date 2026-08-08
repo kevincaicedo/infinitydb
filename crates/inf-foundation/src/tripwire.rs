@@ -21,6 +21,15 @@ pub const LOOP_ITER_P999_US: &str = "loop_iter_p999_us";
 pub const RECORDS_LIVE_BYTES: &str = "records_live_bytes";
 pub const RECORDS_SLACK_BYTES: &str = "records_slack_bytes";
 pub const INDEX_BYTES: &str = "index_bytes";
+pub const WHEEL_BYTES: &str = "wheel_bytes";
+pub const EVICT_BYTES: &str = "evict_bytes";
+pub const DOC_TAPE_BYTES: &str = "doc_tape_bytes";
+pub const DOC_ARENA_BYTES: &str = "doc_arena_bytes";
+pub const DOC_RESIDENT_BYTES: &str = "doc_resident_bytes";
+pub const DOC_INTERN_BYTES: &str = "doc_intern_bytes";
+pub const DOC_SLACK_BYTES: &str = "doc_slack_bytes";
+pub const DOC_SCRATCH_BYTES: &str = "doc_scratch_bytes";
+pub const DOC_PATH_CACHE_BYTES: &str = "doc_path_cache_bytes";
 pub const WIRE_BUFFERS_BYTES: &str = "wire_buffers_bytes";
 pub const CONN_STATE_BYTES: &str = "conn_state_bytes";
 pub const PROCESS_RSS: &str = "process_rss";
@@ -35,6 +44,15 @@ pub const ALL: &[&str] = &[
     RECORDS_LIVE_BYTES,
     RECORDS_SLACK_BYTES,
     INDEX_BYTES,
+    WHEEL_BYTES,
+    EVICT_BYTES,
+    DOC_TAPE_BYTES,
+    DOC_ARENA_BYTES,
+    DOC_RESIDENT_BYTES,
+    DOC_INTERN_BYTES,
+    DOC_SLACK_BYTES,
+    DOC_SCRATCH_BYTES,
+    DOC_PATH_CACHE_BYTES,
     WIRE_BUFFERS_BYTES,
     CONN_STATE_BYTES,
     PROCESS_RSS,

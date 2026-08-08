@@ -5,8 +5,16 @@
 //! M0 contents: `BufferPool` (wire buffers, registered with the backend
 //! driver) and the record `Arena` (size-class slabs over mmap chunks).
 
+pub mod aligned;
 pub mod arena;
 pub mod buffer_pool;
+#[cfg(any(test, feature = "test-counting-allocator"))]
+mod counting_allocator;
+pub mod region;
 
+pub use aligned::{AlignedBox, AlignedBufId, AlignedLeak, AlignedPool, TIER_READ_ALIGN};
 pub use arena::{Arena, ArenaAddr, ArenaConfig, ArenaReport};
 pub use buffer_pool::{BufferId, BufferPool, LeaseKind, LeaseLeak};
+#[cfg(any(test, feature = "test-counting-allocator"))]
+pub use counting_allocator::CountingAllocator;
+pub use region::{REGION_PAGE_BYTES, Region, RegionConfig, RegionReport};

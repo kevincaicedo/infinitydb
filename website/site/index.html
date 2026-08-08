@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InfinityDB — One engine for the cache, the ledger, the document, the queue, and the vector</title>
+<meta name="description" content="InfinityDB is an extensible Redis-compatible key/value engine kernel in Rust: durable KV today, documents, queues, and vector search on a gated milestone train.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2018'%3E%3Ccircle%20cx='10'%20cy='9'%20r='7'%20fill='none'%20stroke='%237c5cff'%20stroke-width='2.4'/%3E%3Ccircle%20cx='24'%20cy='9'%20r='7'%20fill='none'%20stroke='%233ee6c4'%20stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+<style>
+/* ---- landing-only styles ---- */
+.hero { position: relative; overflow: hidden; }
+.hero-grid-bg {
+  position: absolute; inset: 0; pointer-events: none;
+  background-image: linear-gradient(rgba(139,144,168,0.055) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(139,144,168,0.055) 1px, transparent 1px);
+  background-size: 48px 48px;
+  -webkit-mask-image: linear-gradient(to bottom, black 20%, transparent 95%);
+  mask-image: linear-gradient(to bottom, black 20%, transparent 95%);
+}
+.hero-glow-v { position: absolute; top: -180px; left: -140px; width: 560px; height: 560px; pointer-events: none; background: radial-gradient(circle, rgba(124,92,255,0.16) 0%, transparent 65%); }
+.hero-glow-t { position: absolute; top: 40px; right: -160px; width: 620px; height: 620px; pointer-events: none; background: radial-gradient(circle, rgba(62,230,196,0.10) 0%, transparent 65%); }
+.hero-inner {
+  position: relative; max-width: var(--container); margin: 0 auto;
+  padding: clamp(56px, 8vw, 88px) var(--pad-x) 64px;
+  display: grid; grid-template-columns: minmax(0, 460px) minmax(0, 1fr);
+  gap: clamp(36px, 5vw, 56px); align-items: center;
+}
+@media (max-width: 980px) { .hero-inner { grid-template-columns: minmax(0, 1fr); } }
+.hero-kicker { font: 500 12px/1.5 var(--mono); letter-spacing: 0.18em; color: var(--teal); }
+.hero h1 {
+  margin: 20px 0 0; font: 800 clamp(36px, 4.6vw, 52px)/1.04 var(--sans);
+  letter-spacing: -0.025em; color: var(--text); text-wrap: balance;
+}
+.hero h1 .grad {
+  background: linear-gradient(90deg, #7c5cff, #3ee6c4);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.hero .sub { margin: 22px 0 0; font-size: 16px; line-height: 1.65; color: var(--text-muted); max-width: 46ch; text-wrap: pretty; }
+.hero .sub code { font-size: 14px; border: 0; background: none; padding: 0; color: var(--text); }
+.install-bar {
+  display: flex; align-items: center; border: 1px solid rgba(124,92,255,0.45);
+  border-radius: 10px; background: var(--bg-raise); overflow: hidden; margin-top: 30px;
+}
+.install-bar .cmd {
+  flex: 1; padding: 14px 18px; font: 400 13px/1 var(--mono); color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.install-bar .cmd .s { color: var(--teal); }
+.install-bar button {
+  border: 0; border-left: 1px solid rgba(124,92,255,0.35); background: rgba(124,92,255,0.12);
+  color: var(--violet-soft); font: 500 11px/1 var(--mono); letter-spacing: 0.12em;
+  padding: 16px 18px; cursor: pointer;
+}
+.install-bar button:hover { background: rgba(124,92,255,0.28); color: var(--text); }
+.hero-note { margin: 10px 0 0; font: 400 10.5px/1.7 var(--mono); letter-spacing: 0.04em; color: var(--text-faint); }
+.hero-ctas { display: flex; gap: 14px; margin-top: 16px; flex-wrap: wrap; }
+.hero-chips { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 30px; }
+.hero-chip {
+  font: 400 10.5px/1 var(--mono); letter-spacing: 0.06em; color: var(--text-muted);
+  border: 1px solid rgba(139,144,168,0.22); border-radius: 99px; padding: 6px 12px; white-space: nowrap;
+}
+.hero-chip .t { color: var(--teal); }
+.hero-chip .p { color: var(--violet-soft); }
+.spine-svg text { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+
+.status-strip {
+  position: relative; display: flex; gap: 0; flex-wrap: wrap;
+  max-width: var(--container); margin: 0 auto; padding: 0 var(--pad-x) 56px;
+}
+.status-strip .strip-box {
+  display: flex; gap: 0; flex-wrap: wrap; width: 100%;
+  border: 1px solid rgba(139,144,168,0.22); border-radius: 14px; overflow: hidden;
+  background: var(--bg-raise);
+}
+.status-strip .cellp { flex: 1 1 260px; padding: 18px 22px; }
+.status-strip .cellp + .cellp { border-left: 1px solid var(--border); }
+.status-strip .label { font: 500 10px/1 var(--mono); letter-spacing: 0.14em; margin: 0 0 10px; }
+.status-strip p { font-size: 13.5px; line-height: 1.6; color: var(--text-muted); margin: 0; }
+@media (max-width: 620px) { .status-strip .cellp + .cellp { border-left: 0; border-top: 1px solid var(--border); } }
+
+/* workloads grid */
+.wl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 44px; }
+.wl-card {
+  background: var(--bg-raise); border: 1px solid rgba(139,144,168,0.18); border-radius: 14px;
+  padding: 26px; transition: border-color 0.2s, transform 0.2s;
+}
+.wl-card:hover { border-color: rgba(124,92,255,0.6); transform: translateY(-3px); }
+.wl-card .idx { font: 500 11px/1 var(--mono); color: var(--violet); }
+.wl-card h3 { margin: 12px 0 0; font: 700 20px/1.2 var(--sans); color: var(--text); }
+.wl-card h3 .pill { margin-left: 8px; }
+.wl-card .tagline { margin-top: 6px; font: 500 9.5px/1.5 var(--mono); letter-spacing: 0.1em; color: var(--text-faint); text-transform: uppercase; }
+.wl-card p { margin: 14px 0 0; font-size: 13.5px; line-height: 1.6; color: var(--text-muted); }
+.wl-card p code { font-size: 12px; border: 0; background: none; padding: 0; color: var(--teal); }
+.wl-card.plus {
+  background: linear-gradient(135deg, rgba(124,92,255,0.14), rgba(62,230,196,0.08));
+  border-color: rgba(62,230,196,0.45);
+}
+.wl-card.plus:hover { border-color: rgba(62,230,196,0.7); }
+.wl-card.plus .idx { color: var(--teal); }
+
+.thesis {
+  margin-top: 48px; background: var(--bg-raise); border: 1px solid rgba(139,144,168,0.18);
+  border-radius: 14px; padding: 30px 34px;
+}
+.thesis .h { font: 500 10.5px/1 var(--mono); letter-spacing: 0.16em; color: var(--text-faint); margin-bottom: 18px; }
+.thesis-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px 32px; font: 400 13.5px/1.5 var(--mono); }
+.thesis-grid .k { color: var(--violet-soft); }
+.thesis-grid .eq { color: var(--text-faint); }
+.thesis-grid .v { color: var(--text); }
+.thesis-grid .a { color: var(--teal); }
+
+/* split feature sections */
+.split { max-width: var(--container); margin: 0 auto; padding: var(--sp-7) var(--pad-x); display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 460px); gap: clamp(36px, 6vw, 64px); align-items: center; }
+.split.rev { grid-template-columns: minmax(0, 460px) minmax(0, 1fr); }
+@media (max-width: 880px) { .split, .split.rev { grid-template-columns: minmax(0, 1fr); } }
+.split h2 { margin: 14px 0 0; }
+.split .lede { margin: 18px 0 0; font-size: 15.5px; }
+.split .lede code { font-size: 13px; border: 0; background: none; padding: 0; color: var(--violet-soft); }
+.arrow-list { margin-top: 26px; display: flex; flex-direction: column; gap: 14px; }
+.arrow-list > div { display: flex; gap: 14px; align-items: baseline; }
+.arrow-list .a { font: 400 11px/1 var(--mono); color: var(--violet); flex: none; }
+.arrow-list .txt { font-size: 14px; line-height: 1.55; color: var(--text-body); }
+.mini-stats { margin-top: 26px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 480px) { .mini-stats { grid-template-columns: 1fr; } }
+.mini-stats .stat { padding: 16px; }
+.mini-stats .v { font-size: 19px; }
+
+/* measured band */
+.band { background: var(--bg-raise); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.band .stat { background: var(--bg); }
+.bench-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 40px; margin-top: 48px; }
+.bench-h { font: 500 10.5px/1.5 var(--mono); letter-spacing: 0.14em; color: var(--text-faint); margin-bottom: 16px; text-transform: uppercase; }
+.bench-svg text { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+.bench-note { margin-top: 28px; font: 400 10.5px/1.9 var(--mono); letter-spacing: 0.06em; color: var(--text-faint); }
+.bench-note a { letter-spacing: 0; }
+
+/* terminal section */
+.session { max-width: var(--container); margin: 0 auto; padding: var(--sp-7) var(--pad-x); display: grid; grid-template-columns: minmax(0, 400px) minmax(0, 1fr); gap: clamp(36px, 6vw, 64px); align-items: start; }
+@media (max-width: 880px) { .session { grid-template-columns: minmax(0, 1fr); } }
+.session .sticky { position: sticky; top: 96px; }
+@media (max-width: 880px) { .session .sticky { position: static; } }
+.session h2 { margin: 14px 0 0; }
+.session .lede { margin: 18px 0 0; font-size: 15.5px; }
+.session .fine { margin: 14px 0 0; font-size: 13.5px; line-height: 1.6; color: var(--text-faint); }
+.session .terminal { max-width: none; margin: 0; }
+
+/* cta band */
+.cta-band { position: relative; border-top: 1px solid var(--border); overflow: hidden; }
+.cta-band .glow { position: absolute; bottom: -260px; left: 50%; transform: translateX(-50%); width: 900px; height: 520px; pointer-events: none; background: radial-gradient(ellipse, rgba(124,92,255,0.18) 0%, transparent 65%); }
+.cta-band .inner { position: relative; max-width: var(--container); margin: 0 auto; padding: 112px var(--pad-x) 96px; text-align: center; }
+.cta-band h2 { margin: 0; font: 800 clamp(34px, 5vw, 48px)/1.1 var(--sans); letter-spacing: -0.025em; }
+.cta-band p { margin: 18px auto 0; color: var(--text-muted); font-size: 16px; line-height: 1.65; max-width: 520px; text-wrap: pretty; }
+.cta-band .ctas { display: flex; justify-content: center; gap: 14px; margin-top: 34px; flex-wrap: wrap; }
+
+/* hero entrance + terminal typing */
+@media (prefers-reduced-motion: no-preference) {
+  .fx-1 { animation: fadeUp 0.7s 0.05s both; }
+  .fx-2 { animation: fadeUp 0.7s 0.15s both; }
+  .fx-3 { animation: fadeUp 0.7s 0.25s both; }
+  .fx-4 { animation: fadeUp 0.7s 0.35s both; }
+  .fx-5 { animation: fadeUp 0.7s 0.45s both; }
+  .fx-6 { animation: fadeUp 0.9s 0.3s both; }
+  @keyframes typeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .terminal-body .line { animation: typeIn 0.4s both; }
+  .terminal-body .line:nth-child(1) { animation-delay: 0.3s; }
+  .terminal-body .line:nth-child(2) { animation-delay: 0.6s; }
+  .terminal-body .line:nth-child(3) { animation-delay: 0.9s; }
+  .terminal-body .line:nth-child(4) { animation-delay: 1.2s; }
+  .terminal-body .line:nth-child(5) { animation-delay: 1.5s; }
+  .terminal-body .line:nth-child(6) { animation-delay: 1.8s; }
+  .terminal-body .line:nth-child(7) { animation-delay: 2.05s; }
+  .terminal-body .line:nth-child(8) { animation-delay: 2.3s; }
+  .terminal-body .line:nth-child(9) { animation-delay: 2.55s; }
+  .terminal-body .line:nth-child(10) { animation-delay: 2.8s; }
+  .terminal-body .line:nth-child(11) { animation-delay: 3.05s; }
+  .terminal-body .line:nth-child(12) { animation-delay: 3.3s; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .anim-dot { display: none; }
+}
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="nav-brand">
+      <svg class="logo" width="34" height="18" viewBox="0 0 34 18" aria-hidden="true">
+        <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2.4"/>
+        <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2.4"/>
+      </svg>
+      <span class="mark">infinity<b>DB</b></span>
+      <span class="nav-badge">v0.3.0-alpha.1 &middot; IN DEV</span>
+    </a>
+    <span class="nav-spacer"></span>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="nav-links">
+      <a href="docs/index.html">DOCS</a>
+      <a href="blog/index.html">BLOG</a>
+      <a href="#roadmap">ROADMAP</a>
+      <a href="docs/quickstart.html">QUICKSTART</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
+    </div>
+  </div>
+</nav>
+
+<header id="top" class="hero">
+  <div class="hero-grid-bg"></div>
+  <div class="hero-glow-v"></div>
+  <div class="hero-glow-t"></div>
+
+  <div class="hero-inner">
+    <div>
+      <p class="hero-kicker fx-1">// REDIS-COMPATIBLE &middot; RUST &middot; SHARED-NOTHING</p>
+      <h1 class="fx-2"><span class="grad">One engine</span> for the cache, the ledger, the document, the queue, and the vector.</h1>
+      <p class="sub fx-3">Every workload is a projection of one per-core append-only log. Durable KV ships today; documents, queues, and vector search arrive on a gated milestone train &mdash; and it speaks fluent Redis. Keep <code>redis-cli</code>. Keep every SDK. Adopt one namespace at a time.</p>
+      <div id="install" class="fx-4">
+        <div class="install-bar">
+          <div class="cmd"><span class="s">$</span> cargo build --release -p infinityd</div>
+          <button type="button" data-copy="cargo build --release -p infinityd">COPY</button>
+        </div>
+        <p class="hero-note"># builds from source &mdash; binaries + Docker image ship with v0.3.0-alpha.1 &middot; <a href="docs/quickstart.html">full quickstart &rarr;</a></p>
+        <div class="hero-ctas">
+          <a class="btn btn-primary" href="https://github.com/">&#9733; STAR ON GITHUB</a>
+          <a class="btn btn-ghost" href="blog/why-vortex-failed.html">WHY VORTEX DIED &rarr;</a>
+        </div>
+      </div>
+      <div class="hero-chips fx-5">
+        <span class="hero-chip"><span class="t">0.61&times; Redis RSS</span> &mdash; measured</span>
+        <span class="hero-chip"><span class="t">3.21&times; Redis</span> &mdash; unpipelined, in-run</span>
+        <span class="hero-chip"><span class="p">10,000 seeds</span> &mdash; 0 durability violations</span>
+        <span class="hero-chip"><span class="p">port 6379</span> &mdash; drop-in</span>
+      </div>
+      <p class="hero-note fx-5">// measured rows cite the <a href="docs/index.html#claims">claim ledger</a> &mdash; i7-13700KF &middot; 4 cells &middot; turbo off &middot; competitors in-run</p>
+    </div>
+
+    <!-- HERO VISUAL: the log spine -->
+    <div class="fx-6">
+      <svg class="spine-svg" viewBox="0 0 660 560" role="img" aria-label="Commands append to a per-cell log; the log projects into cache, durable KV, documents, streams, and vectors.">
+        <!-- input command labels -->
+        <text x="90" y="170" text-anchor="end" fill="#b9a8ff" font-size="13">SET</text>
+        <text x="90" y="250" text-anchor="end" fill="#b9a8ff" font-size="13">JSON.SET</text>
+        <text x="90" y="330" text-anchor="end" fill="#b9a8ff" font-size="13">XADD</text>
+        <text x="90" y="410" text-anchor="end" fill="#b9a8ff" font-size="13">VADD</text>
+        <!-- input paths -->
+        <path id="in1" d="M 100 166 C 170 166 200 200 254 200" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="in2" d="M 100 246 C 170 246 200 250 254 250" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="in3" d="M 100 326 C 170 326 200 300 254 300" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="in4" d="M 100 406 C 170 406 200 350 254 350" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <!-- the log -->
+        <rect x="260" y="140" width="92" height="300" rx="10" fill="rgba(124,92,255,0.07)" stroke="rgba(124,92,255,0.5)" stroke-width="1.4"/>
+        <rect x="272" y="154" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="186" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="218" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="250" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="282" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="314" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="346" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="378" width="68" height="24" rx="4" fill="rgba(124,92,255,0.28)"/>
+        <rect x="272" y="410" width="68" height="20" rx="4" fill="#3ee6c4" opacity="0.9">
+          <animate attributeName="opacity" values="0.9;0.3;0.9" dur="1.6s" repeatCount="indefinite"/>
+        </rect>
+        <text x="306" y="466" text-anchor="middle" fill="#9096ae" font-size="10" letter-spacing="1.4">PER-CELL APPEND-ONLY LOG</text>
+        <text x="306" y="484" text-anchor="middle" fill="#5c6178" font-size="9.5" letter-spacing="0.8">one primitive &middot; five projections</text>
+        <!-- output paths -->
+        <path id="out1" d="M 356 180 C 410 180 420 110 466 110" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="out2" d="M 356 235 C 410 235 420 200 466 200" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="out3" d="M 356 290 C 412 290 420 290 466 290" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="out4" d="M 356 345 C 410 345 420 380 466 380" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <path id="out5" d="M 356 400 C 410 400 420 470 466 470" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+        <!-- projection nodes -->
+        <rect x="470" y="84" width="168" height="52" rx="10" fill="#0b0e19" stroke="rgba(62,230,196,0.4)"/>
+        <text x="486" y="106" fill="#e8e9f2" font-size="12" font-weight="700" letter-spacing="1">CACHE</text>
+        <text x="486" y="124" fill="#3ee6c4" font-size="9" letter-spacing="0.4">SHIPPING &middot; redis-class</text>
+        <rect x="470" y="174" width="168" height="52" rx="10" fill="#0b0e19" stroke="rgba(62,230,196,0.4)"/>
+        <text x="486" y="196" fill="#e8e9f2" font-size="12" font-weight="700" letter-spacing="1">DURABLE KV</text>
+        <text x="486" y="214" fill="#3ee6c4" font-size="9" letter-spacing="0.4">SHIPPING &middot; dynamodb-class</text>
+        <rect x="470" y="264" width="168" height="52" rx="10" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+        <text x="486" y="286" fill="#e8e9f2" font-size="12" font-weight="700" letter-spacing="1">DOCUMENTS</text>
+        <text x="486" y="304" fill="#b9a8ff" font-size="9" letter-spacing="0.4">M3 &middot; IN DEV &middot; JSON.*</text>
+        <rect x="470" y="354" width="168" height="52" rx="10" fill="#0b0e19" stroke="rgba(139,144,168,0.25)"/>
+        <text x="486" y="376" fill="#e8e9f2" font-size="12" font-weight="700" letter-spacing="1">STREAMS</text>
+        <text x="486" y="394" fill="#5c6178" font-size="9" letter-spacing="0.4">M7 &middot; kafka-core class</text>
+        <rect x="470" y="444" width="168" height="52" rx="10" fill="#0b0e19" stroke="rgba(139,144,168,0.25)"/>
+        <text x="486" y="466" fill="#e8e9f2" font-size="12" font-weight="700" letter-spacing="1">VECTORS</text>
+        <text x="486" y="484" fill="#5c6178" font-size="9" letter-spacing="0.4">M8 &middot; HNSW &middot; SIMD</text>
+        <!-- moving records: in (violet = in motion) -->
+        <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.4s" begin="0s" repeatCount="indefinite"><mpath href="#in1"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.4s" begin="0.6s" repeatCount="indefinite"><mpath href="#in2"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.4s" begin="1.2s" repeatCount="indefinite"><mpath href="#in3"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.4s" begin="1.8s" repeatCount="indefinite"><mpath href="#in4"/></animateMotion></circle>
+        <!-- moving records: out (teal = served) -->
+        <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.8s" begin="0s" repeatCount="indefinite"><mpath href="#out1"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.8s" begin="0.5s" repeatCount="indefinite"><mpath href="#out2"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.8s" begin="1s" repeatCount="indefinite"><mpath href="#out3"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.8s" begin="1.5s" repeatCount="indefinite"><mpath href="#out4"/></animateMotion></circle>
+        <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.8s" begin="2s" repeatCount="indefinite"><mpath href="#out5"/></animateMotion></circle>
+      </svg>
+    </div>
+  </div>
+
+  <div class="status-strip fx-5">
+    <div class="strip-box">
+      <div class="cellp">
+        <p class="label" style="color:var(--teal)">SHIPPING TODAY</p>
+        <p>A Redis-compatible in-memory cache (strings, keys, expiry, all 8 eviction policies, pub/sub) plus <strong style="color:var(--text)">durable KV namespaces</strong> &mdash; per-namespace <code>always</code>/<code>everysec</code> fsync, fork-free checkpoints, parallel crash recovery.</p>
+      </div>
+      <div class="cellp">
+        <p class="label" style="color:var(--violet-soft)">IN PROGRESS &middot; M3</p>
+        <p>JSON documents &mdash; <code>JSON.*</code> + JSONPath over a compact binary tree &mdash; closing on the first public tag, <code>v0.3.0-alpha.1</code> (ADR-0048): pre-tag campaign, ledger re-validation, release pipeline.</p>
+      </div>
+      <div class="cellp">
+        <p class="label" style="color:var(--text-faint)">ON THE TRAIN</p>
+        <p>Tiered storage (M4), indexes + PartiQL subset (M4.5), collections (M5), transactions (M6), streams (M7), vectors (M8), HA (M9), WASM compute (M10). <a href="docs/roadmap.html">The full train &rarr;</a></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- marquee -->
+  <div class="marquee" aria-hidden="false">
+    <div class="marquee-track">
+      <div class="marquee-run">
+        <span>DROP-IN ON PORT 6379</span><span class="tv">&#10038;</span>
+        <span>KEEP redis-cli</span><span class="vv">&#10038;</span>
+        <span>KEEP EVERY SDK</span><span class="tv">&#10038;</span>
+        <span>ADOPT ONE NAMESPACE AT A TIME</span><span class="vv">&#10038;</span>
+        <span>APACHE 2.0</span><span class="tv">&#10038;</span>
+        <span>ONE BINARY &mdash; infinityd</span><span class="vv">&#10038;</span>
+        <span>16,384 SLOTS FROM DAY ONE</span><span class="tv">&#10038;</span>
+      </div>
+      <div class="marquee-run" aria-hidden="true">
+        <span>DROP-IN ON PORT 6379</span><span class="tv">&#10038;</span>
+        <span>KEEP redis-cli</span><span class="vv">&#10038;</span>
+        <span>KEEP EVERY SDK</span><span class="tv">&#10038;</span>
+        <span>ADOPT ONE NAMESPACE AT A TIME</span><span class="vv">&#10038;</span>
+        <span>APACHE 2.0</span><span class="tv">&#10038;</span>
+        <span>ONE BINARY &mdash; infinityd</span><span class="vv">&#10038;</span>
+        <span>16,384 SLOTS FROM DAY ONE</span><span class="tv">&#10038;</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ============ 01 WORKLOADS ============ -->
+<section id="workloads" class="section">
+  <div class="section-inner">
+    <p class="kicker">01 &middot; ONE ENGINE, FIVE WORKLOADS</p>
+    <h2 style="margin-top:0">Stop running five databases.</h2>
+    <p class="lede" style="max-width:620px">A kernel, not a monolith: a small core &mdash; runtime, fabric, log, store &mdash; with versioned seams. Every engine below is an extension of the kernel, arriving on the train with its milestone named. Build cache-only, or build everything.</p>
+
+    <div class="wl-grid">
+      <div class="wl-card">
+        <div class="idx">/01</div>
+        <h3>Cache <span class="pill pill-ship">SHIPPING</span></h3>
+        <div class="tagline">TARGETS REDIS &middot; VALKEY &middot; DRAGONFLY</div>
+        <p>RESP2/3, the string/key/expiry command families, all eight eviction policies, pub/sub. Memory-only namespaces never touch the log. Per-command compat is declared in a <a href="docs/compat.html">generated, byte-diff-verified matrix</a>.</p>
+      </div>
+      <div class="wl-card">
+        <div class="idx">/02</div>
+        <h3>Durable KV <span class="pill pill-ship">SHIPPING</span></h3>
+        <div class="tagline">TARGETS DYNAMODB-CLASS STORES</div>
+        <p>Per-namespace durability &mdash; <code>always</code>, <code>everysec</code>, <code>memory</code> &mdash; group-commit fsync, fuzzy fork-free checkpoints, parallel recovery. Larger-than-RAM tiering arrives at M4.</p>
+      </div>
+      <div class="wl-card">
+        <div class="idx">/03</div>
+        <h3>Documents <span class="pill pill-now">M3 &middot; IN DEV</span></h3>
+        <div class="tagline">REDISJSON-COMPATIBLE NOSQL</div>
+        <p>JSON as a first-class value: <code>JSON.*</code> + JSONPath over a compact binary tree, mutated by path, durable by default. Typed secondary indexes and a planner-free PartiQL subset follow at M4.5.</p>
+      </div>
+      <div class="wl-card">
+        <div class="idx">/04</div>
+        <h3>Streams &amp; Queues <span class="pill pill-plan">M7</span></h3>
+        <div class="tagline">TARGETS KAFKA-CORE &middot; RABBITMQ-CORE</div>
+        <p>Topics and consumer groups built directly on the write-ahead log. Full Redis Streams API, dead-letter queues, delays, idempotent producers.</p>
+      </div>
+      <div class="wl-card">
+        <div class="idx">/05</div>
+        <h3>Vectors <span class="pill pill-plan">M8</span></h3>
+        <div class="tagline">THE AI-ERA LAYER &mdash; IN 1.0</div>
+        <p>Per-shard HNSW + SQ8 quantization, SIMD distance kernels. Vectors are ordinary durable records &mdash; replicated, tiered, checkpointed.</p>
+      </div>
+      <div class="wl-card plus">
+        <div class="idx">/plus</div>
+        <h3>In-database compute <span class="pill pill-plan">M10</span></h3>
+        <div class="tagline">NOBODY ELSE SHIPS THIS NATIVELY</div>
+        <p>WASM reducers run <em>inside</em> the database, on the core that owns the data. Zero network. Zero serialization. Sandboxed, fuel-metered, transactional.</p>
+      </div>
+    </div>
+
+    <div class="thesis">
+      <div class="h">// THE THESIS &mdash; EVERYTHING IS THE LOG</div>
+      <div class="thesis-grid">
+        <div><span class="k">cache</span> <span class="eq">=</span> <span class="v">log(durability: <span class="a">off</span>)</span></div>
+        <div><span class="k">kv</span> <span class="eq">=</span> <span class="v">log + index + ckpt</span></div>
+        <div><span class="k">queue</span> <span class="eq">=</span> <span class="v">log.read_forward(<span class="a">group</span>)</span></div>
+        <div><span class="k">replica</span> <span class="eq">=</span> <span class="v">log.ship(<span class="a">follower</span>)</span></div>
+        <div><span class="k">cdc</span> <span class="eq">=</span> <span class="v">log.subscribe()</span></div>
+        <div><span class="k">vector</span> <span class="eq">=</span> <span class="v">hnsw(log)</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 02 SHARD CELL ============ -->
+<section id="arch" class="split">
+  <div>
+    <svg viewBox="0 0 520 520" style="width:100%;max-width:520px;display:block;font-family:'JetBrains Mono',ui-monospace,monospace" role="img" aria-label="The shard cell reactor loop: reap, parse, execute, log, respond, submit — one syscall per iteration.">
+      <path id="orbitPath" d="M 260 90 A 170 170 0 1 1 259.9 90" fill="none" stroke="rgba(139,144,168,0.22)" stroke-width="1.2" stroke-dasharray="3 7"/>
+      <circle cx="260" cy="260" r="126" fill="none" stroke="rgba(124,92,255,0.16)" stroke-width="1"/>
+      <circle cx="260" cy="90" r="5" fill="#06070d" stroke="#7c5cff" stroke-width="2"/>
+      <circle cx="407" cy="175" r="5" fill="#06070d" stroke="#7c5cff" stroke-width="2"/>
+      <circle cx="407" cy="345" r="5" fill="#06070d" stroke="#7c5cff" stroke-width="2"/>
+      <circle cx="260" cy="430" r="5" fill="#06070d" stroke="#7c5cff" stroke-width="2"/>
+      <circle cx="113" cy="345" r="5" fill="#06070d" stroke="#7c5cff" stroke-width="2"/>
+      <circle cx="113" cy="175" r="5" fill="#06070d" stroke="#7c5cff" stroke-width="2"/>
+      <text x="260" y="68" text-anchor="middle" fill="#9096ae" font-size="11" letter-spacing="1.3">REAP</text>
+      <text x="421" y="172" text-anchor="start" fill="#9096ae" font-size="11" letter-spacing="1.3">PARSE</text>
+      <text x="421" y="356" text-anchor="start" fill="#9096ae" font-size="11" letter-spacing="1.3">EXECUTE</text>
+      <text x="260" y="460" text-anchor="middle" fill="#9096ae" font-size="11" letter-spacing="1.3">LOG</text>
+      <text x="99" y="356" text-anchor="end" fill="#9096ae" font-size="11" letter-spacing="1.3">RESPOND</text>
+      <text x="99" y="172" text-anchor="end" fill="#9096ae" font-size="11" letter-spacing="1.3">SUBMIT</text>
+      <circle class="anim-dot" r="5" fill="#3ee6c4"><animateMotion dur="5s" repeatCount="indefinite"><mpath href="#orbitPath"/></animateMotion></circle>
+      <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="5s" begin="-2.5s" repeatCount="indefinite"><mpath href="#orbitPath"/></animateMotion></circle>
+      <text x="260" y="248" text-anchor="middle" fill="#3ee6c4" font-size="22" font-weight="700" letter-spacing="1.8">1 SYSCALL</text>
+      <text x="260" y="272" text-anchor="middle" fill="#9096ae" font-size="11" letter-spacing="1.8">PER ITERATION</text>
+      <text x="260" y="296" text-anchor="middle" fill="#5c6178" font-size="9.5" letter-spacing="0.8">pinned &middot; lock-free &middot; budgeted</text>
+    </svg>
+  </div>
+  <div>
+    <p class="kicker" style="margin-bottom:0">02 &middot; THE SHARD CELL</p>
+    <h2>One core. One shard. One owner.</h2>
+    <p class="lede">Each core runs a complete miniature database &mdash; reactor, parser, executor, keyspace slice, log writer, allocator. No other thread ever touches its data.</p>
+    <div class="arrow-list">
+      <div><span class="a">&rarr;</span><span class="txt">Every command is a resumable state machine &mdash; the fast path completes synchronously and never pays for the capability.</span></div>
+      <div><span class="a">&rarr;</span><span class="txt">Batch every boundary: syscalls, fsyncs, fabric hops, and cache misses are paid per batch, never per op &mdash; and the batching metrics are CI-gated tripwires, not dashboards.</span></div>
+      <div><span class="a">&rarr;</span><span class="txt">Expiry, eviction, checkpoints, and compaction run under deficit-weighted budgets &mdash; tail latency is protected by construction.</span></div>
+      <div><span class="a">&rarr;</span><span class="txt">Deterministic by design: the whole node replays under simulation from a seed &mdash; every failure is reproducible.</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 03 FABRIC ============ -->
+<section id="fabric" class="split rev">
+  <div>
+    <p class="kicker" style="margin-bottom:0">03 &middot; THE FABRIC</p>
+    <h2>Shared-nothing, without the sharp edges.</h2>
+    <p class="lede">Cells communicate only through a full mesh of lock-free SPSC ring pairs &mdash; batched, poll-integrated, credit-controlled. Cross-slot operations that fail on Redis Cluster just work here; they pay a fabric hop instead of returning <code>CROSSSLOT</code>.</p>
+    <div class="mini-stats">
+      <div class="stat">
+        <div class="v t">1.72&times;</div>
+        <div class="l">DRAGONFLY, CROSS-CELL, IN-RUN &mdash; MEASURED, 4 CELLS</div>
+      </div>
+      <div class="stat">
+        <div class="v p">0 locks</div>
+        <div class="l">ON THE DATA PLANE, ANYWHERE</div>
+      </div>
+      <div class="stat">
+        <div class="v p">16,384</div>
+        <div class="l">SLOTS &mdash; CLUSTER-COMPATIBLE HASH TAGS</div>
+      </div>
+      <div class="stat">
+        <div class="v t">0 wakes</div>
+        <div class="l">PER MESSAGE &mdash; POLLED, BATCHED, CREDITED</div>
+      </div>
+    </div>
+  </div>
+  <div>
+    <svg viewBox="0 0 640 480" style="width:100%;display:block;font-family:'JetBrains Mono',ui-monospace,monospace" role="img" aria-label="Six shard cells exchanging batched messages over a full mesh of SPSC ring pairs.">
+      <line x1="320" y1="70" x2="467" y2="155" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="320" y1="70" x2="467" y2="325" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="320" y1="70" x2="320" y2="410" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="320" y1="70" x2="173" y2="325" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="320" y1="70" x2="173" y2="155" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="155" x2="467" y2="325" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="155" x2="320" y2="410" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="155" x2="173" y2="325" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="155" x2="173" y2="155" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="325" x2="320" y2="410" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="325" x2="173" y2="325" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="467" y1="325" x2="173" y2="155" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="320" y1="410" x2="173" y2="325" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="320" y1="410" x2="173" y2="155" stroke="rgba(139,144,168,0.1)"/>
+      <line x1="173" y1="325" x2="173" y2="155" stroke="rgba(139,144,168,0.1)"/>
+      <path id="m1" d="M320 70 L467 325" fill="none"/>
+      <path id="m2" d="M467 155 L173 325" fill="none"/>
+      <path id="m3" d="M320 410 L173 155" fill="none"/>
+      <path id="m4" d="M173 325 L467 155" fill="none"/>
+      <path id="m5" d="M320 410 L320 70" fill="none"/>
+      <path id="m6" d="M173 155 L467 325" fill="none"/>
+      <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="1.9s" begin="0s" repeatCount="indefinite"><mpath href="#m1"/></animateMotion></circle>
+      <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.3s" begin="0.4s" repeatCount="indefinite"><mpath href="#m2"/></animateMotion></circle>
+      <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.1s" begin="0.9s" repeatCount="indefinite"><mpath href="#m3"/></animateMotion></circle>
+      <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.5s" begin="1.3s" repeatCount="indefinite"><mpath href="#m4"/></animateMotion></circle>
+      <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.2s" begin="1.7s" repeatCount="indefinite"><mpath href="#m5"/></animateMotion></circle>
+      <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.4s" begin="2.1s" repeatCount="indefinite"><mpath href="#m6"/></animateMotion></circle>
+      <rect x="278" y="49" width="84" height="42" rx="9" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+      <text x="320" y="74" text-anchor="middle" fill="#e8e9f2" font-size="11" letter-spacing="1.1">CELL 0</text>
+      <rect x="425" y="134" width="84" height="42" rx="9" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+      <text x="467" y="159" text-anchor="middle" fill="#e8e9f2" font-size="11" letter-spacing="1.1">CELL 1</text>
+      <rect x="425" y="304" width="84" height="42" rx="9" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+      <text x="467" y="329" text-anchor="middle" fill="#e8e9f2" font-size="11" letter-spacing="1.1">CELL 2</text>
+      <rect x="278" y="389" width="84" height="42" rx="9" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+      <text x="320" y="414" text-anchor="middle" fill="#e8e9f2" font-size="11" letter-spacing="1.1">CELL 3</text>
+      <rect x="131" y="304" width="84" height="42" rx="9" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+      <text x="173" y="329" text-anchor="middle" fill="#e8e9f2" font-size="11" letter-spacing="1.1">CELL 4</text>
+      <rect x="131" y="134" width="84" height="42" rx="9" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
+      <text x="173" y="159" text-anchor="middle" fill="#e8e9f2" font-size="11" letter-spacing="1.1">CELL 5</text>
+      <rect x="238" y="222" width="164" height="34" rx="8" fill="#06070d" stroke="rgba(62,230,196,0.35)"/>
+      <text x="320" y="243" text-anchor="middle" fill="#3ee6c4" font-size="10.5" letter-spacing="1.3">N&times;(N&minus;1) SPSC RINGS</text>
+    </svg>
+  </div>
+</section>
+
+<!-- ============ 04 MEASURED ============ -->
+<section id="evidence" class="band">
+  <div class="section-inner">
+    <p class="kicker">04 &middot; MEASURED, NOT PROMISED</p>
+    <h2 style="margin-top:0">Numbers with receipts.</h2>
+    <p class="lede" style="max-width:640px">Every public number is gated by the evidence ledger: replicated runs, clean tree, competitors in the same run on the same box, flamegraph attached &mdash; or the claim does not exist. Everything below cites an <strong style="color:var(--text)">Allowed</strong> ledger row.</p>
+
+    <div class="bench-grid">
+      <div>
+        <div class="bench-h">UNPIPELINED GET/SET &middot; 512 CONNS &middot; SAME RUN, SAME BOX</div>
+        <svg class="bench-svg" viewBox="0 0 560 130" style="width:100%;display:block" data-bench>
+          <defs>
+            <linearGradient id="bgrad1" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0" stop-color="#7c5cff"/>
+              <stop offset="1" stop-color="#3ee6c4"/>
+            </linearGradient>
+          </defs>
+          <text x="0" y="36" fill="#e8e9f2" font-size="12" font-weight="700">INFINITYDB</text>
+          <rect x="128" y="22" width="400" height="22" rx="4" fill="url(#bgrad1)">
+            <animate attributeName="width" from="0" to="400" dur="1.2s" begin="indefinite" fill="freeze" calcMode="spline" keySplines="0.22 1 0.36 1" keyTimes="0;1" data-bar-anim/>
+          </rect>
+          <text x="128" y="60" fill="#3ee6c4" font-size="10" letter-spacing="0.6">3.21&times; REDIS &mdash; MEASURED, IN-RUN</text>
+          <text x="0" y="106" fill="#9096ae" font-size="12">REDIS 8.x</text>
+          <rect x="128" y="92" width="125" height="22" rx="4" fill="rgba(139,144,168,0.35)">
+            <animate attributeName="width" from="0" to="125" dur="0.9s" begin="indefinite" fill="freeze" calcMode="spline" keySplines="0.22 1 0.36 1" keyTimes="0;1" data-bar-anim/>
+          </rect>
+          <text x="264" y="107" fill="#5c6178" font-size="10">1.0&times; baseline</text>
+        </svg>
+      </div>
+      <div>
+        <div class="bench-h">RSS AT 10M KEYS &times; (16 B, 64 B) &mdash; LOWER IS BETTER</div>
+        <svg class="bench-svg" viewBox="0 0 560 190" style="width:100%;display:block" data-bench>
+          <defs>
+            <linearGradient id="bgrad2" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0" stop-color="#7c5cff"/>
+              <stop offset="1" stop-color="#3ee6c4"/>
+            </linearGradient>
+          </defs>
+          <text x="0" y="36" fill="#e8e9f2" font-size="12" font-weight="700">INFINITYDB</text>
+          <rect x="128" y="22" width="98" height="22" rx="4" fill="url(#bgrad2)">
+            <animate attributeName="width" from="0" to="98" dur="0.9s" begin="indefinite" fill="freeze" calcMode="spline" keySplines="0.22 1 0.36 1" keyTimes="0;1" data-bar-anim/>
+          </rect>
+          <text x="236" y="37" fill="#3ee6c4" font-size="10" letter-spacing="0.6">0.61&times; &mdash; MEASURED, SAME RUN</text>
+          <text x="0" y="106" fill="#9096ae" font-size="12">REDIS 8.x</text>
+          <rect x="128" y="92" width="160" height="22" rx="4" fill="rgba(139,144,168,0.35)">
+            <animate attributeName="width" from="0" to="160" dur="1s" begin="indefinite" fill="freeze" calcMode="spline" keySplines="0.22 1 0.36 1" keyTimes="0;1" data-bar-anim/>
+          </rect>
+          <text x="298" y="107" fill="#5c6178" font-size="10">1.0&times; baseline</text>
+          <text x="0" y="166" fill="#9096ae" font-size="12">VORTEX &dagger;</text>
+          <rect x="128" y="152" width="400" height="22" rx="4" fill="rgba(255,92,120,0.28)">
+            <animate attributeName="width" from="0" to="400" dur="1.3s" begin="indefinite" fill="freeze" calcMode="spline" keySplines="0.22 1 0.36 1" keyTimes="0;1" data-bar-anim/>
+          </rect>
+          <text x="330" y="167" fill="#5c6178" font-size="10">2&ndash;3&times; &mdash; why it died: see the blog</text>
+        </svg>
+      </div>
+    </div>
+
+    <div class="stat-grid" style="margin-top:52px">
+      <div class="stat">
+        <div class="v">9.8 s</div>
+        <div class="l">10 GB NODE COLD-BOOTS TO SERVING &mdash; 15 s GATE</div>
+      </div>
+      <div class="stat">
+        <div class="v">10,000</div>
+        <div class="l">POWER-CUT SEEDS &mdash; ZERO DURABILITY-ORACLE VIOLATIONS</div>
+      </div>
+      <div class="stat">
+        <div class="v">14.4 MiB</div>
+        <div class="l">CHECKPOINT PEAK-RSS OVERHEAD &mdash; FORK-FREE, VS CONTROL</div>
+      </div>
+      <div class="stat">
+        <div class="v">96.19%</div>
+        <div class="l">LFU HIT-RATE &mdash; EXACT PARITY WITH REDIS, SAME TRACE</div>
+      </div>
+    </div>
+
+    <div class="card-grid" style="margin-top:44px">
+      <div class="evidence" style="margin:0">
+        <span class="tag">C12 &middot; Allowed</span> &mdash; Durability is deterministically tested: 10,000 simulated power-cut/disk-fault seeds, zero durability-oracle violations &mdash; every <code>always</code>-acked write survives, <code>everysec</code> loses at most one second (simulated time); every seed replays byte-identically.
+        <span class="artifact">.artifacts/dst-sweep-10k &middot; regenerated per release &middot; frame-format v2: 0 refusals at the same 10k seeds</span>
+      </div>
+      <div class="callout" style="margin:0">
+        <span class="callout-tag"><strong>What you don&rsquo;t see here:</strong></span>
+        pipelined throughput peaks, <code>always</code>-mode write rates, tail latencies. Those ledger rows are <em>Narrowed</em> or <em>Evidence-pending</em>, so they don&rsquo;t ship &mdash; design targets never appear as numbers on this site. Every allowed claim lives in the <a href="docs/index.html#claims">claim ledger</a> with its artifact, or it does not exist.
+      </div>
+    </div>
+
+    <p class="bench-note">// reference box: i7-13700KF &middot; pinned P-cores &middot; performance governor &middot; turbo off &middot; competitors in-run &middot; 3&ndash;5 replicates &mdash; ledger rows C5, C7, C8, C12, C14, C16 &middot; &dagger; vortex was our predecessor engine; the post-mortem is <a href="blog/why-vortex-failed.html">on the blog</a></p>
+  </div>
+</section>
+
+<!-- ============ 05 ONE SESSION ============ -->
+<section id="session" class="session">
+  <div class="sticky">
+    <p class="kicker" style="margin-bottom:0">05 &middot; ONE SESSION</p>
+    <h2>Five workloads. One connection.</h2>
+    <p class="lede">A cache write, an fsync-gated durable write, a JSON document mutation, a query, a stream read &mdash; on one node, over the Redis protocol you already speak. What ships is live; what&rsquo;s coming is labeled with its milestone.</p>
+    <p class="fine">Durability is a property of the namespace, not the server. The loss window is a config knob.</p>
+  </div>
+  <div class="terminal">
+    <div class="terminal-bar">
+      <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="title">infinity &mdash; unified session</span>
+    </div>
+    <div class="terminal-body">
+      <div class="line"><span class="s">$</span> redis-cli <span class="c"># your CLI, unchanged</span></div>
+      <div class="line"><span class="p">inf&gt;</span> INF.NS CREATE cart   MODE <span class="s">memory</span>  EVICTION allkeys-lfu</div>
+      <div class="line"><span class="p">inf&gt;</span> INF.NS CREATE orders MODE <span class="s">durable</span> FSYNC always</div>
+      <div class="line"><span class="p">inf&gt;</span> SET cart:{u42}:items "lens &times;3" <span class="c"># cache-speed</span></div>
+      <div class="line"><span class="p">inf&gt;</span> SET orders:{u42}:1009 "paid" <span class="c"># acked after fsync</span></div>
+      <div class="line"><span class="p">inf&gt;</span> INF.CKPT WAIT <span class="c"># fork-free checkpoint</span></div>
+      <div class="terminal-divider">ROADMAP SURFACE &mdash; SAME SESSION, LATER MILESTONES</div>
+      <div class="line dim"><span class="p">inf&gt;</span> JSON.SET catalog:{sku9} $ '{"name":"Lens"}' <span class="c"># M3 &middot; in dev</span></div>
+      <div class="line dim"><span class="p">inf&gt;</span> INF.QL "SELECT &hellip; WHERE price &lt; 5000" <span class="c"># M4.5</span></div>
+      <div class="line dim"><span class="p">inf&gt;</span> XREADGROUP GROUP billing c1 &hellip; <span class="c"># M7</span></div>
+      <div class="line dim"><span class="p">inf&gt;</span> VSIM catalog:emb 10 VECTOR &hellip; <span class="c"># M8</span></div>
+      <div class="line dim"><span class="p">inf&gt;</span> INF.CALL pricing.reprice u42 <span class="c"># M10 &middot; runs where {u42} lives</span></div>
+      <div class="line"><span class="p">inf&gt;</span> <span class="cursor"></span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 06 ROADMAP ============ -->
+<section id="roadmap" class="section">
+  <div class="section-inner" style="padding-top:0">
+    <p class="kicker">06 &middot; THE ROAD TO 1.0</p>
+    <h2 style="margin-top:0">Shippable at every stop.</h2>
+    <p class="lede" style="max-width:620px">Every milestone has STOP gates &mdash; failing one halts the train and the fix happens at the architecture layer. M0&ndash;M2.5 exited on verdicts; M3 carries the first public tag, <code>v0.3.0-alpha.1</code>.</p>
+
+    <div class="rail">
+      <div class="rail-track">
+        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M0</p><p class="d">skeleton</p><p class="s">GO &middot; ADR-0004</p></div>
+        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M1</p><p class="d">cache core</p><p class="s">DONE</p></div>
+        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M2</p><p class="d">durability</p><p class="s">DONE</p></div>
+        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M2.5</p><p class="d">hardening</p><p class="s">DONE</p></div>
+        <div class="rail-stop now"><div class="rail-dot"></div><p class="m">M3</p><p class="d">json docs</p><p class="s">NOW &middot; &alpha; TAG</p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M4</p><p class="d">tiered</p><p class="s"></p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M4.5</p><p class="d">indexes &middot; query</p><p class="s"></p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M5</p><p class="d">data types</p><p class="s"></p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M6</p><p class="d">txns &middot; lua</p><p class="s"></p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M7</p><p class="d">streams</p><p class="s">FIRST &beta;</p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M8</p><p class="d">vectors</p><p class="s"></p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M9</p><p class="d">replication</p><p class="s"></p></div>
+        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M10</p><p class="d">compute</p><p class="s"></p></div>
+        <div class="rail-stop ga"><div class="rail-dot"></div><p class="m">1.0</p><p class="d">GA</p><p class="s"></p></div>
+      </div>
+    </div>
+    <p class="mono-note" style="margin-top:26px">TRAIN REORDERED DOCUMENTS-FIRST BY ADR-0023 &middot; M4.5 INSERTED BY ADR-0024 &middot; FIRST PUBLIC TAG MOVED TO M3 BY ADR-0048 &mdash; <a href="docs/roadmap.html" style="letter-spacing:0">milestone-by-milestone detail &rarr;</a></p>
+  </div>
+</section>
+
+<!-- ============ CTA + FOOTER ============ -->
+<section class="cta-band">
+  <div class="glow"></div>
+  <div class="inner">
+    <svg width="56" height="30" viewBox="0 0 34 18" style="display:block;margin:0 auto 24px" aria-hidden="true">
+      <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2"/>
+      <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2"/>
+    </svg>
+    <h2>One binary. One port. One log.</h2>
+    <p>Start as a faster Redis. End up replacing the stack around it &mdash; one namespace at a time. Gates before features; evidence before claims.</p>
+    <div class="ctas">
+      <a class="btn btn-primary" href="https://github.com/">&#9733; STAR ON GITHUB</a>
+      <a class="btn btn-ghost" href="docs/quickstart.html">QUICKSTART &rarr;</a>
+    </div>
+  </div>
+</section>
+
+<footer class="footer" style="margin-top:0">
+  <div class="footer-inner">
+    <span class="mark">&copy; 2026 INFINITYDB &mdash; APACHE 2.0 &middot; RUST &middot; <b>infinityd</b></span>
+    <div class="footer-links">
+      <a href="docs/index.html">DOCS</a>
+      <a href="blog/index.html">BLOG</a>
+      <a href="docs/roadmap.html">ROADMAP</a>
+      <a href="https://github.com/">GITHUB &#8599;</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  // mobile nav
+  var t = document.querySelector('.nav-toggle');
+  var l = document.querySelector('.nav-links');
+  if (t && l) t.addEventListener('click', function () {
+    var open = l.classList.toggle('open');
+    t.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+
+  // copy-to-clipboard on the install bar
+  document.querySelectorAll('[data-copy]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      try { navigator.clipboard.writeText(btn.getAttribute('data-copy')); } catch (err) {}
+      var prev = btn.textContent;
+      btn.textContent = 'COPIED ✓';
+      clearTimeout(btn._t);
+      btn._t = setTimeout(function () { btn.textContent = prev; }, 1600);
+    });
+  });
+
+  // benchmark bars grow when scrolled into view (bars are full-width by
+  // default, so content is never gated on the animation firing)
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!reduce && 'IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (!entry.isIntersecting) return;
+        entry.target.querySelectorAll('[data-bar-anim]').forEach(function (anim) {
+          try { anim.beginElement(); } catch (err) {}
+        });
+        io.unobserve(entry.target);
+      });
+    }, { threshold: 0.35 });
+    document.querySelectorAll('[data-bench]').forEach(function (el) { io.observe(el); });
+  }
+})();
+</script>
+</body>
+</html>

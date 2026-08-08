@@ -32,12 +32,19 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 
-use inf_alloc::{BufferId, BufferPool, LeaseKind};
+use inf_alloc::{AlignedPool, BufferId, BufferPool, LeaseKind};
+use inf_foundation::BuildIntHasher;
 use io_uring::types::Fd;
 use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
 
+/// Driver-internal op tables key by kernel-issued fds and our own sequential
+/// tokens — trusted integers, hashed with one folded multiply (see
+/// `gate::GateMap`; the S21 Phase-H hashing lever).
+type DriverMap<K, V> = HashMap<K, V, BuildIntHasher>;
+
 use crate::driver::{
-    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, SubmitStats, Wait,
+    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
+    StableBytesMut, SubmitStats, Wait,
 };
 use crate::token::CompletionToken;
 
@@ -88,6 +95,41 @@ enum OpState {
     /// wakeups): a peer's `LoopWaker::wake` posts this CQE, ending a park
     /// immediately. Driver-internal — never surfaces as a completion.
     WakeWatch,
+    /// Positional log-frame write (M2-S05, ADR-0013). `fsync` carries the
+    /// linked fdatasync's (consumer token, op id) so a short write can
+    /// supersede it and a failed write's cancellation is attributable.
+    LogWrite {
+        fd: RawFd,
+        token: CompletionToken,
+        data: StableBytes,
+        offset: u64,
+        written: u32,
+        fsync: Option<(CompletionToken, u64)>,
+    },
+    /// fdatasync — linked behind a `LogWrite` or standalone. `superseded`
+    /// marks a sync that raced a short write: its CQE is swallowed; a fresh
+    /// sync linked behind the remainder owns the consumer token.
+    LogFsync {
+        token: CompletionToken,
+        superseded: bool,
+    },
+    /// Positional cold-tier read (M4-S04). Short reads resubmit the
+    /// remainder in place — `TierRead` is delivered only when the buffer
+    /// is full (the `LogWrite` discipline mirrored on the read side).
+    TierRead {
+        fd: RawFd,
+        token: CompletionToken,
+        buf: StableBytesMut,
+        offset: u64,
+        got: u32,
+    },
+}
+
+/// One backlog unit: a lone SQE, or an `IOSQE_IO_LINK` pair that must enter
+/// the same submission window (a link chain cannot span submit boundaries).
+struct SqeChain {
+    first: squeue::Entry,
+    linked: Option<squeue::Entry>,
 }
 
 struct RecvArm {
@@ -111,21 +153,49 @@ pub struct UringDriver {
     caps: Capabilities,
     pending_ops: Vec<IoOp>,
     /// SQEs that did not fit the SQ; flushed first next submit.
-    backlog: VecDeque<squeue::Entry>,
-    states: HashMap<u64, OpState>,
+    backlog: VecDeque<SqeChain>,
+    states: DriverMap<u64, OpState>,
     next_id: u64,
-    accepts: HashMap<RawFd, CompletionToken>,
-    recvs: HashMap<RawFd, RecvArm>,
+    accepts: DriverMap<RawFd, CompletionToken>,
+    recvs: DriverMap<RawFd, RecvArm>,
     /// Outstanding sends per fd — `Closed` is delivered only after they
     /// resolve (cancelled sends return their buffers first, per contract).
-    sends_inflight: HashMap<RawFd, u32>,
-    closing: HashMap<RawFd, CloseWait>,
+    sends_inflight: DriverMap<RawFd, u32>,
+    closing: DriverMap<RawFd, CloseWait>,
     /// Buffers currently owned by the kernel's provided group, by bid.
     /// CQE `buffer_select` ids resolve through this map — never minted.
-    provided: HashMap<u16, BufferId>,
+    provided: DriverMap<u16, BufferId>,
     /// Wake eventfd watched via `PollAdd` (see [`OpState::WakeWatch`]).
     wake_fd: Option<std::os::fd::OwnedFd>,
+    /// Registered cold-read pool geometry (M4-S08): set by
+    /// `register_tier_pool`, consumed by `arm_tier_read` to upgrade
+    /// in-range reads to the fixed-buffer opcode.
+    tier_fixed: Option<TierFixed>,
     stats: SubmitStats,
+}
+
+/// Geometry of the registered aligned pool: buffer `i` occupies
+/// `[base + i·buf_size, base + (i+1)·buf_size)` and iovec index `i`.
+struct TierFixed {
+    base: usize,
+    buf_size: usize,
+    count: usize,
+}
+
+impl TierFixed {
+    /// The fixed-buffer index serving `[start, start+len)`, when the
+    /// range sits inside exactly one registered buffer starting at its
+    /// base (the `ColdReads::issue` shape). Anything else reads via the
+    /// plain positional opcode — correctness never depends on the
+    /// registration.
+    fn index_of(&self, start: usize, len: usize) -> Option<u16> {
+        let offset = start.checked_sub(self.base)?;
+        let index = offset / self.buf_size;
+        if index >= self.count || offset % self.buf_size != 0 || len > self.buf_size {
+            return None;
+        }
+        Some(index as u16)
+    }
 }
 
 impl UringDriver {
@@ -137,7 +207,11 @@ impl UringDriver {
     pub fn new(entries: u32) -> io::Result<UringDriver> {
         let force_degraded = std::env::var_os("INF_URING_FORCE_DEGRADED").is_some();
 
-        // Setup-flag fallback chain: the builder flags are 6.0/6.1 features.
+        // Setup-flag fallback chain: the builder flags are 6.0/6.1 features,
+        // and an old kernel rejects them with EINVAL. Only EINVAL retries
+        // with fewer flags — anything else (ENOMEM under dirty-page
+        // pressure was the M2.5-S01 mechanism-2 capture) must propagate
+        // untouched, never silently strip performance flags from one cell.
         let mut single_issuer = true;
         let mut defer_taskrun = true;
         let ring = loop {
@@ -150,8 +224,12 @@ impl UringDriver {
             }
             match builder.build(entries) {
                 Ok(ring) => break ring,
-                Err(_) if defer_taskrun => defer_taskrun = false,
-                Err(_) if single_issuer => single_issuer = false,
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) && defer_taskrun => {
+                    defer_taskrun = false;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) && single_issuer => {
+                    single_issuer = false;
+                }
                 Err(e) => return Err(e),
             }
         };
@@ -180,14 +258,15 @@ impl UringDriver {
             },
             pending_ops: Vec::with_capacity(64),
             backlog: VecDeque::new(),
-            states: HashMap::new(),
+            states: DriverMap::default(),
             next_id: 0,
-            accepts: HashMap::new(),
-            recvs: HashMap::new(),
-            sends_inflight: HashMap::new(),
-            closing: HashMap::new(),
-            provided: HashMap::new(),
+            accepts: DriverMap::default(),
+            recvs: DriverMap::default(),
+            sends_inflight: DriverMap::default(),
+            closing: DriverMap::default(),
+            provided: DriverMap::default(),
             wake_fd: None,
+            tier_fixed: None,
             stats: SubmitStats::default(),
         })
     }
@@ -216,35 +295,132 @@ impl UringDriver {
 
     /// Queue an SQE (backlog when the SQ is full; flushed next submit).
     fn push_sqe(&mut self, entry: squeue::Entry) {
-        self.backlog.push_back(entry);
+        self.backlog.push_back(SqeChain { first: entry, linked: None });
+    }
+
+    /// Queue an `IOSQE_IO_LINK` pair. `first` must carry the link flag; the
+    /// flush keeps both inside one submission window so the kernel actually
+    /// chains them.
+    fn push_chain(&mut self, first: squeue::Entry, linked: squeue::Entry) {
+        self.backlog.push_back(SqeChain { first, linked: Some(linked) });
     }
 
     fn flush_backlog(&mut self) -> io::Result<()> {
         // M0-S19 deliberate-regression canary: submit after every SQE so the
         // `sqes_per_submit` tripwire must trip in the gate report. Test-only.
         let submit_per_op = std::env::var_os("INF_URING_SUBMIT_PER_OP").is_some();
-        while let Some(entry) = self.backlog.pop_front() {
+        while let Some(chain) = self.backlog.pop_front() {
             if submit_per_op {
                 self.ring.submitter().submit()?;
                 self.stats.syscalls += 1;
             }
-            // SAFETY: every entry was built over resources (fds, buffer
-            // addresses) that stay live until its CQE arrives — fds are not
-            // closed before their cancellations complete, and pool buffer
-            // addresses are stable for the pool's lifetime.
-            if unsafe { self.ring.submission().push(&entry) }.is_err() {
-                // SQ full: hand the kernel what we have and retry once.
+            let needed = 1 + usize::from(chain.linked.is_some());
+            let room = {
+                let sq = self.ring.submission();
+                sq.capacity() - sq.len()
+            };
+            if room < needed {
+                // SQ full (a chain also refuses to split across the submit
+                // boundary): hand the kernel what we have and retry once.
                 self.ring.submitter().submit()?;
                 self.stats.syscalls += 1;
-                // SAFETY: as above.
-                if unsafe { self.ring.submission().push(&entry) }.is_err() {
-                    self.backlog.push_front(entry);
+                let room = {
+                    let sq = self.ring.submission();
+                    sq.capacity() - sq.len()
+                };
+                if room < needed {
+                    self.backlog.push_front(chain);
                     return Err(io::Error::other("io_uring SQ stuck full after submit"));
                 }
             }
-            self.stats.sqes += 1;
+            // SAFETY: every entry was built over resources (fds, buffer
+            // addresses) that stay live until its CQE arrives — fds are not
+            // closed before their cancellations complete, pool buffer
+            // addresses are stable for the pool's lifetime, and log-frame
+            // addresses are stable under the `StableBytes` contract.
+            unsafe {
+                let mut sq = self.ring.submission();
+                sq.push(&chain.first).expect("room checked above");
+                if let Some(linked) = chain.linked {
+                    sq.push(&linked).expect("room checked above");
+                }
+            }
+            self.stats.sqes += needed as u64;
         }
         Ok(())
+    }
+
+    /// Arm a positional cold-tier read (M4-S04; fixed-buffer upgrade
+    /// M4-S08). `got` > 0 is the short-read resubmission path: the
+    /// remainder reads into the same stable buffer at its fill point.
+    fn arm_tier_read(
+        &mut self,
+        fd: RawFd,
+        offset: u64,
+        buf: StableBytesMut,
+        token: CompletionToken,
+        got: u32,
+    ) {
+        // Registered-pool reads ride the fixed-buffer opcode (M4-S08 —
+        // no per-op page pinning); anything else (tests, one-off
+        // buffers) stays on the plain positional read.
+        let fixed = self
+            .tier_fixed
+            .as_ref()
+            .and_then(|t| t.index_of(buf.as_mut_ptr() as usize, buf.len() as usize));
+        let id = self.alloc_id(OpState::TierRead { fd, token, buf, offset, got });
+        // SAFETY: `buf` upholds the StableBytesMut contract (live, stable,
+        // unaliased until terminal completion); `got` never exceeds
+        // `buf.len()`.
+        let ptr = unsafe { buf.as_mut_ptr().add(got as usize) };
+        let entry = match fixed {
+            Some(index) => opcode::ReadFixed::new(Fd(fd), ptr, buf.len() - got, index)
+                .offset(offset + u64::from(got))
+                .build()
+                .user_data(id),
+            None => opcode::Read::new(Fd(fd), ptr, buf.len() - got)
+                .offset(offset + u64::from(got))
+                .build()
+                .user_data(id),
+        };
+        self.push_sqe(entry);
+    }
+
+    /// Arm a positional log-frame write, optionally with a linked fdatasync
+    /// (ADR-0013 D1). `written` > 0 is the short-write resubmission path —
+    /// the remainder gets a FRESH linked sync so `Synced` can never cover a
+    /// prefix.
+    fn arm_log_write(
+        &mut self,
+        fd: RawFd,
+        offset: u64,
+        data: StableBytes,
+        token: CompletionToken,
+        written: u32,
+        fsync_token: Option<CompletionToken>,
+    ) {
+        let fsync = fsync_token.map(|ft| {
+            let fid = self.alloc_id(OpState::LogFsync { token: ft, superseded: false });
+            (ft, fid)
+        });
+        let wid = self.alloc_id(OpState::LogWrite { fd, token, data, offset, written, fsync });
+        // SAFETY: `data` upholds the StableBytes contract (live + stable
+        // until terminal completion); `written` never exceeds `data.len()`.
+        let ptr = unsafe { data.as_ptr().add(written as usize) };
+        let entry = opcode::Write::new(Fd(fd), ptr, data.len() - written)
+            .offset(offset + u64::from(written))
+            .build()
+            .user_data(wid);
+        match fsync {
+            Some((_, fid)) => {
+                let fentry = opcode::Fsync::new(Fd(fd))
+                    .flags(types::FsyncFlags::DATASYNC)
+                    .build()
+                    .user_data(fid);
+                self.push_chain(entry.flags(squeue::Flags::IO_LINK), fentry);
+            }
+            None => self.push_sqe(entry),
+        }
     }
 
     fn arm_accept_sqe(&mut self, listener: RawFd, token: CompletionToken) {
@@ -417,6 +593,20 @@ impl UringDriver {
                         .insert(fd, CloseWait { token, close_seen: false, close_result: 0 });
                     let id = self.alloc_id(OpState::Close { fd });
                     self.push_sqe(opcode::Close::new(Fd(fd)).build().user_data(id));
+                }
+                IoOp::LogWrite { fd, offset, data, token, fsync_token } => {
+                    self.arm_log_write(fd, offset, data, token, 0, fsync_token);
+                }
+                IoOp::Fdatasync { fd, token } => {
+                    let id = self.alloc_id(OpState::LogFsync { token, superseded: false });
+                    let entry = opcode::Fsync::new(Fd(fd))
+                        .flags(types::FsyncFlags::DATASYNC)
+                        .build()
+                        .user_data(id);
+                    self.push_sqe(entry);
+                }
+                IoOp::TierRead { fd, offset, buf, token } => {
+                    self.arm_tier_read(fd, offset, buf, token, 0);
                 }
             }
         }
@@ -647,6 +837,83 @@ impl UringDriver {
                     pool.unstage(buf);
                 }
             }
+            OpState::LogWrite { fd, token, data, offset, written, fsync } => {
+                if result > 0 || (result == 0 && data.len() == written) {
+                    let written = written + result as u32;
+                    if written < data.len() {
+                        // Short write: the already-linked fdatasync would
+                        // cover a prefix only — supersede it; the remainder
+                        // re-links a fresh sync (ADR-0013 D1).
+                        let fsync_token = fsync.map(|(ft, fid)| {
+                            if let Some(OpState::LogFsync { superseded, .. }) =
+                                self.states.get_mut(&fid)
+                            {
+                                *superseded = true;
+                            }
+                            ft
+                        });
+                        self.arm_log_write(fd, offset, data, token, written, fsync_token);
+                        return;
+                    }
+                    out.push(Completion { token, result: CompletionResult::LogWritten });
+                } else {
+                    // Zero-progress writes on a non-empty range cannot
+                    // happen on a healthy fd; surface them as EIO rather
+                    // than resubmitting forever.
+                    let errno = match result {
+                        0 => libc::EIO,
+                        r if r == -libc::ECANCELED => libc::ECANCELED,
+                        r => -r,
+                    };
+                    // The linked fdatasync (if any, not superseded) is
+                    // cancelled by the kernel and surfaces ECANCELED on its
+                    // own token — no sync-past-failed-write.
+                    out.push(Completion {
+                        token,
+                        result: CompletionResult::Error { errno, buf: None },
+                    });
+                }
+            }
+            OpState::LogFsync { token, superseded } => {
+                if superseded {
+                    // Stale sync from a short-write chain: the consumer
+                    // token now belongs to the re-linked sync.
+                    return;
+                }
+                if result >= 0 {
+                    out.push(Completion { token, result: CompletionResult::Synced });
+                } else {
+                    let errno = if result == -libc::ECANCELED { libc::ECANCELED } else { -result };
+                    out.push(Completion {
+                        token,
+                        result: CompletionResult::Error { errno, buf: None },
+                    });
+                }
+            }
+            OpState::TierRead { fd, token, buf, offset, got } => {
+                if result > 0 {
+                    let got = got + result as u32;
+                    if got < buf.len() {
+                        // Short read: resubmit the remainder in place.
+                        self.arm_tier_read(fd, offset, buf, token, got);
+                        return;
+                    }
+                    out.push(Completion { token, result: CompletionResult::TierRead });
+                } else {
+                    // result == 0 is EOF inside the flushed range — tier
+                    // reads never overrun the file, so a short file is
+                    // corruption, not a condition (the op contract).
+                    let errno = match result {
+                        0 => libc::EIO,
+                        r if r == -libc::ECANCELED => libc::ECANCELED,
+                        r => -r,
+                    };
+                    out.push(Completion {
+                        token,
+                        result: CompletionResult::Error { errno, buf: None },
+                    });
+                }
+            }
         }
     }
 
@@ -800,6 +1067,45 @@ impl BackendDriver for UringDriver {
         // Send/Recv at M0 either way (fixed-buffer data path is an A3-tier
         // measured follow-up).
         self.caps.fixed_buffers = registered.is_ok();
+        Ok(())
+    }
+
+    fn register_tier_pool(&mut self, pool: &mut AlignedPool) -> io::Result<()> {
+        // The recv-pool registration above is a capability probe (no op
+        // consumes fixed send/recv buffers); io_uring has ONE registered-
+        // buffer table, so the cold-read pool takes it over (M4-S08).
+        if self.caps.fixed_buffers {
+            let _ = self.ring.submitter().unregister_buffers();
+        }
+        let buf_size = pool.buf_size();
+        let count = pool.capacity();
+        assert!(count <= usize::from(u16::MAX), "fixed-buffer indices are u16");
+        let mut base = 0usize;
+        let mut iovecs = Vec::with_capacity(count);
+        for (i, bytes) in pool.buffers_mut().enumerate() {
+            if i == 0 {
+                base = bytes.as_ptr() as usize;
+            }
+            iovecs.push(libc::iovec { iov_base: bytes.as_mut_ptr().cast(), iov_len: bytes.len() });
+        }
+        // SAFETY: iovecs describe the pool's single live allocation,
+        // address-stable for the pool's lifetime (inf-alloc invariant);
+        // the kernel reads/writes them only through TierRead ops whose
+        // buffers the in-flight table keeps leased until terminal
+        // completion.
+        let registered = unsafe { self.ring.submitter().register_buffers(&iovecs) };
+        match registered {
+            Ok(()) => {
+                self.tier_fixed = Some(TierFixed { base, buf_size, count });
+                self.caps.fixed_buffers = true;
+            }
+            Err(_) => {
+                // Degrade (RLIMIT_MEMLOCK, old kernel): plain positional
+                // reads stay correct; the probe table is gone either way.
+                self.tier_fixed = None;
+                self.caps.fixed_buffers = false;
+            }
+        }
         Ok(())
     }
 

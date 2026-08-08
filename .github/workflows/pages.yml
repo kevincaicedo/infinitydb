@@ -1,0 +1,78 @@
+# InfinityDB website — GitHub Pages deployment (M2.5-S05).
+#
+# Guarantees enforced before every deploy:
+#   1. The compat page is regenerated from the repo's generated artifact
+#      (docs/compat-matrix.md) and must match the committed page — the site
+#      can never drift from the implementation (L8).
+#   2. The ledger-copy check scans every HTML page: any performance-shaped
+#      number not covered by an Allowed claim-ledger row fails the build
+#      (L10). The ledger of record lives in the planning repo; this repo
+#      carries a committed snapshot (website/site/_ledger-snapshot.md) that
+#      the release-manager checklist refreshes alongside any copy change.
+
+name: website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - "docs/compat-matrix.md"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; don't cancel a production deploy mid-flight.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Regenerate compat page from the repo artifact
+        run: |
+          python3 website/scripts/gen-compat-page.py \
+            --matrix docs/compat-matrix.md \
+            --out website/site/docs/compat.html \
+            --date "$(date -u +%F)"
+
+      - name: Compat page staleness gate (generated page must be committed)
+        run: |
+          # The --date stamp is the only line allowed to differ.
+          if ! git diff -I'gen-compat-page\.py</code> on [0-9-]*\.' --exit-code website/site/docs/compat.html; then
+            echo "::error::website/site/docs/compat.html is stale — regenerate it with website/scripts/gen-compat-page.py and commit."
+            exit 1
+          fi
+
+      - name: Ledger-copy check (no number without an Allowed row)
+        run: |
+          python3 website/scripts/check-ledger-copy.py \
+            --site website/site \
+            --ledger website/site/_ledger-snapshot.md \
+            --allowlist website/scripts/ledger-allowed-numbers.txt \
+            --print-tokens
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -108,6 +108,78 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_m2_gates_file() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/milestones/m2-gates.toml");
+        let gates = load(path).expect("m2 gates file parses");
+        assert_eq!(
+            gates.len(),
+            19,
+            "S09 A/B + counter rows, §6 STOP gates, S12 ckpt-RSS row, tripwires"
+        );
+        let zero = gates.iter().find(|g| g.id == "mem_only_log_records").expect("counter tripwire");
+        assert!(zero.passes(0.0) && !zero.passes(1.0));
+        assert_eq!(zero.tier, "any", "the counter tripwire binds on every box");
+        let ab = gates.iter().find(|g| g.id == "mem_ab_pipelined_ops").expect("A/B gate");
+        assert!(ab.passes(1.0) && !ab.passes(1.01), "the ≤1% zero-cost bar");
+        let always = gates.iter().find(|g| g.id == "always_grouped_wps").expect("always gate");
+        assert!(always.passes(300_000.0) && !always.passes(299_999.0));
+        let ckpt =
+            gates.iter().find(|g| g.id == "ckpt_under_load_p999").expect("anti-BGREWRITEAOF");
+        assert!(ckpt.passes(1999.0) && !ckpt.passes(2000.0));
+        assert!(
+            gates.iter().find(|g| g.id == "grouping_ratio").expect("ratio row").informational,
+            "grouping floor is informational until S21 fixes the value"
+        );
+    }
+
+    /// M3 §7: the three gates the first public tag turns on — read
+    /// latency, write throughput, document memory — plus the two `any`-tier
+    /// zero rows. Added with the file's move in-tree (ADR-0065 D1): the m4
+    /// test below is the one that caught the escaping path, and every
+    /// milestone's encoding deserves the same guard.
+    #[test]
+    fn parses_the_m3_gates_file() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/milestones/m3-gates.toml");
+        let gates = load(path).expect("m3 gates file parses");
+        assert_eq!(gates.len(), 11, "all M3 §7 rows present");
+        // The one gate with a real chance of failing: dev tier reads
+        // 0.6985–0.7252 against a `>= 0.70` bar. It must not drift.
+        let write = gates.iter().find(|g| g.id == "doc_write_throughput_ratio").expect("write row");
+        assert!(write.passes(0.70) && !write.passes(0.6999), "the §7 bar is `>= 0.70`");
+        assert_eq!(write.tier, "linux-reference-box", "the write gate binds on the reference box");
+        let redisjson = gates.iter().find(|g| g.id == "doc_rss_vs_redisjson").expect("memory row");
+        assert!(redisjson.passes(0.70) && !redisjson.passes(0.7001), "`<= 0.70x` is inclusive");
+        for id in ["doc_compat_oracle", "doc_replay_equivalence"] {
+            let zero = gates.iter().find(|g| g.id == id).expect("zero row");
+            assert!(zero.passes(0.0) && !zero.passes(1.0));
+            assert_eq!(zero.tier, "any", "{id} binds on every box");
+        }
+        assert!(!gates.iter().any(|g| g.informational), "no M3 §7 row is a dashboard");
+    }
+
+    /// M4-S16: the write-amplification row exists, bites at exactly 3×,
+    /// and binds on every box (a counter ratio has no box dependence — the
+    /// reference box settles the workload, not the arithmetic).
+    #[test]
+    fn parses_the_m4_gates_file() {
+        // In-tree, like every other milestone above: `bins/inf-bench` →
+        // `bins` → workspace root → `docs/milestones/`. A path that left
+        // the checkout (`../../../docs/`) resolved only on a box where
+        // this repo sits inside the planning repo — it is absent on any CI
+        // runner, and it forked the gate values into two copies that
+        // silently drifted.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/milestones/m4-gates.toml");
+        let gates = load(path).expect("m4 gates file parses");
+        let wa = gates.iter().find(|g| g.id == "write_amplification").expect("WA row");
+        assert!(wa.passes(2.999), "under the gate passes");
+        assert!(!wa.passes(3.0), "the §7 bar is `< 3×`, not `≤`");
+        assert_eq!(wa.tier, "any", "a counter ratio binds on every box");
+        assert!(!wa.informational, "write amplification is a STOP gate, not a dashboard");
+        let zero = gates.iter().find(|g| g.id == "tiering_counters_zero").expect("zero tripwire");
+        assert!(zero.passes(0.0) && !zero.passes(1.0));
+    }
+
+    #[test]
     fn parses_the_m1_gates_file() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/milestones/m1-gates.toml");
         let gates = load(path).expect("m1 gates file parses");

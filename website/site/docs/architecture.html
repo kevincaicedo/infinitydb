@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture — InfinityDB Docs</title>
+<meta name="description" content="How InfinityDB works: shard cells, the lock-free fabric, the log spine, deterministic simulation, and the design laws.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2018'%3E%3Ccircle%20cx='10'%20cy='9'%20r='7'%20fill='none'%20stroke='%237c5cff'%20stroke-width='2.4'/%3E%3Ccircle%20cx='24'%20cy='9'%20r='7'%20fill='none'%20stroke='%233ee6c4'%20stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="../index.html" class="nav-brand">
+      <svg class="logo" width="34" height="18" viewBox="0 0 34 18" aria-hidden="true">
+        <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2.4"/>
+        <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2.4"/>
+      </svg>
+      <span class="mark">infinity<b>DB</b></span>
+      <span class="nav-badge neutral">DOCS</span>
+    </a>
+    <span class="nav-spacer"></span>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="nav-links">
+      <a href="../index.html">HOME</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
+    </div>
+  </div>
+</nav>
+
+<div class="docs-shell">
+  <aside class="docs-side">
+    <p class="side-h">Getting started</p>
+    <a class="side-link" href="index.html">Docs home</a>
+    <a class="side-link" href="quickstart.html">Quickstart</a>
+    <p class="side-h">Concepts</p>
+    <a class="side-link" href="architecture.html" aria-current="page">Architecture</a>
+    <a class="side-link" href="durability.html">Namespaces &amp; durability</a>
+    <p class="side-h">Operations</p>
+    <a class="side-link" href="deployment.html">Deployment</a>
+    <a class="side-link" href="operations.html">Operations</a>
+    <p class="side-h">Reference</p>
+    <a class="side-link" href="compat.html">Command matrix</a>
+    <a class="side-link" href="roadmap.html">Roadmap</a>
+  </aside>
+
+  <main class="docs-main">
+    <article>
+      <p class="doc-kicker">Concepts</p>
+  <h1 class="page-title">Architecture</h1>
+  <p class="lede">A condensed tour of the internals. The full version &mdash; and the first document a new engineer reads &mdash; is <a href="https://github.com/"><code>infinitydb/ARCHITECTURE.md</code></a> in the repository; the architectural authority with laws, gates, and the roadmap is <code>docs/infinity-master-plan.md</code>.</p>
+
+  <h2>The problem</h2>
+  <p>Modern applications run a zoo: Redis for caching and real-time structures, DynamoDB-class stores for durable documents, Kafka or RabbitMQ for queues and events, a vector database for AI retrieval &mdash; plus the glue, the double writes, and the cross-system consistency bugs between them. Each system is operated, secured, monitored, and paid for separately, and the data they share is copied between them over networks.</p>
+  <p>InfinityDB is one engine for those workloads: a key/value engine <em>kernel</em>, Redis-compatible on the wire, with each workload arriving as a projection of the same core rather than a bolted-on subsystem. Workloads are consequences, not targets: anything that would require new kernel semantics rather than a new engine on existing seams is out of scope until a law amendment says otherwise.</p>
+
+  <h2>The shape: one core, one shard, one owner</h2>
+  <p>One node is one process, <code>infinityd</code>. It pins one <strong>shard cell</strong> per data core; each cell is a complete miniature database &mdash; an io_uring reactor, a SIMD RESP parser, a single-threaded command executor, a slice of the keyspace with its index and record arena, a log writer, and an allocator. One additional control thread runs the slow plane (config, topology, stats, checkpoint scheduling) and is never on the data path.</p>
+  <p>The keyspace is partitioned by the same 16,384-slot space as Redis Cluster, assigned to cells in contiguous ranges &mdash; hash tags co-locate keys exactly as Redis Cluster clients expect, and unlike Redis Cluster, cross-slot operations <em>work</em>: they pay a fabric hop instead of returning <code>CROSSSLOT</code>.</p>
+  <p>Cells share <strong>nothing</strong> on the data plane: no locks, no shared atomics, no cross-core cache-line traffic. Persistence, expiry, eviction, memory accounting, and replication all become local, single-threaded problems. The honestly-stated cost is hot keys: a single hot key serializes on one core. Mitigations, in order: a single cell sustains a very large pipelined rate on one key; RESP3 client-side caching (M7) is the protocol-native fix; read-leases are post-1.0 research.</p>
+
+  <h2>The fabric</h2>
+  <p>When a command on cell A needs a key owned by cell B, it crosses the <strong>fabric</strong>: a full mesh of lock-free single-producer/single-consumer ring pairs, polled cooperatively, batched, never waking per message, with credit-based flow control so a saturated peer exerts backpressure to the originating client connection instead of queueing unboundedly. The command future suspends until the reply arrives. The fabric is held to the numbers production thread-per-core systems demonstrably achieve &mdash; a lesson written in blood: the predecessor project rejected shared-nothing based on a broken fabric experiment that contradicted published production behavior.</p>
+
+  <h2>The log spine</h2>
+  <p>Every durable fact is an append to a per-cell, per-namespace segmented log, group-committed once per reactor iteration, with the fsync policy chosen per namespace (<code>always</code> / <code>everysec</code> / <code>memory</code> &mdash; see <a href="durability.html">durability</a>). Everything else &mdash; the hash index, and on the roadmap document trees, secondary indexes, stream offsets, vector graphs &mdash; is a rebuildable <em>projection</em> over that log. Checkpoints are fuzzy snapshots streamed by the owning cell (no fork, no stop-the-world); recovery is checkpoint + parallel per-cell replay. There is no global LSN: each cell replays independently.</p>
+  <p>This is why the feature set can be broad while the trusted computing base stays small: there is one durability mechanism to make correct, not five. A cache is the log with durability off; a queue (M7) is the log read forward by consumer groups; a replica (M9) is the log shipped to a follower.</p>
+
+  <h2>The reactor: batch every boundary</h2>
+  <p>Syscalls, fabric hops, fsyncs, and cache misses are paid per <em>batch</em>, never per operation. Every SQE an iteration produces goes out in a single <code>io_uring_enter</code>; the log writer seals one batch frame per iteration; all concurrent <code>always</code> writers share one group-commit fsync; index probes are prefetched a batch at a time. The batching metrics (<code>sqes/submit</code>, commands per iteration, acks per fsync) are always-on <strong>tripwires with CI gates</strong> &mdash; a benchmark run with red tripwires is invalid for claims by definition.</p>
+
+  <h2>Commands are resumable state machines</h2>
+  <p>Commands compile to <code>!Send</code> futures on a minimal cell-local executor &mdash; no work stealing, no atomic wakers, no global runtime. The local fast path completes synchronously inside <code>poll</code> and pays essentially nothing for the capability; suspension is reserved for the moments that need it: a remote key, a cold read (M4), a durability-gated ack, a blocking op. Background work (expiry, eviction, checkpoints) runs in deficit-weighted budgeted slices so tail latency is protected by construction rather than by retrofitted fairness passes.</p>
+
+  <h2>Determinism is a feature</h2>
+  <p>Time, randomness, disk, network, and fabric effects are injected behind runtime traits. Consequently the <em>entire node</em> &mdash; all cells, fabric, log, recovery &mdash; runs deterministically on one thread inside the simulator, FoundationDB/TigerBeetle-style: simulated disks tear writes and lie about fsync, power cuts land at chosen log positions, and every failure is a seed that replays byte-identically. Invariant oracles (per-key linearizability, durability-watermark honesty, accounting reconciliation) run continuously inside the sim, and a nightly fleet burns simulated time at scale. The simulator&rsquo;s authority is guarded mechanically: cell code cannot name <code>tokio</code>, locks, <code>thread::sleep</code>, ambient clocks, or ambient randomness &mdash; a denylist script enforces it.</p>
+
+  <h2>Memory is the product</h2>
+  <p>Records are variable-size and packed; the index is a compact Swiss-style table; every allocation belongs to a named per-cell domain counted at the allocation site, and <code>sum(domains)</code> diverging from process RSS beyond a bound fails CI. Bytes/key and RSS-vs-Redis are release gates, not dashboards &mdash; the predecessor shipped multiples of Redis memory and could not say where it went; that failure mode is now impossible to hide.</p>
+
+  <h2>A kernel with seams</h2>
+  <p>Every engine capability registers through a versioned seam: the command registry, record-type registry, index projections, fabric opcodes, triggers, transports. First-party engines (documents, query, streams, vectors, compute) are <em>required</em> to use these seams &mdash; the Linux-driver discipline: drivers prove the driver API &mdash; and a mechanical dependency-DAG check makes bypassing them a build failure. That is what makes slim builds real (a cache-only binary contains zero document/query/vector code) and what the post-1.0 native extension SDK will stabilize. The compute plane is the same idea aimed at users: WASM reducers (M10) run inside the process on the core that owns their data &mdash; fuel-metered, memory-capped, capability-scoped, deterministic.</p>
+
+  <h2>Safety is layered</h2>
+  <p><code>unsafe</code> lives only in audited leaf crates (allocator, rings, SIMD), each with a safety inventory and Miri/Loom coverage; everything above is safe Rust. Every byte decoder is fuzzed. Every durability change runs the crash-point matrix. Rust was chosen because the requirements &mdash; no GC pauses on a tail-latency-gated data plane, precise layout, invariants as compile errors, <code>!Send</code> futures encoding &ldquo;this never leaves its core&rdquo; in the signature &mdash; narrow the field to it.</p>
+
+  <h2>Lineage</h2>
+  <p>The design stands on named shoulders: <strong>TigerBeetle</strong> (deterministic simulation, assertion discipline, style-guide culture), <strong>FoundationDB</strong> (DST as the centerpiece of correctness), <strong>Seastar/ScyllaDB</strong> (shard-per-core, scheduling groups), <strong>DragonflyDB</strong> (shared-nothing Redis semantics at production scale), <strong>Microsoft FASTER</strong> (the hybrid-log design behind M4 tiering), <strong>Redpanda</strong> (thread-per-core Kafka-model storage), <strong>simdjson</strong> (SIMD parsing), and <strong>SpacetimeDB</strong> (the in-database reducer model).</p>
+
+  <div class="callout">
+    <span class="callout-tag"><strong>Go deeper:</strong></span>
+    <code>infinitydb/ARCHITECTURE.md</code> (this page&rsquo;s long form) &rarr; <code>docs/infinity-master-plan.md</code> (laws L1&ndash;L11, gates, the train) &rarr; <code>infinitydb/docs/architecture.md</code> (life of a request) &rarr; <code>infinitydb/docs/interfaces-m0.md</code> / <code>interfaces-m2.md</code> (the frozen internal seams). All in the <a href="https://github.com/">repository</a>.
+  </div>
+
+  <div class="doc-footer-nav">
+    <a href="operations.html">&larr; Operations</a>
+    <a href="compat.html">Compatibility matrix &rarr;</a>
+  </div>
+    </article>
+  </main>
+</div>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span class="mark">&copy; 2026 INFINITYDB &mdash; APACHE 2.0 &middot; RUST &middot; <b>infinityd</b></span>
+    <div class="footer-links">
+      <a href="index.html">DOCS</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a href="https://github.com/">GITHUB &#8599;</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var t = document.querySelector('.nav-toggle');
+  var l = document.querySelector('.nav-links');
+  if (t && l) t.addEventListener('click', function () {
+    var open = l.classList.toggle('open');
+    t.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+})();
+</script>
+</body>
+</html>

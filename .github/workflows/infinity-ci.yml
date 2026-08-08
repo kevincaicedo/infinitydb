@@ -1,19 +1,35 @@
-# InfinityDB CI — M0-S02 verification-ladder scaffolding.
+# InfinityDB CI — pull-request lane (verification ladder, M0-S02).
 #
 # Layout: this repository's root IS the Cargo workspace (crates/, bins/,
 # tests/ at the top level). Jobs run from the repo root; there is no nested
 # `infinitydb/` directory on the runner.
 #
-# NOTE (Linux validation pending): the Linux jobs (io_uring suite, kernel
-# matrix, Miri) and the fuzz smoke have not been exercised against a live
-# runner yet. First Linux run must verify: io_uring feature probes on 5.15 vs
-# 6.1, Miri canary (M0-S02 AC), and the fuzz smoke job.
+# Split (2026-07-17): only the two slow jobs were the problem — `miri`
+# (45-min timeout) and the 14-target `fuzz-smoke` (~70 min). Those are
+# REDUCED here (a strict-provenance canary on inf-alloc, and a single 60-s
+# fuzz smoke) and run in FULL in `infinity-ci-full.yml` (label `ci-full` /
+# `/ci-full` comment / dispatch), together with the benchmark compile. Every
+# other job — the full 3-OS build matrix, client-smoke, compat-diff,
+# kernel-matrix, loom, sim-smoke — stays here: each runs in a few minutes and
+# they run in parallel, so they cost little wall-clock but keep PR coverage.
 name: infinity-ci
 
 on:
   push:
     branches: [main]
   pull_request:
+
+# A newer push to the same branch/PR cancels the in-flight run.
+concurrency:
+  group: infinity-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
 
 jobs:
   build-test:
@@ -22,18 +38,28 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
       - name: fmt
         run: cargo fmt --all --check
       - name: dep-DAG law
         run: ./scripts/check-dep-dag.sh
       - name: cell deny-list
         run: ./scripts/check-cell-denylist.sh
+      - name: fault-point inventory (M2-S16)
+        run: ./scripts/check-fault-points.sh
+      - name: fsync fail-stop grep (M2-S17, §8.4)
+        run: ./scripts/check-fsync-fail-stop.sh
+      - name: panic-policy grep (M2.5-S13)
+        run: ./scripts/check-panic-policy.sh
+      - name: SAFETY.md inventory (M2.5-S16, §17.3)
+        run: ./scripts/check-safety-inventory.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build
@@ -43,71 +69,103 @@ jobs:
 
   cargo-deny:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           manifest-path: Cargo.toml
 
-  miri:
-    # Scoped to the unsafe leaf crates (verification ladder §17.2).
+  miri-canary:
+    # REDUCED: strict-provenance Miri on the smallest unsafe leaf (inf-alloc)
+    # only. The FULL Miri (inf-alloc + inf-fabric, all tests) is the M0-S02
+    # acceptance gate and runs in infinity-ci-full — that is the job that was
+    # timing out at 45 min here.
+    #
+    # 2026-08-05 (ADR-0065 D5): inf-alloc alone then blew this budget too —
+    # cancelled at 15 min with 14 of 31 tests done. Two causes, both fixed
+    # rather than papered over with a bigger timeout:
+    #   * the arena alloc/free storm verified every byte of every live range
+    #     through an interpreted loop, and its rare size tier is half a
+    #     megabyte — that ONE test measured > 7.4 min on the dev box. It now
+    #     probes range ends under Miri (full width still runs natively).
+    #   * the buffer-pool lease/release storm had no Miri guard at all
+    #     (100k interpreted iterations); it scales down like the others.
+    # `cargo miri setup` also rebuilds a Miri-instrumented std into
+    # ~/.cache/miri on every cold run — cached below, since rust-cache does
+    # not cover it by default.
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - name: miri (inf-alloc, inf-fabric)
-        run: cargo +nightly miri test -p inf-alloc -p inf-fabric
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: "~/.cache/miri"
+          key: miri-canary
+      - name: miri canary (inf-alloc, strict provenance)
+        run: cargo +nightly miri test -p inf-alloc
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
 
   loom:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
       - name: loom model (SPSC ring)
         run: cargo test -p inf-fabric --release loom_ -- --nocapture
         env:
           RUSTFLAGS: --cfg loom
           LOOM_MAX_PREEMPTIONS: "3"
 
-  fuzz-smoke:
-    # 10-minute smoke per PR (M0-S02); 1 h corpus run is the nightly job.
+  sim-smoke:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - name: install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
-      - name: fuzz RESP parser (smoke)
-        run: cargo +nightly fuzz run resp_parse -- -max_total_time=300
-        working-directory: crates/inf-wire
-      - name: fuzz fabric codec (smoke)
-        run: cargo +nightly fuzz run fabric_codec -- -max_total_time=300
-        working-directory: crates/inf-fabric
-      - name: fuzz glob matcher (smoke, M1 §5)
-        run: cargo +nightly fuzz run glob_match -- -max_total_time=300
-        working-directory: crates/inf-server
-      - name: fuzz SCAN cursor (smoke, M1 §5)
-        run: cargo +nightly fuzz run scan_cursor -- -max_total_time=300
-        working-directory: crates/inf-server
-
-  compat-diff:
-    # M0-S15 AC: command x edge-case matrix byte-identical to real Redis.
-    # M1-S14: the oracle is the PINNED redis:8.0.5 container (the version
-    # E1-E6 byte-diffed against), not whatever apt ships — version drift in
-    # the oracle would silently move the compat claim. The harness connects
-    # via INF_COMPAT_ORACLE_ADDR instead of spawning from PATH.
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: sim tests (determinism, oracle, planted lost-wakeup)
+        run: cargo test -p inf-sim
+      - name: m0-smoke determinism (CLI)
+        run: cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
+
+  fuzz-smoke:
+    # REDUCED: one decoder, 60 s, to catch gross breakage fast. cargo-fuzz
+    # auto-creates fuzz/corpus/resp_parse, so no seed dir is needed here. The
+    # full 14-target smoke (300 s each) runs in infinity-ci-full.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: fuzz RESP parser (60 s smoke)
+        run: cargo +nightly fuzz run resp_parse -- -max_total_time=60
+        working-directory: crates/inf-wire
+
+  compat-diff:
+    # M0-S15 / M1-S14 / M3-S21: declared command x edge-case matrix
+    # byte-identical to pinned Redis + RedisJSON oracles.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
       - name: start pinned oracle (redis 8.0.5, debug commands on, no persistence)
         run: |
           docker run -d --name oracle -p 6390:6379 redis:8.0.5 \
@@ -115,33 +173,55 @@ jobs:
           for i in $(seq 1 100); do
             (echo PING | timeout 1 nc 127.0.0.1 6390 | grep -q PONG) && break || sleep 0.2
           done
+      - name: start pinned RedisJSON oracle (Redis Stack 7.4.0-v8, ReJSON 2.8.9)
+        run: |
+          docker run -d --name json-oracle -p 6391:6379 \
+            -e REDIS_ARGS="--save '' --appendonly no" \
+            redis/redis-stack-server:7.4.0-v8@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
+          for i in $(seq 1 100); do
+            oracle_info=$(printf 'INFO MODULES\r\n' | timeout 1 nc 127.0.0.1 6391 || true)
+            if grep -q 'module:name=ReJSON' <<<"$oracle_info" && grep -q 'ver=20809' <<<"$oracle_info"; then
+              break
+            fi
+            sleep 0.2
+          done
+          grep -q 'module:name=ReJSON' <<<"$oracle_info"
+          grep -q 'ver=20809' <<<"$oracle_info"
       - name: compat-diff matrix + generated-matrix staleness gate
         run: cargo test -p compat -- --nocapture
         env:
           INF_COMPAT_ORACLE_ADDR: 127.0.0.1:6390
+          INF_COMPAT_JSON_ORACLE_ADDR: 127.0.0.1:6391
 
   client-smoke:
-    # M1-S03/S14 AC: major Redis client libraries work against infinityd out
-    # of the box (INFO fields, CLIENT surface, pub/sub, SCAN). One job per
-    # library would waste runners; one server serves all four sequentially.
+    # M1-S03/S14: major Redis client libraries work against infinityd out of
+    # the box. One server serves all four sequentially. Fast (~1-2 min).
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
       - name: build infinityd (release)
         run: cargo build --release -p infinityd
       - name: start infinityd
         run: |
           ./target/release/infinityd --port 6379 &
+          ready=0
           for i in $(seq 1 100); do
-            (echo PING | timeout 1 nc 127.0.0.1 6379 | grep -q PONG) && break || sleep 0.2
+            if printf '*1\r\n$4\r\nPING\r\n' | timeout 1 nc 127.0.0.1 6379 | grep -q PONG; then
+              ready=1; break
+            fi
+            sleep 0.2
           done
+          test "$ready" = 1 || { echo "infinityd never answered PING"; exit 1; }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: redis-py smoke
+        timeout-minutes: 5
         run: |
           pip install 'redis>=5,<7'
           python tests/client-smoke/smoke.py
@@ -149,6 +229,7 @@ jobs:
         with:
           node-version: "22"
       - name: node-redis smoke
+        timeout-minutes: 5
         run: |
           npm install --no-save redis@^4
           node smoke.mjs
@@ -157,6 +238,7 @@ jobs:
         with:
           go-version: "1.23"
       - name: go-redis smoke
+        timeout-minutes: 5
         run: go mod tidy && go run .
         working-directory: tests/client-smoke/go
       - uses: actions/setup-java@v4
@@ -164,34 +246,20 @@ jobs:
           distribution: temurin
           java-version: "21"
       - name: lettuce smoke
+        timeout-minutes: 10
         run: mvn -q -B compile exec:java -Dexec.mainClass=Smoke
         working-directory: tests/client-smoke/java
 
-  sim-smoke:
-    # M0-S20: deterministic simulator — smoke scenario twice with trace
-    # comparison, plus the in-process determinism/oracle/planted-bug tests.
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-      - name: sim tests (determinism, oracle, planted lost-wakeup)
-        run: cargo test -p inf-sim
-      - name: m0-smoke determinism (CLI)
-        run: cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
-
   kernel-matrix:
-    # Asserts io_uring feature-probe fallback across kernels (M0-S02).
-    # 5.15 (no multishot recv) / 6.1 / latest. Runners only provide their own
-    # kernel; older-kernel behavior is exercised via probe-forcing env vars
-    # until a self-hosted matrix box exists. PENDING LINUX VALIDATION.
+    # io_uring feature-probe fallback across kernels (M0-S02). Fast.
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
       - name: uring suite, probed features
         run: cargo test -p inf-runtime --features uring
       - name: uring suite, forced-degraded (oneshot recv, no provided buffers)

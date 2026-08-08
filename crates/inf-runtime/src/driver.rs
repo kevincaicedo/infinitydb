@@ -17,13 +17,105 @@
 use std::io;
 use std::time::Duration;
 
-use inf_alloc::{BufferId, BufferPool};
+use inf_alloc::{AlignedPool, BufferId, BufferPool};
 
 use crate::token::CompletionToken;
 
 /// Raw platform fd. Cell code treats it as an opaque handle; only drivers
 /// perform syscalls on it.
 pub type RawFd = std::os::fd::RawFd;
+
+/// A byte range whose stability outlives the borrow it was made from — the
+/// handoff shape for log-frame writes (M2-S05, ADR-0013 D1). The staging
+/// ring's `FrameLease` is the canonical stability proof: the sealed frame
+/// buffer never reallocates and is not reset until the write's terminal
+/// completion releases the lease.
+#[derive(Copy, Clone, Debug)]
+pub struct StableBytes {
+    ptr: *const u8,
+    len: u32,
+}
+
+impl StableBytes {
+    /// Capture `bytes` for a driver op that outlives this borrow.
+    ///
+    /// # Safety
+    /// The caller must guarantee the bytes stay live, at this address, and
+    /// unmodified until the op carrying them reaches its **terminal**
+    /// completion (`LogWritten` or `Error`). Holding a staging `FrameLease`
+    /// until that completion satisfies this.
+    #[must_use]
+    pub unsafe fn new(bytes: &[u8]) -> StableBytes {
+        StableBytes {
+            ptr: bytes.as_ptr(),
+            len: u32::try_from(bytes.len()).expect("stable byte range fits u32"),
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Address for the backend syscall/SQE. Public because out-of-crate
+    /// drivers (the `inf-sim` disk, test drivers) execute the op too;
+    /// dereferencing is sound only under the constructor's contract.
+    #[must_use]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+}
+
+/// A writable byte range whose stability outlives the borrow it was made
+/// from — the handoff shape for cold-tier reads (M4-S04). The canonical
+/// stability proof is an `inf-alloc` aligned-pool lease: the buffer's
+/// address is stable for the pool's lifetime and the lease is released
+/// only after the op's terminal completion (`TierRead` or `Error`).
+#[derive(Copy, Clone, Debug)]
+pub struct StableBytesMut {
+    ptr: *mut u8,
+    len: u32,
+}
+
+impl StableBytesMut {
+    /// Capture `bytes` as a read target for a driver op that outlives
+    /// this borrow.
+    ///
+    /// # Safety
+    /// The caller must guarantee the bytes stay live, at this address,
+    /// and **unaliased** (no other reader or writer touches them) until
+    /// the op carrying them reaches its terminal completion. Holding an
+    /// aligned-pool lease until that completion — and not reading the
+    /// buffer until it arrives — satisfies this.
+    #[must_use]
+    pub unsafe fn new(bytes: &mut [u8]) -> StableBytesMut {
+        StableBytesMut {
+            ptr: bytes.as_mut_ptr(),
+            len: u32::try_from(bytes.len()).expect("stable byte range fits u32"),
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Address for the backend syscall/SQE (see [`StableBytes::as_ptr`]).
+    #[must_use]
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+}
 
 /// Operations a cell may queue. `push` never performs a syscall — everything
 /// goes out in the single `submit_and_reap` per loop iteration (L3).
@@ -48,6 +140,36 @@ pub enum IoOp {
     /// Close the fd. Pending sends on it complete with `Error(ECANCELED)`
     /// (returning their buffers) before `Closed` is delivered.
     Close { fd: RawFd, token: CompletionToken },
+    /// Positional write of one sealed log frame (M2-S05, ADR-0013). Short
+    /// writes are resubmitted internally: `LogWritten` means ALL bytes hit
+    /// the fd. With `fsync_token`, an fdatasync is chained after the write
+    /// — `IOSQE_IO_LINK` on io_uring (ordering enforced in-kernel), issued
+    /// after the write's completion on fallback tiers. The chained sync's
+    /// `Synced` is delivered only once every byte of THIS write is both
+    /// written and covered (a sync that raced a short write is superseded
+    /// internally); a failed write cancels it (`Error{ECANCELED}` on
+    /// `fsync_token` — never a sync-past-failed-write).
+    LogWrite {
+        fd: RawFd,
+        offset: u64,
+        data: StableBytes,
+        token: CompletionToken,
+        fsync_token: Option<CompletionToken>,
+    },
+    /// Standalone fdatasync-class barrier (everysec tick, segment seal —
+    /// M2-S05). `Synced` on completion is the durability fact (L2).
+    Fdatasync { fd: RawFd, token: CompletionToken },
+    /// Positional cold-tier file read of exactly `buf.len()` bytes
+    /// (M4-S04). Short reads are resubmitted internally: `TierRead` means
+    /// the buffer is FULL. The issuing command holds the buffer's
+    /// aligned-pool lease across its suspension (the lease id is plain
+    /// data, not a borrow — the M0 custody rule) and releases it after
+    /// the terminal completion, on success and on `Error` alike; no
+    /// `BufferId` rides the completion because the recv pool is not
+    /// involved. A read past EOF that cannot fill the buffer completes
+    /// `Error{EIO}` — tier reads are always within the flushed range, so
+    /// a short file is corruption, not a condition.
+    TierRead { fd: RawFd, offset: u64, buf: StableBytesMut, token: CompletionToken },
 }
 
 /// One reaped completion: the token that was armed plus the outcome.
@@ -77,6 +199,16 @@ pub enum CompletionResult {
     Sent {
         buf: BufferId,
     },
+    /// Every byte of a `LogWrite` reached the fd (page cache, NOT durable).
+    /// This is the staging lease's release point — never an ack point.
+    LogWritten,
+    /// An fdatasync completed: everything it covers is durable. The ONLY
+    /// event that may advance the durability watermark (§8.2, ADR-0013).
+    Synced,
+    /// A `TierRead` filled its whole buffer (M4-S04). The issuing command
+    /// resumes, **re-resolves the address**, and only then deserializes —
+    /// never a pre-suspension pointer (the M0 custody rule).
+    TierRead,
     Closed,
     /// Terminal failure. Any buffer the op still held ALWAYS comes back
     /// here; `None` means no consumer-owned buffer was involved.
@@ -161,6 +293,23 @@ pub trait BackendDriver {
     /// (e.g. no provided-buffer support) degrade silently into
     /// [`Capabilities`] instead of erroring.
     fn register_pool(&mut self, pool: &mut BufferPool) -> io::Result<()>;
+
+    /// Register the cold-read aligned pool with the backend (M4-S08,
+    /// extending the frozen contract under the M2 discipline — recorded
+    /// in `interfaces-m0.md`): on io_uring the pool's buffers become the
+    /// ring's registered-buffer table and `TierRead` ops on them upgrade
+    /// to the fixed-buffer read opcode transparently; readiness and sim
+    /// backends no-op (their `TierRead` path is already positional).
+    /// Call once at cell boot, after [`register_pool`](Self::register_pool);
+    /// registration failure degrades [`Capabilities::fixed_buffers`]
+    /// rather than failing boot (plain reads remain correct).
+    ///
+    /// # Errors
+    /// Backend-fatal conditions only.
+    fn register_tier_pool(&mut self, pool: &mut AlignedPool) -> io::Result<()> {
+        let _ = pool;
+        Ok(())
+    }
 
     /// The boot-time feature probe result.
     fn capabilities(&self) -> Capabilities;

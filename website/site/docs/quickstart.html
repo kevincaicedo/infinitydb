@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quickstart — InfinityDB Docs</title>
+<meta name="description" content="Run InfinityDB from source or in Docker, connect with redis-cli, and create your first durable namespace.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2018'%3E%3Ccircle%20cx='10'%20cy='9'%20r='7'%20fill='none'%20stroke='%237c5cff'%20stroke-width='2.4'/%3E%3Ccircle%20cx='24'%20cy='9'%20r='7'%20fill='none'%20stroke='%233ee6c4'%20stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="../index.html" class="nav-brand">
+      <svg class="logo" width="34" height="18" viewBox="0 0 34 18" aria-hidden="true">
+        <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2.4"/>
+        <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2.4"/>
+      </svg>
+      <span class="mark">infinity<b>DB</b></span>
+      <span class="nav-badge neutral">DOCS</span>
+    </a>
+    <span class="nav-spacer"></span>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="nav-links">
+      <a href="../index.html">HOME</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
+    </div>
+  </div>
+</nav>
+
+<div class="docs-shell">
+  <aside class="docs-side">
+    <p class="side-h">Getting started</p>
+    <a class="side-link" href="index.html">Docs home</a>
+    <a class="side-link" href="quickstart.html" aria-current="page">Quickstart</a>
+    <p class="side-h">Concepts</p>
+    <a class="side-link" href="architecture.html">Architecture</a>
+    <a class="side-link" href="durability.html">Namespaces &amp; durability</a>
+    <p class="side-h">Operations</p>
+    <a class="side-link" href="deployment.html">Deployment</a>
+    <a class="side-link" href="operations.html">Operations</a>
+    <p class="side-h">Reference</p>
+    <a class="side-link" href="compat.html">Command matrix</a>
+    <a class="side-link" href="roadmap.html">Roadmap</a>
+  </aside>
+
+  <main class="docs-main">
+    <article>
+      <p class="doc-kicker">Getting started</p>
+  <h1 class="page-title">Quickstart</h1>
+  <p class="lede">InfinityDB speaks the Redis wire protocol, so the only client you need to try it is <code>redis-cli</code> (or any Redis SDK). It is an <strong>early alpha</strong>: single-node, no authentication or TLS yet (both arrive at M7), not production-ready.</p>
+
+  <div class="callout warn">
+    <span class="callout-tag"><strong>Honest packaging note:</strong></span>
+    the first public tagged release, <code>v0.3.0-alpha.1</code>, is in preparation (milestone M3 &mdash; ADR-0048 retired <code>v0.2.0-alpha.1</code> unused and moved the release act to M3). Until it lands there are <strong>no published binaries and no published container images</strong> &mdash; both paths below build from the repository. When the release pipeline runs on the first tag, prebuilt static Linux binaries and an image will be attached to the release.
+  </div>
+
+  <h2>Requirements</h2>
+  <ul>
+    <li><strong>Linux with io_uring</strong> &mdash; kernel 5.15+ (6.1+ recommended). InfinityDB&rsquo;s I/O plane is built on io_uring from the ground up; this is not optional on the serving path.</li>
+    <li><strong>Rust 1.95+</strong> for the source build.</li>
+    <li>macOS builds for <em>development only</em> via kqueue &mdash; it is not a performance or deployment target.</li>
+  </ul>
+
+  <h2>Path A — build from source</h2>
+<pre><code><span class="c"># from the repository root, inside infinitydb/</span>
+just check                            <span class="c"># fmt + dep-DAG law + cell deny-list + clippy + tests</span>
+cargo build --release -p infinityd
+./target/release/infinityd --port 6379</code></pre>
+
+  <p>Then, from another terminal:</p>
+<pre><code>redis-cli -p 6379 ping                <span class="c"># PONG</span>
+redis-cli -p 6379 set hello world     <span class="c"># OK</span>
+redis-cli -p 6379 get hello           <span class="c"># "world"</span></code></pre>
+
+  <h2>Path B — build the Docker image from the repo</h2>
+  <p>The repository carries a <code>Dockerfile</code> (static musl build into a <code>scratch</code>-based image). Build and run it locally:</p>
+<pre><code><span class="c"># from the repository root, inside infinitydb/</span>
+docker build -t infinitydb:dev .
+
+docker run --rm -p 6379:6379 \
+  --security-opt seccomp=deploy/seccomp/infinitydb-seccomp.json \
+  infinitydb:dev</code></pre>
+
+  <div class="callout">
+    <span class="callout-tag"><strong>The <code>--security-opt seccomp=&hellip;</code> flag is required.</strong></span>
+    InfinityDB uses Linux io_uring, and <strong>Docker&rsquo;s default seccomp profile blocks the io_uring syscalls</strong> (<code>io_uring_setup</code> and friends). The bundled profile at <code>deploy/seccomp/infinitydb-seccomp.json</code> re-enables io_uring while still denying the dangerous container-escape syscalls. Alternatives (including a strict allow-list posture and why <code>seccomp=unconfined</code> is development-only) are on the <a href="deployment.html">deployment page</a>. If the container exits complaining about io_uring setup, seccomp is the cause.
+  </div>
+  <p>Running with a mounted data directory, systemd units, the data-dir layout, and every server flag are on the <a href="deployment.html">deployment page</a>.</p>
+
+  <h2>First durable namespace</h2>
+  <p>Durability in InfinityDB is a property of the <em>namespace</em>, not the server. A fresh node serves memory-mode namespaces (pure cache semantics). One command creates a durable one:</p>
+<pre><code>redis-cli -p 6379
+inf&gt; INF.NS CREATE orders MODE durable FSYNC always
+inf&gt; SET orders:invoice:1009 "paid"     <span class="c"># the reply arrives only after group-commit fsync</span>
+inf&gt; INF.CKPT WAIT                       <span class="c"># take a fuzzy checkpoint; returns when the MANIFEST is durable</span></code></pre>
+  <p>What <code>always</code>, <code>everysec</code>, and <code>memory</code> mean precisely &mdash; ack points, loss windows, crash behavior, recovery &mdash; is specified on the <a href="durability.html">namespaces &amp; durability page</a>. Read it before trusting the durable modes with anything you care about; it is short and unusually honest.</p>
+
+  <h2 id="clients">Client libraries</h2>
+  <p>Any Redis client works &mdash; InfinityDB negotiates RESP2 and RESP3 (<code>HELLO 3</code>) like Redis does. These four libraries are exercised end-to-end in the repository&rsquo;s client-smoke suite (<code>tests/client-smoke/</code> &mdash; connection negotiation, strings, expiry, INFO, SCAN iteration, pub/sub); the snippets below use the same API calls the smoke scripts run.</p>
+
+  <h3>redis-py (Python)</h3>
+<pre><code><span class="c"># pip install redis</span>
+import redis
+
+r = redis.Redis(host="127.0.0.1", port=6379, decode_responses=True)
+assert r.ping() is True
+r.set("greeting", "hello")
+print(r.get("greeting"))        <span class="c"># hello</span>
+r.expire("greeting", 100)
+print(r.ttl("greeting"))        <span class="c"># 100 (or just under)</span></code></pre>
+
+  <h3>node-redis (Node.js)</h3>
+<pre><code><span class="c">// npm install redis</span>
+import { createClient } from "redis";
+
+const client = createClient({ socket: { host: "127.0.0.1", port: 6379 } });
+await client.connect();
+console.log(await client.ping());          <span class="c">// PONG</span>
+await client.set("greeting", "hello");
+console.log(await client.get("greeting")); <span class="c">// hello</span>
+await client.quit();</code></pre>
+
+  <h3>go-redis (Go)</h3>
+<pre><code><span class="c">// go get github.com/redis/go-redis/v9</span>
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/redis/go-redis/v9"
+)
+
+func main() {
+	ctx := context.Background()
+	r := redis.NewClient(&amp;redis.Options{Addr: "127.0.0.1:6379"})
+	fmt.Println(r.Ping(ctx).Val())            <span class="c">// PONG</span>
+	r.Set(ctx, "greeting", "hello", 0)
+	fmt.Println(r.Get(ctx, "greeting").Val()) <span class="c">// hello</span>
+}</code></pre>
+
+  <h3>Lettuce (Java)</h3>
+<pre><code><span class="c">// io.lettuce:lettuce-core</span>
+import io.lettuce.core.RedisClient;
+import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.api.sync.RedisCommands;
+
+RedisClient client = RedisClient.create("redis://127.0.0.1:6379");
+try (StatefulRedisConnection&lt;String, String&gt; conn = client.connect()) {
+    RedisCommands&lt;String, String&gt; r = conn.sync();
+    System.out.println(r.ping());          <span class="c">// PONG</span>
+    r.set("greeting", "hello");
+    System.out.println(r.get("greeting")); <span class="c">// hello</span>
+} finally {
+    client.shutdown();
+}</code></pre>
+
+  <h2>Kicking the tires</h2>
+<pre><code><span class="c"># which commands exist, and at what compatibility level?</span>
+redis-cli -p 6379 command              <span class="c"># the honest registry: implemented surface only</span>
+
+<span class="c"># watch persistence internals</span>
+redis-cli -p 6379 info persistence    <span class="c"># watermark, fsync histograms, checkpoint state, loading progress</span>
+
+<span class="c"># pub/sub with RESP3 push</span>
+redis-cli -3 -p 6379 subscribe orders:events</code></pre>
+  <p>The per-command compatibility story &mdash; what is <code>full</code> (byte-diff-verified against Redis 8.0.5), what is <code>partial</code> with documented deviations &mdash; is in the <a href="compat.html">generated compatibility matrix</a>.</p>
+
+  <h2>Developer extras</h2>
+<pre><code>just compat        <span class="c"># byte-diff vs a local redis-server</span>
+just sim-smoke     <span class="c"># deterministic simulator, trace-identity check</span>
+just loom          <span class="c"># concurrency model-check of the SPSC ring</span></code></pre>
+
+  <div class="doc-footer-nav">
+    <a href="index.html">&larr; Docs home</a>
+    <a href="durability.html">Namespaces &amp; durability &rarr;</a>
+  </div>
+    </article>
+  </main>
+</div>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span class="mark">&copy; 2026 INFINITYDB &mdash; APACHE 2.0 &middot; RUST &middot; <b>infinityd</b></span>
+    <div class="footer-links">
+      <a href="index.html">DOCS</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a href="https://github.com/">GITHUB &#8599;</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var t = document.querySelector('.nav-toggle');
+  var l = document.querySelector('.nav-links');
+  if (t && l) t.addEventListener('click', function () {
+    var open = l.classList.toggle('open');
+    t.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+})();
+</script>
+</body>
+</html>

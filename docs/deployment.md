@@ -127,6 +127,33 @@ redis-cli config set client-output-buffer-limit "pubsub 33554432 8388608 60"
 `allkeys-lru`, `volatile-lru`, `allkeys-lfu`, `volatile-lfu`, `allkeys-random`,
 `volatile-random`, `volatile-ttl`.
 
+### Per-namespace budgets (named memory namespaces)
+
+Named **memory** namespaces created with `INF.NS` carry their own enforced
+pressure config since `v0.4.0` (M4-S27, ADR-0068):
+
+```bash
+redis-cli INF.NS CREATE sessions EVICTION allkeys-lru MAXMEMORY 512mb
+redis-cli INF.NS SET sessions MAXMEMORY 1gb          # hot-reloadable
+redis-cli INF.NS SET sessions EVICTION inherit       # back to the node policy
+redis-cli INF.NS SET sessions MAXMEMORY 0            # remove the budget
+```
+
+- **With its own `MAXMEMORY`**, a namespace evicts toward its budget in
+  isolation: it never displaces other namespaces' keys, and other
+  namespaces never reclaim from it. OOM refusals at its budget are scoped
+  to connections using that namespace — the error is the Redis-exact
+  `OOM` string, but the scope is the namespace, not the node.
+- **Without one**, the namespace inherits the node `maxmemory`/policy and
+  participates in node-wide eviction like the numbered databases.
+- `EVICTION` unset (or `inherit`) follows `maxmemory-policy`; an explicit
+  per-namespace policy wins over later `CONFIG SET maxmemory-policy`.
+- **Durable namespaces never evict** (replayed data must not silently
+  disappear); their `EVICTION`/`MAXMEMORY` refuse typed. **Tiered
+  namespaces** budget memory with `MEM-BUDGET` (demotion to disk, not key
+  death) and refuse these keys too — one budget authority per namespace.
+- Like `maxmemory`, a per-namespace budget divides across cells.
+
 ## Connecting
 
 Any Redis client works. Examples:
@@ -159,3 +186,7 @@ supported and any documented deviations.
 - **`MULTI`/`EXEC`** return "not yet supported" errors.
 
 See the [roadmap](roadmap.md) for what lands when.
+
+For running a dataset larger than RAM (durable-tiered namespaces, from
+`v0.4.0-alpha`), see **[Operating tiered storage](ops-tiered-storage.md)** —
+watermarks, memory budgets, the `INFO tiering` fields, and what to alarm on.

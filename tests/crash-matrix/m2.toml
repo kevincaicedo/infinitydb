@@ -1,0 +1,87 @@
+# M2-S17 crash matrix (ADR-0020 D1/D2): {fault point} x {fsync policy} x
+# {workload shape}, kill-and-recover. The runner (`tests/matrix.rs`)
+# executes every row x policy x workload x seed on the MemFs tier —
+# process-KILL physics: completed writes survive; the power-cut physics
+# (lose/tear/reorder of un-fsynced writes) are the M2-S18 sim disk and
+# the M2-S19 sweep. Every point in the fault inventories must appear in
+# a row (the runner enforces it), and a row whose point never fires
+# fails (a vacuous row is a rotted row).
+#
+# expect vocabulary (verified against recovery's typed outcomes):
+#   torn-tail     — recovery truncates the torn/failed final write
+#                   (`torn_truncated_at = Some`), everything before it
+#                   survives
+#   clean         — recovery finds a clean end (`torn_truncated_at =
+#                   None`), zero loss
+#   unit-resolves — the interrupted MANIFEST publication resolves to
+#                   exactly one recovery unit (old xor new, never
+#                   neither, never both-partial)
+#   fail-stop     — node-tier: the process exits non-zero with zero acks
+#                   for the affected batch (carried by the named test)
+
+schema = 1
+milestone = "m2"
+# Seeds per (row x policy x workload) on PRs; the nightly expands the
+# count via CRASH_MATRIX_SEEDS.
+seeds = 3
+
+[[row]]
+point = "torn_frame"
+policies = ["always", "everysec"]
+workloads = ["steady", "rotation_heavy", "ckpt_cycle"]
+expect = "torn-tail"
+
+[[row]]
+point = "log_append_short_write"
+policies = ["always", "everysec"]
+workloads = ["steady", "rotation_heavy"]
+expect = "torn-tail"
+
+[[row]]
+point = "fsync_err"
+policies = ["always", "everysec"]
+workloads = ["rotation_heavy"]
+expect = "clean"
+
+[[row]]
+point = "power_cut_after_seal"
+policies = ["always", "everysec"]
+workloads = ["rotation_heavy"]
+expect = "clean"
+
+[[row]]
+point = "prealloc_no_space"
+policies = ["always", "everysec"]
+workloads = ["rotation_heavy"]
+expect = "clean"
+
+# dir-fsync barrier at segment preallocation (the rotation-tier site).
+[[row]]
+point = "dir_fsync_fail"
+policies = ["always", "everysec"]
+workloads = ["rotation_heavy"]
+expect = "clean"
+
+# dir-fsync barrier at the MANIFEST envelope swap (publication site).
+[[row]]
+point = "dir_fsync_fail"
+policies = ["always", "everysec"]
+workloads = ["ckpt_cycle"]
+expect = "unit-resolves"
+
+[[row]]
+point = "manifest_rename_fail"
+policies = ["always", "everysec"]
+workloads = ["ckpt_cycle"]
+expect = "unit-resolves"
+
+# Node tier (ADR-0020 D3): the fsyncgate row — injected EIO on the fsync
+# completion of a live uring node; process fail-stops with exit code 3,
+# zero acks for the affected batch, restart recovers the pre-batch acked
+# state. Carried by `tests/fsyncgate.rs` as a child-process test; the
+# MemFs runner counts it for coverage and skips execution.
+[[row]]
+point = "durable_fsync_eio"
+tier = "node"
+test = "fsyncgate"
+expect = "fail-stop"

@@ -1,0 +1,50 @@
+# Allowlist for scripts/check-ledger-copy.py — one canonical token per line,
+# format "<number> <unit>", lowercase, no thousands separators.
+#
+# RULE: a token may only be added here if
+#   (a) an **Allowed** row in docs/claim-ledger.md covers the number, in
+#       which case the comment names the row; or
+#   (b) it is demonstrably NOT a performance claim (config example, wire
+#       format bound), in which case the comment says so explicitly.
+# Regenerate/review this file whenever the ledger changes.
+
+# --- ledger C12 (Allowed): DST durability sweep -------------------------
+# (the 1.33% legal-refusal disclosure was retired by frame v2 — ADR-0031;
+#  C12 re-signed at the S19 walk 2026-07-10, site copy updated the same day)
+
+# --- ledger C14 (Allowed): cold-boot recovery ---------------------------
+10 gb           # C14: dataset size of the measured boot
+10 s            # C14: "under 10 seconds" measured wording
+9.8 s           # C14: measured boot time (3 replicates)
+15 s            # C14: the gate value, disclosed alongside the measurement
+1 %             # C14 replicate spread; also C15 "≤ 1% on every gate mix"
+
+# --- ledger C15 (Allowed): memory namespaces pay zero for durability ----
+0.63 %          # C15: worst-case A/B delta
+
+# --- ledger C16 (Allowed): fork-free, memory-flat checkpoints -----------
+15 mib          # C16: RSS-overhead bound vs no-checkpoint control
+14.4 mib        # C16: measured value
+
+# --- ledger C21 (Allowed): exact memory attribution ---------------------
+1.1 %           # C21: sum(domains) vs RSS divergence
+1 gb            # C21: durable fill size of the measured row
+
+# --- ledger C8 (Allowed): LFU hit-rate parity ---------------------------
+96.19 %         # C8: "96.19% vs 96.19% (+0.00 pp)" — landing-page stat tile cites the allowed wording
+
+# --- historical Vortex post-mortem facts (master plan §2) ----------------
+# These describe the RETIRED predecessor engine (and, for RC-4, published
+# third-party systems), quoted verbatim from the constitutional post-mortem
+# in docs/infinity-master-plan.md §2. They are not InfinityDB claims; the
+# blog post carries an explicit disclaimer note saying exactly that.
+966 ms          # §2 preamble (RC context): Vortex p99.9 cliffs under load
+75 %            # §2 RC-1: Vortex CPU share in io_uring completion handling
+25 μs           # §2 RC-4: the invalid POC's measured cross-shard hop cost
+45 μs           # §2 RC-4: upper bound of the same invalid POC measurement
+2 μs            # §2 RC-4: published batched cross-core hop range of production thread-per-core systems (Seastar/Dragonfly/Redpanda)
+
+# --- non-claims (documented) ---------------------------------------------
+16 gb           # config example in the INF.NS docs (MAXMEMORY 16gb) — master plan §4.2 example, not a measurement
+16 mib          # record-format value bound (SETRANGE note in the compat matrix; value bound on the operations limitations list) — wire format, not a measurement
+256 mib         # config defaults (--segment-bytes / --ckpt-interval-bytes) on the deployment page — configuration values, not measurements

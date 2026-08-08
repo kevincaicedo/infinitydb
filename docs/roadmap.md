@@ -26,7 +26,11 @@ Turns the skeleton into a usable, memory-only Redis-compatible cache:
 - A hierarchical TTL timing wheel with budgeted active expiry that holds tail
   latency under same-instant expiry storms.
 - An eviction engine with all eight Redis policies (CLOCK recency + Count-Min
-  Sketch frequency) and per-namespace `maxmemory`.
+  Sketch frequency) under the node-wide `maxmemory`. Per-namespace
+  `MAXMEMORY`/`EVICTION` enforcement on named memory namespaces ships with
+  `v0.4.0` (M4-S27): a namespace with its own budget evicts toward it in
+  isolation — never by displacing other namespaces' keys — and durable
+  namespaces never evict by design.
 - Namespaces v1 (`SELECT` + the `INF.NS` registry, memory mode).
 - Pub/Sub over the fabric, with RESP3 push and per-connection output caps.
 - Release engineering: Docker image, signed release artifacts, an SBOM, and a

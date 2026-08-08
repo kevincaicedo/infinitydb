@@ -11,15 +11,78 @@ description = "Per-cell records, index, string ops, slot routing"
 inf-foundation.workspace = true
 inf-alloc.workspace = true
 inf-simd.workspace = true
+inf-log.workspace = true
+inf-doc = { workspace = true, optional = true }
+
+[features]
+# The document engine edge (ADR-0032 D7, ADR-0037 D7). Default-on; slim
+# builds disable it and cannot construct or replay JsonDoc records.
+default = ["doc"]
+doc = ["dep:inf-doc"]
+# Repeated-key interning experiment (M3-S04, ADR-0038) - default-off.
+doc-intern-keys = ["doc", "inf-doc/doc-intern-keys"]
 
 [dev-dependencies]
 proptest.workspace = true
 criterion.workspace = true
+# statvfs for the M4-S15 endurance test's real-filesystem reclaim assert.
+libc.workspace = true
+# M4-S21: the `*_nospace` injection legs in `tiered_diskfull.rs` — the
+# same dev-dependency feature unification the inf-log tests ride.
+inf-foundation = { workspace = true, features = ["fault-points"] }
 
 [[bench]]
 name = "store"
 harness = false
 test = false
+
+[[bench]]
+name = "resolver"
+harness = false
+test = false
+
+[[bench]]
+name = "mutation"
+harness = false
+test = false
+
+[[bench]]
+name = "demotion_storm"
+harness = false
+test = false
+
+[[bench]]
+name = "compaction_storm"
+harness = false
+test = false
+
+[[bench]]
+name = "recovery_gate"
+harness = false
+test = false
+
+[[bench]]
+name = "write_accounting"
+harness = false
+test = false
+
+[[bench]]
+name = "doc_ingest"
+harness = false
+test = false
+required-features = ["doc"]
+
+[[bench]]
+name = "doc_durability"
+harness = false
+test = false
+required-features = ["doc"]
+
+[[bench]]
+name = "doc_prefetch"
+harness = false
+test = false
+required-features = ["doc"]
 
 [lints]
 workspace = true
