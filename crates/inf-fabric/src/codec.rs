@@ -12,6 +12,8 @@
 //! `inf_foundation::varint` for byte-slice lengths and counts. `Batch`
 //! payloads nest complete non-batch frames, so M4's `LockOp`/`ExecOp` extend
 //! the vocabulary by adding opcodes, not by reshaping the transport.
+//! [`Op::ApplyNs`] (M2-S08, ADR-0015 D1) is the first such additive opcode:
+//! existing wire layouts are untouched, v0 stays the frame version.
 //!
 //! [`decode`] is **total**: any byte input either parses or returns a typed
 //! [`CodecError`] — no panics, no UB (fuzzed by `fuzz/fuzz_targets/
@@ -29,7 +31,7 @@ use crate::msg::FabricToken;
 /// Wire version emitted and accepted by this codec.
 pub const CODEC_VERSION: u8 = 0;
 
-/// Maximum number of argument slices in an [`Op::Apply`].
+/// Maximum number of argument slices in an [`Op::Apply`] / [`Op::ApplyNs`].
 pub const MAX_APPLY_ARGS: usize = 16;
 
 /// Maximum number of nested ops in an [`Op::Batch`].
@@ -42,6 +44,12 @@ const OP_WRITE: u8 = 2;
 const OP_APPLY: u8 = 3;
 const OP_BATCH: u8 = 4;
 const OP_REPLY: u8 = 5;
+const OP_APPLY_NS: u8 = 6;
+
+/// Smallest namespace id an [`Op::ApplyNs`] may carry: ids `0..16` are the
+/// default namespaces (`db0..db15`) and ride [`Op::Apply`]'s packed `cmd`
+/// byte — one canonical encoding per op (ADR-0015 D1).
+const APPLY_NS_MIN: u32 = 16;
 
 const OUTCOME_OK: u8 = 0;
 const OUTCOME_BYTES: u8 = 1;
@@ -156,8 +164,8 @@ pub enum Outcome<'a> {
     Err(ErrCode),
 }
 
-/// Argument slices for [`Op::Apply`] — at most [`MAX_APPLY_ARGS`], stored
-/// inline (no allocation on encode or decode).
+/// Argument slices for [`Op::Apply`] / [`Op::ApplyNs`] — at most
+/// [`MAX_APPLY_ARGS`], stored inline (no allocation on encode or decode).
 #[derive(Copy, Clone)]
 pub struct ApplyArgs<'a> {
     args: [&'a [u8]; MAX_APPLY_ARGS],
@@ -234,6 +242,16 @@ pub enum Op<'a> {
     /// Generic remote command execution — M0-experimental (M4 reshapes into
     /// `ExecOp`).
     Apply { token: FabricToken, slot: KeySlot, cmd: u8, args: ApplyArgs<'a> },
+    /// Generic remote command execution in a **named** namespace (M2-S08,
+    /// ADR-0015 D1) — the additive opcode reserved by ADR-0009 §4. Mirrors
+    /// [`Op::Apply`] with the namespace id as an explicit `u32`
+    /// (little-endian, fixed width) placed right after `cmd`; `cmd` keeps
+    /// the `{0:4 | proto:4}` packing (the db nibble is always zero here).
+    ///
+    /// `ns` must be `>= 16`: ids `0..16` are the default namespaces and
+    /// ride [`Op::Apply`] — one canonical encoding per op (ADR-0015 D1).
+    /// [`decode`] rejects `ns < 16` with [`CodecError::ApplyNsDefault`].
+    ApplyNs { token: FabricToken, slot: KeySlot, cmd: u8, ns: u32, args: ApplyArgs<'a> },
     /// Per-destination coalescing of non-batch data ops (one destination).
     /// `Reply` and nested `Batch` are rejected by [`encode`]/[`decode`].
     Batch { ops: Vec<Op<'a>> },
@@ -247,6 +265,7 @@ impl Op<'_> {
             Op::Read { .. } => OP_READ,
             Op::Write { .. } => OP_WRITE,
             Op::Apply { .. } => OP_APPLY,
+            Op::ApplyNs { .. } => OP_APPLY_NS,
             Op::Batch { .. } => OP_BATCH,
             Op::Reply { .. } => OP_REPLY,
         }
@@ -275,8 +294,11 @@ pub enum CodecError {
     InvalidWriteFlags(u8),
     /// Invalid tag byte (expire/outcome/bool).
     InvalidTag(u8),
-    /// `Apply` declared more than [`MAX_APPLY_ARGS`] arguments.
+    /// `Apply`/`ApplyNs` declared more than [`MAX_APPLY_ARGS`] arguments.
     TooManyArgs(u64),
+    /// `ApplyNs` named a default namespace (`ns < 16`). Defaults ride
+    /// [`Op::Apply`] — one canonical encoding per op (ADR-0015 D1).
+    ApplyNsDefault(u32),
     /// `Batch` declared more than [`MAX_BATCH_OPS`] ops.
     TooManyBatchOps(u64),
     /// `Batch` nested inside `Batch`.
@@ -298,6 +320,9 @@ impl fmt::Display for CodecError {
             CodecError::InvalidWriteFlags(bits) => write!(f, "invalid write flags {bits:#04x}"),
             CodecError::InvalidTag(tag) => write!(f, "invalid tag byte {tag}"),
             CodecError::TooManyArgs(n) => write!(f, "apply args {n} > {MAX_APPLY_ARGS}"),
+            CodecError::ApplyNsDefault(ns) => {
+                write!(f, "apply-ns namespace {ns} is a default (< {APPLY_NS_MIN})")
+            }
             CodecError::TooManyBatchOps(n) => write!(f, "batch ops {n} > {MAX_BATCH_OPS}"),
             CodecError::NestedBatch => write!(f, "batch nested inside batch"),
             CodecError::ReplyInBatch => write!(f, "reply nested inside batch"),
@@ -311,9 +336,12 @@ impl std::error::Error for CodecError {}
 ///
 /// # Panics
 ///
-/// Panics if a `Batch` nests another `Batch` or a `Reply` (rejected before
-/// any bytes are written), or if a payload exceeds `u32::MAX` bytes (not
-/// reachable with in-contract key/value sizes).
+/// Panics if a `Batch` nests another `Batch` or a `Reply`, or if an
+/// `ApplyNs` names a default namespace (`ns < 16` — defaults ride
+/// `Op::Apply`; ADR-0015 D1); both are rejected before any bytes are
+/// written, mirroring what [`decode`] refuses. Also panics if a payload
+/// exceeds `u32::MAX` bytes (not reachable with in-contract key/value
+/// sizes).
 pub fn encode(op: &Op<'_>, out: &mut Vec<u8>) {
     if let Op::Batch { ops } = op {
         for nested in ops {
@@ -323,6 +351,9 @@ pub fn encode(op: &Op<'_>, out: &mut Vec<u8>) {
                 _ => {}
             }
         }
+    }
+    if let Op::ApplyNs { ns, .. } = op {
+        assert!(*ns >= APPLY_NS_MIN, "ApplyNs ns {ns} is a default namespace (rides Op::Apply)");
     }
     let start = out.len();
     out.extend_from_slice(&[CODEC_VERSION, op.opcode(), 0, 0]); // flags:u16 = 0
@@ -358,6 +389,16 @@ fn encode_payload(op: &Op<'_>, out: &mut Vec<u8>) {
             out.extend_from_slice(&token.0.to_le_bytes());
             out.extend_from_slice(&slot.get().to_le_bytes());
             out.push(*cmd);
+            varint::encode_u64(args.len() as u64, out);
+            for arg in args.as_slice() {
+                encode_bytes(arg, out);
+            }
+        }
+        Op::ApplyNs { token, slot, cmd, ns, args } => {
+            out.extend_from_slice(&token.0.to_le_bytes());
+            out.extend_from_slice(&slot.get().to_le_bytes());
+            out.push(*cmd);
+            out.extend_from_slice(&ns.to_le_bytes());
             varint::encode_u64(args.len() as u64, out);
             for arg in args.as_slice() {
                 encode_bytes(arg, out);
@@ -492,6 +533,25 @@ fn decode_frame(buf: &[u8], nested: bool) -> Result<(Op<'_>, usize), CodecError>
             // argc <= MAX_APPLY_ARGS < 256, so the cast is lossless.
             Op::Apply { token, slot, cmd, args: ApplyArgs { args: packed, len: argc as u8 } }
         }
+        OP_APPLY_NS => {
+            let token = reader.token()?;
+            let slot = reader.slot()?;
+            let cmd = reader.u8()?;
+            let ns = reader.u32_le()?;
+            if ns < APPLY_NS_MIN {
+                return Err(CodecError::ApplyNsDefault(ns));
+            }
+            let argc = reader.varint()?;
+            if argc > MAX_APPLY_ARGS as u64 {
+                return Err(CodecError::TooManyArgs(argc));
+            }
+            let mut packed: [&[u8]; MAX_APPLY_ARGS] = [&[]; MAX_APPLY_ARGS];
+            for arg in packed.iter_mut().take(argc as usize) {
+                *arg = reader.bytes()?;
+            }
+            // argc <= MAX_APPLY_ARGS < 256, so the cast is lossless.
+            Op::ApplyNs { token, slot, cmd, ns, args: ApplyArgs { args: packed, len: argc as u8 } }
+        }
         OP_BATCH => {
             if nested {
                 return Err(CodecError::NestedBatch);
@@ -548,6 +608,11 @@ impl<'a> Reader<'a> {
     fn u16_le(&mut self) -> Result<u16, CodecError> {
         let b = self.take(2)?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn u32_le(&mut self) -> Result<u32, CodecError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     fn u64_le(&mut self) -> Result<u64, CodecError> {
@@ -645,10 +710,24 @@ mod tests {
             cmd: 0xEE,
             args: ApplyArgs::new(&[b"a".as_slice(), b"".as_slice(), b"ccc".as_slice()]).unwrap(),
         });
+        round_trip(&Op::ApplyNs {
+            token: token(7, 2),
+            slot: slot(100),
+            cmd: 0x02,
+            ns: 16,
+            args: ApplyArgs::new(&[b"a".as_slice(), b"".as_slice(), b"ccc".as_slice()]).unwrap(),
+        });
         round_trip(&Op::Batch {
             ops: vec![
                 Op::Read { token: token(2, 5), slot: slot(7), key: b"x" },
                 Op::Apply { token: token(2, 6), slot: slot(8), cmd: 1, args: ApplyArgs::EMPTY },
+                Op::ApplyNs {
+                    token: token(2, 7),
+                    slot: slot(9),
+                    cmd: 2,
+                    ns: u32::MAX,
+                    args: ApplyArgs::EMPTY,
+                },
             ],
         });
         round_trip(&Op::Batch { ops: Vec::new() });
@@ -683,8 +762,8 @@ mod tests {
         let mut bad_op = good.clone();
         bad_op[1] = 0;
         assert_eq!(decode(&bad_op), Err(CodecError::UnknownOp(0)));
-        bad_op[1] = 6;
-        assert_eq!(decode(&bad_op), Err(CodecError::UnknownOp(6)));
+        bad_op[1] = 7; // 6 is OP_APPLY_NS since M2-S08
+        assert_eq!(decode(&bad_op), Err(CodecError::UnknownOp(7)));
 
         let mut bad_flags = good.clone();
         bad_flags[2] = 1;
@@ -774,6 +853,106 @@ mod tests {
         varint::encode_u64(MAX_APPLY_ARGS as u64 + 1, &mut payload);
         let frame = frame_with(OP_APPLY, &payload);
         assert_eq!(decode(&frame), Err(CodecError::TooManyArgs(MAX_APPLY_ARGS as u64 + 1)));
+
+        // Same cap on the ApplyNs path (argc sits after the ns word).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&token(1, 1).0.to_le_bytes());
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.push(0); // cmd
+        payload.extend_from_slice(&16u32.to_le_bytes()); // ns
+        varint::encode_u64(MAX_APPLY_ARGS as u64 + 1, &mut payload);
+        let frame = frame_with(OP_APPLY_NS, &payload);
+        assert_eq!(decode(&frame), Err(CodecError::TooManyArgs(MAX_APPLY_ARGS as u64 + 1)));
+    }
+
+    /// M2-S08 AC: `ApplyNs` round-trips at the argument extremes (0, 1, and
+    /// [`MAX_APPLY_ARGS`] args) and at both ns boundaries (16, `u32::MAX`).
+    #[test]
+    fn apply_ns_round_trips_arg_extremes() {
+        round_trip(&Op::ApplyNs {
+            token: token(3, 9),
+            slot: slot(42),
+            cmd: 0x03,
+            ns: 16,
+            args: ApplyArgs::EMPTY,
+        });
+        round_trip(&Op::ApplyNs {
+            token: token(0, u64::from(u32::MAX)),
+            slot: slot(16383),
+            cmd: 0x02,
+            ns: u32::MAX,
+            args: ApplyArgs::new(&[b"key".as_slice()]).unwrap(),
+        });
+        let owned: Vec<Vec<u8>> = (0..MAX_APPLY_ARGS).map(|i| vec![i as u8; i]).collect();
+        let slices: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+        round_trip(&Op::ApplyNs {
+            token: token(1, 0),
+            slot: slot(0),
+            cmd: 0,
+            ns: 1 << 20,
+            args: ApplyArgs::new(&slices).unwrap(),
+        });
+    }
+
+    /// ADR-0015 D1: defaults ride `Op::Apply` — an `ApplyNs` frame naming a
+    /// default namespace (`ns < 16`) has no canonical meaning and is a typed
+    /// decode error, not a silent alias.
+    #[test]
+    fn rejects_apply_ns_default_namespace() {
+        for ns in [0u32, 15] {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&token(1, 1).0.to_le_bytes());
+            payload.extend_from_slice(&1u16.to_le_bytes());
+            payload.push(0x02); // cmd
+            payload.extend_from_slice(&ns.to_le_bytes());
+            varint::encode_u64(0, &mut payload); // argc
+            let frame = frame_with(OP_APPLY_NS, &payload);
+            assert_eq!(decode(&frame), Err(CodecError::ApplyNsDefault(ns)));
+        }
+    }
+
+    /// Golden wire layout for `ApplyNs` (M2-S08, ADR-0015 D1): pins the
+    /// byte-level encoding — `token(8) slot(2) cmd(1) ns(4, LE) argc(varint)
+    /// args…` — so drift is caught as a diff here, not on a peer.
+    #[test]
+    fn apply_ns_golden_wire_layout() {
+        let op = Op::ApplyNs {
+            token: token(2, 0x91),
+            slot: slot(5),
+            cmd: 0x23,
+            ns: 16,
+            args: ApplyArgs::new(&[b"ab".as_slice()]).unwrap(),
+        };
+        let golden: &[u8] = &[
+            0, 6, 0, 0, 19, 0, 0, 0, // header: v0, ApplyNs, flags 0, len 19
+            145, 0, 0, 0, 0, 0, 2, 0, // token: {origin:16, seq:48} = cell 2, seq 0x91
+            5, 0,    // slot
+            0x23, // cmd {0:4 | proto:4}
+            16, 0, 0, 0, // ns (u32 LE) — first non-default id
+            1, // argc (varint)
+            2, // arg0 len (varint)
+            b'a', b'b', // arg0
+        ];
+        let mut out = Vec::new();
+        encode(&op, &mut out);
+        assert_eq!(out.as_slice(), golden);
+        assert_eq!(decode(golden), Ok(op));
+    }
+
+    #[test]
+    #[should_panic(expected = "default namespace")]
+    fn encode_rejects_apply_ns_default() {
+        let mut out = Vec::new();
+        encode(
+            &Op::ApplyNs {
+                token: token(0, 0),
+                slot: slot(0),
+                cmd: 0,
+                ns: 15,
+                args: ApplyArgs::EMPTY,
+            },
+            &mut out,
+        );
     }
 
     #[test]
@@ -814,6 +993,13 @@ mod tests {
             token: u64,
             slot: u16,
             cmd: u8,
+            args: Vec<Vec<u8>>,
+        },
+        ApplyNs {
+            token: u64,
+            slot: u16,
+            cmd: u8,
+            ns: u32,
             args: Vec<Vec<u8>>,
         },
         Batch {
@@ -858,6 +1044,16 @@ mod tests {
                         args: ApplyArgs::new(&slices).unwrap(),
                     }
                 }
+                OwnedOp::ApplyNs { token, slot, cmd, ns, args } => {
+                    let slices: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
+                    Op::ApplyNs {
+                        token: FabricToken(*token),
+                        slot: KeySlot::new(*slot).unwrap(),
+                        cmd: *cmd,
+                        ns: *ns,
+                        args: ApplyArgs::new(&slices).unwrap(),
+                    }
+                }
                 OwnedOp::Batch { ops } => Op::Batch { ops: ops.iter().map(Self::to_op).collect() },
                 OwnedOp::Reply { token, outcome } => Op::Reply {
                     token: FabricToken(*token),
@@ -898,6 +1094,20 @@ mod tests {
                     token,
                     slot,
                     cmd,
+                    args
+                }),
+            (
+                any::<u64>(),
+                0..16384u16,
+                any::<u8>(),
+                16..=u32::MAX, // ns < 16 is not encodable (ADR-0015 D1)
+                prop::collection::vec(bytes.clone(), 0..MAX_APPLY_ARGS)
+            )
+                .prop_map(|(token, slot, cmd, ns, args)| OwnedOp::ApplyNs {
+                    token,
+                    slot,
+                    cmd,
+                    ns,
                     args
                 }),
             (any::<u64>(), outcome())

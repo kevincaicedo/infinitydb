@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 665714ed2c8e9c40e049473162461fbacc819d2f9dbf813d659414b162b1cbd5 # shrinks to value = Arr([Obj([("b", Null)])]), op = Merge(Obj([("a", Bool(false))]), [167, 3, 0, 0, 129, 97, 161]), path = "$..*"
+cc 7642e71dbedcfd8d0c1a43c87723c6d308e825b29d3e80ee219234205c743cf3 # shrinks to value = Arr([Arr([Null, Arr([Null])])]), op = ArrTrim(1, 1), path = "$..*"
+cc 4453d49029564794f0412668e99b99f0a541700749c8a2ad2adf215f0bb9ee31 # shrinks to value = Obj([("a", Obj([("b", Str("s"))]))]), op = Merge(Obj([("b", Str("s"))]), [167, 4, 0, 0, 129, 98, 129, 115]), path = "$..*"

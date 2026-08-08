@@ -1,0 +1,43 @@
+image: redis/redis-stack-server:7.4.0-v8
+digest: sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
+redis_version: 7.4.7
+module: ReJSON/20809 (2.8.9)
+command: INF_COMPAT_JSON_ORACLE_ADDR=127.0.0.1:6391 cargo test -p compat --test json_diff -- --nocapture
+corpus: 84 ordered cases re-derived from S11-S15 + minimized local fuzz regressions
+protocols: RESP2, RESP3
+executions: 168
+exact: 148
+allowlisted: 20
+semantic_equal_allowlisted: 0
+failures: 0
+
+oracle-driven protocol fixups (now exact):
+- JSON.TYPE uses bulk type names in RESP2; RESP3 uses the RedisJSON nested
+  one-element shape for `$` matches and a one-element legacy result.
+- JSON.NUMINCRBY/JSON.NUMMULTBY use RESP3 native integer/double/null arrays;
+  legacy numeric results are one-element arrays. RESP2 remains JSON bulk text.
+- JSON.MERGE applies a path-targeted null to the selected value literally;
+  only null members inside an object patch delete object members (RFC 7386).
+
+allowlist (each entry exists separately for RESP2 and RESP3):
+- JSON.DEBUG / s15-debug-missing: InfinityDB null vs RedisJSON integer 0.
+- JSON.ARRINSERT / edge-get-after-abort: InfinityDB validates every match
+  before commit; RedisJSON mutates an earlier match before a later index error.
+- JSON.DEL / edge-del-overlap: InfinityDB reports three raw recursive matches;
+  RedisJSON reports two removals; post-state is identical.
+- JSON.GET / edge-wrongtype-get: core Redis WRONGTYPE envelope vs module text.
+- JSON.ARRLEN / edge-wrongtype-arrlen: core WRONGTYPE envelope vs module text.
+- JSON.DEBUG / edge-debug-memory: canonical InfinityDB attribution vs module
+  allocator bytes.
+- JSON.GET / fuzz-exp-get: large-exponent f64 rounding/canonical text differs.
+- JSON.SET / edge-invalid-json: both reject; parser-specific text differs.
+- JSON.MERGE / edge-merge-overlap-get: InfinityDB computes retaining
+  overlaps from one immutable snapshot; RedisJSON cascades descendants.
+- JSON.ARRTRIM / edge-trim-overlap: both reach the same post-state;
+  RedisJSON returns a path error while InfinityDB reports per-match results.
+
+teeth:
+- `an_unallowlisted_deviation_fails` is the planted canary.
+- the live differential marks every used allowlist index and fails an unused
+  (stale) entry after the run.
+- raw RESP bytes govern; independent JSON semantic comparison is diagnostic.

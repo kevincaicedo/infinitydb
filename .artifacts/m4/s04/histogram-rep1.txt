@@ -1,0 +1,2 @@
+rounds: 300 (fadvise-DONTNEED per read; includes pump overhead)
+p50 169.8 us | p90 171.0 us | p99 176.4 us | max 256.8 us

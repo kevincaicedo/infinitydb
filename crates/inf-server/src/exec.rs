@@ -31,7 +31,16 @@ use crate::admin;
 use crate::clients::ClientRegistry;
 use crate::config::ConfigStore;
 use crate::glob::glob_match;
+#[cfg(feature = "doc")]
+use crate::json;
 use crate::pubsub;
+
+#[cfg(feature = "doc")]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct DocLogAdmission {
+    pub budget: usize,
+    pub record_max: usize,
+}
 
 /// Node-level state surfaced through the command layer (M0-S19 + M1-S03):
 /// the frozen tripwire snapshot, the memory-attribution domains the store
@@ -44,6 +53,14 @@ pub struct NodeInfo {
     /// Frozen order: sqes_per_submit, cqes_per_reap, cmds_per_iter,
     /// fabric_msgs_per_batch (each ×1000), loop_iter_p999_us.
     pub tripwires: Cell<[u64; 5]>,
+    /// M4-S26 split-service + cold-read scrape (ADR-0064 D3 + the five
+    /// ADR-0055 counters), flushed by the tiered MAINTAIN. Frozen
+    /// order: ram_hit_p{50,99,999}_us, cold_p{50,99,999}_us,
+    /// cold_read_qd_p99, coalesce_ratio_milli, cold_reads_inflight,
+    /// cold_queue_depth, cold_read_p99_us, cold_reads_issued,
+    /// cold_reads_enqueued. Identically zero on nodes that never
+    /// created a tiered namespace (the D8/S03 posture).
+    pub tiering_split: Cell<[u64; 13]>,
     /// Raw lifetime counters (submits, sqes, cqes, iterations, commands,
     /// fabric_msgs) — scrapers diff two snapshots for under-load ratios.
     pub raw_counters: Cell<[u64; 6]>,
@@ -74,10 +91,134 @@ pub struct NodeInfo {
     pub pubsub_fan_msgs: Cell<u64>,
     pub pubsub_delivered: Cell<u64>,
     pub cob_disconnections: Cell<u64>,
+    /// Durable-plane gauges (M2-S08, flushed by MAINTAIN — the S21
+    /// vocabulary for `INFO persistence`).
+    pub log_records_appended: Cell<u64>,
+    pub log_pending_bytes: Cell<u64>,
+    pub log_last_durable_lsn: Cell<u64>,
+    pub log_watermark_lag: Cell<u64>,
+    pub log_fsyncs_completed: Cell<u64>,
+    pub log_acks_gated: Cell<u64>,
+    /// M2-S22 tripwire + attribution observables: cumulative frames
+    /// queued (one per LOG-step writev — `log_writes_per_iter` divides
+    /// this by `raw_iterations`) and the staging domain's resident bytes
+    /// (2 × buffer capacity by construction — the L5 log-staging domain).
+    pub log_frames_queued: Cell<u64>,
+    pub log_staging_bytes: Cell<u64>,
+    /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).
+    pub ckpts_completed: Cell<u64>,
+    pub ckpts_aborted: Cell<u64>,
+    pub ckpt_last_unix_ms: Cell<u64>,
+    pub ckpt_last_begin_lsn: Cell<u64>,
+    pub ckpt_buffer_bytes: Cell<u64>,
+    /// MANIFEST + truncation gauges (M2-S11, flushed by MAINTAIN).
+    pub manifests_published: Cell<u64>,
+    pub manifests_aborted: Cell<u64>,
+    pub segments_truncated: Cell<u64>,
+    pub log_segments_live: Cell<u64>,
+    /// Checkpoint operator surface (M2-S20): streaming-now flag +
+    /// newest durable MANIFEST publication (unix ms, node-wide board
+    /// max — `rdb_last_save_time`/`LASTSAVE`).
+    pub ckpt_in_progress: Cell<u64>,
+    pub rdb_last_save_ms: Cell<u64>,
+    /// M2-S21: windowed rates (previous everysec-tick window) + fsync
+    /// latency percentiles (µs) + checkpoint age (s).
+    pub fsyncs_per_sec: Cell<u64>,
+    pub acks_per_sec: Cell<u64>,
+    pub fsync_p50_us: Cell<u64>,
+    pub fsync_p99_us: Cell<u64>,
+    pub fsync_p999_us: Cell<u64>,
+    /// M2.5-S07 group formation: records covered per durability fsync.
+    pub fsync_group_p50: Cell<u64>,
+    pub fsync_group_p99: Cell<u64>,
+    pub ckpt_age_s: Cell<u64>,
+    /// Boot-recovery gauges (M2-S15, flushed by MAINTAIN while any cell
+    /// is loading; `loading` drops to 0 the iteration after all-ready).
+    pub loading: Cell<u64>,
+    pub loading_start_unix_ms: Cell<u64>,
+    pub loading_total_bytes: Cell<u64>,
+    pub loading_loaded_bytes: Cell<u64>,
+    pub loading_cells_ready: Cell<u64>,
+    /// Node-wide memory board (M3-S25 INFO-attribution fix): set at plane
+    /// assembly when a control plane exists. `None` in bare harnesses,
+    /// where `INFO` renders cell scope and labels it.
+    pub memory_board: RefCell<Option<std::sync::Arc<crate::control::MemoryBoard>>>,
     /// CLIENT registry for this cell's connections (single-threaded).
     pub clients: RefCell<ClientRegistry>,
     /// Typed CONFIG store (M1-S03 freeze: keys + hot-reload classes).
     pub config: RefCell<ConfigStore>,
+    /// Per-cell compiled-path-program cache (M3-S10; ADR-0041 D1) —
+    /// shared by every connection and namespace the cell serves, sized
+    /// by `doc-path-cache-size` at node assembly (default 1024).
+    #[cfg(feature = "doc")]
+    pub path_cache: RefCell<inf_doc::ProgramCache>,
+    /// Per-cell recycled JSON parser (M3-S11): scratch buffers survive
+    /// across commands (the S05 lever-G seam); limits re-point per
+    /// target namespace via `set_limits`.
+    #[cfg(feature = "doc")]
+    pub json_parser: RefCell<inf_doc::JsonParser>,
+    /// Per-cell recycled ingest output buffer (`parse_into`'s half of
+    /// the same seam).
+    #[cfg(feature = "doc")]
+    pub json_ingest_buf: RefCell<Vec<u8>>,
+    /// Present only around an admitted durable JSON write. Presence is the
+    /// capture flag and carries the exact aggregate/single-record limits,
+    /// so stale limits without capture are unrepresentable (ADR-0043 D8).
+    #[cfg(feature = "doc")]
+    pub(crate) doc_log_admission: Cell<Option<DocLogAdmission>>,
+    /// Per-cell recycled document-effect scratch, consumed immediately by
+    /// the durable staging hook after command execution (ADR-0043 D2/D5).
+    #[cfg(feature = "doc")]
+    pub(crate) doc_log: RefCell<json::DocLogScratch>,
+}
+
+/// Fold a keyspace report plus this cell's node-side bytes into the
+/// memory gauges `INFO` renders and the board publishes — one
+/// definition shared by the plane's MAINTAIN publisher and the INFO
+/// render, so the two can never drift.
+pub(crate) fn memory_gauges_of(
+    report: &inf_store::MemoryReport,
+    node: &NodeInfo,
+) -> crate::control::MemoryGauges {
+    crate::control::MemoryGauges {
+        used_bytes: report.attributed_bytes()
+            + node.wire_buffers_bytes.get()
+            + node.conn_state_bytes.get(),
+        docs_live: report.docs_live,
+        doc_tape_bytes: report.doc_tape_bytes,
+        doc_arena_bytes: report.doc_arena_bytes,
+        doc_resident_bytes: report.doc_resident_bytes,
+        doc_intern_bytes: report.doc_intern_bytes,
+        doc_slack_bytes: report.doc_slack_bytes,
+        doc_scratch_bytes: report.doc_scratch_bytes,
+        doc_path_cache_bytes: report.doc_path_cache_bytes,
+    }
+}
+
+impl NodeInfo {
+    /// Publish this cell's memory gauges to the node board and return the
+    /// node-wide fold — `None` without a board (bare harness): the caller
+    /// renders cell scope and labels it (M3-S25 fix).
+    pub(crate) fn publish_and_total_memory(
+        &self,
+        gauges: crate::control::MemoryGauges,
+    ) -> Option<crate::control::MemoryGauges> {
+        let board = self.memory_board.borrow();
+        let board = board.as_ref()?;
+        board.slot(self.cell.get()).publish(gauges);
+        Some(board.totals())
+    }
+
+    /// Add the document pools that are owned once per cell rather than once
+    /// per namespace/store. Called only by tooling/INFO after the keyspace
+    /// report is assembled; never on the command hot path.
+    #[cfg(feature = "doc")]
+    pub(crate) fn add_cell_doc_memory(&self, report: &mut inf_store::MemoryReport) {
+        report.doc_path_cache_bytes = self.path_cache.borrow().bytes() as u64;
+        report.doc_scratch_bytes += self.json_parser.borrow().scratch_bytes() as u64
+            + self.json_ingest_buf.borrow().capacity() as u64
+            + self.doc_log.borrow().bytes() as u64;
+    }
 }
 
 /// Per-connection execution state (protocol negotiated via `HELLO`,
@@ -89,6 +230,10 @@ pub struct ConnCx {
     pub id: u64,
     /// Selected default namespace (`SELECT 0..15`); 0 unless SELECTed.
     pub db: u16,
+    /// Selected *named* namespace (`INF.NS USE`, M2-S08); `None` = the
+    /// default-db path. One `Option` load is the memory fast path's whole
+    /// cost for the durable feature (M2-S09).
+    pub ns: Option<inf_store::NsId>,
     /// Subscribed channels, in subscription order (M1-S10). Empty vectors
     /// never allocate, so a non-subscriber connection pays two length
     /// loads at most.
@@ -108,6 +253,7 @@ impl Default for ConnCx {
             proto: Protocol::Resp2,
             id: 1,
             db: 0,
+            ns: None,
             sub_channels: Vec::new(),
             sub_patterns: Vec::new(),
             node: Rc::new(NodeInfo::default()),
@@ -174,14 +320,26 @@ pub fn execute(
         return arity_error(meta.name, &mut w);
     }
     // M1-S07 OOM gate: DENYOOM commands enter through metadata, never
-    // per-handler checks (kernel rule). The first test is one branch on the
-    // keyspace's cached flag; only genuine pressure pays the inline
-    // eviction escalation, and `noeviction`/unfreeable pressure answers
-    // the Redis-exact OOM error.
-    if meta.flags.contains(CmdFlags::DENYOOM) && ks.over_limit() && ks.free_for_write(now).is_err()
-    {
-        let mut w = RespWriter::new(out, cx.proto);
-        return w.error("OOM command not allowed when used memory > 'maxmemory'.");
+    // per-handler checks (kernel rule). The first test is one branch on a
+    // cached flag; only genuine pressure pays the inline eviction
+    // escalation, and `noeviction`/unfreeable pressure answers the
+    // Redis-exact OOM error. A connection on a named memory namespace
+    // with its own MAXMEMORY consults that namespace's flag *instead of*
+    // the global one (M4-S27, ADR-0068 D4) — the match dispatches on
+    // `cx.ns`, state this path already resolved, so the numbered-DB arm
+    // executes the M1 instructions unchanged (A/B: .artifacts/m4/s27/).
+    if meta.flags.contains(CmdFlags::DENYOOM) {
+        let refused = match cx.ns {
+            Some(ns) => match ks.ns_free_for_write(ns, now) {
+                Some(verdict) => verdict.is_err(),
+                None => ks.over_limit() && ks.free_for_write(now).is_err(),
+            },
+            None => ks.over_limit() && ks.free_for_write(now).is_err(),
+        };
+        if refused {
+            let mut w = RespWriter::new(out, cx.proto);
+            return w.error("OOM command not allowed when used memory > 'maxmemory'.");
+        }
     }
     // M1-S10: a RESP2 subscriber may only run the subscribe family + PING
     // (Redis `processCommand` order: after the OOM gate). RESP3 lifts this.
@@ -198,16 +356,30 @@ pub fn execute(
         }
         CommandId::Flushall => {
             let mut w = RespWriter::new(out, cx.proto);
+            // A durable flush needs per-key Delete records (S10/S11 makes
+            // truncation cheap); refuse loudly until then (ADR-0015).
+            if ks.ns_iter().any(|s| s.mode == inf_store::NsMode::Durable) {
+                return w.error(
+                    "ERR FLUSHALL on a node with durable namespaces is not yet supported (M2)",
+                );
+            }
             flush(argv, ks, None, now, &mut w);
         }
         CommandId::Flushdb => {
             let db = cx.db;
             let mut w = RespWriter::new(out, cx.proto);
+            if cx.ns.is_some() {
+                return w
+                    .error("ERR FLUSHDB on a named namespace is not yet supported (M2, ADR-0015)");
+            }
             flush(argv, ks, Some(db), now, &mut w);
         }
         CommandId::Copy => {
             let db = cx.db;
             let mut w = RespWriter::new(out, cx.proto);
+            if cx.ns.is_some() {
+                return w.error("ERR COPY within a named namespace is not yet supported (M2)");
+            }
             copy(argv, ks, db, now, &mut w);
         }
         CommandId::Info => {
@@ -219,8 +391,9 @@ pub fn execute(
             admin::config(argv, ks, &cx.node, &mut w);
         }
         CommandId::InfNs => {
+            let node = Rc::clone(&cx.node);
             let mut w = RespWriter::new(out, cx.proto);
-            admin::inf_ns(argv, ks, &cx.node, &mut w);
+            admin::inf_ns(argv, ks, cx, &node, &mut w);
         }
         // ---- pub/sub (M1-S10): conn-state ops here; registries, delivery,
         // and fan-out are plane state, so inside a node the plane intercepts
@@ -252,8 +425,27 @@ pub fn execute(
             pubsub::pubsub_fallback(&args, cx, out);
         }
         _ => {
-            let db = usize::from(cx.db);
-            execute_db(meta, argv, ks.db_mut(db), cx, now, out);
+            if let Some(id) = cx.ns {
+                // Tiered namespaces are plane-resident (M4-S26): their
+                // command path needs the reactor (cold-read suspension,
+                // WAL staging), so the planeless fallback refuses rather
+                // than silently serving the empty CellStore shell.
+                if ks.is_tiered(id) {
+                    let mut w = RespWriter::new(out, cx.proto);
+                    return w.error("ERR tiered namespaces require the server plane (M4-S26)");
+                }
+                // Named-namespace path (M2-S08): resolve by id — the
+                // registry is authoritative, so a namespace dropped after
+                // `INF.NS USE` answers a typed error, never a ghost store.
+                let Some(store) = ks.ns_store_mut(id) else {
+                    let mut w = RespWriter::new(out, cx.proto);
+                    return w.error("ERR the selected namespace was dropped (INF.NS USE again)");
+                };
+                execute_db(meta, argv, store, cx, now, out);
+            } else {
+                let db = usize::from(cx.db);
+                execute_db(meta, argv, ks.db_mut(db), cx, now, out);
+            }
         }
     }
     // Mutations refresh the cached pressure flag (no-op without a limit).
@@ -274,6 +466,13 @@ fn execute_db(
 ) {
     let mut w = RespWriter::new(out, cx.proto);
     match meta.id {
+        // Checkpoint operator surface (M2-S20): on a node the plane
+        // intercepts these before `execute` (they speak to the control
+        // handle); this is the planeless fallback (compat candidate,
+        // embedded) — the documented no-durable-plane error.
+        CommandId::InfCkpt | CommandId::Bgsave | CommandId::Lastsave => {
+            w.error("ERR checkpointing requires a durable node (no data dir)");
+        }
         CommandId::Ping => {
             if argv.len() > 2 {
                 w.error("ERR wrong number of arguments for 'ping' command");
@@ -295,9 +494,10 @@ fn execute_db(
             w.simple("OK");
             cx.close_requested.set(true);
         }
-        CommandId::Get => match store.get(argv.arg(1), now) {
-            Some(value) => w.bulk(value),
-            None => w.null(),
+        CommandId::Get => match store.get_str(argv.arg(1), now) {
+            Ok(Some(value)) => w.bulk(value),
+            Ok(None) => w.null(),
+            Err(e) => op_error(e, &mut w),
         },
         CommandId::Set => set(argv, store, &cx.node, now, &mut w),
         CommandId::Setnx => {
@@ -337,6 +537,11 @@ fn execute_db(
         }
         CommandId::Getdel => match store.getdel(argv.arg(1), now) {
             Some(value) => w.bulk(&value),
+            // The store answers `None` for both missing keys and
+            // non-string records (ADR-0037 D6); the command layer owns
+            // the split (M3-S11 matrix) — the second probe rides the
+            // cold miss path only.
+            None if store.exists(argv.arg(1), now) => op_error(OpError::WrongType, &mut w),
             None => w.null(),
         },
         CommandId::Getex => getex(argv, store, &cx.node, now, &mut w),
@@ -355,7 +560,14 @@ fn execute_db(
             w.int(found);
         }
         CommandId::Type => match store.type_of(argv.arg(1), now) {
-            Some(_) => w.simple("string"),
+            // An out-of-line string is a string to the client (M4-S17) —
+            // storage placement is never wire-visible.
+            Some(inf_store::TypeTag::String | inf_store::TypeTag::StringExtent) => {
+                w.simple("string")
+            }
+            // RedisJSON's module type name; S11 oracle-pins + allowlists it
+            // in the generic-command interaction matrix.
+            Some(inf_store::TypeTag::JsonDoc) => w.simple("ReJSON-RL"),
             None => w.simple("none"),
         },
         CommandId::Incr => incr(store, argv.arg(1), 1, now, &mut w),
@@ -388,7 +600,10 @@ fn execute_db(
             Ok(len) => w.int(len as i64),
             Err(e) => op_error(e, &mut w),
         },
-        CommandId::Strlen => w.int(store.strlen(argv.arg(1), now) as i64),
+        CommandId::Strlen => match store.strlen(argv.arg(1), now) {
+            Ok(len) => w.int(len as i64),
+            Err(e) => op_error(e, &mut w),
+        },
         // ---- M1-S01 · string family ----
         CommandId::Mget => {
             let keys: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
@@ -404,8 +619,10 @@ fn execute_db(
             let (Ok(start), Ok(end)) = (parse_i64(argv.arg(2)), parse_i64(argv.arg(3))) else {
                 return w.error("ERR value is not an integer or out of range");
             };
-            let slice = store.get_range(argv.arg(1), start, end, now);
-            w.bulk(slice);
+            match store.get_range(argv.arg(1), start, end, now) {
+                Ok(slice) => w.bulk(slice),
+                Err(e) => op_error(e, &mut w),
+            }
         }
         CommandId::Setrange => {
             let Ok(offset) = parse_i64(argv.arg(2)) else {
@@ -503,6 +720,37 @@ fn execute_db(
         // ---- internal fabric-program ops ----
         CommandId::InfTake | CommandId::InfPeek => {
             inf_take_peek(argv, store, meta.id == CommandId::InfTake, now, &mut w);
+        }
+        // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041) ----
+        CommandId::JsonSet
+        | CommandId::JsonGet
+        | CommandId::JsonMget
+        | CommandId::JsonDel
+        | CommandId::JsonForget
+        | CommandId::JsonType
+        | CommandId::JsonNumIncrBy
+        | CommandId::JsonNumMultBy
+        | CommandId::JsonStrAppend
+        | CommandId::JsonStrLen
+        | CommandId::JsonToggle
+        | CommandId::JsonClear
+        | CommandId::JsonArrAppend
+        | CommandId::JsonArrInsert
+        | CommandId::JsonArrIndex
+        | CommandId::JsonArrLen
+        | CommandId::JsonArrPop
+        | CommandId::JsonArrTrim
+        | CommandId::JsonObjKeys
+        | CommandId::JsonObjLen
+        | CommandId::JsonMerge
+        | CommandId::JsonDebug => {
+            #[cfg(feature = "doc")]
+            crate::json::execute_json(meta.id, argv, store, cx, now, &mut w);
+            // Slim builds carry no document code (L11): the registry rows
+            // exist, the capability does not — unknown-command is the
+            // honest answer.
+            #[cfg(not(feature = "doc"))]
+            unknown_command(argv, &mut w);
         }
         CommandId::Select
         | CommandId::Flushdb
@@ -724,6 +972,9 @@ fn getex(
     }
     match store.get_ex(argv.arg(1), update, now) {
         Some(value) => w.bulk(&value),
+        // Missing vs non-string: the command layer owns the split
+        // (ADR-0037 D6 / M3-S11 matrix) — second probe on the cold path.
+        None if store.exists(argv.arg(1), now) => op_error(OpError::WrongType, w),
         None => w.null(),
     }
 }
@@ -993,6 +1244,7 @@ fn select(argv: &(impl Argv + ?Sized), ks: &mut Keyspace, cx: &mut ConnCx, w: &m
     match parse_i64(argv.arg(1)) {
         Ok(n @ 0..=15) => {
             cx.db = n as u16;
+            cx.ns = None; // SELECT returns the connection to the defaults
             // Materialize eagerly: a SELECTed db is about to be used.
             let _ = ks.db_mut(n as usize);
             w.simple("OK");
@@ -1136,7 +1388,7 @@ pub(crate) fn arity_error(name: &str, w: &mut RespWriter<'_>) {
     w.error(&format!("ERR wrong number of arguments for '{}' command", name.to_ascii_lowercase()));
 }
 
-fn op_error(e: OpError, w: &mut RespWriter<'_>) {
+pub(crate) fn op_error(e: OpError, w: &mut RespWriter<'_>) {
     match e {
         OpError::NotInt => w.error("ERR value is not an integer or out of range"),
         OpError::Overflow => w.error("ERR increment or decrement would overflow"),
@@ -1144,6 +1396,20 @@ fn op_error(e: OpError, w: &mut RespWriter<'_>) {
         OpError::NanOrInf => w.error("ERR increment would produce NaN or Infinity"),
         OpError::OutOfMemory => w.error("OOM command not allowed when used memory > 'maxmemory'."),
         OpError::TooLarge => w.error("ERR key or value exceeds InfinityDB M0 record bounds"),
+        OpError::WrongType => {
+            w.error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
+        // M4-S21 (ADR-0063 D1): the DISKFULL extension class — no Redis
+        // analog; first-word error class like OOM/NOSPACE. Byte shape
+        // pinned by `diskfull_error_shapes`; the compat matrix documents
+        // it as an extension. Reads, deletes, expiry, and in-place
+        // updates never produce this — only new-tier-byte placements.
+        OpError::DiskFull(inf_store::DiskFullCause::Budget { used, budget }) => w.error(&format!(
+            "DISKFULL tiered namespace disk budget exhausted (used={used} budget={budget})"
+        )),
+        OpError::DiskFull(inf_store::DiskFullCause::Device) => {
+            w.error("DISKFULL tier device out of space (ENOSPC)")
+        }
     }
 }
 
@@ -1245,6 +1511,39 @@ mod tests {
     use super::*;
     use inf_store::StoreConfig;
     use inf_wire::{ConnParser, Parsed, ParserLimits};
+
+    /// M4-S21 (ADR-0063 D1): the `DISKFULL` extension error's wire
+    /// shapes, byte-pinned — the compat register's shape source until
+    /// command wiring makes the refusal reachable over TCP (the
+    /// deviation the ledger records). Both RESP protocols render error
+    /// lines identically.
+    #[test]
+    fn diskfull_error_shapes() {
+        use inf_store::DiskFullCause;
+        for proto in [inf_wire::Protocol::Resp2, inf_wire::Protocol::Resp3] {
+            let mut out = Vec::new();
+            let mut w = RespWriter::new(&mut out, proto);
+            op_error(
+                OpError::DiskFull(DiskFullCause::Budget { used: 16_252_928, budget: 16_777_216 }),
+                &mut w,
+            );
+            assert_eq!(
+                out,
+                b"-DISKFULL tiered namespace disk budget exhausted (used=16252928 \
+                  budget=16777216)\r\n"
+                    .to_vec(),
+                "{proto:?}"
+            );
+            let mut out = Vec::new();
+            let mut w = RespWriter::new(&mut out, proto);
+            op_error(OpError::DiskFull(DiskFullCause::Device), &mut w);
+            assert_eq!(
+                out,
+                b"-DISKFULL tier device out of space (ENOSPC)\r\n".to_vec(),
+                "{proto:?}"
+            );
+        }
+    }
 
     fn run_at(cx: &mut ConnCx, store: &mut Keyspace, now: Nanos, parts: &[&[u8]]) -> Vec<u8> {
         let mut wire = format!("*{}\r\n", parts.len()).into_bytes();
@@ -1500,12 +1799,20 @@ mod tests {
             run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"cache"]),
             b"-ERR namespace already exists\r\n"
         );
-        // The M1-S08 honesty AC: durable mode is a documented not-yet error.
+        // M2-S08: the M1 "not yet supported" rejection is gone. Durable
+        // creation on the *planeless* tier still refuses (no control plane
+        // to persist the catalog, no cell log) — with its own documented
+        // error; the node path is exercised in tests/node_e2e.rs.
         let reply = run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable"]);
-        assert!(
-            reply.starts_with(b"-ERR namespace mode 'durable' is not yet supported"),
-            "{reply:?}"
-        );
+        assert!(reply.starts_with(b"-ERR durable namespaces need the node runtime"), "{reply:?}");
+        // FSYNC without durable mode is a typed error (registry rule).
+        let reply = run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"c2", b"FSYNC", b"always"]);
+        assert!(reply.starts_with(b"-ERR FSYNC applies to MODE durable"), "{reply:?}");
+        // INF.NS USE selects a named namespace; SELECT returns to defaults.
+        assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"USE", b"cache"]), b"+OK\r\n");
+        assert!(cx.ns.is_some(), "USE selects the named namespace");
+        assert_eq!(run(&mut cx, &mut ks, &[b"SELECT", b"0"]), b"+OK\r\n");
+        assert!(cx.ns.is_none(), "SELECT returns to the defaults");
         let list = run(&mut cx, &mut ks, &[b"INF.NS", b"LIST"]);
         let text = String::from_utf8(list).expect("ascii");
         assert!(text.starts_with("*17\r\n"), "16 defaults + 1 named: {text}");
@@ -1641,6 +1948,70 @@ mod tests {
         // Lifting the limit recovers immediately (hot-per-cell push at SET).
         run(&mut cx, &mut ks, &[b"CONFIG", b"SET", b"maxmemory", b"0"]);
         assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"x", b"y"]), b"+OK\r\n");
+    }
+
+    /// M4-S27 (ADR-0068 D4): the DENYOOM gate is namespace-scoped — a
+    /// connection on a named memory namespace with its own MAXMEMORY
+    /// answers OOM at *its* budget (the Redis-exact error shape) while
+    /// numbered-db connections on the same keyspace keep writing; lifting
+    /// the budget recovers; with an eviction policy the namespace frees
+    /// its own keys inline instead of refusing.
+    #[test]
+    fn per_ns_budget_gate_scopes_oom_to_the_namespace() {
+        let mut cx = ConnCx::default();
+        let mut ks = Keyspace::new(StoreConfig::default());
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"cache", b"MAXMEMORY", b"1"]),
+            b"+OK\r\n"
+        );
+        assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"USE", b"cache"]), b"+OK\r\n");
+        // First write lands (the gate reads the cached flag, refreshed
+        // after mutations); the second answers the namespace's honest OOM
+        // — the effective policy inherits the node default `noeviction`.
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"v1"]), b"+OK\r\n");
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"SET", b"k", b"v2"]),
+            b"-OOM command not allowed when used memory > 'maxmemory'.\r\n"
+        );
+        // Reads and freeing writes stay allowed inside the namespace.
+        assert_eq!(run(&mut cx, &mut ks, &[b"GET", b"k"]), b"$2\r\nv1\r\n");
+        // The scope is the namespace, not the node: db0 keeps writing.
+        assert_eq!(run(&mut cx, &mut ks, &[b"SELECT", b"0"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"free", b"v"]), b"+OK\r\n");
+        // Back on the namespace: a real budget plus an eviction policy
+        // hot-reload keeps the namespace serving (the inline-reclaim storm
+        // itself is proven in inf-store's evict suite).
+        assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"USE", b"cache"]), b"+OK\r\n");
+        assert_eq!(
+            run(
+                &mut cx,
+                &mut ks,
+                &[
+                    b"INF.NS",
+                    b"SET",
+                    b"cache",
+                    b"MAXMEMORY",
+                    b"1mb",
+                    b"EVICTION",
+                    b"allkeys-random"
+                ],
+            ),
+            b"+OK\r\n"
+        );
+        for i in 0..50 {
+            let key = format!("grow:{i}");
+            assert_eq!(
+                run(&mut cx, &mut ks, &[b"SET", key.as_bytes(), &[0x61; 512]]),
+                b"+OK\r\n",
+                "writes under an evicting per-ns budget must keep landing"
+            );
+        }
+        // Removing the budget disarms the per-ns gate entirely.
+        assert_eq!(
+            run(&mut cx, &mut ks, &[b"INF.NS", b"SET", b"cache", b"MAXMEMORY", b"0"]),
+            b"+OK\r\n"
+        );
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"v3"]), b"+OK\r\n");
     }
 
     #[test]

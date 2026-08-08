@@ -12,6 +12,7 @@ inf-foundation.workspace = true
 inf-wire.workspace = true
 inf-store.workspace = true
 inf-server.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

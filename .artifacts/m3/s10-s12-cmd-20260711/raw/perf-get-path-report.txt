@@ -1,0 +1,532 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 20K of event 'cpu_core/cycles/P'
+# Event count (approx.): 17180652278
+#
+# Overhead  Command          Shared Object              Symbol                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+# ........  ...............  .........................  ....................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    41.22%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] <inf_doc::tape::ObjIter as core::iter::traits::iterator::Iterator>::next
+    13.74%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_doc::tape::read_value
+     9.86%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_doc::path::eval::run
+     4.17%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_doc::path::eval::resolve
+     3.93%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_doc::path::program::read_op
+     2.20%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_doc::ser::serialize_reply_into
+     2.16%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_server::json::execute_json
+     2.00%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_doc::path::cache::ProgramCache::get_or_compile
+     1.88%  json_cmd-cad56d  libc.so.6                  [.] _int_malloc
+     1.74%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_doc::path::eval::consume
+     1.58%  json_cmd-cad56d  libc.so.6                  [.] __memcmp_avx2_movbe
+     0.93%  json_cmd-cad56d  libc.so.6                  [.] malloc
+     0.90%  json_cmd-cad56d  libc.so.6                  [.] __memmove_avx_unaligned_erms
+     0.90%  json_cmd-cad56d  libc.so.6                  [.] cfree@GLIBC_2.2.5
+     0.88%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] alloc::raw_vec::RawVecInner<A>::finish_grow
+     0.75%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_store::store::CellStore::resolve_hashed
+     0.74%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_store::doc::<impl inf_store::store::CellStore>::json_get
+     0.66%  json_cmd-cad56d  libc.so.6                  [.] _int_free_merge_chunk
+     0.65%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_doc::ser::write_scalar
+     0.64%  json_cmd-cad56d  libc.so.6                  [.] _int_realloc
+     0.53%  json_cmd-cad56d  libc.so.6                  [.] realloc
+     0.45%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_server::json::path_reply
+     0.28%  json_cmd-cad56d  libc.so.6                  [.] _int_free_chunk
+     0.28%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_foundation::hash::hash64
+     0.28%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_server::json::compile
+     0.28%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] alloc::raw_vec::RawVecInner<A>::finish_grow
+     0.25%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] alloc::raw_vec::RawVecInner<A>::grow_amortized
+     0.24%  json_cmd-cad56d  libc.so.6                  [.] _int_free_maybe_trim
+     0.23%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] core::ptr::drop_in_place<inf_doc::ser::Reply>
+     0.20%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_server::exec::execute_slices
+     0.19%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] alloc::raw_vec::RawVec<T,A>::grow_one
+     0.17%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_doc::tape::read_value
+     0.14%  cargo            cargo                      [.] <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+     0.14%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] alloc::raw_vec::RawVec<T,A>::grow_one
+     0.13%  json_cmd-cad56d  libc.so.6                  [.] __libc_malloc2
+     0.12%  cargo            libc.so.6                  [.] _int_malloc
+     0.12%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle
+     0.12%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_wire::writer::itoa
+     0.12%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] alloc::raw_vec::RawVecInner<A>::finish_grow
+     0.12%  json_cmd-cad56d  libc.so.6                  [.] unlink_chunk.isra.0
+     0.10%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_server::exec::execute_db
+     0.09%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] alloc::raw_vec::RawVec<T,A>::grow_one
+     0.08%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_wire::command::lookup
+     0.07%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] __rustc::__rust_alloc
+     0.07%  cargo            [unknown]                  [k] 0xffffffffa88d5951
+     0.07%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] alloc::raw_vec::RawVec<T,A>::grow_one
+     0.06%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa9316a3e
+     0.06%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] alloc::raw_vec::RawVec<T,A>::grow_one
+     0.06%  cargo            libc.so.6                  [.] __memcmp_avx2_movbe
+     0.06%  cargo            rustup                     [.] toml::de::parser::parse_document
+     0.05%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8193e53
+     0.05%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa818e203
+     0.05%  cargo            libc.so.6                  [.] _int_free_merge_chunk
+     0.05%  cargo            libc.so.6                  [.] __memmove_avx_unaligned_erms
+     0.05%  cargo            libc.so.6                  [.] __libc_malloc2
+     0.04%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b8545
+     0.04%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa932d7e3
+     0.04%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] criterion::bencher::Bencher<M>::iter
+     0.04%  cargo            libc.so.6                  [.] malloc
+     0.04%  json_cmd-cad56d  libc.so.6                  [.] memcpy@@GLIBC_2.14@plt
+     0.03%  cargo            libc.so.6                  [.] cfree@GLIBC_2.2.5
+     0.03%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8008282
+     0.03%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] inf_store::keyspace::Keyspace::db_mut
+     0.03%  cargo            [unknown]                  [k] 0xffffffffa9316a3e
+     0.02%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8053
+     0.02%  cargo            cargo                      [.] <toml_parser::lexer::Lexer>::into_vec
+     0.02%  cargo            libc.so.6                  [.] _int_free_chunk
+     0.02%  cargo            cargo                      [.] anstream::adapter::strip::next_bytes
+     0.02%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8177c7a
+     0.02%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b855b
+     0.02%  cargo            cargo                      [.] <toml_parser::lexer::Lexer as core::iter::traits::iterator::Iterator>::next
+     0.02%  cargo            cargo                      [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&semver::Version>
+     0.02%  cargo            [unknown]                  [k] 0xffffffffa7c01268
+     0.01%  cargo            cargo                      [.] <alloc::raw_vec::RawVecInner>::finish_grow
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8079
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8145349
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa817744c
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa818f549
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b8577
+     0.01%  cargo            cargo                      [.] <cargo::sources::registry::index::RegistryIndex>::query_inner_with_online
+     0.01%  cargo            cargo                      [.] <serde_json::read::SliceRead>::skip_to_escape
+     0.01%  cargo            [unknown]                  [k] 0xffffffffa932d7e3
+     0.01%  cargo            rustup                     [.] toml_parser::decoder::string::decode_basic_string
+     0.01%  cargo            rustup                     [.] toml::de::parser::key::State::close_key
+     0.01%  cargo            cargo                      [.] ossl_fnv1a_hash
+     0.01%  cargo            cargo                      [.] core::str::converts::from_utf8
+     0.01%  cargo            cargo                      [.] <std::path::Path as core::hash::Hash>::hash::<std::hash::random::DefaultHasher>
+     0.01%  cargo            [unknown]                  [k] 0xffffffffa8431c2d
+     0.01%  cargo            [unknown]                  [k] 0xffffffffa850cf27
+     0.01%  cargo            ld-linux-x86-64.so.2       [.] _dl_relocate_object_no_relro
+     0.01%  cargo            cargo                      [.] core::ptr::drop_in_place::<indexmap::inner::Core<serde_spanned::spanned::Spanned<alloc::borrow::Cow<str>>, serde_spanned::spanned::Spanned<toml::de::parser::devalue::DeValue>>>
+     0.01%  cargo            cargo                      [.] <cargo::util::semver_ext::OptVersionReq>::lock_to
+     0.01%  cargo            cargo                      [.] serde_json::ser::format_escaped_str_contents::<&mut alloc::vec::Vec<u8>, serde_json::ser::CompactFormatter>
+     0.01%  cargo            cargo                      [.] toml::de::parser::key::on_key
+     0.01%  cargo            cargo                      [.] core::fmt::write
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa7fc4360
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa81bc3bc
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80a9509
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa9318060
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d7f87
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8193e16
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8141ca5
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d7ea4
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8194934
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b89d0
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa93180d7
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8539
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa81bce58
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b7234
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8193e29
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b8529
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d7f96
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80f369d
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d7f3d
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa93180b5
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa93180df
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80aa1e1
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa93180db
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b82a7
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b728c
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa81006a7
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b7f05
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b8a6d
+     0.01%  cargo            cargo                      [.] <<cargo_util_schemas::manifest::TomlPackage as serde_core::de::Deserialize>::deserialize::__Visitor as serde_core::de::Visitor>::visit_map::<serde_ignored::MapAccess<toml::de::deserializer::table::TableMapAccess, cargo::util::toml::deserialize_toml::{closure#0}>>
+     0.01%  cargo            cargo                      [.] cargo::ops::resolve::resolve_with_previous
+     0.01%  cargo            cargo                      [.] toml_parser::decoder::string::decode_basic_string
+     0.01%  cargo            cargo                      [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&url::Url>
+     0.01%  cargo            cargo                      [.] cargo_util::paths::normalize_path
+     0.01%  cargo            cargo                      [.] <im_rc::ord::map::OrdMap<cargo::core::package_id::PackageId, im_rc::ord::map::OrdMap<cargo::core::package_id::PackageId, im_rc::hash::set::HashSet<cargo::core::dependency::Dependency, rustc_hash::FxBuildHasher>>>>::get_mut::<cargo::core::package_id::PackageId>
+     0.01%  cargo            rustup                     [.] <toml::de::deserializer::table::TableDeserializer as serde_core::de::Deserializer>::deserialize_any
+     0.01%  cargo            cargo                      [.] cargo::core::summary::build_feature_map
+     0.01%  cargo            cargo                      [.] cargo::util::toml::deprecated_underscore::<bool>
+     0.01%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa7fae860
+     0.01%  cargo            [unknown]                  [k] 0xffffffffa8851c75
+     0.01%  cargo            [unknown]                  [k] 0xffffffffa8410322
+     0.01%  cargo            cargo                      [.] OPENSSL_cleanse
+     0.01%  cargo            [unknown]                  [k] 0xffffffffa83c401c
+     0.01%  cargo            libc.so.6                  [.] unlink_chunk.isra.0
+     0.01%  cargo            rustup                     [.] toml::de::parser::value::on_scalar
+     0.01%  cargo            cargo                      [.] ASN1_item_ex_i2d
+     0.01%  gix::dirwalk::i  cargo                      [.] <gix_index::State>::entry_by_path
+     0.01%  cargo            cargo                      [.] <sha1_checked::Sha1 as digest::Update>::update::{closure#0}
+     0.01%  cargo            cargo                      [.] sha1_checked::compress::compression_states
+     0.01%  cargo            cargo                      [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&cargo::core::package_id::PackageId>
+     0.01%  cargo            [unknown]                  [k] 0xffffffffa83f292c
+     0.01%  cargo            rustup                     [.] regex_automata::nfa::thompson::compiler::Compiler::c
+     0.01%  cargo            [unknown]                  [k] 0xffffffffa930d756
+     0.01%  cargo            [unknown]                  [k] 0xffffffffa80150b5
+     0.01%  cargo            cargo                      [.] <cargo::core::dependency::Dependency>::serialized
+     0.01%  cargo            cargo                      [.] core::ptr::drop_in_place::<[serde_spanned::spanned::Spanned<toml::de::parser::devalue::DeValue>]>
+     0.01%  cargo            cargo                      [.] <hashbrown::map::HashMap<cargo::core::package_id::PackageId, (), std::hash::random::RandomState>>::insert
+     0.01%  cargo            cargo                      [.] core::ptr::drop_in_place::<toml::de::parser::devalue::DeValue>
+     0.01%  cargo            cargo                      [.] core::slice::memchr::memrchr
+     0.00%  cargo            cargo                      [.] core::ptr::drop_in_place::<(semver::Version, cargo::sources::registry::index::MaybeIndexSummary)>
+     0.00%  cargo            cargo                      [.] toml_parser::parser::document::on_expression_key
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84b851a
+     0.00%  cargo            cargo                      [.] <memchr::arch::x86_64::avx2::memchr::Three>::find_raw_avx2
+     0.00%  cargo            cargo                      [.] <<cargo_util_schemas::manifest::TomlDetailedDependency<_> as serde_core::de::Deserialize>::deserialize::__Visitor<alloc::string::String> as serde_core::de::Visitor>::visit_map::<serde_untagged::map::Map>
+     0.00%  cargo            cargo                      [.] <toml::value::Value as serde_core::ser::Serialize>::serialize::<&mut serde_json::ser::Serializer<&mut alloc::vec::Vec<u8>>>
+     0.00%  cargo            cargo                      [.] <serde_ignored::Deserializer<toml::de::deserializer::value::ValueDeserializer, cargo::util::toml::deserialize_toml::{closure#0}> as serde_core::de::Deserializer>::deserialize_any::<serde_value::de::ValueVisitor>
+     0.00%  cargo            cargo                      [.] <alloc::borrow::Cow<str> as toml_parser::decoder::StringBuilder>::push_str
+     0.00%  cargo            cargo                      [.] <toml_parser::source::Raw>::decode_key
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa88d5951
+     0.00%  cargo            cargo                      [.] toml_parser::parser::document::ws_comment_newline
+     0.00%  cargo            cargo                      [.] <toml::de::parser::key::State>::close_key
+     0.00%  cargo            cargo                      [.] <alloc::string::String as core::fmt::Write>::write_str
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b895e
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa81452c2
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d805f
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa817699b
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa931817a
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8749
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa7fc4317
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa7fc42fb
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80da482
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa932d0b9
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d851a
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa817b561
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80aa1d4
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80da4c9
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa817744f
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80a3f79
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b7261
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8176c92
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa92fb596
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8008291
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d801b
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80db9cb
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa81bcdb7
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d854c
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80aa189
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b7109
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa81773b8
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80f5b43
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa7fc433d
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80a3fb3
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8596
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80daafc
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa809be2e
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80a3fc7
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b71c2
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b71d7
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b7200
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d7f6a
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d7fc6
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8193dac
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8193e25
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa7faf9cb
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8008295
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8797
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80aa280
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80a942f
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8066
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8141a52
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d85b0
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8177cb2
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b8a14
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa81bc3a4
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa81bcddd
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa829c737
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80aa262
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b709d
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8167
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d87c1
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80a9524
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa81bce41
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8141e6e
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa932d0e8
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa809e5a2
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d7f5a
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8202cd0
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8665
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa817324c
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80a9444
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8788
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8177f5a
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8679
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8194797
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa92fb8ed
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80db982
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80f36a5
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b89ba
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8141e63
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa817323e
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8177caa
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b8a56
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8193dea
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa829cbb0
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d814b
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80f3699
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa7fc3e42
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b7187
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80db9a6
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa81773fe
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b856c
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80f5b26
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b7cd9
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b8542
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa7faf9c1
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa809e58d
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80aa611
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d7e23
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80aa119
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa829cbd5
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa804d382
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b72b5
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa81bc3df
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8194929
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b8932
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8179
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80a941f
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa809e5a1
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b83bc
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b8968
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b8519
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d872c
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8836
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa81784e2
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8561
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa7ff95c9
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8811
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b7cb9
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa7fc4333
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b83ce
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa7c00ef4
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8777
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b816c
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b85a0
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b7349
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b7229
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa88dbed7
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80a91c9
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b724d
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b7e84
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b837d
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b7244
+     0.00%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] clap_builder::parser::validator::Validator::validate
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80c1d89
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80a9460
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b81ae
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d808d
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa88dbed4
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa800843b
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa931805b
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b7dd2
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80aecbb
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa8176953
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa817455e
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffc08d358d
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80c1ecb
+     0.00%  cargo            cargo                      [.] cargo::util::toml::targets::to_targets
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80a2c96
+     0.00%  cargo            libc.so.6                  [.] clock_gettime@@GLIBC_2.17
+     0.00%  cargo            cargo                      [.] pcache1Unpin
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8380fee
+     0.00%  cargo            cargo                      [.] sqlite3MemMalloc
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80d8072
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa855c15c
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa83e9b5c
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa846298d
+     0.00%  cargo            cargo                      [.] <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa844bf4a
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa83eadd7
+     0.00%  cargo            cargo                      [.] <toml::map::Map<serde_spanned::spanned::Spanned<alloc::borrow::Cow<str>>, serde_spanned::spanned::Spanned<toml::de::parser::devalue::DeValue>>>::entry::<serde_spanned::spanned::Spanned<alloc::borrow::Cow<str>>>
+     0.00%  cargo            cargo                      [.] <cargo::core::resolver::dep_cache::Requirements>::require_value
+     0.00%  cargo            cargo                      [.] <alloc::vec::Vec<toml_parser::parser::event::Event> as toml_parser::parser::event::EventReceiver>::std_table_open
+     0.00%  cargo            cargo                      [.] <toml::value::Value as serde_core::ser::Serialize>::serialize::<toml::ser::value::ValueSerializer>
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8517500
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8462994
+     0.00%  cargo            cargo                      [.] <core::iter::adapters::GenericShunt<itertools::flatten_ok::FlattenOk<core::iter::adapters::map::Map<alloc::vec::into_iter::IntoIter<&cargo::core::dependency::Dependency>, <cargo::core::resolver::features::FeatureResolver>::deps::{closure#0}::{closure#1}>, core::iter::adapters::map::Map<alloc::vec::into_iter::IntoIter<cargo::core::resolver::features::FeaturesFor>, <cargo::core::resolver::features::FeatureResolver>::deps::{closure#0}::{closure#1}::{closure#0}>, anyhow::Error>, core::result::Result<core::convert::Infallible, anyhow::Error>> as core::iter::traits::iterator::Iterator>::next
+     0.00%  cargo            cargo                      [.] <core::iter::adapters::filter::Filter<std::collections::hash::set::Iter<cargo::core::dependency::Dependency>, <cargo::core::resolver::features::FeatureResolver>::deps::{closure#0}::{closure#0}> as core::iter::traits::iterator::Iterator>::next
+     0.00%  cargo            cargo                      [.] <alloc::raw_vec::RawVec<(cargo::core::compiler::unit::Unit, std::collections::hash::set::HashSet<cargo::core::compiler::unit_graph::UnitDep>)>>::grow_one
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa83f29be
+     0.00%  cargo            cargo                      [.] <toml_parser::source::Raw>::decode_scalar
+     0.00%  cargo            cargo                      [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&serde_spanned::spanned::Spanned<alloc::borrow::Cow<str>>>
+     0.00%  cargo            cargo                      [.] pcache1Fetch
+     0.00%  cargo            cargo                      [.] <alloc::string::String as core::fmt::Write>::write_str
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8430d49
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8019f8f
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa81395c5
+     0.00%  cargo            cargo                      [.] <alloc::rc::Rc<im_rc::nodes::btree::Node<im_rc::ord::set::Value<(cargo::core::resolver::types::DepsFrame, u32)>>>>::make_mut
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84b57b3
+     0.00%  cargo            cargo                      [.] <cargo::core::dependency::Dependency>::lock_to
+     0.00%  cargo            cargo                      [.] <cargo::core::package_id::PackageId as core::hash::Hash>::hash::<std::hash::random::DefaultHasher>
+     0.00%  cargo            cargo                      [.] <url::parser::Parser>::with_query_and_fragment
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa850cfa1
+     0.00%  cargo            cargo                      [.] <semver::Prerelease as core::cmp::Ord>::cmp
+     0.00%  cargo            cargo                      [.] <cargo::sources::registry::index::RegistryIndex>::hash
+     0.00%  cargo            cargo                      [.] sqlite3VdbeExec
+     0.00%  cargo            cargo                      [.] <indexmap::inner::Core<serde_spanned::spanned::Spanned<alloc::borrow::Cow<str>>, serde_spanned::spanned::Spanned<toml::de::parser::devalue::DeValue>>>::push_entry
+     0.00%  cargo            cargo                      [.] <indexmap::inner::Core<alloc::string::String, toml::value::Value>>::push_entry
+     0.00%  cargo            cargo                      [.] <serde::private::de::content::ContentRefDeserializer<serde_untagged::error::Error> as serde_core::de::Deserializer>::deserialize_any::<<toml::value::Value as serde_core::de::Deserialize>::deserialize::ValueVisitor>
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa841004e
+     0.00%  cargo            cargo                      [.] toml_parser::parser::document::on_array_open
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa855c0ca
+     0.00%  cargo            cargo                      [.] <alloc::raw_vec::RawVecInner>::finish_grow
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa855ac55
+     0.00%  cargo            cargo                      [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&(cargo::core::dependency::Dependency, core::option::Option<cargo::core::resolver::version_prefs::VersionOrdering>)>
+     0.00%  cargo            cargo                      [.] <cargo::core::source_id::SourceId>::with_precise
+     0.00%  cargo            cargo                      [.] cargo::core::resolver::activate_deps_loop
+     0.00%  cargo            cargo                      [.] semver::parse::version_req
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa7c00b90
+     0.00%  cargo            cargo                      [.] codeAllEqualityTerms
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80b846c
+     0.00%  cargo            cargo                      [.] <cargo::core::resolver::context::ResolverContext>::flag_activated
+     0.00%  cargo            cargo                      [.] std::fs::read::inner
+     0.00%  cargo            libc.so.6                  [.] __open64_nocancel
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80e514a
+     0.00%  cargo            cargo                      [.] <alloc::sync::Arc<cargo::core::manifest::TargetInner>>::make_mut
+     0.00%  cargo            cargo                      [.] core::ptr::drop_in_place::<hashbrown::raw::RawIntoIter<(std::path::PathBuf, alloc::vec::Vec<cargo::core::manifest::Target>)>>
+     0.00%  cargo            cargo                      [.] cargo::core::resolver::resolve
+     0.00%  cargo            [vdso]                     [.] 0x00000000000009e9
+     0.00%  cargo            cargo                      [.] <alloc::sync::Arc<cargo::core::dependency::Inner>>::make_mut
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84f547b
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8401d2b
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84ba30f
+     0.00%  cargo            cargo                      [.] <alloc::sync::Arc<cargo::core::dependency::Inner>>::drop_slow
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa850cf85
+     0.00%  cargo            cargo                      [.] <cargo::core::resolver::dep_cache::Requirements>::require_feature
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa850cf04
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa841034d
+     0.00%  cargo            cargo                      [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&cargo::core::source_id::SourceId>
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84113f9
+     0.00%  cargo            cargo                      [.] <std::path::Components as core::iter::traits::iterator::Iterator>::next
+     0.00%  cargo            cargo                      [.] <core::str::pattern::CharSearcher as core::str::pattern::ReverseSearcher>::next_match_back
+     0.00%  cargo            cargo                      [.] cargo_util_schemas::restricted_names::validate_feature_name
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8383a98
+     0.00%  cargo            cargo                      [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&std::path::Path>
+     0.00%  cargo            cargo                      [.] <serde_json::read::SliceRead as serde_json::read::Read>::parse_str
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa7c00bb7
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84f6043
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa9309b13
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa83eaf17
+     0.00%  cargo            rustup                     [.] core::ptr::drop_in_place<rustup::dist::manifest::PackageTargets>
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84379c2
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa92fe5af
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa85042c7
+     0.00%  cargo            cargo                      [.] <im_rc::ord::map::OrdMap<cargo::core::package_id::PackageId, im_rc::ord::map::OrdMap<cargo::core::package_id::PackageId, std::collections::hash::set::HashSet<cargo::core::dependency::Dependency>>>>::get_mut::<cargo::core::package_id::PackageId>
+     0.00%  cargo            cargo                      [.] <alloc::raw_vec::RawVecInner>::finish_grow
+     0.00%  cargo            cargo                      [.] <std::path::Components as core::iter::traits::double_ended::DoubleEndedIterator>::next_back
+     0.00%  cargo            cargo                      [.] formatf
+     0.00%  cargo            cargo                      [.] toml::de::parser::document::descend_path
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa80163eb
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa89ce332
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa843661f
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8437967
+     0.00%  cargo            cargo                      [.] bn_expand2
+     0.00%  cargo            cargo                      [.] <im_rc::ord::map::OrdMap<cargo::core::package_id::PackageId, im_rc::hash::set::HashSet<cargo::core::dependency::Dependency, rustc_hash::FxBuildHasher>>>::get_mut::<cargo::core::package_id::PackageId>
+     0.00%  cargo            cargo                      [.] <cargo::sources::registry::RegistrySource as cargo::sources::source::Source>::query
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84faa98
+     0.00%  cargo            cargo                      [.] asn1_ex_i2c
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa83fb0c2
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa80ee9d5
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa850cf2b
+     0.00%  cargo            libc.so.6                  [.] __strlen_avx2
+     0.00%  cargo            cargo                      [.] <alloc::collections::btree::map::IntoIter<cargo::util::interning::InternedString, alloc::vec::Vec<cargo::util::interning::InternedString>>>::dying_next
+     0.00%  cargo            cargo                      [.] <cargo_util_schemas::core::source_kind::SourceKind as core::hash::Hash>::hash::<std::hash::random::DefaultHasher>
+     0.00%  cargo            libc.so.6                  [.] pthread_rwlock_unlock@@GLIBC_2.34
+     0.00%  cargo            libc.so.6                  [.] pthread_once@GLIBC_2.2.5
+     0.00%  cargo            cargo                      [.] core::ptr::drop_in_place::<cargo::core::manifest::Manifest>
+     0.00%  cargo            cargo                      [.] core::ptr::drop_in_place::<alloc::vec::Vec<cargo::core::manifest::Target>>
+     0.00%  cargo            cargo                      [.] <jiff::fmt::strtime::parse::Parser>::parse_day
+     0.00%  cargo            cargo                      [.] <erased_serde::de::erase::Visitor<serde_core::de::impls::OptionVisitor<bool>> as erased_serde::de::Visitor>::erased_visit_some
+     0.00%  cargo            cargo                      [.] ossl_bsearch
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa85173ba
+     0.00%  cargo            cargo                      [.] core::ptr::drop_in_place::<alloc::vec::Vec<cargo::core::dependency::Dependency>>
+     0.00%  cargo            cargo                      [.] asn1_item_embed_d2i
+     0.00%  cargo            cargo                      [.] <toml_parser::parser::event::ValidateWhitespace as toml_parser::parser::event::EventReceiver>::newline
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa7c01570
+     0.00%  cargo            cargo                      [.] memchr::arch::x86_64::memchr::memchr_raw::find_avx2
+     0.00%  cargo            cargo                      [.] evp_decodeblock_int
+     0.00%  cargo            cargo                      [.] int_bn_mod_inverse
+     0.00%  cargo            cargo                      [.] CRYPTO_THREAD_run_once
+     0.00%  cargo            cargo                      [.] ossl_sa_doall_arg
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8436365
+     0.00%  cargo            cargo                      [.] core::ptr::drop_in_place::<alloc::collections::btree::map::BTreeMap<alloc::string::String, cargo_util_schemas::manifest::TomlLint>>
+     0.00%  cargo            cargo                      [.] ossl_read_der
+     0.00%  cargo            cargo                      [.] BIO_gets
+     0.00%  cargo            rustup                     [.] <alloc::vec::Vec<toml_parser::parser::event::Event> as toml_parser::parser::event::EventReceiver>::whitespace
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa842aaca
+     0.00%  cargo            cargo                      [.] ossl_obj_obj2nid
+     0.00%  cargo            cargo                      [.] EVP_DecodeUpdate
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa92fa8aa
+     0.00%  cargo            rustup                     [.] <alloc::vec::Vec<toml_parser::parser::event::Event> as toml_parser::parser::event::EventReceiver>::newline
+     0.00%  cargo            cargo                      [.] ASN1_TYPE_set
+     0.00%  cargo            libc.so.6                  [.] __strncmp_avx2
+     0.00%  cargo            rustup                     [.] <toml_parser::parser::event::ValidateWhitespace as toml_parser::parser::event::EventReceiver>::newline
+     0.00%  gix::dirwalk::i  [unknown]                  [k] 0xffffffffa9309aea
+     0.00%  cargo            rustup                     [.] <alloc::vec::Vec<toml_parser::parser::event::Event> as toml_parser::parser::event::EventReceiver>::key_val_sep
+     0.00%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] <regex_syntax::hir::translate::TranslatorI as regex_syntax::ast::visitor::Visitor>::visit_post
+     0.00%  gix::dirwalk::i  cargo                      [.] <std::path::Components>::parse_next_component_back
+     0.00%  cargo            cargo                      [.] <core::str::pattern::StrSearcher>::new
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8198a39
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8173771
+     0.00%  cargo            rustup                     [.] <alloc::vec::Vec<toml_parser::parser::event::Event> as toml_parser::parser::event::EventReceiver>::simple_key
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa92ff8b4
+     0.00%  cargo            cargo                      [.] asn1_template_noexp_d2i
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84f7582
+     0.00%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] <serde_json::read::SliceRead as serde_json::read::Read>::ignore_str
+     0.00%  json_cmd-cad56d  json_cmd-cad56dcbce659a40  [.] serde_json::read::SliceRead::skip_to_escape
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa88dbe72
+     0.00%  gix::dirwalk::i  [unknown]                  [k] 0xffffffffa850424c
+     0.00%  cargo            cargo                      [.] ossl_tolower
+     0.00%  cargo            cargo                      [.] OPENSSL_sk_num
+     0.00%  gix::dirwalk::i  [unknown]                  [k] 0xffffffffa7c0009f
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa932d060
+     0.00%  cargo            rustup                     [.] toml::de::parser::document::descend_path
+     0.00%  cargo            cargo                      [.] ossl_namemap_name2num
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84f53fe
+     0.00%  cargo            libc.so.6                  [.] pthread_rwlock_wrlock@@GLIBC_2.34
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa92e4f07
+     0.00%  cargo            cargo                      [.] <std::path::Components>::parse_next_component_back
+     0.00%  cargo            rustup                     [.] <alloc::borrow::Cow<str> as toml_parser::decoder::StringBuilder>::push_str
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84de3d5
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa83ee36a
+     0.00%  cargo            cargo                      [.] _dopr
+     0.00%  cargo            cargo                      [.] doapr_outch
+     0.00%  cargo            cargo                      [.] sha1_checked::compress::recompression_step
+     0.00%  cargo            cargo                      [.] <clap_builder::parser::parser::Parser>::push_arg_values
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa931d24b
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa83e9b08
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8143944
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa838323c
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa841033b
+     0.00%  cargo            cargo                      [.] <gix_ref::store_impl::file::Store>::find_one_with_verified_input
+     0.00%  json_cmd-cad56d  [unknown]                  [k] 0xffffffffa83fb15e
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84fca69
+     0.00%  cargo            cargo                      [.] <serde_spanned::spanned::Spanned<toml::de::parser::devalue::DeValue> as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa81395b7
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa837f064
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa850cf41
+     0.00%  cargo            cargo                      [.] std::sys::fs::metadata
+     0.00%  cargo            cargo                      [.] err_string_data_cmp
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa9307cca
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa83832ee
+     0.00%  cargo            cargo                      [.] CRYPTO_malloc
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa7c001c4
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa835464d
+     0.00%  cargo            cargo                      [.] <str>::to_uppercase
+     0.00%  cargo            rustup                     [.] <regex_syntax::utf8::Utf8Sequences as core::iter::traits::iterator::Iterator>::next
+     0.00%  cargo            ld-linux-x86-64.so.2       [.] mprotect
+     0.00%  cargo            ld-linux-x86-64.so.2       [.] strcmp
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8395c87
+     0.00%  cargo            rustup                     [.] core::slice::sort::stable::drift::sort
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84362d4
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa80188f2
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa8506e00
+     0.00%  cargo            rustup                     [.] OPENSSL_LH_insert
+     0.00%  cargo            libgcc_s.so.1              [.] __cpu_indicator_init
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa84321bd
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa83ec669
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa7f45bc0
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa92e5aea
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa855a95d
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa83fc4bd
+     0.00%  cargo            [unknown]                  [k] 0xffffffffa931cf28
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

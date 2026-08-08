@@ -1,0 +1,33 @@
+[package]
+name = "crash-matrix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Reviewable durability crash matrices and kill-and-recover oracles"
+
+[dependencies]
+inf-foundation.workspace = true
+inf-log.workspace = true
+inf-store.workspace = true
+inf-server.workspace = true
+
+[dev-dependencies]
+# The matrix arms named points; the feature reaches the library tiers
+# through dev-dependency unification only — `cargo build --workspace
+# --release` never carries the machinery (the M2-S16 cost contract).
+inf-foundation = { workspace = true, features = ["fault-points"] }
+# M3-S18 document fixtures encode the production idoc/path/delta forms;
+# the dependency is test-only and does not alter the shipping crate DAG.
+inf-doc.workspace = true
+
+# The fsyncgate row boots a real single-cell uring node in a child
+# process (ADR-0020 D3) — assembly parts, test-harness edges.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+inf-runtime = { workspace = true, features = ["uring"] }
+inf-alloc.workspace = true
+inf-fabric.workspace = true
+
+[lints]
+workspace = true

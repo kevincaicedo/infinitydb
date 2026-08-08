@@ -1,0 +1,9 @@
+infinityd 8391a38 (git 8391a38fb3b6-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 32831, backend io_uring, route natural
+infinityd: listening on 32831
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records)
+control: cell 2 recovered (0 segments, 0 bytes, 0 records)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records)
+control: recovery complete — 4 cells serving (26 ms)

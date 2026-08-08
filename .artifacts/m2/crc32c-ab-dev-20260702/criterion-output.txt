@@ -1,0 +1,77 @@
+   Compiling inf-simd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-simd)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 6.78s
+     Running benches/crc32c.rs (target/release/deps/crc32c-3aad80f3f6733867)
+Benchmarking crc32c/dispatched/64
+Benchmarking crc32c/dispatched/64: Warming up for 3.0000 s
+Benchmarking crc32c/dispatched/64: Collecting 100 samples in estimated 5.0000 s (1.9B iterations)
+Benchmarking crc32c/dispatched/64: Analyzing
+crc32c/dispatched/64    time:   [2.6505 ns 2.6513 ns 2.6522 ns]
+                        thrpt:  [22.474 GiB/s 22.481 GiB/s 22.488 GiB/s]
+Found 8 outliers among 100 measurements (8.00%)
+  4 (4.00%) high mild
+  4 (4.00%) high severe
+Benchmarking crc32c/software/64
+Benchmarking crc32c/software/64: Warming up for 3.0000 s
+Benchmarking crc32c/software/64: Collecting 100 samples in estimated 5.0001 s (266M iterations)
+Benchmarking crc32c/software/64: Analyzing
+crc32c/software/64      time:   [18.829 ns 18.840 ns 18.853 ns]
+                        thrpt:  [3.1615 GiB/s 3.1638 GiB/s 3.1656 GiB/s]
+Found 12 outliers among 100 measurements (12.00%)
+  7 (7.00%) high mild
+  5 (5.00%) high severe
+Benchmarking crc32c/dispatched/4096
+Benchmarking crc32c/dispatched/4096: Warming up for 3.0000 s
+Benchmarking crc32c/dispatched/4096: Collecting 100 samples in estimated 5.0017 s (14M iterations)
+Benchmarking crc32c/dispatched/4096: Analyzing
+crc32c/dispatched/4096  time:   [370.59 ns 370.65 ns 370.72 ns]
+                        thrpt:  [10.290 GiB/s 10.292 GiB/s 10.294 GiB/s]
+Found 10 outliers among 100 measurements (10.00%)
+  5 (5.00%) high mild
+  5 (5.00%) high severe
+Benchmarking crc32c/software/4096
+Benchmarking crc32c/software/4096: Warming up for 3.0000 s
+Benchmarking crc32c/software/4096: Collecting 100 samples in estimated 5.0093 s (2.1M iterations)
+Benchmarking crc32c/software/4096: Analyzing
+crc32c/software/4096    time:   [2.4084 µs 2.4088 µs 2.4092 µs]
+                        thrpt:  [1.5834 GiB/s 1.5837 GiB/s 1.5839 GiB/s]
+Found 8 outliers among 100 measurements (8.00%)
+  3 (3.00%) high mild
+  5 (5.00%) high severe
+Benchmarking crc32c/dispatched/65536
+Benchmarking crc32c/dispatched/65536: Warming up for 3.0000 s
+Benchmarking crc32c/dispatched/65536: Collecting 100 samples in estimated 5.0358 s (702k iterations)
+Benchmarking crc32c/dispatched/65536: Analyzing
+crc32c/dispatched/65536 time:   [7.1759 µs 7.1770 µs 7.1782 µs]
+                        thrpt:  [8.5029 GiB/s 8.5043 GiB/s 8.5056 GiB/s]
+Found 10 outliers among 100 measurements (10.00%)
+  4 (4.00%) high mild
+  6 (6.00%) high severe
+Benchmarking crc32c/software/65536
+Benchmarking crc32c/software/65536: Warming up for 3.0000 s
+Benchmarking crc32c/software/65536: Collecting 100 samples in estimated 5.1049 s (131k iterations)
+Benchmarking crc32c/software/65536: Analyzing
+crc32c/software/65536   time:   [38.861 µs 38.868 µs 38.876 µs]
+                        thrpt:  [1.5700 GiB/s 1.5703 GiB/s 1.5706 GiB/s]
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+Benchmarking crc32c/dispatched/1048576
+Benchmarking crc32c/dispatched/1048576: Warming up for 3.0000 s
+Benchmarking crc32c/dispatched/1048576: Collecting 100 samples in estimated 5.2723 s (45k iterations)
+Benchmarking crc32c/dispatched/1048576: Analyzing
+crc32c/dispatched/1048576
+                        time:   [116.27 µs 118.60 µs 121.38 µs]
+                        thrpt:  [8.0452 GiB/s 8.2342 GiB/s 8.3992 GiB/s]
+Found 13 outliers among 100 measurements (13.00%)
+  4 (4.00%) high mild
+  9 (9.00%) high severe
+Benchmarking crc32c/software/1048576
+Benchmarking crc32c/software/1048576: Warming up for 3.0000 s
+Benchmarking crc32c/software/1048576: Collecting 100 samples in estimated 6.3070 s (10k iterations)
+Benchmarking crc32c/software/1048576: Analyzing
+crc32c/software/1048576 time:   [623.55 µs 623.73 µs 623.93 µs]
+                        thrpt:  [1.5652 GiB/s 1.5657 GiB/s 1.5661 GiB/s]
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) high mild
+  2 (2.00%) high severe
+

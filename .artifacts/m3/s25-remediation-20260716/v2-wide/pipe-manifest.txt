@@ -1,0 +1,6 @@
+pipe_version = 2
+seed_hex = "0x1D0C2026"
+shape.wide-array = { documents = 300, serialized_bytes = 125806931 }
+documents_total = 300
+serialized_bytes_total = 125806931
+pipe_fnv1a64 = "0ab6f45d2607a156"

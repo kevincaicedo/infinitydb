@@ -147,6 +147,21 @@ dependencies = [
  "inf-server",
  "inf-store",
  "inf-wire",
+ "serde_json",
+]
+
+[[package]]
+name = "crash-matrix"
+version = "0.0.0"
+dependencies = [
+ "inf-alloc",
+ "inf-doc",
+ "inf-fabric",
+ "inf-foundation",
+ "inf-log",
+ "inf-runtime",
+ "inf-server",
+ "inf-store",
 ]
 
 [[package]]
@@ -356,6 +371,15 @@ version = "0.0.0"
 [[package]]
 name = "inf-doc"
 version = "0.0.0"
+dependencies = [
+ "criterion",
+ "inf-alloc",
+ "inf-foundation",
+ "inf-simd",
+ "proptest",
+ "serde_json",
+ "zmij",
+]
 
 [[package]]
 name = "inf-fabric"
@@ -374,6 +398,15 @@ version = "0.0.0"
 [[package]]
 name = "inf-log"
 version = "0.0.0"
+dependencies = [
+ "criterion",
+ "inf-alloc",
+ "inf-foundation",
+ "inf-runtime",
+ "inf-simd",
+ "libc",
+ "proptest",
+]
 
 [[package]]
 name = "inf-replica"
@@ -386,6 +419,8 @@ dependencies = [
  "criterion",
  "inf-alloc",
  "inf-foundation",
+ "inf-log",
+ "inf-store",
  "io-uring",
  "libc",
  "proptest",
@@ -395,12 +430,17 @@ dependencies = [
 name = "inf-server"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "inf-alloc",
+ "inf-doc",
  "inf-fabric",
  "inf-foundation",
+ "inf-log",
  "inf-runtime",
+ "inf-simd",
  "inf-store",
  "inf-wire",
+ "libc",
 ]
 
 [[package]]
@@ -408,8 +448,10 @@ name = "inf-sim"
 version = "0.0.0"
 dependencies = [
  "inf-alloc",
+ "inf-doc",
  "inf-fabric",
  "inf-foundation",
+ "inf-log",
  "inf-runtime",
  "inf-server",
  "inf-store",
@@ -421,6 +463,7 @@ dependencies = [
 name = "inf-simd"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "proptest",
 ]
 
@@ -430,8 +473,11 @@ version = "0.0.0"
 dependencies = [
  "criterion",
  "inf-alloc",
+ "inf-doc",
  "inf-foundation",
+ "inf-log",
  "inf-simd",
+ "libc",
  "proptest",
 ]
 
@@ -828,6 +874,7 @@ version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",

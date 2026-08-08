@@ -1,0 +1,16 @@
+# Memory
+used_memory:31624452
+used_memory_human:30.16M
+used_memory_rss:124768256
+maxmemory:0
+maxmemory_policy:noeviction
+mem_fragmentation_ratio:3.95
+mem_allocator:inf-arena
+doc_tape_bytes:9525194
+doc_arena_bytes:0
+doc_resident_bytes:10485760
+doc_intern_bytes:0
+doc_slack_bytes:0
+doc_scratch_bytes:2864
+doc_path_cache_bytes:8420
+docs_live:10000

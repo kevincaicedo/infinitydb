@@ -1,0 +1,3 @@
+"h:0SS" # Uses: 951
+###### End of recommended dictionary. ######
+Done 9600766 runs in 301 second(s)

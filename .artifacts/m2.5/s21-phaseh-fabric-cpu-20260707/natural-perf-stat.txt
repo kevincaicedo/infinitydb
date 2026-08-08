@@ -1,0 +1,18 @@
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'cycles'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'instructions'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'branches'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'branch-misses'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'cache-references'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'cache-misses'
+
+ Performance counter stats for 'CPU(s) 4,6,8,10':
+
+   136,070,780,904      cpu_core/cycles/                                                      
+   286,588,916,643      cpu_core/instructions/                                                
+    48,338,152,038      cpu_core/branches/                                                    
+       260,749,916      cpu_core/branch-misses/                                               
+     2,694,315,357      cpu_core/cache-references/                                            
+       425,421,107      cpu_core/cache-misses/                                                
+
+      10.003790927 seconds time elapsed
+

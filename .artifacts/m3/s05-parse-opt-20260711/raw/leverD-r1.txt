@@ -1,0 +1,83 @@
+   Compiling inf-doc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-doc)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 20.63s
+     Running benches/parse.rs (target/release/deps/parse-c3274eca77934232)
+Benchmarking parse/small-200B
+Benchmarking parse/small-200B: Warming up for 3.0000 s
+Benchmarking parse/small-200B: Collecting 100 samples in estimated 5.0005 s (12M iterations)
+Benchmarking parse/small-200B: Analyzing
+parse/small-200B        time:   [414.48 ns 414.89 ns 415.28 ns]
+                        thrpt:  [484.55 MiB/s 485.01 MiB/s 485.48 MiB/s]
+                 change:
+                        time:   [−9.3629% −9.2363% −9.1114%] (p = 0.00 < 0.05)
+                        thrpt:  [+10.025% +10.176% +10.330%]
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  2 (2.00%) low mild
+  1 (1.00%) high mild
+Benchmarking parse/gate-1KiB
+Benchmarking parse/gate-1KiB: Warming up for 3.0000 s
+Benchmarking parse/gate-1KiB: Collecting 100 samples in estimated 5.0061 s (3.3M iterations)
+Benchmarking parse/gate-1KiB: Analyzing
+parse/gate-1KiB         time:   [1.5036 µs 1.5063 µs 1.5088 µs]
+                        thrpt:  [518.92 MiB/s 519.81 MiB/s 520.73 MiB/s]
+                 change:
+                        time:   [+2.4843% +2.5993% +2.6957%] (p = 0.00 < 0.05)
+                        thrpt:  [−2.6249% −2.5334% −2.4241%]
+                        Performance has regressed.
+Found 10 outliers among 100 measurements (10.00%)
+  4 (4.00%) low severe
+  5 (5.00%) low mild
+  1 (1.00%) high mild
+Benchmarking parse/medium-2KiB
+Benchmarking parse/medium-2KiB: Warming up for 3.0000 s
+Benchmarking parse/medium-2KiB: Collecting 100 samples in estimated 5.0027 s (2.0M iterations)
+Benchmarking parse/medium-2KiB: Analyzing
+parse/medium-2KiB       time:   [2.5389 µs 2.5419 µs 2.5452 µs]
+                        thrpt:  [521.95 MiB/s 522.63 MiB/s 523.24 MiB/s]
+                 change:
+                        time:   [−1.5215% −1.4130% −1.3099%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.3273% +1.4333% +1.5450%]
+                        Performance has improved.
+Benchmarking parse/large-64KiB
+Benchmarking parse/large-64KiB: Warming up for 3.0000 s
+Benchmarking parse/large-64KiB: Collecting 100 samples in estimated 5.1543 s (45k iterations)
+Benchmarking parse/large-64KiB: Analyzing
+parse/large-64KiB       time:   [113.33 µs 113.40 µs 113.47 µs]
+                        thrpt:  [361.48 MiB/s 361.71 MiB/s 361.93 MiB/s]
+                 change:
+                        time:   [+1.7572% +1.8676% +1.9809%] (p = 0.00 < 0.05)
+                        thrpt:  [−1.9424% −1.8333% −1.7269%]
+                        Performance has regressed.
+Found 6 outliers among 100 measurements (6.00%)
+  1 (1.00%) low severe
+  2 (2.00%) low mild
+  3 (3.00%) high mild
+Benchmarking parse/deep-32
+Benchmarking parse/deep-32: Warming up for 3.0000 s
+Benchmarking parse/deep-32: Collecting 100 samples in estimated 5.0115 s (1.5M iterations)
+Benchmarking parse/deep-32: Analyzing
+parse/deep-32           time:   [3.2557 µs 3.2574 µs 3.2590 µs]
+                        thrpt:  [486.65 MiB/s 486.88 MiB/s 487.14 MiB/s]
+                 change:
+                        time:   [+8.3821% +8.4675% +8.5555%] (p = 0.00 < 0.05)
+                        thrpt:  [−7.8813% −7.8065% −7.7338%]
+                        Performance has regressed.
+Found 5 outliers among 100 measurements (5.00%)
+  5 (5.00%) low mild
+Benchmarking parse/wide-array
+Benchmarking parse/wide-array: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.4s, enable flat sampling, or reduce sample count to 60.
+Benchmarking parse/wide-array: Collecting 100 samples in estimated 5.3753 s (5050 iterations)
+Benchmarking parse/wide-array: Analyzing
+parse/wide-array        time:   [1.0656 ms 1.0663 ms 1.0670 ms]
+                        thrpt:  [354.71 MiB/s 354.93 MiB/s 355.15 MiB/s]
+                 change:
+                        time:   [+13.094% +13.229% +13.361%] (p = 0.00 < 0.05)
+                        thrpt:  [−11.786% −11.683% −11.578%]
+                        Performance has regressed.
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+

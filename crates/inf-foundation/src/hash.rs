@@ -74,6 +74,101 @@ pub fn hash64(data: &[u8], seed: u64) -> u64 {
     mix(P1 ^ (len as u64), mix(a ^ P1, b ^ seed))
 }
 
+// ---- trusted-integer table hashing -------------------------------------------
+
+/// Folded-multiply [`core::hash::Hasher`] for **trusted integer keys**
+/// (fabric tokens, completion tokens, cell ids): one 128-bit multiply per
+/// integer write instead of SipHash's per-byte rounds. Not DoS-resistant —
+/// use only for tables whose keys are internally generated (cell-local
+/// gates, driver op tables), never attacker-chosen (client keys keep
+/// [`hash64`]'s full mixing via the byte-slice fallback).
+#[derive(Default, Clone, Copy)]
+pub struct IntHasher(u64);
+
+impl core::hash::Hasher for IntHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    /// Byte-slice fallback (derived `Hash` on non-integer fields): full
+    /// [`hash64`] quality, seeded by accumulated state.
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = hash64(bytes, self.0);
+    }
+
+    #[inline(always)]
+    fn write_u8(&mut self, v: u8) {
+        self.write_u64(u64::from(v));
+    }
+
+    #[inline(always)]
+    fn write_u16(&mut self, v: u16) {
+        self.write_u64(u64::from(v));
+    }
+
+    #[inline(always)]
+    fn write_u32(&mut self, v: u32) {
+        self.write_u64(u64::from(v));
+    }
+
+    #[inline(always)]
+    fn write_u64(&mut self, v: u64) {
+        self.0 = mix(v ^ P2, self.0 ^ P1);
+    }
+
+    #[inline(always)]
+    fn write_u128(&mut self, v: u128) {
+        self.write_u64(v as u64);
+        self.write_u64((v >> 64) as u64);
+    }
+
+    #[inline(always)]
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+
+    #[inline(always)]
+    fn write_i8(&mut self, v: i8) {
+        self.write_u64(v as u8 as u64);
+    }
+
+    #[inline(always)]
+    fn write_i16(&mut self, v: i16) {
+        self.write_u64(v as u16 as u64);
+    }
+
+    #[inline(always)]
+    fn write_i32(&mut self, v: i32) {
+        self.write_u64(v as u32 as u64);
+    }
+
+    #[inline(always)]
+    fn write_i64(&mut self, v: i64) {
+        self.write_u64(v as u64);
+    }
+
+    #[inline(always)]
+    fn write_isize(&mut self, v: isize) {
+        self.write_u64(v as u64);
+    }
+}
+
+/// [`core::hash::BuildHasher`] for [`IntHasher`] tables
+/// (`HashMap<K, V, BuildIntHasher>`).
+#[derive(Default, Clone, Copy)]
+pub struct BuildIntHasher;
+
+impl core::hash::BuildHasher for BuildIntHasher {
+    type Hasher = IntHasher;
+
+    #[inline(always)]
+    fn build_hasher(&self) -> IntHasher {
+        IntHasher(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +214,37 @@ mod tests {
     fn empty_input_is_defined() {
         let h = hash64(b"", 0);
         assert_eq!(h, hash64(b"", 0));
+    }
+
+    #[test]
+    fn int_hasher_distributes_sequential_tokens() {
+        // Fabric tokens are sequential u64s; low bits (hashbrown's bucket
+        // mask) must not collide over a realistic window.
+        use core::hash::{BuildHasher, Hasher};
+        let mut low7 = std::collections::HashSet::new();
+        for token in 0u64..128 {
+            let mut h = BuildIntHasher.build_hasher();
+            h.write_u64(token);
+            low7.insert(h.finish() & 0x7F);
+        }
+        // Random-quality bar: 128 balls into 128 bins leaves ~81 distinct
+        // in expectation (birthday); degenerate mixing would leave ≤ 16.
+        assert!(low7.len() >= 72, "sequential tokens collapse: {}", low7.len());
+    }
+
+    #[test]
+    fn int_hasher_width_and_sign_insensitive_widening() {
+        use core::hash::{BuildHasher, Hasher};
+        let one = |f: &dyn Fn(&mut IntHasher)| {
+            let mut h = BuildIntHasher.build_hasher();
+            f(&mut h);
+            h.finish()
+        };
+        // Widening writes agree (u8/u16/u32 route through write_u64).
+        assert_eq!(one(&|h| h.write_u8(7)), one(&|h| h.write_u64(7)));
+        assert_eq!(one(&|h| h.write_u16(7)), one(&|h| h.write_u64(7)));
+        assert_eq!(one(&|h| h.write_u32(7)), one(&|h| h.write_u64(7)));
+        // Distinct values hash distinctly.
+        assert_ne!(one(&|h| h.write_u64(1)), one(&|h| h.write_u64(2)));
     }
 }

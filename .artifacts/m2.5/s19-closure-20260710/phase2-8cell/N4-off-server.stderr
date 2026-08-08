@@ -1,0 +1,4 @@
+infinityd: listening on 6421
+infinityd 515c87a (git 515c87a00168, x86_64-unknown-linux-gnu)
+infinityd: 8 cells, port 6421, backend io_uring, route natural
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }

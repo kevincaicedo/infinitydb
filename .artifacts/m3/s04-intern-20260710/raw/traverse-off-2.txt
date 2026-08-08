@@ -1,0 +1,13 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.03s
+     Running benches/traverse.rs (target/release/deps/traverse-d15a6b313db2ccf3)
+Benchmarking depth4_leaf_fetch/tape
+Benchmarking depth4_leaf_fetch/tape: Warming up for 3.0000 s
+Benchmarking depth4_leaf_fetch/tape: Collecting 100 samples in estimated 5.0007 s (22M iterations)
+Benchmarking depth4_leaf_fetch/tape: Analyzing
+depth4_leaf_fetch/tape  time:   [226.95 ns 227.32 ns 227.99 ns]
+                        change: [−3.8356% −3.7125% −3.5422%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) high mild
+  2 (2.00%) high severe
+

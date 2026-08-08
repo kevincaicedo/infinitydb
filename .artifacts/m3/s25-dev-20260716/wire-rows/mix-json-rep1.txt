@@ -1,0 +1,19 @@
+Json file /tmp/claude-1000/-home-kcaicedo-Documents-Projects-databases/f7c996e7-230c-45c8-80f1-979984910087/scratchpad/wire-rows/mix-json-rep1.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 10%,   0 secs]  2 threads 25 conns:     1231156 ops, 1231415 (avg: 1231415) ops/sec, 96.17MB/sec (avg: 96.17MB/sec),  0.65 (avg:  0.65) msec latency[RUN #1 20%,   1 secs]  2 threads 25 conns:     2444748 ops, 1213436 (avg: 1222424) ops/sec, 94.76MB/sec (avg: 95.46MB/sec),  0.66 (avg:  0.65) msec latency[RUN #1 30%,   3 secs]  2 threads 25 conns:     3655095 ops, 1210147 (avg: 1218331) ops/sec, 94.50MB/sec (avg: 95.14MB/sec),  0.66 (avg:  0.65) msec latency[RUN #1 40%,   4 secs]  2 threads 25 conns:     4861078 ops, 1205769 (avg: 1215190) ops/sec, 94.17MB/sec (avg: 94.90MB/sec),  0.66 (avg:  0.65) msec latency[RUN #1 50%,   5 secs]  2 threads 25 conns:     6066702 ops, 1205455 (avg: 1213243) ops/sec, 94.14MB/sec (avg: 94.75MB/sec),  0.66 (avg:  0.66) msec latency[RUN #1 60%,   6 secs]  2 threads 25 conns:     7267224 ops, 1200406 (avg: 1211104) ops/sec, 93.75MB/sec (avg: 94.58MB/sec),  0.66 (avg:  0.66) msec latency[RUN #1 70%,   7 secs]  2 threads 25 conns:     8463446 ops, 1196110 (avg: 1208962) ops/sec, 93.41MB/sec (avg: 94.41MB/sec),  0.67 (avg:  0.66) msec latency[RUN #1 80%,   8 secs]  2 threads 25 conns:     9663807 ops, 1200245 (avg: 1207872) ops/sec, 93.74MB/sec (avg: 94.33MB/sec),  0.66 (avg:  0.66) msec latency[RUN #1 90%,   9 secs]  2 threads 25 conns:    10865582 ops, 1201577 (avg: 1207173) ops/sec, 93.84MB/sec (avg: 94.28MB/sec),  0.66 (avg:  0.66) msec latency[RUN #1 100%,  10 secs]  2 threads 25 conns:    12067733 ops, 1202259 (avg: 1206681) ops/sec, 93.89MB/sec (avg: 94.24MB/sec),  0.66 (avg:  0.66) msec latency[RUN #1 100%,  10 secs]  0 threads 25 conns:    12068305 ops, 1202259 (avg: 1206656) ops/sec, 93.89MB/sec (avg: 94.24MB/sec),  0.66 (avg:  0.66) msec latency
+
+Saving JSON output file: /tmp/claude-1000/-home-kcaicedo-Documents-Projects-databases/f7c996e7-230c-45c8-80f1-979984910087/scratchpad/wire-rows/mix-json-rep1.json
+Json file closed.
+2         Threads
+25        Connections per thread
+10        Seconds
+
+
+ALL STATS
+==============================================================================================================================
+Type           Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+------------------------------------------------------------------------------------------------------------------------------
+Json.gets   1206650.96         0.00         0.00         0.66008         0.65500         1.07900         1.39900     96496.32 
+Totals      1206650.96         0.00         0.00         0.66008         0.65500         1.07900         1.39900    192992.64 

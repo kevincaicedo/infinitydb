@@ -12,8 +12,27 @@
 //! byte-for-byte (the single-key linearizability oracle: apply points on a
 //! single thread form a real total order).
 
+pub mod bootstorm;
+pub mod coldstorm;
+pub mod combined;
+pub mod diskfull;
+mod document;
+pub mod durable;
 pub mod harness;
 pub mod net;
+pub mod pressure;
+pub mod recovery;
 pub mod resp;
+pub mod steel;
+pub mod tiered;
 
+pub use bootstorm::{BootStormReport, BootStormScenario, run_boot_storm_scenario};
+pub use coldstorm::{ColdStormReport, ColdStormScenario, run_cold_storm_scenario};
+pub use combined::{CombinedReport, CombinedScenario, run_combined_scenario};
+pub use diskfull::{DiskfullReport, DiskfullScenario, run_diskfull_scenario};
+pub use durable::{DurableReport, DurableScenario, run_durable_scenario};
 pub use harness::{Scenario, SimReport, run_scenario};
+pub use pressure::{PressureReport, PressureScenario, run_pressure_scenario};
+pub use recovery::{RecoveryReport, RecoveryScenario, run_recovery_scenario};
+pub use steel::{SteelReport, SteelScenario, run_steel_scenario};
+pub use tiered::{TieredNodeReport, TieredScenario, run_tiered_scenario};

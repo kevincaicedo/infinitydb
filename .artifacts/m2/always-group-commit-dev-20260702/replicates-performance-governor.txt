@@ -1,0 +1,24 @@
+=== log_fsync replicate 1 (governor performance) ===
+# log_fsync — one LogWrite + linked fdatasync per iteration (uring, dev tier)
+# file: /home/kcaicedo/Documents/Projects/databases/infinitydb/target/log-fsync-bench.seg (1 GiB fallocated), 5 s/row, record = 70 B
+ group   frames/s   fsyncs/s     writes/s     p50us     p99us    p999us     maxus
+     1       1058       1058         1058       927      1663      2431      6362
+    64        776        776        49649      1247      2015      2111      2376
+   256        825        825       211271      1247      1983      2943      6801
+  1024        756        756       773954      1375      2175      3775      7201
+=== log_fsync replicate 2 (governor performance) ===
+# log_fsync — one LogWrite + linked fdatasync per iteration (uring, dev tier)
+# file: /home/kcaicedo/Documents/Projects/databases/infinitydb/target/log-fsync-bench.seg (1 GiB fallocated), 5 s/row, record = 70 B
+ group   frames/s   fsyncs/s     writes/s     p50us     p99us    p999us     maxus
+     1       1057       1057         1057       927      1599      2751      5112
+    64        773        773        49469      1247      2015      2815      7468
+   256        825        825       211094      1279      2015      2751      4200
+  1024        755        755       773621      1375      2175      4479      9411
+=== log_fsync replicate 3 (governor performance) ===
+# log_fsync — one LogWrite + linked fdatasync per iteration (uring, dev tier)
+# file: /home/kcaicedo/Documents/Projects/databases/infinitydb/target/log-fsync-bench.seg (1 GiB fallocated), 5 s/row, record = 70 B
+ group   frames/s   fsyncs/s     writes/s     p50us     p99us    p999us     maxus
+     1       1059       1059         1059       927      1535      2239      2390
+    64        775        775        49601      1247      2015      4223      6764
+   256        822        822       210379      1279      2047      2559      2586
+  1024        759        759       777577      1375      2175      3263      8215

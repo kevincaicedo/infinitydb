@@ -1,0 +1,16 @@
+== replicate 2 ==
+# log_fsync — one LogWrite + linked fdatasync per iteration (uring, dev tier)
+# file: target/log-fsync-bench.seg (1 GiB fallocated), 5 s/row, record = 70 B
+ group   frames/s   fsyncs/s     writes/s     p50us     p99us    p999us     maxus
+     1       1057       1057         1057       927      1695      2431      8161
+    64        780        780        49920      1247      2047      2687      5134
+   256        829        829       212112      1247      2015      2815      7518
+  1024        759        759       777404      1375      2111      3071      8956
+== replicate 3 ==
+# log_fsync — one LogWrite + linked fdatasync per iteration (uring, dev tier)
+# file: target/log-fsync-bench.seg (1 GiB fallocated), 5 s/row, record = 70 B
+ group   frames/s   fsyncs/s     writes/s     p50us     p99us    p999us     maxus
+     1       1059       1059         1059       927      1567      2303      5389
+    64        779        779        49883      1247      2015      3903      6905
+   256        830        830       212500      1247      2015      2431      3430
+  1024        761        761       778789      1375      2175      3135      6980

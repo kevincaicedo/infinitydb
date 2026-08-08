@@ -1,0 +1,16 @@
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 10%,   1 secs]  8 threads 13 conns:     1262450 ops, 1259213 (avg: 1259213) ops/sec, 1.26GB/sec (avg: 1.26GB/sec),  1.32 (avg:  1.32) msec latency[RUN #1 20%,   2 secs]  8 threads 13 conns:     2530053 ops, 1267457 (avg: 1263330) ops/sec, 1.27GB/sec (avg: 1.27GB/sec),  1.31 (avg:  1.31) msec latency[RUN #1 30%,   3 secs]  8 threads 13 conns:     3797136 ops, 1266934 (avg: 1264530) ops/sec, 1.27GB/sec (avg: 1.27GB/sec),  1.31 (avg:  1.31) msec latency[RUN #1 40%,   4 secs]  8 threads 13 conns:     5064415 ops, 1267135 (avg: 1265181) ops/sec, 1.27GB/sec (avg: 1.27GB/sec),  1.31 (avg:  1.31) msec latency[RUN #1 50%,   5 secs]  8 threads 13 conns:     6323966 ops, 1259406 (avg: 1264027) ops/sec, 1.26GB/sec (avg: 1.27GB/sec),  1.32 (avg:  1.31) msec latency[RUN #1 60%,   6 secs]  8 threads 13 conns:     7589258 ops, 1265149 (avg: 1264214) ops/sec, 1.27GB/sec (avg: 1.27GB/sec),  1.31 (avg:  1.31) msec latency[RUN #1 70%,   7 secs]  8 threads 13 conns:     8850873 ops, 1261464 (avg: 1263821) ops/sec, 1.27GB/sec (avg: 1.27GB/sec),  1.32 (avg:  1.31) msec latency[RUN #1 80%,   8 secs]  8 threads 13 conns:    10110603 ops, 1259586 (avg: 1263292) ops/sec, 1.26GB/sec (avg: 1.27GB/sec),  1.32 (avg:  1.31) msec latency[RUN #1 90%,   9 secs]  8 threads 13 conns:    11280701 ops, 1169964 (avg: 1252925) ops/sec, 1.17GB/sec (avg: 1.26GB/sec),  1.42 (avg:  1.33) msec latency[RUN #1 100%,  10 secs]  0 threads 13 conns:    12541819 ops, 1169964 (avg: 1253992) ops/sec, 1.17GB/sec (avg: 1.26GB/sec),  1.42 (avg:  1.32) msec latency
+
+8         Threads
+13        Connections per thread
+10        Seconds
+
+
+ALL STATS
+==============================================================================================================================
+Type           Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+------------------------------------------------------------------------------------------------------------------------------
+Json.sets   1253964.30         0.00         0.00         1.32512         1.27900         2.46300         3.39100   1319955.48 
+Totals      1253964.30         0.00         0.00         1.32512         1.27900         2.46300         3.39100   2639910.96 

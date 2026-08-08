@@ -1,0 +1,112 @@
+   Compiling inf-simd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-simd)
+   Compiling inf-doc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-doc)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 21.05s
+     Running benches/parse.rs (target/release/deps/parse-c3274eca77934232)
+Benchmarking parse/small-200B
+Benchmarking parse/small-200B: Warming up for 3.0000 s
+Benchmarking parse/small-200B: Collecting 100 samples in estimated 5.0015 s (15M iterations)
+Benchmarking parse/small-200B: Analyzing
+parse/small-200B        time:   [323.91 ns 324.06 ns 324.22 ns]
+                        thrpt:  [620.65 MiB/s 620.95 MiB/s 621.24 MiB/s]
+                 change:
+                        time:   [−5.5925% −5.4861% −5.3904%] (p = 0.00 < 0.05)
+                        thrpt:  [+5.6976% +5.8046% +5.9237%]
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) low mild
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking parse/gate-1KiB
+Benchmarking parse/gate-1KiB: Warming up for 3.0000 s
+Benchmarking parse/gate-1KiB: Collecting 100 samples in estimated 5.0005 s (4.0M iterations)
+Benchmarking parse/gate-1KiB: Analyzing
+parse/gate-1KiB         time:   [1.2340 µs 1.2344 µs 1.2349 µs]
+                        thrpt:  [634.04 MiB/s 634.27 MiB/s 634.48 MiB/s]
+                 change:
+                        time:   [+1.4377% +1.5000% +1.5620%] (p = 0.00 < 0.05)
+                        thrpt:  [−1.5380% −1.4778% −1.4173%]
+                        Performance has regressed.
+Found 6 outliers among 100 measurements (6.00%)
+  2 (2.00%) low mild
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+Benchmarking parse/medium-2KiB
+Benchmarking parse/medium-2KiB: Warming up for 3.0000 s
+Benchmarking parse/medium-2KiB: Collecting 100 samples in estimated 5.0083 s (2.4M iterations)
+Benchmarking parse/medium-2KiB: Analyzing
+parse/medium-2KiB       time:   [2.0879 µs 2.0890 µs 2.0901 µs]
+                        thrpt:  [635.59 MiB/s 635.93 MiB/s 636.28 MiB/s]
+                 change:
+                        time:   [+2.2396% +2.3454% +2.4512%] (p = 0.00 < 0.05)
+                        thrpt:  [−2.3926% −2.2916% −2.1905%]
+                        Performance has regressed.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) low mild
+Benchmarking parse/large-64KiB
+Benchmarking parse/large-64KiB: Warming up for 3.0000 s
+Benchmarking parse/large-64KiB: Collecting 100 samples in estimated 5.2498 s (61k iterations)
+Benchmarking parse/large-64KiB: Analyzing
+parse/large-64KiB       time:   [86.560 µs 86.670 µs 86.775 µs]
+                        thrpt:  [472.69 MiB/s 473.26 MiB/s 473.86 MiB/s]
+                 change:
+                        time:   [−4.0365% −3.8463% −3.6630%] (p = 0.00 < 0.05)
+                        thrpt:  [+3.8023% +4.0002% +4.2062%]
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  2 (2.00%) low severe
+  2 (2.00%) low mild
+  2 (2.00%) high mild
+Benchmarking parse/deep-32
+Benchmarking parse/deep-32: Warming up for 3.0000 s
+Benchmarking parse/deep-32: Collecting 100 samples in estimated 5.0001 s (2.0M iterations)
+Benchmarking parse/deep-32: Analyzing
+parse/deep-32           time:   [2.5180 µs 2.5188 µs 2.5195 µs]
+                        thrpt:  [629.48 MiB/s 629.66 MiB/s 629.85 MiB/s]
+                 change:
+                        time:   [−0.5957% −0.4900% −0.4008%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.4024% +0.4924% +0.5992%]
+                        Change within noise threshold.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) low mild
+  2 (2.00%) high mild
+Benchmarking parse/wide-array
+Benchmarking parse/wide-array: Warming up for 3.0000 s
+Benchmarking parse/wide-array: Collecting 100 samples in estimated 8.1524 s (10k iterations)
+Benchmarking parse/wide-array: Analyzing
+parse/wide-array        time:   [807.32 µs 807.53 µs 807.75 µs]
+                        thrpt:  [468.54 MiB/s 468.66 MiB/s 468.79 MiB/s]
+                 change:
+                        time:   [−0.5722% −0.5116% −0.4572%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.4593% +0.5143% +0.5755%]
+                        Change within noise threshold.
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) low severe
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+
+Benchmarking scan/simd
+Benchmarking scan/simd: Warming up for 3.0000 s
+Benchmarking scan/simd: Collecting 100 samples in estimated 5.0019 s (12M iterations)
+Benchmarking scan/simd: Analyzing
+scan/simd               time:   [425.55 ns 425.84 ns 426.12 ns]
+                        thrpt:  [3.0445 GiB/s 3.0465 GiB/s 3.0486 GiB/s]
+                 change:
+                        time:   [−0.5231% −0.4239% −0.3314%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.3325% +0.4257% +0.5259%]
+                        Change within noise threshold.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) low mild
+Benchmarking scan/scalar
+Benchmarking scan/scalar: Warming up for 3.0000 s
+Benchmarking scan/scalar: Collecting 100 samples in estimated 5.0078 s (1.6M iterations)
+Benchmarking scan/scalar: Analyzing
+scan/scalar             time:   [3.0813 µs 3.0841 µs 3.0869 µs]
+                        thrpt:  [430.36 MiB/s 430.74 MiB/s 431.13 MiB/s]
+                 change:
+                        time:   [+10.998% +11.210% +11.424%] (p = 0.00 < 0.05)
+                        thrpt:  [−10.253% −10.080% −9.9087%]
+                        Performance has regressed.
+Found 8 outliers among 100 measurements (8.00%)
+  3 (3.00%) low mild
+  5 (5.00%) high mild
+

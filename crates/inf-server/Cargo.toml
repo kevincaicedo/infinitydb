@@ -11,12 +11,49 @@ description = "Dispatch + transports; M0: command execution + the ServerPlane no
 inf-foundation.workspace = true
 inf-alloc.workspace = true
 inf-fabric.workspace = true
+inf-log.workspace = true
 inf-runtime.workspace = true
 inf-wire.workspace = true
-inf-store.workspace = true
+inf-store = { workspace = true, default-features = false }
+inf-doc = { workspace = true, optional = true }
+
+[features]
+# The document command surface (M3-S11/S12; ADR-0041 D3). Default-on;
+# slim builds disable it and carry zero document/path code (L11) — the
+# `JSON.*` registry rows then answer unknown-command.
+default = ["doc"]
+doc = ["inf-store/doc", "dep:inf-doc"]
 
 [lints]
 workspace = true
 
+[dev-dependencies]
+# M2-S16: recovery/fault tests arm named points (dev-only unification).
+inf-foundation = { workspace = true, features = ["fault-points"] }
+# M2.5-S12 (ADR-0031): recovery tests hand-build legacy v1 frames (CRC32C)
+# — no shipping code path emits them anymore.
+inf-simd.workspace = true
+# M2-S22: bench-only page-cache cooling (fadvise DONTNEED) for the
+# cold-cache recovery/boot gate rows. The library keeps its no-libc rule.
+libc.workspace = true
+# M3-S10/S11: the command-level JSON.SET/GET vs SET/GET denominator rows.
+criterion.workspace = true
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 inf-runtime = { workspace = true, features = ["uring"] }
+
+[[bench]]
+name = "recovery_replay"
+harness = false
+test = false
+
+[[bench]]
+name = "parallel_boot"
+harness = false
+test = false
+
+[[bench]]
+name = "json_cmd"
+harness = false
+test = false
+required-features = ["doc"]

@@ -1,0 +1,20 @@
+# M4-S10 cold-read shaping (dev tier — ADR-0055)
+env: governor=performance records=262144 reads=50000 reps=3 batch=16 qd_cap=64 zipf θ=0.99
+
+## coalesce: device reads for the identical zipfian batched workload
+rep0 merge=false device reads   50000 / 50000 logical (100.0% of logical) · 0.11s
+rep0 merge=true  device reads   31848 / 50000 logical (63.7% of logical) · 0.11s
+rep0 device-read reduction: 36.3%
+rep1 merge=true  device reads   32209 / 50000 logical (64.4% of logical) · 0.11s
+rep1 merge=false device reads   50000 / 50000 logical (100.0% of logical) · 0.11s
+rep1 device-read reduction: 35.6%
+rep2 merge=false device reads   50000 / 50000 logical (100.0% of logical) · 0.11s
+rep2 merge=true  device reads   32297 / 50000 logical (64.6% of logical) · 0.11s
+rep2 device-read reduction: 35.4%
+
+coalesce verdict: median device-read reduction 35.6% vs the ≥ 20% cut line (plan §2) — PASS (coalescing stays default-on)
+
+## saturate: memory-hit lane, unloaded vs under full-QD cold flood
+rep0 unloaded p50 0.04 µs p99 0.06 µs p99.9 0.07 µs | loaded p50 0.05 µs p99 0.15 µs p99.9 0.24 µs | flood 7154 cold reads, sampled QD p99 64 | substrate altitude (unloaded p99 0.06 µs is timer-scale): ratio non-binding; absolute p99 delta +87 ns recorded — the 1.1× verdict is the S22 command-level rows'
+rep1 unloaded p50 0.05 µs p99 0.07 µs p99.9 0.08 µs | loaded p50 0.05 µs p99 0.14 µs p99.9 0.22 µs | flood 7477 cold reads, sampled QD p99 64 | substrate altitude (unloaded p99 0.07 µs is timer-scale): ratio non-binding; absolute p99 delta +72 ns recorded — the 1.1× verdict is the S22 command-level rows'
+rep2 unloaded p50 0.04 µs p99 0.06 µs p99.9 0.09 µs | loaded p50 0.05 µs p99 0.11 µs p99.9 0.22 µs | flood 6921 cold reads, sampled QD p99 64 | substrate altitude (unloaded p99 0.06 µs is timer-scale): ratio non-binding; absolute p99 delta +53 ns recorded — the 1.1× verdict is the S22 command-level rows'

@@ -2,26 +2,68 @@
 //! routing (master plan §7, milestones M0-E5, M1-E1/E2). Never sees a socket
 //! or a RESP byte (§3.3): commands arrive as parsed arguments through
 //! `inf-server`, time arrives injected as `Nanos` (L7), and memory is
-//! attributed byte-exactly (L5).
+//! attributed byte-exactly (L5). Since M2-S08 it consumes `inf-log`'s
+//! effect/record vocabulary (ADR-0012 D1 / ADR-0015 D7) — it still never
+//! opens a file.
 #![forbid(unsafe_code)]
 
+mod address_space;
+mod catalog;
+mod demote;
+mod doc;
 mod evict;
+mod extents;
 mod index;
 mod keyspace;
+mod live_set;
 mod ns;
 mod record;
 mod router;
 mod store;
+mod tiered;
+mod tiered_recover;
+mod wall;
 mod wheel;
+mod write_accounting;
 
+pub use address_space::{
+    AddrClass, AddressSpace, AddressSpaceConfig, AddressSpaceReport, TieringCounters,
+};
+pub use catalog::{CatalogError, NsCatalog};
+pub use demote::{DemoteStats, DemotionConfig, EvictionPressure, MUTABLE_PERMILLE_DEFAULT};
+pub use doc::DocDomain;
+#[cfg(feature = "doc")]
+pub use doc::{JsonLogDecision, JsonRead, JsonScalarPatch, JsonSetOptions, JsonSetOutcome};
 pub use evict::{EvictStats, EvictionPolicy};
-pub use index::Index;
+pub use extents::{
+    BLOB_MAX_BYTES_DEFAULT, BLOB_RECLAIM_PER_SLICE_DEFAULT, BLOB_THRESHOLD_DEFAULT, BlobConfig,
+    ExtentRefs, ExtentStats,
+};
+pub use index::{Index, MemoryMode, SlotMode, TieredMode};
 pub use inf_alloc::ArenaConfig;
-pub use keyspace::{DEFAULT_DBS, EvictBudget, Keyspace, PressureConfig};
-pub use ns::{NsError, NsMode, NsSpec, valid_ns_name};
-pub use record::{MAX_KEY_LEN, MAX_VAL_LEN, TypeTag};
+// One import point for the shared store↔log vocabulary (ADR-0015 D2/D5).
+pub use inf_foundation::LogicalAddr;
+pub use inf_log::{FsyncClass, NsId};
+pub use keyspace::{
+    DEFAULT_DBS, EvictBudget, Keyspace, PressureConfig, ReplayError, ReplayOutcome, StateDigest,
+    TIERED_VA_LIMIT_DEFAULT, TieredCreateError, TieredUsage,
+};
+pub use live_set::{FileLiveSet, LiveSet};
+pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, valid_ns_name};
+pub use record::{EXTENT_REF_LEN, ExtentRef, MAX_KEY_LEN, MAX_VAL_LEN, TypeTag};
 pub use router::SlotRouter;
 pub use store::{
-    CellStore, CopyResult, Encoding, ExpireCond, ExpiryBudget, ExpiryStats, MemoryReport, OpError,
-    SetCond, SetExpire, SetOptions, SetOutcome, StoreConfig, StoreStats, Ttl, TtlUpdate,
+    CellStore, CheckpointImage, CopyResult, DiskFullCause, Encoding, ExpireCond, ExpiryBudget,
+    ExpiryStats, LogFullImage, MemoryReport, OpError, PostImage, SetCond, SetExpire, SetOptions,
+    SetOutcome, StoreConfig, StoreStats, Ttl, TtlUpdate,
+};
+pub use tiered::compact::{CompactionApplied, CompactionConfig, CompactionWork};
+pub use tiered::{RecordParts, TieredLookup, TieredTable};
+pub use tiered_recover::{
+    RecoveredTier, TierRecoverStats, apply_blob_ref_section, apply_live_set_section,
+    apply_ref_section, recover_tiered_ns,
+};
+pub use wall::WallAnchor;
+pub use write_accounting::{
+    WriteAccounting, WriteAccountingTotals, WriteAmpSummary, WriteAmplification,
 };

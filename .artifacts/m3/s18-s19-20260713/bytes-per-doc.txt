@@ -1,0 +1,18 @@
+command=cargo test -p inf-store --test doc_attribution corpus_shape_bytes_per_document_table -- --nocapture
+seed=0x1D0C2026
+configuration=product defaults; at least 32 MiB source idoc per row where corpus cardinality permits
+corpus=S02 six-shape stand-in; M3-S20 owns the final generator and manifest
+
+shape          idoc_B   docs  records_B/doc  doc_live_B/doc  doc_res_B/doc  slack_B/doc  index_B/doc  attributed_B/doc  attributed/idoc
+small-200B         191  65536          256.0             0.0            0.0          0.0         18.0             274.1            1.435x
+gate-1KiB          610  55007           76.3           610.0          648.1          0.0         10.7             735.3            1.205x
+medium-2KiB       1136  29537           71.0          1136.0         1349.0          0.0         20.0            1440.3            1.268x
+large-64KiB      35388    948         2212.2         77209.0        90699.6          0.0         19.4           92939.9            2.626x
+deep-32           1471  22810           91.9          1471.0         1563.0          0.0         12.9            1668.2            1.134x
+wide-array      300454    111        18893.3        978898.0      1303635.0          0.0         20.8         1322623.1            4.402x
+
+notes:
+- attributed_B/doc is the disjoint store-resident sum: record arena, index, wheel/eviction, document arena, and store freeze scratch.
+- doc_live_B/doc is the logical external payload partition (tape + tree). Inline idoc bytes already live in the record domain and are not double-counted.
+- Per-cell parser/effect scratch and the path-program cache are shared pools, so they remain INFO columns rather than being assigned dishonestly to one key.
+- Large and wide tree-form rows are an explicit downstream memory-gate risk. Attribution is complete; the M3-S20/S25 memory result is not being claimed green.

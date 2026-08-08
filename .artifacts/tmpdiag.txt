@@ -1,0 +1,29 @@
+== infinityd-36265.stderr: 381 bytes
+infinityd 8391a38 (git 8391a38fb3b6-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 36265, backend io_uring, route natural
+infinityd: listening on 36265
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+== infinityd-39515.stderr: 381 bytes
+infinityd 8391a38 (git 8391a38fb3b6-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 39515, backend io_uring, route natural
+infinityd: listening on 39515
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+== infinityd-40243.stderr: 381 bytes
+infinityd 8391a38 (git 8391a38fb3b6-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 40243, backend io_uring, route natural
+infinityd: listening on 40243
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+== infinityd-45027.stderr: 804 bytes
+control: cell 1 recovered (0 segments, 0 bytes, 0 records)
+control: cell 2 recovered (0 segments, 0 bytes, 0 records)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records)
+control: recovery complete — 4 cells serving (24 ms)
+durable-path I/O failed (fail-stop, §8.4): errno 122 on LogWrite
+durable-path I/O failed (fail-stop, §8.4): errno 122 on LogWrite
+== infinityd-46109.stderr: 672 bytes
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records)
+control: cell 2 recovered (0 segments, 0 bytes, 0 records)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records)
+control: recovery complete — 4 cells serving (33 ms)

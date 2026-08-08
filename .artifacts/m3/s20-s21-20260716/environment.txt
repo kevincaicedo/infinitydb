@@ -1,0 +1,18 @@
+campaign: M3-S20 document placement + root-prefetch A/B
+date_start: 2026-07-16T00:57:15-04:00
+date_end: 2026-07-16T00:57:42-04:00
+host_tier: development Linux box; not the reference box
+commit: 8391a38fb3b623b2b9a0ed18d8206922f9484f59
+tree: dirty (55 status entries before the rerun; M3-S18 through S21 work disclosed)
+command: taskset -c 4 cargo bench -p inf-store --bench doc_prefetch
+cpu: 4
+governor_pre/post: performance / performance
+energy_performance_preference_pre/post: performance / performance
+intel_pstate_no_turbo_pre/post: 1 / 1
+temperature_pre/post: 27.8 C / 27.8 C
+loadavg_pre: 0.50 0.43 0.52
+loadavg_post: 0.77 0.51 0.54
+memory_pre: 30 GiB total; 17 GiB free; 25 GiB available; 0 B swap used
+redisjson_container_during_S20: stopped
+environment_overrides: all INF_DOC_PREFETCH_* and INF_DOC_THRESHOLD_* variables unset
+claim_scope: development story gate only; no public or reference-box claim

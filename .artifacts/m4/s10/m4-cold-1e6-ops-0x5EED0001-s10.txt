@@ -1,0 +1,11 @@
+# M4-S10 — m4-cold DST at AC scale (10^6 ops), post-shaping (ADR-0055)
+# Run: ./target/release/inf-sim --scenario m4-cold --seed 0x5EED0001 --ops 1000000
+# (sequential, ulimit -v 4G — session discipline; deterministic, exit 0)
+inf-sim: scenario m4-cold seed 0x5eed0001: 333336 gets (192516 cold, 1004 chunked, 0 restarts, 5956 cancelled [2971 early / 2985 late]), 9279 merged waiters (queue hw 5), 20918 unlinks (2503 deferrals), hash 0x453d736cfa7c449b
+# Oracles green at this scale (violations empty): per-key linearizability
+# (content+version, never addresses); admission identity enqueued =
+# issued + merged_waiters + cancelled_queued; sampled device QD <= cap
+# (cap 3 < pool 4 so the policy limit binds); both cancellation legs
+# exercised (early = drain-skip / late = parked-drop); coalescing
+# observed (merged_waiters > 0 binds at >= 100k ops); unlink deferral
+# under flood; custody reconcile clean.

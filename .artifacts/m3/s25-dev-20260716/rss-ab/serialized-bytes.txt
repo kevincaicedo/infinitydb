@@ -1,0 +1,2 @@
+serialized_json_bytes=207171400
+documents=71200

@@ -1,0 +1,16 @@
+== grep release infinityd binary for fault machinery ==
+injected fault              : 0
+log_append_short_write      : 0
+torn_frame                  : 0
+manifest_rename_fail        : 0
+power_cut_after_seal        : 0
+prealloc_no_space           : 0
+dir_fsync_fail              : 0
+fsync_err                   : 6
+
+Disposition of the 6 "fsync_err" hits: all are debuginfo symbol names of
+the pre-existing GroupCommit::on_fsync_error (M2-S05 production code,
+release profile keeps debuginfo) — substring collision, not fault-point
+machinery. Zero occurrences of the injected-fault error string or any
+point name as data. The registry, arming API, and every injection arm
+are absent from the shipping binary.

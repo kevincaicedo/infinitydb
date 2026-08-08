@@ -242,9 +242,13 @@ mod tests {
     fn lease_release_storm_reconciles() {
         let mut pool = BufferPool::new(8, 64);
         let mut held = Vec::new();
-        // Deterministic pseudo-random storm.
+        // Deterministic pseudo-random storm. Miri interprets every
+        // iteration, so it runs a scaled-down storm on the same seed — the
+        // lease/release state machine is what it checks, and 2k transitions
+        // over an 8-buffer pool cover it (ADR-0065 D5).
+        let iters = if cfg!(miri) { 2_000 } else { 100_000 };
         let mut x: u64 = 0x9E3779B97F4A7C15;
-        for _ in 0..100_000 {
+        for _ in 0..iters {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;

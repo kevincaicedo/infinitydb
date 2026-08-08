@@ -529,11 +529,44 @@ pub static MATRIX: &[Case] = &[
     skip(&["INF.NS", "CREATE", "cache", "EVICTION", "allkeys-lfu"], "InfinityDB extension"),
     skip(
         &["INF.NS", "CREATE", "ledger", "MODE", "durable"],
-        "InfinityDB extension; durable mode honestly rejected until M2",
+        "InfinityDB extension; durable live since M2-S08 (node tier — the \
+         planeless compat candidate answers its documented no-runtime error)",
+    ),
+    skip(
+        &["INF.NS", "USE", "cache"],
+        "InfinityDB extension (M2-S08): named-namespace selection, SELECT-class \
+         conn state; durable-mode deviations documented in ADR-0015",
+    ),
+    skip(
+        &["INF.CKPT"],
+        "InfinityDB extension (M2-S20): checkpoint trigger; the planeless compat candidate \
+         answers its documented no-durable-plane error",
+    ),
+    skip(
+        &["BGSAVE"],
+        "maps onto INF.CKPT (M2-S20): fuzzy checkpoint, no fork, no RDB file; reply \
+         byte-identical on durable nodes; the planeless candidate answers its documented \
+         error (node_e2e pins the live reply)",
+    ),
+    skip(
+        &["LASTSAVE"],
+        "M2-S20: newest durable MANIFEST publication time; 0 before the first save vs \
+         Redis's process-start time; the planeless candidate answers its documented error",
     ),
     skip(&["INF.NS", "LIST"], "InfinityDB extension"),
     skip(&["INF.NS", "INFO", "cache"], "InfinityDB extension"),
     skip(&["INF.NS", "DROP", "cache"], "InfinityDB extension"),
+    // --- INF.NS tiering keys (M4-S19, ADR-0062 — extension) ---
+    skip(
+        &["INF.NS", "CREATE", "hot", "MODE", "durable", "MEM-BUDGET", "64mb"],
+        "InfinityDB extension (M4-S19, ADR-0062): MEM-BUDGET declares a durable-tiered \
+         namespace; the planeless compat candidate answers its documented no-runtime error",
+    ),
+    skip(
+        &["INF.NS", "SET", "hot", "MUTABLE-FRACTION", "300"],
+        "InfinityDB extension (M4-S19, ADR-0062 D3): per-namespace hot-reload; CreateOnly \
+         keys (TIER-IO-MODE, COLD-READ-QD) refuse typed",
+    ),
     // --- terminal cleanup ---
     c(&["FLUSHALL"]),
 ];

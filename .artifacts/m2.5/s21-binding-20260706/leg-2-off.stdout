@@ -1,0 +1,44 @@
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+
+== pipelined replicates (conns=64 P=16, 10s x 3) ==
+  rep 0: 2559250 ops/s, p999 975 us, windowed sqes/submit 16.4
+  rep 1: 2499775 ops/s, p999 943 us, windowed sqes/submit 18.1
+  rep 2: 2479459 ops/s, p999 943 us, windowed sqes/submit 16.7
+
+== cross-cell penalty (natural vs --route-local-only) ==
+  natural 2420418 ops/s vs all-local 6323417 ops/s => penalty 61.7%
+
+== comparator anchor (dragonfly --proactor_threads=4) ==
+  infinityd natural 2444987 ops/s vs dragonfly 1687351 ops/s => 1.45x
+
+== unpipelined 512-conn A/B vs redis ==
+  infinityd 707923 ops/s vs redis 243399 ops/s => 2.91x
+
+== RSS fill: 10000000 keys x (16 B, 64 B), both engines ==
+  infinityd fill: 3236021 sets/s
+  redis fill: 1161663 sets/s
+  RSS: infinityd 1129435136 B vs redis 1850306560 B => 0.610x
+
+== gate verdicts ==
+  Pipelined GET/SET node throughput      FAIL
+  Unpipelined throughput vs Redis, 512 conns PASS
+  io_uring SQEs per submit under pipelined load PASS
+  Fabric hop RTT p50 under load          FAIL
+  Cross-cell architecture vs Dragonfly, uniform random PASS
+  Cross-cell penalty, uniform random keys (informational; M1 S17 target) FAIL (informational)
+  p99.9 latency (memtier, 8 threads)     PASS
+  RSS @ 10M keys x (16 B, 64 B)          PASS
+  Reactor loop iteration p99.9           PASS
+  Syscall CPU share under pipelined load PENDING (tooling)
+
+gate-run: report written to .artifacts/m0/1783392817-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED

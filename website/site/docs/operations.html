@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Operations — InfinityDB Docs</title>
+<meta name="description" content="Operating InfinityDB: recovery and the -LOADING gate, what a fail-stop refusal means, the INFO persistence fields, operator tripwires, and the alpha limitation list.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2018'%3E%3Ccircle%20cx='10'%20cy='9'%20r='7'%20fill='none'%20stroke='%237c5cff'%20stroke-width='2.4'/%3E%3Ccircle%20cx='24'%20cy='9'%20r='7'%20fill='none'%20stroke='%233ee6c4'%20stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="../index.html" class="nav-brand">
+      <svg class="logo" width="34" height="18" viewBox="0 0 34 18" aria-hidden="true">
+        <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2.4"/>
+        <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2.4"/>
+      </svg>
+      <span class="mark">infinity<b>DB</b></span>
+      <span class="nav-badge neutral">DOCS</span>
+    </a>
+    <span class="nav-spacer"></span>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="nav-links">
+      <a href="../index.html">HOME</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
+    </div>
+  </div>
+</nav>
+
+<div class="docs-shell">
+  <aside class="docs-side">
+    <p class="side-h">Getting started</p>
+    <a class="side-link" href="index.html">Docs home</a>
+    <a class="side-link" href="quickstart.html">Quickstart</a>
+    <p class="side-h">Concepts</p>
+    <a class="side-link" href="architecture.html">Architecture</a>
+    <a class="side-link" href="durability.html">Namespaces &amp; durability</a>
+    <p class="side-h">Operations</p>
+    <a class="side-link" href="deployment.html">Deployment</a>
+    <a class="side-link" href="operations.html" aria-current="page">Operations</a>
+    <p class="side-h">Reference</p>
+    <a class="side-link" href="compat.html">Command matrix</a>
+    <a class="side-link" href="roadmap.html">Roadmap</a>
+  </aside>
+
+  <main class="docs-main">
+    <article>
+      <p class="doc-kicker">Operations</p>
+  <h1 class="page-title">Operations</h1>
+  <p class="lede">What the node does after a crash, exactly which commands answer while it loads, what a refusal to boot means (and why there is no <code>--force</code> flag), what to watch in <code>INFO persistence</code>, and the honest list of what this alpha does not do. The semantic contract behind all of it &mdash; ack points and loss windows &mdash; is on the <a href="durability.html">namespaces &amp; durability page</a>.</p>
+
+  <h2>Recovery, step by step</h2>
+  <p>A node started with <code>--data-dir</code> boots in a fixed order: the namespace catalog (<code>META</code>) loads first, then every cell recovers its own shard <strong>independently and in parallel</strong> &mdash; <code>MANIFEST</code> &rarr; the named checkpoint &rarr; log tail replay from the checkpoint&rsquo;s position. There is no global log and no merge step; recovery time scales with the largest shard, not the sum.</p>
+  <ul>
+    <li><strong>The node serves from its first moment</strong> &mdash; but behind a gate. While any cell is still replaying, gated commands receive the exact Redis reply: <code>-LOADING Redis is loading the dataset in memory</code>.</li>
+    <li><strong>The gate is node-scoped:</strong> a cell that finished replaying still answers <code>-LOADING</code> while a peer replays. Clients never observe a half-recovered keyspace.</li>
+    <li><strong>Which commands answer during load</strong> (the exempt set is pinned to <em>observed</em> Redis 8.0.5 behavior, captured on a live instance, not copied from docs): <code>HELLO</code>, <code>ECHO</code>, <code>QUIT</code>, <code>SELECT</code>, <code>INFO</code>, <code>COMMAND</code>, <code>CONFIG</code>, <code>CLIENT</code>, <code>DEBUG</code>, <code>SUBSCRIBE</code>, <code>UNSUBSCRIBE</code>, <code>PSUBSCRIBE</code>, <code>PUNSUBSCRIBE</code>, <code>PUBLISH</code>, <code>PUBSUB</code>, <code>LASTSAVE</code>. Notably <strong><code>PING</code> is gated</strong> &mdash; because it is in Redis. Unknown commands get the unknown-command error first, matching Redis resolution order.</li>
+    <li><strong>Progress is visible</strong> the whole time: <code>INFO persistence</code> (exempt from the gate) reports the <code>loading_*</code> fields below, and the node&rsquo;s stderr narrates per-cell progress.</li>
+  </ul>
+
+  <h2>What recovery repairs, and what it refuses</h2>
+  <p>Recovery draws one line, and draws it loudly. On one side: damage that is <em>provably</em> inside the defined crash window, repaired silently but always counted. On the other: damage that could hide lost acknowledged data, refused with a named error.</p>
+  <h3>Repaired and counted</h3>
+  <ul>
+    <li><strong>A torn final batch frame</strong> (detected by CRC) is truncated and replay resumes cleanly behind it. This is the expected physics of a power cut mid-write.</li>
+    <li><strong>A provably un-covered gap in the un-synced tail.</strong> Since frame format v2 (ADR-0031), every frame carries an epoch, a sequence number, and the durability watermark at seal time under its CRC. When a crash leaves a gap followed by surviving frames, recovery reads those attestations: if no surviving frame attests fsync coverage at or beyond the gap, nothing in it was ever acknowledged as durable &mdash; the tail truncates at the gap and the discarded frames are counted in the recovery stats, never silent.</li>
+    <li><strong>Residue of a discarded log life:</strong> every frame&rsquo;s epoch stamp names which life of the log wrote it, so replay ends cleanly where an older life&rsquo;s leftover frames begin &mdash; discarded data can never resurrect into the live prefix (counted, like every repair).</li>
+    <li><strong>Leftovers of interrupted maintenance</strong> &mdash; stale below-floor segments, orphaned <code>.ick.new</code> checkpoint stagings &mdash; are garbage-collected at boot.</li>
+  </ul>
+  <h3>Refused, with the evidence named</h3>
+  <ul>
+    <li>A surviving frame that <strong>attests fsync coverage past the point where valid data ends</strong> &mdash; the log itself proves the disk lost bytes that had been fsynced and acknowledged.</li>
+    <li><strong>Interior damage in sealed territory:</strong> corruption or gaps inside a sealed segment, or any validating frame beyond a sealed segment&rsquo;s recorded end &mdash; sealed segments were fully covered by their seal fsync, so damage there is covered loss.</li>
+    <li><strong>A MANIFEST that names missing or corrupt state</strong> &mdash; a checkpoint or segment that is absent, or a log whose valid data ends below the MANIFEST&rsquo;s begin position. Everything a MANIFEST names was durable at publication; its absence means the disk lied.</li>
+    <li><strong>An unknown record type or flag inside a CRC-valid frame</strong> &mdash; corruption-or-bug; replay refuses rather than skips.</li>
+    <li><strong>A v1-format frame beyond a gap</strong> &mdash; pre-v2 frames carry no attestation, so the conservative rule holds for them: refuse rather than guess. This class ages out as v1 frames leave the retained log.</li>
+    <li><strong>A frame-format downgrade signature</strong> (a v1 frame after a v2 frame) &mdash; unreachable by any honest writer.</li>
+  </ul>
+  <p>A refusal looks like this on stderr (the corruption class, the file, the offsets, and the evidence are always named):</p>
+<pre><code>infinityd: cell 2 recovery failed (fail-stop, &sect;8.4): log corruption in seg-000004
+at 0x3f2c0: &lt;what the bytes looked like&gt;; a validating frame follows at seg-000004
+offset 0x40000 &mdash; interior data would be lost by truncation, refusing to start (&sect;8.4)</code></pre>
+  <p>The process exits with code 1 and the whole node stops &mdash; a half-recovered node must never serve.</p>
+
+  <div class="callout">
+    <span class="callout-tag"><strong>What a refusal means for you:</strong></span>
+    the on-disk state failed an integrity check that <em>could</em> have hidden lost acknowledged writes. This is disk-integrity evidence, not an InfinityDB bug to work around: in the project&rsquo;s simulation sweeps every refusal is audited, and refusals fire only when the injected fault genuinely destroyed named state. Treat the volume as suspect. Restore the data directory from a backup or snapshot, or rebuild the namespace from an upstream source of truth. What is deliberately <strong>not</strong> offered: a <code>--force</code> or &ldquo;repair&rdquo; flag that truncates through the evidence &mdash; a database that boots with quietly missing acknowledged data is worse than one that refuses and says why. Refusals are also rare by design: frame format v2&rsquo;s per-frame attestations let recovery <em>prove</em> most crash-window gaps harmless and truncate them, so what remains refusing is the class where the log proves the disk dropped covered bytes.
+  </div>
+
+  <h2>Runtime fail-stops</h2>
+  <p>Two conditions stop a running node on purpose. Both mean the storage stack broke a promise; neither is recoverable by retrying.</p>
+  <ul>
+    <li><strong>fsync failure</strong> (the PostgreSQL-fsyncgate lesson): if the device reports an fsync error, the durability watermark <strong>freezes forever</strong> &mdash; zero acknowledgements are issued for the affected batch or anything after it &mdash; and the process exits with code 3 (<code>EXIT_DURABLE_FAILSTOP</code>). This is enforced mechanically: a repo script audits that fsync-error types can only appear at allowlisted fail-stop sites, and a child-process test proves the affected batch is never acknowledged.</li>
+    <li><strong>Namespace catalog swap failure:</strong> a failed <code>META</code> swap after a DDL was acknowledged is the same class and takes the same exit code 3.</li>
+  </ul>
+  <p>Checkpoint I/O failure is deliberately <em>narrower</em>: it aborts the checkpoint, never the process &mdash; nothing was acknowledged against an in-flight checkpoint and the log stays authoritative. You will see it as <code>ckpts_aborted</code> ticking up, which is worth investigating before the same disk fails an fsync.</p>
+
+  <h2>Observability: <code>INFO persistence</code></h2>
+  <p>Everything below is a real field emitted today, in emission order. Dashboards built on the Redis shapes (<code>loading</code>, <code>rdb_*</code>, <code>aof_*</code>) keep working; the InfinityDB-specific fields carry the durable plane&rsquo;s honesty.</p>
+
+  <h3>While loading</h3>
+  <div class="table-wrap">
+    <table class="data">
+      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>loading</code></td><td><code>1</code> while any cell is still replaying, else <code>0</code>. The remaining <code>loading_*</code> fields appear only while it is <code>1</code>.</td></tr>
+        <tr><td><code>loading_start_time</code></td><td>Boot start, unix seconds (Redis shape).</td></tr>
+        <tr><td><code>loading_total_bytes</code> / <code>loading_loaded_bytes</code></td><td>Bytes to replay and bytes replayed. Totals are file extents <em>including</em> preallocated slack &mdash; a disclosed upper bound.</td></tr>
+        <tr><td><code>loading_loaded_perc</code> / <code>loading_eta_seconds</code></td><td>Progress percentage and ETA derived from it (Redis shapes).</td></tr>
+        <tr><td><code>loading_cells_ready</code> / <code>loading_cells</code></td><td>InfinityDB extension: per-cell recovery is an InfinityDB shape, so the gate&rsquo;s state is visible &mdash; how many cells have finished out of how many.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Redis-shape compatibility fields</h3>
+  <div class="table-wrap">
+    <table class="data">
+      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>rdb_bgsave_in_progress</code></td><td><code>1</code> while a checkpoint streams. <code>BGSAVE</code> maps onto the fuzzy checkpoint &mdash; there is no fork and no RDB file.</td></tr>
+        <tr><td><code>rdb_last_save_time</code></td><td>Newest durable MANIFEST publication, unix seconds (the <code>LASTSAVE</code> currency).</td></tr>
+        <tr><td><code>rdb_changes_since_last_save</code>, <code>aof_enabled</code>, <code>aof_rewrite_in_progress</code></td><td>Constant <code>0</code> &mdash; kept so existing dashboards parse; there is no AOF and the log is not one.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Log spine &amp; durability watermark</h3>
+  <div class="table-wrap">
+    <table class="data">
+      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>log_records_appended</code></td><td>Cumulative records staged to the log.</td></tr>
+        <tr><td><code>pending_log_bytes</code></td><td>Bytes written or staged but not yet fsync-covered.</td></tr>
+        <tr><td><code>last_durable_lsn</code></td><td>The durability watermark itself &mdash; the exclusive end of the fsync-covered range.</td></tr>
+        <tr><td><code>watermark_lag_lsn</code></td><td>How far the watermark trails the append cursor.</td></tr>
+        <tr><td><code>fsyncs_completed</code> / <code>acks_gated</code></td><td>Durability fsyncs completed; <code>always</code>-mode replies that suspended on the watermark before being released.</td></tr>
+        <tr><td><code>log_frames_queued</code> / <code>log_staging_bytes</code></td><td>Batch frames handed to the write path; resident bytes of the staging domain (constant by construction &mdash; two fixed buffers).</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>fsync honesty &amp; group commit</h3>
+  <div class="table-wrap">
+    <table class="data">
+      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>fsyncs_per_sec</code> / <code>acks_per_sec</code></td><td>Windowed rates over the previous one-second tick window.</td></tr>
+        <tr><td><code>fsync_latency_p50_us</code> / <code>fsync_latency_p99_us</code> / <code>fsync_latency_p999_us</code></td><td>Device fsync latency percentiles, microseconds. <code>always</code> mode is storage-bound by definition, so the device&rsquo;s truth is reported, not hidden.</td></tr>
+        <tr><td><code>fsync_group_p50</code> / <code>fsync_group_p99</code></td><td>Records newly covered per durability fsync &mdash; the group-commit formation observable.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Checkpoints, MANIFEST &amp; truncation</h3>
+  <div class="table-wrap">
+    <table class="data">
+      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>ckpts_completed</code> / <code>ckpts_aborted</code></td><td>Fuzzy checkpoints finished; checkpoints aborted on I/O error (abort never stops the process).</td></tr>
+        <tr><td><code>ckpt_last_unix_ms</code> / <code>ckpt_last_begin_lsn</code> / <code>ckpt_age_s</code></td><td>When the last checkpoint published, the log position it materializes, and its age.</td></tr>
+        <tr><td><code>ckpt_buffer_bytes</code></td><td>Checkpoint streaming buffers resident right now (part of exact memory attribution).</td></tr>
+        <tr><td><code>manifests_published</code> / <code>manifests_aborted</code></td><td>Recovery-unit transitions committed / abandoned.</td></tr>
+        <tr><td><code>segments_truncated</code> / <code>log_segments_live</code></td><td>Segments reclaimed so far; segments currently live &mdash; the reclamation-bound observable.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>What to actually watch</h3>
+  <p>Field-level tripwires, as operator concepts &mdash; the same signals the project&rsquo;s own benchmark gates enforce mechanically:</p>
+  <ul>
+    <li><strong>Grouping ratio</strong> (<code>fsync_group_p50</code>): <code>always</code> throughput <em>is</em> group commit &mdash; many concurrent writers sharing one fsync. If the group size collapses toward one record per fsync, throughput degrades toward the device&rsquo;s raw fsync rate. Read it together with the fsync latency percentiles: a slow device with healthy grouping and a fast device with collapsed grouping look identical from the outside.</li>
+    <li><strong>Watermark lag</strong> (<code>watermark_lag_lsn</code>, <code>pending_log_bytes</code>): sustained growth means the device is not absorbing the offered durable write rate. InfinityDB&rsquo;s backpressure is bounded and explicit &mdash; you will see admission refusals, never unbounded memory growth.</li>
+    <li><strong>Reclamation health</strong> (<code>log_segments_live</code>, <code>ckpt_age_s</code>): both should stay bounded in steady state. A climbing segment count or an ever-aging checkpoint means truncation is not running &mdash; check <code>ckpts_aborted</code> and <code>manifests_aborted</code> for the disk trouble behind it.</li>
+    <li><strong>Batching health</strong> (a concept from the project&rsquo;s gate runs): the engine batches every boundary &mdash; syscalls per iteration, submissions per ring flush, log writes per loop. The in-repo benchmark harness enforces these as report-level tripwires; a deployment that suspects a pathology should reproduce with <code>inf-bench</code> rather than eyeball raw counters.</li>
+  </ul>
+
+  <h2 id="limitations">Known limitations &mdash; the alpha boundary</h2>
+  <p>The honest list. Every &ldquo;until M<em>n</em>&rdquo; label refers to the <a href="roadmap.html">roadmap</a>; nothing below is hidden behind marketing.</p>
+  <ul>
+    <li><strong>Single node.</strong> No replication, no cluster, no failover. The <code>wait-replica</code> durability class (zero loss across node failure) is M9 &mdash; not shipped. Single-node <code>always</code> means: survives any crash of <em>this</em> node; it does not survive the disk itself dying.</li>
+    <li><strong>No AUTH, no ACL, no TLS until M7.</strong> Bind to localhost or a trusted private network. Docker users: the io_uring <a href="deployment.html">seccomp profile</a> is required; it is a syscall filter, not an authentication substitute.</li>
+    <li><strong>68 commands.</strong> Strings, keys and expiry, SCAN, pub/sub, INFO/CONFIG/CLIENT admin, and the checkpoint surface &mdash; the exact per-command status is the <a href="compat.html">generated compatibility matrix</a>. No collections yet (lists, hashes, sets, sorted sets &mdash; M5), no <code>MULTI</code>/<code>EXEC</code> transactions or Lua (M6), JSON documents arrive at M3, streams at M7.</li>
+    <li><strong>Bounded record sizes:</strong> keys up to 255 bytes, values up to 16 MiB &minus; 1 (the inline record bound &mdash; out-of-line blob storage is a later roadmap item). Oversized operations are refused at the command layer with an error, never truncated.</li>
+    <li><strong>Datasets are RAM-resident.</strong> Durable namespaces are recovered into memory; larger-than-RAM tiered storage is M4.</li>
+    <li><strong>Durability is opt-in per namespace.</strong> The default namespaces behind <code>SELECT 0..15</code> are <code>memory</code> mode &mdash; a fresh node persists <em>nothing</em> until you create a durable namespace with <code>INF.NS</code>. This is the single most important operator fact on this page; the <a href="durability.html">durability page</a> is the contract.</li>
+    <li><strong>Operational surface is deliberately small:</strong> flags plus a <code>CONFIG</code> subset; no config file; no keyspace notifications, <code>SLOWLOG</code>, or <code>MONITOR</code> yet; no shutdown handshake (a stop is a crash, within the stated loss windows).</li>
+    <li><strong>Linux with io_uring is the deployment target.</strong> macOS builds run for development only (kqueue) and are not a performance or deployment target.</li>
+  </ul>
+
+  <div class="doc-footer-nav">
+    <a href="deployment.html">&larr; Deployment</a>
+    <a href="architecture.html">Architecture &rarr;</a>
+  </div>
+    </article>
+  </main>
+</div>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span class="mark">&copy; 2026 INFINITYDB &mdash; APACHE 2.0 &middot; RUST &middot; <b>infinityd</b></span>
+    <div class="footer-links">
+      <a href="index.html">DOCS</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a href="https://github.com/">GITHUB &#8599;</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var t = document.querySelector('.nav-toggle');
+  var l = document.querySelector('.nav-links');
+  if (t && l) t.addEventListener('click', function () {
+    var open = l.classList.toggle('open');
+    t.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,3 @@
+set-1k   ops/s mean    1,595,329 rsd 11.4%  reps [1803799.41, 1515270.78, 1466916.2]
+jset-1k  ops/s mean    1,249,365 rsd 0.8%  reps [1245858.58, 1260506.3, 1241729.92]
+honest JSON.SET/SET (8t generator) = 0.7831  (gate >= 0.70)

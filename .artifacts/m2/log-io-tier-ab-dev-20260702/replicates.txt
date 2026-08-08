@@ -1,0 +1,87 @@
+=== log_io_tier replicate 1 ===
+# log_io_tier — M2-S07 buffered vs O_DIRECT A/B (uring, dev tier)
+# dir: /home/kcaicedo/Documents/Projects/databases/infinitydb/target (1 GiB fallocated files), 5 s/row, record = 70 B, block = 4096 B
+## policy: buffered
+ group   frames/s  barrier/s     writes/s  payMiB/s  devMiB/s     p50us     p99us    p999us     maxus
+     1        812        812          812       0.1       0.1      1215      2111      2751      4013
+    64        637        637        40786       2.7       2.7      1535      2303      3007      9108
+   256        669        669       171148      11.4      11.4      1535      2303      2879      4127
+  1024        673        673       689113      46.0      46.0      1375      2367      3391      9247
+# page-cache footprint (Cached+Dirty delta, indicative): +230 MiB
+## policy: direct
+ group   frames/s  barrier/s     writes/s  payMiB/s  devMiB/s     p50us     p99us    p999us     maxus
+     1        770        770          770       0.1       3.0      1247      2047      3327      4904
+    64        879        879        56244       3.8       6.9      1247      1983      2879      8166
+   256        868        868       222279      14.8      17.0      1247      2015      2559      2795
+  1024        774        774       793034      52.9      54.5      1343      2111      3391      6636
+# page-cache footprint (Cached+Dirty delta, indicative): +0 MiB
+## policy: direct-dsync
+ group   frames/s  barrier/s     writes/s  payMiB/s  devMiB/s     p50us     p99us    p999us     maxus
+     1        777        777          777       0.1       3.0      1247      2015      2943      8828
+    64       1067       1067        68311       4.6       8.3      1247      2015      2303      4312
+   256       1099       1099       281248      18.8      21.5      1247      1983      2943      7845
+  1024        945        945       967278      64.6      66.4      1343      2111      2687      7342
+# page-cache footprint (Cached+Dirty delta, indicative): +0 MiB
+## phase: interference — grouped writer (group 256) vs sequential reader
+        policy     writes/s     p50us     p99us    p999us    readMiB/s
+ (reader-only)            -         -         -         -         1637
+      buffered        99834      2495      3711      5887          387
+        direct       100805      2495      3583      4479          391
+=== log_io_tier replicate 2 ===
+# log_io_tier — M2-S07 buffered vs O_DIRECT A/B (uring, dev tier)
+# dir: /home/kcaicedo/Documents/Projects/databases/infinitydb/target (1 GiB fallocated files), 5 s/row, record = 70 B, block = 4096 B
+## policy: buffered
+ group   frames/s  barrier/s     writes/s  payMiB/s  devMiB/s     p50us     p99us    p999us     maxus
+     1       1055       1055         1055       0.1       0.1       927      1695      1823      2381
+    64        777        777        49713       3.3       3.3      1247      2015      3903      9100
+   256        818        818       209300      14.0      14.0      1279      2047      2879      3019
+  1024        759        759       776812      51.9      51.9      1375      2175      3327      6608
+# page-cache footprint (Cached+Dirty delta, indicative): +259 MiB
+## policy: direct
+ group   frames/s  barrier/s     writes/s  payMiB/s  devMiB/s     p50us     p99us    p999us     maxus
+     1        773        773          773       0.1       3.0      1247      2015      3839      6903
+    64        881        881        56402       3.8       6.9      1247      2015      2175      5209
+   256        867        867       222074      14.8      16.9      1247      1983      2943      7591
+  1024        773        773       791209      52.8      54.3      1343      2111      3007      3229
+# page-cache footprint (Cached+Dirty delta, indicative): +0 MiB
+## policy: direct-dsync
+ group   frames/s  barrier/s     writes/s  payMiB/s  devMiB/s     p50us     p99us    p999us     maxus
+     1        780        780          780       0.1       3.0      1247      2015      3775      7113
+    64       1070       1070        68455       4.6       8.4      1247      1983      2239      6847
+   256       1094       1094       280143      18.7      21.4      1247      2015      2623      4191
+  1024        937        937       959534      64.1      65.9      1343      2303      3327      7598
+# page-cache footprint (Cached+Dirty delta, indicative): +1 MiB
+## phase: interference — grouped writer (group 256) vs sequential reader
+        policy     writes/s     p50us     p99us    p999us    readMiB/s
+ (reader-only)            -         -         -         -         1633
+      buffered       100505      2495      3647      5887          390
+        direct       100150      2495      3647      5503          387
+=== log_io_tier replicate 3 ===
+# log_io_tier — M2-S07 buffered vs O_DIRECT A/B (uring, dev tier)
+# dir: /home/kcaicedo/Documents/Projects/databases/infinitydb/target (1 GiB fallocated files), 5 s/row, record = 70 B, block = 4096 B
+## policy: buffered
+ group   frames/s  barrier/s     writes/s  payMiB/s  devMiB/s     p50us     p99us    p999us     maxus
+     1       1056       1056         1056       0.1       0.1       927      1695      2431      8142
+    64        780        780        49909       3.3       3.3      1247      2015      2431      3465
+   256        820        820       209968      14.0      14.0      1247      1983      2239      6887
+  1024        732        732       749870      50.1      50.1      1375      2175      3519     88204
+# page-cache footprint (Cached+Dirty delta, indicative): +253 MiB
+## policy: direct
+ group   frames/s  barrier/s     writes/s  payMiB/s  devMiB/s     p50us     p99us    p999us     maxus
+     1        594        594          594       0.0       2.3      1247      9983     46079     90574
+    64        791        791        50604       3.4       6.2      1247      7039     12543     13833
+   256        860        860       220183      14.7      16.8      1247      1983      2367      8421
+  1024        774        774       792076      52.9      54.4      1343      2111      3071      7947
+# page-cache footprint (Cached+Dirty delta, indicative): +3 MiB
+## policy: direct-dsync
+ group   frames/s  barrier/s     writes/s  payMiB/s  devMiB/s     p50us     p99us    p999us     maxus
+     1        781        781          781       0.1       3.1      1247      2015      2943      3032
+    64       1072       1072        68604       4.6       8.4      1247      1951      2751      8735
+   256       1094       1094       280020      18.7      21.4      1247      2015      3519      8467
+  1024        947        947       969495      64.7      66.6      1343      2111      2559      5799
+# page-cache footprint (Cached+Dirty delta, indicative): -3 MiB
+## phase: interference — grouped writer (group 256) vs sequential reader
+        policy     writes/s     p50us     p99us    p999us    readMiB/s
+ (reader-only)            -         -         -         -         1641
+      buffered       100903      2495      3583      4607          390
+        direct       100163      2495      3647      5375          392

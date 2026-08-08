@@ -1,0 +1,62 @@
+M3-S23
+=======
+
+$ cargo test -p inf-sim --test document_durability -- --nocapture
+test document_same_seed_replays_byte_identically ... ok
+test document_power_cut_ci_slice_is_atomic_and_replay_equivalent ... ok
+test planted_replay_skip_is_caught_within_100_seeds ... ok
+  canary caught at seed 0xd0c023ca after 1 seeds: REPLAY EQUIVALENCE
+  VIOLATION seed 0xd0c023ca [mid-run-1] cell 0: state digest diverged
+test fuzz_corpus_documents_round_trip_the_full_stack ... ok
+result: 4 passed; equivalence checks + documents-compared + cut-class
+coverage asserted per seed (dead-oracle guards)
+
+$ ./target/release/inf-sim --scenario m3-document --seed 0xD0C00018 --verify-determinism
+result: determinism verified — second run trace byte-identical (the
+oracle's quiesce instants and comparisons are part of the trace contract)
+
+$ ./target/release/inf-sim --scenario m3-document --seed 0xD0C023CA --replay-canary
+result: exit 1; all three comparator layers fired with named diagnostics
+(digest, version live 10 vs replayed 9, canonical-text diff) — see
+canary-run.txt
+
+M3-S24
+=======
+
+$ ./target/release/inf-sim --scenario m3-document --sweep 256 --seed 0xD0C01800
+inf-sim: m3-document sweep shard 0/1: 256 seeds, 0 violations, 0 legal
+taxonomy refusals, 768 equivalence checks, 3840 documents compared, cut
+classes [ckpt-begin:4 doc-delta:175 doc-full:215]
+inf-sim: sim_seconds=779.122495
+
+$ just doc-sweep      # 10,000 seeds, base 0xD0C24000, 8 shards, release
+result: seeds_run=1250 violations=0 refused=0 equivalence_checks=3750
+documents_compared=18750 per shard × 8 = 10,000 seeds, 30,000 checks,
+150,000 documents compared, corpus_documents total 106,369; cut classes
+aggregate doc-delta:6340 doc-full:8436 ckpt-begin:143 — see
+doc-sweep-10k.txt for the exact per-shard manifest lines
+
+$ cargo test -p inf-sim --test corpus -- --nocapture
+test corpus_seeds_replay_green ... ok
+result: curated corpus now carries three m3-document seeds (incl. one
+double-cut) and replays green
+
+Workspace gates
+===============
+
+$ just check
+result: green; format, dependency DAG (incl. the ADR-0045 inf-sim →
+inf-doc edge), cell deny-list, fault/fsync/panic/safety inventories,
+clippy -D warnings, workspace tests, doc-intern-keys lane, and the
+docless slim build all passed
+
+$ cargo deny check
+result: green; only the standing unused-license-allowance warnings
+
+Scope boundary
+==============
+
+Development tier, dirty tree disclosed (env.txt). No reference-box
+campaign, RedisJSON comparison, or public claim — S25 owns those. The
+nightly fleet gains a 4,000-seed m3-document sweep
+(infinity-dst-nightly.yml).

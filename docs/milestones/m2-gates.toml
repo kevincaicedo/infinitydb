@@ -1,0 +1,213 @@
+# M2 exit gates (STOP) — machine-readable encoding of the M2 milestone plan
+# §6 (docs/milestones/m2-durability.md). Values are fixed by the master plan
+# §22 (M2); changing a threshold here is a master-plan amendment, not an
+# edit (L10: a gate may not be passed by narrowing it).
+#
+# Consumed by `inf-bench gate-run m2`. Field semantics identical to
+# m0-gates.toml/m1-gates.toml: loadgen:*/ab:*/tripwire:* rows are measured
+# natively by gate-run (the ab:* zero-cost rows need `--baseline-bin`, the
+# pre-M2 infinityd build); external:* rows come from campaign tooling (DST
+# sweep, crash matrix, recovery timing, soak, M0/M1 regression A/B) and
+# report PENDING from gate-run until that artifact is supplied. The S22 gate
+# campaign is the binding run; S09 lands the ab:* + counter rows first.
+# tier = "linux-reference-box" verdicts bind only on the reference box.
+
+schema = 1
+milestone = "m2"
+
+# ---- M2-S09: memory namespaces pay zero (supporting gate, §6) ------------
+
+[[gate]]
+id = "mem_ab_pipelined_ops"
+name = "Zero-cost A/B: pipelined ops regression"
+threshold = 1
+comparator = "<="
+unit = "% worse than M1 build (improvements clamp to 0, signed value in notes)"
+tier = "linux-reference-box"
+source = "ab:mem_pipelined_ops_delta_pct"
+measured_by = "gate-run m2: M1-baseline vs M2 infinityd, conns 64 P16 1:10 mix, interleaved replicates"
+
+[[gate]]
+id = "mem_ab_pipelined_p999"
+name = "Zero-cost A/B: pipelined p99.9 regression"
+threshold = 1
+comparator = "<="
+unit = "% worse than M1 build (improvements clamp to 0, signed value in notes)"
+tier = "linux-reference-box"
+source = "ab:mem_pipelined_p999_delta_pct"
+measured_by = "same row; LogHistogram quantizes at ~3%/bucket — 0 means same bucket (disclosed)"
+
+[[gate]]
+id = "mem_ab_unpipelined_ops"
+name = "Zero-cost A/B: unpipelined 512-conn ops regression"
+threshold = 1
+comparator = "<="
+unit = "% worse than M1 build (improvements clamp to 0, signed value in notes)"
+tier = "linux-reference-box"
+source = "ab:mem_unpipelined_ops_delta_pct"
+measured_by = "gate-run m2: conns 512 pipeline 1"
+
+[[gate]]
+id = "mem_ab_unpipelined_p999"
+name = "Zero-cost A/B: unpipelined p99.9 regression"
+threshold = 1
+comparator = "<="
+unit = "% worse than M1 build (improvements clamp to 0, signed value in notes)"
+tier = "linux-reference-box"
+source = "ab:mem_unpipelined_p999_delta_pct"
+measured_by = "same row"
+
+[[gate]]
+id = "mem_ab_ttl_ops"
+name = "Zero-cost A/B: ttl-heavy write-mix ops regression"
+threshold = 1
+comparator = "<="
+unit = "% worse than M1 build (improvements clamp to 0, signed value in notes)"
+tier = "linux-reference-box"
+source = "ab:mem_ttl_ops_delta_pct"
+measured_by = "gate-run m2: 1:1 set:get, PX 100..5000 — the mutation path the ns-mode branch lives on"
+
+[[gate]]
+id = "mem_ab_ttl_p999"
+name = "Zero-cost A/B: ttl-heavy p99.9 regression"
+threshold = 1
+comparator = "<="
+unit = "% worse than M1 build (improvements clamp to 0, signed value in notes)"
+tier = "linux-reference-box"
+source = "ab:mem_ttl_p999_delta_pct"
+measured_by = "same row"
+
+[[gate]]
+id = "mem_only_log_records"
+name = "Memory-only rows append zero log records"
+threshold = 0
+comparator = "<="
+unit = "records"
+tier = "any"
+source = "tripwire:mem_only_log_records_appended"
+measured_by = "gate-run m2: INFO log_records_appended summed across cells after every memory-only row; also hard-fails the run"
+
+# ---- §6 STOP gates (S22 campaign; PENDING until their rows land) ---------
+
+[[gate]]
+id = "everysec_penalty"
+name = "everysec penalty vs memory mode"
+threshold = 10
+comparator = "<"
+unit = "%"
+tier = "linux-reference-box"
+source = "loadgen:everysec_penalty_pct"
+measured_by = "S22: A/B same workload, memory-mode vs everysec ns, same box, 3-5 replicates, fsync histograms attached"
+
+[[gate]]
+id = "always_grouped_wps"
+name = "always grouped writes"
+threshold = 300000
+comparator = ">="
+unit = "w/s"
+tier = "linux-reference-box"
+source = "loadgen:always_grouped_wps"
+measured_by = "S22: reference NVMe Gen4, grouped writers, fsync HDR histogram attached to the same run"
+
+[[gate]]
+id = "recovery_per_cell"
+name = "Replay throughput per cell"
+threshold = 1.0
+comparator = ">="
+unit = "GB/s/cell"
+tier = "linux-reference-box"
+source = "external:recovery_gbps_per_cell"
+measured_by = "S13 artifact: per-cell replay throughput counters on the reference NVMe"
+
+[[gate]]
+id = "recovery_10gb"
+name = "10 GB node cold boot"
+threshold = 15
+comparator = "<"
+unit = "s"
+tier = "linux-reference-box"
+source = "external:recovery_10gb_boot_s"
+measured_by = "S15 artifact: timed cold boot, 8-cell 10 GB dataset"
+
+[[gate]]
+id = "dst_sweep"
+name = "DST durability oracle: 10k seeds"
+threshold = 0
+comparator = "<="
+unit = "violations"
+tier = "any"
+source = "external:dst_sweep_violations"
+measured_by = "S19 sweep manifest + per-seed results, reproducible by seed"
+
+[[gate]]
+id = "crash_matrix"
+name = "Crash matrix green in CI"
+threshold = 0
+comparator = "<="
+unit = "failures"
+tier = "any"
+source = "external:crash_matrix_failures"
+measured_by = "S17 CI matrix run, every named fault point covered"
+
+[[gate]]
+id = "ckpt_under_load_p999"
+name = "Checkpoint under full load: foreground p99.9 (anti-BGREWRITEAOF)"
+threshold = 2000
+comparator = "<"
+unit = "us"
+tier = "linux-reference-box"
+source = "loadgen:ckpt_under_load_p999_us"
+measured_by = "S12 pressure row: saturating writes + continuous checkpoints, foreground latency histogram"
+
+[[gate]]
+id = "ckpt_rss_overhead"
+name = "RSS under continuous checkpoints vs no-checkpoint control (anti-2x)"
+threshold = 64
+comparator = "<="
+unit = "MiB peak-VmRSS delta (ckpt buffer domain is ~0.5 MiB/cell; a fork/COW would be dataset-sized)"
+tier = "linux-reference-box"
+source = "loadgen:ckpt_rss_overhead_mib"
+measured_by = "S12 pressure row: identical fill+mix with interval 0 vs continuous cycling, VmRSS sampled at 100 ms in both legs; per-run ckpt_buffer_bytes gauge disclosed in the notes (the S22 attribution row binds the exact-budget assert)"
+
+[[gate]]
+id = "m0m1_regression"
+name = "M0/M1 gates re-pass"
+threshold = 5
+comparator = "<="
+unit = "% vs M1 artifact"
+tier = "linux-reference-box"
+source = "external:m0m1_regression_pct"
+measured_by = "S22: gate-run m0/m1 on the M2 tree A/B vs the archived baselines, same box"
+
+# ---- Tripwires (supporting; report-enforced in the same runs) ------------
+
+[[gate]]
+id = "log_writes_per_iter"
+name = "One log write per iteration"
+threshold = 1
+comparator = "<="
+unit = "writes/iter"
+tier = "any"
+source = "tripwire:log_writes_per_iter"
+measured_by = "S22 durable rows: counter deltas around each replicate (L3)"
+
+[[gate]]
+id = "grouping_ratio"
+name = "acks/fsync grouping ratio above floor"
+threshold = 2
+comparator = ">="
+unit = "acks per fsync"
+tier = "any"
+source = "tripwire:acks_per_fsync"
+informational = true
+measured_by = "S21: the always row computes acks_gated/fsyncs_completed and HARD-FAILS the run below the floor (report-enforced; the canary mode proves the wire fires); the verdict row stays informational — enforcement is in-row"
+
+[[gate]]
+id = "attribution"
+name = "sum(domains) vs RSS divergence (with log domains)"
+threshold = 10
+comparator = "<="
+unit = "%"
+tier = "any"
+source = "attribution_divergence_pct"
+measured_by = "S22: domain counters incl. log staging + ckpt buffer vs VmRSS in the fill leg"

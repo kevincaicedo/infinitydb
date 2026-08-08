@@ -1,0 +1,52 @@
+# M3-S18 document crash matrix: the five record/checkpoint cut classes
+# named by the milestone plan. The runner uses the real tag-6/tag-7 log
+# codec and `open_cell_log` recovery path; this file is the reviewable
+# coverage inventory, not a second durability model.
+
+schema = 1
+milestone = "m3"
+# SimDisk seeds for the `doc_delta_before_fsync` row ONLY — the other
+# four rows are single deterministic fixtures that place their cut
+# exactly (no sweep). The deterministic end-to-end CI slice in `inf-sim`
+# adds 24 whole-server seeds, and the M3-S24 10k-seed fleet generalizes.
+seeds = 24
+
+[[row]]
+point = "doc_delta_before_fsync"
+policies = ["always"]
+workloads = ["multi_match_delta"]
+expect = "old-or-complete-new"
+tier = "document"
+test = "documents"
+
+[[row]]
+point = "doc_delta_before_covering_full"
+policies = ["always"]
+workloads = ["cadence_window"]
+expect = "delta-replayed"
+tier = "document"
+test = "documents"
+
+[[row]]
+point = "torn_doc_full"
+policies = ["always"]
+workloads = ["full_image"]
+expect = "prior-document"
+tier = "document"
+test = "documents"
+
+[[row]]
+point = "checkpoint_before_segment_truncation_with_delta_tail"
+policies = ["always"]
+workloads = ["checkpoint_tail"]
+expect = "checkpoint-plus-tail"
+tier = "document"
+test = "documents"
+
+[[row]]
+point = "fuzzy_overlap_lsn_classes"
+policies = ["always"]
+workloads = ["stale-missing-apply"]
+expect = "byte-exact-prefix"
+tier = "document"
+test = "documents"

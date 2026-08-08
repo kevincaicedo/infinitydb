@@ -1,0 +1,22 @@
+Json file /tmp/claude-1000/-home-kcaicedo-Documents-Projects-databases/f7c996e7-230c-45c8-80f1-979984910087/scratchpad/wire-rows/get-2h-rep3.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 10%,   0 secs]  4 threads 25 conns:     3759924 ops, 3760698 (avg: 3760698) ops/sec, 580.25MB/sec (avg: 580.25MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 20%,   1 secs]  4 threads 25 conns:     7506555 ops, 3746248 (avg: 3753472) ops/sec, 577.63MB/sec (avg: 578.94MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 30%,   2 secs]  4 threads 25 conns:    11254904 ops, 3747962 (avg: 3751635) ops/sec, 578.24MB/sec (avg: 578.70MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 40%,   4 secs]  4 threads 25 conns:    15004275 ops, 3748767 (avg: 3750918) ops/sec, 578.04MB/sec (avg: 578.54MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 50%,   5 secs]  4 threads 25 conns:    18758663 ops, 3753761 (avg: 3751487) ops/sec, 577.14MB/sec (avg: 578.26MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 60%,   6 secs]  4 threads 25 conns:    22499962 ops, 3740696 (avg: 3749688) ops/sec, 574.91MB/sec (avg: 577.70MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 70%,   7 secs]  4 threads 25 conns:    26244143 ops, 3743578 (avg: 3748815) ops/sec, 575.51MB/sec (avg: 577.39MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 80%,   8 secs]  4 threads 25 conns:    29999364 ops, 3754838 (avg: 3749568) ops/sec, 577.39MB/sec (avg: 577.39MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 90%,   9 secs]  4 threads 25 conns:    33750764 ops, 3750859 (avg: 3749712) ops/sec, 576.90MB/sec (avg: 577.33MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 100%,  10 secs]  4 threads 25 conns:    37499374 ops, 3748902 (avg: 3749631) ops/sec, 576.78MB/sec (avg: 577.28MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 100%,  10 secs]  0 threads 25 conns:    37500365 ops, 3748902 (avg: 3749446) ops/sec, 576.78MB/sec (avg: 577.25MB/sec),  0.42 (avg:  0.42) msec latency
+
+warning: GET miss rate 36.68% above target 1.00% (13754035 misses / 37500365 ops)
+Saving JSON output file: /tmp/claude-1000/-home-kcaicedo-Documents-Projects-databases/f7c996e7-230c-45c8-80f1-979984910087/scratchpad/wire-rows/get-2h-rep3.json
+Json file closed.
+4         Threads
+25        Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets            0.00          ---          ---             ---             ---             ---             ---         0.00 
+Gets      3749636.81   2374379.90   1375256.91         0.42388         0.39900         0.88700         0.95100    591133.65 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    3749636.81   2374379.90   1375256.91         0.42388         0.39900         0.88700         0.95100    591133.65 

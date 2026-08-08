@@ -1,0 +1,9 @@
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 10 uncommitted entries
+  cpufreq-governor     FAIL  scaling_governor != performance on 24 cpus: cpu0=powersave, cpu1=powersave, cpu10=powersave, cpu11=powersave (+20 more)
+  cpufreq-epp          PASS
+  thermal-throttle     FAIL  thermal throttling occurred: cpu0/package_throttle_count=21795, cpu1/package_throttle_count=21795, cpu10/core_throttle_count=13209, cpu10/package_throttle_count=25491
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree, cpufreq-governor, thermal-throttle

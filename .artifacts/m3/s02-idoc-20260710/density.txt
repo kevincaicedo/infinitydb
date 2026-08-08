@@ -1,0 +1,8 @@
+shape            idoc  msgpack     text   vs msgpack    vs text
+small-200B        191      180      211       1.061x     0.905x
+gate-1KiB         610      584      726       1.045x     0.840x
+medium-2KiB      1136     1097     1350       1.036x     0.841x
+large-64KiB     35388    34530    43002       1.025x     0.823x
+deep-32          1471     1360     1731       1.082x     0.850x
+wide-array     300454   268509   396845       1.119x     0.757x
+aggregate: 1.108x msgpack, 0.764x text

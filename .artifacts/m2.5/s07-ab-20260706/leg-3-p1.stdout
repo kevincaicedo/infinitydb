@@ -1,0 +1,36 @@
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 6 uncommitted entries
+  cpufreq-governor     FAIL  scaling_governor != performance on 24 cpus: cpu0=powersave, cpu1=powersave, cpu10=powersave, cpu11=powersave (+20 more)
+  cpufreq-epp          PASS
+  thermal-throttle     FAIL  thermal throttling occurred: cpu0/package_throttle_count=72, cpu1/package_throttle_count=72, cpu10/core_throttle_count=72, cpu10/package_throttle_count=72
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+gate-run: CONTINUING WITH FAILED ENV-CHECK — results are not citation-grade
+
+== row: always grouped writes (S21) ==
+
+== gate verdicts ==
+  Zero-cost A/B: pipelined ops regression PENDING (tooling)
+  Zero-cost A/B: pipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: unpipelined 512-conn ops regression PENDING (tooling)
+  Zero-cost A/B: unpipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy write-mix ops regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Memory-only rows append zero log records PENDING (tooling)
+  everysec penalty vs memory mode        PENDING (tooling)
+  always grouped writes                  FAIL (DEV-TIER, non-binding)
+  Replay throughput per cell             PENDING (tooling)
+  10 GB node cold boot                   PENDING (tooling)
+  DST durability oracle: 10k seeds       PENDING (tooling)
+  Crash matrix green in CI               PENDING (tooling)
+  Checkpoint under full load: foreground p99.9 (anti-BGREWRITEAOF) PENDING (tooling)
+  RSS under continuous checkpoints vs no-checkpoint control (anti-2x) PENDING (tooling)
+  M0/M1 gates re-pass                    PENDING (tooling)
+  One log write per iteration            PASS
+  acks/fsync grouping ratio above floor  PASS (informational)
+  sum(domains) vs RSS divergence (with log domains) PENDING (tooling)
+
+gate-run: report written to .artifacts/m2/1783358762-gate-run/report.md

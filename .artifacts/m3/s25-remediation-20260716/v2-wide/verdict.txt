@@ -1,0 +1,4 @@
+wide: serialized=125806931 inf=129323008 stack=448233472
+  inf/serialized = 1.028  (gate <= 1.5)
+  inf/stack      = 0.289  (gate <= 0.7)
+verification: expected_docs=300 inf_dbsize=300 stack_dbsize=300

@@ -1,4 +1,10 @@
-# InfinityDB Architecture
+# InfinityDB Architecture — Intra-Node Walkthrough
+
+> The top-level design-decision document (problem statement, overview,
+> motivations, references) is [`ARCHITECTURE.md`](../ARCHITECTURE.md) at the
+> workspace root — read that first. This file is the finer-grained
+> walkthrough of a single node: the life of a request, routing, MAINTAIN
+> classes, and crate layering.
 
 This document explains how InfinityDB is put together, from a single request
 down to the shared-nothing cell model. It is conceptual overview;

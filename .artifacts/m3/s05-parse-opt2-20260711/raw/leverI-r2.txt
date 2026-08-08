@@ -1,0 +1,26 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.04s
+     Running benches/parse.rs (target/release/deps/parse-c3274eca77934232)
+Benchmarking parse/gate-1KiB
+Benchmarking parse/gate-1KiB: Warming up for 3.0000 s
+Benchmarking parse/gate-1KiB: Collecting 100 samples in estimated 5.0005 s (4.0M iterations)
+Benchmarking parse/gate-1KiB: Analyzing
+parse/gate-1KiB         time:   [1.2533 µs 1.2539 µs 1.2545 µs]
+                        thrpt:  [624.13 MiB/s 624.42 MiB/s 624.71 MiB/s]
+                 change:
+                        time:   [+1.3987% +1.4675% +1.5355%] (p = 0.00 < 0.05)
+                        thrpt:  [−1.5123% −1.4463% −1.3794%]
+                        Performance has regressed.
+Benchmarking parse/medium-2KiB
+Benchmarking parse/medium-2KiB: Warming up for 3.0000 s
+Benchmarking parse/medium-2KiB: Collecting 100 samples in estimated 5.0056 s (2.4M iterations)
+Benchmarking parse/medium-2KiB: Analyzing
+parse/medium-2KiB       time:   [2.0864 µs 2.0879 µs 2.0894 µs]
+                        thrpt:  [635.80 MiB/s 636.27 MiB/s 636.74 MiB/s]
+                 change:
+                        time:   [−0.0696% +0.0254% +0.1225%] (p = 0.61 > 0.05)
+                        thrpt:  [−0.1223% −0.0254% +0.0697%]
+                        No change in performance detected.
+Found 7 outliers among 100 measurements (7.00%)
+  1 (1.00%) low mild
+  6 (6.00%) high mild
+

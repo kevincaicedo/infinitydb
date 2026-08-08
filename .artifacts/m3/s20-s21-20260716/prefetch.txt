@@ -1,0 +1,38 @@
+Finished `bench` profile [optimized + debuginfo] target(s) in 0.04s
+Running benches/doc_prefetch.rs (target/release/deps/doc_prefetch-dcabb1edd1f10b20)
+threshold corpus=small-200B,deep-32,gate-1KiB,medium-2KiB documents=400000 operations=400000 reps=3
+threshold bytes=0 inline_docs=0 records_B_per_doc=52.429 doc_resident_B_per_doc=985.661 attributed_B_per_doc=1049.907 load_mops=2.736877 read_mops=7.121485 ttl_mops=9.018903
+threshold bytes=256 inline_docs=100000 records_B_per_doc=94.372 doc_resident_B_per_doc=933.233 attributed_B_per_doc=1039.422 load_mops=2.720599 read_mops=7.442114 ttl_mops=8.688779
+threshold bytes=512 inline_docs=100000 records_B_per_doc=94.372 doc_resident_B_per_doc=933.233 attributed_B_per_doc=1039.422 load_mops=2.736170 read_mops=7.516089 ttl_mops=9.013788
+threshold bytes=1024 inline_docs=300000 records_B_per_doc=492.831 doc_resident_B_per_doc=513.802 attributed_B_per_doc=1018.453 load_mops=2.746774 read_mops=9.286178 ttl_mops=6.570599
+threshold bytes=2048 inline_docs=400000 records_B_per_doc=990.904 doc_resident_B_per_doc=0.000 attributed_B_per_doc=1002.727 load_mops=2.767082 read_mops=10.925744 ttl_mops=4.926589
+prefetch corpus=gate-1KiB idoc_bytes=953 documents=10000000 operations=1000000 batch=32 seed=0x1D0C2026
+prefetch load_seconds=4.495496 load_mops=2.224449 attributed_bytes=10871644192 doc_resident_bytes=10240393216 index_bytes=150994944
+pair a=off b=record+root schedule=ABBA replicates=3
+prefetch replicate=1 leg=1 arm=off mops=3.400253
+prefetch replicate=1 leg=2 arm=record+root mops=9.559540
+prefetch replicate=1 leg=3 arm=record+root mops=9.574984
+prefetch replicate=1 leg=4 arm=off mops=3.440699
+prefetch replicate=2 leg=1 arm=record+root mops=9.544700
+prefetch replicate=2 leg=2 arm=off mops=3.419598
+prefetch replicate=2 leg=3 arm=off mops=3.408469
+prefetch replicate=2 leg=4 arm=record+root mops=9.546654
+prefetch replicate=3 leg=1 arm=off mops=3.441960
+prefetch replicate=3 leg=2 arm=record+root mops=9.572463
+prefetch replicate=3 leg=3 arm=record+root mops=9.585906
+prefetch replicate=3 leg=4 arm=off mops=3.437340
+prefetch verdict a=off a_mops=3.420476 b=record+root b_mops=9.567262 gain=+179.706%
+pair a=record b=record+root schedule=ABBA replicates=3
+prefetch replicate=1 leg=1 arm=record mops=6.286592
+prefetch replicate=1 leg=2 arm=record+root mops=9.572437
+prefetch replicate=1 leg=3 arm=record+root mops=9.598846
+prefetch replicate=1 leg=4 arm=record mops=6.301335
+prefetch replicate=2 leg=1 arm=record+root mops=9.601751
+prefetch replicate=2 leg=2 arm=record mops=6.293867
+prefetch replicate=2 leg=3 arm=record mops=6.312426
+prefetch replicate=2 leg=4 arm=record+root mops=9.577280
+prefetch replicate=3 leg=1 arm=record mops=6.300915
+prefetch replicate=3 leg=2 arm=record+root mops=9.580875
+prefetch replicate=3 leg=3 arm=record+root mops=9.532001
+prefetch replicate=3 leg=4 arm=record mops=6.289507
+prefetch verdict a=record a_mops=6.295211 b=record+root b_mops=9.585642 gain=+52.269%

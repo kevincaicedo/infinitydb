@@ -16,6 +16,25 @@ pub enum TokenClass {
     Close = 3,
     /// Reserved for cross-thread wakeups (doorbell integration, fabric M0-E3).
     Wake = 4,
+    /// Log-segment frame write (M2-S05, ADR-0013). The token layout is
+    /// frozen; the class *vocabulary* is the extensible dimension.
+    LogWrite = 5,
+    /// fdatasync-class durability barrier (M2-S05, ADR-0013).
+    Fsync = 6,
+    /// Checkpoint section write on the `.ick` fd (M2-S10, ADR-0016 D4 —
+    /// routing-only: the op is an ordinary `LogWrite`).
+    CkptWrite = 7,
+    /// Checkpoint-completion fdatasync on the `.ick` fd (M2-S10).
+    CkptSync = 8,
+    /// MANIFEST-swap barrier (M2-S11/S12, ADR-0017 — routing-only): the
+    /// staging-file fdatasync, the `.ick`/shard dir-fsyncs. The swap's
+    /// fsync-class steps ride the driver so publication never stalls the
+    /// loop; at most one is in flight per cell.
+    ManifestSync = 9,
+    /// Cold-tier positional file read (M4-S04 steel thread; hardened by
+    /// M4-S08). The first consumer of the `IoGate` seam M0 built — a
+    /// command suspends on this token while NVMe works (L6).
+    TierRead = 10,
 }
 
 impl TokenClass {
@@ -26,6 +45,12 @@ impl TokenClass {
             2 => Some(TokenClass::Send),
             3 => Some(TokenClass::Close),
             4 => Some(TokenClass::Wake),
+            5 => Some(TokenClass::LogWrite),
+            6 => Some(TokenClass::Fsync),
+            7 => Some(TokenClass::CkptWrite),
+            8 => Some(TokenClass::CkptSync),
+            9 => Some(TokenClass::ManifestSync),
+            10 => Some(TokenClass::TierRead),
             _ => None,
         }
     }
@@ -97,6 +122,12 @@ mod tests {
             TokenClass::Send,
             TokenClass::Close,
             TokenClass::Wake,
+            TokenClass::LogWrite,
+            TokenClass::Fsync,
+            TokenClass::CkptWrite,
+            TokenClass::CkptSync,
+            TokenClass::ManifestSync,
+            TokenClass::TierRead,
         ] {
             for (slot, generation) in
                 [(0, 0), (1, u32::MAX), (MAX_SLOT, 7u32), (0xAB_CDEF, 0xDEAD_BEEF)]

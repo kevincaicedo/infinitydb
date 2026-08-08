@@ -1,0 +1,16 @@
+errors: 0, replies: 400000
+== leg: baseline-4f9f113 (pre-fix) · keys=400000 · deadline_ms=1783438845871
+   -498 ms  dbsize=400000
+   -395 ms  dbsize=400000
+   -290 ms  dbsize=400000
+   -187 ms  dbsize=400000
+    -83 ms  dbsize=400000
+    +21 ms  dbsize=371968
+   +125 ms  dbsize=299008
+   +228 ms  dbsize=225664
+   +333 ms  dbsize=152000
+   +437 ms  dbsize=79552
+   +541 ms  dbsize=9984
+   +645 ms  dbsize=0
+drained_by: +645 ms after deadline
+observed rate over [21,541] ms: 696123 keys/s

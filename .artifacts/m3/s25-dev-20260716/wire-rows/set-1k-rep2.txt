@@ -1,0 +1,21 @@
+Json file /tmp/claude-1000/-home-kcaicedo-Documents-Projects-databases/f7c996e7-230c-45c8-80f1-979984910087/scratchpad/wire-rows/set-1k-rep2.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 10%,   0 secs]  4 threads 25 conns:     2164934 ops, 2165611 (avg: 2165611) ops/sec, 2.15GB/sec (avg: 2.15GB/sec),  0.74 (avg:  0.74) msec latency[RUN #1 20%,   1 secs]  4 threads 25 conns:     4340067 ops, 2174774 (avg: 2170194) ops/sec, 2.16GB/sec (avg: 2.15GB/sec),  0.73 (avg:  0.73) msec latency[RUN #1 30%,   3 secs]  4 threads 25 conns:     6519452 ops, 2179005 (avg: 2173131) ops/sec, 2.16GB/sec (avg: 2.16GB/sec),  0.73 (avg:  0.73) msec latency[RUN #1 40%,   4 secs]  4 threads 25 conns:     8678149 ops, 2158338 (avg: 2169433) ops/sec, 2.14GB/sec (avg: 2.15GB/sec),  0.74 (avg:  0.73) msec latency[RUN #1 50%,   5 secs]  4 threads 25 conns:    10837686 ops, 2159200 (avg: 2167386) ops/sec, 2.14GB/sec (avg: 2.15GB/sec),  0.74 (avg:  0.74) msec latency[RUN #1 60%,   6 secs]  4 threads 25 conns:    12993661 ops, 2155619 (avg: 2165425) ops/sec, 2.14GB/sec (avg: 2.15GB/sec),  0.74 (avg:  0.74) msec latency[RUN #1 70%,   7 secs]  4 threads 25 conns:    15160762 ops, 2166752 (avg: 2165614) ops/sec, 2.15GB/sec (avg: 2.15GB/sec),  0.74 (avg:  0.74) msec latency[RUN #1 80%,   8 secs]  4 threads 25 conns:    17336091 ops, 2175111 (avg: 2166801) ops/sec, 2.16GB/sec (avg: 2.15GB/sec),  0.73 (avg:  0.74) msec latency[RUN #1 90%,   9 secs]  4 threads 25 conns:    19517704 ops, 2181390 (avg: 2168422) ops/sec, 2.17GB/sec (avg: 2.15GB/sec),  0.73 (avg:  0.74) msec latency[RUN #1 100%,  10 secs]  4 threads 25 conns:    21703221 ops, 2185661 (avg: 2170146) ops/sec, 2.17GB/sec (avg: 2.15GB/sec),  0.73 (avg:  0.73) msec latency[RUN #1 100%,  10 secs]  0 threads 25 conns:    21704408 ops, 2185661 (avg: 2170051) ops/sec, 2.17GB/sec (avg: 2.15GB/sec),  0.73 (avg:  0.73) msec latency
+
+Saving JSON output file: /tmp/claude-1000/-home-kcaicedo-Documents-Projects-databases/f7c996e7-230c-45c8-80f1-979984910087/scratchpad/wire-rows/set-1k-rep2.json
+Json file closed.
+4         Threads
+25        Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      2170193.24          ---          ---         0.73517         0.68700         1.30300         1.68700   2258969.88 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    2170193.24         0.00         0.00         0.73517         0.68700         1.30300         1.68700   2258969.88 

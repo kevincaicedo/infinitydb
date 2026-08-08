@@ -191,26 +191,41 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
         duration: Duration::from_secs(30),
         ..Default::default()
     };
+    // Drain poller — concurrent with the read traffic, on one persistent
+    // connection. Polling only *after* the 30 s read window (the previous
+    // shape) put an ~11 s floor under every observable drain value
+    // (fill + 30 s − 20 s deadline offset): the historic 11.0–11.4 s
+    // "drain" band was the instrument, not the server (M2.5-S10). The gate
+    // still measures the same quantity — deadline instant → DBSIZE 0 with
+    // foreground reads running through the storm.
+    let drain_port = server.port;
+    let drain_poll_deadline = storm_at + Duration::from_secs(60);
+    let poller = std::thread::spawn(move || -> Result<Option<Instant>, String> {
+        let mut conn = connect("127.0.0.1", drain_port)?;
+        loop {
+            let reply = request(&mut conn, &[b"DBSIZE"])?;
+            let size: u64 = String::from_utf8_lossy(&reply)
+                .trim_start_matches(':')
+                .trim()
+                .parse()
+                .unwrap_or(u64::MAX);
+            if size == 0 {
+                return Ok(Some(Instant::now()));
+            }
+            if Instant::now() > drain_poll_deadline {
+                return Ok(None);
+            }
+            // Bench poller thread, not cell code: ~5 ms DBSIZE cadence keeps
+            // the probe load negligible against the foreground fleet.
+            #[allow(clippy::disallowed_methods)]
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
     let report = run_load(&read_spec)?;
     println!("  reads through the storm: p999 {} µs", report.p999_us);
     m.raw_section("expiry-storm reads", &render(&report));
     m.set("loadgen:expiry_storm_p999_us", report.p999_us as f64);
-    let drain_deadline = Instant::now() + Duration::from_secs(60);
-    let drained_at = loop {
-        let reply = control(server.port, &[b"DBSIZE"])?;
-        let size: u64 = String::from_utf8_lossy(&reply)
-            .trim_start_matches(':')
-            .trim()
-            .parse()
-            .unwrap_or(u64::MAX);
-        if size == 0 {
-            break Some(Instant::now());
-        }
-        if Instant::now() > drain_deadline {
-            break None;
-        }
-        std::thread::yield_now();
-    };
+    let drained_at = poller.join().map_err(|_| "drain poller panicked".to_string())??;
     match drained_at {
         Some(t) => {
             let drain_s = t.saturating_duration_since(storm_at).as_secs_f64();

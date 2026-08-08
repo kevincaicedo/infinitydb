@@ -1,0 +1,4 @@
+infinityd 78d4055 (git 78d405538128-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 41779, backend io_uring, route natural
+infinityd: listening on 41779
+infinityd: cell 2 failed: driver setup (ring create): Cannot allocate memory (os error 12)

@@ -1,0 +1,98 @@
+=== cycle 42: narration fired (in setup:driver) — sampling threads ===
+sample 1: cell-0 state=S wchan=io_cqring_wait
+sample 1: cell-1 state=S wchan=io_cqring_wait
+sample 1: cell-2 state=S wchan=io_cqring_wait
+sample 2: cell-0 state=S wchan=io_cqring_wait
+sample 2: cell-1 state=S wchan=io_cqring_wait
+sample 2: cell-2 state=S wchan=io_cqring_wait
+sample 3: cell-0 state=S wchan=io_cqring_wait
+sample 3: cell-1 state=S wchan=io_cqring_wait
+sample 3: cell-2 state=S wchan=io_cqring_wait
+sample 4: cell-0 state=S wchan=io_cqring_wait
+sample 4: cell-1 state=S wchan=io_cqring_wait
+sample 4: cell-2 state=S wchan=io_cqring_wait
+sample 5: cell-0 state=S wchan=io_cqring_wait
+sample 5: cell-1 state=S wchan=io_cqring_wait
+sample 5: cell-2 state=S wchan=0
+sample 6: cell-0 state=S wchan=io_cqring_wait
+sample 6: cell-1 state=S wchan=io_cqring_wait
+sample 6: cell-2 state=S wchan=io_cqring_wait
+--- psi io:
+some avg10=94.12 avg60=92.98 avg300=77.34 total=498890761
+full avg10=93.96 avg60=92.85 avg300=77.04 total=495817300
+--- psi memory:
+some avg10=0.00 avg60=0.00 avg300=0.00 total=26
+full avg10=0.00 avg60=0.00 avg300=0.00 total=20
+--- vmstat compaction/reclaim:
+allocstall_dma 0
+allocstall_dma32 0
+allocstall_normal 0
+allocstall_movable 0
+allocstall_device 0
+compact_stall 0
+compact_fail 0
+compact_success 0
+--- meminfo:
+MemFree:        20675876 kB
+MemAvailable:   26114408 kB
+Dirty:           2097576 kB
+Writeback:             0 kB
+WritebackTmp:          0 kB
+--- buddyinfo (Normal):
+Node 0, zone   Normal   4179   3946   2037   2123   1908    979    371    140     69     57   4548 
+
+=== v3 cycle 1: FAIL-STOP fired (the fix converted the wedge into a named error) ===
+infinityd: cell 0 failed: driver setup (ring create): Cannot allocate memory (os error 12)
+--- psi io:
+some avg10=68.25 avg60=21.53 avg300=22.40 total=517887488
+full avg10=67.46 avg60=21.26 avg300=22.26 total=514571366
+--- vmstat compaction/reclaim:
+allocstall_normal 0
+compact_stall 0
+compact_fail 0
+--- meminfo:
+MemFree:        18863416 kB
+MemAvailable:   26126632 kB
+Dirty:           1753088 kB
+Writeback:         16408 kB
+WritebackTmp:          0 kB
+--- buddyinfo (Normal):
+Node 0, zone   Normal  39480  24247   8920   3968   1746    977    450    189     45     14   4009 
+
+=== interpretation of the v2 cycle-42 capture (2026-07-06) ===
+The narration named the wedge (cell 3, setup:driver) — ADR-0026 D2 held.
+Reading the samples against a healthy-process control changes the D3 mechanism:
+
+1. cell-3's thread is ABSENT from /proc/<pid>/task across all 6 samples
+   (healthy control run shows comm=cell-3 present from spawn, since
+   std::thread::Builder::name sets the comm before user code runs).
+   A thread blocked inside io_uring_setup would still be listed (D or S
+   state with a wchan). Absence means the thread had EXITED.
+2. The three live cells sat in normal idle (S, io_cqring_wait).
+3. System counters at capture: IO PSI full avg10=93.96 (saturated),
+   Dirty ~2.0 GiB, Writeback 0; allocstall_*=0, compact_stall=0,
+   compact_fail=0, memory PSI=0.00, MemFree ~20 GiB.
+
+Mechanism (revised): io_uring_setup did not stall — it FAILED fast
+(no allocation stalls anywhere), cell_main returned Err through
+`make_driver()?` between mark(12) and mark(13), and main's in-order join
+loop (blocked joining cell 0, which never exits) swallowed the error
+forever. The board kept publishing the dead cell's last phase; the
+narrator honestly reported a corpse as "not ready". Silent-wedge shape =
+server-side error-swallowing defect + kernel-side fast setup failure
+under writeback pressure.
+
+Fixes applied (same day):
+- bins/infinityd/src/main.rs: cell threads fail-stop at the thread
+  boundary — setup/loop Err or panic prints `cell N failed: <errno>` and
+  exits the node (L9 §8.4 fail-stop, no silent corpses).
+- crates/inf-runtime/src/uring.rs: the setup-flag fallback chain retries
+  only on EINVAL; ENOMEM-class errors propagate instead of silently
+  stripping single_issuer/defer_taskrun from one cell.
+
+Healthy-process thread-listing control (for the absence claim):
+  tid comms observed: infinityd, inf-control, cell-0..cell-3,
+  iou-wrk-<cell tid> x6 per cell.
+
+The v3 catcher (post-fix) run appends below — expected capture is the
+actual errno at the moment of failure.

@@ -1,0 +1,21 @@
+# M4-S09 tier I/O mode A/B (dev tier — ADR-0054)
+env: fs=ext4 governor=performance records=1048576 (~1024 MiB payload) reads=20000 QD=16 reps=3 (ABBA) merge=off
+memory-honesty scope: cgroup delta is the session scope (shared shell — disclosed); mincore rows are exact per-file page-cache bytes (ADR-0054 D4).
+corpus[buffered]: 1073741824 bytes in 1.2s (build bandwidth is NOT a row — S11 owns flush; the buffered build cost is disclosed context only)
+corpus[direct]: 1073741824 bytes in 3.8s (build bandwidth is NOT a row — S11 owns flush; the direct build cost is disclosed context only)
+
+## row: cold-uniform (range 1048576 records)
+rep0 buffered p50    127.1 µs · p99    436.8 µs · p99.9    580.4 µs · 106429 reads/s · cpu   9.0 µs/op · VmHWM 3048 KiB · cgroup-file Δ +97456 KiB · file-resident 97456 KiB
+rep0 direct   p50    127.8 µs · p99    430.9 µs · p99.9    528.0 µs · 104470 reads/s · cpu   9.0 µs/op · VmHWM 3124 KiB · cgroup-file Δ +0 KiB · file-resident 0 KiB
+rep1 direct   p50    127.3 µs · p99    428.4 µs · p99.9    594.4 µs · 104904 reads/s · cpu   9.0 µs/op · VmHWM 3164 KiB · cgroup-file Δ +0 KiB · file-resident 0 KiB
+rep1 buffered p50    125.9 µs · p99    444.3 µs · p99.9    547.9 µs · 106810 reads/s · cpu   8.9 µs/op · VmHWM 3164 KiB · cgroup-file Δ +96940 KiB · file-resident 96940 KiB
+rep2 buffered p50    126.3 µs · p99    414.6 µs · p99.9    513.7 µs · 108109 reads/s · cpu   8.8 µs/op · VmHWM 3164 KiB · cgroup-file Δ +97560 KiB · file-resident 97560 KiB
+rep2 direct   p50    125.3 µs · p99    419.6 µs · p99.9    541.4 µs · 105546 reads/s · cpu   9.0 µs/op · VmHWM 3320 KiB · cgroup-file Δ +0 KiB · file-resident 0 KiB
+
+## row: re-reference (range 8192 records)
+rep0 buffered p50     11.8 µs · p99    335.2 µs · p99.9    745.6 µs · 605254 reads/s · cpu   1.6 µs/op · VmHWM 3324 KiB · cgroup-file Δ +7504 KiB · file-resident 105064 KiB
+rep0 direct   p50    124.3 µs · p99    461.3 µs · p99.9    606.2 µs · 105233 reads/s · cpu   9.1 µs/op · VmHWM 3280 KiB · cgroup-file Δ +0 KiB · file-resident 0 KiB
+rep1 direct   p50    125.0 µs · p99    430.5 µs · p99.9    598.0 µs · 105424 reads/s · cpu   9.0 µs/op · VmHWM 3280 KiB · cgroup-file Δ +0 KiB · file-resident 0 KiB
+rep1 buffered p50     12.1 µs · p99     18.5 µs · p99.9     27.0 µs · 945582 reads/s · cpu   1.1 µs/op · VmHWM 3280 KiB · cgroup-file Δ +0 KiB · file-resident 105064 KiB
+rep2 buffered p50     11.8 µs · p99     16.5 µs · p99.9     20.9 µs · 964506 reads/s · cpu   1.0 µs/op · VmHWM 3280 KiB · cgroup-file Δ +0 KiB · file-resident 105064 KiB
+rep2 direct   p50    124.6 µs · p99    446.8 µs · p99.9    636.1 µs · 105307 reads/s · cpu   9.0 µs/op · VmHWM 3280 KiB · cgroup-file Δ +32 KiB · file-resident 0 KiB

@@ -1,0 +1,7 @@
+inf-sim: scenario m3-document seed 0xd0c023ca: 212 commands, 339 steps, 5 keys audited, 112 required ops, 86 allowed-lost, 3 equivalence checks, 15 documents compared, 0 corpus docs, cut classes ["doc-delta", "doc-full"], trace 17262 bytes, hash 0xc8c18865d1ee9d5a
+inf-sim: sim_seconds=0.394571 published=0 delivered=0
+inf-sim: ORACLE VIOLATION: REPLAY EQUIVALENCE VIOLATION seed 0xd0c023ca [mid-run-1] cell 0: state digest diverged (live StateDigest { entries: 2, digest: 10532328359477723867 } vs replayed StateDigest { entries: 2, digest: 14350502299968442173 })
+inf-sim: ORACLE VIOLATION: REPLAY EQUIVALENCE VIOLATION seed 0xd0c023ca [mid-run-1] cell 0 ns alw key "k:2:0": version diverged: live 10 vs replayed 9
+inf-sim: ORACLE VIOLATION: REPLAY EQUIVALENCE VIOLATION seed 0xd0c023ca [mid-run-1] cell 0 ns alw key "k:2:0": canonical serialization diverged: live {"values":[3004,3004],"meta":{"tag":670946,"on":true},"x":828336} vs replayed {"values":[3004,3004],"meta":{"tag":365394,"on":true},"x":828336}
+inf-sim: ORACLE VIOLATION: REPLAY EQUIVALENCE VIOLATION seed 0xd0c023ca [mid-run-2] cell 0: state digest diverged (live StateDigest { entries: 2, digest: 9450135884899926169 } vs replayed StateDigest { entries: 2, digest: 1251390649307090180 })
+inf-sim: ORACLE VIOLATION: REPLAY EQUIVALENCE VIOLATION seed 0xd0c023ca [mid-run-2] cell 0 ns alw key "k:1:0": version diverged: live 21 vs replayed 20

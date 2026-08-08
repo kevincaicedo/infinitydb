@@ -1,0 +1,26 @@
+     3.56%  cell-1           infinityd                       [.] inf_doc::json::JsonParser::parse_into
+     3.54%  cell-3           infinityd                       [.] inf_doc::json::JsonParser::parse_into
+     3.48%  cell-0           infinityd                       [.] inf_doc::json::JsonParser::parse_into
+     3.43%  cell-2           infinityd                       [.] inf_doc::json::JsonParser::parse_into
+     1.33%  cell-1           libc.so.6                       [.] __memmove_avx_unaligned_erms
+     1.25%  cell-2           libc.so.6                       [.] __memmove_avx_unaligned_erms
+     1.23%  cell-0           libc.so.6                       [.] __memmove_avx_unaligned_erms
+     1.22%  cell-3           libc.so.6                       [.] __memmove_avx_unaligned_erms
+     0.79%  cell-3           infinityd                       [.] inf_simd::json::avx2_copy_unescaped_fixstr
+     0.77%  cell-1           infinityd                       [.] inf_doc::json::parse_number_value
+     0.75%  cell-2           infinityd                       [.] inf_doc::json::parse_number_value
+     0.74%  cell-0           infinityd                       [.] inf_doc::json::parse_number_value
+     0.73%  cell-3           infinityd                       [.] inf_doc::json::parse_number_value
+     0.70%  cell-1           infinityd                       [.] inf_simd::json::avx2_copy_unescaped_fixstr
+     0.69%  cell-0           infinityd                       [.] inf_simd::json::avx2_copy_unescaped_fixstr
+     0.66%  cell-2           infinityd                       [.] inf_simd::json::avx2_copy_unescaped_fixstr
+     0.63%  cell-3           infinityd                       [.] inf_simd::json::avx2_classify_blocks
+     0.62%  cell-1           infinityd                       [.] inf_simd::json::avx2_classify_blocks
+     0.60%  cell-0           [unknown]                       [k] 0xffffffffa44d7991
+     0.60%  cell-2           [unknown]                       [k] 0xffffffffa44d7991
+     0.60%  cell-0           infinityd                       [.] inf_simd::json::avx2_classify_blocks
+     0.59%  cell-2           infinityd                       [.] inf_simd::json::avx2_classify_blocks
+     0.59%  cell-1           [unknown]                       [k] 0xffffffffa44d7991
+     0.56%  cell-3           [unknown]                       [k] 0xffffffffa44d7991
+
+

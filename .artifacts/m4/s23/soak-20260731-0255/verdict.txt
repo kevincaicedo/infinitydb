@@ -1,0 +1,6 @@
+rss slope +17.739%/24h (first-5% median 958992 kB -> last-5% median 962536 kB, 178 samples)
+disk max 0 bytes (budget 2684354560)
+write-amp milli max 0 (gate < 3000)
+wa flatness: q2 mean 0 -> q4 mean 0 milli
+FAIL (MECHANICS-ONLY: tiered leg named-absent — does NOT satisfy the §7 gate; M4-S26)
+  - RSS slope +17.739%/24h >= 0.5%/24h

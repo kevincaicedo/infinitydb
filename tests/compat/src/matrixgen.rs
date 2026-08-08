@@ -23,6 +23,10 @@
 
 use inf_wire::{COMMANDS, CmdFlags};
 
+use crate::json_oracle::{
+    DEVIATIONS as JSON_DEVIATIONS, JSON_CASES, Protocol as JsonProtocol, REDIS_STACK_DIGEST,
+    REDIS_STACK_IMAGE, REDISJSON_MODULE_VERSION,
+};
 use crate::matrix::{Check, MATRIX};
 
 /// Declared compatibility level (see the module-level decision rule).
@@ -214,9 +218,205 @@ pub static DECLARED: &[Declared] = &[
         "M1",
         "SHARDCHANNELS / SHARDNUMSUB arrive with sharded pub/sub (M3 cut line)",
     ),
-    d("INF.NS", Status::Extension, "M1", "namespace registry v1 — the M2 durability seam"),
+    d(
+        "INF.NS",
+        Status::Extension,
+        "M1",
+        "namespace registry (M2 durability seam; M4-S19 adds SET + the ADR-0062 tiering keys; \
+         M4-S26 lifts the D8 `USE` refusal — the string family, `SCAN`, and `DBSIZE` serve \
+         tiered namespaces; two extension error classes are live on their writes: `DISKFULL …` \
+         (ADR-0063 — disk budget or device full; new-tier-byte placements only) and \
+         `STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)` \
+         (ADR-0053 D4 — retryable). Deviations on tiered namespaces: no expiry (the `EXPIRE` \
+         family + `SET` expiry options refuse typed; `TTL` = -1 for live keys), non-string \
+         families refuse typed, multi-key ops resolve sequentially. M4-S27 (ADR-0068): \
+         `MAXMEMORY`/`EVICTION` on named *memory* namespaces are enforced and Hot via `SET` \
+         (`inherit`/`0` reset them); a namespace with its own budget answers the Redis-exact \
+         OOM error scoped to that namespace and reclaims only its own keys; durable and \
+         tiered namespaces refuse both keys typed (tiered budgets belong to `MEM-BUDGET`)",
+    ),
+    d(
+        "INF.CKPT",
+        Status::Extension,
+        "M2",
+        "checkpoint operator surface (M2-S20): [CELL k] [WAIT]; WAIT returns after the new \
+         MANIFEST is durable — no fork, per-cell timing (ADR-0021)",
+    ),
+    d(
+        "BGSAVE",
+        Status::Partial,
+        "M2",
+        "maps onto INF.CKPT (fuzzy checkpoint, no fork, no RDB file); SCHEDULE accepted and \
+         moot; reply byte-identical; memory-only nodes answer a documented error",
+    ),
+    d(
+        "LASTSAVE",
+        Status::Partial,
+        "M2",
+        "unix seconds of the newest durable MANIFEST publication; 0 before the first \
+         (Redis reports process-start time); loading flag docs-derived, not capture-verified",
+    ),
     d("INF.TAKE", Status::Internal, "M1", "cross-cell RENAME/COPY program primitive"),
     d("INF.PEEK", Status::Internal, "M1", "cross-cell COPY program primitive"),
+    // ---- M3-S11/S12 · `JSON.*` (ADR-0041). S21 supplies the pinned
+    // RedisJSON RESP2/RESP3 byte corpus and explicit deviation allowlist;
+    // S22 (2026-07-16) audited every row: `full` requires byte-compared
+    // cases under both protocols, zero attributable allowlist entries, and
+    // no semantic difference (error-text wording is not representational —
+    // module vocabulary above). Notes whose RedisJSON arm the corpus left
+    // unpinned were settled against the pinned oracle:
+    // `.artifacts/m3/s22-20260716/oracle-probes.txt`.
+    d(
+        "JSON.SET",
+        Status::Partial,
+        "M3",
+        "S21 corpus exact except parser-specific malformed-input text; root sets preserve TTL \
+         (as RedisJSON — S22 probe); durable writes use M3-S17 document records",
+    ),
+    d(
+        "JSON.GET",
+        Status::Partial,
+        "M3",
+        "S21 corpus exact except documented large-exponent f64 text and module-specific \
+         WRONGTYPE wording; INDENT/NEWLINE/SPACE covered; path match sets capped by \
+         doc-max-path-matches",
+    ),
+    d(
+        "JSON.MGET",
+        Status::Partial,
+        "M3",
+        "S21 corpus exact; per-key atomicity only — no cross-cell snapshot (each cell serves \
+         its key at its own serve time)",
+    ),
+    d(
+        "JSON.DEL",
+        Status::Partial,
+        "M3",
+        "recursive-overlap result count differs from RedisJSON while post-state is identical",
+    ),
+    d(
+        "JSON.FORGET",
+        Status::Partial,
+        "M3",
+        "alias of JSON.DEL — inherits its recursive-overlap count difference (S22 probe: the \
+         oracle reports 2 where InfinityDB reports 3 raw matches); own S21 corpus case exact",
+    ),
+    d(
+        "JSON.TYPE",
+        Status::Full,
+        "M3",
+        "RESP2/RESP3 type-name vocabulary and frames are exact in the S21 corpus",
+    ),
+    d(
+        "JSON.NUMINCRBY",
+        Status::Partial,
+        "M3",
+        "i64 preserved exactly; i64 overflow errors atomically where the pinned RedisJSON \
+         wraps to i64::MIN (S22 probe); non-finite results error on both; value echoes share \
+         JSON.GET's large-exponent f64 deviation",
+    ),
+    d(
+        "JSON.NUMMULTBY",
+        Status::Partial,
+        "M3",
+        "same numeric model and deviation classes as JSON.NUMINCRBY; S21 RESP2/RESP3 corpus \
+         exact",
+    ),
+    d(
+        "JSON.STRAPPEND",
+        Status::Full,
+        "M3",
+        "lengths reported in bytes and the implicit legacy root path match the pinned oracle \
+         (S21 corpus + S22 probes)",
+    ),
+    d(
+        "JSON.STRLEN",
+        Status::Full,
+        "M3",
+        "lengths reported in bytes, matching the pinned oracle (S21 corpus + S22 multibyte \
+         probe)",
+    ),
+    d(
+        "JSON.TOGGLE",
+        Status::Full,
+        "M3",
+        "S21 RESP2/RESP3 corpus exact; non-boolean skip (modern) / error (legacy) split \
+         matches the pinned oracle (S22 probe)",
+    ),
+    d(
+        "JSON.CLEAR",
+        Status::Full,
+        "M3",
+        "already-empty containers and zero numbers skip (uncounted), matching the pinned \
+         oracle (S21 corpus + S22 probe)",
+    ),
+    // ---- M3-S13/S14 · array + object ops, MERGE (ADR-0042). The same S21
+    // corpus/allowlist rule applies.
+    d(
+        "JSON.ARRAPPEND",
+        Status::Partial,
+        "M3",
+        "S21 corpus exact; three-argument form appends one value at the legacy root, a form \
+         the pinned RedisJSON rejects with an arity error (S22 probe)",
+    ),
+    d(
+        "JSON.ARRINSERT",
+        Status::Partial,
+        "M3",
+        "resolved index outside 0..=len aborts the whole command atomically (§3.4 R4); \
+         RedisJSON can mutate an earlier match before a later index error",
+    ),
+    d(
+        "JSON.ARRINDEX",
+        Status::Partial,
+        "M3",
+        "scalar needles only (container needles rejected — ADR-0042 D3); mixed-width numbers \
+         compare numerically; S21 corpus exact",
+    ),
+    d(
+        "JSON.ARRLEN",
+        Status::Partial,
+        "M3",
+        "S21 corpus exact except module-specific WRONGTYPE error text",
+    ),
+    d(
+        "JSON.ARRPOP",
+        Status::Partial,
+        "M3",
+        "out-of-range clamps and empty-array null match the pinned oracle (S22 probes); the \
+         popped-value text shares JSON.GET's large-exponent f64 deviation (the oracle echoes \
+         a 3e72 literal as 2.9999999999999996e72); S21 corpus exact",
+    ),
+    d(
+        "JSON.ARRTRIM",
+        Status::Partial,
+        "M3",
+        "inclusive window and out-of-range clamps; overlapping mixed-type reply/error shape \
+         differs from RedisJSON with the same post-state",
+    ),
+    d(
+        "JSON.OBJKEYS",
+        Status::Full,
+        "M3",
+        "keys in insertion order, as the pinned RedisJSON returns them (the only order the \
+         format has — ADR-0036); S21 corpus exact",
+    ),
+    d("JSON.OBJLEN", Status::Full, "M3", "S21 RESP2/RESP3 corpus exact"),
+    d(
+        "JSON.MERGE",
+        Status::Partial,
+        "M3",
+        "RFC 7386 at the selected value; null members inside object patches delete keys, while \
+         a path-targeted null is literal (ADR-0042 D6); retaining overlaps use one immutable \
+         snapshot rather than RedisJSON cascade semantics; missing keys create at the root only",
+    ),
+    d(
+        "JSON.DEBUG",
+        Status::Partial,
+        "M3",
+        "MEMORY reports InfinityDB-attributed record + external document bytes; missing-key \
+         and allocator-specific RedisJSON parity are intentionally not claimed",
+    ),
 ];
 
 /// One rendered matrix row: declaration + mechanically-derived corpus data.
@@ -228,7 +428,7 @@ pub struct CommandRow {
     pub arity: i8,
     pub flags: String,
     pub compared_cases: usize,
-    pub deviations: Vec<&'static str>,
+    pub deviations: Vec<String>,
 }
 
 /// Joins the registry, the declaration, and the corpus — panicking on any
@@ -248,7 +448,7 @@ pub fn rows() -> Vec<CommandRow> {
             .find(|d| d.name == meta.name)
             .unwrap_or_else(|| panic!("{} has no compat declaration", meta.name));
         let mut compared_cases = 0;
-        let mut deviations: Vec<&'static str> = Vec::new();
+        let mut deviations: Vec<String> = Vec::new();
         for case in MATRIX {
             if !case.argv[0].eq_ignore_ascii_case(meta.name) {
                 continue;
@@ -256,11 +456,27 @@ pub fn rows() -> Vec<CommandRow> {
             if case.check.compared() {
                 compared_cases += 1;
             } else if let Check::SkipDiff(why) = case.check
-                && !deviations.contains(&why)
+                && !deviations.iter().any(|deviation| deviation == why)
             {
-                deviations.push(why);
+                deviations.push(why.to_string());
             }
         }
+        compared_cases +=
+            JSON_CASES.iter().filter(|case| case.argv[0].eq_ignore_ascii_case(meta.name)).count()
+                * JsonProtocol::ALL.len();
+        deviations.extend(
+            JSON_DEVIATIONS
+                .iter()
+                .filter(|deviation| deviation.command.eq_ignore_ascii_case(meta.name))
+                .map(|deviation| {
+                    format!(
+                        "RedisJSON {} `{}`: {}",
+                        deviation.protocol.name(),
+                        deviation.case_id,
+                        deviation.justification
+                    )
+                }),
+        );
         if declared.status == Status::Full {
             assert!(
                 compared_cases > 0,
@@ -305,14 +521,18 @@ pub fn rows() -> Vec<CommandRow> {
 /// Command families not yet implemented, with their owning milestone (the
 /// `absent` half of the matrix — a static table in generator code, still
 /// never hand-edited in the artifact).
+// Owners follow the ADR-0023 documents-first train (master plan §21):
+// the pre-reorder numbering this table carried went stale when `JSON.*`
+// (old M6) shipped at M3 — caught by the M3-S13/S15 review.
 pub static ABSENT: &[(&str, &str)] = &[
-    ("Persistence admin (SAVE, BGSAVE, INF.CKPT, …)", "M2 — durability"),
-    ("Hashes, lists, sets, zsets, bitmaps, bitfield, HyperLogLog", "M3 — data types"),
-    ("Keyspace notifications, SLOWLOG, MONITOR, sharded pub/sub (SSUBSCRIBE/SPUBLISH)", "M3"),
-    ("Connection control (QUIT, RESET)", "M3 (RESET pairs with transaction state)"),
-    ("MULTI / EXEC / WATCH / DISCARD, EVAL / Lua, FUNCTION, WAIT", "M4 — transactions"),
-    ("Streams (X*), AUTH / TLS / ACL, CLIENT TRACKING", "M5"),
-    ("JSON.* documents", "M6"),
+    ("Persistence admin (SAVE, …)", "M9 — RDB import/export"),
+    ("Hashes, lists, sets, zsets, bitmaps, bitfield, HyperLogLog", "M5 — data types"),
+    ("Keyspace notifications, SLOWLOG, MONITOR, sharded pub/sub (SSUBSCRIBE/SPUBLISH)", "M5"),
+    ("Connection control (RESET)", "M6 (RESET pairs with transaction state)"),
+    ("MULTI / EXEC / WATCH / DISCARD, EVAL / Lua, FUNCTION, WAIT", "M6 — transactions"),
+    ("Streams (X*), AUTH / TLS / ACL, CLIENT TRACKING", "M7"),
+    ("JSONPath filter expressions `?(@…)`, secondary indexes, query engine", "M4.5 — ADR-0024"),
+    ("`JSON.RESP`", "Never — deprecated upstream; declared absent per the M3 plan anti-goals"),
     ("Vector sets", "M8"),
     ("Replication / cluster admin", "M9+"),
 ];
@@ -320,9 +540,9 @@ pub static ABSENT: &[(&str, &str)] = &[
 /// Renders the full `docs/compat-matrix.md` artifact.
 pub fn render() -> String {
     let rows = rows();
-    let total = MATRIX.len();
-    let skipped = MATRIX.iter().filter(|c| !c.check.compared()).count();
-    let compared = total - skipped;
+    let core_skipped = MATRIX.iter().filter(|c| !c.check.compared()).count();
+    let compared = MATRIX.len() - core_skipped + JSON_CASES.len() * JsonProtocol::ALL.len();
+    let deviations = core_skipped + JSON_DEVIATIONS.len();
     let count = |status: Status| rows.iter().filter(|r| r.status == status).count();
 
     let mut out = String::new();
@@ -337,13 +557,15 @@ pub fn render() -> String {
     push("> Regenerate: `INF_REGEN_MATRIX=1 cargo test -p compat --test matrix_artifact`");
     push("> (CI fails when this file is stale — the release pipeline inherits that refusal).");
     push("");
-    push("Oracle: **Redis 8.0.5** (local oracle on the dev box; the dockerized CI oracle");
-    push("pin lands with the M1-S14 release pipeline). Every declared-`full` behavior is");
-    push("byte-diffed against the oracle on every test run; any new deviation fails CI");
-    push("until it is allowlisted with a justification (L8 — honesty is total).");
+    push("Oracles: **Redis 8.0.5** for the core surface; RedisJSON uses");
+    push(&format!(
+        "**{REDIS_STACK_IMAGE}@{REDIS_STACK_DIGEST}** with ReJSON/{REDISJSON_MODULE_VERSION}."
+    ));
+    push("Every covered behavior is byte-diffed under its declared protocol; any new or");
+    push("stale deviation fails CI (L8 — honesty is total).");
     push("");
     push(&format!(
-        "**Corpus:** {compared} byte-compared cases · {skipped} documented deviations · 0 tolerated failures.",
+        "**Corpus:** {compared} byte-compared executions · {deviations} documented deviations · 0 tolerated failures.",
     ));
     push(&format!(
         "**Surface:** {} commands — {} full · {} partial · {} stub · {} extension · {} internal.",
@@ -380,9 +602,9 @@ pub fn render() -> String {
     push("");
     push("## Documented deviations (the allowlist, verbatim)");
     push("");
-    push("Each entry is a `SkipDiff` justification from the corpus: the candidate must");
-    push("still produce well-formed RESP for these cases, but the bytes differ from the");
-    push("oracle by design.");
+    push("Entries come verbatim from the core `SkipDiff` corpus or the protocol-keyed");
+    push("RedisJSON allowlist. The candidate still produces well-formed RESP, but the");
+    push("bytes or post-state differ by an understood, reviewed design decision.");
     push("");
     for row in &rows {
         if row.deviations.is_empty() {

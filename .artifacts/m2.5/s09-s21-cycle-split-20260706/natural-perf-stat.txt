@@ -1,0 +1,22 @@
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'cycles'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'instructions'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'branches'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'branch-misses'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'cache-references'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'cache-misses'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'L1-dcache-loads'
+WARNING: A requested CPU in '4,6,8,10' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'L1-dcache-load-misses'
+
+ Performance counter stats for 'CPU(s) 4,6,8,10':
+
+   136,069,159,054      cpu_core/cycles/                                                      
+   265,253,303,896      cpu_core/instructions/                                                
+    44,267,128,266      cpu_core/branches/                                                    
+       262,702,337      cpu_core/branch-misses/                                               
+     2,176,223,387      cpu_core/cache-references/                                            
+       333,015,367      cpu_core/cache-misses/                                                
+    65,745,018,414      cpu_core/L1-dcache-loads/                                             
+     1,715,128,139      cpu_core/L1-dcache-load-misses/                                       
+
+      10.003020765 seconds time elapsed
+

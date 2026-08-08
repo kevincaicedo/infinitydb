@@ -1,0 +1,13 @@
+set-1k: ops/s mean 2286576 (rsd 3.6%)  p50 0.634 ms (rsd 6.0%)  reps 3
+jset-1k: ops/s mean 1376572 (rsd 0.2%)  p50 1.124 ms (rsd 0.9%)  reps 3
+get-1k: ops/s mean 1612502 (rsd 0.5%)  p50 0.698 ms (rsd 0.5%)  reps 3
+jget-1k: ops/s mean 1860586 (rsd 0.3%)  p50 0.836 ms (rsd 0.5%)  reps 3
+get-2h: ops/s mean 3700823 (rsd 1.2%)  p50 0.404 ms (rsd 1.9%)  reps 3
+jget-2h: ops/s mean 3465747 (rsd 2.4%)  p50 0.431 ms (rsd 4.0%)  reps 3
+jmut-1k: ops/s mean 3257698 (rsd 3.8%)  p50 0.471 ms (rsd 5.0%)  reps 3
+mix-kv: ops/s mean 913297 (rsd 3.1%)  p50 0.847 ms (rsd 4.8%)  reps 3
+mix-json: ops/s mean 1114604 (rsd 9.4%)  p50 0.706 ms (rsd 7.2%)  reps 3
+
+GATE JSON.SET/SET throughput = 0.6020  (gate >= 0.70)  FAIL (dev tier)
+GATE JSON.GET/GET p50 (1KiB) = 1.1988  (gate <= 1.5)  PASS (dev tier)
+GATE JSON.GET/GET p50 (200B) = 1.0660  (gate <= 1.5)  PASS (dev tier)

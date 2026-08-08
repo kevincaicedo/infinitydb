@@ -1,0 +1,5 @@
+date: 2026-07-29T19:12:15-04:00
+kernel: 7.0.0-28-generic
+governor: powersave
+epp: performance
+git: a9761aa dirty=23 (S15 work in tree, disclosed)

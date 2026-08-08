@@ -1,0 +1,10 @@
+# M2.5-S21 binding campaign (reference-box, env-check OK every leg, clean tree per leg)
+# leg	lever	penalty_%	natural_ops	all_local_ops	dragonfly_anchor_x	gate_run_dir
+baseline	off	60.4	2461039	6211962	1.44	.artifacts/m0/1783391461-gate-run	# 5 replicates
+2	off	61.7	2420418	6323417	1.45	.artifacts/m0/1783392817-gate-run
+5	on	64.2	2359342	6587245	1.37	.artifacts/m0/1783393058-gate-run
+8	on	62.8	2345080	6300969	1.36	.artifacts/m0/1783393622-gate-run
+9	off	61.4	2457647	6373185	1.48	.artifacts/m0/1783393859-gate-run
+# legs 1,3 (batch 1) refused: --remote-first-execute missing from gate-run's known-flag
+# list (fixed 1d90c95→ commit); legs 4,6,7 refused: dirty tree from the prior leg's own
+# artifacts (per-leg evidence commits fix the campaign loop — leg order disclosed here).

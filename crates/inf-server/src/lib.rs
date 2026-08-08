@@ -3,20 +3,60 @@
 //! `inf-wire` registry onto `inf-store` ops with RESP2/RESP3 replies, and
 //! the node assembly: [`ServerPlane`], one cell's complete data plane over
 //! any backend driver (`infinityd` = uring/kqueue, `inf-sim` = sim).
-#![forbid(unsafe_code)]
+//!
+//! `unsafe` posture (M2-S08, ADR-0015 D4): `deny` at the crate root with
+//! exactly one audited opt-out module (`log_bytes` — see `SAFETY.md`).
+#![deny(unsafe_code)]
 
 mod admin;
+mod ckpt;
 mod clients;
 mod config;
+mod control;
+mod durable;
 mod exec;
+pub mod fault;
 mod glob;
+#[cfg(feature = "doc")]
+mod json;
+mod log_bytes;
 mod plane;
 mod pubsub;
+mod readahead;
+mod recover;
+mod tier_cell;
 
+/// Process exit code for a durable-path fail-stop (§8.4, the fsyncgate
+/// rule): an fsync/log-write error freezes the watermark — no ack for the
+/// affected batch ever fires — and the process exits with this code
+/// (M2-S17, ADR-0020 D3). Boot-recovery failure keeps exit code 1
+/// (`infinityd`'s `take_boot_error` path).
+pub const EXIT_DURABLE_FAILSTOP: i32 = 3;
+
+pub use ckpt::{CkptStats, ManifestStats};
 pub use clients::{ClientInfo, ClientRegistry};
 pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
+pub use control::{
+    CellRecoverySlot, ControlHandle, ControlInbox, RecoveryBoard, load_catalog, load_catalog_from,
+    spawn as spawn_control,
+};
+pub use durable::{DurableConfig, DurableStats, RecoverConfig};
+// Durable-config vocabulary re-exported for the assembly tier: bins name
+// `inf-server` only (dep-DAG), and `DurableConfig`'s fields are these
+// types — an assembly cannot fill one without naming them.
 #[doc(hidden)]
 pub use exec::parse_cursor;
 pub use exec::{ConnCx, NodeInfo, execute, execute_slices, stall_request};
 pub use glob::glob_match;
+pub use inf_log::ckpt::DEFAULT_CKPT_INTERVAL_BYTES;
+pub use inf_log::fs::StdSegmentFs;
+#[cfg(feature = "doc")]
+pub use json::{JSON_REPLY_SHAPES, ReplyShape};
+// M2-S18 (ADR-0020 D6/D7): the sim tier's disk, re-exported for the
+// assembly/simulator tier exactly like `StdSegmentFs` above — bins name
+// `inf-server` only (dep-DAG).
+pub use inf_log::fs::sim::{SimDisk, SimDiskConfig, StallConfig};
+pub use inf_log::{CkptConfig, DEFAULT_SEGMENT_BYTES, SegmentConfig, StagingConfig};
 pub use plane::{ExecOrigin, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane};
+pub use readahead::{ReadAheadFile, ReadAheadFs};
+pub use recover::{RecoverStats, RecoveredManifest, Recovery, RecoveryProgress, open_cell_log};

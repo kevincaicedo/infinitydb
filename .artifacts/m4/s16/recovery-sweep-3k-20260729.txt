@@ -1,0 +1,1 @@
+inf-sim: m4-recovery sweep shard 0/1: 3000 seeds, 0 violations, 1013048 refs, 4136576 images, 2362 cut-before-publish lives, 2956 flush-lag lives, 12720 live-set entries, 211263 relocations, 381 retired, 263 unlinked, 118 left-to-boot-gc

@@ -2,7 +2,11 @@
 //! here (reduced command quota in debug); the nightly fleet runs every line
 //! at full scenario size via the CLI.
 
-use inf_sim::{Scenario, run_scenario};
+use inf_sim::{
+    BootStormScenario, CombinedScenario, DurableScenario, Scenario, TieredScenario,
+    run_boot_storm_scenario, run_combined_scenario, run_durable_scenario, run_scenario,
+    run_tiered_scenario,
+};
 
 fn parse_seed(text: &str) -> u64 {
     text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")).map_or_else(
@@ -22,6 +26,62 @@ fn corpus_seeds_replay_green() {
         }
         let (name, seed_text) = line.split_once(' ').expect("`<scenario> <seed>` per line");
         let seed = parse_seed(seed_text.trim());
+        // Durable scenarios share the real disk/recovery runner. M2 can
+        // surface a legal taxonomy refusal; M3 honest document cuts may
+        // not, and its scenario turns one into a violation.
+        if matches!(name, "m2-durable" | "m3-document") {
+            let scenario = match name {
+                "m2-durable" => DurableScenario::m2_durable(seed),
+                "m3-document" => DurableScenario::m3_document(seed),
+                _ => unreachable!(),
+            };
+            let report = run_durable_scenario(&scenario);
+            assert!(
+                report.ok(),
+                "corpus seed {line} regressed: stalled={} violations={:?}",
+                report.stalled,
+                report.violations
+            );
+            ran += 1;
+            continue;
+        }
+        // M2.5-S14 scenarios: their own runners + verdict shapes (the
+        // combined L2/pub-sub oracles; the boot-storm ready-path oracle).
+        if name == "m2-combined" {
+            let report = run_combined_scenario(&CombinedScenario::m2_combined(seed));
+            assert!(
+                report.ok(),
+                "corpus seed {line} regressed: stalled={} violations={:?}",
+                report.stalled,
+                report.violations
+            );
+            ran += 1;
+            continue;
+        }
+        // M4-S26: the command-driven tiered node (its own runner — the
+        // §8.2 command audit, flush liveness, DISKFULL, drop race). A
+        // legal ADR-0018 taxonomy refusal ends the run early and ok().
+        if name == "m4-tiered" {
+            let report = run_tiered_scenario(&TieredScenario::m4_tiered(seed));
+            assert!(
+                report.ok(),
+                "corpus seed {line} regressed: stalled={} violations={:?}",
+                report.stalled,
+                report.violations
+            );
+            ran += 1;
+            continue;
+        }
+        if name == "boot-storm" {
+            let report = run_boot_storm_scenario(&BootStormScenario::m2_boot_storm(seed));
+            assert!(
+                report.ok(),
+                "corpus seed {line} regressed: violations={:?}",
+                report.violations
+            );
+            ran += 1;
+            continue;
+        }
         let mut scenario = match name {
             "m0-smoke" => Scenario::m0_smoke(seed),
             "m1-cache" => Scenario::m1_cache(seed),

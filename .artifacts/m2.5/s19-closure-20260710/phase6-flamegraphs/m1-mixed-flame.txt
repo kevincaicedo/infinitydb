@@ -1,0 +1,67 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 63K of event 'cpu_core/cycles/P'
+# Event count (approx.): 108083979425
+#
+# Overhead  Command  Shared Object     Symbol                                                                                                                                                                   
+# ........  .......  ................  .........................................................................................................................................................................
+#
+     1.36%  cell-3   libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.35%  cell-3   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     1.35%  cell-0   libc.so.6         [.] __memmove_avx_unaligned_erms
+            |          
+             --1.35%--__memmove_avx_unaligned_erms
+
+     1.34%  cell-3   infinityd         [.] inf_server::plane::dispatch_one::{{closure}}
+     1.34%  cell-1   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     1.32%  cell-0   infinityd         [.] inf_server::plane::dispatch_one::{{closure}}
+     1.31%  cell-0   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     1.29%  cell-1   libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.28%  cell-1   infinityd         [.] inf_server::plane::dispatch_one::{{closure}}
+     1.14%  cell-2   libc.so.6         [.] __memmove_avx_unaligned_erms
+     1.08%  cell-2   infinityd         [.] inf_store::store::CellStore::resolve_hashed
+     0.99%  cell-2   infinityd         [.] inf_server::plane::dispatch_one::{{closure}}
+     0.86%  cell-2   infinityd         [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     0.70%  cell-3   infinityd         [.] inf_server::plane::send_apply::{{closure}}
+     0.68%  cell-0   infinityd         [.] inf_server::plane::send_apply::{{closure}}
+     0.64%  cell-0   infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.64%  cell-1   infinityd         [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     0.63%  cell-3   infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.63%  cell-1   infinityd         [.] inf_server::plane::send_apply::{{closure}}
+     0.62%  cell-0   infinityd         [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     0.59%  cell-1   infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.57%  cell-3   infinityd         [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     0.51%  cell-2   infinityd         [.] inf_server::plane::send_apply::{{closure}}
+     0.51%  cell-2   infinityd         [.] inf_server::plane::pump::{{closure}}
+     0.50%  cell-0   infinityd         [.] inf_fabric::codec::decode_frame
+     0.49%  cell-0   infinityd         [.] inf_wire::parser::parse_count_line
+     0.49%  cell-3   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.48%  cell-0   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.48%  cell-2   infinityd         [.] inf_fabric::codec::decode_frame
+     0.46%  cell-1   infinityd         [.] inf_fabric::codec::decode_frame
+     0.45%  cell-3   infinityd         [.] inf_fabric::codec::decode_frame
+     0.45%  cell-3   infinityd         [.] inf_wire::parser::parse_count_line
+     0.44%  cell-1   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.43%  cell-1   infinityd         [.] inf_wire::parser::parse_count_line
+     0.43%  cell-3   infinityd         [.] inf_server::plane::OwnedCmd::from_argv_into
+     0.41%  cell-2   infinityd         [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap
+     0.41%  cell-0   infinityd         [.] inf_server::plane::OwnedCmd::from_argv_into
+     0.38%  cell-2   infinityd         [.] inf_wire::parser::parse_count_line
+     0.38%  cell-2   infinityd         [.] inf_wire::parser::FrameIter::next
+     0.37%  cell-3   infinityd         [.] <inf_runtime::gate::GateWait<K,V> as core::future::future::Future>::poll
+     0.36%  cell-0   infinityd         [.] <inf_runtime::gate::GateWait<K,V> as core::future::future::Future>::poll
+     0.35%  cell-1   infinityd         [.] inf_server::plane::OwnedCmd::from_argv_into
+     0.34%  cell-3   infinityd         [.] inf_server::plane::handle_fabric_op
+     0.33%  cell-1   infinityd         [.] <inf_runtime::gate::GateWait<K,V> as core::future::future::Future>::poll
+     0.32%  cell-1   infinityd         [.] inf_server::plane::handle_fabric_op
+     0.32%  cell-1   infinityd         [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap
+     0.31%  cell-2   infinityd         [.] inf_server::plane::OwnedCmd::from_argv_into
+     0.30%  cell-2   infinityd         [.] <inf_server::plane::ServerPlane<O,F> as inf_runtime::reactor::CellPlane>::maintain
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

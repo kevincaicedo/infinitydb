@@ -1,0 +1,15 @@
+     Running tests/recovery_v2.rs (target/debug/deps/recovery_v2-6f5a510b605fe72c)
+
+running 9 tests
+test s12_rows_are_carried_here ... ok
+test s15_rows_are_carried_here ... ok
+test tier_fsync_frozen_watermark_bounds_manifest ... ok
+test tier_torn_frame_reseal_from_manifest_v2 ... ok
+test s15_covering_swap_dir_fsync_resolves_and_boot_gc_reclaims ... ok
+test s15_unlink_failure_is_nonfatal_and_redriven ... ok
+test manifest_v2_rename_fail_keeps_old_unit ... ok
+test manifest_v2_dir_fsync_crash_resolves_new_unit ... ok
+test s15_covering_swap_abort_serves_from_prior_unit ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

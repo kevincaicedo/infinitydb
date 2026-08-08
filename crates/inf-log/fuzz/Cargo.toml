@@ -1,0 +1,59 @@
+# cargo-fuzz crate for inf-log (M2-S01 AC: frame decoder fuzz, CI smoke +
+# nightly hour). Standalone workspace — built only by `cargo +nightly fuzz`.
+[package]
+name = "inf-log-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+inf-log = { path = ".." }
+inf-simd = { path = "../../inf-simd" }
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_read"
+path = "fuzz_targets/segment_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ick_decode"
+path = "fuzz_targets/ick_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest_decode"
+path = "fuzz_targets/manifest_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+
+[[bin]]
+name = "fuzz_tierfile_decode"
+path = "fuzz_targets/fuzz_tierfile_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extent_decode"
+path = "fuzz_targets/extent_decode.rs"
+test = false
+doc = false
+bench = false

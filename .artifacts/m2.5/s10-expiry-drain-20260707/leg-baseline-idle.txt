@@ -1,0 +1,2 @@
+errors: 0, replies: 400000
+single DBSIZE at +3010 ms: 0  (of 400000 filled; idle-drain rate ≈ 132890/s if linear)

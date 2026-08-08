@@ -21,6 +21,9 @@ use crate::resp;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum EngineKind {
     Redis,
+    /// The pinned RedisJSON comparator (M3 `json` lanes, ADR-0025 D3).
+    /// Docker-only: redis-stack ships no host binary.
+    RedisStack,
     Dragonfly,
     InfinityDb,
 }
@@ -29,6 +32,7 @@ impl EngineKind {
     pub fn label(self) -> &'static str {
         match self {
             EngineKind::Redis => "redis",
+            EngineKind::RedisStack => "redis-stack",
             EngineKind::Dragonfly => "dragonfly",
             EngineKind::InfinityDb => "infinitydb",
         }
@@ -37,9 +41,12 @@ impl EngineKind {
     pub fn parse(s: &str) -> Result<EngineKind, String> {
         match s {
             "redis" => Ok(EngineKind::Redis),
+            "redis-stack" | "redisstack" | "stack" => Ok(EngineKind::RedisStack),
             "dragonfly" | "df" => Ok(EngineKind::Dragonfly),
             "infinitydb" | "infinity" | "infinityd" => Ok(EngineKind::InfinityDb),
-            other => Err(format!("unknown engine `{other}` (known: redis, dragonfly, infinitydb)")),
+            other => Err(format!(
+                "unknown engine `{other}` (known: redis, redis-stack, dragonfly, infinitydb)"
+            )),
         }
     }
 
@@ -47,8 +54,20 @@ impl EngineKind {
     pub fn host_available(self) -> bool {
         match self {
             EngineKind::Redis => on_path("redis-server"),
+            EngineKind::RedisStack => false, // docker-only
             EngineKind::Dragonfly => on_path("dragonfly"),
             EngineKind::InfinityDb => resolve_infinityd().exists() || on_path("infinityd"),
+        }
+    }
+
+    /// `true` if the engine serves the `JSON.*` surface (`json` lanes run;
+    /// otherwise the lane is skipped with a report note).
+    pub fn has_json(self) -> bool {
+        match self {
+            EngineKind::Redis => false,
+            // Dragonfly ships JSON.* natively; redis-stack is the pinned
+            // oracle; InfinityDb is the M3 system under test.
+            EngineKind::RedisStack | EngineKind::Dragonfly | EngineKind::InfinityDb => true,
         }
     }
 }
@@ -85,6 +104,11 @@ pub struct Spec {
 #[derive(Clone, Debug)]
 pub struct Images {
     pub redis: String,
+    /// Pinned by digest to the M3 compat oracle's exact image
+    /// (`tests/compat/src/json_oracle.rs` is the canonical constant; this
+    /// default mirrors it because inf-compare shares no code with the
+    /// system under test or its test crates — zero-dep policy).
+    pub redis_stack: String,
     pub dragonfly: String,
     pub infinitydb: String,
     pub seccomp: PathBuf,
@@ -290,6 +314,9 @@ fn host_argv(spec: &Spec) -> Result<(String, Vec<String>), String> {
             let (p, a) = redis_argv(spec, false);
             Ok(maybe_pin(p, a, spec.pin_start, 1)) // redis is single-threaded
         }
+        EngineKind::RedisStack => {
+            Err("redis-stack is docker-only (no host binary); pass --docker".into())
+        }
         EngineKind::Dragonfly => {
             let (p, a) = dragonfly_argv(spec, false);
             Ok(maybe_pin(p, a, spec.pin_start, spec.threads as usize))
@@ -393,6 +420,16 @@ fn docker_argv(spec: &Spec, images: &Images, name: &str) -> Result<Vec<String>, 
             argv.push("redis-server".to_string());
             let (_, inner) = redis_argv(spec, true);
             argv.extend(inner);
+        }
+        EngineKind::RedisStack => {
+            // The stack image's entrypoint loads the modules itself; a
+            // `redis-server` command override would skip RedisJSON. Config
+            // rides the REDIS_ARGS env var (the CI oracle's launch shape).
+            argv.splice(
+                1..1,
+                ["-e".to_string(), "REDIS_ARGS=--save '' --appendonly no".to_string()],
+            );
+            argv.push(images.redis_stack.clone());
         }
         EngineKind::Dragonfly => {
             // dragonfly needs unlimited locked memory for its io_uring rings.

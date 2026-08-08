@@ -1,0 +1,3 @@
+Linux 7.0.0-28-generic (HomeLab) 	07/17/2026 	_x86_64_	(24 CPU)
+
+08:08:25 PM   UID      TGID       TID    %usr %system  %guest   %wait    %CPU   CPU  Command

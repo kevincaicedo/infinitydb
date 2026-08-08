@@ -1,0 +1,323 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 63K of event 'cpu_core/cycles/P'
+# Event count (approx.): 108029040644
+#
+# Overhead  Shared Object   
+# ........  ................
+#
+    51.34%  infinityd       
+    40.18%  [unknown]       
+            |          
+            |--0.73%--0xffffffffae2d5953
+            |          0xffffffffae9eba72
+            |          0xffffffffae9ebc7b
+            |          0xffffffffae9ebe53
+            |          0xffffffffaeb09c94
+            |          0xffffffffaeb0b101
+            |          0xffffffffaeb5af4f
+            |          0xffffffffae9ca596
+            |          0xffffffffae2a2137
+            |          0xffffffffae27ba91
+            |          0xffffffffae27fff1
+            |          0xffffffffae28b0db
+            |          0xffffffffae28b41b
+            |          0xffffffffae28c4a7
+            |          0xffffffffae28c7a7
+            |          |          
+            |           --0.64%--0xffffffffae28cf98
+            |                     0xffffffffae281311
+            |                     0xffffffffae2813a2
+            |                     0xffffffffad947750
+            |                     0xffffffffaed12b65
+            |                     0xffffffffad60012b
+            |          
+            |--0.43%--0xffffffffaed2d85b
+            |          
+            |--0.41%--0xffffffffc29a0d61
+            |          0xffffffffc29a12db
+            |          0xffffffffc29a156d
+            |          0xffffffffc29a57e8
+            |          0xffffffffaeadf308
+            |          0xffffffffaeaf50a9
+            |          0xffffffffaeaf513e
+            |          0xffffffffaeaf5328
+            |          0xffffffffaeaf5665
+            |          0xffffffffaeb24435
+            |          0xffffffffaeb2677d
+            |          0xffffffffaeb26dc9
+            |          0xffffffffaeb068dd
+            |          0xffffffffaeb07868
+            |          0xffffffffaeb084f0
+            |          0xffffffffaeb5aea6
+            |          0xffffffffae9cb025
+            |          0xffffffffae2a13f9
+            |          0xffffffffae27ba91
+            |          0xffffffffae28035d
+            |          0xffffffffae2806bd
+            |          0xffffffffae280d8e
+            |          0xffffffffae28114c
+            |          0xffffffffae2813a2
+            |          0xffffffffad947750
+            |          0xffffffffaed12b65
+            |          0xffffffffad60012b
+            |          
+            |--0.41%--0xffffffffadb006ab
+            |          0xffffffffaed2d01e
+            |          
+            |--0.40%--0xffffffffae9fbd13
+            |          0xffffffffaea0d2e1
+            |          0xffffffffada4cb71
+            |          0xffffffffaed2ed90
+            |          0xffffffffada4c49f
+            |          0xffffffffada4cf9a
+            |          0xffffffffaea0a1a1
+            |          0xffffffffaeaf178f
+            |          0xffffffffaeaf47d8
+            |          0xffffffffaeaf4b61
+            |          0xffffffffaeaf4ca6
+            |          0xffffffffaeaf4e41
+            |          0xffffffffaeaf5181
+            |          0xffffffffaeaf5328
+            |          0xffffffffaeaf5665
+            |          0xffffffffaeb24435
+            |          0xffffffffaeb2677d
+            |          0xffffffffaeb26dc9
+            |          0xffffffffaeb068dd
+            |          0xffffffffaeb07868
+            |          0xffffffffaeb084f0
+            |          0xffffffffaeb5aea6
+            |          0xffffffffae9cb025
+            |          0xffffffffae2a13f9
+            |          0xffffffffae27ba91
+            |          0xffffffffae28035d
+            |          0xffffffffae2806bd
+            |          0xffffffffae280d8e
+            |          0xffffffffae28114c
+            |          0xffffffffae2813a2
+            |          0xffffffffad947750
+            |          0xffffffffaed12b65
+            |          0xffffffffad60012b
+            |          
+            |--0.40%--0xffffffffaeb13089
+            |          0xffffffffaeb19a27
+            |          |          
+            |           --0.39%--0xffffffffaeb1c86b
+            |                     0xffffffffaeb3193a
+            |                     0xffffffffaeb33c9a
+            |                     0xffffffffaeaeda26
+            |                     0xffffffffaeaedc96
+            |                     0xffffffffaeaedd95
+            |                     0xffffffffaeaee43d
+            |                     0xffffffffaea0c4ad
+            |                     0xffffffffaea0c536
+            |                     0xffffffffaea0c7e0
+            |                     0xffffffffaea0cfa4
+            |                     0xffffffffaea0d377
+            |                     0xffffffffada4cb71
+            |                     0xffffffffaed2ed90
+            |                     0xffffffffada4c49f
+            |                     0xffffffffada4cf9a
+            |                     0xffffffffaea0a1a1
+            |                     0xffffffffaeaf178f
+            |                     0xffffffffaeaf47d8
+            |                     0xffffffffaeaf4b61
+            |                     0xffffffffaeaf4ca6
+            |                     0xffffffffaeaf4e41
+            |                     0xffffffffaeaf5181
+            |                     0xffffffffaeaf5328
+            |                     0xffffffffaeaf5665
+            |                     0xffffffffaeb24435
+            |                     0xffffffffaeb2677d
+            |                     0xffffffffaeb26dc9
+            |                     0xffffffffaeb068dd
+            |                     0xffffffffaeb07868
+            |                     0xffffffffaeb084f0
+            |                     0xffffffffaeb5aea6
+            |                     0xffffffffae9cb025
+            |                     0xffffffffae2a13f9
+            |                     0xffffffffae27ba91
+            |                     0xffffffffae28035d
+            |                     0xffffffffae2806bd
+            |                     0xffffffffae280d8e
+            |                     0xffffffffae28114c
+            |                     0xffffffffae2813a2
+            |                     0xffffffffad947750
+            |                     0xffffffffaed12b65
+            |                     0xffffffffad60012b
+            |          
+            |--0.39%--0xffffffffadae8aac
+            |          0xffffffffadaf1750
+            |          0xffffffffae9d2226
+            |          0xffffffffaeb1b4c9
+            |          |          
+            |           --0.38%--0xffffffffaeb1c8ff
+            |                     0xffffffffaeb3193a
+            |                     0xffffffffaeb33c9a
+            |                     0xffffffffaeaeda26
+            |                     0xffffffffaeaedc96
+            |                     0xffffffffaeaedd95
+            |                     0xffffffffaeaee43d
+            |                     0xffffffffaea0c4ad
+            |                     0xffffffffaea0c536
+            |                     0xffffffffaea0c7e0
+            |                     0xffffffffaea0cfa4
+            |                     0xffffffffaea0d377
+            |                     0xffffffffada4cb71
+            |                     0xffffffffaed2ed90
+            |                     0xffffffffada4c49f
+            |                     0xffffffffada4cf9a
+            |                     0xffffffffaea0a1a1
+            |                     0xffffffffaeaf178f
+            |                     0xffffffffaeaf47d8
+            |                     0xffffffffaeaf4b61
+            |                     0xffffffffaeaf4ca6
+            |                     0xffffffffaeaf4e41
+            |                     0xffffffffaeaf5181
+            |                     0xffffffffaeaf5328
+            |                     0xffffffffaeaf5665
+            |                     0xffffffffaeb24435
+            |                     0xffffffffaeb2677d
+            |                     0xffffffffaeb26dc9
+            |                     0xffffffffaeb068dd
+            |                     0xffffffffaeb07868
+            |                     0xffffffffaeb084f0
+            |                     0xffffffffaeb5aea6
+            |                     0xffffffffae9cb025
+            |                     0xffffffffae2a13f9
+            |                     0xffffffffae27ba91
+            |                     0xffffffffae28035d
+            |                     0xffffffffae2806bd
+            |                     0xffffffffae280d8e
+            |                     0xffffffffae28114c
+            |                     0xffffffffae2813a2
+            |                     0xffffffffad947750
+            |                     0xffffffffaed12b65
+            |                     0xffffffffad60012b
+            |          
+            |--0.36%--0xffffffffae2dc8c6
+            |          
+            |--0.35%--0xffffffffaeb16918
+            |          0xffffffffaeb09876
+            |          0xffffffffaeb0b101
+            |          0xffffffffaeb5af4f
+            |          0xffffffffae9ca596
+            |          0xffffffffae2a2137
+            |          0xffffffffae27ba91
+            |          0xffffffffae27fff1
+            |          0xffffffffae28b0db
+            |          0xffffffffae28b41b
+            |          0xffffffffae28c4a7
+            |          0xffffffffae28c7a7
+            |          
+            |--0.34%--0xffffffffaded3dfd
+            |          0xffffffffaded3fd6
+            |          |          
+            |           --0.34%--0xffffffffae9eba5e
+            |                     0xffffffffae9ebc7b
+            |                     0xffffffffae9ebe53
+            |                     0xffffffffaeb09c94
+            |                     0xffffffffaeb0b101
+            |                     0xffffffffaeb5af4f
+            |                     0xffffffffae9ca596
+            |                     0xffffffffae2a2137
+            |                     0xffffffffae27ba91
+            |                     0xffffffffae27fff1
+            |                     0xffffffffae28b0db
+            |                     0xffffffffae28b41b
+            |                     0xffffffffae28c4a7
+            |                     0xffffffffae28c7a7
+            |                     |          
+            |                      --0.30%--0xffffffffae28cf98
+            |                                0xffffffffae281311
+            |                                0xffffffffae2813a2
+            |                                0xffffffffad947750
+            |                                0xffffffffaed12b65
+            |                                0xffffffffad60012b
+            |          
+            |--0.34%--0xffffffffae9ebb9b
+            |          0xffffffffae9ebe53
+            |          0xffffffffaeb09c94
+            |          0xffffffffaeb0b101
+            |          0xffffffffaeb5af4f
+            |          0xffffffffae9ca596
+            |          0xffffffffae2a2137
+            |          0xffffffffae27ba91
+            |          0xffffffffae27fff1
+            |          0xffffffffae28b0db
+            |          0xffffffffae28b41b
+            |          0xffffffffae28c4a7
+            |          0xffffffffae28c7a7
+            |          
+            |--0.33%--0xffffffffadaacd53
+            |          
+            |--0.33%--0xffffffffaeafb8b1
+            |          0xffffffffaeb33728
+            |          0xffffffffaeaeda26
+            |          0xffffffffaeaedc96
+            |          0xffffffffaeaedd95
+            |          0xffffffffaeaee43d
+            |          0xffffffffaea0c4ad
+            |          0xffffffffaea0c536
+            |          0xffffffffaea0c7e0
+            |          0xffffffffaea0cfa4
+            |          0xffffffffaea0d377
+            |          0xffffffffada4cb71
+            |          0xffffffffaed2ed90
+            |          0xffffffffada4c49f
+            |          0xffffffffada4cf9a
+            |          0xffffffffaea0a1a1
+            |          0xffffffffaeaf178f
+            |          0xffffffffaeaf47d8
+            |          0xffffffffaeaf4b61
+            |          0xffffffffaeaf4ca6
+            |          0xffffffffaeaf4e41
+            |          0xffffffffaeaf5181
+            |          0xffffffffaeaf5328
+            |          0xffffffffaeaf5665
+            |          0xffffffffaeb24435
+            |          0xffffffffaeb2677d
+            |          0xffffffffaeb26dc9
+            |          0xffffffffaeb068dd
+            |          0xffffffffaeb07868
+            |          0xffffffffaeb084f0
+            |          0xffffffffaeb5aea6
+            |          0xffffffffae9cb025
+            |          0xffffffffae2a13f9
+            |          0xffffffffae27ba91
+            |          0xffffffffae28035d
+            |          0xffffffffae2806bd
+            |          0xffffffffae280d8e
+            |          0xffffffffae28114c
+            |          0xffffffffae2813a2
+            |          0xffffffffad947750
+            |          0xffffffffaed12b65
+            |          0xffffffffad60012b
+            |          
+             --0.31%--0xffffffffaeb0812f
+                       0xffffffffaeb084f0
+                       0xffffffffaeb5aea6
+                       0xffffffffae9cb025
+                       0xffffffffae2a13f9
+                       0xffffffffae27ba91
+                       0xffffffffae28035d
+                       0xffffffffae2806bd
+                       0xffffffffae280d8e
+                       0xffffffffae28114c
+                       0xffffffffae2813a2
+                       0xffffffffad947750
+                       0xffffffffaed12b65
+                       0xffffffffad60012b
+
+     8.42%  libc.so.6       
+            |          
+             --1.11%--__memmove_avx_unaligned_erms
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

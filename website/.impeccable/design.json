@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-07-17T00:00:00Z",
+  "title": "Design System: InfinityDB Website",
+  "extensions": {
+    "colorMeta": {
+      "signal-violet": { "role": "primary", "displayName": "Signal Violet", "canonical": "#7c5cff", "tonalRamp": ["#1a1433", "#2c2158", "#42328a", "#5a45bd", "#7c5cff", "#9a80ff", "#b9a8ff", "#dcd2ff"] },
+      "proof-teal": { "role": "secondary", "displayName": "Proof Teal", "canonical": "#3ee6c4", "tonalRamp": ["#0b2b25", "#14453c", "#1d6355", "#28866f", "#32b393", "#3ee6c4", "#7deed6", "#c0f7ea"] },
+      "near-black": { "role": "neutral", "displayName": "Near-Black", "canonical": "#06070d", "tonalRamp": ["#06070d", "#0b0e19", "#1a1e2e", "#2a2f44", "#3a4157", "#5c6178", "#9096ae", "#e8e9f2"] },
+      "caution-amber": { "role": "status", "displayName": "Caution Amber", "canonical": "#ffc45c", "tonalRamp": ["#33250b", "#553d13", "#7d5a1d", "#a87927", "#d49c3f", "#ffc45c", "#ffd88f", "#ffecc7"] },
+      "alarm-red": { "role": "status", "displayName": "Alarm Red", "canonical": "#ff5c78", "tonalRamp": ["#330f16", "#551a25", "#7d2636", "#a83349", "#d4455e", "#ff5c78", "#ff8fa1", "#ffc7d0"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "Hero + CTA-band headlines, Archivo 800; the hero carries the violet→teal gradient on one phrase (a sanctioned blend site)." },
+      "label": { "displayName": "Mono Machine Voice", "purpose": "Kickers, nav links, buttons, pills, table headers, stat values, marquee, meta lines — JetBrains Mono, tracked, uppercase. In v2 the machine voice speaks the chrome, not just the labels." }
+    },
+    "shadows": [
+      { "name": "terminal-lift", "value": "0 24px 80px rgba(0, 0, 0, 0.5)", "purpose": "The terminal only — the site's single drop shadow (The One Shadow Rule)." },
+      { "name": "pulse-ring", "value": "0 0 0 12px rgba(124, 92, 255, 0)", "purpose": "Animated halo endpoint on the roadmap's NOW dot." }
+    ],
+    "motion": [
+      { "name": "fade-up", "value": "fadeUp 0.7-0.9s both, ~0.1s stagger", "purpose": "Hero entrance (.fx-1…6); single 0.4s fade on inner-page articles." },
+      { "name": "particle-flow", "value": "SMIL animateMotion, 1.9-6s loops", "purpose": "Diagram particles: violet flows in (commands/appends), teal flows out (serves/projections). Dots carry .anim-dot and hide under reduced motion." },
+      { "name": "type-in", "value": "typeIn 0.4s both, ~0.25-0.35s per line", "purpose": "Terminal lines typing in with a blinking teal block cursor." },
+      { "name": "marquee", "value": "marquee 30s linear infinite, duplicated track", "purpose": "The product-facts band; paused on hover, dead under reduced motion." },
+      { "name": "pulse", "value": "pulseDot 1.6s + pulseRing 2s infinite", "purpose": "The roadmap NOW dot only." },
+      { "name": "bar-grow", "value": "SMIL width 0→N, begin=indefinite, IntersectionObserver trigger", "purpose": "Benchmark bars grow on scroll-entry; bars are full-width by default so content never gates on the animation, and the trigger is skipped under reduced motion." }
+    ],
+    "breakpoints": [
+      { "name": "nav-collapse", "value": "760px" },
+      { "name": "docs-sidebar-stack", "value": "880px" },
+      { "name": "hero-stack", "value": "980px" },
+      { "name": "strip-stack", "value": "620px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Teal lamp, mono uppercase voice; hover hands off to the violet lamp.",
+      "html": "<a href=\"#\" class=\"btn btn-primary\">★ STAR ON GITHUB</a>",
+      "css": ".btn { display: inline-block; font: 700 12px/1 'JetBrains Mono', ui-monospace, monospace; letter-spacing: 0.1em; padding: 13px 22px; border-radius: 8px; text-transform: uppercase; text-decoration: none; } .btn-primary { background: #3ee6c4; color: #06070d; } .btn-primary:hover { background: #7c5cff; color: #e8e9f2; } .btn-primary:focus-visible { outline: 2px solid #3ee6c4; outline-offset: 3px; }"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Seam-bordered secondary; border and text warm to teal on hover.",
+      "html": "<a href=\"#\" class=\"btn btn-ghost\">QUICKSTART →</a>",
+      "css": ".btn-ghost { border: 1px solid rgba(139,144,168,0.3); color: #9096ae; font-weight: 500; } .btn-ghost:hover { border-color: #3ee6c4; color: #3ee6c4; }"
+    },
+    {
+      "name": "Status Pills",
+      "kind": "chip",
+      "refersTo": "pill",
+      "description": "The honesty system: teal = shipped, violet = in dev/now, faint = planned. Outline-only except blog category pills (teal fill).",
+      "html": "<span class=\"pill pill-ship\">SHIPPING</span> <span class=\"pill pill-now\">M3 · IN DEV</span> <span class=\"pill pill-plan\">M7</span>",
+      "css": ".pill { display: inline-block; font: 500 10px/1 'JetBrains Mono', ui-monospace, monospace; letter-spacing: 0.08em; border-radius: 99px; padding: 4px 9px; white-space: nowrap; } .pill-ship { color: #3ee6c4; border: 1px solid rgba(62,230,196,0.45); } .pill-now { color: #b9a8ff; border: 1px solid rgba(124,92,255,0.4); } .pill-plan { color: #5c6178; border: 1px solid rgba(139,144,168,0.3); }"
+    },
+    {
+      "name": "Workload Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Panel card with violet mono index, honesty pill, TARGETS tagline; hover lifts with a violet border.",
+      "html": "<div class=\"wl-card\"><div class=\"idx\">/02</div><h3>Durable KV <span class=\"pill pill-ship\">SHIPPING</span></h3><div class=\"tagline\">TARGETS DYNAMODB-CLASS STORES</div><p>Per-namespace durability — always, everysec, memory — group-commit fsync, fork-free checkpoints, parallel recovery.</p></div>",
+      "css": ".wl-card { background: #0b0e19; border: 1px solid rgba(139,144,168,0.18); border-radius: 14px; padding: 26px; max-width: 340px; transition: border-color 0.2s, transform 0.2s; } .wl-card:hover { border-color: rgba(124,92,255,0.6); transform: translateY(-3px); } .wl-card .idx { font: 500 11px/1 'JetBrains Mono', monospace; color: #7c5cff; } .wl-card h3 { margin: 12px 0 0; font: 700 20px/1.2 'Archivo', sans-serif; color: #e8e9f2; } .wl-card .tagline { margin-top: 6px; font: 500 9.5px/1.5 'JetBrains Mono', monospace; letter-spacing: 0.1em; color: #5c6178; text-transform: uppercase; } .wl-card p { margin: 14px 0 0; font-size: 13.5px; line-height: 1.6; color: #9096ae; }"
+    },
+    {
+      "name": "Evidence Block",
+      "kind": "custom",
+      "refersTo": "evidence",
+      "description": "Signature: a ledger-Allowed claim with its row tag and artifact path. Every measured number lives in one (or in a stat tile citing its row).",
+      "html": "<div class=\"evidence\"><span class=\"tag\">C12 · Allowed</span> — Durability is deterministically tested: 10,000 simulated power-cut/disk-fault seeds, zero durability-oracle violations.<span class=\"artifact\">.artifacts/dst-sweep-10k · regenerated per release</span></div>",
+      "css": ".evidence { border: 1px solid rgba(139,144,168,0.2); background: #0b0e19; border-radius: 10px; padding: 18px 22px; font: 400 15px/1.7 'Archivo', sans-serif; color: #9096ae; max-width: 560px; } .evidence .tag { color: #3ee6c4; font: 600 13px 'JetBrains Mono', monospace; } .evidence .artifact { display: block; font: 400 11.5px/1.7 'JetBrains Mono', monospace; color: #5c6178; margin-top: 8px; overflow-wrap: anywhere; }"
+    },
+    {
+      "name": "Stat Tile",
+      "kind": "custom",
+      "refersTo": "stat",
+      "description": "Measured-value tile — mono value + faint uppercase label. Ledger-Allowed measurements only; never targets.",
+      "html": "<div class=\"stat\"><div class=\"v\">9.8 s</div><div class=\"l\">10 GB NODE COLD-BOOTS TO SERVING — 15 s GATE</div></div>",
+      "css": ".stat { border: 1px solid rgba(139,144,168,0.2); border-radius: 10px; padding: 18px; background: #06070d; max-width: 260px; } .stat .v { font: 700 22px/1.2 'JetBrains Mono', monospace; color: #e8e9f2; } .stat .l { margin-top: 6px; font: 400 9.5px/1.5 'JetBrains Mono', monospace; letter-spacing: 0.08em; color: #5c6178; text-transform: uppercase; }"
+    },
+    {
+      "name": "Callout",
+      "kind": "custom",
+      "refersTo": "callout",
+      "description": "Inline notice with a 3px teal left edge (amber for warn); the blog's LAW DERIVED block is the same family.",
+      "html": "<div class=\"callout\"><span class=\"callout-tag\"><strong>Honest packaging note:</strong></span> no published binaries yet — build from source or Docker-from-repo.</div>",
+      "css": ".callout { border: 1px solid rgba(139,144,168,0.2); border-left: 3px solid #3ee6c4; background: #0b0e19; border-radius: 10px; padding: 16px 20px; font: 400 15px 'Archivo', sans-serif; color: #c4c8d8; max-width: 560px; } .callout .callout-tag { color: #3ee6c4; }"
+    },
+    {
+      "name": "Kicker",
+      "kind": "custom",
+      "refersTo": "label",
+      "description": "Teal mono microlabel; on the landing page it carries the numbered-readout sequence (01 · …) — landing only.",
+      "html": "<p class=\"kicker\">04 · MEASURED, NOT PROMISED</p>",
+      "css": ".kicker { font: 500 12px/1 'JetBrains Mono', ui-monospace, monospace; letter-spacing: 0.18em; text-transform: uppercase; color: #3ee6c4; margin: 0; }"
+    },
+    {
+      "name": "Terminal",
+      "kind": "custom",
+      "refersTo": "terminal",
+      "description": "The hero instrument: red/amber/teal chrome dots, mono body, $ teal / inf> violet prompts, dimmed milestone-tagged roadmap surface, the site's only drop shadow.",
+      "html": "<div class=\"terminal\"><div class=\"terminal-bar\"><span class=\"dot\"></span><span class=\"dot\"></span><span class=\"dot\"></span><span class=\"title\">infinity — unified session</span></div><div class=\"terminal-body\"><div class=\"line\"><span class=\"s\">$</span> redis-cli</div><div class=\"line\"><span class=\"p\">inf&gt;</span> SET orders:{u42} \"paid\" <span class=\"c\"># acked after fsync</span></div><div class=\"line\"><span class=\"p\">inf&gt;</span> <span class=\"cursor\"></span></div></div></div>",
+      "css": ".terminal { background: #0b0e19; border: 1px solid rgba(139,144,168,0.22); border-radius: 14px; overflow: hidden; box-shadow: 0 24px 80px rgba(0,0,0,0.5); max-width: 480px; } .terminal-bar { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid rgba(139,144,168,0.14); } .terminal-bar .dot { width: 10px; height: 10px; border-radius: 50%; } .terminal-bar .dot:nth-child(1) { background: rgba(255,92,120,0.6); } .terminal-bar .dot:nth-child(2) { background: rgba(255,196,92,0.6); } .terminal-bar .dot:nth-child(3) { background: rgba(62,230,196,0.6); } .terminal-bar .title { margin-left: 10px; font: 400 10px/1 'JetBrains Mono', monospace; letter-spacing: 0.1em; color: #5c6178; } .terminal-body { padding: 22px 24px; font: 400 12.5px/2 'JetBrains Mono', monospace; color: #cdd1e0; } .terminal-body .p { color: #b9a8ff; } .terminal-body .s { color: #3ee6c4; } .terminal-body .c { color: #5c6178; } .cursor { display: inline-block; width: 8px; height: 15px; background: #3ee6c4; vertical-align: -2px; animation: blink 1.1s step-end infinite; } @keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Two Lamps on Near-Black",
+    "overview": "A dark instrument panel where data is visibly moving. Near-black blue surfaces seamed with hairline slate borders; two indicator lamps divide all meaning — Signal Violet for what is in motion (records in flight, the current milestone, the in-dev surface) and Proof Teal for what has arrived (links, shipped capabilities, measured numbers, the live cursor). Diagrams are animated instruments: SMIL particles ride SVG paths through the log spine, the reactor orbit, and the fabric mesh. The one sanctioned blend of the lamps is the violet→teal gradient — hero phrase, benchmark bar fills, featured wash: motion arriving at proof. The honesty machinery (status pills, evidence blocks, the milestone rail, ledger-cited numbers) is first-class brand material.",
+    "keyCharacteristics": [
+      "Two accents with disjoint jobs: violet = in motion / current, teal = proven / interactive; their gradient blend is reserved for three sites",
+      "Hairline slate seams and one tonal step carry all depth; the terminal keeps the single drop shadow",
+      "Archivo 800 headlines; JetBrains Mono speaks the chrome — nav, buttons, kickers, stat values — uppercase and tracked",
+      "Diagrams are animated instruments: particle flows, a pulsing tail block, doorbell rings, scroll-triggered bar growth",
+      "Measured, not promised: only ledger-Allowed numbers render, inside evidence blocks and stat tiles with disclosures"
+    ],
+    "rules": [
+      { "name": "The Two Lamps Rule", "body": "Violet marks what is in motion (current, in-dev, in-flight); teal marks what is proven or actionable (shipped, measured, clickable). If swapping an element's lamp would not change its meaning, the color is decoration and therefore wrong. The gradient is their only blend and appears in exactly three places: the hero headline phrase, benchmark bar fills, and the featured-card wash.", "section": "colors" },
+      { "name": "The Two Voices Rule (extended)", "body": "Prose is always Archivo. Everything small, structural, machine-generated, or actionable-chrome — labels, tags, paths, code, statuses, nav links, buttons, stat values — is JetBrains Mono, uppercase and tracked. No third font.", "section": "typography" },
+      { "name": "The One Shadow Rule", "body": "The terminal keeps the site's only drop shadow. Every other surface separates with a seam and the panel step; card hover lifts via transform + violet border, never a shadow.", "section": "elevation" },
+      { "name": "Measured, Not Promised", "body": "Numbers on the site come only from Allowed/Narrowed claim-ledger rows, rendered in evidence blocks or stat tiles with box/cells/tier disclosed. Targets never appear (master plan §18); what is absent is named, with the reason.", "section": "content" }
+    ],
+    "dos": [
+      "Do keep every measured number inside an Evidence Block or stat tile citing an Allowed ledger row — the ledger-copy CI check fails the build otherwise (L10).",
+      "Do pin a status pill or milestone tag to every capability mention, including terminal commands and diagram nodes.",
+      "Do give each lamp its own job and keep the gradient to its three sanctioned sites.",
+      "Do state what is absent and why — designed absence is brand material.",
+      "Do ship the reduced-motion fallback for every animation, including SMIL particles (.anim-dot hides) and observer-triggered bars (full-width by default)."
+    ],
+    "donts": [
+      "Don't publish targets as numbers anywhere on the site — targets live in the master plan, measurements on the page.",
+      "Don't blend or swap the lamps: no teal NOW dots, no violet links, no gradient outside its three sites.",
+      "Don't add drop shadows to new surfaces (One Shadow Rule).",
+      "Don't write 'REPLACES X' as a claim — capability taglines say TARGETS …; comparisons exist only as in-run measured rows.",
+      "Don't hand-edit site/docs/compat.html — it is generated and CI fails on drift.",
+      "Don't spread the numbered-kicker system beyond the landing page."
+    ]
+  }
+}

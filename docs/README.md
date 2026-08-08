@@ -10,6 +10,9 @@ Public documentation for InfinityDB. Start with the
   diagrams.
 - **[Deployment](deployment.md)** — running with Docker (and the `io_uring` /
   seccomp requirement), prebuilt binaries, server options, and configuration.
+- **[Operating tiered storage](ops-tiered-storage.md)** — datasets larger than
+  RAM: the address space and its watermarks, memory budgets, the `INFO
+  tiering` fields, what to alarm on, and the write-amplification baseline.
 - **[Roadmap](roadmap.md)** — the milestone train and what lands when.
 - **[Contributing](../CONTRIBUTING.md)** — development setup, the validation
   ladder, and the design laws contributors must respect.
@@ -26,8 +29,10 @@ Public documentation for InfinityDB. Start with the
 - **[Compatibility matrix](compat-matrix.md)** — every command's Redis
   compatibility status, with documented deviations. *Generated artifact —
   do not edit by hand.*
-- **[Interfaces](interfaces-m0.md)** — the frozen internal seams between
+- **[Interfaces (M0)](interfaces-m0.md)** — the frozen internal seams between
   crates (engineering reference).
+- **[Interfaces (M2)](interfaces-m2.md)** — the log-spine formats and seams
+  (record/frame/LSN/segment lifecycle); draft until M2 exit.
 
 ## Operations artifacts
 

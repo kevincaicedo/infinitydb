@@ -1,0 +1,121 @@
+infinityd 78d4055 (git 78d405538128-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 37819, backend io_uring, route natural
+infinityd: listening on 37819
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: false, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records)
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 5s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 6s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 7s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 8s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 9s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 10s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 11s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 12s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 13s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 14s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 15s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 16s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 17s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 18s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 19s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 20s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 21s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 22s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 23s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 24s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 25s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 26s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 27s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 28s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 29s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 30s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 31s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 32s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 33s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 34s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 35s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 36s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 37s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 38s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 39s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 40s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 41s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 42s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 43s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 44s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 45s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 46s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 47s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 48s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 49s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 50s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 51s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 52s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 53s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 54s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 55s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 56s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 57s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 58s
+control: recovery 3/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 2 not ready — in setup:driver (0/0 bytes) for 59s

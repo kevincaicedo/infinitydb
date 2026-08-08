@@ -1,0 +1,1 @@
+gate-1KiB: serialized=40960000 inf=48070656 stack=54325248 inf/serialized=1.174 inf/stack=0.885

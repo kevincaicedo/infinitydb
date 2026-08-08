@@ -1,0 +1,33 @@
+recovery_replay (M2-S13 dev rehearsal)
+  kernel   7.0.0-27-generic
+  governor performance
+  target   1024 MiB (~2025927 records), 5 replicates, warm page cache
+  caveat   dev tier: CPU-path rehearsal; the ≥ 1 GB/s gate binds on the
+           reference NVMe with a cold-cache row at S22
+
+== row: tail-only ==
+   image: 2025927 records, 1024.7 MiB replayed per boot
+   rep 0:   1070.0 ms    0.94 GiB/s     1893331 records/s  (applied 2025927 + ckpt 0)
+   rep 1:   1038.5 ms    0.96 GiB/s     1950910 records/s  (applied 2025927 + ckpt 0)
+   rep 2:   1041.0 ms    0.96 GiB/s     1946098 records/s  (applied 2025927 + ckpt 0)
+   rep 3:   1042.7 ms    0.96 GiB/s     1942902 records/s  (applied 2025927 + ckpt 0)
+   rep 4:   1040.0 ms    0.96 GiB/s     1948067 records/s  (applied 2025927 + ckpt 0)
+   state digest 0x931565df6815d6ae identical across 5 replicates (L7)
+
+== row: ick-tail ==
+   image: 2025927 records, 1024.8 MiB replayed per boot
+   rep 0:    911.1 ms    1.10 GiB/s     2223723 records/s  (applied 1012964 + ckpt 1012963)
+   rep 1:    897.5 ms    1.11 GiB/s     2257231 records/s  (applied 1012964 + ckpt 1012963)
+   rep 2:    893.4 ms    1.12 GiB/s     2267548 records/s  (applied 1012964 + ckpt 1012963)
+   rep 3:    896.6 ms    1.12 GiB/s     2259669 records/s  (applied 1012964 + ckpt 1012963)
+   rep 4:    900.2 ms    1.11 GiB/s     2250481 records/s  (applied 1012964 + ckpt 1012963)
+   state digest 0x931565df6815d6ae identical across 5 replicates (L7)
+
+== row: slack-floor (S14 scan cost) ==
+   image: 8000 records, 4.0 MiB replayed per boot
+   rep 0:     90.3 ms    0.04 GiB/s       88562 records/s  (applied 8000 + ckpt 0)
+   rep 1:     60.1 ms    0.07 GiB/s      133129 records/s  (applied 8000 + ckpt 0)
+   rep 2:     56.3 ms    0.07 GiB/s      142176 records/s  (applied 8000 + ckpt 0)
+   rep 3:     60.3 ms    0.07 GiB/s      132764 records/s  (applied 8000 + ckpt 0)
+   rep 4:     55.1 ms    0.07 GiB/s      145135 records/s  (applied 8000 + ckpt 0)
+   state digest 0xec318f4276c71c51 identical across 5 replicates (L7)

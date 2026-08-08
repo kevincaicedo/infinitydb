@@ -1,0 +1,57 @@
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 22.20s
+     Running benches/doc_ingest.rs (target/release/deps/doc_ingest-173d62003836ed8c)
+Benchmarking doc_ingest_1kib/parse
+Benchmarking doc_ingest_1kib/parse: Warming up for 3.0000 s
+Benchmarking doc_ingest_1kib/parse: Collecting 100 samples in estimated 5.0001 s (3.4M iterations)
+Benchmarking doc_ingest_1kib/parse: Analyzing
+doc_ingest_1kib/parse   time:   [1.4551 µs 1.4558 µs 1.4566 µs]
+                        thrpt:  [537.54 MiB/s 537.81 MiB/s 538.08 MiB/s]
+                 change:
+                        time:   [−30.595% −30.537% −30.476%] (p = 0.00 < 0.05)
+                        thrpt:  [+43.836% +43.961% +44.082%]
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high mild
+Benchmarking doc_ingest_1kib/store_set
+Benchmarking doc_ingest_1kib/store_set: Warming up for 3.0000 s
+Benchmarking doc_ingest_1kib/store_set: Collecting 100 samples in estimated 5.0002 s (102M iterations)
+Benchmarking doc_ingest_1kib/store_set: Analyzing
+doc_ingest_1kib/store_set
+                        time:   [47.231 ns 47.378 ns 47.533 ns]
+                        thrpt:  [16.086 GiB/s 16.139 GiB/s 16.189 GiB/s]
+                 change:
+                        time:   [−1.2107% −0.7749% −0.3615%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.3628% +0.7810% +1.2256%]
+                        Change within noise threshold.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking doc_ingest_1kib/json_set_prebuilt
+Benchmarking doc_ingest_1kib/json_set_prebuilt: Warming up for 3.0000 s
+Benchmarking doc_ingest_1kib/json_set_prebuilt: Collecting 100 samples in estimated 5.0003 s (80M iterations)
+Benchmarking doc_ingest_1kib/json_set_prebuilt: Analyzing
+doc_ingest_1kib/json_set_prebuilt
+                        time:   [62.376 ns 62.499 ns 62.626 ns]
+                        thrpt:  [12.209 GiB/s 12.234 GiB/s 12.258 GiB/s]
+                 change:
+                        time:   [−1.8979% −1.5887% −1.2911%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.3080% +1.6144% +1.9346%]
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking doc_ingest_1kib/parse_plus_json_set
+Benchmarking doc_ingest_1kib/parse_plus_json_set: Warming up for 3.0000 s
+Benchmarking doc_ingest_1kib/parse_plus_json_set: Collecting 100 samples in estimated 5.0009 s (3.0M iterations)
+Benchmarking doc_ingest_1kib/parse_plus_json_set: Analyzing
+doc_ingest_1kib/parse_plus_json_set
+                        time:   [1.5845 µs 1.5870 µs 1.5899 µs]
+                        thrpt:  [492.48 MiB/s 493.38 MiB/s 494.14 MiB/s]
+                 change:
+                        time:   [−27.598% −27.291% −27.016%] (p = 0.00 < 0.05)
+                        thrpt:  [+37.016% +37.534% +38.118%]
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+

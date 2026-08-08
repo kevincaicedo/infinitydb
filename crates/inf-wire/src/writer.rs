@@ -60,6 +60,36 @@ impl<'b> RespWriter<'b> {
         self.out.extend_from_slice(b"\r\n");
     }
 
+    /// Bulk string of unknown length (ADR-0039 D1's wire half, built at
+    /// M3-S11 per ADR-0041 D10): reserve the maximal length-header width,
+    /// let `build` append the payload once, back-patch the digits, and
+    /// close the gap with one overlapping `copy_within` of the payload.
+    /// The move is O(payload) — bounded by the 16 MiB−1 document cap and
+    /// ~tens of ns at the 1 KiB gate shape; rejected alternatives
+    /// (scratch-buffer double write; deferred-length iovec chains) are
+    /// recorded in the ADR.
+    pub fn bulk_patched(&mut self, build: impl FnOnce(&mut Vec<u8>)) {
+        // 8 digits cover the record-format value bound (16 MiB − 1).
+        const MAX_DIGITS: usize = 8;
+        self.out.push(b'$');
+        let digits_at = self.out.len();
+        self.out.extend_from_slice(b"00000000\r\n");
+        let payload_at = digits_at + MAX_DIGITS + 2;
+        build(self.out);
+        let len = self.out.len() - payload_at;
+        debug_assert!(len < 100_000_000, "payload exceeds the reserved header width");
+        let mut buf = [0u8; 20];
+        let text = itoa(len as i64, &mut buf);
+        let gap = MAX_DIGITS - text.len();
+        self.out[digits_at..digits_at + text.len()].copy_from_slice(text);
+        self.out[digits_at + text.len()..digits_at + text.len() + 2].copy_from_slice(b"\r\n");
+        if gap > 0 {
+            self.out.copy_within(payload_at.., payload_at - gap);
+            self.out.truncate(self.out.len() - gap);
+        }
+        self.out.extend_from_slice(b"\r\n");
+    }
+
     /// Null: `$-1\r\n` (RESP2) / `_\r\n` (RESP3).
     pub fn null(&mut self) {
         match self.proto {
@@ -266,6 +296,24 @@ mod tests {
             b"=9\r\ntxt:hello\r\n"
         );
         assert_eq!(render(Protocol::Resp3, |w| w.big_number("123456")), b"(123456\r\n");
+    }
+
+    #[test]
+    fn bulk_patched_matches_bulk_byte_for_byte() {
+        for payload in [&b""[..], b"x", b"hello", &[b'y'; 12_345_678]] {
+            let plain = render(Protocol::Resp2, |w| w.bulk(payload));
+            let patched = render(Protocol::Resp2, |w| {
+                w.bulk_patched(|out| out.extend_from_slice(payload));
+            });
+            assert_eq!(plain, patched, "len {}", payload.len());
+        }
+        // Mid-stream: earlier and later replies stay untouched.
+        let out = render(Protocol::Resp2, |w| {
+            w.int(1);
+            w.bulk_patched(|out| out.extend_from_slice(b"abc"));
+            w.simple("OK");
+        });
+        assert_eq!(out, b":1\r\n$3\r\nabc\r\n+OK\r\n");
     }
 
     #[test]

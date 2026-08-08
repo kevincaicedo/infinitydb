@@ -29,6 +29,10 @@ proptest.workspace = true
 criterion.workspace = true
 # Conformance tests poke sockets (setsockopt) directly.
 libc.workspace = true
+# M4-S04 steel thread: the integration vertical crosses store/log/alloc.
+# Dev-only — tests may cross layers (dep-dag exemption).
+inf-store.workspace = true
+inf-log.workspace = true
 
 [[bench]]
 name = "executor"
@@ -42,5 +46,34 @@ harness = false
 test = false
 required-features = ["uring"]
 
+# M2-S05/S06 group-commit rehearsal: LogWrite + linked fdatasync rows with
+# fsync latency histograms (dev tier; gate values bind on the reference box).
+[[bench]]
+name = "log_fsync"
+harness = false
+test = false
+required-features = ["uring"]
+
 [lints]
 workspace = true
+
+# M2-S07 buffered vs O_DIRECT A/B (Linux + uring only).
+[[bench]]
+name = "log_io_tier"
+harness = false
+test = false
+required-features = ["uring"]
+
+# M4-S09 tier-file I/O mode A/B (ADR-0054; Linux + uring only).
+[[bench]]
+name = "tier_io_mode"
+harness = false
+test = false
+required-features = ["uring"]
+
+# M4-S10 cold-read shaping: coalescing A/B + saturation (ADR-0055).
+[[bench]]
+name = "cold_shaping"
+harness = false
+test = false
+required-features = ["uring"]

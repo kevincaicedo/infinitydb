@@ -1,0 +1,13 @@
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 9 uncommitted entries
+  cpufreq-governor     FAIL  scaling_governor != performance on 24 cpus: cpu0=powersave, cpu1=powersave, cpu10=powersave, cpu11=powersave (+20 more)
+  cpufreq-epp          PASS
+  thermal-throttle     FAIL  thermal throttling occurred: cpu0/package_throttle_count=21651, cpu1/package_throttle_count=21651, cpu10/core_throttle_count=13118, cpu10/package_throttle_count=25347
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+gate-run: CONTINUING WITH FAILED ENV-CHECK — results are not citation-grade
+== ycsb: loading 655360 keys (640 MiB) ==
+inf-bench: loader integrity: DBSIZE 655284 != 655360 filled keys

@@ -1,0 +1,14 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.05s
+     Running tests/tiered_write_amp.rs (target/release/deps/tiered_write_amp-a9b7e72d2523888a)
+
+running 3 tests
+test delete_only_namespace_reports_unbounded_amplification ... ok
+relocated 419328 B → flush +532480 B; numerator 6118400 B, rejected numerator 6537728 B (+6.9% double-counted)
+test relocated_bytes_reach_the_device_through_the_flush_leg ... ok
+--- M4-S16 write-amplification canary (gate 3000 milli) ---
+tuned (50% dead)       user   4297672 | wal   4441672 | flush   8617984 | relocated   1994165 B /  11034 recs | unlinked  78 | WA 3.039× (rejected numerator 3.502×)
+canary (10% dead)      user   4297672 | wal   4441672 | flush  31305728 | relocated  19839381 B / 103591 recs | unlinked 414 | WA 8.318× (rejected numerator 12.934×)
+test mistuned_dead_ratio_trips_the_write_amp_gate ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+

@@ -10,10 +10,12 @@ use std::rc::Rc;
 
 use inf_alloc::{BufferPool, LeaseKind};
 use inf_foundation::rng::{Entropy, SplitMix64};
+use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_runtime::{
     BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken, IoOp, RawFd,
-    SubmitStats, Wait,
+    StableBytes, StableBytesMut, SubmitStats, Wait,
 };
+use inf_server::SimDisk;
 
 /// Fault plants (armed per scenario, fire on seeded draws).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -24,6 +26,12 @@ pub enum Plant {
     /// being delivered until *new* bytes arrive (the classic lost wakeup).
     /// Sequential clients never send again before the reply ⇒ stall.
     LostWakeup,
+    /// The M2-S19 durability-oracle canary (ADR-0021 D4): every driver
+    /// fsync completes `Synced` **without flushing the disk** — the
+    /// watermark advances, `always` acks release, and a power cut then
+    /// eats acked bytes. Models any path that acks ahead of durable
+    /// coverage; the oracle must catch it within 1,000 seeds.
+    FsyncLies,
 }
 
 #[derive(Debug, Default)]
@@ -119,18 +127,99 @@ impl CellNet {
     }
 }
 
-/// `BackendDriver` over a [`CellNet`]. One per cell.
+/// `BackendDriver` over a [`CellNet`]. One per cell. Durable scenarios
+/// attach a [`SimDisk`] (M2-S18, ADR-0020 D7): `LogWrite`/`Fdatasync`
+/// execute against its volatile/durable layers — a write completes
+/// `LogWritten` (page-cache semantics, NOT durable), an fsync flushes
+/// and completes `Synced`, and failure semantics mirror the uring
+/// contract (a failed write surfaces its linked sync as `ECANCELED`; a
+/// dead disk completes ops with `EIO`).
 #[derive(Debug)]
 pub struct SimDriver {
     net: Rc<RefCell<CellNet>>,
+    disk: Option<SimDisk>,
+    /// Injected clock (M2.5-S14): armed together with a stall-modeled
+    /// disk so fsync completions land later in virtual time. `None`
+    /// keeps the legacy instant-fsync driver byte-identical.
+    clock: Option<Rc<VirtualClock>>,
+    /// Deferred fsync CQEs, due-time order (the disk's serial timeline
+    /// keeps due times monotone, so pushes append in order).
+    pending_syncs: Vec<PendingSync>,
     ops: Vec<IoOp>,
     stats: SubmitStats,
 }
 
+/// One deferred fsync: flushed AND completed only once the virtual clock
+/// passes `due` — during the service window the bytes stay page-cache
+/// volatile, so a power cut eats them (the honest-stall invariant).
+/// Dir-vs-file routing happens at release time via `driver_fdatasync`,
+/// which already branches on dir fds.
+#[derive(Debug)]
+struct PendingSync {
+    due: Nanos,
+    fd: i32,
+    token: CompletionToken,
+}
+
 impl SimDriver {
     pub fn new(net: Rc<RefCell<CellNet>>) -> SimDriver {
-        SimDriver { net, ops: Vec::new(), stats: SubmitStats::default() }
+        SimDriver {
+            net,
+            disk: None,
+            clock: None,
+            pending_syncs: Vec::new(),
+            ops: Vec::new(),
+            stats: SubmitStats::default(),
+        }
     }
+
+    /// A driver whose file ops execute against `disk` (M2-S18).
+    pub fn with_disk(net: Rc<RefCell<CellNet>>, disk: SimDisk) -> SimDriver {
+        SimDriver { disk: Some(disk), ..SimDriver::new(net) }
+    }
+
+    /// M2.5-S14: a durable driver with the injected clock the stall
+    /// device needs. With no stall model armed on `disk` this behaves
+    /// exactly like [`Self::with_disk`] (fsyncs complete inline).
+    pub fn with_disk_stall(
+        net: Rc<RefCell<CellNet>>,
+        disk: SimDisk,
+        clock: Rc<VirtualClock>,
+    ) -> SimDriver {
+        SimDriver { disk: Some(disk), clock: Some(clock), ..SimDriver::new(net) }
+    }
+
+    /// Draws a deferred completion time for one fsync, `None` on the
+    /// legacy inline path (no clock or no stall model armed).
+    fn schedule_sync(&self, disk: &SimDisk) -> Option<Nanos> {
+        let clock = self.clock.as_ref()?;
+        disk.schedule_fsync(clock.now().0).map(Nanos)
+    }
+}
+
+/// Audited unsafe (see `SAFETY.md`): a backend driver executing an op
+/// reads its `StableBytes` payload.
+fn stable_slice(data: &StableBytes) -> &[u8] {
+    // SAFETY: the plane holds the staging `FrameLease` until this op's
+    // terminal completion (the `StableBytes::new` contract, ADR-0013);
+    // we are inside `submit_and_reap`, strictly before that completion
+    // is delivered, so the bytes are live, at this address, unmodified.
+    unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len() as usize) }
+}
+
+/// Audited unsafe (see `SAFETY.md`): a backend driver executing a
+/// `TierRead` fills its `StableBytesMut` target (M4-S04). The mut-from-
+/// ref shape is the point: `StableBytesMut` is a `Copy` raw-pointer
+/// capability whose exclusivity comes from its constructor's contract,
+/// not from the borrow — exactly what the uring tier hands the kernel.
+#[allow(clippy::mut_from_ref)]
+fn stable_mut_slice(buf: &StableBytesMut) -> &mut [u8] {
+    // SAFETY: the issuing command holds the aligned-pool lease and does
+    // not touch the buffer until this op's terminal completion (the
+    // `StableBytesMut::new` contract); we are inside `submit_and_reap`,
+    // strictly before that completion is delivered, so the bytes are
+    // live, at this address, and unaliased.
+    unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len() as usize) }
 }
 
 impl BackendDriver for SimDriver {
@@ -148,7 +237,34 @@ impl BackendDriver for SimDriver {
         let mut net = self.net.borrow_mut();
         let submitted = self.ops.len() as u64;
 
-        for op in self.ops.drain(..) {
+        // M2.5-S14: release fsyncs whose device service time elapsed.
+        // The flush is deferred WITH the completion — during the stall
+        // window the bytes are page-cache volatile, so a power cut must
+        // eat them and the watermark must not have advanced. Deferring
+        // only the CQE while flushing early would defeat the oracle.
+        if !self.pending_syncs.is_empty() {
+            let now = self.clock.as_ref().expect("pending syncs imply a stall clock").now();
+            while self.pending_syncs.first().is_some_and(|sync| sync.due <= now) {
+                let PendingSync { fd, token, .. } = self.pending_syncs.remove(0);
+                let disk = self.disk.as_ref().expect("pending syncs imply a disk");
+                // Plant::FsyncLies (ADR-0021 D4) holds here too: Synced
+                // without the flush — the canary the oracle must catch.
+                let result = if net.plant == Plant::FsyncLies {
+                    CompletionResult::Synced
+                } else {
+                    match disk.driver_fdatasync(fd) {
+                        Ok(()) => CompletionResult::Synced,
+                        Err(_) => CompletionResult::Error { errno: libc::EIO, buf: None },
+                    }
+                };
+                out.push(Completion { token, result });
+            }
+        }
+
+        // Reused backing storage: the drain below may push deferred
+        // syncs, which needs `self` free of the `ops` borrow.
+        let mut ops = core::mem::take(&mut self.ops);
+        for op in ops.drain(..) {
             match op {
                 IoOp::AcceptArm { token, .. } => {
                     net.accept_armed = true;
@@ -182,8 +298,108 @@ impl BackendDriver for SimDriver {
                     }
                     out.push(Completion { token, result: CompletionResult::Closed });
                 }
+                // The simulated disk (M2-S18, ADR-0020 D7). Completion
+                // order is submission order — the group-commit ledger
+                // already tolerates cross-fd reordering (ADR-0013);
+                // *survival* reordering is the disk model's job.
+                IoOp::LogWrite { fd, offset, data, token, fsync_token } => {
+                    let disk = self
+                        .disk
+                        .as_ref()
+                        .expect("durable sim scenarios construct SimDriver::with_disk (M2-S18)");
+                    match disk.driver_write_at(fd, offset, stable_slice(&data)) {
+                        Ok(()) => {
+                            out.push(Completion { token, result: CompletionResult::LogWritten });
+                            if let Some(sync) = fsync_token {
+                                // Stall device (M2.5-S14): the linked
+                                // fsync defers to its drawn completion
+                                // time — flush AND CQE together, above.
+                                if let Some(due) = self.schedule_sync(disk) {
+                                    debug_assert!(
+                                        self.pending_syncs.last().is_none_or(|p| p.due <= due),
+                                        "device timeline is FIFO"
+                                    );
+                                    self.pending_syncs.push(PendingSync { due, fd, token: sync });
+                                    continue;
+                                }
+                                // Plant::FsyncLies (ADR-0021 D4): report
+                                // Synced without flushing — the canary the
+                                // durability oracle must catch.
+                                let result = if net.plant == Plant::FsyncLies {
+                                    CompletionResult::Synced
+                                } else {
+                                    match disk.driver_fdatasync(fd) {
+                                        Ok(()) => CompletionResult::Synced,
+                                        Err(_) => {
+                                            CompletionResult::Error { errno: libc::EIO, buf: None }
+                                        }
+                                    }
+                                };
+                                out.push(Completion { token: sync, result });
+                            }
+                        }
+                        Err(_) => {
+                            // Uring linked-chain contract: the failed write
+                            // cancels its linked sync — `Synced` can never
+                            // cover a failed prefix (ADR-0013).
+                            out.push(Completion {
+                                token,
+                                result: CompletionResult::Error { errno: libc::EIO, buf: None },
+                            });
+                            if let Some(sync) = fsync_token {
+                                out.push(Completion {
+                                    token: sync,
+                                    result: CompletionResult::Error {
+                                        errno: libc::ECANCELED,
+                                        buf: None,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                IoOp::TierRead { fd, offset, buf, token } => {
+                    let disk = self
+                        .disk
+                        .as_ref()
+                        .expect("tiered sim scenarios construct SimDriver::with_disk (M4-S04)");
+                    let dest = stable_mut_slice(&buf);
+                    // The op contract: `TierRead` means the buffer is
+                    // FULL; EOF inside the flushed range is corruption.
+                    let result = match disk.driver_read_at(fd, offset, dest) {
+                        Ok(n) if n == dest.len() => CompletionResult::TierRead,
+                        Ok(_) | Err(_) => CompletionResult::Error { errno: libc::EIO, buf: None },
+                    };
+                    out.push(Completion { token, result });
+                }
+                IoOp::Fdatasync { fd, token } => {
+                    let disk = self
+                        .disk
+                        .as_ref()
+                        .expect("durable sim scenarios construct SimDriver::with_disk (M2-S18)");
+                    // Stall device (M2.5-S14): standalone fsyncs (barrier
+                    // dirs, everysec ticks) defer exactly like linked ones.
+                    if let Some(due) = self.schedule_sync(disk) {
+                        debug_assert!(
+                            self.pending_syncs.last().is_none_or(|p| p.due <= due),
+                            "device timeline is FIFO"
+                        );
+                        self.pending_syncs.push(PendingSync { due, fd, token });
+                        continue;
+                    }
+                    let result = if net.plant == Plant::FsyncLies {
+                        CompletionResult::Synced // the lying-fsync canary
+                    } else {
+                        match disk.driver_fdatasync(fd) {
+                            Ok(()) => CompletionResult::Synced,
+                            Err(_) => CompletionResult::Error { errno: libc::EIO, buf: None },
+                        }
+                    };
+                    out.push(Completion { token, result });
+                }
             }
         }
+        self.ops = ops;
 
         // Accept everything queued (multishot semantics).
         if net.accept_armed {

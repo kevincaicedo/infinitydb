@@ -1,0 +1,14 @@
+    29.02%  parse-c3274eca7  parse-c3274eca77934232  [.] inf_doc::json::JsonParser::parse_indexed
+    28.25%  parse-c3274eca7  parse-c3274eca77934232  [.] inf_doc::json::JsonParser::emit_string
+    11.57%  parse-c3274eca7  parse-c3274eca77934232  [.] inf_simd::json::flush_block
+     8.65%  parse-c3274eca7  parse-c3274eca77934232  [.] inf_doc::json::parse_number
+     4.46%  parse-c3274eca7  parse-c3274eca77934232  [.] inf_doc::emit::str_header
+     3.10%  parse-c3274eca7  libc.so.6               [.] __memcmp_avx2_movbe
+            |
+            ---__memcmp_avx2_movbe
+     3.01%  parse-c3274eca7  parse-c3274eca77934232  [.] inf_simd::json::avx2_scan
+     2.88%  parse-c3274eca7  parse-c3274eca77934232  [.] inf_simd::json::masks_bytewise
+     2.13%  parse-c3274eca7  parse-c3274eca77934232  [.] core::str::converts::from_utf8
+     1.53%  parse-c3274eca7  parse-c3274eca77934232  [.] inf_doc::json::emit_i64_checked
+     0.89%  parse-c3274eca7  parse-c3274eca77934232  [.] inf_doc::json::parse_literal
+     0.81%  parse-c3274eca7  parse-c3274eca77934232  [.] inf_doc::json::JsonParser::close_obj_frame

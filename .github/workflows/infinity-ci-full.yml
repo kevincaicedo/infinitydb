@@ -1,0 +1,226 @@
+# InfinityDB CI — heavy suite (on-demand).
+#
+# Runs ONLY the jobs that are too slow for every push and were the reason the
+# PR pipeline blew up: the full strict-provenance Miri (inf-alloc + inf-fabric,
+# the M0-S02 acceptance gate — was timing out at 45 min), the full 11-target
+# fuzz smoke (~42 min), and a benchmark COMPILE smoke. Everything else (3-OS
+# build matrix, client-smoke, compat-diff, kernel-matrix, loom, sim-smoke)
+# stays on the fast PR lane in infinity-ci.yml, where it costs little.
+#
+# Triggers:
+#   • pull_request labeled `ci-full` — add the label to a PR to run the suite.
+#     `pull_request` uses the workflow file from the PR branch, so this is the
+#     path that works for PR #1 (before this file is on `main`).
+#   • issue_comment `/ci-full` on a PR, from a maintainer (author_association
+#     OWNER / MEMBER / COLLABORATOR). GitHub loads comment-triggered workflows
+#     from the DEFAULT branch, so `/ci-full` (and the "Run workflow" button)
+#     activate only once this file is merged to `main`.
+#   • workflow_dispatch — the Actions "Run workflow" button (also requires the
+#     file on `main`).
+#
+# Real benchmark *numbers* never come from CI (shared runners; L10 / §19). The
+# bench job is compile-only; gate numbers come from the reference-box campaign
+# (M3 plan H6: inf-bench gate-run --reference-box, inf-compare).
+name: infinity-ci-full
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled] # add the `ci-full` label to run the suite on a PR
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: infinity-ci-full-${{ github.event.issue.number || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  authorize:
+    # Gate the suite, acknowledge the command, and resolve the commit to test.
+    #   - workflow_dispatch: always runs, tests the dispatched branch head.
+    #   - pull_request labeled `ci-full`: tests the PR head SHA.
+    #   - issue_comment `/ci-full` on a PR from a maintainer: tests the PR head.
+    #   - anything else (random label / comment): the `if` is false, so this
+    #     job and every job that `needs` it is skipped — no runner is spent.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.label.name == 'ci-full') ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '/ci-full') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: acknowledge the /ci-full command
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket',
+            });
+      - name: resolve commit to test
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (context.eventName === 'issue_comment') {
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+              });
+              core.setOutput('sha', pr.data.head.sha);
+            } else if (context.eventName === 'pull_request') {
+              core.setOutput('sha', context.payload.pull_request.head.sha);
+            } else {
+              core.setOutput('sha', context.sha);
+            }
+
+  miri:
+    # Full M0-S02 gate: strict-provenance Miri on both unsafe leaves.
+    needs: authorize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # `cargo miri setup` rebuilds a Miri-instrumented std into
+          # ~/.cache/miri, which rust-cache does not cover by default.
+          cache-directories: "~/.cache/miri"
+          key: miri-full
+      - name: miri (inf-alloc, inf-fabric) strict provenance
+        run: cargo +nightly miri test -p inf-alloc -p inf-fabric
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+
+  fuzz-smoke:
+    # Full 11-target smoke, 300 s each. The json_parse / path_program targets
+    # take an explicit writable corpus dir that is gitignored; create it so a
+    # fresh checkout does not fail with "required directory ... does not exist"
+    # (the run #9 fuzz-smoke failure). The committed seed corpora
+    # (fuzz/corpora/*) already exist.
+    needs: authorize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: fuzz RESP parser (smoke)
+        run: cargo +nightly fuzz run resp_parse -- -max_total_time=300
+        working-directory: crates/inf-wire
+      - name: fuzz fabric codec (smoke)
+        run: cargo +nightly fuzz run fabric_codec -- -max_total_time=300
+        working-directory: crates/inf-fabric
+      - name: fuzz glob matcher (smoke, M1 §5)
+        run: cargo +nightly fuzz run glob_match -- -max_total_time=300
+        working-directory: crates/inf-server
+      - name: fuzz SCAN cursor (smoke, M1 §5)
+        run: cargo +nightly fuzz run scan_cursor -- -max_total_time=300
+        working-directory: crates/inf-server
+      - name: fuzz log frame decoder (smoke, M2-S01)
+        run: cargo +nightly fuzz run frame_decode -- -max_total_time=300
+        working-directory: crates/inf-log
+      - name: fuzz segment reader (smoke, M2-S04)
+        run: cargo +nightly fuzz run segment_read -- -max_total_time=300
+        working-directory: crates/inf-log
+      - name: fuzz .ick loader (smoke, M2-S10)
+        run: cargo +nightly fuzz run ick_decode -- -max_total_time=300
+        working-directory: crates/inf-log
+      - name: fuzz manifest decoder (smoke, M2/M4 — readiness F2)
+        run: cargo +nightly fuzz run manifest_decode -- -max_total_time=300
+        working-directory: crates/inf-log
+      - name: fuzz extent decoder (smoke, M4-S17 — readiness F2)
+        run: cargo +nightly fuzz run extent_decode -- -max_total_time=300
+        working-directory: crates/inf-log
+      - name: fuzz tier-file decoder (smoke, M4-S11 — M4 §6 requires nightly accrual)
+        run: cargo +nightly fuzz run fuzz_tierfile_decode -- -max_total_time=300
+        working-directory: crates/inf-log
+      - name: fuzz idoc decoder (smoke, M3-S01/S02)
+        run: cargo +nightly fuzz run idoc_decode -- -max_total_time=300
+        working-directory: crates/inf-doc
+      - name: fuzz JSON parser (smoke, M3-S05; seeded from the committed minimized corpus, M3-S07)
+        run: |
+          mkdir -p fuzz/corpus/json_parse
+          cargo +nightly fuzz run json_parse fuzz/corpus/json_parse fuzz/corpora/json -- -max_total_time=300
+        working-directory: crates/inf-doc
+      - name: fuzz path programs (smoke, M3-S08/S09; seeded from the pinned child-len-overflow regression)
+        run: |
+          mkdir -p fuzz/corpus/path_program
+          cargo +nightly fuzz run path_program fuzz/corpus/path_program fuzz/corpora/path_program -- -max_total_time=300
+        working-directory: crates/inf-doc
+      - name: fuzz delta apply (smoke, M3 — readiness F2)
+        run: cargo +nightly fuzz run fuzz_delta_apply -- -max_total_time=300
+        working-directory: crates/inf-doc
+
+  bench-build:
+    # Benchmark COMPILE smoke only — verifies the campaign harnesses and the
+    # criterion benches build in release. NO measurements: CI runners never
+    # back a number (L10 / §19). Real gate numbers come from the reference
+    # box (inf-bench gate-run --reference-box, inf-compare).
+    needs: authorize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: campaign harnesses build (release)
+        run: cargo build --release -p inf-bench -p inf-compare -p inf-sim
+      - name: criterion benches compile (no run)
+        run: cargo bench --workspace --no-run
+
+  report:
+    # Post the outcome back to the PR when invoked via /ci-full or the label.
+    needs: [authorize, miri, fuzz-smoke, bench-build]
+    if: always() && needs.authorize.result != 'skipped' && (github.event_name == 'issue_comment' || github.event_name == 'pull_request')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const r = ${{ toJSON(needs) }};
+            const order = ['miri', 'fuzz-smoke', 'bench-build'];
+            const icon = s => s === 'success' ? '✅' : s === 'skipped' ? '⏭️' : '❌';
+            const lines = order.map(k => `- ${icon(r[k] && r[k].result)} ${k}: ${r[k] ? r[k].result : 'n/a'}`);
+            const anyFail = order.some(k => r[k] && r[k].result !== 'success' && r[k].result !== 'skipped');
+            const prNumber = context.issue.number || context.payload.pull_request.number;
+            const body = [
+              `### infinity-ci-full ${anyFail ? '❌ failed' : '✅ passed'}`,
+              '',
+              ...lines,
+              '',
+              `[Full run log](${url})`,
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body,
+            });

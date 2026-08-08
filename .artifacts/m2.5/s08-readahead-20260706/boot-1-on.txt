@@ -1,0 +1,183 @@
+# parallel_boot dev rehearsal: 8 cells × 1280 MiB (≈ 2532409 records/cell), reps 3
+# built 8 images in 25.8s — replay set 11.01 GiB (data extents + .ick)
+# cold-cache mode: fadvise(DONTNEED) over every image file before each rep
+control: recovery 0/8 cells ready, 1486024032/16106389880 bytes (9.2%), eta 10s
+control: recovery 0/8 cells ready, 3039212992/16106389880 bytes (18.9%), eta 9s
+control: recovery 0/8 cells ready, 4567215104/16106389880 bytes (28.4%), eta 8s
+control: recovery 0/8 cells ready, 5840385912/16106389880 bytes (36.3%), eta 8s
+control: recovery 0/8 cells ready, 6825171659/16106389880 bytes (42.4%), eta 7s
+control: cell 0 not ready — in replay (822628420/2013298735 bytes) for 5s
+control: cell 1 not ready — in replay (881555204/2013298735 bytes) for 5s
+control: cell 2 not ready — in replay (839464644/2013298735 bytes) for 5s
+control: cell 3 not ready — in replay (932063876/2013298735 bytes) for 5s
+control: cell 4 not ready — in replay (831046532/2013298735 bytes) for 5s
+control: cell 5 not ready — in replay (856300868/2013298735 bytes) for 5s
+control: cell 6 not ready — in replay (797393135/2013298735 bytes) for 5s
+control: cell 7 not ready — in replay (864718980/2013298735 bytes) for 5s
+control: recovery 0/8 cells ready, 7812014285/16106389880 bytes (48.5%), eta 7s
+control: cell 0 not ready — in replay (939556911/2013298735 bytes) for 6s
+control: cell 1 not ready — in replay (998483695/2013298735 bytes) for 6s
+control: cell 2 not ready — in replay (964811247/2013298735 bytes) for 6s
+control: cell 3 not ready — in replay (1057410479/2013298735 bytes) for 6s
+control: cell 4 not ready — in replay (956393135/2013298735 bytes) for 6s
+control: cell 5 not ready — in replay (973229359/2013298735 bytes) for 6s
+control: cell 6 not ready — in replay (923645764/2013298735 bytes) for 6s
+control: cell 7 not ready — in replay (998483695/2013298735 bytes) for 6s
+control: recovery 0/8 cells ready, 8812844536/16106389880 bytes (54.7%), eta 6s
+control: cell 0 not ready — in replay (1074246703/2013298735 bytes) for 7s
+control: cell 1 not ready — in replay (1116337263/2013298735 bytes) for 7s
+control: cell 2 not ready — in replay (1091082927/2013298735 bytes) for 7s
+control: cell 3 not ready — in replay (1183682159/2013298735 bytes) for 7s
+control: cell 4 not ready — in replay (1082664815/2013298735 bytes) for 7s
+control: cell 5 not ready — in replay (1091082927/2013298735 bytes) for 7s
+control: cell 6 not ready — in replay (1057410479/2013298735 bytes) for 7s
+control: cell 7 not ready — in replay (1116337263/2013298735 bytes) for 7s
+control: recovery 0/8 cells ready, 9800516984/16106389880 bytes (60.8%), eta 6s
+control: cell 0 not ready — in replay (1192100271/2013298735 bytes) for 8s
+control: cell 1 not ready — in replay (1250082927/2013298735 bytes) for 8s
+control: cell 2 not ready — in replay (1216410479/2013298735 bytes) for 8s
+control: cell 3 not ready — in replay (1309009711/2013298735 bytes) for 8s
+control: cell 4 not ready — in replay (1216410479/2013298735 bytes) for 8s
+control: cell 5 not ready — in replay (1216410479/2013298735 bytes) for 8s
+control: cell 6 not ready — in replay (1158427823/2013298735 bytes) for 8s
+control: cell 7 not ready — in replay (1241664815/2013298735 bytes) for 8s
+control: recovery 0/8 cells ready, 10909819512/16106389880 bytes (67.7%), eta 5s
+control: cell 0 not ready — in replay (1342682159/2013298735 bytes) for 9s
+control: cell 1 not ready — in replay (1393190831/2013298735 bytes) for 9s
+control: cell 2 not ready — in replay (1342682159/2013298735 bytes) for 9s
+control: cell 3 not ready — in replay (1443699503/2013298735 bytes) for 9s
+control: cell 4 not ready — in replay (1359518383/2013298735 bytes) for 9s
+control: cell 5 not ready — in replay (1342682159/2013298735 bytes) for 9s
+control: cell 6 not ready — in replay (1300591599/2013298735 bytes) for 9s
+control: cell 7 not ready — in replay (1384772719/2013298735 bytes) for 9s
+control: cell 3 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 1 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 7 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 2 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 4 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 0 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 5 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: cell 6 recovered (5 segments, 2013298735 bytes, 2532409 records)
+control: recovery complete — 8 cells serving (10011 ms)
+boot rep 0: 9982 ms to all-ready — aggregate 1.10 GiB/s (0.14 GiB/s/cell effective)
+control: recovery 0/8 cells ready, 1486024032/18253873528 bytes (8.1%), eta 12s
+control: recovery 0/8 cells ready, 2997234912/18253873528 bytes (16.4%), eta 11s
+control: recovery 0/8 cells ready, 4525237024/18253873528 bytes (24.8%), eta 10s
+control: recovery 0/8 cells ready, 5790678462/18253873528 bytes (31.7%), eta 9s
+control: recovery 0/8 cells ready, 6740990539/18253873528 bytes (36.9%), eta 9s
+control: cell 0 not ready — in replay (814210308/2281734191 bytes) for 5s
+control: cell 1 not ready — in replay (881555204/2281734191 bytes) for 5s
+control: cell 2 not ready — in replay (831046532/2281734191 bytes) for 5s
+control: cell 3 not ready — in replay (814210308/2281734191 bytes) for 5s
+control: cell 4 not ready — in replay (889973316/2281734191 bytes) for 5s
+control: cell 5 not ready — in replay (932063876/2281734191 bytes) for 5s
+control: cell 6 not ready — in replay (679539567/2281734191 bytes) for 5s
+control: cell 7 not ready — in replay (898391428/2281734191 bytes) for 5s
+control: recovery 0/8 cells ready, 7754012578/18253873528 bytes (42.5%), eta 9s
+control: cell 0 not ready — in replay (947975023/2281734191 bytes) for 6s
+control: cell 1 not ready — in replay (1006901807/2281734191 bytes) for 6s
+control: cell 2 not ready — in replay (947975023/2281734191 bytes) for 6s
+control: cell 3 not ready — in replay (932063876/2281734191 bytes) for 6s
+control: cell 4 not ready — in replay (1015319919/2281734191 bytes) for 6s
+control: cell 5 not ready — in replay (1057410479/2281734191 bytes) for 6s
+control: cell 6 not ready — in replay (814210308/2281734191 bytes) for 6s
+control: cell 7 not ready — in replay (1032156143/2281734191 bytes) for 6s
+control: recovery 0/8 cells ready, 8787590200/18253873528 bytes (48.1%), eta 8s
+control: cell 0 not ready — in replay (1082664815/2281734191 bytes) for 7s
+control: cell 1 not ready — in replay (1124755375/2281734191 bytes) for 7s
+control: cell 2 not ready — in replay (1074246703/2281734191 bytes) for 7s
+control: cell 3 not ready — in replay (1065828591/2281734191 bytes) for 7s
+control: cell 4 not ready — in replay (1133173487/2281734191 bytes) for 7s
+control: cell 5 not ready — in replay (1175264047/2281734191 bytes) for 7s
+control: cell 6 not ready — in replay (973229359/2281734191 bytes) for 7s
+control: cell 7 not ready — in replay (1158427823/2281734191 bytes) for 7s
+control: recovery 0/8 cells ready, 9801461112/18253873528 bytes (53.7%), eta 7s
+control: cell 0 not ready — in replay (1207992367/2281734191 bytes) for 8s
+control: cell 1 not ready — in replay (1266919151/2281734191 bytes) for 8s
+control: cell 2 not ready — in replay (1200518383/2281734191 bytes) for 8s
+control: cell 3 not ready — in replay (1183682159/2281734191 bytes) for 8s
+control: cell 4 not ready — in replay (1258501039/2281734191 bytes) for 8s
+control: cell 5 not ready — in replay (1300591599/2281734191 bytes) for 8s
+control: cell 6 not ready — in replay (1082664815/2281734191 bytes) for 8s
+control: cell 7 not ready — in replay (1300591599/2281734191 bytes) for 8s
+control: recovery 0/8 cells ready, 10808802168/18253873528 bytes (59.2%), eta 7s
+control: cell 0 not ready — in replay (1325845935/2281734191 bytes) for 9s
+control: cell 1 not ready — in replay (1393190831/2281734191 bytes) for 9s
+control: cell 2 not ready — in replay (1334264047/2281734191 bytes) for 9s
+control: cell 3 not ready — in replay (1309009711/2281734191 bytes) for 9s
+control: cell 4 not ready — in replay (1384772719/2281734191 bytes) for 9s
+control: cell 5 not ready — in replay (1426863279/2281734191 bytes) for 9s
+control: cell 6 not ready — in replay (1216410479/2281734191 bytes) for 9s
+control: cell 7 not ready — in replay (1418445167/2281734191 bytes) for 9s
+control: cell 5 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: cell 7 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: cell 1 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: cell 4 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: cell 0 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: cell 2 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: cell 3 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: recovery 7/8 cells ready, 18253873528/18253873528 bytes (100.0%), eta 0s
+control: cell 6 not ready — in audit (2281734191/2281734191 bytes) for 10s
+control: cell 6 recovered (6 segments, 2281734191 bytes, 2532409 records)
+control: recovery complete — 8 cells serving (10108 ms)
+boot rep 1: 10047 ms to all-ready — aggregate 1.10 GiB/s (0.14 GiB/s/cell effective)
+control: recovery 0/8 cells ready, 1553188960/20401357176 bytes (7.6%), eta 13s
+control: recovery 0/8 cells ready, 3181938464/20401357176 bytes (15.6%), eta 11s
+control: recovery 0/8 cells ready, 4810687968/20401357176 bytes (23.6%), eta 10s
+control: recovery 0/8 cells ready, 6025584376/20401357176 bytes (29.5%), eta 10s
+control: recovery 0/8 cells ready, 6985096736/20401357176 bytes (34.2%), eta 10s
+control: cell 0 not ready — in replay (873137092/2550169647 bytes) for 5s
+control: cell 1 not ready — in replay (889973316/2550169647 bytes) for 5s
+control: cell 2 not ready — in replay (881555204/2550169647 bytes) for 5s
+control: cell 3 not ready — in replay (856300868/2550169647 bytes) for 5s
+control: cell 4 not ready — in replay (881555204/2550169647 bytes) for 5s
+control: cell 5 not ready — in replay (873137092/2550169647 bytes) for 5s
+control: cell 6 not ready — in replay (856300868/2550169647 bytes) for 5s
+control: cell 7 not ready — in replay (873137092/2550169647 bytes) for 5s
+control: recovery 0/8 cells ready, 7962615224/20401357176 bytes (39.0%), eta 10s
+control: cell 0 not ready — in replay (990065583/2550169647 bytes) for 6s
+control: cell 1 not ready — in replay (1032156143/2550169647 bytes) for 6s
+control: cell 2 not ready — in replay (998483695/2550169647 bytes) for 6s
+control: cell 3 not ready — in replay (973229359/2550169647 bytes) for 6s
+control: cell 4 not ready — in replay (1006901807/2550169647 bytes) for 6s
+control: cell 5 not ready — in replay (990065583/2550169647 bytes) for 6s
+control: cell 6 not ready — in replay (973229359/2550169647 bytes) for 6s
+control: cell 7 not ready — in replay (998483695/2550169647 bytes) for 6s
+control: recovery 0/8 cells ready, 9006461112/20401357176 bytes (44.1%), eta 9s
+control: cell 0 not ready — in replay (1107919151/2550169647 bytes) for 7s
+control: cell 1 not ready — in replay (1192100271/2550169647 bytes) for 7s
+control: cell 2 not ready — in replay (1133173487/2550169647 bytes) for 7s
+control: cell 3 not ready — in replay (1099501039/2550169647 bytes) for 7s
+control: cell 4 not ready — in replay (1150009711/2550169647 bytes) for 7s
+control: cell 5 not ready — in replay (1107919151/2550169647 bytes) for 7s
+control: cell 6 not ready — in replay (1099501039/2550169647 bytes) for 7s
+control: cell 7 not ready — in replay (1116337263/2550169647 bytes) for 7s
+control: recovery 0/8 cells ready, 10017499640/20401357176 bytes (49.1%), eta 9s
+control: cell 0 not ready — in replay (1241664815/2550169647 bytes) for 8s
+control: cell 1 not ready — in replay (1317427823/2550169647 bytes) for 8s
+control: cell 2 not ready — in replay (1258501039/2550169647 bytes) for 8s
+control: cell 3 not ready — in replay (1224828591/2550169647 bytes) for 8s
+control: cell 4 not ready — in replay (1275337263/2550169647 bytes) for 8s
+control: cell 5 not ready — in replay (1233246703/2550169647 bytes) for 8s
+control: cell 6 not ready — in replay (1224828591/2550169647 bytes) for 8s
+control: cell 7 not ready — in replay (1241664815/2550169647 bytes) for 8s
+control: recovery 0/8 cells ready, 11027673080/20401357176 bytes (54.1%), eta 8s
+control: cell 0 not ready — in replay (1367936495/2550169647 bytes) for 9s
+control: cell 1 not ready — in replay (1443699503/2550169647 bytes) for 9s
+control: cell 2 not ready — in replay (1384772719/2550169647 bytes) for 9s
+control: cell 3 not ready — in replay (1351100271/2550169647 bytes) for 9s
+control: cell 4 not ready — in replay (1401608943/2550169647 bytes) for 9s
+control: cell 5 not ready — in replay (1359518383/2550169647 bytes) for 9s
+control: cell 6 not ready — in replay (1351100271/2550169647 bytes) for 9s
+control: cell 7 not ready — in replay (1367936495/2550169647 bytes) for 9s
+control: cell 1 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 2 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 4 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 7 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 0 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 3 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 5 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: cell 6 recovered (7 segments, 2550169647 bytes, 2532409 records)
+control: recovery complete — 8 cells serving (10012 ms)
+boot rep 2: 9975 ms to all-ready — aggregate 1.10 GiB/s (0.14 GiB/s/cell effective)
+# gate context: 10 GB/8 cells < 15 s binds on the reference box (S22, cold cache)

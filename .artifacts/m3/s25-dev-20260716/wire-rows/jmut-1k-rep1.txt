@@ -1,0 +1,19 @@
+Json file /tmp/claude-1000/-home-kcaicedo-Documents-Projects-databases/f7c996e7-230c-45c8-80f1-979984910087/scratchpad/wire-rows/jmut-1k-rep1.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 10%,   0 secs]  4 threads 25 conns:     3074663 ops, 3076087 (avg: 3076087) ops/sec, 230.05MB/sec (avg: 230.05MB/sec),  0.52 (avg:  0.52) msec latency[RUN #1 20%,   1 secs]  4 threads 25 conns:     6139459 ops, 3064305 (avg: 3070194) ops/sec, 245.38MB/sec (avg: 237.72MB/sec),  0.52 (avg:  0.52) msec latency[RUN #1 30%,   2 secs]  4 threads 25 conns:     9211989 ops, 3072124 (avg: 3070838) ops/sec, 222.33MB/sec (avg: 232.59MB/sec),  0.52 (avg:  0.52) msec latency[RUN #1 40%,   3 secs]  4 threads 25 conns:    12294604 ops, 3082316 (avg: 3073707) ops/sec, 217.25MB/sec (avg: 228.75MB/sec),  0.52 (avg:  0.52) msec latency[RUN #1 50%,   5 secs]  4 threads 25 conns:    15377774 ops, 3082732 (avg: 3075512) ops/sec, 217.23MB/sec (avg: 226.45MB/sec),  0.52 (avg:  0.52) msec latency[RUN #1 60%,   6 secs]  4 threads 25 conns:    18442131 ops, 3063842 (avg: 3073567) ops/sec, 216.16MB/sec (avg: 224.73MB/sec),  0.52 (avg:  0.52) msec latency[RUN #1 70%,   7 secs]  4 threads 25 conns:    21515946 ops, 3073314 (avg: 3073531) ops/sec, 218.16MB/sec (avg: 223.79MB/sec),  0.52 (avg:  0.52) msec latency[RUN #1 80%,   8 secs]  4 threads 25 conns:    24649247 ops, 3132799 (avg: 3080940) ops/sec, 223.52MB/sec (avg: 223.76MB/sec),  0.51 (avg:  0.52) msec latency[RUN #1 90%,   9 secs]  4 threads 25 conns:    27782883 ops, 3133125 (avg: 3086739) ops/sec, 223.76MB/sec (avg: 223.76MB/sec),  0.51 (avg:  0.51) msec latency[RUN #1 100%,  10 secs]  4 threads 25 conns:    30922702 ops, 3139888 (avg: 3092053) ops/sec, 224.25MB/sec (avg: 223.81MB/sec),  0.51 (avg:  0.51) msec latency[RUN #1 100%,  10 secs]  0 threads 25 conns:    30923918 ops, 3139888 (avg: 3091648) ops/sec, 224.25MB/sec (avg: 223.78MB/sec),  0.51 (avg:  0.51) msec latency
+
+Saving JSON output file: /tmp/claude-1000/-home-kcaicedo-Documents-Projects-databases/f7c996e7-230c-45c8-80f1-979984910087/scratchpad/wire-rows/jmut-1k-rep1.json
+Json file closed.
+4         Threads
+25        Connections per thread
+10        Seconds
+
+
+ALL STATS
+====================================================================================================================================
+Type                 Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+------------------------------------------------------------------------------------------------------------------------------------
+Json.numincrbys   3091475.47         0.00         0.00         0.51433         0.50300         0.91900         1.10300    229137.41 
+Totals            3091475.47         0.00         0.00         0.51433         0.50300         0.91900         1.10300    458274.81 

@@ -10,3 +10,22 @@ m0-smoke 0x5EED
 m1-cache 0xCAFE
 m1-cache 0xC0FFEE
 m1-cache 0xD15EA5E
+m2-durable 0xC0FFEE
+m2-durable 0x5EED005D
+m2-durable 0x5EED0003
+# M3-S18: multi-match document delta + cadence full + checkpoint cuts.
+m3-document 0xD0C00018
+# M3-S23/S24: merge-heavy + fuzz-corpus workload with the equivalence
+# oracle armed; 0xD0C01803 is a double-cut seed.
+m3-document 0xD0C02400
+m3-document 0xD0C01803
+# M2.5-S14: the unified durable+memory+pub/sub+expiry shape (0x5EED0003 is a
+# double-cut seed) and the boot-storm wedge oracle.
+m2-combined 0xC0FFEE
+m2-combined 0x5EED0003
+boot-storm 0xB007
+boot-storm 0x5EED0003
+# M4-S26: the command-driven tiered node — 0x5EED0003 is a double-cut
+# seed whose phase-2 traffic completes with pre-cut flushed tier bytes
+# (recovery composes MANIFEST v2 → tier files → checkpoint → WAL tail).
+m4-tiered 0x5EED0003

@@ -1,0 +1,51 @@
+M3-S18
+=======
+
+$ cargo test -p crash-matrix --test documents -- --nocapture
+test m3_document_crash_matrix ... ok
+result: 1 passed; five data-declared cut rows executed
+
+$ cargo test -p inf-sim --test document_durability -- --nocapture
+test document_same_seed_replays_byte_identically ... ok
+test document_power_cut_ci_slice_is_atomic ... ok
+result: 2 passed; 24 debug CI seeds, including double cuts
+
+$ cargo run -p inf-sim -- --scenario m3-document --sweep 256 --seed 0xD0C01800
+inf-sim: m3-document sweep shard 0/1: 256 seeds, 0 violations, 0 legal taxonomy refusals
+inf-sim: sim_seconds=779.483958 published=0 delivered=0
+
+$ cargo test -p inf-server --test node_e2e fuzzy_checkpoint_streams_under_live_writes -- --nocapture
+test fuzzy_checkpoint_streams_under_live_writes ... ok
+result: one two-match JSON.NUMINCRBY produced one DocDelta record; restart byte checks passed
+
+$ cargo test -p inf-sim --test corpus -- --nocapture
+test corpus_seeds_replay_green ... ok
+result: committed m3-document seed replays with the full curated corpus
+
+M3-S19
+=======
+
+$ cargo test -p inf-server --test doc_rss_attribution -- --nocapture
+document RSS attribution: documents=65536 domains=70322614 rss=70283264 divergence=0.056%
+test document_heavy_domains_track_incremental_rss_within_ten_percent ... ok
+result: 1 passed; Linux CI threshold <= 10%
+
+$ cargo test -p inf-store --test doc_attribution corpus_shape_bytes_per_document_table -- --nocapture
+result: 1 passed; six rows emitted (see bytes-per-doc.txt)
+
+Workspace gates
+===============
+
+$ just check
+result: green; format, dependency DAG, cell deny-list, fault/fsync/panic/safety inventories, clippy -D warnings, workspace tests, generated compatibility/reply artifacts, doc-intern-keys lane, and docless slim build all passed
+
+$ cargo deny check
+result: green; advisories, bans, licenses, and sources passed; only standing unused-license-allowance warnings were emitted
+
+$ just durable-sweep
+result: 10,000 M2 regression seeds across 8 shards; zero violations and zero legal taxonomy refusals
+
+Scope boundary
+==============
+
+No reference-box campaign, RedisJSON RSS comparison, generalized replay-equivalence fleet, or 10,000-seed document sweep was run. Those remain owned by M3-S23/M3-S24/M3-S25; this bundle makes no public performance claim.
