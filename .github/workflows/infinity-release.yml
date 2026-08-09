@@ -86,12 +86,14 @@ jobs:
           build-args: |
             INF_RELEASE_VERSION=${{ github.ref_name }}
             INF_GIT_SHA=${{ github.sha }}
-      - name: image size gate (< 30 MB)
+      - name: image size gate (< 10 MB)
         run: |
           docker pull ${{ env.IMAGE }}:${{ github.ref_name }}
           size=$(docker image inspect ${{ env.IMAGE }}:${{ github.ref_name }} --format '{{.Size}}')
           echo "image size: $size bytes"
-          test "$size" -lt 31457280
+          # 10 MB — owner decision 2026-08-08 (v0.4.0 readiness §9 D6);
+          # matches m1-gates.toml image_size and the M1 §6 table.
+          test "$size" -lt 10485760
       - name: smoke (redis-cli out of the box)
         run: |
           docker run -d --name inf -p 6399:6379 ${{ env.IMAGE }}:${{ github.ref_name }}
