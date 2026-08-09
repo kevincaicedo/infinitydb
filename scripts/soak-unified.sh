@@ -36,6 +36,13 @@
 #   SOAK_MEM_BUDGET_MB (64)     tiered namespace memory budget
 #   SOAK_MULTIPLE      (10)     tiered dataset = multiple x budget
 #   SOAK_LEG_SECS      (1800)   one tiered ycsb leg per loop iteration
+#   SOAK_WARMUP_HOURS  (8)      ADR-0069 D1: declared warm-up excluded from
+#                               the slope gates. Prospective — declared here,
+#                               before the run, never fitted afterwards. The
+#                               citation-grade form is `soak-unified.sh 32`
+#                               (8 h warm-up + 24 h steady window); runs
+#                               shorter than 2x the warm-up gate on the
+#                               whole run and the verdict says so.
 # Run from infinitydb/ on the reference box after `just check` on a clean
 # tree, with the box otherwise idle (§6: a soak and a campaign leg are
 # mutually exclusive).
@@ -51,6 +58,7 @@ LOADGEN_CPUS="${SOAK_LOADGEN_CPUS:-12-23}"
 MEM_BUDGET_MB="${SOAK_MEM_BUDGET_MB:-64}"
 MULTIPLE="${SOAK_MULTIPLE:-10}"
 LEG_SECS="${SOAK_LEG_SECS:-1800}"
+WARMUP_HOURS="${SOAK_WARMUP_HOURS:-8}"
 SEED=0x1D0C2026          # the blessed corpus seed (ADR-0046 D3)
 SEED_DEC=486541350
 DURATION_S=$(awk -v h="$HOURS" 'BEGIN { printf "%d", h * 3600 }')
@@ -117,10 +125,32 @@ with open(f"{work}/mutations.resp", "wb") as f:
 EOF
 
 # ---- server ----------------------------------------------------------------
-./target/release/infinityd --port $PORT --cells "$CELLS" --pin-start "$PIN_START" \
-  --data-dir "$DATA_DIR" --segment-bytes $((64 << 20)) \
-  --ckpt-interval-bytes $((64 << 20)) >"$OUT/infinityd.log" 2>&1 &
-SERVER_PID=$!
+# ADR-0069 D3: prefer a dedicated cgroup scope so the scope's memory.stat
+# isolates the server's file cache from the loadgens (which re-read
+# $WORK/*.resp every loop and polluted the shared terminal scope with
+# ~1 GB of file cache in the 20260807 analysis). Falls back to a plain
+# child if systemd-run is unavailable; either way the attribution sampler
+# resolves the actual cgroup from /proc/<pid>/cgroup and the mode is
+# recorded here.
+SERVER_ARGS=(--port $PORT --cells "$CELLS" --pin-start "$PIN_START"
+  --data-dir "$DATA_DIR" --segment-bytes $((64 << 20))
+  --ckpt-interval-bytes $((64 << 20)))
+LAUNCH_MODE=plain
+if command -v systemd-run >/dev/null 2>&1; then
+  systemd-run --user --scope --unit="inf-soak-$(date +%s)" --quiet -- \
+    ./target/release/infinityd "${SERVER_ARGS[@]}" >"$OUT/infinityd.log" 2>&1 &
+  SERVER_PID=""
+  for _ in $(seq 1 50); do
+    SERVER_PID=$(pgrep -nx infinityd 2>/dev/null || true)
+    [ -n "$SERVER_PID" ] && { LAUNCH_MODE=scoped; break; }
+    sleep 0.2
+  done
+fi
+if [ -z "${SERVER_PID:-}" ]; then
+  ./target/release/infinityd "${SERVER_ARGS[@]}" >"$OUT/infinityd.log" 2>&1 &
+  SERVER_PID=$!
+fi
+echo "soak-unified: server launch mode $LAUNCH_MODE (pid $SERVER_PID)" | tee "$OUT/launch-mode.txt"
 trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
 
 for _ in $(seq 1 100); do
@@ -193,9 +223,14 @@ sample_line() {
     $1 == "log_segments_live"           { segs += $2 }
     $1 == "raw_submits"                 { subs += $2 }
     $1 == "raw_sqes"                    { sqes += $2 }
-    END { printf "%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%.1f,%d\n",
+    $1 == "tiering_committed_bytes"     { tcom += $2 }
+    $1 == "tiering_index_bytes"         { tidx += $2 }
+    $1 == "log_staging_bytes"           { stag += $2 }
+    $1 == "ckpt_buffer_bytes"           { ckb  += $2 }
+    END { printf "%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d\n",
           ts, rss, docs, dres, disk, wam, ref, ck, mf, segs,
-          (subs > 0 ? sqes / subs : 0), int(um / 1024) }
+          (subs > 0 ? sqes / subs : 0), int(um / 1024),
+          tcom, tidx, stag, ckb }
   ' <<<"$info"
 }
 
@@ -210,7 +245,11 @@ alert() {
   # docs_live) trails so no positional consumer shifts. It exists so a
   # failing RSS slope decomposes into accounted vs unaccounted growth
   # (the 20260805 FAIL could not be attributed without it — readiness F9).
-  echo "unix_s,vmrss_kb,docs_live,doc_resident_bytes,disk_used_bytes,wa_milli_max,diskfull_refusals,ckpts,manifests,segs_live,sqes_per_submit,used_memory_kb" >"$OUT/samples.csv"
+  # Trailing columns after used_memory_kb (ADR-0069 D3): node-summed
+  # cell-scope memory terms — the 20260807 analysis showed the Tiering/
+  # Persistence INFO sections are per-cell, so a single-cell scrape
+  # under-reports them 4x and the RSS "gap" was exactly that.
+  echo "unix_s,vmrss_kb,docs_live,doc_resident_bytes,disk_used_bytes,wa_milli_max,diskfull_refusals,ckpts,manifests,segs_live,sqes_per_submit,used_memory_kb,tier_committed_bytes,tier_index_bytes,log_staging_bytes,ckpt_buffer_bytes" >"$OUT/samples.csv"
   : >"$OUT/alerts.log"
   n=0
   while kill -0 $SERVER_PID 2>/dev/null && [ $n -lt $MAX_SAMPLES ]; do
@@ -225,6 +264,35 @@ alert() {
   done
 ) &
 SAMPLER_PID=$!
+
+# ---- attribution sampler (ADR-0069 D3) --------------------------------------
+# smaps_rollup at start/hourly/end so RSS decomposes into anon/file/shmem,
+# plus the server's cgroup memory.stat for the file-cache disclosure the
+# M4 §7 gate text names. Caveat recorded in-band: infinityd runs inside the
+# launching user session's cgroup scope, so memory.stat is the slice, not
+# the process — smaps_rollup is the per-process truth, memory.stat bounds
+# the file-cache term.
+CG_PATH=$(awk -F: 'NR==1{print $3}' "/proc/$SERVER_PID/cgroup" 2>/dev/null || true)
+attr_snap() {
+  {
+    echo "=== $(date +%s) $1 ==="
+    cat "/proc/$SERVER_PID/smaps_rollup" 2>/dev/null || echo "smaps_rollup unavailable"
+    if [ -n "$CG_PATH" ] && [ -r "/sys/fs/cgroup$CG_PATH/memory.stat" ]; then
+      echo "--- cgroup $CG_PATH memory.stat (session-slice scope, see header) ---"
+      cat "/sys/fs/cgroup$CG_PATH/memory.stat"
+    else
+      echo "--- cgroup memory.stat unavailable (path: ${CG_PATH:-none}) ---"
+    fi
+  } >>"$OUT/attribution.log"
+}
+attr_snap start
+(
+  while kill -0 $SERVER_PID 2>/dev/null; do
+    sleep 3600
+    kill -0 $SERVER_PID 2>/dev/null && attr_snap hourly
+  done
+) &
+ATTR_PID=$!
 
 # ---- legs -------------------------------------------------------------------
 LEGS=()
@@ -291,7 +359,7 @@ else
   echo "tiered leg: NOT RUN — plane unwired (M4-S26). The namespace stands; its VA reservation, budgets, and index structures are in the RSS profile." >"$OUT/tier-leg.txt"
 fi
 
-trap 'kill ${LEGS[*]} $SAMPLER_PID $SERVER_PID 2>/dev/null || true' EXIT
+trap 'kill ${LEGS[*]} $SAMPLER_PID $ATTR_PID $SERVER_PID 2>/dev/null || true' EXIT
 
 echo "soak-unified[$MODE]: running ${HOURS} h against pid $SERVER_PID (out: $OUT)"
 sleep "$DURATION_S"
@@ -308,38 +376,76 @@ redis-cli -p $PORT INFO tripwires  >>"$OUT/info-end.txt" 2>/dev/null || true
   echo "# provenance probe; this one only re-checks governor/EPP/thermal."
 } >"$OUT/env-end.txt"
 ./target/release/inf-bench env-check >>"$OUT/env-end.txt" 2>&1 || true
+attr_snap end
 
 SERVER_ALIVE=0
 kill -0 $SERVER_PID 2>/dev/null && SERVER_ALIVE=1
 
-python3 - "$OUT/samples.csv" "$HOURS" "$SERVER_ALIVE" "$DISK_BUDGET_BYTES" "$MODE" <<'EOF' | tee "$OUT/verdict.txt"
+python3 - "$OUT/samples.csv" "$HOURS" "$SERVER_ALIVE" "$DISK_BUDGET_BYTES" "$MODE" "$WARMUP_HOURS" <<'EOF' | tee "$OUT/verdict.txt"
 import csv, sys
 rows = [r for r in csv.DictReader(open(sys.argv[1])) if int(r["vmrss_kb"]) > 0]
-hours, alive, budget, mode = float(sys.argv[2]), sys.argv[3] == "1", int(sys.argv[4]), sys.argv[5]
+hours, alive, budget = float(sys.argv[2]), sys.argv[3] == "1", int(sys.argv[4])
+mode, warmup = sys.argv[5], float(sys.argv[6])
 fails = []
 if not alive:
     fails.append("server died during the soak (see infinityd.log)")
 if len(rows) < 6:
     fails.append(f"only {len(rows)} samples — sampler failure invalidates the run")
 else:
-    # RSS slope: first/last-5% medians, storm-resistant, scaled to /24 h.
-    k = max(1, len(rows) // 20)
     med = lambda xs: sorted(xs)[len(xs) // 2]
-    first = med([int(r["vmrss_kb"]) for r in rows[:k]])
-    last = med([int(r["vmrss_kb"]) for r in rows[-k:]])
-    slope = (last - first) / first * 100 / (hours / 24)
-    print(f"rss slope {slope:+.3f}%/24h (first-5% median {first} kB -> last-5% median {last} kB, {len(rows)} samples)")
-    if slope >= 0.5:
-        fails.append(f"RSS slope {slope:+.3f}%/24h >= 0.5%/24h")
-    # Diagnostic only (readiness F9) — accounted-memory slope beside the
-    # RSS gate, so a failing slope decomposes into accounted growth
-    # (data structures / high-water) vs unaccounted (leak). Older CSVs
-    # lack the column; the gate above is unchanged either way.
+    def sl(rs, key):
+        # First/last-5% medians, storm-resistant, normalized to %/24 h of
+        # the window's actual timestamp span (not the nominal duration).
+        k = max(1, len(rs) // 20)
+        first = med([int(r[key]) for r in rs[:k]])
+        last = med([int(r[key]) for r in rs[-k:]])
+        span_h = (int(rs[-1]["unix_s"]) - int(rs[0]["unix_s"])) / 3600
+        return (last - first) / max(first, 1) * 100 / (max(span_h, 1e-9) / 24), first, last
+    # ADR-0069 D1: the RSS gate binds over a prospectively declared
+    # steady-state window (first `warmup` hours excluded). The citation
+    # form is a 32 h run = 8 h warm-up + 24 h window. Runs too short for
+    # the window (<= 2x warm-up) gate on the whole run and say so.
+    t0 = int(rows[0]["unix_s"])
+    steady = [r for r in rows if int(r["unix_s"]) >= t0 + warmup * 3600]
+    windowed = hours > 2 * warmup and len(steady) >= 60
+    s_all, f_all, l_all = sl(rows, "vmrss_kb")
+    print(f"rss slope whole-run {s_all:+.3f}%/24h (first-5% median {f_all} kB -> last-5% median {l_all} kB, {len(rows)} samples; disclosure)")
+    if windowed:
+        s_gate, f_st, l_st = sl(steady, "vmrss_kb")
+        print(f"rss slope steady-state {s_gate:+.3f}%/24h (first {warmup:g} h excluded per ADR-0069 D1, {len(steady)} samples, {f_st} kB -> {l_st} kB; GATE)")
+    else:
+        s_gate = s_all
+        print(f"steady-state window not applicable (run {hours:g} h <= 2x warm-up {warmup:g} h) — whole-run slope gates; not the ADR-0069 citation form")
+    if s_gate >= 0.5:
+        fails.append(f"RSS slope {s_gate:+.3f}%/24h >= 0.5%/24h" + (" (steady-state window)" if windowed else ""))
+    # ADR-0069 D2: accounted slope is a HARD sub-gate — a data-structure
+    # leak cannot hide inside allocator/high-water noise. Missing or zero
+    # accounted series fails the run outright.
     if "used_memory_kb" in rows[0] and int(rows[-1]["used_memory_kb"]) > 0:
-        um_first = med([int(r["used_memory_kb"]) for r in rows[:k]])
-        um_last = med([int(r["used_memory_kb"]) for r in rows[-k:]])
-        um_slope = (um_last - um_first) / max(um_first, 1) * 100 / (hours / 24)
-        print(f"accounted slope {um_slope:+.3f}%/24h (used_memory first-5% median {um_first} kB -> last-5% {um_last} kB; diagnostic, not a gate)")
+        u_all, uf, ul = sl(rows, "used_memory_kb")
+        print(f"accounted slope whole-run {u_all:+.3f}%/24h (used_memory first-5% median {uf} kB -> last-5% {ul} kB; disclosure)")
+        if windowed:
+            u_gate = sl(steady, "used_memory_kb")[0]
+            print(f"accounted slope steady-state {u_gate:+.3f}%/24h (GATE)")
+        else:
+            u_gate = u_all
+        if u_gate >= 0.5:
+            fails.append(f"accounted slope {u_gate:+.3f}%/24h >= 0.5%/24h — data-structure growth, not allocator shape")
+    else:
+        fails.append("accounted series (used_memory_kb) missing or zero — ADR-0069 D2 requires it")
+    # ADR-0069 D3 disclosure: end-of-run attribution reconciliation. The
+    # tier/staging/ckpt columns are node-summed by the sampler; fixed boot
+    # overhead (uring + fabric rings, stacks, text, recycle pools) lands
+    # in the residual (~30 MB expected). Disclosure, not a gate — the
+    # attribution table in the bundle carries the full model.
+    if "tier_committed_bytes" in rows[-1] and int(rows[-1].get("tier_committed_bytes") or 0) >= 0:
+        r = rows[-1]
+        named_kb = (int(r["tier_committed_bytes"]) + int(r["tier_index_bytes"])
+                    + int(r["log_staging_bytes"]) + int(r["ckpt_buffer_bytes"])) // 1024
+        model_kb = int(r["used_memory_kb"]) + named_kb
+        rss_kb = int(r["vmrss_kb"])
+        resid = rss_kb - model_kb
+        print(f"attribution (end): rss {rss_kb} kB vs used_memory + tier_committed + tier_index + staging + ckpt = {model_kb} kB — residual {resid} kB ({resid / max(rss_kb, 1) * 100:+.1f}%; disclosure)")
     disk_max = max(int(r["disk_used_bytes"]) for r in rows)
     print(f"tiering disk max {disk_max} bytes (budget {budget})")
     if disk_max > budget:
