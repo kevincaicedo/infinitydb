@@ -1,10 +1,16 @@
-# Nightly 1 h fuzz campaign per decoder (M0-S02 promised it; M2-S01 makes it
-# an AC for the log frame decoder). Each target runs a full hour on its own
-# runner; a crash uploads the reproducing artifact — fixes land WITH the
-# input minimized into the target's corpus.
+# Nightly fuzz campaign per decoder (M0-S02 promised it; M2-S01 makes it
+# an AC for the log frame decoder). Each target runs on its own runner; a
+# crash uploads the reproducing artifact — fixes land WITH the input
+# minimized into the target's corpus.
 #
-# NOTE: the repo root is the Cargo workspace; jobs run from the root. Not
-# yet exercised against a live runner.
+# Per-target budget: 5.5 h (owner decision 2026-08-08, v0.4.0 readiness
+# §9 D4 — max out the runner). GitHub hard-kills jobs at 6 h wall
+# including checkout/toolchain/cargo-install/fuzz-build overhead, so a
+# literal 6 h of fuzz time would be killed mid-run and bank nothing;
+# 5.5 h + overhead fits. The 24 h/target release gate accrues in 5
+# nights (4 nights + a workflow_dispatch top-up also works).
+#
+# NOTE: the repo root is the Cargo workspace; jobs run from the root.
 name: infinity-fuzz-nightly
 
 on:
@@ -18,7 +24,7 @@ permissions:
 jobs:
   fuzz-hour:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 355
     strategy:
       fail-fast: false
       matrix:
@@ -53,8 +59,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
-      - name: "fuzz ${{ matrix.target }} (1 h)"
-        run: cargo +nightly fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} ${{ matrix.seeds }} -- -max_total_time=3600
+      - name: "fuzz ${{ matrix.target }} (5.5 h)"
+        run: cargo +nightly fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} ${{ matrix.seeds }} -- -max_total_time=19800
         working-directory: ${{ matrix.dir }}
       - name: upload crash artifacts
         if: failure()
