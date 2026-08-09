@@ -266,3 +266,59 @@ jobs:
         run: cargo test -p inf-runtime --features uring
         env:
           INF_URING_FORCE_DEGRADED: "1"
+
+  website-gates:
+    # M2.5-S05 gates, moved into the PR lane (2026-08-08).
+    #
+    # These two checks previously ran ONLY in `pages.yml`, which triggers on
+    # push-to-main. A PR that regenerated docs/compat-matrix.md therefore
+    # passed review and merged green, and the drift only surfaced afterwards
+    # as a failed production deploy (PR #2 → website run #1). The same gates
+    # run here, on the PR, where the fix is a one-line regeneration commit.
+    #
+    # Cheap by construction: stdlib python3, no toolchain, no build.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: workflow YAML lint
+        # A syntactically invalid workflow is otherwise only discovered when
+        # its schedule fires (infinity-dst-nightly carried an unquoted colon
+        # in a step name for a full nightly cycle). Parse every workflow here.
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys, yaml
+          bad = 0
+          for p in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
+              try:
+                  yaml.safe_load(p.read_text())
+                  print(f"ok   {p}")
+              except yaml.YAMLError as e:
+                  print(f"::error file={p}::invalid workflow YAML: {e}")
+                  bad = 1
+          sys.exit(bad)
+          PY
+
+      - name: regenerate compat page from the repo artifact
+        run: |
+          python3 website/scripts/gen-compat-page.py \
+            --matrix docs/compat-matrix.md \
+            --out website/site/docs/compat.html \
+            --date "$(date -u +%F)"
+
+      - name: compat page staleness gate (generated page must be committed)
+        run: |
+          # The --date stamp is the only line allowed to differ.
+          if ! git diff -I'gen-compat-page\.py</code> on [0-9-]*\.' --exit-code website/site/docs/compat.html; then
+            echo "::error::website/site/docs/compat.html is stale — regenerate it with website/scripts/gen-compat-page.py and commit."
+            exit 1
+          fi
+
+      - name: ledger-copy check (no number without an Allowed row)
+        run: |
+          python3 website/scripts/check-ledger-copy.py \
+            --site website/site \
+            --ledger website/site/_ledger-snapshot.md \
+            --allowlist website/scripts/ledger-allowed-numbers.txt \
+            --print-tokens

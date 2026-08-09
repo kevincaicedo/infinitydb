@@ -2,19 +2,74 @@
 # CI-bench — reduced, reference box weekly").
 #
 # REQUIRES a self-hosted runner labeled `reference-box` (the M0-R2 box:
-# pinned cores, performance governor, redis-server 8.x installed). Until
-# that runner is registered this workflow can only be dispatched manually
-# and will queue forever on schedule — that is intentional honesty: the
-# rows are meaningless on shared GitHub runners (L10).
+# pinned cores, performance governor, redis-server 8.x installed). The rows
+# are meaningless on shared GitHub runners (L10), so the campaign job never
+# falls back to one — it simply does not run until the box is registered.
+#
+# ARMING SWITCH (2026-08-08). The job is gated on the repository variable
+# `REFERENCE_BOX_ONLINE`. Unset, the weekly schedule fires, reports that the
+# campaign is disarmed, and exits green in seconds.
+#
+#   Before: every Monday's `pressure-rows` sat in the queue with no runner
+#   able to accept it until GitHub killed it at the 24 h limit — one red
+#   "exceeded the maximum execution time while awaiting a runner" annotation
+#   per week (run #8), which is noise, not honesty. `timeout-minutes` does
+#   not bound queue time, so only a guard can prevent this.
+#
+#   To arm, once the reference-box runner is registered and online:
+#       gh variable set REFERENCE_BOX_ONLINE --body 1
+#   (or Settings → Secrets and variables → Actions → Variables). The weekly
+#   cadence then resumes with no further edit to this file. To disarm again
+#   (box down for maintenance), delete the variable or set it to 0.
+#
+# `workflow_dispatch` accepts a `force` input that bypasses the guard, for
+# the case where the runner is online but the variable has not been set yet.
+# A forced run with no runner present WILL queue for 24 h — that is the
+# deliberate override, not the default.
 name: infinity-bench-weekly
 
 on:
   schedule:
     - cron: "0 4 * * 1"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even if REFERENCE_BOX_ONLINE is unset (queues 24 h if no reference-box runner accepts it)"
+        type: boolean
+        default: false
 
 jobs:
+  preflight:
+    # Always runs, on a shared runner, in seconds: makes the weekly run's
+    # status legible instead of leaving an opaque skipped job behind.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      armed: ${{ steps.gate.outputs.armed }}
+    steps:
+      - id: gate
+        run: |
+          if [ "${{ vars.REFERENCE_BOX_ONLINE }}" = "1" ] || [ "${{ inputs.force }}" = "true" ]; then
+            echo "armed=true" >> "$GITHUB_OUTPUT"
+            echo "reference-box campaign ARMED (REFERENCE_BOX_ONLINE=${{ vars.REFERENCE_BOX_ONLINE }}, force=${{ inputs.force }})" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "armed=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Weekly pressure-row campaign: DISARMED"
+              echo
+              echo "No \`reference-box\` self-hosted runner is declared online, so the"
+              echo "campaign did not run. Binding rows require the M0-R2 box (pinned"
+              echo "cores, performance governor, redis-server 8.x) — a shared GitHub"
+              echo "runner cannot produce them (L10), and queueing for one that does"
+              echo "not exist just burns the 24 h runner-wait limit."
+              echo
+              echo "Arm with: \`gh variable set REFERENCE_BOX_ONLINE --body 1\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   pressure-rows:
+    needs: preflight
+    if: needs.preflight.outputs.armed == 'true'
     runs-on: [self-hosted, reference-box]
     timeout-minutes: 180
     steps:
