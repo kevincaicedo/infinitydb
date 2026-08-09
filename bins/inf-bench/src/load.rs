@@ -67,14 +67,27 @@ impl Default for LoadSpec {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+/// Distinct error-reply texts retained per report. Bounded so a
+/// pathological server cannot balloon a soak leg's memory; 8 distinct
+/// strings has always been enough to name every refusal class in play
+/// (the 20260807 soak had exactly one across 31 M errors).
+const ERROR_SAMPLE_CAP: usize = 8;
+
+#[derive(Clone, Debug, Default)]
 pub struct LoadReport {
     pub ops: u64,
     pub errors: u64,
+    /// The subset of `errors` that are `-BUSY` typed retryable refusals
+    /// (admission backpressure). A leg with only BUSY refusals is a
+    /// different fact than one with `-ERR`s — the 20260807 soak's 31 M
+    /// unclassified errors took a post-hoc repro to diagnose.
+    pub busy_retryable: u64,
     /// RESP nil replies (`$-1`) — client-side GET misses (M4-S20: the
     /// cache-leg hit-rate proxy that no INFO scrape can mix up across
     /// concurrently loaded namespaces).
     pub nils: u64,
+    /// First few distinct error-reply lines observed (capped).
+    pub error_samples: Vec<String>,
     pub elapsed_s: f64,
     pub ops_per_sec: f64,
     pub p50_us: u64,
@@ -87,7 +100,9 @@ pub struct LoadReport {
 struct ConnResult {
     ops: u64,
     errors: u64,
+    busy: u64,
     nils: u64,
+    error_samples: Vec<String>,
     hist_us: LogHistogram,
 }
 
@@ -116,7 +131,14 @@ fn run_conn(
     }
     let mut rng = SplitMix64::new(spec.seed ^ (0xB0A7 + conn_index as u64));
     let value = vec![0xABu8; spec.value_size];
-    let mut result = ConnResult { ops: 0, errors: 0, nils: 0, hist_us: LogHistogram::new() };
+    let mut result = ConnResult {
+        ops: 0,
+        errors: 0,
+        busy: 0,
+        nils: 0,
+        error_samples: Vec::new(),
+        hist_us: LogHistogram::new(),
+    };
 
     // Fill mode: a partitioned range, exactly once, pipelined.
     let mut fill_range = spec.fill.map(|total| {
@@ -208,9 +230,22 @@ fn run_conn(
                 if rx[rx_at..].starts_with(b"$-1") {
                     result.nils += 1;
                 }
-            }
-            if rx[rx_at] == b'-' {
-                result.errors += 1;
+                // Errors count under the same warmup guard as ops, so an
+                // error *rate* is errors/ops over one window (pre-fix the
+                // first leg's rate was inflated by warmup-only errors).
+                if rx[rx_at] == b'-' {
+                    result.errors += 1;
+                    let line = &rx[rx_at..rx_at + end];
+                    if line.starts_with(b"-BUSY") {
+                        result.busy += 1;
+                    }
+                    if result.error_samples.len() < ERROR_SAMPLE_CAP {
+                        let text = String::from_utf8_lossy(line).trim_end().to_string();
+                        if !result.error_samples.contains(&text) {
+                            result.error_samples.push(text);
+                        }
+                    }
+                }
             }
             rx_at += end;
             if inflight.is_empty() {
@@ -245,7 +280,15 @@ pub fn run(spec: &LoadSpec) -> Result<LoadReport, String> {
         let conn = result?;
         report.ops += conn.ops;
         report.errors += conn.errors;
+        report.busy_retryable += conn.busy;
         report.nils += conn.nils;
+        for sample in conn.error_samples {
+            if report.error_samples.len() < ERROR_SAMPLE_CAP
+                && !report.error_samples.contains(&sample)
+            {
+                report.error_samples.push(sample);
+            }
+        }
         hist.merge(&conn.hist_us);
     }
     report.ops_per_sec = report.ops as f64 / report.elapsed_s;
@@ -258,11 +301,12 @@ pub fn run(spec: &LoadSpec) -> Result<LoadReport, String> {
 }
 
 pub fn render(report: &LoadReport) -> String {
-    format!(
-        "ops = {}\nerrors = {}\nelapsed_s = {:.3}\nops_per_sec = {:.0}\n\
+    let mut out = format!(
+        "ops = {}\nerrors = {}\nbusy_retryable = {}\nelapsed_s = {:.3}\nops_per_sec = {:.0}\n\
          p50_us = {}\np99_us = {}\np999_us = {}\np9999_us = {}\nmax_us = {}\n",
         report.ops,
         report.errors,
+        report.busy_retryable,
         report.elapsed_s,
         report.ops_per_sec,
         report.p50_us,
@@ -270,7 +314,11 @@ pub fn render(report: &LoadReport) -> String {
         report.p999_us,
         report.p9999_us,
         report.max_us
-    )
+    );
+    for sample in &report.error_samples {
+        out.push_str(&format!("error_sample = {sample}\n"));
+    }
+    out
 }
 
 /// `inf-bench load` CLI.
@@ -348,7 +396,13 @@ pub fn cmd_load(args: &[String]) -> Result<(), String> {
         std::fs::write(path, rendered).map_err(|e| format!("--out {path}: {e}"))?;
     }
     if report.errors > 0 {
-        return Err(format!("{} error replies under load", report.errors));
+        // Keep the "error replies under load" prefix stable — soak
+        // tooling greps for it. The classification rides behind it.
+        let first = report.error_samples.first().map(String::as_str).unwrap_or("none sampled");
+        return Err(format!(
+            "{} error replies under load ({} BUSY-retryable; first sample: {})",
+            report.errors, report.busy_retryable, first
+        ));
     }
     Ok(())
 }

@@ -363,6 +363,12 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// leg every remote command defers (M2.5 Phase H). Bounded by
     /// [`CMD_POOL_MAX`]/[`CMD_POOL_BUF_CAP`].
     cmd_pool: RefCell<Vec<Vec<u8>>>,
+    /// Running capacity sums of the two recycle pools (L5 — the
+    /// `reply_pool_bytes`/`cmd_pool_bytes` gauges): maintained at the
+    /// push/pop sites so the MAINTAIN flush never walks up to 4096
+    /// buffers per pool (v0.4.0-alpha RSS-attribution instrument).
+    reply_pool_bytes: Cell<u64>,
+    cmd_pool_bytes: Cell<u64>,
     recv_dropped: Cell<u64>,
     /// Pub/sub registries (M1-S10): local subscriber lists, owner-side
     /// per-cell counts, the replicated pattern index.
@@ -496,6 +502,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     /// An empty reply buffer, recycled when possible.
     fn take_reply_buf(&self) -> Vec<u8> {
         let mut buf = self.reply_pool.borrow_mut().pop().unwrap_or_default();
+        let cap = buf.capacity() as u64;
+        debug_assert!(self.reply_pool_bytes.get() >= cap, "pool byte sum tracks contents");
+        self.reply_pool_bytes.set(self.reply_pool_bytes.get() - cap);
         buf.clear();
         buf
     }
@@ -507,13 +516,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         }
         let mut pool = self.reply_pool.borrow_mut();
         if pool.len() < REPLY_POOL_MAX {
+            self.reply_pool_bytes.set(self.reply_pool_bytes.get() + buf.capacity() as u64);
             pool.push(buf);
         }
     }
 
     /// An empty `OwnedCmd` flat buffer, recycled when possible.
     fn take_cmd_buf(&self) -> Vec<u8> {
-        self.cmd_pool.borrow_mut().pop().unwrap_or_default()
+        let buf = self.cmd_pool.borrow_mut().pop().unwrap_or_default();
+        let cap = buf.capacity() as u64;
+        debug_assert!(self.cmd_pool_bytes.get() >= cap, "pool byte sum tracks contents");
+        self.cmd_pool_bytes.set(self.cmd_pool_bytes.get() - cap);
+        buf
     }
 
     /// Returns an `OwnedCmd` buffer to the pool (bounded; oversized drop).
@@ -523,6 +537,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         }
         let mut pool = self.cmd_pool.borrow_mut();
         if pool.len() < CMD_POOL_MAX {
+            self.cmd_pool_bytes.set(self.cmd_pool_bytes.get() + buf.capacity() as u64);
             pool.push(buf);
         }
     }
@@ -824,6 +839,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         let durable = self.durable.borrow();
         let cell = durable.as_ref().expect("checked above");
         if !cell.would_fit(est) {
+            // The `would_fit` pre-check refuses without ever calling
+            // `stage()`, so no staging counter fires — count the typed
+            // refusal here (v0.4.0-alpha instrument fix: the 24 h soak
+            // took 31 M of these with no server-side trace).
+            self.node.log_admission_busy.set(self.node.log_admission_busy.get() + 1);
             return Some(crate::durable::STAGING_BUSY_ERROR);
         }
         #[cfg(feature = "doc")]
@@ -1136,6 +1156,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 rtt_sent: RefCell::new(vec![VecDeque::new(); usize::from(cells)]),
                 reply_pool: RefCell::new(Vec::new()),
                 cmd_pool: RefCell::new(Vec::new()),
+                reply_pool_bytes: Cell::new(0),
+                cmd_pool_bytes: Cell::new(0),
                 recv_dropped: Cell::new(0),
                 pubsub: RefCell::new(PubSubCell::new(cells)),
                 pub_queue: RefCell::new(VecDeque::new()),
@@ -1429,7 +1451,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let tier = self.shared.tier.borrow();
             let tier = tier.as_ref().expect("cold engine implies tier state");
             let counters = cold.counters();
-            let coalesce_milli = counters.enqueued.saturating_mul(1000) / counters.issued.max(1);
+            // ADR-0055 D5: `1 − device/logical` — 0 at zero coalescing
+            // (the v0.4.0-alpha soak rendered the inverted
+            // `enqueued/issued`, 1000 exactly there — instrument fix).
+            let coalesce_milli = counters.coalesce_ratio_milli();
+            self.shared.node.cold_pool_bytes.set(cold.pool_reserved_bytes());
             self.shared.node.tiering_split.set([
                 tier.ram_hit_us.percentile(50.0),
                 tier.ram_hit_us.percentile(99.0),
@@ -1444,6 +1470,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 cold.latency_percentile_us(99.0),
                 counters.issued,
                 counters.enqueued,
+                counters.pool_dry,
+                counters.queue_full,
             ]);
         }
     }
@@ -2410,6 +2438,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             }
         }
         node.conn_state_bytes.set(bytes as u64);
+        // Recycle-pool residency (v0.4.0-alpha RSS-attribution gauges):
+        // running sums maintained at the push/pop sites, flushed here.
+        node.reply_pool_bytes.set(self.shared.reply_pool_bytes.get());
+        node.cmd_pool_bytes.set(self.shared.cmd_pool_bytes.get());
     }
 
     fn seal_log(&mut self, cx: &mut LoopCx<'_>) {
@@ -4734,7 +4766,11 @@ async fn compact_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                     break 'chain;
                 };
                 let len = frames as usize * inf_log::TIER_FRAME_BYTES;
-                match cold.enqueue(fd, file, offset, len, inf_runtime::ReadClass::Maintain, 0) {
+                // Same-clock stamp as `on_completion` (the
+                // `cold_read_p99_us` pair).
+                let now_us = shared.now.get().as_micros();
+                match cold.enqueue(fd, file, offset, len, inf_runtime::ReadClass::Maintain, now_us)
+                {
                     Ok(wait) => (wait, frames, skip),
                     Err(_) => break 'chain, // queue full: back off to the next round
                 }

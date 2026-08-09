@@ -58,14 +58,28 @@ pub struct NodeInfo {
     /// order: ram_hit_p{50,99,999}_us, cold_p{50,99,999}_us,
     /// cold_read_qd_p99, coalesce_ratio_milli, cold_reads_inflight,
     /// cold_queue_depth, cold_read_p99_us, cold_reads_issued,
-    /// cold_reads_enqueued. Identically zero on nodes that never
-    /// created a tiered namespace (the D8/S03 posture).
-    pub tiering_split: Cell<[u64; 13]>,
+    /// cold_reads_enqueued, cold_pool_dry, cold_queue_full (the last
+    /// two appended by the v0.4.0-alpha instrument fix — existing slot
+    /// order unchanged). Identically zero on nodes that never created a
+    /// tiered namespace (the D8/S03 posture). Slots 0–2 are
+    /// iteration-clock-quantized (a non-suspending command records 0):
+    /// `INFO` renders them absent-with-disclosure while tiered is live,
+    /// never as numbers (v0.4.0-alpha instrument fix).
+    pub tiering_split: Cell<[u64; 15]>,
     /// Raw lifetime counters (submits, sqes, cqes, iterations, commands,
     /// fabric_msgs) — scrapers diff two snapshots for under-load ratios.
     pub raw_counters: Cell<[u64; 6]>,
     pub wire_buffers_bytes: Cell<u64>,
     pub conn_state_bytes: Cell<u64>,
+    /// Recycle-pool residency (v0.4.0-alpha RSS-attribution gauges,
+    /// flushed by MAINTAIN): running capacity sums of the per-cell
+    /// reply/command pools, and the cold-read aligned pool's whole
+    /// reservation. Render-only — deliberately not folded into
+    /// [`memory_gauges_of`] (that sum feeds maxmemory enforcement, so
+    /// widening it is a policy change, not an instrument fix).
+    pub reply_pool_bytes: Cell<u64>,
+    pub cmd_pool_bytes: Cell<u64>,
+    pub cold_pool_bytes: Cell<u64>,
     pub connections: Cell<u64>,
     pub recv_dropped: Cell<u64>,
     pub fabric_rtt_p50_ns: Cell<u64>,
@@ -105,6 +119,12 @@ pub struct NodeInfo {
     /// (2 × buffer capacity by construction — the L5 log-staging domain).
     pub log_frames_queued: Cell<u64>,
     pub log_staging_bytes: Cell<u64>,
+    /// Typed `-BUSY` staging-admission refusals (v0.4.0-alpha
+    /// instrument fix): the `would_fit` pre-check refuses without ever
+    /// calling `stage()`, so no staging counter sees these — the
+    /// refusal sites themselves increment (owner-side admission + the
+    /// doc path's exact late admission).
+    pub log_admission_busy: Cell<u64>,
     /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).
     pub ckpts_completed: Cell<u64>,
     pub ckpts_aborted: Cell<u64>,

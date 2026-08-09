@@ -242,6 +242,10 @@ pub(crate) fn info(
         // staging domain's resident bytes (attribution observable).
         push(&mut text, &format!("log_frames_queued:{}", node.log_frames_queued.get()));
         push(&mut text, &format!("log_staging_bytes:{}", node.log_staging_bytes.get()));
+        // Typed `-BUSY` staging-admission refusals (v0.4.0-alpha
+        // instrument fix): the `would_fit` pre-check stages nothing, so
+        // only this counter records them.
+        push(&mut text, &format!("log_admission_busy:{}", node.log_admission_busy.get()));
         // M2-S21: windowed rates (previous everysec tick window, injected
         // clock) + fsync latency percentiles (HDR-class histogram, ~3%
         // quantization — the §8.2 storage-bound honesty fields).
@@ -358,6 +362,13 @@ pub(crate) fn info(
         push(&mut text, &format!("pubsub_state_bytes:{}", node.pubsub_state_bytes.get()));
         push(&mut text, &format!("{}:{}", tw::WIRE_BUFFERS_BYTES, node.wire_buffers_bytes.get()));
         push(&mut text, &format!("{}:{}", tw::CONN_STATE_BYTES, node.conn_state_bytes.get()));
+        // Recycle-pool residency (v0.4.0-alpha RSS-attribution gauges):
+        // the reply/command pools were the last unattributed malloc
+        // consumers — the warm-up-grower hypothesis instrument, read
+        // against `process_rss` over a soak.
+        push(&mut text, &format!("reply_pool_bytes:{}", node.reply_pool_bytes.get()));
+        push(&mut text, &format!("cmd_pool_bytes:{}", node.cmd_pool_bytes.get()));
+        push(&mut text, &format!("cold_pool_bytes:{}", node.cold_pool_bytes.get()));
         push(&mut text, &format!("{}:{}", tw::PROCESS_RSS, process_rss_bytes()));
         text.push_str("\r\n");
     }
@@ -414,11 +425,26 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     // M4-S26 (ADR-0064 D3): the pinned `SPLIT_FIELDS` contract — the
     // resolver-tagged service percentiles the S22 harness scrapes — plus
     // the five ADR-0055 cold-read counters. Flushed by the tiered
-    // MAINTAIN; identically zero on nodes with no tiered namespace.
+    // MAINTAIN; identically zero on nodes with no tiered namespace. The
+    // ram-hit half renders absent while tiered is live — see the branch.
     let split = node.tiering_split.get();
-    push(text, &format!("tiering_ram_hit_p50_us:{}", split[0]));
-    push(text, &format!("tiering_ram_hit_p99_us:{}", split[1]));
-    push(text, &format!("tiering_ram_hit_p999_us:{}", split[2]));
+    if ks.tiered_tables() == 0 {
+        // Degenerate contract (§3.3): every field literal zero.
+        push(text, &format!("tiering_ram_hit_p50_us:{}", split[0]));
+        push(text, &format!("tiering_ram_hit_p99_us:{}", split[1]));
+        push(text, &format!("tiering_ram_hit_p999_us:{}", split[2]));
+    } else {
+        // The ram-hit lane records on the loop clock, which is frozen
+        // per reactor iteration — a command that never suspends reads
+        // 0 µs whatever its true service time. Rendering those zeros
+        // would let the M4 §7 hot-set gate "pass" on an instrument with
+        // no discriminating power, so the percentile fields go absent
+        // (refuse/absent over silent zero) and this named line keeps
+        // the absence loud. The S22 harness refuses a tiered row that
+        // misses a SPLIT_FIELDS entry — by design, until a finer
+        // injected clock exists (v0.4.0-alpha instrument fix).
+        push(text, "tiering_ram_hit_split:unmeasured-iteration-clock");
+    }
     push(text, &format!("tiering_cold_p50_us:{}", split[3]));
     push(text, &format!("tiering_cold_p99_us:{}", split[4]));
     push(text, &format!("tiering_cold_p999_us:{}", split[5]));
@@ -429,6 +455,10 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("cold_read_p99_us:{}", split[10]));
     push(text, &format!("cold_reads_issued:{}", split[11]));
     push(text, &format!("cold_reads_enqueued:{}", split[12]));
+    // Pool-sizing stalls + typed enqueue refusals (v0.4.0-alpha
+    // instrument fix — invisible in soak artifacts until now).
+    push(text, &format!("cold_pool_dry:{}", split[13]));
+    push(text, &format!("cold_queue_full:{}", split[14]));
     push(text, &format!("tiering_tail_allocs:{}", tiering.tail_allocs));
     push(text, &format!("tiering_seal_holes:{}", tiering.seal_holes));
     push(text, &format!("tiering_seal_hole_bytes:{}", tiering.seal_hole_bytes));
@@ -1722,6 +1752,82 @@ mod tests {
         assert!(line.contains("wal_bytes=0"), "no WAL record was staged: {line}");
         assert!(text.contains("tiering_user_bytes:8"), "the aggregate sums the lines: {text}");
         assert!(text.contains("tiering_tables:1"), "{text}");
+    }
+
+    /// v0.4.0-alpha instrument fix: with a tiered namespace live, the
+    /// RAM-hit percentile fields render **absent**, replaced by a named
+    /// disclosure — the loop clock cannot resolve a command that never
+    /// suspends, so numbers here would be silent zeros the M4 §7 gate
+    /// could "pass" on. On a memory-mode node the fields stay literal
+    /// zero (the §3.3 degenerate contract, asserted above).
+    #[test]
+    fn info_tiering_ram_hit_split_renders_absent_not_zero_when_tiered() {
+        use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId};
+
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let ns = NsId(23);
+        let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
+        assert!(
+            store
+                .materialize_tiered(
+                    ns,
+                    AddressSpaceConfig {
+                        reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
+                        page_bytes: 4 << 10,
+                        life_origin: LogicalAddr::ZERO,
+                    },
+                    demote,
+                    64,
+                )
+                .is_ok()
+        );
+        let text =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tiering"])).expect("ascii");
+        for absent in
+            ["tiering_ram_hit_p50_us:", "tiering_ram_hit_p99_us:", "tiering_ram_hit_p999_us:"]
+        {
+            assert!(!text.contains(absent), "{absent} must be absent, not zero: {text}");
+        }
+        assert!(text.contains("tiering_ram_hit_split:unmeasured-iteration-clock"), "{text}");
+        // The cold half of the split still renders numerically.
+        assert!(text.contains("tiering_cold_p99_us:"), "{text}");
+        // The appended shaping counters render beside the cold family
+        // (v0.4.0-alpha instrument fix: pool-sizing stalls and typed
+        // enqueue refusals were invisible in soak artifacts).
+        assert!(text.contains("cold_pool_dry:0"), "{text}");
+        assert!(text.contains("cold_queue_full:0"), "{text}");
+    }
+
+    /// v0.4.0-alpha instrument fix: the typed `-BUSY` staging-admission
+    /// refusals surface in `INFO persistence` — the `would_fit`
+    /// pre-check stages nothing, so no other counter records them (the
+    /// 24 h soak took 31 M with no server-side trace).
+    #[test]
+    fn info_persistence_renders_admission_busy_refusals() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        cx.node.log_admission_busy.set(31_260_000);
+        let text =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"persistence"])).expect("ascii");
+        assert!(text.contains("log_admission_busy:31260000"), "{text}");
+    }
+
+    /// v0.4.0-alpha RSS-attribution gauges: the recycle-pool residency
+    /// fields render in the tripwires section beside the other
+    /// byte-attribution observables.
+    #[test]
+    fn info_tripwires_renders_recycle_pool_bytes() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        cx.node.reply_pool_bytes.set(4096 * 100);
+        cx.node.cmd_pool_bytes.set(4096 * 7);
+        cx.node.cold_pool_bytes.set(1 << 24);
+        let text =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tripwires"])).expect("ascii");
+        assert!(text.contains("reply_pool_bytes:409600"), "{text}");
+        assert!(text.contains("cmd_pool_bytes:28672"), "{text}");
+        assert!(text.contains("cold_pool_bytes:16777216"), "{text}");
     }
 
     /// M4-S16: the per-namespace line carries the write-amplification

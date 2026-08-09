@@ -244,6 +244,12 @@ overwrites landed on records still in the mutable region.
 | `tiering_seal_holes` / `tiering_seal_hole_bytes` | ring-top seals and the dead bytes they skipped |
 | `tiering_region_commit_pages` / `..._decommit_pages` | RAM pages taken from and returned to the OS |
 | `tiering_cold_resolves` | lookups that landed below `head` — cold-read candidates |
+| `tiering_cold_p50_us` / `..._p99_us` / `..._p999_us` | service-time percentiles (µs, loop clock) of tiered commands that issued at least one cold read — end-to-end command service, not device time |
+| `tiering_ram_hit_split` | **disclosure, not a number**: reads `unmeasured-iteration-clock` while a tiered namespace is live. RAM-hit service is quantized to the reactor-iteration clock — a command that never suspends records 0 µs whatever its true service time — so the `tiering_ram_hit_p50/p99/p999_us` fields render **absent** rather than as silent zeros (they stay literal `0` on a memory-mode node, per the degenerate contract). A gate or dashboard that wants these numbers must wait for a finer injected clock, not read zeros |
+| `cold_read_p99_us` | p99 enqueue→delivery latency of cold **device reads** (µs, injected loop clock; delivered reads only) |
+| `coalesce_ratio_milli` | `1 − device_reads/logical_reads` × 1000 (ADR-0055 D5): `0` = no merging, higher = more device trips saved. Raw counters (`cold_reads_enqueued`, `cold_reads_issued`) stay exposed |
+| `cold_pool_dry` | drain stalls with QD headroom but no free pool buffer — **pool-sizing pressure**, distinct from the policy cap; never an error |
+| `cold_queue_full` | typed cold-read enqueue refusals on a full class FIFO (`BUSY` backpressure to the client) |
 | `tiering_demote_slices` / `tiering_demote_sealed_bytes` | seal steps and the bytes they froze |
 | `tiering_flush_slices` / `tiering_flush_confirmed_bytes` | flush barriers and the bytes they made durable |
 | `tiering_reserved_bytes` | virtual address space reserved for the region rings (not RSS) |

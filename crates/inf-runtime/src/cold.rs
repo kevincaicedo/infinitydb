@@ -43,8 +43,10 @@
 //! merged_waiters + cancelled_queued` at quiesce) · `cold_read_p99_us`
 //! ([`ColdReads::latency_percentile_us`], **injected time** — `now_us`
 //! parameters, sim time in DST; no ambient clocks in cell code, L7).
-//! The `INFO tiering` surface joins the command-wiring story (recorded
-//! ADR-0055 deviation — no live `ColdReads` in `inf-server` yet).
+//! `INFO tiering` renders it since the S26 wiring; enqueue and
+//! completion must stamp the **same** injected clock — a zero enqueue
+//! stamp degrades the percentile to absolute uptime (the v0.4.0-alpha
+//! soak instrument fix, regression-pinned in this module's tests).
 //!
 //! Pins (§3.3): a tier file with queued or in-flight cold reads is never
 //! closed or deleted — compaction/reclaim (S15) and namespace drop (S19)
@@ -169,6 +171,21 @@ pub struct ColdReadCounters {
     /// High-water mark of queued intents across both classes (the
     /// overflow-depth tripwire input).
     pub queue_depth_high_water: u32,
+}
+
+impl ColdReadCounters {
+    /// ADR-0055 D5 `coalesce_ratio`, in milli-units: `1 −
+    /// device_reads/logical_reads` — 0 with nothing merged, approaching
+    /// the merged fraction under heavy coalescing. Derived at scrape
+    /// from the two raw counters (both stay exposed); 0 on an idle
+    /// engine. (The v0.4.0-alpha soak rendered the *inverted*
+    /// `enqueued/issued`, which reads 1000 at exactly zero coalescing —
+    /// the defect this method replaces.)
+    #[must_use]
+    pub fn coalesce_ratio_milli(&self) -> u64 {
+        let saved = self.enqueued.saturating_sub(self.issued);
+        saved.saturating_mul(1000) / self.enqueued.max(1)
+    }
 }
 
 /// Why [`ColdReads::enqueue`] refused (backpressure, never failure).
@@ -334,6 +351,13 @@ impl ColdReads {
     #[must_use]
     pub fn buf_size(&self) -> usize {
         self.state.borrow().pool.buf_size()
+    }
+
+    /// Attributed bytes of the aligned cold-read pool (L5 — the
+    /// `cold_pool_bytes` gauge): the whole reservation, leased or not.
+    #[must_use]
+    pub fn pool_reserved_bytes(&self) -> u64 {
+        self.state.borrow().pool.reserved_bytes()
     }
 
     /// Parks a read intent in its class FIFO and returns the waiter.
@@ -1021,6 +1045,28 @@ mod tests {
             counters.enqueued,
             counters.issued + counters.merged_waiters + counters.cancelled_queued
         );
+        // D5 ratio on the live engine: four logical reads, one device
+        // read — three quarters of the trips were saved.
+        assert_eq!(counters.coalesce_ratio_milli(), 750);
+    }
+
+    /// ADR-0055 D5 conformance for `coalesce_ratio`: `1 − device/logical`
+    /// — near-zero merging reads ≈ 0 milli, heavy merging reads the
+    /// merged fraction. Pins the v0.4.0-alpha soak inversion, which
+    /// rendered `enqueued/issued` = 1000 at effectively zero coalescing.
+    #[test]
+    fn coalesce_ratio_follows_the_d5_definition() {
+        // The soak's raw counters: 427 merged waiters in 102 M reads.
+        let soak = ColdReadCounters {
+            enqueued: 102_311_118,
+            issued: 102_310_691,
+            ..ColdReadCounters::default()
+        };
+        assert_eq!(soak.coalesce_ratio_milli(), 0, "essentially zero coalescing reads 0");
+        let merged =
+            ColdReadCounters { enqueued: 1000, issued: 250, ..ColdReadCounters::default() };
+        assert_eq!(merged.coalesce_ratio_milli(), 750, "three of four trips saved");
+        assert_eq!(ColdReadCounters::default().coalesce_ratio_milli(), 0, "idle engine reads 0");
     }
 
     /// Cancelling one waiter of a merged read releases exactly its share:
@@ -1092,6 +1138,63 @@ mod tests {
         let split: String = order.iter().collect();
         assert_eq!(split, "fffmfffmfffmfffm", "3:1 deficit under contention");
         drop(waiters);
+    }
+
+    /// The v0.4.0-alpha soak fingerprint (`cold_read_p99_us:85899345919`):
+    /// the histogram must report the enqueue→delivery *delta*, so a read
+    /// issued deep into a long run reports its own latency, never the
+    /// absolute clock. The wired plane stamps both ends with the same
+    /// injected loop clock; a zero enqueue stamp is the bug this pins —
+    /// the percentile then reads ~uptime, and after 24 h that lands on
+    /// the log-bucket edge 2^36 + 2^34 - 1 µs.
+    #[test]
+    fn latency_measures_the_delta_not_the_absolute_clock() {
+        let cold = path(1);
+        let file = TierFileId::new(14);
+        // ~23.9 h of injected uptime, then a 12 µs device read.
+        let late_us: u64 = 86_000_000_000;
+        let waiter =
+            cold.enqueue(3, file, 0, 64, ReadClass::Foreground, late_us).expect("queue sized");
+        let mut ops = drain_ops(&cold);
+        let token = complete(ops.remove(0), 0xC0);
+        assert_eq!(cold.on_completion(token, CompletionResult::TierRead, late_us + 12), 1);
+        assert_eq!(cold.latency_percentile_us(99.0), 12, "the delta, never uptime");
+        drop(block_on_ready(waiter));
+        assert_eq!(cold.reconcile(), Ok(()));
+    }
+
+    /// The percentile walk must hold past any u32 sample count (the 24 h
+    /// soak recorded 102 M deliveries; this goes to > 2^32 for margin):
+    /// bucket counts and their accumulation are u64 end to end, so the
+    /// reported value stays inside the recorded range instead of walking
+    /// off the buckets. Counts inflate by histogram merge-doubling —
+    /// recording 4.3 B samples one by one has no place in a unit test.
+    #[test]
+    fn latency_percentile_holds_past_u32_sample_counts() {
+        let cold = path(1);
+        let file = TierFileId::new(15);
+        let waiter = ask(&cold, 3, file, 0, 64);
+        let mut ops = drain_ops(&cold);
+        let token = complete(ops.remove(0), 0xC0);
+        assert_eq!(cold.on_completion(token, CompletionResult::TierRead, 12), 1);
+        {
+            // Same-file test module: reach the private histogram and
+            // Fibonacci-double its counts past u32::MAX (25 rounds of
+            // pairwise merge ≈ F(51) ≈ 2×10^10 samples of value 12).
+            let mut state = cold.state.borrow_mut();
+            let mut mirror = LogHistogram::new();
+            mirror.merge(&state.latency_hist);
+            for _ in 0..25 {
+                state.latency_hist.merge(&mirror);
+                mirror.merge(&state.latency_hist);
+            }
+            assert!(state.latency_hist.count() > u64::from(u32::MAX), "count exceeds any u32");
+        }
+        assert_eq!(cold.latency_percentile_us(50.0), 12);
+        assert_eq!(cold.latency_percentile_us(99.0), 12);
+        assert_eq!(cold.latency_percentile_us(99.9), 12, "inside the recorded range");
+        drop(block_on_ready(waiter));
+        assert_eq!(cold.reconcile(), Ok(()));
     }
 
     /// Minimal single-future block_on for gate waiters whose value is

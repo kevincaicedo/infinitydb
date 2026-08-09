@@ -37,6 +37,21 @@ fn main() {
     println!("cargo::rerun-if-env-changed=INF_RELEASE_VERSION");
     println!("cargo::rerun-if-env-changed=INF_GIT_SHA");
     if let Some(dir) = git(&["rev-parse", "--git-dir"]) {
+        // On a checked-out branch `HEAD` holds `ref: refs/heads/<branch>` and
+        // does not change on commit — only the resolved ref (or `packed-refs`
+        // after a pack) moves. Watching HEAD alone froze the stamped SHA at
+        // the last branch switch (soak-unified-20260807 stamped 147c33a while
+        // the launch tree was 3712006). Watch all three that exist.
         println!("cargo::rerun-if-changed={dir}/HEAD");
+        let packed = format!("{dir}/packed-refs");
+        if std::path::Path::new(&packed).exists() {
+            println!("cargo::rerun-if-changed={packed}");
+        }
+        if let Some(head_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
+            let loose = format!("{dir}/{head_ref}");
+            if std::path::Path::new(&loose).exists() {
+                println!("cargo::rerun-if-changed={loose}");
+            }
+        }
     }
 }
