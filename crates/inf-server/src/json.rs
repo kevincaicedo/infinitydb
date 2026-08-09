@@ -147,6 +147,10 @@ fn durable_full_fits(cx: &ConnCx, key: &[u8], idoc: &[u8], w: &mut RespWriter<'_
         return false;
     }
     if full.saturating_add(expiry) > admission.budget {
+        // Counted with the owner-side `would_fit` refusals
+        // (`log_admission_busy`): same typed reply, same
+        // invisible-to-staging pre-check shape.
+        cx.node.log_admission_busy.set(cx.node.log_admission_busy.get() + 1);
         w.error(crate::durable::STAGING_BUSY_ERROR);
         return false;
     }
@@ -1842,6 +1846,11 @@ mod tests {
             }
             assert!(out.starts_with(prefix), "reply was {}", String::from_utf8_lossy(&out));
             assert!(store.json_freeze(b"doc", now).unwrap().is_none(), "refusal committed state");
+            // The BUSY refusal is the only one the `log_admission_busy`
+            // gauge counts — a too-large record is a caller error, not
+            // staging pressure (v0.4.0-alpha instrument fix).
+            let busy = u64::from(prefix.starts_with(b"-BUSY"));
+            assert_eq!(cx.node.log_admission_busy.get(), busy, "refusal counter");
         }
     }
 }

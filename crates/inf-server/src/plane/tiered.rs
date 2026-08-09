@@ -116,7 +116,13 @@ pub(super) async fn dispatch_tiered<O: PlaneObserver + 'static, F: SegmentFs + C
     let cold_before = cold_issued(shared);
     let outcome = run_command(shared, ns, meta, argv, proto, class).await;
     // Split service histograms (ADR-0064 D3): µs on the loop clock,
-    // lane-tagged by whether this command issued any cold read.
+    // lane-tagged by whether this command issued any cold read. The
+    // loop clock is frozen per reactor iteration, so a command that
+    // never suspends records exactly 0 whatever its true service time:
+    // the ram-hit lane resolves *iteration crossings* (parks, stalls),
+    // not microseconds — `INFO` therefore refuses to render its
+    // percentiles as numbers (`admin::tiering_section`). The cold lane
+    // always crosses an iteration and stays honest.
     let elapsed = shared.now.get().saturating_sub(started).as_micros();
     let served_cold = cold_issued(shared) > cold_before;
     if let Some(tier) = shared.tier.borrow_mut().as_mut() {
@@ -268,7 +274,12 @@ fn probe<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         return Probe::Fail("__replan");
     };
     let bytes = frames as usize * inf_log::TIER_FRAME_BYTES;
-    match cold.enqueue(fd, file, offset, bytes, inf_runtime::ReadClass::Foreground, 0) {
+    // The enqueue stamp and `on_completion`'s stamp must come from the
+    // same injected clock (L7): the plane completes with `cx.now`, so a
+    // zero here turns `cold_read_p99_us` into absolute uptime — the
+    // v0.4.0-alpha soak's 85899345919 µs fingerprint (instrument fix).
+    let now_us = shared.now.get().as_micros();
+    match cold.enqueue(fd, file, offset, bytes, inf_runtime::ReadClass::Foreground, now_us) {
         Ok(wait) => Probe::Cold(ColdPlan { wait, addr, frames, skip }),
         Err(_) => Probe::Fail(ERR_COLD_BUSY),
     }
@@ -1044,8 +1055,11 @@ async fn fetch_key<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         let (fd, file, offset, frames, skip) =
             t.plan_cold_read(addr, TieredTable::RECORD_HEADER_LEN)?;
         let bytes = frames as usize * inf_log::TIER_FRAME_BYTES;
-        let wait =
-            cold.enqueue(fd, file, offset, bytes, inf_runtime::ReadClass::Foreground, 0).ok()?;
+        // Same-clock stamp as `on_completion` (the `cold_read_p99_us` pair).
+        let now_us = shared.now.get().as_micros();
+        let wait = cold
+            .enqueue(fd, file, offset, bytes, inf_runtime::ReadClass::Foreground, now_us)
+            .ok()?;
         ColdPlan { wait, addr, frames, skip }
     };
     let done = plan.wait.await;
@@ -1094,13 +1108,15 @@ async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         let wait = {
             let tier = shared.tier.borrow();
             let cold = tier.as_ref().and_then(|t| t.cold.clone())?;
+            // Same-clock stamp as `on_completion` (the `cold_read_p99_us`
+            // pair).
             cold.enqueue(
                 fd,
                 file,
                 inf_log::blob::extent_frame_offset(first),
                 frames as usize * inf_log::TIER_FRAME_BYTES,
                 inf_runtime::ReadClass::Foreground,
-                0,
+                shared.now.get().as_micros(),
             )
             .ok()?
         };
