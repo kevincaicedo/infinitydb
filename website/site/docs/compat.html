@@ -82,7 +82,7 @@
 
   <div class="callout">
     <span class="callout-tag"><strong>Generated page &mdash; do not edit.</strong></span>
-    Rendered from <code>infinitydb/docs/compat-matrix.md</code> (itself generated from the <code>inf-wire</code> command registry and the oracle-diff corpus by <code>tests/compat/src/matrixgen.rs</code>, with a CI staleness gate) by <code>scripts/gen-compat-page.py</code> on 2026-07-17. Upstream regenerate: <code>INF_REGEN_MATRIX=1 cargo test -p compat --test matrix_artifact</code> (CI fails when this file is stale — the release pipeline inherits that refusal).
+    Rendered from <code>infinitydb/docs/compat-matrix.md</code> (itself generated from the <code>inf-wire</code> command registry and the oracle-diff corpus by <code>tests/compat/src/matrixgen.rs</code>, with a CI staleness gate) by <code>scripts/gen-compat-page.py</code> on 2026-08-09. Upstream regenerate: <code>INF_REGEN_MATRIX=1 cargo test -p compat --test matrix_artifact</code> (CI fails when this file is stale — the release pipeline inherits that refusal).
   </div>
 
   <div class="stat-row">
@@ -92,7 +92,7 @@
     <div class="stat"><div class="v">2</div><div class="l">extension</div></div>
     <div class="stat"><div class="v">2</div><div class="l">internal</div></div>
   </div>
-  <p class="mono-note">CORPUS: 546 byte-compared executions · 56 documented deviations · 0 tolerated failures &middot; SURFACE: 90 commands — 54 full · 32 partial · 0 stub · 2 extension · 2 internal</p>
+  <p class="mono-note">CORPUS: 546 byte-compared executions · 58 documented deviations · 0 tolerated failures &middot; SURFACE: 90 commands — 54 full · 32 partial · 0 stub · 2 extension · 2 internal</p>
 
   <h2 style="margin-top:40px">Status vocabulary</h2>
   <ul>
@@ -179,7 +179,7 @@
         <tr data-status="full"><td><code>PUNSUBSCRIBE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>-1</td><td>3</td><td>same bare-form ordering note as UNSUBSCRIBE</td></tr>
         <tr data-status="full"><td><code>PUBLISH</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>3</td><td>4</td><td>a publisher subscribed to its own channel via a remote owner cell may receive its frame before the publish reply (local owners match Redis order)</td></tr>
         <tr data-status="partial"><td><code>PUBSUB</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">readonly</td><td>-2</td><td>8</td><td>SHARDCHANNELS / SHARDNUMSUB arrive with sharded pub/sub (M3 cut line)</td></tr>
-        <tr data-status="extension"><td><code>INF.NS</code></td><td><span class="st st-ext">extension</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>0</td><td>namespace registry v1 — the M2 durability seam</td></tr>
+        <tr data-status="extension"><td><code>INF.NS</code></td><td><span class="st st-ext">extension</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>0</td><td>namespace registry (M2 durability seam; M4-S19 adds SET + the ADR-0062 tiering keys; M4-S26 lifts the D8 <code>USE</code> refusal — the string family, <code>SCAN</code>, and <code>DBSIZE</code> serve tiered namespaces; two extension error classes are live on their writes: <code>DISKFULL …</code> (ADR-0063 — disk budget or device full; new-tier-byte placements only) and <code>STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)</code> (ADR-0053 D4 — retryable). Deviations on tiered namespaces: no expiry (the <code>EXPIRE</code> family + <code>SET</code> expiry options refuse typed; <code>TTL</code> = -1 for live keys), non-string families refuse typed, multi-key ops resolve sequentially. M4-S27 (ADR-0068): <code>MAXMEMORY</code>/<code>EVICTION</code> on named *memory* namespaces are enforced and Hot via <code>SET</code> (<code>inherit</code>/<code>0</code> reset them); a namespace with its own budget answers the Redis-exact OOM error scoped to that namespace and reclaims only its own keys; durable and tiered namespaces refuse both keys typed (tiered budgets belong to <code>MEM-BUDGET</code>)</td></tr>
         <tr data-status="extension"><td><code>INF.CKPT</code></td><td><span class="st st-ext">extension</span></td><td>M2</td><td class="faint">admin</td><td>-1</td><td>0</td><td>checkpoint operator surface (M2-S20): [CELL k] [WAIT]; WAIT returns after the new MANIFEST is durable — no fork, per-cell timing (ADR-0021)</td></tr>
         <tr data-status="partial"><td><code>BGSAVE</code></td><td><span class="st st-partial">partial</span></td><td>M2</td><td class="faint">admin</td><td>-1</td><td>0</td><td>maps onto INF.CKPT (fuzzy checkpoint, no fork, no RDB file); SCHEDULE accepted and moot; reply byte-identical; memory-only nodes answer a documented error</td></tr>
         <tr data-status="partial"><td><code>LASTSAVE</code></td><td><span class="st st-partial">partial</span></td><td>M2</td><td class="faint">readonly fast</td><td>1</td><td>0</td><td>unix seconds of the newest durable MANIFEST publication; 0 before the first (Redis reports process-start time); loading flag docs-derived, not capture-verified</td></tr>
@@ -278,6 +278,8 @@
       <li>InfinityDB extension</li>
       <li>InfinityDB extension; durable live since M2-S08 (node tier — the planeless compat candidate answers its documented no-runtime error)</li>
       <li>InfinityDB extension (M2-S08): named-namespace selection, SELECT-class conn state; durable-mode deviations documented in ADR-0015</li>
+      <li>InfinityDB extension (M4-S19, ADR-0062): MEM-BUDGET declares a durable-tiered namespace; the planeless compat candidate answers its documented no-runtime error</li>
+      <li>InfinityDB extension (M4-S19, ADR-0062 D3): per-namespace hot-reload; CreateOnly keys (TIER-IO-MODE, COLD-READ-QD) refuse typed</li>
     </ul>
     <h3><code>INF.CKPT</code></h3>
     <ul>
