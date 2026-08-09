@@ -1,0 +1,2871 @@
+ops = 85554643
+errors = 246302
+elapsed_s = 300.000
+ops_per_sec = 285182
+p50_us = 211
+p99_us = 2239
+p999_us = 17919
+p9999_us = 368639
+max_us = 1454635
+inf-bench: 246302 error replies under load
+ops = 134586775
+errors = 217881
+elapsed_s = 300.000
+ops_per_sec = 448622
+p50_us = 195
+p99_us = 927
+p999_us = 7039
+p9999_us = 131071
+max_us = 1691100
+inf-bench: 217881 error replies under load
+ops = 142785712
+errors = 95875
+elapsed_s = 300.005
+ops_per_sec = 475945
+p50_us = 199
+p99_us = 943
+p999_us = 6911
+p9999_us = 30207
+max_us = 807710
+inf-bench: 95875 error replies under load
+ops = 148645791
+errors = 89291
+elapsed_s = 300.001
+ops_per_sec = 495485
+p50_us = 199
+p99_us = 895
+p999_us = 6527
+p9999_us = 11775
+max_us = 566381
+inf-bench: 89291 error replies under load
+ops = 145120359
+errors = 111927
+elapsed_s = 300.000
+ops_per_sec = 483734
+p50_us = 199
+p99_us = 895
+p999_us = 6271
+p9999_us = 16127
+max_us = 978860
+inf-bench: 111927 error replies under load
+ops = 146194022
+errors = 104749
+elapsed_s = 300.000
+ops_per_sec = 487313
+p50_us = 195
+p99_us = 895
+p999_us = 6783
+p9999_us = 19455
+max_us = 638986
+inf-bench: 104749 error replies under load
+ops = 145236720
+errors = 77767
+elapsed_s = 300.000
+ops_per_sec = 484122
+p50_us = 199
+p99_us = 943
+p999_us = 6911
+p9999_us = 22527
+max_us = 473889
+inf-bench: 77767 error replies under load
+ops = 138196694
+errors = 143055
+elapsed_s = 300.004
+ops_per_sec = 460649
+p50_us = 203
+p99_us = 991
+p999_us = 7039
+p9999_us = 53247
+max_us = 1084017
+inf-bench: 143055 error replies under load
+ops = 130700327
+errors = 91296
+elapsed_s = 300.005
+ops_per_sec = 435661
+p50_us = 219
+p99_us = 1087
+p999_us = 7935
+p9999_us = 54271
+max_us = 2055842
+inf-bench: 91296 error replies under load
+ops = 141066990
+errors = 113107
+elapsed_s = 300.000
+ops_per_sec = 470223
+p50_us = 199
+p99_us = 959
+p999_us = 7679
+p9999_us = 47103
+max_us = 1486725
+inf-bench: 113107 error replies under load
+ops = 135479177
+errors = 137302
+elapsed_s = 300.001
+ops_per_sec = 451596
+p50_us = 211
+p99_us = 975
+p999_us = 7039
+p9999_us = 58367
+max_us = 2359223
+inf-bench: 137302 error replies under load
+ops = 144827105
+errors = 73581
+elapsed_s = 300.000
+ops_per_sec = 482756
+p50_us = 195
+p99_us = 911
+p999_us = 6911
+p9999_us = 34815
+max_us = 1196184
+inf-bench: 73581 error replies under load
+ops = 129599632
+errors = 145111
+elapsed_s = 300.001
+ops_per_sec = 431998
+p50_us = 219
+p99_us = 991
+p999_us = 7551
+p9999_us = 67583
+max_us = 716459
+inf-bench: 145111 error replies under load
+ops = 153849935
+errors = 67623
+elapsed_s = 300.000
+ops_per_sec = 512833
+p50_us = 191
+p99_us = 879
+p999_us = 6399
+p9999_us = 12287
+max_us = 399927
+inf-bench: 67623 error replies under load
+ops = 145079513
+errors = 145772
+elapsed_s = 300.000
+ops_per_sec = 483598
+p50_us = 199
+p99_us = 911
+p999_us = 6527
+p9999_us = 20991
+max_us = 1810030
+inf-bench: 145772 error replies under load
+ops = 134034166
+errors = 61972
+elapsed_s = 300.000
+ops_per_sec = 446780
+p50_us = 215
+p99_us = 1087
+p999_us = 7551
+p9999_us = 32767
+max_us = 1614740
+inf-bench: 61972 error replies under load
+ops = 132870158
+errors = 71358
+elapsed_s = 300.000
+ops_per_sec = 442900
+p50_us = 203
+p99_us = 1087
+p999_us = 7807
+p9999_us = 69631
+max_us = 1127365
+inf-bench: 71358 error replies under load
+ops = 125105306
+errors = 145973
+elapsed_s = 300.000
+ops_per_sec = 417017
+p50_us = 211
+p99_us = 1023
+p999_us = 7807
+p9999_us = 120831
+max_us = 1317428
+inf-bench: 145973 error replies under load
+ops = 150447222
+errors = 174494
+elapsed_s = 300.000
+ops_per_sec = 501490
+p50_us = 191
+p99_us = 895
+p999_us = 7039
+p9999_us = 28671
+max_us = 507273
+inf-bench: 174494 error replies under load
+ops = 152579801
+errors = 73510
+elapsed_s = 300.000
+ops_per_sec = 508599
+p50_us = 191
+p99_us = 895
+p999_us = 6655
+p9999_us = 16895
+max_us = 675007
+inf-bench: 73510 error replies under load
+ops = 139606088
+errors = 92138
+elapsed_s = 300.010
+ops_per_sec = 465339
+p50_us = 195
+p99_us = 943
+p999_us = 7679
+p9999_us = 59391
+max_us = 1975911
+inf-bench: 92138 error replies under load
+ops = 131044726
+errors = 168757
+elapsed_s = 300.008
+ops_per_sec = 436804
+p50_us = 199
+p99_us = 927
+p999_us = 7295
+p9999_us = 126975
+max_us = 1533009
+inf-bench: 168757 error replies under load
+ops = 142308902
+errors = 116450
+elapsed_s = 300.000
+ops_per_sec = 474362
+p50_us = 191
+p99_us = 927
+p999_us = 6911
+p9999_us = 36863
+max_us = 877242
+inf-bench: 116450 error replies under load
+ops = 148693804
+errors = 54674
+elapsed_s = 300.000
+ops_per_sec = 495645
+p50_us = 203
+p99_us = 911
+p999_us = 6527
+p9999_us = 11775
+max_us = 423370
+inf-bench: 54674 error replies under load
+ops = 140031006
+errors = 83425
+elapsed_s = 300.000
+ops_per_sec = 466769
+p50_us = 215
+p99_us = 943
+p999_us = 6527
+p9999_us = 15615
+max_us = 468776
+inf-bench: 83425 error replies under load
+ops = 147541498
+errors = 60700
+elapsed_s = 300.001
+ops_per_sec = 491803
+p50_us = 199
+p99_us = 927
+p999_us = 6911
+p9999_us = 17407
+max_us = 692453
+inf-bench: 60700 error replies under load
+ops = 140911061
+errors = 63595
+elapsed_s = 300.000
+ops_per_sec = 469703
+p50_us = 207
+p99_us = 1007
+p999_us = 7551
+p9999_us = 36863
+max_us = 634394
+inf-bench: 63595 error replies under load
+ops = 138509517
+errors = 81196
+elapsed_s = 300.547
+ops_per_sec = 460859
+p50_us = 199
+p99_us = 1023
+p999_us = 7039
+p9999_us = 50175
+max_us = 1074753
+inf-bench: 81196 error replies under load
+ops = 132296465
+errors = 73631
+elapsed_s = 300.000
+ops_per_sec = 440988
+p50_us = 211
+p99_us = 1023
+p999_us = 7807
+p9999_us = 54271
+max_us = 1393173
+inf-bench: 73631 error replies under load
+ops = 148709124
+errors = 109985
+elapsed_s = 300.059
+ops_per_sec = 495600
+p50_us = 191
+p99_us = 879
+p999_us = 6527
+p9999_us = 27135
+max_us = 1760708
+inf-bench: 109985 error replies under load
+ops = 141586174
+errors = 104194
+elapsed_s = 300.000
+ops_per_sec = 471953
+p50_us = 199
+p99_us = 927
+p999_us = 6911
+p9999_us = 50175
+max_us = 1140486
+inf-bench: 104194 error replies under load
+ops = 147628557
+errors = 60252
+elapsed_s = 300.000
+ops_per_sec = 492095
+p50_us = 199
+p99_us = 911
+p999_us = 7167
+p9999_us = 19455
+max_us = 1054574
+inf-bench: 60252 error replies under load
+ops = 138421523
+errors = 66175
+elapsed_s = 300.000
+ops_per_sec = 461404
+p50_us = 207
+p99_us = 991
+p999_us = 7423
+p9999_us = 43007
+max_us = 1350171
+inf-bench: 66175 error replies under load
+ops = 113807020
+errors = 234455
+elapsed_s = 300.000
+ops_per_sec = 379356
+p50_us = 199
+p99_us = 959
+p999_us = 7807
+p9999_us = 270335
+max_us = 2802014
+inf-bench: 234455 error replies under load
+ops = 142997032
+errors = 122730
+elapsed_s = 300.000
+ops_per_sec = 476656
+p50_us = 203
+p99_us = 927
+p999_us = 6911
+p9999_us = 32255
+max_us = 993623
+inf-bench: 122730 error replies under load
+ops = 136196025
+errors = 114891
+elapsed_s = 300.000
+ops_per_sec = 453986
+p50_us = 211
+p99_us = 959
+p999_us = 7039
+p9999_us = 56319
+max_us = 497979
+inf-bench: 114891 error replies under load
+ops = 140832095
+errors = 98081
+elapsed_s = 300.001
+ops_per_sec = 469439
+p50_us = 215
+p99_us = 943
+p999_us = 7039
+p9999_us = 18943
+max_us = 554739
+inf-bench: 98081 error replies under load
+ops = 137860146
+errors = 57909
+elapsed_s = 300.010
+ops_per_sec = 459519
+p50_us = 203
+p99_us = 1055
+p999_us = 7551
+p9999_us = 37887
+max_us = 1272147
+inf-bench: 57909 error replies under load
+ops = 146800568
+errors = 61374
+elapsed_s = 300.000
+ops_per_sec = 489334
+p50_us = 195
+p99_us = 943
+p999_us = 7551
+p9999_us = 43007
+max_us = 664451
+inf-bench: 61374 error replies under load
+ops = 142223644
+errors = 132221
+elapsed_s = 300.001
+ops_per_sec = 474078
+p50_us = 199
+p99_us = 895
+p999_us = 6783
+p9999_us = 38911
+max_us = 2366160
+inf-bench: 132221 error replies under load
+ops = 141553390
+errors = 104583
+elapsed_s = 300.001
+ops_per_sec = 471843
+p50_us = 207
+p99_us = 1007
+p999_us = 7295
+p9999_us = 23551
+max_us = 732735
+inf-bench: 104583 error replies under load
+ops = 134731879
+errors = 137764
+elapsed_s = 300.000
+ops_per_sec = 449106
+p50_us = 211
+p99_us = 975
+p999_us = 7167
+p9999_us = 67583
+max_us = 1036241
+inf-bench: 137764 error replies under load
+ops = 136183770
+errors = 142986
+elapsed_s = 300.000
+ops_per_sec = 453945
+p50_us = 203
+p99_us = 991
+p999_us = 7679
+p9999_us = 61439
+max_us = 1891070
+inf-bench: 142986 error replies under load
+ops = 149627988
+errors = 135971
+elapsed_s = 300.000
+ops_per_sec = 498759
+p50_us = 191
+p99_us = 895
+p999_us = 7039
+p9999_us = 37887
+max_us = 995714
+inf-bench: 135971 error replies under load
+ops = 145184839
+errors = 75568
+elapsed_s = 300.000
+ops_per_sec = 483949
+p50_us = 203
+p99_us = 943
+p999_us = 6911
+p9999_us = 26111
+max_us = 826379
+inf-bench: 75568 error replies under load
+ops = 137421156
+errors = 113317
+elapsed_s = 300.000
+ops_per_sec = 458070
+p50_us = 199
+p99_us = 991
+p999_us = 7935
+p9999_us = 62463
+max_us = 2369716
+inf-bench: 113317 error replies under load
+ops = 137953813
+errors = 104826
+elapsed_s = 300.001
+ops_per_sec = 459844
+p50_us = 199
+p99_us = 959
+p999_us = 7423
+p9999_us = 64511
+max_us = 597947
+inf-bench: 104826 error replies under load
+ops = 140968261
+errors = 56466
+elapsed_s = 300.000
+ops_per_sec = 469894
+p50_us = 207
+p99_us = 991
+p999_us = 7167
+p9999_us = 18431
+max_us = 968333
+inf-bench: 56466 error replies under load
+ops = 142312989
+errors = 106527
+elapsed_s = 300.081
+ops_per_sec = 474249
+p50_us = 203
+p99_us = 959
+p999_us = 7039
+p9999_us = 40959
+max_us = 1037552
+inf-bench: 106527 error replies under load
+ops = 145744077
+errors = 119985
+elapsed_s = 300.000
+ops_per_sec = 485813
+p50_us = 195
+p99_us = 879
+p999_us = 6783
+p9999_us = 34815
+max_us = 2016704
+inf-bench: 119985 error replies under load
+ops = 129591568
+errors = 109612
+elapsed_s = 300.000
+ops_per_sec = 431971
+p50_us = 219
+p99_us = 1087
+p999_us = 7807
+p9999_us = 61439
+max_us = 1327370
+inf-bench: 109612 error replies under load
+ops = 141245014
+errors = 119205
+elapsed_s = 300.000
+ops_per_sec = 470816
+p50_us = 199
+p99_us = 991
+p999_us = 7551
+p9999_us = 38911
+max_us = 1105672
+inf-bench: 119205 error replies under load
+ops = 140697408
+errors = 103289
+elapsed_s = 300.000
+ops_per_sec = 468991
+p50_us = 203
+p99_us = 959
+p999_us = 7295
+p9999_us = 36863
+max_us = 1282321
+inf-bench: 103289 error replies under load
+ops = 144171537
+errors = 105380
+elapsed_s = 300.141
+ops_per_sec = 480346
+p50_us = 191
+p99_us = 895
+p999_us = 7039
+p9999_us = 49151
+max_us = 1125333
+inf-bench: 105380 error replies under load
+ops = 151227896
+errors = 101511
+elapsed_s = 300.000
+ops_per_sec = 504092
+p50_us = 195
+p99_us = 879
+p999_us = 6527
+p9999_us = 14079
+max_us = 505659
+inf-bench: 101511 error replies under load
+ops = 137527346
+errors = 103409
+elapsed_s = 300.001
+ops_per_sec = 458424
+p50_us = 199
+p99_us = 991
+p999_us = 7935
+p9999_us = 56319
+max_us = 1621149
+inf-bench: 103409 error replies under load
+ops = 145847508
+errors = 135756
+elapsed_s = 300.000
+ops_per_sec = 486158
+p50_us = 195
+p99_us = 959
+p999_us = 7167
+p9999_us = 35839
+max_us = 663351
+inf-bench: 135756 error replies under load
+ops = 137154351
+errors = 139836
+elapsed_s = 300.001
+ops_per_sec = 457180
+p50_us = 199
+p99_us = 943
+p999_us = 7423
+p9999_us = 54271
+max_us = 1156195
+inf-bench: 139836 error replies under load
+ops = 140657808
+errors = 74231
+elapsed_s = 300.015
+ops_per_sec = 468836
+p50_us = 207
+p99_us = 943
+p999_us = 7039
+p9999_us = 23551
+max_us = 2090578
+inf-bench: 74231 error replies under load
+ops = 143160033
+errors = 88806
+elapsed_s = 300.001
+ops_per_sec = 477199
+p50_us = 203
+p99_us = 895
+p999_us = 6655
+p9999_us = 14591
+max_us = 432501
+inf-bench: 88806 error replies under load
+ops = 140856465
+errors = 55046
+elapsed_s = 300.000
+ops_per_sec = 469521
+p50_us = 203
+p99_us = 975
+p999_us = 7167
+p9999_us = 33791
+max_us = 1336588
+inf-bench: 55046 error replies under load
+ops = 139999719
+errors = 82693
+elapsed_s = 300.000
+ops_per_sec = 466665
+p50_us = 203
+p99_us = 1007
+p999_us = 7295
+p9999_us = 29695
+max_us = 1567059
+inf-bench: 82693 error replies under load
+ops = 137427962
+errors = 84038
+elapsed_s = 301.595
+ops_per_sec = 455671
+p50_us = 203
+p99_us = 1023
+p999_us = 7935
+p9999_us = 41983
+max_us = 2434624
+inf-bench: 84038 error replies under load
+ops = 133018024
+errors = 97728
+elapsed_s = 300.000
+ops_per_sec = 443393
+p50_us = 203
+p99_us = 975
+p999_us = 7551
+p9999_us = 71679
+max_us = 2179751
+inf-bench: 97728 error replies under load
+ops = 133362705
+errors = 94323
+elapsed_s = 300.000
+ops_per_sec = 444542
+p50_us = 207
+p99_us = 911
+p999_us = 7167
+p9999_us = 69631
+max_us = 1924121
+inf-bench: 94323 error replies under load
+ops = 139122576
+errors = 158318
+elapsed_s = 300.000
+ops_per_sec = 463741
+p50_us = 207
+p99_us = 943
+p999_us = 6911
+p9999_us = 29183
+max_us = 1097075
+inf-bench: 158318 error replies under load
+ops = 135803276
+errors = 56277
+elapsed_s = 300.000
+ops_per_sec = 452677
+p50_us = 207
+p99_us = 1023
+p999_us = 7551
+p9999_us = 50175
+max_us = 2079249
+inf-bench: 56277 error replies under load
+ops = 134648238
+errors = 117801
+elapsed_s = 300.039
+ops_per_sec = 448769
+p50_us = 215
+p99_us = 1087
+p999_us = 7551
+p9999_us = 35839
+max_us = 1150843
+inf-bench: 117801 error replies under load
+ops = 133654908
+errors = 150272
+elapsed_s = 300.000
+ops_per_sec = 445516
+p50_us = 195
+p99_us = 895
+p999_us = 6783
+p9999_us = 90111
+max_us = 2730188
+inf-bench: 150272 error replies under load
+ops = 133902006
+errors = 101300
+elapsed_s = 300.001
+ops_per_sec = 446339
+p50_us = 219
+p99_us = 975
+p999_us = 6783
+p9999_us = 34815
+max_us = 1595595
+inf-bench: 101300 error replies under load
+ops = 148678517
+errors = 134748
+elapsed_s = 300.008
+ops_per_sec = 495582
+p50_us = 195
+p99_us = 895
+p999_us = 6655
+p9999_us = 16383
+max_us = 1186282
+inf-bench: 134748 error replies under load
+ops = 142470582
+errors = 190599
+elapsed_s = 300.000
+ops_per_sec = 474901
+p50_us = 199
+p99_us = 943
+p999_us = 6911
+p9999_us = 40959
+max_us = 523163
+inf-bench: 190599 error replies under load
+ops = 145081515
+errors = 60326
+elapsed_s = 300.000
+ops_per_sec = 483605
+p50_us = 199
+p99_us = 959
+p999_us = 6911
+p9999_us = 19967
+max_us = 922353
+inf-bench: 60326 error replies under load
+ops = 131406967
+errors = 130629
+elapsed_s = 300.000
+ops_per_sec = 438023
+p50_us = 195
+p99_us = 943
+p999_us = 7551
+p9999_us = 114687
+max_us = 2060596
+inf-bench: 130629 error replies under load
+ops = 126477012
+errors = 129226
+elapsed_s = 300.000
+ops_per_sec = 421590
+p50_us = 203
+p99_us = 943
+p999_us = 7679
+p9999_us = 139263
+max_us = 2663744
+inf-bench: 129226 error replies under load
+ops = 126295689
+errors = 144454
+elapsed_s = 300.000
+ops_per_sec = 420985
+p50_us = 207
+p99_us = 991
+p999_us = 7807
+p9999_us = 102399
+max_us = 2122277
+inf-bench: 144454 error replies under load
+ops = 136368813
+errors = 61007
+elapsed_s = 300.004
+ops_per_sec = 454557
+p50_us = 203
+p99_us = 975
+p999_us = 7423
+p9999_us = 47103
+max_us = 2204655
+inf-bench: 61007 error replies under load
+ops = 136365491
+errors = 146353
+elapsed_s = 300.001
+ops_per_sec = 454550
+p50_us = 195
+p99_us = 927
+p999_us = 7295
+p9999_us = 71679
+max_us = 2789417
+inf-bench: 146353 error replies under load
+ops = 127963757
+errors = 196238
+elapsed_s = 300.001
+ops_per_sec = 426545
+p50_us = 191
+p99_us = 911
+p999_us = 7167
+p9999_us = 200703
+max_us = 2434295
+inf-bench: 196238 error replies under load
+ops = 144248784
+errors = 56005
+elapsed_s = 300.000
+ops_per_sec = 480828
+p50_us = 199
+p99_us = 927
+p999_us = 6911
+p9999_us = 31743
+max_us = 1513791
+inf-bench: 56005 error replies under load
+ops = 137948302
+errors = 104717
+elapsed_s = 300.000
+ops_per_sec = 459827
+p50_us = 203
+p99_us = 991
+p999_us = 7679
+p9999_us = 58367
+max_us = 1605436
+inf-bench: 104717 error replies under load
+ops = 137188547
+errors = 128067
+elapsed_s = 300.001
+ops_per_sec = 457294
+p50_us = 203
+p99_us = 943
+p999_us = 7167
+p9999_us = 62463
+max_us = 879730
+inf-bench: 128067 error replies under load
+ops = 136606649
+errors = 108136
+elapsed_s = 300.000
+ops_per_sec = 455355
+p50_us = 219
+p99_us = 1007
+p999_us = 7295
+p9999_us = 38911
+max_us = 810081
+inf-bench: 108136 error replies under load
+ops = 130005758
+errors = 118381
+elapsed_s = 300.000
+ops_per_sec = 433352
+p50_us = 207
+p99_us = 991
+p999_us = 7807
+p9999_us = 71679
+max_us = 2056091
+inf-bench: 118381 error replies under load
+ops = 149182376
+errors = 66667
+elapsed_s = 300.001
+ops_per_sec = 497273
+p50_us = 199
+p99_us = 927
+p999_us = 6655
+p9999_us = 16895
+max_us = 409434
+inf-bench: 66667 error replies under load
+ops = 133831602
+errors = 102169
+elapsed_s = 300.000
+ops_per_sec = 446105
+p50_us = 199
+p99_us = 959
+p999_us = 7551
+p9999_us = 77823
+max_us = 2009543
+inf-bench: 102169 error replies under load
+ops = 135896495
+errors = 122841
+elapsed_s = 300.000
+ops_per_sec = 452988
+p50_us = 203
+p99_us = 975
+p999_us = 7295
+p9999_us = 62463
+max_us = 1332666
+inf-bench: 122841 error replies under load
+ops = 134008483
+errors = 131489
+elapsed_s = 300.000
+ops_per_sec = 446694
+p50_us = 211
+p99_us = 1023
+p999_us = 7167
+p9999_us = 57343
+max_us = 1238392
+inf-bench: 131489 error replies under load
+ops = 141070551
+errors = 110059
+elapsed_s = 300.000
+ops_per_sec = 470234
+p50_us = 199
+p99_us = 927
+p999_us = 7039
+p9999_us = 55295
+max_us = 1817911
+inf-bench: 110059 error replies under load
+ops = 136298919
+errors = 84166
+elapsed_s = 300.000
+ops_per_sec = 454329
+p50_us = 207
+p99_us = 927
+p999_us = 7039
+p9999_us = 32255
+max_us = 2363936
+inf-bench: 84166 error replies under load
+ops = 141605046
+errors = 92492
+elapsed_s = 300.000
+ops_per_sec = 472016
+p50_us = 195
+p99_us = 1007
+p999_us = 8447
+p9999_us = 48127
+max_us = 717475
+inf-bench: 92492 error replies under load
+ops = 133064640
+errors = 148767
+elapsed_s = 300.001
+ops_per_sec = 443548
+p50_us = 207
+p99_us = 1007
+p999_us = 7551
+p9999_us = 75775
+max_us = 1326589
+inf-bench: 148767 error replies under load
+ops = 139990230
+errors = 126583
+elapsed_s = 300.001
+ops_per_sec = 466633
+p50_us = 199
+p99_us = 943
+p999_us = 6911
+p9999_us = 40959
+max_us = 1001449
+inf-bench: 126583 error replies under load
+ops = 136814981
+errors = 92769
+elapsed_s = 300.007
+ops_per_sec = 456039
+p50_us = 199
+p99_us = 943
+p999_us = 7551
+p9999_us = 62463
+max_us = 2227069
+inf-bench: 92769 error replies under load
+ops = 154227580
+errors = 59936
+elapsed_s = 300.000
+ops_per_sec = 514091
+p50_us = 195
+p99_us = 879
+p999_us = 6655
+p9999_us = 11775
+max_us = 499929
+inf-bench: 59936 error replies under load
+ops = 131225487
+errors = 115711
+elapsed_s = 300.000
+ops_per_sec = 437418
+p50_us = 211
+p99_us = 1007
+p999_us = 7935
+p9999_us = 65535
+max_us = 1516865
+inf-bench: 115711 error replies under load
+ops = 130659906
+errors = 132553
+elapsed_s = 300.001
+ops_per_sec = 435532
+p50_us = 215
+p99_us = 1055
+p999_us = 7679
+p9999_us = 61439
+max_us = 2223419
+inf-bench: 132553 error replies under load
+ops = 134610232
+errors = 168479
+elapsed_s = 300.001
+ops_per_sec = 448700
+p50_us = 207
+p99_us = 959
+p999_us = 7039
+p9999_us = 77823
+max_us = 1189994
+inf-bench: 168479 error replies under load
+ops = 140250044
+errors = 89734
+elapsed_s = 300.001
+ops_per_sec = 467499
+p50_us = 203
+p99_us = 959
+p999_us = 7039
+p9999_us = 38911
+max_us = 1532189
+inf-bench: 89734 error replies under load
+ops = 146024155
+errors = 83816
+elapsed_s = 300.001
+ops_per_sec = 486746
+p50_us = 195
+p99_us = 879
+p999_us = 6527
+p9999_us = 15871
+max_us = 947361
+inf-bench: 83816 error replies under load
+ops = 129709225
+errors = 88365
+elapsed_s = 300.000
+ops_per_sec = 432364
+p50_us = 219
+p99_us = 1055
+p999_us = 7935
+p9999_us = 57343
+max_us = 1298585
+inf-bench: 88365 error replies under load
+ops = 128029008
+errors = 109718
+elapsed_s = 300.000
+ops_per_sec = 426763
+p50_us = 223
+p99_us = 1087
+p999_us = 7295
+p9999_us = 58367
+max_us = 1581859
+inf-bench: 109718 error replies under load
+ops = 139231343
+errors = 99101
+elapsed_s = 300.001
+ops_per_sec = 464103
+p50_us = 199
+p99_us = 959
+p999_us = 7039
+p9999_us = 60415
+max_us = 1535552
+inf-bench: 99101 error replies under load
+ops = 137132730
+errors = 103779
+elapsed_s = 300.000
+ops_per_sec = 457109
+p50_us = 215
+p99_us = 943
+p999_us = 6911
+p9999_us = 30719
+max_us = 2274644
+inf-bench: 103779 error replies under load
+ops = 143472638
+errors = 101538
+elapsed_s = 300.004
+ops_per_sec = 478236
+p50_us = 207
+p99_us = 911
+p999_us = 6655
+p9999_us = 14847
+max_us = 483233
+inf-bench: 101538 error replies under load
+ops = 142320520
+errors = 133027
+elapsed_s = 300.000
+ops_per_sec = 474401
+p50_us = 199
+p99_us = 991
+p999_us = 7167
+p9999_us = 46079
+max_us = 1287348
+inf-bench: 133027 error replies under load
+ops = 126648103
+errors = 126362
+elapsed_s = 300.000
+ops_per_sec = 422160
+p50_us = 231
+p99_us = 1087
+p999_us = 7551
+p9999_us = 44031
+max_us = 1031898
+inf-bench: 126362 error replies under load
+ops = 135807756
+errors = 37662
+elapsed_s = 300.001
+ops_per_sec = 452691
+p50_us = 207
+p99_us = 1087
+p999_us = 7935
+p9999_us = 49151
+max_us = 2115033
+inf-bench: 37662 error replies under load
+ops = 143763816
+errors = 125094
+elapsed_s = 300.000
+ops_per_sec = 479212
+p50_us = 195
+p99_us = 927
+p999_us = 7295
+p9999_us = 36863
+max_us = 1280695
+inf-bench: 125094 error replies under load
+ops = 136277850
+errors = 102010
+elapsed_s = 300.000
+ops_per_sec = 454259
+p50_us = 203
+p99_us = 911
+p999_us = 6911
+p9999_us = 64511
+max_us = 1704168
+inf-bench: 102010 error replies under load
+ops = 144746280
+errors = 59503
+elapsed_s = 300.000
+ops_per_sec = 482487
+p50_us = 195
+p99_us = 943
+p999_us = 6911
+p9999_us = 24575
+max_us = 1688032
+inf-bench: 59503 error replies under load
+ops = 139842183
+errors = 98631
+elapsed_s = 300.000
+ops_per_sec = 466140
+p50_us = 199
+p99_us = 991
+p999_us = 7423
+p9999_us = 47103
+max_us = 686068
+inf-bench: 98631 error replies under load
+ops = 131815636
+errors = 111625
+elapsed_s = 300.000
+ops_per_sec = 439385
+p50_us = 215
+p99_us = 1055
+p999_us = 7295
+p9999_us = 39935
+max_us = 1446487
+inf-bench: 111625 error replies under load
+ops = 141105443
+errors = 106766
+elapsed_s = 300.000
+ops_per_sec = 470351
+p50_us = 203
+p99_us = 943
+p999_us = 6655
+p9999_us = 38911
+max_us = 1098718
+inf-bench: 106766 error replies under load
+ops = 137905373
+errors = 69099
+elapsed_s = 300.000
+ops_per_sec = 459684
+p50_us = 215
+p99_us = 959
+p999_us = 6527
+p9999_us = 15103
+max_us = 661852
+inf-bench: 69099 error replies under load
+ops = 141118332
+errors = 134627
+elapsed_s = 300.000
+ops_per_sec = 470394
+p50_us = 203
+p99_us = 943
+p999_us = 6655
+p9999_us = 27647
+max_us = 604959
+inf-bench: 134627 error replies under load
+ops = 139828938
+errors = 112358
+elapsed_s = 300.000
+ops_per_sec = 466096
+p50_us = 207
+p99_us = 1007
+p999_us = 7167
+p9999_us = 32255
+max_us = 1965106
+inf-bench: 112358 error replies under load
+ops = 137623550
+errors = 92473
+elapsed_s = 300.000
+ops_per_sec = 458745
+p50_us = 207
+p99_us = 1087
+p999_us = 7551
+p9999_us = 37887
+max_us = 1756644
+inf-bench: 92473 error replies under load
+ops = 134446745
+errors = 84684
+elapsed_s = 300.000
+ops_per_sec = 448155
+p50_us = 207
+p99_us = 1023
+p999_us = 7423
+p9999_us = 60415
+max_us = 1744420
+inf-bench: 84684 error replies under load
+ops = 144504634
+errors = 47543
+elapsed_s = 300.000
+ops_per_sec = 481681
+p50_us = 199
+p99_us = 911
+p999_us = 7039
+p9999_us = 28671
+max_us = 793726
+inf-bench: 47543 error replies under load
+ops = 143592131
+errors = 114530
+elapsed_s = 300.000
+ops_per_sec = 478640
+p50_us = 195
+p99_us = 927
+p999_us = 6783
+p9999_us = 38911
+max_us = 1187445
+inf-bench: 114530 error replies under load
+ops = 137948621
+errors = 126444
+elapsed_s = 300.027
+ops_per_sec = 459787
+p50_us = 207
+p99_us = 975
+p999_us = 6911
+p9999_us = 41983
+max_us = 1552949
+inf-bench: 126444 error replies under load
+ops = 133513744
+errors = 82643
+elapsed_s = 300.000
+ops_per_sec = 445045
+p50_us = 215
+p99_us = 1055
+p999_us = 7679
+p9999_us = 41983
+max_us = 1510903
+inf-bench: 82643 error replies under load
+ops = 137792953
+errors = 84143
+elapsed_s = 300.000
+ops_per_sec = 459309
+p50_us = 223
+p99_us = 1007
+p999_us = 7167
+p9999_us = 28159
+max_us = 629827
+inf-bench: 84143 error replies under load
+ops = 139366935
+errors = 124037
+elapsed_s = 300.000
+ops_per_sec = 464556
+p50_us = 203
+p99_us = 911
+p999_us = 6655
+p9999_us = 54271
+max_us = 868141
+inf-bench: 124037 error replies under load
+ops = 144876318
+errors = 126434
+elapsed_s = 300.000
+ops_per_sec = 482920
+p50_us = 215
+p99_us = 991
+p999_us = 6911
+p9999_us = 15615
+max_us = 536689
+inf-bench: 126434 error replies under load
+ops = 147590066
+errors = 74892
+elapsed_s = 300.000
+ops_per_sec = 491966
+p50_us = 203
+p99_us = 959
+p999_us = 6911
+p9999_us = 13567
+max_us = 300122
+inf-bench: 74892 error replies under load
+ops = 140381195
+errors = 71922
+elapsed_s = 300.002
+ops_per_sec = 467934
+p50_us = 203
+p99_us = 1023
+p999_us = 7679
+p9999_us = 39935
+max_us = 1272736
+inf-bench: 71922 error replies under load
+ops = 137956931
+errors = 54718
+elapsed_s = 300.000
+ops_per_sec = 459856
+p50_us = 203
+p99_us = 1007
+p999_us = 7807
+p9999_us = 51199
+max_us = 1639707
+inf-bench: 54718 error replies under load
+ops = 137718739
+errors = 121084
+elapsed_s = 300.000
+ops_per_sec = 459062
+p50_us = 215
+p99_us = 959
+p999_us = 7039
+p9999_us = 33791
+max_us = 1304417
+inf-bench: 121084 error replies under load
+ops = 138815391
+errors = 61556
+elapsed_s = 300.000
+ops_per_sec = 462717
+p50_us = 203
+p99_us = 975
+p999_us = 7039
+p9999_us = 41983
+max_us = 2187124
+inf-bench: 61556 error replies under load
+ops = 143341977
+errors = 121305
+elapsed_s = 300.000
+ops_per_sec = 477806
+p50_us = 195
+p99_us = 911
+p999_us = 7039
+p9999_us = 56319
+max_us = 483570
+inf-bench: 121305 error replies under load
+ops = 142040509
+errors = 99966
+elapsed_s = 300.001
+ops_per_sec = 473467
+p50_us = 199
+p99_us = 943
+p999_us = 7423
+p9999_us = 37887
+max_us = 2564515
+inf-bench: 99966 error replies under load
+ops = 142190466
+errors = 128435
+elapsed_s = 300.000
+ops_per_sec = 473968
+p50_us = 199
+p99_us = 943
+p999_us = 7167
+p9999_us = 36863
+max_us = 2225581
+inf-bench: 128435 error replies under load
+ops = 139882125
+errors = 73692
+elapsed_s = 300.001
+ops_per_sec = 466273
+p50_us = 203
+p99_us = 927
+p999_us = 6783
+p9999_us = 36863
+max_us = 1926973
+inf-bench: 73692 error replies under load
+ops = 130446915
+errors = 34217
+elapsed_s = 300.000
+ops_per_sec = 434823
+p50_us = 215
+p99_us = 1087
+p999_us = 7935
+p9999_us = 55295
+max_us = 1103108
+inf-bench: 34217 error replies under load
+ops = 135003254
+errors = 145388
+elapsed_s = 300.000
+ops_per_sec = 450010
+p50_us = 199
+p99_us = 943
+p999_us = 7167
+p9999_us = 81919
+max_us = 1252069
+inf-bench: 145388 error replies under load
+ops = 136620006
+errors = 115968
+elapsed_s = 300.001
+ops_per_sec = 455399
+p50_us = 207
+p99_us = 991
+p999_us = 7423
+p9999_us = 52223
+max_us = 1676928
+inf-bench: 115968 error replies under load
+ops = 146991374
+errors = 147208
+elapsed_s = 300.000
+ops_per_sec = 489970
+p50_us = 195
+p99_us = 911
+p999_us = 7167
+p9999_us = 35839
+max_us = 1240669
+inf-bench: 147208 error replies under load
+ops = 137602087
+errors = 71247
+elapsed_s = 300.001
+ops_per_sec = 458672
+p50_us = 231
+p99_us = 991
+p999_us = 7039
+p9999_us = 18431
+max_us = 538124
+inf-bench: 71247 error replies under load
+ops = 135841530
+errors = 76660
+elapsed_s = 300.000
+ops_per_sec = 452805
+p50_us = 211
+p99_us = 1087
+p999_us = 7935
+p9999_us = 43007
+max_us = 586185
+inf-bench: 76660 error replies under load
+ops = 135102926
+errors = 125408
+elapsed_s = 300.000
+ops_per_sec = 450343
+p50_us = 203
+p99_us = 975
+p999_us = 7167
+p9999_us = 77823
+max_us = 886745
+inf-bench: 125408 error replies under load
+ops = 136574063
+errors = 99858
+elapsed_s = 300.006
+ops_per_sec = 455238
+p50_us = 203
+p99_us = 991
+p999_us = 7039
+p9999_us = 47103
+max_us = 1212647
+inf-bench: 99858 error replies under load
+ops = 128913087
+errors = 149689
+elapsed_s = 300.001
+ops_per_sec = 429709
+p50_us = 219
+p99_us = 1007
+p999_us = 7807
+p9999_us = 71679
+max_us = 1047005
+inf-bench: 149689 error replies under load
+ops = 149442442
+errors = 65896
+elapsed_s = 300.000
+ops_per_sec = 498141
+p50_us = 195
+p99_us = 879
+p999_us = 6655
+p9999_us = 23039
+max_us = 738994
+inf-bench: 65896 error replies under load
+ops = 129975555
+errors = 112949
+elapsed_s = 300.001
+ops_per_sec = 433251
+p50_us = 215
+p99_us = 1055
+p999_us = 7807
+p9999_us = 60415
+max_us = 1394143
+inf-bench: 112949 error replies under load
+ops = 135319765
+errors = 191963
+elapsed_s = 300.008
+ops_per_sec = 451054
+p50_us = 207
+p99_us = 991
+p999_us = 7167
+p9999_us = 69631
+max_us = 1340491
+inf-bench: 191963 error replies under load
+ops = 130981167
+errors = 119432
+elapsed_s = 300.001
+ops_per_sec = 436603
+p50_us = 227
+p99_us = 1055
+p999_us = 7295
+p9999_us = 30207
+max_us = 705998
+inf-bench: 119432 error replies under load
+ops = 133792489
+errors = 67258
+elapsed_s = 300.001
+ops_per_sec = 445974
+p50_us = 219
+p99_us = 1007
+p999_us = 7423
+p9999_us = 33791
+max_us = 1331821
+inf-bench: 67258 error replies under load
+ops = 146442846
+errors = 96410
+elapsed_s = 300.000
+ops_per_sec = 488142
+p50_us = 195
+p99_us = 895
+p999_us = 6399
+p9999_us = 28159
+max_us = 2257658
+inf-bench: 96410 error replies under load
+ops = 136728730
+errors = 125159
+elapsed_s = 300.000
+ops_per_sec = 455762
+p50_us = 203
+p99_us = 1055
+p999_us = 7935
+p9999_us = 53247
+max_us = 1873822
+inf-bench: 125159 error replies under load
+ops = 137207624
+errors = 157610
+elapsed_s = 300.001
+ops_per_sec = 457358
+p50_us = 195
+p99_us = 959
+p999_us = 7807
+p9999_us = 64511
+max_us = 1974713
+inf-bench: 157610 error replies under load
+ops = 121505542
+errors = 221017
+elapsed_s = 300.001
+ops_per_sec = 405018
+p50_us = 207
+p99_us = 943
+p999_us = 7167
+p9999_us = 225279
+max_us = 1991148
+inf-bench: 221017 error replies under load
+ops = 132135493
+errors = 61427
+elapsed_s = 300.001
+ops_per_sec = 440451
+p50_us = 219
+p99_us = 991
+p999_us = 7679
+p9999_us = 40959
+max_us = 1367159
+inf-bench: 61427 error replies under load
+ops = 138115999
+errors = 171061
+elapsed_s = 300.006
+ops_per_sec = 460377
+p50_us = 195
+p99_us = 863
+p999_us = 6655
+p9999_us = 54271
+max_us = 2413482
+inf-bench: 171061 error replies under load
+ops = 137235097
+errors = 67852
+elapsed_s = 300.000
+ops_per_sec = 457450
+p50_us = 203
+p99_us = 1055
+p999_us = 7551
+p9999_us = 57343
+max_us = 1718310
+inf-bench: 67852 error replies under load
+ops = 131854428
+errors = 102497
+elapsed_s = 300.002
+ops_per_sec = 439511
+p50_us = 211
+p99_us = 1055
+p999_us = 7551
+p9999_us = 64511
+max_us = 1473104
+inf-bench: 102497 error replies under load
+ops = 136667952
+errors = 120832
+elapsed_s = 300.000
+ops_per_sec = 455559
+p50_us = 203
+p99_us = 959
+p999_us = 6911
+p9999_us = 51199
+max_us = 1431460
+inf-bench: 120832 error replies under load
+ops = 146650958
+errors = 104646
+elapsed_s = 300.001
+ops_per_sec = 488835
+p50_us = 199
+p99_us = 911
+p999_us = 6399
+p9999_us = 21503
+max_us = 471868
+inf-bench: 104646 error replies under load
+ops = 140952681
+errors = 51536
+elapsed_s = 300.000
+ops_per_sec = 469842
+p50_us = 215
+p99_us = 959
+p999_us = 6911
+p9999_us = 13055
+max_us = 1746631
+inf-bench: 51536 error replies under load
+ops = 141809670
+errors = 93472
+elapsed_s = 300.000
+ops_per_sec = 472698
+p50_us = 199
+p99_us = 975
+p999_us = 7423
+p9999_us = 38911
+max_us = 1354691
+inf-bench: 93472 error replies under load
+ops = 131971591
+errors = 93382
+elapsed_s = 300.001
+ops_per_sec = 439904
+p50_us = 215
+p99_us = 1023
+p999_us = 7423
+p9999_us = 62463
+max_us = 703383
+inf-bench: 93382 error replies under load
+ops = 126279266
+errors = 90109
+elapsed_s = 300.000
+ops_per_sec = 420930
+p50_us = 215
+p99_us = 1087
+p999_us = 8447
+p9999_us = 75775
+max_us = 1684830
+inf-bench: 90109 error replies under load
+ops = 137570515
+errors = 96114
+elapsed_s = 300.001
+ops_per_sec = 458567
+p50_us = 199
+p99_us = 927
+p999_us = 6911
+p9999_us = 51199
+max_us = 1606305
+inf-bench: 96114 error replies under load
+ops = 136139774
+errors = 145208
+elapsed_s = 300.000
+ops_per_sec = 453799
+p50_us = 215
+p99_us = 943
+p999_us = 6527
+p9999_us = 40959
+max_us = 925628
+inf-bench: 145208 error replies under load
+ops = 139822623
+errors = 87101
+elapsed_s = 300.000
+ops_per_sec = 466075
+p50_us = 211
+p99_us = 991
+p999_us = 7551
+p9999_us = 28159
+max_us = 574407
+inf-bench: 87101 error replies under load
+ops = 139563854
+errors = 80354
+elapsed_s = 300.000
+ops_per_sec = 465212
+p50_us = 203
+p99_us = 959
+p999_us = 7423
+p9999_us = 49151
+max_us = 1177404
+inf-bench: 80354 error replies under load
+ops = 132252939
+errors = 131724
+elapsed_s = 300.001
+ops_per_sec = 440842
+p50_us = 207
+p99_us = 1055
+p999_us = 8063
+p9999_us = 62463
+max_us = 1877155
+inf-bench: 131724 error replies under load
+ops = 141319829
+errors = 75531
+elapsed_s = 300.001
+ops_per_sec = 471065
+p50_us = 203
+p99_us = 927
+p999_us = 6911
+p9999_us = 40959
+max_us = 1357649
+inf-bench: 75531 error replies under load
+ops = 140369708
+errors = 157193
+elapsed_s = 300.000
+ops_per_sec = 467898
+p50_us = 207
+p99_us = 895
+p999_us = 6399
+p9999_us = 39935
+max_us = 534349
+inf-bench: 157193 error replies under load
+ops = 144043603
+errors = 105984
+elapsed_s = 300.000
+ops_per_sec = 480145
+p50_us = 203
+p99_us = 927
+p999_us = 6911
+p9999_us = 18943
+max_us = 544125
+inf-bench: 105984 error replies under load
+ops = 136308266
+errors = 179365
+elapsed_s = 300.000
+ops_per_sec = 454360
+p50_us = 199
+p99_us = 991
+p999_us = 7551
+p9999_us = 77823
+max_us = 1360274
+inf-bench: 179365 error replies under load
+ops = 136793729
+errors = 147774
+elapsed_s = 300.000
+ops_per_sec = 455978
+p50_us = 207
+p99_us = 1007
+p999_us = 8191
+p9999_us = 53247
+max_us = 2093890
+inf-bench: 147774 error replies under load
+ops = 140938495
+errors = 56620
+elapsed_s = 300.000
+ops_per_sec = 469794
+p50_us = 203
+p99_us = 943
+p999_us = 7295
+p9999_us = 40959
+max_us = 1405780
+inf-bench: 56620 error replies under load
+ops = 154333037
+errors = 134108
+elapsed_s = 300.000
+ops_per_sec = 514443
+p50_us = 191
+p99_us = 863
+p999_us = 6271
+p9999_us = 19455
+max_us = 551582
+inf-bench: 134108 error replies under load
+ops = 146965740
+errors = 194744
+elapsed_s = 300.000
+ops_per_sec = 489885
+p50_us = 191
+p99_us = 879
+p999_us = 6655
+p9999_us = 41983
+max_us = 1214832
+inf-bench: 194744 error replies under load
+ops = 142136362
+errors = 124410
+elapsed_s = 300.000
+ops_per_sec = 473787
+p50_us = 195
+p99_us = 911
+p999_us = 7295
+p9999_us = 61439
+max_us = 1793743
+inf-bench: 124410 error replies under load
+ops = 137331094
+errors = 116323
+elapsed_s = 300.001
+ops_per_sec = 457769
+p50_us = 199
+p99_us = 975
+p999_us = 8063
+p9999_us = 61439
+max_us = 2174494
+inf-bench: 116323 error replies under load
+ops = 150527652
+errors = 53533
+elapsed_s = 300.000
+ops_per_sec = 501758
+p50_us = 195
+p99_us = 895
+p999_us = 7039
+p9999_us = 26623
+max_us = 410654
+inf-bench: 53533 error replies under load
+ops = 143689054
+errors = 101781
+elapsed_s = 300.000
+ops_per_sec = 478963
+p50_us = 203
+p99_us = 911
+p999_us = 7039
+p9999_us = 34815
+max_us = 1459065
+inf-bench: 101781 error replies under load
+ops = 140344414
+errors = 98966
+elapsed_s = 300.000
+ops_per_sec = 467814
+p50_us = 203
+p99_us = 943
+p999_us = 7039
+p9999_us = 38911
+max_us = 1142503
+inf-bench: 98966 error replies under load
+ops = 145024941
+errors = 120881
+elapsed_s = 300.001
+ops_per_sec = 483415
+p50_us = 199
+p99_us = 927
+p999_us = 6783
+p9999_us = 20991
+max_us = 845391
+inf-bench: 120881 error replies under load
+ops = 138027405
+errors = 108354
+elapsed_s = 300.000
+ops_per_sec = 460091
+p50_us = 199
+p99_us = 1007
+p999_us = 7679
+p9999_us = 60415
+max_us = 1223886
+inf-bench: 108354 error replies under load
+ops = 135518039
+errors = 115821
+elapsed_s = 300.000
+ops_per_sec = 451726
+p50_us = 211
+p99_us = 959
+p999_us = 7039
+p9999_us = 51199
+max_us = 1539300
+inf-bench: 115821 error replies under load
+ops = 141316589
+errors = 182170
+elapsed_s = 300.000
+ops_per_sec = 471055
+p50_us = 199
+p99_us = 911
+p999_us = 7167
+p9999_us = 57343
+max_us = 2145385
+inf-bench: 182170 error replies under load
+ops = 144079951
+errors = 76688
+elapsed_s = 300.000
+ops_per_sec = 480266
+p50_us = 195
+p99_us = 943
+p999_us = 7551
+p9999_us = 39935
+max_us = 1001824
+inf-bench: 76688 error replies under load
+ops = 140255964
+errors = 140852
+elapsed_s = 300.000
+ops_per_sec = 467519
+p50_us = 199
+p99_us = 927
+p999_us = 6655
+p9999_us = 51199
+max_us = 570969
+inf-bench: 140852 error replies under load
+ops = 143206625
+errors = 118005
+elapsed_s = 300.001
+ops_per_sec = 477354
+p50_us = 199
+p99_us = 975
+p999_us = 7295
+p9999_us = 39935
+max_us = 682393
+inf-bench: 118005 error replies under load
+ops = 140919374
+errors = 78588
+elapsed_s = 300.000
+ops_per_sec = 469731
+p50_us = 203
+p99_us = 959
+p999_us = 7039
+p9999_us = 33791
+max_us = 1856303
+inf-bench: 78588 error replies under load
+ops = 141902289
+errors = 144985
+elapsed_s = 300.000
+ops_per_sec = 473007
+p50_us = 203
+p99_us = 943
+p999_us = 6655
+p9999_us = 34815
+max_us = 1788254
+inf-bench: 144985 error replies under load
+ops = 134972305
+errors = 104734
+elapsed_s = 300.000
+ops_per_sec = 449907
+p50_us = 207
+p99_us = 1007
+p999_us = 8063
+p9999_us = 57343
+max_us = 2290887
+inf-bench: 104734 error replies under load
+ops = 131426843
+errors = 197830
+elapsed_s = 300.000
+ops_per_sec = 438089
+p50_us = 207
+p99_us = 975
+p999_us = 7167
+p9999_us = 106495
+max_us = 967372
+inf-bench: 197830 error replies under load
+ops = 139408766
+errors = 100464
+elapsed_s = 300.000
+ops_per_sec = 464695
+p50_us = 203
+p99_us = 991
+p999_us = 7039
+p9999_us = 34815
+max_us = 791326
+inf-bench: 100464 error replies under load
+ops = 143373487
+errors = 124103
+elapsed_s = 300.000
+ops_per_sec = 477911
+p50_us = 199
+p99_us = 927
+p999_us = 6783
+p9999_us = 33791
+max_us = 1746714
+inf-bench: 124103 error replies under load
+ops = 147215469
+errors = 62246
+elapsed_s = 300.000
+ops_per_sec = 490718
+p50_us = 199
+p99_us = 911
+p999_us = 6911
+p9999_us = 20479
+max_us = 2037240
+inf-bench: 62246 error replies under load
+ops = 119940797
+errors = 54454
+elapsed_s = 300.004
+ops_per_sec = 399797
+p50_us = 239
+p99_us = 1215
+p999_us = 7935
+p9999_us = 57343
+max_us = 2281386
+inf-bench: 54454 error replies under load
+ops = 133717956
+errors = 157920
+elapsed_s = 300.005
+ops_per_sec = 445718
+p50_us = 203
+p99_us = 975
+p999_us = 6911
+p9999_us = 86015
+max_us = 1519054
+inf-bench: 157920 error replies under load
+ops = 140736007
+errors = 78418
+elapsed_s = 300.000
+ops_per_sec = 469119
+p50_us = 203
+p99_us = 975
+p999_us = 7167
+p9999_us = 34815
+max_us = 1129166
+inf-bench: 78418 error replies under load
+ops = 132385859
+errors = 90589
+elapsed_s = 300.304
+ops_per_sec = 440840
+p50_us = 223
+p99_us = 1007
+p999_us = 7295
+p9999_us = 33791
+max_us = 1619546
+inf-bench: 90589 error replies under load
+ops = 136900464
+errors = 105271
+elapsed_s = 300.001
+ops_per_sec = 456334
+p50_us = 215
+p99_us = 959
+p999_us = 6655
+p9999_us = 31743
+max_us = 1611624
+inf-bench: 105271 error replies under load
+ops = 134760276
+errors = 92058
+elapsed_s = 300.000
+ops_per_sec = 449200
+p50_us = 211
+p99_us = 1055
+p999_us = 7807
+p9999_us = 54271
+max_us = 1097587
+inf-bench: 92058 error replies under load
+ops = 142548259
+errors = 117192
+elapsed_s = 300.000
+ops_per_sec = 475160
+p50_us = 199
+p99_us = 911
+p999_us = 6783
+p9999_us = 43007
+max_us = 969035
+inf-bench: 117192 error replies under load
+ops = 140752726
+errors = 78883
+elapsed_s = 300.001
+ops_per_sec = 469175
+p50_us = 203
+p99_us = 975
+p999_us = 7167
+p9999_us = 32255
+max_us = 460747
+inf-bench: 78883 error replies under load
+ops = 129846329
+errors = 75973
+elapsed_s = 300.000
+ops_per_sec = 432821
+p50_us = 227
+p99_us = 991
+p999_us = 7679
+p9999_us = 41983
+max_us = 934698
+inf-bench: 75973 error replies under load
+ops = 148502984
+errors = 138155
+elapsed_s = 300.050
+ops_per_sec = 494927
+p50_us = 195
+p99_us = 895
+p999_us = 6783
+p9999_us = 16383
+max_us = 1476566
+inf-bench: 138155 error replies under load
+ops = 136358169
+errors = 71188
+elapsed_s = 300.000
+ops_per_sec = 454527
+p50_us = 211
+p99_us = 1023
+p999_us = 8063
+p9999_us = 53247
+max_us = 1343459
+inf-bench: 71188 error replies under load
+ops = 145210034
+errors = 119962
+elapsed_s = 300.074
+ops_per_sec = 483914
+p50_us = 195
+p99_us = 959
+p999_us = 7295
+p9999_us = 39935
+max_us = 426555
+inf-bench: 119962 error replies under load
+ops = 143882514
+errors = 160773
+elapsed_s = 300.003
+ops_per_sec = 479604
+p50_us = 191
+p99_us = 911
+p999_us = 7039
+p9999_us = 57343
+max_us = 1704596
+inf-bench: 160773 error replies under load
+ops = 144107863
+errors = 96192
+elapsed_s = 300.001
+ops_per_sec = 480359
+p50_us = 195
+p99_us = 911
+p999_us = 7167
+p9999_us = 47103
+max_us = 1509573
+inf-bench: 96192 error replies under load
+ops = 143413633
+errors = 94278
+elapsed_s = 300.000
+ops_per_sec = 478045
+p50_us = 207
+p99_us = 911
+p999_us = 7039
+p9999_us = 18431
+max_us = 1772955
+inf-bench: 94278 error replies under load
+ops = 141216908
+errors = 80812
+elapsed_s = 300.000
+ops_per_sec = 470722
+p50_us = 199
+p99_us = 991
+p999_us = 7551
+p9999_us = 51199
+max_us = 992604
+inf-bench: 80812 error replies under load
+ops = 143506215
+errors = 107438
+elapsed_s = 300.014
+ops_per_sec = 478332
+p50_us = 195
+p99_us = 911
+p999_us = 7167
+p9999_us = 48127
+max_us = 682118
+inf-bench: 107438 error replies under load
+ops = 134075099
+errors = 162773
+elapsed_s = 300.000
+ops_per_sec = 446916
+p50_us = 203
+p99_us = 959
+p999_us = 7423
+p9999_us = 104447
+max_us = 928529
+inf-bench: 162773 error replies under load
+ops = 136724137
+errors = 56221
+elapsed_s = 300.000
+ops_per_sec = 455747
+p50_us = 223
+p99_us = 991
+p999_us = 7167
+p9999_us = 15871
+max_us = 1036120
+inf-bench: 56221 error replies under load
+ops = 148537195
+errors = 95225
+elapsed_s = 300.000
+ops_per_sec = 495123
+p50_us = 203
+p99_us = 895
+p999_us = 6399
+p9999_us = 19967
+max_us = 479443
+inf-bench: 95225 error replies under load
+ops = 137895945
+errors = 72460
+elapsed_s = 300.000
+ops_per_sec = 459653
+p50_us = 207
+p99_us = 991
+p999_us = 7423
+p9999_us = 51199
+max_us = 1448861
+inf-bench: 72460 error replies under load
+ops = 130954706
+errors = 98040
+elapsed_s = 300.000
+ops_per_sec = 436515
+p50_us = 219
+p99_us = 1055
+p999_us = 7295
+p9999_us = 57343
+max_us = 1073230
+inf-bench: 98040 error replies under load
+ops = 123220293
+errors = 109036
+elapsed_s = 300.049
+ops_per_sec = 410667
+p50_us = 227
+p99_us = 1119
+p999_us = 7807
+p9999_us = 73727
+max_us = 1523961
+inf-bench: 109036 error replies under load
+ops = 142927288
+errors = 154869
+elapsed_s = 300.009
+ops_per_sec = 476410
+p50_us = 199
+p99_us = 959
+p999_us = 6911
+p9999_us = 36863
+max_us = 955251
+inf-bench: 154869 error replies under load
+ops = 141864914
+errors = 140827
+elapsed_s = 300.000
+ops_per_sec = 472882
+p50_us = 199
+p99_us = 927
+p999_us = 7039
+p9999_us = 49151
+max_us = 1271162
+inf-bench: 140827 error replies under load
+ops = 134078482
+errors = 76484
+elapsed_s = 300.003
+ops_per_sec = 446923
+p50_us = 223
+p99_us = 1119
+p999_us = 7167
+p9999_us = 30719
+max_us = 470295
+inf-bench: 76484 error replies under load
+ops = 138121299
+errors = 89852
+elapsed_s = 300.000
+ops_per_sec = 460404
+p50_us = 207
+p99_us = 1055
+p999_us = 7551
+p9999_us = 38911
+max_us = 689305
+inf-bench: 89852 error replies under load
+ops = 134202420
+errors = 122506
+elapsed_s = 300.000
+ops_per_sec = 447341
+p50_us = 199
+p99_us = 959
+p999_us = 6911
+p9999_us = 96255
+max_us = 1504549
+inf-bench: 122506 error replies under load
+ops = 142478682
+errors = 160298
+elapsed_s = 300.000
+ops_per_sec = 474928
+p50_us = 207
+p99_us = 911
+p999_us = 6783
+p9999_us = 45055
+max_us = 880229
+inf-bench: 160298 error replies under load
+ops = 146873826
+errors = 69950
+elapsed_s = 300.000
+ops_per_sec = 489579
+p50_us = 199
+p99_us = 911
+p999_us = 6271
+p9999_us = 12031
+max_us = 1416377
+inf-bench: 69950 error replies under load
+ops = 138048996
+errors = 105669
+elapsed_s = 300.000
+ops_per_sec = 460163
+p50_us = 211
+p99_us = 975
+p999_us = 7295
+p9999_us = 33791
+max_us = 1105369
+inf-bench: 105669 error replies under load
+ops = 141505442
+errors = 83051
+elapsed_s = 300.000
+ops_per_sec = 471684
+p50_us = 195
+p99_us = 943
+p999_us = 7167
+p9999_us = 54271
+max_us = 1968519
+inf-bench: 83051 error replies under load
+ops = 129580070
+errors = 129494
+elapsed_s = 300.000
+ops_per_sec = 431933
+p50_us = 215
+p99_us = 1055
+p999_us = 7423
+p9999_us = 71679
+max_us = 1094381
+inf-bench: 129494 error replies under load
+ops = 143067325
+errors = 150736
+elapsed_s = 300.000
+ops_per_sec = 476890
+p50_us = 199
+p99_us = 927
+p999_us = 6655
+p9999_us = 35839
+max_us = 865922
+inf-bench: 150736 error replies under load
+ops = 142943025
+errors = 83979
+elapsed_s = 300.008
+ops_per_sec = 476463
+p50_us = 199
+p99_us = 895
+p999_us = 6655
+p9999_us = 25599
+max_us = 1970728
+inf-bench: 83979 error replies under load
+ops = 136177454
+errors = 119628
+elapsed_s = 300.001
+ops_per_sec = 453923
+p50_us = 207
+p99_us = 959
+p999_us = 7295
+p9999_us = 52223
+max_us = 1087146
+inf-bench: 119628 error replies under load
+ops = 130443044
+errors = 69158
+elapsed_s = 300.000
+ops_per_sec = 434810
+p50_us = 219
+p99_us = 1055
+p999_us = 7935
+p9999_us = 50175
+max_us = 1538653
+inf-bench: 69158 error replies under load
+ops = 129256062
+errors = 144905
+elapsed_s = 300.000
+ops_per_sec = 430853
+p50_us = 203
+p99_us = 991
+p999_us = 7551
+p9999_us = 98303
+max_us = 3032937
+inf-bench: 144905 error replies under load
+ops = 129544224
+errors = 157652
+elapsed_s = 300.065
+ops_per_sec = 431721
+p50_us = 207
+p99_us = 959
+p999_us = 7295
+p9999_us = 69631
+max_us = 2474699
+inf-bench: 157652 error replies under load
+ops = 134890827
+errors = 137655
+elapsed_s = 300.006
+ops_per_sec = 449627
+p50_us = 199
+p99_us = 879
+p999_us = 6783
+p9999_us = 135167
+max_us = 2436464
+inf-bench: 137655 error replies under load
+ops = 137662525
+errors = 91715
+elapsed_s = 300.004
+ops_per_sec = 458870
+p50_us = 215
+p99_us = 991
+p999_us = 7039
+p9999_us = 27135
+max_us = 454700
+inf-bench: 91715 error replies under load
+ops = 140509383
+errors = 132898
+elapsed_s = 300.001
+ops_per_sec = 468364
+p50_us = 199
+p99_us = 927
+p999_us = 6911
+p9999_us = 55295
+max_us = 1030007
+inf-bench: 132898 error replies under load
+ops = 115706141
+errors = 67834
+elapsed_s = 300.012
+ops_per_sec = 385672
+p50_us = 235
+p99_us = 1183
+p999_us = 8447
+p9999_us = 75775
+max_us = 2081728
+inf-bench: 67834 error replies under load
+ops = 136542125
+errors = 134539
+elapsed_s = 300.000
+ops_per_sec = 455140
+p50_us = 207
+p99_us = 927
+p999_us = 7039
+p9999_us = 53247
+max_us = 1613508
+inf-bench: 134539 error replies under load
+ops = 144033627
+errors = 86501
+elapsed_s = 300.000
+ops_per_sec = 480111
+p50_us = 195
+p99_us = 847
+p999_us = 6655
+p9999_us = 52223
+max_us = 1859122
+inf-bench: 86501 error replies under load
+ops = 143729603
+errors = 114729
+elapsed_s = 300.000
+ops_per_sec = 479098
+p50_us = 195
+p99_us = 911
+p999_us = 6911
+p9999_us = 36863
+max_us = 1577601
+inf-bench: 114729 error replies under load
+ops = 143329257
+errors = 123090
+elapsed_s = 300.001
+ops_per_sec = 477763
+p50_us = 199
+p99_us = 911
+p999_us = 6655
+p9999_us = 44031
+max_us = 473849
+inf-bench: 123090 error replies under load
+ops = 134980012
+errors = 117314
+elapsed_s = 300.000
+ops_per_sec = 449933
+p50_us = 203
+p99_us = 1023
+p999_us = 7679
+p9999_us = 54271
+max_us = 1693197
+inf-bench: 117314 error replies under load
+ops = 142644287
+errors = 133330
+elapsed_s = 300.000
+ops_per_sec = 475480
+p50_us = 199
+p99_us = 911
+p999_us = 7039
+p9999_us = 40959
+max_us = 2504987
+inf-bench: 133330 error replies under load
+ops = 138317611
+errors = 120090
+elapsed_s = 300.001
+ops_per_sec = 461058
+p50_us = 195
+p99_us = 895
+p999_us = 7039
+p9999_us = 69631
+max_us = 2372689
+inf-bench: 120090 error replies under load
+ops = 137525363
+errors = 91127
+elapsed_s = 300.001
+ops_per_sec = 458417
+p50_us = 211
+p99_us = 1023
+p999_us = 7423
+p9999_us = 43007
+max_us = 1569896
+inf-bench: 91127 error replies under load
+ops = 137290965
+errors = 173255
+elapsed_s = 300.000
+ops_per_sec = 457636
+p50_us = 191
+p99_us = 895
+p999_us = 6911
+p9999_us = 129023
+max_us = 1246468
+inf-bench: 173255 error replies under load
+ops = 135542081
+errors = 107349
+elapsed_s = 300.000
+ops_per_sec = 451806
+p50_us = 211
+p99_us = 1055
+p999_us = 7679
+p9999_us = 46079
+max_us = 1472544
+inf-bench: 107349 error replies under load
+ops = 138615250
+errors = 111421
+elapsed_s = 300.000
+ops_per_sec = 462050
+p50_us = 215
+p99_us = 1007
+p999_us = 7167
+p9999_us = 16127
+max_us = 926690
+inf-bench: 111421 error replies under load
+ops = 134967348
+errors = 78338
+elapsed_s = 300.000
+ops_per_sec = 449891
+p50_us = 211
+p99_us = 975
+p999_us = 7551
+p9999_us = 30207
+max_us = 1737155
+inf-bench: 78338 error replies under load
+ops = 136102460
+errors = 30792
+elapsed_s = 300.025
+ops_per_sec = 453638
+p50_us = 211
+p99_us = 1055
+p999_us = 8191
+p9999_us = 40959
+max_us = 801519
+inf-bench: 30792 error replies under load
+ops = 141795494
+errors = 200160
+elapsed_s = 300.016
+ops_per_sec = 472626
+p50_us = 191
+p99_us = 879
+p999_us = 7167
+p9999_us = 67583
+max_us = 1425593
+inf-bench: 200160 error replies under load
+ops = 138032358
+errors = 127322
+elapsed_s = 300.000
+ops_per_sec = 460107
+p50_us = 207
+p99_us = 1007
+p999_us = 7551
+p9999_us = 48127
+max_us = 1569408
+inf-bench: 127322 error replies under load
+ops = 143973051
+errors = 94792
+elapsed_s = 300.001
+ops_per_sec = 479909
+p50_us = 199
+p99_us = 911
+p999_us = 6911
+p9999_us = 26623
+max_us = 2051846
+inf-bench: 94792 error replies under load
+ops = 139823410
+errors = 88685
+elapsed_s = 300.000
+ops_per_sec = 466077
+p50_us = 207
+p99_us = 927
+p999_us = 6911
+p9999_us = 37887
+max_us = 1115942
+inf-bench: 88685 error replies under load
+ops = 140864882
+errors = 83216
+elapsed_s = 300.000
+ops_per_sec = 469549
+p50_us = 203
+p99_us = 1007
+p999_us = 7807
+p9999_us = 48127
+max_us = 1586981
+inf-bench: 83216 error replies under load
+ops = 119287288
+errors = 161920
+elapsed_s = 300.000
+ops_per_sec = 397624
+p50_us = 219
+p99_us = 975
+p999_us = 7551
+p9999_us = 122879
+max_us = 2442956
+inf-bench: 161920 error replies under load
+ops = 141640372
+errors = 70611
+elapsed_s = 300.000
+ops_per_sec = 472134
+p50_us = 207
+p99_us = 1007
+p999_us = 7039
+p9999_us = 20479
+max_us = 523444
+inf-bench: 70611 error replies under load
+ops = 137710427
+errors = 95898
+elapsed_s = 300.001
+ops_per_sec = 459034
+p50_us = 203
+p99_us = 943
+p999_us = 7167
+p9999_us = 34815
+max_us = 2166751
+inf-bench: 95898 error replies under load
+ops = 148636640
+errors = 98236
+elapsed_s = 300.000
+ops_per_sec = 495455
+p50_us = 195
+p99_us = 879
+p999_us = 6911
+p9999_us = 23039
+max_us = 1296230
+inf-bench: 98236 error replies under load
+ops = 137125774
+errors = 108145
+elapsed_s = 300.001
+ops_per_sec = 457084
+p50_us = 199
+p99_us = 1007
+p999_us = 8063
+p9999_us = 63487
+max_us = 1026342
+inf-bench: 108145 error replies under load
+ops = 134083024
+errors = 111463
+elapsed_s = 300.000
+ops_per_sec = 446943
+p50_us = 207
+p99_us = 991
+p999_us = 7295
+p9999_us = 65535
+max_us = 1277049
+inf-bench: 111463 error replies under load
+ops = 143384056
+errors = 162542
+elapsed_s = 300.000
+ops_per_sec = 477946
+p50_us = 191
+p99_us = 895
+p999_us = 7167
+p9999_us = 58367
+max_us = 1237140
+inf-bench: 162542 error replies under load
+ops = 145744777
+errors = 92146
+elapsed_s = 300.000
+ops_per_sec = 485815
+p50_us = 203
+p99_us = 895
+p999_us = 7295
+p9999_us = 27647
+max_us = 472586
+inf-bench: 92146 error replies under load
+ops = 150439909
+errors = 61000
+elapsed_s = 300.000
+ops_per_sec = 501466
+p50_us = 195
+p99_us = 863
+p999_us = 6399
+p9999_us = 14591
+max_us = 3424692
+inf-bench: 61000 error replies under load
+ops = 140426026
+errors = 105411
+elapsed_s = 300.001
+ops_per_sec = 468086
+p50_us = 199
+p99_us = 991
+p999_us = 7935
+p9999_us = 52223
+max_us = 1086042
+inf-bench: 105411 error replies under load
+ops = 135737919
+errors = 95236
+elapsed_s = 300.000
+ops_per_sec = 452459
+p50_us = 207
+p99_us = 1007
+p999_us = 7423
+p9999_us = 60415
+max_us = 1414607
+inf-bench: 95236 error replies under load
+ops = 128956833
+errors = 185026
+elapsed_s = 300.000
+ops_per_sec = 429856
+p50_us = 199
+p99_us = 911
+p999_us = 7167
+p9999_us = 155647
+max_us = 1903961
+inf-bench: 185026 error replies under load
+ops = 147484799
+errors = 146629
+elapsed_s = 300.000
+ops_per_sec = 491615
+p50_us = 191
+p99_us = 895
+p999_us = 7039
+p9999_us = 30719
+max_us = 742635
+inf-bench: 146629 error replies under load
+ops = 145664018
+errors = 91442
+elapsed_s = 300.001
+ops_per_sec = 485546
+p50_us = 207
+p99_us = 895
+p999_us = 7039
+p9999_us = 18431
+max_us = 662564
+inf-bench: 91442 error replies under load
+ops = 139115717
+errors = 72062
+elapsed_s = 300.002
+ops_per_sec = 463717
+p50_us = 207
+p99_us = 1087
+p999_us = 7807
+p9999_us = 37887
+max_us = 623006
+inf-bench: 72062 error replies under load
+ops = 130385220
+errors = 153078
+elapsed_s = 300.075
+ops_per_sec = 434509
+p50_us = 215
+p99_us = 1023
+p999_us = 7295
+p9999_us = 57343
+max_us = 1156397
+inf-bench: 153078 error replies under load
+ops = 143772349
+errors = 128401
+elapsed_s = 300.000
+ops_per_sec = 479241
+p50_us = 195
+p99_us = 911
+p999_us = 6911
+p9999_us = 49151
+max_us = 609817
+inf-bench: 128401 error replies under load
+ops = 140402250
+errors = 85906
+elapsed_s = 300.000
+ops_per_sec = 468007
+p50_us = 211
+p99_us = 959
+p999_us = 6911
+p9999_us = 22527
+max_us = 895029
+inf-bench: 85906 error replies under load
+ops = 146595264
+errors = 70381
+elapsed_s = 300.006
+ops_per_sec = 488641
+p50_us = 207
+p99_us = 879
+p999_us = 6399
+p9999_us = 13055
+max_us = 734284
+inf-bench: 70381 error replies under load
+ops = 135945530
+errors = 51232
+elapsed_s = 300.000
+ops_per_sec = 453151
+p50_us = 211
+p99_us = 1023
+p999_us = 7935
+p9999_us = 48127
+max_us = 1747166
+inf-bench: 51232 error replies under load
+ops = 137582572
+errors = 90152
+elapsed_s = 300.000
+ops_per_sec = 458608
+p50_us = 207
+p99_us = 1007
+p999_us = 7167
+p9999_us = 43007
+max_us = 1414618
+inf-bench: 90152 error replies under load
+ops = 135097714
+errors = 148330
+elapsed_s = 300.000
+ops_per_sec = 450325
+p50_us = 199
+p99_us = 959
+p999_us = 7423
+p9999_us = 71679
+max_us = 1385506
+inf-bench: 148330 error replies under load
+ops = 150980274
+errors = 147019
+elapsed_s = 300.000
+ops_per_sec = 503267
+p50_us = 191
+p99_us = 863
+p999_us = 6655
+p9999_us = 31743
+max_us = 1098033
+inf-bench: 147019 error replies under load
+ops = 142086497
+errors = 100478
+elapsed_s = 300.000
+ops_per_sec = 473621
+p50_us = 203
+p99_us = 911
+p999_us = 6783
+p9999_us = 28671
+max_us = 1434661
+inf-bench: 100478 error replies under load
+ops = 149498891
+errors = 136559
+elapsed_s = 300.000
+ops_per_sec = 498329
+p50_us = 187
+p99_us = 927
+p999_us = 7679
+p9999_us = 41983
+max_us = 1367290
+inf-bench: 136559 error replies under load
+ops = 134910418
+errors = 112751
+elapsed_s = 300.004
+ops_per_sec = 449695
+p50_us = 211
+p99_us = 959
+p999_us = 7295
+p9999_us = 59391
+max_us = 1365203
+inf-bench: 112751 error replies under load
+ops = 134482613
+errors = 170637
+elapsed_s = 300.474
+ops_per_sec = 447568
+p50_us = 191
+p99_us = 895
+p999_us = 7679
+p9999_us = 108543
+max_us = 2783144
+inf-bench: 170637 error replies under load
+ops = 138405012
+errors = 85617
+elapsed_s = 300.010
+ops_per_sec = 461335
+p50_us = 203
+p99_us = 879
+p999_us = 6783
+p9999_us = 29695
+max_us = 1876714
+inf-bench: 85617 error replies under load
+ops = 144115432
+errors = 73028
+elapsed_s = 300.000
+ops_per_sec = 480384
+p50_us = 207
+p99_us = 911
+p999_us = 6399
+p9999_us = 16895
+max_us = 477299
+inf-bench: 73028 error replies under load
+ops = 146771561
+errors = 78771
+elapsed_s = 300.000
+ops_per_sec = 489238
+p50_us = 199
+p99_us = 927
+p999_us = 6783
+p9999_us = 19967
+max_us = 1227427
+inf-bench: 78771 error replies under load
+ops = 141830838
+errors = 137042
+elapsed_s = 300.000
+ops_per_sec = 472769
+p50_us = 203
+p99_us = 911
+p999_us = 6655
+p9999_us = 32767
+max_us = 1171608
+inf-bench: 137042 error replies under load
+inf-bench: server closed connection under load

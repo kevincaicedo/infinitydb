@@ -1,0 +1,9 @@
+rss slope +1.147%/24h (first-5% median 2003064 kB -> last-5% median 2026032 kB, 8559 samples)
+accounted slope +0.234%/24h (used_memory first-5% median 618183 kB -> last-5% 619627 kB; diagnostic, not a gate)
+tiering disk max 18004279296 bytes (budget 42949672960)
+write-amp milli max 1920 (gate < 3000)
+diskfull refusals 0
+docs_live 14235 -> 14240 (document plane live throughout: yes)
+checkpoints completed 0 -> 47871 (delta 47871)
+FAIL — discharges: M2.5 stability soak, M3 §7 doc soak, M4 §7 memory honesty
+  - RSS slope +1.147%/24h >= 0.5%/24h
