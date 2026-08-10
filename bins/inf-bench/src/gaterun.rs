@@ -242,6 +242,7 @@ pub(crate) struct Measurements {
     pub(crate) notes: Vec<String>,
     pub(crate) raw: String,
     rows: Vec<RowWriteAmp>,
+    sidecars: Vec<(String, String)>,
 }
 
 impl Measurements {
@@ -251,7 +252,17 @@ impl Measurements {
             notes: Vec::new(),
             raw: String::new(),
             rows: Vec::new(),
+            sidecars: Vec::new(),
         }
+    }
+
+    /// Registers a machine-readable file to write beside `report.md` in
+    /// this run's artifact directory. Campaign legs that must be compared
+    /// across processes (the ADR-0071 D3 hot-set reference carrier) hand
+    /// their numbers forward this way rather than through a human parsing
+    /// a report table back into a flag.
+    pub(crate) fn sidecar(&mut self, name: &str, body: String) {
+        self.sidecars.push((name.to_string(), body));
     }
 
     /// Declares a workload row. From M4-S16 on, every declared row owes a
@@ -413,6 +424,11 @@ pub(crate) fn finish_report(
         std::fs::File::create(&report_path).map_err(|e| format!("{report_path}: {e}"))?;
     file.write_all(report.as_bytes()).map_err(|e| format!("{report_path}: {e}"))?;
     println!("\ngate-run: report written to {report_path}");
+    for (name, body) in &m.sidecars {
+        let path = format!("{dir}/{name}");
+        std::fs::write(&path, body).map_err(|e| format!("{path}: {e}"))?;
+        println!("gate-run: sidecar written to {path}");
+    }
     if binding_failures > 0 {
         return Err(format!("{binding_failures} binding gate(s) FAILED"));
     }
