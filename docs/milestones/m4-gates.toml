@@ -197,7 +197,7 @@ comparator = "<="
 unit = "pct vs RAM-resident reference leg, memory-hit split"
 tier = "linux-reference-box"
 source = "ycsb:hot_set_p50_delta_pct"
-measured_by = "inf-bench ycsb tiered leg vs --dataset-multiple 1 reference leg, same campaign (blocked on M4-S26 wiring)"
+measured_by = "inf-bench ycsb tiered leg vs --dataset-multiple 1 reference leg, same campaign, compared through the client-derived memory-hit split (ADR-0071 D2/D3: mem-hit.tsv + --hot-set-reference; worst matched row binds, ineligible rows named and excluded)"
 
 [[gate]]
 id = "hot_set_p99"
@@ -207,7 +207,7 @@ comparator = "<="
 unit = "pct vs RAM-resident reference leg, memory-hit split"
 tier = "linux-reference-box"
 source = "ycsb:hot_set_p99_delta_pct"
-measured_by = "inf-bench ycsb split histograms (blocked on M4-S26 wiring)"
+measured_by = "inf-bench ycsb client-derived memory-hit split vs the RAM-resident reference leg (ADR-0071 D2/D3)"
 
 [[gate]]
 id = "hot_set_p999"
@@ -217,7 +217,7 @@ comparator = "<="
 unit = "pct vs RAM-resident reference leg, memory-hit split (LogHistogram ~3% buckets)"
 tier = "linux-reference-box"
 source = "ycsb:hot_set_p999_delta_pct"
-measured_by = "inf-bench ycsb split histograms (blocked on M4-S26 wiring)"
+measured_by = "inf-bench ycsb client-derived memory-hit split vs the RAM-resident reference leg (ADR-0071 D2/D3)"
 
 [[gate]]
 id = "cold_read_p99"
@@ -228,7 +228,7 @@ comparator = "<"
 unit = "ms, cold-read split histogram, worst loaded row"
 tier = "linux-reference-box"
 source = "ycsb:cold_read_p99_ms"
-measured_by = "inf-bench ycsb tiered rows, INFO tiering cold split scrape (blocked on M4-S26 wiring)"
+measured_by = "inf-bench ycsb tiered rows, INFO tiering cold split scrape (COLD_SPLIT_FIELDS — the half that stays a hard contract, ADR-0071 D1)"
 
 [[gate]]
 id = "endurance_rss_slope"

@@ -36,6 +36,16 @@
 #   SOAK_MEM_BUDGET_MB (64)     tiered namespace memory budget
 #   SOAK_MULTIPLE      (10)     tiered dataset = multiple x budget
 #   SOAK_LEG_SECS      (1800)   one tiered ycsb leg per loop iteration
+#   SOAK_TIER_WORKLOADS (a,b)   YCSB rows the tiered leg drives. The default
+#                               is the endurance blend the gate is written
+#                               against and the one attempt 2 ran; it is
+#                               already write-heavy enough to drive
+#                               compaction hard (measured 2026-08-08: 6.5 M
+#                               compact slices, 22.4 GB compacted, 54.9 GB
+#                               dead over 24 h). Add `f` (read-modify-write)
+#                               for more write pressure — but a changed mix
+#                               is a changed workload, so say so in the
+#                               run's notes rather than comparing across it.
 #   SOAK_WARMUP_HOURS  (8)      ADR-0069 D1: declared warm-up excluded from
 #                               the slope gates. Prospective — declared here,
 #                               before the run, never fitted afterwards. The
@@ -58,6 +68,7 @@ LOADGEN_CPUS="${SOAK_LOADGEN_CPUS:-12-23}"
 MEM_BUDGET_MB="${SOAK_MEM_BUDGET_MB:-64}"
 MULTIPLE="${SOAK_MULTIPLE:-10}"
 LEG_SECS="${SOAK_LEG_SECS:-1800}"
+TIER_WORKLOADS="${SOAK_TIER_WORKLOADS:-a,b}"
 WARMUP_HOURS="${SOAK_WARMUP_HOURS:-8}"
 SEED=0x1D0C2026          # the blessed corpus seed (ADR-0046 D3)
 SEED_DEC=486541350
@@ -227,10 +238,13 @@ sample_line() {
     $1 == "tiering_index_bytes"         { tidx += $2 }
     $1 == "log_staging_bytes"           { stag += $2 }
     $1 == "ckpt_buffer_bytes"           { ckb  += $2 }
-    END { printf "%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d\n",
+    $1 == "cold_reads_issued"           { cread += $2 }
+    $1 == "tiering_flush_slices"        { fsl  += $2 }
+    $1 == "tiering_compact_slices"      { csl  += $2 }
+    END { printf "%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d,%d,%d,%d\n",
           ts, rss, docs, dres, disk, wam, ref, ck, mf, segs,
           (subs > 0 ? sqes / subs : 0), int(um / 1024),
-          tcom, tidx, stag, ckb }
+          tcom, tidx, stag, ckb, cread, fsl, csl }
   ' <<<"$info"
 }
 
@@ -249,7 +263,14 @@ alert() {
   # cell-scope memory terms — the 20260807 analysis showed the Tiering/
   # Persistence INFO sections are per-cell, so a single-cell scrape
   # under-reports them 4x and the RSS "gap" was exactly that.
-  echo "unix_s,vmrss_kb,docs_live,doc_resident_bytes,disk_used_bytes,wa_milli_max,diskfull_refusals,ckpts,manifests,segs_live,sqes_per_submit,used_memory_kb,tier_committed_bytes,tier_index_bytes,log_staging_bytes,ckpt_buffer_bytes" >"$OUT/samples.csv"
+  # Trailing again (ADR-0071 D4): the tiered plane's own liveness series.
+  # The 20260808 run passed every memory gate while its tiered leg had been
+  # dead for 31.4 of 32.1 h — invisible, because no sampled column could
+  # have shown it. cold_reads_issued / flush_slices / compact_slices are
+  # monotonic per-cell counters; the verdict requires them to ADVANCE
+  # across the measured window, which is what "the tier was under load"
+  # actually means.
+  echo "unix_s,vmrss_kb,docs_live,doc_resident_bytes,disk_used_bytes,wa_milli_max,diskfull_refusals,ckpts,manifests,segs_live,sqes_per_submit,used_memory_kb,tier_committed_bytes,tier_index_bytes,log_staging_bytes,ckpt_buffer_bytes,cold_reads_issued,flush_slices,compact_slices" >"$OUT/samples.csv"
   : >"$OUT/alerts.log"
   n=0
   while kill -0 $SERVER_PID 2>/dev/null && [ $n -lt $MAX_SAMPLES ]; do
@@ -344,13 +365,27 @@ if [ "$MODE" = "FULL" ]; then
       leg=$(( left < LEG_SECS ? left : LEG_SECS ))
       [ $leg -lt 30 ] && break
       if taskset -c "$LOADGEN_CPUS" ./target/release/inf-bench ycsb \
-          "${YCSB_COMMON[@]}" --skip-fill --workloads a,b --distribution zipfian \
+          "${YCSB_COMMON[@]}" --skip-fill --workloads "$TIER_WORKLOADS" --distribution zipfian \
           --duration $((leg / 3 > 5 ? leg / 3 : 5)) >>"$OUT/loadgen-tier.log" 2>&1; then
         FAILS=0
       else
         FAILS=$((FAILS + 1))
         echo "$(date +%s) ALERT ycsb tiered leg failed ($FAILS consecutive)" >>"$OUT/alerts.log"
-        [ $FAILS -ge 3 ] && { echo "3 consecutive tiered leg failures" >>"$OUT/alerts.log"; break; }
+        # A dead tiered leg is not a footnote: it is the difference
+        # between a run that measured the tiered plane and one that did
+        # not. Leaving a sentinel is what lets the verdict downgrade its
+        # own stamp instead of discharging a gate it never exercised
+        # (ADR-0071 D4; readiness F17).
+        if [ $FAILS -ge 3 ]; then
+          echo "3 consecutive tiered leg failures" >>"$OUT/alerts.log"
+          {
+            echo "broken_at_unix=$(date +%s)"
+            echo "reason=3 consecutive \`inf-bench ycsb\` failures — see loadgen-tier.log"
+            echo "consequence=the tiered plane served no traffic after this point; this run"
+            echo "consequence=cannot discharge the M4 §7 memory-honesty gate"
+          } >"$OUT/tier-leg-broken.txt"
+          break
+        fi
         sleep 5
       fi
     done
@@ -381,14 +416,32 @@ attr_snap end
 SERVER_ALIVE=0
 kill -0 $SERVER_PID 2>/dev/null && SERVER_ALIVE=1
 
-python3 - "$OUT/samples.csv" "$HOURS" "$SERVER_ALIVE" "$DISK_BUDGET_BYTES" "$MODE" "$WARMUP_HOURS" <<'EOF' | tee "$OUT/verdict.txt"
+ALERT_LINES=$(wc -l <"$OUT/alerts.log" 2>/dev/null || echo 0)
+TIER_BROKEN=0
+[ -f "$OUT/tier-leg-broken.txt" ] && TIER_BROKEN=1
+
+python3 - "$OUT/samples.csv" "$HOURS" "$SERVER_ALIVE" "$DISK_BUDGET_BYTES" "$MODE" "$WARMUP_HOURS" "$ALERT_LINES" "$TIER_BROKEN" <<'EOF' | tee "$OUT/verdict.txt"
 import csv, sys
 rows = [r for r in csv.DictReader(open(sys.argv[1])) if int(r["vmrss_kb"]) > 0]
 hours, alive, budget = float(sys.argv[2]), sys.argv[3] == "1", int(sys.argv[4])
 mode, warmup = sys.argv[5], float(sys.argv[6])
+alert_lines, tier_broken = int(sys.argv[7]), sys.argv[8] == "1"
 fails = []
 if not alive:
     fails.append("server died during the soak (see infinityd.log)")
+# ADR-0071 D4. Alerts were advisory until 2026-08-08, when a run raised
+# three of them, lost its tiered workload, and still stamped PASS. An
+# alert is the run telling you it stopped being the run you launched.
+if alert_lines > 0:
+    fails.append(
+        f"{alert_lines} alert line(s) in alerts.log — an alerting soak is not a clean soak; "
+        "root-cause each one in run-notes.md (§19) and re-run"
+    )
+if tier_broken:
+    fails.append(
+        "tiered leg broke mid-run (tier-leg-broken.txt) — the tiered plane stopped serving, so "
+        "this run cannot speak for the tiered profile whatever its memory series say"
+    )
 if len(rows) < 6:
     fails.append(f"only {len(rows)} samples — sampler failure invalidates the run")
 else:
@@ -466,9 +519,49 @@ else:
     print(f"checkpoints completed {ck[0]} -> {ck[-1]} (delta {ck[-1] - ck[0]})")
     if ck[-1] - ck[0] <= 0:
         fails.append("no checkpoints completed — the durable plane was not exercised")
+    # ADR-0071 D4: tiered-plane liveness over the *measured* window. Every
+    # memory gate above can pass on a node whose tier is a frozen 2.7 GiB
+    # of committed regions; the 20260808 run proved it. These three
+    # counters are what "the tiered plane was under load" reduces to, and
+    # `compact_slices` is specifically the S23 story title ("24 h
+    # endurance with compaction active") made checkable.
+    window = steady if windowed else rows
+    live = {
+        "cold_reads_issued": "cold reads",
+        "flush_slices": "flush slices",
+        "compact_slices": "compaction slices",
+    }
+    if all(c in rows[0] for c in live):
+        for column, label in live.items():
+            first, last = int(window[0][column]), int(window[-1][column])
+            scope = "steady window" if windowed else "whole run"
+            print(f"tier liveness: {column} {first} -> {last} over the {scope} (delta {last - first})")
+            if mode == "FULL" and last - first <= 0:
+                fails.append(
+                    f"tiered plane served no {label} across the {scope} — the tier was static, so "
+                    "the M4 §7 rows measured a node that was not doing the work they describe"
+                )
+    elif mode == "FULL":
+        fails.append(
+            "tier-liveness columns absent from samples.csv — this sampler predates ADR-0071 D4 "
+            "and cannot prove the tiered plane was under load"
+        )
 verdict = "FAIL" if fails else "PASS"
-if mode == "FULL":
+# The stamp is decided by what the run DID, never by what it was launched
+# as. `mode` is fixed at boot from a wiring probe; a leg that dies at
+# +35 min cannot be allowed to keep the launch-time claim (ADR-0071 D4).
+tier_served = mode == "FULL" and not tier_broken
+if fails:
+    # A failing run discharges nothing. Printing a "discharges:" list next
+    # to FAIL is how the 20260807 verdict read, and it invites exactly the
+    # misquote it looks like.
+    stamp = " — discharges: NOTHING (a failing run is not evidence for any gate)"
+elif tier_served:
     stamp = " — discharges: M2.5 stability soak, M3 §7 doc soak, M4 §7 memory honesty"
+elif mode == "FULL":
+    stamp = (" (PARTIAL: launched FULL, but the tiered leg broke mid-run)"
+             "\n  discharges: M2.5 stability soak, M3 §7 doc soak"
+             "\n  does NOT discharge: M4 §7 memory honesty (the tiered plane stopped serving)")
 else:
     stamp = (" (TIER-MECHANICS-ONLY: tiered namespace stands but serves no traffic — M4-S26)"
              "\n  discharges: M2.5 stability soak, M3 §7 doc soak"

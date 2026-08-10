@@ -25,8 +25,17 @@
 //! machinery against a memory-mode namespace, every tiered-only figure a
 //! named-absent line. The mode is probed live (the S20 pattern): a wired
 //! plane flips the run to tiered rows automatically, and a tiered run
-//! whose INFO scrape lacks the split-histogram fields fails loudly — the
-//! split is the deliverable, not an optional extra.
+//! whose INFO scrape lacks the **cold** split-histogram fields fails
+//! loudly — the split is the deliverable, not an optional extra.
+//!
+//! The **memory-hit** half is derived client-side ([`derive_mem_hit`],
+//! ADR-0071 D2). Its server-side fields were withdrawn on 2026-08-08: the
+//! reactor's per-iteration clock cannot time a command that never
+//! suspends, so they recorded 0 µs for every memory hit. Refusing the row
+//! on their absence — which is what this harness did between that fix and
+//! ADR-0071 — silenced the tiered leg of a 32 h soak for 31.4 hours
+//! (readiness F17). A missing *citation* instrument must not become a
+//! refusal to run *load*.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -39,8 +48,8 @@ use inf_foundation::rng::{Entropy, SplitMix64};
 
 use crate::cli::Flags;
 use crate::gaterun::{
-    Measurements, ServerGuard, env_gate, finish_report, load_gates, scrape_cells, spawn_infinityd,
-    sum_field,
+    Measurements, ServerGuard, env_gate, finish_report, load_gates, max_field, scrape_cells,
+    spawn_infinityd, sum_field,
 };
 use crate::load::{LoadSpec, make_key, render, run as run_load};
 use crate::m2rows::delta_pct;
@@ -52,21 +61,47 @@ use crate::writeamp;
 const KEY_PREFIX: &str = "y:";
 const KEY_SIZE: usize = 16;
 
-/// The served-from split fields the report consumes from `INFO tiering`.
-/// This array is the harness side of the M4-S26 contract: command wiring
-/// must emit exactly these (µs percentiles from the resolver-tagged
-/// completion histograms; `coalesce_ratio_milli` is the S10 tripwire).
-/// A tiered run missing any of them fails — see [`split_section`].
-const SPLIT_FIELDS: [&str; 8] = [
-    "tiering_ram_hit_p50_us",
-    "tiering_ram_hit_p99_us",
-    "tiering_ram_hit_p999_us",
+/// The cold half of the served-from split contract (M4-S26 / ADR-0064 D3).
+/// Command wiring must emit exactly these: µs percentiles from the
+/// resolver-tagged cold completion histogram, plus the two S10 cold
+/// tripwires. A tiered run missing any of them is invalid by construction
+/// and fails — see [`split_section`].
+const COLD_SPLIT_FIELDS: [&str; 5] = [
     "tiering_cold_p50_us",
     "tiering_cold_p99_us",
     "tiering_cold_p999_us",
     "cold_read_qd_p99",
     "coalesce_ratio_milli",
 ];
+
+/// The **withdrawn** server-side memory-hit fields (ADR-0071 D1). They were
+/// part of the D3 contract until 2026-08-08, when the reactor's
+/// per-iteration clock was shown to make them structurally unmeasurable: a
+/// command that never suspends reads the same iteration timestamp at
+/// enqueue and completion, so every memory hit recorded 0 µs. The server
+/// now renders `tiering_ram_hit_split:unmeasured-iteration-clock` in their
+/// place, and the memory-hit half of the split is **derived client-side**
+/// ([`derive_mem_hit`]).
+///
+/// This array exists so the absence is *named* rather than silent: the
+/// report prints the withdrawal with its reason, and a future server that
+/// starts emitting them again is detected and reported rather than
+/// ignored. It is deliberately **not** a refusal list — the D3 refusal
+/// existed to keep an unsplit row out of a *citation*, and turning it into
+/// a refusal to *run* silenced the tiered workload of the 32 h soak of
+/// 2026-08-08 for 31.4 of its 32.1 hours (readiness F17).
+const WITHDRAWN_RAM_HIT_FIELDS: [&str; 3] =
+    ["tiering_ram_hit_p50_us", "tiering_ram_hit_p99_us", "tiering_ram_hit_p999_us"];
+
+/// Ceiling on the cold fraction for which the [`derive_mem_hit`]
+/// truncation is meaningful. Above it the "hot set" is not being served
+/// from memory in any useful sense and the derived percentiles describe a
+/// population too small to gate on.
+const MEM_HIT_MAX_COLD_FRACTION: f64 = 0.5;
+
+/// Minimum client ops in a row before its derived memory-hit percentiles
+/// are allowed to carry a gate value (p99.9 needs a population).
+const MEM_HIT_MIN_OPS: u64 = 100_000;
 
 /// YCSB-style Zipf(θ) over `n` ranks — Gray et al.'s quick method, lifted
 /// from the `cold_shaping` bench (the generator the plan names as the
@@ -531,6 +566,10 @@ struct RowOut {
     max_us: u64,
     hot_share_pct: f64,
     checksum: u64,
+    /// The merged client latency histogram, kept whole. The memory-hit
+    /// half of the split is a quantile of *this* distribution, so the row
+    /// cannot throw it away after taking p50/p99/p99.9 (ADR-0071 D2).
+    hist_us: LogHistogram,
 }
 
 fn run_row(spec: &RowSpec, w: &Workload, zipf: &Zipf) -> Result<RowOut, String> {
@@ -572,6 +611,7 @@ fn run_row(spec: &RowSpec, w: &Workload, zipf: &Zipf) -> Result<RowOut, String> 
         max_us: hist.max(),
         hot_share_pct: if total == 0 { 0.0 } else { hot as f64 * 100.0 / total as f64 },
         checksum: inf_foundation::hash64(&checksums, 0x5EED),
+        hist_us: hist,
     })
 }
 
@@ -633,28 +673,296 @@ fn verify_seed(spec: &RowSpec, zipf: &Zipf, ops: u64) -> Result<String, String> 
     Ok(format!("seed verification: {ops} ops regenerated identically (checksum {first:#018x})"))
 }
 
-/// Renders the served-from split for one row. Tiered rows **must** find
-/// every [`SPLIT_FIELDS`] entry in the scrape (max across cells binds —
-/// per-cell histograms cannot merge from percentiles, disclosed); in
-/// harness-validation mode the section is one named-absent contract line.
+/// The memory-hit half of the split, derived client-side (ADR-0071 D2).
+///
+/// The two populations in a tiered row's latency distribution are cleanly
+/// separated in practice (memory hits are tens of µs, cold reads are
+/// milliseconds). Given the cold fraction `f`, the fastest `1 − f` of the
+/// client distribution *is* the memory-hit population, so the memory-hit
+/// percentile at `X` is the overall quantile at `X · (1 − f)`.
+///
+/// Separation is checked, not assumed: the derived p99.9 must land below
+/// the server's measured cold p50, or the row is rendered with its numbers
+/// and refused a gate value. That check is what makes this an instrument
+/// rather than an assumption.
+struct MemHit {
+    ops: u64,
+    cold_reads: u64,
+    cold_resolves: u64,
+    cold_frac: f64,
+    p50_us: u64,
+    p99_us: u64,
+    p999_us: u64,
+    /// The server's cold p50 this row was checked against — rendered so
+    /// the separation margin is visible on a passing row too, not only in
+    /// the refusal text of a failing one.
+    cold_p50_us: u64,
+    /// `Err(reason)` = derived and rendered, but not gate-eligible.
+    eligible: Result<(), String>,
+}
+
+/// Derives [`MemHit`] from one row's client histogram and the cold-read
+/// counters scraped across it.
+///
+/// `cold_reads` (not `cold_resolves`) is the numerator: one client op that
+/// suspends resolves cold **twice** — once before the read, once on resume
+/// — so `cold_resolves` overstates the cold population by the re-resolve
+/// factor (measured 2.33× on 2026-08-08). Coalescing pushes the other way
+/// (one read can serve several ops), which *under*states `f`, keeps more of
+/// the tail inside the truncation, and can only make the derived
+/// percentiles worse — the safe direction for a gate.
+fn derive_mem_hit(out: &RowOut, cold_reads: u64, cold_resolves: u64, cold_p50_us: u64) -> MemHit {
+    let cold_frac = if out.ops == 0 { 1.0 } else { (cold_reads as f64 / out.ops as f64).min(1.0) };
+    let keep = (1.0 - cold_frac).max(0.0);
+    let at = |p: f64| out.hist_us.percentile(p * keep);
+    let (p50_us, p99_us, p999_us) = (at(50.0), at(99.0), at(99.9));
+    let eligible = if out.ops < MEM_HIT_MIN_OPS {
+        Err(format!("{} ops < {MEM_HIT_MIN_OPS} — too few for a p99.9 gate value", out.ops))
+    } else if cold_frac > MEM_HIT_MAX_COLD_FRACTION {
+        Err(format!(
+            "cold fraction {:.1}% > {:.0}% — the hot set is not memory-resident in this row, so \
+             the truncation describes no useful population",
+            cold_frac * 100.0,
+            MEM_HIT_MAX_COLD_FRACTION * 100.0
+        ))
+    } else if cold_p50_us == 0 {
+        Err("server cold p50 reads 0 — no separation check is possible".into())
+    } else if p999_us >= cold_p50_us {
+        Err(format!(
+            "separation check FAILED: derived memory-hit p99.9 {p999_us} µs >= server cold p50 \
+             {cold_p50_us} µs — the two populations overlap and the quantile truncation cannot \
+             tell them apart (client tail spread {} µs vs cold service {cold_p50_us} µs)",
+            p999_us.saturating_sub(p50_us)
+        ))
+    } else {
+        Ok(())
+    };
+    MemHit {
+        ops: out.ops,
+        cold_reads,
+        cold_resolves,
+        cold_frac,
+        p50_us,
+        p99_us,
+        p999_us,
+        cold_p50_us,
+        eligible,
+    }
+}
+
+/// The reference carrier (ADR-0071 D3): one line per row, so the
+/// RAM-resident leg and the tiered leg — which cannot share a process,
+/// because they need different dataset sizes and therefore different
+/// fills — still compare through the same instrument in the same campaign.
+fn render_mem_hit_tsv(mem_hits: &[(String, MemHit)]) -> String {
+    let mut out = String::from(
+        "# inf-bench ycsb — client-derived memory-hit split (ADR-0071 D2)\n\
+         # row\tops\tcold_frac\tp50_us\tp99_us\tp999_us\teligible\n",
+    );
+    for (name, mem) in mem_hits {
+        out.push_str(&format!(
+            "{name}\t{}\t{:.6}\t{}\t{}\t{}\t{}\n",
+            mem.ops,
+            mem.cold_frac,
+            mem.p50_us,
+            mem.p99_us,
+            mem.p999_us,
+            if mem.eligible.is_ok() { "ok" } else { "ineligible" },
+        ));
+    }
+    out
+}
+
+/// One reference-leg row: the three percentiles plus whether that leg
+/// considered the row gate-eligible.
+struct RefRow {
+    p50_us: u64,
+    p99_us: u64,
+    p999_us: u64,
+    eligible: bool,
+}
+
+/// Reads a `mem-hit.tsv` written by [`render_mem_hit_tsv`]. `path` may name
+/// the file itself or the gate-run directory that holds it.
+fn load_mem_hit_tsv(path: &str) -> Result<std::collections::BTreeMap<String, RefRow>, String> {
+    let candidates = [PathBuf::from(path), PathBuf::from(path).join("mem-hit.tsv")];
+    let (found, text) = candidates
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok().map(|t| (p.clone(), t)))
+        .ok_or_else(|| {
+            format!(
+                "--hot-set-reference {path}: no mem-hit.tsv here or at {path}/mem-hit.tsv — the \
+                 reference leg must be an `inf-bench ycsb --dataset-multiple 1` run of this \
+                 harness (ADR-0071 D3)"
+            )
+        })?;
+    let mut rows = std::collections::BTreeMap::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() != 7 {
+            return Err(format!(
+                "{}: line {} has {} fields, expected 7 — not a mem-hit.tsv",
+                found.display(),
+                n + 1,
+                f.len()
+            ));
+        }
+        let num = |i: usize| -> Result<u64, String> {
+            f[i].parse::<u64>().map_err(|e| format!("{}: line {}: {e}", found.display(), n + 1))
+        };
+        rows.insert(
+            f[0].to_string(),
+            RefRow {
+                p50_us: num(3)?,
+                p99_us: num(4)?,
+                p999_us: num(5)?,
+                eligible: f[6].trim() == "ok",
+            },
+        );
+    }
+    if rows.is_empty() {
+        return Err(format!("{}: no rows", found.display()));
+    }
+    Ok(rows)
+}
+
+/// Compares this (tiered) leg's memory-hit split against the RAM-resident
+/// reference leg and sets the three `ycsb:hot_set_*_delta_pct` gate values
+/// to the **worst** matched row per percentile. A row that either leg
+/// ruled ineligible is named and excluded — never silently dropped.
+fn compare_hot_set(
+    m: &mut Measurements,
+    mem_hits: &[(String, MemHit)],
+    reference: &std::collections::BTreeMap<String, RefRow>,
+    path: &str,
+) -> (String, String) {
+    let mut table = format!(
+        "reference leg: {path}\n\n\
+         | row | percentile | reference µs | tiered µs | delta |\n|---|---|---|---|---|\n"
+    );
+    let mut excluded: Vec<String> = Vec::new();
+    let mut worst: [Option<f64>; 3] = [None; 3];
+    let mut matched = 0usize;
+    for (name, mem) in mem_hits {
+        let Some(reference_row) = reference.get(name) else {
+            excluded.push(format!("{name} (absent from the reference leg)"));
+            continue;
+        };
+        if let Err(reason) = &mem.eligible {
+            excluded.push(format!("{name} (tiered leg: {reason})"));
+            continue;
+        }
+        if !reference_row.eligible {
+            excluded.push(format!("{name} (reference leg ruled it ineligible)"));
+            continue;
+        }
+        matched += 1;
+        for (i, (label, a, b)) in [
+            ("p50", reference_row.p50_us, mem.p50_us),
+            ("p99", reference_row.p99_us, mem.p99_us),
+            ("p99.9", reference_row.p999_us, mem.p999_us),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let delta = delta_pct(a as f64, b as f64);
+            table.push_str(&format!("| {name} | {label} | {a} | {b} | {delta:+.2}% |\n"));
+            worst[i] = Some(worst[i].map_or(delta, |w: f64| w.max(delta)));
+        }
+    }
+    if !excluded.is_empty() {
+        table.push_str(&format!(
+            "\nexcluded rows (named, not dropped):\n- {}\n",
+            excluded.join("\n- ")
+        ));
+    }
+    for (key, value) in [
+        ("ycsb:hot_set_p50_delta_pct", worst[0]),
+        ("ycsb:hot_set_p99_delta_pct", worst[1]),
+        ("ycsb:hot_set_p999_delta_pct", worst[2]),
+    ] {
+        if let Some(value) = value {
+            m.set(key, value);
+        }
+    }
+    let note = if matched == 0 {
+        format!(
+            "hot-set gate: NO gate value — 0 of {} rows matched an eligible reference row \
+             ({}); the gate stays PENDING rather than binding on a partial comparison",
+            mem_hits.len(),
+            excluded.join("; ")
+        )
+    } else {
+        format!(
+            "hot-set gate: {matched} row(s) compared against the RAM-resident reference leg \
+             (worst per percentile binds); {} row(s) excluded and named in the section",
+            excluded.len()
+        )
+    };
+    (note, table)
+}
+
+impl MemHit {
+    fn render(&self) -> String {
+        let verdict = match &self.eligible {
+            Ok(()) => "gate-eligible (separation check passed)".to_string(),
+            Err(reason) => format!("NOT gate-eligible — {reason}"),
+        };
+        format!(
+            "memory-hit split (client-derived, ADR-0071 D2):\n  \
+             cold_frac = {:.4}% (cold_reads {} · cold_resolves {} — re-resolve ratio {:.2}×)\n  \
+             mem_hit p50_us = {} · p99_us = {} · p999_us = {}\n  \
+             separation: mem_hit p99.9 {} µs vs server cold p50 {} µs (client tail spread {} µs \
+             — the truncation only separates the two modes while cold service exceeds it)\n  \
+             {verdict}\n",
+            self.cold_frac * 100.0,
+            self.cold_reads,
+            self.cold_resolves,
+            if self.cold_reads == 0 {
+                0.0
+            } else {
+                self.cold_resolves as f64 / self.cold_reads as f64
+            },
+            self.p50_us,
+            self.p99_us,
+            self.p999_us,
+            self.p999_us,
+            self.cold_p50_us,
+            self.p999_us.saturating_sub(self.p50_us),
+        )
+    }
+}
+
+/// Renders the served-from split for one row.
+///
+/// Tiered rows **must** find every [`COLD_SPLIT_FIELDS`] entry in the
+/// scrape (max across cells binds — per-cell histograms cannot merge from
+/// percentiles, disclosed). The memory-hit half arrives as `mem`, derived
+/// client-side; the withdrawn server fields are named, never demanded
+/// (ADR-0071 D1). In harness-validation mode the section is one
+/// named-absent contract line.
 fn split_section(
     scrape: &[std::collections::BTreeMap<String, String>],
     tiered_live: bool,
+    mem: Option<&MemHit>,
 ) -> Result<String, String> {
     if !tiered_live {
         return Ok("memory-hit / cold split: NAMED-ABSENT — the tiered data plane is behind the \
-                   ADR-0062 D8 refusal; M4-S26 emits the split service histograms \
-                   (resolver-tagged {mutable, ro, cold}) under the SPLIT_FIELDS names\n"
+                   ADR-0062 D8 refusal; M4-S26 emits the cold split service histograms \
+                   (resolver-tagged {ro, cold}) under the COLD_SPLIT_FIELDS names\n"
             .into());
     }
     let mut lines = String::new();
-    for field in SPLIT_FIELDS {
+    for field in COLD_SPLIT_FIELDS {
         let present = scrape.iter().any(|cells| cells.contains_key(field));
         if !present {
             return Err(format!(
-                "tiered row ran but `{field}` is missing from INFO tiering — the split \
-                 histogram contract (M4-S26 / SPLIT_FIELDS) is not met; a tiered row \
-                 without the split is invalid by construction (§18/§19)"
+                "tiered row ran but `{field}` is missing from INFO tiering — the cold split \
+                 histogram contract (M4-S26 / ADR-0064 D3 as amended by ADR-0071 D1) is not \
+                 met; a tiered row without the cold split is invalid by construction (§18/§19)"
             ));
         }
         let worst = scrape
@@ -665,8 +973,39 @@ fn split_section(
             .unwrap_or(0);
         lines.push_str(&format!("{field} (worst cell) = {worst}\n"));
     }
-    let cold_resolves = sum_field(scrape, "tiering_cold_resolves");
-    lines.push_str(&format!("tiering_cold_resolves = {cold_resolves}\n"));
+    let returned: Vec<&str> = WITHDRAWN_RAM_HIT_FIELDS
+        .into_iter()
+        .filter(|f| scrape.iter().any(|cells| cells.contains_key(*f)))
+        .collect();
+    if returned.is_empty() {
+        let split_note = scrape
+            .iter()
+            .find_map(|cells| cells.get("tiering_ram_hit_split"))
+            .map_or_else(|| "(field absent)".to_string(), Clone::clone);
+        lines.push_str(&format!(
+            "server ram-hit fields: WITHDRAWN — {} named-absent, server says `{split_note}`; the \
+             reactor's per-iteration clock cannot time a non-suspending command (ADR-0064 \
+             amendment 2026-08-08). The memory-hit half below is client-derived.\n",
+            WITHDRAWN_RAM_HIT_FIELDS.join(", ")
+        ));
+    } else {
+        lines.push_str(&format!(
+            "server ram-hit fields: UNEXPECTEDLY PRESENT ({}) — ADR-0071 D1 withdrew them; a \
+             server emitting them again means the instrument changed under this harness. \
+             Reconcile before citing the client-derived numbers below.\n",
+            returned.join(", ")
+        ));
+    }
+    lines.push_str(&format!(
+        "tiering_cold_resolves = {}\n",
+        sum_field(scrape, "tiering_cold_resolves")
+    ));
+    match mem {
+        Some(mem) => lines.push_str(&mem.render()),
+        None => lines.push_str(
+            "memory-hit split: NOT DERIVED — no pre-row cold-counter baseline for this row\n",
+        ),
+    }
     Ok(lines)
 }
 
@@ -819,6 +1158,9 @@ pub fn cmd_ycsb(args: &[String]) -> Result<(), String> {
             "skip-fill",
             "fill-only",
             "named-absent",
+            // Hot-set gate (ADR-0071 D3): the RAM-resident reference leg's
+            // gate-run dir (or its mem-hit.tsv) to compare against.
+            "hot-set-reference",
         ],
     )?;
     let gates_list = load_gates(&flags, "m4")?;
@@ -1053,15 +1395,33 @@ pub fn cmd_ycsb(args: &[String]) -> Result<(), String> {
     }
 
     let mut saturation_done = false;
+    let mut mem_hits: Vec<(String, MemHit)> = Vec::new();
     for (name, w, dist) in &rows {
         println!("== ycsb row: {name} ==");
         m.row_open(name);
         let spec = RowSpec { ..base_spec.clone() };
         let w_effective = Workload { dist: *dist, ..**w };
+        // Cold-counter baseline *before* the row: the memory-hit
+        // derivation needs this row's own cold reads, not the node's
+        // lifetime total (a soak leg is row N of hundreds).
+        let pre = if tiered_live { Some(scrape_cells(port, cells)?) } else { None };
         let out = run_row(&spec, &w_effective, &zipf)?;
         let mut body = render_row(&out, w, *dist);
         let scrape = scrape_cells(port, cells)?;
-        body.push_str(&split_section(&scrape, tiered_live)?);
+        let mem = pre.as_ref().map(|pre| {
+            let delta =
+                |field: &str| sum_field(&scrape, field).saturating_sub(sum_field(pre, field));
+            derive_mem_hit(
+                &out,
+                delta("cold_reads_issued"),
+                delta("tiering_cold_resolves"),
+                max_field(&scrape, "tiering_cold_p50_us"),
+            )
+        });
+        body.push_str(&split_section(&scrape, tiered_live, mem.as_ref())?);
+        if let Some(mem) = mem {
+            mem_hits.push((name.clone(), mem));
+        }
         // Tripwires in every row (§19): raw submit grouping.
         let (submits, sqes) = (sum_field(&scrape, "raw_submits"), sum_field(&scrape, "raw_sqes"));
         let grouping = if submits == 0 { 0.0 } else { sqes as f64 / submits as f64 };
@@ -1116,15 +1476,24 @@ pub fn cmd_ycsb(args: &[String]) -> Result<(), String> {
     }
 
     // Hot-set gate rows (tiered mode only): the memory-speed reference is
-    // a fully-RAM-resident run through the *same instrument* — the S22
-    // plan-interpretation note; produced only when the split fields exist.
-    if tiered_live {
-        m.note(
-            "hot-set gate rows (ycsb:hot_set_*) require the reference leg — run \
-             `inf-bench ycsb --dataset-multiple 1` in the same campaign and compare the \
-             memory-hit split percentiles (S24 runbook step); this run reports the tiered \
-             side only",
-        );
+    // a fully-RAM-resident run through the *same instrument* (ADR-0064 D4),
+    // compared on the client-derived memory-hit split (ADR-0071 D2).
+    if tiered_live && !mem_hits.is_empty() {
+        m.sidecar("mem-hit.tsv", render_mem_hit_tsv(&mem_hits));
+        match flags.get("hot-set-reference") {
+            None => m.note(
+                "hot-set gate rows (ycsb:hot_set_*): PENDING the reference leg — run \
+                 `inf-bench ycsb --dataset-multiple 1` in the same campaign and re-run this leg \
+                 with `--hot-set-reference <that run's dir or mem-hit.tsv>`; this run publishes \
+                 its own memory-hit split in `mem-hit.tsv` for that comparison",
+            ),
+            Some(path) => {
+                let reference = load_mem_hit_tsv(path)?;
+                let (note, section) = compare_hot_set(&mut m, &mem_hits, &reference, path);
+                m.note(note);
+                m.raw_section("hot-set gate: tiered vs RAM-resident reference leg", &section);
+            }
+        }
     }
 
     finish_report(
@@ -1187,6 +1556,150 @@ mod tests {
             (measured - zipf.top1_share * 100.0).abs() > 1.5,
             "uniform draws must not pass the zipfian self-check"
         );
+    }
+
+    /// A synthetic bimodal row: `mem` ops at `mem_us`, `cold` ops at
+    /// `cold_us` — the shape every tiered row has.
+    fn bimodal_row(mem: u64, mem_us: u64, cold: u64, cold_us: u64) -> RowOut {
+        let mut hist = LogHistogram::new();
+        for _ in 0..mem {
+            hist.record(mem_us);
+        }
+        for _ in 0..cold {
+            hist.record(cold_us);
+        }
+        RowOut {
+            ops: mem + cold,
+            errors: 0,
+            nils: 0,
+            ops_per_sec: 0.0,
+            p50_us: hist.percentile(50.0),
+            p99_us: hist.percentile(99.0),
+            p999_us: hist.percentile(99.9),
+            max_us: hist.max(),
+            hot_share_pct: 0.0,
+            checksum: 0,
+            hist_us: hist,
+        }
+    }
+
+    #[test]
+    fn mem_hit_truncation_recovers_the_memory_population() {
+        // 2% of ops cold at 2 ms; the rest memory hits at 80 µs. The
+        // blended p99 sits in the cold mode (that is the lie the split
+        // exists to prevent); the derived memory-hit p99 must not.
+        let out = bimodal_row(196_000, 80, 4_000, 2_000);
+        assert!(out.p99_us >= 2_000, "combined p99 is cold-dominated: {}", out.p99_us);
+        let mem = derive_mem_hit(&out, 4_000, 9_320, 1_800);
+        assert!(mem.eligible.is_ok(), "{:?}", mem.eligible);
+        assert!((mem.cold_frac - 0.02).abs() < 1e-6, "cold_frac {}", mem.cold_frac);
+        // LogHistogram reports the bucket's upper bound (~3% wide).
+        for (label, value) in [("p50", mem.p50_us), ("p99", mem.p99_us), ("p99.9", mem.p999_us)] {
+            assert!((80..=83).contains(&value), "memory-hit {label} = {value}, expected ~80 µs");
+        }
+    }
+
+    #[test]
+    fn mem_hit_refuses_when_the_populations_overlap() {
+        // A memory population with a tail *slower* than the cold reads:
+        // 180k hits at 80 µs, 15k at 900 µs, 5k cold at 600 µs. The
+        // truncation cannot tell the slow memory tail from a cold read,
+        // so the row renders and is refused a gate value — never quietly
+        // published.
+        let mut hist = LogHistogram::new();
+        for _ in 0..180_000 {
+            hist.record(80);
+        }
+        for _ in 0..15_000 {
+            hist.record(900);
+        }
+        for _ in 0..5_000 {
+            hist.record(600);
+        }
+        let out = RowOut {
+            ops: 200_000,
+            errors: 0,
+            nils: 0,
+            ops_per_sec: 0.0,
+            p50_us: hist.percentile(50.0),
+            p99_us: hist.percentile(99.0),
+            p999_us: hist.percentile(99.9),
+            max_us: hist.max(),
+            hot_share_pct: 0.0,
+            checksum: 0,
+            hist_us: hist,
+        };
+        let mem = derive_mem_hit(&out, 5_000, 11_650, 600);
+        let reason = mem.eligible.expect_err("overlapping populations must be refused");
+        assert!(reason.contains("separation check FAILED"), "{reason}");
+    }
+
+    #[test]
+    fn mem_hit_refuses_a_cold_dominated_row() {
+        let out = bimodal_row(40_000, 80, 160_000, 2_000);
+        let mem = derive_mem_hit(&out, 160_000, 320_000, 1_800);
+        let reason = mem.eligible.expect_err("a mostly-cold row has no hot set to gate");
+        assert!(reason.contains("cold fraction"), "{reason}");
+    }
+
+    #[test]
+    fn mem_hit_refuses_too_few_ops_for_a_p999() {
+        let out = bimodal_row(9_000, 80, 100, 2_000);
+        let mem = derive_mem_hit(&out, 100, 233, 1_800);
+        let reason = mem.eligible.expect_err("a short row cannot carry a p99.9 gate value");
+        assert!(reason.contains("too few"), "{reason}");
+    }
+
+    #[test]
+    fn mem_hit_tsv_round_trips_through_the_reference_carrier() {
+        let rows = vec![
+            (
+                "ycsb-a-zipfian".to_string(),
+                derive_mem_hit(&bimodal_row(196_000, 80, 4_000, 2_000), 4_000, 9_320, 1_800),
+            ),
+            (
+                "ycsb-b-zipfian".to_string(),
+                derive_mem_hit(&bimodal_row(40_000, 80, 160_000, 2_000), 160_000, 320_000, 1_800),
+            ),
+        ];
+        let tsv = render_mem_hit_tsv(&rows);
+        let dir = std::env::temp_dir().join(format!("inf-memhit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("mem-hit.tsv"), &tsv).expect("write");
+        let loaded = load_mem_hit_tsv(&dir.to_string_lossy()).expect("load by directory");
+        assert_eq!(loaded.len(), 2);
+        let a = &loaded["ycsb-a-zipfian"];
+        assert!(a.eligible);
+        assert_eq!(a.p99_us, rows[0].1.p99_us);
+        // The ineligible row round-trips as ineligible: the reference leg
+        // must never lend a row its blessing.
+        assert!(!loaded["ycsb-b-zipfian"].eligible);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn withdrawn_ram_hit_fields_do_not_refuse_a_tiered_row() {
+        // The F17 regression, pinned: a scrape carrying the cold half but
+        // none of the withdrawn ram-hit fields must render, not refuse.
+        let mut cell = std::collections::BTreeMap::new();
+        for (k, v) in [
+            ("tiering_cold_p50_us", "1119"),
+            ("tiering_cold_p99_us", "14591"),
+            ("tiering_cold_p999_us", "56319"),
+            ("cold_read_qd_p99", "4"),
+            ("coalesce_ratio_milli", "0"),
+            ("tiering_ram_hit_split", "unmeasured-iteration-clock"),
+            ("tiering_cold_resolves", "3948175"),
+        ] {
+            cell.insert(k.to_string(), v.to_string());
+        }
+        let body = split_section(&[cell.clone()], true, None).expect("tiered row must render");
+        assert!(body.contains("tiering_cold_p99_us (worst cell) = 14591"), "{body}");
+        assert!(body.contains("WITHDRAWN"), "{body}");
+        // ...and the cold half is still a hard contract.
+        cell.remove("tiering_cold_p99_us");
+        let err = split_section(&[cell], true, None).expect_err("missing cold field must refuse");
+        assert!(err.contains("cold split"), "{err}");
     }
 
     #[test]
