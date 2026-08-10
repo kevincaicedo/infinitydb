@@ -1,0 +1,39 @@
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 2 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     FAIL  thermal throttling occurred: cpu0/package_throttle_count=31, cpu1/package_throttle_count=31, cpu10/core_throttle_count=23, cpu10/package_throttle_count=31
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+gate-run: CONTINUING WITH FAILED ENV-CHECK — results are not citation-grade
+== ycsb row: ycsb-a-zipfian ==
+inf-bench: tiered row ran but `tiering_ram_hit_p50_us` is missing from INFO tiering — the split histogram contract (M4-S26 / SPLIT_FIELDS) is not met; a tiered row without the split is invalid by construction (§18/§19)
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 2 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     FAIL  thermal throttling occurred: cpu0/package_throttle_count=31, cpu1/package_throttle_count=31, cpu10/core_throttle_count=23, cpu10/package_throttle_count=31
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+gate-run: CONTINUING WITH FAILED ENV-CHECK — results are not citation-grade
+== ycsb row: ycsb-a-zipfian ==
+inf-bench: tiered row ran but `tiering_ram_hit_p50_us` is missing from INFO tiering — the split histogram contract (M4-S26 / SPLIT_FIELDS) is not met; a tiered row without the split is invalid by construction (§18/§19)
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 2 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     FAIL  thermal throttling occurred: cpu0/package_throttle_count=31, cpu1/package_throttle_count=31, cpu10/core_throttle_count=23, cpu10/package_throttle_count=31
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+gate-run: CONTINUING WITH FAILED ENV-CHECK — results are not citation-grade
+== ycsb row: ycsb-a-zipfian ==
+inf-bench: tiered row ran but `tiering_ram_hit_p50_us` is missing from INFO tiering — the split histogram contract (M4-S26 / SPLIT_FIELDS) is not met; a tiered row without the split is invalid by construction (§18/§19)

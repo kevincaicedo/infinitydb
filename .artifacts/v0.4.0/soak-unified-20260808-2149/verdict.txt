@@ -1,0 +1,11 @@
+rss slope whole-run +0.248%/24h (first-5% median 3340044 kB -> last-5% median 3351116 kB, 11440 samples; disclosure)
+rss slope steady-state +0.208%/24h (first 8 h excluded per ADR-0069 D1, 8586 samples, 3344140 kB -> 3351116 kB; GATE)
+accounted slope whole-run +0.098%/24h (used_memory first-5% median 618767 kB -> last-5% 619574 kB; disclosure)
+accounted slope steady-state +0.066%/24h (GATE)
+attribution (end): rss 3352756 kB vs used_memory + tier_committed + tier_index + staging + ckpt = 3322014 kB — residual 30742 kB (+0.9%; disclosure)
+tiering disk max 22223470592 bytes (budget 85899345920)
+write-amp milli max 1920 (gate < 3000)
+diskfull refusals 0
+docs_live 12502 -> 14240 (document plane live throughout: yes)
+checkpoints completed 0 -> 36814 (delta 36814)
+PASS — discharges: M2.5 stability soak, M3 §7 doc soak, M4 §7 memory honesty
