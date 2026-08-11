@@ -163,8 +163,9 @@ track them.
 
 ### Status
 - **Caution Amber** `#ffc45c` — warn callouts, `partial` compat chips.
-- **Alarm Red** `#ff5c78` — the Vortex bar and terminal-chrome dot only;
-  never marketing.
+- **Alarm Red** `#ff5c78` — the terminal-chrome dot only; never marketing.
+  (Its former second use, the Vortex comparison bar, was retired with the
+  vortex content on 2026-08-10.)
 
 ### Named Rules
 **The Two Lamps Rule.** Violet marks what is *in motion* (current,
@@ -293,9 +294,9 @@ columns; last row loses its border.
 Sticky, 14px blur over `rgba(6,7,13,0.82)`, bottom hairline. Brand:
 the dual-circle logo (violet + teal rings — the infinity mark),
 `infinityDB` in 800 with teal `DB`, and the version badge pill
-(`v0.3.0-alpha.1 · IN DEV` on the landing; a neutral section badge
-`DOCS`/`BLOG` on inner pages). Links: mono 12px, 0.1em, uppercase,
-muted → teal on hover/current. One filled CTA (`★ GITHUB`).
+(`v0.4.0-alpha · IN DEV` on the landing; a neutral section badge
+`DOCS`/`BLOG`/`EVIDENCE` on inner pages). Links: mono 12px, 0.1em,
+uppercase, muted → teal on hover/current. One filled CTA (`★ GITHUB`).
 
 ### Callouts
 Panel-raised, 10px radius, seam-mid border with a 3px teal left edge

@@ -158,6 +158,14 @@ def main() -> int:
     violations = []
     found_any = []
     for page in sorted(site.rglob("*.html")):
+        # site/evidence/ holds GENERATED verbatim renders of citation-grade
+        # campaign artifacts (gen-compare-page.py, which hard-refuses any
+        # report whose tier banner is not binding). Those pages ARE the
+        # artifacts the ledger rows cite — the copy gate exists to stop
+        # unreviewed numbers in *prose*, not to re-review the evidence
+        # itself. Hand-written pages must never live under evidence/.
+        if "evidence" in page.relative_to(site).parts:
+            continue
         text = visible_text(page.read_text(encoding="utf-8"))
         for token, snippet in extract_tokens(text):
             found_any.append((page, token, snippet))

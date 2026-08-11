@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmarks &amp; evidence — InfinityDB Docs</title>
+<meta name="description" content="How InfinityDB benchmarks are conducted: two harnesses, competitors in the same run, crossover A/B replicates, environment checks, the claim ledger — and every number the ledger currently allows.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2018'%3E%3Ccircle%20cx='10'%20cy='9'%20r='7'%20fill='none'%20stroke='%237c5cff'%20stroke-width='2.4'/%3E%3Ccircle%20cx='24'%20cy='9'%20r='7'%20fill='none'%20stroke='%233ee6c4'%20stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+.method-svg text { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+@media (prefers-reduced-motion: reduce) { .anim-dot { display: none; } }
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="../index.html" class="nav-brand">
+      <svg class="logo" width="34" height="18" viewBox="0 0 34 18" aria-hidden="true">
+        <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2.4"/>
+        <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2.4"/>
+      </svg>
+      <span class="mark">infinity<b>DB</b></span>
+      <span class="nav-badge neutral">DOCS</span>
+    </a>
+    <span class="nav-spacer"></span>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="nav-links">
+      <a href="../index.html">HOME</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
+    </div>
+  </div>
+</nav>
+
+<div class="docs-shell">
+  <aside class="docs-side">
+    <p class="side-h">Getting started</p>
+    <a class="side-link" href="index.html">Docs home</a>
+    <a class="side-link" href="quickstart.html">Quickstart</a>
+    <p class="side-h">Concepts</p>
+    <a class="side-link" href="architecture.html">Architecture</a>
+    <a class="side-link" href="durability.html">Namespaces &amp; durability</a>
+    <p class="side-h">Operations</p>
+    <a class="side-link" href="deployment.html">Deployment</a>
+    <a class="side-link" href="operations.html">Operations</a>
+    <p class="side-h">Evidence</p>
+    <a class="side-link" href="benchmarks.html" aria-current="page">Benchmarks &amp; evidence</a>
+    <a class="side-link" href="../evidence/inf-compare.html">Comparative report</a>
+    <p class="side-h">Reference</p>
+    <a class="side-link" href="compat.html">Command matrix</a>
+    <a class="side-link" href="roadmap.html">Roadmap</a>
+  </aside>
+
+  <main class="docs-main">
+    <article>
+      <p class="doc-kicker">Evidence</p>
+  <h1 class="page-title">How we benchmark</h1>
+  <p class="lede">Every performance number InfinityDB publishes was produced by a process designed to make lying hard &mdash; to you, and to ourselves. This page is that process, end to end: the harnesses, the environment rules, the replicate discipline, the instrument checks, and finally the numbers themselves &mdash; each one carrying its ledger row and its disclosures.</p>
+
+  <h2>The rule that governs everything</h2>
+  <p>Project law L10: <strong>claims follow evidence.</strong> Every number or comparative statement in public copy must have a row marked <strong>Allowed</strong> in <code>docs/claim-ledger.md</code>, citing a committed artifact. Rows carry one of five statuses &mdash; <em>Allowed</em>, <em>Narrowed</em> (a weaker wording is allowed; the original is not), <em>Evidence-pending</em>, <em>Rejected</em>, or bound to a named blocker &mdash; and are re-validated per release: a row whose artifact was not re-run in the release campaign reverts to Evidence-pending for that announcement. This website is scanned in CI against the ledger; an uncovered number fails the build. Targets never appear as numbers anywhere &mdash; a target dressed as a result is the exact failure mode this project was restarted to kill.</p>
+
+  <h2>Two harnesses, no silent substitution</h2>
+  <p><strong><code>inf-bench</code></strong> is the in-house gate harness: it drives the milestone gate workloads (eviction storms, TTL mixes, checkpoint-under-load, crash/recovery cycles, YCSB-style tiered rows) that generic load generators cannot express, and it proves the <em>gates</em>. Because it is ours, its rows are always labeled <code>inf-bench</code> &mdash; an in-house harness is a conflict of interest that must be visible.</p>
+  <p><strong><code>inf-compare</code></strong> is the comparative harness, and it is deliberately zero-dependency about the interesting part: the load is generated by <em>independent, third-party generators</em> &mdash; memtier_benchmark and redis-benchmark &mdash; never by our own code. Competitors run <strong>in the same run on the same box</strong>, each with its own best launch configuration, recorded verbatim in the report. A comparative number without the competitor in the run does not exist. The two generators cross-check each other on every engine/workload pair, and the report flags its own divergences rather than quoting the friendlier one.</p>
+  <p>The current binding comparative report is published verbatim: <a href="../evidence/inf-compare.html">the campaign report</a>, rendered by a generator that refuses any report not stamped citation-grade.</p>
+
+  <h2>What makes a run valid</h2>
+  <p>A run that fails any of these is invalid for claims &mdash; not discounted, not caveated: <em>invalid</em>, and labeled so in the artifact.</p>
+  <ul style="color:var(--text-muted);font-size:14px;line-height:1.8">
+    <li><strong>Environment check, mechanically enforced.</strong> <code>inf-bench env-check</code> must pass before a binding run starts: clean git tree, <code>performance</code> governor and EPP, turbo off, zero thermal-throttle counters. The harness refuses to run otherwise (a <code>--unsafe-env</code> escape records a permanently non-citable dev run).</li>
+    <li><strong>Placement is pinned and disclosed.</strong> Server cells on named P-cores, the load generator on a disjoint CPU set, both recorded in the report header.</li>
+    <li><strong>Replicates with medians.</strong> Binding rows run 3&ndash;6 replicates; leg medians decide, per-replicate values are committed. Relative spread is reported, and a row whose spread swamps its threshold gets a disposition note instead of a verdict.</li>
+    <li><strong>Tripwires bind per run.</strong> Batching metrics (<code>sqes/submit</code> and friends) are recorded in every row; a red tripwire invalidates the row by definition &mdash; the number might be flattering, and it still dies.</li>
+    <li><strong>Generator saturation is dispositioned.</strong> If the load generator itself is the ceiling, the row is labeled generator-limited and absolute numbers from it are not quoted &mdash; only deltas at fixed generator config.</li>
+    <li><strong>Box and tier are named.</strong> Development-box numbers can never back a public claim. The reference box (i7-13700KF, consumer Gen3 DRAM-less NVMe &mdash; the device class is itself a disclosure) is where binding rows run; device-bound rows that need better hardware are dispositioned Evidence-pending, not rounded up.</li>
+  </ul>
+
+  <h2>A/B runs: the crossover instrument</h2>
+  <p>Regression gates compare two binaries with interleaved ABBA legs &mdash; and the instrument itself is audited. Our week-4 M4 risk gate produced a tail-latency reading that <em>followed the harness slot, not the binary</em>: a same-binary A/A control reproduced the exact failing signature with identical binaries. The fix is structural: servers respawn fresh per replicate, the binary&harr;slot assignment alternates every replicate, and legs run in spawn order &mdash; slot and load-order bias alternate sign against the binary and cancel in the leg medians over an even replicate count.</p>
+  <svg class="method-svg" viewBox="0 0 640 190" style="width:100%;max-width:640px;display:block;margin-top:18px" role="img" aria-label="Crossover A/B: across six replicates the two binaries alternate between the two server slots, so slot bias cancels in the medians.">
+    <text x="0" y="24" fill="#9096ae" font-size="11" letter-spacing="1.2">SLOT 1</text>
+    <text x="0" y="94" fill="#9096ae" font-size="11" letter-spacing="1.2">SLOT 2</text>
+    <text x="0" y="160" fill="#5c6178" font-size="9.5">REPLICATE</text>
+    <!-- replicate columns: alternating assignment -->
+    <g font-size="10">
+      <rect x="90"  y="8"  width="72" height="26" rx="6" fill="rgba(124,92,255,0.18)" stroke="rgba(124,92,255,0.5)"/><text x="126" y="25" text-anchor="middle" fill="#b9a8ff">A</text>
+      <rect x="90"  y="78" width="72" height="26" rx="6" fill="rgba(62,230,196,0.10)" stroke="rgba(62,230,196,0.4)"/><text x="126" y="95" text-anchor="middle" fill="#3ee6c4">B</text>
+      <rect x="180" y="8"  width="72" height="26" rx="6" fill="rgba(62,230,196,0.10)" stroke="rgba(62,230,196,0.4)"/><text x="216" y="25" text-anchor="middle" fill="#3ee6c4">B</text>
+      <rect x="180" y="78" width="72" height="26" rx="6" fill="rgba(124,92,255,0.18)" stroke="rgba(124,92,255,0.5)"/><text x="216" y="95" text-anchor="middle" fill="#b9a8ff">A</text>
+      <rect x="270" y="8"  width="72" height="26" rx="6" fill="rgba(124,92,255,0.18)" stroke="rgba(124,92,255,0.5)"/><text x="306" y="25" text-anchor="middle" fill="#b9a8ff">A</text>
+      <rect x="270" y="78" width="72" height="26" rx="6" fill="rgba(62,230,196,0.10)" stroke="rgba(62,230,196,0.4)"/><text x="306" y="95" text-anchor="middle" fill="#3ee6c4">B</text>
+      <rect x="360" y="8"  width="72" height="26" rx="6" fill="rgba(62,230,196,0.10)" stroke="rgba(62,230,196,0.4)"/><text x="396" y="25" text-anchor="middle" fill="#3ee6c4">B</text>
+      <rect x="360" y="78" width="72" height="26" rx="6" fill="rgba(124,92,255,0.18)" stroke="rgba(124,92,255,0.5)"/><text x="396" y="95" text-anchor="middle" fill="#b9a8ff">A</text>
+      <rect x="450" y="8"  width="72" height="26" rx="6" fill="rgba(124,92,255,0.18)" stroke="rgba(124,92,255,0.5)"/><text x="486" y="25" text-anchor="middle" fill="#b9a8ff">A</text>
+      <rect x="450" y="78" width="72" height="26" rx="6" fill="rgba(62,230,196,0.10)" stroke="rgba(62,230,196,0.4)"/><text x="486" y="95" text-anchor="middle" fill="#3ee6c4">B</text>
+      <rect x="540" y="8"  width="72" height="26" rx="6" fill="rgba(62,230,196,0.10)" stroke="rgba(62,230,196,0.4)"/><text x="576" y="25" text-anchor="middle" fill="#3ee6c4">B</text>
+      <rect x="540" y="78" width="72" height="26" rx="6" fill="rgba(124,92,255,0.18)" stroke="rgba(124,92,255,0.5)"/><text x="576" y="95" text-anchor="middle" fill="#b9a8ff">A</text>
+    </g>
+    <g fill="#5c6178" font-size="9.5" text-anchor="middle">
+      <text x="126" y="160">0</text><text x="216" y="160">1</text><text x="306" y="160">2</text>
+      <text x="396" y="160">3</text><text x="486" y="160">4</text><text x="576" y="160">5</text>
+    </g>
+    <text x="90" y="132" fill="#5c6178" font-size="9.5">FRESH SERVERS EVERY REPLICATE &middot; EVEN COUNT &middot; SLOT BIAS CANCELS IN THE LEG MEDIANS</text>
+  </svg>
+  <p>Two consequences worth naming. First, every binary in a binding A/B is <em>fingerprinted</em> into the report, and baselines are rebuilt from a pinned commit whose fingerprint must reproduce byte-exact &mdash; a baseline you cannot reproduce is not a baseline. Second, the same-binary <strong>A/A control</strong> is a standing part of the protocol: it measures the instrument&rsquo;s own noise floor, and a reading inside that floor is recorded as <em>inconclusive at instrument resolution</em> &mdash; claimed by neither side. Tail percentiles come from log-scaled histograms whose buckets are a few percent wide; a one-bucket delta cannot adjudicate a one-percent threshold, and we say so instead of picking the flattering interpretation.</p>
+
+  <h2>The tiered rule: split percentiles, always</h2>
+  <p>Beyond-RAM workloads (M4) serve two populations: memory hits in microseconds and cold reads that touch NVMe. A blended p99 over that bimodal distribution is a lie by construction &mdash; it reports a number no request actually experiences and hides the cold tail entirely. The reporting contract is fixed before the first public tiered number exists: <strong>memory-hit and cold-read percentiles are published separately, always</strong>; the combined client histogram is context, never the headline.</p>
+
+  <h2>The numbers the ledger allows today</h2>
+  <p>Everything below cites an <strong>Allowed</strong> (or, where stated, <em>Narrowed</em>) ledger row and was measured on the reference box with env-check green and competitors in-run. Nothing else on this site carries a performance number.</p>
+
+  <div class="evidence">
+    <span class="tag">C5 &middot; Narrowed &rarr; binding rows citable</span> &mdash; Unpipelined GET/SET at 512 connections: <strong style="color:var(--text)">3.21&times; Redis</strong>, same run, same box, 4 cells. Cross-cell comparator anchor: <strong style="color:var(--text)">1.72&times; Dragonfly</strong> in-run at 4 cells. Pipelined rows exist and bind but are quoted only with their shape context &mdash; the 8-cell natural row carries a disclosed red batching tripwire and is never quoted bare.
+    <span class="artifact">.artifacts/m0/1783698386-gate-run/ &middot; S19 closure campaign 2026-07-10 &middot; i7-13700KF, turbo off</span>
+  </div>
+  <div class="evidence">
+    <span class="tag">C7 &middot; Allowed</span> &mdash; <strong style="color:var(--text)">0.61&times; Redis RSS</strong> at 10M keys &times; (16 B keys, 64 B values), both engines filled in the same run on the same box.
+    <span class="artifact">.artifacts/m0/1783698386-gate-run/ + .artifacts/m1/1783699242-gate-run/ &middot; both runs read 0.611&times;</span>
+  </div>
+  <div class="evidence">
+    <span class="tag">C8 &middot; Allowed</span> &mdash; LFU eviction hit-rate parity with Redis under a zipfian trace: <strong style="color:var(--text)">96.19% vs 96.19%</strong> (+0.00 pp), 1M keyspace, 5M ops, same trace both engines.
+    <span class="artifact">.artifacts/m1/1783699242-gate-run/</span>
+  </div>
+  <div class="evidence">
+    <span class="tag">C12 &middot; Allowed</span> &mdash; 10,000 simulated power-cut/disk-fault seeds: zero durability-oracle violations &mdash; every <code>always</code>-acked write survives, <code>everysec</code> loses at most one second (simulated time), every seed replays byte-identically; zero recovery refusals on the current frame-format tree at the same seeds.
+    <span class="artifact">m2.5/s12-frame-seq-20260709/ + dst-sweep-10k artifacts &middot; regenerated per release</span>
+  </div>
+  <div class="evidence">
+    <span class="tag">C14 &middot; Allowed</span> &mdash; A 10 GB node (8 cells) cold-boots to serving in <strong style="color:var(--text)">9.8 s</strong> (under 10 s measured, 15 s gate), cold page cache, 3 replicates under 1% spread. Device: consumer Gen3 DRAM-less NVMe, named.
+    <span class="artifact">parallel-boot-cold-20260705/ + m2.5/s08-readahead-20260706/ (7.3 s re-run)</span>
+  </div>
+  <div class="evidence">
+    <span class="tag">C16 &middot; Allowed</span> &mdash; Checkpoints are fork-free and memory-flat: continuous checkpoint cycling under a saturating durable write mix costs <strong style="color:var(--text)">14.4 MiB</strong> of peak RSS vs a no-checkpoint control (bound: 15 MiB; a fork/COW rewrite would cost the dataset).
+    <span class="artifact">.artifacts/m2/1783699515-gate-run/ &middot; 176 cycles in-row</span>
+  </div>
+  <div class="evidence">
+    <span class="tag">C19 &middot; Narrowed</span> &mdash; <code>everysec</code> durability costs &asymp; <strong style="color:var(--text)">10&ndash;11%</strong> of throughput vs a memory-mode namespace on our reference box (consumer Gen3 DRAM-less NVMe; interleaved ABBA, 3 replicates). The &ldquo;&lt; 10%&rdquo; absolute stays Evidence-pending on this device class.
+    <span class="artifact">.artifacts/m2/1783699515-gate-run/</span>
+  </div>
+  <div class="evidence">
+    <span class="tag">C21 &middot; Allowed</span> &mdash; Memory attribution stays exact with the durable plane live: sum of per-domain accounting &mdash; log staging and checkpoint buffers included &mdash; within <strong style="color:var(--text)">1.1%</strong> of process RSS on a 1 GB durable fill (measured 1.04%; divergence over 10% fails the gate).
+    <span class="artifact">.artifacts/m2/1783699515-gate-run/ attribution row</span>
+  </div>
+  <div class="evidence">
+    <span class="tag">C24 &middot; Allowed</span> &mdash; Documents are stored as a compact binary tape (<code>idoc</code> v1): <strong style="color:var(--text)">1.108&times; msgpack</strong> and <strong style="color:var(--text)">0.764&times; JSON text</strong> aggregate density on the reference corpus shapes (deterministic byte counts; per-shape worst cases live in the artifact and travel with any per-shape quote).
+    <span class="artifact">infinitydb/.artifacts/m3/s02-idoc-20260710/</span>
+  </div>
+  <div class="evidence">
+    <span class="tag">C25 &middot; Allowed</span> &mdash; Document reads never run a JSON text parser &mdash; profile-proven: zero parser/path-compiler symbols in a 1,659-row profile under a live <code>JSON.GET</code> load, and a CI check greps the profile so a regression fails loudly.
+    <span class="artifact">infinitydb/.artifacts/m3/s25-dev-20260716/ &middot; dev-tier proof, named; the release campaign re-proves it</span>
+  </div>
+  <div class="evidence">
+    <span class="tag">C26 &middot; Allowed</span> &mdash; Every document path mutation is one delta log record &mdash; <strong style="color:var(--text)">0.066&times;</strong> full-document log volume on the 64-op mutation mix &mdash; and 10,000 simulated document power-cut seeds produced zero durability-oracle and zero replay-equivalence violations, replayed state byte-exact including lineage and version.
+    <span class="artifact">infinitydb/.artifacts/m3/s16-s17-20260712/ + s23-s24-20260716/doc-sweep-10k.txt</span>
+  </div>
+  <div class="evidence">
+    <span class="tag">C27 &middot; Allowed</span> &mdash; Document memory is attributed always-on (tape/tree/slack/path-cache domains, per namespace); attribution reconciles with RSS at <strong style="color:var(--text)">0.056%</strong> divergence on a 65k-document load (10% fails CI).
+    <span class="artifact">infinitydb/.artifacts/m3/s18-s19-20260713/</span>
+  </div>
+
+  <h2>What you will not find here, and why</h2>
+  <p>The absences are part of the method. Each one is a ledger row that has not earned Allowed status, and each names what is missing:</p>
+  <ul style="color:var(--text-muted);font-size:14px;line-height:1.8">
+    <li><strong>Absolute <code>always</code>-mode write rates.</strong> The mechanism is proven (one durability fsync in flight, collecting every arrival during the flush), but the absolute number is owned by the flush latency of a better device class than our Gen3 DRAM-less reference NVMe. Evidence-pending; the mechanism story is citable, the number is not.</li>
+    <li><strong>Absolute tail-latency claims.</strong> The reference device itself stalls under sustained write load with checkpoints <em>off</em> &mdash; the control run proves the excursions belong to the device class, so an absolute p99.9 claim would be a claim about our SSD, not our engine. Narrowed to relative wordings.</li>
+    <li><strong>Tiered-storage numbers (M4).</strong> The harness, the split-percentile contract, and the gate table exist; the binding campaign is in progress. Until its rows are signed, no cold-read or beyond-RAM number appears anywhere &mdash; and when they do, cold-read tail rows will carry the Gen3 device disclosure explicitly.</li>
+    <li><strong>Document wire ratios (reads vs <code>GET</code>, writes vs <code>SET</code>).</strong> Measured at dev tier, on the gate line; the reference-box campaign owns the verdict. Evidence-pending &mdash; quoting the dev numbers would be exactly the shortcut the ledger exists to prevent.</li>
+  </ul>
+
+  <div class="callout">
+    <span class="callout-tag"><strong>Reproduce it:</strong></span>
+    every artifact path above is committed in the repository, raw generator output included. The harnesses are in-tree (<code>bins/inf-bench</code>, <code>bins/inf-compare</code>), the environment checker is <code>inf-bench env-check</code>, and the comparative report renders from its artifact by generator &mdash; <a href="../evidence/inf-compare.html">read the current binding report</a>.
+  </div>
+
+  <div class="doc-footer-nav">
+    <a href="operations.html">&larr; Operations</a>
+    <a href="../evidence/inf-compare.html">The comparative report &rarr;</a>
+  </div>
+    </article>
+  </main>
+</div>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span class="mark">&copy; 2026 INFINITYDB &mdash; APACHE 2.0 &middot; RUST &middot; <b>infinityd</b></span>
+    <div class="footer-links">
+      <a href="index.html">DOCS</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="roadmap.html">ROADMAP</a>
+      <a href="https://github.com/">GITHUB &#8599;</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var t = document.querySelector('.nav-toggle');
+  var l = document.querySelector('.nav-links');
+  if (t && l) t.addEventListener('click', function () {
+    var open = l.classList.toggle('open');
+    t.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+})();
+</script>
+</body>
+</html>

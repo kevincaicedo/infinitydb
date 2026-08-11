@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>inf-compare — competitive benchmark report — InfinityDB Evidence</title>
+<meta name="description" content="Verbatim render of a binding inf-compare campaign report: competitors in the same run on the same box, environment recorded, raw artifacts committed.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2018'%3E%3Ccircle%20cx='10'%20cy='9'%20r='7'%20fill='none'%20stroke='%237c5cff'%20stroke-width='2.4'/%3E%3Ccircle%20cx='24'%20cy='9'%20r='7'%20fill='none'%20stroke='%233ee6c4'%20stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+.evidence-wrap { max-width: var(--container); margin: 0 auto; padding: 64px var(--pad-x) 120px; animation: fadeUp 0.4s both; }
+.evidence-wrap h2 { font-size: 22px; margin: var(--sp-5) 0 8px; }
+.evidence-wrap p { font-size: 14px; line-height: 1.7; color: var(--text-muted); max-width: 760px; }
+.evidence-wrap ul { color: var(--text-muted); font-size: 13.5px; line-height: 1.8; max-width: 760px; }
+.tier-banner {
+  display: inline-block; font: 700 11px/1 var(--mono); letter-spacing: 0.12em;
+  color: var(--bg); background: var(--teal); border-radius: 99px; padding: 6px 14px;
+  text-transform: uppercase;
+}
+table.data td:first-child { color: var(--teal); }
+table.data td { font-family: var(--mono); font-size: 12.5px; }
+.gen-note { font: 400 10.5px/1.9 var(--mono); letter-spacing: 0.06em; color: var(--text-faint); margin-top: var(--sp-5); }
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="../index.html" class="nav-brand">
+      <svg class="logo" width="34" height="18" viewBox="0 0 34 18" aria-hidden="true">
+        <circle cx="10" cy="9" r="7" fill="none" stroke="#7c5cff" stroke-width="2.4"/>
+        <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2.4"/>
+      </svg>
+      <span class="mark">infinity<b>DB</b></span>
+      <span class="nav-badge neutral">EVIDENCE</span>
+    </a>
+    <span class="nav-spacer"></span>
+    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <div class="nav-links">
+      <a href="../index.html">HOME</a>
+      <a href="../docs/index.html">DOCS</a>
+      <a href="../docs/benchmarks.html">BENCHMARKS</a>
+      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
+    </div>
+  </div>
+</nav>
+
+<main class="evidence-wrap">
+  <p class="doc-kicker">Evidence &middot; generated page &mdash; do not edit</p>
+  <h1 class="page-title">inf-compare — competitive benchmark report</h1>
+  <p><span class="tier-banner">reference-box (binding, citation-grade)</span></p>
+  <div class="callout">
+    <span class="callout-tag"><strong>What this page is:</strong></span>
+    a verbatim render of the committed report from the M2.5-S19 closure campaign (2026-07-10, git 98864f4, .artifacts/compare/1783699575-compare/) &mdash; the
+    comparative campaign behind ledger rows C5 (throughput), C7 (memory). Every engine ran
+    in the same run on the same box with its launch command recorded below;
+    the environment check (governor, EPP, turbo, thermals, clean tree)
+    passed before any row was recorded. Numbers here are quotable only in
+    the wording the claim ledger allows &mdash; see
+    <a href="../docs/benchmarks.html">how we benchmark</a> for the rules,
+    including the independent-generator cross-check that deliberately flags
+    its own divergences below.
+  </div>
+<div class="table-wrap"><table class="data"><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>Generated</td><td>unix 1783699575</td></tr>
+<tr><td>Git</td><td><code>98864f4</code></td></tr>
+<tr><td>Host</td><td>7.0.0-27-generic, 24 cores</td></tr>
+<tr><td>CPU governor / EPP</td><td><code>performance</code> / <code>performance</code></td></tr>
+<tr><td>inf-bench env-check</td><td>PASS (<code>target/release/inf-bench env-check</code> exit 0)</td></tr>
+<tr><td>Mode</td><td>host</td></tr>
+<tr><td>Generators</td><td>memtier + redis-benchmark</td></tr>
+<tr><td>memtier</td><td><code>memtier_benchmark v=255.255.255 sha=62413fd6:0 bits=64 libevent=2.1.12-stable openssl=OpenSSL 3.5.5 27 Jan 2026</code></td></tr>
+<tr><td>redis-benchmark</td><td><code>redis-benchmark 8.0.5</code></td></tr>
+<tr><td>Parameters</td><td>duration=15s · threads=4 · clients=50 · value=64 B · keyspace=1000000 · pipeline=1, 16 · maxmemory=unset</td></tr>
+</tbody></table></div>
+<h2>Engines — published configs</h2>
+<div class="table-wrap"><table class="data"><thead><tr><th>Engine</th><th>Mode</th><th>Version</th><th style="text-align:right">Peak RSS (MiB)</th><th>Launch command</th></tr></thead><tbody>
+<tr><td>redis</td><td>host</td><td>Redis server v=8.0.5 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=9729964261b8fc0f</td><td style="text-align:right">143.9</td><td><code>redis-server --port 7000 --save '' --appendonly no</code></td></tr>
+<tr><td>dragonfly</td><td>host</td><td>dragonfly v1.39.0-699862e5da7cb29bf5642a1da422c4c78cefae38</td><td style="text-align:right">93.9</td><td><code>dragonfly --port 7001 --proactor_threads 4 --cache_mode --dbfilename '' --logtostderr --dir /tmp</code></td></tr>
+<tr><td>infinitydb</td><td>host</td><td>infinityd 515c87a (git 515c87a00168, x86_64-unknown-linux-gnu)</td><td style="text-align:right">167.1</td><td><code>target/release/infinityd --port 7002 --cells 4</code></td></tr>
+</tbody></table></div>
+<h2>Results — memtier_benchmark</h2>
+<div class="table-wrap"><table class="data"><thead><tr><th>Engine</th><th>Workload</th><th style="text-align:right">Pipe</th><th style="text-align:right">Throughput (ops/s)</th><th style="text-align:right">avg (ms)</th><th style="text-align:right">p50 (ms)</th><th style="text-align:right">p99 (ms)</th><th style="text-align:right">p99.9 (ms)</th><th style="text-align:right">RSS (MiB)</th></tr></thead><tbody>
+<tr><td>redis</td><td>set</td><td style="text-align:right">1</td><td style="text-align:right">267052</td><td style="text-align:right">0.749</td><td style="text-align:right">0.711</td><td style="text-align:right">1.423</td><td style="text-align:right">1.711</td><td style="text-align:right">128.8</td></tr>
+<tr><td>redis</td><td>set</td><td style="text-align:right">16</td><td style="text-align:right">1790743</td><td style="text-align:right">1.784</td><td style="text-align:right">1.599</td><td style="text-align:right">2.815</td><td style="text-align:right">3.407</td><td style="text-align:right">145.8</td></tr>
+<tr><td>redis</td><td>get</td><td style="text-align:right">1</td><td style="text-align:right">269725</td><td style="text-align:right">0.741</td><td style="text-align:right">0.695</td><td style="text-align:right">1.399</td><td style="text-align:right">1.695</td><td style="text-align:right">19.3</td></tr>
+<tr><td>redis</td><td>get</td><td style="text-align:right">16</td><td style="text-align:right">2292089</td><td style="text-align:right">1.393</td><td style="text-align:right">1.223</td><td style="text-align:right">2.367</td><td style="text-align:right">2.863</td><td style="text-align:right">19.4</td></tr>
+<tr><td>redis</td><td>mixed</td><td style="text-align:right">1</td><td style="text-align:right">274308</td><td style="text-align:right">0.729</td><td style="text-align:right">0.695</td><td style="text-align:right">1.391</td><td style="text-align:right">1.631</td><td style="text-align:right">18.9</td></tr>
+<tr><td>redis</td><td>mixed</td><td style="text-align:right">16</td><td style="text-align:right">2188404</td><td style="text-align:right">1.459</td><td style="text-align:right">1.279</td><td style="text-align:right">2.431</td><td style="text-align:right">2.959</td><td style="text-align:right">20.2</td></tr>
+<tr><td>dragonfly</td><td>set</td><td style="text-align:right">1</td><td style="text-align:right">533482</td><td style="text-align:right">0.375</td><td style="text-align:right">0.375</td><td style="text-align:right">0.567</td><td style="text-align:right">1.327</td><td style="text-align:right">86.1</td></tr>
+<tr><td>dragonfly</td><td>set</td><td style="text-align:right">16</td><td style="text-align:right">1554681</td><td style="text-align:right">2.056</td><td style="text-align:right">2.015</td><td style="text-align:right">3.583</td><td style="text-align:right">4.543</td><td style="text-align:right">92.9</td></tr>
+<tr><td>dragonfly</td><td>get</td><td style="text-align:right">1</td><td style="text-align:right">586603</td><td style="text-align:right">0.341</td><td style="text-align:right">0.343</td><td style="text-align:right">0.511</td><td style="text-align:right">1.015</td><td style="text-align:right">25.5</td></tr>
+<tr><td>dragonfly</td><td>get</td><td style="text-align:right">16</td><td style="text-align:right">2037402</td><td style="text-align:right">1.568</td><td style="text-align:right">1.511</td><td style="text-align:right">3.055</td><td style="text-align:right">4.047</td><td style="text-align:right">27.5</td></tr>
+<tr><td>dragonfly</td><td>mixed</td><td style="text-align:right">1</td><td style="text-align:right">576697</td><td style="text-align:right">0.346</td><td style="text-align:right">0.351</td><td style="text-align:right">0.519</td><td style="text-align:right">1.039</td><td style="text-align:right">26.0</td></tr>
+<tr><td>dragonfly</td><td>mixed</td><td style="text-align:right">16</td><td style="text-align:right">1911196</td><td style="text-align:right">1.671</td><td style="text-align:right">1.607</td><td style="text-align:right">3.247</td><td style="text-align:right">4.319</td><td style="text-align:right">27.6</td></tr>
+<tr><td>infinitydb</td><td>set</td><td style="text-align:right">1</td><td style="text-align:right">735185</td><td style="text-align:right">0.272</td><td style="text-align:right">0.247</td><td style="text-align:right">0.423</td><td style="text-align:right">0.535</td><td style="text-align:right">146.2</td></tr>
+<tr><td>infinitydb</td><td>set</td><td style="text-align:right">16</td><td style="text-align:right">3116238</td><td style="text-align:right">1.025</td><td style="text-align:right">0.983</td><td style="text-align:right">1.935</td><td style="text-align:right">2.783</td><td style="text-align:right">168.9</td></tr>
+<tr><td>infinitydb</td><td>get</td><td style="text-align:right">1</td><td style="text-align:right">741202</td><td style="text-align:right">0.270</td><td style="text-align:right">0.255</td><td style="text-align:right">0.423</td><td style="text-align:right">0.599</td><td style="text-align:right">97.2</td></tr>
+<tr><td>infinitydb</td><td>get</td><td style="text-align:right">16</td><td style="text-align:right">3486766</td><td style="text-align:right">0.916</td><td style="text-align:right">0.879</td><td style="text-align:right">1.759</td><td style="text-align:right">2.367</td><td style="text-align:right">97.2</td></tr>
+<tr><td>infinitydb</td><td>mixed</td><td style="text-align:right">1</td><td style="text-align:right">721624</td><td style="text-align:right">0.277</td><td style="text-align:right">0.263</td><td style="text-align:right">0.439</td><td style="text-align:right">0.631</td><td style="text-align:right">96.0</td></tr>
+<tr><td>infinitydb</td><td>mixed</td><td style="text-align:right">16</td><td style="text-align:right">3448639</td><td style="text-align:right">0.926</td><td style="text-align:right">0.879</td><td style="text-align:right">1.775</td><td style="text-align:right">2.287</td><td style="text-align:right">97.9</td></tr>
+</tbody></table></div>
+<h2>Results — redis-benchmark</h2>
+<div class="table-wrap"><table class="data"><thead><tr><th>Engine</th><th>Workload</th><th style="text-align:right">Pipe</th><th style="text-align:right">Throughput (req/s)</th><th style="text-align:right">avg (ms)</th><th style="text-align:right">p50 (ms)</th><th style="text-align:right">p99 (ms)</th></tr></thead><tbody>
+<tr><td>redis</td><td>set</td><td style="text-align:right">1</td><td style="text-align:right">189681</td><td style="text-align:right">0.141</td><td style="text-align:right">0.135</td><td style="text-align:right">0.263</td></tr>
+<tr><td>redis</td><td>set</td><td style="text-align:right">16</td><td style="text-align:right">970874</td><td style="text-align:right">0.773</td><td style="text-align:right">0.735</td><td style="text-align:right">1.391</td></tr>
+<tr><td>redis</td><td>get</td><td style="text-align:right">1</td><td style="text-align:right">179662</td><td style="text-align:right">0.145</td><td style="text-align:right">0.143</td><td style="text-align:right">0.263</td></tr>
+<tr><td>redis</td><td>get</td><td style="text-align:right">16</td><td style="text-align:right">2277904</td><td style="text-align:right">0.292</td><td style="text-align:right">0.287</td><td style="text-align:right">0.487</td></tr>
+<tr><td>dragonfly</td><td>set</td><td style="text-align:right">1</td><td style="text-align:right">167757</td><td style="text-align:right">0.158</td><td style="text-align:right">0.159</td><td style="text-align:right">0.231</td></tr>
+<tr><td>dragonfly</td><td>set</td><td style="text-align:right">16</td><td style="text-align:right">1490313</td><td style="text-align:right">0.512</td><td style="text-align:right">0.503</td><td style="text-align:right">0.871</td></tr>
+<tr><td>dragonfly</td><td>get</td><td style="text-align:right">1</td><td style="text-align:right">179372</td><td style="text-align:right">0.147</td><td style="text-align:right">0.151</td><td style="text-align:right">0.215</td></tr>
+<tr><td>dragonfly</td><td>get</td><td style="text-align:right">16</td><td style="text-align:right">2096436</td><td style="text-align:right">0.354</td><td style="text-align:right">0.351</td><td style="text-align:right">0.519</td></tr>
+<tr><td>infinitydb</td><td>set</td><td style="text-align:right">1</td><td style="text-align:right">185943</td><td style="text-align:right">0.141</td><td style="text-align:right">0.143</td><td style="text-align:right">0.215</td></tr>
+<tr><td>infinitydb</td><td>set</td><td style="text-align:right">16</td><td style="text-align:right">2040816</td><td style="text-align:right">0.211</td><td style="text-align:right">0.207</td><td style="text-align:right">0.287</td></tr>
+<tr><td>infinitydb</td><td>get</td><td style="text-align:right">1</td><td style="text-align:right">189681</td><td style="text-align:right">0.138</td><td style="text-align:right">0.143</td><td style="text-align:right">0.207</td></tr>
+<tr><td>infinitydb</td><td>get</td><td style="text-align:right">16</td><td style="text-align:right">2074689</td><td style="text-align:right">0.203</td><td style="text-align:right">0.199</td><td style="text-align:right">0.319</td></tr>
+</tbody></table></div>
+<h2>Cross-check — memtier vs redis-benchmark throughput</h2>
+<p>Independent-generator agreement on the same engine/workload. Flagged when the two disagree by more than 25%.</p>
+<div class="table-wrap"><table class="data"><thead><tr><th>Engine</th><th>Workload</th><th style="text-align:right">Pipe</th><th style="text-align:right">memtier (ops/s)</th><th style="text-align:right">redis-bench (req/s)</th><th style="text-align:right">Δ</th><th></th></tr></thead><tbody>
+<tr><td>redis</td><td>set</td><td style="text-align:right">1</td><td style="text-align:right">267052</td><td style="text-align:right">189681</td><td style="text-align:right">+40.8%</td><td>⚠ diverges</td></tr>
+<tr><td>redis</td><td>set</td><td style="text-align:right">16</td><td style="text-align:right">1790743</td><td style="text-align:right">970874</td><td style="text-align:right">+84.4%</td><td>⚠ diverges</td></tr>
+<tr><td>redis</td><td>get</td><td style="text-align:right">1</td><td style="text-align:right">269725</td><td style="text-align:right">179662</td><td style="text-align:right">+50.1%</td><td>⚠ diverges</td></tr>
+<tr><td>redis</td><td>get</td><td style="text-align:right">16</td><td style="text-align:right">2292089</td><td style="text-align:right">2277904</td><td style="text-align:right">+0.6%</td><td>ok</td></tr>
+<tr><td>dragonfly</td><td>set</td><td style="text-align:right">1</td><td style="text-align:right">533482</td><td style="text-align:right">167757</td><td style="text-align:right">+218.0%</td><td>⚠ diverges</td></tr>
+<tr><td>dragonfly</td><td>set</td><td style="text-align:right">16</td><td style="text-align:right">1554681</td><td style="text-align:right">1490313</td><td style="text-align:right">+4.3%</td><td>ok</td></tr>
+<tr><td>dragonfly</td><td>get</td><td style="text-align:right">1</td><td style="text-align:right">586603</td><td style="text-align:right">179372</td><td style="text-align:right">+227.0%</td><td>⚠ diverges</td></tr>
+<tr><td>dragonfly</td><td>get</td><td style="text-align:right">16</td><td style="text-align:right">2037402</td><td style="text-align:right">2096436</td><td style="text-align:right">-2.8%</td><td>ok</td></tr>
+<tr><td>infinitydb</td><td>set</td><td style="text-align:right">1</td><td style="text-align:right">735185</td><td style="text-align:right">185943</td><td style="text-align:right">+295.4%</td><td>⚠ diverges</td></tr>
+<tr><td>infinitydb</td><td>set</td><td style="text-align:right">16</td><td style="text-align:right">3116238</td><td style="text-align:right">2040816</td><td style="text-align:right">+52.7%</td><td>⚠ diverges</td></tr>
+<tr><td>infinitydb</td><td>get</td><td style="text-align:right">1</td><td style="text-align:right">741202</td><td style="text-align:right">189681</td><td style="text-align:right">+290.8%</td><td>⚠ diverges</td></tr>
+<tr><td>infinitydb</td><td>get</td><td style="text-align:right">16</td><td style="text-align:right">3486766</td><td style="text-align:right">2074689</td><td style="text-align:right">+68.1%</td><td>⚠ diverges</td></tr>
+</tbody></table></div>
+<h2>Memory attribution — bytes/key</h2>
+<p>Fill the keyspace, then <code>(RSS_after − RSS_baseline) ÷ DBSIZE</code>. The L5 gate shape; the binding ≤ 1.0× Redis gate is <code>inf-bench gate-run m1</code> on the reference box.</p>
+<div class="table-wrap"><table class="data"><thead><tr><th>Engine</th><th style="text-align:right">Keys</th><th style="text-align:right">Value (B)</th><th style="text-align:right">RSS baseline (MiB)</th><th style="text-align:right">RSS after (MiB)</th><th style="text-align:right">bytes/key</th></tr></thead><tbody>
+<tr><td>redis</td><td style="text-align:right">13728</td><td style="text-align:right">64</td><td style="text-align:right">18.1</td><td style="text-align:right">20.2</td><td style="text-align:right">164.1</td></tr>
+<tr><td>dragonfly</td><td style="text-align:right">27403</td><td style="text-align:right">64</td><td style="text-align:right">26.5</td><td style="text-align:right">27.4</td><td style="text-align:right">36.3</td></tr>
+<tr><td>infinitydb</td><td style="text-align:right">42682</td><td style="text-align:right">64</td><td style="text-align:right">95.5</td><td style="text-align:right">99.1</td><td style="text-align:right">88.3</td></tr>
+</tbody></table></div>
+<h2>Notes &amp; honesty</h2>
+<ul>
+<li>redis is single-threaded; dragonfly and infinitydb ran with 4 threads/cells. Each engine kept its own best config (recorded above), per master plan §22.</li>
+<li>GET rows were measured after a 5s sequential populate; redis-benchmark uses its own key format, so its GET cross-check reads against keys memtier didn't write (throughput-comparable, hit rate not).</li>
+<li>redis-benchmark is request-count based (<code>-n 1000000</code>) and reports only p50/p95/p99; p99.9 always comes from memtier. The two are compared on throughput, not latency.</li>
+<li>Pub/sub fan-out latency is <strong>not</strong> measured here — memtier/redis-benchmark don't set up subscribers. That row lives in <code>inf-bench gate-run m1</code> (delivery-acked).</li>
+<li>Raw memtier JSON + redis-benchmark CSV for every row are under <code>raw/</code>.</li>
+</ul>  <p class="gen-note">GENERATED BY scripts/gen-compare-page.py FROM /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/compare/1783699575-compare/report.md &mdash; REGENERATED PER CAMPAIGN; HAND EDITS ARE OVERWRITTEN &middot; RAW GENERATOR OUTPUT (memtier JSON, redis-benchmark CSV) IS COMMITTED UNDER THE SAME ARTIFACT DIRECTORY</p>
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span class="mark">&copy; 2026 INFINITYDB &mdash; APACHE 2.0 &middot; RUST &middot; <b>infinityd</b></span>
+    <div class="footer-links">
+      <a href="../docs/index.html">DOCS</a>
+      <a href="../blog/index.html">BLOG</a>
+      <a href="../docs/roadmap.html">ROADMAP</a>
+      <a href="https://github.com/">GITHUB &#8599;</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var t = document.querySelector('.nav-toggle');
+  var l = document.querySelector('.nav-links');
+  if (t && l) t.addEventListener('click', function () {
+    var open = l.classList.toggle('open');
+    t.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+})();
+</script>
+</body>
+</html>
