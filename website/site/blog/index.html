@@ -72,25 +72,25 @@
   <h1>Notes from the log spine.</h1>
   <p class="blog-lede">Post-mortems, architecture decisions, and evidence-gated numbers &mdash; written the way we build: honesty is total.</p>
 
-  <a class="featured" href="why-vortex-failed.html">
+  <a class="featured" href="the-log-is-the-database.html">
     <div class="tags">
       <span class="pill-feat">FEATURED</span>
-      <span class="meta">POST-MORTEM &middot; 2026-07-17 &middot; 14 MIN READ</span>
+      <span class="meta">DISCIPLINE &middot; 2026-07-07 &middot; 12 MIN READ</span>
     </div>
-    <h2>Why Vortex failed: a post-mortem in five root causes and eleven laws</h2>
-    <p>Our previous engine accumulated 76 KLoC, a SIMD parser, and a 1,152-run concurrency experiment &mdash; and still shipped roughly Redis-parity throughput at a multiple of Redis&rsquo;s memory. The failure was architectural. Here is exactly what went wrong, and how each root cause became a design law of InfinityDB.</p>
-    <div class="go">READ THE POST-MORTEM &rarr;</div>
+    <h2>The log is the database &mdash; how InfinityDB is being built</h2>
+    <p>A cache is the log with durability off. A queue is the log read forward. Why five workloads are projections of one primitive &mdash; and the laws, gates, simulation fleet, and claim ledger that keep the build honest.</p>
+    <div class="go">READ THE POST &rarr;</div>
   </a>
 
   <div class="post-grid">
-    <a class="post-card" href="the-log-is-the-database.html">
-      <p class="meta">DISCIPLINE &middot; 2026-07-07</p>
-      <h3>The log is the database &mdash; how InfinityDB is being built</h3>
-      <p>A cache is the log with durability off. A queue is the log read forward. Why five workloads are projections of one primitive &mdash; and the laws, gates, simulation fleet, and claim ledger that keep the build honest.</p>
+    <a class="post-card" href="../docs/benchmarks.html">
+      <p class="meta">EVIDENCE &middot; UPDATED PER CAMPAIGN</p>
+      <h3>How we benchmark &mdash; and the numbers we refuse to publish</h3>
+      <p>The two harnesses, competitors in the same run, crossover A/B replicates, environment checks, and the claim ledger that gates every public number. The full methodology lives in the docs.</p>
     </a>
   </div>
 
-  <p class="queue-note">IN THE QUEUE &mdash; PLANNED, NOT YET WRITTEN &middot; NO DATES PROMISED: &ldquo;BATCH EVERY BOUNDARY: KILLING THE SYSCALL TAX&rdquo; &middot; &ldquo;DETERMINISTIC SIMULATION: EVERY FAILURE IS A SEED&rdquo; &middot; &ldquo;THE EVIDENCE LEDGER AT WORK: WHAT WE REFUSED TO CLAIM&rdquo;</p>
+  <p class="queue-note">IN THE QUEUE &mdash; PLANNED, NOT YET WRITTEN &middot; NO DATES PROMISED: &ldquo;BATCH EVERY BOUNDARY: KILLING THE SYSCALL TAX&rdquo; &middot; &ldquo;DETERMINISTIC SIMULATION: EVERY FAILURE IS A SEED&rdquo; &middot; &ldquo;BEYOND RAM WITHOUT A BLENDED p99: THE SPLIT-PERCENTILE RULE&rdquo;</p>
 </main>
 
 <footer class="footer">

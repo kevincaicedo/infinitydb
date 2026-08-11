@@ -45,6 +45,9 @@
     <p class="side-h">Operations</p>
     <a class="side-link" href="deployment.html">Deployment</a>
     <a class="side-link" href="operations.html">Operations</a>
+    <p class="side-h">Evidence</p>
+    <a class="side-link" href="benchmarks.html">Benchmarks &amp; evidence</a>
+    <a class="side-link" href="../evidence/inf-compare.html">Comparative report</a>
     <p class="side-h">Reference</p>
     <a class="side-link" href="compat.html">Command matrix</a>
     <a class="side-link" href="roadmap.html">Roadmap</a>
@@ -77,13 +80,21 @@
           <h3 style="font-size:18px">Architecture</h3>
           <p class="muted" style="font-size:13.5px;margin:0;line-height:1.6">Shard cells, the fabric, the log spine, deterministic simulation, and the design laws &mdash; a condensed tour with pointers into the repository.</p>
         </a>
+        <a class="card" href="benchmarks.html" style="display:block;color:inherit">
+          <h3 style="font-size:18px">Benchmarks &amp; evidence</h3>
+          <p class="muted" style="font-size:13.5px;margin:0;line-height:1.6">How every number is produced: the two harnesses, competitors in the same run, crossover A/B replicates, environment checks, the claim ledger &mdash; and every number it currently allows, with artifacts.</p>
+        </a>
+        <a class="card" href="../evidence/inf-compare.html" style="display:block;color:inherit">
+          <h3 style="font-size:18px">Comparative report</h3>
+          <p class="muted" style="font-size:13.5px;margin:0;line-height:1.6">The binding <code>inf-compare</code> campaign report, rendered verbatim from its committed artifact: engines in the same run, configs recorded, cross-checked by two independent generators.</p>
+        </a>
         <a class="card" href="compat.html" style="display:block;color:inherit">
           <h3 style="font-size:18px">Redis compatibility matrix</h3>
           <p class="muted" style="font-size:13.5px;margin:0;line-height:1.6">Per-command status (<code>full</code> / <code>partial</code> / <code>extension</code>), byte-diff-verified against Redis 8.0.5. Rendered from the generated repo artifact &mdash; never hand-written.</p>
         </a>
         <a class="card" href="roadmap.html" style="display:block;color:inherit">
           <h3 style="font-size:18px">Roadmap</h3>
-          <p class="muted" style="font-size:13.5px;margin:0;line-height:1.6">The milestone train, gate by gate: what is done, what is in progress (M3), what each future milestone ships, and the ADRs that reordered the train.</p>
+          <p class="muted" style="font-size:13.5px;margin:0;line-height:1.6">The milestone train, gate by gate: what is done, what is in progress (M4 &mdash; tiered storage, closing on the first public tag), what each future milestone ships, and the ADRs that reordered the train.</p>
         </a>
         <a class="card" href="../blog/the-log-is-the-database.html" style="display:block;color:inherit">
           <h3 style="font-size:18px">How it&rsquo;s built</h3>
@@ -93,7 +104,7 @@
 
       <h2 id="claims">Claims &amp; evidence</h2>
       <p>Every number or comparative statement in InfinityDB&rsquo;s public copy must have an <strong style="color:var(--text)">Allowed</strong> row in the project&rsquo;s claim ledger, citing a validated artifact (replicated runs, clean tree, recorded environment, competitors in the same run). A claim absent from the ledger does not exist &mdash; and this website is checked against the ledger in CI.</p>
-      <p>The ledger lives in the repository at <code>docs/claim-ledger.md</code> (a snapshot used by the site&rsquo;s CI check is committed as <a href="../_ledger-snapshot.md"><code>_ledger-snapshot.md</code></a>). The benchmark story, honestly: the landing page shows exactly the rows the ledger <em>Allows</em> &mdash; memory footprint and unpipelined throughput versus Redis in the same run, the Dragonfly cross-cell anchor, cold-boot recovery, checkpoint overhead, and the simulation/crash-matrix correctness sweeps &mdash; and nothing more. Pipelined peaks, <code>always</code>-mode write rates, and absolute tail-latency claims are still <em>Narrowed</em> or <em>Evidence-pending</em>, so they are absent by rule, not by oversight.</p>
+      <p>The ledger lives in the repository at <code>docs/claim-ledger.md</code> (a snapshot used by the site&rsquo;s CI check is committed as <a href="../_ledger-snapshot.md"><code>_ledger-snapshot.md</code></a>). The full methodology &mdash; harnesses, environment rules, replicate discipline, the instrument checks &mdash; and every currently-Allowed number with its artifact live on the <a href="benchmarks.html">benchmarks &amp; evidence page</a>; the binding comparative campaign report is published verbatim as <a href="../evidence/inf-compare.html">an evidence page</a>. Pipelined peaks, <code>always</code>-mode write rates, absolute tail-latency claims, and every tiered-storage number are still <em>Narrowed</em> or <em>Evidence-pending</em>, so they are absent by rule, not by oversight.</p>
 
       <h2>In the repository</h2>
       <ul style="color:var(--text-muted);font-size:14px;line-height:1.8">

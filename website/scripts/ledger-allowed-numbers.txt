@@ -33,18 +33,31 @@
 # --- ledger C8 (Allowed): LFU hit-rate parity ---------------------------
 96.19 %         # C8: "96.19% vs 96.19% (+0.00 pp)" — landing-page stat tile cites the allowed wording
 
-# --- historical Vortex post-mortem facts (master plan §2) ----------------
-# These describe the RETIRED predecessor engine (and, for RC-4, published
-# third-party systems), quoted verbatim from the constitutional post-mortem
-# in docs/infinity-master-plan.md §2. They are not InfinityDB claims; the
-# blog post carries an explicit disclaimer note saying exactly that.
-966 ms          # §2 preamble (RC context): Vortex p99.9 cliffs under load
-75 %            # §2 RC-1: Vortex CPU share in io_uring completion handling
-25 μs           # §2 RC-4: the invalid POC's measured cross-shard hop cost
-45 μs           # §2 RC-4: upper bound of the same invalid POC measurement
-2 μs            # §2 RC-4: published batched cross-core hop range of production thread-per-core systems (Seastar/Dragonfly/Redpanda)
+# (the historical Vortex post-mortem block was removed 2026-08-10 with the
+#  vortex article — no vortex content remains on the site)
+
+# --- ledger C14 (Allowed): cold-boot re-run -----------------------------
+7.3 s           # C14: the S08 read-ahead re-run recorded in the Allowed row's evidence cell
+
+# --- ledger C19 (Narrowed): everysec cost — narrowed wording ------------
+11 %            # C19: "≈ 10–11%" narrowed wording (the tokenizer reads the range's upper bound)
+10 %            # C19: the "< 10%" absolute, quoted only as Evidence-pending; also the divergence gate value named in C21/C27 ("10% fails CI")
+
+# --- ledger C21 (Allowed): attribution measured value -------------------
+1.04 %          # C21: measured divergence on the re-validated row (1.1% is the allowed bound wording)
+
+# --- ledger C24 (Allowed): idoc density ---------------------------------
+1.108 x         # C24: aggregate density vs msgpack
+0.764 x         # C24: aggregate density vs JSON text
+
+# --- ledger C26 (Allowed): delta log volume -----------------------------
+0.066 x         # C26: delta records vs full-document log volume, 64-op mix
+
+# --- ledger C27 (Allowed): document attribution -------------------------
+0.056 %         # C27: attribution vs RSS divergence, 65k-document load
 
 # --- non-claims (documented) ---------------------------------------------
 16 gb           # config example in the INF.NS docs (MAXMEMORY 16gb) — master plan §4.2 example, not a measurement
 16 mib          # record-format value bound (SETRANGE note in the compat matrix; value bound on the operations limitations list) — wire format, not a measurement
 256 mib         # config defaults (--segment-bytes / --ckpt-interval-bytes) on the deployment page — configuration values, not measurements
+2048 mb         # config example in the landing terminal (INF.NS ... MEM-BUDGET 2048mb) — a knob value, not a measurement

@@ -171,6 +171,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <p class="side-h">Operations</p>
     <a class="side-link" href="deployment.html">Deployment</a>
     <a class="side-link" href="operations.html">Operations</a>
+    <p class="side-h">Evidence</p>
+    <a class="side-link" href="benchmarks.html">Benchmarks &amp; evidence</a>
+    <a class="side-link" href="../evidence/inf-compare.html">Comparative report</a>
     <p class="side-h">Reference</p>
     <a class="side-link" href="compat.html" aria-current="page">Command matrix</a>
     <a class="side-link" href="roadmap.html">Roadmap</a>
