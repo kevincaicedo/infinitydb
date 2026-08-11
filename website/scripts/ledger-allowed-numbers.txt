@@ -39,9 +39,10 @@
 # --- ledger C14 (Allowed): cold-boot re-run -----------------------------
 7.3 s           # C14: the S08 read-ahead re-run recorded in the Allowed row's evidence cell
 
-# --- ledger C19 (Narrowed): everysec cost — narrowed wording ------------
-11 %            # C19: "≈ 10–11%" narrowed wording (the tokenizer reads the range's upper bound)
-10 %            # C19: the "< 10%" absolute, quoted only as Evidence-pending; also the divergence gate value named in C21/C27 ("10% fails CI")
+# (C19's "≈ 10–11%" tokens were removed 2026-08-11: the S24 re-read did not
+#  reproduce the range — drive-state per readiness F20 — and the row
+#  reverted to Evidence-pending, so the number came off the site)
+10 %            # the divergence gate value named in Allowed rows C21/C27 ("10% fails CI")
 
 # --- ledger C21 (Allowed): attribution measured value -------------------
 1.04 %          # C21: measured divergence on the re-validated row (1.1% is the allowed bound wording)

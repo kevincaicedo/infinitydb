@@ -116,8 +116,10 @@ the 1.72× Dragonfly cross-cell anchor, disclosures in the mono footnote),
 **C7** (0.61× RSS), **C8** (96.19% LFU parity), **C12** (10k-seed sweep),
 **C14** (9.8 s cold boot), **C16** (14.4 MiB checkpoint overhead) — in
 evidence blocks and stat tiles; `docs/benchmarks.html` carries the full
-Allowed set including the M3 document rows (**C19** narrowed everysec
-wording, **C21**, **C24–C27**) beside the methodology; the durability
+Allowed set including the M3 document rows (**C21**, **C24–C27**) beside
+the methodology (**C19**'s everysec range came OFF the page 2026-08-11 —
+its S24 re-read did not reproduce and the row reverted to
+Evidence-pending; the page's absence list tells that story); the durability
 page cites **C12–C16, C21** verbatim with artifacts; the blog cites
 **C3, C4, C12**. Deployment/operations carry only config non-claims
 (`256 MiB` defaults, `16 MiB` bound). `evidence/inf-compare.html` is the
