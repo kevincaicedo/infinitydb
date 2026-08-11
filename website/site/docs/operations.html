@@ -45,6 +45,9 @@
     <p class="side-h">Operations</p>
     <a class="side-link" href="deployment.html">Deployment</a>
     <a class="side-link" href="operations.html" aria-current="page">Operations</a>
+    <p class="side-h">Evidence</p>
+    <a class="side-link" href="benchmarks.html">Benchmarks &amp; evidence</a>
+    <a class="side-link" href="../evidence/inf-compare.html">Comparative report</a>
     <p class="side-h">Reference</p>
     <a class="side-link" href="compat.html">Command matrix</a>
     <a class="side-link" href="roadmap.html">Roadmap</a>
@@ -186,9 +189,9 @@ offset 0x40000 &mdash; interior data would be lost by truncation, refusing to st
   <ul>
     <li><strong>Single node.</strong> No replication, no cluster, no failover. The <code>wait-replica</code> durability class (zero loss across node failure) is M9 &mdash; not shipped. Single-node <code>always</code> means: survives any crash of <em>this</em> node; it does not survive the disk itself dying.</li>
     <li><strong>No AUTH, no ACL, no TLS until M7.</strong> Bind to localhost or a trusted private network. Docker users: the io_uring <a href="deployment.html">seccomp profile</a> is required; it is a syscall filter, not an authentication substitute.</li>
-    <li><strong>68 commands.</strong> Strings, keys and expiry, SCAN, pub/sub, INFO/CONFIG/CLIENT admin, and the checkpoint surface &mdash; the exact per-command status is the <a href="compat.html">generated compatibility matrix</a>. No collections yet (lists, hashes, sets, sorted sets &mdash; M5), no <code>MULTI</code>/<code>EXEC</code> transactions or Lua (M6), JSON documents arrive at M3, streams at M7.</li>
+    <li><strong>Strings, keys and expiry, SCAN, pub/sub, the <code>JSON.*</code> document surface, INFO/CONFIG/CLIENT admin, and the checkpoint surface</strong> &mdash; the exact per-command status is the <a href="compat.html">generated compatibility matrix</a>. No collections yet (lists, hashes, sets, sorted sets &mdash; M5), no <code>MULTI</code>/<code>EXEC</code> transactions or Lua (M6), streams at M7.</li>
     <li><strong>Bounded record sizes:</strong> keys up to 255 bytes, values up to 16 MiB &minus; 1 (the inline record bound &mdash; out-of-line blob storage is a later roadmap item). Oversized operations are refused at the command layer with an error, never truncated.</li>
-    <li><strong>Datasets are RAM-resident.</strong> Durable namespaces are recovered into memory; larger-than-RAM tiered storage is M4.</li>
+    <li><strong>Datasets are RAM-resident.</strong> Durable namespaces are recovered into memory; larger-than-RAM tiered storage is M4 &mdash; in dev now, shipping with <code>v0.4.0-alpha</code>.</li>
     <li><strong>Durability is opt-in per namespace.</strong> The default namespaces behind <code>SELECT 0..15</code> are <code>memory</code> mode &mdash; a fresh node persists <em>nothing</em> until you create a durable namespace with <code>INF.NS</code>. This is the single most important operator fact on this page; the <a href="durability.html">durability page</a> is the contract.</li>
     <li><strong>Operational surface is deliberately small:</strong> flags plus a <code>CONFIG</code> subset; no config file; no keyspace notifications, <code>SLOWLOG</code>, or <code>MONITOR</code> yet; no shutdown handshake (a stop is a crash, within the stated loss windows).</li>
     <li><strong>Linux with io_uring is the deployment target.</strong> macOS builds run for development only (kqueue) and are not a performance or deployment target.</li>

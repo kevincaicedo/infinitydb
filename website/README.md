@@ -23,18 +23,29 @@ site/                          ← the deployable root (upload this to Pages)
     durability.html            namespaces, durability classes, loss windows, recovery
     deployment.html            docker/systemd/seccomp, data-dir layout, flags, upgrades (M2.5-S06)
     operations.html            -LOADING, refusal taxonomy, INFO persistence, alpha limits (M2.5-S06)
-    architecture.html          condensed from infinitydb/ARCHITECTURE.md
+    architecture.html          the internals tour with animated diagrams
+                               (cell, fabric, group commit, M4 tiering)
+    benchmarks.html            methodology + every Allowed number w/ artifact
     compat.html                GENERATED — do not edit (see below)
     roadmap.html               the milestone train, ADR reorders named
+  evidence/
+    inf-compare.html           GENERATED — the binding comparative campaign
+                               report, rendered verbatim (see below)
   blog/
     index.html
-    why-vortex-failed.html         featured post-mortem (master plan §2, adapted)
-    the-log-is-the-database.html   inaugural post (discipline model)
+    the-log-is-the-database.html   featured post (discipline model)
 scripts/
   gen-compat-page.py           renders compat.html from the repo artifact
+  gen-compare-page.py          renders evidence/inf-compare.html from a
+                               BINDING inf-compare report (refuses dev-tier)
   check-ledger-copy.py         CI: no perf number without an Allowed ledger row
+                               (skips site/evidence/ — generated artifact renders)
   ledger-allowed-numbers.txt   the allowlist (regenerated from Allowed rows)
 ```
+
+The Vortex post-mortem article and comparison bar were retired 2026-08-10
+(owner decision): no vortex content on the site; the predecessor survives
+only as unnamed context in the discipline post.
 
 Placement (as landed, M2.5-S05): this directory is `website/` in the
 InfinityDB repo; the deploy workflow is `.github/workflows/pages.yml` with
@@ -104,14 +115,19 @@ the first Allowed measured rows — **C5** (unpipelined 3.21× Redis +
 the 1.72× Dragonfly cross-cell anchor, disclosures in the mono footnote),
 **C7** (0.61× RSS), **C8** (96.19% LFU parity), **C12** (10k-seed sweep),
 **C14** (9.8 s cold boot), **C16** (14.4 MiB checkpoint overhead) — in
-evidence blocks and stat tiles; the durability page cites **C12–C16,
-C21** verbatim with artifacts; the blog cites **C3, C4, C12** plus the
-historical Vortex post-mortem facts (master plan §2 — allowlisted as
-documented non-claims with an in-post disclaimer). Deployment/operations
-carry only config non-claims (`256 MiB` defaults, `16 MiB` bound).
-Pipelined peaks, `always`-mode write rates, and absolute tail-latency
-claims remain absent — Narrowed/Evidence-pending rows never render, and
-the landing's "what you don't see here" callout says so explicitly.
+evidence blocks and stat tiles; `docs/benchmarks.html` carries the full
+Allowed set including the M3 document rows (**C19** narrowed everysec
+wording, **C21**, **C24–C27**) beside the methodology; the durability
+page cites **C12–C16, C21** verbatim with artifacts; the blog cites
+**C3, C4, C12**. Deployment/operations carry only config non-claims
+(`256 MiB` defaults, `16 MiB` bound). `evidence/inf-compare.html` is the
+generated verbatim render of the binding comparative report (excluded
+from the copy check by design — it IS the artifact; the generator
+refuses non-binding reports). Pipelined peaks, `always`-mode write
+rates, absolute tail-latency claims, and all tiered-storage numbers
+remain absent — Narrowed/Evidence-pending rows never render, and both
+the landing's "what you don't see here" callout and the benchmarks
+page's absence list say so explicitly.
 
 ## Deploying to GitHub Pages
 
@@ -136,23 +152,28 @@ the landing's "what you don't see here" callout says so explicitly.
 - [ ] Custom domain, if any (`site/CNAME` + DNS).
 - [ ] S05 AC: verify the quickstart cold on a clean machine (source build +
   Docker-from-repo path), per the milestone plan.
-- [ ] When `v0.2.0-alpha.1` actually tags: update the quickstart's "no
-  published binaries yet" callout to point at the release artifacts, and
-  re-run the ledger check against the release's re-validated ledger.
+- [ ] When `v0.4.0-alpha` actually tags: update the quickstart's "no
+  published binaries yet" callout to point at the release artifacts,
+  re-run the ledger check against the release's re-validated ledger, and
+  regenerate `evidence/inf-compare.html` from the v0.4.0 campaign's
+  binding report once its rows are signed (S25 release checklist).
 
 ## Honesty invariants baked into the copy (keep them when editing)
 
 - Shipping today = Redis-compatible in-memory cache + durable KV
-  namespaces (JSON documents are M3 · IN DEV). Queries/collections/
-  streams/vectors/compute/HA are roadmap items and every mention carries
-  its milestone label — including terminal commands and diagram nodes.
-- Version badge = `v0.3.0-alpha.1 · IN DEV` (ADR-0048, 2026-07-16:
-  `v0.2.0-alpha.1` retired unused; the first public tag is M3's
-  `v0.3.0-alpha.1`, release act in M3-S26; nothing has been tagged yet).
+  namespaces + the built-and-verified JSON document plane (M3 · verdict
+  reached, tags at v0.4.0-alpha); tiered storage is M4 · IN DEV.
+  Queries/collections/streams/vectors/compute/HA are roadmap items and
+  every mention carries its milestone label — including terminal
+  commands and diagram nodes.
+- Version badge = `v0.4.0-alpha · IN DEV` (ADR-0067, 2026-08-06:
+  `v0.3.0-alpha.1` retired unused; the first public tag is M4's
+  `v0.4.0-alpha`, shipping M3 + M4 together, release act in M4-S25;
+  nothing has been tagged yet).
 - The roadmap page mirrors master plan §21–22 including the
-  ADR-0023/0024 reorders, M4.5, and the ADR-0048 first-tag move; the
-  design prototypes' stale train (old numbering, "M1 · NOW") was
-  corrected during the port, not reproduced.
+  ADR-0023/0024 reorders, M4.5, and the ADR-0048 → ADR-0067 first-tag
+  moves; the design prototypes' stale train (old numbering, "M1 · NOW")
+  was corrected during the port, not reproduced.
 - The Docker quickstart builds from the repo and keeps the io_uring seccomp
   requirement front and center.
 - The `wait-replica` durability row is labeled M9 (not shipped).
