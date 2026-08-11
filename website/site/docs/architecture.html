@@ -10,6 +10,12 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../assets/site.css">
+<style>
+.arch-svg { width: 100%; display: block; margin: 22px 0 6px; }
+.arch-svg text { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+.svg-caption { font: 400 10.5px/1.8 var(--mono); letter-spacing: 0.06em; color: var(--text-faint); margin: 0 0 8px; }
+@media (prefers-reduced-motion: reduce) { .anim-dot { display: none; } }
+</style>
 </head>
 <body>
 
@@ -45,6 +51,9 @@
     <p class="side-h">Operations</p>
     <a class="side-link" href="deployment.html">Deployment</a>
     <a class="side-link" href="operations.html">Operations</a>
+    <p class="side-h">Evidence</p>
+    <a class="side-link" href="benchmarks.html">Benchmarks &amp; evidence</a>
+    <a class="side-link" href="../evidence/inf-compare.html">Comparative report</a>
     <p class="side-h">Reference</p>
     <a class="side-link" href="compat.html">Command matrix</a>
     <a class="side-link" href="roadmap.html">Roadmap</a>
@@ -54,7 +63,7 @@
     <article>
       <p class="doc-kicker">Concepts</p>
   <h1 class="page-title">Architecture</h1>
-  <p class="lede">A condensed tour of the internals. The full version &mdash; and the first document a new engineer reads &mdash; is <a href="https://github.com/"><code>infinitydb/ARCHITECTURE.md</code></a> in the repository; the architectural authority with laws, gates, and the roadmap is <code>docs/infinity-master-plan.md</code>.</p>
+  <p class="lede">A tour of the internals, with the machinery drawn as it runs. The full version &mdash; and the first document a new engineer reads &mdash; is <a href="https://github.com/"><code>infinitydb/ARCHITECTURE.md</code></a> in the repository; the architectural authority with laws, gates, and the roadmap is <code>docs/infinity-master-plan.md</code>. In the diagrams below, violet marks what is in motion, teal marks what has arrived &mdash; the same two-lamp rule the whole site uses.</p>
 
   <h2>The problem</h2>
   <p>Modern applications run a zoo: Redis for caching and real-time structures, DynamoDB-class stores for durable documents, Kafka or RabbitMQ for queues and events, a vector database for AI retrieval &mdash; plus the glue, the double writes, and the cross-system consistency bugs between them. Each system is operated, secured, monitored, and paid for separately, and the data they share is copied between them over networks.</p>
@@ -72,11 +81,117 @@
   <p>Every durable fact is an append to a per-cell, per-namespace segmented log, group-committed once per reactor iteration, with the fsync policy chosen per namespace (<code>always</code> / <code>everysec</code> / <code>memory</code> &mdash; see <a href="durability.html">durability</a>). Everything else &mdash; the hash index, and on the roadmap document trees, secondary indexes, stream offsets, vector graphs &mdash; is a rebuildable <em>projection</em> over that log. Checkpoints are fuzzy snapshots streamed by the owning cell (no fork, no stop-the-world); recovery is checkpoint + parallel per-cell replay. There is no global LSN: each cell replays independently.</p>
   <p>This is why the feature set can be broad while the trusted computing base stays small: there is one durability mechanism to make correct, not five. A cache is the log with durability off; a queue (M7) is the log read forward by consumer groups; a replica (M9) is the log shipped to a follower.</p>
 
+  <h2>The life of a write</h2>
+  <p>Watch one reactor iteration on the durable path. Every <code>always</code>-mode write that arrives while the previous fsync is in flight joins the <em>next</em> group &mdash; one durability fsync in flight at a time, collecting every arrival during the flush. The group forms itself from the device&rsquo;s own latency; nobody waits on a timer. Acks release only when the watermark covers them: the client&rsquo;s <code>+OK</code> <em>means</em> the bytes are on disk.</p>
+  <svg class="arch-svg" viewBox="0 0 680 250" role="img" aria-label="Concurrent writers converge into one staging batch, sealed as a single frame, made durable by one fsync; acknowledgements fan back only after the fsync completes.">
+    <!-- writers -->
+    <text x="8" y="42" fill="#b9a8ff" font-size="11">SET a</text>
+    <text x="8" y="92" fill="#b9a8ff" font-size="11">SET b</text>
+    <text x="8" y="142" fill="#b9a8ff" font-size="11">SET c</text>
+    <text x="8" y="192" fill="#b9a8ff" font-size="11">SET d</text>
+    <path id="w1" d="M 70 38 C 130 38 150 92 208 100" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <path id="w2" d="M 70 88 C 130 88 150 100 208 108" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <path id="w3" d="M 70 138 C 130 138 150 124 208 116" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <path id="w4" d="M 70 188 C 130 188 150 132 208 124" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <!-- staging ring -->
+    <rect x="212" y="72" width="120" height="80" rx="10" fill="rgba(124,92,255,0.07)" stroke="rgba(124,92,255,0.5)" stroke-width="1.3"/>
+    <text x="272" y="100" text-anchor="middle" fill="#e8e9f2" font-size="11" font-weight="700" letter-spacing="1">STAGING</text>
+    <text x="272" y="118" text-anchor="middle" fill="#9096ae" font-size="9">one group forms</text>
+    <text x="272" y="132" text-anchor="middle" fill="#9096ae" font-size="9">during the flush</text>
+    <!-- frame + fsync -->
+    <path id="fr" d="M 332 112 L 420 112" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <rect x="424" y="84" width="112" height="56" rx="10" fill="#0b0e19" stroke="rgba(62,230,196,0.4)"/>
+    <text x="480" y="108" text-anchor="middle" fill="#e8e9f2" font-size="11" font-weight="700" letter-spacing="1">1 FRAME</text>
+    <text x="480" y="126" text-anchor="middle" fill="#3ee6c4" font-size="9" letter-spacing="0.4">CRC &middot; SEALED PER ITERATION</text>
+    <path id="fs" d="M 536 112 L 600 112" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <circle cx="622" cy="112" r="18" fill="none" stroke="#3ee6c4" stroke-width="1.6"/>
+    <text x="622" y="116" text-anchor="middle" fill="#3ee6c4" font-size="9" font-weight="700">FSYNC</text>
+    <text x="622" y="150" text-anchor="middle" fill="#9096ae" font-size="9">one, shared</text>
+    <!-- ack path back -->
+    <path id="ack" d="M 622 130 C 622 210 340 218 80 218" fill="none" stroke="rgba(62,230,196,0.25)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <text x="8" y="222" fill="#3ee6c4" font-size="10">+OK &times;4</text>
+    <text x="330" y="240" fill="#5c6178" font-size="9" letter-spacing="0.6">ACKS RELEASE AT THE DURABILITY WATERMARK — NEVER BEFORE</text>
+    <!-- particles -->
+    <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="1.8s" begin="0s" repeatCount="indefinite"><mpath href="#w1"/></animateMotion></circle>
+    <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="1.8s" begin="0.3s" repeatCount="indefinite"><mpath href="#w2"/></animateMotion></circle>
+    <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="1.8s" begin="0.6s" repeatCount="indefinite"><mpath href="#w3"/></animateMotion></circle>
+    <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="1.8s" begin="0.9s" repeatCount="indefinite"><mpath href="#w4"/></animateMotion></circle>
+    <circle class="anim-dot" r="3.5" fill="#7c5cff"><animateMotion dur="1.4s" begin="0.4s" repeatCount="indefinite"><mpath href="#fr"/></animateMotion></circle>
+    <circle class="anim-dot" r="3.5" fill="#3ee6c4"><animateMotion dur="1.2s" begin="1s" repeatCount="indefinite"><mpath href="#fs"/></animateMotion></circle>
+    <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.2s" begin="1.4s" repeatCount="indefinite"><mpath href="#ack"/></animateMotion></circle>
+  </svg>
+  <p class="svg-caption">// THE GROUP-COMMIT SHAPE: ARRIVALS DURING THE FLUSH BECOME THE NEXT GROUP &mdash; MEASURED, NOT ASSUMED (SEE <a href="benchmarks.html" style="letter-spacing:0">BENCHMARKS &amp; EVIDENCE</a>)</p>
+
   <h2>The reactor: batch every boundary</h2>
   <p>Syscalls, fabric hops, fsyncs, and cache misses are paid per <em>batch</em>, never per operation. Every SQE an iteration produces goes out in a single <code>io_uring_enter</code>; the log writer seals one batch frame per iteration; all concurrent <code>always</code> writers share one group-commit fsync; index probes are prefetched a batch at a time. The batching metrics (<code>sqes/submit</code>, commands per iteration, acks per fsync) are always-on <strong>tripwires with CI gates</strong> &mdash; a benchmark run with red tripwires is invalid for claims by definition.</p>
 
   <h2>Commands are resumable state machines</h2>
   <p>Commands compile to <code>!Send</code> futures on a minimal cell-local executor &mdash; no work stealing, no atomic wakers, no global runtime. The local fast path completes synchronously inside <code>poll</code> and pays essentially nothing for the capability; suspension is reserved for the moments that need it: a remote key, a cold read (M4), a durability-gated ack, a blocking op. Background work (expiry, eviction, checkpoints) runs in deficit-weighted budgeted slices so tail latency is protected by construction rather than by retrofitted fairness passes.</p>
+
+  <h2>Beyond RAM: the tiered address space <span class="pill pill-now">M4 &middot; IN DEV</span></h2>
+  <p>M4 gives each cell <strong>one logical address space</strong> spanning three regions &mdash; the hybrid-log design in the Microsoft FASTER lineage. New writes land in the <em>mutable</em> RAM region at the tail. As the tail advances, records demote to a <em>read-only</em> RAM region, and from there to <em>disk</em> in sequential, batched flushes. The index never changes shape: it maps keys to logical addresses, and the address alone says which region serves the read. A namespace declares a memory budget and a disk budget (<code>INF.NS &hellip; MEM-BUDGET &hellip; DISK-BUDGET</code>); demotion, flush, compaction, and blob reclaim all run as budgeted background slices under those declared limits.</p>
+  <svg class="arch-svg" viewBox="0 0 680 240" role="img" aria-label="One logical address space per cell: records demote from the mutable RAM tail through read-only RAM to disk; compaction copies live records forward; a cold read rises from disk back to the client.">
+    <!-- address space bar -->
+    <rect x="20" y="70" width="300" height="64" rx="10" fill="rgba(139,144,168,0.06)" stroke="rgba(139,144,168,0.3)" stroke-width="1.2"/>
+    <rect x="320" y="70" width="180" height="64" rx="0" fill="rgba(124,92,255,0.06)" stroke="rgba(124,92,255,0.4)" stroke-width="1.2"/>
+    <rect x="500" y="70" width="150" height="64" rx="10" fill="rgba(124,92,255,0.13)" stroke="rgba(124,92,255,0.6)" stroke-width="1.3"/>
+    <text x="170" y="96" text-anchor="middle" fill="#e8e9f2" font-size="11" font-weight="700" letter-spacing="1">DISK &middot; COLD</text>
+    <text x="170" y="114" text-anchor="middle" fill="#9096ae" font-size="9">sequential tier files &middot; O_DIRECT</text>
+    <text x="410" y="96" text-anchor="middle" fill="#e8e9f2" font-size="11" font-weight="700" letter-spacing="1">READ-ONLY RAM</text>
+    <text x="410" y="114" text-anchor="middle" fill="#9096ae" font-size="9">demoted, immutable</text>
+    <text x="575" y="96" text-anchor="middle" fill="#e8e9f2" font-size="11" font-weight="700" letter-spacing="1">MUTABLE RAM</text>
+    <text x="575" y="114" text-anchor="middle" fill="#b9a8ff" font-size="9">the tail &mdash; writes land here</text>
+    <text x="20" y="58" fill="#5c6178" font-size="9" letter-spacing="0.8">ONE LOGICAL ADDRESS SPACE PER CELL &mdash; THE ADDRESS SAYS WHICH REGION SERVES</text>
+    <!-- demotion flow (right to left, violet = in motion) -->
+    <path id="dem1" d="M 560 140 C 520 158 470 158 430 146" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <path id="dem2" d="M 390 146 C 340 160 280 160 230 146" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <text x="470" y="176" text-anchor="middle" fill="#9096ae" font-size="9" letter-spacing="0.6">DEMOTE</text>
+    <text x="300" y="176" text-anchor="middle" fill="#9096ae" font-size="9" letter-spacing="0.6">FLUSH &middot; BATCHED, SEQUENTIAL</text>
+    <!-- compaction copy-forward (left back to tail, under) -->
+    <path id="comp" d="M 120 140 C 140 210 520 214 585 140" fill="none" stroke="rgba(139,144,168,0.22)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <text x="350" y="222" text-anchor="middle" fill="#9096ae" font-size="9" letter-spacing="0.6">COMPACTION: LIVE RECORDS COPY FORWARD &middot; DEAD SPACE RETIRES &middot; BUDGETED SLICES</text>
+    <!-- cold read (up from disk, teal = served) -->
+    <path id="cold" d="M 130 70 C 130 26 420 22 650 30" fill="none" stroke="rgba(62,230,196,0.25)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <text x="655" y="34" fill="#3ee6c4" font-size="10" text-anchor="end">SERVED &rarr;</text>
+    <text x="360" y="16" text-anchor="middle" fill="#5c6178" font-size="9" letter-spacing="0.6">COLD READ &mdash; io_uring, QD-CAPPED, COALESCED</text>
+    <!-- particles -->
+    <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.2s" begin="0s" repeatCount="indefinite"><mpath href="#dem1"/></animateMotion></circle>
+    <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="2.2s" begin="1.1s" repeatCount="indefinite"><mpath href="#dem2"/></animateMotion></circle>
+    <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="4.5s" begin="0.6s" repeatCount="indefinite"><mpath href="#comp"/></animateMotion></circle>
+    <circle class="anim-dot" r="3.5" fill="#3ee6c4"><animateMotion dur="2.6s" begin="0.3s" repeatCount="indefinite"><mpath href="#cold"/></animateMotion></circle>
+  </svg>
+  <p class="svg-caption">// CACHE-MODE NAMESPACES ARE THE DEGENERATE CASE AND NEVER EXECUTE THIS CODE &mdash; PROVEN A/B AGAINST THE PRE-TIERING BINARY IN EVERY CAMPAIGN, WITH EVERY TIERING COUNTER ASSERTED ZERO</p>
+  <p>A read that resolves to the disk region cannot block the cell &mdash; a blocked cell would stall every other key it owns. This is where the resumable-state-machine design pays off: the command <em>suspends</em>, the read goes out through the same io_uring reactor as everything else, and the cell keeps executing other commands. When the completion arrives, the command resumes, re-resolves (the record may have moved &mdash; compaction never invalidates a suspended reader), and replies. Cold reads are shaped deliberately: a queue-depth cap keeps the NVMe from queue-collapse under a cold flood, adjacent intents coalesce into one device read, and a deficit weight keeps demotion and compaction from starving foreground reads.</p>
+  <svg class="arch-svg" viewBox="0 0 680 210" role="img" aria-label="Cold-read suspension: a command resolves; a RAM hit replies inline in microseconds; a cold resolve suspends on an I/O token, the NVMe read completes, the command resumes, re-resolves, and replies.">
+    <rect x="12" y="80" width="104" height="46" rx="10" fill="#0b0e19" stroke="rgba(139,144,168,0.3)"/>
+    <text x="64" y="100" text-anchor="middle" fill="#e8e9f2" font-size="10.5" font-weight="700" letter-spacing="0.8">EXECUTE</text>
+    <text x="64" y="116" text-anchor="middle" fill="#9096ae" font-size="8.5">one cell, one core</text>
+    <rect x="166" y="80" width="104" height="46" rx="10" fill="#0b0e19" stroke="rgba(139,144,168,0.3)"/>
+    <text x="218" y="100" text-anchor="middle" fill="#e8e9f2" font-size="10.5" font-weight="700" letter-spacing="0.8">RESOLVE</text>
+    <text x="218" y="116" text-anchor="middle" fill="#9096ae" font-size="8.5">index &rarr; address</text>
+    <!-- fast path -->
+    <path id="fast" d="M 270 88 C 380 54 520 54 648 66" fill="none" stroke="rgba(62,230,196,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <text x="452" y="46" text-anchor="middle" fill="#3ee6c4" font-size="9.5" letter-spacing="0.6">RAM HIT &mdash; REPLY INLINE, NO SUSPENSION, NO ALLOCATION</text>
+    <!-- cold path -->
+    <path id="c1" d="M 270 118 C 310 140 330 140 360 140" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <rect x="364" y="117" width="112" height="46" rx="10" fill="rgba(124,92,255,0.1)" stroke="rgba(124,92,255,0.55)"/>
+    <text x="420" y="137" text-anchor="middle" fill="#b9a8ff" font-size="10.5" font-weight="700" letter-spacing="0.8">SUSPEND</text>
+    <text x="420" y="153" text-anchor="middle" fill="#9096ae" font-size="8.5">IoToken &middot; cell keeps serving</text>
+    <path id="c2" d="M 476 140 L 530 140" fill="none" stroke="rgba(139,144,168,0.3)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <rect x="534" y="117" width="70" height="46" rx="10" fill="#0b0e19" stroke="rgba(139,144,168,0.3)"/>
+    <text x="569" y="137" text-anchor="middle" fill="#e8e9f2" font-size="10.5" font-weight="700" letter-spacing="0.8">NVMe</text>
+    <text x="569" y="153" text-anchor="middle" fill="#9096ae" font-size="8.5">QD-capped</text>
+    <path id="c3" d="M 569 163 C 560 196 380 200 218 168 C 218 168 218 150 218 130" fill="none" stroke="rgba(62,230,196,0.25)" stroke-width="1.2" stroke-dasharray="2 6"/>
+    <text x="400" y="196" text-anchor="middle" fill="#9096ae" font-size="9" letter-spacing="0.6">RESUME &rarr; RE-RESOLVE &rarr; REPLY</text>
+    <text x="648" y="84" text-anchor="end" fill="#3ee6c4" font-size="10">&rarr; CLIENT</text>
+    <!-- particles -->
+    <circle class="anim-dot" r="3.5" fill="#3ee6c4"><animateMotion dur="1.1s" begin="0s" repeatCount="indefinite"><mpath href="#fast"/></animateMotion></circle>
+    <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="1.6s" begin="0.2s" repeatCount="indefinite"><mpath href="#c1"/></animateMotion></circle>
+    <circle class="anim-dot" r="3" fill="#7c5cff"><animateMotion dur="1.2s" begin="1.6s" repeatCount="indefinite"><mpath href="#c2"/></animateMotion></circle>
+    <circle class="anim-dot" r="3" fill="#3ee6c4"><animateMotion dur="2.4s" begin="2.6s" repeatCount="indefinite"><mpath href="#c3"/></animateMotion></circle>
+  </svg>
+  <p class="svg-caption">// THE REPORTING CONTRACT IS FIXED BEFORE THE FIRST PUBLIC NUMBER: MEMORY-HIT AND COLD-READ PERCENTILES PUBLISH SEPARATELY, ALWAYS &mdash; A BLENDED p99 OVER A BIMODAL DISTRIBUTION IS A LIE BY CONSTRUCTION</p>
+  <p>Full operations run out of declared headroom, not hope: at the disk budget (or a full device) writes refuse with a documented <code>DISKFULL</code> error while reads and compaction keep working from a reserved slice &mdash; fail writes, never corrupt, never silently drop. Recovery composes tiered state exactly like everything else: checkpoint plus per-cell replay, with the cold index rebuilding without touching cold data. All of it &mdash; power cuts over tiered namespaces, disk-full storms, drop races with in-flight cold reads &mdash; runs as command-driven scenarios inside the deterministic simulator, seed-replayable like the rest of the engine.</p>
 
   <h2>Determinism is a feature</h2>
   <p>Time, randomness, disk, network, and fabric effects are injected behind runtime traits. Consequently the <em>entire node</em> &mdash; all cells, fabric, log, recovery &mdash; runs deterministically on one thread inside the simulator, FoundationDB/TigerBeetle-style: simulated disks tear writes and lie about fsync, power cuts land at chosen log positions, and every failure is a seed that replays byte-identically. Invariant oracles (per-key linearizability, durability-watermark honesty, accounting reconciliation) run continuously inside the sim, and a nightly fleet burns simulated time at scale. The simulator&rsquo;s authority is guarded mechanically: cell code cannot name <code>tokio</code>, locks, <code>thread::sleep</code>, ambient clocks, or ambient randomness &mdash; a denylist script enforces it.</p>

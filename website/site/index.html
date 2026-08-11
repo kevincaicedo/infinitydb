@@ -178,6 +178,8 @@
   .terminal-body .line:nth-child(10) { animation-delay: 2.8s; }
   .terminal-body .line:nth-child(11) { animation-delay: 3.05s; }
   .terminal-body .line:nth-child(12) { animation-delay: 3.3s; }
+  .terminal-body .line:nth-child(13) { animation-delay: 3.55s; }
+  .terminal-body .line:nth-child(14) { animation-delay: 3.8s; }
 }
 @media (prefers-reduced-motion: reduce) {
   .anim-dot { display: none; }
@@ -194,7 +196,7 @@
         <circle cx="24" cy="9" r="7" fill="none" stroke="#3ee6c4" stroke-width="2.4"/>
       </svg>
       <span class="mark">infinity<b>DB</b></span>
-      <span class="nav-badge">v0.3.0-alpha.1 &middot; IN DEV</span>
+      <span class="nav-badge">v0.4.0-alpha &middot; IN DEV</span>
     </a>
     <span class="nav-spacer"></span>
     <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
@@ -217,16 +219,16 @@
     <div>
       <p class="hero-kicker fx-1">// REDIS-COMPATIBLE &middot; RUST &middot; SHARED-NOTHING</p>
       <h1 class="fx-2"><span class="grad">One engine</span> for the cache, the ledger, the document, the queue, and the vector.</h1>
-      <p class="sub fx-3">Every workload is a projection of one per-core append-only log. Durable KV ships today; documents, queues, and vector search arrive on a gated milestone train &mdash; and it speaks fluent Redis. Keep <code>redis-cli</code>. Keep every SDK. Adopt one namespace at a time.</p>
+      <p class="sub fx-3">Every workload is a projection of one per-core append-only log. Durable KV and JSON documents are built; beyond-RAM tiered storage is closing out now &mdash; and it speaks fluent Redis. Keep <code>redis-cli</code>. Keep every SDK. Adopt one namespace at a time.</p>
       <div id="install" class="fx-4">
         <div class="install-bar">
           <div class="cmd"><span class="s">$</span> cargo build --release -p infinityd</div>
           <button type="button" data-copy="cargo build --release -p infinityd">COPY</button>
         </div>
-        <p class="hero-note"># builds from source &mdash; binaries + Docker image ship with v0.3.0-alpha.1 &middot; <a href="docs/quickstart.html">full quickstart &rarr;</a></p>
+        <p class="hero-note"># builds from source &mdash; binaries + Docker image ship with v0.4.0-alpha, the first public tag &middot; <a href="docs/quickstart.html">full quickstart &rarr;</a></p>
         <div class="hero-ctas">
           <a class="btn btn-primary" href="https://github.com/">&#9733; STAR ON GITHUB</a>
-          <a class="btn btn-ghost" href="blog/why-vortex-failed.html">WHY VORTEX DIED &rarr;</a>
+          <a class="btn btn-ghost" href="blog/the-log-is-the-database.html">HOW IT&rsquo;S BUILT &rarr;</a>
         </div>
       </div>
       <div class="hero-chips fx-5">
@@ -281,7 +283,7 @@
         <text x="486" y="214" fill="#3ee6c4" font-size="9" letter-spacing="0.4">SHIPPING &middot; dynamodb-class</text>
         <rect x="470" y="264" width="168" height="52" rx="10" fill="#0b0e19" stroke="rgba(124,92,255,0.5)"/>
         <text x="486" y="286" fill="#e8e9f2" font-size="12" font-weight="700" letter-spacing="1">DOCUMENTS</text>
-        <text x="486" y="304" fill="#b9a8ff" font-size="9" letter-spacing="0.4">M3 &middot; IN DEV &middot; JSON.*</text>
+        <text x="486" y="304" fill="#b9a8ff" font-size="9" letter-spacing="0.4">M3 &middot; BUILT &middot; TAGS v0.4.0-&alpha;</text>
         <rect x="470" y="354" width="168" height="52" rx="10" fill="#0b0e19" stroke="rgba(139,144,168,0.25)"/>
         <text x="486" y="376" fill="#e8e9f2" font-size="12" font-weight="700" letter-spacing="1">STREAMS</text>
         <text x="486" y="394" fill="#5c6178" font-size="9" letter-spacing="0.4">M7 &middot; kafka-core class</text>
@@ -310,12 +312,12 @@
         <p>A Redis-compatible in-memory cache (strings, keys, expiry, all 8 eviction policies, pub/sub) plus <strong style="color:var(--text)">durable KV namespaces</strong> &mdash; per-namespace <code>always</code>/<code>everysec</code> fsync, fork-free checkpoints, parallel crash recovery.</p>
       </div>
       <div class="cellp">
-        <p class="label" style="color:var(--violet-soft)">IN PROGRESS &middot; M3</p>
-        <p>JSON documents &mdash; <code>JSON.*</code> + JSONPath over a compact binary tree &mdash; closing on the first public tag, <code>v0.3.0-alpha.1</code> (ADR-0048): pre-tag campaign, ledger re-validation, release pipeline.</p>
+        <p class="label" style="color:var(--violet-soft)">IN PROGRESS &middot; M4</p>
+        <p>Tiered storage &mdash; KV and JSON documents beyond RAM on one logical address space &mdash; closing on the first public tag, <code>v0.4.0-alpha</code> (ADR-0067): it ships M3&rsquo;s JSON documents and M4&rsquo;s tiering together, gate campaign and ledger re-validation included.</p>
       </div>
       <div class="cellp">
         <p class="label" style="color:var(--text-faint)">ON THE TRAIN</p>
-        <p>Tiered storage (M4), indexes + PartiQL subset (M4.5), collections (M5), transactions (M6), streams (M7), vectors (M8), HA (M9), WASM compute (M10). <a href="docs/roadmap.html">The full train &rarr;</a></p>
+        <p>Indexes + PartiQL subset (M4.5), collections (M5), transactions (M6), streams (M7), vectors (M8), HA (M9), WASM compute (M10). <a href="docs/roadmap.html">The full train &rarr;</a></p>
       </div>
     </div>
   </div>
@@ -363,13 +365,13 @@
         <div class="idx">/02</div>
         <h3>Durable KV <span class="pill pill-ship">SHIPPING</span></h3>
         <div class="tagline">TARGETS DYNAMODB-CLASS STORES</div>
-        <p>Per-namespace durability &mdash; <code>always</code>, <code>everysec</code>, <code>memory</code> &mdash; group-commit fsync, fuzzy fork-free checkpoints, parallel recovery. Larger-than-RAM tiering arrives at M4.</p>
+        <p>Per-namespace durability &mdash; <code>always</code>, <code>everysec</code>, <code>memory</code> &mdash; group-commit fsync, fuzzy fork-free checkpoints, parallel recovery. Larger-than-RAM tiering is in dev now (M4).</p>
       </div>
       <div class="wl-card">
         <div class="idx">/03</div>
-        <h3>Documents <span class="pill pill-now">M3 &middot; IN DEV</span></h3>
+        <h3>Documents <span class="pill pill-now">M3 &middot; BUILT &middot; TAGS v0.4.0-&alpha;</span></h3>
         <div class="tagline">REDISJSON-COMPATIBLE NOSQL</div>
-        <p>JSON as a first-class value: <code>JSON.*</code> + JSONPath over a compact binary tree, mutated by path, durable by default. Typed secondary indexes and a planner-free PartiQL subset follow at M4.5.</p>
+        <p>JSON as a first-class value: <code>JSON.*</code> + JSONPath over a compact binary tree, mutated by path, durable by default. Byte-diff-verified against RedisJSON; ships with the first public tag. Typed secondary indexes and a planner-free PartiQL subset follow at M4.5.</p>
       </div>
       <div class="wl-card">
         <div class="idx">/04</div>
@@ -546,7 +548,7 @@
       </div>
       <div>
         <div class="bench-h">RSS AT 10M KEYS &times; (16 B, 64 B) &mdash; LOWER IS BETTER</div>
-        <svg class="bench-svg" viewBox="0 0 560 190" style="width:100%;display:block" data-bench>
+        <svg class="bench-svg" viewBox="0 0 560 130" style="width:100%;display:block" data-bench>
           <defs>
             <linearGradient id="bgrad2" x1="0" y1="0" x2="1" y2="0">
               <stop offset="0" stop-color="#7c5cff"/>
@@ -563,11 +565,6 @@
             <animate attributeName="width" from="0" to="160" dur="1s" begin="indefinite" fill="freeze" calcMode="spline" keySplines="0.22 1 0.36 1" keyTimes="0;1" data-bar-anim/>
           </rect>
           <text x="298" y="107" fill="#5c6178" font-size="10">1.0&times; baseline</text>
-          <text x="0" y="166" fill="#9096ae" font-size="12">VORTEX &dagger;</text>
-          <rect x="128" y="152" width="400" height="22" rx="4" fill="rgba(255,92,120,0.28)">
-            <animate attributeName="width" from="0" to="400" dur="1.3s" begin="indefinite" fill="freeze" calcMode="spline" keySplines="0.22 1 0.36 1" keyTimes="0;1" data-bar-anim/>
-          </rect>
-          <text x="330" y="167" fill="#5c6178" font-size="10">2&ndash;3&times; &mdash; why it died: see the blog</text>
         </svg>
       </div>
     </div>
@@ -602,7 +599,7 @@
       </div>
     </div>
 
-    <p class="bench-note">// reference box: i7-13700KF &middot; pinned P-cores &middot; performance governor &middot; turbo off &middot; competitors in-run &middot; 3&ndash;5 replicates &mdash; ledger rows C5, C7, C8, C12, C14, C16 &middot; &dagger; vortex was our predecessor engine; the post-mortem is <a href="blog/why-vortex-failed.html">on the blog</a></p>
+    <p class="bench-note">// reference box: i7-13700KF &middot; pinned P-cores &middot; performance governor &middot; turbo off &middot; competitors in-run &middot; 3&ndash;5 replicates &mdash; ledger rows C5, C7, C8, C12, C14, C16 &middot; full methodology: <a href="docs/benchmarks.html">how we benchmark</a></p>
   </div>
 </section>
 
@@ -627,7 +624,8 @@
       <div class="line"><span class="p">inf&gt;</span> SET orders:{u42}:1009 "paid" <span class="c"># acked after fsync</span></div>
       <div class="line"><span class="p">inf&gt;</span> INF.CKPT WAIT <span class="c"># fork-free checkpoint</span></div>
       <div class="terminal-divider">ROADMAP SURFACE &mdash; SAME SESSION, LATER MILESTONES</div>
-      <div class="line dim"><span class="p">inf&gt;</span> JSON.SET catalog:{sku9} $ '{"name":"Lens"}' <span class="c"># M3 &middot; in dev</span></div>
+      <div class="line dim"><span class="p">inf&gt;</span> JSON.SET catalog:{sku9} $ '{"name":"Lens"}' <span class="c"># M3 &middot; built &middot; tags v0.4.0-&alpha;</span></div>
+      <div class="line dim"><span class="p">inf&gt;</span> INF.NS CREATE archive MODE durable MEM-BUDGET 2048mb <span class="c"># M4 &middot; in dev &mdash; beyond RAM</span></div>
       <div class="line dim"><span class="p">inf&gt;</span> INF.QL "SELECT &hellip; WHERE price &lt; 5000" <span class="c"># M4.5</span></div>
       <div class="line dim"><span class="p">inf&gt;</span> XREADGROUP GROUP billing c1 &hellip; <span class="c"># M7</span></div>
       <div class="line dim"><span class="p">inf&gt;</span> VSIM catalog:emb 10 VECTOR &hellip; <span class="c"># M8</span></div>
@@ -642,7 +640,7 @@
   <div class="section-inner" style="padding-top:0">
     <p class="kicker">06 &middot; THE ROAD TO 1.0</p>
     <h2 style="margin-top:0">Shippable at every stop.</h2>
-    <p class="lede" style="max-width:620px">Every milestone has STOP gates &mdash; failing one halts the train and the fix happens at the architecture layer. M0&ndash;M2.5 exited on verdicts; M3 carries the first public tag, <code>v0.3.0-alpha.1</code>.</p>
+    <p class="lede" style="max-width:620px">Every milestone has STOP gates &mdash; failing one halts the train and the fix happens at the architecture layer. M0&ndash;M3 exited on verdicts; M4 carries the first public tag, <code>v0.4.0-alpha</code>, shipping JSON documents and tiered storage together (ADR-0067).</p>
 
     <div class="rail">
       <div class="rail-track">
@@ -650,8 +648,8 @@
         <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M1</p><p class="d">cache core</p><p class="s">DONE</p></div>
         <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M2</p><p class="d">durability</p><p class="s">DONE</p></div>
         <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M2.5</p><p class="d">hardening</p><p class="s">DONE</p></div>
-        <div class="rail-stop now"><div class="rail-dot"></div><p class="m">M3</p><p class="d">json docs</p><p class="s">NOW &middot; &alpha; TAG</p></div>
-        <div class="rail-stop"><div class="rail-dot"></div><p class="m">M4</p><p class="d">tiered</p><p class="s"></p></div>
+        <div class="rail-stop done"><div class="rail-dot"></div><p class="m">M3</p><p class="d">json docs</p><p class="s">DONE</p></div>
+        <div class="rail-stop now"><div class="rail-dot"></div><p class="m">M4</p><p class="d">tiered</p><p class="s">NOW &middot; &alpha; TAG</p></div>
         <div class="rail-stop"><div class="rail-dot"></div><p class="m">M4.5</p><p class="d">indexes &middot; query</p><p class="s"></p></div>
         <div class="rail-stop"><div class="rail-dot"></div><p class="m">M5</p><p class="d">data types</p><p class="s"></p></div>
         <div class="rail-stop"><div class="rail-dot"></div><p class="m">M6</p><p class="d">txns &middot; lua</p><p class="s"></p></div>
@@ -662,7 +660,7 @@
         <div class="rail-stop ga"><div class="rail-dot"></div><p class="m">1.0</p><p class="d">GA</p><p class="s"></p></div>
       </div>
     </div>
-    <p class="mono-note" style="margin-top:26px">TRAIN REORDERED DOCUMENTS-FIRST BY ADR-0023 &middot; M4.5 INSERTED BY ADR-0024 &middot; FIRST PUBLIC TAG MOVED TO M3 BY ADR-0048 &mdash; <a href="docs/roadmap.html" style="letter-spacing:0">milestone-by-milestone detail &rarr;</a></p>
+    <p class="mono-note" style="margin-top:26px">TRAIN REORDERED DOCUMENTS-FIRST BY ADR-0023 &middot; M4.5 INSERTED BY ADR-0024 &middot; FIRST PUBLIC TAG MOVED TO M3 BY ADR-0048, THEN TO M4&rsquo;S v0.4.0-alpha BY ADR-0067 &mdash; <a href="docs/roadmap.html" style="letter-spacing:0">milestone-by-milestone detail &rarr;</a></p>
   </div>
 </section>
 
