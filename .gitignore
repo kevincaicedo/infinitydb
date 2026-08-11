@@ -17,3 +17,9 @@ crates/inf-doc/fuzz/corpus/json_parse
 tests/client-smoke/node_modules/
 .artifacts/m3/adr0047-stage-fusion-20260717/wire/preload-docs.resp
 .artifacts/m3/adr0047-stage-fusion-20260717/wire2/preload-docs.resp
+
+# Raw RESP loadgen streams are reproducible from seed and exceed GitHub's
+# 100 MB limit — keep them on disk, never in git (reports + summaries are
+# the committed evidence; a campaign script must add specific run dirs,
+# never a bare `git add -f .artifacts/`).
+.artifacts/**/*.resp
