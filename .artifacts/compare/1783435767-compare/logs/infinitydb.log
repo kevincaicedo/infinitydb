@@ -1,0 +1,4 @@
+infinityd: listening on 7001
+infinityd v0.2.0-alpha.1-21-g0eaab11 (git 0eaab11a52a7, x86_64-unknown-linux-gnu)
+infinityd: 12 cells, port 7001, backend io_uring, route natural
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: false, single_issuer: true, defer_taskrun: true, performance_tier: true }

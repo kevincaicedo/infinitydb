@@ -1,0 +1,28 @@
+I0710 01:04:58.194865  108543 init.cc:144] dragonfly running in opt mode.
+                   .--::--.                   
+   :+*=:          =@@@@@@@@=          :+*+:   
+  %@@@@@@%*=.     =@@@@@@@@-     .=*%@@@@@@#  
+  @@@@@@@@@@@@#+-. .%@@@@#. .-+#@@@@@@@@@@@%  
+  -@@@@@@@@@@@@@@@@*:#@@#:*@@@@@@@@@@@@@@@@-  
+    :+*********####-%@%%@%-####********++.    
+   .%@@@@@@@@@@@@@%:@@@@@@:@@@@@@@@@@@@@@%    
+   .@@@@@@@@%*+-:   =@@@@=  .:-+*%@@@@@@@%.   
+     =*+-:           ###*          .:-+*=     
+                     %@@%                     
+                     *@@*                     
+                     +@@=                     
+                     :##:                     
+                     :@@:                     
+                      @@                      
+                      ..                      
+* Logs will be written to the first available of the following paths:
+* For the available flags type dragonfly [--help | --helpfull]
+* Documentation can be found at: https://www.dragonflydb.io/docs
+I0710 01:04:58.194926  108543 dfly_main.cc:1096] Starting dragonfly df-v1.39.0-699862e5da7cb29bf5642a1da422c4c78cefae38
+I0710 01:04:58.195029  108543 dfly_main.cc:1137] Using proactor_threads=16 (overriding cgroup-derived 0)
+W0710 01:04:58.195032  108543 dfly_main.cc:1144] SWAP is enabled. Consider disabling it when running Dragonfly.
+I0710 01:04:58.195037  108543 dfly_main.cc:1150] maxmemory has not been specified. Deciding myself....
+I0710 01:04:58.195038  108543 dfly_main.cc:1159] Found 24.48GiB available memory. Setting maxmemory to 19.58GiB
+I0710 01:04:58.196140  108544 uring_proactor.cc:263] IORing with 1024 entries, allocated 98368 bytes, cq_entries is 2048
+E0710 01:04:58.196669  108553 uring_proactor.cc:220] io_uring does not have enough memory. That can happen when your max locked memory is too limited. If you run me via docker, try adding '--ulimit memlock=-1' todocker run command
+E0710 01:04:58.196749  108554 uring_proactor.cc:220] io_uring does not have enough memory. That can happen when your max locked memory is too limited. If you run me via docker, try adding '--ulimit memlock=-1' todocker run command

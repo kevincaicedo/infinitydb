@@ -1,0 +1,4 @@
+infinityd v0.2.0-alpha.1-26-gfe797e1 (git fe797e17cdf9, x86_64-unknown-linux-gnu)
+infinityd: 16 cells, port 7001, backend io_uring, route natural
+infinityd: listening on 7001
+infinityd: cell 8 failed: driver setup (ring create): Cannot allocate memory (os error 12)

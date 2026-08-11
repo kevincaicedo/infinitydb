@@ -1,0 +1,31 @@
+I0716 19:41:14.473659  126742 init.cc:144] dragonfly running in opt mode.
+                   .--::--.                   
+   :+*=:          =@@@@@@@@=          :+*+:   
+  %@@@@@@%*=.     =@@@@@@@@-     .=*%@@@@@@#  
+  @@@@@@@@@@@@#+-. .%@@@@#. .-+#@@@@@@@@@@@%  
+  -@@@@@@@@@@@@@@@@*:#@@#:*@@@@@@@@@@@@@@@@-  
+    :+*********####-%@%%@%-####********++.    
+   .%@@@@@@@@@@@@@%:@@@@@@:@@@@@@@@@@@@@@%    
+   .@@@@@@@@%*+-:   =@@@@=  .:-+*%@@@@@@@%.   
+     =*+-:           ###*          .:-+*=     
+                     %@@%                     
+                     *@@*                     
+                     +@@=                     
+                     :##:                     
+                     :@@:                     
+                      @@                      
+                      ..                      
+* Logs will be written to the first available of the following paths:
+* For the available flags type dragonfly [--help | --helpfull]
+* Documentation can be found at: https://www.dragonflydb.io/docs
+I0716 19:41:14.473712  126742 dfly_main.cc:1096] Starting dragonfly df-v1.39.0-699862e5da7cb29bf5642a1da422c4c78cefae38
+I0716 19:41:14.473813  126742 dfly_main.cc:1137] Using proactor_threads=8 (overriding cgroup-derived 0)
+W0716 19:41:14.473817  126742 dfly_main.cc:1144] SWAP is enabled. Consider disabling it when running Dragonfly.
+I0716 19:41:14.473821  126742 dfly_main.cc:1150] maxmemory has not been specified. Deciding myself....
+I0716 19:41:14.473823  126742 dfly_main.cc:1159] Found 22.83GiB available memory. Setting maxmemory to 18.27GiB
+I0716 19:41:14.474937  126743 uring_proactor.cc:263] IORing with 1024 entries, allocated 98368 bytes, cq_entries is 2048
+I0716 19:41:14.475468  126742 proactor_pool.cc:149] Running 8 io threads
+I0716 19:41:14.476320  126742 dragonfly_listener.cc:152] SSL version: OpenSSL 3.4.5 7 Apr 2026
+W0716 19:41:14.476345  126742 dfly_main.cc:350] Protected mode enabled. Binding to localhost only because no password is set. To accept remote connections, set a password with --requirepass or specify a bind address with --bind.
+I0716 19:41:14.477204  126742 server_family.cc:1221] Host OS: Linux 7.0.0-27-generic x86_64 with 8 threads
+I0716 19:41:14.482131  126744 listener_interface.cc:102] sock[22] AcceptServer - listening on 127.0.0.1:7001

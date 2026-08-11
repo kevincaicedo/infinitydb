@@ -1,0 +1,4 @@
+infinityd: listening on 7000
+infinityd 53cd74c (git 53cd74cef82e-dirty, x86_64-unknown-linux-gnu)
+infinityd: 16 cells, port 7000, backend io_uring, route natural
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }

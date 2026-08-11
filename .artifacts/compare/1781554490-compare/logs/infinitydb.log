@@ -1,0 +1,4 @@
+infinityd e1fc538 (git e1fc5383af95-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 7002, backend io_uring, route natural
+infinityd: listening on 7002
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: false, single_issuer: true, defer_taskrun: true, performance_tier: true }
