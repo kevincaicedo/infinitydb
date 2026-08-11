@@ -142,10 +142,6 @@
     <span class="artifact">.artifacts/m2/1783699515-gate-run/ &middot; 176 cycles in-row</span>
   </div>
   <div class="evidence">
-    <span class="tag">C19 &middot; Narrowed</span> &mdash; <code>everysec</code> durability costs &asymp; <strong style="color:var(--text)">10&ndash;11%</strong> of throughput vs a memory-mode namespace on our reference box (consumer Gen3 DRAM-less NVMe; interleaved ABBA, 3 replicates). The &ldquo;&lt; 10%&rdquo; absolute stays Evidence-pending on this device class.
-    <span class="artifact">.artifacts/m2/1783699515-gate-run/</span>
-  </div>
-  <div class="evidence">
     <span class="tag">C21 &middot; Allowed</span> &mdash; Memory attribution stays exact with the durable plane live: sum of per-domain accounting &mdash; log staging and checkpoint buffers included &mdash; within <strong style="color:var(--text)">1.1%</strong> of process RSS on a 1 GB durable fill (measured 1.04%; divergence over 10% fails the gate).
     <span class="artifact">.artifacts/m2/1783699515-gate-run/ attribution row</span>
   </div>
@@ -170,6 +166,7 @@
   <p>The absences are part of the method. Each one is a ledger row that has not earned Allowed status, and each names what is missing:</p>
   <ul style="color:var(--text-muted);font-size:14px;line-height:1.8">
     <li><strong>Absolute <code>always</code>-mode write rates.</strong> The mechanism is proven (one durability fsync in flight, collecting every arrival during the flush), but the absolute number is owned by the flush latency of a better device class than our Gen3 DRAM-less reference NVMe. Evidence-pending; the mechanism story is citable, the number is not.</li>
+    <li><strong>The <code>everysec</code> cost figure.</strong> A previous campaign narrowed it to a citable range; the current campaign&rsquo;s re-read did <em>not</em> reproduce it &mdash; the same binary read dramatically better on a RAM disk the same night, so the shift belongs to the reference SSD&rsquo;s current state, not the engine. Per the re-validation rule the row reverted to Evidence-pending and the number came off this page &mdash; that is the ledger working, not a gap in it.</li>
     <li><strong>Absolute tail-latency claims.</strong> The reference device itself stalls under sustained write load with checkpoints <em>off</em> &mdash; the control run proves the excursions belong to the device class, so an absolute p99.9 claim would be a claim about our SSD, not our engine. Narrowed to relative wordings.</li>
     <li><strong>Tiered-storage numbers (M4).</strong> The harness, the split-percentile contract, and the gate table exist; the binding campaign is in progress. Until its rows are signed, no cold-read or beyond-RAM number appears anywhere &mdash; and when they do, cold-read tail rows will carry the Gen3 device disclosure explicitly.</li>
     <li><strong>Document wire ratios (reads vs <code>GET</code>, writes vs <code>SET</code>).</strong> Measured at dev tier, on the gate line; the reference-box campaign owns the verdict. Evidence-pending &mdash; quoting the dev numbers would be exactly the shortcut the ledger exists to prevent.</li>
