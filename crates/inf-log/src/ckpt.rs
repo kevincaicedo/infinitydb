@@ -1116,9 +1116,12 @@ pub fn read_ick_counts<F: SegmentFs>(
         match head[0] {
             // All section classes hop identically: the class meta lives
             // inside body_len (ADR-0057 D3 / ADR-0058 D3, deliberately).
-            // The 0x03/0x04 tags are a v2 vocabulary — in a v1 file they
-            // are corruption.
-            BLOCK_SECTION | BLOCK_ADDR_SECTION | BLOCK_LIVESET => {
+            // The 0x03/0x04/0x05 tags are a v2 vocabulary — in a v1 file
+            // they are corruption. Every tag `seal_section` can emit must
+            // appear here or the footer-probe fallback misdiagnoses a
+            // valid file as corrupt (the ADR-0073 D4 three-site rule —
+            // 0x05 was missing until M4.5-S00's audit).
+            BLOCK_SECTION | BLOCK_ADDR_SECTION | BLOCK_LIVESET | BLOCK_BLOBREF => {
                 if head[0] != BLOCK_SECTION && version != ICK_VERSION_V2 {
                     return Err(IckReadError::UnknownBlock { tag: head[0], at: offset });
                 }
@@ -1949,6 +1952,51 @@ mod tests {
         // footer probe; the section hop still finds the footer and returns
         // the same hint.
         let mut padded = bytes.clone();
+        padded.extend_from_slice(b"junk");
+        let pad = MemFs::new();
+        pad.create_dir_all(dir).unwrap();
+        use crate::fs::{SegmentFile, SegmentFs as _};
+        let mut f = pad.create_meta(&path).expect("create");
+        f.write_at(0, &padded).expect("write");
+        let counts =
+            read_ick_counts(&pad, &path, IckReaderConfig::default()).expect("hop fallback");
+        assert_eq!(counts, summary.entries_per_ns, "fallback hint matches the footer");
+    }
+
+    // The hop fallback must recognize every tag `seal_section` can emit:
+    // a v2 file carrying all three v2 section classes, with the direct
+    // footer probe defeated by trailing bytes, still yields the footer's
+    // counts by hopping. Regression for the M4.5-S00 audit finding — the
+    // hop arm omitted BLOCK_BLOBREF (0x05), so this shape misdiagnosed as
+    // `UnknownBlock { tag: 5 }` (ADR-0073 D4).
+    #[test]
+    fn counts_hop_fallback_covers_every_v2_section_class() {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let mut w = SyncIckWriter::create_v2(
+            fs.clone(),
+            dir,
+            &small_cfg(),
+            0,
+            21,
+            Lsn::new(crate::lsn::SegmentId(1), 64),
+            &[16],
+        )
+        .expect("create v2");
+        w.append(&RecordView::StringPostImage {
+            ns: crate::record::NsId(16),
+            key: b"k",
+            value: b"v",
+        })
+        .expect("image");
+        w.append_ref(16, 4096, 0xfeed_beef, 128).expect("addr ref");
+        w.append_live_set(16, 1, 4096, 0, true).expect("live set");
+        w.append_blob_ref(16, 100, 7, 4096).expect("blob ref");
+        let summary = w.finish().expect("finish");
+
+        let path = dir.join(ick_file_name(21));
+        let mut padded = fs.contents(&path).expect("ick bytes");
         padded.extend_from_slice(b"junk");
         let pad = MemFs::new();
         pad.create_dir_all(dir).unwrap();
