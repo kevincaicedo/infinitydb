@@ -409,6 +409,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "inf-query"
+version = "0.0.0"
+
+[[package]]
 name = "inf-replica"
 version = "0.0.0"
 

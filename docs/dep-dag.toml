@@ -27,6 +27,13 @@ inf-stream = ["inf-foundation", "inf-log", "inf-store"]
 # inf-doc -> inf-simd: SIMD structural scanning behind safe wrappers
 # (ADR-0032 D7; M3 plan §3.3). Never inf-wire/inf-log/inf-server.
 inf-doc = ["inf-foundation", "inf-alloc", "inf-simd"]
+# inf-query -> inf-doc/inf-store: the M4.5 engine edges (ADR-0072 D9;
+# M4.5 plan §3.3) — cursor reads and the public index/range APIs. Never
+# inf-wire/inf-log/inf-server/inf-fabric: the crate sees no RESP, no
+# sockets, no raw record memory, no log files (L11 proof case #1). The
+# S01 B+-tree leaf-search kernels live in inf-simd and reach inf-store
+# through the existing inf-store -> inf-simd edge (no new edge).
+inf-query = ["inf-foundation", "inf-doc", "inf-store"]
 inf-vector = ["inf-foundation", "inf-simd", "inf-alloc"]
 inf-compute = ["inf-foundation", "inf-store"]
 inf-replica = ["inf-foundation", "inf-log"]
@@ -35,6 +42,10 @@ inf-replica = ["inf-foundation", "inf-log"]
 # serialization into wire buffers (the ADR-0039 D1 split). Feature-gated
 # (`doc`); the arrow points down and inf-doc still never sees RESP,
 # records, sockets, or logs (M3 plan §3.3).
+# inf-server -> inf-query: the M4.5-S10/S11 command-surface edge
+# (ADR-0072 D9, authorized ahead of use — the ADR-0032 D7
+# allowed-but-unused posture): INF.QL/INF.IDX dispatch behind a `query`
+# feature, the ADR-0041 D3 `doc` precedent. Slim builds compile it out.
 inf-server = [
     "inf-foundation",
     "inf-simd",
@@ -46,6 +57,7 @@ inf-server = [
     "inf-store",
     "inf-stream",
     "inf-doc",
+    "inf-query",
 ]
 infinity-embedded = ["inf-foundation", "inf-server"]
 

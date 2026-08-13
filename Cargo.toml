@@ -26,6 +26,7 @@ inf-log = { path = "crates/inf-log" }
 inf-store = { path = "crates/inf-store", default-features = false }
 inf-stream = { path = "crates/inf-stream" }
 inf-doc = { path = "crates/inf-doc" }
+inf-query = { path = "crates/inf-query" }
 inf-vector = { path = "crates/inf-vector" }
 inf-compute = { path = "crates/inf-compute" }
 inf-replica = { path = "crates/inf-replica" }
