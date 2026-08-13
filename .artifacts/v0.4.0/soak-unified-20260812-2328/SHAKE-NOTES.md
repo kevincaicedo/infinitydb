@@ -18,8 +18,11 @@ endurance readings and must never be quoted as any.
    `486541350, 3140977111, 5795412872, 8449848633, 11104284394,
    13758720155, 16413155916, 19067591677`.
 2. **The reclaim series populates.** `dead_bytes` 0 → **641,611,744**
-   over 8 legs; `live_bytes` 5,494,538,240 per cell (~22 GB node-wide);
-   `compact_idle_pressure` 0.
+   over 8 legs and `compact_idle_pressure` 0. (`live_bytes` —
+   5,494,538,240 per cell, ~22 GB node-wide — was read by direct
+   `INFO tiering` scrape during this run; it joined `samples.csv` only
+   *after* the shake, as part of the fix below, so this bundle's CSV
+   carries 21 columns and later ones carry 22.)
 3. **The fix does what it was meant to.** Dead space now accumulates
    steadily across legs — 57.9 MB after leg 0, 393 MB by leg 5, 641 MB
    by leg 7 (~25.7 MB/min node-wide) — where the 20260811 run's
