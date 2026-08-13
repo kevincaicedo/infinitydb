@@ -1,0 +1,25 @@
+# cargo-fuzz crate for inf-store (M4.5-S02 AC: the typed index-key
+# encoding is a durable contract and its decoder is L9 surface —
+# `fuzz_index_key` lands in the same PR as the encoder, ADR-0074 D7).
+# Standalone workspace — built only by `cargo +nightly fuzz`.
+[package]
+name = "inf-store-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+inf-store = { path = ".." }
+
+[[bin]]
+name = "fuzz_index_key"
+path = "fuzz_targets/fuzz_index_key.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

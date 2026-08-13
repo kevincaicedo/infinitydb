@@ -14,6 +14,7 @@ mod doc;
 mod evict;
 mod extents;
 mod index;
+mod index_key;
 mod keyspace;
 mod live_set;
 mod ns;
@@ -41,6 +42,10 @@ pub use extents::{
     ExtentRefs, ExtentStats,
 };
 pub use index::{Index, MemoryMode, SlotMode, TieredMode};
+pub use index_key::{
+    DecodedIndexKey, INDEX_KEY_ENCODING_VERSION, IndexKeyBuf, IndexKeyDecodeError, IndexKeyType,
+    IndexScalar, KeySkip, compare_i64_f64, index_key_decode, index_key_encode, index_scalar_coerce,
+};
 pub use inf_alloc::ArenaConfig;
 // One import point for the shared store↔log vocabulary (ADR-0015 D2/D5).
 pub use inf_foundation::LogicalAddr;

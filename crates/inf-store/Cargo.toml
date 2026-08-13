@@ -47,6 +47,11 @@ harness = false
 test = false
 
 [[bench]]
+name = "index_key"
+harness = false
+test = false
+
+[[bench]]
 name = "mutation"
 harness = false
 test = false

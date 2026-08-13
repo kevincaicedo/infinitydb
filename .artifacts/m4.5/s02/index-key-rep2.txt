@@ -1,0 +1,8 @@
+row=encode_i64 n=100000 ns_per_op=10.07
+row=encode_f64 n=100000 ns_per_op=10.38
+row=encode_f64_from_i64 n=100000 ns_per_op=5.90
+row=encode_bool n=100000 ns_per_op=10.02
+row=encode_utf8_16 n=100000 ns_per_op=12.58
+row=encode_utf8_64 n=100000 ns_per_op=31.38
+row=encode_utf8_16_nul n=100000 ns_per_op=19.33
+row=compare_i64_f64 n=100000 ns_per_op=10.03
