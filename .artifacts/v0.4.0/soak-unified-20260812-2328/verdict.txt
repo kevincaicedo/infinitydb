@@ -1,0 +1,17 @@
+rss slope whole-run +398.692%/24h (first-5% median 2994940 kB -> last-5% median 3310868 kB, 223 samples; disclosure)
+steady-state window not applicable (run 0.5 h <= 2x warm-up 8 h) — whole-run slope gates; not the ADR-0069 citation form
+accounted slope whole-run +305.151%/24h (used_memory first-5% median 544007 kB -> last-5% 587929 kB; disclosure)
+attribution (end): rss 3311204 kB vs used_memory + tier_committed + tier_index + staging + ckpt = 3299288 kB — residual 11916 kB (+0.4%; disclosure)
+tiering disk max 20489486336 bytes (budget 85899345920)
+write-amp milli max 1920 (gate < 3000)
+diskfull refusals 0
+docs_live 9549 -> 14240 (document plane live throughout: yes)
+checkpoints completed 0 -> 429 (delta 429)
+tier reclaim: dead_bytes 0 -> 641611744 over the whole run (delta 641611744, peak 641611744); compact_idle_pressure delta 0
+tier liveness: cold_reads_issued 0 -> 2048186 over the whole run (delta 2048186)
+tier liveness: flush_slices 0 -> 19521 over the whole run (delta 19521)
+tier liveness: compact_slices 0 -> 0 over the whole run (delta 0)
+FAIL — discharges: NOTHING (a failing run is not evidence for any gate)
+  - RSS slope +398.692%/24h >= 0.5%/24h
+  - accounted slope +305.151%/24h >= 0.5%/24h — data-structure growth, not allocator shape
+  - tiered plane served no compaction slices across the whole run — the tier was static, so the M4 §7 rows measured a node that was not doing the work they describe — and 641611744 bytes of reclaimable space accumulated while it did not run (compact_idle_pressure delta 0): this is the ENGINE-SIDE shape, escalate before re-running

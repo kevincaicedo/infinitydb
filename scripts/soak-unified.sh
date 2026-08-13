@@ -70,6 +70,12 @@ MULTIPLE="${SOAK_MULTIPLE:-10}"
 LEG_SECS="${SOAK_LEG_SECS:-1800}"
 TIER_WORKLOADS="${SOAK_TIER_WORKLOADS:-a,b}"
 WARMUP_HOURS="${SOAK_WARMUP_HOURS:-8}"
+# Mirrors TierSpec::compaction_dead_ratio_pct (inf-store/src/ns.rs,
+# default 50, clamped 50..=100 by ADR-0059 D1). The verdict needs it to
+# say whether a zero-compaction run was ever *eligible* to compact.
+# Override only if the soak namespace is created with a non-default
+# COMPACTION-DEAD-RATIO, or the verdict will reason against the wrong bar.
+DEAD_RATIO_PCT="${SOAK_DEAD_RATIO_PCT:-50}"
 SEED=0x1D0C2026          # the blessed corpus seed (ADR-0046 D3)
 SEED_DEC=486541350
 DURATION_S=$(awk -v h="$HOURS" 'BEGIN { printf "%d", h * 3600 }')
@@ -242,11 +248,12 @@ sample_line() {
     $1 == "tiering_flush_slices"        { fsl  += $2 }
     $1 == "tiering_compact_slices"      { csl  += $2 }
     $1 == "tiering_dead_bytes"          { dead += $2 }
+    $1 == "tiering_live_bytes"          { live += $2 }
     $1 == "tiering_compact_idle_pressure" { cidle += $2 }
-    END { printf "%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+    END { printf "%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
           ts, rss, docs, dres, disk, wam, ref, ck, mf, segs,
           (subs > 0 ? sqes / subs : 0), int(um / 1024),
-          tcom, tidx, stag, ckb, cread, fsl, csl, dead, cidle }
+          tcom, tidx, stag, ckb, cread, fsl, csl, dead, live, cidle }
   ' <<<"$info"
 }
 
@@ -277,13 +284,17 @@ alert() {
   # and still never compacted, and the bundle could not say whether that
   # meant "no dead space was created" (workload) or "dead space was
   # ignored" (engine) — because no sampled column carried dead space.
-  # `INFO tiering` already emits both of these per cell; not sampling
-  # them was the gap. dead_bytes is the reclaimable backlog;
-  # compact_idle_pressure counts the times compaction was pressured and
-  # found nothing to do, which separates "never asked" from "asked,
-  # nothing there". A gate that can detect a frozen tier but not
-  # diagnose one is half an instrument.
-  echo "unix_s,vmrss_kb,docs_live,doc_resident_bytes,disk_used_bytes,wa_milli_max,diskfull_refusals,ckpts,manifests,segs_live,sqes_per_submit,used_memory_kb,tier_committed_bytes,tier_index_bytes,log_staging_bytes,ckpt_buffer_bytes,cold_reads_issued,flush_slices,compact_slices,dead_bytes,compact_idle_pressure" >"$OUT/samples.csv"
+  # `INFO tiering` already emits all three per cell; not sampling them was
+  # the gap. dead_bytes is the reclaimable backlog and live_bytes is its
+  # denominator — compaction triggers on the RATIO (dead / (dead + live)
+  # >= COMPACTION-DEAD-RATIO, default 50%), so dead alone cannot say
+  # whether compaction *should* have run. The 20260812 shake proved that
+  # the hard way: 641 MB of dead read as alarming in isolation and was in
+  # fact 2.8% of live, far below any trigger. compact_idle_pressure
+  # counts the times compaction was pressured and found nothing, which
+  # separates "never asked" from "asked, nothing there". A gate that can
+  # detect a frozen tier but not diagnose one is half an instrument.
+  echo "unix_s,vmrss_kb,docs_live,doc_resident_bytes,disk_used_bytes,wa_milli_max,diskfull_refusals,ckpts,manifests,segs_live,sqes_per_submit,used_memory_kb,tier_committed_bytes,tier_index_bytes,log_staging_bytes,ckpt_buffer_bytes,cold_reads_issued,flush_slices,compact_slices,dead_bytes,live_bytes,compact_idle_pressure" >"$OUT/samples.csv"
   : >"$OUT/alerts.log"
   n=0
   while kill -0 $SERVER_PID 2>/dev/null && [ $n -lt $MAX_SAMPLES ]; do
@@ -457,12 +468,13 @@ ALERT_LINES=$(wc -l <"$OUT/alerts.log" 2>/dev/null || echo 0)
 TIER_BROKEN=0
 [ -f "$OUT/tier-leg-broken.txt" ] && TIER_BROKEN=1
 
-python3 - "$OUT/samples.csv" "$HOURS" "$SERVER_ALIVE" "$DISK_BUDGET_BYTES" "$MODE" "$WARMUP_HOURS" "$ALERT_LINES" "$TIER_BROKEN" <<'EOF' | tee "$OUT/verdict.txt"
+python3 - "$OUT/samples.csv" "$HOURS" "$SERVER_ALIVE" "$DISK_BUDGET_BYTES" "$MODE" "$WARMUP_HOURS" "$ALERT_LINES" "$TIER_BROKEN" "$DEAD_RATIO_PCT" <<'EOF' | tee "$OUT/verdict.txt"
 import csv, sys
 rows = [r for r in csv.DictReader(open(sys.argv[1])) if int(r["vmrss_kb"]) > 0]
 hours, alive, budget = float(sys.argv[2]), sys.argv[3] == "1", int(sys.argv[4])
 mode, warmup = sys.argv[5], float(sys.argv[6])
 alert_lines, tier_broken = int(sys.argv[7]), sys.argv[8] == "1"
+dead_ratio_pct = float(sys.argv[9]) if len(sys.argv) > 9 else 50.0
 fails = []
 if not alive:
     fails.append("server died during the soak (see infinityd.log)")
@@ -573,32 +585,47 @@ else:
     # not gate — it explains. `compact_slices == 0` is a FAIL either way
     # (the story's title is "endurance WITH COMPACTION ACTIVE"), but the
     # two causes have opposite severity and the message must say which.
-    dead_delta = idle_delta = None
-    if "dead_bytes" in rows[0]:
+    dead_delta = idle_delta = peak_ratio = None
+    if "dead_bytes" in rows[0] and "live_bytes" in rows[0]:
         d0, d1 = int(window[0]["dead_bytes"]), int(window[-1]["dead_bytes"])
-        dead_delta, dead_peak = d1 - d0, max(int(r["dead_bytes"]) for r in window)
+        dead_delta = d1 - d0
         i0, i1 = int(window[0]["compact_idle_pressure"]), int(window[-1]["compact_idle_pressure"])
         idle_delta = i1 - i0
-        print(f"tier reclaim: dead_bytes {d0} -> {d1} over the {scope} "
-              f"(delta {dead_delta}, peak {dead_peak}); compact_idle_pressure delta {idle_delta}")
+        # Compaction triggers on the RATIO, so the ratio is what the
+        # verdict must reason about. Peak, not final: compaction that ran
+        # would have pulled the ratio back down, so the highest ratio the
+        # run ever reached is the honest "did it ever qualify?" statistic.
+        ratios = [int(r["dead_bytes"]) / max(int(r["dead_bytes"]) + int(r["live_bytes"]), 1) * 100
+                  for r in window]
+        peak_ratio = max(ratios)
+        print(f"tier reclaim: dead_bytes {d0} -> {d1} over the {scope} (delta {dead_delta}); "
+              f"live_bytes {int(window[-1]['live_bytes'])}; peak dead ratio {peak_ratio:.2f}% "
+              f"vs the {dead_ratio_pct}% compaction trigger; "
+              f"compact_idle_pressure delta {idle_delta}")
     if all(c in rows[0] for c in live):
         for column, label in live.items():
             first, last = int(window[0][column]), int(window[-1][column])
             print(f"tier liveness: {column} {first} -> {last} over the {scope} (delta {last - first})")
             if mode == "FULL" and last - first <= 0:
                 why = ""
-                if column == "compact_slices" and dead_delta is not None:
-                    # 64 MiB: comfortably above sampling jitter on the
-                    # counter, far below anything a real backlog looks
-                    # like (the 20260812 diagnostic made 244 MB in 2 min).
-                    if dead_delta > 64 * 1024 * 1024:
-                        why = (f" — and {dead_delta} bytes of reclaimable space accumulated while it "
-                               f"did not run (compact_idle_pressure delta {idle_delta}): this is the "
-                               "ENGINE-SIDE shape, escalate before re-running")
+                if column == "compact_slices" and peak_ratio is not None:
+                    # The discriminator is the ratio against the trigger,
+                    # NOT an absolute byte count. Compaction is *supposed*
+                    # to stay idle below the trigger, so "lots of dead
+                    # bytes" alone proves nothing: the 20260812 shake hit
+                    # 641 MB dead — alarming in isolation, 2.8% of live in
+                    # fact, and correctly no compaction.
+                    if peak_ratio >= dead_ratio_pct:
+                        why = (f" — and the dead ratio reached {peak_ratio:.2f}%, at or past the "
+                               f"{dead_ratio_pct}% trigger, while compaction stayed idle "
+                               f"(compact_idle_pressure delta {idle_delta}): this is the ENGINE-SIDE "
+                               "shape, escalate before spending another run")
                     else:
-                        why = (f" — dead_bytes moved only {dead_delta} bytes, so the workload never "
-                               "created reclaimable space: this is the WORKLOAD/HARNESS shape, fix "
-                               "the leg mix or key stream, not the compaction driver")
+                        why = (f" — but the dead ratio only reached {peak_ratio:.2f}% against a "
+                               f"{dead_ratio_pct}% trigger, so compaction was never eligible to run: "
+                               "the run never posed the question. This is the WORKLOAD/CONFIG shape "
+                               "— lengthen the run, raise write pressure, or lower the memory budget "
+                               "(the trigger scales with the live dataset), not an engine fault")
                 fails.append(
                     f"tiered plane served no {label} across the {scope} — the tier was static, so "
                     "the M4 §7 rows measured a node that was not doing the work they describe"

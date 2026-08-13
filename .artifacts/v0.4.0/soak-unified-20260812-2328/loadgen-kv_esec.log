@@ -1,0 +1,85 @@
+ops = 19631417
+errors = 118
+busy_retryable = 118
+elapsed_s = 300.088
+ops_per_sec = 65419
+p50_us = 311
+p99_us = 22015
+p999_us = 368639
+p9999_us = 1441791
+max_us = 4106030
+error_sample = -BUSY durable log staging is full, retry
+inf-bench: 118 error replies under load (118 BUSY-retryable; first sample: -BUSY durable log staging is full, retry)
+ops = 48599044
+errors = 266320
+busy_retryable = 266320
+elapsed_s = 300.000
+ops_per_sec = 161997
+p50_us = 223
+p99_us = 3903
+p999_us = 100351
+p9999_us = 802815
+max_us = 2753362
+error_sample = -BUSY durable log staging is full, retry
+inf-bench: 266320 error replies under load (266320 BUSY-retryable; first sample: -BUSY durable log staging is full, retry)
+ops = 103710078
+errors = 701550
+busy_retryable = 701550
+elapsed_s = 300.234
+ops_per_sec = 345431
+p50_us = 191
+p99_us = 831
+p999_us = 8447
+p9999_us = 344063
+max_us = 3053696
+error_sample = -BUSY durable log staging is full, retry
+inf-bench: 701550 error replies under load (701550 BUSY-retryable; first sample: -BUSY durable log staging is full, retry)
+ops = 104900563
+errors = 499673
+busy_retryable = 499673
+elapsed_s = 300.000
+ops_per_sec = 349668
+p50_us = 183
+p99_us = 831
+p999_us = 8191
+p9999_us = 368639
+max_us = 2176549
+error_sample = -BUSY durable log staging is full, retry
+inf-bench: 499673 error replies under load (499673 BUSY-retryable; first sample: -BUSY durable log staging is full, retry)
+ops = 108036536
+errors = 564992
+busy_retryable = 564992
+elapsed_s = 300.000
+ops_per_sec = 360121
+p50_us = 179
+p99_us = 799
+p999_us = 8063
+p9999_us = 327679
+max_us = 4197936
+error_sample = -BUSY durable log staging is full, retry
+inf-bench: 564992 error replies under load (564992 BUSY-retryable; first sample: -BUSY durable log staging is full, retry)
+ops = 111085188
+errors = 550462
+busy_retryable = 550462
+elapsed_s = 300.277
+ops_per_sec = 369942
+p50_us = 179
+p99_us = 831
+p999_us = 8447
+p9999_us = 303103
+max_us = 3725139
+error_sample = -BUSY durable log staging is full, retry
+inf-bench: 550462 error replies under load (550462 BUSY-retryable; first sample: -BUSY durable log staging is full, retry)
+ops = 107469551
+errors = 513314
+busy_retryable = 513314
+elapsed_s = 300.000
+ops_per_sec = 358231
+p50_us = 183
+p99_us = 847
+p999_us = 7935
+p9999_us = 319487
+max_us = 3598740
+error_sample = -BUSY durable log staging is full, retry
+inf-bench: 513314 error replies under load (513314 BUSY-retryable; first sample: -BUSY durable log staging is full, retry)
+inf-bench: read: Connection reset by peer (os error 104)
