@@ -5182,7 +5182,11 @@ async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     }
     // Persist the catalog; ack only once the swap is durable (a DDL whose
     // definition can vanish after +OK would be a §8.2 violation).
-    let epoch = control.request_persist(shared.store.borrow().export_catalog(control.next_ns_id()));
+    let epoch = control.request_persist(shared.store.borrow().export_catalog(
+        control.next_ns_id(),
+        control.next_index_id(),
+        control.next_index_generation(),
+    ));
     while !control.persisted(epoch) {
         shared.ddl_waiters.wait(0).await;
     }

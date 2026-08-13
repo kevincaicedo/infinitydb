@@ -37,8 +37,8 @@ pub use ckpt::{CkptStats, ManifestStats};
 pub use clients::{ClientInfo, ClientRegistry};
 pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
 pub use control::{
-    CellRecoverySlot, ControlHandle, ControlInbox, RecoveryBoard, load_catalog, load_catalog_from,
-    spawn as spawn_control,
+    CellRecoverySlot, ControlHandle, ControlInbox, INDEX_SLOTS, IndexBoard, RecoveryBoard,
+    load_catalog, load_catalog_from, spawn as spawn_control,
 };
 pub use durable::{DurableConfig, DurableStats, RecoverConfig};
 // Durable-config vocabulary re-exported for the assembly tier: bins name

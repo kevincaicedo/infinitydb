@@ -1,16 +1,30 @@
-//! Namespace-catalog encoding **v2** (M2-S08/ADR-0015 D3 shape; M4-S19/
-//! ADR-0062 D6 adds the tier block): the bytes that ride `inf-log`'s
-//! `META` envelope. The envelope (write/fsync/rename swap, CRC, version
-//! tag) is `inf-log`'s protocol and treats this payload as opaque;
-//! `inf-store` owns only the encoding and still never opens a file.
+//! Namespace-catalog encoding **v2/v3** (M2-S08/ADR-0015 D3 shape;
+//! M4-S19/ADR-0062 D6 adds the tier block; M4.5-S03/ADR-0075 D2 adds the
+//! v3 index section): the bytes that ride `inf-log`'s `META` envelope.
+//! The envelope (write/fsync/rename swap, CRC, version tag) is
+//! `inf-log`'s protocol and treats this payload as opaque; `inf-store`
+//! owns only the encoding and still never opens a file.
 //!
-//! ## Wire format v2 (all integers little-endian)
+//! ## Wire format v2/v3 (all integers little-endian)
 //!
 //! ```text
-//! catalog := version: u8 (= 2)
+//! catalog := version: u8 (= 2 | 3)
 //!            next_id: u32          # node id counter; named ids start at 16
 //!            count:   u32          # entry count
 //!            entry*count
+//!            [index_section]       # v3 only (ADR-0075 D2)
+//! index_section := next_index_id: u32        # ≥ 1; never regresses
+//!                  next_generation: u64      # ≥ 1; never regresses
+//!                  index_count: u32          # ≤ INDEXES_PER_NODE_MAX
+//!                  index_record*index_count
+//! index_record  := id: u32 · generation: u64 · ns: u32 · state: u8
+//!                  # 0 = declared, 1 = backfilling, 2 = ready,
+//!                  # 3 = dropping
+//!                  key_type: u8              # 0 = utf8, 1 = i64,
+//!                                            # 2 = f64, 3 = bool
+//!                  encoding_version: u16     # must equal 1 (ADR-0074 D1)
+//!                  program_len: u16 · program bytes  # M3 bytecode v1
+//!                  name_len: u16 · name
 //! entry   := id:        u32        # ≥ 16 (0..16 are the implicit defaults)
 //!            mode:      u8         # 0 = memory, 1 = durable, 2 = topic
 //!            fsync:     u8         # 0 = none, 1 = everysec, 2 = always
@@ -30,10 +44,14 @@
 //!               tail_stall_timeout_ms: u32
 //! ```
 //!
-//! **v1 decodes forever** (ADR-0062 D6): v1 is v2 without the tier byte,
-//! and v0.3.0-alpha shipped v1 catalogs — refusing them would turn an
-//! upgrade into data loss. The writer always emits v2; versions above 2
-//! fail-stop exactly as before.
+//! **v1 and v2 decode forever** (ADR-0062 D6 / ADR-0075 D2): v1 is v2
+//! without the tier byte; v2 is v3 without the index section — both
+//! decode index-absent. The writer emits **v3 iff the index feature has
+//! been used** (any index entry, or a moved index counter — a
+//! created-then-dropped index must not reset its id space) and v2
+//! byte-identically otherwise: never-indexed nodes stay
+//! downgrade-unaffected, the degenerate-case-is-absence rule at the
+//! format layer (ADR-0073 D2 precedent). Versions above 3 fail-stop.
 //!
 //! Decode is **fail-stop** for callers (§8.4 honesty): unknown version,
 //! truncation, trailing bytes, invalid mode/fsync/policy/tier bytes,
@@ -54,8 +72,15 @@ use inf_log::fs::TierIoMode;
 use inf_log::{FsyncClass, NsId};
 
 use crate::evict::EvictionPolicy;
+use crate::index_key::{INDEX_KEY_ENCODING_VERSION, IndexKeyType};
+use crate::index_registry::{
+    FIRST_INDEX_GENERATION, FIRST_INDEX_ID, INDEX_PROGRAM_MAX, INDEXES_PER_NODE_MAX, IndexId,
+    IndexSpec, IndexState,
+};
 use crate::ns::{FIRST_NAMED_NS_ID, NsMode, NsSpec, TierSpec, is_default_name, valid_ns_name};
 
+/// v3 = v2 + the index section (M4.5-S03, ADR-0075 D2).
+const CATALOG_VERSION_V3: u8 = 3;
 const CATALOG_VERSION: u8 = 2;
 /// The last version whose payloads this decoder still accepts (v1 = the
 /// v0.3.0-alpha on-disk catalogs — tier-absent by construction).
@@ -63,14 +88,51 @@ const CATALOG_VERSION_V1: u8 = 1;
 /// Fixed tier-block size (ADR-0062 D6).
 const TIER_BLOCK_BYTES: usize = 46;
 
-/// The node's namespace catalog: the id counter plus every named entry.
-/// Boot seeds each cell's registry from it before cells replay or serve
-/// (ADR-0015 D3); DDL persists it through the `META` swap.
+/// The index half of the catalog (ADR-0075 D2): the two never-regressing
+/// allocator counters plus every live index declaration. Pristine (never
+/// used) ⇒ the payload stays v2 byte-identically.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct IndexCatalog {
+    /// Next index id the node allocator hands out (≥ [`FIRST_INDEX_ID`];
+    /// ids are allocated once and never reused — the ADR-0015 D2 rule).
+    pub next_id: u32,
+    /// Next generation (catalog-global monotone counter, ≥ 1).
+    pub next_generation: u64,
+    pub entries: Vec<IndexSpec>,
+}
+
+impl Default for IndexCatalog {
+    fn default() -> IndexCatalog {
+        IndexCatalog {
+            next_id: FIRST_INDEX_ID,
+            next_generation: FIRST_INDEX_GENERATION,
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl IndexCatalog {
+    /// True while the index feature has never been used — the writer's
+    /// v2-vs-v3 pivot (ADR-0075 D2.2).
+    #[must_use]
+    pub fn is_pristine(&self) -> bool {
+        self.entries.is_empty()
+            && self.next_id == FIRST_INDEX_ID
+            && self.next_generation == FIRST_INDEX_GENERATION
+    }
+}
+
+/// The node's namespace catalog: the id counter plus every named entry,
+/// and (since v3) the index declarations. Boot seeds each cell's
+/// registry from it before cells replay or serve (ADR-0015 D3); DDL
+/// persists it through the `META` swap.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NsCatalog {
     /// Next id the node-level allocator hands out (≥ [`FIRST_NAMED_NS_ID`]).
     pub next_id: u32,
     pub entries: Vec<NsSpec>,
+    /// Index declarations + counters (M4.5-S03, ADR-0075 D2).
+    pub index: IndexCatalog,
 }
 
 /// Why a catalog payload failed to decode. Every variant means the `META`
@@ -106,6 +168,26 @@ pub enum CatalogError {
     /// budget authority per namespace — the parser refuses it, so a
     /// catalog holding it is corrupt or foreign.
     TierOwnsBudget(u32),
+    /// An index record violates a byte-level or range rule (M4.5-S03,
+    /// ADR-0075 D2.4); the reason names it.
+    InvalidIndexRecord(&'static str),
+    /// An index record's key-encoding version is not the one this binary
+    /// writes — a future-encoding catalog needs a future binary
+    /// (ADR-0074 D1 / ADR-0073 D7 posture).
+    UnknownIndexEncodingVersion(u16),
+    /// Two index records claim the same id (ids are never reused).
+    DuplicateIndexId(u32),
+    /// An index names a named namespace absent from this payload
+    /// (defaults `0..16` are implicitly valid).
+    IndexUnknownNamespace(u32),
+    /// An index names a tiered namespace — `INF.IDX` refuses them
+    /// (ADR-0072 D8a), so bytes claiming one are corrupt or foreign.
+    IndexOnTieredNamespace(u32),
+    /// Index records present but this build has no document engine
+    /// (`doc` feature off): declarations cannot be maintained, so the
+    /// catalog refuses typed rather than silently dropping them (L8;
+    /// the ADR-0073 D7 boundary posture).
+    IndexesRequireDocBuild,
 }
 
 impl fmt::Display for CatalogError {
@@ -128,6 +210,22 @@ impl fmt::Display for CatalogError {
                     "tiered namespace id {id} carries MAXMEMORY (MEM-BUDGET is its one budget authority)"
                 )
             }
+            CatalogError::InvalidIndexRecord(reason) => {
+                write!(f, "invalid index record: {reason}")
+            }
+            CatalogError::UnknownIndexEncodingVersion(v) => {
+                write!(f, "unknown index key-encoding version {v}")
+            }
+            CatalogError::DuplicateIndexId(id) => write!(f, "duplicate index id {id}"),
+            CatalogError::IndexUnknownNamespace(ns) => {
+                write!(f, "index names unknown namespace id {ns}")
+            }
+            CatalogError::IndexOnTieredNamespace(ns) => {
+                write!(f, "index on tiered namespace id {ns} (INF.IDX refuses tiered namespaces)")
+            }
+            CatalogError::IndexesRequireDocBuild => {
+                write!(f, "catalog declares indexes but this build has no document engine")
+            }
         }
     }
 }
@@ -135,8 +233,10 @@ impl fmt::Display for CatalogError {
 impl std::error::Error for CatalogError {}
 
 impl NsCatalog {
-    /// Encodes the catalog into the v2 payload (see module docs). Durable
-    /// entries always encode a resolved fsync class (`None` → `everysec`).
+    /// Encodes the catalog (see module docs): v3 when the index feature
+    /// has been used, v2 byte-identically otherwise (ADR-0075 D2.2).
+    /// Durable entries always encode a resolved fsync class (`None` →
+    /// `everysec`).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let payload: usize = self
@@ -145,7 +245,8 @@ impl NsCatalog {
             .map(|e| 17 + if e.tier.is_some() { TIER_BLOCK_BYTES } else { 0 } + e.name.len())
             .sum();
         let mut out = Vec::with_capacity(9 + payload);
-        out.push(CATALOG_VERSION);
+        let pristine = self.index.is_pristine();
+        out.push(if pristine { CATALOG_VERSION } else { CATALOG_VERSION_V3 });
         out.extend_from_slice(&self.next_id.to_le_bytes());
         out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for e in &self.entries {
@@ -166,20 +267,24 @@ impl NsCatalog {
             out.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
             out.extend_from_slice(&e.name);
         }
+        if !pristine {
+            encode_index_section(&self.index, &mut out);
+        }
         out
     }
 
-    /// Decodes a v1 or v2 payload, enforcing every format and registry
-    /// rule (see module docs). v1 — the v0.3.0-alpha on-disk format — is
-    /// v2 without the tier byte and decodes with every entry tier-absent
-    /// (ADR-0062 D6: a shipped catalog never becomes unreadable).
+    /// Decodes a v1, v2, or v3 payload, enforcing every format and
+    /// registry rule (see module docs). v1 — the v0.3.0-alpha on-disk
+    /// format — is v2 without the tier byte; v2 is v3 without the index
+    /// section; both decode index-absent (a shipped catalog never
+    /// becomes unreadable).
     ///
     /// # Errors
     /// A [`CatalogError`] naming the violated rule; callers fail-stop.
     pub fn decode(buf: &[u8]) -> Result<NsCatalog, CatalogError> {
         let mut r = Cursor { buf, at: 0 };
         let version = r.u8()?;
-        if version != CATALOG_VERSION && version != CATALOG_VERSION_V1 {
+        if !(CATALOG_VERSION_V1..=CATALOG_VERSION_V3).contains(&version) {
             return Err(CatalogError::UnknownVersion(version));
         }
         let next_id = r.u32_le()?;
@@ -192,10 +297,15 @@ impl NsCatalog {
             }
             entries.push(entry);
         }
+        let index = if version >= CATALOG_VERSION_V3 {
+            decode_index_section(&mut r, &entries)?
+        } else {
+            IndexCatalog::default()
+        };
         if r.at != buf.len() {
             return Err(CatalogError::TrailingBytes);
         }
-        Ok(NsCatalog { next_id, entries })
+        Ok(NsCatalog { next_id, entries, index })
     }
 }
 
@@ -231,6 +341,150 @@ fn decode_entry(r: &mut Cursor<'_>, version: u8) -> Result<NsSpec, CatalogError>
         return Err(CatalogError::InvalidName);
     }
     Ok(NsSpec { id: NsId(id), name, mode, fsync, policy, maxmemory, tier })
+}
+
+fn encode_index_section(index: &IndexCatalog, out: &mut Vec<u8>) {
+    out.extend_from_slice(&index.next_id.to_le_bytes());
+    out.extend_from_slice(&index.next_generation.to_le_bytes());
+    out.extend_from_slice(&(index.entries.len() as u32).to_le_bytes());
+    for e in &index.entries {
+        debug_assert!(valid_ns_name(&e.name), "registered index names are validated");
+        debug_assert!(!e.program.is_empty(), "registered programs are non-empty");
+        out.extend_from_slice(&e.id.0.to_le_bytes());
+        out.extend_from_slice(&e.generation.to_le_bytes());
+        out.extend_from_slice(&e.ns.0.to_le_bytes());
+        out.push(index_state_to_byte(e.state));
+        out.push(index_key_type_to_byte(e.key_type));
+        out.extend_from_slice(&INDEX_KEY_ENCODING_VERSION.to_le_bytes());
+        out.extend_from_slice(&(e.program.len() as u16).to_le_bytes());
+        out.extend_from_slice(&e.program);
+        out.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&e.name);
+    }
+}
+
+/// Decodes the v3 index section against the already-decoded namespace
+/// entries (the cross-field rules of ADR-0075 D2.4). Fail-stop strict:
+/// nothing is skipped or repaired.
+fn decode_index_section(
+    r: &mut Cursor<'_>,
+    ns_entries: &[NsSpec],
+) -> Result<IndexCatalog, CatalogError> {
+    let next_id = r.u32_le()?;
+    let next_generation = r.u64_le()?;
+    if next_id < FIRST_INDEX_ID || next_generation < FIRST_INDEX_GENERATION {
+        return Err(CatalogError::InvalidIndexRecord("counter below its floor"));
+    }
+    let count = r.u32_le()?;
+    if count as usize > INDEXES_PER_NODE_MAX {
+        return Err(CatalogError::InvalidIndexRecord("index count above the node cap"));
+    }
+    if count > 0 && !cfg!(feature = "doc") {
+        return Err(CatalogError::IndexesRequireDocBuild);
+    }
+    let mut entries: Vec<IndexSpec> = Vec::new();
+    for _ in 0..count {
+        let entry = decode_index_record(r, ns_entries)?;
+        if entry.id.0 >= next_id || entry.generation >= next_generation {
+            return Err(CatalogError::InvalidIndexRecord("counter regressed below a record"));
+        }
+        if entries.iter().any(|e| e.id == entry.id) {
+            return Err(CatalogError::DuplicateIndexId(entry.id.0));
+        }
+        if entries.iter().any(|e| e.ns == entry.ns && e.name == entry.name) {
+            return Err(CatalogError::InvalidIndexRecord("duplicate index name in namespace"));
+        }
+        entries.push(entry);
+    }
+    Ok(IndexCatalog { next_id, next_generation, entries })
+}
+
+fn decode_index_record(
+    r: &mut Cursor<'_>,
+    ns_entries: &[NsSpec],
+) -> Result<IndexSpec, CatalogError> {
+    let id = r.u32_le()?;
+    if id < FIRST_INDEX_ID {
+        return Err(CatalogError::InvalidIndexRecord("reserved index id 0"));
+    }
+    let generation = r.u64_le()?;
+    if generation < FIRST_INDEX_GENERATION {
+        return Err(CatalogError::InvalidIndexRecord("reserved generation 0"));
+    }
+    let ns = r.u32_le()?;
+    if ns >= FIRST_NAMED_NS_ID {
+        // Defaults (0..16) are implicitly valid; a named target must
+        // exist in this same payload, and tiered namespaces refuse
+        // indexes (ADR-0072 D8a) — bytes claiming one are corrupt.
+        let spec = ns_entries
+            .iter()
+            .find(|e| e.id.0 == ns)
+            .ok_or(CatalogError::IndexUnknownNamespace(ns))?;
+        if spec.tier.is_some() {
+            return Err(CatalogError::IndexOnTieredNamespace(ns));
+        }
+    }
+    let state = index_state_from_byte(r.u8()?)?;
+    let key_type = index_key_type_from_byte(r.u8()?)?;
+    let encoding_version = r.u16_le()?;
+    if encoding_version != INDEX_KEY_ENCODING_VERSION {
+        return Err(CatalogError::UnknownIndexEncodingVersion(encoding_version));
+    }
+    let program_len = usize::from(r.u16_le()?);
+    if program_len == 0 || program_len > INDEX_PROGRAM_MAX {
+        return Err(CatalogError::InvalidIndexRecord("path program length out of range"));
+    }
+    let program = r.bytes(program_len)?.to_vec();
+    // The one gauntlet (shared with the DDL path): valid M3 bytecode v1,
+    // inside the §3.1 indexable-path fence. Doc builds only — count > 0
+    // already refused above without the feature.
+    #[cfg(feature = "doc")]
+    crate::index_registry::validate_index_program(&program)
+        .map_err(CatalogError::InvalidIndexRecord)?;
+    let name_len = usize::from(r.u16_le()?);
+    let name = r.bytes(name_len)?.to_vec();
+    if !valid_ns_name(&name) {
+        return Err(CatalogError::InvalidIndexRecord("invalid index name"));
+    }
+    Ok(IndexSpec { id: IndexId(id), generation, ns: NsId(ns), name, program, key_type, state })
+}
+
+fn index_state_to_byte(state: IndexState) -> u8 {
+    match state {
+        IndexState::Declared => 0,
+        IndexState::Backfilling => 1,
+        IndexState::Ready => 2,
+        IndexState::Dropping => 3,
+    }
+}
+
+fn index_state_from_byte(b: u8) -> Result<IndexState, CatalogError> {
+    Ok(match b {
+        0 => IndexState::Declared,
+        1 => IndexState::Backfilling,
+        2 => IndexState::Ready,
+        3 => IndexState::Dropping,
+        _ => return Err(CatalogError::InvalidIndexRecord("invalid index state byte")),
+    })
+}
+
+fn index_key_type_to_byte(key_type: IndexKeyType) -> u8 {
+    match key_type {
+        IndexKeyType::Utf8 => 0,
+        IndexKeyType::I64 => 1,
+        IndexKeyType::F64 => 2,
+        IndexKeyType::Bool => 3,
+    }
+}
+
+fn index_key_type_from_byte(b: u8) -> Result<IndexKeyType, CatalogError> {
+    Ok(match b {
+        0 => IndexKeyType::Utf8,
+        1 => IndexKeyType::I64,
+        2 => IndexKeyType::F64,
+        3 => IndexKeyType::Bool,
+        _ => return Err(CatalogError::InvalidIndexRecord("invalid index key-type byte")),
+    })
 }
 
 fn encode_tier_block(tier: &TierSpec, out: &mut Vec<u8>) {
@@ -437,7 +691,7 @@ mod tests {
 
     #[test]
     fn empty_catalog_round_trips() {
-        let cat = NsCatalog { next_id: 16, entries: Vec::new() };
+        let cat = NsCatalog { next_id: 16, entries: Vec::new(), index: IndexCatalog::default() };
         assert_eq!(NsCatalog::decode(&cat.encode()), Ok(cat));
     }
 
@@ -474,13 +728,17 @@ mod tests {
         // Topic: format-valid (mode byte 2); the registry rejects it at
         // seed time until M5.
         entries.push(entry(id, b"topic-0", NsMode::Topic));
-        let cat = NsCatalog { next_id: id + 1, entries };
+        let cat = NsCatalog { next_id: id + 1, entries, index: IndexCatalog::default() };
         assert_eq!(NsCatalog::decode(&cat.encode()), Ok(cat));
     }
 
     #[test]
     fn durable_fsync_none_encodes_as_resolved_everysec() {
-        let cat = NsCatalog { next_id: 17, entries: vec![entry(16, b"ledger", NsMode::Durable)] };
+        let cat = NsCatalog {
+            next_id: 17,
+            entries: vec![entry(16, b"ledger", NsMode::Durable)],
+            index: IndexCatalog::default(),
+        };
         let decoded = NsCatalog::decode(&cat.encode()).expect("decode");
         assert_eq!(decoded.entries[0].fsync, Some(FsyncClass::Everysec));
     }
@@ -489,7 +747,11 @@ mod tests {
     fn truncation_at_every_prefix_length_errors() {
         let mut e = entry(16, b"ledger", NsMode::Durable);
         e.fsync = Some(FsyncClass::Always);
-        let cat = NsCatalog { next_id: 17, entries: vec![e, entry(17, b"cache", NsMode::Memory)] };
+        let cat = NsCatalog {
+            next_id: 17,
+            entries: vec![e, entry(17, b"cache", NsMode::Memory)],
+            index: IndexCatalog::default(),
+        };
         let buf = cat.encode();
         for cut in 0..buf.len() {
             assert!(NsCatalog::decode(&buf[..cut]).is_err(), "cut at {cut} must not decode");
@@ -498,10 +760,13 @@ mod tests {
 
     #[test]
     fn bad_version_errors() {
-        let cat = NsCatalog { next_id: 16, entries: Vec::new() };
+        let cat = NsCatalog { next_id: 16, entries: Vec::new(), index: IndexCatalog::default() };
         let mut buf = cat.encode();
+        buf[0] = 4;
+        assert_eq!(NsCatalog::decode(&buf), Err(CatalogError::UnknownVersion(4)));
+        // v3 with no index section is short, not unknown (M4.5-S03).
         buf[0] = 3;
-        assert_eq!(NsCatalog::decode(&buf), Err(CatalogError::UnknownVersion(3)));
+        assert_eq!(NsCatalog::decode(&buf), Err(CatalogError::Truncated));
     }
 
     /// M4-S19 (ADR-0062 D6): a tiered entry round-trips its whole tier
@@ -524,7 +789,11 @@ mod tests {
         let mut e = entry(16, b"tiered", NsMode::Durable);
         e.fsync = Some(FsyncClass::Always);
         e.tier = Some(tier);
-        let cat = NsCatalog { next_id: 17, entries: vec![e, entry(17, b"plain", NsMode::Memory)] };
+        let cat = NsCatalog {
+            next_id: 17,
+            entries: vec![e, entry(17, b"plain", NsMode::Memory)],
+            index: IndexCatalog::default(),
+        };
         let decoded = NsCatalog::decode(&cat.encode()).expect("decode");
         assert_eq!(decoded, cat);
         assert_eq!(decoded.entries[0].tier, Some(tier));
@@ -537,7 +806,11 @@ mod tests {
     fn v1_payloads_decode_with_tier_absent() {
         let mut e = entry(16, b"ledger", NsMode::Durable);
         e.fsync = Some(FsyncClass::Everysec);
-        let cat = NsCatalog { next_id: 18, entries: vec![e, entry(17, b"cache", NsMode::Memory)] };
+        let cat = NsCatalog {
+            next_id: 18,
+            entries: vec![e, entry(17, b"cache", NsMode::Memory)],
+            index: IndexCatalog::default(),
+        };
         let decoded = NsCatalog::decode(&encode_v1(&cat)).expect("v1 decodes");
         assert_eq!(decoded, cat, "v1 is v2 with every entry tier-absent");
     }
@@ -551,7 +824,7 @@ mod tests {
         let mut e = entry(16, b"tiered", NsMode::Durable);
         e.fsync = Some(FsyncClass::Everysec);
         e.tier = Some(TierSpec::for_budget(64 << 20));
-        let cat = NsCatalog { next_id: 17, entries: vec![e] };
+        let cat = NsCatalog { next_id: 17, entries: vec![e], index: IndexCatalog::default() };
         let buf = cat.encode();
         for cut in 0..buf.len() {
             assert!(NsCatalog::decode(&buf[..cut]).is_err(), "cut at {cut} must not decode");
@@ -583,7 +856,7 @@ mod tests {
         let mut e = entry(16, b"tiered", NsMode::Durable);
         e.fsync = Some(FsyncClass::Everysec);
         e.tier = Some(TierSpec::for_budget(64 << 20));
-        let cat = NsCatalog { next_id: 17, entries: vec![e] };
+        let cat = NsCatalog { next_id: 17, entries: vec![e], index: IndexCatalog::default() };
         let mut buf = cat.encode();
         // Flip the mode byte to memory; zero the fsync byte to keep the
         // fsync cross-rule satisfied — the tier rule must fire.
@@ -600,13 +873,18 @@ mod tests {
         let cat = NsCatalog {
             next_id: 18,
             entries: vec![entry(16, b"one", NsMode::Memory), entry(16, b"two", NsMode::Memory)],
+            index: IndexCatalog::default(),
         };
         assert_eq!(NsCatalog::decode(&cat.encode()), Err(CatalogError::DuplicateId(16)));
     }
 
     #[test]
     fn reserved_ids_are_rejected() {
-        let cat = NsCatalog { next_id: 16, entries: vec![entry(3, b"sneaky", NsMode::Memory)] };
+        let cat = NsCatalog {
+            next_id: 16,
+            entries: vec![entry(3, b"sneaky", NsMode::Memory)],
+            index: IndexCatalog::default(),
+        };
         assert_eq!(NsCatalog::decode(&cat.encode()), Err(CatalogError::ReservedId(3)));
     }
 
@@ -621,13 +899,17 @@ mod tests {
             tier: Some(TierSpec::for_budget(64 << 20)),
             ..entry(16, b"hot", NsMode::Durable)
         };
-        let cat = NsCatalog { next_id: 17, entries: vec![bad] };
+        let cat = NsCatalog { next_id: 17, entries: vec![bad], index: IndexCatalog::default() };
         assert_eq!(NsCatalog::decode(&cat.encode()), Err(CatalogError::TierOwnsBudget(16)));
     }
 
     #[test]
     fn invalid_bytes_are_typed_errors() {
-        let cat = NsCatalog { next_id: 17, entries: vec![entry(16, b"cache", NsMode::Memory)] };
+        let cat = NsCatalog {
+            next_id: 17,
+            entries: vec![entry(16, b"cache", NsMode::Memory)],
+            index: IndexCatalog::default(),
+        };
         let buf = cat.encode();
         // Entry layout after the 9-byte header: id(4) mode(1) fsync(1)
         // policy(1) maxmemory(8) name_len(2) name.
@@ -657,34 +939,327 @@ mod tests {
 
     #[test]
     fn invalid_names_are_rejected() {
-        let cat = NsCatalog { next_id: 17, entries: vec![entry(16, b"ok", NsMode::Memory)] };
+        let cat = NsCatalog {
+            next_id: 17,
+            entries: vec![entry(16, b"ok", NsMode::Memory)],
+            index: IndexCatalog::default(),
+        };
         let mut buf = cat.encode();
         let space_at = buf.len() - 2;
         buf[space_at] = b' ';
         assert_eq!(NsCatalog::decode(&buf), Err(CatalogError::InvalidName));
         // Default-name collisions are registry rules and rejected here too.
-        let dflt = NsCatalog { next_id: 17, entries: vec![entry(16, b"db0", NsMode::Memory)] };
+        let dflt = NsCatalog {
+            next_id: 17,
+            entries: vec![entry(16, b"db0", NsMode::Memory)],
+            index: IndexCatalog::default(),
+        };
         assert_eq!(NsCatalog::decode(&dflt.encode()), Err(CatalogError::InvalidName));
     }
 
     #[test]
     fn trailing_bytes_are_rejected() {
-        let cat = NsCatalog { next_id: 16, entries: Vec::new() };
+        let cat = NsCatalog { next_id: 16, entries: Vec::new(), index: IndexCatalog::default() };
         let mut buf = cat.encode();
         buf.push(0);
         assert_eq!(NsCatalog::decode(&buf), Err(CatalogError::TrailingBytes));
+    }
+
+    // ---- M4.5-S03 (ADR-0075 D2): the v3 index section ----
+
+    /// Compiled program bytes for index-record tests (the gauntlet needs
+    /// real M3 bytecode, so this block is doc-build scoped like the
+    /// feature itself — a slim build refuses index-bearing catalogs
+    /// before any record decodes).
+    #[cfg(feature = "doc")]
+    mod index_section {
+        use super::*;
+        use crate::index_registry::{FIRST_INDEX_GENERATION, FIRST_INDEX_ID};
+        use crate::ns::TierSpec;
+
+        fn program(text: &str) -> Vec<u8> {
+            inf_doc::path::compile(text.as_bytes()).expect("valid path").as_bytes().to_vec()
+        }
+
+        fn idx(
+            id: u32,
+            ns: u32,
+            name: &[u8],
+            state: IndexState,
+            key_type: IndexKeyType,
+        ) -> IndexSpec {
+            IndexSpec {
+                id: IndexId(id),
+                generation: u64::from(id) * 3,
+                ns: NsId(ns),
+                name: name.to_vec(),
+                program: program("$.price"),
+                key_type,
+                state,
+            }
+        }
+
+        /// Every state × key-type combination round-trips, targets on a
+        /// named namespace and a default db both included.
+        #[test]
+        fn v3_round_trips_every_state_and_type() {
+            let states = [
+                IndexState::Declared,
+                IndexState::Backfilling,
+                IndexState::Ready,
+                IndexState::Dropping,
+            ];
+            let types =
+                [IndexKeyType::Utf8, IndexKeyType::I64, IndexKeyType::F64, IndexKeyType::Bool];
+            let mut entries = Vec::new();
+            for (i, (state, key_type)) in states.into_iter().zip(types).enumerate() {
+                let ns = if i % 2 == 0 { 16 } else { 0 }; // named + default db
+                let name = format!("by-{i}");
+                entries.push(idx(i as u32 + 1, ns, name.as_bytes(), state, key_type));
+            }
+            let cat = NsCatalog {
+                next_id: 17,
+                entries: vec![entry(16, b"docs", NsMode::Memory)],
+                index: IndexCatalog { next_id: 10, next_generation: 100, entries },
+            };
+            let buf = cat.encode();
+            assert_eq!(buf[0], 3, "index-bearing catalogs are v3");
+            assert_eq!(NsCatalog::decode(&buf), Ok(cat));
+        }
+
+        /// The degenerate case is absence (ADR-0075 D2.2): a pristine
+        /// index catalog encodes byte-identically to the pre-index v2
+        /// writer — never-indexed nodes are downgrade-unaffected.
+        #[test]
+        fn pristine_index_catalog_stays_v2_byte_identical() {
+            let mut e = entry(16, b"ledger", NsMode::Durable);
+            e.fsync = Some(FsyncClass::Always);
+            let cat = NsCatalog {
+                next_id: 17,
+                entries: vec![e.clone(), entry(17, b"cache", NsMode::Memory)],
+                index: IndexCatalog::default(),
+            };
+            let buf = cat.encode();
+            assert_eq!(buf[0], 2);
+            // The v0.4.0 v2 writer, reproduced field-for-field.
+            let mut reference = vec![2u8];
+            reference.extend_from_slice(&cat.next_id.to_le_bytes());
+            reference.extend_from_slice(&(cat.entries.len() as u32).to_le_bytes());
+            for e in &cat.entries {
+                reference.extend_from_slice(&e.id.0.to_le_bytes());
+                reference.push(mode_to_byte(e.mode));
+                reference.push(fsync_to_byte(e));
+                reference.push(policy_to_byte(e.policy));
+                reference.extend_from_slice(&e.maxmemory.unwrap_or(u64::MAX).to_le_bytes());
+                reference.push(0); // tier absent
+                reference.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+                reference.extend_from_slice(&e.name);
+            }
+            assert_eq!(buf, reference, "pristine encode is the v2 writer verbatim");
+        }
+
+        /// Moved counters alone force v3 (a created-then-dropped index
+        /// must not reset its id space at the next boot).
+        #[test]
+        fn moved_counters_ride_v3_with_zero_entries() {
+            let cat = NsCatalog {
+                next_id: 16,
+                entries: Vec::new(),
+                index: IndexCatalog { next_id: 5, next_generation: 9, entries: Vec::new() },
+            };
+            let buf = cat.encode();
+            assert_eq!(buf[0], 3);
+            let decoded = NsCatalog::decode(&buf).expect("decode");
+            assert_eq!(decoded.index.next_id, 5);
+            assert_eq!(decoded.index.next_generation, 9);
+            assert!(decoded.index.entries.is_empty());
+        }
+
+        #[test]
+        fn v3_truncation_at_every_prefix_errors() {
+            let cat = NsCatalog {
+                next_id: 17,
+                entries: vec![entry(16, b"docs", NsMode::Memory)],
+                index: IndexCatalog {
+                    next_id: 2,
+                    next_generation: 4,
+                    entries: vec![idx(1, 16, b"by-price", IndexState::Ready, IndexKeyType::F64)],
+                },
+            };
+            let buf = cat.encode();
+            for cut in 0..buf.len() {
+                assert!(NsCatalog::decode(&buf[..cut]).is_err(), "cut at {cut} must not decode");
+            }
+        }
+
+        /// v1 and v2 payloads decode index-absent forever.
+        #[test]
+        fn v1_and_v2_decode_index_pristine() {
+            let cat = NsCatalog {
+                next_id: 17,
+                entries: vec![entry(16, b"cache", NsMode::Memory)],
+                index: IndexCatalog::default(),
+            };
+            let decoded = NsCatalog::decode(&cat.encode()).expect("v2 decodes");
+            assert!(decoded.index.is_pristine());
+            let decoded = NsCatalog::decode(&encode_v1(&cat)).expect("v1 decodes");
+            assert!(decoded.index.is_pristine());
+        }
+
+        /// Cross-field rules: unknown named namespace, tiered target,
+        /// duplicate id, duplicate (ns, name), counter regression, and a
+        /// fenced-out program are each their own typed refusal.
+        #[test]
+        fn cross_field_rules_refuse_typed() {
+            let base = |index: IndexCatalog| NsCatalog {
+                next_id: 18,
+                entries: vec![entry(16, b"docs", NsMode::Memory), {
+                    let mut t = entry(17, b"cold", NsMode::Durable);
+                    t.fsync = Some(FsyncClass::Everysec);
+                    t.tier = Some(TierSpec::for_budget(64 << 20));
+                    t
+                }],
+                index,
+            };
+            let with = |entries: Vec<IndexSpec>| IndexCatalog {
+                next_id: 100,
+                next_generation: 100,
+                entries,
+            };
+            let ok = idx(1, 16, b"by-price", IndexState::Ready, IndexKeyType::F64);
+            NsCatalog::decode(&base(with(vec![ok.clone()])).encode()).expect("baseline decodes");
+            // Unknown named namespace.
+            let unknown = IndexSpec { ns: NsId(99), ..ok.clone() };
+            assert_eq!(
+                NsCatalog::decode(&base(with(vec![unknown])).encode()),
+                Err(CatalogError::IndexUnknownNamespace(99))
+            );
+            // Tiered target (ADR-0072 D8a).
+            let tiered = IndexSpec { ns: NsId(17), ..ok.clone() };
+            assert_eq!(
+                NsCatalog::decode(&base(with(vec![tiered])).encode()),
+                Err(CatalogError::IndexOnTieredNamespace(17))
+            );
+            // Duplicate id / duplicate (ns, name).
+            let twin_id = IndexSpec { name: b"other".to_vec(), ..ok.clone() };
+            assert_eq!(
+                NsCatalog::decode(&base(with(vec![ok.clone(), twin_id])).encode()),
+                Err(CatalogError::DuplicateIndexId(1))
+            );
+            let twin_name = IndexSpec { id: IndexId(2), ..ok.clone() };
+            assert_eq!(
+                NsCatalog::decode(&base(with(vec![ok.clone(), twin_name])).encode()),
+                Err(CatalogError::InvalidIndexRecord("duplicate index name in namespace"))
+            );
+            // Counter regression: a record at/above its allocator.
+            let regressed =
+                IndexCatalog { next_id: 1, next_generation: 100, entries: vec![ok.clone()] };
+            assert_eq!(
+                NsCatalog::decode(&base(regressed).encode()),
+                Err(CatalogError::InvalidIndexRecord("counter regressed below a record"))
+            );
+            // A fenced-out program (the shared gauntlet at the trust
+            // boundary): recursive descent can never have registered.
+            let fenced = IndexSpec { program: program("$..a"), ..ok };
+            assert!(matches!(
+                NsCatalog::decode(&base(with(vec![fenced])).encode()),
+                Err(CatalogError::InvalidIndexRecord(_))
+            ));
+        }
+
+        /// Byte-level mutations: state, key type, and encoding version
+        /// each refuse typed at their exact offset.
+        #[test]
+        fn invalid_index_bytes_are_typed_errors() {
+            let cat = NsCatalog {
+                next_id: 17,
+                entries: vec![entry(16, b"docs", NsMode::Memory)],
+                index: IndexCatalog {
+                    next_id: 2,
+                    next_generation: 4,
+                    entries: vec![idx(1, 16, b"by-price", IndexState::Ready, IndexKeyType::F64)],
+                },
+            };
+            let buf = cat.encode();
+            // Section layout after the 9-byte header + one memory entry
+            // (id 4 · mode 1 · fsync 1 · policy 1 · maxmemory 8 · tier 1
+            // · name_len 2 · name 4 = 22 bytes): next_index_id(4)
+            // next_generation(8) count(4), then the record: id(4)
+            // generation(8) ns(4) state(1) key_type(1)
+            // encoding_version(2) ...
+            let section_at = 9 + 22;
+            let record_at = section_at + 16;
+            let (state_at, type_at, encver_at) = (record_at + 16, record_at + 17, record_at + 18);
+            let mut bad = buf.clone();
+            bad[state_at] = 9;
+            assert_eq!(
+                NsCatalog::decode(&bad),
+                Err(CatalogError::InvalidIndexRecord("invalid index state byte"))
+            );
+            let mut bad = buf.clone();
+            bad[type_at] = 7;
+            assert_eq!(
+                NsCatalog::decode(&bad),
+                Err(CatalogError::InvalidIndexRecord("invalid index key-type byte"))
+            );
+            let mut bad = buf;
+            bad[encver_at] = 2;
+            assert_eq!(NsCatalog::decode(&bad), Err(CatalogError::UnknownIndexEncodingVersion(2)));
+        }
+
+        /// Reserved id/generation zero and the node cap refuse typed.
+        #[test]
+        fn reserved_values_and_cap_refuse_typed() {
+            let ok = idx(1, 16, b"by-price", IndexState::Ready, IndexKeyType::F64);
+            let base = |index: IndexCatalog| NsCatalog {
+                next_id: 17,
+                entries: vec![entry(16, b"docs", NsMode::Memory)],
+                index,
+            };
+            let zero_id = IndexSpec { id: IndexId(0), ..ok.clone() };
+            assert_eq!(
+                NsCatalog::decode(
+                    &base(IndexCatalog { next_id: 9, next_generation: 9, entries: vec![zero_id] })
+                        .encode()
+                ),
+                Err(CatalogError::InvalidIndexRecord("reserved index id 0"))
+            );
+            let zero_generation = IndexSpec { generation: 0, ..ok };
+            assert_eq!(
+                NsCatalog::decode(
+                    &base(IndexCatalog {
+                        next_id: 9,
+                        next_generation: 9,
+                        entries: vec![zero_generation]
+                    })
+                    .encode()
+                ),
+                Err(CatalogError::InvalidIndexRecord("reserved generation 0"))
+            );
+            // Counter floors.
+            let floor = base(IndexCatalog {
+                next_id: 0,
+                next_generation: FIRST_INDEX_GENERATION,
+                entries: Vec::new(),
+            });
+            assert_eq!(
+                NsCatalog::decode(&floor.encode()),
+                Err(CatalogError::InvalidIndexRecord("counter below its floor"))
+            );
+            let _ = FIRST_INDEX_ID; // floor constant referenced by the rule above
+        }
     }
 
     #[test]
     fn maxmemory_sentinel_is_inherit() {
         let mut e = entry(16, b"cap", NsMode::Memory);
         e.maxmemory = Some(4096);
-        let cat = NsCatalog { next_id: 17, entries: vec![e] };
+        let cat = NsCatalog { next_id: 17, entries: vec![e], index: IndexCatalog::default() };
         let decoded = NsCatalog::decode(&cat.encode()).expect("decode");
         assert_eq!(decoded.entries[0].maxmemory, Some(4096));
         let mut e = entry(16, b"cap", NsMode::Memory);
         e.maxmemory = None;
-        let cat = NsCatalog { next_id: 17, entries: vec![e] };
+        let cat = NsCatalog { next_id: 17, entries: vec![e], index: IndexCatalog::default() };
         let decoded = NsCatalog::decode(&cat.encode()).expect("decode");
         assert_eq!(decoded.entries[0].maxmemory, None);
     }

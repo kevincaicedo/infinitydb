@@ -189,6 +189,10 @@ pub(crate) fn info(
         push(&mut text, &format!("doc_scratch_bytes:{}", g.doc_scratch_bytes));
         push(&mut text, &format!("doc_path_cache_bytes:{}", g.doc_path_cache_bytes));
         push(&mut text, &format!("docs_live:{}", g.docs_live));
+        // Index-tree domains (M4.5-S03, ADR-0075 D6): counted in
+        // used_memory and the namespace budgets — never a second ledger.
+        push(&mut text, &format!("idx_tree_bytes:{}", g.idx_tree_bytes));
+        push(&mut text, &format!("idx_slack_bytes:{}", g.idx_slack_bytes));
         text.push_str("\r\n");
     }
     if wants("persistence") {
@@ -354,6 +358,8 @@ pub(crate) fn info(
         push(&mut text, &format!("{}:{}", tw::DOC_SLACK_BYTES, report.doc_slack_bytes));
         push(&mut text, &format!("{}:{}", tw::DOC_SCRATCH_BYTES, report.doc_scratch_bytes));
         push(&mut text, &format!("{}:{}", tw::DOC_PATH_CACHE_BYTES, report.doc_path_cache_bytes));
+        push(&mut text, &format!("idx_tree_bytes:{}", report.idx_tree_bytes));
+        push(&mut text, &format!("idx_slack_bytes:{}", report.idx_slack_bytes));
         push(&mut text, &format!("wheel_fallback:{}", stats.wheel_fallback));
         push(&mut text, &format!("wheel_stale:{}", stats.wheel_stale));
         push(&mut text, &format!("evicted_keys:{}", stats.evicted_keys));
