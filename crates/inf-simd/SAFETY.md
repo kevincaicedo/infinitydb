@@ -136,11 +136,24 @@ All unsafe code is platform intrinsics in `crlf.rs`, `group16.rs`, and
 - **Fallback**: slicing-by-8 with const-built tables, fully safe; it is the
   sim/dev tier and the proptest oracle.
 
+## `lower_bound.rs` — sorted-prefix lower bound (M4.5-S01)
+
+- **No unsafe code.** The explicit AVX2/SSE4.2 kernel (sign-flip
+  `pcmpgtq` + movemask popcount behind the `crlf.rs` dispatch pattern)
+  was built, measured, and **rejected by the S01 A/B**
+  (`.artifacts/m4.5/s01/` — it lost every probe row to the plain
+  count-loop, which LLVM auto-vectorizes and inlines while
+  `#[target_feature]` blocks inlining). Per the M0-S14 rule the losing
+  kernel is recorded, not merged: the module ships one safe branchless
+  loop, proptested against `slice::partition_point`. Any future
+  explicit kernel (AVX-512, reference box) re-enters through a new A/B
+  and re-adds its inventory entry here.
+
 ## Verification
 
 Every SIMD path is property-tested against its scalar oracle
 (`scalar_scan_crlf`, `scalar_eq_mask16`, `scalar_high_bit_mask16`,
-`scalar_crc32c_update`) on arbitrary inputs (1000 cases per run, plus fixed
+`scalar_crc32c_update`, `scalar_lower_bound_u64`) on arbitrary inputs (1000 cases per run, plus fixed
 chunk-boundary/edge corpora ported from `vortex-proto`; CRC32C additionally
 pins the RFC 3720 iSCSI vectors). The aarch64 NEON paths (new in this port —
 Vortex used nightly `std::simd`) are covered by the same equivalence suites;

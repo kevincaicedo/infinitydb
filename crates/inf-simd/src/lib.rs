@@ -15,6 +15,7 @@ mod crlf;
 mod group16;
 #[allow(unsafe_code)]
 mod json;
+mod lower_bound;
 mod swar;
 #[allow(unsafe_code)]
 mod utf8;
@@ -30,5 +31,6 @@ pub use json::{
     scalar_json_copy_unescaped, scalar_json_copy_unescaped_fixstr,
     scalar_json_copy_unescaped_short, scalar_json_scan_structurals,
 };
+pub use lower_bound::{lower_bound_u64, scalar_lower_bound_u64};
 pub use swar::swar_parse_int;
 pub use utf8::utf8_is_valid;

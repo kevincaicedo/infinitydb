@@ -1,0 +1,30 @@
+   Compiling inf-simd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-simd)
+   Compiling inf-doc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-doc)
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 10.99s
+     Running benches/ordered.rs (target/release/deps/ordered-51e0dfd02d76ff0a)
+# ordered bench: n=10000000 rounds=15 hot_set=100000
+row=insert scheme=fixed8 fanout=64 corpus=random n=10000000 ns_per_op=269.4
+row=probe scheme=fixed8 fanout=64 hot_set=1000 search=early ns_per_op=140.8
+row=probe scheme=fixed8 fanout=64 hot_set=1000 search=count ns_per_op=162.0
+row=probe scheme=fixed8 fanout=64 hot_set=10000 search=early ns_per_op=190.5
+row=probe scheme=fixed8 fanout=64 hot_set=10000 search=count ns_per_op=201.3
+row=probe scheme=fixed8 fanout=64 hot_set=100000 search=early ns_per_op=267.5
+row=probe scheme=fixed8 fanout=64 hot_set=100000 search=count ns_per_op=276.6
+row=next scheme=fixed8 fanout=64 ns_per_op=5.89
+row=memory scheme=fixed8 fanout=64 corpus=random entries=10000000 total_bytes=246549944 slack_bytes=9113176 bytes_per_entry=24.65
+row=insert scheme=fixed8 fanout=64 corpus=sequential n=10000000 ns_per_op=91.5
+row=memory scheme=fixed8 fanout=64 corpus=sequential entries=10000000 total_bytes=175762064 slack_bytes=8021832 bytes_per_entry=17.58
+row=insert scheme=fixed8 fanout=32 corpus=random n=10000000 ns_per_op=259.4
+row=probe scheme=fixed8 fanout=32 hot_set=1000 search=early ns_per_op=127.3
+row=probe scheme=fixed8 fanout=32 hot_set=1000 search=count ns_per_op=149.9
+row=probe scheme=fixed8 fanout=32 hot_set=10000 search=early ns_per_op=182.0
+row=probe scheme=fixed8 fanout=32 hot_set=10000 search=count ns_per_op=201.8
+row=probe scheme=fixed8 fanout=32 hot_set=100000 search=early ns_per_op=266.3
+row=probe scheme=fixed8 fanout=32 hot_set=100000 search=count ns_per_op=281.3
+row=next scheme=fixed8 fanout=32 ns_per_op=8.71
+row=memory scheme=fixed8 fanout=32 corpus=random entries=10000000 total_bytes=259874304 slack_bytes=14164352 bytes_per_entry=25.99
+row=insert scheme=fixed8 fanout=32 corpus=sequential n=10000000 ns_per_op=81.7
+row=memory scheme=fixed8 fanout=32 corpus=sequential entries=10000000 total_bytes=186780504 slack_bytes=10781368 bytes_per_entry=18.68
+row=memory scheme=var16 fanout=64 corpus=random entries=10000000 total_bytes=425420996 slack_bytes=18076260 bytes_per_entry=42.54
