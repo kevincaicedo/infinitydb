@@ -1,0 +1,2 @@
+8d1ba465e8cdc0b87450350c106f6afc71217034
+ M .artifacts/v0.4.0/soak-unified-20260812-2328/SHAKE-NOTES.md

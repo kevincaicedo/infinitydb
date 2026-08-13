@@ -1,0 +1,17 @@
+rss slope whole-run +225689.374%/24h (first-5% median 79872 kB -> last-5% median 695352 kB, 30 samples; disclosure)
+steady-state window not applicable (run 0.08 h <= 2x warm-up 8 h) — whole-run slope gates; not the ADR-0069 citation form
+accounted slope whole-run +47666.116%/24h (used_memory first-5% median 232683 kB -> last-5% 611372 kB; disclosure)
+attribution (end): rss 695352 kB vs used_memory + tier_committed + tier_index + staging + ckpt = 739372 kB — residual -44020 kB (-6.3%; disclosure)
+tiering disk max 923713536 bytes (budget 2684354560)
+write-amp milli max 1908 (gate < 3000)
+diskfull refusals 0
+docs_live 12925 -> 14240 (document plane live throughout: yes)
+checkpoints completed 0 -> 626 (delta 626)
+tier reclaim: dead_bytes 0 -> 305605608 over the whole run (delta 305605608); live_bytes 686817280; peak dead ratio 30.79% vs the 50.0% compaction trigger; compact_idle_pressure delta 0
+tier liveness: cold_reads_issued 0 -> 853211 over the whole run (delta 853211)
+tier liveness: flush_slices 0 -> 880 over the whole run (delta 880)
+tier liveness: compact_slices 0 -> 0 over the whole run (delta 0)
+FAIL — discharges: NOTHING (a failing run is not evidence for any gate)
+  - RSS slope +225689.374%/24h >= 0.5%/24h
+  - accounted slope +47666.116%/24h >= 0.5%/24h — data-structure growth, not allocator shape
+  - tiered plane served no compaction slices across the whole run — the tier was static, so the M4 §7 rows measured a node that was not doing the work they describe — but the dead ratio only reached 30.79% against a 50.0% trigger, so compaction was never eligible to run: the run never posed the question. This is the WORKLOAD/CONFIG shape — lengthen the run, raise write pressure, or lower the memory budget (the trigger scales with the live dataset), not an engine fault
