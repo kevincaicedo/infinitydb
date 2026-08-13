@@ -17,6 +17,7 @@ mod index;
 mod keyspace;
 mod live_set;
 mod ns;
+mod ordered;
 mod record;
 mod router;
 mod store;
@@ -50,6 +51,10 @@ pub use keyspace::{
 };
 pub use live_set::{FileLiveSet, LiveSet};
 pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, valid_ns_name};
+pub use ordered::{
+    Fixed8, KeyScheme, ORDERED_KEY_MAX, OrderedCursor, OrderedMap, OrderedMapError,
+    OrderedMapMemory, VarKey,
+};
 pub use record::{EXTENT_REF_LEN, ExtentRef, MAX_KEY_LEN, MAX_VAL_LEN, TypeTag};
 pub use router::SlotRouter;
 pub use store::{

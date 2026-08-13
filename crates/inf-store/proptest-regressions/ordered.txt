@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bd5f58a516f06613ab970911de66b86bf37aa3a87b7b22a0ed946a8e599f1aa5 # shrinks to initial = {([], 1), ([0], 0), ([0], 1), ([0, 0], 0), ([1], 0)}, ops = [Insert([2], 0), Insert([0, 0], 1), Insert([], 2), Insert([], 3), Insert([0], 2), Insert([0, 1], 0), Insert([], 0), Insert([1], 1), Insert([0], 3), Insert([2], 1), Insert([1, 0], 0), Insert([3], 0)], stride = 1
+cc c3ff8222a0d0bd0e60e448c5d2d234be0788257888ff9d184f3031baf309ec67 # shrinks to ops = [Insert([0], 0), Insert([1], 0), Insert([], 2), Insert([0], 1), Insert([], 0), Insert([1], 1), Insert([2], 0), Insert([], 3), Insert([3], 0), Insert([0], 2), Insert([0], 3), Insert([1], 2), Insert([0, 0], 0), Insert([2], 1), Insert([0, 0], 1), Insert([0, 1], 0), Insert([], 1)]
