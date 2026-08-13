@@ -53,6 +53,17 @@
 #                               (8 h warm-up + 24 h steady window); runs
 #                               shorter than 2x the warm-up gate on the
 #                               whole run and the verdict says so.
+#   SOAK_WARMUP_DEAD_CHECK   (1)  ADR-0071 D5: warm-up-end reclaim watchdog.
+#                                 At warm-up end, node dead_bytes below the
+#                                 bar means the run can only repeat the
+#                                 20260811 zero-compaction FAIL — abort at
+#                                 hour ~8 instead of hour 30. 0 disables.
+#   SOAK_WARMUP_DEAD_MIN_PCT (5)  the bar, as % of the tiered dataset
+#                                 (budget x multiple). Prospective, declared
+#                                 before the run; the healthy post-F22 shape
+#                                 is ~50% of dataset by hour 8, the broken
+#                                 shape <0.5% — 5% separates them with an
+#                                 order of magnitude on each side.
 # Run from infinitydb/ on the reference box after `just check` on a clean
 # tree, with the box otherwise idle (§6: a soak and a campaign leg are
 # mutually exclusive).
@@ -91,6 +102,28 @@ if df -T "$DATA_DIR" | tail -n 1 | grep -q tmpfs; then
   echo "soak-unified: REFUSING — $DATA_DIR is tmpfs; the durable and tiered planes need a real device" >&2
   exit 1
 fi
+
+# ENOSPC at hour 20 costs a box-night. The tier namespace is entitled to its
+# full DISK-BUDGET, and the durable planes hold segments + checkpoints beside
+# it — require the declared budget plus margin up front, not mid-window.
+FREE_MB=$(df -Pm "$DATA_DIR" | awk 'NR == 2 { print $4 }')
+NEED_MB=$((DISK_BUDGET_MB + DISK_BUDGET_MB / 4 + 10240))
+if [ "$FREE_MB" -lt "$NEED_MB" ]; then
+  echo "soak-unified: REFUSING — $FREE_MB MB free under $DATA_DIR, need $NEED_MB MB (DISK-BUDGET $DISK_BUDGET_MB MB + 25% + 10 GB durable-plane margin)" >&2
+  exit 1
+fi
+
+# /tmp carries usrquota on this box since the 2026-08 OS update (EDQUOT
+# fail-stops observed on tmpfs-default data dirs). $WORK holds the generated
+# .resp pipes — probe the quota now, at minute 1, not when doc-corpus dies.
+if ! dd if=/dev/zero of="$WORK/.quota-probe" bs=1M count=64 status=none 2>/dev/null; then
+  echo "soak-unified: REFUSING — cannot write 64 MB to WORK=$WORK (quota/space); set WORK to a writable dir" >&2
+  rm -f "$WORK/.quota-probe"
+  exit 1
+fi
+rm -f "$WORK/.quota-probe"
+
+echo "soak-unified: NOTE — quiet-box rule (§6): no campaign legs beside a soak; drive state drifts tail results — \`sudo fstrim -v /\` before a box-night is the standing recipe (20260809)."
 
 MAX_SAMPLES=$((DURATION_S / 10 + 120))
 MAX_ALERTS=1000
@@ -442,10 +475,56 @@ else
   echo "tiered leg: NOT RUN — plane unwired (M4-S26). The namespace stands; its VA reservation, budgets, and index structures are in the RSS profile." >"$OUT/tier-leg.txt"
 fi
 
-trap 'kill ${LEGS[*]} $SAMPLER_PID $ATTR_PID $SERVER_PID 2>/dev/null || true' EXIT
+# ---- warm-up-end reclaim watchdog (ADR-0071 D5; readiness F22) --------------
+# Attempt 4 spent 30.35 h to learn its tier had stopped accumulating dead
+# space within the first hours. That shape is decidable at warm-up end: at
+# the measured post-F22 rate the reclaim backlog is on pace for the
+# compaction trigger by hour 8 (~half the dataset), while the broken shape
+# sits at tens of MB — orders apart, so a 5%-of-dataset bar separates them
+# with margin on both sides. Below the bar, the remaining 24 h cannot reach
+# the trigger and the run can only repeat the 20260811 FAIL — abort now.
+# The watchdog kills the LEGS and leaves the server up, so the end-of-run
+# scrapes and the verdict still run and stamp the FAIL with the ratio
+# discriminator; early-abort.txt carries the reason into the bundle.
+WARMUP_DEAD_CHECK="${SOAK_WARMUP_DEAD_CHECK:-1}"
+WARMUP_DEAD_MIN_PCT="${SOAK_WARMUP_DEAD_MIN_PCT:-5}"
+WATCH_PID=""
+if [ "$MODE" = "FULL" ] && [ "$WARMUP_DEAD_CHECK" = "1" ] \
+   && awk -v h="$HOURS" -v w="$WARMUP_HOURS" 'BEGIN { exit !(h > 2 * w) }'; then
+  (
+    sleep "$(awk -v w="$WARMUP_HOURS" 'BEGIN { printf "%d", w * 3600 + 600 }')"
+    kill -0 $SERVER_PID 2>/dev/null || exit 0
+    BAR=$((MEM_BUDGET_MB * MULTIPLE * 1024 * 1024 / 100 * WARMUP_DEAD_MIN_PCT))
+    # dead_bytes is column 20 of samples.csv (node-summed by the sampler);
+    # take the last complete row's value.
+    DEAD=$(awk -F, 'NF >= 20 && $20 ~ /^[0-9]+$/ { d = $20 } END { print d + 0 }' "$OUT/samples.csv")
+    if [ "$DEAD" -lt "$BAR" ]; then
+      {
+        echo "aborted_at_unix=$(date +%s)"
+        echo "reason=warm-up-end reclaim check: node dead_bytes $DEAD < bar $BAR (${WARMUP_DEAD_MIN_PCT}% of the $((MEM_BUDGET_MB * MULTIPLE)) MB tiered dataset)"
+        echo "consequence=dead-space accumulation matches the 20260811 zero-compaction shape; the remaining hours cannot reach the compaction trigger, so the run was aborted at warm-up end instead of hour 30"
+      } >"$OUT/early-abort.txt"
+      echo "$(date +%s) ALERT warm-up-end reclaim check: dead_bytes $DEAD < bar $BAR — early abort" >>"$OUT/alerts.log"
+      kill ${LEGS[*]} 2>/dev/null || true
+    else
+      echo "warm-up-end reclaim check: ON-TRACK — dead_bytes $DEAD >= bar $BAR (${WARMUP_DEAD_MIN_PCT}% of the tiered dataset)" \
+        | tee "$OUT/warmup-check.txt"
+    fi
+  ) & WATCH_PID=$!
+fi
+
+trap 'kill ${LEGS[*]} $SAMPLER_PID $ATTR_PID $WATCH_PID $SERVER_PID 2>/dev/null || true' EXIT
 
 echo "soak-unified[$MODE]: running ${HOURS} h against pid $SERVER_PID (out: $OUT)"
-sleep "$DURATION_S"
+END_TS=$(($(date +%s) + DURATION_S))
+while [ "$(date +%s)" -lt "$END_TS" ] && [ ! -f "$OUT/early-abort.txt" ]; do
+  REMAIN=$((END_TS - $(date +%s)))
+  sleep $((REMAIN < 60 ? REMAIN : 60))
+done
+if [ -f "$OUT/early-abort.txt" ]; then
+  echo "soak-unified: EARLY ABORT at warm-up end —"
+  cat "$OUT/early-abort.txt"
+fi
 kill ${LEGS[*]} 2>/dev/null || true
 sleep 2
 
