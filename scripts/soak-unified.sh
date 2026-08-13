@@ -241,10 +241,12 @@ sample_line() {
     $1 == "cold_reads_issued"           { cread += $2 }
     $1 == "tiering_flush_slices"        { fsl  += $2 }
     $1 == "tiering_compact_slices"      { csl  += $2 }
-    END { printf "%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d,%d,%d,%d\n",
+    $1 == "tiering_dead_bytes"          { dead += $2 }
+    $1 == "tiering_compact_idle_pressure" { cidle += $2 }
+    END { printf "%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
           ts, rss, docs, dres, disk, wam, ref, ck, mf, segs,
           (subs > 0 ? sqes / subs : 0), int(um / 1024),
-          tcom, tidx, stag, ckb, cread, fsl, csl }
+          tcom, tidx, stag, ckb, cread, fsl, csl, dead, cidle }
   ' <<<"$info"
 }
 
@@ -270,7 +272,18 @@ alert() {
   # monotonic per-cell counters; the verdict requires them to ADVANCE
   # across the measured window, which is what "the tier was under load"
   # actually means.
-  echo "unix_s,vmrss_kb,docs_live,doc_resident_bytes,disk_used_bytes,wa_milli_max,diskfull_refusals,ckpts,manifests,segs_live,sqes_per_submit,used_memory_kb,tier_committed_bytes,tier_index_bytes,log_staging_bytes,ckpt_buffer_bytes,cold_reads_issued,flush_slices,compact_slices" >"$OUT/samples.csv"
+  # Trailing once more (readiness F22, 2026-08-12): the *reclaim* side.
+  # The 20260811 run kept its tier demonstrably alive (99.9 M cold reads)
+  # and still never compacted, and the bundle could not say whether that
+  # meant "no dead space was created" (workload) or "dead space was
+  # ignored" (engine) — because no sampled column carried dead space.
+  # `INFO tiering` already emits both of these per cell; not sampling
+  # them was the gap. dead_bytes is the reclaimable backlog;
+  # compact_idle_pressure counts the times compaction was pressured and
+  # found nothing to do, which separates "never asked" from "asked,
+  # nothing there". A gate that can detect a frozen tier but not
+  # diagnose one is half an instrument.
+  echo "unix_s,vmrss_kb,docs_live,doc_resident_bytes,disk_used_bytes,wa_milli_max,diskfull_refusals,ckpts,manifests,segs_live,sqes_per_submit,used_memory_kb,tier_committed_bytes,tier_index_bytes,log_staging_bytes,ckpt_buffer_bytes,cold_reads_issued,flush_slices,compact_slices,dead_bytes,compact_idle_pressure" >"$OUT/samples.csv"
   : >"$OUT/alerts.log"
   n=0
   while kill -0 $SERVER_PID 2>/dev/null && [ $n -lt $MAX_SAMPLES ]; do
@@ -355,17 +368,41 @@ doc_leg doc_esec   "$WORK/ingest.resp"    doc_esec & LEGS+=($!)
 if [ "$MODE" = "FULL" ]; then
   YCSB_COMMON=(--attach-port $PORT --mem-budget-mb "$MEM_BUDGET_MB" \
     --dataset-multiple "$MULTIPLE" --value-size 1024 --cells "$CELLS" \
-    --seed $SEED_DEC --artifacts-root "$OUT/legs" --allow-dirty --unsafe-env --ns tier)
+    --artifacts-root "$OUT/legs" --allow-dirty --unsafe-env --ns tier)
+  # The FILL keeps the blessed corpus seed: the dataset must be identical
+  # across runs for any cross-run comparison to mean anything. Key
+  # identity is `load::make_key(index)` — prefix + zero-padded index, no
+  # seed in it — so the seed selects which keys a leg *draws*, never
+  # which keys *exist*.
   taskset -c "$LOADGEN_CPUS" ./target/release/inf-bench ycsb \
-    "${YCSB_COMMON[@]}" --fill-only >"$OUT/fill.log" 2>&1
+    "${YCSB_COMMON[@]}" --seed $SEED_DEC --fill-only >"$OUT/fill.log" 2>&1
   (
-    END=$(( $(date +%s) + DURATION_S )); FAILS=0
+    END=$(( $(date +%s) + DURATION_S )); FAILS=0; LEG_INDEX=0
     while [ "$(date +%s)" -lt $END ]; do
       left=$(( END - $(date +%s) ))
       leg=$(( left < LEG_SECS ? left : LEG_SECS ))
       [ $leg -lt 30 ] && break
+      # ADR-0064 D7 amended 2026-08-12 (owner) — readiness F22. Every leg
+      # used to be handed the SAME seed, so the 145 legs of the 20260811
+      # run replayed one identical scrambled-zipfian key stream: a 32 h
+      # endurance soak was one leg repeated 145 times, which is not the
+      # workload the gate imagines. Fixed on its own merits.
+      # HONESTY NOTE — this is NOT established as the cause of that run's
+      # zero compaction: the 20260807 run (attempt 2) carried the same
+      # fixed seed and still wrote 125.8 GB of user bytes, accumulated
+      # 54.9 GB dead and drove 6.5 M compaction slices. Whatever collapsed
+      # attempt 4's tiered *writes* (reads were unchanged: 99.9 M vs
+      # 102.3 M cold reads) is still open — see readiness F22. The stream
+      # now advances per leg while staying fully reproducible: leg i is a
+      # pure function of the run's master seed and i (golden-ratio step,
+      # so adjacent legs are not adjacent streams), echoed into the log.
+      LEG_SEED=$(( SEED_DEC + LEG_INDEX * 2654435761 ))
+      echo "== soak tier leg $LEG_INDEX: seed $LEG_SEED (master $SEED_DEC + $LEG_INDEX x 2654435761) ==" \
+        >>"$OUT/loadgen-tier.log"
+      LEG_INDEX=$((LEG_INDEX + 1))
       if taskset -c "$LOADGEN_CPUS" ./target/release/inf-bench ycsb \
-          "${YCSB_COMMON[@]}" --skip-fill --workloads "$TIER_WORKLOADS" --distribution zipfian \
+          "${YCSB_COMMON[@]}" --seed $LEG_SEED \
+          --skip-fill --workloads "$TIER_WORKLOADS" --distribution zipfian \
           --duration $((leg / 3 > 5 ? leg / 3 : 5)) >>"$OUT/loadgen-tier.log" 2>&1; then
         FAILS=0
       else
@@ -531,15 +568,41 @@ else:
         "flush_slices": "flush slices",
         "compact_slices": "compaction slices",
     }
+    scope = "steady window" if windowed else "whole run"
+    # readiness F22: the reclaim series, sampled since 2026-08-12. It does
+    # not gate — it explains. `compact_slices == 0` is a FAIL either way
+    # (the story's title is "endurance WITH COMPACTION ACTIVE"), but the
+    # two causes have opposite severity and the message must say which.
+    dead_delta = idle_delta = None
+    if "dead_bytes" in rows[0]:
+        d0, d1 = int(window[0]["dead_bytes"]), int(window[-1]["dead_bytes"])
+        dead_delta, dead_peak = d1 - d0, max(int(r["dead_bytes"]) for r in window)
+        i0, i1 = int(window[0]["compact_idle_pressure"]), int(window[-1]["compact_idle_pressure"])
+        idle_delta = i1 - i0
+        print(f"tier reclaim: dead_bytes {d0} -> {d1} over the {scope} "
+              f"(delta {dead_delta}, peak {dead_peak}); compact_idle_pressure delta {idle_delta}")
     if all(c in rows[0] for c in live):
         for column, label in live.items():
             first, last = int(window[0][column]), int(window[-1][column])
-            scope = "steady window" if windowed else "whole run"
             print(f"tier liveness: {column} {first} -> {last} over the {scope} (delta {last - first})")
             if mode == "FULL" and last - first <= 0:
+                why = ""
+                if column == "compact_slices" and dead_delta is not None:
+                    # 64 MiB: comfortably above sampling jitter on the
+                    # counter, far below anything a real backlog looks
+                    # like (the 20260812 diagnostic made 244 MB in 2 min).
+                    if dead_delta > 64 * 1024 * 1024:
+                        why = (f" — and {dead_delta} bytes of reclaimable space accumulated while it "
+                               f"did not run (compact_idle_pressure delta {idle_delta}): this is the "
+                               "ENGINE-SIDE shape, escalate before re-running")
+                    else:
+                        why = (f" — dead_bytes moved only {dead_delta} bytes, so the workload never "
+                               "created reclaimable space: this is the WORKLOAD/HARNESS shape, fix "
+                               "the leg mix or key stream, not the compaction driver")
                 fails.append(
                     f"tiered plane served no {label} across the {scope} — the tier was static, so "
                     "the M4 §7 rows measured a node that was not doing the work they describe"
+                    + why
                 )
     elif mode == "FULL":
         fails.append(
