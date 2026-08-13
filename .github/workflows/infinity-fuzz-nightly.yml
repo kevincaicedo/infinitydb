@@ -55,13 +55,40 @@ jobs:
           # M3 delta-apply decoder (readiness F2).
           - { dir: crates/inf-doc, target: fuzz_delta_apply }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
+      # cargo-fuzz auto-creates the DEFAULT corpus dir but hard-errors on an
+      # explicitly named one that is missing ("The required directory ...
+      # does not exist"). Only 3 of the 14 working corpora are committed
+      # (manifest_decode, extent_decode, fuzz_tierfile_decode); the rest are
+      # gitignored, so on a fresh checkout those 11 jobs died at startup and
+      # banked ZERO hours from the day the arg landed (2026-08-06) until
+      # this fix (2026-08-13) — the 24 h/target release clock for them
+      # starts tonight. Restore the previous night's grown corpus first,
+      # then mkdir -p for the cache-miss / first-night case (the same
+      # pattern infinity-ci-full.yml already uses).
+      - name: restore corpus from previous nights
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ matrix.dir }}/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: ensure corpus dir exists
+        run: mkdir -p fuzz/corpus/${{ matrix.target }}
+        working-directory: ${{ matrix.dir }}
       - name: "fuzz ${{ matrix.target }} (5.5 h)"
         run: cargo +nightly fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} ${{ matrix.seeds }} -- -max_total_time=19800
         working-directory: ${{ matrix.dir }}
+      # Save even when the job fails: a crash night is exactly the corpus
+      # worth keeping — the input that found the crash is in it.
+      - name: save corpus for the next night
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ matrix.dir }}/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
       - name: upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
