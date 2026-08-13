@@ -1,0 +1,15 @@
+rss slope whole-run +0.440%/24h (first-5% median 3332012 kB -> last-5% median 3350552 kB, 10706 samples; disclosure)
+rss slope steady-state +0.151%/24h (first 8 h excluded per ADR-0069 D1, 7889 samples, 3346052 kB -> 3350764 kB; GATE)
+accounted slope whole-run +0.122%/24h (used_memory first-5% median 610906 kB -> last-5% 611847 kB; disclosure)
+accounted slope steady-state -0.001%/24h (GATE)
+attribution (end): rss 3351440 kB vs used_memory + tier_committed + tier_index + staging + ckpt = 3310665 kB — residual 40775 kB (+1.2%; disclosure)
+tiering disk max 23901782016 bytes (budget 85899345920)
+write-amp milli max 1920 (gate < 3000)
+diskfull refusals 0
+docs_live 13407 -> 14240 (document plane live throughout: yes)
+checkpoints completed 0 -> 19761 (delta 19761)
+tier liveness: cold_reads_issued 31441442 -> 99855922 over the steady window (delta 68414480)
+tier liveness: flush_slices 22553 -> 22772 over the steady window (delta 219)
+tier liveness: compact_slices 0 -> 0 over the steady window (delta 0)
+FAIL — discharges: NOTHING (a failing run is not evidence for any gate)
+  - tiered plane served no compaction slices across the steady window — the tier was static, so the M4 §7 rows measured a node that was not doing the work they describe

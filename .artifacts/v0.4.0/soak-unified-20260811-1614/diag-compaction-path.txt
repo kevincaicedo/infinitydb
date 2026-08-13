@@ -1,0 +1,58 @@
+Compaction-path diagnostic — 2026-08-12, same tree (23610ff), dev-tier,
+NON-CITATION (dirty tree, unpinned, 4 cells on port 7412, data dir
+$HOME/.cache/inf-tmp/diag-compact).
+
+Purpose: decide whether attempt 4's `compact_slices == 0` means the
+compaction driver is broken, or that no dead space was created. The soak
+bundle cannot tell these apart (no dead_bytes column — see run-notes.md).
+
+Method: create a tiered namespace, fill it, then run the SAME update-heavy
+row the soak drives (`inf-bench ycsb --workloads a --distribution zipfian
+--skip-fill`), scraping per-namespace `INFO tiering` at each stage.
+
+  redis-cli -p 7412 INF.NS CREATE tdiag MODE durable FSYNC everysec \
+      MEM-BUDGET 64mb DISK-BUDGET 4096mb
+  inf-bench ycsb --attach-port 7412 --ns tdiag --workloads a \
+      --mem-budget-mb 64 --dataset-multiple 10 --fill-only
+  inf-bench ycsb --attach-port 7412 --ns tdiag --workloads a \
+      --mem-budget-mb 64 --dataset-multiple 10 --duration 150 --skip-fill
+
+Scrapes are per-cell (INFO Tiering is cell-scope); node counters are the
+`tiering_*` lines.
+
+--- AFTER FILL (pure inserts) ---
+live_bytes=171704320
+dead_bytes=368                  <-- ~zero: inserts create no dead space
+user_bytes=170393600
+flush_bytes=154898432
+compaction_bytes=0
+write_amp_milli=1915            <-- 1.915x, the write-twice baseline
+disk_used_bytes=154304512
+cold_reads_issued:0
+tiering_flush_slices:147
+tiering_compact_slices:0
+tiering_dead_bytes:368
+
+--- DURING THE UPDATE ROW (~2 min in) ---
+live_bytes=171704320
+dead_bytes=244195584            <-- updates DO displace: 244 MB dead
+user_bytes=757560960
+flush_bytes=400416768
+compaction_bytes=62317224       <-- compaction IS reclaiming
+write_amp_milli=1543
+cold_reads_issued:338859
+tiering_flush_slices:378
+tiering_compact_slices:16276    <-- 16,276 slices in ~2 minutes
+tiering_dead_bytes:241963344
+
+CONCLUSION: the update -> displacement -> dead-space -> compaction path
+is live and fires within ~2 minutes of update pressure on this tree.
+Attempt 4's zero is therefore NOT a compaction-driver defect; it is the
+absence of tier write traffic in that run's steady window (WA decayed to
+1.086, flush 9.8 slices/h, disk +0.23 GB/22.35 h). The remaining question
+is why the soak's tiered legs stopped delivering displacing writes at
+2048 MiB scale — see run-notes.md (fixed-per-leg-seed hypothesis) and the
+named sampler change.
+
+Non-citable by construction: dirty tree, unpinned, small scale. This is a
+mechanism probe, not a gate row.

@@ -1,0 +1,3253 @@
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786481158-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786481158-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786482662-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786482662-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786484166-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786484166-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786485670-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786485670-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786487174-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786487174-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786488678-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786488678-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786490182-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786490182-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786491686-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786491686-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786493192-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786493192-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786494696-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786494696-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786496204-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786496204-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786497712-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786497712-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786499216-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786499216-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786500720-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786500720-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786502223-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786502223-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786503728-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786503728-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786505234-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786505234-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786506739-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786506739-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786508242-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786508242-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786509749-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786509749-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786511252-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786511252-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786512757-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786512757-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786514261-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786514261-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786515764-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786515764-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786517268-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786517268-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786518772-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786518772-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786520278-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786520278-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786521782-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786521782-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786523287-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786523287-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786524793-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786524793-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786526297-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786526297-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786527802-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786527802-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786529306-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786529306-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786530810-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786530810-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786532315-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786532315-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786533821-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786533821-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786535326-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786535326-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786536830-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786536830-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786538334-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786538334-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786539838-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786539838-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786541342-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786541342-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786542846-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786542846-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786544351-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786544351-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786545854-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786545854-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786547358-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786547358-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786548862-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786548862-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786550368-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786550368-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786551873-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786551873-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786553377-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786553377-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786554880-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786554880-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786556385-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786556385-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786557889-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786557889-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786559396-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786559396-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786560901-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786560901-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786562408-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786562408-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786563916-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786563916-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786565420-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786565420-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786566924-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786566924-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786568430-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786568430-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786569933-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786569933-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786571438-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786571438-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786572942-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786572942-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786574448-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786574448-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786575953-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786575953-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786577458-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786577458-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786578965-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786578965-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786580469-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786580469-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786581978-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786581978-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786583482-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786583482-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786584986-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786584986-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786586492-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786586492-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-b-zipfian ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786587996-gate-run/report.md
+gate-run: sidecar written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786587996-gate-run/mem-hit.tsv
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb row: ycsb-a-zipfian ==

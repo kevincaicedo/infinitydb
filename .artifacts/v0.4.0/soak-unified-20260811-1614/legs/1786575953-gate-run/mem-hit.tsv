@@ -1,0 +1,4 @@
+# inf-bench ycsb — client-derived memory-hit split (ADR-0071 D2)
+# row	ops	cold_frac	p50_us	p99_us	p999_us	eligible
+ycsb-a-zipfian	5625909	0.086716	1023	10239	12031	ineligible
+ycsb-b-zipfian	5399179	0.086629	1183	15103	16895	ineligible

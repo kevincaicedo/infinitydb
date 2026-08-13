@@ -1,0 +1,42 @@
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+
+env-check: OK
+== ycsb: loading 20971520 keys (20480 MiB) ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PENDING (tooling)
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows PENDING (tooling)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/v0.4.0/soak-unified-20260811-1614/legs/1786479655-gate-run/report.md
