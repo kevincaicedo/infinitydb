@@ -301,6 +301,22 @@ fn arb_path() -> impl Strategy<Value = PathAst> {
         .prop_map(|(legacy, segments)| PathAst { legacy, segments })
 }
 
+/// M4.5 §3.1 indexable-path fence (ADR-0075 D2.4): child steps, `[*]`,
+/// and array indices are inside; recursive descent, slices, and unions
+/// are outside — each case pinned on the compiled program, the exact
+/// bytes the index catalog stores.
+#[test]
+fn index_fence_splits_the_grammar() {
+    for text in ["$", "$.a", "$.a.b", "$[0]", "$.items[2].price", "$.tags[*]", "$.a[*].b"] {
+        let program = compile(text.as_bytes()).expect("valid path");
+        assert!(program.within_index_fence(), "{text} is inside the fence");
+    }
+    for text in ["$..a", "$.a..b", "$[1:3]", "$[:2]", "$['a','b']", "$[0,1]", "$..[*]"] {
+        let program = compile(text.as_bytes()).expect("valid path");
+        assert!(!program.within_index_fence(), "{text} is outside the fence");
+    }
+}
+
 proptest! {
     /// The S08 property AC: `parse(print(ast)) == ast` over generated
     /// paths — both modes, every selector kind, escapes included.

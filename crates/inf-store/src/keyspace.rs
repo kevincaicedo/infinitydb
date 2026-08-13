@@ -36,9 +36,10 @@ use inf_log::{FsyncClass, NsId, RecordView as LogRecordView};
 use inf_foundation::LogicalAddr;
 
 use crate::address_space::{AddressSpaceConfig, TieringCounters};
-use crate::catalog::NsCatalog;
+use crate::catalog::{IndexCatalog, NsCatalog};
 use crate::demote::{DemoteStats, DemotionConfig, EvictionPressure};
 use crate::evict::{EvictStats, EvictionPolicy};
+use crate::index_registry::{IndexError, IndexId, IndexRegistry, IndexSpec, IndexState};
 use crate::ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsRegistry, NsSpec};
 use crate::record::ExtentRef;
 use crate::store::{
@@ -170,6 +171,11 @@ pub struct Keyspace {
     /// drains them. Non-empty at end-of-log is a decode error the
     /// recovery driver checks via [`displace_register_len`](Self::displace_register_len).
     pending_displace: Vec<(NsId, u64)>,
+    /// Per-cell index registry (M4.5-S03, ADR-0075/ADR-0072 D2):
+    /// declarations replicated by the DDL fan, this cell's trees and
+    /// machine states beside them. Consulted at DDL/MAINTAIN rate only —
+    /// the mutation path reads a cached flag (S04).
+    indexes: IndexRegistry,
 }
 
 impl Keyspace {
@@ -188,6 +194,7 @@ impl Keyspace {
             hand_db: 0,
             tiered_va_limit_bytes: TIERED_VA_LIMIT_DEFAULT,
             pending_displace: Vec::new(),
+            indexes: IndexRegistry::default(),
         };
         // db0 is eager: it serves every connection that never SELECTs.
         let _ = ks.db_mut(0);
@@ -240,6 +247,8 @@ impl Keyspace {
             doc_slack_bytes: 0,
             doc_scratch_bytes: 0,
             doc_path_cache_bytes: 0,
+            idx_tree_bytes: 0,
+            idx_slack_bytes: 0,
             live_records: 0,
             docs_live: 0,
         };
@@ -261,6 +270,11 @@ impl Keyspace {
             total.live_records += r.live_records;
             total.docs_live += r.docs_live;
         }
+        // Index trees are keyspace-owned (per-ns registry, M4.5-S03) —
+        // folded here so per-store reports stay store-scoped.
+        let idx = self.indexes.memory_total();
+        total.idx_tree_bytes = idx.idx_tree_bytes;
+        total.idx_slack_bytes = idx.idx_slack_bytes;
         total
     }
 
@@ -667,28 +681,40 @@ impl Keyspace {
         self.over_limit
     }
 
-    /// Logical used bytes across dbs and named stores (the `maxmemory`
-    /// comparable). Every named store counts toward the global flag — L5
-    /// attribution truth (ADR-0068 D5) — but reclaim authority differs:
-    /// budget-less memory stores join the global hand, budgeted ones own
-    /// their per-namespace pass, and durable/tiered stores never evict, so
-    /// their sustained pressure resolves as honest OOM refusals.
+    /// Logical used bytes across dbs, named stores, and index trees (the
+    /// `maxmemory` comparable). Every named store counts toward the
+    /// global flag — L5 attribution truth (ADR-0068 D5) — but reclaim
+    /// authority differs: budget-less memory stores join the global hand,
+    /// budgeted ones own their per-namespace pass, and durable/tiered
+    /// stores never evict, so their sustained pressure resolves as honest
+    /// OOM refusals. Index trees count too (ADR-0075 D6: an unattributed
+    /// byte is a lie) — eviction shrinks them back through the S04
+    /// removal hook, never directly.
     pub fn used_bytes(&self) -> u64 {
         let named: u64 = self.named_stores.iter().map(|e| e.store.used_bytes()).sum();
-        self.dbs().map(|(_, s)| s.used_bytes()).sum::<u64>() + named
+        let idx = self.indexes.memory_total().idx_tree_bytes;
+        self.dbs().map(|(_, s)| s.used_bytes()).sum::<u64>() + named + idx
     }
 
     /// Recomputes the cached pressure flags — global and per-namespace
     /// (ADR-0068 D5: the per-ns flags cache at the same touch points).
     /// Called after mutations (cheap: a few loads per materialized store;
-    /// the global half short-circuits when no limit is set).
+    /// the global half short-circuits when no limit is set). Per-ns
+    /// comparisons include the namespace's index-tree bytes (ADR-0075
+    /// D6 — index growth tightens the document budget).
     #[inline]
     pub fn refresh_pressure(&mut self) {
         self.over_limit =
             self.pressure.limit_bytes != 0 && self.used_bytes() > self.pressure.limit_bytes;
-        for entry in &mut self.named_stores {
-            entry.over_limit =
-                entry.budget_share != 0 && entry.store.used_bytes() > entry.budget_share;
+        for i in 0..self.named_stores.len() {
+            let entry = &self.named_stores[i];
+            if entry.budget_share == 0 {
+                self.named_stores[i].over_limit = false;
+                continue;
+            }
+            let idx = self.indexes.memory_of(entry.id).idx_tree_bytes;
+            let used = self.named_stores[i].store.used_bytes() + idx;
+            self.named_stores[i].over_limit = used > self.named_stores[i].budget_share;
         }
     }
 
@@ -724,7 +750,10 @@ impl Keyspace {
         if !self.named_stores[i].over_limit {
             return Some(Ok(()));
         }
-        let target = self.named_stores[i].budget_share;
+        // The store-side target leaves room for the namespace's index
+        // trees (ADR-0075 D6: the flag compares store + idx vs share).
+        let idx = self.indexes.memory_of(ns).idx_tree_bytes;
+        let target = self.named_stores[i].budget_share.saturating_sub(idx);
         self.evict_ns_toward(i, target, INLINE_MAX_EVICTIONS, now);
         self.refresh_pressure();
         Some(if self.named_stores[i].over_limit { Err(OpError::OutOfMemory) } else { Ok(()) })
@@ -763,7 +792,11 @@ impl Keyspace {
         while i < self.named_stores.len() && left > 0 {
             let share = self.named_stores[i].budget_share;
             if share != 0 {
-                let step = self.evict_ns_toward(i, share - share / 16, left, now);
+                // Store-side watermark: the share minus the namespace's
+                // index-tree bytes (ADR-0075 D6 accounting).
+                let idx = self.indexes.memory_of(self.named_stores[i].id).idx_tree_bytes;
+                let target = (share - share / 16).saturating_sub(idx);
+                let step = self.evict_ns_toward(i, target, left, now);
                 left -= (step.evicted as u32).min(left);
                 stats.absorb(step);
             }
@@ -962,6 +995,9 @@ impl Keyspace {
         if let Some(id) = id {
             self.named_stores.retain(|e| e.id != id);
             self.tiered_stores.retain(|(nid, _)| *nid != id);
+            // A namespace drop takes its index declarations and trees
+            // with it (M4.5-S03) — their ids stay retired.
+            self.indexes.remove_ns(id);
             self.refresh_pressure();
         }
         Ok(())
@@ -1067,6 +1103,14 @@ impl Keyspace {
     /// standing wiring obligation, and no live-node write can predate it
     /// (the D8 `USE` refusal keeps the data plane unreachable).
     ///
+    /// Index declarations seed per ADR-0075 D4: `dropping` entries resume
+    /// their drop (not seeded — removal persists with the next swap);
+    /// every other entry survives with id/generation/program/type intact
+    /// and regresses to `backfilling` (contents are projections and must
+    /// rebuild before planning resumes), with the pre-crash-`ready` hint
+    /// retained for S06's sidecar path. Generations never bump at boot
+    /// (a bump would permanently stale every sidecar — ADR-0073 D5.1).
+    ///
     /// # Errors
     /// The first registry-rule or admission violation — a failing catalog
     /// is a fail-stop at boot, never a partial seed.
@@ -1074,18 +1118,97 @@ impl Keyspace {
         self.named = NsRegistry::default();
         self.named_stores.clear();
         self.tiered_stores.clear();
+        self.indexes = IndexRegistry::default();
         for spec in &cat.entries {
             // `ns_create` materializes tiered entries under the D4 bound
             // — seeding and DDL share one path, so they cannot drift.
             self.ns_create(spec.clone())?;
         }
+        for spec in &cat.index.entries {
+            if spec.state == IndexState::Dropping {
+                continue;
+            }
+            let was_ready = spec.state == IndexState::Ready;
+            let seeded = IndexSpec { state: IndexState::Backfilling, ..spec.clone() };
+            // Decode already ran every record rule (ADR-0075 D2.4), so a
+            // refusal here is a violated invariant, not an operating error.
+            self.indexes.create(seeded, was_ready).expect("catalog decode validated the record");
+        }
+        self.refresh_pressure();
         Ok(())
     }
 
-    /// Snapshot the registry as a catalog (the DDL persist path; the caller
-    /// owns `next_id` — it lives on the node-level allocator).
-    pub fn export_catalog(&self, next_id: u32) -> NsCatalog {
-        NsCatalog { next_id, entries: self.ns_iter().cloned().collect() }
+    /// Snapshot the registry as a catalog (the DDL persist path; the
+    /// caller owns all three counters — they live on the node-level
+    /// allocator and never regress).
+    pub fn export_catalog(
+        &self,
+        next_id: u32,
+        next_index_id: u32,
+        next_index_generation: u64,
+    ) -> NsCatalog {
+        NsCatalog {
+            next_id,
+            entries: self.ns_iter().cloned().collect(),
+            index: IndexCatalog {
+                next_id: next_index_id,
+                next_generation: next_index_generation,
+                entries: self.indexes.export(),
+            },
+        }
+    }
+
+    // ---- index declarations (M4.5-S03, ADR-0075) ----
+
+    /// Registers an index declaration on this cell (the DDL fan's apply
+    /// leg and the S10 origin leg share this path). The namespace-mode
+    /// gate runs here — the registry itself is namespace-agnostic.
+    ///
+    /// # Errors
+    /// `UnknownNamespace` for an unregistered named target;
+    /// `TierRefusesIndexes` (ADR-0072 D8a); `InvalidProgram` from the
+    /// gauntlet; the registry's own typed refusals.
+    pub fn idx_create(&mut self, spec: IndexSpec) -> Result<(), IndexError> {
+        if spec.ns.0 >= FIRST_NAMED_NS_ID {
+            let ns_spec =
+                self.named.get_by_id(spec.ns).ok_or(IndexError::UnknownNamespace(spec.ns.0))?;
+            if ns_spec.tier.is_some() {
+                return Err(IndexError::TierRefusesIndexes);
+            }
+        }
+        validate_program_gate(&spec.program)?;
+        self.indexes.create(spec, false)?;
+        self.refresh_pressure();
+        Ok(())
+    }
+
+    /// Completes a drop (teardown finished on this cell): the entry and
+    /// its tree go; the id stays retired forever.
+    ///
+    /// # Errors
+    /// `Unknown` for an unregistered id.
+    pub fn idx_drop_finish(&mut self, id: IndexId) -> Result<(), IndexError> {
+        self.indexes.remove(id)?;
+        self.refresh_pressure();
+        Ok(())
+    }
+
+    /// The per-cell index registry (lifecycle transitions, trees,
+    /// binding validation — DDL/MAINTAIN-rate access only).
+    pub fn idx_registry(&self) -> &IndexRegistry {
+        &self.indexes
+    }
+
+    pub fn idx_registry_mut(&mut self) -> &mut IndexRegistry {
+        &mut self.indexes
+    }
+
+    /// Whether `ns` carries any live index declaration — the recompute
+    /// source for the S04 store-side cached flag (ADR-0072 D2), never
+    /// the per-mutation consultation itself.
+    #[must_use]
+    pub fn ns_has_indexes(&self, ns: NsId) -> bool {
+        self.indexes.has_indexes(ns)
     }
 
     // ---- replay (M2-S08, ADR-0015 D7) ----
@@ -1424,6 +1547,19 @@ impl Keyspace {
 /// node `maxmemory`. `0` means "no budget" (the inheritance leg), so a
 /// budget smaller than the cell count floors at 1 byte per cell — a
 /// nonsense-tiny budget stays a budget, never accidentally unlimited.
+/// The DDL-side program gauntlet (ADR-0075 D2.4) — byte-valid M3
+/// bytecode inside the indexable-path fence. A doc-less build refuses:
+/// it could not maintain the projection it would be declaring (L8).
+#[cfg(feature = "doc")]
+fn validate_program_gate(bytes: &[u8]) -> Result<(), IndexError> {
+    crate::index_registry::validate_index_program(bytes).map_err(IndexError::InvalidProgram)
+}
+
+#[cfg(not(feature = "doc"))]
+fn validate_program_gate(_bytes: &[u8]) -> Result<(), IndexError> {
+    Err(IndexError::InvalidProgram("indexes require the document engine (doc feature)"))
+}
+
 fn ns_budget_share(maxmemory: Option<u64>, shares: u64) -> u64 {
     maxmemory.map_or(0, |bytes| (bytes / shares.max(1)).max(1))
 }
@@ -1744,11 +1880,168 @@ mod tests {
     fn catalog_seed_and_export_round_trip() {
         let mut ks = Keyspace::new(StoreConfig::default());
         ks.ns_create(durable_spec(16, b"ledger")).expect("create");
-        let cat = ks.export_catalog(17);
+        let cat = ks.export_catalog(17, 1, 1);
         let mut fresh = Keyspace::new(StoreConfig::default());
         fresh.seed_catalog(&cat).expect("seed");
-        assert_eq!(fresh.export_catalog(17), cat);
+        assert_eq!(fresh.export_catalog(17, 1, 1), cat);
         assert!(fresh.ns_store_mut(NsId(16)).is_some());
+    }
+
+    // ---- M4.5-S03 (ADR-0075): index registry + catalog + accounting ----
+
+    #[cfg(feature = "doc")]
+    fn idx_spec(id: u32, generation: u64, ns: u32, name: &[u8], state: IndexState) -> IndexSpec {
+        IndexSpec {
+            id: IndexId(id),
+            generation,
+            ns: NsId(ns),
+            name: name.to_vec(),
+            program: inf_doc::path::compile(b"$.price").expect("valid path").as_bytes().to_vec(),
+            key_type: crate::IndexKeyType::F64,
+            state,
+        }
+    }
+
+    /// The DDL gates: tiered namespaces refuse (ADR-0072 D8a), unknown
+    /// named targets refuse, default dbs and plain namespaces accept,
+    /// and a fenced-out path refuses through the shared gauntlet.
+    #[cfg(feature = "doc")]
+    #[test]
+    fn idx_create_gates_by_namespace_mode() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(NsSpec {
+            fsync: Some(FsyncClass::Everysec),
+            tier: Some(crate::ns::TierSpec::for_budget(64 << 20)),
+            ..durable_spec(17, b"cold")
+        })
+        .expect("tiered create");
+        ks.idx_create(idx_spec(1, 1, 0, b"on-db0", IndexState::Declared)).expect("default db");
+        ks.idx_create(idx_spec(2, 2, 16, b"on-ledger", IndexState::Declared)).expect("named ns");
+        assert_eq!(
+            ks.idx_create(idx_spec(3, 3, 17, b"on-cold", IndexState::Declared)),
+            Err(IndexError::TierRefusesIndexes)
+        );
+        assert_eq!(
+            ks.idx_create(idx_spec(3, 3, 99, b"nowhere", IndexState::Declared)),
+            Err(IndexError::UnknownNamespace(99))
+        );
+        let fenced = IndexSpec {
+            program: inf_doc::path::compile(b"$..a").expect("valid path").as_bytes().to_vec(),
+            ..idx_spec(3, 3, 16, b"fenced", IndexState::Declared)
+        };
+        assert!(matches!(ks.idx_create(fenced), Err(IndexError::InvalidProgram(_))));
+        assert!(ks.ns_has_indexes(NsId(0)));
+        assert!(ks.ns_has_indexes(NsId(16)));
+        assert!(!ks.ns_has_indexes(NsId(17)));
+    }
+
+    /// The ADR-0075 D4 restart semantics: `dropping` resumes its drop
+    /// (gone after seed, gone from the next export); every other state
+    /// survives with id/generation intact and regresses to
+    /// `backfilling`, with the pre-crash-`ready` hint retained for S06.
+    /// Driving the rebuild to completion returns the pre-crash-ready
+    /// index to `ready` — the AC's end state.
+    #[cfg(feature = "doc")]
+    #[test]
+    fn catalog_restart_maps_index_states_per_d4() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.idx_create(idx_spec(1, 10, 16, b"was-ready", IndexState::Declared)).expect("create");
+        ks.idx_create(idx_spec(2, 11, 16, b"mid-backfill", IndexState::Declared)).expect("create");
+        ks.idx_create(idx_spec(3, 12, 16, b"mid-drop", IndexState::Declared)).expect("create");
+        let reg = ks.idx_registry_mut();
+        reg.set_catalog_state(IndexId(1), IndexState::Backfilling).expect("edge");
+        reg.set_catalog_state(IndexId(1), IndexState::Ready).expect("edge");
+        reg.set_catalog_state(IndexId(2), IndexState::Backfilling).expect("edge");
+        reg.set_catalog_state(IndexId(3), IndexState::Dropping).expect("edge");
+        let cat = ks.export_catalog(17, 4, 13);
+
+        let mut fresh = Keyspace::new(StoreConfig::default());
+        fresh.seed_catalog(&cat).expect("seed");
+        let reg = fresh.idx_registry();
+        // The dropping entry resumed its drop: not seeded.
+        assert!(reg.get_by_id(IndexId(3)).is_none());
+        // Survivors regress to backfilling, generations un-bumped
+        // (ADR-0073 D5.1 — a boot bump would stale every sidecar).
+        let ready = reg.get_by_id(IndexId(1)).expect("survives");
+        assert_eq!(ready.state, IndexState::Backfilling);
+        assert_eq!(ready.generation, 10);
+        assert_eq!(reg.was_ready(IndexId(1)), Some(true), "the S06 sidecar hint");
+        let mid = reg.get_by_id(IndexId(2)).expect("survives");
+        assert_eq!(mid.state, IndexState::Backfilling);
+        assert_eq!(reg.was_ready(IndexId(2)), Some(false));
+        // Planning refuses both until rebuild completes...
+        assert!(fresh.idx_registry().validate_binding(NsId(16), IndexId(1), 10).is_err());
+        // ...and the next export no longer carries the dropped entry.
+        assert!(!fresh.export_catalog(17, 4, 13).index.entries.iter().any(|e| e.id == IndexId(3)));
+        // Rebuild completion returns the pre-crash-ready index to ready.
+        fresh.idx_registry_mut().set_catalog_state(IndexId(1), IndexState::Ready).expect("edge");
+        fresh.idx_registry().validate_binding(NsId(16), IndexId(1), 10).expect("ready again");
+    }
+
+    /// ADR-0075 D6 (the ADR-0072 D8c decision): `idx_tree_bytes` counts
+    /// toward the namespace's `MAXMEMORY` used bytes — index growth
+    /// tightens the document budget, and the OOM verdict is honest when
+    /// nothing evictable remains below `share − idx`.
+    #[cfg(feature = "doc")]
+    #[test]
+    fn idx_tree_bytes_count_toward_the_namespace_budget() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        ks.ns_create(NsSpec {
+            id: NsId(16),
+            name: b"cache".to_vec(),
+            mode: NsMode::Memory,
+            fsync: None,
+            policy: Some(EvictionPolicy::AllKeysRandom),
+            maxmemory: None,
+            tier: None,
+        })
+        .expect("create");
+        ks.idx_create(idx_spec(1, 1, 16, b"by-price", IndexState::Declared)).expect("create");
+        // Fill documents-side bytes, then set the budget just above the
+        // store's own usage — without index bytes the flag stays clear.
+        for i in 0..64u64 {
+            let key = format!("k{i}");
+            ks.ns_store_mut(NsId(16))
+                .expect("store")
+                .set(key.as_bytes(), &[0u8; 128], SetOptions::default(), now())
+                .expect("set");
+        }
+        let store_used = ks.ns_store(NsId(16)).expect("store").used_bytes();
+        ks.ns_set_memory(b"cache", Some(EvictionPolicy::AllKeysRandom), Some(store_used + 4096))
+            .expect("budget");
+        assert!(!ks.ns_over_limit(NsId(16)), "no index bytes yet — under budget");
+        // Grow the tree past the headroom; the flag must flip on the
+        // combined comparison and the report must attribute the bytes.
+        let tree = ks.idx_registry_mut().tree_mut(IndexId(1)).expect("tree");
+        for i in 0..4096u64 {
+            tree.insert(&i.to_be_bytes(), i).expect("insert");
+        }
+        ks.refresh_pressure();
+        assert!(ks.ns_over_limit(NsId(16)), "index growth tightens the namespace budget");
+        let report = ks.report();
+        assert!(report.idx_tree_bytes > 4096, "trees attribute (L5)");
+        assert!(report.idx_slack_bytes < report.idx_tree_bytes);
+        assert!(ks.used_bytes() >= store_used + report.idx_tree_bytes);
+        // Dropping the index returns the namespace under budget.
+        ks.idx_drop_finish(IndexId(1)).expect("drop");
+        assert!(!ks.ns_over_limit(NsId(16)), "drop returns the budget");
+        assert_eq!(ks.report().idx_tree_bytes, 0);
+    }
+
+    /// A namespace drop takes its declarations with it; the ids stay
+    /// retired and the flags recompute.
+    #[cfg(feature = "doc")]
+    #[test]
+    fn ns_drop_removes_its_index_declarations() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.idx_create(idx_spec(1, 1, 16, b"by-price", IndexState::Declared)).expect("create");
+        assert!(ks.ns_has_indexes(NsId(16)));
+        ks.ns_drop(b"ledger").expect("drop");
+        assert!(!ks.ns_has_indexes(NsId(16)));
+        assert!(ks.idx_registry().get_by_id(IndexId(1)).is_none());
     }
 
     /// M4-S27 (ADR-0068): a memory namespace's persisted pressure knobs
@@ -1768,7 +2061,7 @@ mod tests {
             tier: None,
         };
         ks.ns_create(spec).expect("create");
-        let cat = ks.export_catalog(17);
+        let cat = ks.export_catalog(17, 1, 1);
         let mut fresh = Keyspace::new(StoreConfig::default());
         fresh.seed_catalog(&cat).expect("seed");
         let store = fresh.ns_store_mut(NsId(16)).expect("live");

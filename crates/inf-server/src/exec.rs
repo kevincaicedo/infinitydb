@@ -212,6 +212,8 @@ pub(crate) fn memory_gauges_of(
         doc_slack_bytes: report.doc_slack_bytes,
         doc_scratch_bytes: report.doc_scratch_bytes,
         doc_path_cache_bytes: report.doc_path_cache_bytes,
+        idx_tree_bytes: report.idx_tree_bytes,
+        idx_slack_bytes: report.idx_slack_bytes,
     }
 }
 

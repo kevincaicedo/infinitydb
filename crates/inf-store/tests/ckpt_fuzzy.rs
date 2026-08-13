@@ -41,6 +41,7 @@ fn durable_keyspace() -> Keyspace {
             maxmemory: None,
             tier: None,
         }],
+        index: Default::default(),
     };
     ks.seed_catalog(&catalog).expect("seed");
     ks

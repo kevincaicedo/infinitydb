@@ -131,6 +131,25 @@ pub(crate) struct SimpleSteps<'a> {
 }
 
 impl PathProgram {
+    /// True when every selector is inside the M4.5 §3.1 indexable-path
+    /// fence: dot/bracket child steps, array index, and the `[*]`
+    /// wildcard. Recursive descent, slices, and unions are outside it —
+    /// `..` makes per-mutation index maintenance cost proportional to
+    /// document size regardless of relevance (ADR-0075 D2.4; growing
+    /// the fence is ADR-per-extension). Zero-allocation walk over the
+    /// validated bytes, the `simple_steps` shape.
+    pub fn within_index_fence(&self) -> bool {
+        let mut at = 3; // version, flags, Root
+        while at < self.bytes.len() {
+            let (op, next) = read_op(&self.bytes, at);
+            if !matches!(op, Op::Child(_) | Op::ChildAny | Op::Index(_)) {
+                return false;
+            }
+            at = next;
+        }
+        true
+    }
+
     /// Returns a zero-allocation iterator only when the whole validated
     /// program is a root followed by `Child`/`Index` selectors.
     pub(crate) fn simple_steps(&self) -> Option<SimpleSteps<'_>> {

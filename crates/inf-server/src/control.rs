@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use inf_log::fs::StdSegmentFs;
 use inf_log::meta::{read_meta, write_meta};
-use inf_store::{FIRST_NAMED_NS_ID, NsCatalog};
+use inf_store::{FIRST_INDEX_GENERATION, FIRST_INDEX_ID, FIRST_NAMED_NS_ID, NsCatalog};
 
 /// One cell's boot-recovery slot on the [`RecoveryBoard`] (M2-S15).
 /// Single writer (the owning cell, relaxed stores); readers are the
@@ -283,6 +283,9 @@ pub struct MemoryGauges {
     pub doc_slack_bytes: u64,
     pub doc_scratch_bytes: u64,
     pub doc_path_cache_bytes: u64,
+    /// Index-tree domains (M4.5-S03, ADR-0075 D6 — L5).
+    pub idx_tree_bytes: u64,
+    pub idx_slack_bytes: u64,
 }
 
 /// Per-cell memory publication slot. Same L1 control-plane carve-out
@@ -301,6 +304,8 @@ pub struct MemorySlot {
     doc_slack_bytes: AtomicU64,
     doc_scratch_bytes: AtomicU64,
     doc_path_cache_bytes: AtomicU64,
+    idx_tree_bytes: AtomicU64,
+    idx_slack_bytes: AtomicU64,
 }
 
 impl MemorySlot {
@@ -314,6 +319,8 @@ impl MemorySlot {
         self.doc_slack_bytes.store(g.doc_slack_bytes, Ordering::Relaxed);
         self.doc_scratch_bytes.store(g.doc_scratch_bytes, Ordering::Relaxed);
         self.doc_path_cache_bytes.store(g.doc_path_cache_bytes, Ordering::Relaxed);
+        self.idx_tree_bytes.store(g.idx_tree_bytes, Ordering::Relaxed);
+        self.idx_slack_bytes.store(g.idx_slack_bytes, Ordering::Relaxed);
     }
 
     fn read(&self) -> MemoryGauges {
@@ -327,6 +334,8 @@ impl MemorySlot {
             doc_slack_bytes: self.doc_slack_bytes.load(Ordering::Relaxed),
             doc_scratch_bytes: self.doc_scratch_bytes.load(Ordering::Relaxed),
             doc_path_cache_bytes: self.doc_path_cache_bytes.load(Ordering::Relaxed),
+            idx_tree_bytes: self.idx_tree_bytes.load(Ordering::Relaxed),
+            idx_slack_bytes: self.idx_slack_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -371,8 +380,74 @@ impl MemoryBoard {
             t.doc_slack_bytes += g.doc_slack_bytes;
             t.doc_scratch_bytes += g.doc_scratch_bytes;
             t.doc_path_cache_bytes += g.doc_path_cache_bytes;
+            t.idx_tree_bytes += g.idx_tree_bytes;
+            t.idx_slack_bytes += g.idx_slack_bytes;
         }
         t
+    }
+}
+
+/// Per-cell × per-index-slot readiness board (M4.5-S03, ADR-0075 D5):
+/// each owning cell publishes the **generation** it last reported ready
+/// for the index occupying a slot (0 = none) — the CkptBoard L1
+/// carve-out class, single writer per (cell, slot). The catalog flips
+/// `backfilling → ready` only when [`fleet_ready`] holds; generation-
+/// exact matching makes a stale report (a cell still on the pre-rebuild
+/// generation) read as not-ready — ABA-safe by construction. Slots are
+/// assigned by the control plane at create, freed at drop completion,
+/// and never persisted (boot reassigns from the seeded catalog; the
+/// zeroed board at boot *is* the ADR-0075 D4 readiness regression).
+///
+/// [`fleet_ready`]: IndexBoard::fleet_ready
+#[derive(Debug)]
+pub struct IndexBoard {
+    /// `cells × INDEX_SLOTS` ready-generation words, row-major by cell.
+    slots: Vec<AtomicU64>,
+    cells: u16,
+}
+
+/// One board row per possible live index ([`inf_store::INDEXES_PER_NODE_MAX`]).
+pub const INDEX_SLOTS: usize = inf_store::INDEXES_PER_NODE_MAX;
+
+impl IndexBoard {
+    #[must_use]
+    pub fn new(cells: u16) -> IndexBoard {
+        let n = usize::from(cells) * INDEX_SLOTS;
+        IndexBoard { slots: (0..n).map(|_| AtomicU64::new(0)).collect(), cells }
+    }
+
+    fn at(&self, cell: u16, slot: usize) -> &AtomicU64 {
+        assert!(cell < self.cells, "cell id validated by the assembly");
+        assert!(slot < INDEX_SLOTS, "slot ids are control-plane-assigned < INDEX_SLOTS");
+        &self.slots[usize::from(cell) * INDEX_SLOTS + slot]
+    }
+
+    /// This cell reports ready for the index at `slot`, at `generation`
+    /// (owning cell only, from MAINTAIN — the S05 publisher).
+    pub fn publish_ready(&self, cell: u16, slot: usize, generation: u64) {
+        debug_assert!(generation > 0, "generation 0 is the reserved null");
+        self.at(cell, slot).store(generation, Ordering::Release);
+    }
+
+    /// Clears this cell's report (drop teardown / rebuild start).
+    pub fn clear(&self, cell: u16, slot: usize) {
+        self.at(cell, slot).store(0, Ordering::Release);
+    }
+
+    /// The generation `cell` last reported ready for `slot` (0 = none).
+    #[must_use]
+    pub fn cell_ready_generation(&self, cell: u16, slot: usize) -> u64 {
+        self.at(cell, slot).load(Ordering::Acquire)
+    }
+
+    /// True once **every** cell reports exactly `generation` for `slot`
+    /// — the §3.1 aggregation: the catalog flips to `ready` on this and
+    /// nothing else. Monotone under one generation (cells only regress
+    /// through DDL, which bumps the generation first).
+    #[must_use]
+    pub fn fleet_ready(&self, slot: usize, generation: u64) -> bool {
+        debug_assert!(generation > 0, "generation 0 is the reserved null");
+        (0..self.cells).all(|cell| self.cell_ready_generation(cell, slot) == generation)
     }
 }
 
@@ -399,6 +474,10 @@ enum ControlMsg {
 pub struct ControlHandle {
     tx: mpsc::SyncSender<ControlMsg>,
     next_ns_id: AtomicU32,
+    /// Index-id + generation allocators (M4.5-S03, ADR-0075 D1): both
+    /// node-unique, allocated once, never reused — the ns-id discipline.
+    next_index_id: AtomicU32,
+    next_index_generation: AtomicU64,
     next_epoch: AtomicU64,
     persisted_epoch: Arc<AtomicU64>,
     /// Manual-checkpoint request epoch (M2-S10, ADR-0016 D7): bumping it
@@ -413,6 +492,8 @@ pub struct ControlHandle {
     recovery: Arc<RecoveryBoard>,
     /// Per-cell memory gauges for node-scope `INFO` (M3-S25 fix).
     memory_board: Arc<MemoryBoard>,
+    /// Per-cell index readiness (M4.5-S03, ADR-0075 D5).
+    index_board: Arc<IndexBoard>,
 }
 
 impl ControlHandle {
@@ -424,6 +505,32 @@ impl ControlHandle {
     /// The id the allocator would hand out next (catalog `next_id`).
     pub fn next_ns_id(&self) -> u32 {
         self.next_ns_id.load(Ordering::Relaxed)
+    }
+
+    /// Allocates one index id (never reused — ADR-0075 D1).
+    pub fn alloc_index_id(&self) -> u32 {
+        self.next_index_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The index id the allocator would hand out next.
+    pub fn next_index_id(&self) -> u32 {
+        self.next_index_id.load(Ordering::Relaxed)
+    }
+
+    /// Allocates one index generation (create + rebuild — ADR-0075 D3).
+    pub fn alloc_index_generation(&self) -> u64 {
+        self.next_index_generation.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The generation the allocator would hand out next.
+    pub fn next_index_generation(&self) -> u64 {
+        self.next_index_generation.load(Ordering::Relaxed)
+    }
+
+    /// The index readiness board (M4.5-S03, ADR-0075 D5).
+    #[must_use]
+    pub fn index_board(&self) -> &Arc<IndexBoard> {
+        &self.index_board
     }
 
     /// Queues `catalog` for a durable swap; returns the epoch to await.
@@ -551,6 +658,9 @@ impl ControlInbox {
                 ControlMsg::Persist(req) => {
                     let mut catalog = req.catalog;
                     catalog.next_id = catalog.next_id.max(self.handle.next_ns_id());
+                    catalog.index.next_id = catalog.index.next_id.max(self.handle.next_index_id());
+                    catalog.index.next_generation =
+                        catalog.index.next_generation.max(self.handle.next_index_generation());
                     write_meta(fs, data_dir, &catalog.encode())?;
                     self.handle.persisted_epoch.store(req.epoch, Ordering::Release);
                 }
@@ -569,34 +679,39 @@ impl ControlHandle {
     /// [`spawn`]; the sim's determinism forbids the thread.
     #[must_use]
     pub fn detached(cells: u16, start_unix_ms: u64) -> (Arc<ControlHandle>, ControlInbox) {
-        let (handle, rx) = ControlHandle::new_parts(FIRST_NAMED_NS_ID, cells, start_unix_ms);
-        let inbox = ControlInbox { rx, handle: Arc::clone(&handle) };
-        (handle, inbox)
+        ControlHandle::detached_with_catalog(None, cells, start_unix_ms)
     }
 
     /// A detached control plane seeded from a recovered catalog (the
-    /// reboot path: ids never regress across restart — ADR-0015 D2).
+    /// reboot path: ids never regress across restart — ADR-0015 D2;
+    /// index counters follow the same rule, ADR-0075 D1).
     #[must_use]
     pub fn detached_with_catalog(
         seed: Option<&NsCatalog>,
         cells: u16,
         start_unix_ms: u64,
     ) -> (Arc<ControlHandle>, ControlInbox) {
-        let next_id = seed.map_or(FIRST_NAMED_NS_ID, |c| c.next_id.max(FIRST_NAMED_NS_ID));
-        let (handle, rx) = ControlHandle::new_parts(next_id, cells, start_unix_ms);
+        let (handle, rx) = ControlHandle::new_parts(seed, cells, start_unix_ms);
         let inbox = ControlInbox { rx, handle: Arc::clone(&handle) };
         (handle, inbox)
     }
 
     fn new_parts(
-        next_id: u32,
+        seed: Option<&NsCatalog>,
         cells: u16,
         start_unix_ms: u64,
     ) -> (Arc<ControlHandle>, mpsc::Receiver<ControlMsg>) {
+        let next_id = seed.map_or(FIRST_NAMED_NS_ID, |c| c.next_id.max(FIRST_NAMED_NS_ID));
+        let next_index_id = seed.map_or(FIRST_INDEX_ID, |c| c.index.next_id.max(FIRST_INDEX_ID));
+        let next_index_generation = seed.map_or(FIRST_INDEX_GENERATION, |c| {
+            c.index.next_generation.max(FIRST_INDEX_GENERATION)
+        });
         let (tx, rx) = mpsc::sync_channel::<ControlMsg>(256);
         let handle = Arc::new(ControlHandle {
             tx,
             next_ns_id: AtomicU32::new(next_id),
+            next_index_id: AtomicU32::new(next_index_id),
+            next_index_generation: AtomicU64::new(next_index_generation),
             next_epoch: AtomicU64::new(0),
             persisted_epoch: Arc::new(AtomicU64::new(0)),
             ckpt_epoch: AtomicU64::new(0),
@@ -605,6 +720,7 @@ impl ControlHandle {
             }),
             recovery: Arc::new(RecoveryBoard::new(cells, start_unix_ms)),
             memory_board: Arc::new(MemoryBoard::new(cells)),
+            index_board: Arc::new(IndexBoard::new(cells)),
         });
         (handle, rx)
     }
@@ -622,8 +738,7 @@ pub fn spawn(
     cells: u16,
     start_unix_ms: u64,
 ) -> Arc<ControlHandle> {
-    let next_id = seed.map_or(FIRST_NAMED_NS_ID, |c| c.next_id.max(FIRST_NAMED_NS_ID));
-    let (handle, rx) = ControlHandle::new_parts(next_id, cells, start_unix_ms);
+    let (handle, rx) = ControlHandle::new_parts(seed, cells, start_unix_ms);
     let allocator = Arc::clone(&handle);
     let persisted = Arc::clone(&handle.persisted_epoch);
     let board = Arc::clone(&handle.recovery);
@@ -661,12 +776,15 @@ fn control_main(
     {
         let handle_msg = |msg: ControlMsg| match msg {
             ControlMsg::Persist(req) => {
-                // The persisted next_id must always cover the
-                // allocator so ids never regress across restart,
-                // even for namespaces whose DDL raced this
-                // snapshot.
+                // The persisted counters must always cover their
+                // allocators so ids and generations never regress
+                // across restart, even for DDL that raced this
+                // snapshot (ADR-0015 D2; index counters ADR-0075 D1).
                 let mut catalog = req.catalog;
                 catalog.next_id = catalog.next_id.max(allocator.next_ns_id());
+                catalog.index.next_id = catalog.index.next_id.max(allocator.next_index_id());
+                catalog.index.next_generation =
+                    catalog.index.next_generation.max(allocator.next_index_generation());
                 let payload = catalog.encode();
                 if let Err(err) = write_meta(&StdSegmentFs, data_dir, &payload) {
                     // §8.4 fail-stop: a DDL was acked against this

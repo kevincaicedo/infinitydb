@@ -29,10 +29,12 @@ fn constructed_report_sums_only_disjoint_resident_domains() {
         doc_slack_bytes: 29,
         doc_scratch_bytes: 31,
         doc_path_cache_bytes: 37,
+        idx_tree_bytes: 47,
+        idx_slack_bytes: 53,
         live_records: 41,
         docs_live: 43,
     };
-    assert_eq!(report.attributed_bytes(), 3 + 5 + 7 + 11 + 19 + 31 + 37);
+    assert_eq!(report.attributed_bytes(), 3 + 5 + 7 + 11 + 19 + 31 + 37 + 47);
 }
 
 #[test]

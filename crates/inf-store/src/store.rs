@@ -378,6 +378,13 @@ pub struct MemoryReport {
     pub doc_scratch_bytes: u64,
     /// One bounded path-program cache per cell; zero in a store-only report.
     pub doc_path_cache_bytes: u64,
+    /// Index-tree reserved bytes (M4.5-S03 L5 domain, ADR-0075 D6). The
+    /// registry is keyspace-owned, so a store-only report holds zero;
+    /// [`Keyspace::report`](crate::Keyspace::report) folds it in.
+    pub idx_tree_bytes: u64,
+    /// Slack inside `idx_tree_bytes` (diagnostic overlay, like
+    /// `doc_slack_bytes` — never double-counted against RSS).
+    pub idx_slack_bytes: u64,
     pub live_records: u64,
     pub docs_live: u64,
 }
@@ -394,6 +401,7 @@ impl MemoryReport {
             + self.doc_resident_bytes
             + self.doc_scratch_bytes
             + self.doc_path_cache_bytes
+            + self.idx_tree_bytes
     }
 }
 
@@ -507,6 +515,8 @@ impl CellStore {
             doc_slack_bytes: docs.domain.slack_bytes,
             doc_scratch_bytes: docs.scratch_bytes,
             doc_path_cache_bytes: 0,
+            idx_tree_bytes: 0,
+            idx_slack_bytes: 0,
             live_records: arena.live_allocs,
             docs_live: docs.domain.docs_live,
         }
