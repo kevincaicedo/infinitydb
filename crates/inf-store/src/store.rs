@@ -1898,7 +1898,7 @@ impl CellStore {
     }
 
     #[inline]
-    fn note_reap_lazy(&mut self) {
+    pub(crate) fn note_reap_lazy(&mut self) {
         self.stats.expired_lazy += 1;
         self.stats.ttl_live = self.stats.ttl_live.saturating_sub(1);
     }

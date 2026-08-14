@@ -15,7 +15,7 @@ Status column tracks arrival.
 | Declaration lifecycle {declared → backfilling → ready → dropping} + fleet-readiness aggregation | `inf-store` / `inf-server::control` | implemented (M4.5-S03, ADR-0075 D3–D5 — explicit invalid-transition rejection; `IndexBoard` per-cell × per-slot ready generations; catalog `ready` ⟺ every cell reports the exact generation) |
 | Cursor/compile binding gate `{ns, index id, generation}` | `inf-store` | implemented (M4.5-S03, ADR-0075 D7 — `IndexRegistry::validate_binding`, typed `{UnknownIndex, StaleGeneration, NotReady}`; S09/S11 consult it) |
 | At-mutation maintenance hook (the ADR-0072 bracket + removal sites) | `inf-store`/`inf-server` | implemented (M4.5-S04, ADR-0076 — attach-block custody, `hash64(key)` pk ref, the numbered-db funnel bracket, death hook + truncate + replay arm) |
-| Backfill state machine (MAINTAIN slices, resumable watermark) | `inf-store` | pending (M4.5-S05) |
+| Backfill state machine (MAINTAIN slices, resumable watermark) | `inf-store` | implemented (M4.5-S05, ADR-0077 — store-resident walk, volatile resume-only watermark (crash ⇒ restart), per-index jobs, slot = id-rank, MAINTAIN-edge catalog flip) |
 | Index checkpoint sidecar v1 (`.ick` v2 tag 0x06) | `inf-log` | pending (M4.5-S06 — constraints frozen in ADR-0073) |
 | Access-program form v1 | `inf-query` | pending (M4.5-S09) |
 | Predicate VM bytecode v1 | `inf-query` | pending (M4.5-S07/S08) |
@@ -86,3 +86,35 @@ Status column tracks arrival.
   nan/toolong skips, inserts/removes/prunes, degraded trips) via
   `Keyspace::idx_counters[_total]`; `INFO stats` renders the cell-scope
   fold; `INF.IDX LIST` (S10) renders per-index detail.
+
+## Backfill surface (M4.5-S05, ADR-0077 — the plan's backfill machine as-built)
+
+- **The tick:** `Keyspace::idx_backfill_tick(now, BackfillBudget)` —
+  registry sync (job create / rebuild-reset / drop / park) then budgeted
+  walk slices, tick-granularity round-robin across jobs. **Serving cells
+  only**: the plane gates on recovery completion (replay maintains
+  nothing by default, ADR-0076 D7). The walk is `CellStore`-resident on
+  the reverse-binary home-group enumeration (the SCAN guarantee), reaps
+  expired records on encounter, and inserts via the attach block's
+  idempotent `backfill_insert_doc`.
+- **Watermark (ADR-0077 D2):** the cursor is volatile and resume-only —
+  never consulted for membership, never persisted; **crash ⇒ restart the
+  walk**. Boot clears jobs (`seed_catalog`); rebuild (generation bump)
+  resets them.
+- **Completion (D4):** store materialized → `idx_set_converged` →
+  cell machine `Ready`; the plane republishes `(slot, generation)` to
+  `IndexBoard` **every** MAINTAIN tick. `slot = idx_slot_of(id)` — the
+  id's rank among live declarations (D5; derived, never stored; false
+  `fleet_ready` impossible — generations are globally unique).
+- **The catalog flip (D6):** each cell flips its local entry
+  `backfilling → ready` on observing `fleet_ready(slot, generation)` in
+  MAINTAIN (`idx_fleet_candidates` → `set_catalog_state`); cell 0 alone
+  persists on its flip edge (the ADR-0075 D4 `was_ready` hint for S06).
+- **Failure (D7):** eval overflow or tree-capacity exhaustion mid-walk
+  degrades the index and **parks** the build (`BackfillPhase::Parked`) —
+  no convergence, no publication; rebuild resets. Fault point
+  `idx_backfill_trip`.
+- **Progress (D8):** `idx_backfill_progress()` (per-job rows) and
+  `idx_backfill_info()` (phase counts + cumulative totals); `INFO stats`
+  renders `idx_backfill_*`; per-index rendering rides S10's
+  `INF.IDX LIST`. DST: `inf-sim --scenario m45-backfill`.

@@ -467,7 +467,7 @@ type SimLoop = CellLoop<SimDriver, Rc<VirtualClock>>;
 pub(crate) struct Node {
     cells: Vec<(SimLoop, SimPlane)>,
     pub(crate) nets: Vec<Rc<RefCell<CellNet>>>,
-    control: std::sync::Arc<inf_server::ControlHandle>,
+    pub(crate) control: std::sync::Arc<inf_server::ControlHandle>,
     inbox: ControlInbox,
     data_dir: PathBuf,
 }

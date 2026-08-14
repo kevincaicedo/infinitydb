@@ -145,6 +145,39 @@ fn main() {
         }
         return;
     }
+    // The M4.5-S05 backfill scenario (crash at every backfill phase;
+    // ready only with oracle-verified contents — ADR-0077).
+    if scenario_name == "m45-backfill" {
+        let scenario = inf_sim::BackfillScenario::m45_backfill(seed);
+        let report = inf_sim::run_backfill_scenario(&scenario);
+        println!(
+            "inf-sim: scenario m45-backfill seed {seed:#x}: {} boots, cuts {:?}, \
+             {} ready checks, {} refused bindings, {} raced mutations, {} steps, \
+             hash {:#018x}",
+            report.boots,
+            report.cuts,
+            report.ready_checks,
+            report.refused_bindings,
+            report.raced_mutations,
+            report.scheduler_steps,
+            report.trace_hash
+        );
+        if verify {
+            let second = inf_sim::run_backfill_scenario(&scenario);
+            assert_eq!(
+                report.trace_hash, second.trace_hash,
+                "m45-backfill determinism: second run diverged"
+            );
+            println!("inf-sim: determinism verified — second run hash-identical");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
     // The M4-S21 disk-budget admission scenario (typed DISKFULL, refusal
     // purity, the compaction reserve, automatic recovery — ADR-0063).
     if scenario_name == "m4-diskfull" {

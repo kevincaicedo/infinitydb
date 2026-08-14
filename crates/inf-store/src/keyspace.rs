@@ -39,6 +39,7 @@ use crate::address_space::{AddressSpaceConfig, TieringCounters};
 use crate::catalog::{IndexCatalog, NsCatalog};
 use crate::demote::{DemoteStats, DemotionConfig, EvictionPressure};
 use crate::evict::{EvictStats, EvictionPolicy};
+use crate::index_backfill::{BackfillInfo, BackfillJob, BackfillTickStats};
 use crate::index_registry::{IndexError, IndexId, IndexRegistry, IndexSpec, IndexState};
 use crate::ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsRegistry, NsSpec};
 use crate::record::ExtentRef;
@@ -176,6 +177,14 @@ pub struct Keyspace {
     /// machine states beside them. Consulted at DDL/MAINTAIN rate only —
     /// the mutation path reads a cached flag (S04).
     indexes: IndexRegistry,
+    /// Per-cell backfill jobs (M4.5-S05, ADR-0077): volatile by design —
+    /// nothing here is durable or recovery-load-bearing; boot re-derives
+    /// jobs from the seeded registry (D2: crash ⇒ restart the walk).
+    pub(crate) backfill: Vec<BackfillJob>,
+    /// Cumulative walk totals for INFO (per boot, like the S04 `idx_*`
+    /// counter lines).
+    backfill_docs_total: u64,
+    backfill_inserted_total: u64,
 }
 
 impl Keyspace {
@@ -195,6 +204,9 @@ impl Keyspace {
             tiered_va_limit_bytes: TIERED_VA_LIMIT_DEFAULT,
             pending_displace: Vec::new(),
             indexes: IndexRegistry::default(),
+            backfill: Vec::new(),
+            backfill_docs_total: 0,
+            backfill_inserted_total: 0,
         };
         // db0 is eager: it serves every connection that never SELECTs.
         let _ = ks.db_mut(0);
@@ -1142,6 +1154,9 @@ impl Keyspace {
         self.named_stores.clear();
         self.tiered_stores.clear();
         self.indexes = IndexRegistry::default();
+        // Boot restarts every build (ADR-0077 D2): jobs re-derive from
+        // the seeded registry at the first MAINTAIN tick.
+        self.backfill.clear();
         for spec in &cat.entries {
             // `ns_create` materializes tiered entries under the D4 bound
             // — seeding and DDL share one path, so they cannot drift.
@@ -1270,6 +1285,26 @@ impl Keyspace {
         &self.indexes
     }
 
+    /// Split borrow for the backfill sync's retain pass (M4.5-S05).
+    pub(crate) fn backfill_and_registry_mut(&mut self) -> (&mut Vec<BackfillJob>, &IndexRegistry) {
+        (&mut self.backfill, &self.indexes)
+    }
+
+    /// Folds one tick into the cumulative INFO totals (M4.5-S05).
+    pub(crate) fn idx_backfill_note_totals(&mut self, stats: &BackfillTickStats) {
+        self.backfill_docs_total += stats.docs_scanned;
+        self.backfill_inserted_total += stats.entries_inserted;
+    }
+
+    /// The cumulative walk totals half of [`BackfillInfo`] (M4.5-S05).
+    pub(crate) fn backfill_totals(&self) -> BackfillInfo {
+        BackfillInfo {
+            docs_scanned_total: self.backfill_docs_total,
+            entries_inserted_total: self.backfill_inserted_total,
+            ..BackfillInfo::default()
+        }
+    }
+
     pub fn idx_registry_mut(&mut self) -> &mut IndexRegistry {
         &mut self.indexes
     }
@@ -1293,7 +1328,7 @@ impl Keyspace {
     /// The store owning `ns` **iff already materialized** (attach sync
     /// points must never force materialization on the DDL path).
     #[cfg(feature = "doc")]
-    fn existing_store_mut(&mut self, ns: NsId) -> Option<&mut CellStore> {
+    pub(crate) fn existing_store_mut(&mut self, ns: NsId) -> Option<&mut CellStore> {
         if ns.0 < FIRST_NAMED_NS_ID {
             self.dbs[ns.0 as usize].as_deref_mut()
         } else {
@@ -1303,7 +1338,7 @@ impl Keyspace {
 
     /// Read-only resolution of `ns` to its store (defaults + named).
     #[cfg(feature = "doc")]
-    fn existing_store(&self, ns: NsId) -> Option<&CellStore> {
+    pub(crate) fn existing_store(&self, ns: NsId) -> Option<&CellStore> {
         if ns.0 < FIRST_NAMED_NS_ID {
             self.dbs.get(ns.0 as usize).and_then(|s| s.as_deref())
         } else {

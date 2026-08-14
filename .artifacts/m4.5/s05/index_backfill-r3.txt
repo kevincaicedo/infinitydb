@@ -1,0 +1,4 @@
+corpus: 10000000 docs in 2.3s (926 MiB attributed)
+backfill: 10000000 entries processed (9995215 fresh, rest raced by the hook) in 9721 slices; walk 5.78s → 1731284 entries/s walk-time, 1719768 entries/s wall
+slice: max 5.950 ms (cap 1024 docs); foreground (queued-arrival model, 38884 samples): p50 0.606 ms · p99 0.742 ms · p99.9 0.965 ms · max 5.951 ms
+co-gate: entries/s PASS (≥ 500k) · foreground p99.9 PASS (< 2 ms) → PASS

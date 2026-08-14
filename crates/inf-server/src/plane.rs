@@ -110,6 +110,14 @@ const ARGV_INLINE: usize = 16;
 /// Hard cap on wheel fires per expiry MAINTAIN slice — the debt-aware
 /// escalation (M1-S05) may multiply the deficit budget, never exceed this.
 const MAX_EXPIRY_FIRES_PER_SLICE: u32 = 4096;
+/// Hard caps on one backfill MAINTAIN tick (M4.5-S05, ADR-0077 D3): the
+/// deficit budget scales the slice, these bound its worst case — the
+/// docs cap keeps one tick well under the 2 ms foreground co-gate at
+/// the measured per-document walk cost.
+#[cfg(feature = "doc")]
+const MAX_BACKFILL_DOCS_PER_TICK: u32 = 1024;
+#[cfg(feature = "doc")]
+const MAX_BACKFILL_STEPS_PER_TICK: u32 = 8192;
 /// SCAN cursor layout (M1-S02): `{cell:16 | per-cell cursor:48}`.
 const SCAN_CELL_SHIFT: u32 = 48;
 const SCAN_LOCAL_MASK: u64 = (1 << SCAN_CELL_SHIFT) - 1;
@@ -2388,6 +2396,62 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 (stats.reaped + stats.stale).min(u64::from(u32::MAX)) as u32 + stats.steps / 64;
             if units > 0 {
                 cx.charge(GroupClass::Maintenance, units);
+            }
+        }
+        // ---- index backfill (M4.5-S05, ADR-0077): budgeted walk slices
+        // on the Maintenance class, then readiness publication and the D6
+        // catalog flip. Guarded on registry emptiness (one Vec-len load
+        // when the feature is unused) and on recovery completion — replay
+        // maintains nothing by default (ADR-0076 D7), so a walk over a
+        // half-replayed store would go stale silently.
+        #[cfg(feature = "doc")]
+        if self.boot.is_none() {
+            let mut store = self.shared.store.borrow_mut();
+            if !store.idx_registry().is_empty() {
+                let budget = cx.budget(GroupClass::Maintenance);
+                if budget > 0 {
+                    let slice = inf_store::BackfillBudget {
+                        max_docs: budget.saturating_mul(4).min(MAX_BACKFILL_DOCS_PER_TICK),
+                        max_steps: budget.saturating_mul(32).min(MAX_BACKFILL_STEPS_PER_TICK),
+                    };
+                    let stats = store.idx_backfill_tick(cx.now, slice);
+                    let units = (stats.docs_scanned + stats.reaped).min(u64::from(u32::MAX)) as u32
+                        + stats.steps / 64;
+                    if units > 0 {
+                        cx.charge(GroupClass::Maintenance, units);
+                    }
+                }
+                if let Some(control) = self.shared.control.borrow().as_ref() {
+                    let board = control.index_board();
+                    let cell = self.shared.cell.0;
+                    // Republish every tick (ADR-0077 D4): ≤ 64 relaxed
+                    // stores, and it makes the D5 rank rule self-healing.
+                    for (slot, generation) in store.idx_ready_reports() {
+                        board.publish_ready(cell, slot, generation);
+                    }
+                    let mut flipped = false;
+                    for (id, slot, generation) in store.idx_fleet_candidates() {
+                        if board.fleet_ready(slot, generation) {
+                            // The ADR-0077 D6 flip: monotone, per cell,
+                            // generation-exact.
+                            store
+                                .idx_registry_mut()
+                                .set_catalog_state(id, inf_store::IndexState::Ready)
+                                .expect("Backfilling → Ready is an ADR-0075 D3 edge");
+                            flipped = true;
+                        }
+                    }
+                    // One writer persists the flip (cell 0) — the durable
+                    // `ready` is the ADR-0075 D4 rebuild-class hint S06's
+                    // sidecar load reads at the next boot.
+                    if flipped && cell == 0 {
+                        control.request_persist(store.export_catalog(
+                            control.next_ns_id(),
+                            control.next_index_id(),
+                            control.next_index_generation(),
+                        ));
+                    }
+                }
             }
         }
         // ---- CLIENT KILL sweep: ids encode {slot:32 | generation:32}, so

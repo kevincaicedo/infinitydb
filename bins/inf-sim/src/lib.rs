@@ -12,6 +12,7 @@
 //! byte-for-byte (the single-key linearizability oracle: apply points on a
 //! single thread form a real total order).
 
+pub mod backfill;
 pub mod bootstorm;
 pub mod coldstorm;
 pub mod combined;
@@ -26,6 +27,7 @@ pub mod resp;
 pub mod steel;
 pub mod tiered;
 
+pub use backfill::{BackfillReport, BackfillScenario, run_backfill_scenario};
 pub use bootstorm::{BootStormReport, BootStormScenario, run_boot_storm_scenario};
 pub use coldstorm::{ColdStormReport, ColdStormScenario, run_cold_storm_scenario};
 pub use combined::{CombinedReport, CombinedScenario, run_combined_scenario};

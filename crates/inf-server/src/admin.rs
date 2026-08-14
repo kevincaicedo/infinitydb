@@ -317,6 +317,17 @@ pub(crate) fn info(
             push(&mut text, &format!("idx_skipped_toolong:{}", idx.skipped_toolong));
             push(&mut text, &format!("idx_degraded_trips:{}", idx.degraded_trips));
         }
+        // M4.5-S05 (ADR-0077 D8): backfill progress, cell-scope fold —
+        // phase counts plus cumulative walk totals (same per-boot
+        // cumulative deviation as the idx_* lines above).
+        {
+            let backfill = ks.idx_backfill_info();
+            push(&mut text, &format!("idx_backfill_walking:{}", backfill.walking));
+            push(&mut text, &format!("idx_backfill_parked:{}", backfill.parked));
+            push(&mut text, &format!("idx_backfill_published:{}", backfill.published));
+            push(&mut text, &format!("idx_backfill_scanned:{}", backfill.docs_scanned_total));
+            push(&mut text, &format!("idx_backfill_inserted:{}", backfill.entries_inserted_total));
+        }
         push(&mut text, &format!("pubsub_channels:{}", node.pubsub_channels.get()));
         push(&mut text, &format!("pubsub_patterns:{}", node.pubsub_patterns.get()));
         push(
