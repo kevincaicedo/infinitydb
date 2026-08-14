@@ -1432,6 +1432,9 @@ pub(crate) fn op_error(e: OpError, w: &mut RespWriter<'_>) {
         OpError::DiskFull(inf_store::DiskFullCause::Device) => {
             w.error("DISKFULL tier device out of space (ENOSPC)")
         }
+        // M4.5-S04 (ADR-0072 D7.1): the bracket refused before anything
+        // changed; one message definition rides the refusal type.
+        OpError::IndexMaintenance(refusal) => w.error(refusal.message()),
     }
 }
 

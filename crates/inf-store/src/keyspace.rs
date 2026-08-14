@@ -213,6 +213,10 @@ impl Keyspace {
             cfg.evict_seed = self.cfg.evict_seed ^ (db as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let mut store = Box::new(CellStore::new(cfg));
             store.set_eviction_policy(self.pressure.policy);
+            // Attach-block sync point (ADR-0076 D1): declarations that
+            // predate materialization install their trees now.
+            #[cfg(feature = "doc")]
+            install_ns_attaches(&self.indexes, NsId(db as u32), &mut store);
             self.dbs[db] = Some(store);
         }
         self.dbs[db].as_mut().expect("materialized above")
@@ -267,14 +271,13 @@ impl Keyspace {
             total.doc_slack_bytes += r.doc_slack_bytes;
             total.doc_scratch_bytes += r.doc_scratch_bytes;
             total.doc_path_cache_bytes += r.doc_path_cache_bytes;
+            // Index trees live in the owning store's attach block since
+            // ADR-0076 D1 — the fold rides the per-store reports.
+            total.idx_tree_bytes += r.idx_tree_bytes;
+            total.idx_slack_bytes += r.idx_slack_bytes;
             total.live_records += r.live_records;
             total.docs_live += r.docs_live;
         }
-        // Index trees are keyspace-owned (per-ns registry, M4.5-S03) —
-        // folded here so per-store reports stay store-scoped.
-        let idx = self.indexes.memory_total();
-        total.idx_tree_bytes = idx.idx_tree_bytes;
-        total.idx_slack_bytes = idx.idx_slack_bytes;
         total
     }
 
@@ -692,7 +695,7 @@ impl Keyspace {
     /// removal hook, never directly.
     pub fn used_bytes(&self) -> u64 {
         let named: u64 = self.named_stores.iter().map(|e| e.store.used_bytes()).sum();
-        let idx = self.indexes.memory_total().idx_tree_bytes;
+        let idx: u64 = self.all_stores().map(|s| s.idx_memory().idx_tree_bytes).sum();
         self.dbs().map(|(_, s)| s.used_bytes()).sum::<u64>() + named + idx
     }
 
@@ -712,7 +715,7 @@ impl Keyspace {
                 self.named_stores[i].over_limit = false;
                 continue;
             }
-            let idx = self.indexes.memory_of(entry.id).idx_tree_bytes;
+            let idx = entry.store.idx_memory().idx_tree_bytes;
             let used = self.named_stores[i].store.used_bytes() + idx;
             self.named_stores[i].over_limit = used > self.named_stores[i].budget_share;
         }
@@ -752,7 +755,7 @@ impl Keyspace {
         }
         // The store-side target leaves room for the namespace's index
         // trees (ADR-0075 D6: the flag compares store + idx vs share).
-        let idx = self.indexes.memory_of(ns).idx_tree_bytes;
+        let idx = self.named_stores[i].store.idx_memory().idx_tree_bytes;
         let target = self.named_stores[i].budget_share.saturating_sub(idx);
         self.evict_ns_toward(i, target, INLINE_MAX_EVICTIONS, now);
         self.refresh_pressure();
@@ -794,7 +797,7 @@ impl Keyspace {
             if share != 0 {
                 // Store-side watermark: the share minus the namespace's
                 // index-tree bytes (ADR-0075 D6 accounting).
-                let idx = self.indexes.memory_of(self.named_stores[i].id).idx_tree_bytes;
+                let idx = self.named_stores[i].store.idx_memory().idx_tree_bytes;
                 let target = (share - share / 16).saturating_sub(idx);
                 let step = self.evict_ns_toward(i, target, left, now);
                 left -= (step.evicted as u32).min(left);
@@ -923,7 +926,23 @@ impl Keyspace {
         let Some(rec) = self.db_mut(src_db).copy_out(src, now) else {
             return Ok(crate::store::CopyResult::SourceMissing);
         };
-        self.db_mut(dst_db).copy_in(dst, &rec, replace, now)
+        // Cross-db COPY is excluded from the plane brackets (ADR-0076
+        // D3): the destination store is only unambiguous here.
+        let dst_store = self.db_mut(dst_db);
+        #[cfg(feature = "doc")]
+        {
+            dst_store.idx_bracket_begin(&[dst], None).map_err(OpError::IndexMaintenance)?;
+            let result = dst_store.copy_in(dst, &rec, replace, now);
+            match &result {
+                Ok(crate::store::CopyResult::Copied) => {
+                    dst_store.idx_bracket_commit(&[dst], crate::index_maint::MaintMode::Strict);
+                }
+                _ => dst_store.idx_bracket_abort(),
+            }
+            result
+        }
+        #[cfg(not(feature = "doc"))]
+        dst_store.copy_in(dst, &rec, replace, now)
     }
 
     // ---- named namespaces (M1-S08 registry; M2-S08 stores + catalog) ----
@@ -1064,6 +1083,10 @@ impl Keyspace {
         cfg.evict_seed = self.cfg.evict_seed ^ u64::from(id.0).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mut store = Box::new(CellStore::new(cfg));
         store.set_eviction_policy(policy);
+        // Attach-block sync point (ADR-0076 D1): declarations that
+        // predate materialization install their trees now.
+        #[cfg(feature = "doc")]
+        install_ns_attaches(&self.indexes, id, &mut store);
         self.named_stores.push(NamedStore { id, store, budget_share, over_limit: false });
         Some(self.named_stores.last_mut().expect("pushed above").store.as_mut())
     }
@@ -1134,6 +1157,20 @@ impl Keyspace {
             // refusal here is a violated invariant, not an operating error.
             self.indexes.create(seeded, was_ready).expect("catalog decode validated the record");
         }
+        // Attach-block resync (ADR-0076 D1): default dbs survive a
+        // re-seed materialized, so any stale attach is rebuilt from the
+        // fresh registry (named stores were just cleared and rebuild
+        // their attaches at materialization).
+        #[cfg(feature = "doc")]
+        {
+            let Keyspace { dbs, indexes, .. } = self;
+            for (db, store) in dbs.iter_mut().enumerate() {
+                if let Some(store) = store.as_deref_mut() {
+                    store.idx = crate::index_maint::CellIndexes::default();
+                    install_ns_attaches(indexes, NsId(db as u32), store);
+                }
+            }
+        }
         self.refresh_pressure();
         Ok(())
     }
@@ -1177,7 +1214,17 @@ impl Keyspace {
             }
         }
         validate_program_gate(&spec.program)?;
+        #[cfg(feature = "doc")]
+        let attach = (spec.id, spec.generation, spec.key_type, spec.ns);
+        #[cfg(feature = "doc")]
+        let program = spec.program.clone();
         self.indexes.create(spec, false)?;
+        // Attach-block sync point (ADR-0076 D1): a materialized store
+        // gets its tree now; a lazy store installs at materialization.
+        #[cfg(feature = "doc")]
+        if let Some(store) = self.existing_store_mut(attach.3) {
+            store.idx.install(attach.0, attach.1, attach.2, &program);
+        }
         self.refresh_pressure();
         Ok(())
     }
@@ -1188,7 +1235,31 @@ impl Keyspace {
     /// # Errors
     /// `Unknown` for an unregistered id.
     pub fn idx_drop_finish(&mut self, id: IndexId) -> Result<(), IndexError> {
-        self.indexes.remove(id)?;
+        let spec = self.indexes.remove(id)?;
+        #[cfg(feature = "doc")]
+        if let Some(store) = self.existing_store_mut(spec.ns) {
+            store.idx.remove(id);
+        }
+        #[cfg(not(feature = "doc"))]
+        let _ = spec;
+        self.refresh_pressure();
+        Ok(())
+    }
+
+    /// Rebuild on this cell: the catalog transition (generation bump,
+    /// ADR-0075 D3) and the attach tree reset (ADR-0076 D1) together.
+    ///
+    /// # Errors
+    /// `Unknown` / `InvalidTransition` (only `Ready` rebuilds).
+    pub fn idx_rebuild(&mut self, id: IndexId, new_generation: u64) -> Result<(), IndexError> {
+        self.indexes.rebuild(id, new_generation)?;
+        #[cfg(feature = "doc")]
+        {
+            let ns = self.indexes.get_by_id(id).expect("just rebuilt").ns;
+            if let Some(store) = self.existing_store_mut(ns) {
+                store.idx.reset_tree(id, new_generation);
+            }
+        }
         self.refresh_pressure();
         Ok(())
     }
@@ -1209,6 +1280,170 @@ impl Keyspace {
     #[must_use]
     pub fn ns_has_indexes(&self, ns: NsId) -> bool {
         self.indexes.has_indexes(ns)
+    }
+
+    /// The plane's bracket guard (M4.5-S04, ADR-0076 D3): one cheap test
+    /// per write command — with zero indexes anywhere it is a load of an
+    /// empty list's length.
+    #[must_use]
+    pub fn ns_indexed(&self, ns: NsId) -> bool {
+        self.indexes.has_indexes(ns)
+    }
+
+    /// The store owning `ns` **iff already materialized** (attach sync
+    /// points must never force materialization on the DDL path).
+    #[cfg(feature = "doc")]
+    fn existing_store_mut(&mut self, ns: NsId) -> Option<&mut CellStore> {
+        if ns.0 < FIRST_NAMED_NS_ID {
+            self.dbs[ns.0 as usize].as_deref_mut()
+        } else {
+            self.named_stores.iter_mut().find(|e| e.id == ns).map(|e| e.store.as_mut())
+        }
+    }
+
+    /// Read-only resolution of `ns` to its store (defaults + named).
+    #[cfg(feature = "doc")]
+    fn existing_store(&self, ns: NsId) -> Option<&CellStore> {
+        if ns.0 < FIRST_NAMED_NS_ID {
+            self.dbs.get(ns.0 as usize).and_then(|s| s.as_deref())
+        } else {
+            self.named_stores.iter().find(|e| e.id == ns).map(|e| e.store.as_ref())
+        }
+    }
+
+    /// The bracket pre-half for one command on `ns` (ADR-0072 D3 rows —
+    /// the plane calls this after admission, before execution).
+    /// Materializes the store: an indexed namespace's first write must
+    /// still run its bracket.
+    ///
+    /// # Errors
+    /// [`IdxMaintRefusal`] — the caller writes the typed refusal and the
+    /// command never executes (nothing changed).
+    #[cfg(feature = "doc")]
+    pub fn idx_bracket_begin(
+        &mut self,
+        ns: NsId,
+        keys: &[&[u8]],
+        mutation_path: Option<&inf_doc::PathProgram>,
+    ) -> Result<(), crate::index_maint::IdxMaintRefusal> {
+        let store = if ns.0 < FIRST_NAMED_NS_ID {
+            self.db_mut(ns.0 as usize)
+        } else {
+            let Some(store) = self.ns_store_mut(ns) else { return Ok(()) };
+            store
+        };
+        store.idx_bracket_begin(keys, mutation_path)
+    }
+
+    /// The bracket commit-half (after the mutation applied and, on
+    /// durable namespaces, staged). Infallible — failures land in the
+    /// degraded backstop (ADR-0072 D7.2).
+    #[cfg(feature = "doc")]
+    pub fn idx_bracket_commit(&mut self, ns: NsId, keys: &[&[u8]]) {
+        if let Some(store) = self.existing_store_mut(ns) {
+            store.idx_bracket_commit(keys, crate::index_maint::MaintMode::Strict);
+        }
+    }
+
+    /// Aborts an open bracket without applying (the plane's refusal
+    /// paths between the halves).
+    #[cfg(feature = "doc")]
+    pub fn idx_bracket_abort(&mut self, ns: NsId) {
+        if let Some(store) = self.existing_store_mut(ns) {
+            store.idx_bracket_abort();
+        }
+    }
+
+    /// Mutable tree access for `(ns, id)` — S05's backfill walk inserts
+    /// through this; tests grow trees without a document corpus.
+    #[cfg(feature = "doc")]
+    pub fn idx_tree_mut(
+        &mut self,
+        ns: NsId,
+        id: IndexId,
+    ) -> Option<&mut crate::index_registry::IndexTree> {
+        self.existing_store_mut(ns).and_then(|s| s.idx.tree_mut(id))
+    }
+
+    /// This cell's tree for `(ns, id)` (tests, S05's walk, S11's range
+    /// reads) — `None` until the store materializes or when undeclared.
+    pub fn idx_tree(&self, ns: NsId, id: IndexId) -> Option<&crate::index_registry::IndexTree> {
+        #[cfg(feature = "doc")]
+        {
+            self.existing_store(ns).and_then(|s| s.idx.tree(id))
+        }
+        #[cfg(not(feature = "doc"))]
+        {
+            let _ = (ns, id);
+            None
+        }
+    }
+
+    /// The cell-local serving veto (ADR-0072 D7.2): `Some(true)` means
+    /// queries must refuse with the rebuild-path error (S11 consults it
+    /// beside the registry's binding gate).
+    pub fn idx_degraded(&self, ns: NsId, id: IndexId) -> Option<bool> {
+        #[cfg(feature = "doc")]
+        {
+            self.existing_store(ns).and_then(|s| s.idx.is_degraded(id))
+        }
+        #[cfg(not(feature = "doc"))]
+        {
+            let _ = (ns, id);
+            None
+        }
+    }
+
+    /// Per-index maintenance counters (S10's `INF.IDX LIST` renders
+    /// these; tests assert them).
+    pub fn idx_counters(&self, ns: NsId, id: IndexId) -> Option<crate::index_maint::IdxCounters> {
+        #[cfg(feature = "doc")]
+        {
+            self.existing_store(ns).and_then(|s| s.idx.counters(id))
+        }
+        #[cfg(not(feature = "doc"))]
+        {
+            let _ = (ns, id);
+            None
+        }
+    }
+
+    /// Node-fold of the maintenance counters (the INFO stats lines).
+    pub fn idx_counters_total(&self) -> crate::index_maint::IdxCounters {
+        let mut total = crate::index_maint::IdxCounters::default();
+        for store in self.all_stores() {
+            total.absorb(&store.idx.counters_fold());
+        }
+        total
+    }
+
+    /// Marks this cell's copy of `(ns, id)` converged (S05 flips it when
+    /// the backfill walk completes; the `Strict` found/fresh asserts
+    /// apply only past it).
+    #[cfg(feature = "doc")]
+    pub fn idx_set_converged(&mut self, ns: NsId, id: IndexId, converged: bool) {
+        if let Some(store) = self.existing_store_mut(ns) {
+            store.idx.set_converged(id, converged);
+        }
+    }
+
+    /// Arms replay-time maintenance on `ns` (ADR-0076 D7): `None` (the
+    /// boot default) means replay does not maintain — the no-sidecar
+    /// path rebuilds via S05. S06's sidecar load arms `CatchUp`;
+    /// rebuild-through-replay tests arm `Strict`.
+    #[cfg(feature = "doc")]
+    pub fn idx_set_replay_maintenance(
+        &mut self,
+        ns: NsId,
+        mode: Option<crate::index_maint::MaintMode>,
+    ) {
+        let store = if ns.0 < FIRST_NAMED_NS_ID {
+            self.db_mut(ns.0 as usize)
+        } else {
+            let Some(store) = self.ns_store_mut(ns) else { return };
+            store
+        };
+        store.idx.set_replay_maintenance(mode);
     }
 
     // ---- replay (M2-S08, ADR-0015 D7) ----
@@ -1244,14 +1479,30 @@ impl Keyspace {
                 let Some(store) = self.replay_store(ns) else {
                     return Ok(ReplayOutcome::SkippedUnknownNs);
                 };
-                store.replay_set(key, value, now).map_err(ReplayError::Store)?;
+                // Replay maintenance (ADR-0072 D4): a string image over a
+                // document key is an overwrite death — the same bracket,
+                // the same code path, dialed by the store's replay mode.
+                #[cfg(feature = "doc")]
+                let maint = store.idx_replay_begin(key);
+                let outcome = store.replay_set(key, value, now);
+                #[cfg(feature = "doc")]
+                if let Some(mode) = maint {
+                    store.idx_bracket_commit(&[key], mode);
+                }
+                outcome.map_err(ReplayError::Store)?;
                 Ok(ReplayOutcome::Applied)
             }
             LogRecordView::Delete { ns, key } => {
                 let Some(store) = self.replay_store(ns) else {
                     return Ok(ReplayOutcome::SkippedUnknownNs);
                 };
+                #[cfg(feature = "doc")]
+                let maint = store.idx_replay_begin(key);
                 store.replay_del(key, now);
+                #[cfg(feature = "doc")]
+                if let Some(mode) = maint {
+                    store.idx_bracket_commit(&[key], mode);
+                }
                 Ok(ReplayOutcome::Applied)
             }
             LogRecordView::ExpireAt { ns, at_unix_ms, key } => {
@@ -1285,7 +1536,12 @@ impl Keyspace {
                 };
                 #[cfg(feature = "doc")]
                 {
-                    store.replay_json_full(key, lineage, version, idoc, now)?;
+                    let maint = store.idx_replay_begin(key);
+                    let outcome = store.replay_json_full(key, lineage, version, idoc, now);
+                    if let Some(mode) = maint {
+                        store.idx_bracket_commit(&[key], mode);
+                    }
+                    outcome?;
                     Ok(ReplayOutcome::Applied)
                 }
                 #[cfg(not(feature = "doc"))]
@@ -1314,7 +1570,8 @@ impl Keyspace {
                         .map_err(ReplayError::InvalidPathProgram)?;
                     let op = inf_doc::decode_apply_op(opcode, operand)
                         .map_err(ReplayError::InvalidDelta)?;
-                    match store.replay_json_delta(
+                    let maint = store.idx_replay_begin(key);
+                    let outcome = store.replay_json_delta(
                         key,
                         crate::doc::DocDeltaWitness {
                             lineage,
@@ -1325,7 +1582,11 @@ impl Keyspace {
                         &program,
                         &op,
                         now,
-                    )? {
+                    );
+                    if let Some(mode) = maint {
+                        store.idx_bracket_commit(&[key], mode);
+                    }
+                    match outcome? {
                         crate::doc::DocReplayOutcome::Applied => Ok(ReplayOutcome::Applied),
                         crate::doc::DocReplayOutcome::SkippedStale => {
                             Ok(ReplayOutcome::SkippedDocDeltaStale)
@@ -1547,6 +1808,16 @@ impl Keyspace {
 /// node `maxmemory`. `0` means "no budget" (the inheritance leg), so a
 /// budget smaller than the cell count floors at 1 byte per cell — a
 /// nonsense-tiny budget stays a budget, never accidentally unlimited.
+/// Install every declaration of `ns` into a store's attach block — the
+/// ADR-0076 D1 sync helper shared by materialization, DDL, and the seed
+/// resync. The registry validated each program at its trust boundary.
+#[cfg(feature = "doc")]
+fn install_ns_attaches(indexes: &IndexRegistry, ns: NsId, store: &mut CellStore) {
+    for spec in indexes.iter().filter(|s| s.ns == ns) {
+        store.idx.install(spec.id, spec.generation, spec.key_type, &spec.program);
+    }
+}
+
 /// The DDL-side program gauntlet (ADR-0075 D2.4) — byte-valid M3
 /// bytecode inside the indexable-path fence. A doc-less build refuses:
 /// it could not maintain the projection it would be declaring (L8).
@@ -2014,7 +2285,7 @@ mod tests {
         assert!(!ks.ns_over_limit(NsId(16)), "no index bytes yet — under budget");
         // Grow the tree past the headroom; the flag must flip on the
         // combined comparison and the report must attribute the bytes.
-        let tree = ks.idx_registry_mut().tree_mut(IndexId(1)).expect("tree");
+        let tree = ks.idx_tree_mut(NsId(16), IndexId(1)).expect("tree");
         for i in 0..4096u64 {
             tree.insert(&i.to_be_bytes(), i).expect("insert");
         }

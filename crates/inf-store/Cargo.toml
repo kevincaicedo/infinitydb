@@ -77,6 +77,12 @@ harness = false
 test = false
 
 [[bench]]
+name = "index_maint"
+harness = false
+test = false
+required-features = ["doc"]
+
+[[bench]]
 name = "doc_ingest"
 harness = false
 test = false

@@ -204,6 +204,40 @@ pub(crate) fn payload_of(
     DocPayload::None
 }
 
+/// The form-agnostic root cursor of the document record at `addr`
+/// (`None` for non-document records). Free-standing — the M4.5-S04
+/// maintenance hook calls it from destructured death sites and bracket
+/// peeks (ADR-0076 D1); `json_get` shares it so the form dispatch has
+/// exactly one implementation.
+#[cfg(feature = "doc")]
+pub(crate) fn doc_root_at<'a>(
+    arena: &'a Arena,
+    docs: &'a DocStore,
+    addr: ArenaAddr,
+    len: usize,
+) -> Option<DocValue<'a>> {
+    let view = RecordView::new(arena.bytes(addr, len));
+    if view.type_tag() != TypeTag::JsonDoc {
+        return None;
+    }
+    let value = view.value();
+    Some(match value[0] {
+        FORM_INLINE => {
+            DocValue::from(TapeDoc::from_validated_bytes(&value[VALUE_PREFIX_LEN..]).root())
+        }
+        FORM_TAPE => {
+            let (baddr, blen) = decode_tape_handle(value);
+            let bytes = docs.arena.bytes(baddr, blen as usize);
+            DocValue::from(TapeDoc::from_validated_bytes(bytes).root())
+        }
+        FORM_TREE => {
+            let (root, mem, _) = decode_tree_handle(value);
+            ArenaDoc::from_parts(root, mem).root_value(&docs.arena)
+        }
+        form => unreachable!("store-written form byte is 0..=2, got {form}"),
+    })
+}
+
 // ---- handle codecs (store-written bytes only — ADR-0037 D1) ---------------
 
 #[cfg(feature = "doc")]
@@ -589,22 +623,8 @@ impl CellStore {
             return Err(OpError::WrongType);
         }
         let version = view.version();
-        let value = view.value();
-        let root = match value[0] {
-            FORM_INLINE => {
-                DocValue::from(TapeDoc::from_validated_bytes(&value[VALUE_PREFIX_LEN..]).root())
-            }
-            FORM_TAPE => {
-                let (baddr, blen) = decode_tape_handle(value);
-                let bytes = self.docs.arena.bytes(baddr, blen as usize);
-                DocValue::from(TapeDoc::from_validated_bytes(bytes).root())
-            }
-            FORM_TREE => {
-                let (root, mem, _) = decode_tree_handle(value);
-                ArenaDoc::from_parts(root, mem).root_value(&self.docs.arena)
-            }
-            form => unreachable!("store-written form byte is 0..=2, got {form}"),
-        };
+        let root = doc_root_at(&self.arena, &self.docs, addr, len)
+            .expect("type tag checked: the record is a document");
         Ok(Some(JsonRead { root, version }))
     }
 

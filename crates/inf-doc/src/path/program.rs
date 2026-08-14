@@ -150,6 +150,15 @@ impl PathProgram {
         true
     }
 
+    /// Zero-allocation step walk over the validated bytes for
+    /// structural path comparison (the M4.5-S04 static path-overlap
+    /// prune, ADR-0076 D6): the index-fence vocabulary plus [`PathStep::Other`]
+    /// for everything outside it. Consumers must treat `Other` as "may
+    /// match anything" — the conservative overlap verdict.
+    pub fn steps(&self) -> PathSteps<'_> {
+        PathSteps { bytes: &self.bytes, at: 3 }
+    }
+
     /// Returns a zero-allocation iterator only when the whole validated
     /// program is a root followed by `Child`/`Index` selectors.
     pub(crate) fn simple_steps(&self) -> Option<SimpleSteps<'_>> {
@@ -178,6 +187,48 @@ impl<'a> Iterator for SimpleSteps<'a> {
             Op::Child(key) => SimpleStep::Child(key),
             Op::Index(index) => SimpleStep::Index(index),
             _ => unreachable!("simple_steps prevalidated the whole program"),
+        })
+    }
+}
+
+/// One decoded step for structural comparison ([`PathProgram::steps`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PathStep<'a> {
+    /// A named child selector (`.name` / `['name']`).
+    Child(&'a [u8]),
+    /// An array index selector (`[i]`, possibly negative).
+    Index(i64),
+    /// The `[*]` / `.*` wildcard.
+    Wild,
+    /// Slice, union, or recursive descent — outside the index fence;
+    /// consumers must treat it as "may match anything".
+    Other,
+}
+
+/// Iterator behind [`PathProgram::steps`]. A `Descend` prefix op yields
+/// `Other` and leaves its bound selector to the next call — harmless
+/// because every consumer stops at the first `Other` (conservative
+/// overlap), and exact continuation past one is never consulted.
+pub struct PathSteps<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Iterator for PathSteps<'a> {
+    type Item = PathStep<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.at >= self.bytes.len() {
+            return None;
+        }
+        let (op, next) = read_op(self.bytes, self.at);
+        self.at = next;
+        Some(match op {
+            Op::Child(key) => PathStep::Child(key),
+            Op::Index(index) => PathStep::Index(index),
+            Op::ChildAny => PathStep::Wild,
+            Op::Slice(_) | Op::Union(_) | Op::Descend => PathStep::Other,
+            Op::Root => unreachable!("Root only leads (validated)"),
         })
     }
 }

@@ -13,8 +13,12 @@ mod demote;
 mod doc;
 mod evict;
 mod extents;
+/// Named fault points (M4.5-S04): inventory consumed by
+/// `scripts/check-fault-points.sh` and armed by tests.
+pub mod fault;
 mod index;
 mod index_key;
+mod index_maint;
 mod index_registry;
 mod keyspace;
 mod live_set;
@@ -47,6 +51,7 @@ pub use index_key::{
     DecodedIndexKey, INDEX_KEY_ENCODING_VERSION, IndexKeyBuf, IndexKeyDecodeError, IndexKeyType,
     IndexScalar, KeySkip, compare_i64_f64, index_key_decode, index_key_encode, index_scalar_coerce,
 };
+pub use index_maint::{BRACKET_ENTRY_CAP, IdxCounters, IdxMaintRefusal, MaintMode};
 #[cfg(feature = "doc")]
 pub use index_registry::validate_index_program;
 pub use index_registry::{

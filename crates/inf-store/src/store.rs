@@ -144,6 +144,10 @@ pub enum OpError {
     /// updates proceed. Maps to the `DISKFULL` extension error at the
     /// command layer.
     DiskFull(DiskFullCause),
+    /// The index-maintenance bracket refused the mutation before any
+    /// state changed (M4.5-S04, ADR-0072 D7.1) — plan-then-commit
+    /// reservation or the entry-set cap.
+    IndexMaintenance(crate::index_maint::IdxMaintRefusal),
 }
 
 /// Why disk admission refused (ADR-0063 D1) — the error payload carries
@@ -415,6 +419,11 @@ pub struct CellStore {
     pub(crate) evict: EvictState,
     /// Document arena + domain counters (ADR-0037; no-op without `doc`).
     pub(crate) docs: DocStore,
+    /// Index attach block (M4.5-S04, ADR-0076 D1): this namespace's live
+    /// indexes and their trees, synced from the registry at DDL
+    /// transitions. A zero-index store pays one cached branch; slim
+    /// builds get the folded-away stub.
+    pub(crate) idx: crate::index_maint::CellIndexes,
     pub(crate) cfg: StoreConfig,
 }
 
@@ -429,6 +438,7 @@ impl CellStore {
             stats: StoreStats::default(),
             evict,
             docs: DocStore::new(&cfg),
+            idx: crate::index_maint::CellIndexes::default(),
             cfg,
         }
     }
@@ -501,6 +511,7 @@ impl CellStore {
     pub fn report(&self) -> MemoryReport {
         let arena = self.arena.report();
         let docs = self.docs.report();
+        let idx = self.idx.memory();
         MemoryReport {
             records_live_bytes: arena.live_bytes,
             records_slack_bytes: arena.slack_bytes,
@@ -515,11 +526,17 @@ impl CellStore {
             doc_slack_bytes: docs.domain.slack_bytes,
             doc_scratch_bytes: docs.scratch_bytes,
             doc_path_cache_bytes: 0,
-            idx_tree_bytes: 0,
-            idx_slack_bytes: 0,
+            idx_tree_bytes: idx.idx_tree_bytes,
+            idx_slack_bytes: idx.idx_slack_bytes,
             live_records: arena.live_allocs,
             docs_live: docs.domain.docs_live,
         }
+    }
+
+    /// L5 fold of this store's attached index trees (M4.5-S04, ADR-0076
+    /// D1 — the S03 `idx_*` domains, source moved with tree custody).
+    pub fn idx_memory(&self) -> crate::index_registry::IndexMemory {
+        self.idx.memory()
     }
 
     // ---- reads (expire-on-read makes them `&mut`) ----
@@ -1200,6 +1217,36 @@ impl CellStore {
         let Some((src_addr, src_len)) = self.resolve(src, now) else {
             return Ok(CopyResult::SourceMissing);
         };
+        // COPY is excluded from the plane brackets (ADR-0076 D3): the
+        // destination may live in another database, so the mini-bracket
+        // runs here, where the owning store is unambiguous. The peek
+        // mutates nothing — `src_addr` stays valid across it.
+        #[cfg(feature = "doc")]
+        {
+            self.idx_bracket_begin(&[dst], None).map_err(OpError::IndexMaintenance)?;
+            let result = self.copy_from_resolved(src_addr, src_len, dst, replace, now);
+            match &result {
+                Ok(CopyResult::Copied) => {
+                    self.idx_bracket_commit(&[dst], crate::index_maint::MaintMode::Strict);
+                }
+                _ => self.idx_bracket_abort(),
+            }
+            result
+        }
+        #[cfg(not(feature = "doc"))]
+        self.copy_from_resolved(src_addr, src_len, dst, replace, now)
+    }
+
+    /// The COPY body past source resolution (split out for the S04
+    /// mini-bracket above).
+    fn copy_from_resolved(
+        &mut self,
+        src_addr: ArenaAddr,
+        src_len: usize,
+        dst: &[u8],
+        replace: bool,
+        now: Nanos,
+    ) -> Result<CopyResult, OpError> {
         let view = RecordView::new(self.arena.bytes(src_addr, src_len));
         #[cfg(feature = "doc")]
         if view.type_tag() == TypeTag::JsonDoc {
@@ -1671,6 +1718,10 @@ impl CellStore {
         self.index = Index::with_capacity(self.cfg.initial_keys.max(64));
         self.wheel = TtlWheel::new(now.0 / 1_000_000);
         self.docs.reset(&self.cfg);
+        // FLUSH* is a removal class (ADR-0072 D6): a bulk replace runs
+        // the whole-namespace index truncate, never N removals.
+        // Declarations survive; an empty namespace projects empty trees.
+        self.idx.truncate_all();
         self.stats.ttl_live = 0;
         self.evict.hand = 0;
     }
@@ -1684,7 +1735,11 @@ impl CellStore {
     /// cursor steps so a 1M-same-second storm cannot cliff the loop.
     pub fn expire_tick(&mut self, now: Nanos, budget: ExpiryBudget) -> ExpiryStats {
         let now_ms = now.0 / 1_000_000;
-        let CellStore { arena, index, wheel, stats, docs, .. } = self;
+        #[cfg(feature = "doc")]
+        let max_matches = self.cfg.doc_max_path_matches;
+        let CellStore { arena, index, wheel, stats, docs, idx, .. } = self;
+        #[cfg(not(feature = "doc"))]
+        let _ = &idx;
         let mut out = ExpiryStats::default();
         let tick = wheel.tick(now_ms, budget, |hash, _deadline| {
             // Reap any record on this hash's probe path that is genuinely
@@ -1698,6 +1753,18 @@ impl CellStore {
             match found {
                 Some(addr) => {
                     let len = record_at(arena, addr).encoded_len();
+                    // The record-death hook (ADR-0072 D6): active expiry
+                    // is a removal class like any other; the split-borrow
+                    // reap deliberately bypasses `free_record`, so the
+                    // hook is wired here too (the D6 structural
+                    // exception). MAINTAIN slices never run inside a
+                    // command, so no bracket can cover this death.
+                    #[cfg(feature = "doc")]
+                    if idx.death_hook_wanted(hash)
+                        && let Some(root) = doc::doc_root_at(arena, docs, addr, len)
+                    {
+                        idx.remove_doc_entries(hash, root, max_matches);
+                    }
                     let payload = doc::payload_of(arena, addr, len);
                     index.remove(hash, addr);
                     arena.free(addr, len);
@@ -1793,7 +1860,21 @@ impl CellStore {
     /// document payload behind it (the ADR-0037 D3 choke point). Every
     /// reap/delete/evict site funnels here; the only deliberate bypass is
     /// RENAME's source removal (the handle transferred to the destination).
+    ///
+    /// Record-death hook (M4.5-S04, ADR-0072 D6): a dying document's
+    /// index entries are removed here — the last moment its values are
+    /// readable — unless this death is bracket-covered (a write-set key
+    /// dying inside its own command; the bracket's diff owns it,
+    /// ADR-0076 D4). Zero-index stores pay one cached branch.
     pub(crate) fn free_record(&mut self, hash: u64, addr: ArenaAddr, len: usize) {
+        #[cfg(feature = "doc")]
+        if self.idx.death_hook_wanted(hash) {
+            let max_matches = self.cfg.doc_max_path_matches;
+            let CellStore { arena, docs, idx, .. } = self;
+            if let Some(root) = doc::doc_root_at(arena, docs, addr, len) {
+                idx.remove_doc_entries(hash, root, max_matches);
+            }
+        }
         let payload = doc::payload_of(&self.arena, addr, len);
         self.index.remove(hash, addr);
         self.arena.free(addr, len);

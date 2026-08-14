@@ -19,8 +19,8 @@ pub use eval::{
     CanonicalMatches, EvalError, EvalLimits, EvalState, EvalStep, Matches, eval, eval_budgeted,
     resolve,
 };
-pub use program::PathProgram;
 pub(crate) use program::SimpleStep;
+pub use program::{PathProgram, PathStep, PathSteps};
 
 /// Hard ceiling on path text and program bytes (u16-shaped lengths in
 /// the S10 cache and delta accounting; ADR-0040 D6). Config lowers via
