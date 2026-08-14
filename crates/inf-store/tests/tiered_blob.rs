@@ -700,6 +700,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
             apply_blob_ref_section(&mut table.borrow_mut(), &section);
             Ok(())
         },
+        |_| panic!("no index-sidecar sections in this image"),
     )
     .expect("hybrid load");
     let mut table = table.into_inner();

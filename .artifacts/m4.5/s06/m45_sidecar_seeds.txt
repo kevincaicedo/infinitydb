@@ -1,0 +1,20 @@
+inf-sim: scenario m45-sidecar seed 0x1: 4 boots, cuts ["mid-write(extra=2,published=0)", "post-publish(storm=9)"], 4 loaded, 9 storm-during-stream, 10 ready checks, 6 refused bindings, 115 steps, hash 0x90dadea757a0660c
+inf-sim: determinism verified — second run hash-identical
+inf-sim: scenario m45-sidecar seed 0x2: 4 boots, cuts ["mid-write(extra=3,published=0)", "post-publish(storm=10)"], 4 loaded, 10 storm-during-stream, 10 ready checks, 6 refused bindings, 116 steps, hash 0x1664b46c422fc4d7
+inf-sim: determinism verified — second run hash-identical
+inf-sim: scenario m45-sidecar seed 0x3: 4 boots, cuts ["mid-write(extra=5,published=0)", "post-publish(storm=7)"], 4 loaded, 7 storm-during-stream, 10 ready checks, 6 refused bindings, 118 steps, hash 0x26ffe44e73d7da42
+inf-sim: determinism verified — second run hash-identical
+inf-sim: scenario m45-sidecar seed 0x4: 4 boots, cuts ["mid-write(extra=4,published=0)", "post-publish(storm=8)"], 4 loaded, 8 storm-during-stream, 10 ready checks, 6 refused bindings, 117 steps, hash 0x5f4addea40cd6e8c
+inf-sim: determinism verified — second run hash-identical
+inf-sim: scenario m45-sidecar seed 0x5: 4 boots, cuts ["mid-write(extra=4,published=0)", "post-publish(storm=8)"], 4 loaded, 8 storm-during-stream, 10 ready checks, 6 refused bindings, 117 steps, hash 0xf407e7a34a27e956
+inf-sim: determinism verified — second run hash-identical
+inf-sim: scenario m45-sidecar seed 0x6: 4 boots, cuts ["mid-write(extra=0,published=0)", "post-publish(storm=9)"], 4 loaded, 9 storm-during-stream, 10 ready checks, 6 refused bindings, 113 steps, hash 0x29178af8c8cee915
+inf-sim: determinism verified — second run hash-identical
+inf-sim: scenario m45-sidecar seed 0x7: 4 boots, cuts ["mid-write(extra=4,published=0)", "post-publish(storm=8)"], 4 loaded, 8 storm-during-stream, 10 ready checks, 6 refused bindings, 117 steps, hash 0xba42aababea46562
+inf-sim: determinism verified — second run hash-identical
+inf-sim: scenario m45-sidecar seed 0x8: 4 boots, cuts ["mid-write(extra=3,published=0)", "post-publish(storm=8)"], 4 loaded, 8 storm-during-stream, 10 ready checks, 6 refused bindings, 116 steps, hash 0xaf0ac7f7e9761399
+inf-sim: determinism verified — second run hash-identical
+inf-sim: scenario m45-sidecar seed 0x9: 4 boots, cuts ["mid-write(extra=2,published=0)", "post-publish(storm=9)"], 4 loaded, 9 storm-during-stream, 10 ready checks, 6 refused bindings, 115 steps, hash 0xc891b6a83a85284e
+inf-sim: determinism verified — second run hash-identical
+inf-sim: scenario m45-sidecar seed 0xa: 4 boots, cuts ["mid-write(extra=0,published=0)", "post-publish(storm=8)"], 4 loaded, 8 storm-during-stream, 10 ready checks, 6 refused bindings, 113 steps, hash 0x284dc05643d5687e
+inf-sim: determinism verified — second run hash-identical

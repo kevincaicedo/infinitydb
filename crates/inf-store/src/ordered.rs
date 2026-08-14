@@ -65,6 +65,17 @@ pub enum OrderedMapError {
     NodeLimit,
 }
 
+/// Why [`OrderedMap::append`] refused (M4.5-S06, ADR-0078 D5). The
+/// input is disk bytes at the one call site (the sidecar loader), so
+/// out-of-order is an operating condition — never a panic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppendError {
+    /// The pair is not strictly greater than the tree's maximum.
+    OutOfOrder,
+    /// A capacity refusal from the underlying structures.
+    Map(OrderedMapError),
+}
+
 /// Per-tree memory attribution (L5) — every byte the tree holds, split
 /// into reserved and slack so the S03 `idx_tree_bytes`/`idx_slack_bytes`
 /// domains can be assembled without probing internals.
@@ -611,6 +622,68 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
         self.len += 1;
         self.epoch += 1;
         Ok(true)
+    }
+
+    /// Append a pair known to exceed every present pair — the sidecar
+    /// bulk-load path (M4.5-S06, ADR-0078 D5): hop the rightmost spine
+    /// (no comparisons), one order check against the current maximum,
+    /// write at the leaf tail. A full leaf takes the ordinary
+    /// [`insert_split`](Self::insert_split) plan/commit, whose
+    /// rightmost-append heuristic splits full/empty — appended trees
+    /// load with full leaves (less slack than a randomly-built one, L5).
+    /// Semantics equal `insert` on strictly-ascending input (proptested);
+    /// out-of-order input is a typed refusal because the caller's bytes
+    /// come from disk — the loader maps it to a body-class discard.
+    ///
+    /// # Errors
+    /// [`AppendError::OutOfOrder`] when the pair is not strictly greater
+    /// than the tree's maximum; [`AppendError::Map`] for capacity
+    /// refusals (the tree is unchanged either way).
+    pub fn append(&mut self, key: &[u8], entry_ref: u64) -> Result<(), AppendError> {
+        let probe = make_probe::<S>(key);
+        if self.root == NONE {
+            self.insert_first(&probe, entry_ref).map_err(AppendError::Map)?;
+            return Ok(());
+        }
+        // The rightmost spine: child `count` at every internal level.
+        let mut path = [(NONE, 0u16); MAX_HEIGHT];
+        assert!((self.height as usize) < MAX_HEIGHT, "tree height invariant violated");
+        let mut node = self.root;
+        for slot in path.iter_mut().take(self.height as usize) {
+            let internal = self.internals.get(node);
+            let child = internal.count as usize;
+            *slot = (node, child as u16);
+            node = internal.children[child];
+        }
+        let leaf_id = node;
+        let leaf = self.leaves.get(leaf_id);
+        debug_assert_eq!(leaf.next, NONE, "the rightmost spine ends at the rightmost leaf");
+        let count = leaf.count as usize;
+        debug_assert!(count > 0, "a rooted tree keeps every leaf non-empty");
+        let last = count - 1;
+        let order = self.cmp_pair(
+            leaf.prefixes[last],
+            leaf.metas[last],
+            leaf.refs[last],
+            &probe,
+            entry_ref,
+        );
+        if order != Ordering::Less {
+            return Err(AppendError::OutOfOrder);
+        }
+        if count < F {
+            let meta = self.store_meta(&probe).map_err(AppendError::Map)?;
+            let leaf = self.leaves.get_mut(leaf_id);
+            write_slot(leaf, count, probe.prefix, meta, entry_ref);
+            leaf.count += 1;
+        } else {
+            // idx == F on the rightmost leaf: the split heuristic keeps
+            // the full leaf and starts a fresh one with this entry.
+            self.insert_split(leaf_id, F, &probe, entry_ref, &path).map_err(AppendError::Map)?;
+        }
+        self.len += 1;
+        self.epoch += 1;
+        Ok(())
     }
 
     fn insert_first(&mut self, probe: &Probe<'_>, entry_ref: u64) -> Result<bool, OrderedMapError> {
@@ -1632,7 +1705,72 @@ mod tests {
         out
     }
 
+    // The S06 loader path (ADR-0078 D5): append equals insert on
+    // ascending input, refuses everything else typed, and fills leaves
+    // full/empty (the tree the loader builds is denser, not looser).
+    #[test]
+    fn append_matches_insert_on_ascending_input() {
+        let mut appended = FixedMap::new();
+        let mut inserted = FixedMap::new();
+        let n = 5_000u64;
+        for v in 0..n {
+            appended.append(&key8(v / 3), v).expect("ascending");
+            assert!(inserted.insert(&key8(v / 3), v).unwrap());
+        }
+        appended.check_invariants();
+        assert_eq!(appended.len(), inserted.len());
+        assert_eq!(full_scan_fixed(&appended), full_scan_fixed(&inserted));
+        // Duplicates and regressions refuse typed — the tree unchanged.
+        assert_eq!(appended.append(&key8((n - 1) / 3), n - 1), Err(AppendError::OutOfOrder));
+        assert_eq!(appended.append(&key8(0), 0), Err(AppendError::OutOfOrder));
+        assert_eq!(appended.len(), n);
+        appended.check_invariants();
+    }
+
+    #[test]
+    fn append_interleaves_with_ordinary_mutation() {
+        // The loader owns the tree only until replay ends; afterwards
+        // the live path mutates it — appends and inserts must compose.
+        let mut map = VarMap::new();
+        for i in 0..600u64 {
+            let key = format!("k{i:05}");
+            map.append(key.as_bytes(), i).expect("ascending");
+        }
+        assert!(map.remove(b"k00007", 7));
+        assert!(map.insert(b"a-before-everything", 1).unwrap());
+        map.append(b"z-after-everything", 9).expect("still the maximum edge");
+        assert_eq!(map.append(b"k99999", 1), Err(AppendError::OutOfOrder));
+        map.check_invariants();
+    }
+
+    fn full_scan_fixed(map: &FixedMap) -> Vec<(Vec<u8>, u64)> {
+        let mut cursor = OrderedCursor::from_start();
+        let mut out = Vec::new();
+        while let Some((key, entry_ref)) = cursor.next(map) {
+            out.push((key.to_vec(), entry_ref));
+        }
+        out
+    }
+
     proptest! {
+        // Append == insert over arbitrary ascending pair streams (the
+        // ADR-0078 D5 equivalence, VarKey edition — zero-padding edges
+        // included by the small alphabet).
+        #[test]
+        fn append_equals_insert_proptest(
+            pairs in prop::collection::btree_set(
+                (prop::collection::vec(0u8..4, 0..10), 0u64..8), 1..200),
+        ) {
+            let mut appended = VarMap::new();
+            let mut inserted = VarMap::new();
+            for (key, entry_ref) in &pairs {
+                appended.append(key, *entry_ref).expect("btree_set iterates ascending");
+                prop_assert!(inserted.insert(key, *entry_ref).unwrap());
+            }
+            appended.check_invariants();
+            prop_assert_eq!(full_scan(&appended), full_scan(&inserted));
+        }
+
         // The model equivalence AC: random op sequences, identical
         // contents AND iteration order vs the BTreeSet model. The
         // 10⁶-op storm variant lives in tests/ordered_storm.rs.

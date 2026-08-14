@@ -19,7 +19,7 @@ use inf_log::NsId;
 use crate::index_key::{INDEX_KEY_ENCODING_VERSION, IndexKeyType};
 use crate::ns::valid_ns_name;
 use crate::ordered::{
-    Fixed8, OrderedCursor, OrderedMap, OrderedMapError, OrderedMapMemory, VarKey,
+    AppendError, Fixed8, OrderedCursor, OrderedMap, OrderedMapError, OrderedMapMemory, VarKey,
 };
 
 /// First allocatable index id; `IndexId(0)` is reserved (the board's
@@ -141,6 +141,71 @@ pub enum IndexBindError {
     NotReady(IndexState),
 }
 
+/// Why a sidecar load ended in a rebuild (M4.5-S06, ADR-0078 D6) —
+/// recorded per index per boot (L10); per-index rendering rides S10's
+/// `INF.IDX LIST` beside the other per-index rows.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SidecarRebuildReason {
+    /// The checkpoint carried no sections for this index (never
+    /// converged pre-crash, or no checkpoint at all).
+    NoSidecar,
+    /// Sections named a declaration the seeded catalog does not hold
+    /// (dropped before the crash). Never surfaces on a row — the id no
+    /// longer exists to carry one — but the state machine still
+    /// swallows the stream's remaining sections.
+    StaleDeclaration,
+    /// Sections bound a generation the seeded catalog does not hold
+    /// (rebuilt or re-created since the checkpoint — ADR-0073 D5.1).
+    GenerationMismatch,
+    /// Sections bound a key-encoding version this binary does not
+    /// produce (ADR-0073 D5.2).
+    EncodingVersion,
+    /// The section's key scheme disagrees with the declared key type.
+    SchemeMismatch,
+    /// A section's `entries_before` broke the ordinal chain (writer
+    /// abandonment or unattributed damage resolving here — ADR-0078
+    /// D4/D6).
+    NonContiguous,
+    /// A pair failed the cross-section strictly-ascending canon.
+    OutOfOrder,
+    /// The tree refused an append (structural capacity).
+    Capacity,
+    /// The stream ended without a FINAL section.
+    Incomplete,
+    /// A section arrived after the FINAL marker.
+    AfterFinal,
+    /// The FINAL total disagreed with what loaded.
+    TotalMismatch,
+}
+
+impl SidecarRebuildReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            SidecarRebuildReason::NoSidecar => "no-sidecar",
+            SidecarRebuildReason::StaleDeclaration => "stale-declaration",
+            SidecarRebuildReason::GenerationMismatch => "generation-mismatch",
+            SidecarRebuildReason::EncodingVersion => "encoding-version",
+            SidecarRebuildReason::SchemeMismatch => "scheme-mismatch",
+            SidecarRebuildReason::NonContiguous => "non-contiguous",
+            SidecarRebuildReason::OutOfOrder => "out-of-order",
+            SidecarRebuildReason::Capacity => "capacity",
+            SidecarRebuildReason::Incomplete => "incomplete",
+            SidecarRebuildReason::AfterFinal => "after-final",
+            SidecarRebuildReason::TotalMismatch => "total-mismatch",
+        }
+    }
+}
+
+/// The per-boot rebuild-vs-load decision (ADR-0078 D6 — the plan's S06
+/// "recorded per index per boot" requirement as data).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SidecarBootDecision {
+    /// The sidecar loaded whole and tail catch-up will finish the job.
+    Loaded { entries: u64 },
+    /// The projection rebuilds from scratch (the S05 machine).
+    Rebuilt { reason: SidecarRebuildReason },
+}
+
 /// One index's tree: the projection contents, scheme-monomorphized per
 /// the declared key type (ADR-0074 D1 — i64/f64/bool keys are exactly
 /// 8 bytes and ride `Fixed8`; utf8 rides `VarKey`). Custody: trees live
@@ -204,6 +269,26 @@ impl IndexTree {
         }
     }
 
+    /// Append a strictly-ascending pair — the S06 sidecar load path
+    /// (ADR-0078 D5). Same semantics as `insert` on ascending input;
+    /// out-of-order input refuses typed (the loader's bytes come from
+    /// disk — a body-class discard, never a panic).
+    ///
+    /// # Errors
+    /// [`AppendError`] — the tree is unchanged.
+    pub fn append(&mut self, key: &[u8], entry_ref: u64) -> Result<(), AppendError> {
+        match self {
+            IndexTree::Fixed8(map) => map.append(key, entry_ref),
+            IndexTree::Var(map) => map.append(key, entry_ref),
+        }
+    }
+
+    /// True when the tree keys ride the `Fixed8` scheme (the sidecar
+    /// meta's `key_scheme` byte — ADR-0078 D2).
+    pub fn fixed8(&self) -> bool {
+        matches!(self, IndexTree::Fixed8(_))
+    }
+
     /// Remove-if-present on the exact pair; `true` when it was present.
     pub fn remove(&mut self, key: &[u8], entry_ref: u64) -> bool {
         match self {
@@ -256,9 +341,13 @@ struct RegEntry {
     /// never consulted by planning.
     cell_state: IndexState,
     /// ADR-0075 D4 rebuild-class hint: the pre-crash persisted state was
-    /// `ready`, so this entry is sidecar-eligible at S06. False for
-    /// live-created entries.
+    /// `ready`. S06 reads it for *severity*, not outcome (ADR-0078 D6):
+    /// a was-ready index that ends rebuilt was serving before the crash
+    /// and now is not — that downgrade is named loudly in the boot log.
     was_ready: bool,
+    /// This boot's rebuild-vs-load decision (M4.5-S06, ADR-0078 D6).
+    /// `None` until recovery decides (and forever on a fresh cell).
+    sidecar_boot: Option<SidecarBootDecision>,
 }
 
 /// The per-cell registry (ADR-0072 D2): every declaration replicated,
@@ -301,7 +390,7 @@ impl IndexRegistry {
         debug_assert!(spec.id.0 >= FIRST_INDEX_ID, "id 0 is reserved");
         debug_assert!(spec.generation >= FIRST_INDEX_GENERATION, "generation 0 is reserved");
         let cell_state = spec.state;
-        self.entries.push(RegEntry { spec, cell_state, was_ready });
+        self.entries.push(RegEntry { spec, cell_state, was_ready, sidecar_boot: None });
         self.recompute_flags();
         Ok(())
     }
@@ -423,6 +512,21 @@ impl IndexRegistry {
     /// The D4 sidecar-eligibility hint (S06 reads it at boot).
     pub fn was_ready(&self, id: IndexId) -> Option<bool> {
         self.entries.iter().find(|e| e.spec.id == id).map(|e| e.was_ready)
+    }
+
+    /// Records this boot's rebuild-vs-load decision for `id` (M4.5-S06,
+    /// ADR-0078 D6). Unknown ids are ignored — a stale sidecar's
+    /// declaration no longer exists to carry a record.
+    pub fn note_sidecar_boot(&mut self, id: IndexId, decision: SidecarBootDecision) {
+        if let Some(entry) = self.entry_mut(id) {
+            entry.sidecar_boot = Some(decision);
+        }
+    }
+
+    /// This boot's rebuild-vs-load decision for `id` (`None` until
+    /// recovery decides — and forever on a fresh cell).
+    pub fn sidecar_boot(&self, id: IndexId) -> Option<SidecarBootDecision> {
+        self.entries.iter().find(|e| e.spec.id == id).and_then(|e| e.sidecar_boot)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &IndexSpec> {

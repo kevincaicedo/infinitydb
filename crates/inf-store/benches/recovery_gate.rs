@@ -86,6 +86,7 @@ fn bench_images(n: u64, value_len: usize) {
             |_| Ok(()),
             |_| Ok(()),
             |_| Ok(()),
+            |_| panic!("no index-sidecar sections in this image"),
         )
         .expect("load");
         let secs = t.elapsed().as_secs_f64();
@@ -175,6 +176,7 @@ fn bench_refs(n: u64) {
             },
             |_| Ok(()),
             |_| Ok(()),
+            |_| panic!("no index-sidecar sections in this image"),
         )
         .expect("load");
         let secs = t.elapsed().as_secs_f64();

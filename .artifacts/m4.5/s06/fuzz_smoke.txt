@@ -1,0 +1,9 @@
+"\000\002\000\000" # Uses: 52
+###### End of recommended dictionary. ######
+Done 1277390 runs in 301 second(s)
+=== ick_decode ===
+"\3120\212;" # Uses: 5432
+###### End of recommended dictionary. ######
+Done 2911159 runs in 301 second(s)
+
+[exited with code 0]

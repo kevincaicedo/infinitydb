@@ -74,6 +74,25 @@ pub(crate) struct Streaming<File: SegmentFile> {
     /// pass, so class seals happen only at pass boundaries.
     pub tier_pass: u8,
     pub walk_done: bool,
+    /// The stream opened v2 — sidecar emission is representable
+    /// (M4.5-S06; an index converging mid-walk on a v1 stream waits
+    /// for the next checkpoint).
+    pub v2: bool,
+    /// Sidecar emission plan (M4.5-S06, ADR-0078 D1): captured once
+    /// when the record walk completes — converged, non-degraded
+    /// indexes on the captured durable namespaces. `None` until then.
+    pub sidecar_plan: Option<Vec<inf_log::ckpt::IdxSidecarMeta>>,
+    /// Position in the plan; the entries below it are finished or
+    /// abandoned.
+    pub sidecar_at: usize,
+    /// The current index's re-seek walk cursor (owns its resume pair —
+    /// nothing borrowed across slices, the S01 freeze).
+    pub sidecar_cursor: inf_store::OrderedCursor,
+    /// Pairs emitted for the current index (the ordinal counter and
+    /// the FINAL total).
+    pub sidecar_emitted: u64,
+    /// Every plan entry emitted or abandoned — the footer may stage.
+    pub sidecar_done: bool,
     pub footer_staged: bool,
     pub sync_issued: bool,
     pub sync_done: bool,
@@ -184,15 +203,17 @@ impl<F: SegmentFs> CkptCell<F> {
         id: u64,
         begin_lsn: Lsn,
         ns_ids: Vec<u32>,
-        tiered_present: bool,
+        v2: bool,
         now: inf_foundation::time::Nanos,
     ) -> io::Result<()> {
         // v2 opens the ADR-0057 D3 vocabulary (address refs, live-set,
-        // blob refs) — emitted only when a tiered namespace exists, so
-        // memory-durable nodes keep producing v1 files byte-identically
-        // (M4-S26; the S03 zero-change posture).
-        let mut stream =
-            if tiered_present { IckStream::new_v2(&self.cfg) } else { IckStream::new(&self.cfg) };
+        // blob refs) plus the ADR-0073 D2 index sidecars — selected iff
+        // a tiered namespace exists or an index declaration targets a
+        // durable namespace (ADR-0078 D7: registration, not
+        // convergence, drives the version — it must be fixed at header
+        // time). Cells with neither keep producing v1 byte-identically
+        // (the S03 zero-change posture).
+        let mut stream = if v2 { IckStream::new_v2(&self.cfg) } else { IckStream::new(&self.cfg) };
         let file = self.fs.create_meta(&self.dir.join(ick_staging_file_name(id)))?;
         let fd = file.raw_fd().ok_or_else(|| io::Error::other("std segment tier has fds"))?;
         let lease = stream.begin(self.cell, id, begin_lsn, &ns_ids);
@@ -209,6 +230,12 @@ impl<F: SegmentFs> CkptCell<F> {
             cursor: 0,
             tier_pass: 0,
             walk_done: false,
+            v2,
+            sidecar_plan: None,
+            sidecar_at: 0,
+            sidecar_cursor: inf_store::OrderedCursor::from_start(),
+            sidecar_emitted: 0,
+            sidecar_done: false,
             footer_staged: false,
             sync_issued: false,
             sync_done: false,

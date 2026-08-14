@@ -373,6 +373,7 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
             apply_blob_ref_section(&mut cell.borrow_mut(), &section);
             Ok(())
         },
+        |_| panic!("no index-sidecar sections in this image"),
     )
     .expect("hybrid load");
     let mut t = cell.into_inner();

@@ -22,11 +22,11 @@ use std::path::PathBuf;
 use inf_foundation::time::Nanos;
 use inf_log::fs::SegmentFs;
 use inf_log::{
-    FsyncClass, FsyncTicket, GroupCommit, MutationEffect, NsId, RecordView, SegmentConfig,
-    SegmentRotor, StagingConfig, StagingRing,
+    FsyncClass, FsyncTicket, GroupCommit, IdxSidecarMeta, MutationEffect, NsId, RecordView,
+    SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
 };
 use inf_runtime::{CompletionToken, IoOp, LoopCx, TokenClass, WaitList, WatermarkGate};
-use inf_store::{CheckpointImage, Keyspace, WallAnchor};
+use inf_store::{CheckpointImage, IndexId, Keyspace, WallAnchor};
 
 use crate::ckpt::{
     CkptCell, CkptPhase, CkptStats, MAX_TRUNC_PER_SLICE_ADAPTIVE, MAX_UNLINKS_PER_SLICE,
@@ -510,8 +510,12 @@ impl<F: SegmentFs> DurableCell<F> {
         // Begun: create the .ick.new file + queue the header write.
         if let CkptPhase::Begun { id, begin_lsn } = self.ckpt.phase {
             let ns_ids = ks.durable_ns_ids();
-            let tiered_present = ns_ids.iter().any(|&raw| ks.is_tiered(NsId(raw)));
-            if let Err(err) = self.ckpt.open_stream(id, begin_lsn, ns_ids, tiered_present, cx.now) {
+            // v2 iff tiered namespaces or index declarations on durable
+            // namespaces exist (ADR-0073 D2 / ADR-0078 D7) — cells with
+            // neither keep writing v1 byte-identically.
+            let v2 =
+                ns_ids.iter().any(|&raw| ks.is_tiered(NsId(raw))) || ks.idx_declared_on_durable();
+            if let Err(err) = self.ckpt.open_stream(id, begin_lsn, ns_ids, v2, cx.now) {
                 self.ckpt.abort("create", &err.to_string());
                 return 1;
             }
@@ -558,6 +562,12 @@ impl<F: SegmentFs> DurableCell<F> {
             cursor,
             tier_pass,
             walk_done,
+            v2,
+            sidecar_plan,
+            sidecar_at,
+            sidecar_cursor,
+            sidecar_emitted,
+            sidecar_done,
             footer_staged,
             sync_issued,
             in_flight,
@@ -574,8 +584,9 @@ impl<F: SegmentFs> DurableCell<F> {
         // × elapsed` — an unpaced walk dirties pages at memcpy speed and
         // the kernel's writeback throttling then stalls the log write's
         // CQE path (the S12-measured foreground cliff). Injected time, so
-        // DST compresses it (L7).
-        if !*walk_done && cfg.stream_bytes_per_sec > 0 {
+        // DST compresses it (L7). Sidecar emission is walk output like
+        // any other (M4.5-S06) and rides the same meter.
+        if !(*walk_done && *sidecar_done) && cfg.stream_bytes_per_sec > 0 {
             let elapsed_ms = cx.now.saturating_sub(*opened_at).as_millis();
             let allowed = (u64::from(cfg.stream_bytes_per_sec) * elapsed_ms.max(1)) / 1000;
             if *streamed_bytes >= allowed {
@@ -598,8 +609,8 @@ impl<F: SegmentFs> DurableCell<F> {
         // resize-stable SCAN cursor, ADR-0016 D2).
         let mut emitted: u32 = 0;
         let mut force_seal = false;
+        let slice_cap = cfg.slice_bytes.min(budget_units.saturating_mul(1024)).max(1);
         if !*walk_done {
-            let slice_cap = cfg.slice_bytes.min(budget_units.saturating_mul(1024)).max(1);
             while emitted < slice_cap && !*walk_done && !stream.section_full() && !force_seal {
                 let Some(&ns_raw) = ns_ids.get(*ns_idx) else {
                     *walk_done = true;
@@ -687,13 +698,34 @@ impl<F: SegmentFs> DurableCell<F> {
                     }
                 }
             }
+        } else if !*sidecar_done {
+            // Sidecar phase (M4.5-S06, ADR-0078 D1): derived data last —
+            // converged trees stream after every record image. A v1
+            // stream cannot represent them (an index converging mid-walk
+            // waits for the next checkpoint, which opens v2).
+            if *v2 {
+                force_seal = sidecar_walk_step(
+                    stream,
+                    ks,
+                    ns_ids,
+                    sidecar_plan,
+                    sidecar_at,
+                    sidecar_cursor,
+                    sidecar_emitted,
+                    sidecar_done,
+                    slice_cap,
+                    &mut emitted,
+                );
+            } else {
+                *sidecar_done = true;
+            }
         }
         // Queue at most one block per slice: a full (or final partial)
-        // section, a class-boundary seal (M4-S26 tiered passes), or —
-        // once everything drained — the footer.
+        // section, a class-boundary seal (M4-S26 tiered passes / S06
+        // index boundaries), or — once everything drained — the footer.
         if stream.section_full()
             || (force_seal && stream.can_seal())
-            || (*walk_done && stream.can_seal())
+            || (*walk_done && *sidecar_done && stream.can_seal())
         {
             let lease = stream.seal_section();
             *write_seq += 1;
@@ -705,7 +737,7 @@ impl<F: SegmentFs> DurableCell<F> {
                 fsync_token: None,
             });
             *in_flight = Some(lease);
-        } else if *walk_done {
+        } else if *walk_done && *sidecar_done {
             let lease = stream.finish();
             *write_seq += 1;
             cx.push(IoOp::LogWrite {
@@ -1057,6 +1089,97 @@ fn advance_pass(cursor: &mut u64, tier_pass: &mut u8, next: u64) {
         *tier_pass += 1;
     } else {
         *cursor = next;
+    }
+}
+
+// ---- index-sidecar walk (M4.5-S06; ADR-0078 D1/D2) ----
+
+/// Pairs pulled per sidecar emission call — bounds the section-target
+/// overshoot to one chunk (the staging buffer absorbs it).
+const SIDECAR_CHUNK_ENTRIES: u32 = 256;
+
+/// One bounded step of the sidecar phase. The plan captures once at
+/// entry (converged, non-degraded indexes on the walk's namespaces —
+/// ADR-0078 D1); each index streams through its re-seek cursor and
+/// closes with a FINAL marker. Eligibility is re-checked every step:
+/// a drop, rebuild, or degrade mid-emission abandons the stream — no
+/// FINAL, and the loader discards it as incomplete. Returns `true`
+/// when the pending section must seal now (index boundary, FINAL, or
+/// a foreign class left from the record walk).
+#[allow(clippy::too_many_arguments)] // the fill loop's split fields
+fn sidecar_walk_step(
+    stream: &mut inf_log::IckStream,
+    ks: &Keyspace,
+    ns_ids: &[u32],
+    plan: &mut Option<Vec<IdxSidecarMeta>>,
+    at: &mut usize,
+    cursor: &mut inf_store::OrderedCursor,
+    emitted_pairs: &mut u64,
+    done: &mut bool,
+    slice_cap: u32,
+    emitted: &mut u32,
+) -> bool {
+    let plan = plan.get_or_insert_with(|| {
+        let mut entries = Vec::new();
+        for &ns_raw in ns_ids {
+            for (id, generation, fixed8, _entries) in ks.idx_sidecar_candidates(NsId(ns_raw)) {
+                entries.push(IdxSidecarMeta {
+                    ns: ns_raw,
+                    index_id: id.0,
+                    generation,
+                    key_encoding_version: inf_store::INDEX_KEY_ENCODING_VERSION,
+                    fixed8,
+                });
+            }
+        }
+        entries
+    });
+    loop {
+        let Some(meta) = plan.get(*at).copied() else {
+            *done = true;
+            // A pending tail section seals through the caller's
+            // walk-complete condition.
+            return false;
+        };
+        // Class purity: a pending foreign section (the record walk's
+        // tail, or a previous index's) seals before this index stages.
+        let key = (meta.ns, meta.index_id, meta.generation);
+        if stream.has_pending_section() && stream.pending_idx_stream() != Some(key) {
+            return true;
+        }
+        if !ks.idx_sidecar_eligible(NsId(meta.ns), IndexId(meta.index_id), meta.generation) {
+            *at += 1;
+            *cursor = inf_store::OrderedCursor::from_start();
+            *emitted_pairs = 0;
+            if stream.has_pending_section() {
+                return true; // flush the abandoned partial section
+            }
+            continue;
+        }
+        let pulled = ks.idx_sidecar_emit(
+            NsId(meta.ns),
+            IndexId(meta.index_id),
+            cursor,
+            SIDECAR_CHUNK_ENTRIES,
+            |key_bytes, entry_ref| {
+                stream.stage_idx_entry(&meta, *emitted_pairs, key_bytes, entry_ref);
+                *emitted_pairs += 1;
+                let entry_bytes = if meta.fixed8 { 16 } else { 2 + key_bytes.len() + 8 };
+                *emitted = emitted.saturating_add(entry_bytes as u32);
+            },
+        );
+        if pulled < SIDECAR_CHUNK_ENTRIES {
+            // Exhausted at this instant (fuzzy — tail catch-up owns any
+            // later drift): close the stream and seal the FINAL section.
+            stream.stage_idx_final(&meta, *emitted_pairs);
+            *at += 1;
+            *cursor = inf_store::OrderedCursor::from_start();
+            *emitted_pairs = 0;
+            return true;
+        }
+        if stream.section_full() || *emitted >= slice_cap {
+            return false; // a full section seals below; budget ends the slice
+        }
     }
 }
 

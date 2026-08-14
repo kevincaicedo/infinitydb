@@ -464,6 +464,7 @@ fn unified_recovery_round_trips_all_classes() {
             inf_store::apply_blob_ref_section(&mut table.borrow_mut(), &section);
             Ok(())
         },
+        |_| panic!("no index-sidecar sections in this image"),
     )
     .expect("hybrid load");
     assert_eq!(info.ckpt_id, ckpt_id);

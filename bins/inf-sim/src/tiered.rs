@@ -159,6 +159,7 @@ impl TieredScenario {
             plant: Plant::None,
             segment_bytes: self.segment_bytes,
             ckpt_interval_bytes: self.ckpt_interval_bytes,
+            ckpt_stream_bytes_per_sec: None,
             stall: self.stall.clone(),
             replay_canary: false,
         }

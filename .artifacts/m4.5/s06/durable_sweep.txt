@@ -1,0 +1,7 @@
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=3/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[]
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=4/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[]
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=5/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[]
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=6/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[]
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=7/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[]
+
+[exited with code 0]

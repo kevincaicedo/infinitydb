@@ -94,6 +94,10 @@ pub struct DurableScenario {
     /// swaps, and truncation all happen inside a short run.
     pub segment_bytes: u32,
     pub ckpt_interval_bytes: u64,
+    /// Checkpoint stream pacing override (M4.5-S06): `Some(rate)` keeps
+    /// a stream open across many scheduler steps so scenarios can storm
+    /// the fuzzy window; `None` = the production default.
+    pub ckpt_stream_bytes_per_sec: Option<u32>,
     /// Device service-time model (M2.5-S14). `None` = instant fsyncs
     /// (the pre-S14 device); `m2_durable` arms the reference stall
     /// device so the fleet sees nonzero fsync latency every night.
@@ -150,6 +154,7 @@ impl DurableScenario {
             plant: Plant::None,
             segment_bytes: 16 << 10,
             ckpt_interval_bytes: 24 << 10,
+            ckpt_stream_bytes_per_sec: None,
             stall: Some(m2_stall_config()),
             replay_canary: false,
         }
@@ -182,6 +187,7 @@ impl DurableScenario {
             plant: Plant::None,
             segment_bytes: 64 << 10,
             ckpt_interval_bytes: 24 << 10,
+            ckpt_stream_bytes_per_sec: None,
             stall: Some(m2_stall_config()),
             replay_canary: false,
         }
@@ -522,6 +528,9 @@ pub(crate) fn boot(
             },
             ckpt: inf_server::CkptConfig {
                 interval_bytes: scenario.ckpt_interval_bytes,
+                stream_bytes_per_sec: scenario
+                    .ckpt_stream_bytes_per_sec
+                    .unwrap_or(inf_server::CkptConfig::default().stream_bytes_per_sec),
                 ..Default::default()
             },
             recover: Default::default(),

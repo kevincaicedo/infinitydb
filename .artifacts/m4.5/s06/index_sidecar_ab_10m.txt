@@ -1,0 +1,7 @@
+index_sidecar load A/B: 10000000 entries, 3 replicates
+  fixed8 rep 0: append 17.9 ns/entry (18 B/entry, 10781368 B slack) vs insert 83.5 ns/entry (18 B/entry, 10781368 B slack)
+  fixed8 rep 1: append 18.5 ns/entry (18 B/entry, 10781368 B slack) vs insert 83.1 ns/entry (18 B/entry, 10781368 B slack)
+  fixed8 rep 2: append 18.4 ns/entry (18 B/entry, 10781368 B slack) vs insert 83.5 ns/entry (18 B/entry, 10781368 B slack)
+  varkey rep 0: append 38.8 ns/entry (34 B/entry, 40414546 B slack) vs insert 553.6 ns/entry (34 B/entry, 40414546 B slack)
+  varkey rep 1: append 38.5 ns/entry (34 B/entry, 40414546 B slack) vs insert 556.6 ns/entry (34 B/entry, 40414546 B slack)
+  varkey rep 2: append 38.8 ns/entry (34 B/entry, 40414546 B slack) vs insert 557.3 ns/entry (34 B/entry, 40414546 B slack)

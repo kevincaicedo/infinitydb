@@ -1,0 +1,51 @@
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 18.01s
+     Running benches/sidecar_recovery.rs (target/release/deps/sidecar_recovery-009c6a0b2eef0d51)
+sidecar_recovery: 10000000 docs × ~1 KiB, 4 indexes, 3 replicates
+  corpus ≈ 10.04 GB of record bytes
+cell 0: index 16/1 sidecar loaded (10000000 entries; tail caught up)
+cell 0: index 16/2 sidecar loaded (10000000 entries; tail caught up)
+cell 0: index 16/3 sidecar loaded (10000000 entries; tail caught up)
+cell 0: index 16/4 sidecar loaded (10000000 entries; tail caught up)
+  sidecar rep 0: boot 10.46s — 40000000 entries loaded (3.8 M entries/s if load-only) [gate < 15 s at the 10 GB shape]
+cell 0: index 16/1 sidecar loaded (10000000 entries; tail caught up)
+cell 0: index 16/2 sidecar loaded (10000000 entries; tail caught up)
+cell 0: index 16/3 sidecar loaded (10000000 entries; tail caught up)
+cell 0: index 16/4 sidecar loaded (10000000 entries; tail caught up)
+  sidecar rep 1: boot 11.42s — 40000000 entries loaded (3.5 M entries/s if load-only) [gate < 15 s at the 10 GB shape]
+cell 0: index 16/1 sidecar loaded (10000000 entries; tail caught up)
+cell 0: index 16/2 sidecar loaded (10000000 entries; tail caught up)
+cell 0: index 16/3 sidecar loaded (10000000 entries; tail caught up)
+cell 0: index 16/4 sidecar loaded (10000000 entries; tail caught up)
+  sidecar rep 2: boot 12.14s — 40000000 entries loaded (3.3 M entries/s if load-only) [gate < 15 s at the 10 GB shape]
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/3 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/4 rebuilding (no-sidecar) — was serving before the crash
+  control rep 0: boot 8.18s (no sidecar sections)
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/3 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/4 rebuilding (no-sidecar) — was serving before the crash
+  control rep 1: boot 10.48s (no sidecar sections)
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/3 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/4 rebuilding (no-sidecar) — was serving before the crash
+  control rep 2: boot 10.34s (no sidecar sections)
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/3 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/4 rebuilding (no-sidecar) — was serving before the crash
+  rebuild rep 0: boot 10.48s + walk 34.00s = 44.48s (the fallback the sidecar avoids)
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/3 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/4 rebuilding (no-sidecar) — was serving before the crash
+  rebuild rep 1: boot 10.32s + walk 33.95s = 44.27s (the fallback the sidecar avoids)
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/3 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/4 rebuilding (no-sidecar) — was serving before the crash
+  rebuild rep 2: boot 10.34s + walk 33.91s = 44.25s (the fallback the sidecar avoids)

@@ -21,6 +21,7 @@ mod index_backfill;
 mod index_key;
 mod index_maint;
 mod index_registry;
+mod index_sidecar;
 mod keyspace;
 mod live_set;
 mod ns;
@@ -61,8 +62,11 @@ pub use index_registry::validate_index_program;
 pub use index_registry::{
     FIRST_INDEX_GENERATION, FIRST_INDEX_ID, INDEX_PROGRAM_MAX, INDEXES_PER_NODE_MAX,
     IndexBindError, IndexError, IndexId, IndexMemory, IndexRegistry, IndexSpec, IndexState,
-    IndexTree,
+    IndexTree, SidecarBootDecision, SidecarRebuildReason,
 };
+#[cfg(feature = "doc")]
+pub use index_sidecar::SidecarLoader;
+pub use index_sidecar::{SidecarBootInfo, SidecarBootRow};
 pub use inf_alloc::ArenaConfig;
 // One import point for the shared store↔log vocabulary (ADR-0015 D2/D5).
 pub use inf_foundation::LogicalAddr;
@@ -74,7 +78,7 @@ pub use keyspace::{
 pub use live_set::{FileLiveSet, LiveSet};
 pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, valid_ns_name};
 pub use ordered::{
-    Fixed8, KeyScheme, ORDERED_KEY_MAX, OrderedCursor, OrderedMap, OrderedMapError,
+    AppendError, Fixed8, KeyScheme, ORDERED_KEY_MAX, OrderedCursor, OrderedMap, OrderedMapError,
     OrderedMapMemory, VarKey,
 };
 pub use record::{EXTENT_REF_LEN, ExtentRef, MAX_KEY_LEN, MAX_VAL_LEN, TypeTag};

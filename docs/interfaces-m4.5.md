@@ -16,7 +16,7 @@ Status column tracks arrival.
 | Cursor/compile binding gate `{ns, index id, generation}` | `inf-store` | implemented (M4.5-S03, ADR-0075 D7 — `IndexRegistry::validate_binding`, typed `{UnknownIndex, StaleGeneration, NotReady}`; S09/S11 consult it) |
 | At-mutation maintenance hook (the ADR-0072 bracket + removal sites) | `inf-store`/`inf-server` | implemented (M4.5-S04, ADR-0076 — attach-block custody, `hash64(key)` pk ref, the numbered-db funnel bracket, death hook + truncate + replay arm) |
 | Backfill state machine (MAINTAIN slices, resumable watermark) | `inf-store` | implemented (M4.5-S05, ADR-0077 — store-resident walk, volatile resume-only watermark (crash ⇒ restart), per-index jobs, slot = id-rank, MAINTAIN-edge catalog flip) |
-| Index checkpoint sidecar v1 (`.ick` v2 tag 0x06) | `inf-log` | pending (M4.5-S06 — constraints frozen in ADR-0073) |
+| Index checkpoint sidecar v1 (`.ick` v2 tag 0x06) | `inf-log` | implemented (M4.5-S06, ADR-0078 under the ADR-0073 constraints — 36-byte self-describing body meta `{ns, index id, generation, key-encoding version, key scheme, flags, entries_before, total_entries}` + strictly-ascending `(typed key bytes, entry_ref)` pairs, FINAL-closed streams; the only *soft* body class: damage rebuilds one projection, never refuses a boot) |
 | Access-program form v1 | `inf-query` | pending (M4.5-S09) |
 | Predicate VM bytecode v1 | `inf-query` | pending (M4.5-S07/S08) |
 | `QueryOp` codec (fabric v1.2) | `inf-fabric` | pending (M4.5-S11) |
@@ -118,3 +118,45 @@ Status column tracks arrival.
   `idx_backfill_info()` (phase counts + cumulative totals); `INFO stats`
   renders `idx_backfill_*`; per-index rendering rides S10's
   `INF.IDX LIST`. DST: `inf-sim --scenario m45-backfill`.
+
+## Sidecar surface (M4.5-S06, ADR-0078 — the ADR-0073 constraints as-built)
+
+- **Writer:** the checkpoint's sidecar phase runs after `walk_done`
+  (derived data last) — `Keyspace::idx_sidecar_candidates` captures the
+  emission plan (converged + non-degraded only, D1),
+  `idx_sidecar_emit` streams each tree through its re-seek cursor, and
+  `IckStream::stage_idx_entry / stage_idx_final` (sync tier:
+  `SyncIckWriter::append_idx_entry / append_idx_final`) frame the
+  sections. Eligibility re-checks between slices; any change abandons
+  the stream (no FINAL ⇒ the loader discards it). `.ick` **v2 selects**
+  iff `tiered_present || idx_declared_on_durable()` (registration, not
+  convergence — D7); cells with neither stay v1 byte-identical.
+- **Footer accounting (D2):** sidecar entries join **neither**
+  `records_total` nor the per-ns presize counts — the soft class must
+  not be audit-load-bearing. `section_count` and the digest (stored
+  CRC, ADR-0073 D3.3) cover 0x06 like every class.
+- **Reader:** `next_step_hybrid`/`read_ick_hybrid` gained the fifth
+  handler (`IckIdxSidecarStep::{Section, Damaged}`); body CRC/canon
+  failures deliver `Damaged` and the read continues (D4); records-only
+  loaders refuse typed (`IdxSidecarSectionUnsupported` — the ADR-0073
+  D7 downgrade boundary). Fuzz: `fuzz_index_sidecar` + the `ick_decode`
+  sidecar oracles.
+- **Loader (D6):** `inf-store::SidecarLoader` — per-`(ns, id)` state
+  machine (`Accepting → Loaded | Discarded{reason}`); binding checks
+  {generation, `INDEX_KEY_ENCODING_VERSION`, key scheme}, ordinal
+  contiguity, and the ascending canon via `IndexTree::append`'s own
+  refusal (`OrderedMap::append` — the rightmost-spine bulk path, the
+  < 15 s gate's mechanism). `finish_load` at checkpoint end discards
+  open streams and arms `idx_set_replay_maintenance(CatchUp)` per
+  loaded namespace; `commit_ready` at end of replay flips loaded
+  indexes converged + cell-`Ready` (readiness still aggregates through
+  the S05 board — a sidecar never flips catalog state directly) and
+  records every decision.
+- **The decision record (L10):** per index per boot on the registry
+  (`sidecar_boot()` — `Loaded{entries}` / `Rebuilt{reason}`, reasons
+  `SidecarRebuildReason`); `INFO stats` renders the fold
+  (`idx_sidecar_{loaded,rebuilt,entries_loaded,damaged}`); a
+  `was_ready` index that ends rebuilt logs its serving downgrade
+  loudly. Crash ⇒ restart (ADR-0077 D2) is untouched — no sidecar means
+  the S05 machine rebuilds. DST: `inf-sim --scenario m45-sidecar`;
+  crash rows: `tests/crash-matrix/tests/sidecar.rs`.

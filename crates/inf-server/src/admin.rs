@@ -328,6 +328,16 @@ pub(crate) fn info(
             push(&mut text, &format!("idx_backfill_scanned:{}", backfill.docs_scanned_total));
             push(&mut text, &format!("idx_backfill_inserted:{}", backfill.entries_inserted_total));
         }
+        // M4.5-S06 (ADR-0078 D6): this boot's sidecar rebuild-vs-load
+        // fold (per-index rows ride `INF.IDX LIST` at S10; damaged
+        // sections are unattributable and counted here — L10).
+        {
+            let sidecar = ks.idx_sidecar_info();
+            push(&mut text, &format!("idx_sidecar_loaded:{}", sidecar.loaded));
+            push(&mut text, &format!("idx_sidecar_rebuilt:{}", sidecar.rebuilt));
+            push(&mut text, &format!("idx_sidecar_entries_loaded:{}", sidecar.entries_loaded));
+            push(&mut text, &format!("idx_sidecar_damaged:{}", sidecar.damaged_sections));
+        }
         push(&mut text, &format!("pubsub_channels:{}", node.pubsub_channels.get()));
         push(&mut text, &format!("pubsub_patterns:{}", node.pubsub_patterns.get()));
         push(

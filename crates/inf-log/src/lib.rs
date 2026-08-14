@@ -43,8 +43,9 @@ pub use blob::{
     parse_extent_header, probe_extent_file, unlink_extent_file,
 };
 pub use ckpt::{
-    BlobRefEntry, CkptConfig, IckBlobRefSection, IckLiveSetSection, IckRefSection, IckStream,
-    IckSummary, LiveSetFileEntry, SectionLease, SyncIckWriter, read_ick, read_ick_hybrid,
+    BlobRefEntry, CkptConfig, IckBlobRefSection, IckIdxSidecarSection, IckIdxSidecarStep,
+    IckLiveSetSection, IckRefSection, IckStream, IckSummary, IdxSidecarMeta, LiveSetFileEntry,
+    SectionLease, SyncIckWriter, read_ick, read_ick_hybrid,
 };
 pub use commit::{CommitStats, FsyncClass, FsyncTicket, GroupCommit, SyncReason};
 pub use effect::MutationEffect;

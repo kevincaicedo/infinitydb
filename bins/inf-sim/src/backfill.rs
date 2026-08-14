@@ -109,6 +109,7 @@ fn base(scenario: &BackfillScenario) -> DurableScenario {
         plant: Plant::None,
         segment_bytes: 64 << 10,
         ckpt_interval_bytes: 1 << 30,
+        ckpt_stream_bytes_per_sec: None,
         stall: None,
         replay_canary: false,
     }
@@ -127,8 +128,9 @@ fn doc_of(i: u64) -> Vec<u8> {
 
 /// From-scratch truth for one `(cell, index)`: the read-only digest walk
 /// over the cell's recovered documents, evaluated + encoded through
-/// public APIs — independent of the hook and the walk.
-fn cell_truth(
+/// public APIs — independent of the hook and the walk (shared with the
+/// S06 sidecar scenario).
+pub(crate) fn cell_truth(
     ks: &Keyspace,
     ns: NsId,
     program: &PathProgram,
@@ -167,7 +169,7 @@ fn cell_truth(
     }
 }
 
-fn cell_tree(ks: &Keyspace, ns: NsId, id: IndexId) -> BTreeSet<(Vec<u8>, u64)> {
+pub(crate) fn cell_tree(ks: &Keyspace, ns: NsId, id: IndexId) -> BTreeSet<(Vec<u8>, u64)> {
     let mut out = BTreeSet::new();
     let Some(tree) = ks.idx_tree(ns, id) else { return out };
     let mut cursor = OrderedCursor::from_start();
