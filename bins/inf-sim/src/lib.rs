@@ -24,6 +24,7 @@ pub mod net;
 pub mod pressure;
 pub mod recovery;
 pub mod resp;
+pub mod sidecar;
 pub mod steel;
 pub mod tiered;
 
@@ -36,5 +37,6 @@ pub use durable::{DurableReport, DurableScenario, run_durable_scenario};
 pub use harness::{Scenario, SimReport, run_scenario};
 pub use pressure::{PressureReport, PressureScenario, run_pressure_scenario};
 pub use recovery::{RecoveryReport, RecoveryScenario, run_recovery_scenario};
+pub use sidecar::{SidecarReport, SidecarScenario, run_sidecar_scenario};
 pub use steel::{SteelReport, SteelScenario, run_steel_scenario};
 pub use tiered::{TieredNodeReport, TieredScenario, run_tiered_scenario};

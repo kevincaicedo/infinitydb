@@ -70,6 +70,14 @@ const BLOCK_LIVESET: u8 = 4;
 /// re-coordinates the registry: the M4.5 index-sidecar reservation
 /// moves to 0x06+ (ADR-0061). body := ns u32 · entries.
 const BLOCK_BLOBREF: u8 = 5;
+/// Index-sidecar section (v2 only — M4.5-S06, ADR-0073 D1 activates the
+/// reservation, ADR-0078 D2 owns the schema): one converged index's
+/// `(typed key bytes, entry_ref)` pairs, strictly ascending, one index
+/// per section, possibly many sections per index. The only *soft*
+/// body class in the file (ADR-0073 D6): the stored CRC folds into the
+/// digest before verification, and body damage degrades to a rebuild of
+/// that projection — never a refused boot. body := meta 36 B · entries.
+const BLOCK_IDXSIDECAR: u8 = 6;
 /// tag + body_len + record_count.
 const SECTION_HEADER_LEN: usize = 1 + 4 + 4;
 /// ns u32 + walk_watermark u64, at the head of an addr-ref body.
@@ -83,6 +91,22 @@ const LIVESET_META_LEN: usize = 4;
 pub const LIVESET_ENTRY_LEN: usize = 4 + 8 + 8 + 1;
 /// ns u32, at the head of a blob-ref body.
 const BLOBREF_META_LEN: usize = 4;
+/// Index-sidecar body meta (ADR-0078 D2): ns u32 · index id u32 ·
+/// generation u64 · key-encoding version u16 · key scheme u8 · flags u8
+/// · entries_before u64 · total_entries u64.
+const IDXSIDECAR_META_LEN: usize = 4 + 4 + 8 + 2 + 1 + 1 + 8 + 8;
+/// Structural cap on a sidecar key (`ORDERED_KEY_MAX`, restated here —
+/// `inf-log` never sees the tree; the two constants are cross-checked
+/// by the S06 round-trip test).
+pub const IDXSIDECAR_KEY_MAX: usize = 1024;
+/// Fixed8 sidecar entry: key 8 B · entry_ref u64.
+const IDXSIDECAR_FIXED_ENTRY_LEN: usize = 8 + 8;
+/// `flags` bit 0: this is the index's last section; `total_entries` is
+/// meaningful. Any other bit is a body-class failure within v1.
+const IDXSIDECAR_FLAG_FINAL: u8 = 0x01;
+/// `key_scheme` values (ADR-0078 D2).
+const IDXSIDECAR_SCHEME_FIXED8: u8 = 0;
+const IDXSIDECAR_SCHEME_VAR: u8 = 1;
 /// One blob-ref entry: logical addr u48 LE · extent id u64 · value len
 /// u64 (ADR-0061 D6). Entries ascend strictly by address (the reference
 /// map iterates ordered; decode enforces canonically).
@@ -246,6 +270,24 @@ enum SectionClass {
     /// Cold blob-reference map entries (tag 0x05) for one namespace
     /// (M4-S17, ADR-0061 D6).
     BlobRefs { ns: u32 },
+    /// One converged index's pair stream (tag 0x06) — sections seal at
+    /// every index boundary (M4.5-S06, ADR-0078 D2).
+    IdxSidecar { ns: u32, index_id: u32, generation: u64 },
+}
+
+/// The writer-facing identity of one index's sidecar stream (M4.5-S06,
+/// ADR-0078 D2): every field lands in every section's body meta, so
+/// sections are independently attributable — the damage policy depends
+/// on it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IdxSidecarMeta {
+    pub ns: u32,
+    pub index_id: u32,
+    pub generation: u64,
+    pub key_encoding_version: u16,
+    /// True: `Fixed8` (keys exactly 8 bytes); false: `VarKey`
+    /// (length-prefixed, ≤ [`IDXSIDECAR_KEY_MAX`]).
+    pub fixed8: bool,
 }
 
 /// The checkpoint-buffer domain of one cell: a double-buffered section
@@ -266,6 +308,13 @@ pub struct IckStream {
     /// Last staged blob-ref address — the writer half of the tag-0x05
     /// strictly-ascending canon (decode enforces the reader half).
     staged_blob_prev_addr: u64,
+    /// The pending sidecar section's first ordinal — the writer half of
+    /// the tag-0x06 contiguity canon (M4.5-S06, ADR-0078 D2).
+    staged_idx_entries_before: u64,
+    /// Last staged sidecar pair — the writer half of the ascending
+    /// canon (buffer reused across sections; cleared at first stage).
+    staged_idx_prev_key: Vec<u8>,
+    staged_idx_prev_ref: u64,
     version: u16,
     sections: u32,
     records_total: u64,
@@ -303,6 +352,9 @@ impl IckStream {
             staged_records: 0,
             staged_class: None,
             staged_blob_prev_addr: 0,
+            staged_idx_entries_before: 0,
+            staged_idx_prev_key: Vec::new(),
+            staged_idx_prev_ref: 0,
             version,
             sections: 0,
             records_total: 0,
@@ -326,7 +378,7 @@ impl IckStream {
         ns_ids: &[u32],
     ) -> SectionLease {
         assert!(!self.header_written, "ick header staged twice");
-        assert!(self.in_flight.is_none() && self.staged_records == 0, "begin on a dirty stream");
+        assert!(self.in_flight.is_none() && self.staged_class.is_none(), "begin on a dirty stream");
         let buf = &mut self.bufs[self.staging];
         buf.clear();
         buf.extend_from_slice(&ICK_MAGIC);
@@ -358,7 +410,7 @@ impl IckStream {
     pub fn stage_record(&mut self, view: &RecordView<'_>) {
         assert!(self.header_written && !self.finished, "stage outside header..finish");
         let buf = &mut self.bufs[self.staging];
-        if self.staged_records == 0 {
+        if self.staged_class.is_none() {
             debug_assert!(buf.is_empty());
             self.staged_class = Some(SectionClass::Images);
             buf.resize(SECTION_HEADER_LEN, 0); // header placeholder, filled at seal
@@ -389,7 +441,7 @@ impl IckStream {
         assert!(addr < walk_watermark, "a ref must sit below its walk watermark");
         assert!(walk_watermark < ADDR_LIMIT, "watermarks are 48-bit");
         let buf = &mut self.bufs[self.staging];
-        if self.staged_records == 0 {
+        if self.staged_class.is_none() {
             debug_assert!(buf.is_empty());
             self.staged_class = Some(SectionClass::Refs { ns, walk_watermark });
             buf.resize(SECTION_HEADER_LEN, 0);
@@ -434,7 +486,7 @@ impl IckStream {
         assert_eq!(self.version, ICK_VERSION_V2, "live-set sections are a v2 vocabulary");
         assert!(dead_bytes <= data_len, "dead bytes exceed the file's data bytes");
         let buf = &mut self.bufs[self.staging];
-        if self.staged_records == 0 {
+        if self.staged_class.is_none() {
             debug_assert!(buf.is_empty());
             self.staged_class = Some(SectionClass::LiveSet { ns });
             buf.resize(SECTION_HEADER_LEN, 0);
@@ -470,7 +522,7 @@ impl IckStream {
         assert!(addr < ADDR_LIMIT, "logical addresses are 48-bit");
         assert!(len > 0, "an extent reference names at least one byte");
         let buf = &mut self.bufs[self.staging];
-        if self.staged_records == 0 {
+        if self.staged_class.is_none() {
             debug_assert!(buf.is_empty());
             self.staged_class = Some(SectionClass::BlobRefs { ns });
             self.staged_blob_prev_addr = 0;
@@ -494,10 +546,167 @@ impl IckStream {
         self.staged_records += 1;
     }
 
+    /// Appends one index-sidecar pair (M4.5-S06, ADR-0078 D2). One
+    /// index per section: the caller seals at every index boundary.
+    /// `ordinal` is the pair's position in the index's whole emission —
+    /// the section meta records the first one (`entries_before`) and
+    /// continuity is asserted per stage (the writer half of the reader's
+    /// contiguity canon). Ascending order is asserted in release like
+    /// the tag-0x05 canon — walker bugs, never input.
+    ///
+    /// # Panics
+    /// Panics on a v1 stream, a pending section of another class or
+    /// index, an ordinal gap, a non-ascending pair, or a key outside
+    /// the scheme's bounds.
+    pub fn stage_idx_entry(
+        &mut self,
+        meta: &IdxSidecarMeta,
+        ordinal: u64,
+        key: &[u8],
+        entry_ref: u64,
+    ) {
+        assert!(self.header_written && !self.finished, "stage outside header..finish");
+        assert_eq!(self.version, ICK_VERSION_V2, "index sidecars are a v2 vocabulary");
+        if meta.fixed8 {
+            assert!(key.len() == 8, "Fixed8 sidecar keys are exactly 8 bytes");
+        } else {
+            assert!(key.len() <= IDXSIDECAR_KEY_MAX, "sidecar key exceeds the structural cap");
+        }
+        let class = SectionClass::IdxSidecar {
+            ns: meta.ns,
+            index_id: meta.index_id,
+            generation: meta.generation,
+        };
+        if self.staged_class.is_none() {
+            self.open_idx_section(meta, ordinal, 0);
+        }
+        assert_eq!(
+            self.staged_class,
+            Some(class),
+            "seal before switching class, index, or generation"
+        );
+        assert_eq!(
+            ordinal,
+            self.staged_idx_entries_before + u64::from(self.staged_records),
+            "sidecar ordinals are contiguous within a section"
+        );
+        assert_eq!(
+            self.bufs[self.staging][SECTION_HEADER_LEN + 19],
+            0,
+            "no entries after a FINAL marker"
+        );
+        assert!(
+            self.staged_records == 0
+                || (key, entry_ref)
+                    > (self.staged_idx_prev_key.as_slice(), self.staged_idx_prev_ref),
+            "sidecar pairs ascend strictly"
+        );
+        self.staged_idx_prev_key.clear();
+        self.staged_idx_prev_key.extend_from_slice(key);
+        self.staged_idx_prev_ref = entry_ref;
+        let buf = &mut self.bufs[self.staging];
+        if !meta.fixed8 {
+            buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        }
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(&entry_ref.to_le_bytes());
+        self.staged_records += 1;
+        // Deliberately NOT entries_per_ns and (at seal) NOT
+        // records_total: 0x06 is the only soft body class — no body
+        // byte may be load-bearing for the file-level audit (ADR-0078
+        // D2's footer-accounting deviation).
+    }
+
+    /// Marks the pending sidecar section as the index's last, recording
+    /// the whole-stream cardinality (ADR-0078 D2). With no pending
+    /// section (the boundary landed exactly on a seal, or the tree was
+    /// empty) a zero-entry FINAL section is opened — `entry_count == 0`
+    /// is legal for tag 0x06 exactly in that configuration.
+    ///
+    /// # Panics
+    /// Panics on a v1 stream or a pending section of another class or
+    /// index.
+    pub fn stage_idx_final(&mut self, meta: &IdxSidecarMeta, total_entries: u64) {
+        assert!(self.header_written && !self.finished, "stage outside header..finish");
+        assert_eq!(self.version, ICK_VERSION_V2, "index sidecars are a v2 vocabulary");
+        let class = SectionClass::IdxSidecar {
+            ns: meta.ns,
+            index_id: meta.index_id,
+            generation: meta.generation,
+        };
+        if self.staged_class.is_none() {
+            self.open_idx_section(meta, total_entries, total_entries);
+            self.patch_idx_final(total_entries);
+            return;
+        }
+        assert_eq!(self.staged_class, Some(class), "seal before finalizing another index");
+        assert_eq!(
+            total_entries,
+            self.staged_idx_entries_before + u64::from(self.staged_records),
+            "the FINAL total equals the emitted ordinal count"
+        );
+        self.patch_idx_final(total_entries);
+    }
+
+    /// Writes a fresh sidecar body meta into the staging buffer.
+    fn open_idx_section(&mut self, meta: &IdxSidecarMeta, entries_before: u64, total: u64) {
+        let buf = &mut self.bufs[self.staging];
+        debug_assert!(buf.is_empty());
+        self.staged_class = Some(SectionClass::IdxSidecar {
+            ns: meta.ns,
+            index_id: meta.index_id,
+            generation: meta.generation,
+        });
+        self.staged_idx_entries_before = entries_before;
+        self.staged_idx_prev_key.clear();
+        self.staged_idx_prev_ref = 0;
+        buf.resize(SECTION_HEADER_LEN, 0);
+        buf.extend_from_slice(&meta.ns.to_le_bytes());
+        buf.extend_from_slice(&meta.index_id.to_le_bytes());
+        buf.extend_from_slice(&meta.generation.to_le_bytes());
+        buf.extend_from_slice(&meta.key_encoding_version.to_le_bytes());
+        buf.push(if meta.fixed8 { IDXSIDECAR_SCHEME_FIXED8 } else { IDXSIDECAR_SCHEME_VAR });
+        buf.push(0); // flags — patched by `stage_idx_final`.
+        buf.extend_from_slice(&entries_before.to_le_bytes());
+        buf.extend_from_slice(&total.to_le_bytes());
+        debug_assert_eq!(buf.len(), SECTION_HEADER_LEN + IDXSIDECAR_META_LEN);
+    }
+
+    /// Patches FINAL + `total_entries` into the pending section's meta.
+    fn patch_idx_final(&mut self, total_entries: u64) {
+        let buf = &mut self.bufs[self.staging];
+        let flags_at = SECTION_HEADER_LEN + 19;
+        assert_eq!(buf[flags_at], 0, "an index finalizes once");
+        buf[flags_at] = IDXSIDECAR_FLAG_FINAL;
+        let total_at = SECTION_HEADER_LEN + 28;
+        buf[total_at..total_at + 8].copy_from_slice(&total_entries.to_le_bytes());
+    }
+
     /// True once the staging section reached its seal target.
     #[must_use]
     pub fn section_full(&self) -> bool {
         self.staged_body_bytes() >= self.section_target
+    }
+
+    /// True while any section is open in staging (the seal-first signal
+    /// for phase-boundary drivers — M4.5-S06).
+    #[must_use]
+    pub fn has_pending_section(&self) -> bool {
+        self.staged_class.is_some()
+    }
+
+    /// The pending sidecar stream's identity `(ns, index id,
+    /// generation)`, or `None` when the pending section is another
+    /// class (or nothing is staged) — the checkpoint driver's
+    /// continue-vs-seal-first test at sidecar boundaries (M4.5-S06).
+    #[must_use]
+    pub fn pending_idx_stream(&self) -> Option<(u32, u32, u64)> {
+        match self.staged_class {
+            Some(SectionClass::IdxSidecar { ns, index_id, generation }) => {
+                Some((ns, index_id, generation))
+            }
+            _ => None,
+        }
     }
 
     /// Record bytes staged into the pending section.
@@ -514,10 +723,13 @@ impl IckStream {
         self.in_flight.is_some()
     }
 
-    /// True when `seal_section` may run now.
+    /// True when `seal_section` may run now. A pending section usually
+    /// holds records, but a zero-entry FINAL sidecar section (ADR-0078
+    /// D2's empty-tree shape) is a sealable section too — the open
+    /// class, not the record count, is the truth.
     #[must_use]
     pub fn can_seal(&self) -> bool {
-        self.staged_records > 0 && self.in_flight.is_none()
+        self.staged_class.is_some() && self.in_flight.is_none()
     }
 
     /// Seals the staging section: header fields + trailing CRC32C, digest
@@ -529,7 +741,7 @@ impl IckStream {
     /// If nothing is staged or a lease is outstanding (`can_seal`).
     pub fn seal_section(&mut self) -> SectionLease {
         assert!(self.can_seal(), "seal_section without can_seal");
-        let class = self.staged_class.take().expect("staged records imply a class");
+        let class = self.staged_class.take().expect("can_seal implies a class");
         let buf = &mut self.bufs[self.staging];
         let body_len = u32::try_from(buf.len() - SECTION_HEADER_LEN).expect("body fits u32");
         buf[0] = match class {
@@ -537,6 +749,7 @@ impl IckStream {
             SectionClass::Refs { .. } => BLOCK_ADDR_SECTION,
             SectionClass::LiveSet { .. } => BLOCK_LIVESET,
             SectionClass::BlobRefs { .. } => BLOCK_BLOBREF,
+            SectionClass::IdxSidecar { .. } => BLOCK_IDXSIDECAR,
         };
         buf[1..5].copy_from_slice(&body_len.to_le_bytes());
         buf[5..9].copy_from_slice(&self.staged_records.to_le_bytes());
@@ -544,7 +757,12 @@ impl IckStream {
         buf.extend_from_slice(&crc.to_le_bytes());
         self.digest = fold_digest(self.digest, crc);
         self.sections += 1;
-        self.records_total += u64::from(self.staged_records);
+        // Sidecar entries stay out of `records_total`: 0x06 is the only
+        // soft body class, and its counts must not be load-bearing for
+        // the footer audit (ADR-0078 D2).
+        if !matches!(class, SectionClass::IdxSidecar { .. }) {
+            self.records_total += u64::from(self.staged_records);
+        }
         self.staged_records = 0;
         self.lease_staging()
     }
@@ -557,7 +775,7 @@ impl IckStream {
     /// was never staged.
     pub fn finish(&mut self) -> SectionLease {
         assert!(self.header_written && !self.finished, "finish outside header..finish");
-        assert!(self.staged_records == 0, "finish with a partial section staged");
+        assert!(self.staged_class.is_none(), "finish with a partial section staged");
         assert!(self.in_flight.is_none(), "finish with a section in flight");
         let entries = std::mem::take(&mut self.entries_per_ns);
         let buf = &mut self.bufs[self.staging];
@@ -806,6 +1024,56 @@ impl<F: SegmentFs> SyncIckWriter<F> {
         Ok(())
     }
 
+    /// Appends one index-sidecar pair (M4.5-S06, ADR-0078 D2), sealing
+    /// the pending section first when it holds another class, index, or
+    /// generation.
+    ///
+    /// # Errors
+    /// Write failure from the fs seam.
+    pub fn append_idx_entry(
+        &mut self,
+        meta: &IdxSidecarMeta,
+        ordinal: u64,
+        key: &[u8],
+        entry_ref: u64,
+    ) -> io::Result<()> {
+        let key_class = SectionClass::IdxSidecar {
+            ns: meta.ns,
+            index_id: meta.index_id,
+            generation: meta.generation,
+        };
+        if self.stream.staged_class.is_some_and(|class| class != key_class) {
+            self.write_sealed()?;
+        }
+        self.stream.stage_idx_entry(meta, ordinal, key, entry_ref);
+        if self.stream.section_full() {
+            self.write_sealed()?;
+        }
+        Ok(())
+    }
+
+    /// Finalizes an index's sidecar stream (ADR-0078 D2) and seals the
+    /// section — FINAL ends the stream, so nothing else may join it.
+    ///
+    /// # Errors
+    /// Write failure from the fs seam.
+    pub fn append_idx_final(
+        &mut self,
+        meta: &IdxSidecarMeta,
+        total_entries: u64,
+    ) -> io::Result<()> {
+        let key_class = SectionClass::IdxSidecar {
+            ns: meta.ns,
+            index_id: meta.index_id,
+            generation: meta.generation,
+        };
+        if self.stream.staged_class.is_some_and(|class| class != key_class) {
+            self.write_sealed()?;
+        }
+        self.stream.stage_idx_final(meta, total_entries);
+        self.write_sealed()
+    }
+
     fn write_sealed(&mut self) -> io::Result<()> {
         let lease = self.stream.seal_section();
         self.file.write_at(lease.offset(), self.stream.leased_bytes(&lease))?;
@@ -910,6 +1178,12 @@ pub enum IckReadError {
     BlobRefSectionUnsupported {
         at: u64,
     },
+    /// The load path cannot apply index sidecars (a loader without the
+    /// sidecar arm opened a v2 checkpoint carrying tag 0x06 — the
+    /// ADR-0073 D7 downgrade boundary, typed).
+    IdxSidecarSectionUnsupported {
+        at: u64,
+    },
     /// A footer field disagrees with what the sections actually contained.
     FooterMismatch {
         field: &'static str,
@@ -973,6 +1247,12 @@ impl std::fmt::Display for IckReadError {
                 write!(
                     f,
                     "ick blob-ref section at offset {at} but the load path has no blob-ref arm"
+                )
+            }
+            IckReadError::IdxSidecarSectionUnsupported { at } => {
+                write!(
+                    f,
+                    "ick index-sidecar section at offset {at} but the load path has no sidecar arm"
                 )
             }
             IckReadError::FooterMismatch { field } => {
@@ -1041,6 +1321,10 @@ fn read_exact_at<File: SegmentFile>(
         done += n;
     }
     Ok(())
+}
+
+fn le_u16(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes(bytes.try_into().expect("2 bytes"))
 }
 
 fn le_u32(bytes: &[u8]) -> u32 {
@@ -1116,12 +1400,13 @@ pub fn read_ick_counts<F: SegmentFs>(
         match head[0] {
             // All section classes hop identically: the class meta lives
             // inside body_len (ADR-0057 D3 / ADR-0058 D3, deliberately).
-            // The 0x03/0x04/0x05 tags are a v2 vocabulary — in a v1 file
-            // they are corruption. Every tag `seal_section` can emit must
-            // appear here or the footer-probe fallback misdiagnoses a
-            // valid file as corrupt (the ADR-0073 D4 three-site rule —
+            // The 0x03/0x04/0x05/0x06 tags are a v2 vocabulary — in a v1
+            // file they are corruption. Every tag `seal_section` can emit
+            // must appear here or the footer-probe fallback misdiagnoses
+            // a valid file as corrupt (the ADR-0073 D4 three-site rule —
             // 0x05 was missing until M4.5-S00's audit).
-            BLOCK_SECTION | BLOCK_ADDR_SECTION | BLOCK_LIVESET | BLOCK_BLOBREF => {
+            BLOCK_SECTION | BLOCK_ADDR_SECTION | BLOCK_LIVESET | BLOCK_BLOBREF
+            | BLOCK_IDXSIDECAR => {
                 if head[0] != BLOCK_SECTION && version != ICK_VERSION_V2 {
                     return Err(IckReadError::UnknownBlock { tag: head[0], at: offset });
                 }
@@ -1168,6 +1453,91 @@ type LiveSetHandler<'a, E> = &'a mut dyn FnMut(IckLiveSetSection<'_>) -> Result<
 
 /// The per-section blob-reference handler (M4-S17) — same shape.
 type BlobRefHandler<'a, E> = &'a mut dyn FnMut(IckBlobRefSection<'_>) -> Result<(), E>;
+
+/// The per-section index-sidecar handler (M4.5-S06) — same per-section
+/// dyn dispatch shape; receives damaged-body notifications too (the
+/// soft class must stay countable, L10).
+type IdxSidecarHandler<'a, E> = &'a mut dyn FnMut(IckIdxSidecarStep<'_>) -> Result<(), E>;
+
+/// One index-sidecar delivery (M4.5-S06, ADR-0078 D4): tag 0x06 is the
+/// file's only *soft* body class — a section whose body fails its CRC
+/// or canon arrives as `Damaged` (counted by the applier; per-index
+/// outcomes resolve through the loader's completeness rules) and the
+/// read continues. Everything else about the file stays fail-stop.
+#[derive(Debug)]
+pub enum IckIdxSidecarStep<'a> {
+    /// A validated section: shape, flags, key bounds, and the strictly-
+    /// ascending canon all passed — the applier trusts the shape.
+    Section(IckIdxSidecarSection<'a>),
+    /// A well-framed section whose body failed (CRC or canon). The body
+    /// is untrusted, so the damage is deliberately unattributed.
+    Damaged { at: u64 },
+}
+
+/// One validated index-sidecar section (v2, ADR-0078 D2/D3): one
+/// converged index's `(typed key bytes, entry_ref)` pairs, strictly
+/// ascending — per-section dispatch, tight per-entry loop (the
+/// [`IckRefSection`] posture).
+#[derive(Debug)]
+pub struct IckIdxSidecarSection<'a> {
+    /// Owning namespace.
+    pub ns: u32,
+    /// The index's node-unique id.
+    pub index_id: u32,
+    /// The generation the pairs were maintained under — the loader
+    /// discards on any mismatch with the seeded registry (ADR-0073
+    /// D5.1).
+    pub generation: u64,
+    /// The S02 key-encoding version the key bytes were produced by.
+    pub key_encoding_version: u16,
+    /// True: `Fixed8` entries; false: length-prefixed `VarKey` entries.
+    pub fixed8: bool,
+    /// This is the index's last section; `total_entries` is meaningful.
+    pub final_section: bool,
+    /// Ordinal of this section's first pair within the index's whole
+    /// emission (the loader's contiguity check).
+    pub entries_before: u64,
+    /// Whole-stream cardinality (0 unless `final_section`).
+    pub total_entries: u64,
+    entries: &'a [u8],
+}
+
+impl IckIdxSidecarSection<'_> {
+    /// Entry count (audited against the section header at decode).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        if self.fixed8 {
+            return self.entries.len() / IDXSIDECAR_FIXED_ENTRY_LEN;
+        }
+        self.iter().count()
+    }
+
+    /// True for the zero-entry FINAL shape (the empty converged tree —
+    /// legal for tag 0x06 exactly there, ADR-0078 D2).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// `(typed key bytes, entry_ref)` pairs in file (= ascending) order.
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], u64)> + '_ {
+        let mut rest = self.entries;
+        let fixed8 = self.fixed8;
+        std::iter::from_fn(move || {
+            if rest.is_empty() {
+                return None;
+            }
+            // Decode audited the shape; the arithmetic below cannot go
+            // out of bounds on a delivered section.
+            let key_len = if fixed8 { 8 } else { le_u16(&rest[0..2]) as usize };
+            let key_at = if fixed8 { 0 } else { 2 };
+            let key = &rest[key_at..key_at + key_len];
+            let entry_ref = le_u64(&rest[key_at + key_len..key_at + key_len + 8]);
+            rest = &rest[key_at + key_len + 8..];
+            Some((key, entry_ref))
+        })
+    }
+}
 
 /// One [`IckReader::next_step`] outcome.
 #[derive(Debug)]
@@ -1320,6 +1690,72 @@ impl IckLiveSetSection<'_> {
     }
 }
 
+/// Body audit for a well-framed, CRC-clean 0x06 section (ADR-0078 D3):
+/// meta shape, known flags, scheme, key bounds, entry-count agreement,
+/// and the strictly-ascending canon — iterative, bounded by the body
+/// length (L9). `None` is a **body-class** verdict: the caller delivers
+/// [`IckIdxSidecarStep::Damaged`], never a read error (the soft class).
+fn parse_idx_sidecar_body(body: &[u8], record_count: u32) -> Option<IckIdxSidecarSection<'_>> {
+    if body.len() < IDXSIDECAR_META_LEN {
+        return None;
+    }
+    let fixed8 = match body[18] {
+        IDXSIDECAR_SCHEME_FIXED8 => true,
+        IDXSIDECAR_SCHEME_VAR => false,
+        _ => return None,
+    };
+    let flags = body[19];
+    if flags & !IDXSIDECAR_FLAG_FINAL != 0 {
+        return None;
+    }
+    let final_section = flags & IDXSIDECAR_FLAG_FINAL != 0;
+    let total_entries = le_u64(&body[28..36]);
+    if !final_section && (total_entries != 0 || record_count == 0) {
+        return None;
+    }
+    // Entry audit: exact count and the strictly-ascending pair canon.
+    let entries = &body[IDXSIDECAR_META_LEN..];
+    let mut rest = entries;
+    let mut decoded: u32 = 0;
+    let mut prev: Option<(&[u8], u64)> = None;
+    while !rest.is_empty() {
+        let key_len = if fixed8 {
+            8
+        } else {
+            if rest.len() < 2 {
+                return None;
+            }
+            le_u16(&rest[0..2]) as usize
+        };
+        let key_at = if fixed8 { 0 } else { 2 };
+        if key_len > IDXSIDECAR_KEY_MAX || rest.len() < key_at + key_len + 8 {
+            return None;
+        }
+        let key = &rest[key_at..key_at + key_len];
+        let entry_ref = le_u64(&rest[key_at + key_len..key_at + key_len + 8]);
+        if prev.is_some_and(|p| (key, entry_ref) <= p) {
+            return None;
+        }
+        prev = Some((key, entry_ref));
+        decoded = decoded.checked_add(1)?;
+        rest = &rest[key_at + key_len + 8..];
+    }
+    if decoded != record_count {
+        return None;
+    }
+    Some(IckIdxSidecarSection {
+        ns: le_u32(&body[0..4]),
+        index_id: le_u32(&body[4..8]),
+        generation: le_u64(&body[8..16]),
+        key_encoding_version: le_u16(&body[16..18]),
+        fixed8,
+        final_section,
+        entries_before: le_u64(&body[20..28]),
+        total_entries,
+        entries,
+    })
+}
+
 /// Pull-based validating `.ick` loader (M2-S15): the same header → section
 /// CRC-then-apply → footer audit as [`read_ick`], one section per
 /// [`next_step`](Self::next_step) call, so boot recovery can load a
@@ -1422,13 +1858,14 @@ impl<File: SegmentFile> IckReader<File> {
         &mut self,
         mut apply: impl FnMut(RecordView<'_>) -> Result<(), E>,
     ) -> Result<IckStep, IckApplyError<E>> {
-        self.step_inner(&mut apply, None, None, None)
+        self.step_inner(&mut apply, None, None, None, None)
     }
 
-    /// [`next_step`](Self::next_step) with the v2 arms: ref and live-set
-    /// sections arrive whole, post-audit (shape, CRC, per-entry
-    /// invariants), one callback per section (M4-S12/S14, ADR-0057 D3/D6,
-    /// ADR-0058 D3).
+    /// [`next_step`](Self::next_step) with the v2 arms: ref, live-set,
+    /// blob-ref, and index-sidecar sections arrive whole, post-audit
+    /// (shape, CRC, per-entry invariants), one callback per section
+    /// (M4-S12/S14/S17, M4.5-S06 — ADR-0057 D3/D6, ADR-0058 D3,
+    /// ADR-0061 D6, ADR-0078 D3/D4).
     ///
     /// # Errors
     /// As [`next_step`](Self::next_step).
@@ -1438,12 +1875,14 @@ impl<File: SegmentFile> IckReader<File> {
         mut on_refs: impl FnMut(IckRefSection<'_>) -> Result<(), E>,
         mut on_live_set: impl FnMut(IckLiveSetSection<'_>) -> Result<(), E>,
         mut on_blob_refs: impl FnMut(IckBlobRefSection<'_>) -> Result<(), E>,
+        mut on_idx_sidecar: impl FnMut(IckIdxSidecarStep<'_>) -> Result<(), E>,
     ) -> Result<IckStep, IckApplyError<E>> {
         self.step_inner(
             &mut apply,
             Some(&mut on_refs),
             Some(&mut on_live_set),
             Some(&mut on_blob_refs),
+            Some(&mut on_idx_sidecar),
         )
     }
 
@@ -1453,6 +1892,7 @@ impl<File: SegmentFile> IckReader<File> {
         refs: Option<RefHandler<'_, E>>,
         live_set: Option<LiveSetHandler<'_, E>>,
         blob_refs: Option<BlobRefHandler<'_, E>>,
+        idx_sidecar: Option<IdxSidecarHandler<'_, E>>,
     ) -> Result<IckStep, IckApplyError<E>> {
         assert!(!self.done, "IckReader stepped past its footer");
         if self.offset == self.file_size {
@@ -1733,6 +2173,54 @@ impl<File: SegmentFile> IckReader<File> {
                 self.offset += block_len as u64;
                 Ok(IckStep::Section { bytes: block_len as u64 })
             }
+            BLOCK_IDXSIDECAR if self.info.version == ICK_VERSION_V2 => {
+                let mut head = [0u8; SECTION_HEADER_LEN];
+                read_exact_at(&self.file, self.offset, &mut head)?;
+                let body_len = le_u32(&head[1..5]);
+                if body_len > self.cfg.max_section_bytes {
+                    return Err(IckReadError::SectionTooLarge {
+                        len: body_len,
+                        max: self.cfg.max_section_bytes,
+                    }
+                    .into());
+                }
+                let record_count = le_u32(&head[5..9]);
+                let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
+                self.block.resize(block_len, 0);
+                read_exact_at(&self.file, self.offset, &mut self.block)?;
+                self.file.advise_read_ahead(self.offset + block_len as u64, 4 * block_len as u64);
+                let Some(on_idx_sidecar) = idx_sidecar else {
+                    return Err(
+                        IckReadError::IdxSidecarSectionUnsupported { at: self.offset }.into()
+                    );
+                };
+                // The stored CRC folds into the digest BEFORE
+                // verification (ADR-0073 D3.3/D6): the file-level audit
+                // and the body verdict are independent — that is what
+                // makes 0x06 the file's only soft body class. Damage to
+                // the CRC *field* itself fails the footer digest audit
+                // ⇒ fail-stop, conservatively (the D6 asymmetry).
+                let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
+                self.digest = fold_digest(self.digest, stored_crc);
+                let step = if crc32c(&self.block[..block_len - CRC_LEN]) == stored_crc {
+                    let body = &self.block[SECTION_HEADER_LEN..block_len - CRC_LEN];
+                    match parse_idx_sidecar_body(body, record_count) {
+                        Some(section) => IckIdxSidecarStep::Section(section),
+                        None => IckIdxSidecarStep::Damaged { at: self.offset },
+                    }
+                } else {
+                    IckIdxSidecarStep::Damaged { at: self.offset }
+                };
+                on_idx_sidecar(step)
+                    .map_err(|error| IckApplyError::Apply { section: self.sections, error })?;
+                // Sidecar entries join neither `records_total` nor the
+                // per-ns counts (ADR-0078 D2, mirroring the writer):
+                // no soft-class body byte may be load-bearing for the
+                // footer audit.
+                self.sections += 1;
+                self.offset += block_len as u64;
+                Ok(IckStep::Section { bytes: block_len as u64 })
+            }
             BLOCK_FOOTER => {
                 let mut fixed = [0u8; FOOTER_FIXED_LEN];
                 read_exact_at(&self.file, self.offset, &mut fixed)?;
@@ -1818,13 +2306,17 @@ pub fn read_ick<F: SegmentFs, E>(
     }
 }
 
-/// [`read_ick`] with the v2 arms (M4-S12/S14, ADR-0057 D3/D6, ADR-0058
-/// D3): the hybrid load recovery drives — records through `apply`,
-/// validated ref sections through `on_refs`, validated live-set sections
-/// through `on_live_set`. Same audit, same fuzz surface.
+/// [`read_ick`] with the v2 arms (M4-S12/S14/S17, M4.5-S06 — ADR-0057
+/// D3/D6, ADR-0058 D3, ADR-0061 D6, ADR-0078 D3/D4): the hybrid load
+/// recovery drives — records through `apply`, validated ref sections
+/// through `on_refs`, validated live-set sections through
+/// `on_live_set`, blob refs through `on_blob_refs`, and index-sidecar
+/// deliveries (validated or damaged-soft) through `on_idx_sidecar`.
+/// Same audit, same fuzz surface.
 ///
 /// # Errors
 /// As [`read_ick`].
+#[allow(clippy::too_many_arguments)] // one handler per v2 section class, deliberately flat
 pub fn read_ick_hybrid<F: SegmentFs, E>(
     fs: &F,
     path: &Path,
@@ -1833,6 +2325,7 @@ pub fn read_ick_hybrid<F: SegmentFs, E>(
     mut on_refs: impl FnMut(IckRefSection<'_>) -> Result<(), E>,
     mut on_live_set: impl FnMut(IckLiveSetSection<'_>) -> Result<(), E>,
     mut on_blob_refs: impl FnMut(IckBlobRefSection<'_>) -> Result<(), E>,
+    mut on_idx_sidecar: impl FnMut(IckIdxSidecarStep<'_>) -> Result<(), E>,
 ) -> Result<(IckInfo, IckSummary), IckApplyError<E>> {
     let mut reader = IckReader::open(fs, path, cfg)?;
     loop {
@@ -1841,6 +2334,7 @@ pub fn read_ick_hybrid<F: SegmentFs, E>(
             &mut on_refs,
             &mut on_live_set,
             &mut on_blob_refs,
+            &mut on_idx_sidecar,
         )? {
             IckStep::Section { .. } => {}
             IckStep::Done(summary) => return Ok((reader.info, summary)),
@@ -1993,6 +2487,15 @@ mod tests {
         w.append_ref(16, 4096, 0xfeed_beef, 128).expect("addr ref");
         w.append_live_set(16, 1, 4096, 0, true).expect("live set");
         w.append_blob_ref(16, 100, 7, 4096).expect("blob ref");
+        let meta = IdxSidecarMeta {
+            ns: 16,
+            index_id: 1,
+            generation: 1,
+            key_encoding_version: 1,
+            fixed8: true,
+        };
+        w.append_idx_entry(&meta, 0, &7u64.to_be_bytes(), 42).expect("idx entry");
+        w.append_idx_final(&meta, 1).expect("idx final");
         let summary = w.finish().expect("finish");
 
         let path = dir.join(ick_file_name(21));
@@ -2129,6 +2632,7 @@ mod tests {
             },
             |_| panic!("no live-set sections in this image"),
             |_| panic!("no blob-ref sections in this image"),
+            |_| panic!("no index-sidecar sections in this image"),
         )
         .expect("hybrid load");
         assert_eq!(info.version, ICK_VERSION_V2);
@@ -2163,6 +2667,7 @@ mod tests {
                     &fs2,
                     &path,
                     IckReaderConfig::default(),
+                    |_| Ok::<(), ()>(()),
                     |_| Ok::<(), ()>(()),
                     |_| Ok::<(), ()>(()),
                     |_| Ok::<(), ()>(()),
@@ -2228,6 +2733,7 @@ mod tests {
                 Ok::<(), ()>(())
             },
             |_| panic!("no blob-ref sections in this image"),
+            |_| panic!("no index-sidecar sections in this image"),
         )
         .expect("hybrid load");
         assert_eq!(info.version, ICK_VERSION_V2);
@@ -2275,6 +2781,7 @@ mod tests {
                 &fs2,
                 &path,
                 IckReaderConfig::default(),
+                |_| Ok::<(), ()>(()),
                 |_| Ok::<(), ()>(()),
                 |_| Ok::<(), ()>(()),
                 |_| Ok::<(), ()>(()),
@@ -2358,6 +2865,7 @@ mod tests {
                 got.extend(section.iter().map(|e| (e.addr, e.extent_id, e.len)));
                 Ok::<(), ()>(())
             },
+            |_| panic!("no index-sidecar sections in this image"),
         )
         .expect("hybrid load");
         assert_eq!(info.version, ICK_VERSION_V2);
@@ -2403,6 +2911,7 @@ mod tests {
                 |_| Ok::<(), ()>(()),
                 |_| Ok::<(), ()>(()),
                 |_| Ok::<(), ()>(()),
+                |_| Ok::<(), ()>(()),
             )
             .expect_err("semantic damage must not load");
             assert!(
@@ -2428,6 +2937,312 @@ mod tests {
             stream.stage_blob_ref(16, 100, 2, 10);
         });
         assert!(result.is_err(), "non-ascending addresses must panic at stage time");
+    }
+
+    /// Index-sidecar sections (tag 0x06, M4.5-S06, ADR-0078 D2/D3/D4):
+    /// exact multi-section round trip across both key schemes plus the
+    /// zero-entry FINAL shape; the footer-accounting exemption
+    /// (`records_total` and the per-ns presize counts both untouched);
+    /// the records-only refusal; and the soft damage policy — body
+    /// damage delivers `Damaged` and the load *continues*, while damage
+    /// to the stored CRC field fail-stops at the footer digest audit.
+    #[test]
+    fn idx_sidecar_sections_round_trip_and_audit() {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let mut w = SyncIckWriter::create_v2(
+            fs.clone(),
+            dir,
+            &small_cfg(),
+            0,
+            15,
+            Lsn::new(crate::lsn::SegmentId(1), 64),
+            &[16, 17],
+        )
+        .expect("create v2");
+        for i in 0..3u32 {
+            let key = format!("k{i}").into_bytes();
+            w.append(&RecordView::StringPostImage { ns: NsId(16), key: &key, value: b"v" })
+                .expect("image");
+        }
+        // Index A: Fixed8, 5 pairs — the 64-byte section target splits
+        // the stream into three sections (2 + 2 + 1-with-FINAL).
+        let idx_a = IdxSidecarMeta {
+            ns: 16,
+            index_id: 1,
+            generation: 3,
+            key_encoding_version: 1,
+            fixed8: true,
+        };
+        let want_a: Vec<(Vec<u8>, u64)> =
+            (0..5u64).map(|i| ((i * 3).to_be_bytes().to_vec(), 100 + i)).collect();
+        for (ordinal, (key, entry_ref)) in want_a.iter().enumerate() {
+            w.append_idx_entry(&idx_a, ordinal as u64, key, *entry_ref).expect("idx entry");
+        }
+        w.append_idx_final(&idx_a, want_a.len() as u64).expect("idx final");
+        // Index B: VarKey with shared prefixes, >8-byte keys, and a
+        // duplicate key under two refs.
+        let idx_b = IdxSidecarMeta {
+            ns: 16,
+            index_id: 2,
+            generation: 7,
+            key_encoding_version: 1,
+            fixed8: false,
+        };
+        let want_b: Vec<(Vec<u8>, u64)> = vec![
+            (b"alpha".to_vec(), 1),
+            (b"alpha".to_vec(), 9),
+            (b"alphabetically-long-key".to_vec(), 2),
+            (b"beta".to_vec(), 3),
+        ];
+        for (ordinal, (key, entry_ref)) in want_b.iter().enumerate() {
+            w.append_idx_entry(&idx_b, ordinal as u64, key, *entry_ref).expect("idx entry");
+        }
+        w.append_idx_final(&idx_b, want_b.len() as u64).expect("idx final");
+        // Index C: the empty converged tree — exactly one zero-entry
+        // FINAL section (ADR-0078 D2).
+        let idx_c = IdxSidecarMeta {
+            ns: 17,
+            index_id: 3,
+            generation: 1,
+            key_encoding_version: 1,
+            fixed8: true,
+        };
+        w.append_idx_final(&idx_c, 0).expect("empty final");
+        let summary = w.finish().expect("finish");
+        assert_eq!(summary.records, 3, "sidecar pairs stay out of records_total (ADR-0078 D2)");
+        assert_eq!(
+            summary.entries_per_ns,
+            vec![(16, 3)],
+            "sidecar pairs stay out of the presize hint; ns 17 has no live entries at all"
+        );
+
+        // Exact hybrid round trip: per-index order, contiguity, FINAL
+        // totals, and the empty-FINAL shape.
+        let path = dir.join(ick_file_name(15));
+        type GotSection = (u32, u32, u64, bool, bool, u64, u64, Vec<(Vec<u8>, u64)>);
+        let mut got: Vec<GotSection> = Vec::new();
+        let mut damaged = 0u64;
+        let (info, audit) = read_ick_hybrid(
+            &fs,
+            &path,
+            IckReaderConfig::default(),
+            |_| Ok::<(), ()>(()),
+            |_| panic!("no addr-ref sections in this image"),
+            |_| panic!("no live-set sections in this image"),
+            |_| panic!("no blob-ref sections in this image"),
+            |step| {
+                match step {
+                    IckIdxSidecarStep::Section(section) => got.push((
+                        section.ns,
+                        section.index_id,
+                        section.generation,
+                        section.fixed8,
+                        section.final_section,
+                        section.entries_before,
+                        section.total_entries,
+                        section.iter().map(|(key, r)| (key.to_vec(), r)).collect(),
+                    )),
+                    IckIdxSidecarStep::Damaged { .. } => damaged += 1,
+                }
+                Ok::<(), ()>(())
+            },
+        )
+        .expect("hybrid load");
+        assert_eq!(info.version, ICK_VERSION_V2);
+        assert_eq!(audit, summary, "loader audit reproduces the writer summary");
+        assert_eq!(damaged, 0);
+        for (id, generation, fixed8, want) in [(1u32, 3u64, true, &want_a), (2, 7, false, &want_b)]
+        {
+            let sections: Vec<_> = got.iter().filter(|s| s.1 == id).collect();
+            let mut replayed = Vec::new();
+            let mut expect_before = 0u64;
+            for (at, s) in sections.iter().enumerate() {
+                assert_eq!((s.0, s.2, s.3), (16, generation, fixed8));
+                assert_eq!(s.5, expect_before, "sections arrive ordinal-contiguous");
+                assert_eq!(s.4, at == sections.len() - 1, "FINAL marks the last section only");
+                assert_eq!(s.6, if s.4 { want.len() as u64 } else { 0 });
+                replayed.extend(s.7.iter().cloned());
+                expect_before += s.7.len() as u64;
+            }
+            assert_eq!(&replayed, want, "pairs replay in order, exact");
+        }
+        let empties: Vec<_> = got.iter().filter(|s| s.1 == 3).collect();
+        assert_eq!(empties.len(), 1, "an empty tree is exactly one section");
+        assert!(empties[0].4 && empties[0].6 == 0 && empties[0].7.is_empty());
+        assert!(got.iter().filter(|s| s.1 == 1).count() >= 3, "the target split index A");
+
+        // The counts probe (both paths) ignores sidecar sections.
+        let probe = read_ick_counts(&fs, &path, IckReaderConfig::default()).expect("counts");
+        assert_eq!(probe, summary.entries_per_ns);
+        let mut padded = fs.contents(&path).expect("image");
+        padded.extend_from_slice(b"junk");
+        let pad = MemFs::new();
+        pad.create_dir_all(dir).unwrap();
+        let mut f = pad.create_meta(&path).expect("create");
+        f.write_at(0, &padded).expect("write");
+        let counts = read_ick_counts(&pad, &path, IckReaderConfig::default()).expect("hop");
+        assert_eq!(counts, summary.entries_per_ns, "the hop arm covers 0x06");
+
+        // Loaders without the sidecar arm refuse typed (the ADR-0073 D7
+        // downgrade boundary).
+        let err = read_ick(&fs, &path, IckReaderConfig::default(), |_| Ok::<(), ()>(()))
+            .expect_err("records-only load must refuse sidecar sections");
+        assert!(matches!(
+            err,
+            IckApplyError::Read(IckReadError::IdxSidecarSectionUnsupported { .. })
+        ));
+
+        // Soft damage (ADR-0078 D4): a flipped entry byte fails the
+        // section CRC — delivered as Damaged, and the load *continues*
+        // to a clean footer (the digest folds the stored CRC).
+        let image = fs.contents(&path).expect("image");
+        let sec_at = find_block(&image, BLOCK_IDXSIDECAR);
+        let body_len = le_u32(&image[sec_at + 1..sec_at + 5]) as usize;
+        let load_with = |image: Vec<u8>| {
+            let fs2 = MemFs::new();
+            fs2.create_dir_all(dir).unwrap();
+            let mut f = fs2.create_segment(&path, 0).unwrap();
+            f.write_at(0, &image).unwrap();
+            drop(f);
+            let mut sections = 0u64;
+            let mut damaged = 0u64;
+            let result = read_ick_hybrid(
+                &fs2,
+                &path,
+                IckReaderConfig::default(),
+                |_| Ok::<(), ()>(()),
+                |_| Ok::<(), ()>(()),
+                |_| Ok::<(), ()>(()),
+                |_| Ok::<(), ()>(()),
+                |step| {
+                    match step {
+                        IckIdxSidecarStep::Section(_) => sections += 1,
+                        IckIdxSidecarStep::Damaged { .. } => damaged += 1,
+                    }
+                    Ok::<(), ()>(())
+                },
+            );
+            (result.map(|_| ()), sections, damaged)
+        };
+        let mut body_damaged = image.clone();
+        body_damaged[sec_at + SECTION_HEADER_LEN + IDXSIDECAR_META_LEN + 3] ^= 0x40;
+        let (result, sections, damaged) = load_with(body_damaged);
+        result.expect("body damage never refuses the boot (L2)");
+        assert_eq!(damaged, 1, "the damaged section is counted");
+        assert!(sections >= 4, "every other sidecar section still delivers");
+
+        // Semantic damage behind a valid CRC — the writer-bug model: a
+        // non-canonical body written with a correct CRC and a footer
+        // digest to match (bit-rot cannot produce this; only a buggy
+        // writer can, so every checksum is made consistent). The canon
+        // audit, not any CRC, must catch it.
+        let mut canon_damaged = image.clone();
+        let entry0 = sec_at + SECTION_HEADER_LEN + IDXSIDECAR_META_LEN;
+        let first: [u8; 16] = canon_damaged[entry0..entry0 + 16].try_into().unwrap();
+        canon_damaged[entry0 + 16..entry0 + 32].copy_from_slice(&first);
+        let crc_at = sec_at + SECTION_HEADER_LEN + body_len;
+        let crc = crc32c(&canon_damaged[sec_at..crc_at]);
+        canon_damaged[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+        refresh_footer(&mut canon_damaged);
+        let (result, _, damaged) = load_with(canon_damaged);
+        result.expect("canon damage is body-class too");
+        assert_eq!(damaged, 1, "the non-ascending body arrives as Damaged");
+
+        // Damage to the stored CRC *field* is indistinguishable from
+        // framing damage — the footer digest audit fail-stops (the
+        // ADR-0073 D6 asymmetry, conservative by design).
+        let mut crc_damaged = image.clone();
+        crc_damaged[crc_at + 1] ^= 0x01;
+        let (result, _, _) = load_with(crc_damaged);
+        assert!(result.is_err(), "a damaged stored CRC fails the file-level audit");
+
+        // Writer gates: v1 refusal, ordinal gaps, regressions, and
+        // entries after FINAL are walker bugs — refused loud.
+        for gate in [
+            (|| {
+                let mut stream = IckStream::new(&small_cfg());
+                let lease = stream.begin(0, 1, Lsn::new(crate::lsn::SegmentId(0), 0), &[16]);
+                stream.release(lease);
+                let meta = IdxSidecarMeta {
+                    ns: 16,
+                    index_id: 1,
+                    generation: 1,
+                    key_encoding_version: 1,
+                    fixed8: true,
+                };
+                stream.stage_idx_entry(&meta, 0, &1u64.to_be_bytes(), 1);
+            }) as fn(),
+            || {
+                let mut stream = IckStream::new_v2(&small_cfg());
+                let lease = stream.begin(0, 1, Lsn::new(crate::lsn::SegmentId(0), 0), &[16]);
+                stream.release(lease);
+                let meta = IdxSidecarMeta {
+                    ns: 16,
+                    index_id: 1,
+                    generation: 1,
+                    key_encoding_version: 1,
+                    fixed8: true,
+                };
+                stream.stage_idx_entry(&meta, 0, &1u64.to_be_bytes(), 1);
+                stream.stage_idx_entry(&meta, 2, &2u64.to_be_bytes(), 1); // ordinal gap
+            },
+            || {
+                let mut stream = IckStream::new_v2(&small_cfg());
+                let lease = stream.begin(0, 1, Lsn::new(crate::lsn::SegmentId(0), 0), &[16]);
+                stream.release(lease);
+                let meta = IdxSidecarMeta {
+                    ns: 16,
+                    index_id: 1,
+                    generation: 1,
+                    key_encoding_version: 1,
+                    fixed8: true,
+                };
+                stream.stage_idx_entry(&meta, 0, &2u64.to_be_bytes(), 1);
+                stream.stage_idx_entry(&meta, 1, &1u64.to_be_bytes(), 1); // regression
+            },
+            || {
+                let mut stream = IckStream::new_v2(&small_cfg());
+                let lease = stream.begin(0, 1, Lsn::new(crate::lsn::SegmentId(0), 0), &[16]);
+                stream.release(lease);
+                let meta = IdxSidecarMeta {
+                    ns: 16,
+                    index_id: 1,
+                    generation: 1,
+                    key_encoding_version: 1,
+                    fixed8: true,
+                };
+                stream.stage_idx_entry(&meta, 0, &1u64.to_be_bytes(), 1);
+                stream.stage_idx_final(&meta, 1);
+                stream.stage_idx_entry(&meta, 1, &2u64.to_be_bytes(), 1); // after FINAL
+            },
+        ] {
+            assert!(std::panic::catch_unwind(gate).is_err(), "writer gate must panic");
+        }
+    }
+
+    /// Recomputes the footer's digest (the fold of the header CRC and
+    /// every section's *stored* CRC, in order) and its trailing CRC —
+    /// the test-side writer-bug forge: content changed with every
+    /// checksum made consistent, so only semantic audits can object.
+    fn refresh_footer(image: &mut [u8]) {
+        let ns_count = le_u32(&image[28..32]) as usize;
+        let header_crc_at = HEADER_FIXED_LEN + ns_count * 4;
+        let mut digest = fold_digest(DIGEST_SEED, le_u32(&image[header_crc_at..header_crc_at + 4]));
+        let mut at = header_crc_at + CRC_LEN;
+        while image[at] != BLOCK_FOOTER {
+            let body_len = le_u32(&image[at + 1..at + 5]) as usize;
+            let crc_at = at + SECTION_HEADER_LEN + body_len;
+            digest = fold_digest(digest, le_u32(&image[crc_at..crc_at + 4]));
+            at = crc_at + CRC_LEN;
+        }
+        let block_len = image.len() - at;
+        let digest_at = image.len() - CRC_LEN - 8;
+        image[digest_at..digest_at + 8].copy_from_slice(&digest.to_le_bytes());
+        let crc = crc32c(&image[at..at + block_len - CRC_LEN]);
+        let crc_field = image.len() - CRC_LEN;
+        image[crc_field..].copy_from_slice(&crc.to_le_bytes());
     }
 
     /// Locates the first block with `tag` by hopping section headers —

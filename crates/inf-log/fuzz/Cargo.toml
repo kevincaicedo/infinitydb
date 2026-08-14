@@ -57,3 +57,10 @@ path = "fuzz_targets/extent_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_index_sidecar"
+path = "fuzz_targets/fuzz_index_sidecar.rs"
+test = false
+doc = false
+bench = false

@@ -185,6 +185,9 @@ pub struct Keyspace {
     /// counter lines).
     backfill_docs_total: u64,
     backfill_inserted_total: u64,
+    /// This boot's sidecar load fold (M4.5-S06, ADR-0078 D6) — written
+    /// once by the loader's commit, rendered by `INFO stats`.
+    sidecar_info: crate::index_sidecar::SidecarBootInfo,
 }
 
 impl Keyspace {
@@ -207,6 +210,7 @@ impl Keyspace {
             backfill: Vec::new(),
             backfill_docs_total: 0,
             backfill_inserted_total: 0,
+            sidecar_info: Default::default(),
         };
         // db0 is eager: it serves every connection that never SELECTs.
         let _ = ks.db_mut(0);
@@ -1460,6 +1464,111 @@ impl Keyspace {
         if let Some(store) = self.existing_store_mut(ns) {
             store.idx.set_converged(id, converged);
         }
+    }
+
+    // ---- checkpoint sidecar (M4.5-S06, ADR-0078) ----
+
+    /// Sidecar-eligible indexes on `ns` (ADR-0078 D1: converged and
+    /// non-degraded). Rows: `(id, generation, fixed8, entries)` — the
+    /// checkpoint driver captures its emission plan from these.
+    #[must_use]
+    pub fn idx_sidecar_candidates(&self, ns: NsId) -> Vec<(IndexId, u64, bool, u64)> {
+        #[cfg(feature = "doc")]
+        {
+            self.existing_store(ns).map(|s| s.idx.sidecar_candidates()).unwrap_or_default()
+        }
+        #[cfg(not(feature = "doc"))]
+        {
+            let _ = ns;
+            Vec::new()
+        }
+    }
+
+    /// Whether `(ns, id, generation)` is still sidecar-eligible — the
+    /// driver re-checks between slices and abandons the stream (no
+    /// FINAL) on any change (ADR-0078 D1).
+    #[must_use]
+    pub fn idx_sidecar_eligible(&self, ns: NsId, id: IndexId, generation: u64) -> bool {
+        #[cfg(feature = "doc")]
+        {
+            self.existing_store(ns).is_some_and(|s| s.idx.sidecar_eligible(id, generation))
+        }
+        #[cfg(not(feature = "doc"))]
+        {
+            let _ = (ns, id, generation);
+            false
+        }
+    }
+
+    /// Emits up to `max_entries` pairs of `(ns, id)`'s tree from
+    /// `cursor` in ascending order (the re-seek cursor is the walk's
+    /// resume state — never pinned across slices). Returns the emitted
+    /// count; fewer than `max_entries` means the tree is exhausted.
+    pub fn idx_sidecar_emit(
+        &self,
+        ns: NsId,
+        id: IndexId,
+        cursor: &mut crate::ordered::OrderedCursor,
+        max_entries: u32,
+        mut emit: impl FnMut(&[u8], u64),
+    ) -> u32 {
+        let Some(tree) = self.idx_tree(ns, id) else { return 0 };
+        let mut emitted = 0u32;
+        while emitted < max_entries {
+            let Some((key, entry_ref)) = tree.cursor_next(cursor) else { break };
+            emit(key, entry_ref);
+            emitted += 1;
+        }
+        emitted
+    }
+
+    /// Whether any declaration targets a durable namespace — the `.ick`
+    /// v2 selection predicate's index half (ADR-0073 D2 as refined by
+    /// ADR-0078 D7: registration, not convergence, drives the version).
+    #[must_use]
+    pub fn idx_declared_on_durable(&self) -> bool {
+        self.indexes
+            .iter()
+            .any(|spec| self.named.get_by_id(spec.ns).is_some_and(|ns| ns.mode == NsMode::Durable))
+    }
+
+    /// Mutable tree access for the sidecar loader, materializing the
+    /// owning store (an index on an unwritten namespace still loads its
+    /// empty-FINAL sidecar — the backfill-tick materialization
+    /// precedent).
+    #[cfg(feature = "doc")]
+    pub(crate) fn idx_sidecar_tree_mut(
+        &mut self,
+        ns: NsId,
+        id: IndexId,
+    ) -> Option<&mut crate::index_registry::IndexTree> {
+        let store = if ns.0 < FIRST_NAMED_NS_ID {
+            self.db_mut(ns.0 as usize)
+        } else {
+            self.ns_store_mut(ns)?
+        };
+        store.idx.tree_mut(id)
+    }
+
+    /// The loader's body-class discard: empty the tree, touch nothing
+    /// else (ADR-0078 D6).
+    #[cfg(feature = "doc")]
+    pub(crate) fn idx_sidecar_reset(&mut self, ns: NsId, id: IndexId) {
+        if let Some(store) = self.existing_store_mut(ns) {
+            store.idx.reset_tree_contents(id);
+        }
+    }
+
+    /// This boot's sidecar fold (`INFO stats` renders `idx_sidecar_*`).
+    #[must_use]
+    pub fn idx_sidecar_info(&self) -> crate::index_sidecar::SidecarBootInfo {
+        self.sidecar_info
+    }
+
+    /// Written once by the loader's commit (ADR-0078 D6).
+    #[cfg(feature = "doc")]
+    pub(crate) fn note_sidecar_totals(&mut self, info: crate::index_sidecar::SidecarBootInfo) {
+        self.sidecar_info = info;
     }
 
     /// Arms replay-time maintenance on `ns` (ADR-0076 D7): `None` (the

@@ -265,6 +265,12 @@ pub struct Recovery<F: SegmentFs> {
     recovered_tiers: Vec<RecoveredTierNs<F>>,
     /// End-of-replay tiered checks ran (once, on entering the audit).
     tier_replay_checked: bool,
+    /// Sidecar boot loader (M4.5-S06, ADR-0078 D6): consumes tag-0x06
+    /// sections during the ick phase, arms `CatchUp` for the tail, and
+    /// commits loaded trees at end of replay. Taken (once) on entering
+    /// the audit — the commit point.
+    #[cfg(feature = "doc")]
+    sidecar: Option<inf_store::SidecarLoader>,
 }
 
 /// One recovered tiered namespace's plane-side pieces (M4-S26).
@@ -319,6 +325,8 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             finished: None,
             recovered_tiers: Vec::new(),
             tier_replay_checked: false,
+            #[cfg(feature = "doc")]
+            sidecar: Some(inf_store::SidecarLoader::default()),
         }
     }
 
@@ -416,6 +424,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             Phase::Audit { idx } => {
                 if !self.tier_replay_checked {
                     self.finish_tier_replay(ks)?;
+                    self.finish_index_replay(ks);
                 }
                 self.step_audit(idx)
             }
@@ -619,6 +628,41 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         Ok(())
     }
 
+    /// End-of-replay sidecar commit (M4.5-S06, ADR-0078 D6), run once
+    /// on entering the audit: loaded trees are tail-caught-up — mark
+    /// them converged + cell `Ready`, disarm replay maintenance, and
+    /// log every per-index rebuild-vs-load decision (the was-ready
+    /// downgrade loudly — L10). No-checkpoint boots commit an empty
+    /// loader: every declaration records `rebuilt (no-sidecar)`.
+    fn finish_index_replay(&mut self, ks: &mut Keyspace) {
+        #[cfg(feature = "doc")]
+        if let Some(sidecar) = self.sidecar.take() {
+            for row in sidecar.commit_ready(ks) {
+                match row.decision {
+                    inf_store::SidecarBootDecision::Loaded { entries } => eprintln!(
+                        "cell {}: index {}/{} sidecar loaded ({entries} entries; tail caught up)",
+                        self.cell, row.ns.0, row.id.0
+                    ),
+                    inf_store::SidecarBootDecision::Rebuilt { reason } => {
+                        let downgrade =
+                            if row.was_ready { " — was serving before the crash" } else { "" };
+                        eprintln!(
+                            "cell {}: index {}/{} rebuilding ({}){downgrade}",
+                            self.cell,
+                            row.ns.0,
+                            row.id.0,
+                            reason.name()
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "doc"))]
+        {
+            let _ = ks;
+        }
+    }
+
     /// Hands the recovered tiered plane halves to the caller (the plane
     /// installs them into its tier state at completion — M4-S26).
     pub(crate) fn take_recovered_tiers(&mut self) -> Vec<RecoveredTierNs<F>> {
@@ -683,6 +727,47 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                         inf_store::apply_blob_ref_section(table, &blob);
                         Ok(())
                     },
+                    // Index sidecars (M4.5-S06, ADR-0078 D4/D6): every
+                    // verdict is a loader-state transition — body damage
+                    // is counted and the read continues; a boot is never
+                    // refused past the file's framing audit.
+                    |step| {
+                        #[cfg(feature = "doc")]
+                        {
+                            let sidecar =
+                                self.sidecar.as_mut().expect("loader present until the audit");
+                            match step {
+                                inf_log::IckIdxSidecarStep::Section(section) => {
+                                    let mut guard = ks.borrow_mut();
+                                    sidecar.apply_section(&mut guard, &section);
+                                }
+                                inf_log::IckIdxSidecarStep::Damaged { at } => {
+                                    eprintln!(
+                                        "cell {}: damaged index-sidecar section at offset {at} — \
+                                         unattributed; affected streams resolve as incomplete \
+                                         (ADR-0078 D4)",
+                                        self.cell
+                                    );
+                                    sidecar.note_damaged();
+                                }
+                            }
+                            Ok(())
+                        }
+                        // A slim build refuses index-bearing catalogs at
+                        // seed (ADR-0075 D2.5), so this arm is typed,
+                        // never reached on a healthy node.
+                        #[cfg(not(feature = "doc"))]
+                        {
+                            let at = match step {
+                                inf_log::IckIdxSidecarStep::Section(ref s) => u64::from(s.ns),
+                                inf_log::IckIdxSidecarStep::Damaged { at } => at,
+                            };
+                            Err(io_msg(format!(
+                                "index-sidecar section (near {at}) but this build carries no \
+                                 document support"
+                            )))
+                        }
+                    },
                 )
                 .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
             match step {
@@ -698,6 +783,15 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 }
                 IckStep::Done(summary) => {
                     self.stats.ckpt_records = summary.records;
+                    // Sidecar streams close with the checkpoint: open
+                    // ones discard as incomplete, and `CatchUp` arms on
+                    // every loaded namespace *before* the first tail
+                    // record applies (ADR-0078 D6).
+                    #[cfg(feature = "doc")]
+                    if let Some(sidecar) = self.sidecar.as_mut() {
+                        let mut guard = ks.borrow_mut();
+                        sidecar.finish_load(&mut guard);
+                    }
                     // Header + footer bytes complete the file's credit.
                     let rest = reader.file_size().saturating_sub(self.ick_credited);
                     self.bytes_done += rest;

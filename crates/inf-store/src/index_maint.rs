@@ -323,6 +323,37 @@ mod imp {
             self.entries.iter_mut().find(|e| e.id == id).map(|e| &mut e.tree)
         }
 
+        /// Sidecar-eligible indexes on this store (M4.5-S06, ADR-0078
+        /// D1): converged and non-degraded only — a mid-backfill tree
+        /// is incomplete in a way no reader can repair, and a degraded
+        /// tree's contents are suspect by the veto's own definition.
+        /// Rows: `(id, generation, fixed8, entries)`.
+        pub(crate) fn sidecar_candidates(&self) -> Vec<(IndexId, u64, bool, u64)> {
+            self.entries
+                .iter()
+                .filter(|e| e.converged && !e.degraded)
+                .map(|e| (e.id, e.generation, e.tree.fixed8(), e.tree.len()))
+                .collect()
+        }
+
+        /// Whether `(id, generation)` is still sidecar-eligible — the
+        /// checkpoint driver re-checks between slices and abandons the
+        /// stream (no FINAL) on any change (ADR-0078 D1).
+        pub(crate) fn sidecar_eligible(&self, id: IndexId, generation: u64) -> bool {
+            self.entries
+                .iter()
+                .any(|e| e.id == id && e.generation == generation && e.converged && !e.degraded)
+        }
+
+        /// Empties one tree without touching generation or lifecycle —
+        /// the sidecar loader's body-class discard (ADR-0078 D6): the
+        /// entries are untrusted, the declaration is not.
+        pub(crate) fn reset_tree_contents(&mut self, id: IndexId) {
+            if let Some(entry) = self.entry_mut(id) {
+                entry.tree = IndexTree::new(entry.key_type);
+            }
+        }
+
         pub(crate) fn counters(&self, id: IndexId) -> Option<IdxCounters> {
             self.entries.iter().find(|e| e.id == id).map(|e| e.counters)
         }

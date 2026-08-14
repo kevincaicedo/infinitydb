@@ -52,6 +52,11 @@ harness = false
 test = false
 
 [[bench]]
+name = "index_sidecar"
+harness = false
+test = false
+
+[[bench]]
 name = "mutation"
 harness = false
 test = false

@@ -791,6 +791,7 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
             inf_store::apply_blob_ref_section(&mut table.borrow_mut(), &section);
             Ok(())
         },
+        |_| panic!("no index-sidecar sections in this image"),
     )
     .expect("hybrid load");
     let mut table = table.into_inner();

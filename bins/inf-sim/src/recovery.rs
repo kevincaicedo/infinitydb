@@ -994,6 +994,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                 apply_blob_ref_section(&mut table.borrow_mut(), &section);
                 Ok(())
             },
+            |_| panic!("no index-sidecar sections in this image"),
         );
         if let Err(e) = loaded {
             run.report.violations.push(format!("checkpoint load failed: {e:?}"));
