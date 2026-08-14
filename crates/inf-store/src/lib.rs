@@ -17,6 +17,7 @@ mod extents;
 /// `scripts/check-fault-points.sh` and armed by tests.
 pub mod fault;
 mod index;
+mod index_backfill;
 mod index_key;
 mod index_maint;
 mod index_registry;
@@ -47,6 +48,9 @@ pub use extents::{
     ExtentRefs, ExtentStats,
 };
 pub use index::{Index, MemoryMode, SlotMode, TieredMode};
+pub use index_backfill::{
+    BackfillBudget, BackfillInfo, BackfillPhase, BackfillProgress, BackfillTickStats,
+};
 pub use index_key::{
     DecodedIndexKey, INDEX_KEY_ENCODING_VERSION, IndexKeyBuf, IndexKeyDecodeError, IndexKeyType,
     IndexScalar, KeySkip, compare_i64_f64, index_key_decode, index_key_encode, index_scalar_coerce,

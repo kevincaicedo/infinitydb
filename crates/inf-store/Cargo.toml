@@ -83,6 +83,12 @@ test = false
 required-features = ["doc"]
 
 [[bench]]
+name = "index_backfill"
+harness = false
+test = false
+required-features = ["doc"]
+
+[[bench]]
 name = "doc_ingest"
 harness = false
 test = false

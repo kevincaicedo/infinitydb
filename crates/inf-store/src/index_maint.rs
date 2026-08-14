@@ -571,6 +571,109 @@ mod imp {
             self.clear_scratch();
         }
 
+        /// One walked document's inserts for the backfilling index `id`
+        /// (M4.5-S05, ADR-0077 D1/D7): evaluate, encode, dedup per
+        /// document, insert-if-absent — the walk half of the convergence
+        /// argument (the always-on bracket is the other half). Returns
+        /// the fresh-insert count; re-emitted documents are no-ops by
+        /// idempotence. `Err` means the document cannot enter the index
+        /// whole (eval overflow) or the tree has no headroom — the index
+        /// is degraded and counted here, and the caller parks the build
+        /// (a partial `ready` is unrepresentable).
+        ///
+        /// Runs only from MAINTAIN slices — never inside a bracket (the
+        /// death scratch is shared with the death hook, which is
+        /// sequential with the walk on the single-threaded cell).
+        ///
+        /// # Errors
+        /// `Err(())` after degrading the index (ADR-0077 D7).
+        pub(crate) fn backfill_insert_doc(
+            &mut self,
+            id: IndexId,
+            hash: u64,
+            root: DocValue<'_>,
+            max_matches: u32,
+        ) -> Result<u32, ()> {
+            debug_assert!(!self.scratch.open, "backfill slices never run inside a bracket");
+            let limits = EvalLimits { max_matches };
+            let CellIndexes { entries, scratch, .. } = self;
+            let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+                debug_assert!(false, "backfill job outlived its attach entry (sync point bug)");
+                return Err(());
+            };
+            debug_assert!(!entry.converged, "a converged index never backfills");
+            if entry.degraded {
+                return Err(());
+            }
+            scratch.death_bytes.clear();
+            scratch.death_entries.clear();
+            let Ok(matches) = eval(&entry.program, root, &limits) else {
+                // A pre-declaration document whose matches exceed the cap
+                // cannot be indexed whole — degrade rather than serve a
+                // partial projection (the death-hook rule, ADR-0077 D7).
+                entry.degraded = true;
+                entry.counters.degraded_trips += 1;
+                return Err(());
+            };
+            for steps in matches.iter() {
+                let Some(value) = resolve(root, steps) else { continue };
+                let Some(scalar) = scalar_of(value) else {
+                    entry.counters.skipped_sparse += 1;
+                    continue;
+                };
+                match index_key_encode(entry.key_type, scalar, &mut scratch.key_buf) {
+                    Ok(()) => {
+                        let encoded = scratch.key_buf.as_bytes();
+                        let off = scratch.death_bytes.len() as u32;
+                        scratch.death_bytes.extend_from_slice(encoded);
+                        scratch.death_entries.push(ScratchEntry {
+                            ord: 0,
+                            entry_ref: hash,
+                            off,
+                            len: encoded.len() as u16,
+                        });
+                    }
+                    Err(skip) => entry.counters.note_skip(skip),
+                }
+            }
+            let bytes = &scratch.death_bytes;
+            let key_of = |e: &ScratchEntry| -> &[u8] {
+                &bytes[e.off as usize..e.off as usize + e.len as usize]
+            };
+            scratch.death_entries.sort_unstable_by(|a, b| key_of(a).cmp(key_of(b)));
+            let headroom_wanted = scratch.death_entries.len() as u64;
+            if fault::fire(crate::fault::IDX_BACKFILL_TRIP)
+                || !entry.tree.insert_headroom(headroom_wanted)
+            {
+                // The corpus outgrew the tree's structural limits (or the
+                // planted trip): honest refusal, never a partial ready.
+                entry.degraded = true;
+                entry.counters.degraded_trips += 1;
+                return Err(());
+            }
+            let mut fresh = 0u32;
+            let mut previous: Option<&ScratchEntry> = None;
+            for e in &scratch.death_entries {
+                // One hash for the whole document ⇒ dedup is byte
+                // equality on the sorted run (the death-hook pattern).
+                if previous.is_some_and(|p| key_of(p) == key_of(e)) {
+                    continue;
+                }
+                previous = Some(e);
+                match entry.tree.insert(key_of(e), hash) {
+                    Ok(true) => fresh += 1,
+                    Ok(false) => {}
+                    Err(_) => {
+                        // Headroom said this cannot happen — the backstop.
+                        entry.degraded = true;
+                        entry.counters.degraded_trips += 1;
+                        return Err(());
+                    }
+                }
+            }
+            Ok(fresh)
+        }
+
         /// The record-death hook (ADR-0072 D6): evaluate the dying
         /// document's entries and remove them — idempotent, infallible
         /// (removals never allocate). Runs at `free_record`, the wheel
