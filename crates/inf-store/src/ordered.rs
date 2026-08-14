@@ -434,6 +434,17 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
         self.len == 0
     }
 
+    /// Whether `additional` inserts are guaranteed inside the tree's
+    /// structural limits (u32 node-id spaces; the heap's own refusal is
+    /// per-op atomic) — the S04 reservation's arithmetic headroom check
+    /// (ADR-0076 D5). Conservative: each insert is charged one leaf plus
+    /// its split chain; no allocation happens here.
+    pub fn insert_headroom(&self, additional: u64) -> bool {
+        let margin = additional.saturating_add(2 * MAX_HEIGHT as u64);
+        (self.leaves.nodes.len() as u64).saturating_add(margin) < u64::from(NONE)
+            && (self.internals.nodes.len() as u64).saturating_add(margin) < u64::from(NONE)
+    }
+
     /// L5 attribution snapshot — O(1) from maintained pool/heap state.
     pub fn memory(&self) -> OrderedMapMemory {
         let heap_free_list_bytes: u64 =

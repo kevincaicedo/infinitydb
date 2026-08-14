@@ -143,14 +143,18 @@ pub enum IndexBindError {
 
 /// One index's tree: the projection contents, scheme-monomorphized per
 /// the declared key type (ADR-0074 D1 — i64/f64/bool keys are exactly
-/// 8 bytes and ride `Fixed8`; utf8 rides `VarKey`).
+/// 8 bytes and ride `Fixed8`; utf8 rides `VarKey`). Custody: trees live
+/// in the owning store's attach block (`index_maint`, ADR-0076 D1 —
+/// amending the D1 wording here); the registry stays the catalog
+/// authority.
 pub enum IndexTree {
     Fixed8(OrderedMap<Fixed8>),
     Var(OrderedMap<VarKey>),
 }
 
 impl IndexTree {
-    fn new(key_type: IndexKeyType) -> IndexTree {
+    #[cfg(feature = "doc")]
+    pub(crate) fn new(key_type: IndexKeyType) -> IndexTree {
         if key_type.fixed8() {
             IndexTree::Fixed8(OrderedMap::new())
         } else {
@@ -187,6 +191,16 @@ impl IndexTree {
         match self {
             IndexTree::Fixed8(map) => map.insert(key, entry_ref),
             IndexTree::Var(map) => map.insert(key, entry_ref),
+        }
+    }
+
+    /// Whether `additional` inserts are guaranteed inside the tree's
+    /// structural limits — the S04 reservation's arithmetic headroom
+    /// check (ADR-0076 D5): no allocation, conservative.
+    pub fn insert_headroom(&self, additional: u64) -> bool {
+        match self {
+            IndexTree::Fixed8(map) => map.insert_headroom(additional),
+            IndexTree::Var(map) => map.insert_headroom(additional),
         }
     }
 
@@ -228,7 +242,8 @@ pub struct IndexMemory {
 }
 
 impl IndexMemory {
-    fn absorb(&mut self, m: OrderedMapMemory) {
+    #[cfg(feature = "doc")]
+    pub(crate) fn absorb(&mut self, m: OrderedMapMemory) {
         self.idx_tree_bytes += m.total_bytes();
         self.idx_slack_bytes += m.slack_bytes;
         self.entries += m.entries;
@@ -244,7 +259,6 @@ struct RegEntry {
     /// `ready`, so this entry is sidecar-eligible at S06. False for
     /// live-created entries.
     was_ready: bool,
-    tree: IndexTree,
 }
 
 /// The per-cell registry (ADR-0072 D2): every declaration replicated,
@@ -286,9 +300,8 @@ impl IndexRegistry {
         }
         debug_assert!(spec.id.0 >= FIRST_INDEX_ID, "id 0 is reserved");
         debug_assert!(spec.generation >= FIRST_INDEX_GENERATION, "generation 0 is reserved");
-        let tree = IndexTree::new(spec.key_type);
         let cell_state = spec.state;
-        self.entries.push(RegEntry { spec, cell_state, was_ready, tree });
+        self.entries.push(RegEntry { spec, cell_state, was_ready });
         self.recompute_flags();
         Ok(())
     }
@@ -333,6 +346,8 @@ impl IndexRegistry {
 
     /// Rebuild (S05/S10 consume; the surface is D3's): `Ready →
     /// Backfilling` with the fresh generation from the catalog allocator.
+    /// The keyspace resets the owning store's attach tree in the same
+    /// transition (ADR-0076 D1 — custody lives with the store).
     ///
     /// # Errors
     /// `Unknown` / `InvalidTransition` (only `Ready` rebuilds).
@@ -346,7 +361,6 @@ impl IndexRegistry {
         entry.spec.generation = new_generation;
         entry.spec.state = IndexState::Backfilling;
         entry.cell_state = IndexState::Backfilling;
-        entry.tree = IndexTree::new(entry.spec.key_type);
         Ok(())
     }
 
@@ -428,38 +442,11 @@ impl IndexRegistry {
         self.entries.iter().map(|e| e.spec.clone()).collect()
     }
 
-    pub fn tree(&self, id: IndexId) -> Option<&IndexTree> {
-        self.entries.iter().find(|e| e.spec.id == id).map(|e| &e.tree)
-    }
-
-    pub fn tree_mut(&mut self, id: IndexId) -> Option<&mut IndexTree> {
-        self.entries.iter_mut().find(|e| e.spec.id == id).map(|e| &mut e.tree)
-    }
-
     /// Whether `ns` has any live index — the recomputed source behind
     /// the store-side one-branch cached flag (ADR-0072 D2). DDL-rate
     /// callers only; the mutation path reads the store's cache.
     pub fn has_indexes(&self, ns: NsId) -> bool {
         self.ns_flagged.contains(&ns)
-    }
-
-    /// `idx_*` byte fold for one namespace (the ADR-0072 D8c accounting
-    /// input — counted against the namespace budget).
-    pub fn memory_of(&self, ns: NsId) -> IndexMemory {
-        let mut total = IndexMemory::default();
-        for entry in self.entries.iter().filter(|e| e.spec.ns == ns) {
-            total.absorb(entry.tree.memory());
-        }
-        total
-    }
-
-    /// Node-wide `idx_*` fold (`INFO memory` + attribution).
-    pub fn memory_total(&self) -> IndexMemory {
-        let mut total = IndexMemory::default();
-        for entry in &self.entries {
-            total.absorb(entry.tree.memory());
-        }
-        total
     }
 
     fn entry_mut(&mut self, id: IndexId) -> Option<&mut RegEntry> {
@@ -631,20 +618,19 @@ mod tests {
         );
     }
 
-    /// Rebuild bumps the generation and resets contents: a cursor bound
-    /// to the old generation fails typed; the tree restarts empty.
+    /// Rebuild bumps the generation and regresses the states: a cursor
+    /// bound to the old generation fails typed. (Tree contents live in
+    /// the owning store's attach block since ADR-0076 D1 — the reset leg
+    /// is covered by the keyspace rebuild test.)
     #[test]
-    fn rebuild_bumps_generation_and_resets_the_tree() {
+    fn rebuild_bumps_generation_and_state() {
         let mut reg = IndexRegistry::default();
         reg.create(spec(1, 16, b"by-price", IndexState::Ready), false).expect("create");
-        let key = 42u64.to_be_bytes();
-        reg.tree_mut(IndexId(1)).expect("tree").insert(&key, 7).expect("insert");
-        assert_eq!(reg.tree(IndexId(1)).expect("tree").len(), 1);
         reg.rebuild(IndexId(1), 9).expect("rebuild from ready");
         let spec_after = reg.get_by_id(IndexId(1)).expect("entry");
         assert_eq!(spec_after.generation, 9);
         assert_eq!(spec_after.state, IndexState::Backfilling);
-        assert!(reg.tree(IndexId(1)).expect("tree").is_empty(), "contents reset");
+        assert_eq!(reg.cell_state(IndexId(1)), Some(IndexState::Backfilling));
         assert_eq!(
             reg.validate_binding(NsId(16), IndexId(1), 1),
             Err(IndexBindError::StaleGeneration { bound: 1, current: 9 })
@@ -670,31 +656,9 @@ mod tests {
         assert!(reg.has_indexes(NsId(0)), "other namespaces untouched");
     }
 
-    /// The L5 fold: tree bytes appear under the owning namespace, both
-    /// schemes, and reconcile with the node-wide total.
-    #[test]
-    fn memory_folds_reconcile_per_ns_and_total() {
-        let mut reg = IndexRegistry::default();
-        reg.create(spec(1, 16, b"num", IndexState::Declared), false).expect("create");
-        let utf8 =
-            IndexSpec { key_type: IndexKeyType::Utf8, ..spec(2, 17, b"str", IndexState::Declared) };
-        reg.create(utf8, false).expect("create");
-        for i in 0..100u64 {
-            reg.tree_mut(IndexId(1)).expect("t").insert(&i.to_be_bytes(), i).expect("insert");
-            let key = format!("key-{i:04}\x00");
-            reg.tree_mut(IndexId(2)).expect("t").insert(key.as_bytes(), i).expect("insert");
-        }
-        let ns16 = reg.memory_of(NsId(16));
-        let ns17 = reg.memory_of(NsId(17));
-        assert!(ns16.idx_tree_bytes > 0);
-        assert!(ns17.idx_tree_bytes > 0);
-        assert_eq!(ns16.entries, 100);
-        assert_eq!(ns17.entries, 100);
-        let total = reg.memory_total();
-        assert_eq!(total.idx_tree_bytes, ns16.idx_tree_bytes + ns17.idx_tree_bytes);
-        assert_eq!(total.idx_slack_bytes, ns16.idx_slack_bytes + ns17.idx_slack_bytes);
-        assert_eq!(reg.memory_of(NsId(18)), IndexMemory::default());
-    }
+    // The L5 memory-fold reconciliation moved with tree custody
+    // (ADR-0076 D1): per-store attach folds are covered beside the
+    // maintenance hook and the keyspace accounting tests.
 
     /// The fence gauntlet splits accepted and rejected programs (the
     /// catalog-decode trust boundary shares this exact function).

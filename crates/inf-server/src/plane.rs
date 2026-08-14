@@ -449,6 +449,14 @@ struct OwnerPub {
     payload: Vec<u8>,
 }
 
+/// One armed maintenance bracket (M4.5-S04, ADR-0076 D3): the write-set
+/// keys plus the optional mutation path the prune consumes. The `NsId`
+/// variant carries the resolved numbered-db namespace.
+#[cfg(feature = "doc")]
+type ArmedDbBracket<'a> = (NsId, Vec<&'a [u8]>, Option<inf_doc::PathProgram>);
+#[cfg(feature = "doc")]
+type ArmedNsBracket<'a> = (Vec<&'a [u8]>, Option<inf_doc::PathProgram>);
+
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     fn with_conn<R>(&self, key: ConnKey, f: impl FnOnce(&mut Conn) -> R) -> Option<R> {
         self.conns.borrow_mut().get_mut(key).map(f)
@@ -493,10 +501,90 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
                 self.node.doc_log_admission.set(None);
             }
         }
+        // Numbered-db maintenance bracket (M4.5-S04, ADR-0076 D3 row 3):
+        // every numbered-db write funnels through this function, so one
+        // attachment covers the mirror, the MSET legs, and the fabric
+        // apply structurally. Named-ns calls (`Some(ns)`) are bracketed
+        // at their two plane sites, where the commit half must follow
+        // effect staging. Zero-index namespaces pay one guard branch.
+        #[cfg(feature = "doc")]
+        let bracket: Option<ArmedDbBracket<'_>> = if ns.is_none() {
+            let target = NsId(u32::from(db));
+            if self.store.borrow().ns_indexed(target) {
+                match lookup(argv[0]) {
+                    // COPY is store-mini-bracketed (ADR-0076 D3): its
+                    // destination may live in another database.
+                    Some(meta)
+                        if meta.flags.contains(CmdFlags::WRITE) && meta.id != CommandId::Copy =>
+                    {
+                        let keys = extract_keys_slices(meta, argv);
+                        if keys.is_empty() {
+                            None
+                        } else {
+                            let path = self.json_mutation_path(meta.id, argv);
+                            Some((target, keys, path))
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "doc")]
+        if let Some((target, keys, path)) = &bracket
+            && let Err(refusal) =
+                self.store.borrow_mut().idx_bracket_begin(*target, keys, path.as_ref())
+        {
+            // Typed refusal before anything changed (ADR-0072 D7.1).
+            RespWriter::new(out, proto).error(refusal.message());
+            self.node.doc_log_admission.set(None);
+            self.observer.borrow_mut().on_execute(self.cell, origin, argv, &out[before..], now);
+            return;
+        }
         execute_slices(argv, &mut self.store.borrow_mut(), &mut cx, now, out);
+        #[cfg(feature = "doc")]
+        if let Some((target, keys, _)) = &bracket {
+            // Numbered dbs never stage — the commit half attaches at the
+            // same boundary with the staging call absent (ADR-0072 D3).
+            self.store.borrow_mut().idx_bracket_commit(*target, keys);
+        }
         #[cfg(feature = "doc")]
         self.node.doc_log_admission.set(None);
         self.observer.borrow_mut().on_execute(self.cell, origin, argv, &out[before..], now);
+    }
+
+    /// The mutation's path program for the S04 static path-overlap prune
+    /// (ADR-0076 D6): only unambiguous path-carrying JSON writes yield
+    /// one — everything else evaluates in full. A path that fails to
+    /// compile never prunes (the command will fail with its own error).
+    #[cfg(feature = "doc")]
+    fn json_mutation_path(&self, id: CommandId, argv: &[&[u8]]) -> Option<inf_doc::PathProgram> {
+        let text: &[u8] = match id {
+            CommandId::JsonSet if argv.len() >= 4 => argv[2],
+            CommandId::JsonNumIncrBy | CommandId::JsonNumMultBy if argv.len() >= 4 => argv[2],
+            CommandId::JsonDel | CommandId::JsonForget if argv.len() >= 3 => argv[2],
+            CommandId::JsonToggle | CommandId::JsonClear | CommandId::JsonArrPop
+                if argv.len() >= 3 =>
+            {
+                argv[2]
+            }
+            CommandId::JsonArrAppend | CommandId::JsonArrInsert | CommandId::JsonArrTrim
+                if argv.len() >= 4 =>
+            {
+                argv[2]
+            }
+            CommandId::JsonMerge if argv.len() >= 4 => argv[2],
+            // With three args the trailing one is the value (legacy root
+            // path) — ambiguous positions never prune.
+            CommandId::JsonStrAppend if argv.len() == 4 => argv[2],
+            _ => return None,
+        };
+        let max_path_bytes = self.store.borrow().db(0)?.doc_max_path_bytes();
+        let mut cache = self.node.path_cache.borrow_mut();
+        cache.get_or_compile(text, max_path_bytes).ok().cloned()
     }
 
     /// An empty reply buffer, recycled when possible.
@@ -802,7 +890,33 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
             RespWriter::new(out, proto).error(refusal);
             return NsApplyOutcome::Reply;
         }
+        // Maintenance bracket, fabric named-ns row (ADR-0072 D3 /
+        // ADR-0076 D3 row 1): pre-half after admission, before execute;
+        // commit-half after effect staging, before the reply queues.
+        #[cfg(feature = "doc")]
+        let bracket: Option<ArmedNsBracket<'_>> = match meta {
+            Some(meta)
+                if is_write && meta.id != CommandId::Copy && self.store.borrow().ns_indexed(ns) =>
+            {
+                let keys = extract_keys_slices(meta, argv);
+                if keys.is_empty() {
+                    None
+                } else {
+                    let path = self.json_mutation_path(meta.id, argv);
+                    Some((keys, path))
+                }
+            }
+            _ => None,
+        };
+        #[cfg(feature = "doc")]
+        if let Some((keys, path)) = &bracket
+            && let Err(refusal) = self.store.borrow_mut().idx_bracket_begin(ns, keys, path.as_ref())
+        {
+            RespWriter::new(out, proto).error(refusal.message());
+            return NsApplyOutcome::Reply;
+        }
         self.execute_owned_into(ExecOrigin::Fabric(from), argv, proto, 0, 0, Some(ns), out);
+        let mut outcome = NsApplyOutcome::Reply;
         if is_write
             && out.get(before) != Some(&b'-')
             && let (Some(meta), Some(class)) = (meta, class)
@@ -810,9 +924,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
             && class == FsyncClass::Always
         {
             self.durable.borrow_mut().as_mut().expect("staged above").note_gated_ack();
-            return NsApplyOutcome::Gated(seq);
+            outcome = NsApplyOutcome::Gated(seq);
         }
-        NsApplyOutcome::Reply
+        #[cfg(feature = "doc")]
+        if let Some((keys, _)) = &bracket {
+            self.store.borrow_mut().idx_bracket_commit(ns, keys);
+        }
+        outcome
     }
 
     /// Durable-write admission (owner side — cannot suspend inside the
@@ -4969,14 +5087,43 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
             }
         }
     }
+    // Maintenance bracket, local pump named-ns row (ADR-0072 D3 /
+    // ADR-0076 D3 row 2): pre-half after the admission loop, before
+    // execute; commit-half after the staging window.
+    #[cfg(feature = "doc")]
+    let bracket: Option<Option<inf_doc::PathProgram>> = if is_write
+        && meta.id != CommandId::Copy
+        && !keys.is_empty()
+        && shared.store.borrow().ns_indexed(ns)
+    {
+        Some(shared.json_mutation_path(meta.id, argv))
+    } else {
+        None
+    };
+    #[cfg(feature = "doc")]
+    if let Some(path) = &bracket
+        && let Err(refusal) = shared.store.borrow_mut().idx_bracket_begin(ns, &keys, path.as_ref())
+    {
+        pending.push_back(PendingReply::Done(error_reply(shared, proto, refusal.message())));
+        return true;
+    }
     let mut reply = shared.take_reply_buf();
     shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), &mut reply);
-    if is_write
+    let gated = if is_write
         && reply.first() != Some(&b'-')
         && let Some(class) = class
         && let Some(seq) = shared.stage_durable_effects(ns, meta, argv, class)
         && class == FsyncClass::Always
     {
+        Some(seq)
+    } else {
+        None
+    };
+    #[cfg(feature = "doc")]
+    if bracket.is_some() {
+        shared.store.borrow_mut().idx_bracket_commit(ns, &keys);
+    }
+    if let Some(seq) = gated {
         let waiter = {
             let mut durable = shared.durable.borrow_mut();
             let cell = durable.as_mut().expect("staged above");

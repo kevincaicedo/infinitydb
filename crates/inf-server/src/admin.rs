@@ -302,6 +302,21 @@ pub(crate) fn info(
             push(&mut text, &format!("path_cache_misses:{}", cache.misses()));
             push(&mut text, &format!("path_cache_evictions:{}", cache.evictions()));
         }
+        // M4.5-S04 (ADR-0076 D8): index-maintenance counters, cell-scope
+        // fold (per-index detail rides `INF.IDX LIST` at S10). Nothing
+        // skips, prunes, or degrades silently (L10). Cumulative per boot
+        // — CONFIG RESETSTAT does not reset them (recorded deviation).
+        {
+            let idx = ks.idx_counters_total();
+            push(&mut text, &format!("idx_maint_inserts:{}", idx.maint_inserts));
+            push(&mut text, &format!("idx_maint_removes:{}", idx.maint_removes));
+            push(&mut text, &format!("idx_maint_prunes:{}", idx.maint_prunes));
+            push(&mut text, &format!("idx_skipped_sparse:{}", idx.skipped_sparse));
+            push(&mut text, &format!("idx_skipped_inexact:{}", idx.skipped_inexact));
+            push(&mut text, &format!("idx_skipped_nan:{}", idx.skipped_nan));
+            push(&mut text, &format!("idx_skipped_toolong:{}", idx.skipped_toolong));
+            push(&mut text, &format!("idx_degraded_trips:{}", idx.degraded_trips));
+        }
         push(&mut text, &format!("pubsub_channels:{}", node.pubsub_channels.get()));
         push(&mut text, &format!("pubsub_patterns:{}", node.pubsub_patterns.get()));
         push(

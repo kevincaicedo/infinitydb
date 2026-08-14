@@ -1,0 +1,394 @@
+--- base
++++ s04
+@@ -4,115 +4,114 @@
+ push   %r13
+ push   %r12
+ push   %rbx
+-sub    $0xd8,%rsp
++sub    $0xa8,%rsp
+ mov    %rcx,%r10
+-mov    %rdx,0x70(%rsp)
+-mov    %rdi,0x8(%rsp)
+-mov    0x2298(%rsi),%rcx
+-mov    0x22b0(%rsi),%rdx
++mov    %rdx,0x58(%rsp)
++mov    %rdi,(%rsp)
++mov    0x2760(%rsi),%rcx
++mov    0x2778(%rsi),%rdx
+ shr    $0x4,%rdx
+ dec    %rdx
+ mov    %rdx,%rdi
+ and    %r8,%rdi
+-mov    %rdi,%r12
+-shl    $0x4,%r12
+-lea    0xf(%r12),%rax
+-mov    %rcx,0x20(%rsp)
++mov    %rdi,%r11
++shl    $0x4,%r11
++lea    0xf(%r11),%rax
++mov    %rcx,0x10(%rsp)
+ cmp    %rcx,%rax
+ jae    <inf_store::store::CellStore::resolve_hashed+OFF>
+-mov    %r9,0x38(%rsp)
+-lea    0x2290(%rsi),%rax
+-mov    %rax,0x30(%rsp)
+-mov    %r8,%r14
+-shr    $0x2a,%r14
+-mov    %r8,0x10(%rsp)
++mov    %r9,0x18(%rsp)
++mov    %r8,%r9
++shr    $0x2a,%r9
++mov    %r8,0x8(%rsp)
+ mov    %r8,%rax
+ shr    $0x39,%rax
+-mov    0x2290(%rsi),%rcx
+-mov    %rcx,0x48(%rsp)
++mov    0x2758(%rsi),%rcx
++mov    %rcx,0x30(%rsp)
+ movd   %eax,%xmm0
+ punpcklbw %xmm0,%xmm0
+ pshuflw $0x0,%xmm0,%xmm0
+ pshufd $0x44,%xmm0,%xmm0
+-movdqa %xmm0,0x90(%rsp)
+-mov    0x22a8(%rsi),%rax
+-mov    %rax,0x28(%rsp)
+-mov    0x22a0(%rsi),%rax
+-mov    %rax,0x88(%rsp)
+-mov    0x38(%rsi),%r9
+-mov    %rsi,0x18(%rsp)
+-mov    0x40(%rsi),%r8
++movdqa %xmm0,0x80(%rsp)
++mov    0x2770(%rsi),%r14
++mov    0x2768(%rsi),%rax
++mov    %rax,0x78(%rsp)
++mov    0x38(%rsi),%rax
++mov    %rax,0x70(%rsp)
++mov    %rsi,0x20(%rsp)
++mov    0x40(%rsi),%rbp
+ xor    %ecx,%ecx
+-mov    %rdx,0x40(%rsp)
+-mov    %r14,0x68(%rsp)
+-mov    %r8,0x60(%rsp)
+-nopw   0x0(%rax,%rax,1)
+-mov    %rcx,0x58(%rsp)
+-mov    %rdi,0x50(%rsp)
+-mov    0x48(%rsp),%rax
+-movdqu (%rax,%r12,1),%xmm1
+-movdqa 0x90(%rsp),%xmm0
+-movdqa %xmm1,0xa0(%rsp)
++mov    %rdx,0x28(%rsp)
++mov    %r14,0x50(%rsp)
++mov    %rbp,0x48(%rsp)
++cs nopw 0x0(%rax,%rax,1)
++mov    %rcx,0x40(%rsp)
++mov    %rdi,0x38(%rsp)
++mov    0x30(%rsp),%rax
++movdqu (%rax,%r11,1),%xmm1
++movdqa 0x80(%rsp),%xmm0
++movdqa %xmm1,0x90(%rsp)
+ pcmpeqb %xmm1,%xmm0
+ pmovmskb %xmm0,%eax
+ test   %eax,%eax
+-mov    %r12,0x78(%rsp)
+-jne    <inf_store::store::CellStore::resolve_hashed+OFF>
+-movdqa 0xa0(%rsp),%xmm0
++mov    %r11,0x60(%rsp)
++jne    <inf_store::store::CellStore::resolve_hashed+OFF>
++movdqa 0x90(%rsp),%xmm0
+ pcmpeqb 0x0(%rip),%xmm0        # <anon.58baeeae7d5fe476157d296c9f08f803.346.llvm.5844774155465566772+OFF>
+ pmovmskb %xmm0,%eax
+ test   %eax,%eax
+ jne    <inf_store::store::CellStore::resolve_hashed+OFF>
+-mov    0x58(%rsp),%rcx
++mov    0x40(%rsp),%rcx
+ inc    %rcx
+-mov    0x40(%rsp),%rdx
++mov    0x28(%rsp),%rdx
+ cmp    %rdx,%rcx
+ ja     <inf_store::store::CellStore::resolve_hashed+OFF>
+-mov    0x50(%rsp),%rdi
++mov    0x38(%rsp),%rdi
+ add    %rcx,%rdi
+ and    %rdx,%rdi
+-mov    %rdi,%r12
+-shl    $0x4,%r12
+-lea    0xf(%r12),%rax
+-cmp    0x20(%rsp),%rax
++mov    %rdi,%r11
++shl    $0x4,%r11
++lea    0xf(%r11),%rax
++cmp    0x10(%rsp),%rax
+ jb     <inf_store::store::CellStore::resolve_hashed+OFF>
+ jmp    <inf_store::store::CellStore::resolve_hashed+OFF>
+-data16 data16 data16 data16 cs nopw 0x0(%rax,%rax,1)
++data16 data16 data16 data16 data16 cs nopw 0x0(%rax,%rax,1)
+ lea    -0x1(%rbx),%eax
+ and    %ebx,%eax
+ test   %ax,%ax
+ je     <inf_store::store::CellStore::resolve_hashed+OFF>
+ mov    %eax,%ebx
+ tzcnt  %ebx,%edi
+-or     %r12,%rdi
+-cmp    0x28(%rsp),%rdi
+-jae    <inf_store::store::CellStore::resolve_hashed+OFF>
+-mov    0x88(%rsp),%rax
++or     %r11,%rdi
++cmp    %r14,%rdi
++jae    <inf_store::store::CellStore::resolve_hashed+OFF>
++mov    0x78(%rsp),%rax
+ mov    (%rax,%rdi,8),%rax
+ mov    %rax,%rcx
+ shr    $0x30,%rcx
+-xor    %r14d,%ecx
++xor    %r9d,%ecx
+ test   $0x7fff,%ecx
+ jne    <inf_store::store::CellStore::resolve_hashed+OFF>
+-mov    %rax,%r11
++mov    %rax,%r8
+ movabs $0xffffffffffff,%rcx
+-and    %rcx,%r11
+-mov    %r11,%rdi
++and    %rcx,%r8
++mov    %r8,%rdi
+ shr    $0x15,%rdi
+-cmp    %r8,%rdi
++cmp    %rbp,%rdi
+ jae    <inf_store::store::CellStore::resolve_hashed+OFF>
+ shl    $0x4,%edi
+ and    $0x1fffff,%eax
+ lea    0x8(%rax),%rdx
+-mov    0x8(%r9,%rdi,1),%rcx
++mov    0x70(%rsp),%rsi
++mov    0x8(%rsi,%rdi,1),%rcx
+ cmp    %rcx,%rdx
+ ja     <inf_store::store::CellStore::resolve_hashed+OFF>
+-add    %r9,%rdi
+-mov    (%rdi),%rbp
+-movzbl 0x0(%rbp,%rax,1),%edi
+-movzbl 0x1(%rbp,%rax,1),%edx
+-movzwl 0x2(%rbp,%rax,1),%esi
+-movzbl 0x4(%rbp,%rax,1),%r13d
++add    %rsi,%rdi
++mov    (%rdi),%r12
++movzbl (%r12,%rax,1),%edi
++movzbl 0x1(%r12,%rax,1),%edx
++movzwl 0x2(%r12,%rax,1),%esi
++movzbl 0x4(%r12,%rax,1),%r13d
+ shl    $0x10,%r13d
+ or     %rsi,%r13
+ mov    %rdi,%r15
+@@ -127,60 +126,59 @@
+ ja     <inf_store::store::CellStore::resolve_hashed+OFF>
+ cmp    %rdx,%r10
+ jne    <inf_store::store::CellStore::resolve_hashed+OFF>
+-add    %rax,%rbp
+-add    %rbp,%rdi
+-mov    0x70(%rsp),%rsi
++add    %rax,%r12
++add    %r12,%rdi
++mov    0x58(%rsp),%rsi
+ mov    %r10,%rdx
++mov    %r10,%rbp
+ mov    %r9,%r14
+-mov    %r11,0x80(%rsp)
+-mov    %r10,%r12
++mov    %r8,0x68(%rsp)
+ call   *0x0(%rip)        # <bcmp@GLIBC_2.2.5>
+-mov    %r12,%r10
+-mov    0x80(%rsp),%rcx
++mov    0x60(%rsp),%r11
++mov    0x68(%rsp),%r8
+ mov    %r14,%r9
+-mov    0x68(%rsp),%r14
+-mov    0x60(%rsp),%r8
+-mov    0x78(%rsp),%r12
++mov    0x50(%rsp),%r14
++mov    %rbp,%r10
++mov    0x48(%rsp),%rbp
+ test   %eax,%eax
+ jne    <inf_store::store::CellStore::resolve_hashed+OFF>
+ add    %r10,%r13
+ test   $0x1,%r15b
++mov    0x20(%rsp),%rbx
+ je     <inf_store::store::CellStore::resolve_hashed+OFF>
+ cmp    $0xc,%r13
+ jbe    <inf_store::store::CellStore::resolve_hashed+OFF>
+-mov    0x8(%rbp),%edi
++mov    0x8(%r12),%ecx
+ movabs $0x431bde82d7b634db,%rdx
+-mov    0x38(%rsp),%rax
++mov    0x18(%rsp),%rax
+ mul    %rdx
+-movzbl 0xc(%rbp),%eax
++movzbl 0xc(%r12),%eax
+ shl    $0x20,%rax
+-or     %rdi,%rax
++or     %rcx,%rax
+ shr    $0x12,%rdx
+ cmp    %rax,%rdx
+ jae    <inf_store::store::CellStore::resolve_hashed+OFF>
+-mov    %rcx,%r12
+-mov    0x18(%rsp),%rcx
+-movzbl 0x2289(%rcx),%eax
++movzbl 0x2751(%rbx),%eax
+ test   %eax,%eax
+ je     <inf_store::store::CellStore::resolve_hashed+OFF>
+ cmp    $0x1,%eax
+ jne    <inf_store::store::CellStore::resolve_hashed+OFF>
+ or     $0xc,%r15b
+-mov    %r15b,0x0(%rbp)
+-jmp    <inf_store::store::CellStore::resolve_hashed+OFF>
+-mov    0x8(%rsp),%rax
++mov    %r15b,(%r12)
++jmp    <inf_store::store::CellStore::resolve_hashed+OFF>
++mov    (%rsp),%rax
+ xor    %ecx,%ecx
+ jmp    <inf_store::store::CellStore::resolve_hashed+OFF>
+ movabs $0x9e3779b97f4a7c15,%rax
+-add    0x2278(%rcx),%rax
+-mov    %rax,0x2278(%rcx)
+-mov    0x2270(%rcx),%rcx
++add    0x2740(%rbx),%rax
++mov    %rax,0x2740(%rbx)
++mov    0x2738(%rbx),%rcx
+ test   %rcx,%rcx
+ je     <inf_store::store::CellStore::resolve_hashed+OFF>
+-mov    0x10(%rsp),%rdx
+-mov    %edx,%r8d
+-shr    $0xb,%r8d
+-and    $0x7ff,%r8d
++mov    0x8(%rsp),%rdx
++mov    %edx,%r15d
++shr    $0xb,%r15d
++and    $0x7ff,%r15d
+ mov    %rdx,%rdi
+ shr    $0x16,%rdi
+ and    $0x7ff,%edi
+@@ -189,7 +187,7 @@
+ and    $0x7ff,%esi
+ and    $0x7ff,%edx
+ movzbl (%rcx,%rdx,1),%r14d
+-movzbl 0x800(%rcx,%r8,1),%ebx
++movzbl 0x800(%rcx,%r15,1),%ebx
+ movzbl 0x1000(%rcx,%rdi,1),%r9d
+ cmp    %bl,%r14b
+ mov    %ebx,%ebp
+@@ -202,7 +200,7 @@
+ cmovae %r10d,%ebp
+ cmp    $0xff,%bpl
+ je     <inf_store::store::CellStore::resolve_hashed+OFF>
+-mov    %rdx,%r15
++mov    %rdx,%r12
+ mov    %rax,%rdx
+ shr    $0x1e,%rdx
+ xor    %rax,%rdx
+@@ -232,39 +230,25 @@
+ ja     <inf_store::store::CellStore::resolve_hashed+OFF>
+ lea    0x1(%r10),%eax
+ mov    %al,0x1800(%rcx,%rsi,1)
+-mov    0x8(%rsp),%rax
+-mov    %r12,0x8(%rax)
++mov    (%rsp),%rax
++mov    %r8,0x8(%rax)
+ mov    %r13,0x10(%rax)
+ mov    $0x1,%ecx
+ jmp    <inf_store::store::CellStore::resolve_hashed+OFF>
+-lea    0xb8(%rsp),%rbx
+ mov    %rbx,%rdi
+-mov    %r9,%rsi
++mov    0x8(%rsp),%rsi
+ mov    %r8,%rdx
+-mov    %r13,%r8
+-mov    %rcx,%r15
+-call   <inf_store::doc::payload_of>
+-mov    0x30(%rsp),%rdi
+-mov    0x10(%rsp),%rsi
+-mov    %r15,%rdx
+-call   <inf_store::index::Index<M>::remove>
+-mov    0x18(%rsp),%r14
+-mov    %r14,%rdi
+-mov    %r15,%rsi
+-mov    %r13,%rdx
+-call   *0x0(%rip)        # <_DYNAMIC+OFF>
+-lea    0x80(%r14),%rdi
+-mov    %rbx,%rsi
+-call   <inf_store::doc::DocStore::release>
+-incq   0x22d8(%r14)
+-mov    0x22e8(%r14),%rax
++mov    %r13,%rcx
++call   *0x0(%rip)        # <_DYNAMIC+OFF>
++incq   0x27a0(%rbx)
++mov    0x27b0(%rbx),%rax
+ cmp    $0x1,%rax
+ adc    $0xffffffffffffffff,%rax
+-mov    %rax,0x22e8(%r14)
++mov    %rax,0x27b0(%rbx)
+ xor    %ecx,%ecx
+-mov    0x8(%rsp),%rax
++mov    (%rsp),%rax
+ mov    %rcx,(%rax)
+-add    $0xd8,%rsp
++add    $0xa8,%rsp
+ pop    %rbx
+ pop    %r12
+ pop    %r13
+@@ -272,16 +256,16 @@
+ pop    %r15
+ pop    %rbp
+ ret
+-lea    0x0(%rip),%rdi        # <anon.a93dd16d3da8856dffc16e8afc15beb9.322.llvm.3655386565944175712+OFF>
+-lea    0x0(%rip),%rdx        # <anon.a93dd16d3da8856dffc16e8afc15beb9.323.llvm.3655386565944175712+OFF>
++lea    0x0(%rip),%rdi        # <anon.4538fc0f0f6c4a4dec4317bb113f19f8.322.llvm.11790107869987619155+OFF>
++lea    0x0(%rip),%rdx        # <anon.4538fc0f0f6c4a4dec4317bb113f19f8.323.llvm.11790107869987619155+OFF>
+ mov    $0x63,%esi
+ call   *0x0(%rip)        # <_DYNAMIC+OFF>
+ lea    0x1(%r14),%eax
+-mov    %al,(%rcx,%r15,1)
++mov    %al,(%rcx,%r12,1)
+ cmp    %bpl,%bl
+ jne    <inf_store::store::CellStore::resolve_hashed+OFF>
+ lea    0x1(%rbx),%eax
+-mov    %al,0x800(%rcx,%r8,1)
++mov    %al,0x800(%rcx,%r15,1)
+ cmp    %bpl,%r9b
+ jne    <inf_store::store::CellStore::resolve_hashed+OFF>
+ lea    0x1(%r9),%eax
+@@ -289,20 +273,26 @@
+ cmp    %r11b,%r10b
+ jbe    <inf_store::store::CellStore::resolve_hashed+OFF>
+ jmp    <inf_store::store::CellStore::resolve_hashed+OFF>
+-lea    0x10(%r12),%rsi
+-lea    0x0(%rip),%rcx        # <anon.6eae8eab5b5001bf886bb5a904615194.336.llvm.4750593345494487467>
+-mov    %r12,%rdi
+-mov    0x20(%rsp),%rdx
+-call   *0x0(%rip)        # <_DYNAMIC+OFF>
+-lea    0x0(%rip),%rcx        # <anon.6eae8eab5b5001bf886bb5a904615194.356.llvm.4750593345494487467+OFF>
++lea    0x10(%r11),%rsi
++lea    0x0(%rip),%rcx        # <anon.c3ede78c9b5129e1230e526cdf53562a.388.llvm.7438497109383721384>
++mov    %r11,%rdi
++mov    0x10(%rsp),%rdx
++call   *0x0(%rip)        # <_DYNAMIC+OFF>
++lea    0x0(%rip),%rcx        # <anon.c3ede78c9b5129e1230e526cdf53562a.408.llvm.7438497109383721384+OFF>
+ mov    $0x8,%edi
+ mov    $0xd,%esi
+ mov    %r13,%rdx
+ call   *0x0(%rip)        # <_DYNAMIC+OFF>
+-lea    0x0(%rip),%rdx        # <anon.6eae8eab5b5001bf886bb5a904615194.336.llvm.4750593345494487467+OFF>
+-mov    0x28(%rsp),%rsi
+-call   *0x0(%rip)        # <_DYNAMIC+OFF>
+-lea    0x0(%rip),%rdx        # <anon.a93dd16d3da8856dffc16e8afc15beb9.323.llvm.3655386565944175712+OFF>
+-mov    %r8,%rsi
+-call   *0x0(%rip)        # <_DYNAMIC+OFF>
++lea    0x0(%rip),%rdx        # <anon.c3ede78c9b5129e1230e526cdf53562a.388.llvm.7438497109383721384+OFF>
++mov    %r14,%rsi
++call   *0x0(%rip)        # <_DYNAMIC+OFF>
++lea    0x0(%rip),%rdx        # <anon.4538fc0f0f6c4a4dec4317bb113f19f8.323.llvm.11790107869987619155+OFF>
++mov    %rbp,%rsi
++call   *0x0(%rip)        # <_DYNAMIC+OFF>
++int3
++int3
++int3
++int3
++int3
++int3
+ 

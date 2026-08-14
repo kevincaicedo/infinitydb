@@ -1,0 +1,123 @@
+--- base
++++ s04
+@@ -227,7 +227,7 @@
+ mov    %r13,%rcx
+ call   <inf_store::store::CellStore::write_record_carrying>
+ mov    0x48(%rsp),%rax
+-cmp    $0x9,%rax
++cmp    $0xb,%rax
+ jne    <inf_store::store::CellStore::set+OFF>
+ mov    %r12d,0xd8(%rsp)
+ movaps 0xb0(%rsp),%xmm0
+@@ -247,7 +247,7 @@
+ mov    %r13,%rcx
+ call   <inf_store::store::CellStore::write_record_carrying>
+ mov    0x48(%rsp),%rax
+-cmp    $0x9,%rax
++cmp    $0xb,%rax
+ jne    <inf_store::store::CellStore::set+OFF>
+ cmpq   $0x0,0x10(%rsp)
+ je     <inf_store::store::CellStore::set+OFF>
+@@ -272,7 +272,7 @@
+ mov    0x8(%rsp),%rdx
+ jne    <inf_store::store::CellStore::set+OFF>
+ mov    (%rsp),%rax
+-incq   0x22e8(%rax)
++incq   0x27b0(%rax)
+ movabs $0x1af1d8a50db5eed1,%rdx
+ mov    %rbp,%rdi
+ mov    %r13,%rsi
+@@ -286,7 +286,7 @@
+ cmp    $0xffffff,%rdi
+ jne    <inf_store::store::CellStore::set+OFF>
+ mov    0x220(%r10),%r12
+-mov    $0x22f8,%eax
++mov    $0x27c0,%eax
+ cmp    $0xfffffe,%r12
+ ja     <inf_store::store::CellStore::set+OFF>
+ lea    0x210(%r10),%rdi
+@@ -306,10 +306,10 @@
+ lea    -0x1(%r12),%edi
+ jmp    <inf_store::store::CellStore::set+OFF>
+ mov    (%rsp),%rcx
+-mov    0x22e8(%rcx),%rax
++mov    0x27b0(%rcx),%rax
+ cmp    $0x1,%rax
+ adc    $0xffffffffffffffff,%rax
+-mov    %rax,0x22e8(%rcx)
++mov    %rax,0x27b0(%rcx)
+ jmp    <inf_store::store::CellStore::set+OFF>
+ mov    0x220(%r10),%r12
+ cmp    %rdi,%r12
+@@ -393,53 +393,53 @@
+ pop    %r15
+ pop    %rbp
+ ret
+-lea    0x0(%rip),%rdi        # <anon.a93dd16d3da8856dffc16e8afc15beb9.322.llvm.3655386565944175712+OFF>
+-lea    0x0(%rip),%rdx        # <anon.a93dd16d3da8856dffc16e8afc15beb9.323.llvm.3655386565944175712+OFF>
++lea    0x0(%rip),%rdi        # <anon.4538fc0f0f6c4a4dec4317bb113f19f8.322.llvm.11790107869987619155+OFF>
++lea    0x0(%rip),%rdx        # <anon.4538fc0f0f6c4a4dec4317bb113f19f8.323.llvm.11790107869987619155+OFF>
+ mov    $0x63,%esi
+ call   *0x0(%rip)        # <_DYNAMIC+OFF>
+-lea    0x0(%rip),%rcx        # <anon.6eae8eab5b5001bf886bb5a904615194.356.llvm.4750593345494487467+OFF>
++lea    0x0(%rip),%rcx        # <anon.c3ede78c9b5129e1230e526cdf53562a.408.llvm.7438497109383721384+OFF>
+ mov    $0x5,%edi
+ mov    $0x8,%esi
+ call   *0x0(%rip)        # <_DYNAMIC+OFF>
+ jmp    <inf_store::store::CellStore::set+OFF>
+-lea    0x0(%rip),%rcx        # <anon.6eae8eab5b5001bf886bb5a904615194.356.llvm.4750593345494487467+OFF>
++lea    0x0(%rip),%rcx        # <anon.c3ede78c9b5129e1230e526cdf53562a.408.llvm.7438497109383721384+OFF>
+ mov    $0x8,%edi
+ mov    $0xd,%esi
+ call   *0x0(%rip)        # <_DYNAMIC+OFF>
+-lea    0x0(%rip),%rcx        # <anon.6eae8eab5b5001bf886bb5a904615194.356.llvm.4750593345494487467+OFF>
++lea    0x0(%rip),%rcx        # <anon.c3ede78c9b5129e1230e526cdf53562a.408.llvm.7438497109383721384+OFF>
+ mov    $0x2,%edi
+ mov    $0x5,%esi
+ call   *0x0(%rip)        # <_DYNAMIC+OFF>
+-lea    0x0(%rip),%rcx        # <anon.6eae8eab5b5001bf886bb5a904615194.356.llvm.4750593345494487467+OFF>
++lea    0x0(%rip),%rcx        # <anon.c3ede78c9b5129e1230e526cdf53562a.408.llvm.7438497109383721384+OFF>
+ call   *0x0(%rip)        # <_DYNAMIC+OFF>
+ lea    0x0(%rip),%rdi        # <anon.58baeeae7d5fe476157d296c9f08f803.1.llvm.5844774155465566772+OFF>
+-lea    0x0(%rip),%rdx        # <anon.6eae8eab5b5001bf886bb5a904615194.356.llvm.4750593345494487467+OFF>
++lea    0x0(%rip),%rdx        # <anon.c3ede78c9b5129e1230e526cdf53562a.408.llvm.7438497109383721384+OFF>
+ mov    $0x10,%esi
+ call   *0x0(%rip)        # <_DYNAMIC+OFF>
+-lea    0x0(%rip),%rdx        # <anon.a93dd16d3da8856dffc16e8afc15beb9.323.llvm.3655386565944175712+OFF>
+-call   *0x0(%rip)        # <_DYNAMIC+OFF>
+-lea    0x0(%rip),%rdx        # <anon.6eae8eab5b5001bf886bb5a904615194.356.llvm.4750593345494487467+OFF>
++lea    0x0(%rip),%rdx        # <anon.4538fc0f0f6c4a4dec4317bb113f19f8.323.llvm.11790107869987619155+OFF>
++call   *0x0(%rip)        # <_DYNAMIC+OFF>
++lea    0x0(%rip),%rdx        # <anon.c3ede78c9b5129e1230e526cdf53562a.408.llvm.7438497109383721384+OFF>
+ xor    %edi,%edi
+ xor    %esi,%esi
+ call   *0x0(%rip)        # <_DYNAMIC+OFF>
+-lea    0x0(%rip),%rdx        # <anon.6eae8eab5b5001bf886bb5a904615194.356.llvm.4750593345494487467+OFF>
++lea    0x0(%rip),%rdx        # <anon.c3ede78c9b5129e1230e526cdf53562a.408.llvm.7438497109383721384+OFF>
+ xor    %edi,%edi
+ xor    %esi,%esi
+ call   *0x0(%rip)        # <_DYNAMIC+OFF>
+-lea    0x0(%rip),%rdx        # <anon.6eae8eab5b5001bf886bb5a904615194.356.llvm.4750593345494487467+OFF>
+-jmp    <inf_store::store::CellStore::set+OFF>
+-lea    0x0(%rip),%rdx        # <anon.6eae8eab5b5001bf886bb5a904615194.356.llvm.4750593345494487467+OFF>
++lea    0x0(%rip),%rdx        # <anon.c3ede78c9b5129e1230e526cdf53562a.408.llvm.7438497109383721384+OFF>
++jmp    <inf_store::store::CellStore::set+OFF>
++lea    0x0(%rip),%rdx        # <anon.c3ede78c9b5129e1230e526cdf53562a.408.llvm.7438497109383721384+OFF>
+ jmp    <inf_store::store::CellStore::set+OFF>
+ mov    $0x1,%edi
+ mov    %rbp,%rsi
+ call   *0x0(%rip)        # <_DYNAMIC+OFF>
+-lea    0x0(%rip),%rdx        # <anon.6eae8eab5b5001bf886bb5a904615194.356.llvm.4750593345494487467+OFF>
+-jmp    <inf_store::store::CellStore::set+OFF>
+-lea    0x0(%rip),%rdx        # <anon.6eae8eab5b5001bf886bb5a904615194.356.llvm.4750593345494487467+OFF>
++lea    0x0(%rip),%rdx        # <anon.c3ede78c9b5129e1230e526cdf53562a.408.llvm.7438497109383721384+OFF>
++jmp    <inf_store::store::CellStore::set+OFF>
++lea    0x0(%rip),%rdx        # <anon.c3ede78c9b5129e1230e526cdf53562a.408.llvm.7438497109383721384+OFF>
+ mov    %r12,%rsi
+ call   *0x0(%rip)        # <_DYNAMIC+OFF>
+ ud2
+-lea    0x0(%rip),%rdx        # <anon.a93dd16d3da8856dffc16e8afc15beb9.323.llvm.3655386565944175712+OFF>
++lea    0x0(%rip),%rdx        # <anon.4538fc0f0f6c4a4dec4317bb113f19f8.323.llvm.11790107869987619155+OFF>
+ mov    $0x1,%edi
+ mov    $0x1,%esi
+ call   *0x0(%rip)        # <_DYNAMIC+OFF>

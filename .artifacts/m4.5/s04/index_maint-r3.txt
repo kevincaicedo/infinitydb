@@ -1,0 +1,6 @@
+row=json_set_zero_index ops=20000 ns_per_op=45.5
+row=json_set_one_index_10m ops=20000 ns_per_op=512.7
+row=maintenance_pair_at_10m ns_per_pair=467.3 budget=600
+row=bracket_4idx_unpruned ops=20000 ns_per_op=1950.6
+row=bracket_4idx_pruned ops=20000 ns_per_op=111.4
+row=prune_delta unpruned_ns=1950.6 pruned_ns=111.4 ratio=17.5x
