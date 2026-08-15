@@ -137,3 +137,72 @@ draft one row per §7 gate (Allowed/Narrowed wording per the S19-closure
 worksheet shape), dev-tier rows stay Evidence-pending, and the release
 re-validation rule applies (a row not re-run this campaign reverts to
 Evidence-pending for the v0.4.0 announcement).
+
+---
+
+## Phase 4 addendum (2026-08-15) — the two things that decide whether this phase produces a number at all
+
+Written after a calibration pair that cost 20 minutes and would otherwise
+have cost the phase. Both findings are about the **hot-set** gate; the
+cold-p99 and write-amplification rows are unaffected.
+
+### 1. Both legs must run at pipeline depth 1
+
+The memory-hit split is **client-observed**. At pipeline 8 a cold read
+blocks the responses queued behind it on the same connection (RESP is
+in-order), so memory hits inherit cold-scale latency and the two
+populations stop being separable. Measured on the same row, same box,
+2026-08-15:
+
+| pipeline | mem-hit p50 | mem-hit p99.9 | server cold p50 | separation check |
+|---|---|---|---|---|
+| 8 | 279 µs | 527 µs | 175 µs | **FAILED** |
+| 1 | 22 µs | 131 µs | 135 µs | **passed** |
+
+Pipeline depth alone moved the derived memory-hit p50 by 12×. That is
+queueing, not service. This is also the mechanism behind the 20260814
+soak refusing all 156 of its rows — it ran the tiered legs pipelined.
+
+So phase 4's gate pair runs `--conns 8 --pipeline 1`, and the harness now
+records the config in `mem-hit.tsv` and **refuses** a comparison across
+two different depths rather than reporting a queueing delta as memory
+speed (ADR-0071 D6).
+
+The loaded cold-read disclosure is a *separate* leg at `--pipeline 8`:
+that row wants a loaded device and carries no hot-set value.
+
+### 2. Only zipfian rows can carry the gate
+
+At 10× RAM a *uniform* row reads 94–98% cold — correctly refused by the
+50% cold-fraction ceiling, because a uniform workload over 10× RAM has no
+hot set to serve at memory speed. Expect the gate value to come from the
+zipfian rows only, with the uniform rows named and excluded. That is the
+instrument working, not a gap.
+
+### Invocation actually used
+
+```bash
+B=~/.cache/inf-campaign/v0.4.0-bin
+# 1) reference leg first — the tiered leg consumes its sidecar
+$B/inf-bench ycsb --reference-box --mem-budget-mb 2048 --dataset-multiple 1 \
+  --duration 60 --conns 8 --pipeline 1 \
+  --data-root $HOME/.cache/inf-tmp --infinityd-bin $B/infinityd \
+  --artifacts-root .artifacts/m4/s24/ycsb-ref
+# 2) tiered gate leg, same generator config
+$B/inf-bench ycsb --reference-box --mem-budget-mb 2048 --dataset-multiple 10 \
+  --duration 60 --conns 8 --pipeline 1 --verify-seed \
+  --hot-set-reference .artifacts/m4/s24/ycsb-ref/<stamp>-gate-run \
+  --data-root $HOME/.cache/inf-tmp --infinityd-bin $B/infinityd \
+  --artifacts-root .artifacts/m4/s24/ycsb
+# 3) loaded leg for the cold-p99 disclosure + a WA cross-read
+$B/inf-bench ycsb --reference-box --mem-budget-mb 2048 --dataset-multiple 10 \
+  --duration 60 --conns 8 --pipeline 8 \
+  --data-root $HOME/.cache/inf-tmp --infinityd-bin $B/infinityd \
+  --artifacts-root .artifacts/m4/s24/ycsb-loaded
+```
+
+`INF_GATERUN_STDERR_DIR` lives **outside** the checkout
+(`~/.cache/inf-campaign/stderr`): the runbook's original `mkdir -p …
+stderr` puts it in the tree, where it is invisible to git while empty and
+fails the next leg's `git-dirty-tree` probe as soon as a run writes to it.
+Campaign binaries live outside the checkout for the same reason.
