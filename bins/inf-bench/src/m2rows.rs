@@ -42,52 +42,82 @@ pub(crate) fn delta_pct(a: f64, b: f64) -> f64 {
     if a == 0.0 { 0.0 } else { (b - a) / a * 100.0 }
 }
 
-/// One interleaved A/B row: `replicates` alternating runs of the same
-/// `LoadSpec` shape against two live servers, in ABBA order (the leg that
-/// runs second flips every replicate, so drift/thermal bias cancels in the
-/// medians instead of always taxing the same build). With no baseline
-/// server the M2 leg still runs (the counter tripwire below needs it) and
-/// the delta gates stay PENDING.
+/// One crossover A/B row — the ADR-0064 D1 instrument fix, ported from
+/// `m4rows::degenerate_row` (readiness F5: the fix landed on the M4 rows
+/// only, and any m2 tail verdict cited from the pre-fix shape carries the
+/// bias below).
+///
+/// The pre-fix shape spawned both servers **once** and then alternated only
+/// the *load order* across replicates. That cancels drift and thermal bias,
+/// but not slot bias: the first-spawned slot's unpipelined p99.9 reads one
+/// LogHistogram bucket high with *identical* binaries (the week-4 A/A
+/// control, `.artifacts/m4/s03/week-4-risk-gate/verdict.md`) because the
+/// bias follows spawn order, port draw and process lifetime — and with
+/// fixed slots that bias landed entirely on one build, every replicate.
+///
+/// Fix, identical to M4's: servers respawn fresh **per replicate** and the
+/// binary↔slot assignment alternates; legs run in spawn order, so the slot
+/// and load-order nuisances move together and alternate sign against the
+/// binary — both cancel in the leg medians over an even replicate count.
+/// Both legs stay equally fresh within a replicate.
+///
+/// With no baseline binary the M2 leg still runs (the counter tripwire
+/// needs it) and the delta gates stay PENDING.
+#[allow(clippy::too_many_arguments)] // orchestration row: linear, not branchy
 fn ab_row(
     m: &mut Measurements,
     name: &str,
     keys: &RowKeys,
     replicates: usize,
-    baseline: Option<&ServerGuard>,
-    m2: &ServerGuard,
+    infinityd_bin: &str,
+    baseline_bin: Option<&str>,
+    cells: u16,
+    server_extra: &[&str],
     spec_for: impl Fn(u16) -> LoadSpec,
 ) -> Result<(), String> {
-    println!("\n== row: {name} (interleaved ABBA × {replicates}) ==");
+    println!("\n== row: {name} (crossover A/B × {replicates}) ==");
     let mut base_ops: Vec<f64> = Vec::new();
     let mut base_p999: Vec<f64> = Vec::new();
     let mut m2_ops: Vec<f64> = Vec::new();
     let mut m2_p999: Vec<f64> = Vec::new();
     for rep in 0..replicates {
-        let baseline_first = rep % 2 == 0;
-        for leg in 0..2 {
-            if (leg == 0) == baseline_first {
-                let Some(server) = baseline else { continue };
-                let report = run_load(&spec_for(server.port))?;
-                println!(
-                    "  rep {rep} m1-baseline: {:.0} ops/s, p999 {} µs",
-                    report.ops_per_sec, report.p999_us
-                );
-                m.raw_section(&format!("{name} m1-baseline rep {rep}"), &render(&report));
-                base_ops.push(report.ops_per_sec);
-                base_p999.push(report.p999_us as f64);
-            } else {
-                let report = run_load(&spec_for(m2.port))?;
-                println!(
-                    "  rep {rep} m2: {:.0} ops/s, p999 {} µs",
-                    report.ops_per_sec, report.p999_us
-                );
-                m.raw_section(&format!("{name} m2 rep {rep}"), &render(&report));
-                m2_ops.push(report.ops_per_sec);
-                m2_p999.push(report.p999_us as f64);
+        // Slot order this replicate: (binary, is_m2) in spawn order.
+        let order: Vec<(&str, bool)> = match baseline_bin {
+            Some(base_bin) if rep.is_multiple_of(2) => {
+                vec![(infinityd_bin, true), (base_bin, false)]
+            }
+            Some(base_bin) => vec![(base_bin, false), (infinityd_bin, true)],
+            None => vec![(infinityd_bin, true)],
+        };
+        // Spawn every slot before any leg runs: the pre-fix shape kept both
+        // servers resident on the same cpu set while one served — the
+        // crossover changes assignment, never the concurrency shape.
+        let servers = order
+            .iter()
+            .map(|(bin, _)| spawn_infinityd(bin, cells, server_extra))
+            .collect::<Result<Vec<_>, String>>()?;
+        for ((_, is_m2), server) in order.iter().zip(&servers) {
+            let report = run_load(&spec_for(server.port))?;
+            let label = if *is_m2 { "m2" } else { "m1-baseline" };
+            println!(
+                "  rep {rep} {label}: {:.0} ops/s, p999 {} µs",
+                report.ops_per_sec, report.p999_us
+            );
+            m.raw_section(&format!("{name} {label} rep {rep}"), &render(&report));
+            let (ops, p999) =
+                if *is_m2 { (&mut m2_ops, &mut m2_p999) } else { (&mut base_ops, &mut base_p999) };
+            ops.push(report.ops_per_sec);
+            p999.push(report.p999_us as f64);
+            // Audit the M2 leg before its server drops: with per-replicate
+            // respawn there is no long-lived server left to scrape after
+            // the row, so each server lifetime owns its own zero (same
+            // move as `m4rows::degenerate_row`).
+            if *is_m2 {
+                assert_zero_log_records(m, server.port, cells, name)?;
             }
         }
     }
-    if baseline.is_some() {
+    if baseline_bin.is_some() {
         let (a_ops, b_ops) = (median(&mut base_ops), median(&mut m2_ops));
         let (a_p999, b_p999) = (median(&mut base_p999), median(&mut m2_p999));
         // The gate is a REGRESSION bound (the plan's "pays zero"): a faster
@@ -985,15 +1015,21 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
         m.note(format!("server cells pinned: {} (same cpu set both legs)", pin_args.join(" ")));
     }
     for (name, keys, spec) in &rows {
-        let m2_server = spawn_infinityd(&infinityd, cells, &server_extra)?;
-        let baseline_server = match &baseline_bin {
-            Some(bin) => Some(spawn_infinityd(bin, cells, &server_extra)?),
-            None => None,
-        };
-        ab_row(&mut m, name, keys, replicates, baseline_server.as_ref(), &m2_server, |port| {
-            spec(port, duration)
-        })?;
-        assert_zero_log_records(&mut m, m2_server.port, cells, name)?;
+        // Servers are spawned inside the row now — the crossover owns
+        // their lifetimes so the binary↔slot assignment can alternate per
+        // replicate (ADR-0064 D1; readiness F5). The zero-log-records
+        // tripwire moved in with them, asserted per M2 server lifetime.
+        ab_row(
+            &mut m,
+            name,
+            keys,
+            replicates,
+            &infinityd,
+            baseline_bin.as_deref(),
+            cells,
+            &server_extra,
+            |port| spec(port, duration),
+        )?;
     }
 
     // S21: always grouped writes + the grouping-ratio tripwire.
