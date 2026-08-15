@@ -1,0 +1,10 @@
+set-1k   ops/s mean    1,877,042 rsd 0.7%  p50 0.807 ms
+jset-1k  ops/s mean    1,279,560 rsd 0.9%  p50 1.218 ms
+get-1k   ops/s mean    1,541,558 rsd 2.9%  p50 0.903 ms
+jget-1k  ops/s mean    1,462,036 rsd 1.1%  p50 1.060 ms
+get-2h   ops/s mean    3,271,708 rsd 2.6%  p50 0.444 ms
+jget-2h  ops/s mean    2,485,113 rsd 1.2%  p50 0.639 ms
+jmut-1k  ops/s mean    2,691,509 rsd 0.7%  p50 0.580 ms
+GATE doc_write_throughput_ratio = 0.6817  (>= 0.70)
+GATE doc_read_p50_ratio_1k      = 1.1742  (<= 1.5)
+GATE doc_read_p50_ratio_200b    = 1.4381  (<= 1.5)

@@ -1,0 +1,19 @@
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 20%,   0 secs]  4 threads 25 conns:     2019348 ops, 2020788 (avg: 2020788) ops/sec, 2.01GB/sec (avg: 2.01GB/sec),  1.58 (avg:  1.58) msec latency[RUN #1 44%,   1 secs]  4 threads 25 conns:     4361766 ops, 2342172 (avg: 2181546) ops/sec, 2.33GB/sec (avg: 2.17GB/sec),  1.36 (avg:  1.46) msec latency[RUN #1 64%,   2 secs]  4 threads 25 conns:     6413235 ops, 2051181 (avg: 2138078) ops/sec, 2.04GB/sec (avg: 2.12GB/sec),  1.56 (avg:  1.49) msec latency[RUN #1 84%,   3 secs]  4 threads 25 conns:     8447285 ops, 2043357 (avg: 2114476) ops/sec, 2.03GB/sec (avg: 2.10GB/sec),  1.56 (avg:  1.51) msec latency[RUN #1 99%,   4 secs]  4 threads 25 conns:     9905940 ops, 2645558 (avg: 2178883) ops/sec, 2.63GB/sec (avg: 2.16GB/sec),  1.21 (avg:  1.46) msec latency[RUN #1 100%,   4 secs]  0 threads 25 conns:    10000000 ops, 2645558 (avg: 2191872) ops/sec, 2.63GB/sec (avg: 2.18GB/sec),  1.21 (avg:  1.46) msec latency
+
+setting requests to 100000
+4         Threads
+25        Connections per thread
+100000    Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      2120118.27          ---          ---         1.45683         1.40700         2.84700         3.79100   2206844.44 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    2120118.27         0.00         0.00         1.45683         1.40700         2.84700         3.79100   2206844.44 

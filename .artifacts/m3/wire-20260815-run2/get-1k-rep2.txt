@@ -1,0 +1,18 @@
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 10%,   0 secs]  4 threads 25 conns:     1538462 ops, 1538954 (avg: 1538954) ops/sec, 1.52GB/sec (avg: 1.52GB/sec),  1.04 (avg:  1.04) msec latency[RUN #1 20%,   1 secs]  4 threads 25 conns:     2879453 ops, 1340820 (avg: 1439865) ops/sec, 1.32GB/sec (avg: 1.42GB/sec),  1.19 (avg:  1.11) msec latency[RUN #1 30%,   2 secs]  4 threads 25 conns:     4219971 ops, 1340294 (avg: 1406669) ops/sec, 1.32GB/sec (avg: 1.39GB/sec),  1.19 (avg:  1.14) msec latency[RUN #1 40%,   4 secs]  4 threads 25 conns:     5621468 ops, 1401342 (avg: 1405337) ops/sec, 1.38GB/sec (avg: 1.39GB/sec),  1.14 (avg:  1.14) msec latency[RUN #1 50%,   5 secs]  4 threads 25 conns:     7166498 ops, 1544806 (avg: 1433233) ops/sec, 1.53GB/sec (avg: 1.42GB/sec),  1.03 (avg:  1.11) msec latency[RUN #1 60%,   6 secs]  4 threads 25 conns:     8741779 ops, 1575044 (avg: 1456871) ops/sec, 1.56GB/sec (avg: 1.44GB/sec),  1.01 (avg:  1.10) msec latency[RUN #1 70%,   7 secs]  4 threads 25 conns:    10323521 ops, 1581520 (avg: 1474679) ops/sec, 1.56GB/sec (avg: 1.46GB/sec),  1.01 (avg:  1.08) msec latency[RUN #1 80%,   8 secs]  4 threads 25 conns:    11873729 ops, 1549961 (avg: 1484090) ops/sec, 1.53GB/sec (avg: 1.47GB/sec),  1.03 (avg:  1.08) msec latency[RUN #1 90%,   9 secs]  4 threads 25 conns:    13251527 ops, 1377563 (avg: 1472253) ops/sec, 1.36GB/sec (avg: 1.45GB/sec),  1.16 (avg:  1.09) msec latency[RUN #1 100%,  10 secs]  4 threads 25 conns:    14708085 ops, 1456620 (avg: 1470690) ops/sec, 1.44GB/sec (avg: 1.45GB/sec),  1.10 (avg:  1.09) msec latency[RUN #1 100%,  10 secs]  0 threads 25 conns:    14709545 ops, 1456620 (avg: 1470688) ops/sec, 1.44GB/sec (avg: 1.45GB/sec),  1.10 (avg:  1.09) msec latency
+
+4         Threads
+25        Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets            0.00          ---          ---             ---             ---             ---             ---         0.00 
+Gets      1470515.09   1470515.09         0.00         1.08745         0.99100         1.99100         3.23100   1523489.65 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1470515.09   1470515.09         0.00         1.08745         0.99100         1.99100         3.23100   1523489.65 
