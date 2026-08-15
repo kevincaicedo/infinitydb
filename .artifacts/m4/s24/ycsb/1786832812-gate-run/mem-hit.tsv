@@ -1,0 +1,13 @@
+# inf-bench ycsb — client-derived memory-hit split (ADR-0071 D2)
+# config: conns=8 pipeline=1 value_size=1024
+# row	ops	cold_frac	p50_us	p99_us	p999_us	eligible
+ycsb-a-zipfian	2392674	0.333253	21	191	195	ok
+ycsb-a-uniform	1242979	0.916044	19	87	99	ineligible
+ycsb-b-zipfian	4785164	0.200992	22	191	195	ok
+ycsb-b-uniform	2035279	0.646011	19	143	143	ineligible
+ycsb-c-zipfian	5627279	0.202160	20	167	175	ok
+ycsb-c-uniform	2002794	0.625242	19	163	163	ineligible
+ycsb-d-latest	4048121	0.295235	19	163	167	ok
+ycsb-e-zipfian	34114	1.000000	14	14	14	ineligible
+ycsb-f-zipfian	2788626	0.191183	33	147	155	ok
+ycsb-f-uniform	1588962	0.675789	37	51	51	ineligible
