@@ -254,7 +254,7 @@ overwrites landed on records still in the mutable region.
 | `tiering_flush_slices` / `tiering_flush_confirmed_bytes` | flush barriers and the bytes they made durable |
 | `tiering_reserved_bytes` | virtual address space reserved for the region rings (not RSS) |
 | `tiering_committed_bytes` | **RAM actually committed** — the number the memory budget bounds |
-| `tiering_allocated_bytes` / `tiering_dead_bytes` / `tiering_live_bytes` | address bytes allocated this life, dead bytes, live record bytes |
+| `tiering_allocated_bytes` / `tiering_dead_bytes` / `tiering_live_bytes` | address bytes allocated this life, dead bytes, live record bytes. **`dead_bytes` accumulates for the life and is never decremented** — it is "dead space *produced* since this life began", not "dead space sitting there now", so it keeps climbing while compaction reclaims normally. Do not read it as a reclaimable-space gauge, and do not divide it by `dead + live` and compare that to `COMPACTION-DEAD-RATIO`: the trigger is evaluated **per file** against that file's own current extent, so a node-level ratio drifts upward in any healthy long-running namespace (the v0.4.0 endurance run reached 80% node-wide while compaction ran 9.6 M slices). To ask "is reclaim keeping up?", watch `tiering_disk_used_bytes` **fall** and `tiering_compact_slices` **rise** |
 | `tiering_index_bytes` | index + hash sidecar bytes |
 | `tiering_user_bytes` · `tiering_wal_bytes` · `tiering_flush_bytes` · `tiering_compaction_bytes` | the four write counters, summed |
 | `tiering_written_bytes` | `wal + flush` — the write-amplification numerator (the relocation volume is *not* added; see the previous section) |
