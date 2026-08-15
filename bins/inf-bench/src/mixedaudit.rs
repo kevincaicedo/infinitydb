@@ -78,7 +78,14 @@ const DOC_KEYS: u64 = 20_000;
 /// about). The hot-set question itself belongs to `inf-bench ycsb`.
 const TIER_CONNS: usize = 2;
 /// Queue depth comes from pipelining, not threads (see the module doc).
-const TIER_PIPELINE: usize = 32;
+/// Sized against the measurement, not by feel: at 32 the first binding
+/// run (2026-08-15) reached only `cold_read_qd_p99 = 3` against the
+/// ADR-0055 D2 cap of 64, because 2×32 outstanding ops spread over four
+/// cells and only the cold half of the reads suspend. 128 puts ~256 ops
+/// in flight and drives the cold queue deep enough for the AC's
+/// "full-QD cold reads" condition to be a measured fact rather than a
+/// hope — and it costs no extra generator threads.
+const TIER_PIPELINE: usize = 128;
 const TIER_VALUE: usize = 512;
 const TIER_KEYS: u64 = 1_310_720;
 const TIER_MEM_BUDGET: &str = "64mb";
@@ -738,13 +745,22 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     push("## Findings");
     push("");
     push(
-        "- **Per-namespace `MAXMEMORY` on named memory namespaces is unenforced**: the \
-          registry carries it (M1) but the eviction sweep rotates the numbered dbs only \
-          (`Keyspace::evict_toward`), so a named cache namespace never evicts. This audit \
-          therefore runs the cache leg on the default DB under node-level `CONFIG SET \
-          maxmemory` (the proven M1 machinery). Recorded for the plan: per-namespace \
-          eviction enforcement needs an owner before a multi-cache node is honest.",
+        "- **The original audit finding is CLOSED.** Per-namespace `MAXMEMORY` on named \
+          memory namespaces was registry-carried but unenforced when this audit first ran \
+          (2026-07-30): `Keyspace::evict_toward` rotated the numbered dbs only, so a named \
+          cache namespace never evicted and its growth evicted numbered-DB keys instead. \
+          **M4-S27 (ADR-0068) enforces it since 2026-08-06** — budgeted memory namespaces \
+          evict toward their own budget in structural isolation. The cache leg still runs on \
+          the default DB so its numbers stay comparable with the 2026-07-30 baseline; that \
+          is now a continuity choice, not a workaround.",
     );
+    push(&format!(
+        "- **Cold-read queue depth reached p99 {cold_qd_p99} against the ADR-0055 D2 cap of \
+          64.** The AC's condition is that the cache namespace holds its latency *while the \
+          tiered namespace serves cold reads at full QD*, so the depth is part of the claim, \
+          not a footnote: a shallow queue would make the isolation number look better than \
+          the profile it is supposed to describe."
+    ));
     push("");
     push("## Named absent (debt-forward, honesty rules)");
     push("");
