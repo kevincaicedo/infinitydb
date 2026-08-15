@@ -25,12 +25,17 @@
 //!
 //! Generator sizing is deliberate (the C5 lesson): the cache and
 //! document legs keep the exact connection counts their solo baselines
-//! use, and the tiered leg buys its queue depth from *pipelining* rather
-//! than from threads — 2 connections that are blocked on cold-read I/O
-//! essentially all the time. Cold-read queue depth is a server-side
-//! property of outstanding requests, not of generator threads, so this
-//! reaches full QD without putting the mixed leg's generator on a
-//! different footing from the solo legs'.
+//! use, so the isolation deltas are not contaminated by a mixed leg whose
+//! generator is more crowded than its baseline's. The tiered leg adds
+//! only 2 connections, deeply pipelined, and they are blocked on
+//! cold-read I/O essentially all the time.
+//!
+//! What that does **not** achieve is the AC's literal "full QD" — see
+//! [`TIER_PIPELINE`]. Cold-read queue depth turns out to be set by device
+//! service time, not by how hard the generator pushes, and the ADR-0055
+//! D2 cap of 64 does not bind on this box under any profile measured. The
+//! report says so with the numbers rather than implying the condition was
+//! met.
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -77,15 +82,17 @@ const DOC_KEYS: u64 = 20_000;
 /// most reads from memory and understate the interference the AC asks
 /// about). The hot-set question itself belongs to `inf-bench ycsb`.
 const TIER_CONNS: usize = 2;
-/// Queue depth comes from pipelining, not threads (see the module doc).
-/// Sized against the measurement, not by feel: at 32 the first binding
-/// run (2026-08-15) reached only `cold_read_qd_p99 = 3` against the
-/// ADR-0055 D2 cap of 64, because 2×32 outstanding ops spread over four
-/// cells and only the cold half of the reads suspend. 128 puts ~256 ops
-/// in flight and drives the cold queue deep enough for the AC's
-/// "full-QD cold reads" condition to be a measured fact rather than a
-/// hope — and it costs no extra generator threads.
-const TIER_PIPELINE: usize = 128;
+/// Deep enough to keep the cold path continuously busy. Note what it
+/// does *not* buy: cold-read **queue depth**. Measured 2026-08-15, four
+/// ways — this harness at pipeline 32 (`cold_read_qd_p99` 3) and at 128
+/// (still 3), and `ycsb` at 8 conns (5) and 64 conns (7), while
+/// throughput over the same conn sweep went 39.6k → 68.2k ops/s. The
+/// ADR-0055 D2 cap of 64 does not bind on this box under any profile
+/// measured, including the 32 h unified soak (5): the cells drain the
+/// cold queue about as fast as the generator can fill it, so depth is
+/// set by device service time, not by admission. Driving harder buys
+/// throughput, not depth.
+const TIER_PIPELINE: usize = 32;
 const TIER_VALUE: usize = 512;
 const TIER_KEYS: u64 = 1_310_720;
 const TIER_MEM_BUDGET: &str = "64mb";
@@ -755,11 +762,18 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
           is now a continuity choice, not a workaround.",
     );
     push(&format!(
-        "- **Cold-read queue depth reached p99 {cold_qd_p99} against the ADR-0055 D2 cap of \
-          64.** The AC's condition is that the cache namespace holds its latency *while the \
-          tiered namespace serves cold reads at full QD*, so the depth is part of the claim, \
-          not a footnote: a shallow queue would make the isolation number look better than \
-          the profile it is supposed to describe."
+        "- **The AC's \"full QD\" condition is not reachable on this box, and that is a \
+          measurement, not a shortfall.** This run reached `cold_read_qd_p99` \
+          **{cold_qd_p99}** against the ADR-0055 D2 cap of 64. The cap was probed directly \
+          on 2026-08-15: quadrupling this harness's pipeline depth (32 → 128) left the \
+          depth unchanged, and an `ycsb` connection sweep moved it only 5 → 7 while \
+          throughput went 39.6k → 68.2k ops/s. The 32 h unified soak read 5. The cells drain \
+          the cold queue about as fast as a generator can fill it, so depth is set by device \
+          service time rather than by admission — reaching 64 would need a slower device or \
+          a lower cap, not a harder push. The isolation number below is therefore taken \
+          against a **continuously busy** cold path ({cold_mixed} cold reads in the mixed \
+          leg), which is the strongest form of the condition this hardware admits, and the \
+          reader should not read it as the cap-saturated case."
     ));
     push("");
     push("## Named absent (debt-forward, honesty rules)");
