@@ -155,7 +155,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       <a href="../index.html">HOME</a>
       <a href="../blog/index.html">BLOG</a>
       <a href="roadmap.html">ROADMAP</a>
-      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
+      <a class="nav-cta" href="https://github.com/kevincaicedo/infinitydb">&#9733; GITHUB</a>
     </div>
   </div>
 </nav>
@@ -187,7 +187,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
   <div class="callout">
     <span class="callout-tag"><strong>Generated page &mdash; do not edit.</strong></span>
-    Rendered from <code>infinitydb/docs/compat-matrix.md</code> (itself generated from the <code>inf-wire</code> command registry and the oracle-diff corpus by <code>tests/compat/src/matrixgen.rs</code>, with a CI staleness gate) by <code>scripts/gen-compat-page.py</code> on {gen_date}. {preamble}
+    Rendered from <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/compat-matrix.md"><code>docs/compat-matrix.md</code></a> (itself generated from the <code>inf-wire</code> command registry and the oracle-diff corpus by <code>tests/compat/src/matrixgen.rs</code>, with a CI staleness gate) by <code>scripts/gen-compat-page.py</code> on {gen_date}. {preamble}
   </div>
 
   <div class="stat-row">
@@ -241,7 +241,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       <a href="index.html">DOCS</a>
       <a href="../blog/index.html">BLOG</a>
       <a href="roadmap.html">ROADMAP</a>
-      <a href="https://github.com/">GITHUB &#8599;</a>
+      <a href="https://github.com/kevincaicedo/infinitydb">GITHUB &#8599;</a>
     </div>
   </div>
 </footer>
