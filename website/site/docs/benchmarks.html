@@ -33,7 +33,7 @@
       <a href="../index.html">HOME</a>
       <a href="../blog/index.html">BLOG</a>
       <a href="roadmap.html">ROADMAP</a>
-      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
+      <a class="nav-cta" href="https://github.com/kevincaicedo/infinitydb">&#9733; GITHUB</a>
     </div>
   </div>
 </nav>
@@ -64,7 +64,7 @@
   <p class="lede">Every performance number InfinityDB publishes was produced by a process designed to make lying hard &mdash; to you, and to ourselves. This page is that process, end to end: the harnesses, the environment rules, the replicate discipline, the instrument checks, and finally the numbers themselves &mdash; each one carrying its ledger row and its disclosures.</p>
 
   <h2>The rule that governs everything</h2>
-  <p>Project law L10: <strong>claims follow evidence.</strong> Every number or comparative statement in public copy must have a row marked <strong>Allowed</strong> in <code>docs/claim-ledger.md</code>, citing a committed artifact. Rows carry one of five statuses &mdash; <em>Allowed</em>, <em>Narrowed</em> (a weaker wording is allowed; the original is not), <em>Evidence-pending</em>, <em>Rejected</em>, or bound to a named blocker &mdash; and are re-validated per release: a row whose artifact was not re-run in the release campaign reverts to Evidence-pending for that announcement. This website is scanned in CI against the ledger; an uncovered number fails the build. Targets never appear as numbers anywhere &mdash; a target dressed as a result is the exact failure mode this project was restarted to kill.</p>
+  <p>Project law L10: <strong>claims follow evidence.</strong> Every number or comparative statement in public copy must have a row marked <strong>Allowed</strong> in the <a href="../_ledger-snapshot.md">published claim ledger</a>, citing a committed artifact. Rows carry one of five statuses &mdash; <em>Allowed</em>, <em>Narrowed</em> (a weaker wording is allowed; the original is not), <em>Evidence-pending</em>, <em>Rejected</em>, or bound to a named blocker &mdash; and are re-validated per release: a row whose artifact was not re-run in the release campaign reverts to Evidence-pending for that announcement. This website is scanned in CI against the ledger; an uncovered number fails the build. Targets never appear as numbers anywhere &mdash; a target dressed as a result is the exact failure mode this project was restarted to kill.</p>
 
   <h2>Two harnesses, no silent substitution</h2>
   <p><strong><code>inf-bench</code></strong> is the in-house gate harness: it drives the milestone gate workloads (eviction storms, TTL mixes, checkpoint-under-load, crash/recovery cycles, YCSB-style tiered rows) that generic load generators cannot express, and it proves the <em>gates</em>. Because it is ours, its rows are always labeled <code>inf-bench</code> &mdash; an in-house harness is a conflict of interest that must be visible.</p>
@@ -192,7 +192,7 @@
       <a href="index.html">DOCS</a>
       <a href="../blog/index.html">BLOG</a>
       <a href="roadmap.html">ROADMAP</a>
-      <a href="https://github.com/">GITHUB &#8599;</a>
+      <a href="https://github.com/kevincaicedo/infinitydb">GITHUB &#8599;</a>
     </div>
   </div>
 </footer>

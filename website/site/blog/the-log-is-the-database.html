@@ -44,7 +44,7 @@
       <a href="../index.html">HOME</a>
       <a href="../docs/index.html">DOCS</a>
       <a href="../docs/roadmap.html">ROADMAP</a>
-      <a class="nav-cta" href="https://github.com/">&#9733; GITHUB</a>
+      <a class="nav-cta" href="https://github.com/kevincaicedo/infinitydb">&#9733; GITHUB</a>
     </div>
   </div>
 </nav>
@@ -79,14 +79,14 @@
   <p>This has real consequences. Milestones M1 through M3 produced <em>verdicts</em>, not public releases &mdash; their gate campaigns are why there has never been an InfinityDB release tag, even with the cache, durability, and document planes implemented and tested. By owner decision (ADR-0048, then ADR-0067), the first public tag is <code>v0.4.0-alpha</code>, shipping the JSON-documents milestone and beyond-RAM tiered storage together: rather than shipping an alpha its successor would immediately supersede, the release act &mdash; pre-tag binding campaign, ledger re-validation, signed announcement &mdash; moved forward with the milestones that add the surface. The M2 campaign is also a good advertisement for gates: one of its rows caught a real group-commit defect &mdash; the fsync grouping ratio was a fraction of what the architecture promised &mdash; which was fixed in-campaign and verified by the same harness that caught it. That is what gates are <em>for</em>. A benchmark suite that only ever says yes is decoration.</p>
 
   <h2>The claim ledger, or: why numbers here are rare and cited</h2>
-  <p>The strangest artifact in the repository, for most visitors, will be <code>docs/claim-ledger.md</code>. Every number or comparative statement in InfinityDB&rsquo;s public copy &mdash; this site included &mdash; must have a row there marked <strong>Allowed</strong>, citing a validated artifact: replicated runs, clean tree, recorded governor and thermals, load-generator saturation checked, competitors in the same run on the same box, flamegraph and memory attribution attached. Development-box numbers can never back a performance claim. Rows are re-validated per release; a stale artifact flips its row back to pending. A claim absent from the ledger does not exist, and this website is scanned against the ledger in CI.</p>
+  <p>The strangest artifact this project keeps, for most visitors, will be its <a href="../_ledger-snapshot.md">claim ledger</a>. Every number or comparative statement in InfinityDB&rsquo;s public copy &mdash; this site included &mdash; must have a row there marked <strong>Allowed</strong>, citing a validated artifact: replicated runs, clean tree, recorded governor and thermals, load-generator saturation checked, competitors in the same run on the same box, flamegraph and memory attribution attached. Development-box numbers can never back a performance claim. Rows are re-validated per release; a stale artifact flips its row back to pending. A claim absent from the ledger does not exist, and this website is scanned against the ledger in CI.</p>
   <p>When this post was first published, the ledger allowed only <em>correctness</em> claims &mdash; byte-compatibility counts against a pinned Redis oracle, the simulation and crash-matrix results above, recovery behavior. Since then, the hardening milestone&rsquo;s closure campaign moved the first performance rows to Allowed &mdash; memory versus Redis in the same run, unpipelined throughput, the comparator-anchored cross-cell result &mdash; and those now appear on the landing page inside evidence blocks, each with its artifact and its disclosures. Everything else &mdash; pipelined peaks, <code>always</code>-mode write rates, absolute tail-latency claims &mdash; remains Narrowed or Evidence-pending and therefore absent. What we will not do is publish a target dressed as a result. That is precisely the failure mode this project was restarted to kill.</p>
 
   <h2>What ships today, and what&rsquo;s next</h2>
   <p>Today InfinityDB is a Redis-compatible in-memory cache (strings, keys, expiry, eviction, pub/sub &mdash; per-command status in the <a href="../docs/compat.html">generated matrix</a>) plus <a href="../docs/durability.html">durable KV namespaces</a> with <code>always</code>/<code>everysec</code> fsync classes, fork-free checkpoints, and parallel recovery, plus the built-and-verified JSON document plane. Single node, no auth or TLS yet, early alpha. In dev now: beyond-RAM tiered storage (M4), which carries the first public tag &mdash; <code>v0.4.0-alpha</code>, shipping documents and tiering together.</p>
-  <p>If the discipline model appeals to you more than the feature list &mdash; that is the correct reaction, and you should <a href="https://github.com/">follow the build</a>. Read the master plan. Hold us to it.</p>
+  <p>If the discipline model appeals to you more than the feature list &mdash; that is the correct reaction, and you should <a href="https://github.com/kevincaicedo/infinitydb">follow the build</a>. Read the master plan. Hold us to it.</p>
 
-  <p class="mono-note" style="margin-top:48px">EVERY NUMBER IN THIS POST IS BACKED BY AN ALLOWED CLAIM-LEDGER ROW (C3, C4, C12) &middot; docs/claim-ledger.md</p>
+  <p class="mono-note" style="margin-top:48px">EVERY NUMBER IN THIS POST IS BACKED BY AN ALLOWED CLAIM-LEDGER ROW (C3, C4, C12) &middot; SEE THE LEDGER SNAPSHOT</p>
 
   <div class="post-ctas">
     <a class="btn btn-primary" href="../docs/roadmap.html">THE ROADMAP &rarr;</a>
@@ -101,7 +101,7 @@
       <a href="../docs/index.html">DOCS</a>
       <a href="index.html">BLOG</a>
       <a href="../docs/roadmap.html">ROADMAP</a>
-      <a href="https://github.com/">GITHUB &#8599;</a>
+      <a href="https://github.com/kevincaicedo/infinitydb">GITHUB &#8599;</a>
     </div>
   </div>
 </footer>
