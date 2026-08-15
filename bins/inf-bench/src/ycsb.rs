@@ -725,8 +725,20 @@ fn derive_mem_hit(out: &RowOut, cold_reads: u64, cold_resolves: u64, cold_p50_us
             cold_frac * 100.0,
             MEM_HIT_MAX_COLD_FRACTION * 100.0
         ))
+    } else if cold_reads == 0 {
+        // The RAM-resident reference leg (ADR-0064 D4 / ADR-0071 D6):
+        // nothing demoted, so this row's client population is *unimodal*
+        // and the truncation is the identity. There is no second mode to
+        // separate from — the separation check is vacuous here, not
+        // failed. Refusing it made the reference leg ineligible by
+        // construction, which made `compare_hot_set` exclude every row
+        // and left the §7 hot-set gate unable to bind at all.
+        Ok(())
     } else if cold_p50_us == 0 {
-        Err("server cold p50 reads 0 — no separation check is possible".into())
+        Err(format!(
+            "server cold p50 reads 0 while {cold_reads} cold reads were issued in this row — \
+             that is a broken instrument, not a memory-resident population"
+        ))
     } else if p999_us >= cold_p50_us {
         Err(format!(
             "separation check FAILED: derived memory-hit p99.9 {p999_us} µs >= server cold p50 \
@@ -911,13 +923,26 @@ impl MemHit {
             Ok(()) => "gate-eligible (separation check passed)".to_string(),
             Err(reason) => format!("NOT gate-eligible — {reason}"),
         };
+        let separation = if self.cold_reads == 0 {
+            "separation: not applicable — 0 cold reads in this row, so the client population is \
+             unimodal (the RAM-resident reference shape, ADR-0071 D6) and the truncation is the \
+             identity\n  "
+                .to_string()
+        } else {
+            format!(
+                "separation: mem_hit p99.9 {} µs vs server cold p50 {} µs (client tail spread \
+                 {} µs — the truncation only separates the two modes while cold service exceeds \
+                 it)\n  ",
+                self.p999_us,
+                self.cold_p50_us,
+                self.p999_us.saturating_sub(self.p50_us),
+            )
+        };
         format!(
             "memory-hit split (client-derived, ADR-0071 D2):\n  \
              cold_frac = {:.4}% (cold_reads {} · cold_resolves {} — re-resolve ratio {:.2}×)\n  \
              mem_hit p50_us = {} · p99_us = {} · p999_us = {}\n  \
-             separation: mem_hit p99.9 {} µs vs server cold p50 {} µs (client tail spread {} µs \
-             — the truncation only separates the two modes while cold service exceeds it)\n  \
-             {verdict}\n",
+             {separation}{verdict}\n",
             self.cold_frac * 100.0,
             self.cold_reads,
             self.cold_resolves,
@@ -929,9 +954,6 @@ impl MemHit {
             self.p50_us,
             self.p99_us,
             self.p999_us,
-            self.p999_us,
-            self.cold_p50_us,
-            self.p999_us.saturating_sub(self.p50_us),
         )
     }
 }
@@ -1632,6 +1654,40 @@ mod tests {
         let mem = derive_mem_hit(&out, 5_000, 11_650, 600);
         let reason = mem.eligible.expect_err("overlapping populations must be refused");
         assert!(reason.contains("separation check FAILED"), "{reason}");
+    }
+
+    #[test]
+    fn mem_hit_accepts_the_ram_resident_reference_leg() {
+        // ADR-0071 D6 (readiness F25): `--dataset-multiple 1` demotes
+        // nothing, so the server's cold histogram is empty and
+        // `tiering_cold_p50_us` scrapes 0. Before D6 that made *every*
+        // reference row ineligible, `compare_hot_set` excluded every
+        // matched row, and the §7 hot-set gate could not bind at all —
+        // phase 4 would have returned "NO gate value" however clean the
+        // run was. A row with zero cold reads is unimodal: the
+        // separation check is vacuous, not failed.
+        let out = bimodal_row(200_000, 80, 0, 2_000);
+        let mem = derive_mem_hit(&out, 0, 0, 0);
+        assert!(mem.eligible.is_ok(), "{:?}", mem.eligible);
+        assert_eq!(mem.cold_frac, 0.0);
+        // keep == 1.0, so the truncation is the identity on the client
+        // percentiles — the reference leg publishes its own numbers.
+        assert_eq!(mem.p50_us, out.p50_us);
+        assert_eq!(mem.p99_us, out.p99_us);
+        assert_eq!(mem.p999_us, out.p999_us);
+        assert!(mem.render().contains("separation: not applicable"), "{}", mem.render());
+    }
+
+    #[test]
+    fn mem_hit_still_refuses_a_zero_cold_p50_when_cold_reads_happened() {
+        // The narrow case the D6 change must NOT swallow: cold reads
+        // occurred, so the population *is* bimodal, but the server
+        // reported no cold service time. That is a broken instrument and
+        // the row must carry no gate value (the F13 class).
+        let out = bimodal_row(196_000, 80, 4_000, 2_000);
+        let mem = derive_mem_hit(&out, 4_000, 9_320, 0);
+        let reason = mem.eligible.expect_err("a cold row with no cold service time is broken");
+        assert!(reason.contains("broken instrument"), "{reason}");
     }
 
     #[test]
