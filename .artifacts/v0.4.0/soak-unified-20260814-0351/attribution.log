@@ -1,0 +1,3264 @@
+=== 1786693912 start ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:               79808 kB
+Pss:               77858 kB
+Pss_Dirty:         76852 kB
+Pss_Anon:          74152 kB
+Pss_File:           3706 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:       992 kB
+Private_Dirty:     76852 kB
+Referenced:        79808 kB
+Anonymous:         74152 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 75952128
+file 8192
+kernel 5980160
+kernel_stack 475136
+pagetables 286720
+sec_pagetables 0
+percpu 416
+sock 0
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 4096
+file_writeback 0
+swapcached 0
+anon_thp 0
+file_thp 0
+shmem_thp 0
+inactive_anon 0
+active_anon 75808768
+inactive_file 8192
+active_file 4096
+unevictable 0
+slab_reclaimable 41792
+slab_unreclaimable 3080616
+slab 3122408
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 0
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 0
+pgsteal 0
+pswpin 0
+pswpout 0
+pgscan_kswapd 0
+pgscan_direct 0
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 0
+pgsteal_direct 0
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 18704
+pgmajfault 0
+pgrefill 0
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786697512 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3326612 kB
+Pss:             3324663 kB
+Pss_Dirty:       3321908 kB
+Pss_Anon:        3320788 kB
+Pss_File:           3875 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2740 kB
+Private_Dirty:   3321908 kB
+Referenced:      3326612 kB
+Anonymous:       3320788 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3400568832
+file 8301281280
+kernel 287313920
+kernel_stack 360448
+pagetables 36421632
+sec_pagetables 0
+percpu 416
+sock 61440
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1413255168
+file_writeback 622592
+swapcached 0
+anon_thp 0
+file_thp 255852544
+shmem_thp 0
+inactive_anon 0
+active_anon 3400560640
+inactive_file 8301076480
+active_file 4096
+unevictable 0
+slab_reclaimable 245266712
+slab_unreclaimable 3152424
+slab 248419136
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 48
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 66974240
+pgsteal 66974226
+pswpin 0
+pswpout 0
+pgscan_kswapd 64180232
+pgscan_direct 2794008
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 64180218
+pgsteal_direct 2794008
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 6322749
+pgmajfault 0
+pgrefill 131
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786701112 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3319472 kB
+Pss:             3317523 kB
+Pss_Dirty:       3314776 kB
+Pss_Anon:        3313656 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3314776 kB
+Referenced:      3319472 kB
+Anonymous:       3313656 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3393200128
+file 8953683968
+kernel 307306496
+kernel_stack 425984
+pagetables 36433920
+sec_pagetables 0
+percpu 416
+sock 77824
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1416605696
+file_writeback 16777216
+swapcached 0
+anon_thp 0
+file_thp 555745280
+shmem_thp 0
+inactive_anon 0
+active_anon 3393191936
+inactive_file 8953659392
+active_file 4096
+unevictable 0
+slab_reclaimable 265134456
+slab_unreclaimable 3209312
+slab 268343768
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 95
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 156592529
+pgsteal 156592334
+pswpin 0
+pswpout 0
+pgscan_kswapd 149577496
+pgscan_direct 7015033
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 149577301
+pgsteal_direct 7015033
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 6753894
+pgmajfault 0
+pgrefill 202
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786704712 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3322992 kB
+Pss:             3321043 kB
+Pss_Dirty:       3318296 kB
+Pss_Anon:        3317176 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3318296 kB
+Referenced:      3322992 kB
+Anonymous:       3317176 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3396788224
+file 9263484928
+kernel 315629568
+kernel_stack 409600
+pagetables 36438016
+sec_pagetables 0
+percpu 416
+sock 20480
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 2035220480
+file_writeback 20115456
+swapcached 0
+anon_thp 0
+file_thp 425721856
+shmem_thp 0
+inactive_anon 0
+active_anon 3396784128
+inactive_file 9263460352
+active_file 4096
+unevictable 0
+slab_reclaimable 273491688
+slab_unreclaimable 3185720
+slab 276677408
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 113
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 244204945
+pgsteal 244204697
+pswpin 0
+pswpout 0
+pgscan_kswapd 232904739
+pgscan_direct 11300206
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 232904491
+pgsteal_direct 11300206
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 7081459
+pgmajfault 0
+pgrefill 267
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786708313 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3330464 kB
+Pss:             3328515 kB
+Pss_Dirty:       3325768 kB
+Pss_Anon:        3324648 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3325768 kB
+Referenced:      3330464 kB
+Anonymous:       3324648 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3404505088
+file 7747940352
+kernel 271286272
+kernel_stack 393216
+pagetables 36438016
+sec_pagetables 0
+percpu 416
+sock 442368
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1227345920
+file_writeback 1376256
+swapcached 0
+anon_thp 0
+file_thp 341835776
+shmem_thp 0
+inactive_anon 0
+active_anon 3404500992
+inactive_file 7747866624
+active_file 4096
+unevictable 0
+slab_reclaimable 229171968
+slab_unreclaimable 3175888
+slab 232347856
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 122
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 341864733
+pgsteal 341864467
+pswpin 0
+pswpout 0
+pgscan_kswapd 325982579
+pgscan_direct 15882154
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 325982313
+pgsteal_direct 15882154
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 7418719
+pgmajfault 0
+pgrefill 308
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786711913 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3325076 kB
+Pss:             3323127 kB
+Pss_Dirty:       3320380 kB
+Pss_Anon:        3319260 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3320380 kB
+Referenced:      3325076 kB
+Anonymous:       3319260 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3398922240
+file 9534611456
+kernel 326320128
+kernel_stack 442368
+pagetables 36442112
+sec_pagetables 0
+percpu 416
+sock 204800
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 2277769216
+file_writeback 74096640
+swapcached 0
+anon_thp 0
+file_thp 423624704
+shmem_thp 0
+inactive_anon 0
+active_anon 3398918144
+inactive_file 9534398464
+active_file 4096
+unevictable 0
+slab_reclaimable 284115456
+slab_unreclaimable 3210024
+slab 287325480
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 138
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 446050662
+pgsteal 446050396
+pswpin 0
+pswpout 0
+pgscan_kswapd 425258259
+pgscan_direct 20792403
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 425257993
+pgsteal_direct 20792403
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 7788832
+pgmajfault 0
+pgrefill 395
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786715513 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3327960 kB
+Pss:             3326011 kB
+Pss_Dirty:       3323264 kB
+Pss_Anon:        3322144 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3323264 kB
+Referenced:      3327960 kB
+Anonymous:       3322144 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3400839168
+file 7345926144
+kernel 262078464
+kernel_stack 409600
+pagetables 36446208
+sec_pagetables 0
+percpu 416
+sock 659456
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 954261504
+file_writeback 39936000
+swapcached 0
+anon_thp 0
+file_thp 385875968
+shmem_thp 0
+inactive_anon 0
+active_anon 3400835072
+inactive_file 7345811456
+active_file 4096
+unevictable 0
+slab_reclaimable 219923984
+slab_unreclaimable 3189280
+slab 223113264
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 146
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 546893941
+pgsteal 546893545
+pswpin 0
+pswpout 0
+pgscan_kswapd 521614843
+pgscan_direct 25279098
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 521614447
+pgsteal_direct 25279098
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 8419597
+pgmajfault 0
+pgrefill 444
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786719113 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3329664 kB
+Pss:             3327715 kB
+Pss_Dirty:       3324968 kB
+Pss_Anon:        3323848 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3324968 kB
+Referenced:      3329664 kB
+Anonymous:       3323848 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3403681792
+file 8361267200
+kernel 294322176
+kernel_stack 425984
+pagetables 36454400
+sec_pagetables 0
+percpu 416
+sock 565248
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1334267904
+file_writeback 50331648
+swapcached 0
+anon_thp 0
+file_thp 341835776
+shmem_thp 0
+inactive_anon 0
+active_anon 3403673600
+inactive_file 8361246720
+active_file 4096
+unevictable 0
+slab_reclaimable 252123024
+slab_unreclaimable 3211472
+slab 255334496
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 154
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 651173307
+pgsteal 651172781
+pswpin 0
+pswpout 0
+pgscan_kswapd 621183866
+pgscan_direct 29989441
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 621183340
+pgsteal_direct 29989441
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 8992205
+pgmajfault 0
+pgrefill 473
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786722713 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3332052 kB
+Pss:             3330103 kB
+Pss_Dirty:       3327356 kB
+Pss_Anon:        3326236 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3327356 kB
+Referenced:      3332052 kB
+Anonymous:       3326236 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3406069760
+file 8671358976
+kernel 298164224
+kernel_stack 409600
+pagetables 36454400
+sec_pagetables 0
+percpu 416
+sock 57344
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1782247424
+file_writeback 913408
+swapcached 0
+anon_thp 0
+file_thp 381681664
+shmem_thp 0
+inactive_anon 0
+active_anon 3406065664
+inactive_file 8671313920
+active_file 4096
+unevictable 0
+slab_reclaimable 256006632
+slab_unreclaimable 3189800
+slab 259196432
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 154
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 764298436
+pgsteal 764297809
+pswpin 0
+pswpout 0
+pgscan_kswapd 729039577
+pgscan_direct 35258859
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 729038950
+pgsteal_direct 35258859
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 9325345
+pgmajfault 0
+pgrefill 497
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786726313 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3344836 kB
+Pss:             3342887 kB
+Pss_Dirty:       3340140 kB
+Pss_Anon:        3339020 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3340140 kB
+Referenced:      3344836 kB
+Anonymous:       3339020 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3419164672
+file 9468608512
+kernel 322342912
+kernel_stack 409600
+pagetables 36458496
+sec_pagetables 0
+percpu 416
+sock 45056
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1539784704
+file_writeback 3940352
+swapcached 0
+anon_thp 0
+file_thp 201326592
+shmem_thp 0
+inactive_anon 0
+active_anon 3419160576
+inactive_file 9468432384
+active_file 4096
+unevictable 0
+slab_reclaimable 280178880
+slab_unreclaimable 3188560
+slab 283367440
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 158
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 856721460
+pgsteal 856720277
+pswpin 0
+pswpout 0
+pgscan_kswapd 817704844
+pgscan_direct 39016616
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 817703678
+pgsteal_direct 39016599
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 10223013
+pgmajfault 0
+pgrefill 560
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786729913 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3334256 kB
+Pss:             3332307 kB
+Pss_Dirty:       3329560 kB
+Pss_Anon:        3328440 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3329560 kB
+Referenced:      3334256 kB
+Anonymous:       3328440 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3408334848
+file 8215232512
+kernel 289943552
+kernel_stack 425984
+pagetables 36458496
+sec_pagetables 0
+percpu 416
+sock 475136
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1492582400
+file_writeback 53665792
+swapcached 0
+anon_thp 0
+file_thp 291504128
+shmem_thp 0
+inactive_anon 0
+active_anon 3408330752
+inactive_file 8215044096
+active_file 4096
+unevictable 0
+slab_reclaimable 247736848
+slab_unreclaimable 3210672
+slab 250947520
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 164
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 969913219
+pgsteal 969912036
+pswpin 0
+pswpout 0
+pgscan_kswapd 925272889
+pgscan_direct 44640330
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 925271723
+pgsteal_direct 44640313
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 10597980
+pgmajfault 0
+pgrefill 594
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786733513 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3335120 kB
+Pss:             3333171 kB
+Pss_Dirty:       3330424 kB
+Pss_Anon:        3329304 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3330424 kB
+Referenced:      3335120 kB
+Anonymous:       3329304 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3409207296
+file 9345855488
+kernel 317325312
+kernel_stack 425984
+pagetables 36458496
+sec_pagetables 0
+percpu 416
+sock 479232
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1786511360
+file_writeback 39124992
+swapcached 0
+anon_thp 0
+file_thp 473956352
+shmem_thp 0
+inactive_anon 0
+active_anon 3409203200
+inactive_file 9345761280
+active_file 4096
+unevictable 0
+slab_reclaimable 275139424
+slab_unreclaimable 3199056
+slab 278338480
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 170
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 1091379969
+pgsteal 1091377735
+pswpin 0
+pswpout 0
+pgscan_kswapd 1041457400
+pgscan_direct 49922569
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 1041455183
+pgsteal_direct 49922552
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 10859833
+pgmajfault 0
+pgrefill 624
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786737114 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3335624 kB
+Pss:             3333675 kB
+Pss_Dirty:       3330928 kB
+Pss_Anon:        3329808 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3330928 kB
+Referenced:      3335624 kB
+Anonymous:       3329808 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3409723392
+file 7741227008
+kernel 277975040
+kernel_stack 425984
+pagetables 36462592
+sec_pagetables 0
+percpu 416
+sock 40960
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 2552377344
+file_writeback 58720256
+swapcached 0
+anon_thp 0
+file_thp 272629760
+shmem_thp 0
+inactive_anon 0
+active_anon 3409719296
+inactive_file 7741026304
+active_file 4096
+unevictable 0
+slab_reclaimable 235766176
+slab_unreclaimable 3210608
+slab 238976784
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 174
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 1196754183
+pgsteal 1196751941
+pswpin 0
+pswpout 0
+pgscan_kswapd 1142210807
+pgscan_direct 54543376
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 1142208582
+pgsteal_direct 54543359
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 11786944
+pgmajfault 0
+pgrefill 657
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786740715 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3335432 kB
+Pss:             3333483 kB
+Pss_Dirty:       3330736 kB
+Pss_Anon:        3329616 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3330736 kB
+Referenced:      3335432 kB
+Anonymous:       3329616 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3409526784
+file 7020498944
+kernel 251072512
+kernel_stack 409600
+pagetables 36462592
+sec_pagetables 0
+percpu 416
+sock 36864
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1085083648
+file_writeback 245760
+swapcached 0
+anon_thp 0
+file_thp 287309824
+shmem_thp 0
+inactive_anon 0
+active_anon 3409522688
+inactive_file 7020179456
+active_file 4096
+unevictable 0
+slab_reclaimable 208906200
+slab_unreclaimable 3188584
+slab 212094784
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 181
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 1319781709
+pgsteal 1319779462
+pswpin 0
+pswpout 0
+pgscan_kswapd 1258985087
+pgscan_direct 60796622
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 1258982857
+pgsteal_direct 60796605
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 12344215
+pgmajfault 0
+pgrefill 687
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786744315 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3335516 kB
+Pss:             3333567 kB
+Pss_Dirty:       3330820 kB
+Pss_Anon:        3329700 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3330820 kB
+Referenced:      3335516 kB
+Anonymous:       3329700 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3409612800
+file 9122394112
+kernel 312635392
+kernel_stack 458752
+pagetables 36466688
+sec_pagetables 0
+percpu 416
+sock 16384
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 2759159808
+file_writeback 58720256
+swapcached 0
+anon_thp 0
+file_thp 461373440
+shmem_thp 0
+inactive_anon 0
+active_anon 3409608704
+inactive_file 9122304000
+active_file 4096
+unevictable 0
+slab_reclaimable 270378696
+slab_unreclaimable 3223800
+slab 273602496
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 181
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 1441330004
+pgsteal 1441324278
+pswpin 0
+pswpout 0
+pgscan_kswapd 1374918992
+pgscan_direct 66411012
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 1374913283
+pgsteal_direct 66410995
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 13022649
+pgmajfault 0
+pgrefill 721
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786747915 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3339352 kB
+Pss:             3337403 kB
+Pss_Dirty:       3334656 kB
+Pss_Anon:        3333536 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3334656 kB
+Referenced:      3339352 kB
+Anonymous:       3333536 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3413544960
+file 7404290048
+kernel 267489280
+kernel_stack 409600
+pagetables 36466688
+sec_pagetables 0
+percpu 416
+sock 65536
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 833585152
+file_writeback 60928000
+swapcached 0
+anon_thp 0
+file_thp 367001600
+shmem_thp 0
+inactive_anon 0
+active_anon 3413540864
+inactive_file 7404040192
+active_file 4096
+unevictable 0
+slab_reclaimable 225314256
+slab_unreclaimable 3198824
+slab 228513080
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 181
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 1552575570
+pgsteal 1552568514
+pswpin 0
+pswpout 0
+pgscan_kswapd 1481050158
+pgscan_direct 71525412
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 1481043119
+pgsteal_direct 71525395
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 13972359
+pgmajfault 0
+pgrefill 781
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786751515 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3339492 kB
+Pss:             3337543 kB
+Pss_Dirty:       3334796 kB
+Pss_Anon:        3333676 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3334796 kB
+Referenced:      3339492 kB
+Anonymous:       3333676 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3413684224
+file 9106100224
+kernel 315625472
+kernel_stack 458752
+pagetables 36466688
+sec_pagetables 0
+percpu 416
+sock 393216
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 762793984
+file_writeback 64323584
+swapcached 0
+anon_thp 0
+file_thp 408944640
+shmem_thp 0
+inactive_anon 0
+active_anon 3413680128
+inactive_file 9106051072
+active_file 4096
+unevictable 0
+slab_reclaimable 273375184
+slab_unreclaimable 3222680
+slab 276597864
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 183
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 1675903636
+pgsteal 1675896516
+pswpin 0
+pswpout 0
+pgscan_kswapd 1598612577
+pgscan_direct 77291059
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 1598605474
+pgsteal_direct 77291042
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 14293422
+pgmajfault 0
+pgrefill 804
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786755116 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3347968 kB
+Pss:             3346019 kB
+Pss_Dirty:       3343272 kB
+Pss_Anon:        3342152 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3343272 kB
+Referenced:      3347968 kB
+Anonymous:       3342152 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3422371840
+file 9302241280
+kernel 317845504
+kernel_stack 409600
+pagetables 36466688
+sec_pagetables 0
+percpu 416
+sock 36864
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 2185777152
+file_writeback 26177536
+swapcached 0
+anon_thp 0
+file_thp 293601280
+shmem_thp 0
+inactive_anon 0
+active_anon 3422367744
+inactive_file 9302167552
+active_file 4096
+unevictable 0
+slab_reclaimable 275676240
+slab_unreclaimable 3187504
+slab 278863744
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 203
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 1807511191
+pgsteal 1807503517
+pswpin 0
+pswpout 0
+pgscan_kswapd 1724558582
+pgscan_direct 82952609
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 1724550925
+pgsteal_direct 82952592
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 14648314
+pgmajfault 0
+pgrefill 858
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786758716 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3339472 kB
+Pss:             3337523 kB
+Pss_Dirty:       3334776 kB
+Pss_Anon:        3333656 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3334776 kB
+Referenced:      3339472 kB
+Anonymous:       3333656 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3413663744
+file 8443174912
+kernel 292188160
+kernel_stack 425984
+pagetables 36466688
+sec_pagetables 0
+percpu 416
+sock 106496
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 2560839680
+file_writeback 97013760
+swapcached 0
+anon_thp 0
+file_thp 341835776
+shmem_thp 0
+inactive_anon 0
+active_anon 3413659648
+inactive_file 8442920960
+active_file 4096
+unevictable 0
+slab_reclaimable 249987400
+slab_unreclaimable 3202336
+slab 253189736
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 205
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 1922553223
+pgsteal 1922545044
+pswpin 0
+pswpout 0
+pgscan_kswapd 1834379965
+pgscan_direct 88173258
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 1834371803
+pgsteal_direct 88173241
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 15566768
+pgmajfault 0
+pgrefill 897
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786762316 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3340164 kB
+Pss:             3338215 kB
+Pss_Dirty:       3335468 kB
+Pss_Anon:        3334348 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3335468 kB
+Referenced:      3340164 kB
+Anonymous:       3334348 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3414376448
+file 7410388992
+kernel 261586944
+kernel_stack 442368
+pagetables 36466688
+sec_pagetables 0
+percpu 416
+sock 520192
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 493228032
+file_writeback 21843968
+swapcached 0
+anon_thp 0
+file_thp 335544320
+shmem_thp 0
+inactive_anon 0
+active_anon 3414372352
+inactive_file 7410352128
+active_file 4096
+unevictable 0
+slab_reclaimable 219357632
+slab_unreclaimable 3209168
+slab 222566800
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 208
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 2039352456
+pgsteal 2039344267
+pswpin 0
+pswpout 0
+pgscan_kswapd 1945716050
+pgscan_direct 93636406
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 1945707878
+pgsteal_direct 93636389
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 16450911
+pgmajfault 0
+pgrefill 923
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786765916 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3341060 kB
+Pss:             3339111 kB
+Pss_Dirty:       3336364 kB
+Pss_Anon:        3335244 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3336364 kB
+Referenced:      3341060 kB
+Anonymous:       3335244 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3414241280
+file 9405845504
+kernel 321417216
+kernel_stack 409600
+pagetables 36466688
+sec_pagetables 0
+percpu 416
+sock 557056
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 2099265536
+file_writeback 55521280
+swapcached 0
+anon_thp 0
+file_thp 216006656
+shmem_thp 0
+inactive_anon 0
+active_anon 3414237184
+inactive_file 9405644800
+active_file 4096
+unevictable 0
+slab_reclaimable 279227808
+slab_unreclaimable 3196984
+slab 282424792
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 212
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 2159303339
+pgsteal 2159295058
+pswpin 0
+pswpout 0
+pgscan_kswapd 2060101108
+pgscan_direct 99202231
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 2060092844
+pgsteal_direct 99202214
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 17178439
+pgmajfault 0
+pgrefill 929
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786769516 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3340932 kB
+Pss:             3338983 kB
+Pss_Dirty:       3336236 kB
+Pss_Anon:        3335116 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3336236 kB
+Referenced:      3340932 kB
+Anonymous:       3335116 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3414110208
+file 8571957248
+kernel 296931328
+kernel_stack 409600
+pagetables 36466688
+sec_pagetables 0
+percpu 416
+sock 86016
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 2745077760
+file_writeback 42471424
+swapcached 0
+anon_thp 0
+file_thp 543162368
+shmem_thp 0
+inactive_anon 0
+active_anon 3414106112
+inactive_file 8571793408
+active_file 4096
+unevictable 0
+slab_reclaimable 254762960
+slab_unreclaimable 3187224
+slab 257950184
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 235
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 2286105322
+pgsteal 2286097041
+pswpin 0
+pswpout 0
+pgscan_kswapd 2180880781
+pgscan_direct 105224541
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 2180872517
+pgsteal_direct 105224524
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 17709356
+pgmajfault 0
+pgrefill 955
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786773117 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3341584 kB
+Pss:             3339635 kB
+Pss_Dirty:       3336888 kB
+Pss_Anon:        3335768 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3336888 kB
+Referenced:      3341584 kB
+Anonymous:       3335768 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3415826432
+file 7867080704
+kernel 282865664
+kernel_stack 475136
+pagetables 36470784
+sec_pagetables 0
+percpu 416
+sock 40960
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 2205057024
+file_writeback 94371840
+swapcached 0
+anon_thp 0
+file_thp 289406976
+shmem_thp 0
+inactive_anon 0
+active_anon 3415822336
+inactive_file 7866826752
+active_file 4096
+unevictable 0
+slab_reclaimable 240580856
+slab_unreclaimable 3226992
+slab 243807848
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 256
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 2423363740
+pgsteal 2423355425
+pswpin 0
+pswpout 0
+pgscan_kswapd 2312172179
+pgscan_direct 111191561
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 2312163881
+pgsteal_direct 111191544
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 18075868
+pgmajfault 0
+pgrefill 976
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786776718 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3339960 kB
+Pss:             3338011 kB
+Pss_Dirty:       3335264 kB
+Pss_Anon:        3334144 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3335264 kB
+Referenced:      3339960 kB
+Anonymous:       3334144 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3414163456
+file 7626731520
+kernel 273272832
+kernel_stack 458752
+pagetables 36470784
+sec_pagetables 0
+percpu 416
+sock 471040
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1966280704
+file_writeback 57937920
+swapcached 0
+anon_thp 0
+file_thp 450887680
+shmem_thp 0
+inactive_anon 0
+active_anon 3414159360
+inactive_file 7626608640
+active_file 4096
+unevictable 0
+slab_reclaimable 231015632
+slab_unreclaimable 3221880
+slab 234237512
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 256
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 2540283499
+pgsteal 2540275005
+pswpin 0
+pswpout 0
+pgscan_kswapd 2423838396
+pgscan_direct 116445103
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 2423829919
+pgsteal_direct 116445086
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 18975051
+pgmajfault 0
+pgrefill 998
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786780318 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3340212 kB
+Pss:             3338263 kB
+Pss_Dirty:       3335516 kB
+Pss_Anon:        3334396 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3335516 kB
+Referenced:      3340212 kB
+Anonymous:       3334396 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3414491136
+file 7545659392
+kernel 267673600
+kernel_stack 409600
+pagetables 36470784
+sec_pagetables 0
+percpu 416
+sock 61440
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 230019072
+file_writeback 41525248
+swapcached 0
+anon_thp 0
+file_thp 310378496
+shmem_thp 0
+inactive_anon 0
+active_anon 3414474752
+inactive_file 7545417728
+active_file 4096
+unevictable 0
+slab_reclaimable 225494552
+slab_unreclaimable 3190144
+slab 228684696
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 256
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 2664251749
+pgsteal 2664243295
+pswpin 0
+pswpout 0
+pgscan_kswapd 2542056449
+pgscan_direct 122195300
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 2542048012
+pgsteal_direct 122195283
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 19512481
+pgmajfault 0
+pgrefill 1020
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786783918 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3342184 kB
+Pss:             3340235 kB
+Pss_Dirty:       3337488 kB
+Pss_Anon:        3336368 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3337488 kB
+Referenced:      3342184 kB
+Anonymous:       3336368 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3416440832
+file 8310747136
+kernel 291704832
+kernel_stack 376832
+pagetables 36470784
+sec_pagetables 0
+percpu 416
+sock 229376
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 2227113984
+file_writeback 50331648
+swapcached 0
+anon_thp 0
+file_thp 249561088
+shmem_thp 0
+inactive_anon 0
+active_anon 3416424448
+inactive_file 8310747136
+active_file 4096
+unevictable 0
+slab_reclaimable 249578816
+slab_unreclaimable 3190712
+slab 252769528
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 256
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 2789337002
+pgsteal 2789328191
+pswpin 0
+pswpout 0
+pgscan_kswapd 2661421001
+pgscan_direct 127916001
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 2661412207
+pgsteal_direct 127915984
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 20308872
+pgmajfault 0
+pgrefill 1100
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786787519 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3341192 kB
+Pss:             3339243 kB
+Pss_Dirty:       3336496 kB
+Pss_Anon:        3335376 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3336496 kB
+Referenced:      3341192 kB
+Anonymous:       3335376 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3415465984
+file 7910006784
+kernel 277127168
+kernel_stack 409600
+pagetables 36470784
+sec_pagetables 0
+percpu 416
+sock 77824
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1470484480
+file_writeback 73568256
+swapcached 0
+anon_thp 0
+file_thp 457179136
+shmem_thp 0
+inactive_anon 0
+active_anon 3415461888
+inactive_file 7909871616
+active_file 4096
+unevictable 0
+slab_reclaimable 234949464
+slab_unreclaimable 3187864
+slab 238137328
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 260
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 2905446793
+pgsteal 2905437975
+pswpin 0
+pswpout 0
+pgscan_kswapd 2772255061
+pgscan_direct 133191732
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 2772246260
+pgsteal_direct 133191715
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 21398692
+pgmajfault 0
+pgrefill 1128
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786791119 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3346348 kB
+Pss:             3344399 kB
+Pss_Dirty:       3341652 kB
+Pss_Anon:        3340532 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3341652 kB
+Referenced:      3346348 kB
+Anonymous:       3340532 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3420704768
+file 8397242368
+kernel 290881536
+kernel_stack 409600
+pagetables 36470784
+sec_pagetables 0
+percpu 416
+sock 53248
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 2193563648
+file_writeback 35373056
+swapcached 0
+anon_thp 0
+file_thp 352321536
+shmem_thp 0
+inactive_anon 0
+active_anon 3420700672
+inactive_file 8397037568
+active_file 4096
+unevictable 0
+slab_reclaimable 248707040
+slab_unreclaimable 3186824
+slab 251893864
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 262
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 3041952623
+pgsteal 3041943782
+pswpin 0
+pswpout 0
+pgscan_kswapd 2902114408
+pgscan_direct 139838215
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 2902105584
+pgsteal_direct 139838198
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 22089386
+pgmajfault 0
+pgrefill 1189
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786794720 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3341300 kB
+Pss:             3339351 kB
+Pss_Dirty:       3336604 kB
+Pss_Anon:        3335484 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3336604 kB
+Referenced:      3341300 kB
+Anonymous:       3335484 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3415539712
+file 6854705152
+kernel 244441088
+kernel_stack 393216
+pagetables 36470784
+sec_pagetables 0
+percpu 416
+sock 16384
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1001299968
+file_writeback 557056
+swapcached 0
+anon_thp 0
+file_thp 260046848
+shmem_thp 0
+inactive_anon 0
+active_anon 3415535616
+inactive_file 6854549504
+active_file 4096
+unevictable 0
+slab_reclaimable 202289216
+slab_unreclaimable 3178832
+slab 205468048
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 262
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 3173492731
+pgsteal 3173483890
+pswpin 0
+pswpout 0
+pgscan_kswapd 3027755510
+pgscan_direct 145737221
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 3027746686
+pgsteal_direct 145737204
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 22591428
+pgmajfault 0
+pgrefill 1253
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786798320 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3341788 kB
+Pss:             3339839 kB
+Pss_Dirty:       3337092 kB
+Pss_Anon:        3335972 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3337092 kB
+Referenced:      3341788 kB
+Anonymous:       3335972 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3416039424
+file 7302295552
+kernel 260403200
+kernel_stack 409600
+pagetables 36470784
+sec_pagetables 0
+percpu 416
+sock 12288
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1361907712
+file_writeback 33013760
+swapcached 0
+anon_thp 0
+file_thp 381681664
+shmem_thp 0
+inactive_anon 0
+active_anon 3416035328
+inactive_file 7302266880
+active_file 4096
+unevictable 0
+slab_reclaimable 218226480
+slab_unreclaimable 3190944
+slab 221417424
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 275
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 3292590613
+pgsteal 3292581261
+pswpin 0
+pswpout 0
+pgscan_kswapd 3141263687
+pgscan_direct 151326926
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 3141254352
+pgsteal_direct 151326909
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 23723593
+pgmajfault 0
+pgrefill 1322
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786801920 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3345048 kB
+Pss:             3343099 kB
+Pss_Dirty:       3340352 kB
+Pss_Anon:        3339232 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3340352 kB
+Referenced:      3345048 kB
+Anonymous:       3339232 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3419381760
+file 8883073024
+kernel 307077120
+kernel_stack 409600
+pagetables 36470784
+sec_pagetables 0
+percpu 416
+sock 45056
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 2487341056
+file_writeback 41943040
+swapcached 0
+anon_thp 0
+file_thp 285212672
+shmem_thp 0
+inactive_anon 0
+active_anon 3419373568
+inactive_file 8882843648
+active_file 4096
+unevictable 0
+slab_reclaimable 264888048
+slab_unreclaimable 3198304
+slab 268086352
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 279
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 3416716559
+pgsteal 3416707171
+pswpin 0
+pswpout 0
+pgscan_kswapd 3259701716
+pgscan_direct 157014843
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 3259692345
+pgsteal_direct 157014826
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 24945790
+pgmajfault 0
+pgrefill 1402
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786805520 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3342240 kB
+Pss:             3340291 kB
+Pss_Dirty:       3337544 kB
+Pss_Anon:        3336424 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3337544 kB
+Referenced:      3342240 kB
+Anonymous:       3336424 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3416522752
+file 8718405632
+kernel 304115712
+kernel_stack 409600
+pagetables 36470784
+sec_pagetables 0
+percpu 416
+sock 53248
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1819590656
+file_writeback 39448576
+swapcached 0
+anon_thp 0
+file_thp 346030080
+shmem_thp 0
+inactive_anon 0
+active_anon 3416518656
+inactive_file 8718131200
+active_file 4096
+unevictable 0
+slab_reclaimable 261946296
+slab_unreclaimable 3187104
+slab 265133400
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 281
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 3537333708
+pgsteal 3537324242
+pswpin 0
+pswpout 0
+pgscan_kswapd 3374605416
+pgscan_direct 162728292
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 3374595967
+pgsteal_direct 162728275
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 26145227
+pgmajfault 0
+pgrefill 1484
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786809120 hourly ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3342392 kB
+Pss:             3340443 kB
+Pss_Dirty:       3337696 kB
+Pss_Anon:        3336576 kB
+Pss_File:           3867 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3337696 kB
+Referenced:      3342392 kB
+Anonymous:       3336576 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3416719360
+file 8311795712
+kernel 284852224
+kernel_stack 425984
+pagetables 36470784
+sec_pagetables 0
+percpu 416
+sock 69632
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 960536576
+file_writeback 77750272
+swapcached 0
+anon_thp 0
+file_thp 425721856
+shmem_thp 0
+inactive_anon 0
+active_anon 3416715264
+inactive_file 8311455744
+active_file 4096
+unevictable 0
+slab_reclaimable 242639128
+slab_unreclaimable 3210256
+slab 245849384
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 281
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 3660054413
+pgsteal 3660044883
+pswpin 0
+pswpout 0
+pgscan_kswapd 3491397750
+pgscan_direct 168656663
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 3491388237
+pgsteal_direct 168656646
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 27218433
+pgmajfault 0
+pgrefill 1549
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0
+=== 1786809617 end ===
+573f81d05000-7ffe2c87b000 ---p 00000000 00:00 0                          [rollup]
+Rss:             3341076 kB
+Pss:             3339128 kB
+Pss_Dirty:       3336380 kB
+Pss_Anon:        3335260 kB
+Pss_File:           3868 kB
+Pss_Shmem:             0 kB
+Shared_Clean:       1964 kB
+Shared_Dirty:          0 kB
+Private_Clean:      2732 kB
+Private_Dirty:   3336380 kB
+Referenced:      3341076 kB
+Anonymous:       3335260 kB
+KSM:                   0 kB
+LazyFree:              0 kB
+AnonHugePages:         0 kB
+ShmemPmdMapped:        0 kB
+FilePmdMapped:         0 kB
+Shared_Hugetlb:        0 kB
+Private_Hugetlb:       0 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+Locked:                0 kB
+--- cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/inf-soak-1786693912.scope memory.stat (session-slice scope, see header) ---
+anon 3415306240
+file 7273861120
+kernel 257114112
+kernel_stack 409600
+pagetables 36470784
+sec_pagetables 0
+percpu 416
+sock 53248
+vmalloc 0
+shmem 0
+zswap 0
+zswapped 0
+file_mapped 1654784
+file_dirty 1231142912
+file_writeback 15261696
+swapcached 0
+anon_thp 0
+file_thp 381681664
+shmem_thp 0
+inactive_anon 0
+active_anon 3415302144
+inactive_file 7273631744
+active_file 4096
+unevictable 0
+slab_reclaimable 214966528
+slab_unreclaimable 3163864
+slab 218130392
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 281
+workingset_activate_anon 0
+workingset_activate_file 0
+workingset_restore_anon 0
+workingset_restore_file 0
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgpromote_success 0
+pgscan 3676736780
+pgsteal 3676727250
+pswpin 0
+pswpout 0
+pgscan_kswapd 3507301923
+pgscan_direct 169434857
+pgscan_khugepaged 0
+pgscan_proactive 0
+pgsteal_kswapd 3507292410
+pgsteal_direct 169434840
+pgsteal_khugepaged 0
+pgsteal_proactive 0
+pgfault 27360170
+pgmajfault 0
+pgrefill 1549
+pgactivate 0
+pgdeactivate 0
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+zswpin 0
+zswpout 0
+zswpwb 0
+thp_fault_alloc 0
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+numa_pages_migrated 0
+numa_pte_updates 0
+numa_hint_faults 0

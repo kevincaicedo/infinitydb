@@ -1,0 +1,2 @@
+82a81571a350e9007bea817485fb88ed79e8ebc6
+?? .artifacts/v0.4.0/soak-20260814.log

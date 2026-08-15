@@ -1,0 +1,30 @@
+soak-unified: NOTE — quiet-box rule (§6): no campaign legs beside a soak; drive state drifts tail results — `sudo fstrim -v /` before a box-night is the standing recipe (20260809).
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling infinityd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/infinityd)
+    Finished `release` profile [optimized + debuginfo] target(s) in 19.81s
+soak-unified: env-check FAILED at start — run is not citation-grade (see env-start.txt)
+soak-unified: server launch mode scoped (pid 311821)
+OK
+OK
+OK
+OK
+soak-unified: tiered data plane is wired — running the full three-plane form
+soak-unified[FULL]: running 32 h against pid 311821 (out: .artifacts/v0.4.0/soak-unified-20260814-0351)
+warm-up-end reclaim check: ON-TRACK — dead_bytes 15072167160 >= bar 1073741820 (5% of the tiered dataset)
+rss slope whole-run +0.649%/24h (first-5% median 3313692 kB -> last-5% median 3342500 kB, 11264 samples; disclosure)
+rss slope steady-state +0.234%/24h (first 8 h excluded per ADR-0069 D1, 8452 samples, 3334596 kB -> 3342428 kB; GATE)
+accounted slope whole-run +0.535%/24h (used_memory first-5% median 591531 kB -> last-5% 595769 kB; disclosure)
+accounted slope steady-state -0.016%/24h (GATE)
+attribution (end): rss 3342248 kB vs used_memory + tier_committed + tier_index + staging + ckpt = 3301180 kB — residual 41068 kB (+1.2%; disclosure)
+tiering disk max 38732812288 bytes (budget 85899345920)
+write-amp milli max 1920 (gate < 3000)
+diskfull refusals 0
+docs_live 13875 -> 14240 (document plane live throughout: yes)
+checkpoints completed 0 -> 22574 (delta 22574)
+tier reclaim: dead_bytes 13882568736 -> 87732831296 over the steady window (delta 73850262560); live_bytes 21978152960; peak dead ratio 79.97% vs the 50.0% compaction trigger; compact_idle_pressure delta 0
+tier liveness: cold_reads_issued 34858811 -> 154147538 over the steady window (delta 119288727)
+tier liveness: flush_slices 32149 -> 102580 over the steady window (delta 70431)
+tier liveness: compact_slices 520400 -> 9592708 over the steady window (delta 9072308)
+PASS — discharges: M2.5 stability soak, M3 §7 doc soak, M4 §7 memory honesty
+soak-unified: done — 0 alert lines; artifacts in .artifacts/v0.4.0/soak-unified-20260814-0351

@@ -23,3 +23,9 @@ tests/client-smoke/node_modules/
 # the committed evidence; a campaign script must add specific run dirs,
 # never a bare `git add -f .artifacts/`).
 .artifacts/**/*.resp
+
+# Same rule, same reason, for the soaks' document-leg logs: `redis-cli
+# --pipe` writes one summary line per iteration, so a 32 h run leaves
+# 1.4 M lines / 686 MB (one file 568 MB, past GitHub's limit) carrying
+# nothing the committed `loadgen-doc-summary.md` does not state exactly.
+.artifacts/**/loadgen-doc_*.log
