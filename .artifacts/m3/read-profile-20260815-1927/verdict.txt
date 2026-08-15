@@ -1,0 +1,1 @@
+PASS: zero parser/compiler symbols in 2220 report rows (.artifacts/m3/read-profile-20260815-1927/jget-read-report.txt)

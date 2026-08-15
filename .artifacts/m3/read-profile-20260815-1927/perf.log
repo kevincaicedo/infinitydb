@@ -1,0 +1,17 @@
+WARNING: A requested CPU in '0-7' is not supported by PMU 'cpu_atom' (CPUs 16-23) for event 'cpu_atom/cycles/P'
+WARNING: Kernel address maps (/proc/{kallsyms,modules}) are restricted,
+check /proc/sys/kernel/kptr_restrict and /proc/sys/kernel/perf_event_paranoid.
+
+Samples in kernel functions may not be resolved if a suitable vmlinux
+file is not found in the buildid cache or in the vmlinux path.
+
+Samples in kernel modules won't be resolved at all.
+
+If some relocation was applied (e.g. kexec) symbols may be misresolved
+even with a suitable vmlinux or kallsyms file.
+
+Couldn't record kernel reference relocation symbol
+Symbol resolution may be skewed if relocation was used (e.g. kexec).
+Check /proc/kallsyms permission or run as root.
+[ perf record: Woken up 4020 times to write data ]
+[ perf record: Captured and wrote 1030.419 MB .artifacts/m3/read-profile-20260815-1927/jget-read.perf (68370 samples) ]
