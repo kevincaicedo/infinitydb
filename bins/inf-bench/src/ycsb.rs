@@ -103,6 +103,15 @@ const MEM_HIT_MAX_COLD_FRACTION: f64 = 0.5;
 /// are allowed to carry a gate value (p99.9 needs a population).
 const MEM_HIT_MIN_OPS: u64 = 100_000;
 
+/// Ceiling on the cold fraction of a **reference** leg row (ADR-0071 D6).
+/// The reference leg is the memory-speed yardstick: `--dataset-multiple 1`
+/// is supposed to demote nothing, and in practice demotes a trace amount
+/// because the dataset is sized *at* the budget. An order of magnitude
+/// below the tiered ceiling, this bound accepts that trace while refusing
+/// a leg that quietly became a second tiered leg — which would compare
+/// tiered against tiered and report a flattering delta.
+const MEM_HIT_REFERENCE_MAX_COLD_FRACTION: f64 = 0.01;
+
 /// YCSB-style Zipf(θ) over `n` ranks — Gray et al.'s quick method, lifted
 /// from the `cold_shaping` bench (the generator the plan names as the
 /// correct one to promote into `inf-bench`). Rank 0 is the hottest.
@@ -699,6 +708,39 @@ struct MemHit {
     cold_p50_us: u64,
     /// `Err(reason)` = derived and rendered, but not gate-eligible.
     eligible: Result<(), String>,
+    /// Which leg produced this row — the eligibility rules differ by
+    /// role, not by instrument (ADR-0071 D6).
+    role: MemHitRole,
+}
+
+/// Which of the two legs of the hot-set comparison a row belongs to.
+///
+/// The legs share one instrument (D3) but they are asked different
+/// questions, and conflating the two is what left the §7 hot-set gate
+/// unable to bind (readiness F25):
+///
+/// - [`MemHitRole::Tiered`] (`--dataset-multiple > 1`) is genuinely
+///   bimodal. The question is *"did the truncation actually remove the
+///   cold mode?"* — that is the separation check, and it is essential.
+/// - [`MemHitRole::Reference`] (`--dataset-multiple 1`, ADR-0064 D4) has
+///   no cold mode by construction. The question is *"are these numbers
+///   memory speed?"* — which is answered by an upper bound on the cold
+///   fraction, not by a separation check. Asking a leg built to have no
+///   second population whether it can separate two populations makes it
+///   fail by construction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MemHitRole {
+    Reference,
+    Tiered,
+}
+
+impl MemHitRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Reference => "reference (RAM-resident)",
+            Self::Tiered => "tiered",
+        }
+    }
 }
 
 /// Derives [`MemHit`] from one row's client histogram and the cold-read
@@ -711,13 +753,37 @@ struct MemHit {
 /// (one read can serve several ops), which *under*states `f`, keeps more of
 /// the tail inside the truncation, and can only make the derived
 /// percentiles worse — the safe direction for a gate.
-fn derive_mem_hit(out: &RowOut, cold_reads: u64, cold_resolves: u64, cold_p50_us: u64) -> MemHit {
+fn derive_mem_hit(
+    out: &RowOut,
+    cold_reads: u64,
+    cold_resolves: u64,
+    cold_p50_us: u64,
+    role: MemHitRole,
+) -> MemHit {
     let cold_frac = if out.ops == 0 { 1.0 } else { (cold_reads as f64 / out.ops as f64).min(1.0) };
     let keep = (1.0 - cold_frac).max(0.0);
     let at = |p: f64| out.hist_us.percentile(p * keep);
     let (p50_us, p99_us, p999_us) = (at(50.0), at(99.0), at(99.9));
     let eligible = if out.ops < MEM_HIT_MIN_OPS {
         Err(format!("{} ops < {MEM_HIT_MIN_OPS} — too few for a p99.9 gate value", out.ops))
+    } else if role == MemHitRole::Reference {
+        // The reference leg's only job is to publish memory-speed
+        // percentiles for the same workload through the same instrument
+        // (ADR-0064 D4). It has no cold mode to separate from — what it
+        // must prove is that it really is RAM-resident, which is an
+        // upper bound on the cold fraction an order of magnitude tighter
+        // than the tiered leg's ceiling.
+        if cold_frac > MEM_HIT_REFERENCE_MAX_COLD_FRACTION {
+            Err(format!(
+                "reference leg cold fraction {:.3}% > {:.0}% — this leg is not RAM-resident, so \
+                 its percentiles do not describe memory speed and cannot be the hot-set \
+                 reference (raise the memory budget or lower the dataset)",
+                cold_frac * 100.0,
+                MEM_HIT_REFERENCE_MAX_COLD_FRACTION * 100.0
+            ))
+        } else {
+            Ok(())
+        }
     } else if cold_frac > MEM_HIT_MAX_COLD_FRACTION {
         Err(format!(
             "cold fraction {:.1}% > {:.0}% — the hot set is not memory-resident in this row, so \
@@ -759,6 +825,7 @@ fn derive_mem_hit(out: &RowOut, cold_reads: u64, cold_resolves: u64, cold_p50_us
         p999_us,
         cold_p50_us,
         eligible,
+        role,
     }
 }
 
@@ -766,10 +833,12 @@ fn derive_mem_hit(out: &RowOut, cold_reads: u64, cold_resolves: u64, cold_p50_us
 /// RAM-resident leg and the tiered leg — which cannot share a process,
 /// because they need different dataset sizes and therefore different
 /// fills — still compare through the same instrument in the same campaign.
-fn render_mem_hit_tsv(mem_hits: &[(String, MemHit)]) -> String {
-    let mut out = String::from(
+fn render_mem_hit_tsv(mem_hits: &[(String, MemHit)], config: &LegConfig) -> String {
+    let mut out = format!(
         "# inf-bench ycsb — client-derived memory-hit split (ADR-0071 D2)\n\
+         # config: {}\n\
          # row\tops\tcold_frac\tp50_us\tp99_us\tp999_us\teligible\n",
+        config.render()
     );
     for (name, mem) in mem_hits {
         out.push_str(&format!(
@@ -785,6 +854,41 @@ fn render_mem_hit_tsv(mem_hits: &[(String, MemHit)]) -> String {
     out
 }
 
+/// The generator configuration a leg ran at. Both legs of the hot-set
+/// comparison must share it: the derived percentiles are *client*-observed,
+/// so pipeline depth alone moves a memory-hit p50 by an order of magnitude
+/// (measured 2026-08-15: 22 µs at pipeline 1 vs 279 µs at pipeline 8 on the
+/// same row). Comparing legs at different depths compares queueing, not
+/// service — so the carrier records it and the comparison refuses on a
+/// mismatch rather than producing a confident wrong number.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct LegConfig {
+    conns: usize,
+    pipeline: usize,
+    value_size: usize,
+}
+
+impl LegConfig {
+    fn render(&self) -> String {
+        format!("conns={} pipeline={} value_size={}", self.conns, self.pipeline, self.value_size)
+    }
+
+    /// Parses the `# config:` line. `None` = a pre-D6 sidecar with no
+    /// config line, which the comparison treats as unknown-and-disclosed
+    /// rather than as a match.
+    fn parse(text: &str) -> Option<Self> {
+        let line = text.lines().find(|l| l.starts_with("# config:"))?;
+        let field = |name: &str| -> Option<usize> {
+            line.split_whitespace().find_map(|kv| kv.strip_prefix(name)?.parse::<usize>().ok())
+        };
+        Some(Self {
+            conns: field("conns=")?,
+            pipeline: field("pipeline=")?,
+            value_size: field("value_size=")?,
+        })
+    }
+}
+
 /// One reference-leg row: the three percentiles plus whether that leg
 /// considered the row gate-eligible.
 struct RefRow {
@@ -796,7 +900,9 @@ struct RefRow {
 
 /// Reads a `mem-hit.tsv` written by [`render_mem_hit_tsv`]. `path` may name
 /// the file itself or the gate-run directory that holds it.
-fn load_mem_hit_tsv(path: &str) -> Result<std::collections::BTreeMap<String, RefRow>, String> {
+fn load_mem_hit_tsv(
+    path: &str,
+) -> Result<(Option<LegConfig>, std::collections::BTreeMap<String, RefRow>), String> {
     let candidates = [PathBuf::from(path), PathBuf::from(path).join("mem-hit.tsv")];
     let (found, text) = candidates
         .iter()
@@ -838,7 +944,7 @@ fn load_mem_hit_tsv(path: &str) -> Result<std::collections::BTreeMap<String, Ref
     if rows.is_empty() {
         return Err(format!("{}: no rows", found.display()));
     }
-    Ok(rows)
+    Ok((LegConfig::parse(&text), rows))
 }
 
 /// Compares this (tiered) leg's memory-hit split against the RAM-resident
@@ -849,12 +955,33 @@ fn compare_hot_set(
     m: &mut Measurements,
     mem_hits: &[(String, MemHit)],
     reference: &std::collections::BTreeMap<String, RefRow>,
+    reference_config: Option<LegConfig>,
+    config: &LegConfig,
     path: &str,
 ) -> (String, String) {
     let mut table = format!(
-        "reference leg: {path}\n\n\
-         | row | percentile | reference µs | tiered µs | delta |\n|---|---|---|---|---|\n"
+        "reference leg: {path}\n\
+         this leg: {}\nreference leg config: {}\n\n\
+         | row | percentile | reference µs | tiered µs | delta |\n|---|---|---|---|---|\n",
+        config.render(),
+        reference_config.map_or_else(
+            || "unknown (pre-ADR-0071-D6 sidecar, no config line)".to_string(),
+            |c| c.render()
+        ),
     );
+    // A generator-config mismatch compares queueing, not service
+    // (ADR-0071 D6). Refuse the citation; still render every number.
+    if reference_config != Some(*config) {
+        let note = format!(
+            "hot-set gate: NO gate value — generator-config mismatch between the legs (this leg \
+             {}, reference leg {}). The memory-hit split is client-observed, so pipeline depth \
+             alone moves a p50 by ~10×; a delta across different depths measures queueing, not \
+             memory speed. Re-run both legs at one config.",
+            config.render(),
+            reference_config.map_or_else(|| "unknown".to_string(), |c| c.render()),
+        );
+        return (note, table);
+    }
     let mut excluded: Vec<String> = Vec::new();
     let mut worst: [Option<f64>; 3] = [None; 3];
     let mut matched = 0usize;
@@ -923,7 +1050,15 @@ impl MemHit {
             Ok(()) => "gate-eligible (separation check passed)".to_string(),
             Err(reason) => format!("NOT gate-eligible — {reason}"),
         };
-        let separation = if self.cold_reads == 0 {
+        let separation = if self.role == MemHitRole::Reference {
+            format!(
+                "separation: not applicable — this is the {} leg, which has no cold mode to \
+                 separate from (ADR-0071 D6); it is checked against the {:.0}% \
+                 RAM-residency bound instead\n  ",
+                self.role.label(),
+                MEM_HIT_REFERENCE_MAX_COLD_FRACTION * 100.0
+            )
+        } else if self.cold_reads == 0 {
             "separation: not applicable — 0 cold reads in this row, so the client population is \
              unimodal (the RAM-resident reference shape, ADR-0071 D6) and the truncation is the \
              identity\n  "
@@ -1416,6 +1551,17 @@ pub fn cmd_ycsb(args: &[String]) -> Result<(), String> {
         }
     }
 
+    // Which question this leg answers (ADR-0071 D6): `--dataset-multiple 1`
+    // is the RAM-resident yardstick, anything above it is the tiered leg.
+    let mem_hit_role =
+        if dataset_multiple == 1 { MemHitRole::Reference } else { MemHitRole::Tiered };
+    let leg_config = LegConfig { conns, pipeline, value_size };
+    m.note(format!(
+        "hot-set instrument role: {} leg at {} (ADR-0071 D6 — both legs of the comparison must \
+         share this config; the comparison refuses on a mismatch)",
+        mem_hit_role.label(),
+        leg_config.render()
+    ));
     let mut saturation_done = false;
     let mut mem_hits: Vec<(String, MemHit)> = Vec::new();
     for (name, w, dist) in &rows {
@@ -1438,6 +1584,7 @@ pub fn cmd_ycsb(args: &[String]) -> Result<(), String> {
                 delta("cold_reads_issued"),
                 delta("tiering_cold_resolves"),
                 max_field(&scrape, "tiering_cold_p50_us"),
+                mem_hit_role,
             )
         });
         body.push_str(&split_section(&scrape, tiered_live, mem.as_ref())?);
@@ -1501,17 +1648,25 @@ pub fn cmd_ycsb(args: &[String]) -> Result<(), String> {
     // a fully-RAM-resident run through the *same instrument* (ADR-0064 D4),
     // compared on the client-derived memory-hit split (ADR-0071 D2).
     if tiered_live && !mem_hits.is_empty() {
-        m.sidecar("mem-hit.tsv", render_mem_hit_tsv(&mem_hits));
+        m.sidecar("mem-hit.tsv", render_mem_hit_tsv(&mem_hits, &leg_config));
         match flags.get("hot-set-reference") {
             None => m.note(
                 "hot-set gate rows (ycsb:hot_set_*): PENDING the reference leg — run \
-                 `inf-bench ycsb --dataset-multiple 1` in the same campaign and re-run this leg \
-                 with `--hot-set-reference <that run's dir or mem-hit.tsv>`; this run publishes \
+                 `inf-bench ycsb --dataset-multiple 1` in the same campaign at the same \
+                 --conns/--pipeline/--value-size and re-run this leg with \
+                 `--hot-set-reference <that run's dir or mem-hit.tsv>`; this run publishes \
                  its own memory-hit split in `mem-hit.tsv` for that comparison",
             ),
             Some(path) => {
-                let reference = load_mem_hit_tsv(path)?;
-                let (note, section) = compare_hot_set(&mut m, &mem_hits, &reference, path);
+                let (reference_config, reference) = load_mem_hit_tsv(path)?;
+                let (note, section) = compare_hot_set(
+                    &mut m,
+                    &mem_hits,
+                    &reference,
+                    reference_config,
+                    &leg_config,
+                    path,
+                );
                 m.note(note);
                 m.raw_section("hot-set gate: tiered vs RAM-resident reference leg", &section);
             }
@@ -1612,7 +1767,7 @@ mod tests {
         // exists to prevent); the derived memory-hit p99 must not.
         let out = bimodal_row(196_000, 80, 4_000, 2_000);
         assert!(out.p99_us >= 2_000, "combined p99 is cold-dominated: {}", out.p99_us);
-        let mem = derive_mem_hit(&out, 4_000, 9_320, 1_800);
+        let mem = derive_mem_hit(&out, 4_000, 9_320, 1_800, MemHitRole::Tiered);
         assert!(mem.eligible.is_ok(), "{:?}", mem.eligible);
         assert!((mem.cold_frac - 0.02).abs() < 1e-6, "cold_frac {}", mem.cold_frac);
         // LogHistogram reports the bucket's upper bound (~3% wide).
@@ -1651,7 +1806,7 @@ mod tests {
             checksum: 0,
             hist_us: hist,
         };
-        let mem = derive_mem_hit(&out, 5_000, 11_650, 600);
+        let mem = derive_mem_hit(&out, 5_000, 11_650, 600, MemHitRole::Tiered);
         let reason = mem.eligible.expect_err("overlapping populations must be refused");
         assert!(reason.contains("separation check FAILED"), "{reason}");
     }
@@ -1667,7 +1822,7 @@ mod tests {
         // run was. A row with zero cold reads is unimodal: the
         // separation check is vacuous, not failed.
         let out = bimodal_row(200_000, 80, 0, 2_000);
-        let mem = derive_mem_hit(&out, 0, 0, 0);
+        let mem = derive_mem_hit(&out, 0, 0, 0, MemHitRole::Tiered);
         assert!(mem.eligible.is_ok(), "{:?}", mem.eligible);
         assert_eq!(mem.cold_frac, 0.0);
         // keep == 1.0, so the truncation is the identity on the client
@@ -1685,7 +1840,7 @@ mod tests {
         // reported no cold service time. That is a broken instrument and
         // the row must carry no gate value (the F13 class).
         let out = bimodal_row(196_000, 80, 4_000, 2_000);
-        let mem = derive_mem_hit(&out, 4_000, 9_320, 0);
+        let mem = derive_mem_hit(&out, 4_000, 9_320, 0, MemHitRole::Tiered);
         let reason = mem.eligible.expect_err("a cold row with no cold service time is broken");
         assert!(reason.contains("broken instrument"), "{reason}");
     }
@@ -1693,7 +1848,7 @@ mod tests {
     #[test]
     fn mem_hit_refuses_a_cold_dominated_row() {
         let out = bimodal_row(40_000, 80, 160_000, 2_000);
-        let mem = derive_mem_hit(&out, 160_000, 320_000, 1_800);
+        let mem = derive_mem_hit(&out, 160_000, 320_000, 1_800, MemHitRole::Tiered);
         let reason = mem.eligible.expect_err("a mostly-cold row has no hot set to gate");
         assert!(reason.contains("cold fraction"), "{reason}");
     }
@@ -1701,7 +1856,7 @@ mod tests {
     #[test]
     fn mem_hit_refuses_too_few_ops_for_a_p999() {
         let out = bimodal_row(9_000, 80, 100, 2_000);
-        let mem = derive_mem_hit(&out, 100, 233, 1_800);
+        let mem = derive_mem_hit(&out, 100, 233, 1_800, MemHitRole::Tiered);
         let reason = mem.eligible.expect_err("a short row cannot carry a p99.9 gate value");
         assert!(reason.contains("too few"), "{reason}");
     }
@@ -1711,18 +1866,35 @@ mod tests {
         let rows = vec![
             (
                 "ycsb-a-zipfian".to_string(),
-                derive_mem_hit(&bimodal_row(196_000, 80, 4_000, 2_000), 4_000, 9_320, 1_800),
+                derive_mem_hit(
+                    &bimodal_row(196_000, 80, 4_000, 2_000),
+                    4_000,
+                    9_320,
+                    1_800,
+                    MemHitRole::Tiered,
+                ),
             ),
             (
                 "ycsb-b-zipfian".to_string(),
-                derive_mem_hit(&bimodal_row(40_000, 80, 160_000, 2_000), 160_000, 320_000, 1_800),
+                derive_mem_hit(
+                    &bimodal_row(40_000, 80, 160_000, 2_000),
+                    160_000,
+                    320_000,
+                    1_800,
+                    MemHitRole::Tiered,
+                ),
             ),
         ];
-        let tsv = render_mem_hit_tsv(&rows);
+        let config = LegConfig { conns: 8, pipeline: 1, value_size: 1024 };
+        let tsv = render_mem_hit_tsv(&rows, &config);
         let dir = std::env::temp_dir().join(format!("inf-memhit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(dir.join("mem-hit.tsv"), &tsv).expect("write");
-        let loaded = load_mem_hit_tsv(&dir.to_string_lossy()).expect("load by directory");
+        let (loaded_config, loaded) =
+            load_mem_hit_tsv(&dir.to_string_lossy()).expect("load by directory");
+        // The generator config round-trips: a comparison across two
+        // different pipeline depths measures queueing, not memory speed.
+        assert_eq!(loaded_config, Some(config));
         assert_eq!(loaded.len(), 2);
         let a = &loaded["ycsb-a-zipfian"];
         assert!(a.eligible);
@@ -1731,6 +1903,75 @@ mod tests {
         // must never lend a row its blessing.
         assert!(!loaded["ycsb-b-zipfian"].eligible);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reference_leg_rows_are_judged_on_ram_residency_not_separation() {
+        // Measured 2026-08-15 on the calibration pair (readiness F25):
+        // the RAM-resident leg at `--dataset-multiple 1` still issues a
+        // trace of cold reads (485 of 6.07 M ops), so `cold_p50_us` is a
+        // real ~163 µs — while the leg's own p99.9 is 163 µs too, out of
+        // ordinary client/scheduler jitter that has nothing to do with
+        // tiering. Under the tiered ladder that reads as a separation
+        // FAILURE, which made every reference row ineligible and left the
+        // §7 hot-set gate with nothing to compare against. In the
+        // reference role there is no second mode: the row is judged on
+        // RAM-residency instead.
+        //
+        // The shape below reproduces it: 0.15% of ops sit in a 200 µs
+        // jitter tail (not cold service), so the truncation — which only
+        // removes the 0.008% cold mass — leaves p99.9 above cold p50.
+        let out = bimodal_row(6_059_000, 24, 9_000, 200);
+        let tiered_view = derive_mem_hit(&out, 485, 1_212, 163, MemHitRole::Tiered);
+        assert!(tiered_view.eligible.is_err(), "the tiered ladder refuses it — that is the bug");
+        let mem = derive_mem_hit(&out, 485, 1_212, 163, MemHitRole::Reference);
+        assert!(mem.eligible.is_ok(), "{:?}", mem.eligible);
+        assert!(mem.render().contains("separation: not applicable"), "{}", mem.render());
+    }
+
+    #[test]
+    fn a_reference_leg_that_is_not_ram_resident_is_refused() {
+        // The bound the reference role replaces the separation check
+        // with: a "reference" leg that quietly demoted 5% of its dataset
+        // is a second tiered leg, and comparing tiered against tiered
+        // would report a flatteringly small delta.
+        let out = bimodal_row(190_000, 24, 10_000, 2_000);
+        let mem = derive_mem_hit(&out, 10_000, 25_000, 1_800, MemHitRole::Reference);
+        let reason = mem.eligible.expect_err("5% cold is not a RAM-resident reference");
+        assert!(reason.contains("not RAM-resident"), "{reason}");
+    }
+
+    #[test]
+    fn a_generator_config_mismatch_refuses_the_hot_set_citation() {
+        // pipeline depth alone moved a measured memory-hit p50 from 22 µs
+        // to 279 µs on the same row (2026-08-15 calibration). A delta
+        // across two depths is a queueing delta, so it carries no gate
+        // value at all.
+        let mem_hits = vec![(
+            "ycsb-a-zipfian".to_string(),
+            derive_mem_hit(
+                &bimodal_row(196_000, 80, 4_000, 2_000),
+                4_000,
+                9_320,
+                1_800,
+                MemHitRole::Tiered,
+            ),
+        )];
+        let mut reference = std::collections::BTreeMap::new();
+        reference.insert(
+            "ycsb-a-zipfian".to_string(),
+            RefRow { p50_us: 80, p99_us: 80, p999_us: 80, eligible: true },
+        );
+        let mut m = Measurements::new();
+        let this = LegConfig { conns: 8, pipeline: 1, value_size: 1024 };
+        let other = LegConfig { conns: 8, pipeline: 8, value_size: 1024 };
+        let (note, _) = compare_hot_set(&mut m, &mem_hits, &reference, Some(other), &this, "ref");
+        assert!(note.contains("generator-config mismatch"), "{note}");
+        assert!(!m.values.contains_key("ycsb:hot_set_p50_delta_pct"), "no gate value on mismatch");
+        // The matching case still binds.
+        let (note, _) = compare_hot_set(&mut m, &mem_hits, &reference, Some(this), &this, "ref");
+        assert!(note.contains("1 row(s) compared"), "{note}");
+        assert!(m.values.contains_key("ycsb:hot_set_p50_delta_pct"));
     }
 
     #[test]
