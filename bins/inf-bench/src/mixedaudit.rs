@@ -12,16 +12,25 @@
 //! `sum(domains) vs RSS` divergence throughout the mixed run, and a §19
 //! generator-saturation disposition per leg.
 //!
-//! **The named-absent row (never a silent substitution — ADR-0025 D3):**
-//! the tiered namespace's *data* leg does not run. Its plan shape is the
-//! S22 YCSB harness at 10× RAM, and the tiered data plane sits behind
-//! the ADR-0062 D8 `USE` refusal until command wiring — so this audit
-//! proves the control-plane half only (budgets admitted, reserved VA and
-//! committed bytes visible in attribution, zero interference from the
-//! standing tables) and the report says exactly that. The full
-//! three-workload audit re-runs when wiring + S22 land (S24 campaign at
-//! the latest). Topics join at M7, collections at M5 — both named in the
+//! **The tiered data leg runs (since 2026-08-15, S24 phase 5).** M4-S26
+//! lifted the ADR-0062 D8 `USE` refusal, so the third workload is real:
+//! a uniform 1:1 SET/GET stream over a dataset 10× the tiered
+//! namespace's memory budget, deeply pipelined so the *cold-read queue*
+//! is what the other two namespaces must coexist with — the AC's
+//! "full-QD cold reads" condition. The refusal probe is inverted rather
+//! than deleted: the audit now fails loudly if the plane is **not**
+//! reachable, so this leg can never silently become named-absent again.
+//! Topics join at M7, collections at M5 — both still named in the
 //! report.
+//!
+//! Generator sizing is deliberate (the C5 lesson): the cache and
+//! document legs keep the exact connection counts their solo baselines
+//! use, and the tiered leg buys its queue depth from *pipelining* rather
+//! than from threads — 2 connections that are blocked on cold-read I/O
+//! essentially all the time. Cold-read queue depth is a server-side
+//! property of outstanding requests, not of generator threads, so this
+//! reaches full QD without putting the mixed leg's generator on a
+//! different footing from the solo legs'.
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -60,6 +69,21 @@ const CACHE_VALUE: usize = 512;
 /// Document corpus: per-index-unique 1 KiB documents (the gate shape).
 const DOC_SHAPE: &str = "gate-1KiB";
 const DOC_KEYS: u64 = 20_000;
+/// The tiered leg (S24 phase 5). `TIER_KEYS × TIER_VALUE` is **10×**
+/// `TIER_MEM_BUDGET`, the §7 shape: 1,310,720 × 512 B = 640 MiB against a
+/// 64 MiB budget. Uniform keys, not zipfian — this leg exists to be the
+/// *interference source* for the other two namespaces, and uniform over
+/// 10× RAM is the maximal-cold-read shape (a zipfian hot set would serve
+/// most reads from memory and understate the interference the AC asks
+/// about). The hot-set question itself belongs to `inf-bench ycsb`.
+const TIER_CONNS: usize = 2;
+/// Queue depth comes from pipelining, not threads (see the module doc).
+const TIER_PIPELINE: usize = 32;
+const TIER_VALUE: usize = 512;
+const TIER_KEYS: u64 = 1_310_720;
+const TIER_MEM_BUDGET: &str = "64mb";
+/// Dataset + write-amplification headroom + the S21 compaction reserve.
+const TIER_DISK_BUDGET: &str = "4gb";
 
 struct DataDirGuard(PathBuf);
 
@@ -214,6 +238,25 @@ fn cache_spec(port: u16, duration: Duration, conns: usize, seed: u64) -> LoadSpe
     }
 }
 
+/// The tiered leg: uniform 1:1 SET/GET on `audit-tier`, deeply
+/// pipelined. `setup` carries the `INF.NS USE` that S26 made legal.
+fn tier_spec(port: u16, duration: Duration, seed: u64) -> LoadSpec {
+    LoadSpec {
+        port,
+        conns: TIER_CONNS,
+        pipeline: TIER_PIPELINE,
+        duration,
+        set_weight: 1,
+        get_weight: 1,
+        keys: TIER_KEYS,
+        key_prefix: "t:".into(),
+        value_size: TIER_VALUE,
+        seed,
+        setup: vec![vec![b"INF.NS".to_vec(), b"USE".to_vec(), TIER_NS.as_bytes().to_vec()]],
+        ..Default::default()
+    }
+}
+
 fn control(port: u16, argv: &[&[u8]]) -> Result<Vec<u8>, String> {
     // A durable node's socket accepts before recovery finishes; the
     // typed `-LOADING` refusal is the ready probe (bounded wait).
@@ -346,20 +389,23 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
             b"MODE",
             b"durable",
             b"MEM-BUDGET",
-            b"8mb",
+            TIER_MEM_BUDGET.as_bytes(),
             b"DISK-BUDGET",
-            b"64mb",
+            TIER_DISK_BUDGET.as_bytes(),
         ],
     )?;
-    // The D8 refusal, verified live — the report's named-absent row is a
-    // measured fact, not an assumption.
+    // The inverted probe (M4-S26 lifted the D8 refusal): the tiered data
+    // plane must be *reachable*. The old assertion checked for the
+    // refusal, which is how a named-absent row stays alive past the work
+    // that should have retired it — the F17/F18 shape. This one fails if
+    // the third workload cannot run, so it can never quietly not run.
     let mut probe = connect("127.0.0.1", port)?;
-    let refusal = request(&mut probe, &[b"INF.NS", b"USE", TIER_NS.as_bytes()])?;
-    if !refusal.starts_with(b"-ERR tiered namespaces are not command-addressable") {
+    let reply = request(&mut probe, &[b"INF.NS", b"USE", TIER_NS.as_bytes()])?;
+    if reply.starts_with(b"-") {
         return Err(format!(
-            "expected the ADR-0062 D8 USE refusal — the tiered data plane appears wired; \
-             this audit's named-absent row is stale, rebuild it with the real leg: {}",
-            String::from_utf8_lossy(&refusal)
+            "the tiered data plane is not reachable ({}) — M4-S26 wired it, so this is a \
+             regression, not a reason to publish a two-workload audit as a three-workload one",
+            String::from_utf8_lossy(&reply).trim()
         ));
     }
     drop(probe);
@@ -372,6 +418,21 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     std::thread::sleep(Duration::from_secs(1));
     let rss_baseline = server.rss_bytes();
     let domains_baseline = sum_domains(&scrape_cells(port, cells)?);
+
+    // The tiered dataset has to exist before anything can read it cold.
+    // A fill converges rather than benchmarks: the durable admission path
+    // answers typed refusals under sustained pipelined SETs, so the fill
+    // is checked on DBSIZE, not on its own error count (the S22 lesson).
+    println!(
+        "== mixed-audit: tiered fill ({TIER_KEYS} keys x {TIER_VALUE} B = 10x {TIER_MEM_BUDGET}) =="
+    );
+    let tier_fill = run_load(&LoadSpec {
+        fill: Some(TIER_KEYS),
+        pipeline: 64,
+        conns: 8,
+        ..tier_spec(port, duration, seed ^ 0x7F)
+    })?;
+    println!("{}", render(&tier_fill));
 
     // Solo baselines (same campaign, same box, same config — §19).
     println!("== mixed-audit: cache solo ==");
@@ -387,6 +448,11 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
         seed,
     })?;
     println!("{}", render(&doc_solo));
+    println!("== mixed-audit: tiered solo ==");
+    let tier_pre_solo = scrape_cells(port, cells)?;
+    let tier_solo = run_load(&tier_spec(port, duration, seed))?;
+    let tier_post_solo = scrape_cells(port, cells)?;
+    println!("{}", render(&tier_solo));
 
     // §19 saturation probe: the cache leg again at +50% connections for
     // half the duration — if throughput moves materially, the generator
@@ -416,7 +482,8 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     let worst_div_milli = AtomicU64::new(0);
     let div_samples = AtomicU64::new(0);
     let pid = server.pid();
-    let (cache_mixed, doc_mixed) = std::thread::scope(|scope| {
+    let tier_pre_mixed = scrape_cells(port, cells)?;
+    let (cache_mixed, doc_mixed, tier_mixed) = std::thread::scope(|scope| {
         let sampler = scope.spawn(|| {
             while !stop.load(Ordering::Relaxed) {
                 for _ in 0..10 {
@@ -460,24 +527,50 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
                 seed: seed ^ 0x22,
             })
         });
+        let tier_handle = scope.spawn(|| run_load(&tier_spec(port, duration, seed ^ 0x33)));
         let cache_mixed = cache_handle.join().expect("cache leg thread");
         let doc_mixed = doc_handle.join().expect("doc leg thread");
+        let tier_mixed = tier_handle.join().expect("tier leg thread");
         stop.store(true, Ordering::Relaxed);
         sampler.join().expect("sampler thread");
-        (cache_mixed, doc_mixed)
+        (cache_mixed, doc_mixed, tier_mixed)
     });
     let cache_mixed = cache_mixed?;
     let doc_mixed = doc_mixed?;
+    let tier_mixed = tier_mixed?;
     println!("{}", render(&cache_mixed));
     println!("{}", render(&doc_mixed));
+    println!("{}", render(&tier_mixed));
 
-    // Post-run scrape: the tiered namespace's budgets are standing and
-    // its counters read zero activity (no data plane — the D8 half).
+    // Post-run scrape. The liveness assertions are inverted from the D8
+    // era (ADR-0071 D4's lesson: a leg that produced no load must fail
+    // the run, not decorate it): the tiered namespace must stand on every
+    // cell **and** show data-plane work, and the mixed leg must have
+    // actually served cold reads or its isolation number describes
+    // nothing.
     let infos = scrape_cells(port, cells)?;
     let tier_tables = sum_field(&infos, "tiering_tables");
     let tier_committed = sum_field(&infos, "tiering_committed_bytes");
     let tier_reserved = sum_field(&infos, "tiering_reserved_bytes");
     let tier_allocs = sum_field(&infos, "tiering_tail_allocs");
+    let cold_delta = |pre: &[std::collections::BTreeMap<String, String>],
+                      post: &[std::collections::BTreeMap<String, String>]| {
+        sum_field(post, "cold_reads_issued").saturating_sub(sum_field(pre, "cold_reads_issued"))
+    };
+    let cold_solo = cold_delta(&tier_pre_solo, &tier_post_solo);
+    let cold_mixed = cold_delta(&tier_pre_mixed, &infos);
+    let cold_qd_p99 = infos
+        .iter()
+        .filter_map(|c| c.get("cold_read_qd_p99"))
+        .filter_map(|v| v.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    let cold_p99_us = infos
+        .iter()
+        .filter_map(|c| c.get("tiering_cold_p99_us"))
+        .filter_map(|v| v.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
     let final_rss = server.rss_bytes();
     drop(server);
     drop(guard);
@@ -486,10 +579,17 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
             "the tiered namespace should stand on every cell ({tier_tables} tables, {cells} cells)"
         ));
     }
-    if tier_allocs != 0 {
+    if tier_allocs == 0 {
+        return Err(
+            "the tiered namespace served no data-plane work — the third workload did not run, \
+             so this is not a three-workload audit"
+                .into(),
+        );
+    }
+    if cold_mixed == 0 {
         return Err(format!(
-            "the tiered namespace shows data-plane activity ({tier_allocs} tail allocs) behind \
-             the USE refusal — that is a bug report, not an audit note"
+            "the tiered leg issued zero cold reads during the mixed run ({cold_solo} solo) — \
+             the isolation row is about coexisting with cold-read traffic, and there was none"
         ));
     }
 
@@ -498,6 +598,8 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     let cache_ops_delta = delta_pct(cache_solo.ops_per_sec, cache_mixed.ops_per_sec);
     let doc_p99_delta = delta_pct(doc_solo.p99_us as f64, doc_mixed.p99_us as f64);
     let doc_ops_delta = delta_pct(doc_solo.ops_per_sec, doc_mixed.ops_per_sec);
+    let tier_p99_delta = delta_pct(tier_solo.p99_us as f64, tier_mixed.p99_us as f64);
+    let tier_ops_delta = delta_pct(tier_solo.ops_per_sec, tier_mixed.ops_per_sec);
     let worst_div = worst_div_milli.load(Ordering::Relaxed) as f64 / 1000.0;
     let samples = div_samples.load(Ordering::Relaxed);
     let miss_rate = |r: &LoadReport| {
@@ -528,8 +630,18 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     push(&format!(
         "- seed {seed:#x} · {}s per leg · cache = default DB, node maxmemory {NODE_MAXMEMORY} \
          allkeys-lru, {CACHE_KEYS} keys × {CACHE_VALUE} B offered · documents {DOC_KEYS} × \
-         {DOC_SHAPE} on `{DOC_NS}`",
+         {DOC_SHAPE} on `{DOC_NS}` · tiered {TIER_KEYS} × {TIER_VALUE} B = 10× \
+         {TIER_MEM_BUDGET} on `{TIER_NS}` (disk budget {TIER_DISK_BUDGET})",
         duration.as_secs()
+    ));
+    push(&format!(
+        "- generator placement: cache {CACHE_CONNS} conns × pipeline {CACHE_PIPELINE}, \
+         documents {DOC_CONNS} × 4, tiered {TIER_CONNS} × {TIER_PIPELINE}. The cache and \
+         document legs run the identical connection counts solo and mixed; the tiered leg \
+         takes its queue depth from pipelining rather than threads, so the mixed leg adds \
+         {TIER_CONNS} mostly-I/O-blocked generator threads rather than a second workload's \
+         worth of CPU (the C5 lesson — a mixed leg whose generator is crowded measures \
+         generator crowding)"
     ));
     push("");
     push("## Legs");
@@ -538,8 +650,16 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     push("|---|---|---|---|---|---|---|");
     push(&leg_line("cache solo", &cache_solo));
     push(&leg_line("document solo", &doc_solo));
+    push(&leg_line("tiered solo", &tier_solo));
     push(&leg_line("cache mixed", &cache_mixed));
     push(&leg_line("document mixed", &doc_mixed));
+    push(&leg_line("tiered mixed", &tier_mixed));
+    push("");
+    push(&format!(
+        "Tiered fill: {} keys at {:.0} sets/s, {} error replies (typed durable admission \
+         backpressure is a refusal, not a loss — the fill is checked on convergence).",
+        TIER_KEYS, tier_fill.ops_per_sec, tier_fill.errors
+    ));
     push("");
     push("## Isolation (solo → mixed, same campaign)");
     push("");
@@ -551,6 +671,17 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
         miss_rate(&cache_mixed)
     ));
     push(&format!("| documents | {doc_ops_delta:+.1}% | {doc_p99_delta:+.1}% | — |"));
+    push(&format!("| tiered | {tier_ops_delta:+.1}% | {tier_p99_delta:+.1}% | — |"));
+    push("");
+    push(&format!(
+        "Cold-read evidence for the isolation condition (\"while the tiered ns serves cold \
+         reads at full QD\"): **{cold_mixed} cold reads issued during the mixed run** \
+         ({cold_solo} solo), cold-read queue depth p99 **{cold_qd_p99}** (cap 64, ADR-0055 \
+         D2), tiered cold service p99 **{:.1} ms**, {tier_allocs} tail allocations, \
+         {tier_committed} B committed. A run that reached the mixed leg without cold reads \
+         fails rather than reports.",
+        cold_p99_us as f64 / 1000.0
+    ));
     push("");
     push(&format!(
         "Gate `cache_isolation_p99` (≤ 10%, reference-box): measured {cache_p99_delta:+.1}% — \
@@ -581,10 +712,13 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
         rss_peak.load(Ordering::Relaxed),
         final_rss
     ));
-    push(
-        "- page-cache disclosure: no tiered data plane exists on this node (D8), so no file-\
-          cache term applies; the S09 cgroup series joins the S24 re-audit with real tier I/O",
-    );
+    push(&format!(
+        "- page-cache disclosure: the tiered leg does real file I/O this run \
+          ({tier_committed} B committed, {cold_mixed} cold reads in the mixed leg). S09 chose \
+          `Direct` (ADR-0054), so tier reads bypass the page cache and no file-cache term is \
+          claimed against RSS; `tiering_reserved_bytes` ({tier_reserved} B) is VA, not \
+          resident, and is excluded from the domain sum for that reason"
+    ));
     push("");
     push("## Saturation disposition (§19)");
     push("");
@@ -593,6 +727,12 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
         "- document generator: not probed this run — the doc leg's absolutes are context, \
           not claims; its isolation *delta* is the audit quantity (fixed generator config \
           both sides)",
+    );
+    push(
+        "- tiered generator: not probed. This leg is device-bound by construction (uniform \
+          keys over 10× its memory budget on a Gen3 DRAM-less NVMe), so a connection probe \
+          would measure the drive, not the generator; its absolutes are context and its \
+          isolation delta is the audit quantity",
     );
     push("");
     push("## Findings");
@@ -610,12 +750,10 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     push("");
     push("| row | why absent | rejoins |");
     push("|---|---|---|");
-    push(&format!(
-        "| tiered data leg (YCSB 10× RAM, full-QD cold reads) | the data plane is behind the \
-         ADR-0062 D8 `USE` refusal (verified live this run: {tier_tables} standing tables, \
-         zero tail allocs) and the S22 harness is unbuilt | command wiring + S22 → the S24 \
-         campaign re-audit |"
-    ));
+    push(
+        "| *(the tiered data leg is no longer absent — it ran this campaign; the row is kept \
+         here struck through so the audit's own history stays readable)* | — | — |",
+    );
     push("| topic workload | M7 owns topics | M7, per the plan's debt-forward note |");
     push("| collections workload | M5 owns collections | M5, per the plan's debt-forward note |");
     let report_path = dir.join("report.md");
