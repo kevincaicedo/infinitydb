@@ -1,0 +1,10 @@
+date: 2026-08-16
+governor: performance
+no_turbo: 1
+epp: performance
+kernel: 7.0.0-29-generic
+tree: bf1dc07 (clean at run time)
+pin: taskset -c 4
+INF_STORM_DIR: $HOME/.cache/inf-tmp
+/dev/nvme0n1p3 ext4 306480056 120171636 170667028  42% /
+thermal_mC: 27800 38000 40000 

@@ -1,0 +1,141 @@
+
+==========================================================================
+A/B  m4(6bd25b1) vs m3-baseline(a1ebcb9)  (ab-transcript.txt)
+==========================================================================
+
+-- pipelined 1:10 (M0 gate mix)
+   n=32/32  m4-first in 16/32 reps (crossover balanced: True)
+   p999 median  base    799 -> m4    783 µs   signed   -2.00%   GATE   0.00%
+   ops  median  base  3159188 -> m4  3154227      signed   -0.16%   GATE   0.16%
+   slot: ran-FIRST median    783 µs | ran-SECOND median    799 µs  (second/first 1.02x)
+   p999 distinct values across both legs (n=64): 13 -> [719, 735, 767, 783, 799, 815, 831, 847, 863, 879, 895, 911] ...
+   m4   sorted[14:19] = [783, 783, 783, 783, 783]   (median idx16 = 783)
+   base sorted[14:19] = [799, 799, 799, 815, 815]   (median idx16 = 799)
+
+-- unpipelined 512-conn (M0 gate mix)
+   n=32/32  m4-first in 16/32 reps (crossover balanced: True)
+   p999 median  base   1791 -> m4   1855 µs   signed   +3.57%   GATE   3.57%
+   ops  median  base   804959 -> m4   805133      signed   +0.02%   GATE   0.00%
+   slot: ran-FIRST median   1823 µs | ran-SECOND median   1823 µs  (second/first 1.00x)
+   p999 distinct values across both legs (n=64): 12 -> [1631, 1663, 1695, 1727, 1759, 1791, 1823, 1855, 1887, 1919, 1951, 1983]
+   m4   sorted[14:19] = [1823, 1855, 1855, 1855, 1855]   (median idx16 = 1855)
+   base sorted[14:19] = [1791, 1791, 1791, 1791, 1791]   (median idx16 = 1791)
+
+-- ttl-heavy 1:1 writes (M1 gate mix)
+   n=32/32  m4-first in 16/32 reps (crossover balanced: True)
+   p999 median  base   4223 -> m4   4095 µs   signed   -3.03%   GATE   0.00%
+   ops  median  base  2692211 -> m4  2693904      signed   +0.06%   GATE   0.00%
+   slot: ran-FIRST median   3007 µs | ran-SECOND median   4479 µs  (second/first 1.49x)
+   p999 distinct values across both legs (n=64): 35 -> [2111, 2303, 2367, 2431, 2495, 2559, 2687, 2815, 2879, 2943, 3007, 3071] ...
+   m4   sorted[14:19] = [4095, 4095, 4095, 4223, 4223]   (median idx16 = 4095)
+   base sorted[14:19] = [3839, 4223, 4223, 4223, 4223]   (median idx16 = 4223)
+
+==========================================================================
+A/A  m4(6bd25b1) vs m4(6bd25b1)  IDENTICAL BINARIES  (aa-transcript.txt)
+==========================================================================
+
+-- pipelined 1:10 (M0 gate mix)
+   n=32/32  m4-first in 16/32 reps (crossover balanced: True)
+   p999 median  base    767 -> m4    767 µs   signed   +0.00%   GATE   0.00%
+   ops  median  base  3163279 -> m4  3173654      signed   +0.33%   GATE   0.00%
+   slot: ran-FIRST median    767 µs | ran-SECOND median    767 µs  (second/first 1.00x)
+   p999 distinct values across both legs (n=64): 17 -> [655, 671, 687, 703, 719, 735, 751, 767, 783, 799, 815, 831] ...
+   m4   sorted[14:19] = [767, 767, 767, 783, 783]   (median idx16 = 767)
+   base sorted[14:19] = [751, 767, 767, 767, 783]   (median idx16 = 767)
+
+-- unpipelined 512-conn (M0 gate mix)
+   n=32/32  m4-first in 16/32 reps (crossover balanced: True)
+   p999 median  base   1823 -> m4   1791 µs   signed   -1.76%   GATE   0.00%
+   ops  median  base   804816 -> m4   805084      signed   +0.03%   GATE   0.00%
+   slot: ran-FIRST median   1823 µs | ran-SECOND median   1791 µs  (second/first 0.98x)
+   p999 distinct values across both legs (n=64): 11 -> [1631, 1663, 1695, 1727, 1759, 1791, 1823, 1855, 1887, 1919, 1951]
+   m4   sorted[14:19] = [1791, 1791, 1791, 1823, 1823]   (median idx16 = 1791)
+   base sorted[14:19] = [1791, 1823, 1823, 1823, 1855]   (median idx16 = 1823)
+
+-- ttl-heavy 1:1 writes (M1 gate mix)
+   n=32/32  m4-first in 16/32 reps (crossover balanced: True)
+   p999 median  base   4351 -> m4   4223 µs   signed   -2.94%   GATE   0.00%
+   ops  median  base  2678639 -> m4  2670471      signed   -0.30%   GATE   0.30%
+   slot: ran-FIRST median   3135 µs | ran-SECOND median   4479 µs  (second/first 1.43x)
+   p999 distinct values across both legs (n=64): 32 -> [1823, 2111, 2175, 2303, 2367, 2495, 2623, 2687, 2751, 2879, 2943, 3007] ...
+   m4   sorted[14:19] = [4095, 4095, 4223, 4351, 4351]   (median idx16 = 4223)
+   base sorted[14:19] = [4223, 4351, 4351, 4351, 4479]   (median idx16 = 4351)
+
+==========================================================================
+VERDICT TABLE  (threshold: ops/RSS 1.0%; p999 rows re-expressed 0.0% = same bucket or better, ADR-0070 D4b)
+==========================================================================
+row                                  A/B p999   A/A p999   A/B ops   A/A ops
+pipelined 1:10 (M0 gate mix)            0.00%      0.00%     0.16%     0.00%
+unpipelined 512-conn (M0 gate mix)      3.57%      0.00%     0.00%     0.00%
+ttl-heavy 1:1 writes (M1 gate mix)      0.00%      0.00%     0.00%     0.30%
+
+
+############################################################################
+# A/B — m4 6bd25b1  vs  m3 baseline a1ebcb9
+############################################################################
+
+=== pipelined 1:10 (M0 gate mix)
+  bucket width here: 16 µs at ~783 µs  ->  one bucket = 2.04%  (1% bar is 2.0 buckets wide -> UNREACHABLE)
+  POOLED gate  base 799 -> m4 783  = -2.00%  (-1 buckets)
+  slot=first  n=16  base 783 -> m4 783 = +0.00% (+0 buckets)
+  slot=second n=16  base 815 -> m4 783 = -3.93% (-2 buckets)
+  m4   hist: {719: 2, 735: 1, 767: 7, 783: 9, 799: 4, 815: 3, 831: 3, 863: 1, 911: 1, 959: 1}
+  base hist: {719: 2, 735: 1, 767: 5, 783: 5, 799: 4, 815: 4, 831: 4, 847: 2, 879: 3, 895: 2}
+  bootstrap pooled delta: 95% CI [-5.78%, +2.04%]  P(m4 worse) = 0.04
+
+=== unpipelined 512-conn (M0 gate mix)
+  bucket width here: 32 µs at ~1855 µs  ->  one bucket = 1.73%  (1% bar is 1.7 buckets wide -> UNREACHABLE)
+  POOLED gate  base 1791 -> m4 1855  = +3.57%  (+2 buckets)
+  slot=first  n=16  base 1791 -> m4 1855 = +3.57% (+2 buckets)
+  slot=second n=16  base 1791 -> m4 1823 = +1.79% (+1 buckets)
+  m4   hist: {1631: 1, 1663: 3, 1695: 3, 1727: 2, 1759: 1, 1791: 2, 1823: 3, 1855: 7, 1887: 3, 1919: 3, 1951: 3, 1983: 1}
+  base hist: {1663: 1, 1695: 3, 1727: 1, 1759: 6, 1791: 9, 1823: 3, 1855: 4, 1887: 4, 1951: 1}
+  bootstrap pooled delta: 95% CI [+0.00%, +5.36%]  P(m4 worse) = 0.90
+
+=== ttl-heavy 1:1 writes (M1 gate mix)
+  bucket width here: 64 µs at ~4095 µs  ->  one bucket = 1.56%  (1% bar is 1.6 buckets wide -> UNREACHABLE)
+  POOLED gate  base 4223 -> m4 4095  = -3.03%  (-2 buckets)
+  slot=first  n=16  base 3007 -> m4 3135 = +4.26% (+2 buckets)
+  slot=second n=16  base 4479 -> m4 4479 = +0.00% (+0 buckets)
+  m4   hist: {2111: 2, 2303: 2, 2559: 1, 2687: 1, 3007: 2, 3135: 1, 3327: 1, 3391: 1, 3583: 1, 3711: 1, 3775: 1, 4095: 3, 4223: 2, 4351: 3, 4479: 3, 4607: 1, 4735: 1, 5247: 1, 5375: 1, 5759: 1, 6271: 1, 11007: 1}
+  base hist: {2367: 1, 2431: 1, 2495: 1, 2687: 1, 2815: 2, 2879: 1, 2943: 1, 3007: 1, 3071: 1, 3263: 1, 3583: 1, 3647: 2, 3839: 1, 4223: 4, 4351: 2, 4479: 3, 4607: 2, 4735: 1, 4991: 1, 5119: 1, 5247: 1, 5759: 1, 5887: 1}
+  bootstrap pooled delta: 95% CI [-18.06%, +22.81%]  P(m4 worse) = 0.37
+
+############################################################################
+# A/A — m4 6bd25b1  vs  m4 6bd25b1  (IDENTICAL BINARIES = null)
+############################################################################
+
+=== pipelined 1:10 (M0 gate mix)
+  bucket width here: 16 µs at ~767 µs  ->  one bucket = 2.09%  (1% bar is 2.1 buckets wide -> UNREACHABLE)
+  POOLED gate  base 767 -> m4 767  = +0.00%  (+0 buckets)
+  slot=first  n=16  base 767 -> m4 783 = +2.09% (+1 buckets)
+  slot=second n=16  base 767 -> m4 767 = +0.00% (+0 buckets)
+  m4   hist: {655: 1, 671: 1, 703: 1, 719: 3, 735: 2, 751: 2, 767: 7, 783: 7, 799: 2, 815: 2, 831: 1, 847: 1, 879: 1, 895: 1}
+  base hist: {687: 1, 703: 1, 719: 2, 735: 2, 751: 9, 767: 3, 783: 3, 799: 4, 815: 2, 831: 1, 847: 1, 863: 2, 911: 1}
+  bootstrap pooled delta: 95% CI [-4.01%, +4.26%]  P(m4 worse) = 0.46
+
+=== unpipelined 512-conn (M0 gate mix)
+  bucket width here: 32 µs at ~1791 µs  ->  one bucket = 1.79%  (1% bar is 1.8 buckets wide -> UNREACHABLE)
+  POOLED gate  base 1823 -> m4 1791  = -1.76%  (-1 buckets)
+  slot=first  n=16  base 1855 -> m4 1791 = -3.45% (-2 buckets)
+  slot=second n=16  base 1791 -> m4 1823 = +1.79% (+1 buckets)
+  m4   hist: {1631: 1, 1663: 2, 1695: 3, 1727: 4, 1759: 4, 1791: 3, 1823: 4, 1855: 4, 1887: 2, 1919: 3, 1951: 2}
+  base hist: {1631: 1, 1695: 1, 1727: 2, 1759: 4, 1791: 7, 1823: 3, 1855: 3, 1887: 6, 1919: 3, 1951: 2}
+  bootstrap pooled delta: 95% CI [-5.18%, +1.79%]  P(m4 worse) = 0.15
+
+=== ttl-heavy 1:1 writes (M1 gate mix)
+  bucket width here: 64 µs at ~4223 µs  ->  one bucket = 1.52%  (1% bar is 1.5 buckets wide -> UNREACHABLE)
+  POOLED gate  base 4351 -> m4 4223  = -2.94%  (-2 buckets)
+  slot=first  n=16  base 3135 -> m4 3455 = +10.21% (+5 buckets)
+  slot=second n=16  base 4607 -> m4 4479 = -2.78% (-2 buckets)
+  m4   hist: {2111: 1, 2175: 1, 2623: 1, 2687: 1, 2751: 2, 2943: 1, 3071: 1, 3455: 1, 3711: 1, 3775: 1, 3839: 1, 4095: 4, 4223: 1, 4351: 3, 4479: 4, 4607: 2, 4735: 1, 4863: 1, 4991: 2, 5247: 1, 11007: 1}
+  base hist: {1823: 1, 2303: 1, 2367: 1, 2495: 1, 2879: 2, 3007: 1, 3135: 2, 3327: 1, 3711: 1, 4031: 1, 4095: 1, 4223: 2, 4351: 3, 4479: 2, 4607: 3, 4735: 1, 4863: 3, 4991: 2, 5119: 1, 10239: 1, 11007: 1}
+  bootstrap pooled delta: 95% CI [-14.29%, +11.11%]  P(m4 worse) = 0.23
+
+============================================================================
+SUMMARY: is any A/B p99.9 shift bigger than the same-binary null?
+============================================================================
+row                                               A/B         A/A (null)
+pipelined 1:10 (M0 gate mix)        -2.00% [-5.8,+2.0]  +0.00% [-4.0,+4.3]
+unpipelined 512-conn (M0 gate mix)  +3.57% [+0.0,+5.4]  -1.76% [-5.2,+1.8]
+ttl-heavy 1:1 writes (M1 gate mix)  -3.03% [-18.1,+22.8]  -2.94% [-14.3,+11.1]

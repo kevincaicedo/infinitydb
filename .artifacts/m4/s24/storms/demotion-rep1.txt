@@ -1,0 +1,4 @@
+--- M4-S07/S11 demotion storm (real-device Direct) ---
+ops 400000 (+ maintain slices) | cold candidates 30 | demote slices 3243 | sealed 13283553 B | flush slices 3233 | flushed 13279272 B | files sealed 3 | stalls 0
+committed 8396800 B (budget 33554432 B + slice 4096 B) | demoted-to-disk head 13279272
+foreground+slice latency: p50 84 ns | p99 2227 ns | p99.9 1704414 ns | max 11216243 ns
