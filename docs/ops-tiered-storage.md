@@ -405,6 +405,60 @@ Fsync-time failures are a different class entirely: tier/WAL fsync
 failure is fail-stop (state unknowable — the fsyncgate rule), a blob
 fsync failure abandons that extent typed.
 
+## What the v0.4.0-alpha campaign measured (2026-08-15/16)
+
+Numbers an operator can size against, re-read against this chapter after
+the release campaign. Reference box, consumer **Gen3 DRAM-less NVMe**
+(ADATA LEGEND 700, 476.9 GiB) — the device disposition travels with every
+storage-bound figure here (ADR-0022 D4). Ledger rows in brackets.
+
+| What | Measured | Gate | Read it as |
+|---|---|---|---|
+| Write amplification, worst namespace | **1.89×** on two tiered legs at different generator configs; **1.920×** independently over a 32 h endurance run | < 3× | Stable and load-independent — it is a counter ratio, so it does not move with offered load. If yours drifts past ~3×, work the `## What to alarm on` row for `tiering_write_amp_milli_max` [C33] |
+| Memory over 24 h, three planes on one node | RSS slope **+0.234%/24 h**, accounted **−0.016%/24 h**, zero crashes, 32 h run | < 0.5%/24 h | Flat. Compaction ran 9.59 M slices and disk *fell* from a 38.73 GB peak to 30.30 GB [C31, C32] |
+| 10 GB tiered node restart | **5.906 s** to first `PONG` | < 15 s | Comfortable, and this is the **worst** shape: no checkpoint had completed, so the boot replayed the whole tail with no `.ick` prefix to skip [C38a] |
+| Per-cell replay rate | **0.266 GB/s/cell** (2.81 M records/cell in 5.906 s = **476 k records/s/cell**) | ≥ 1 GB/s/cell | **Gate not met.** Recovery is bound by *record count*, not device bandwidth — the same drive reads sequentially at 3.6 GiB/s. **Sizing consequence: your restart time scales with the number of records in the replay window, not its bytes.** A workload of many small records restarts more slowly than the same bytes in fewer, larger ones; checkpoint frequency is the lever you control [C38b, M4.5-S21] |
+| Cold-read p99 under load | **1.44 ms** at 8 conns / pipeline 1 · **3.65 ms** pipelined · 60–63 ms inside a saturated three-plane run | < 1.5 ms | **Gate not met under load**, disclosed. Cold-read latency on this device class is dominated by read/write interference — see the research note in `.artifacts/v0.4.0/cold-read-p99-research-20260808.md` [C35] |
+| Hot set vs a RAM-resident node | p50 **12–22% faster**; p99 **+328%**, p99.9 **+40%** | within 10% | **Tail gate not met.** No tiering lookup cost exists — the profile shows no new hot-path symbol. Foreground commands occasionally queue behind maintenance and I/O completion on the same cell [C34a, C34b] |
+| Cache p99 with three namespaces on one node | **+59% to +83%** vs the same namespace running alone | ≤ 10% | **Documented deviation.** The unified profile's real cost model. **Size for it**: if a latency-sensitive cache namespace shares a node with a document or tiered namespace, budget its p99 at roughly double its solo figure [C38d] |
+
+### One counter that will not tell you what you expect
+
+**`cold_read_qd_p99` does not rise under load on this hardware.** Probed
+four ways during the campaign: this node at client pipeline 32 read
+`qd_p99` **3**, at pipeline 128 still **3**; an `ycsb` connection sweep
+from 8 to 64 connections moved it only **5 → 7** while throughput went
+39.6k → 68.2k ops/s; and the 32 h endurance run read **5**. The ADR-0055
+D2 admission cap is **64** and it never binds.
+
+The reason is not that the queue is healthy — it is that queue depth here
+is set by **device service time**, not by admission pressure: the cells
+drain the cold queue about as fast as any generator can fill it. So
+`cold_read_qd_p99` is a poor saturation signal on a device this fast
+relative to the cell loop. Watch `tiering_cold_p99_us` and the foreground
+latency instead; treat a `cold_read_qd_p99` anywhere near 64 as a genuine
+alarm precisely because nothing in this campaign could produce one.
+
+### The RAM-hit fields, and what the release gate actually used
+
+`tiering_ram_hit_split` still reads `unmeasured-iteration-clock` and the
+`tiering_ram_hit_p*_us` fields still render **absent** while a tiered
+namespace is live — that part of the field reference above is unchanged
+and correct. What changed is the *gate*: since ADR-0071 D2/D3 the
+hot-set comparison is derived **client-side** from the cold-read counters,
+and ADR-0071 D6 (2026-08-16) made its eligibility rules depend on which
+leg is being measured. Two consequences for anyone reproducing the
+measurement:
+
+1. **Both legs must run at the same generator configuration**, and the
+   comparison now refuses across differing ones. Client pipeline depth
+   alone moved a derived memory-hit p50 by **12×** (22 µs at depth 1 vs
+   279 µs at depth 8), because RESP replies are in-order and a cold read
+   blocks everything queued behind it on that connection.
+2. **Only skewed (zipfian) workloads can carry the row.** A uniform
+   workload over 10× RAM reads 62–92% cold and is correctly refused — it
+   has no hot set to serve at memory speed.
+
 ## Not here yet
 
 Named so their absence is visible rather than mysterious:
