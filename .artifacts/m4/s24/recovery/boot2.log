@@ -1,0 +1,18 @@
+infinityd 6bd25b1 (git 6bd25b139d16, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 6499, backend io_uring, route natural
+infinityd: listening on 6499
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 407239831/6278457156 bytes (6.5%), eta 73s
+control: cell 0 not ready — in checkpoint (67794774/1569488192 bytes) for 5s
+control: cell 1 not ready — in checkpoint (84830295/1570059952 bytes) for 5s
+control: cell 2 not ready — in checkpoint (144373450/1569892618 bytes) for 5s
+control: cell 3 not ready — in checkpoint (110241312/1569016394 bytes) for 5s
+control: cell 0 recovered (4 segments, 1569488192 bytes, 2812633 records)
+control: cell 1 recovered (4 segments, 1570059952 bytes, 2812237 records)
+control: cell 2 recovered (4 segments, 1569892618 bytes, 2812069 records)
+control: cell 3 recovered (4 segments, 1569016394 bytes, 2811913 records)
+control: recovery complete — 4 cells serving (5906 ms)

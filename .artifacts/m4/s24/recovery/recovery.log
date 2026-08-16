@@ -1,0 +1,34 @@
+== cold boot 1 (empty) ==
+empty boot: .040886894s
+OK
+== fill 10 GiB into the tiered namespace ==
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PENDING (tooling)
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows PENDING (tooling)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to .artifacts/m4/s24/recovery/fill/1786839342-gate-run/report.md
+fill wall: 110.94 s
+16388637563	/home/kcaicedo/.cache/inf-tmp/recovery-tiered-44845
+== clean stop ==
+== drop page cache is not available without sudo; disclose warm cache ==
+== cold boot 2 (10 GiB tiered image) ==
+recovery boot: 5.908438204s over image 16389506828 B, 4 cells
+image 16.39 GB, boot 5.908 s
+node replay rate  = 2.774 GB/s
+per-cell rate     = 0.693 GB/s/cell  (gate >= 1.0)
+10 GB boot        = 3.605 s          (gate < 15)
+0
