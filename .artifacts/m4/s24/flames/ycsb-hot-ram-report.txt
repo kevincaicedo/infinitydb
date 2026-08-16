@@ -1,0 +1,50 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 1230
+#
+# Samples: 72K of event 'cpu_core/cycles/P'
+# Event count (approx.): 110158213079
+#
+# Overhead  Command          Shared Object                Symbol                                                                                                                                                                          
+# ........  ...............  ...........................  ................................................................................................................................................................................
+#
+     9.73%  cell-1           infinityd-6bd25b1            [.] <inf_server::plane::ServerPlane<O,F> as inf_runtime::reactor::CellPlane>::maintain
+     9.43%  cell-0           infinityd-6bd25b1            [.] <inf_server::plane::ServerPlane<O,F> as inf_runtime::reactor::CellPlane>::maintain
+            |          
+             --0.94%--percentile (inlined)
+                       |          
+                        --0.80%--stats<inf_server::readahead::ReadAheadFs<inf_log::fs::StdSegmentFs>> (inlined)
+                                  maintain<inf_server::plane::NoopObserver, inf_server::readahead::ReadAheadFs<inf_log::fs::StdSegmentFs>> (inlined)
+                                  run_iteration<inf_runtime::uring::UringDriver, inf_foundation::time::StdClock, inf_server::plane::ServerPlane<inf_server::plane::NoopObserver, inf_server::readahead::ReadAheadFs<inf_log::fs::StdSegmentFs>>> (inlined)
+                                  cell_main (inlined)
+                                  {closure#0} (inlined)
+                                  call_once<core::result::Result<(), std::io::error::Error>, infinityd::main::{closure#3}::{closure_env#0}> (inlined)
+                                  do_call<core::panic::unwind_safe::AssertUnwindSafe<infinityd::main::{closure#3}::{closure_env#0}>, core::result::Result<(), std::io::error::Error>> (inlined)
+                                  catch_unwind<core::result::Result<(), std::io::error::Error>, core::panic::unwind_safe::AssertUnwindSafe<infinityd::main::{closure#3}::{closure_env#0}>> (inlined)
+                                  catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<infinityd::main::{closure#3}::{closure_env#0}>, core::result::Result<(), std::io::error::Error>> (inlined)
+                                  {closure#3} (inlined)
+                                  __rust_begin_short_backtrace<infinityd::main::{closure_env#3}, core::result::Result<(), std::io::error::Error>> (inlined)
+
+     6.20%  cell-1           infinityd-6bd25b1            [.] inf_server::plane::ServerPlane<O,F>::tier_maintain
+     5.02%  cell-0           infinityd-6bd25b1            [.] inf_server::plane::ServerPlane<O,F>::tier_maintain
+     2.94%  cell-1           infinityd-6bd25b1            [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     2.88%  cell-0           infinityd-6bd25b1            [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     1.09%  cell-0           libc.so.6                    [.] __memmove_avx_unaligned_erms
+            |
+            ---__memmove_avx_unaligned_erms
+
+     0.96%  cell-1           libc.so.6                    [.] __memmove_avx_unaligned_erms
+     0.89%  cell-0           infinityd-6bd25b1            [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap
+     0.67%  cell-1           infinityd-6bd25b1            [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap
+     0.66%  cell-1           [unknown]                    [k] 0xffffffffb2401268
+     0.60%  cell-1           infinityd-6bd25b1            [.] inf_fabric::mesh::CellFabric::flush
+     0.53%  cell-1           [unknown]                    [k] 0xffffffffb280943b
+            |
+            ---0xffffffffb280943d
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

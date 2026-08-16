@@ -1,0 +1,4 @@
+# inf-bench ycsb — client-derived memory-hit split (ADR-0071 D2)
+# config: conns=8 pipeline=1 value_size=1024
+# row	ops	cold_frac	p50_us	p99_us	p999_us	eligible
+ycsb-a-zipfian	15094028	0.001433	27	103	195	ok

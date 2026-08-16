@@ -1,0 +1,54 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 611
+#
+# Samples: 50K of event 'cpu_core/cycles/P'
+# Event count (approx.): 52590895266
+#
+# Overhead  Command          Shared Object                    Symbol                                                                                                                                                                          
+# ........  ...............  ...............................  ................................................................................................................................................................................
+#
+    13.47%  cell-0           infinityd-6bd25b1                [.] <inf_server::plane::ServerPlane<O,F> as inf_runtime::reactor::CellPlane>::maintain
+    10.73%  cell-1           infinityd-6bd25b1                [.] <inf_server::plane::ServerPlane<O,F> as inf_runtime::reactor::CellPlane>::maintain
+     6.08%  cell-0           infinityd-6bd25b1                [.] inf_server::plane::ServerPlane<O,F>::tier_maintain
+     5.84%  cell-1           infinityd-6bd25b1                [.] inf_server::plane::ServerPlane<O,F>::tier_maintain
+     3.42%  cell-0           infinityd-6bd25b1                [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     2.68%  cell-1           infinityd-6bd25b1                [.] inf_runtime::reactor::CellLoop<D,C>::run_iteration
+     1.71%  swapper          [unknown]                        [k] 0xffffffffb3b22a8e
+            |
+            ---0xffffffffb3b22a92
+               0xffffffffb3b21934
+               0xffffffffb3773e80
+               0xffffffffb28c7871
+               0xffffffffb28d5d0b
+               0xffffffffb28d5e34
+               0xffffffffb28d60a9
+               0xffffffffb27ec085
+               0xffffffffb279c1cd
+
+     1.02%  cell-0           [unknown]                        [k] 0xffffffffb2401268
+     0.89%  cell-0           [unknown]                        [k] 0xffffffffb280943b
+            |
+            ---0xffffffffb280943d
+
+     0.74%  cell-1           [unknown]                        [k] 0xffffffffb280943b
+            |
+            ---0xffffffffb280943d
+
+     0.69%  cell-1           [unknown]                        [k] 0xffffffffb2401268
+     0.62%  cell-1           infinityd-6bd25b1                [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap
+     0.61%  cell-1           infinityd-6bd25b1                [.] inf_fabric::mesh::CellFabric::flush
+     0.58%  cell-1           libc.so.6                        [.] getenv
+     0.52%  cell-0           infinityd-6bd25b1                [.] ceil
+     0.51%  cell-0           infinityd-6bd25b1                [.] std::sys::env::unix::getenv::{closure#0}
+     0.50%  cell-0           infinityd-6bd25b1                [.] <inf_runtime::uring::UringDriver as inf_runtime::driver::BackendDriver>::submit_and_reap
+     0.50%  cell-0           libc.so.6                        [.] getenv
+            |
+            ---getenv
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#
