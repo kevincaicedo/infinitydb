@@ -47,6 +47,19 @@ perf record -C "$SERVER_CPUS" -F 1997 -g --call-graph dwarf,16384 \
 wait $LOADPID
 perf report -i "$OUT/jget-read.perf" --stdio --percent-limit 0.05 \
     >"$OUT/jget-read-report.txt" 2>/dev/null
+# The raw sample file is machine-local intermediate data, not evidence:
+# this one runs ~1 GB, which is 10x GitHub's hard file limit and blocked a
+# push on 2026-08-16. The extracted report below is what the gate reads and
+# what a reviewer cites, so drop the raw file once it has been extracted.
+# `KEEP_PERF_DATA=1` retains it for local debugging (it is gitignored
+# either way).
+PERF_BYTES=$(stat -c %s "$OUT/jget-read.perf" 2>/dev/null || echo 0)
+if [ "${KEEP_PERF_DATA:-0}" = "1" ]; then
+    echo "raw perf data retained at $OUT/jget-read.perf ($PERF_BYTES B) — gitignored" >>"$OUT/perf.log"
+else
+    rm -f "$OUT/jget-read.perf"
+    echo "raw perf data ($PERF_BYTES B) discarded after extraction; set KEEP_PERF_DATA=1 to retain" >>"$OUT/perf.log"
+fi
 
 kill $SRV 2>/dev/null || true; wait $SRV 2>/dev/null || true
 
