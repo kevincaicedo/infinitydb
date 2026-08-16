@@ -586,6 +586,22 @@
         <div class="v">96.19%</div>
         <div class="l">LFU HIT-RATE &mdash; EXACT PARITY WITH REDIS, SAME TRACE</div>
       </div>
+      <div class="stat">
+        <div class="v">+0.234%</div>
+        <div class="l">RSS SLOPE OVER A 24 h MEASURED WINDOW &mdash; 0.5% GATE, 32 h RUN, THREE PLANES</div>
+      </div>
+      <div class="stat">
+        <div class="v">1.89&times;</div>
+        <div class="l">WRITE AMPLIFICATION ON THE TIERED PLANE &mdash; 3&times; GATE, WORST NAMESPACE</div>
+      </div>
+      <div class="stat">
+        <div class="v">0.38&times;</div>
+        <div class="l">JSON DOCUMENT MEMORY vs REDISJSON &mdash; 0.7&times; GATE, FROZEN CORPUS</div>
+      </div>
+      <div class="stat">
+        <div class="v">20,000</div>
+        <div class="l">TIERED SIMULATION SEEDS &mdash; ZERO NEVER-NONE VIOLATIONS, TWO SCENARIOS</div>
+      </div>
     </div>
 
     <div class="card-grid" style="margin-top:44px">
@@ -597,9 +613,13 @@
         <span class="callout-tag"><strong>What you don&rsquo;t see here:</strong></span>
         pipelined throughput peaks, <code>always</code>-mode write rates, tail latencies. Those ledger rows are <em>Narrowed</em> or <em>Evidence-pending</em>, so they don&rsquo;t ship &mdash; design targets never appear as numbers on this site. Every allowed claim lives in the <a href="docs/index.html#claims">claim ledger</a> with its artifact, or it does not exist.
       </div>
+      <div class="callout" style="margin:0">
+        <span class="callout-tag"><strong>Gates we measured and did not meet:</strong></span>
+        four of them, in the v0.4.0-alpha campaign &mdash; document write throughput against a plain-string write, hot-set latency in the <em>tail</em> (the median is faster than a RAM-resident node; the tail is not), per-cell recovery replay rate, and cross-namespace latency isolation on a node running three workloads at once. Each is a <em>Rejected</em> ledger row that keeps its number, because a gate we failed is evidence too. They are named in the release notes with their causes, and two of them are scheduled engineering work rather than deferrals.
+      </div>
     </div>
 
-    <p class="bench-note">// reference box: i7-13700KF &middot; pinned P-cores &middot; performance governor &middot; turbo off &middot; competitors in-run &middot; 3&ndash;5 replicates &mdash; ledger rows C5, C7, C8, C12, C14, C16 &middot; full methodology: <a href="docs/benchmarks.html">how we benchmark</a></p>
+    <p class="bench-note">// reference box: i7-13700KF &middot; pinned P-cores &middot; performance governor &middot; turbo off &middot; competitors in-run &middot; 3&ndash;5 replicates &mdash; ledger rows C5, C7, C8, C12, C14, C16, C29, C31, C33, C40 &middot; storage-bound rows name a consumer Gen3 DRAM-less NVMe &middot; full methodology: <a href="docs/benchmarks.html">how we benchmark</a></p>
   </div>
 </section>
 

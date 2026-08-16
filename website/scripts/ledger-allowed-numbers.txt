@@ -62,3 +62,29 @@
 16 mib          # record-format value bound (SETRANGE note in the compat matrix; value bound on the operations limitations list) — wire format, not a measurement
 256 mib         # config defaults (--segment-bytes / --ckpt-interval-bytes) on the deployment page — configuration values, not measurements
 2048 mb         # config example in the landing terminal (INF.NS ... MEM-BUDGET 2048mb) — a knob value, not a measurement
+
+# --- v0.4.0-alpha campaign, walked 2026-08-16 ---------------------------
+# --- ledger C31 (Allowed): 24 h memory flatness, three planes -----------
+0.234 %         # C31: measured RSS slope per 24 h
+0.5 %           # C31: the gate value, disclosed alongside the measurement
+0.016 %         # C31: accounted-memory slope (the hard sub-gate)
+# --- ledger C33 (Allowed): tiered write amplification -------------------
+1.89 x          # C33: measured worst-namespace write amplification
+3 x             # C33: the gate value, disclosed alongside the measurement
+# --- ledger C29 (Allowed): document memory vs RedisJSON -----------------
+0.38 x          # C29: measured resident memory vs RedisJSON, frozen corpus
+0.7 x           # C29: the gate value, disclosed alongside the measurement
+1.04 x          # C29: measured resident memory vs serialized size
+# --- ledger C40 (Allowed): tiered fault-injection safety ----------------
+20000 seeds     # C40: randomized simulation seeds, two scenarios, 0 violations
+                # (the soft cross-check warns because the ledger writes it "20,000")
+# --- ledger C38a (Allowed): tiered node restart -------------------------
+5.9 s           # C38a: measured 10 GB tiered node boot to serving
+# --- ledger C38c (Allowed): three-plane memory attribution --------------
+6.5 %           # C38c: worst sum(domains)-vs-RSS divergence, tiered leg live
+# --- ledger C28a (Allowed): document read latency vs GET ----------------
+1.13 x          # C28a: measured 1 KiB document read p50 vs plain GET
+1.44 x          # C28a: measured 200 B document read p50 vs plain GET
+1.5 x           # C28a: the gate value, disclosed alongside the measurement
+# --- ledger C39 (Allowed): document write throughput --------------------
+1.28 m ops/s    # C39: measured JSON.SET throughput at 1 KiB (standalone claim)

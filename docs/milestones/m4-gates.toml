@@ -43,9 +43,9 @@ measured_by = "gate-run m4 ABBA row (M0 gate mix), median of replicates"
 [[gate]]
 id = "degenerate_pipelined_p999"
 name = "Degenerate A/B: pipelined p99.9 regression"
-threshold = 1.0
+threshold = 0.0
 comparator = "<="
-unit = "% vs M3 baseline (LogHistogram ~3% buckets: nonzero spans >= 1 bucket)"
+unit = "% vs M3 baseline — SAME HISTOGRAM BUCKET OR BETTER (ADR-0070 D4b, 2026-08-16). LogHistogram quantises at 32 sub-buckets/octave = ~3%/bucket, so the only readable states are 0.00 (same bucket) and >= 1 bucket; the former 1% threshold was unreadable and a same-binary A/A control failed it"
 tier = "linux-reference-box"
 source = "ab:degenerate_pipelined_p999_delta_pct"
 measured_by = "gate-run m4 ABBA row (M0 gate mix)"
@@ -63,9 +63,9 @@ measured_by = "gate-run m4 ABBA row (512-conn M0 gate mix)"
 [[gate]]
 id = "degenerate_unpipelined_p999"
 name = "Degenerate A/B: unpipelined p99.9 regression"
-threshold = 1.0
+threshold = 0.0
 comparator = "<="
-unit = "% vs M3 baseline"
+unit = "% vs M3 baseline — SAME HISTOGRAM BUCKET OR BETTER (ADR-0070 D4b, 2026-08-16). LogHistogram quantises at ~3%/bucket, so the only readable states are 0.00 (same bucket) and >= 1 bucket; the former 1% threshold was unreadable and a same-binary A/A control failed it"
 tier = "linux-reference-box"
 source = "ab:degenerate_unpipelined_p999_delta_pct"
 measured_by = "gate-run m4 ABBA row (512-conn M0 gate mix)"
@@ -83,9 +83,9 @@ measured_by = "gate-run m4 ABBA row (M1 gate mix)"
 [[gate]]
 id = "degenerate_ttl_p999"
 name = "Degenerate A/B: ttl-heavy p99.9 regression"
-threshold = 1.0
+threshold = 0.0
 comparator = "<="
-unit = "% vs M3 baseline"
+unit = "% vs M3 baseline — SAME HISTOGRAM BUCKET OR BETTER (ADR-0070 D4b, 2026-08-16). LogHistogram quantises at ~3%/bucket, so the only readable states are 0.00 (same bucket) and >= 1 bucket; the former 1% threshold was unreadable and a same-binary A/A control failed it"
 tier = "linux-reference-box"
 source = "ab:degenerate_ttl_p999_delta_pct"
 measured_by = "gate-run m4 ABBA row (M1 gate mix)"
