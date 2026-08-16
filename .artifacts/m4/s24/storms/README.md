@@ -67,7 +67,7 @@ matching how the other worst-of rows bind).
 `.artifacts/m4/s11/demotion-storm-device-20260718.md` measured the same
 demotion bench, same substrate, same pin, on 2026-07-18 at **1.287–1.367 ms**
 (3 reps, tree `147c33a`+S11). Today the same bench reads **1.702–1.715 ms**:
-**+25%**, and the gate's headroom drops from ~32% to ~14%.
+**+27.9% median-to-median** (1.3329 -> 1.7044 ms; +25.5% worst-to-worst), and the gate's headroom drops from 31.7% to 14.0%.
 
 This is recorded, not explained away. It is **not** attributed to any
 specific change, because this campaign did not run the A/B that would

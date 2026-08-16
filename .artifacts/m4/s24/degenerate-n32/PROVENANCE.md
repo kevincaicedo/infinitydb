@@ -15,6 +15,19 @@ Specifically missing versus a normal artifact: the report header's
 binary fingerprints, the rendered gate table, the peak-RSS deltas, and the
 machine-checkable `gates.json`.
 
+**Box-state caveat that cannot be closed retroactively.** A stray
+`recovery-cold` `infinityd` — 2.3 GB resident, four cell threads on cpu 5
+burning ~4% of it continuously — was found running at 15:10 on 2026-08-16,
+having started at **14:46:08**. The gate legs pin their cells to cpus 4–7.
+Because neither leg wrote a report, **there is no record of when either
+leg ran**, so it cannot be established whether the A/A leg overlapped it.
+The A/B leg's ttl-heavy conclusion does not rest on this (it is a
+sign reversal across three sample sizes, not a marginal call), but the A/A
+control at n=32 carries this caveat and the assembly re-run in
+`.artifacts/m4/s24/final-n32-assembly/` — measured with the stray
+`SIGSTOP`ped and verified at zero ticks — is the leg to cite. See
+readiness F31/F32.
+
 What *is* established by the transcripts themselves:
 
 - `inf-bench env-check` printed **OK** at the top of both legs, with
@@ -92,20 +105,36 @@ on that row.
 
 ## Why the p99.9 rows behave this way — measured, not asserted
 
-**1. One bucket is wider than the 1% bar, on every row.** Measured from
-the distinct values actually emitted (n=64 per row):
+**1. One bucket is wider than the 1% bar, on every row.** `LogHistogram`
+uses 32 sub-buckets per octave, so a value `v` sits in a bucket of width
+`2^floor(log2 v) / 32`. Evaluated at the medians actually compared — and
+cross-checked against the gaps between distinct values the instrument
+emitted (n=64 per row), which match exactly:
 
-| row | median | bucket width | one bucket = |
+| row | medians compared (base → m4) | bucket width | one bucket = |
 |---|---|---|---|
-| pipelined | ~783 µs | 16 µs | **2.04%** |
-| unpipelined | ~1855 µs | 32 µs | **1.73%** |
-| ttl-heavy | ~4095 µs | 128 µs | **3.13%** |
+| pipelined | 799 → 783 µs | 16 µs | **2.00–2.04%** |
+| unpipelined | 1791 → 1855 µs | 32 µs | **1.73–1.79%** |
+| ttl-heavy | 4223 → 4095 µs | 128 / 64 µs † | **3.03–1.56%** |
 
-The smallest non-zero delta the instrument can express is 1.7–3.1%
-depending on the row. A 1% threshold was unreachable on all three. This
-confirms ADR-0070 D4b's "~3%/bucket" with a direct measurement, and
-refines it: the figure is row-dependent because bucket width doubles per
-octave.
+† **4096 µs is an octave boundary and the ttl-heavy medians straddle it.**
+4223 sits in the 4096–8192 octave (128 µs buckets, 3.03%); 4095 is the top
+bucket of 2048–4096 (64 µs, 1.56%). So the coarsest and the finest
+resolutions on any of these rows occur on the *same row*, 128 µs apart.
+Absolute width doubles per octave while relative width sawtooths between
+~1.6% and ~3.1% — which is why any single "%/bucket" figure for this
+instrument is an approximation and a range is the honest form.
+
+**The minimum across all three rows is 1.56% and the maximum is 3.03%;
+every one exceeds the 1% bar.** The conclusion does not depend on which
+end of the range you take. This confirms ADR-0070 D4b's "~3%/bucket" by
+direct measurement and refines it — the figure is row-dependent, and D4b's
+convenient constant was the coarse end.
+
+*(`deep.py` prints the smallest gap between observed distinct values,
+which for the ttl-heavy row is 64 µs — the finest bucket present anywhere
+in that row's range, not the width at its median. The table above is the
+figure to quote.)*
 
 **2. The failing row is uncorrelated with the binary pair.** Six legs:
 
