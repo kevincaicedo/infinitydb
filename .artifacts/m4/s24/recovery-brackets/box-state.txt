@@ -1,0 +1,9 @@
+date: 2026-08-16T20:03:27-04:00
+governor: performance
+no_turbo: 1
+epp: performance
+kernel: 7.0.0-29-generic
+tree: 60a4679 (clean at env-check)
+infinityd: /home/kcaicedo/.cache/inf-campaign/v0.4.0-bin/infinityd-6bd25b1 (656fc9efde0d87bf)
+cells: 4 · mem-budget: 1024mb · dataset-multiple: 10
+/dev/nvme0n1p3 ext4 306480056 120173112 170665552  42% /

@@ -1,0 +1,53 @@
+infinityd 6bd25b1 (git 6bd25b139d16, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 6499, backend io_uring, route natural
+infinityd: listening on 6499
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in start (0/0 bytes) for 5s
+control: cell 1 not ready — in start (0/0 bytes) for 5s
+control: cell 2 not ready — in start (0/0 bytes) for 5s
+control: cell 3 not ready — in start (0/0 bytes) for 5s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in start (0/0 bytes) for 6s
+control: cell 1 not ready — in start (0/0 bytes) for 6s
+control: cell 2 not ready — in start (0/0 bytes) for 6s
+control: cell 3 not ready — in start (0/0 bytes) for 6s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in start (0/0 bytes) for 7s
+control: cell 1 not ready — in start (0/0 bytes) for 7s
+control: cell 2 not ready — in start (0/0 bytes) for 7s
+control: cell 3 not ready — in start (0/0 bytes) for 7s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in start (0/0 bytes) for 8s
+control: cell 1 not ready — in start (0/0 bytes) for 8s
+control: cell 2 not ready — in start (0/0 bytes) for 8s
+control: cell 3 not ready — in start (0/0 bytes) for 8s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in start (0/0 bytes) for 9s
+control: cell 1 not ready — in start (0/0 bytes) for 9s
+control: cell 2 not ready — in start (0/0 bytes) for 9s
+control: cell 3 not ready — in start (0/0 bytes) for 9s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in start (0/0 bytes) for 10s
+control: cell 1 not ready — in start (0/0 bytes) for 10s
+control: cell 2 not ready — in start (0/0 bytes) for 10s
+control: cell 3 not ready — in start (0/0 bytes) for 10s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in start (0/0 bytes) for 11s
+control: cell 1 not ready — in start (0/0 bytes) for 11s
+control: cell 2 not ready — in start (0/0 bytes) for 11s
+control: cell 3 not ready — in start (0/0 bytes) for 11s
+control: recovery 0/4 cells ready, 195152427/3363946178 bytes (5.8%), eta 195s
+control: cell 0 not ready — in checkpoint (76448907/839519793 bytes) for 12s
+control: cell 1 not ready — in checkpoint (25338074/839570348 bytes) for 12s
+control: cell 2 not ready — in checkpoint (33754976/840030841 bytes) for 12s
+control: cell 3 not ready — in checkpoint (59610470/844825196 bytes) for 12s
+control: cell 0 recovered (2 segments, 839519793 bytes, 2647738 records)
+control: cell 1 recovered (2 segments, 839570348 bytes, 2647738 records)
+control: cell 2 recovered (2 segments, 840030841 bytes, 2647751 records)
+control: cell 3 recovered (2 segments, 844825196 bytes, 2668669 records)
+control: recovery complete — 4 cells serving (12308 ms)
