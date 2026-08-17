@@ -449,6 +449,8 @@ pub fn cmd_gate_run_m4(flags: &Flags) -> Result<(), String> {
         ("cache-isolation-pct", "cache_isolation_p99_delta_pct"),
         ("recovery-gbps-per-cell", "recovery:tiered_gbps_per_cell"),
         ("recovery-boot-s", "recovery:tiered_10gb_boot_s"),
+        // ADR-0070 D7: Phase::Start overhead, split out of the replay row.
+        ("recovery-setup-s", "recovery:tiered_setup_s"),
         ("dst-violations", "dst:never_none_violations"),
         ("crash-failures", "crash:matrix_failures"),
         ("m3-regression-pct", "m3:regression_worst_pct"),
