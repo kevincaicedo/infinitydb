@@ -31,6 +31,7 @@
 #   sudo -v && scripts/recovery-brackets.sh                 # both legs
 #   LEGS=ick-tail COLD=0 scripts/recovery-brackets.sh OUT    # leg A only, no sudo
 #   LEGS=cold-cache scripts/recovery-brackets.sh OUT         # leg B only
+#   LEGS=tail-only COLD=0 scripts/recovery-brackets.sh OUT   # same-session repro of the 2026-08-15 point
 #
 # Env: BIN BENCH DATA_ROOT WORK CELLS COLD PORT MEM_BUDGET_MB DATASET_MULT
 
@@ -225,6 +226,16 @@ run_leg() {
 
 FAILED=0
 want() { case ",$LEGS," in *",$1,"*) return 0;; *) return 1;; esac; }
+
+# Same-session reproduction of the 2026-08-15 point (tail-only + warm).
+# Not one of the two owed corners — it exists because this box's drive state
+# drifts enough to swamp a shape comparison (F20/F29: 10% -> 34% on the m2
+# everysec row from drive state alone). Comparing today's ick-tail against
+# an August-15 tail-only confounds shape with drive state; this leg removes
+# that. Run it whenever a cross-day recovery comparison is being made.
+if want tail-only; then
+    run_leg tail-only 0 0 || { log "!! leg tail-only FAILED"; FAILED=1; }
+fi
 
 if want ick-tail; then
     run_leg ick-tail 1 0 || { log "!! leg ick-tail FAILED"; FAILED=1; }
