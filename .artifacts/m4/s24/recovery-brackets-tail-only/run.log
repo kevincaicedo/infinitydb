@@ -1,0 +1,75 @@
+box state -> /home/kcaicedo/.cache/inf-campaign/recovery-brackets/box-state.txt
+
+======== leg tail-only (checkpoint-first=0 cold-cache=0) ========
+-- create tiered namespace ycsb (MEM-BUDGET 1024mb, DISK-BUDGET 40960mb)
+OK
+-- fill 10 GiB via inf-bench ycsb --attach-port
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+== ycsb: loading 10485760 keys (10240 MiB) ==
+== ycsb row: ycsb-a-zipfian ==
+== ycsb: saturation probe (ycsb-a-zipfian, +50% conns) ==
+== ycsb row: ycsb-a-uniform ==
+== ycsb row: ycsb-b-zipfian ==
+== ycsb row: ycsb-b-uniform ==
+== ycsb row: ycsb-c-zipfian ==
+== ycsb row: ycsb-c-uniform ==
+== ycsb row: ycsb-d-latest ==
+== ycsb row: ycsb-e-zipfian ==
+== ycsb row: ycsb-f-zipfian ==
+== ycsb row: ycsb-f-uniform ==
+
+== gate verdicts ==
+  Degenerate A/B: pipelined ops regression PENDING (tooling)
+  Degenerate A/B: pipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: unpipelined ops regression PENDING (tooling)
+  Degenerate A/B: unpipelined p99.9 regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy ops regression PENDING (tooling)
+  Degenerate A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Degenerate A/B: peak-RSS regression (worst row) PENDING (tooling)
+  Memory-mode node constructs zero tiered tables PENDING (tooling)
+  Tiering code-path counters identically zero PENDING (tooling)
+  Write amplification, worst tiered namespace PASS
+  Memory-only rows append zero log records (M2 posture carried) PENDING (tooling)
+  Mixed-node attribution divergence (M4-S20) PENDING (tooling)
+  Cache-namespace p99 isolation under the mixed node (M4-S20) PENDING (tooling)
+  Hot set at memory speed: memory-hit p50 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99 delta PENDING (tooling)
+  Hot set at memory speed: memory-hit p99.9 delta PENDING (tooling)
+  Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows FAIL (DEV-TIER, non-binding)
+  Memory honesty: RSS slope over the 24 h endurance run PENDING (tooling)
+  Endurance: zero crashes over the full 24 h run PENDING (tooling)
+  M3 regression: worst M3 gate delta on memory-mode namespaces PENDING (tooling)
+  Recovery with tiering on: replay throughput per cell PENDING (tooling)
+  Recovery with tiering on: 10 GB boot   PENDING (tooling)
+  Never-none invariant: zero violations in the 10k-seed DST sweep PENDING (tooling)
+  Crash + ENOSPC matrices: all fault points green PENDING (tooling)
+  Foreground protection: p99.9 during demotion + compaction storms PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/.cache/inf-campaign/recovery-brackets/tail-only-fill/1786925815-gate-run/report.md
+gate-run: sidecar written to /home/kcaicedo/.cache/inf-campaign/recovery-brackets/tail-only-fill/1786925815-gate-run/mem-hit.tsv
+fill wall: 326.623467941 s
+-- no checkpoint (tail-only shape, matches the 2026-08-15 leg)
+image on disk: 15283823910 B (INCLUDES tier files that recovery never replays)
+-- clean stop
+-- page cache left WARM (disclose it)
+-- boot on the filled image, timed to first PONG
+BOOT WALL (tail-only): 13.522418116 s
+-- replayed, per boot2.log (authoritative — NOT du):
+control: cell 3 recovered (3 segments, 1109424041 bytes, 3145831 records)
+control: cell 0 recovered (3 segments, 1108522765 bytes, 2755593 records)
+control: cell 1 recovered (3 segments, 1108406369 bytes, 2793601 records)
+control: cell 2 recovered (3 segments, 1108640590 bytes, 2762763 records)
+control: recovery complete — 4 cells serving (13415 ms)
+
+leg A (ick-tail) SKIPPED — not in LEGS=tail-only
+
+leg B (cold-cache) SKIPPED — not in LEGS=tail-only
