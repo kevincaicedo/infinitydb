@@ -28,7 +28,9 @@
 # leg B. Leg A needs no privileges. `COLD=0` skips leg B entirely.
 #
 # Usage:
-#   sudo -v && scripts/recovery-brackets.sh
+#   sudo -v && scripts/recovery-brackets.sh                 # both legs
+#   LEGS=ick-tail COLD=0 scripts/recovery-brackets.sh OUT    # leg A only, no sudo
+#   LEGS=cold-cache scripts/recovery-brackets.sh OUT         # leg B only
 #
 # Env: BIN BENCH DATA_ROOT WORK CELLS COLD PORT MEM_BUDGET_MB DATASET_MULT
 
@@ -45,6 +47,7 @@ PORT="${PORT:-6499}"
 MEM_BUDGET_MB="${MEM_BUDGET_MB:-1024}"                 # matches the 2026-08-15 leg
 DATASET_MULT="${DATASET_MULT:-10}"                     # => 10 GiB of user data
 NS="${NS:-ycsb}"
+LEGS="${LEGS:-ick-tail,cold-cache}"                    # comma list; run one leg at a time if you like
 
 # ---------------------------------------------------------------------------
 # Phase 0 — every check that can fail runs BEFORE anything is written inside
@@ -221,11 +224,22 @@ run_leg() {
 }
 
 FAILED=0
-run_leg ick-tail 1 0 || { log "!! leg ick-tail FAILED"; FAILED=1; }
-if [ "$COLD" = "1" ]; then
-    run_leg cold-cache 0 1 || { log "!! leg cold-cache FAILED"; FAILED=1; }
+want() { case ",$LEGS," in *",$1,"*) return 0;; *) return 1;; esac; }
+
+if want ick-tail; then
+    run_leg ick-tail 1 0 || { log "!! leg ick-tail FAILED"; FAILED=1; }
 else
-    log ""; log "leg B (cold cache) SKIPPED — COLD=0"
+    log ""; log "leg A (ick-tail) SKIPPED — not in LEGS=$LEGS"
+fi
+
+if want cold-cache; then
+    if [ "$COLD" = "1" ]; then
+        run_leg cold-cache 0 1 || { log "!! leg cold-cache FAILED"; FAILED=1; }
+    else
+        log ""; log "leg B (cold-cache) SKIPPED — COLD=0 (needs sudo for vm.drop_caches)"
+    fi
+else
+    log ""; log "leg B (cold-cache) SKIPPED — not in LEGS=$LEGS"
 fi
 
 # ---------------------------------------------------------------------------
