@@ -1,17 +1,18 @@
 # Recovery brackets (2026-08-16) — the gate is not measuring what its name says
 
-Three legs, one box, one binary (`infinityd-6bd25b1`). Two run in the same
-session minutes apart; the third is the 2026-08-15 campaign point.
+Four legs, one box, one binary (`infinityd-6bd25b1`). Three run in the
+same session; the fourth is the 2026-08-15 campaign point.
 
 | leg | when | shape | cache | boot wall | replayed | records |
 |---|---|---|---|---|---|---|
 | tail-only | 2026-08-15 | no checkpoint | warm | **5.906 s** | 6.278 GB | 11,248,852 |
 | **tail-only** | **2026-08-16** | no checkpoint | warm | **13.415 s** | 4.435 GB | 11,457,788 |
 | **ick-tail** | **2026-08-16** | checkpoint completed | warm | **12.308 s** | 3.364 GB | 10,611,896 |
+| **tail-only** | **2026-08-16** | no checkpoint | **COLD** | **13.115 s** | 4.167 GB | 11,772,379 |
 
-Artifacts: `recovery-brackets/` (ick-tail), `recovery-brackets-tail-only/`,
-and `recovery/` (the 08-15 point). Leg B (cold cache) is **not yet run** —
-it needs `sudo`.
+All four legs pass the `< 15 s` boot gate. Artifacts: `recovery-brackets/`
+(ick-tail), `recovery-brackets-tail-only/`, `recovery-brackets-cold/`, and
+`recovery/` (the 08-15 point). **The 2×2 is complete.**
 
 ## Finding 1 — the boot shape is not the variable. The drive is.
 
@@ -23,8 +24,8 @@ today versus 110.9 s on 08-15**, a 3× slowdown on the same work.
 
 This is the F20/F29 drive-state effect reaching the recovery gate. It has
 a direct consequence: **the 5.906 s figure in ledger C38a is not
-reproducible.** The `< 15 s` gate still passes today at 13.4 s, but the
-margin collapses from **2.5× to 1.11×**.
+reproducible.** The `< 15 s` gate passes in **all four legs** — worst 13.415 s — but the
+margin collapses from **2.5× to 1.12×**.
 
 **A correction to an earlier reading in this same session.** Comparing
 today's ick-tail (12.3 s) against 08-15's tail-only (5.9 s) suggested the
@@ -68,6 +69,7 @@ Splitting each boot at the observed phase transition:
 | tail-only 08-15 | ~4.5 s | ~1.4 s | ~1.12 | 0.266 |
 | tail-only today | ~12.5 s | ~0.9 s | ~1.21 | 0.083 |
 | ick-tail today | ~11.5 s | ~0.8 s | ~1.04 | 0.068 |
+| tail-only today, COLD | ~10.8 s | ~2.3 s | ~0.45 | 0.079 |
 
 **Record replay moves 3.4–6.3 GB in about one second in every leg.** The
 whole-boot figure varies 4× across legs only because `Start` does.
@@ -76,7 +78,7 @@ whole-boot figure varies 4× across legs only because `Start` does.
 
 The §7 row is *"Recovery with tiering on: **replay throughput** per cell
 ≥ 1 GB/s"*. Measured against the phase the row is named after, all three
-legs sit at **~1.0–1.2 GB/s/cell** — at or above the bar. The published
+warm legs sit at **~1.0–1.2 GB/s/cell** — at or above the bar (the cold leg's replay phase is wider and its rate correspondingly lower, but see the precision caveat: at ±1 s these splits do not separate). The published
 **0.266 GB/s/cell FAIL divides replayed bytes by total boot time**, most
 of which is `Start` doing directory and manifest I/O that replays no
 records at all.
@@ -104,12 +106,55 @@ granularity**, so each phase boundary carries ±1 s. On a replay phase of
 are order-of-magnitude, **not** precise figures, and none of them should be
 quoted as a claim. What is robust is the qualitative split — the phase
 labels are explicit in the log, and `Start` is measured in seconds while
-replay finishes inside one reporting interval in all three legs.
+replay finishes inside one or two reporting intervals in all four legs.
 
 **The first thing any follow-up should do is timestamp the phase
 transitions directly** (`Recovery::phase_code` already exists; it needs
 per-transition timing, not a poll). Until then no precise per-phase number
 is claimable.
+
+## Finding 2b — `Start` is not page-cache work either (a clean negative)
+
+The cold leg was run expecting the harshest corner: `Start` is directory
+and manifest I/O, which is exactly what dropping the page cache should
+punish. It did nothing.
+
+| same shape, same session | boot | replayed |
+|---|---|---|
+| tail-only, warm | **13.415 s** | 4.435 GB |
+| tail-only, **cold** (`vm.drop_caches=3`) | **13.115 s** | 4.167 GB |
+
+The cold boot is **2.2% faster** — i.e. indistinguishable. The drop was
+real: `Cached` fell to 969 MB and `MemFree` sat at 28.6 GB immediately
+before the boot, and `drop_caches=3` evicts dentries and inodes as well as
+page cache, so directory enumeration started from nothing.
+
+**A prediction recorded here on 2026-08-16 said this leg could flip C38a
+from PASS to FAIL. It did not.** With 1.6 s of headroom and a phase built
+from metadata I/O, that looked like the likely outcome; it was wrong, and
+the wrong prediction is left in place above rather than edited out.
+
+The negative result is worth more than the verdict, because it eliminates
+a class of explanation. Across the three legs measured in one session, the
+boot cost is ~12.3–13.4 s **regardless of boot shape and regardless of
+page-cache state**, while replay volume varies 3.4–4.4 GB. Yet the same
+shape read 5.906 s the previous day. So `Start` is:
+
+- **not** re-reading data the page cache would have held (cold == warm);
+- **not** a function of replay volume (the 08-15 leg replayed the *most*,
+  6.278 GB, and was the *fastest* at 5.906 s);
+- **not** a function of boot shape (ick-tail ≈ tail-only);
+- **but strongly correlated with device state across days** — the same
+  fill took 110.9 s on 08-15 and 326–346 s on 08-16, and the boot moved
+  with it.
+
+That combination points away from reads and toward **write- or
+metadata-side work inside `Start`** — its documented steps include
+*"checkpoint open + presize"*, and a large `fallocate`/preallocation on a
+DRAM-less SSD with a saturated SLC cache is both device-state sensitive
+and page-cache insensitive. **That is a hypothesis, not a finding**; it is
+what M4.5-S21's phase instrumentation should test first, because it is the
+only candidate left standing after the two negatives above.
 
 ## Finding 3 — the progress reporter is actively misleading during `Start`
 
