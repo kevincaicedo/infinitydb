@@ -1,6 +1,14 @@
 //! M3-S16 AC: the accepted scalar lane performs zero heap allocations on
 //! both canonical tape and arena-tree representations after construction.
-//! One test owns this binary because the counter is process-global.
+//!
+//! The delta is taken on the **thread-local** counter, not the global one.
+//! The AC is about this code path; a process-global delta also captures
+//! whatever the harness or another thread did in the same window, which it
+//! cannot attribute. That is not hypothetical — the global form failed CI
+//! on 2026-08-17 with 4 allocations across 20,000 calls (0.0002/call, so
+//! not a per-call allocation), on a path that measures 0 at 20,000
+//! iterations locally and is allocation-free by construction: Toggle
+//! rewrites an inline slot and maps no arena chunk.
 
 use inf_alloc::CountingAllocator;
 use inf_alloc::arena::{Arena, ArenaConfig};
@@ -30,7 +38,7 @@ fn accepted_tape_and_arena_scalar_patches_allocate_nothing() {
         Ok(ScalarPatch::Toggled(true))
     ));
 
-    let before = ALLOC.allocations();
+    let before = ALLOC.thread_allocations();
     for _ in 0..10_000 {
         assert!(matches!(
             patch_scalar_in_place(&mut tape, &program, &ApplyOp::Toggle),
@@ -41,6 +49,6 @@ fn accepted_tape_and_arena_scalar_patches_allocate_nothing() {
             Ok(ScalarPatch::Toggled(_))
         ));
     }
-    let after = ALLOC.allocations();
-    assert_eq!(after - before, 0, "accepted scalar patch path allocated");
+    let after = ALLOC.thread_allocations();
+    assert_eq!(after - before, 0, "accepted scalar patch path allocated on this thread");
 }
