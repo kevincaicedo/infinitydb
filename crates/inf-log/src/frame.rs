@@ -210,6 +210,14 @@ pub enum FrameDecodeError {
         stored: u32,
         computed: u32,
     },
+    /// `first_lsn.offset` cannot be a frame's own record cursor: it sits
+    /// below one header length, or the frame's bytes would run past the
+    /// `u32` offset ceiling. Honest writers derive it as `base + header_len`
+    /// (20 for v1, 40 for v2) inside a segment — ADR-0011 D2 as restated
+    /// per-version by ADR-0072 D1 — so either shape is corruption.
+    BadFirstLsn {
+        offset: u32,
+    },
 }
 
 impl fmt::Display for FrameDecodeError {
@@ -225,6 +233,9 @@ impl fmt::Display for FrameDecodeError {
             FrameDecodeError::BadStamp => write!(f, "frame stamp with reserved epoch/seq 0"),
             FrameDecodeError::CrcMismatch { stored, computed } => {
                 write!(f, "frame CRC mismatch: stored {stored:#010x}, computed {computed:#010x}")
+            }
+            FrameDecodeError::BadFirstLsn { offset } => {
+                write!(f, "frame first_lsn offset {offset} cannot address this frame's records")
             }
         }
     }
@@ -435,6 +446,22 @@ pub fn decode_frame(
         SegmentId(u32::from_le_bytes(frame[12..16].try_into().expect("4-byte slice"))),
         u32::from_le_bytes(frame[16..20].try_into().expect("4-byte slice")),
     );
+    // An honest writer derives the first record's offset as `base +
+    // header_len` — 20 for v1, 40 for v2 — and the whole frame sits inside a
+    // u32-addressed segment (ADR-0011 D2 as restated per-version by
+    // ADR-0072 D1; D2's own text says "+ 20", which is v1-era wording).
+    // So the offset is at least one header in and the frame's own bytes fit
+    // below the ceiling. Without this bound a CRC-valid frame declaring a
+    // near-`u32::MAX` offset makes `RecordIter` advance the record cursor
+    // past the ceiling and panic in `Lsn::advance`, and makes
+    // `Phase::Replay`'s `first_lsn.offset - header_len` frame-base
+    // subtraction underflow.
+    let header_len_u32 = shape.header_len as u32;
+    if first_lsn.offset < header_len_u32
+        || (first_lsn.offset - header_len_u32).checked_add(frame_len).is_none()
+    {
+        return Err(FrameDecodeError::BadFirstLsn { offset: first_lsn.offset });
+    }
     let stamp = if shape.has_stamp {
         let stamp = FrameStamp {
             epoch: u32::from_le_bytes(frame[20..24].try_into().expect("4-byte slice")),
@@ -503,5 +530,71 @@ impl<'a> Iterator for FrameIter<'a> {
                 Some(Err(err))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::NsId;
+
+    /// One honest single-record v2 frame, then `first_lsn.offset` rewritten
+    /// to `offset` with the trailer repaired — the frame stays CRC-valid,
+    /// which is exactly what a misdirected write delivers (ADR-0011 D2).
+    fn frame_with_first_offset(offset: u32) -> Vec<u8> {
+        let mut builder = FrameBuilder::new();
+        builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: b"v" });
+        let stamp = FrameStamp { epoch: 1, seq: 1, covered_lsn: 0 };
+        let mut image =
+            builder.finalize(Lsn::new(SegmentId(0), FRAME_HEADER_LEN as u32), stamp).to_vec();
+        image[16..20].copy_from_slice(&offset.to_le_bytes());
+        let end = image.len() - FRAME_TRAILER_LEN;
+        let crc = crc32c(&image[..end]);
+        image[end..].copy_from_slice(&crc.to_le_bytes());
+        image
+    }
+
+    /// A CRC-valid frame whose record cursor would run past the `u32` offset
+    /// ceiling is refused at decode. Before this bound `decode_frame`
+    /// admitted it and `RecordIter` panicked in `Lsn::advance` on the first
+    /// record — nightly fuzz `frame_decode`, 2026-08-17.
+    #[test]
+    fn first_lsn_offset_past_the_offset_ceiling_is_a_decode_error() {
+        let image = frame_with_first_offset(u32::MAX);
+        assert!(matches!(
+            decode_frame(&image, DEFAULT_MAX_FRAME_LEN),
+            Err(FrameDecodeError::BadFirstLsn { offset: u32::MAX })
+        ));
+    }
+
+    /// The mirror bound: a frame's first record never sits inside the
+    /// frame's own header, so `Phase::Replay`'s `offset - header_len`
+    /// frame-base subtraction cannot underflow.
+    #[test]
+    fn first_lsn_offset_inside_the_header_is_a_decode_error() {
+        for offset in [0, 1, FRAME_HEADER_LEN as u32 - 1] {
+            let image = frame_with_first_offset(offset);
+            assert!(
+                matches!(
+                    decode_frame(&image, DEFAULT_MAX_FRAME_LEN),
+                    Err(FrameDecodeError::BadFirstLsn { .. })
+                ),
+                "offset {offset} must not decode"
+            );
+        }
+    }
+
+    /// The bound admits the whole legal range: a frame ending exactly at the
+    /// ceiling decodes, and every record walks without panicking.
+    #[test]
+    fn frame_ending_at_the_offset_ceiling_decodes_and_walks() {
+        let frame_len = frame_with_first_offset(FRAME_HEADER_LEN as u32).len() as u32;
+        let last = u32::MAX - frame_len + FRAME_HEADER_LEN as u32;
+        let image = frame_with_first_offset(last);
+        let (frame, consumed) =
+            decode_frame(&image, DEFAULT_MAX_FRAME_LEN).expect("legal offset decodes");
+        assert_eq!(consumed, frame_len as usize);
+        assert_eq!(frame.first_lsn().offset, last);
+        assert_eq!(frame.records().filter(|r| r.is_ok()).count(), 1);
     }
 }

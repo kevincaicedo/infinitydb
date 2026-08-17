@@ -135,6 +135,33 @@ len-4  4    CRC32C(header·body): u32 LE
   frame in a replay prefix is a named refusal (append order — no
   downgrade after the first v2 frame).
 
+## `first_lsn` bound — post-M2-exit amendment (ADR-0072, 2026-08-17)
+
+Post-exit change to a frozen surface, ADR-gated per the freeze discipline.
+The nightly `frame_decode` campaign found that `first_lsn.offset` was read
+from the header and never bounded: a CRC-valid frame declaring
+`offset = u32::MAX` made `RecordIter` advance the record cursor past the
+`u32` ceiling and panic in `Lsn::advance`.
+
+- **The derivation is per-version.** `first record = frame base +
+  header_len` — 20 for v1, 40 for v2. ADR-0011 D2's text says "frame base
+  + 20", which is v1-era wording from before ADR-0031's 40-byte v2 header;
+  ADR-0072 D1 restates it. **Cite `header_len`, never the constant 20.**
+- **`decode_frame` bounds the field** where it is read, for both formats:
+  `header_len ≤ first_lsn.offset` and `(first_lsn.offset − header_len) +
+  frame_len ≤ u32::MAX`. A frame's first record is never inside its own
+  header, and a frame always fits inside a u32-addressed segment.
+- **New public variant `FrameDecodeError::BadFirstLsn { offset: u32 }`** —
+  corruption class, not the torn-tail class (`ZeroMagic` stays the only
+  expected end-of-log signal). `FrameDecodeError` deliberately stays
+  exhaustive (no `#[non_exhaustive]`, ADR-0072 D3): the added variant is
+  semver-breaking for external matchers, accepted pre-1.0 and revisited at
+  1.0. Decoder error enums grow by ADR, each naming its semver impact.
+- The bound also makes `inf-server::recover`'s `first_lsn.offset −
+  header_len` frame-base subtraction sound on its own, instead of relying
+  on `SegmentReader::next_frame`'s physical-offset cross-check having run
+  first.
+
 ## LSN addressing (`inf-log::lsn`)
 
 `Lsn = { segment: SegmentId(u32), offset: u32 }`, per cell; ordering is
