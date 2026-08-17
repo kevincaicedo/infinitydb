@@ -262,13 +262,23 @@ measured_by = "M3 gate set re-run on the tiering build (same harness, A/B vs the
 
 [[gate]]
 id = "recovery_tiered_gbps"
-name = "Recovery with tiering on: replay throughput per cell"
+name = "Recovery with tiering on: replay throughput per cell (REPLAY PHASE ONLY)"
 threshold = 1.0
 comparator = ">="
-unit = "GB/s/cell"
+unit = "GB/s/cell, measured over Phase::Replay only (ADR-0070 D7, 2026-08-16)"
 tier = "linux-reference-box"
 source = "recovery:tiered_gbps_per_cell"
-measured_by = "M2 recovery gate re-run with tiering on (S12 shape); carried via --recovery-gbps-per-cell + --campaign-note"
+measured_by = "M2 recovery gate re-run with tiering on (S12 shape); carried via --recovery-gbps-per-cell + --campaign-note. SCOPE FIXED BY ADR-0070 D7: this row was previously computed as replayed bytes / TOTAL boot time, which conflated replay with Phase::Start and produced 0.266 GB/s/cell. Measured over the phase the row is named after, all four 2026-08-16 legs read ~1.0-1.2 GB/s/cell. The row stays Evidence-pending until M4.5-S21 task 1 lands per-phase timestamps: 1-second progress polls can adjudicate a 2.4x miss on Start but cannot certify a ~1 GB/s pass on a ~1 s phase."
+
+[[gate]]
+id = "recovery_tiered_setup_s"
+name = "Recovery with tiering on: startup overhead before replay begins"
+threshold = 5.0
+comparator = "<"
+unit = "s, Phase::Start (dirs, MANIFEST, scan, floor checks, checkpoint open + presize)"
+tier = "linux-reference-box"
+source = "recovery:tiered_setup_s"
+measured_by = "Boot-log phase transitions; carried via --recovery-setup-s + --campaign-note. ADDED BY ADR-0070 D7 (owner, 2026-08-16) when the single replay row was split in two. Threshold derived, not fitted: the operator-facing promise is the 15 s boot gate, Phase::Start does no user-visible work, so pure overhead may not dominate that budget -- one third is the bar. Measured 10.8-12.5 s on 2026-08-16 (4 legs), a 2.2-2.5x miss, far outside the +/-1 s poll uncertainty, so the row binds as FAIL now. This is an ADDITIONAL constraint the project did not previously have to meet -- the 1 GB/s and 15 s bars are both unchanged."
 
 [[gate]]
 id = "recovery_tiered_boot"

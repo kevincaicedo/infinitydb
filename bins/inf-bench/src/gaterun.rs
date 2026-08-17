@@ -510,6 +510,9 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-always",
         "recovery-gbps-per-cell",
         "recovery-boot-s",
+        // ADR-0070 D7 (2026-08-16): Phase::Start overhead, split out of the
+        // replay row after F33 showed the two were being conflated.
+        "recovery-setup-s",
         "dst-violations",
         "crash-failures",
         "m0m1-pct",
