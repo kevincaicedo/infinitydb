@@ -13,6 +13,7 @@
 mod program;
 mod vm;
 
+pub(crate) use program::explain as explain_predicate;
 pub use program::{
     CmpOp, Constant, Predicate, PredicateBuildError, PredicateError, PredicateErrorKind,
     PredicateProgram, encode,

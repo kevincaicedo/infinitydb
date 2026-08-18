@@ -1,0 +1,5 @@
+compile_typical         time:   [1.2633 µs 1.2645 µs 1.2659 µs]
+compile_point           time:   [343.68 ns 344.35 ns 345.12 ns]
+compile_reject          time:   [172.91 ns 173.04 ns 173.20 ns]
+cache_hit               time:   [52.509 ns 52.561 ns 52.626 ns]
+cache_hot_mix           time:   [61.079 ns 61.112 ns 61.147 ns]

@@ -15,10 +15,26 @@ libfuzzer-sys = "0.4"
 inf-query = { path = ".." }
 # Evaluation-corpus documents for the S08 evaluator lane.
 inf-doc = { path = "../../inf-doc" }
+# Catalog fixture types for the S09 compiler lane.
+inf-store = { path = "../../inf-store" }
 
 [[bin]]
 name = "fuzz_predicate_program"
 path = "fuzz_targets/fuzz_predicate_program.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_partiql_parse"
+path = "fuzz_targets/fuzz_partiql_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_access_program"
+path = "fuzz_targets/fuzz_access_program.rs"
 test = false
 doc = false
 bench = false

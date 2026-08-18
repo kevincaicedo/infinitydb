@@ -89,6 +89,7 @@ version = "0.0.0"
 dependencies = [
  "inf-doc",
  "inf-query",
+ "inf-store",
  "libfuzzer-sys",
 ]
 
@@ -101,6 +102,7 @@ name = "inf-store"
 version = "0.0.0"
 dependencies = [
  "inf-alloc",
+ "inf-doc",
  "inf-foundation",
  "inf-log",
  "inf-simd",

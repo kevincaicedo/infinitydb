@@ -27,5 +27,9 @@ inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
 name = "predicate_eval"
 harness = false
 
+[[bench]]
+name = "partiql_compile"
+harness = false
+
 [lints]
 workspace = true

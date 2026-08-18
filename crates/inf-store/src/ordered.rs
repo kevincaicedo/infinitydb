@@ -1483,6 +1483,19 @@ impl OrderedCursor {
         cursor
     }
 
+    /// Cursor strictly after the exact `(key, entry_ref)` pair — the
+    /// page-resume shape (ADR-0080 D4). Unlike `from_key(key, false)`,
+    /// which skips *every* ref of `key`, this resumes mid-key: a
+    /// multi-valued index holds many refs under one key and a page
+    /// boundary must not skip the rest of them.
+    pub fn resume_after(key: &[u8], entry_ref: u64) -> OrderedCursor {
+        let mut cursor = OrderedCursor::from_start();
+        cursor.key_buf.extend_from_slice(key);
+        cursor.pos = CursorPos::After;
+        cursor.entry_ref = entry_ref;
+        cursor
+    }
+
     /// The next pair, or `None` past the end. A cursor at the end stays
     /// valid: pairs inserted later beyond the resume point will be
     /// returned by subsequent calls (the M1 SCAN posture).
@@ -1664,6 +1677,32 @@ mod tests {
         let mut cursor = OrderedCursor::from_key(&key8(20), false);
         let (key, _) = cursor.next(&map).unwrap();
         assert_eq!(u64::from_be_bytes(key.try_into().unwrap()), 30);
+    }
+
+    // The S09 page-resume shape (ADR-0080 D4): strictly after an exact
+    // (key, ref) pair — mid-key, unlike `from_key(_, false)`, which
+    // skips every ref of the key. Also across mutation: the cursor
+    // owns its pair and re-seeks.
+    #[test]
+    fn resume_after_resumes_mid_key() {
+        let mut map = FixedMap::new();
+        for (v, r) in [(10u64, 0u64), (20, 1), (20, 2), (20, 3), (30, 4)] {
+            map.insert(&key8(v), r).unwrap();
+        }
+        let mut cursor = OrderedCursor::resume_after(&key8(20), 1);
+        let (key, entry_ref) = cursor.next(&map).unwrap();
+        assert_eq!((u64::from_be_bytes(key.try_into().unwrap()), entry_ref), (20, 2));
+        // Mutation between calls: a pair inserted behind the resume
+        // point stays invisible; one at the resume key's tail shows.
+        map.insert(&key8(15), 9).unwrap();
+        map.insert(&key8(20), 7).unwrap();
+        let (key, entry_ref) = cursor.next(&map).unwrap();
+        assert_eq!((u64::from_be_bytes(key.try_into().unwrap()), entry_ref), (20, 3));
+        let (key, entry_ref) = cursor.next(&map).unwrap();
+        assert_eq!((u64::from_be_bytes(key.try_into().unwrap()), entry_ref), (20, 7));
+        let (key, entry_ref) = cursor.next(&map).unwrap();
+        assert_eq!((u64::from_be_bytes(key.try_into().unwrap()), entry_ref), (30, 4));
+        assert!(cursor.next(&map).is_none());
     }
 
     #[derive(Clone, Debug)]

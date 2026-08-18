@@ -17,8 +17,9 @@ Status column tracks arrival.
 | At-mutation maintenance hook (the ADR-0072 bracket + removal sites) | `inf-store`/`inf-server` | implemented (M4.5-S04, ADR-0076 — attach-block custody, `hash64(key)` pk ref, the numbered-db funnel bracket, death hook + truncate + replay arm) |
 | Backfill state machine (MAINTAIN slices, resumable watermark) | `inf-store` | implemented (M4.5-S05, ADR-0077 — store-resident walk, volatile resume-only watermark (crash ⇒ restart), per-index jobs, slot = id-rank, MAINTAIN-edge catalog flip) |
 | Index checkpoint sidecar v1 (`.ick` v2 tag 0x06) | `inf-log` | implemented (M4.5-S06, ADR-0078 under the ADR-0073 constraints — 36-byte self-describing body meta `{ns, index id, generation, key-encoding version, key scheme, flags, entries_before, total_entries}` + strictly-ascending `(typed key bytes, entry_ref)` pairs, FINAL-closed streams; the only *soft* body class: damage rebuilds one projection, never refuses a boot) |
-| Access-program form v1 | `inf-query` | pending (M4.5-S09) |
-| Predicate VM bytecode v1 | `inf-query` | pending (M4.5-S07/S08) |
+| Access-program form v1 | `inf-query` | implemented (M4.5-S09, ADR-0080 — `access::AccessProgram`: one access step + residual + page spec, serialized/versioned, `from_bytes` trust boundary; EXPLAIN rendering golden-pinned) |
+| PartiQL subset v1 (grammar + total compiler + statement cache) | `inf-query` | implemented (M4.5-S09, ADR-0080 — `partiql::compile`/`StatementCache`/`CatalogView`; contract: `docs/partiql-subset.md` + the 303-case golden suite) |
+| Predicate VM bytecode v1 | `inf-query` | implemented (M4.5-S07/S08, ADR-0079 — `predicate::PredicateProgram` + `PredicateVm`; this row lagged those stories and is corrected at S09) |
 | `QueryOp` codec (fabric v1.2) | `inf-fabric` | pending (M4.5-S11) |
 | Cursor wire format (opaque, CRC + version + shape + {index id, generation} binding) | `inf-server` | pending (M4.5-S11 — the binding half exists as `validate_binding`, S03) |
 
@@ -160,3 +161,56 @@ Status column tracks arrival.
   loudly. Crash ⇒ restart (ADR-0077 D2) is untouched — no sidecar means
   the S05 machine rebuilds. DST: `inf-sim --scenario m45-sidecar`;
   crash rows: `tests/crash-matrix/tests/sidecar.rs`.
+
+## Compiler surface (M4.5-S09, ADR-0080 — the ADR-0024 D2 fence as-built)
+
+- **Total compilation:** `inf_query::partiql::compile[_with_max_bytes]`
+  — statement text → `CompiledStatement { program, access, vm }`, or a
+  `QlError` whose `Display` string is the documented rejection
+  (`infinitydb/docs/partiql-subset.md` §7 — the compat contract; the
+  300-case golden suite pins it verbatim). The output type has exactly
+  one access-step field; no code path compares two candidate plans —
+  ambiguity is a typed refusal naming the explicit `FROM ns."index"`
+  form.
+- **Catalog input:** the `partiql::CatalogView` trait (`resolve_ns`,
+  `index_by_name`, `indexes`, `catalog_epoch`) — planning reads catalog
+  state only (ADR-0075 D3); `inf-server` implements it over the real
+  catalog at S10/S11. `IndexRegistry::epoch()` (new, additive) backs
+  the epoch; server views fold namespace DDL in.
+- **Access-program form v1:** `inf_query::access` —
+  `Access`/`AccessStep::{PkGet, IndexRange, Scan}`/`RangeEdge`/
+  `Projection`; `encode` is the only writer, `AccessProgram::from_bytes`
+  the trust boundary (nested residual revalidation included);
+  `AccessProgram::explain()` is the deterministic rendering S12 reuses.
+  Bounds are **encoded key bytes** (the truth-table mapping runs once,
+  at compile); `{index id, generation, key type}` ride the program and
+  re-assert at the executing cell via `validate_binding`.
+- **Range bounds (ADR-0080 D3):** constructed against the S02 encoding
+  — `begins_with` on the ADR-0074 D2 prefix property
+  (`index_key_escape_prefix`, new in `inf-store::index_key`, owns the
+  escape image), cross-numeric bounds via integral tightening (i64
+  index) and encoded-word neighbor stepping (f64 index), reversed/
+  contradictory ranges compile empty (never an error). Proven by the
+  `partiql_bounds` oracle: encoded-key membership ≡ the production VM
+  verdict for every admitted value (boundary corpus + property lane).
+- **Statement cache:** `partiql::StatementCache` — the M3-S10
+  `ProgramCache` shape keyed by raw statement text, epoch-guarded
+  (stale entries recompile, counted as `invalidations`); the value
+  holds the residual's `PredicateVm` pools pre-decoded (the S08 cold
+  path lives in the cache, not per execution). Rejections are never
+  cached.
+- **Page step (ADR-0080 D4):** `inf_query::page::RangePager` — seek
+  (resume pair or lower edge; `OrderedCursor::resume_after`, new,
+  additive — mid-key exact), upper-edge check, scan-budget bound
+  (entries **scanned**, not matched), statement-`LIMIT` countdown,
+  resume production. S11 drives it per page and owns doc resolution,
+  TTL filtering, wire assembly, and yields; `COUNT(*)` pages return
+  {matched, scanned} — the DynamoDB `Count`/`ScannedCount` register.
+- **Scan consent:** the `FROM ns.SCAN` grammar and
+  `AccessStep::Scan` compile here (grammar is one contract); S14 owns
+  execution, rate limits, and the storm proof. `SCAN` is a reserved
+  index name (S10 refuses it at `CREATE`).
+- **Fuzz:** `fuzz_partiql_parse` (statement bytes: no panic,
+  deterministic accept/reject, round-trip, EXPLAIN total) and
+  `fuzz_access_program` (decoder bytes: no panic, decode→encode byte
+  identity) — same-PR L9.
