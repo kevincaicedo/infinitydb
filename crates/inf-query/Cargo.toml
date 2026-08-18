@@ -9,9 +9,23 @@ publish.workspace = true
 [dependencies]
 inf-foundation = { workspace = true }
 inf-doc = { workspace = true }
+# The ADR-0074 truth-table import (compare_i64_f64 — the two-importer
+# rule); default-features = false at the workspace level keeps the doc
+# engine edge scoped by the consumer (ADR-0041 D3).
+inf-store = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Differential-oracle reference only (the S08 plan AC); never a
+# data-plane dependency.
+serde_json = { workspace = true }
+criterion = { workspace = true }
+# Thread-local allocation counter for the S08 zero-allocation gate.
+inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
+
+[[bench]]
+name = "predicate_eval"
+harness = false
 
 [lints]
 workspace = true

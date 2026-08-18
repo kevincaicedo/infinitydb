@@ -7,15 +7,17 @@
 //! pools (embedded ADR-0040 path programs; typed constants). There is
 //! no jump opcode — control flow is the expression tree's shape, so
 //! termination is structural, not an evaluator promise (ADR-0079 D2/D8).
-//! This module owns the serialized form; the S08 evaluator adds `eval`
-//! against the ADR-0079 D4–D6 semantics.
+//! `program` owns the serialized form (S07); `vm` owns evaluation
+//! against the ADR-0079 D4–D6 semantics (S08).
 
 mod program;
+mod vm;
 
 pub use program::{
     CmpOp, Constant, Predicate, PredicateBuildError, PredicateError, PredicateErrorKind,
     PredicateProgram, encode,
 };
+pub use vm::{EvalFlags, EvalOutcome, PredicateEvalError, PredicateVm};
 
 /// Format ceiling for one serialized predicate program (ADR-0079 D7).
 /// Same class as `PATH_BYTES_CEILING`: programs ride `QueryOp` fabric

@@ -14,6 +14,8 @@
 //! cursors never cross a suspension boundary; resume re-derives them);
 //! the match set is capped with a typed error.
 
+use core::ops::ControlFlow;
+
 use crate::cursor::{ArrEntries, DocValue, ObjEntries};
 
 use super::PathProgram;
@@ -341,6 +343,227 @@ fn consume<'a>(
         progress: Progress::Fresh,
     });
     Ok(())
+}
+
+/// Fixed hot capacity of [`VisitFrames`]. The live spine is one frame
+/// per op application root-to-current (plus one per document level
+/// under `..`), so 16 covers every realistic predicate path without
+/// touching the heap; deeper walks spill (correctness path, not the
+/// M4.5-S08 zero-allocation eval path).
+const VISIT_FRAMES_HOT: usize = 16;
+
+/// Frame storage for [`eval_visit`]'s general walk: a fixed hot array
+/// (stack-resident — the S08 zero-allocation requirement) with heap
+/// spill past realistic depth. Constructed only when a walk actually
+/// needs frames — simple chains take the [`visit_simple`] lane and
+/// never pay the array fill (the perf profile made the fill ~18% of a
+/// two-leaf predicate eval before this split).
+struct VisitFrames<'a> {
+    hot: [Frame<'a>; VISIT_FRAMES_HOT],
+    hot_len: usize,
+    spill: Vec<Frame<'a>>,
+}
+
+impl<'a> VisitFrames<'a> {
+    fn new() -> VisitFrames<'a> {
+        let dummy = || Frame {
+            op_at: 0,
+            next_pc: 0,
+            node: DocValue::Null,
+            stepped: false,
+            progress: Progress::Fresh,
+        };
+        VisitFrames { hot: core::array::from_fn(|_| dummy()), hot_len: 0, spill: Vec::new() }
+    }
+
+    fn push(&mut self, frame: Frame<'a>) {
+        // The spine is bounded: ≤ 2 frames per segment level (a union
+        // frame plus its member's frame) plus one per document level
+        // under `..` — all format-capped, so spill growth is finite (L9).
+        debug_assert!(
+            self.hot_len + self.spill.len() < 2 * super::SEGMENTS_MAX + crate::limits::DEPTH_MAX,
+            "frame spine exceeds the segment + document-depth bound"
+        );
+        if self.hot_len < VISIT_FRAMES_HOT {
+            self.hot[self.hot_len] = frame;
+            self.hot_len += 1;
+        } else {
+            self.spill.push(frame);
+        }
+    }
+
+    fn pop_discard(&mut self) {
+        if !self.spill.is_empty() {
+            self.spill.pop();
+            return;
+        }
+        debug_assert!(self.hot_len > 0, "pop on an empty frame stack");
+        self.hot_len -= 1;
+    }
+
+    fn last_mut(&mut self) -> Option<&mut Frame<'a>> {
+        if !self.spill.is_empty() {
+            return self.spill.last_mut();
+        }
+        if self.hot_len == 0 {
+            return None;
+        }
+        Some(&mut self.hot[self.hot_len - 1])
+    }
+}
+
+/// How a [`eval_visit`] walk ended.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VisitEnd {
+    /// Every match was delivered.
+    Complete,
+    /// The visitor broke early.
+    Stopped,
+    /// The node budget ran out. There is no yield state: a predicate
+    /// eval either completes within fuel or the caller surfaces the
+    /// typed fuel error (ADR-0079 D6).
+    Exhausted,
+}
+
+/// [`eval_visit`]'s result: how the walk ended plus the nodes it
+/// consumed — the ADR-0040 D6 budget unit, the caller's fuel charge.
+#[derive(Copy, Clone, Debug)]
+pub struct VisitOutcome {
+    pub end: VisitEnd,
+    pub nodes_visited: u64,
+}
+
+/// Streaming evaluation (M4.5-S08): every match is handed to `on_match`
+/// as a live cursor instead of being recorded as a location path — the
+/// predicate VM tests values existentially and never materializes the
+/// match set (no `Matches`, no step trail, no second `resolve` walk).
+/// Selector semantics are [`advance`], the same core [`eval`] and
+/// [`eval_budgeted`] drive, so this cannot diverge from the frozen
+/// ADR-0040 order/dedup rules — this loop differs only in match
+/// delivery and storage discipline; plain `Child`/`Index` chains take
+/// the established ADR-0043 D1 simple lane ([`visit_simple`]) with
+/// identical accounting. Matches stream in raw program order,
+/// duplicates included ([`Matches::canonical`] is where dedup lives);
+/// existential consumers are insensitive to both. The `max_matches`
+/// cap does not apply — nothing accumulates; the node budget is the
+/// bound. Zero heap allocation up to a [`VISIT_FRAMES_HOT`]-deep frame
+/// spine; deeper general walks spill.
+pub fn eval_visit<'a, F>(
+    program: &PathProgram,
+    root: DocValue<'a>,
+    budget_nodes: u64,
+    mut on_match: F,
+) -> VisitOutcome
+where
+    F: FnMut(DocValue<'a>) -> ControlFlow<()>,
+{
+    if let Some(steps) = program.simple_steps() {
+        return visit_simple(steps, root, budget_nodes, on_match);
+    }
+    let bytes = program.as_bytes();
+    let end = bytes.len() as u32;
+    let mut frames = VisitFrames::new();
+    let mut budget = budget_nodes;
+    let mut nodes_visited: u64 = 0;
+    // The Root op (offset 2) selects the root node once, unbudgeted —
+    // the run() convention, so a completing walk consumes exactly the
+    // nodes eval_budgeted would (the congruence tests pin it).
+    let staged = Item { node: root, pc: 3, cont: cont_of(bytes, 3), step: None };
+    if stage_visit(staged, &mut frames, end, &mut on_match).is_break() {
+        return VisitOutcome { end: VisitEnd::Stopped, nodes_visited };
+    }
+    loop {
+        let Some(top) = frames.last_mut() else {
+            return VisitOutcome { end: VisitEnd::Complete, nodes_visited };
+        };
+        let Some(item) = advance(top, bytes, end) else {
+            frames.pop_discard();
+            continue;
+        };
+        if budget == 0 {
+            debug_assert_eq!(nodes_visited, budget_nodes, "exhaustion consumes the exact budget");
+            return VisitOutcome { end: VisitEnd::Exhausted, nodes_visited };
+        }
+        budget -= 1;
+        nodes_visited += 1;
+        if stage_visit(item, &mut frames, end, &mut on_match).is_break() {
+            return VisitOutcome { end: VisitEnd::Stopped, nodes_visited };
+        }
+    }
+}
+
+/// The ADR-0043 D1 lane for `Child`/`Index` chains: direct cursor hops,
+/// no frames, no op re-decode — at most one match by construction.
+/// Accounting is item-for-item what the general loop would do (each
+/// successful hop is the one item [`advance`] would produce, checked
+/// against the budget before it is consumed); the congruence proptest
+/// pins the equivalence across both lanes.
+fn visit_simple<'a, F>(
+    steps: super::program::SimpleSteps<'_>,
+    root: DocValue<'a>,
+    budget_nodes: u64,
+    mut on_match: F,
+) -> VisitOutcome
+where
+    F: FnMut(DocValue<'a>) -> ControlFlow<()>,
+{
+    let mut node = root;
+    let mut budget = budget_nodes;
+    let mut nodes_visited: u64 = 0;
+    for step in steps {
+        let child = match step {
+            super::program::SimpleStep::Child(key) => match node {
+                DocValue::Obj(entries) => {
+                    entries.iter().find(|(k, _)| k.as_bytes() == key).map(|(_, value)| value)
+                }
+                _ => None,
+            },
+            super::program::SimpleStep::Index(index) => match node {
+                DocValue::Arr(items) => resolve_index(index, || items.len() as i64)
+                    .and_then(|ordinal| items.index(ordinal as usize)),
+                _ => None,
+            },
+        };
+        // A failed hop is an empty match set — no item was produced, so
+        // nothing charges (the general loop's accounting, exactly).
+        let Some(child) = child else {
+            return VisitOutcome { end: VisitEnd::Complete, nodes_visited };
+        };
+        if budget == 0 {
+            debug_assert_eq!(nodes_visited, budget_nodes, "exhaustion consumes the exact budget");
+            return VisitOutcome { end: VisitEnd::Exhausted, nodes_visited };
+        }
+        budget -= 1;
+        nodes_visited += 1;
+        node = child;
+    }
+    let end = if on_match(node).is_break() { VisitEnd::Stopped } else { VisitEnd::Complete };
+    VisitOutcome { end, nodes_visited }
+}
+
+/// Deliver a finished item to the visitor, or push its frame. The step
+/// trail run() maintains does not exist here — no caller reads location
+/// paths, so `stepped` is dead weight kept false.
+fn stage_visit<'a, F>(
+    item: Item<'a>,
+    frames: &mut VisitFrames<'a>,
+    end: u32,
+    on_match: &mut F,
+) -> ControlFlow<()>
+where
+    F: FnMut(DocValue<'a>) -> ControlFlow<()>,
+{
+    if item.pc == end {
+        return on_match(item.node);
+    }
+    frames.push(Frame {
+        op_at: item.pc,
+        next_pc: item.cont,
+        node: item.node,
+        stepped: false,
+        progress: Progress::Fresh,
+    });
+    ControlFlow::Continue(())
 }
 
 /// Continuation of the op at `pc` (== `end` when `pc` is the last op).

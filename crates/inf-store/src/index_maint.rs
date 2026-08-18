@@ -201,6 +201,11 @@ mod imp {
     }
 
     impl CellIndexes {
+        /// Empty attach block (cell-boot state: no indexes attached).
+        pub(crate) fn new() -> CellIndexes {
+            CellIndexes::default()
+        }
+
         /// The zero-index fast path: one predictable branch.
         #[inline]
         pub(crate) fn is_active(&self) -> bool {
@@ -960,6 +965,13 @@ pub(crate) struct CellIndexes;
 
 #[cfg(not(feature = "doc"))]
 impl CellIndexes {
+    // Unit-struct value, but constructed like the doc-lane type so the
+    // one call site reads identically under both cfgs.
+    #[inline]
+    pub(crate) fn new() -> CellIndexes {
+        CellIndexes
+    }
+
     #[inline]
     pub(crate) fn memory(&self) -> crate::index_registry::IndexMemory {
         crate::index_registry::IndexMemory::default()

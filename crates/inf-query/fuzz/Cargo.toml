@@ -13,6 +13,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 inf-query = { path = ".." }
+# Evaluation-corpus documents for the S08 evaluator lane.
+inf-doc = { path = "../../inf-doc" }
 
 [[bin]]
 name = "fuzz_predicate_program"
