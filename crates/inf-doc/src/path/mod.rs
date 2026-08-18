@@ -16,8 +16,8 @@ mod program;
 pub use ast::{Member, PathAst, Segment, SliceSpec};
 pub use cache::{PROGRAM_CACHE_DEFAULT_ENTRIES, ProgramCache};
 pub use eval::{
-    CanonicalMatches, EvalError, EvalLimits, EvalState, EvalStep, Matches, eval, eval_budgeted,
-    resolve,
+    CanonicalMatches, EvalError, EvalLimits, EvalState, EvalStep, Matches, VisitEnd, VisitOutcome,
+    eval, eval_budgeted, eval_visit, resolve,
 };
 pub(crate) use program::SimpleStep;
 pub use program::{PathProgram, PathStep, PathSteps};

@@ -866,7 +866,7 @@ pub(crate) fn read_op(bytes: &[u8], at: usize) -> (Op<'_>, usize) {
     (op, next)
 }
 
-fn decode_paths(bytes: &[u8], at: &mut usize) -> Vec<PathProgram> {
+pub(crate) fn decode_paths(bytes: &[u8], at: &mut usize) -> Vec<PathProgram> {
     let count = trusted_varint(bytes, at);
     let mut paths = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -878,7 +878,7 @@ fn decode_paths(bytes: &[u8], at: &mut usize) -> Vec<PathProgram> {
     paths
 }
 
-fn decode_constants(bytes: &[u8], at: &mut usize) -> Vec<Constant> {
+pub(crate) fn decode_constants(bytes: &[u8], at: &mut usize) -> Vec<Constant> {
     let count = trusted_varint(bytes, at);
     let mut constants = Vec::with_capacity(count as usize);
     for _ in 0..count {

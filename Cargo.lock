@@ -412,9 +412,13 @@ dependencies = [
 name = "inf-query"
 version = "0.0.0"
 dependencies = [
+ "criterion",
+ "inf-alloc",
  "inf-doc",
  "inf-foundation",
+ "inf-store",
  "proptest",
+ "serde_json",
 ]
 
 [[package]]

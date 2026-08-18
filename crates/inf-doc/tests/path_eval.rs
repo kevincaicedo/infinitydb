@@ -11,7 +11,7 @@ use inf_alloc::arena::{Arena, ArenaConfig};
 use inf_doc::model::{self, Value};
 use inf_doc::path::{
     self, EvalLimits, EvalStep, Matches, Member, PathAst, Segment, SliceSpec, compile, eval,
-    eval_budgeted, resolve,
+    eval_budgeted, eval_visit, resolve,
 };
 use inf_doc::{ArenaDoc, DocValue, TapeDoc};
 use proptest::prelude::*;
@@ -430,5 +430,72 @@ proptest! {
             }
         };
         prop_assert_eq!(resumed, unbudgeted);
+    }
+
+    /// M4.5-S08 congruence pair-assertion: the streaming entry
+    /// (`eval_visit`) delivers exactly the values the recording entry
+    /// (`eval`) locates — same multiset, same raw order — and its node
+    /// accounting matches `eval_budgeted`'s yield behavior at every
+    /// budget. Two walks over one `advance` core must agree everywhere
+    /// or the predicate VM's verdicts fork from path semantics.
+    #[test]
+    fn visit_streams_the_recorded_matches(value in arb_value(), ast in arb_path_ast(), budget in 0u64..24) {
+        let text = path::ast::print(&ast);
+        let program = compile(text.as_bytes()).expect("compiles");
+        let bytes = model::encode(&value).expect("encodes");
+        let tape = TapeDoc::from_bytes(&bytes).expect("validates");
+        let root = DocValue::from(tape.root());
+        let matches = eval(&program, root, &EvalLimits::default()).expect("ok");
+        let expected: Vec<Value> = matches
+            .iter()
+            .map(|steps| model::from_cursor(path::resolve(root, steps).expect("match resolves")))
+            .collect();
+        let mut streamed: Vec<Value> = Vec::new();
+        let outcome = eval_visit(&program, root, u64::MAX, |v| {
+            streamed.push(model::from_cursor(v));
+            core::ops::ControlFlow::Continue(())
+        });
+        prop_assert_eq!(outcome.end, path::VisitEnd::Complete);
+        prop_assert_eq!(&streamed, &expected, "visit ≡ eval for {}", text);
+        // Budget congruence: eval_visit exhausts exactly where
+        // eval_budgeted yields (same meter, ADR-0040 D6), and a
+        // completing walk reports nodes within the budget.
+        let bounded = eval_visit(&program, root, budget, |_| {
+            core::ops::ControlFlow::Continue(())
+        });
+        let step = eval_budgeted(&program, root, &EvalLimits::default(), budget, None).expect("ok");
+        match step {
+            EvalStep::Done(_) => {
+                prop_assert_eq!(bounded.end, path::VisitEnd::Complete);
+                prop_assert!(bounded.nodes_visited <= budget);
+            }
+            EvalStep::Yield(_) => {
+                prop_assert_eq!(bounded.end, path::VisitEnd::Exhausted);
+                prop_assert_eq!(bounded.nodes_visited, budget);
+            }
+        }
+    }
+
+    /// The visitor's early break stops the walk and reports it.
+    #[test]
+    fn visit_break_stops_the_walk(value in arb_value(), ast in arb_path_ast()) {
+        let text = path::ast::print(&ast);
+        let program = compile(text.as_bytes()).expect("compiles");
+        let bytes = model::encode(&value).expect("encodes");
+        let tape = TapeDoc::from_bytes(&bytes).expect("validates");
+        let root = DocValue::from(tape.root());
+        let total = eval(&program, root, &EvalLimits::default()).expect("ok").len();
+        let mut seen = 0usize;
+        let outcome = eval_visit(&program, root, u64::MAX, |_| {
+            seen += 1;
+            core::ops::ControlFlow::Break(())
+        });
+        if total == 0 {
+            prop_assert_eq!(outcome.end, path::VisitEnd::Complete);
+            prop_assert_eq!(seen, 0);
+        } else {
+            prop_assert_eq!(outcome.end, path::VisitEnd::Stopped);
+            prop_assert_eq!(seen, 1);
+        }
     }
 }

@@ -438,7 +438,7 @@ impl CellStore {
             stats: StoreStats::default(),
             evict,
             docs: DocStore::new(&cfg),
-            idx: crate::index_maint::CellIndexes::default(),
+            idx: crate::index_maint::CellIndexes::new(),
             cfg,
         }
     }

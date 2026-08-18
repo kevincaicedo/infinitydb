@@ -66,17 +66,28 @@ name = "inf-foundation"
 version = "0.0.0"
 
 [[package]]
+name = "inf-log"
+version = "0.0.0"
+dependencies = [
+ "inf-foundation",
+ "inf-simd",
+ "libc",
+]
+
+[[package]]
 name = "inf-query"
 version = "0.0.0"
 dependencies = [
  "inf-doc",
  "inf-foundation",
+ "inf-store",
 ]
 
 [[package]]
 name = "inf-query-fuzz"
 version = "0.0.0"
 dependencies = [
+ "inf-doc",
  "inf-query",
  "libfuzzer-sys",
 ]
@@ -84,6 +95,16 @@ dependencies = [
 [[package]]
 name = "inf-simd"
 version = "0.0.0"
+
+[[package]]
+name = "inf-store"
+version = "0.0.0"
+dependencies = [
+ "inf-alloc",
+ "inf-foundation",
+ "inf-log",
+ "inf-simd",
+]
 
 [[package]]
 name = "jobserver"

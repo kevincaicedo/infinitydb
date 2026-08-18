@@ -1,0 +1,14 @@
+# perf report --no-children -g none — predicate_eval_1kib rows, taskset -c 4, F 4999
+# Eval-loop samples only (taskset pins bench + setup to one core; the 0.4% floor
+# hides one-time setup). Zero allocator symbols: the S08 allocation-free AC —
+# the standing regression gate is tests/predicate_alloc.rs (thread-local counter).
+    33.43%  predicate_eval-  predicate_eval-2c6ff4524e2c10c2  [.] inf_query::predicate::vm::PredicateVm::eval
+    23.16%  predicate_eval-  predicate_eval-2c6ff4524e2c10c2  [.] <inf_doc::tape::ObjIter as core::iter::traits::iterator::Iterator>::next
+     8.86%  predicate_eval-  predicate_eval-2c6ff4524e2c10c2  [.] inf_doc::path::program::read_op
+     8.00%  predicate_eval-  predicate_eval-2c6ff4524e2c10c2  [.] inf_doc::tape::read_value
+     6.67%  predicate_eval-  predicate_eval-2c6ff4524e2c10c2  [.] inf_query::predicate::program::read_op
+     5.18%  predicate_eval-  predicate_eval-2c6ff4524e2c10c2  [.] criterion::bencher::Bencher<M>::iter
+     5.00%  predicate_eval-  predicate_eval-2c6ff4524e2c10c2  [.] inf_query::predicate::vm::relation
+     4.30%  predicate_eval-  predicate_eval-2c6ff4524e2c10c2  [.] inf_query::predicate::vm::PredicateVm::leaf::{{closure}}
+     2.96%  predicate_eval-  libc.so.6                        [.] __memcmp_avx2_movbe
+     2.19%  predicate_eval-  predicate_eval-2c6ff4524e2c10c2  [.] inf_doc::tape::read_value

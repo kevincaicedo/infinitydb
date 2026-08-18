@@ -1,0 +1,10 @@
+predicate_eval_1kib/residual_two_leaf
+                        time:   [177.31 ns 177.46 ns 177.60 ns]
+predicate_eval_1kib/residual_short_circuit
+                        time:   [104.53 ns 104.59 ns 104.64 ns]
+predicate_eval_1kib/residual_deep_path
+                        time:   [459.49 ns 460.69 ns 461.81 ns]
+predicate_eval_1kib/residual_in_list
+                        time:   [88.680 ns 88.760 ns 88.850 ns]
+predicate_eval_2kib/residual_multi_match
+                        time:   [1.7185 µs 1.7212 µs 1.7237 µs]
