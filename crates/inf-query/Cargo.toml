@@ -6,5 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[dependencies]
+inf-foundation = { workspace = true }
+inf-doc = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true

@@ -411,6 +411,11 @@ dependencies = [
 [[package]]
 name = "inf-query"
 version = "0.0.0"
+dependencies = [
+ "inf-doc",
+ "inf-foundation",
+ "proptest",
+]
 
 [[package]]
 name = "inf-replica"

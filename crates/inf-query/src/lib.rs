@@ -1,8 +1,14 @@
-//! `inf-query` — InfinityDB workspace crate (see master plan §20).
+//! `inf-query` — the feature-gated query engine (master plan §20;
+//! ADR-0024).
 //!
-//! Stub at M4.5-S00 (ADR-0072 D9): the PartiQL subset compiler, predicate
-//! VM, and cursor machinery arrive with M4.5-S07+; the crate exists now so
-//! the dependency DAG and boundaries are enforced before code arrives.
+//! Landed surface: **predicate VM bytecode v1** (M4.5-S07, ADR-0079) —
+//! the one compiled predicate form PartiQL `WHERE` residuals (S09),
+//! JSONPath filter expressions (S13), and post-1.0 live queries share.
+//! The evaluator (S08), the PartiQL compiler (S09), and the cursor
+//! machinery (S11) build on it.
+//!
 //! Allowed edges: `inf-foundation`, `inf-doc`, `inf-store` — never RESP,
 //! sockets, raw record memory, or log files (L11).
 #![forbid(unsafe_code)]
+
+pub mod predicate;

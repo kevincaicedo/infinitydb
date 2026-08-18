@@ -1,0 +1,24 @@
+# cargo-fuzz crate for inf-query (M4.5-S07 AC: predicate-program
+# decoder fuzz, same-PR L9 rule — CI smoke + nightly hour). Standalone
+# workspace — built only by `cargo +nightly fuzz`.
+[package]
+name = "inf-query-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+inf-query = { path = ".." }
+
+[[bin]]
+name = "fuzz_predicate_program"
+path = "fuzz_targets/fuzz_predicate_program.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
