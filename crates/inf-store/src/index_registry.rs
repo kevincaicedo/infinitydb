@@ -360,6 +360,12 @@ pub struct IndexRegistry {
     /// Namespaces with ≥ 1 live entry, recomputed at DDL transitions —
     /// the source the store-side cached flags (S04) refresh from.
     ns_flagged: Vec<NsId>,
+    /// Monotone catalog epoch (ADR-0080 D5): bumps on every mutation
+    /// that can change what a statement compiles to — create, remove,
+    /// catalog-state flip, rebuild. Cell-machine state changes do not
+    /// bump it (planning reads catalog state only, ADR-0075 D3). The
+    /// S09 statement cache guards entries with it.
+    epoch: u64,
 }
 
 impl IndexRegistry {
@@ -392,6 +398,7 @@ impl IndexRegistry {
         let cell_state = spec.state;
         self.entries.push(RegEntry { spec, cell_state, was_ready, sidecar_boot: None });
         self.recompute_flags();
+        self.epoch += 1;
         Ok(())
     }
 
@@ -401,6 +408,7 @@ impl IndexRegistry {
         let at = self.entries.iter().position(|e| e.spec.id == id).ok_or(IndexError::Unknown)?;
         let entry = self.entries.remove(at);
         self.recompute_flags();
+        self.epoch += 1;
         Ok(entry.spec)
     }
 
@@ -412,6 +420,7 @@ impl IndexRegistry {
         let removed = before - self.entries.len();
         if removed > 0 {
             self.recompute_flags();
+            self.epoch += 1;
         }
         removed
     }
@@ -430,6 +439,7 @@ impl IndexRegistry {
             return Err(IndexError::InvalidTransition { from, to });
         }
         entry.spec.state = to;
+        self.epoch += 1;
         Ok(())
     }
 
@@ -450,6 +460,7 @@ impl IndexRegistry {
         entry.spec.generation = new_generation;
         entry.spec.state = IndexState::Backfilling;
         entry.cell_state = IndexState::Backfilling;
+        self.epoch += 1;
         Ok(())
     }
 
@@ -527,6 +538,13 @@ impl IndexRegistry {
     /// recovery decides — and forever on a fresh cell).
     pub fn sidecar_boot(&self, id: IndexId) -> Option<SidecarBootDecision> {
         self.entries.iter().find(|e| e.spec.id == id).and_then(|e| e.sidecar_boot)
+    }
+
+    /// Monotone catalog epoch (ADR-0080 D5) — changes iff a statement
+    /// could now compile differently. The S09 statement cache compares
+    /// it on every hit; server-side catalog views fold namespace DDL in.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &IndexSpec> {
@@ -619,6 +637,32 @@ mod tests {
     }
 
     /// Every D3-legal edge transitions; every illegal edge is the
+    /// The catalog epoch (ADR-0080 D5) moves on exactly the mutations
+    /// that can change what a statement compiles to — and not on
+    /// cell-machine progress, which planning never reads (ADR-0075 D3).
+    #[test]
+    fn epoch_moves_on_catalog_mutations_only() {
+        let mut reg = IndexRegistry::default();
+        assert_eq!(reg.epoch(), 0);
+        reg.create(spec(1, 16, b"by-price", IndexState::Declared), false).expect("create");
+        assert_eq!(reg.epoch(), 1);
+        reg.set_catalog_state(IndexId(1), IndexState::Backfilling).expect("flip");
+        assert_eq!(reg.epoch(), 2);
+        reg.set_cell_state(IndexId(1), IndexState::Backfilling).expect("cell flip");
+        assert_eq!(reg.epoch(), 2, "cell-machine state never influences planning");
+        reg.set_catalog_state(IndexId(1), IndexState::Ready).expect("ready");
+        assert_eq!(reg.epoch(), 3);
+        reg.rebuild(IndexId(1), 2).expect("rebuild");
+        assert_eq!(reg.epoch(), 4);
+        assert!(reg.set_catalog_state(IndexId(1), IndexState::Declared).is_err());
+        assert_eq!(reg.epoch(), 4, "refused transitions do not move the epoch");
+        reg.remove(IndexId(1)).expect("remove");
+        assert_eq!(reg.epoch(), 5);
+        reg.create(spec(2, 16, b"by-score", IndexState::Declared), false).expect("create");
+        assert_eq!(reg.remove_ns(NsId(16)), 1);
+        assert_eq!(reg.epoch(), 7);
+    }
+
     /// explicit typed rejection — at both state scopes.
     #[test]
     fn lifecycle_edges_are_exactly_the_d3_set() {

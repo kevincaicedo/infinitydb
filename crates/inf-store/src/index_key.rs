@@ -258,6 +258,36 @@ fn encode_utf8(s: &str, out: &mut IndexKeyBuf) {
     out.len = (len + 1) as u16;
 }
 
+/// The terminator-less escape image of `s`, truncated to
+/// [`ORDERED_KEY_MAX`] bytes; returns the **untruncated** escaped
+/// length so callers can tell truncation happened. This is the S09
+/// bound-construction primitive (ADR-0080 D3): `begins_with` lower
+/// bounds are the full image (prefix safety, D2), and over-cap
+/// comparison literals bind at the truncated image — the escape rule
+/// stays in this module (the §3.1 one-implementation discipline), it
+/// is never re-derived by a consumer.
+pub fn index_key_escape_prefix(s: &str, out: &mut IndexKeyBuf) -> usize {
+    let mut len: usize = 0;
+    let mut full: usize = 0;
+    for &b in s.as_bytes() {
+        full += 1;
+        if len < ORDERED_KEY_MAX {
+            out.bytes[len] = b;
+            len += 1;
+        }
+        if b == 0x00 {
+            full += 1;
+            if len < ORDERED_KEY_MAX {
+                out.bytes[len] = 0xFF;
+                len += 1;
+            }
+        }
+    }
+    out.len = len as u16;
+    debug_assert_eq!(len, full.min(ORDERED_KEY_MAX));
+    full
+}
+
 /// Exact i64-vs-f64 comparison — the VM's cross-numeric compare
 /// (ADR-0074 D5). No lossy casts: range-classify, then compare integer
 /// parts via exact truncation, then the fractional sign. NaN is a
@@ -710,6 +740,18 @@ mod tests {
             }
         }
 
+        /// The S09 bound primitive (ADR-0080 D3): within the cap the
+        /// image IS enc(s) minus its terminator; the returned length is
+        /// the untruncated escaped length either way.
+        #[test]
+        fn escape_prefix_matches_encoding(s in "[\\x00-\\x7Fé]{0,64}") {
+            let mut image = IndexKeyBuf::new();
+            let full = index_key_escape_prefix(&s, &mut image);
+            let enc = key_bytes(IndexKeyType::Utf8, IndexScalar::Utf8(&s));
+            prop_assert_eq!(image.as_bytes(), &enc[..enc.len() - 1]);
+            prop_assert_eq!(full, enc.len() - 1);
+        }
+
         /// The consistency law (ADR-0074 D5): wherever two numerics
         /// both admit into one index type, byte order ≡ the VM's
         /// comparison verdict.
@@ -723,6 +765,27 @@ mod tests {
                     prop_assert_eq!(ka.cmp(&kb), compare_i64_f64(a, b), "{:?}", key_type);
                 }
             }
+        }
+
+        /// Over-cap strings truncate the image at the tree's key cap —
+        /// the truncated-image bound rule (ADR-0080 D3) stands on the
+        /// image being exactly `enc(s)[..ORDERED_KEY_MAX]`.
+        #[test]
+        fn escape_prefix_truncates_at_the_cap(head in "[\\x00-\\x7F]{0,8}") {
+            let long = format!("{head}{}", "x".repeat(ORDERED_KEY_MAX + 8));
+            let mut image = IndexKeyBuf::new();
+            let full = index_key_escape_prefix(&long, &mut image);
+            let nuls = head.as_bytes().iter().filter(|&&b| b == 0).count();
+            prop_assert_eq!(full, long.len() + nuls);
+            prop_assert_eq!(image.as_bytes().len(), ORDERED_KEY_MAX);
+            let mut expected = Vec::new();
+            for &b in long.as_bytes() {
+                expected.push(b);
+                if b == 0 {
+                    expected.push(0xFF);
+                }
+            }
+            prop_assert_eq!(image.as_bytes(), &expected[..ORDERED_KEY_MAX]);
         }
 
         /// compare_i64_f64 agrees with an independent exact reference,

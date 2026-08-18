@@ -54,7 +54,8 @@ pub use index_backfill::{
 };
 pub use index_key::{
     DecodedIndexKey, INDEX_KEY_ENCODING_VERSION, IndexKeyBuf, IndexKeyDecodeError, IndexKeyType,
-    IndexScalar, KeySkip, compare_i64_f64, index_key_decode, index_key_encode, index_scalar_coerce,
+    IndexScalar, KeySkip, compare_i64_f64, index_key_decode, index_key_encode,
+    index_key_escape_prefix, index_scalar_coerce,
 };
 pub use index_maint::{BRACKET_ENTRY_CAP, IdxCounters, IdxMaintRefusal, MaintMode};
 #[cfg(feature = "doc")]

@@ -998,6 +998,95 @@ fn decode_expr(
     }
 }
 
+// ---------------------------------------------------------------------
+// EXPLAIN rendering (M4.5-S09, ADR-0080 D2): the residual op listing —
+// a deterministic, stable-order text form of the *compiled* bytes. The
+// S09 golden suite pins it; S12 renders it verbatim (L7 — never a
+// re-derivation from the statement).
+// ---------------------------------------------------------------------
+
+/// Append the decoded op listing of `program` to `out`, one op per
+/// line, `indent` leading spaces at the root, children +2. Iterative
+/// walk (house rule) over the decoded tree; cold path, allocates.
+pub(crate) fn explain(program: &PredicateProgram, indent: usize, out: &mut String) {
+    let mut work: Vec<(Predicate, usize)> = vec![(program.decode(), indent)];
+    while let Some((node, depth)) = work.pop() {
+        for _ in 0..depth {
+            out.push(' ');
+        }
+        match node {
+            Predicate::And(children) => {
+                out.push_str(&format!("and n={}\n", children.len()));
+                for child in children.into_iter().rev() {
+                    work.push((child, depth + 2));
+                }
+            }
+            Predicate::Or(children) => {
+                out.push_str(&format!("or n={}\n", children.len()));
+                for child in children.into_iter().rev() {
+                    work.push((child, depth + 2));
+                }
+            }
+            Predicate::Not(inner) => {
+                out.push_str("not\n");
+                work.push((*inner, depth + 2));
+            }
+            Predicate::Cmp { op, path, constant } => {
+                let op = match op {
+                    CmpOp::Eq => "eq",
+                    CmpOp::Ne => "ne",
+                    CmpOp::Lt => "lt",
+                    CmpOp::Le => "le",
+                    CmpOp::Gt => "gt",
+                    CmpOp::Ge => "ge",
+                };
+                out.push_str(&format!(
+                    "cmp op={op} path={} const={}\n",
+                    path_text(&path),
+                    constant_text(&constant)
+                ));
+            }
+            Predicate::Between { path, lo, hi } => {
+                out.push_str(&format!(
+                    "between path={} lo={} hi={}\n",
+                    path_text(&path),
+                    constant_text(&lo),
+                    constant_text(&hi)
+                ));
+            }
+            Predicate::BeginsWith { path, prefix } => {
+                out.push_str(&format!("begins-with path={} prefix={prefix:?}\n", path_text(&path)));
+            }
+            Predicate::In { path, members } => {
+                let rendered: Vec<String> = members.iter().map(constant_text).collect();
+                out.push_str(&format!(
+                    "in path={} members=[{}]\n",
+                    path_text(&path),
+                    rendered.join(", ")
+                ));
+            }
+            Predicate::Exists { path } => {
+                out.push_str(&format!("exists path={}\n", path_text(&path)));
+            }
+        }
+    }
+}
+
+fn path_text(path: &PathProgram) -> String {
+    inf_doc::path::ast::print(&path.decode())
+}
+
+/// Typed constant rendering: `{:?}` on f64 is the shortest round-trip
+/// form (deterministic) and on strings the escaped double-quoted form.
+fn constant_text(constant: &Constant) -> String {
+    match constant {
+        Constant::I64(v) => format!("i64:{v}"),
+        Constant::F64(v) => format!("f64:{v:?}"),
+        Constant::Bool(v) => format!("bool:{v}"),
+        Constant::Utf8(s) => format!("utf8:{s:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use inf_doc::path;
