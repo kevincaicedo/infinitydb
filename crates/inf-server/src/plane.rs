@@ -405,6 +405,15 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// fabric-origin cold-read concurrency is `cells − 1` per owner.
     tier_applies: RefCell<Vec<VecDeque<TierApply>>>,
     tier_pump_active: RefCell<Vec<bool>>,
+    /// Gated `always` verdicts the tiered apply pumps produced (M4.5-S29):
+    /// each is a fabric reply awaiting this cell's fsync watermark. The
+    /// pump queues the verdict and moves on — holding its FIFO across the
+    /// durability wait serialized every fabric origin to one write per
+    /// fsync (the S29 flat-scaling defect). FABRIC-IN drains this into
+    /// the same deferred-reply futures the synchronous drain spawns
+    /// (ADR-0015 D6 — the client-visible ack still never precedes this
+    /// cell's fsync). Bounded by the origins' fabric windows.
+    tier_gated: RefCell<VecDeque<GatedReply>>,
     /// Node control-thread handle (id allocation + catalog persistence).
     control: RefCell<Option<Arc<ControlHandle>>>,
     /// DDL pumps parked on catalog persistence (ADR-0015 D3).
@@ -1293,6 +1302,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 tier: RefCell::new(None),
                 tier_applies: RefCell::new((0..cells).map(|_| VecDeque::new()).collect::<Vec<_>>()),
                 tier_pump_active: RefCell::new(vec![false; usize::from(cells)]),
+                tier_gated: RefCell::new(VecDeque::new()),
                 control: RefCell::new(None),
                 ddl_waiters: WaitList::new(),
                 ckpt_waiters: WaitList::new(),
@@ -2025,10 +2035,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             }
         });
         flush_apply_stage(shared, stage, stage_bytes, scratch, staged, &mut pubs);
-        if drained == 0 {
+        // M4.5-S29: gated verdicts the tiered apply pumps queued since the
+        // last pass join this pass's deferred-reply spawns below. They must
+        // drain even on a fabric-quiet iteration — their producers ran in
+        // run_ready, not in this drain.
+        gated.extend(self.shared.tier_gated.borrow_mut().drain(..));
+        if drained == 0 && gated.is_empty() {
             return;
         }
-        cx.note_fabric(drained as u64);
+        if drained > 0 {
+            cx.note_fabric(drained as u64);
+        }
 
         let mut fabric = self.shared.fabric.borrow_mut();
         for _ in 0..orphans {
@@ -4879,43 +4896,65 @@ async fn tier_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         };
         let Some(item) = next else { return };
         let argv: Vec<&[u8]> = item.args.iter().map(Vec::as_slice).collect();
-        let reply = apply_tiered_one(&shared, origin, item.ns, &argv, item.proto).await;
-        shared.fabric.borrow_mut().reply(CellId(origin), item.token, &Outcome::Bytes(&reply));
-        shared.recycle_reply_buf(reply);
+        match apply_tiered_one(&shared, origin, item.ns, &argv, item.proto).await {
+            tiered::TieredReply::Done(reply) => {
+                shared.fabric.borrow_mut().reply(
+                    CellId(origin),
+                    item.token,
+                    &Outcome::Bytes(&reply),
+                );
+                shared.recycle_reply_buf(reply);
+            }
+            // M4.5-S29: the durability wait leaves the pump. Holding the
+            // FIFO across it serialized each origin to one `always` write
+            // per fsync window — the flat-scaling defect. Staging already
+            // happened (in FIFO order, no await since), so apply order is
+            // intact; the reply ships from FABRIC-IN's deferred-reply
+            // future once the watermark covers `seq`, and the origin
+            // matches it by token — per-connection reply order is the
+            // origin's pending-FIFO's job, not this queue's.
+            tiered::TieredReply::Gated { reply, seq } => {
+                shared
+                    .durable
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("tiered implies the durable plane")
+                    .note_gated_ack();
+                shared.tier_gated.borrow_mut().push_back(GatedReply {
+                    to: CellId(origin),
+                    token: item.token,
+                    seq,
+                    reply,
+                });
+            }
+        }
     }
 }
 
-/// One fabric-origin tiered apply: validate, execute through the tiered
-/// arm, and for `always` writes hold the reply behind the ack gate
-/// (§8.2 — the client-visible ack never precedes the owner's fsync).
+/// One fabric-origin tiered apply: validate and execute through the
+/// tiered arm. An `always` write returns its gated verdict — the caller
+/// queues it for the deferred-reply future (§8.2: the client-visible ack
+/// never precedes the owner's fsync), never awaiting it in FIFO custody.
 async fn apply_tiered_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     origin: u16,
     ns: NsId,
     argv: &[&[u8]],
     proto: Protocol,
-) -> Vec<u8> {
+) -> tiered::TieredReply {
     let Some(meta) = lookup(argv[0]) else {
-        return error_reply(shared, proto, "ERR unknown command");
+        return tiered::TieredReply::Done(error_reply(shared, proto, "ERR unknown command"));
     };
     if !arity_ok(meta, argv.len()) {
-        return error_reply(shared, proto, "ERR wrong number of arguments");
+        return tiered::TieredReply::Done(error_reply(
+            shared,
+            proto,
+            "ERR wrong number of arguments",
+        ));
     }
     let class = shared.store.borrow().ns_fsync_class(ns);
     let origin_cell = ExecOrigin::Fabric(CellId(origin));
-    match tiered::dispatch_tiered(shared, origin_cell, ns, meta, argv, proto, class).await {
-        tiered::TieredReply::Done(reply) => reply,
-        tiered::TieredReply::Gated { reply, seq } => {
-            let waiter = {
-                let mut durable = shared.durable.borrow_mut();
-                let cell = durable.as_mut().expect("tiered implies the durable plane");
-                cell.note_gated_ack();
-                cell.ack_gate.waiter(seq)
-            };
-            waiter.await;
-            reply
-        }
-    }
+    tiered::dispatch_tiered(shared, origin_cell, ns, meta, argv, proto, class).await
 }
 
 /// One compaction read chain (M4-S26 driving ADR-0059 D2): chunked cold

@@ -502,6 +502,9 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         // dir, which is often tmpfs — point it at a real filesystem for
         // rows that must exercise the device (disclosed in the report).
         "pressure-data-root",
+        // M4.5 S29 row: server data-dir root. Must not be tmpfs — the
+        // row's fsyncs must hit a real device (same rule as above).
+        "data-root",
         // M2-S22 campaign: durable attribution fill size, external gate
         // artifacts (values measured by campaign tooling; provenance is
         // mandatory via --campaign-note), and the provenance note itself.
@@ -548,7 +551,8 @@ pub fn cmd_gate_run(args: &[String]) -> Result<(), String> {
         "m1" => crate::m1rows::cmd_gate_run_m1(&flags),
         "m2" => crate::m2rows::cmd_gate_run_m2(&flags),
         "m4" => crate::m4rows::cmd_gate_run_m4(&flags),
-        other => Err(format!("unknown milestone {other} (have: m0, m1, m2, m4)")),
+        "m4.5" => crate::m45rows::cmd_gate_run_m45(&flags),
+        other => Err(format!("unknown milestone {other} (have: m0, m1, m2, m4, m4.5)")),
     }
 }
 
