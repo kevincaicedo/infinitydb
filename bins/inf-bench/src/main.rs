@@ -24,6 +24,7 @@ mod gates;
 mod load;
 mod m1rows;
 mod m2rows;
+mod m45rows;
 mod m4rows;
 mod mixedaudit;
 mod resp;
@@ -41,7 +42,7 @@ USAGE:
     inf-bench load --host H --port P [--threads N] [--conns-per-thread N] [--pipeline P]
                    [--duration SECS] [--mix SET:GET] [--keys N] [--key-prefix S]
                    [--value-size BYTES] [--seed N] [--out FILE.toml]
-    inf-bench gate-run m0|m1|m2|m4 [--replicates N] [--gates FILE] [--artifacts-root DIR]
+    inf-bench gate-run m0|m1|m2|m4|m4.5 [--replicates N] [--gates FILE] [--artifacts-root DIR]
                    [--allow-dirty] [--unsafe-env] [--reference-box] [--skip-fill]
                    [--cells N] [--duration SECS] [--fill-keys N]
                    [--infinityd-bin PATH] [--redis-bin PATH]
@@ -52,6 +53,9 @@ USAGE:
                    m4 rows: [--baseline-bin PATH]  (M3-tip infinityd for the
                             degenerate-case A/B — M4-S03 hard sub-gate;
                             tiering-counter tripwire binds on every box)
+                   m4.5 rows: [--data-root DIR] [--pin-start N]
+                            (S29 tiered-always scaling row; data-root
+                             must not be tmpfs — fsyncs must hit a device)
     inf-bench boot-storm --infinityd-bin PATH [--cycles 500] [--cells 4]
                    [--pressure-mb 2048] [--data-root DIR] [--ready-timeout-s 10]
                    [--pin-start N] [--artifacts-root DIR]

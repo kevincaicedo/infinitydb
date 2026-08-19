@@ -1,0 +1,37 @@
+prefix rep1 load-tierbig throughput_ops_s=4457
+prefix rep1 load-syncflat throughput_ops_s=14205
+prefix rep1 run-tierbig c64 throughput_ops_s=4520 p50_ms=7.350 p99_ms=52.110 
+prefix rep1 run-syncflat c64 throughput_ops_s=12202 p50_ms=4.960 p99_ms=19.521 
+prefix rep1 run-tierbig c256 throughput_ops_s=4098 p50_ms=7.834 p99_ms=308.228 
+prefix rep1 run-syncflat c256 throughput_ops_s=52196 p50_ms=4.973 p99_ms=7.655 
+prefix rep2 load-tierbig throughput_ops_s=4506
+prefix rep2 load-syncflat throughput_ops_s=14307
+prefix rep2 run-tierbig c64 throughput_ops_s=4448 p50_ms=7.120 p99_ms=52.997 
+prefix rep2 run-syncflat c64 throughput_ops_s=13600 p50_ms=4.918 p99_ms=7.484 
+prefix rep2 run-tierbig c256 throughput_ops_s=3978 p50_ms=7.963 p99_ms=364.044 
+prefix rep2 run-syncflat c256 throughput_ops_s=42904 p50_ms=6.106 p99_ms=8.974 
+prefix rep3 load-tierbig throughput_ops_s=3254
+prefix rep3 load-syncflat throughput_ops_s=11905
+prefix rep3 run-tierbig c64 throughput_ops_s=3569 p50_ms=8.992 p99_ms=73.807 
+prefix rep3 run-syncflat c64 throughput_ops_s=10965 p50_ms=6.051 p99_ms=8.659 
+prefix rep3 run-tierbig c256 throughput_ops_s=3280 p50_ms=9.923 p99_ms=369.776 
+prefix rep3 run-syncflat c256 throughput_ops_s=42989 p50_ms=6.093 p99_ms=8.916 
+s29fix rep1 load-tierbig throughput_ops_s=11388
+s29fix rep1 load-syncflat throughput_ops_s=11180
+s29fix rep1 run-tierbig c64 throughput_ops_s=10882 p50_ms=6.088 p99_ms=8.579 
+s29fix rep1 run-syncflat c64 throughput_ops_s=11038 p50_ms=6.024 p99_ms=8.520 
+s29fix rep1 run-tierbig c256 throughput_ops_s=43085 p50_ms=6.115 p99_ms=8.431 
+s29fix rep1 run-syncflat c256 throughput_ops_s=42490 p50_ms=6.169 p99_ms=8.617 
+s29fix rep2 load-tierbig throughput_ops_s=11674
+s29fix rep2 load-syncflat throughput_ops_s=10978
+s29fix rep2 run-tierbig c64 throughput_ops_s=10918 p50_ms=6.075 p99_ms=8.534 
+s29fix rep2 run-syncflat c64 throughput_ops_s=8790 p50_ms=6.128 p99_ms=31.267 
+s29fix rep2 run-tierbig c256 throughput_ops_s=25249 p50_ms=6.249 p99_ms=38.875 
+s29fix rep2 run-syncflat c256 throughput_ops_s=43210 p50_ms=6.108 p99_ms=8.661 
+s29fix rep3 load-tierbig throughput_ops_s=11845
+s29fix rep3 load-syncflat throughput_ops_s=12614
+s29fix rep3 run-tierbig c64 throughput_ops_s=11204 p50_ms=6.022 p99_ms=8.538 
+s29fix rep3 run-syncflat c64 throughput_ops_s=11099 p50_ms=6.020 p99_ms=8.520 
+s29fix rep3 run-tierbig c256 throughput_ops_s=43452 p50_ms=6.106 p99_ms=8.412 
+s29fix rep3 run-syncflat c256 throughput_ops_s=43743 p50_ms=6.074 p99_ms=8.602 
+AB_DONE

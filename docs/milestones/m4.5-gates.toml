@@ -1,0 +1,62 @@
+# M4.5 gate rows — machine-readable encoding of the M4.5 milestone plan's
+# E4.5 performance stories. First occupant: the S29 tiered-`always`
+# concurrency-scaling row (opened 2026-08-19, remediated same session —
+# `reviews/tiered-always-group-commit-finding-20260819.md`).
+#
+# The S29 defect was a *slope* defect: tiered `always` flat at ~3.6k
+# ops/s across an 8× concurrency range while non-tiered `always` scaled
+# 3.9× for 4× conns on the same node/binary/device. These gates therefore
+# bind on the slope and the tiered:flat parity ratio, never on a peak —
+# a fix that raises a single point without restoring the slope has not
+# addressed the defect (plan §5, M4.5-S29 pitfalls).
+#
+# Thresholds carry margin on both sides of the measured arms
+# (pre-fix: slope 0.89×, parity@256 0.09×, p99 ratio ~40×;
+# post-fix dev-tier medians: slope 3.9×, parity ~1.0×, p99 ratio ~1.0×).
+# Changing a threshold here is a milestone-plan amendment, not an edit
+# (L10: a gate may not be passed by narrowing it).
+#
+# Consumed by `inf-bench gate-run m4.5`.
+# tier = "linux-reference-box" verdicts bind only on the reference box.
+
+schema = 1
+
+[[gate]]
+id = "s29_tiered_scaling_slope"
+name = "S29: tiered always scaling slope (c256/c64)"
+threshold = 2.0
+comparator = ">="
+unit = "x (ops/s ratio across 4x conns)"
+tier = "linux-reference-box"
+source = "s29:tiered_scaling_slope_x"
+measured_by = "gate-run m4.5 tiered-always-scaling row, median of replicates"
+
+[[gate]]
+id = "s29_tiered_flat_parity_c64"
+name = "S29: tiered:flat always parity at 64 conns"
+threshold = 0.7
+comparator = ">="
+unit = "x (tiered ops/s / flat ops/s, same node+session)"
+tier = "linux-reference-box"
+source = "s29:tiered_flat_ratio_c64"
+measured_by = "gate-run m4.5 tiered-always-scaling row, median of replicates"
+
+[[gate]]
+id = "s29_tiered_flat_parity_c256"
+name = "S29: tiered:flat always parity at 256 conns"
+threshold = 0.7
+comparator = ">="
+unit = "x (tiered ops/s / flat ops/s, same node+session)"
+tier = "linux-reference-box"
+source = "s29:tiered_flat_ratio_c256"
+measured_by = "gate-run m4.5 tiered-always-scaling row, median of replicates"
+
+[[gate]]
+id = "s29_tiered_p99_parity_c256"
+name = "S29: tiered:flat always p99 ratio at 256 conns"
+threshold = 4.0
+comparator = "<="
+unit = "x (tiered p99 / flat p99 — pre-fix read ~40x)"
+tier = "linux-reference-box"
+source = "s29:tiered_flat_p99_ratio_c256"
+measured_by = "gate-run m4.5 tiered-always-scaling row, median of replicates"
