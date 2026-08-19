@@ -403,9 +403,14 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// (the fabric delivers per-pair FIFO; the pump applies in arrival
     /// order); cross-origin applies interleave freely. Recorded bound:
     /// fabric-origin cold-read concurrency is `cells − 1` per owner.
-    tier_applies: RefCell<Vec<VecDeque<TierApply>>>,
-    tier_pump_active: RefCell<Vec<bool>>,
-    /// Gated `always` verdicts the tiered apply pumps produced (M4.5-S29):
+    /// M4.5-S27 (ADR-0083 D1): flat durable-namespace applies join the
+    /// same per-origin queue under staging pressure — pacing instead of
+    /// the owner-side `-BUSY` refusal — and whenever the pump already
+    /// holds this origin's work (FIFO = apply order). Bounded by the
+    /// origins' fabric windows, never a new unbounded queue.
+    ns_applies: RefCell<Vec<VecDeque<NsApply>>>,
+    ns_pump_active: RefCell<Vec<bool>>,
+    /// Gated `always` verdicts the apply pumps produced (M4.5-S29):
     /// each is a fabric reply awaiting this cell's fsync watermark. The
     /// pump queues the verdict and moves on — holding its FIFO across the
     /// durability wait serialized every fabric origin to one write per
@@ -413,7 +418,7 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// the same deferred-reply futures the synchronous drain spawns
     /// (ADR-0015 D6 — the client-visible ack still never precedes this
     /// cell's fsync). Bounded by the origins' fabric windows.
-    tier_gated: RefCell<VecDeque<GatedReply>>,
+    pump_gated: RefCell<VecDeque<GatedReply>>,
     /// Node control-thread handle (id allocation + catalog persistence).
     control: RefCell<Option<Arc<ControlHandle>>>,
     /// DDL pumps parked on catalog persistence (ADR-0015 D3).
@@ -449,9 +454,10 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     deasync_dispatch: Cell<bool>,
 }
 
-/// One fabric-origin tiered apply parked for its origin's FIFO pump
-/// (M4-S26 — the suspension-capable sibling of the gated-reply future).
-struct TierApply {
+/// One fabric-origin namespace apply parked for its origin's FIFO pump
+/// (M4-S26 tiered; M4.5-S27 added flat durable applies under staging
+/// pressure — the suspension-capable sibling of the gated-reply future).
+struct NsApply {
     token: FabricToken,
     ns: NsId,
     proto: Protocol,
@@ -709,11 +715,48 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         let arg_reserve = arg_bytes;
         let mut est = 64usize.saturating_add(arg_reserve);
         let store = ks.ns_store(ns);
+        // Per-key reserve mirrors `stage_durable_effects` by effect class
+        // (M4.5-S27, ADR-0083 D2). The estimate stays an upper bound —
+        // `stage()` treats a post-admission refusal as an invariant
+        // violation — but classes whose post-image provably excludes the
+        // current image must not charge it: with the old blanket
+        // `+image`, a DEL of a near-capacity value could never be
+        // admitted (a park livelock), and a replace-SET was double-billed.
         for key in extract_keys_slices(meta, argv) {
-            est = est.saturating_add(key.len() + 96);
-            if let Some(store) = store {
-                est = est.saturating_add(store.log_image_bytes(key, now).unwrap_or(0));
-            }
+            let per_key = match meta.id {
+                // Delete effect only: `Delete { ns, key }` (+96 framing).
+                CommandId::Del | CommandId::Unlink | CommandId::Getdel => key.len() + 96,
+                // Replace class: the post-image is the new value, already
+                // counted in `arg_reserve`; the second key term covers the
+                // optional `ExpireAt` rider record.
+                CommandId::Set
+                | CommandId::Setnx
+                | CommandId::Setex
+                | CommandId::Psetex
+                | CommandId::Getset
+                | CommandId::Mset
+                | CommandId::Msetnx => 2 * key.len() + 128,
+                // SETRANGE builds `max(old_len, offset + payload)`: the
+                // zero-padded gap is in no argument and not in the old
+                // image — charge the declared offset too (a malformed
+                // offset parses as 0 and fails in execution anyway).
+                CommandId::Setrange => {
+                    let offset: usize = argv
+                        .get(2)
+                        .and_then(|a| std::str::from_utf8(a).ok())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    let image = store.and_then(|s| s.log_image_bytes(key, now)).unwrap_or(0);
+                    key.len() + 96 + image.max(offset)
+                }
+                // Read-modify default (APPEND, INCR-family, COPY, expiry
+                // rewrites, doc writes): post ≤ current image + arguments.
+                _ => {
+                    let image = store.and_then(|s| s.log_image_bytes(key, now)).unwrap_or(0);
+                    key.len() + 96 + image
+                }
+            };
+            est = est.saturating_add(per_key);
         }
         est
     }
@@ -902,10 +945,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         let is_write = meta.is_some_and(|m| m.flags.contains(CmdFlags::WRITE));
         if let (Some(meta), Some(_)) = (meta, class)
             && is_write
-            && let Some(refusal) = self.durable_admission(ns, meta, argv)
         {
-            RespWriter::new(out, proto).error(refusal);
-            return NsApplyOutcome::Reply;
+            match self.durable_admission(ns, meta, argv) {
+                DurableAdmission::Admit => {}
+                // Pacing, not refusal (M4.5-S27, ADR-0083 D1): the caller
+                // parks this apply on the origin's FIFO pump; nothing was
+                // executed or staged, so the retry re-enters here whole.
+                DurableAdmission::Park => return NsApplyOutcome::Park,
+                DurableAdmission::Refuse(refusal) => {
+                    RespWriter::new(out, proto).error(refusal);
+                    return NsApplyOutcome::Reply;
+                }
+            }
         }
         // Maintenance bracket, fabric named-ns row (ADR-0072 D3 /
         // ADR-0076 D3 row 1): pre-half after admission, before execute;
@@ -950,44 +1001,72 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         outcome
     }
 
-    /// Durable-write admission (owner side — cannot suspend inside the
-    /// fabric drain, so pressure answers a typed retryable refusal; the
-    /// local pump path parks instead). `None` = admitted.
+    /// Durable-write admission — one typed verdict for every path
+    /// (M4.5-S27, ADR-0083 D1/D2): the local pump and the fabric pump
+    /// both park on [`DurableAdmission::Park`]; only conditions no drain
+    /// can ever cure refuse. The pre-fix shape — local parks, fabric
+    /// replies `-BUSY` — made hard refusal the node's dominant behaviour
+    /// under pressure (~¾ of writes are fabric-routed at 4 cells).
     fn durable_admission(
         &self,
         ns: NsId,
         meta: &'static inf_wire::CommandMeta,
         argv: &[&[u8]],
-    ) -> Option<&'static str> {
+    ) -> DurableAdmission {
         let durable = self.durable.borrow();
         let Some(cell) = durable.as_ref() else {
-            return Some("ERR durable namespace on a cell without durable storage");
+            return DurableAdmission::Refuse(
+                "ERR durable namespace on a cell without durable storage",
+            );
         };
         if cell.failed {
-            return Some("ERR durable plane failed (fail-stop)");
+            return DurableAdmission::Refuse("ERR durable plane failed (fail-stop)");
         }
         if cell.space_exhausted() {
-            return Some("ERR durable write refused: log storage exhausted (NOSPACE)");
+            return DurableAdmission::Refuse(
+                "ERR durable write refused: log storage exhausted (NOSPACE)",
+            );
         }
         drop(durable);
         let est = self.estimate_effect_bytes(ns, meta, argv);
         let durable = self.durable.borrow();
         let cell = durable.as_ref().expect("checked above");
+        let record_max = cell.staging.max_record_len() as usize;
         if !cell.would_fit(est) {
-            // The `would_fit` pre-check refuses without ever calling
-            // `stage()`, so no staging counter fires — count the typed
-            // refusal here (v0.4.0-alpha instrument fix: the 24 h soak
-            // took 31 M of these with no server-side trace).
-            self.node.log_admission_busy.set(self.node.log_admission_busy.get() + 1);
-            return Some(crate::durable::STAGING_BUSY_ERROR);
+            // `would_fit(est)` can never pass when `est > record_max`:
+            // parking is then a livelock, not backpressure (the M2-S08
+            // up-front bound check `staging.rs` demands — ADR-0083 D2).
+            if est > record_max {
+                #[cfg(feature = "doc")]
+                if crate::json::is_json_write(meta.id) {
+                    // The doc estimate is ×4-conservative; the exact
+                    // late checks (`json.rs` record-max/budget) govern
+                    // with real encoded bytes — admit to execution.
+                    let (budget, record_max) = cell.staging_limits();
+                    self.node.doc_log_admission.set(Some(DocLogAdmission { budget, record_max }));
+                    return DurableAdmission::Admit;
+                }
+                self.node.log_admission_oversized.set(self.node.log_admission_oversized.get() + 1);
+                return DurableAdmission::Refuse(crate::durable::STAGING_OVERSIZED_ERROR);
+            }
+            return DurableAdmission::Park;
         }
         #[cfg(feature = "doc")]
         if crate::json::is_json_write(meta.id) {
             let (budget, record_max) = cell.staging_limits();
             self.node.doc_log_admission.set(Some(DocLogAdmission { budget, record_max }));
         }
-        None
+        DurableAdmission::Admit
     }
+}
+
+/// One durable-admission verdict (M4.5-S27, ADR-0083): `Park` is
+/// backpressure a drain will cure (wake on `drained`); `Refuse` is a
+/// typed condition no retry can cure and goes to the client.
+enum DurableAdmission {
+    Admit,
+    Park,
+    Refuse(&'static str),
 }
 
 /// One owner-side `always` reply deferred on the fsync watermark.
@@ -1004,6 +1083,10 @@ enum NsApplyOutcome {
     Reply,
     /// `always` write: ship the reply only once seq is durable.
     Gated(u64),
+    /// Staging pressure (M4.5-S27, ADR-0083 D1): nothing executed or
+    /// staged — the apply parks on the origin's FIFO pump and retries
+    /// when the drain wakes it, instead of refusing with `-BUSY`.
+    Park,
 }
 
 /// Applies the internal `INF.NSFAN` DDL fan on a peer cell (M2-S08):
@@ -1300,9 +1383,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 cob_pubsub: Cell::new((0, 0, 0)),
                 durable: RefCell::new(None),
                 tier: RefCell::new(None),
-                tier_applies: RefCell::new((0..cells).map(|_| VecDeque::new()).collect::<Vec<_>>()),
-                tier_pump_active: RefCell::new(vec![false; usize::from(cells)]),
-                tier_gated: RefCell::new(VecDeque::new()),
+                ns_applies: RefCell::new((0..cells).map(|_| VecDeque::new()).collect::<Vec<_>>()),
+                ns_pump_active: RefCell::new(vec![false; usize::from(cells)]),
+                pump_gated: RefCell::new(VecDeque::new()),
                 control: RefCell::new(None),
                 ddl_waiters: WaitList::new(),
                 ckpt_waiters: WaitList::new(),
@@ -1920,7 +2003,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 if c.token.class() == TokenClass::CkptWrite {
                     cell.on_ckpt_written();
                 } else {
-                    cell.on_log_written();
+                    cell.on_log_written(cx.now);
                 }
             }
             CompletionResult::Synced => {
@@ -2039,7 +2122,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         // last pass join this pass's deferred-reply spawns below. They must
         // drain even on a fabric-quiet iteration — their producers ran in
         // run_ready, not in this drain.
-        gated.extend(self.shared.tier_gated.borrow_mut().drain(..));
+        gated.extend(self.shared.pump_gated.borrow_mut().drain(..));
         if drained == 0 && gated.is_empty() {
             return;
         }
@@ -2097,17 +2180,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         }
         // Tiered fabric applies (M4-S26): wake each origin's FIFO pump.
         let tier_pending: Vec<u16> = {
-            let queues = self.shared.tier_applies.borrow();
-            let active = self.shared.tier_pump_active.borrow();
+            let queues = self.shared.ns_applies.borrow();
+            let active = self.shared.ns_pump_active.borrow();
             (0..queues.len())
                 .filter(|&i| !queues[i].is_empty() && !active[i])
                 .map(|i| i as u16)
                 .collect()
         };
         for origin in tier_pending {
-            self.shared.tier_pump_active.borrow_mut()[usize::from(origin)] = true;
+            self.shared.ns_pump_active.borrow_mut()[usize::from(origin)] = true;
             let shared = Rc::clone(&self.shared);
-            let _ = cx.executor.poll_immediate(tier_apply_pump(shared, origin));
+            let _ = cx.executor.poll_immediate(ns_apply_pump(shared, origin));
         }
         // Fabric-origin PUBLISHes fan out on this cell's owner pump (one
         // long-lived FIFO future — arrival order is delivery order). The
@@ -2577,6 +2660,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.fsync_p999_us.set(stats.fsync_p999_us);
             node.fsync_group_p50.set(stats.fsync_group_p50);
             node.fsync_group_p99.set(stats.fsync_group_p99);
+            node.log_write_stall_p50_us.set(stats.write_stall_p50_us);
+            node.log_write_stall_p99_us.set(stats.write_stall_p99_us);
+            node.log_write_stall_p999_us.set(stats.write_stall_p999_us);
+            node.log_staging_capacity.set(stats.staging_capacity_bytes);
+            node.log_admission_parked.set(stats.admission_parked);
+            node.log_admission_parked_total.set(stats.admission_parked_total);
+            node.fsyncs_linked.set(stats.fsyncs_linked);
+            node.fsyncs_seal.set(stats.fsyncs_seal);
+            node.fsyncs_standalone.set(stats.fsyncs_standalone);
+            node.fsyncs_completion.set(stats.fsyncs_completion);
             node.log_segments_live.set(stats.log_segments_live);
             let ckpt = cell.ckpt_stats();
             let unix_now_ms = self.shared.wall_anchor().unix_from_internal(cx.now);
@@ -2786,11 +2879,24 @@ fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             // semantics authoritatively (never trusting the origin).
             let argv = args.as_slice();
             let proto = if cmd & 0x0F == 3 { Protocol::Resp3 } else { Protocol::Resp2 };
-            // A tiered apply can suspend on a cold read — it defers to
-            // the origin's FIFO pump instead of the synchronous drain
-            // (M4-S26); `fabric_in` wakes the pump after this batch.
-            if shared.store.borrow().is_tiered(NsId(ns)) {
-                shared.tier_applies.borrow_mut()[usize::from(from.0)].push_back(TierApply {
+            // A tiered apply can suspend on a cold read — it always
+            // defers to the origin's FIFO pump instead of the synchronous
+            // drain (M4-S26). A flat *durable*-namespace apply joins the
+            // same pump whenever the pump already holds (or is applying)
+            // this origin's work — FIFO is the apply-order currency, so
+            // nothing may overtake a parked apply (M4.5-S27, ADR-0083
+            // D1). Memory namespaces never queue behind durable pressure
+            // (namespace isolation). `fabric_in` wakes the pump after
+            // this batch.
+            let divert = {
+                let store = shared.store.borrow();
+                store.is_tiered(NsId(ns))
+                    || (store.ns_fsync_class(NsId(ns)).is_some()
+                        && (shared.ns_pump_active.borrow()[usize::from(from.0)]
+                            || !shared.ns_applies.borrow()[usize::from(from.0)].is_empty()))
+            };
+            if divert {
+                shared.ns_applies.borrow_mut()[usize::from(from.0)].push_back(NsApply {
                     token,
                     ns: NsId(ns),
                     proto,
@@ -2807,6 +2913,18 @@ fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                     let reply = scratch[start..].to_vec();
                     scratch.truncate(start);
                     gated.push(GatedReply { to: from, token, seq, reply });
+                }
+                // Staging pressure: nothing executed or staged — the
+                // apply parks on the pump and paces instead of refusing
+                // with `-BUSY` (M4.5-S27, ADR-0083 D1).
+                NsApplyOutcome::Park => {
+                    scratch.truncate(start);
+                    shared.ns_applies.borrow_mut()[usize::from(from.0)].push_back(NsApply {
+                        token,
+                        ns: NsId(ns),
+                        proto,
+                        args: argv.iter().map(|a| a.to_vec()).collect(),
+                    });
                 }
             }
         }
@@ -4875,27 +4993,37 @@ fn extract_keys_iter<'v, 'a>(
     (start..=last).step_by(usize::from(spec.step).max(1)).map_while(move |i| argv.get(i).copied())
 }
 
-/// One origin cell's tiered-apply pump (M4-S26): applies arrive in
-/// fabric FIFO order and execute strictly in that order — a suspended
-/// cold read holds the queue behind it, which is exactly what preserves
-/// the origin's per-connection command ordering. Deactivates when its
+/// One origin cell's namespace-apply pump (M4-S26; generalized by
+/// M4.5-S27): applies arrive in fabric FIFO order and execute strictly
+/// in that order — a suspended cold read (tiered) or a staging park
+/// (flat under pressure, ADR-0083 D1) holds the queue behind it, which
+/// is exactly what preserves the origin's per-connection command
+/// ordering. Deactivates when its
 /// queue drains (the flag and the emptiness check share one borrow, so
 /// a concurrent enqueue always observes a live pump or respawns one).
-async fn tier_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+async fn ns_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: Rc<Shared<O, F>>,
     origin: u16,
 ) {
     loop {
         let next = {
-            let mut queues = shared.tier_applies.borrow_mut();
+            let mut queues = shared.ns_applies.borrow_mut();
             let item = queues[usize::from(origin)].pop_front();
             if item.is_none() {
-                shared.tier_pump_active.borrow_mut()[usize::from(origin)] = false;
+                shared.ns_pump_active.borrow_mut()[usize::from(origin)] = false;
             }
             item
         };
         let Some(item) = next else { return };
         let argv: Vec<&[u8]> = item.args.iter().map(Vec::as_slice).collect();
+        // Flat durable applies ride the same FIFO under staging pressure
+        // (M4.5-S27, ADR-0083 D1); the tier is re-resolved here because
+        // the owner stays authoritative and DDL can retier a namespace
+        // while an apply is queued.
+        if !shared.store.borrow().is_tiered(item.ns) {
+            apply_flat_one(&shared, origin, item.ns, &argv, item.proto, item.token).await;
+            continue;
+        }
         match apply_tiered_one(&shared, origin, item.ns, &argv, item.proto).await {
             tiered::TieredReply::Done(reply) => {
                 shared.fabric.borrow_mut().reply(
@@ -4920,12 +5048,58 @@ async fn tier_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
                     .as_mut()
                     .expect("tiered implies the durable plane")
                     .note_gated_ack();
-                shared.tier_gated.borrow_mut().push_back(GatedReply {
+                shared.pump_gated.borrow_mut().push_back(GatedReply {
                     to: CellId(origin),
                     token: item.token,
                     seq,
                     reply,
                 });
+            }
+        }
+    }
+}
+
+/// One fabric-origin flat-namespace apply on the pump (M4.5-S27,
+/// ADR-0083 D1): admission parks on `drained` — pacing, the same shape
+/// the local pump has always had — and on admission success execution
+/// and staging run with no await between, so apply order is the pump's
+/// FIFO. A gated `always` verdict queues for FABRIC-IN's deferred-reply
+/// spawn exactly like the tiered arm (ADR-0082: never awaited in FIFO
+/// custody). `execute_ns_owned` counts the gated ack itself.
+async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    origin: u16,
+    ns: NsId,
+    argv: &[&[u8]],
+    proto: Protocol,
+    token: FabricToken,
+) {
+    loop {
+        let mut buf = shared.take_reply_buf();
+        match shared.execute_ns_owned(CellId(origin), argv, proto, ns, &mut buf) {
+            NsApplyOutcome::Park => {
+                shared.recycle_reply_buf(buf);
+                let wait = {
+                    let mut durable = shared.durable.borrow_mut();
+                    let cell = durable.as_mut().expect("durable admission parked");
+                    cell.note_parked();
+                    cell.drained.wait(())
+                };
+                wait.await;
+            }
+            NsApplyOutcome::Reply => {
+                shared.fabric.borrow_mut().reply(CellId(origin), token, &Outcome::Bytes(&buf));
+                shared.recycle_reply_buf(buf);
+                return;
+            }
+            NsApplyOutcome::Gated(seq) => {
+                shared.pump_gated.borrow_mut().push_back(GatedReply {
+                    to: CellId(origin),
+                    token,
+                    seq,
+                    reply: buf,
+                });
+                return;
             }
         }
     }
@@ -5170,20 +5344,23 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         return true;
     }
     // Local path: durable admission parks on the drain waitlist instead of
-    // erroring (bounded-everything; the owner-side refusal is fabric-only).
+    // erroring — with ADR-0083 the fabric path paces the same way, so the
+    // typed verdict is shared and the two paths cannot drift (M4.5-S27).
     let is_write = meta.flags.contains(CmdFlags::WRITE);
     if class.is_some() && is_write {
         loop {
             match shared.durable_admission(ns, meta, argv) {
-                None => break,
-                Some(refusal) if !refusal.starts_with("BUSY") => {
+                DurableAdmission::Admit => break,
+                DurableAdmission::Refuse(refusal) => {
                     pending.push_back(PendingReply::Done(error_reply(shared, proto, refusal)));
                     return true;
                 }
-                Some(_full) => {
+                DurableAdmission::Park => {
                     let wait = {
-                        let durable = shared.durable.borrow();
-                        durable.as_ref().expect("durable admission ran").drained.wait(())
+                        let mut durable = shared.durable.borrow_mut();
+                        let cell = durable.as_mut().expect("durable admission ran");
+                        cell.note_parked();
+                        cell.drained.wait(())
                     };
                     wait.await;
                 }

@@ -120,11 +120,31 @@ pub struct NodeInfo {
     pub log_frames_queued: Cell<u64>,
     pub log_staging_bytes: Cell<u64>,
     /// Typed `-BUSY` staging-admission refusals (v0.4.0-alpha
-    /// instrument fix): the `would_fit` pre-check refuses without ever
-    /// calling `stage()`, so no staging counter sees these — the
-    /// refusal sites themselves increment (owner-side admission + the
-    /// doc path's exact late admission).
+    /// instrument fix; **re-scoped by M4.5-S27/ADR-0083 D5 to
+    /// client-visible refusals only** — parks are counted separately):
+    /// after ADR-0083 D1 the only remaining emitter is the doc path's
+    /// exact late admission, so a non-zero rate here is a finding.
     pub log_admission_busy: Cell<u64>,
+    /// M4.5-S27 (ADR-0083 D2): typed never-fits refusals — the staged
+    /// record can never fit any drain (`est > max_record_len`).
+    pub log_admission_oversized: Cell<u64>,
+    /// M4.5-S27 (ADR-0083 D5): pacing observables — commands currently
+    /// parked on the drain waitlist, cumulative park episodes, the
+    /// configured staging capacity (per buffer), and the frame-write
+    /// submit → `LogWritten` stall percentiles (µs) — the staging
+    /// drain's binding variable.
+    pub log_admission_parked: Cell<u64>,
+    pub log_admission_parked_total: Cell<u64>,
+    pub log_staging_capacity: Cell<u64>,
+    pub log_write_stall_p50_us: Cell<u64>,
+    pub log_write_stall_p99_us: Cell<u64>,
+    pub log_write_stall_p999_us: Cell<u64>,
+    /// M4.5-S27 (ADR-0083 D5): per-reason durability-fsync counts (the
+    /// S29 named observability gap).
+    pub fsyncs_linked: Cell<u64>,
+    pub fsyncs_seal: Cell<u64>,
+    pub fsyncs_standalone: Cell<u64>,
+    pub fsyncs_completion: Cell<u64>,
     /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).
     pub ckpts_completed: Cell<u64>,
     pub ckpts_aborted: Cell<u64>,

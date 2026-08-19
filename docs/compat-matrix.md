@@ -243,6 +243,21 @@ bytes or post-state differ by an understood, reviewed design decision.
 - RedisJSON RESP3 `s15-debug-missing`: missing document: InfinityDB returns null; RedisJSON returns integer 0
 - RedisJSON RESP3 `edge-debug-memory`: InfinityDB reports canonical document attribution; RedisJSON reports module allocator bytes
 
+## Durable write backpressure (extension surface, L8 note — M4.5-S27, ADR-0083)
+
+Durable namespaces under log-staging pressure **pace** (the reply is
+delayed while the command stays suspended) instead of erroring — every
+path, local and fabric-routed (ADR-0083 D1). Redis has no equivalent
+surface (no durable log). Mainstream Redis clients do not auto-retry
+`-BUSY`, which is why refusal is not the design response to pressure;
+the remaining typed `-BUSY` emitters are the document exact late
+admission and the tiered cold-read queue cap, both counted
+(`log_admission_busy`) and expected ≈ 0 — a climbing rate is a finding,
+not designed behaviour. A durable write whose record can never fit the
+staging domain refuses up front with typed
+`ERR write exceeds durable log staging capacity` — non-retryable by
+design (ADR-0083 D2; retrying it is a livelock).
+
 ## Absent (owner milestone)
 
 | Family | Arrives |

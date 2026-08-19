@@ -327,6 +327,13 @@ impl StagingRing {
         2 * self.capacity_bytes as usize
     }
 
+    /// The configured per-buffer capacity — the admission bound the
+    /// `log_staging_capacity_bytes` observable exports (M4.5-S27).
+    #[must_use]
+    pub fn capacity_bytes(&self) -> u32 {
+        self.capacity_bytes
+    }
+
     /// True when the previous frame is still in flight: sealing must wait
     /// for its release (bounded: at most one in-flight frame).
     #[must_use]

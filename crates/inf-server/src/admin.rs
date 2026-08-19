@@ -247,9 +247,26 @@ pub(crate) fn info(
         push(&mut text, &format!("log_frames_queued:{}", node.log_frames_queued.get()));
         push(&mut text, &format!("log_staging_bytes:{}", node.log_staging_bytes.get()));
         // Typed `-BUSY` staging-admission refusals (v0.4.0-alpha
-        // instrument fix): the `would_fit` pre-check stages nothing, so
-        // only this counter records them.
+        // instrument fix; M4.5-S27 re-scoped it to client-visible
+        // refusals only — the doc exact late admission is the one
+        // remaining emitter, so a climbing rate here is a finding).
         push(&mut text, &format!("log_admission_busy:{}", node.log_admission_busy.get()));
+        // M4.5-S27 (ADR-0083 D2/D5): the pacing observables. Parks are
+        // backpressure working as designed; `oversized` is the typed
+        // never-fits refusal; the write-stall percentiles are the
+        // staging drain's binding variable (frame-write submit →
+        // LogWritten — under kernel writeback throttling this is what
+        // starves staging, and fsync latency is the correlated symptom).
+        push(&mut text, &format!("log_admission_oversized:{}", node.log_admission_oversized.get()));
+        push(&mut text, &format!("log_admission_parked:{}", node.log_admission_parked.get()));
+        push(
+            &mut text,
+            &format!("log_admission_parked_total:{}", node.log_admission_parked_total.get()),
+        );
+        push(&mut text, &format!("log_staging_capacity_bytes:{}", node.log_staging_capacity.get()));
+        push(&mut text, &format!("log_write_stall_p50_us:{}", node.log_write_stall_p50_us.get()));
+        push(&mut text, &format!("log_write_stall_p99_us:{}", node.log_write_stall_p99_us.get()));
+        push(&mut text, &format!("log_write_stall_p999_us:{}", node.log_write_stall_p999_us.get()));
         // M2-S21: windowed rates (previous everysec tick window, injected
         // clock) + fsync latency percentiles (HDR-class histogram, ~3%
         // quantization — the §8.2 storage-bound honesty fields).
@@ -262,6 +279,16 @@ pub(crate) fn info(
         // fsync (the >= 0.8x available-in-flight-writes gate observable).
         push(&mut text, &format!("fsync_group_p50:{}", node.fsync_group_p50.get()));
         push(&mut text, &format!("fsync_group_p99:{}", node.fsync_group_p99.get()));
+        // M4.5-S27 (ADR-0083 D5): per-reason durability-fsync counts —
+        // the S29 named observability gap (`CommitStats` had them,
+        // nothing exported them). Linked syncs' latency samples rebase
+        // at their covering write's completion (ADR-0083 D4), so the
+        // fsync percentiles above measure sync service time, never the
+        // write+sync chain.
+        push(&mut text, &format!("fsyncs_linked:{}", node.fsyncs_linked.get()));
+        push(&mut text, &format!("fsyncs_seal:{}", node.fsyncs_seal.get()));
+        push(&mut text, &format!("fsyncs_standalone:{}", node.fsyncs_standalone.get()));
+        push(&mut text, &format!("fsyncs_completion:{}", node.fsyncs_completion.get()));
         // Fuzzy-checkpoint gauges (M2-S10; `ckpt_age_s` derives at S21).
         push(&mut text, &format!("ckpts_completed:{}", node.ckpts_completed.get()));
         push(&mut text, &format!("ckpts_aborted:{}", node.ckpts_aborted.get()));

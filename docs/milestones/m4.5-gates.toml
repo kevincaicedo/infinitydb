@@ -1,7 +1,11 @@
 # M4.5 gate rows — machine-readable encoding of the M4.5 milestone plan's
 # E4.5 performance stories. First occupant: the S29 tiered-`always`
 # concurrency-scaling row (opened 2026-08-19, remediated same session —
-# `reviews/tiered-always-group-commit-finding-20260819.md`).
+# `reviews/tiered-always-group-commit-finding-20260819.md`). Second:
+# the S27 durable-write-backpressure row (ADR-0083 D7 — refusals,
+# decay, and max in the provoked `--log-staging-mib 1` regime; the
+# ADR-0081 D5 bar restated for the gate harness, binding on the
+# reference box).
 #
 # The S29 defect was a *slope* defect: tiered `always` flat at ~3.6k
 # ops/s across an 8× concurrency range while non-tiered `always` scaled
@@ -60,3 +64,33 @@ unit = "x (tiered p99 / flat p99 — pre-fix read ~40x)"
 tier = "linux-reference-box"
 source = "s29:tiered_flat_p99_ratio_c256"
 measured_by = "gate-run m4.5 tiered-always-scaling row, median of replicates"
+
+[[gate]]
+id = "s27_busy_refusals_pct"
+name = "S27: client-visible -BUSY refusals under provoked staging pressure"
+threshold = 0.05
+comparator = "<="
+unit = "% of operations (ADR-0081 D5: pacing, not refusal)"
+tier = "linux-reference-box"
+source = "s27:busy_refusals_pct"
+measured_by = "gate-run m4.5 durable-write-backpressure row, both leg-sets (provoked --log-staging-mib 1 set + default-staging D5 set)"
+
+[[gate]]
+id = "s27_write_repeat_decay"
+name = "S27: last:first throughput across back-to-back write repeats"
+threshold = 0.90
+comparator = ">="
+unit = "x (the finding's signature was 2.4x monotonic decay)"
+tier = "linux-reference-box"
+source = "s27:write_repeat_decay_x"
+measured_by = "gate-run m4.5 durable-write-backpressure row, default-staging D5 leg-set (ADR-0081 D5 shape)"
+
+[[gate]]
+id = "s27_max_latency_ms"
+name = "S27: worst per-leg max latency at everysec under provoked pressure"
+threshold = 50.0
+comparator = "<="
+unit = "ms (ADR-0081 D5: max <= 50 ms at everysec)"
+tier = "linux-reference-box"
+source = "s27:max_ms"
+measured_by = "gate-run m4.5 durable-write-backpressure row, default-staging D5 leg-set (ADR-0081 D5 shape)"

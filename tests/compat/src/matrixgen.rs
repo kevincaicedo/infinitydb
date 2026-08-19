@@ -617,6 +617,21 @@ pub fn render() -> String {
         }
         push("");
     }
+    push("## Durable write backpressure (extension surface, L8 note — M4.5-S27, ADR-0083)");
+    push("");
+    push("Durable namespaces under log-staging pressure **pace** (the reply is");
+    push("delayed while the command stays suspended) instead of erroring — every");
+    push("path, local and fabric-routed (ADR-0083 D1). Redis has no equivalent");
+    push("surface (no durable log). Mainstream Redis clients do not auto-retry");
+    push("`-BUSY`, which is why refusal is not the design response to pressure;");
+    push("the remaining typed `-BUSY` emitters are the document exact late");
+    push("admission and the tiered cold-read queue cap, both counted");
+    push("(`log_admission_busy`) and expected ≈ 0 — a climbing rate is a finding,");
+    push("not designed behaviour. A durable write whose record can never fit the");
+    push("staging domain refuses up front with typed");
+    push("`ERR write exceeds durable log staging capacity` — non-retryable by");
+    push("design (ADR-0083 D2; retrying it is a livelock).");
+    push("");
     push("## Absent (owner milestone)");
     push("");
     push("| Family | Arrives |");

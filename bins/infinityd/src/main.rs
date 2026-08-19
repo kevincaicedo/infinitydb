@@ -44,6 +44,13 @@ struct Args {
     /// Durability fsyncs in flight per cell (M2.5-S07 A/B knob): 1 = the
     /// ADR-0022 D3 discipline, 2 = the bounded two-in-flight pipeline.
     sync_pipeline: u8,
+    /// Per-buffer log-staging capacity in MiB (M4.5-S27, ADR-0083 D3).
+    /// The buffer absorbs `arrival_rate × frame-write stall`; the 4 MiB
+    /// default is ~8.5 ms at 470 MB/s. With ADR-0083 D1 pacing the bound
+    /// never refuses — it is a pacing point — so this is a latency/memory
+    /// trade (resident = 2 × capacity × cells), and shrinking it is the
+    /// deliberate way to provoke the pressure regime on a healthy device.
+    log_staging_mib: u32,
     /// M2.5-S21 A/B knob: publish staged fabric ops at the head of
     /// MAINTAIN so the hop RTT overlaps local execution.
     early_fabric_flush: bool,
@@ -85,6 +92,7 @@ impl Default for Args {
             ckpt_interval_bytes: inf_server::DEFAULT_CKPT_INTERVAL_BYTES,
             segment_bytes: inf_server::DEFAULT_SEGMENT_BYTES,
             sync_pipeline: 1,
+            log_staging_mib: 4,
             early_fabric_flush: false,
             remote_first_execute: false,
             fabric_apply_prefetch: true,
@@ -147,6 +155,17 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--sync-pipeline is 1 or 2, never a queue".into());
                 }
             }
+            "--log-staging-mib" => {
+                args.log_staging_mib = take("--log-staging-mib")?
+                    .parse()
+                    .map_err(|e| format!("--log-staging-mib: {e}"))?;
+                // 1 MiB holds any wire-legal command's record; 64 MiB is
+                // the frame decoder bound (every written frame must stay
+                // readable by a default-configured reader).
+                if !(1..=64).contains(&args.log_staging_mib) {
+                    return Err("--log-staging-mib is 1..=64 (the frame decoder bound)".into());
+                }
+            }
             "--version" | "-V" => {
                 println!("{}", version_line());
                 std::process::exit(0);
@@ -156,7 +175,7 @@ fn parse_args() -> Result<Args, String> {
                     "infinityd [--port 6379] [--cells 4] [--buffers 4096] [--buf-size 4096] \
                      [--pin-start CORE] [--route-local-only] [--data-dir PATH] \
                      [--ckpt-interval-bytes N] [--segment-bytes N] [--sync-pipeline 1|2] \
-                     [--early-fabric-flush] [--remote-first-execute] \
+                     [--log-staging-mib 4] [--early-fabric-flush] [--remote-first-execute] \
                      [--fabric-apply-prefetch|--no-fabric-apply-prefetch] \
                      [--parse-batch-prefetch|--no-parse-batch-prefetch] \
                      [--deasync-dispatch|--no-deasync-dispatch] [--version]"
@@ -372,7 +391,7 @@ fn cell_main(
         }
         let cfg = inf_server::DurableConfig {
             data_dir: dir.clone(),
-            staging: inf_server::StagingConfig::default(),
+            staging: inf_server::StagingConfig { capacity_bytes: args.log_staging_mib << 20 },
             segment: inf_server::SegmentConfig {
                 segment_bytes: args.segment_bytes,
                 ..Default::default()
