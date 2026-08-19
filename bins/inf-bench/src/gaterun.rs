@@ -454,6 +454,8 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "no-deasync-dispatch",
         "skip-comparator",
         "only-always",
+        // M4.5 S27 row (the A/B arms skip the S29 legs).
+        "only-s27",
     ],
     &[
         "allow-dirty",
@@ -511,6 +513,7 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "attribution-keys",
         "sync-pipeline",
         "only-always",
+        "only-s27",
         "recovery-gbps-per-cell",
         "recovery-boot-s",
         // ADR-0070 D7 (2026-08-16): Phase::Start overhead, split out of the

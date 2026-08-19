@@ -565,6 +565,24 @@ impl<File: SegmentFile> GroupCommit<File> {
         self.written_bytes = self.queued_bytes;
     }
 
+    /// Rebase a pending linked fsync's latency clock to `now` — its
+    /// covering write just completed (M4.5-S27, ADR-0083 D4). A linked
+    /// fdatasync is an `IO_LINK` chain: the sync SQE starts only after
+    /// the write, but the ticket registered at the LOG step, so without
+    /// this the histogram absorbs the write's full duration (under
+    /// writeback throttling, seconds — the ADR-0081 D6 artefact).
+    /// No-ops on a ticket already completed or failed (a short-write
+    /// resubmission chain may complete its sync out of band).
+    pub fn rebase_clock(&mut self, ticket: FsyncTicket, now: Nanos) {
+        if let Some(entry) = self.pending.iter_mut().find(|p| p.ticket == ticket.0)
+            && !entry.done
+            && !entry.failed
+        {
+            debug_assert_eq!(entry.reason, SyncReason::Linked, "only linked syncs rebase");
+            entry.submitted_at = now;
+        }
+    }
+
     /// An fsync's `Synced` arrived. Returns the new watermark — the
     /// exclusive end of the durable range — when the done-prefix advanced;
     /// the plane feeds it to `WatermarkGate::advance(end.to_u64())` (S06).
@@ -716,6 +734,42 @@ mod tests {
         assert_eq!(gc.watermark(), Some(lsn(0, 200)));
         assert_eq!(gc.pending_log_bytes(), 0);
         assert_eq!(gc.fsync_latency_hist().count(), 2);
+    }
+
+    #[test]
+    fn linked_fsync_latency_rebases_at_write_completion() {
+        // ADR-0083 D4 (resolves ADR-0081 D6): a linked fdatasync's SQE
+        // starts only after its covering write completes (IO_LINK), so
+        // its latency clock must start at `LogWritten` — measured from
+        // registration it absorbs the write's full duration, which is
+        // exactly how the finding's 8.39 s "fsync p99" sample was made
+        // (a multi-second throttled write ahead of a millisecond sync).
+        let mut gc = commit();
+        gc.note_staged(FsyncClass::Always);
+        gc.note_frame_queued(lsn(0, 100), 100);
+        let t = gc.register_linked_fsync(Nanos::ZERO);
+        // The covering write stalls 5 s in writeback throttling, then
+        // completes; the device services the sync itself in 2 ms.
+        gc.rebase_clock(t, Nanos::from_secs(5));
+        gc.note_frame_written();
+        gc.on_fsync_complete(t, Nanos::from_secs(5) + Nanos::from_millis(2));
+        let p50 = gc.fsync_latency_hist().percentile(50.0);
+        assert!(p50 >= 1_000, "the 2 ms sync is in the histogram: p50={p50}µs");
+        assert!(p50 < 100_000, "sync service time recorded, never the 5 s chain: p50={p50}µs");
+    }
+
+    #[test]
+    fn rebase_clock_ignores_completed_and_failed_tickets() {
+        // A short-write resubmission chain can complete (or fail) its
+        // sync before the rebasing call lands — the rebase must no-op.
+        let mut gc = commit();
+        gc.note_staged(FsyncClass::Always);
+        gc.note_frame_queued(lsn(0, 100), 100);
+        let t = gc.register_linked_fsync(Nanos::ZERO);
+        gc.note_frame_written();
+        gc.on_fsync_complete(t, Nanos::from_millis(3));
+        gc.rebase_clock(t, Nanos::from_secs(9));
+        assert_eq!(gc.fsync_latency_hist().count(), 1, "completed ticket stays completed");
     }
 
     #[test]

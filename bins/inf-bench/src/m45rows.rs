@@ -1,6 +1,11 @@
-//! `inf-bench gate-run m4.5` — the M4.5-S29 scaling row: tiered
-//! `FSYNC always` must scale with client concurrency like the
-//! non-tiered `always` path does.
+//! `inf-bench gate-run m4.5` — the E4.5 performance-debt rows.
+//!
+//! Row 1 (M4.5-S29): tiered `FSYNC always` must scale with client
+//! concurrency like the non-tiered `always` path does.
+//! Row 2 (M4.5-S27, ADR-0083 D7): durable admission under staging
+//! pressure paces instead of refusing — back-to-back sustained-write
+//! repeats in a deliberately provoked regime (`--log-staging-mib 1`)
+//! must show refusals ≤ 0.05 %, no monotonic decay, and a bounded max.
 //!
 //! The defect this row pins (2026-08-19 finding,
 //! `reviews/tiered-always-group-commit-finding-20260819.md`): fabric
@@ -63,6 +68,10 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
     // (p50 ~77 µs) measures nothing this row cares about.
     let data_root = flags.str_or("data-root", ".artifacts/m4.5/s29-gate-data");
 
+    // `--only-s27` runs just the S27 backpressure row (the `gate-run m2
+    // --only-always` precedent) — the A/B arms don't need the S29 legs.
+    let only_s27 = flags.bool("only-s27");
+
     let env_ok = env_gate(flags)?;
     let mut m = Measurements::new();
     if !env_ok {
@@ -70,6 +79,19 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
     }
     if !reference_box {
         m.note("dev-tier run: verdicts are non-binding; the S29 AC binds on the reference box");
+    }
+    if only_s27 {
+        m.note("--only-s27: the S29 scaling row was skipped; its gate keys are absent");
+        s27_write_repeat_row(flags, &infinityd, cells, duration, &data_root, &mut m)?;
+        return finish_report(
+            "m4.5",
+            &gates_list,
+            &m,
+            env_ok,
+            reference_box,
+            &artifacts_root,
+            &format!("binary {infinityd} · cells {cells} · S27 row only"),
+        );
     }
     m.note(format!(
         "row shape: {FILL_KEYS} keys × 1 KiB per namespace, tiered MEM-BUDGET {MEM_BUDGET}/cell \
@@ -188,6 +210,8 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
     );
     m.raw_section("per-leg samples", &raw);
 
+    s27_write_repeat_row(flags, &infinityd, cells, duration, &data_root, &mut m)?;
+
     finish_report(
         "m4.5",
         &gates_list,
@@ -198,6 +222,209 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
         &format!("binary {infinityd} · cells {cells} · {replicates} replicates"),
     )
 }
+
+/// The M4.5-S27 sustained-write-repeat row (ADR-0083 D7): a fresh
+/// server in the deliberately provoked pressure regime
+/// (`--log-staging-mib 1` — headroom below one burst at closed-loop
+/// arrival, so admission pressure engages on a healthy device), one
+/// flat `everysec` namespace, `S27_REPEATS` back-to-back 100 %-write
+/// legs on one node. Gate keys: client-visible refusal rate, the
+/// last:first throughput ratio (the finding's monotonic-decay
+/// signature), and the worst per-leg max. An informational `always`
+/// leg rides along (the ADR-0081 "measure `always` for the same
+/// shape" obligation); its disposition lives in the ledger, not a
+/// gate. Pre-fix, this row storms `-BUSY` (the fabric-owner refusal);
+/// post-fix it parks — `log_admission_parked_total` in the raw
+/// section proves the regime engaged.
+fn s27_write_repeat_row(
+    flags: &Flags,
+    infinityd: &str,
+    cells: u16,
+    duration: u64,
+    data_root: &str,
+    m: &mut Measurements,
+) -> Result<(), String> {
+    // Leg-set 1 — the **provoked regime** (--log-staging-mib 1, pipeline
+    // 4): admission pressure engages deterministically because arrival
+    // exceeds the drain during frame-write stalls. This set gates the
+    // *refusal shape only* — max/decay here are device-writeback physics
+    // (SLC state at saturation), not the admission mechanism.
+    let mut raw = String::new();
+    let mut ops_total: u64 = 0;
+    let mut busy_total: u64 = 0;
+    {
+        let (server, port) = s27_spawn(flags, infinityd, cells, data_root, Some(1))?;
+        let before = scrape_cells(port, cells)?;
+        for rep in 0..S27_REPEATS {
+            let report = s27_leg(port, "s27press", 4, duration)?;
+            check_non_busy(&report, &format!("s27 provoked rep{rep}"))?;
+            ops_total += report.ops;
+            busy_total += report.busy_retryable;
+            raw.push_str(&format!(
+                "provoked rep{rep} everysec ops/s={:<8.0} p99_us={:<7} max_us={:<8} busy={}\n",
+                report.ops_per_sec, report.p99_us, report.max_us, report.busy_retryable
+            ));
+        }
+        let after = scrape_cells(port, cells)?;
+        let parked = sum_field(&after, "log_admission_parked_total")
+            .saturating_sub(sum_field(&before, "log_admission_parked_total"));
+        let stall_p99 = after
+            .iter()
+            .filter_map(|c| c.get("log_write_stall_p99_us").and_then(|v| v.parse::<u64>().ok()))
+            .max()
+            .unwrap_or(0);
+        raw.push_str(&format!(
+            "provoked regime: parked_total(delta)={parked} \
+             write_stall_p99_us(worst cell)={stall_p99}\n"
+        ));
+        if parked == 0 {
+            m.note(
+                "s27: WARNING — parked_total delta is 0 in the provoked set: either pressure \
+                 never engaged (regime vacuous) or the server predates the counter (pre-fix \
+                 A/B arm)",
+            );
+        }
+        // Informational `always` leg (the ADR-0081 "measure `always` for
+        // the same shape" obligation — dispositioned in the ledger).
+        let always = s27_leg(port, "s27always", 4, duration)?;
+        raw.push_str(&format!(
+            "provoked always informational ops/s={:<8.0} p99_us={:<7} max_us={:<8} busy={}\n",
+            always.ops_per_sec, always.p99_us, always.max_us, always.busy_retryable
+        ));
+        busy_total += always.busy_retryable;
+        ops_total += always.ops;
+        drop(server);
+    }
+
+    // Leg-set 2 — the **ADR-0081 D5 shape**: default staging, the
+    // finding's closed loop (32 conns, pipeline 1), back-to-back repeats
+    // on one node. This set carries the D5 bar: no monotonic decay and a
+    // bounded max at `everysec`.
+    let mut max_us_worst: u64 = 0;
+    let mut first_rep_ops_per_sec = 0.0f64;
+    let mut last_rep_ops_per_sec = 0.0f64;
+    {
+        let (server, port) = s27_spawn(flags, infinityd, cells, data_root, None)?;
+        for rep in 0..S27_REPEATS {
+            let report = s27_leg(port, "s27press", 1, duration)?;
+            check_non_busy(&report, &format!("s27 d5 rep{rep}"))?;
+            ops_total += report.ops;
+            busy_total += report.busy_retryable;
+            max_us_worst = max_us_worst.max(report.max_us);
+            if rep == 0 {
+                first_rep_ops_per_sec = report.ops_per_sec;
+            }
+            last_rep_ops_per_sec = report.ops_per_sec;
+            raw.push_str(&format!(
+                "d5-shape rep{rep} everysec ops/s={:<8.0} p99_us={:<7} max_us={:<8} busy={}\n",
+                report.ops_per_sec, report.p99_us, report.max_us, report.busy_retryable
+            ));
+        }
+        drop(server);
+    }
+
+    m.set("s27:busy_refusals_pct", busy_total as f64 * 100.0 / ops_total.max(1) as f64);
+    m.set("s27:write_repeat_decay_x", last_rep_ops_per_sec / first_rep_ops_per_sec.max(1.0));
+    m.set("s27:max_ms", max_us_worst as f64 / 1000.0);
+    m.note(format!(
+        "s27 row: refusal gate spans both leg-sets ({S27_REPEATS} provoked \
+         --log-staging-mib 1 pipeline-4 repeats + always leg, then {S27_REPEATS} \
+         default-staging pipeline-1 repeats — the ADR-0081 D5 shape); decay and max gate the \
+         D5 leg-set only ({duration}s legs, 32 conns, 1 KiB values, flat everysec)"
+    ));
+    m.row_open("durable-write-backpressure");
+    m.row_write_amp(
+        "not measured by this row — the S27 row gates the backpressure shape (refusals, \
+         decay, max); write amplification is unchanged by it",
+    );
+    m.raw_section("s27 per-repeat samples", &raw);
+    Ok(())
+}
+
+/// Spawns the S27 row's server (fresh data dir per spawn; optional
+/// shrunk staging = the provoked regime) and creates + fans both
+/// namespaces.
+fn s27_spawn(
+    flags: &Flags,
+    infinityd: &str,
+    cells: u16,
+    data_root: &str,
+    staging_mib: Option<u32>,
+) -> Result<(crate::gaterun::ServerGuard, u16), String> {
+    let dir = format!("{data_root}/s27");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
+    let mut extra: Vec<String> = vec!["--data-dir".into(), dir];
+    if let Some(mib) = staging_mib {
+        extra.push("--log-staging-mib".into());
+        extra.push(mib.to_string());
+    }
+    if let Some(pin) = flags.get("pin-start") {
+        extra.push("--pin-start".into());
+        extra.push(pin.to_string());
+    }
+    // ADR-0081 D4 / ADR-0083 D6: the sync-pipeline A/B arm rides this
+    // row (`--sync-pipeline 2` re-runs the M2.5-S07 matrix in the
+    // slow-regime shape it never measured).
+    if let Some(pipeline) = flags.get("sync-pipeline") {
+        extra.push("--sync-pipeline".into());
+        extra.push(pipeline.to_string());
+    }
+    let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
+    let server = spawn_infinityd(infinityd, cells, &extra_refs)?;
+    let port = server.port;
+    create_ns(
+        port,
+        &[b"INF.NS", b"CREATE", b"s27press", b"MODE", b"durable", b"FSYNC", b"everysec"],
+    )?;
+    create_ns(
+        port,
+        &[b"INF.NS", b"CREATE", b"s27always", b"MODE", b"durable", b"FSYNC", b"always"],
+    )?;
+    await_fan(port, "s27press", cells)?;
+    await_fan(port, "s27always", cells)?;
+    Ok((server, port))
+}
+
+/// One S27 100%-write leg (32 conns, 1 KiB values) against `ns`.
+fn s27_leg(
+    port: u16,
+    ns: &str,
+    pipeline: usize,
+    duration: u64,
+) -> Result<crate::load::LoadReport, String> {
+    run_load(&LoadSpec {
+        port,
+        conns: 32,
+        pipeline,
+        duration: Duration::from_secs(duration),
+        warmup: Duration::from_secs(1),
+        set_weight: 1,
+        get_weight: 0,
+        keys: FILL_KEYS,
+        key_prefix: format!("{ns}:"),
+        value_size: 1024,
+        setup: vec![vec![b"INF.NS".to_vec(), b"USE".to_vec(), ns.as_bytes().to_vec()]],
+        ..LoadSpec::default()
+    })
+}
+
+/// A leg aborts on any non-BUSY error; BUSY replies are the row's
+/// subject and are counted, never fatal.
+fn check_non_busy(report: &crate::load::LoadReport, leg: &str) -> Result<(), String> {
+    if report.errors > report.busy_retryable {
+        return Err(format!(
+            "{leg}: {} non-BUSY errors (first: {:?})",
+            report.errors - report.busy_retryable,
+            report.error_samples.first()
+        ));
+    }
+    Ok(())
+}
+
+/// Back-to-back sustained-write repeats in the S27 row — the shape that
+/// exposed the finding (decay only shows across repeats).
+const S27_REPEATS: usize = 3;
 
 /// Sends one `INF.NS CREATE` and demands `+OK`, riding out the boot
 /// `-LOADING` window (the listener accepts before recovery completes;

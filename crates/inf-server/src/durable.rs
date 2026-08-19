@@ -41,9 +41,17 @@ pub(crate) const EVERYSEC_TIMER_KEY: u64 = 0xE5EC_0001;
 /// `durable_fsync_eio` fault point injects (M2-S17).
 const EIO: i32 = 5;
 
-/// Pinned retryable reply for aggregate staging backpressure. Early
-/// admission and late exact document admission must stay byte-identical.
+/// Pinned retryable reply for staging backpressure the caller cannot
+/// park on. After ADR-0083 D1 (M4.5-S27) the only emitter left is the
+/// doc path's exact late admission — every parkable path paces instead.
+#[cfg(feature = "doc")]
 pub(crate) const STAGING_BUSY_ERROR: &str = "BUSY durable log staging is full, retry";
+
+/// Typed non-retryable refusal for a write whose staged record can never
+/// fit the staging domain (M4.5-S27, ADR-0083 D2) — the up-front bound
+/// check `staging.rs` demands of admission: no drain can ever admit it,
+/// so parking or client retry is a livelock, never backpressure.
+pub(crate) const STAGING_OVERSIZED_ERROR: &str = "ERR write exceeds durable log staging capacity";
 
 /// Durable-path configuration one cell receives from the node assembly.
 /// Absent config means a memory-only cell: durable DDL is refused with a
@@ -116,6 +124,26 @@ pub struct DurableStats {
     /// durability-fsync completion (distribution percentiles).
     pub fsync_group_p50: u64,
     pub fsync_group_p99: u64,
+    /// M4.5-S27 (ADR-0083 D5): the staging drain's binding variable —
+    /// frame-write submit → `LogWritten` latency (µs percentiles). Under
+    /// kernel writeback throttling this is what starves the staging
+    /// domain; fsync latency is the correlated symptom.
+    pub write_stall_p50_us: u64,
+    pub write_stall_p99_us: u64,
+    pub write_stall_p999_us: u64,
+    /// M4.5-S27: the configured per-buffer staging capacity (the
+    /// admission bound; `staging_resident_bytes` = 2 × this).
+    pub staging_capacity_bytes: u64,
+    /// M4.5-S27: commands currently parked on the drain waitlist, and
+    /// cumulative park episodes — pacing made visible (ADR-0083 D5).
+    pub admission_parked: u64,
+    pub admission_parked_total: u64,
+    /// M4.5-S27: per-reason durability-fsync counts (the S29 named
+    /// observability gap — `CommitStats` had them, nothing exported them).
+    pub fsyncs_linked: u64,
+    pub fsyncs_seal: u64,
+    pub fsyncs_standalone: u64,
+    pub fsyncs_completion: u64,
     pub segments_truncated: u64,
     /// 1 while a checkpoint is streaming (`rdb_bgsave_in_progress`).
     pub ckpt_in_progress: u64,
@@ -139,6 +167,18 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     /// MANIFEST + truncation driver (M2-S11, ADR-0017).
     pub manifest: ManifestCell<F>,
     in_flight: Option<inf_log::FrameLease>,
+    /// Submission time of the in-flight frame write and the ticket of the
+    /// fdatasync linked to it, if any (M4.5-S27): `on_log_written` records
+    /// the write-stall sample and rebases the linked ticket's latency
+    /// clock so `fsync_latency_*` measures sync service time, not the
+    /// chain (ADR-0083 D4).
+    write_submitted_at: Nanos,
+    linked_ticket: Option<FsyncTicket>,
+    /// Frame-write submit → `LogWritten` latency (µs) — the staging
+    /// drain's binding variable (ADR-0083 D5).
+    write_stall_hist: inf_foundation::LogHistogram,
+    /// Cumulative admission park episodes (local pump + fabric pump).
+    parked_total: u64,
     /// Last durable seq assigned (0 = none; the gate starts at 0).
     last_seq: u64,
     /// Last seq the ack gate advanced to (group-formation bookkeeping).
@@ -183,6 +223,10 @@ impl<F: SegmentFs> DurableCell<F> {
             ckpt,
             manifest,
             in_flight: None,
+            write_submitted_at: Nanos(0),
+            linked_ticket: None,
+            write_stall_hist: inf_foundation::LogHistogram::new(),
+            parked_total: 0,
             last_seq: 0,
             acked_seq: 0,
             group_hist_records: inf_foundation::LogHistogram::new(),
@@ -356,10 +400,13 @@ impl<F: SegmentFs> DurableCell<F> {
             self.ckpt.on_frame_sealed(&lease);
             self.frame_seqs.push_back((end.to_u64(), self.last_seq));
             self.commit.note_frame_queued(end, frame_len);
-            let fsync = self
-                .commit
-                .frame_fsync_due()
-                .then(|| fsync_token(self.commit.register_linked_fsync(cx.now)));
+            let linked =
+                self.commit.frame_fsync_due().then(|| self.commit.register_linked_fsync(cx.now));
+            let fsync = linked.map(fsync_token);
+            // The linked sync's clock rebases at `LogWritten` (ADR-0083
+            // D4): its SQE starts only after the covering write.
+            self.linked_ticket = linked;
+            self.write_submitted_at = cx.now;
             let offset = u64::from(slot.base().offset);
             let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
             self.rotor.commit_frame_queued(slot);
@@ -382,11 +429,25 @@ impl<F: SegmentFs> DurableCell<F> {
 
     /// REAP: the frame write's terminal completion — release the lease
     /// (the `StableBytes` custody point) and wake staging-parked pumps.
-    pub fn on_log_written(&mut self) {
+    /// Records the write-stall sample (submit → `LogWritten`, the staging
+    /// drain's binding variable) and rebases the linked sync's latency
+    /// clock so the fsync histogram measures the sync, not the chain
+    /// (M4.5-S27, ADR-0083 D4/D5).
+    pub fn on_log_written(&mut self, now: Nanos) {
+        self.write_stall_hist.record(now.saturating_sub(self.write_submitted_at).as_micros());
+        if let Some(ticket) = self.linked_ticket.take() {
+            self.commit.rebase_clock(ticket, now);
+        }
         self.commit.note_frame_written();
         let lease = self.in_flight.take().expect("LogWritten with no in-flight lease");
         self.staging.release(lease);
         self.drained.wake_all(());
+    }
+
+    /// One admission park episode began (local pump or fabric pump) —
+    /// the pacing observable's cumulative half (ADR-0083 D5).
+    pub fn note_parked(&mut self) {
+        self.parked_total += 1;
     }
 
     /// REAP: an fsync completed — advance the durability watermark, wake
@@ -915,6 +976,16 @@ impl<F: SegmentFs> DurableCell<F> {
             fsync_p999_us: self.commit.fsync_latency_hist().percentile(99.9),
             fsync_group_p50: self.group_hist_records.percentile(50.0),
             fsync_group_p99: self.group_hist_records.percentile(99.0),
+            write_stall_p50_us: self.write_stall_hist.percentile(50.0),
+            write_stall_p99_us: self.write_stall_hist.percentile(99.0),
+            write_stall_p999_us: self.write_stall_hist.percentile(99.9),
+            staging_capacity_bytes: u64::from(self.staging.capacity_bytes()),
+            admission_parked: self.drained.waiting() as u64,
+            admission_parked_total: self.parked_total,
+            fsyncs_linked: self.commit.stats().fsyncs_linked,
+            fsyncs_seal: self.commit.stats().fsyncs_seal,
+            fsyncs_standalone: self.commit.stats().fsyncs_standalone,
+            fsyncs_completion: self.commit.stats().fsyncs_completion,
             segments_truncated: manifest.truncated_segments,
             ckpt_in_progress: u64::from(!matches!(self.ckpt.phase, CkptPhase::Idle)),
             log_segments_live: self.rotor.sealed().len() as u64

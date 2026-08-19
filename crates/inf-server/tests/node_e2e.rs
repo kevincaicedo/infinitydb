@@ -87,17 +87,17 @@ impl Node {
     /// Node with the M2.5 Phase-H fabric-apply prefetch enabled (the A/B
     /// lever's on-arm correctness surface).
     fn start_with_apply_prefetch(cells: u16) -> Node {
-        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), true, false, false)
+        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), true, false, false, None)
     }
 
     fn start_with_parse_prefetch(cells: u16) -> Node {
-        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, true, false)
+        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, true, false, None)
     }
 
     /// Node with the M2.5 Phase-H de-async dispatch enabled (ADR-0030 D4
     /// lever): the pump's sync fast path on-arm correctness surface.
     fn start_with_deasync(cells: u16) -> Node {
-        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, false, true)
+        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, false, true, None)
     }
 
     fn start_full(
@@ -107,10 +107,43 @@ impl Node {
         recover: inf_server::RecoverConfig,
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
     ) -> Node {
-        Node::start_cfg(cells, data_dir, ckpt_interval_bytes, recover, faults, false, false, false)
+        Node::start_cfg(
+            cells,
+            data_dir,
+            ckpt_interval_bytes,
+            recover,
+            faults,
+            false,
+            false,
+            false,
+            None,
+        )
+    }
+
+    /// M4.5-S27: a durable node with a deliberately tiny staging domain —
+    /// the pressure-regime injector (ADR-0083 D3): headroom below one
+    /// pipelined burst makes admission pressure deterministic on any
+    /// device, no degraded drive required.
+    fn start_durable_small_staging(
+        cells: u16,
+        data_dir: &std::path::Path,
+        staging_bytes: u32,
+    ) -> Node {
+        Node::start_cfg(
+            cells,
+            Some(data_dir.to_path_buf()),
+            0,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            Some(staging_bytes),
+        )
     }
 
     #[allow(clippy::too_many_arguments)] // test harness funnel
+    #[allow(clippy::too_many_arguments)] // test harness assembly, not an API surface
     fn start_cfg(
         cells: u16,
         data_dir: Option<std::path::PathBuf>,
@@ -120,6 +153,7 @@ impl Node {
         apply_prefetch: bool,
         parse_prefetch: bool,
         deasync_dispatch: bool,
+        staging_bytes: Option<u32>,
     ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
         // Bind cell 0 first on an ephemeral port, then the rest join it.
@@ -172,7 +206,9 @@ impl Node {
                     }
                     let cfg = inf_server::DurableConfig {
                         data_dir: dir.clone(),
-                        staging: inf_log::StagingConfig::default(),
+                        staging: staging_bytes
+                            .map(|capacity_bytes| inf_log::StagingConfig { capacity_bytes })
+                            .unwrap_or_default(),
                         segment: inf_log::SegmentConfig {
                             segment_bytes: 8 << 20, // small: tests rotate
                             ..Default::default()
@@ -957,6 +993,235 @@ fn durable_namespace_survives_restart() {
     let ttl = read_line(&mut c);
     assert!(ttl.starts_with(b":") && ttl != b":-1\r\n" && ttl != b":-2\r\n", "{ttl:?}");
     drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- M4.5-S27: durable admission paces instead of refusing (ADR-0083) ----
+
+/// `n` distinct keys owned by `cell` under the N-cell contiguous router.
+fn keys_for_cell(cells: u16, cell: u16, n: usize) -> Vec<Vec<u8>> {
+    let router = SlotRouter::new_contiguous(cells);
+    let mut keys = Vec::with_capacity(n);
+    for i in 0..1_000_000u32 {
+        if keys.len() == n {
+            break;
+        }
+        let key = format!("k:{i}");
+        if router.cell_of(SlotRouter::slot_of(key.as_bytes())) == CellId(cell) {
+            keys.push(key.into_bytes());
+        }
+    }
+    assert_eq!(keys.len(), n, "not enough keys routed to cell {cell}");
+    keys
+}
+
+/// Connects and selects `ns`, retrying fresh connections until the DDL
+/// fan has reached the landed cell (REUSEPORT spreads connections, and a
+/// peer cell may not have applied the CREATE yet — the S29 bench trap).
+fn connect_use(node: &Node, ns: &[u8]) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut c = node.connect();
+        c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+        let line = read_line(&mut c);
+        if line == b"+OK\r\n" {
+            return c;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "USE never fanned to all cells: {:?}",
+            String::from_utf8_lossy(&line)
+        );
+    }
+}
+
+/// One `INFO persistence` round-trip (bulk-string reply → text).
+fn info_persistence(c: &mut TcpStream) -> String {
+    c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
+    let header = read_line(c);
+    assert!(header.starts_with(b"$"), "bulk header: {header:?}");
+    let len: usize = String::from_utf8_lossy(&header[1..header.len() - 2]).parse().expect("len");
+    let mut body = vec![0u8; len + 2];
+    c.read_exact(&mut body).expect("info body");
+    String::from_utf8_lossy(&body[..len]).into_owned()
+}
+
+fn info_field(info: &str, field: &str) -> u64 {
+    info.lines()
+        .find_map(|l| l.strip_prefix(&format!("{field}:")))
+        .unwrap_or_else(|| panic!("{field} missing from INFO:\n{info}"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("{field} not numeric"))
+}
+
+/// M4.5-S27 (ADR-0083 D1): under staging pressure every durable write —
+/// local *and* fabric-routed — parks and succeeds; none refuses with
+/// `-BUSY`. Pre-fix, the owner-side fabric admission answered `-BUSY`
+/// while only local writes parked, so this test pins the regression: a
+/// 64 KiB staging domain against pipelined 8 KiB values over keys owned
+/// by both cells makes the pressure regime deterministic on any device.
+#[test]
+fn durable_pressure_parks_fabric_writes_instead_of_busy() {
+    let dir = temp_data_dir("s27-park");
+    let node = Node::start_durable_small_staging(2, &dir, 64 * 1024);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"press",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+
+    let value = vec![b'v'; 8 * 1024];
+    let keys0 = keys_for_cell(2, 0, 50);
+    let keys1 = keys_for_cell(2, 1, 50);
+    let mut conns: Vec<TcpStream> = (0..3).map(|_| connect_use(&node, b"press")).collect();
+    for (ci, c) in conns.iter_mut().enumerate() {
+        let mut pipeline = Vec::new();
+        for (k0, k1) in keys0.iter().zip(&keys1) {
+            let mut k0 = k0.clone();
+            let mut k1 = k1.clone();
+            k0.extend_from_slice(format!(":{ci}").as_bytes());
+            k1.extend_from_slice(format!(":{ci}").as_bytes());
+            pipeline.extend(cmd(&[b"SET", &k0, &value]));
+            pipeline.extend(cmd(&[b"SET", &k1, &value]));
+        }
+        c.write_all(&pipeline).expect("write burst");
+    }
+    // Every reply is +OK: fabric-routed writes parked (paced) instead of
+    // bouncing with the typed -BUSY refusal.
+    for c in &mut conns {
+        for _ in 0..100 {
+            read_exactly(c, b"+OK\r\n");
+        }
+    }
+    // The pressure regime actually engaged (this is not a trivially-idle
+    // pass), and no client-visible refusal was counted anywhere: sample
+    // both cells via fresh REUSEPORT connections.
+    let mut parked_total = 0u64;
+    for _ in 0..8 {
+        let mut c = node.connect();
+        let info = info_persistence(&mut c);
+        assert_eq!(info_field(&info, "log_admission_busy"), 0, "no -BUSY was issued:\n{info}");
+        parked_total += info_field(&info, "log_admission_parked_total");
+    }
+    assert!(parked_total > 0, "staging pressure engaged at least once across cells");
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M4.5-S27 ordering: a GET pipelined behind a parked SET on the same
+/// connection must observe that SET (read-your-write through the pump
+/// FIFO) — under pressure, reads divert to the same per-origin queue so
+/// nothing overtakes a parked write.
+#[test]
+fn durable_pressure_preserves_read_your_write_order() {
+    let dir = temp_data_dir("s27-order");
+    let node = Node::start_durable_small_staging(2, &dir, 64 * 1024);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"ordr", b"MODE", b"durable", b"FSYNC", b"everysec"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+
+    let keys0 = keys_for_cell(2, 0, 25);
+    let keys1 = keys_for_cell(2, 1, 25);
+    let mut c = connect_use(&node, b"ordr");
+    // Interleaved SET/GET bursts, values large enough that the SETs park:
+    // every GET must return the value its immediately-preceding SET wrote.
+    let mut pipeline = Vec::new();
+    let mut expected: Vec<Vec<u8>> = Vec::new();
+    for (i, key) in keys0.iter().chain(&keys1).enumerate() {
+        let value = vec![b'a' + (i % 26) as u8; 8 * 1024];
+        pipeline.extend(cmd(&[b"SET", key, &value]));
+        pipeline.extend(cmd(&[b"GET", key]));
+        expected.push(value);
+    }
+    c.write_all(&pipeline).expect("write burst");
+    for value in &expected {
+        read_exactly(&mut c, b"+OK\r\n");
+        read_exactly(&mut c, format!("${}\r\n", value.len()).as_bytes());
+        let mut body = vec![0u8; value.len() + 2];
+        c.read_exact(&mut body).expect("bulk body");
+        assert_eq!(&body[..value.len()], value.as_slice(), "GET observed its preceding SET");
+    }
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M4.5-S27 (ADR-0083 D2): a write whose record can never fit any drain
+/// refuses up front with a typed ERR — never `-BUSY`, never a parked
+/// livelock — and the connection (and node) stay serviceable after it.
+#[test]
+fn oversized_durable_write_refuses_typed_and_never_livelocks() {
+    let dir = temp_data_dir("s27-oversized");
+    let node = Node::start_durable_small_staging(2, &dir, 64 * 1024);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"tight",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+
+    let huge = vec![b'x'; 100 * 1024]; // > the 64 KiB staging domain
+    for cell in 0..2u16 {
+        let key = key_for_cell(2, cell);
+        let mut c = connect_use(&node, b"tight");
+        c.write_all(&cmd(&[b"SET", &key, &huge])).expect("write");
+        let line = read_line(&mut c);
+        assert!(
+            line.starts_with(b"-ERR write exceeds durable log staging capacity"),
+            "typed never-fits refusal (got {:?})",
+            String::from_utf8_lossy(&line)
+        );
+        // The refusal is per-write, not a wedge: a normal write succeeds.
+        c.write_all(&cmd(&[b"SET", &key, b"small"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M4.5-S27 × ADR-0082: `FSYNC always` under staging pressure — parked
+/// fabric writes produce *gated* verdicts through the pump, and every
+/// ack still arrives (after fsync) with zero refusals.
+#[test]
+fn durable_pressure_always_acks_gate_through_the_pump() {
+    let dir = temp_data_dir("s27-always");
+    let node = Node::start_durable_small_staging(2, &dir, 64 * 1024);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"led27", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+
+    let value = vec![b'w'; 8 * 1024];
+    let keys0 = keys_for_cell(2, 0, 25);
+    let keys1 = keys_for_cell(2, 1, 25);
+    let mut c = connect_use(&node, b"led27");
+    let mut pipeline = Vec::new();
+    for key in keys0.iter().chain(&keys1) {
+        pipeline.extend(cmd(&[b"SET", key, &value]));
+    }
+    c.write_all(&pipeline).expect("write burst");
+    for _ in 0..50 {
+        read_exactly(&mut c, b"+OK\r\n"); // fsync-gated ack, never -BUSY
+    }
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
 }

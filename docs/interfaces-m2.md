@@ -291,8 +291,16 @@ one-writev — ADR-0012), fixed capacity, allocated once per cell.
   generation-checked — the S06 `WatermarkGate` registration input.
 - Accounting (L5): `staged_bytes`/`in_flight_bytes` exact at every
   append/seal/release; `resident_bytes` = 2 × capacity, constant;
+  `capacity_bytes()` (M4.5-S27 — the `log_staging_capacity_bytes`
+  observable, operator-set via `infinityd --log-staging-mib`);
   cumulative `StagingStats{appends, append_bytes, refusals, seals,
   releases}`.
+- M4.5-S27 amendment (ADR-0083 D1/D2): admission behaviour above this
+  seam changed — every parkable path (local pump *and* the fabric
+  per-origin pump) paces on `StagingFull` instead of refusing; typed
+  `-BUSY` is no longer the design response to pressure. A record that
+  can never fit (`est > max_record_len`) refuses up front with a typed
+  `ERR` (the M2-S08 up-front bound check this section always demanded).
 
 ## Sequential read path (`inf-log::reader`, M2-S04)
 
@@ -423,6 +431,11 @@ the module docs; `inf-server` adopts it at S08):
   FIFO by LSN under the EXECUTE budget (wake storms drain across slices).
 - Counters (S21 vocabulary): `CommitStats`, `fsync_latency_hist` (µs),
   `pending_log_bytes`, `last_durable_lsn` (= watermark), `queued_up_to`.
+- M4.5-S27 amendment (ADR-0083 D4): `rebase_clock(FsyncTicket, now)` —
+  a *linked* fsync's latency clock restarts at its covering write's
+  `LogWritten` (the `IO_LINK` sync starts only after the write), so
+  `fsync_latency_hist` measures sync service time, never the
+  write+sync chain. No-ops on completed/failed tickets.
 
 ## Segment lifecycle additions (M2-S05, ADR-0013 D4)
 
