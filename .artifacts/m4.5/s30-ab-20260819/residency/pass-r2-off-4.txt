@@ -1,0 +1,12 @@
+tri-bench Cfg { engine: "infinity", phase: "run", records: 4000000, ops: 400000, conns: 32, read_pct: 100, dist: "zipfian", host: "127.0.0.1", port: 7385, ns: "readonly", warmup_s: 3, shape: "kv", journal: false }
+---RESULT---
+engine=infinity phase=run conns=32
+ops=400000 errors=3 secs=6.569
+throughput_ops_s=60894
+p50_ms=0.350
+p95_ms=1.466
+p99_ms=1.970
+p999_ms=2.449
+max_ms=3.812
+err_sample=GET->
+---END---

@@ -1,0 +1,13 @@
+cold_reads_issued 1325924
+cold_reads_enqueued 1325926
+tiering_promotions 106475
+tiering_promoted_bytes 109456300
+tiering_promote_first_touch 1134419
+tiering_promote_skip_window 0
+tiering_promote_skip_pinned 4228
+tiering_promote_skip_disk 0
+tiering_promote_skip_stale 0
+tiering_promote_skip_cap 0
+tiering_flush_rounds 2410
+tiering_flush_bytes 3780026368
+tiering_compaction_bytes 0

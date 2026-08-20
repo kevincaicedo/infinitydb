@@ -1,0 +1,12 @@
+tri-bench Cfg { engine: "infinity", phase: "load", records: 4000000, ops: 500000, conns: 16, read_pct: 50, dist: "zipfian", host: "127.0.0.1", port: 7385, ns: "readonly", warmup_s: 5, shape: "kv", journal: false }
+---RESULT---
+engine=infinity phase=load conns=16
+ops=4000000 errors=64 secs=26.103
+throughput_ops_s=153238
+p50_ms=0.046
+p95_ms=0.101
+p99_ms=0.204
+p999_ms=0.693
+max_ms=3000.093
+err_sample=LOAD->STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)
+---END---
