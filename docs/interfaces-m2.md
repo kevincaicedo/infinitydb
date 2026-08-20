@@ -349,6 +349,22 @@ freeze discipline). The token *layout* is unchanged; `TokenClass` gains
 - `fallocate`/rename/dir-fsync ops were deliberately NOT added (no unused
   surface); they land with S11/ENOSPC-hardening consumers.
 
+### Amendment (2026-08-19, M4.5-S31 — ADR-0084): tier-flush token classes
+
+The token *layout* stays frozen; `TokenClass` gains two routing-only
+classes: `TierFlushWrite = 11` and `TierFlushSync = 12`. The ops are the
+existing `IoOp::LogWrite`/`Fdatasync` (the ADR-0056 alternatives-rejected
+rule) — only the completion routing differs: these classes route to the
+tier plane's round bookkeeping (`TierCell::on_flush_completion`), never
+to `DurableCell` (the frame-lease custody chain is not theirs) and never
+into the WAL commit ledger (flush watermarks are a separate custody
+chain; acks never wait on a tier barrier — ADR-0022 D3 untouched). Token
+payload: `slot = lane × 256 + op_index` (lane = the namespace's stable
+per-cell flush lane; ≤ 256 ops per round, asserted), `generation =
+round_seq` (stale completions mismatch and are counted, never applied).
+A third `StableBytes` construction (`log_bytes::tier_round_bytes`) joins
+the audit surface with the round-custody proof (SAFETY.md).
+
 ## M2.5-S01/S07 amendments (boot barriers · sync pipeline — ADR-0026)
 
 Post-M2-exit changes to frozen surfaces, ADR-gated per the freeze
@@ -1074,3 +1090,41 @@ free `debug_assert`.
 Total invariants inventoried: **39** across 6 machines (+ the DurableCell
 glue). Deliberate unchecked gaps: **2**. Promotions proposed: **5** (6
 call sites after the split).
+
+### A.7 — Tier-flush round machine (M4.5-S31, ADR-0084)
+
+The reactor-drive flush state machine (`TierFlush` round state in
+`inf-log`, `FlushRound` bookkeeping in `inf-server/tier_cell.rs`):
+
+- **One round in flight per namespace** — by-construction
+  (`TierNs::round: Option<FlushRound>`; staging debug-asserts
+  `!round_active()`).
+- **No durability fact at submission**: `advance_flushed`, `durable_len`,
+  seal catalog commits, and gap crossings apply only in
+  `complete_flush_round`, after every op's terminal completion —
+  by-construction (effects are data on the round; the only applier runs
+  post-completion). The equivalence storm
+  (`tiered_flush_reactor.rs`) asserts the watermark is unmoved between
+  stage and completion, every round.
+- **Barriers submit only after every write completed** (fdatasync covers
+  only completed writes) — by-construction (`FlushRound::barriers_sent`
+  gates on `pending == 0` with no write errors); conservative across
+  files (a two-file round waits for both files' writes).
+- **Effects apply in stage order** (`SealCommit` before the `GapCross`
+  it covers — ADR-0052 D2) — by-construction (a `Vec`, drained in
+  order); `commit_oldest_seal` release-asserts a pending seal exists,
+  `confirm_durable_to` release-asserts monotone-and-bounded.
+- **Window custody**: pool windows return only in `finish_round`
+  (all-terminal), and a dropped namespace parks whole in `round_drain`
+  until its completions drain — by-construction; the `StableBytes`
+  proof is SAFETY.md `tier_round_bytes`.
+- **Barrier completion error is fatal** (§8.4): re-surfaced as
+  `TierFlushError::Fsync` at the next MAINTAIN → the plane's fatal arm →
+  `fail_stop` — checked by `check-fsync-fail-stop.sh` (allowlisted with
+  the review note); write errors resubmit byte-identical (ENOSPC latches
+  admission first, ADR-0063 D4).
+- **Deliberately unchecked**: op-index/kind agreement between the token
+  and the round table is a `debug_assert` (the generation check already
+  rejects cross-round routing); resubmitted write bytes are not
+  re-CRC'd (windows are never written after stage — custody, not
+  checksum).

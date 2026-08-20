@@ -1137,19 +1137,7 @@ impl TieredTable {
             // the fdatasync both landed.
             self.disk_admit.device_full = false;
         }
-        if let Some(limit) = flush.confirmable_end() {
-            let confirm =
-                self.flush_ends.iter().copied().filter(|&e| e <= limit).max().unwrap_or(0);
-            if confirm > self.space.flushed().to_raw() {
-                self.space.advance_flushed(
-                    LogicalAddr::from_raw(confirm).expect("watermarks stay 48-bit"),
-                );
-            }
-            let now_flushed = self.space.flushed().to_raw();
-            while self.flush_ends.front().is_some_and(|&e| e <= now_flushed) {
-                self.flush_ends.pop_front();
-            }
-        }
+        self.confirm_to_claimable(flush);
         outcome.files_sealed =
             u32::try_from(flush.sealed().len() - sealed0).expect("seals per slice fit u32");
         outcome.confirmed_bytes = self.space.flushed().to_raw() - flushed0;
@@ -1237,6 +1225,154 @@ impl TieredTable {
         }
         self.charge_flush_device(flush);
         Ok(())
+    }
+
+    /// Advances `flushed` to the largest staged chunk end the pipeline's
+    /// claimable bound covers, pruning confirmed candidates (the shared
+    /// confirm of the seam slice and the reactor round — ADR-0056 D5's
+    /// claim rule in one place).
+    fn confirm_to_claimable<F: SegmentFs>(&mut self, flush: &TierFlush<F>) {
+        let Some(limit) = flush.confirmable_end() else { return };
+        let confirm = self.flush_ends.iter().copied().filter(|&e| e <= limit).max().unwrap_or(0);
+        if confirm > self.space.flushed().to_raw() {
+            self.space
+                .advance_flushed(LogicalAddr::from_raw(confirm).expect("watermarks stay 48-bit"));
+        }
+        let now_flushed = self.space.flushed().to_raw();
+        while self.flush_ends.front().is_some_and(|&e| e <= now_flushed) {
+            self.flush_ends.pop_front();
+        }
+    }
+
+    // ---- reactor-drive flush rounds (M4.5-S31, ADR-0084) ----
+
+    /// Stages one reactor-drive flush round — the queued twin of
+    /// [`flush_slice`](Self::flush_slice): the same chunk pull, the same
+    /// rotation/early-seal decisions, **no device I/O and no watermark
+    /// movement**. Device intents land on the pipeline's round for the
+    /// plane to ride (`IoOp::LogWrite`/`Fdatasync`); every durability
+    /// fact defers to a round effect that
+    /// [`complete_flush_round`](Self::complete_flush_round) applies at
+    /// the round's last barrier completion. Rounds end early at a
+    /// ring-top gap (effect-ordering simplicity; gaps are once per ring
+    /// wrap). Returns the staged record bytes.
+    ///
+    /// # Errors
+    /// File-creation metadata I/O only (the once-per-`TIER-FILE-BYTES`
+    /// open — ADR-0084 D2); a `StorageFull`-class refusal latches the
+    /// device leg exactly like the seam drive (ADR-0063 D4).
+    pub fn stage_flush_round<F: SegmentFs>(
+        &mut self,
+        flush: &mut TierFlush<F>,
+    ) -> Result<u64, TierFlushError> {
+        let res = self.stage_flush_round_inner(flush);
+        if let Err(e) = &res {
+            if e.is_storage_full() {
+                self.disk_admit.device_full = true;
+            }
+            // A partial round may exist (a mid-pull creation failed).
+            // Every staged write is already barrier-covered by its seal
+            // — this defensive sync covers the impossible dangling case
+            // so the invariant is structural, not argued.
+            if flush.round_active() {
+                flush.sync_queued();
+            }
+        }
+        res
+    }
+
+    fn stage_flush_round_inner<F: SegmentFs>(
+        &mut self,
+        flush: &mut TierFlush<F>,
+    ) -> Result<u64, TierFlushError> {
+        debug_assert!(!flush.round_active(), "staging over an in-flight round");
+        let budget = flush.slice_bytes();
+        let flushed0 = self.space.flushed().to_raw();
+        let mut cursor = flush.append_cursor().unwrap_or(flushed0);
+        assert!(cursor >= flushed0, "flush cursor behind the watermark");
+        let mut spent = 0u64;
+        let mut wrote = false;
+        while spent < budget {
+            let at = LogicalAddr::from_raw(cursor).expect("watermarks stay 48-bit");
+            let Some(chunk) = self.space.next_flush_chunk(at, budget - spent) else { break };
+            match chunk {
+                FlushChunk::Gap { at, len } => {
+                    debug_assert_eq!(at.to_raw(), cursor, "gap starts at the cursor");
+                    flush.seal_for_gap_queued(at.to_raw() + len);
+                    break;
+                }
+                FlushChunk::Records { addr, len } => {
+                    let n = usize::try_from(len).expect("chunk fits usize");
+                    flush.append_range_queued(addr, self.space.bytes(addr, n))?;
+                    // File the chunk (M4-S14) — stage-time, exactly like
+                    // the seam drive (durability is not the counters'
+                    // input; the recovery appliers reconcile).
+                    let (id, base, _, _, _) =
+                        flush.active().expect("append_range leaves a file active");
+                    self.live.note_filed(id, base.to_raw(), addr.to_raw(), len);
+                    cursor = addr.to_raw() + len;
+                    if self.flush_ends.len() == FLUSH_ENDS_CAP {
+                        self.flush_ends.pop_front(); // dominated candidate
+                    }
+                    self.flush_ends.push_back(cursor);
+                    spent += len;
+                    wrote = true;
+                }
+            }
+        }
+        if wrote {
+            flush.sync_queued();
+        }
+        Ok(spent)
+    }
+
+    /// Applies a completed round's deferred effects **in stage order**
+    /// (durable-watermark advances, seal catalog commits, gap crossings
+    /// — ADR-0084 D2), then runs the shared confirm. The caller (plane)
+    /// guarantees every op of the round reached a terminal successful
+    /// completion — a failed barrier never gets here (§8.4 fail-stop).
+    pub fn complete_flush_round<F: SegmentFs>(
+        &mut self,
+        flush: &mut TierFlush<F>,
+    ) -> FlushSliceOutcome {
+        let flushed0 = self.space.flushed().to_raw();
+        let sealed0 = flush.sealed().len();
+        let probed = flush.round_barrier_count() > 0;
+        let mut outcome = FlushSliceOutcome::default();
+        for effect in flush.finish_round() {
+            match effect {
+                inf_log::RoundEffect::DurableTo { data_len } => flush.confirm_durable_to(data_len),
+                inf_log::RoundEffect::SealCommit => flush.commit_oldest_seal(),
+                inf_log::RoundEffect::GapCross { to } => {
+                    self.space.advance_flushed(
+                        LogicalAddr::from_raw(to).expect("watermarks stay 48-bit"),
+                    );
+                    while self.flush_ends.front().is_some_and(|&e| e <= to) {
+                        self.flush_ends.pop_front();
+                    }
+                    outcome.gaps_crossed += 1;
+                }
+            }
+        }
+        debug_assert_eq!(flush.pending_seal_count(), 0, "every staged seal committed");
+        // A successful barrier set is the ADR-0063 D4 probe's answer.
+        if probed {
+            self.disk_admit.device_full = false;
+        }
+        self.confirm_to_claimable(flush);
+        outcome.files_sealed =
+            u32::try_from(flush.sealed().len() - sealed0).expect("seals per round fit u32");
+        outcome.confirmed_bytes = self.space.flushed().to_raw() - flushed0;
+        self.space.note_flush_slice(outcome.confirmed_bytes);
+        self.charge_flush_device(flush);
+        outcome
+    }
+
+    /// Latches the ADR-0063 D4 device leg from a reactor-drive write
+    /// completion that reported `ENOSPC` (the plane's completion handler
+    /// is the only caller; the seam drive latches inside the slice).
+    pub fn note_flush_device_full(&mut self) {
+        self.disk_admit.device_full = true;
     }
 
     // ---- hybrid checkpoint walk (M4-S12, ADR-0057 D1/D2) ----
@@ -1459,6 +1595,17 @@ impl TieredTable {
             let durable_len = (base + meta.data_len).min(flushed).saturating_sub(base);
             if durable_len > 0 {
                 files.push(TierFileRange { id: meta.id, base, durable_len });
+            }
+        }
+        // Files whose seal is staged but not completion-committed
+        // (M4.5-S31, ADR-0084 D2) stay manifest-visible as unsealed
+        // ranges at their flushed prefix — recovery must never treat a
+        // mid-round file as dead-life garbage.
+        for pending in flush.pending_seals() {
+            let base = pending.base.to_raw();
+            let durable_len = (base + pending.data_len).min(flushed).saturating_sub(base);
+            if durable_len > 0 {
+                files.push(TierFileRange { id: pending.id, base, durable_len });
             }
         }
         if let Some((id, base, _, _, _)) = flush.active() {

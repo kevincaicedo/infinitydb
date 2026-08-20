@@ -50,7 +50,8 @@ pub use ckpt::{
 pub use commit::{CommitStats, FsyncClass, FsyncTicket, GroupCommit, SyncReason};
 pub use effect::MutationEffect;
 pub use flush::{
-    TIER_FILE_CAPACITY_DEFAULT, TierFileMeta, TierFlush, TierFlushConfig, TierFlushError,
+    PendingSealView, TIER_FILE_CAPACITY_DEFAULT, TierDrive, TierFileMeta, TierFlush,
+    TierFlushConfig, TierFlushError,
 };
 pub use frame::{
     DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN, FRAME_HEADER_LEN_V1, FRAME_MAGIC, FRAME_MAGIC_V1,
@@ -82,9 +83,9 @@ pub use staging::{
 };
 pub use tail::{LogCorruption, RegionEvidence, RegionScan, scan_region, scan_region_evidence};
 pub use tier::{
-    SealOutcome, SealReason, TIER_FOOTER_BYTES, TIER_FRAME_BYTES, TIER_FRAME_DATA,
+    RoundEffect, SealOutcome, SealReason, TIER_FOOTER_BYTES, TIER_FRAME_BYTES, TIER_FRAME_DATA,
     TIER_HEADER_BYTES, TierCorruption, TierDecodeError, TierFooterV1, TierHeaderV1, TierIdentity,
-    TierSummary, TierWriteFailure, TierWriter, inspect_tier_bytes, parse_tier_file_name,
-    parse_tier_footer, parse_tier_header, probe_tier_file, tier_extract, tier_file_name,
-    tier_frame_offset, tier_frame_span,
+    TierOpView, TierSummary, TierWriteFailure, TierWriter, inspect_tier_bytes,
+    parse_tier_file_name, parse_tier_footer, parse_tier_header, probe_tier_file, tier_extract,
+    tier_file_name, tier_frame_offset, tier_frame_span,
 };

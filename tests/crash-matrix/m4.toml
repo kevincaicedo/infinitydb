@@ -191,3 +191,12 @@ point = "blob_write_nospace"
 tier = "node"
 test = "blob.rs"
 expect = "blob-write-fails-typed"
+
+# ---- M4.5-S31 reactor-drive cut windows (ADR-0084 D4) ----
+# Cut-timing windows, not fault points, so they carry as named
+# power-cut tests in tier.rs (the documents.rs precedent — the row
+# schema requires a declared point):
+#   reactor_seal_barrier_lost_reseals_at_the_manifested_watermark
+#     (footer write completed, seal fdatasync did not → reseal-at-watermark)
+#   reactor_sealed_file_beyond_the_manifest_is_clamped_inert
+#     (seal completed, MANIFEST never named it → manifested-prefix clamp)

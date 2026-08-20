@@ -8,12 +8,14 @@
 //! S12's MANIFEST v2 consumes. What it does **not** own: addresses,
 //! records, watermarks — the store side pulls record-aligned ranges from
 //! its address space and pushes them here (`inf-store → inf-log` is the
-//! existing vocabulary edge; the drive loop is
-//! `TieredTable::flush_slice`). Blocking seam writes, the `SyncIckWriter`
-//! pattern — driven from MAINTAIN slices in tests/DST/benches; the
-//! reactor-tier drive rides `IoOp::LogWrite`/`Fdatasync` on the same
-//! staged intents when command wiring lands (recorded deviation,
-//! ADR-0056 D3).
+//! existing vocabulary edge). Two drives (M4.5-S31, ADR-0084 — the
+//! ADR-0056 D3 deviation discharged): the **seam drive**
+//! (`TieredTable::flush_slice` — blocking `SegmentFs` writes, the
+//! `SyncIckWriter` pattern; recovery, orderly drains, component
+//! tests/DST) and the **reactor drive** (`stage_flush_round` — intents
+//! queue on a bounded [`TierRound`], the plane rides them as
+//! `IoOp::LogWrite`/`Fdatasync`, and every durability fact defers to a
+//! [`RoundEffect`] applied at the round's last barrier completion).
 //!
 //! fsync failure is fatal-by-default (§8.4, ADR-0056 D4): it surfaces as
 //! [`TierFlushError::Fsync`] and the flushed watermark freezes — no
@@ -24,9 +26,24 @@ use std::path::PathBuf;
 
 use inf_foundation::LogicalAddr;
 
-use crate::fs::{SegmentFs, TierIoMode};
+use crate::fs::{SegmentFile, SegmentFs, TierIoMode};
 use crate::record::NsId;
-use crate::tier::{SealReason, TierWriteFailure, TierWriter};
+use crate::tier::{
+    QueuedSeal, RoundEffect, SealReason, TierOpView, TierRound, TierWriteFailure, TierWriter,
+    WindowPool,
+};
+
+/// How a pipeline's I/O reaches the device (M4.5-S31, ADR-0084 D1).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TierDrive {
+    /// Blocking `SegmentFs` calls at the call site — recovery, orderly
+    /// drains, component tests/DST, fd-less filesystems (`MemFs`).
+    Seam,
+    /// Staged intents ride the cell driver (`IoOp::LogWrite`/
+    /// `Fdatasync`); durability facts apply at completion CQEs. Plane
+    /// pipelines only; requires fd-backed files.
+    Reactor,
+}
 
 /// Default file-capacity target: 1 GiB of data bytes (ADR-0056 D2 —
 /// knob joins S19's `INF.NS` ADR; construction parameter until then).
@@ -153,6 +170,51 @@ pub struct TierFlush<F: SegmentFs> {
     /// the creation-mode fd instead of reopening (ADR-0054; M4-S26).
     /// Undrained handles simply close when the pipeline drops.
     sealed_handles: Vec<(u32, F::File)>,
+    /// The drive (M4.5-S31, ADR-0084 D1). `Seam` by construction; the
+    /// plane flips to `Reactor` before the first flush.
+    drive: TierDrive,
+    /// Reactor-drive window pool (empty and unused on the seam drive).
+    pool: WindowPool,
+    /// The one in-flight round, staged here and executed by the plane
+    /// (ADR-0084 D2 — the explicit bound: one per namespace).
+    round: Option<TierRound>,
+    /// Directory handles a round's dir-fsync barriers target — held
+    /// until the round finishes (the fd must outlive the op).
+    round_dir_holds: Vec<F::File>,
+    /// Files whose seal is staged in the in-flight round: catalog
+    /// commit happens at the barrier completion ([`RoundEffect::
+    /// SealCommit`]); until then the open handle serves cold reads on
+    /// the confirmed prefix and the file stays manifest-visible as an
+    /// unsealed range. Empty whenever no round is in flight.
+    pending_seals: Vec<PendingSeal<F>>,
+}
+
+/// A seal staged but not yet completion-committed (ADR-0084 D2).
+struct PendingSeal<F: SegmentFs> {
+    id: u32,
+    base: LogicalAddr,
+    data_len: u64,
+    /// Confirmed durable prefix at stage time (cold reads' bound).
+    confirmed_len: u64,
+    reason: SealReason,
+    path: PathBuf,
+    device_bytes: u64,
+    file: F::File,
+}
+
+/// Read-side view of a pending seal (manifest, cold reads, disk usage).
+#[derive(Copy, Clone, Debug)]
+pub struct PendingSealView {
+    /// File id (`tier-NNNNNN.itier`).
+    pub id: u32,
+    /// First logical address of the file's range.
+    pub base: LogicalAddr,
+    /// Exact data bytes staged (the sealed length once committed).
+    pub data_len: u64,
+    /// Confirmed durable prefix at stage time — the cold-read bound.
+    pub confirmed_len: u64,
+    /// Backend fd for cold-read ops.
+    pub fd: Option<std::os::fd::RawFd>,
 }
 
 impl<F: SegmentFs> TierFlush<F> {
@@ -200,6 +262,11 @@ impl<F: SegmentFs> TierFlush<F> {
             active_id: 0,
             sealed_device_bytes: 0,
             sealed_handles: Vec::new(),
+            drive: TierDrive::Seam,
+            pool: WindowPool::new(),
+            round: None,
+            round_dir_holds: Vec::new(),
+            pending_seals: Vec::new(),
         }
     }
 
@@ -208,6 +275,239 @@ impl<F: SegmentFs> TierFlush<F> {
     /// in its cold-read file table; dropping one closes the fd.
     pub fn take_sealed_handles(&mut self) -> Vec<(u32, F::File)> {
         core::mem::take(&mut self.sealed_handles)
+    }
+
+    // ---- reactor drive (M4.5-S31, ADR-0084) ----
+
+    /// Switches the drive. Plane-only; called once per pipeline life,
+    /// before any flush work (fresh creation or recovery install).
+    ///
+    /// # Panics
+    /// Panics with a round in flight or pending seals — the drive never
+    /// changes mid-flight.
+    pub fn set_drive(&mut self, drive: TierDrive) {
+        assert!(self.round.is_none(), "drive change with a round in flight");
+        assert!(self.pending_seals.is_empty(), "drive change with pending seals");
+        self.drive = drive;
+    }
+
+    /// The pipeline's drive.
+    #[must_use]
+    pub fn drive(&self) -> TierDrive {
+        self.drive
+    }
+
+    /// Whether a staged round exists (in flight or awaiting `finish_round`).
+    #[must_use]
+    pub fn round_active(&self) -> bool {
+        self.round.is_some()
+    }
+
+    /// Ops of the staged round: total, leading writes, barriers.
+    #[must_use]
+    pub fn round_op_count(&self) -> usize {
+        self.round.as_ref().map_or(0, TierRound::op_count)
+    }
+
+    /// Leading ops of the round that are data writes (wave 1).
+    #[must_use]
+    pub fn round_write_count(&self) -> usize {
+        self.round.as_ref().map_or(0, TierRound::write_count)
+    }
+
+    /// Barrier ops of the round (wave 2).
+    #[must_use]
+    pub fn round_barrier_count(&self) -> usize {
+        self.round.as_ref().map_or(0, TierRound::barrier_count)
+    }
+
+    /// The round op at `index` — the plane converts writes to
+    /// `IoOp::LogWrite` and barriers to `IoOp::Fdatasync`. The returned
+    /// window bytes stay valid (pool-owned, heap-stable) until
+    /// [`finish_round`](Self::finish_round).
+    ///
+    /// # Panics
+    /// Panics without a round or past its op count.
+    #[must_use]
+    pub fn round_op(&self, index: usize) -> TierOpView<'_> {
+        self.round.as_ref().expect("round op view without a round").op(index)
+    }
+
+    /// Queued twin of [`append_range`](Self::append_range): identical
+    /// rotation/early-seal decisions, but every device intent lands on
+    /// the round and every durability fact defers to a round effect.
+    ///
+    /// # Errors
+    /// File-creation metadata I/O only (the open — ADR-0084 D2); all
+    /// staged work is infallible.
+    ///
+    /// # Panics
+    /// Panics off the write cursor (the contiguity contract) or on the
+    /// seam drive.
+    pub fn append_range_queued(
+        &mut self,
+        addr: LogicalAddr,
+        bytes: &[u8],
+    ) -> Result<(), TierFlushError> {
+        assert_eq!(self.drive, TierDrive::Reactor, "queued append on the seam drive");
+        if let Some(w) = &self.writer {
+            let cursor = w.base().to_raw() + w.data_len();
+            assert_eq!(
+                addr.to_raw(),
+                cursor,
+                "flush ranges are contiguous; gaps go through seal_for_gap_queued"
+            );
+            if w.data_len() > 0 && w.data_len() + bytes.len() as u64 > self.config.file_capacity {
+                self.seal_active_queued(SealReason::Capacity);
+            }
+        }
+        if self.writer.is_none() {
+            self.create_file_queued(addr)?;
+        }
+        let round = self.round.get_or_insert_with(TierRound::new);
+        let w = self.writer.as_mut().expect("created above");
+        w.append_queued(addr, bytes, round, &mut self.pool);
+        Ok(())
+    }
+
+    /// Queued twin of [`seal_for_gap`](Self::seal_for_gap): stages the
+    /// gap seal (when a file is active) and the [`RoundEffect::GapCross`]
+    /// fact — `flushed` crosses the hole only at the covering barrier's
+    /// completion (ADR-0052 D2, completion-gated).
+    pub fn seal_for_gap_queued(&mut self, gap_end: u64) {
+        assert_eq!(self.drive, TierDrive::Reactor, "queued gap seal on the seam drive");
+        if self.writer.is_some() {
+            self.seal_active_queued(SealReason::RingTopGap);
+        }
+        let round = self.round.get_or_insert_with(TierRound::new);
+        round.push_effect(RoundEffect::GapCross { to: gap_end });
+    }
+
+    /// Queued twin of [`sync`](Self::sync): stages the slice barrier and
+    /// its `DurableTo` fact. No-op without an active file.
+    pub fn sync_queued(&mut self) {
+        assert_eq!(self.drive, TierDrive::Reactor, "queued sync on the seam drive");
+        if let Some(w) = &mut self.writer {
+            let round = self.round.get_or_insert_with(TierRound::new);
+            w.sync_queued(round, &mut self.pool);
+        }
+    }
+
+    /// Finishes the completed round: recycles its windows into the pool,
+    /// releases the directory holds, and yields the deferred effects in
+    /// stage order for the store to apply. Callable only once every op
+    /// reached a terminal completion (the plane's custody obligation).
+    #[must_use]
+    pub fn finish_round(&mut self) -> Vec<RoundEffect> {
+        self.round_dir_holds.clear();
+        match self.round.take() {
+            Some(round) => round.recycle(&mut self.pool),
+            None => Vec::new(),
+        }
+    }
+
+    /// Applies a completed round's `DurableTo` fact to the active file.
+    ///
+    /// # Panics
+    /// Panics without an active writer — the effect was generated by it.
+    pub fn confirm_durable_to(&mut self, data_len: u64) {
+        self.writer
+            .as_mut()
+            .expect("DurableTo without an active writer")
+            .confirm_durable_to(data_len);
+    }
+
+    /// Applies a completed round's `SealCommit` fact: the oldest pending
+    /// seal joins the catalog exactly as a seam seal would have.
+    ///
+    /// # Panics
+    /// Panics without a pending seal — effects mirror stage order.
+    pub fn commit_oldest_seal(&mut self) {
+        assert!(!self.pending_seals.is_empty(), "SealCommit without a pending seal");
+        let seal = self.pending_seals.remove(0);
+        self.sealed_device_bytes += seal.device_bytes;
+        self.sealed_handles.push((seal.id, seal.file));
+        self.sealed.push(TierFileMeta {
+            id: seal.id,
+            base: seal.base,
+            data_len: seal.data_len,
+            reason: seal.reason,
+            path: seal.path,
+        });
+    }
+
+    /// Seals staged in the in-flight round, not yet committed — the
+    /// manifest names them as unsealed ranges, cold reads may target
+    /// their confirmed prefix, disk usage counts them. Empty whenever no
+    /// round is in flight.
+    pub fn pending_seals(&self) -> impl Iterator<Item = PendingSealView> + '_ {
+        self.pending_seals.iter().map(|s| PendingSealView {
+            id: s.id,
+            base: s.base,
+            data_len: s.data_len,
+            confirmed_len: s.confirmed_len,
+            fd: s.file.raw_fd(),
+        })
+    }
+
+    /// Pending (staged, uncommitted) seals in the in-flight round.
+    #[must_use]
+    pub fn pending_seal_count(&self) -> usize {
+        self.pending_seals.len()
+    }
+
+    fn seal_active_queued(&mut self, reason: SealReason) {
+        let writer = self.writer.take().expect("caller checked an active file exists");
+        let round = self.round.get_or_insert_with(TierRound::new);
+        let sealed: QueuedSeal<F::File> = writer.seal_queued(reason, round, &mut self.pool);
+        round.push_effect(RoundEffect::SealCommit);
+        self.pending_seals.push(PendingSeal {
+            id: self.active_id,
+            base: sealed.base,
+            data_len: sealed.outcome.data_len,
+            confirmed_len: sealed.confirmed_len,
+            reason,
+            path: sealed.outcome.path,
+            device_bytes: sealed.outcome.device_bytes,
+            file: sealed.file,
+        });
+    }
+
+    fn create_file_queued(&mut self, base: LogicalAddr) -> Result<(), TierFlushError> {
+        let id = self.next_id;
+        let round = self.round.get_or_insert_with(TierRound::new);
+        let writer = TierWriter::create_queued(
+            &self.fs,
+            &self.config.shard_dir,
+            id,
+            self.config.cell,
+            self.config.ns,
+            base,
+            self.config.mode,
+            self.config.file_capacity,
+            round,
+            &mut self.pool,
+        )
+        .map_err(|source| TierFlushError::Io {
+            path: self.config.shard_dir.join("cold"),
+            source,
+        })?;
+        // The segment-create rule, completion-gated (ADR-0084 D2): both
+        // dirent barriers join the round; the confirm waits on them, so
+        // no manifest can name the file before its name is durable.
+        for dir in [self.config.shard_dir.clone(), self.config.shard_dir.join("cold")] {
+            let handle = self
+                .fs
+                .open_dir(&dir)
+                .map_err(|source| TierFlushError::Io { path: dir, source })?;
+            let fd = handle.raw_fd().expect("reactor drive requires fd-backed dirs (ADR-0084)");
+            round.push_barrier(fd);
+            self.round_dir_holds.push(handle);
+        }
+        self.next_id += 1;
+        self.active_id = id;
+        self.writer = Some(writer);
+        Ok(())
     }
 
     /// The active file's raw fd, when one is open and the tier has real
@@ -279,7 +579,8 @@ impl<F: SegmentFs> TierFlush<F> {
                 + if sealed { TIER_FOOTER_BYTES as u64 } else { 0 }
         };
         let sealed: u64 = self.sealed.iter().map(|m| file_bytes(m.data_len, true)).sum();
-        sealed + self.writer.as_ref().map_or(0, |w| file_bytes(w.data_len(), false))
+        let pending: u64 = self.pending_seals.iter().map(|s| file_bytes(s.data_len, true)).sum();
+        sealed + pending + self.writer.as_ref().map_or(0, |w| file_bytes(w.data_len(), false))
     }
 
     /// The active file, if any: `(id, base, data_len, durable_len, path)`.
@@ -314,6 +615,7 @@ impl<F: SegmentFs> TierFlush<F> {
     /// Panics when `addr` is not the active file's write cursor (the
     /// contiguity contract above).
     pub fn append_range(&mut self, addr: LogicalAddr, bytes: &[u8]) -> Result<(), TierFlushError> {
+        assert!(self.round.is_none(), "seam append while a reactor round is in flight");
         if let Some(w) = &self.writer {
             let cursor = w.base().to_raw() + w.data_len();
             assert_eq!(
@@ -344,6 +646,7 @@ impl<F: SegmentFs> TierFlush<F> {
     /// [`TierFlushError`] — a failed seal means the gap (and everything
     /// after it) is not yet crossable.
     pub fn seal_for_gap(&mut self) -> Result<(), TierFlushError> {
+        assert!(self.round.is_none(), "seam gap seal while a reactor round is in flight");
         if self.writer.is_some() {
             self.seal_active(SealReason::RingTopGap)?;
         }
@@ -357,6 +660,7 @@ impl<F: SegmentFs> TierFlush<F> {
     /// # Errors
     /// [`TierFlushError::Fsync`] is fatal (§8.4).
     pub fn sync(&mut self) -> Result<(), TierFlushError> {
+        assert!(self.round.is_none(), "seam sync while a reactor round is in flight");
         if let Some(w) = &mut self.writer {
             let path = w.path().to_path_buf();
             w.sync().map_err(|failure| classify(failure, path))?;
@@ -369,6 +673,7 @@ impl<F: SegmentFs> TierFlush<F> {
     /// # Errors
     /// [`TierFlushError`] as for any seal.
     pub fn seal_shutdown(&mut self) -> Result<(), TierFlushError> {
+        assert!(self.round.is_none(), "seam seal while a reactor round is in flight");
         if self.writer.is_some() {
             self.seal_active(SealReason::Shutdown)?;
         }
@@ -384,6 +689,7 @@ impl<F: SegmentFs> TierFlush<F> {
     /// # Errors
     /// [`TierFlushError`] as for any seal.
     pub fn seal_stall(&mut self) -> Result<(), TierFlushError> {
+        assert!(self.round.is_none(), "seam seal while a reactor round is in flight");
         if self.writer.is_some() {
             self.seal_active(SealReason::Stall)?;
         }
@@ -598,5 +904,170 @@ mod tests {
         let err = flush.sync().expect_err("injected fsync failure");
         assert!(err.is_fatal(), "fsync failures are the §8.4 class");
         assert!(err.to_string().contains("FATAL"), "the message says stop");
+    }
+
+    // ---- reactor drive (M4.5-S31, ADR-0084) ----
+
+    use crate::fs::sim::SimDisk;
+
+    fn sim_pipeline(disk: &SimDisk, capacity: u64) -> TierFlush<SimDisk> {
+        let mut flush = TierFlush::new(
+            disk.clone(),
+            TierFlushConfig {
+                shard_dir: Path::new("shard-0").to_path_buf(),
+                cell: 0,
+                ns: NsId(17),
+                mode: TierIoMode::Buffered,
+                file_capacity: capacity,
+                slice_bytes: 4096,
+            },
+            0,
+        );
+        flush.set_drive(TierDrive::Reactor);
+        flush
+    }
+
+    /// Executes a staged round the plane's way — every write, then every
+    /// barrier (fdatasync covers only completed writes) — and returns
+    /// the deferred effects.
+    fn run_round(disk: &SimDisk, flush: &mut TierFlush<SimDisk>) -> Vec<RoundEffect> {
+        let writes = flush.round_write_count();
+        for index in 0..writes {
+            let op = flush.round_op(index);
+            assert!(!op.is_barrier, "writes lead the op list");
+            disk.driver_write_at(op.fd, op.offset, op.bytes).expect("driver write");
+        }
+        for index in writes..flush.round_op_count() {
+            let op = flush.round_op(index);
+            assert!(op.is_barrier, "barriers trail the op list");
+            disk.driver_fdatasync(op.fd).expect("driver barrier");
+        }
+        flush.finish_round()
+    }
+
+    fn image(disk: &SimDisk, path: &Path) -> Vec<u8> {
+        let file = disk.open_read(path).expect("file exists");
+        let size = file.file_size().expect("size") as usize;
+        let mut bytes = vec![0u8; size];
+        let mut read = 0;
+        while read < size {
+            let n = file.read_at(read as u64, &mut bytes[read..]).expect("read");
+            assert!(n > 0, "no EOF inside the image");
+            read += n;
+        }
+        bytes
+    }
+
+    /// A queued round performs no device I/O at stage time and advances
+    /// no durability watermark until its effects apply — `durable_len`
+    /// and the claim bound move only at the barrier's completion
+    /// (ADR-0084 D2, the §3.1 chain).
+    #[test]
+    fn queued_round_defers_durability_to_completion() {
+        let disk = SimDisk::new();
+        let mut flush = sim_pipeline(&disk, 1 << 20);
+        let payload = vec![0x5D; TIER_FRAME_DATA + 1908];
+        flush.append_range_queued(LogicalAddr::ZERO, &payload).expect("stage");
+        flush.sync_queued();
+        // Header + one full frame + the partial tail frame, one barrier
+        // on the file, two dirent barriers from the creation.
+        assert_eq!(flush.round_write_count(), 3, "header + batch + tail");
+        assert_eq!(flush.round_barrier_count(), 3, "file + shard dir + cold dir");
+        assert_eq!(flush.confirmable_end(), Some(0), "nothing claimable before completion");
+        let effects = run_round(&disk, &mut flush);
+        assert_eq!(effects.len(), 1);
+        let RoundEffect::DurableTo { data_len } = effects[0] else {
+            panic!("sync stages DurableTo, got {:?}", effects[0]);
+        };
+        assert_eq!(data_len, payload.len() as u64);
+        flush.confirm_durable_to(data_len);
+        assert_eq!(
+            flush.confirmable_end(),
+            Some(TIER_FRAME_DATA as u64),
+            "claim rule holds: the partial tail frame waits for the seal"
+        );
+    }
+
+    /// A capacity seal staged in a round commits to the catalog only at
+    /// effect application: mid-round the file is a pending seal (visible
+    /// to manifest/cold lookups), afterwards it is sealed on disk with a
+    /// verified footer and its handle drains to the cold-read table.
+    #[test]
+    fn queued_capacity_seal_commits_at_completion() {
+        let disk = SimDisk::new();
+        let mut flush = sim_pipeline(&disk, 1000);
+        flush.append_range_queued(LogicalAddr::ZERO, &[0xA0; 600]).expect("stage");
+        let a1 = LogicalAddr::ZERO.advanced(600).expect("fits");
+        flush.append_range_queued(a1, &[0xA1; 600]).expect("stage");
+        flush.sync_queued();
+        assert_eq!(flush.sealed().len(), 0, "no catalog commit at stage time");
+        assert_eq!(flush.pending_seal_count(), 1, "the capacity seal is pending");
+        let pending: Vec<_> = flush.pending_seals().collect();
+        assert_eq!(pending[0].id, 0);
+        assert_eq!(pending[0].data_len, 600);
+        let effects = run_round(&disk, &mut flush);
+        assert!(
+            matches!(effects[0], RoundEffect::SealCommit),
+            "the seal precedes the new file's durability in stage order"
+        );
+        for effect in effects {
+            match effect {
+                RoundEffect::DurableTo { data_len } => flush.confirm_durable_to(data_len),
+                RoundEffect::SealCommit => flush.commit_oldest_seal(),
+                RoundEffect::GapCross { .. } => panic!("no gap staged"),
+            }
+        }
+        assert_eq!(flush.pending_seal_count(), 0);
+        assert_eq!(flush.sealed().len(), 1);
+        assert_eq!(flush.sealed()[0].data_len, 600, "sealed at the range boundary");
+        assert_eq!(flush.sealed()[0].reason, SealReason::Capacity);
+        let handles = flush.take_sealed_handles();
+        assert_eq!(handles.len(), 1, "the seal hands its fd to the cold-read table");
+        let img = image(&disk, &flush.sealed()[0].path);
+        let summary = crate::tier::inspect_tier_bytes(&img).expect("valid sealed image");
+        assert_eq!(summary.sealed.expect("footer present").data_len, 600);
+        assert_eq!(summary.first_bad_frame, None, "every frame verifies");
+        assert_eq!(
+            flush.confirmable_end(),
+            Some(600),
+            "file A is fully claimable; file B's partial tail frame is \
+             held back until its own seal (ADR-0056 D5)"
+        );
+    }
+
+    /// A ring-top gap stages `SealCommit` before `GapCross` — `flushed`
+    /// may cross the hole only after the covering seal's barrier
+    /// (ADR-0052 D2, completion-gated).
+    #[test]
+    fn queued_gap_orders_seal_before_crossing() {
+        let disk = SimDisk::new();
+        let mut flush = sim_pipeline(&disk, 1 << 20);
+        flush.append_range_queued(LogicalAddr::ZERO, &[0x5B; 700]).expect("stage");
+        flush.seal_for_gap_queued(90_000);
+        flush.sync_queued(); // no active file: a no-op, stages nothing
+        let effects = run_round(&disk, &mut flush);
+        assert_eq!(effects.len(), 2);
+        assert!(matches!(effects[0], RoundEffect::SealCommit));
+        let RoundEffect::GapCross { to } = effects[1] else { panic!("gap crossing follows") };
+        assert_eq!(to, 90_000);
+        flush.commit_oldest_seal();
+        assert_eq!(flush.sealed()[0].reason, SealReason::RingTopGap);
+        assert_eq!(
+            flush.confirmable_end(),
+            Some(700),
+            "the whole sealed file is claimable after commit"
+        );
+    }
+
+    /// Fd-less filesystems never take the reactor drive: the queued
+    /// funnels are unreachable on `MemFs` by the drive contract, and the
+    /// seam pipeline refuses a drive flip while work is staged.
+    #[test]
+    #[should_panic(expected = "drive change with a round in flight")]
+    fn drive_flip_with_a_staged_round_panics() {
+        let disk = SimDisk::new();
+        let mut flush = sim_pipeline(&disk, 1 << 20);
+        flush.append_range_queued(LogicalAddr::ZERO, &[0x11; 64]).expect("stage");
+        flush.set_drive(TierDrive::Seam);
     }
 }

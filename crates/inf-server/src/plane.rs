@@ -1600,6 +1600,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// tiered namespace was ever created: one `None` check.
     fn tier_maintain(&mut self, cx: &mut LoopCx<'_>) {
         let mut compact_reads: Vec<crate::tier_cell::CompactRead> = Vec::new();
+        let mut flush_ops: Vec<IoOp> = Vec::new();
         let cold = {
             let mut tier_slot = self.shared.tier.borrow_mut();
             let Some(tier) = tier_slot.as_mut() else { return };
@@ -1618,8 +1619,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let mut ks = self.shared.store.borrow_mut();
             let mut units = 0u32;
             let mut fatal: Option<String> = None;
+            let now_us = cx.now.as_micros();
             for at in 0..tier.namespaces.len() {
-                match tier.maintain_ns(&mut ks, at, durable_mark, transition_idle) {
+                match tier.maintain_ns(
+                    &mut ks,
+                    at,
+                    durable_mark,
+                    transition_idle,
+                    now_us,
+                    &mut flush_ops,
+                ) {
                     Ok((used, work)) => {
                         units += used;
                         compact_reads.extend(work);
@@ -1644,8 +1653,28 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 let cell = durable.as_mut().expect("tiered namespaces require the durable plane");
                 cell.fail_stop("tier flush", &detail);
             }
+            // Reactor-drive flush observables (M4.5-S31, ADR-0084 D6).
+            let stats = &tier.flush_stats;
+            let files_sealed: u64 =
+                tier.namespaces.iter().map(|t| t.flush.sealed().len() as u64).sum();
+            self.shared.node.tier_flush.set([
+                stats.rounds,
+                stats.write_retries,
+                stats.stale_completions,
+                stats.round_us.percentile(50.0),
+                stats.round_us.percentile(99.0),
+                tier.flush_rounds_inflight(),
+                files_sealed,
+                tier.namespaces.iter().filter(|t| t.flush.active().is_some()).count() as u64,
+            ]);
             tier.cold.clone()
         };
+        // Reactor-drive flush ops (M4.5-S31): pushed outside the tier
+        // borrow — REAP routes their completions back via
+        // `on_flush_completion`.
+        for op in flush_ops {
+            cx.push(op);
+        }
         for read in compact_reads {
             let shared = Rc::clone(&self.shared);
             let _ = cx.executor.poll_immediate(compact_pump(shared, read));
@@ -1941,6 +1970,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 if let Some(buf) = buf {
                     cx.pool.release(buf);
                 }
+                // Tier-flush op failures (M4.5-S31, ADR-0084 D4) are the
+                // round's to classify at the next MAINTAIN — ENOSPC
+                // latches admission and retries; a failed barrier is the
+                // §8.4 fatal class there. Never connection housekeeping.
+                if matches!(c.token.class(), TokenClass::TierFlushWrite | TokenClass::TierFlushSync)
+                {
+                    let mut tier = self.shared.tier.borrow_mut();
+                    let tier = tier.as_mut().expect("tier-flush completion implies tier state");
+                    tier.on_flush_completion(c.token, Some(errno));
+                    return;
+                }
                 // Log-op failures are fail-stop territory (§8.4), never
                 // connection housekeeping.
                 if matches!(c.token.class(), TokenClass::LogWrite | TokenClass::Fsync) {
@@ -1998,6 +2038,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             // terminal completion; watermark advance + gated-ack wakes on
             // a log Synced; checkpoint progress on the ckpt classes.
             CompletionResult::LogWritten => {
+                // Tier-flush writes (M4.5-S31): a round-counter update in
+                // the tier plane — never the WAL frame lease's custody.
+                if c.token.class() == TokenClass::TierFlushWrite {
+                    let mut tier = self.shared.tier.borrow_mut();
+                    let tier = tier.as_mut().expect("tier-flush completion implies tier state");
+                    tier.on_flush_completion(c.token, None);
+                    return;
+                }
                 let mut durable = self.shared.durable.borrow_mut();
                 let cell = durable.as_mut().expect("LogWritten without durable plane");
                 if c.token.class() == TokenClass::CkptWrite {
@@ -2007,6 +2055,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 }
             }
             CompletionResult::Synced => {
+                // Tier-flush barriers (M4.5-S31): recorded here, applied
+                // at MAINTAIN — flush watermarks never ride the WAL
+                // commit ledger (ADR-0084 D1).
+                if c.token.class() == TokenClass::TierFlushSync {
+                    let mut tier = self.shared.tier.borrow_mut();
+                    let tier = tier.as_mut().expect("tier-flush completion implies tier state");
+                    tier.on_flush_completion(c.token, None);
+                    return;
+                }
                 let mut durable = self.shared.durable.borrow_mut();
                 let cell = durable.as_mut().expect("Synced without durable plane");
                 if c.token.class() == TokenClass::CkptSync {

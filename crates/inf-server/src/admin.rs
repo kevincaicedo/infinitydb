@@ -542,6 +542,17 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     // M4-S11: flush-pipeline counters — same zero contract.
     push(text, &format!("tiering_flush_slices:{}", tiering.flush_slices));
     push(text, &format!("tiering_flush_confirmed_bytes:{}", tiering.flush_confirmed_bytes));
+    // M4.5-S31 (ADR-0084 D6): reactor-drive flush rounds — the sealing
+    // path's visibility, cell scope, flushed by the tiered MAINTAIN.
+    let flush = node.tier_flush.get();
+    push(text, &format!("tiering_flush_rounds:{}", flush[0]));
+    push(text, &format!("tiering_flush_write_retries:{}", flush[1]));
+    push(text, &format!("tiering_flush_stale_completions:{}", flush[2]));
+    push(text, &format!("tiering_flush_round_p50_us:{}", flush[3]));
+    push(text, &format!("tiering_flush_round_p99_us:{}", flush[4]));
+    push(text, &format!("tiering_flush_rounds_inflight:{}", flush[5]));
+    push(text, &format!("tiering_files_sealed:{}", flush[6]));
+    push(text, &format!("tiering_files_active:{}", flush[7]));
     // M4-S15: copy-forward slices — same zero contract.
     push(text, &format!("tiering_compact_slices:{}", tiering.compact_slices));
     let usage = ks.tiering_usage();
