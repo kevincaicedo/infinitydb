@@ -90,6 +90,7 @@ pub use store::{
     SetOutcome, StoreConfig, StoreStats, Ttl, TtlUpdate,
 };
 pub use tiered::compact::{CompactionApplied, CompactionConfig, CompactionWork};
+pub use tiered::promote::PromotionCounters;
 pub use tiered::{RecordParts, TieredLookup, TieredTable};
 pub use tiered_recover::{
     RecoveredTier, TierRecoverStats, apply_blob_ref_section, apply_live_set_section,

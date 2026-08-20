@@ -47,6 +47,7 @@ use crate::store::{
     CellStore, CheckpointImage, ExpiryStats, MemoryReport, OpError, StoreConfig, StoreStats,
 };
 use crate::tiered::TieredTable;
+use crate::tiered::promote::PromotionCounters;
 use crate::wall::WallAnchor;
 use crate::wheel::ExpiryBudget;
 use crate::write_accounting::{WriteAccountingTotals, WriteAmpSummary};
@@ -166,6 +167,10 @@ pub struct Keyspace {
     /// (M4-S19, ADR-0062 D4). Admission-only: lowering it under standing
     /// reservations refuses new creations, never evicts.
     tiered_va_limit_bytes: u64,
+    /// Read-driven promotion admission (M4.5-S30, ADR-0085 D6): the
+    /// `tiered-promote-on-read` CONFIG key's cell-local value, applied
+    /// to every standing and future tiered table.
+    tier_promote: bool,
     /// Replay displacement register (ADR-0057 D4, widened to a bounded
     /// list by ADR-0059 D9): `ColdDisplace` markers park here until the
     /// paired mutation record — the very next record, same namespace —
@@ -205,6 +210,7 @@ impl Keyspace {
             over_limit: false,
             hand_db: 0,
             tiered_va_limit_bytes: TIERED_VA_LIMIT_DEFAULT,
+            tier_promote: true,
             pending_displace: Vec::new(),
             indexes: IndexRegistry::default(),
             backfill: Vec::new(),
@@ -336,8 +342,9 @@ impl Keyspace {
                 limit_bytes,
             });
         }
-        let table = TieredTable::new(config, demote, initial_keys)
+        let mut table = TieredTable::new(config, demote, initial_keys)
             .ok_or(TieredCreateError::Unrepresentable)?;
+        table.set_promote_enabled(self.tier_promote);
         self.tiered_stores.push((ns, Box::new(table)));
         Ok(())
     }
@@ -395,6 +402,7 @@ impl Keyspace {
         entry.1.set_compaction_config(tier.compaction_config());
         entry.1.set_blob_config(tier.blob_config());
         entry.1.set_disk_budget(tier.disk_budget_bytes);
+        entry.1.set_promote_enabled(self.tier_promote);
     }
 
     /// This cell's share of the node reserved-VA limit (ADR-0062 D4).
@@ -407,6 +415,28 @@ impl Keyspace {
     /// admission-only: standing reservations are never evicted).
     pub fn set_tiered_va_limit(&mut self, bytes: u64) {
         self.tiered_va_limit_bytes = bytes;
+    }
+
+    /// Pushes the read-driven-promotion admission flag (M4.5-S30,
+    /// ADR-0085 D6 — the `tiered-promote-on-read` CONFIG sweep) to every
+    /// standing tiered table; future tables inherit it at materialize/
+    /// install time.
+    pub fn set_tier_promote(&mut self, on: bool) {
+        self.tier_promote = on;
+        for (_, table) in &mut self.tiered_stores {
+            table.set_promote_enabled(on);
+        }
+    }
+
+    /// Aggregated read-promotion counters across every tiered table on
+    /// this cell (M4.5-S30, ADR-0085 D6) — identically zero on a
+    /// memory-mode node (the §3.3 zero contract).
+    pub fn tiering_promotion(&self) -> PromotionCounters {
+        let mut total = PromotionCounters::default();
+        for (_, table) in &self.tiered_stores {
+            total.add(table.promotion_counters());
+        }
+        total
     }
 
     /// EvictionPressure v2 (M4-S07, §3.2): how namespace `ns` answers

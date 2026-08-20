@@ -302,6 +302,36 @@ simply means the dataset is bigger than RAM and cold reads are happening,
 which is the feature; `tiering_reserved_bytes` is virtual address space,
 not memory, and a large value is normal.
 
+## Read-driven promotion (M4.5-S30, ADR-0085)
+
+Residency is emergent from the log: written data congregates at the RAM
+tail, untouched data ages to disk. Since M4.5-S30 **reads participate
+too**: the second verified cold read of a key relocates the fetched
+record back to the tail (a 64 KiB per-namespace second-touch filter
+admits it; one-touch sweeps and `SCAN` never promote), so a bulk-loaded,
+read-only working set warms instead of paying a cold read forever.
+Promotion is unlogged (it reuses compaction's relocation machinery and
+its replay repair) and strictly best-effort — it skips, never waits,
+under a pinned checkpoint walk, a full tail window, the relocation-origin
+cap, or disk-admission pressure.
+
+- **Knob:** `CONFIG SET tiered-promote-on-read no|yes` (default `yes`,
+  hot, node-wide). Turn it off for namespaces served by one-off readers
+  where warming buys nothing — a per-namespace key is reserved, not yet
+  wired.
+- **Observability:** `tiering_promotions` / `tiering_promoted_bytes`
+  (engagement; the per-namespace lines carry both), the
+  `tiering_promote_skip_*` reasons, and `tiering_promote_first_touch`.
+  A read-heavy namespace whose `promotions` counter sits at zero while
+  `cold_reads_issued` climbs is either disabled or its reads are
+  one-touch — both are answers, not faults.
+- **Cost model:** promoted bytes re-flush (they appear in `flush_bytes`,
+  attributed by `tiering_promoted_bytes` the way `compaction_bytes`
+  attributes copy-forward) and the displaced cold copy becomes dead
+  bytes compaction reclaims. A converged working set stops promoting on
+  its own — a permanently high promotion rate means the working set
+  does not fit `MEM-BUDGET`.
+
 ## Tuning: the slice budget decides tier write amplification
 
 A tier file's partial tail frame is rewritten in place at every flush

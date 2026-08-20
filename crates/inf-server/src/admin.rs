@@ -555,6 +555,25 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tiering_files_active:{}", flush[7]));
     // M4-S15: copy-forward slices — same zero contract.
     push(text, &format!("tiering_compact_slices:{}", tiering.compact_slices));
+    // M4.5-S30 (ADR-0085 D6): read-driven promotion — engagement, the
+    // counted skip reasons, and the filter's fixed L5 term. Same zero
+    // contract; the A/B and the DST oracles read these.
+    let promo = ks.tiering_promotion();
+    push(text, &format!("tiering_promotions:{}", promo.promotions));
+    push(text, &format!("tiering_promoted_bytes:{}", promo.promoted_bytes));
+    push(text, &format!("tiering_promote_first_touch:{}", promo.first_touch));
+    push(text, &format!("tiering_promote_skip_window:{}", promo.skip_window));
+    push(text, &format!("tiering_promote_skip_pinned:{}", promo.skip_pinned));
+    push(text, &format!("tiering_promote_skip_disk:{}", promo.skip_disk));
+    push(text, &format!("tiering_promote_skip_stale:{}", promo.skip_stale));
+    push(text, &format!("tiering_promote_skip_cap:{}", promo.skip_cap));
+    push(
+        text,
+        &format!(
+            "tiering_promote_filter_bytes:{}",
+            ks.tiered_tables() as u64 * inf_store::TieredTable::promote_filter_bytes()
+        ),
+    );
     let usage = ks.tiering_usage();
     push(text, &format!("tiering_reserved_bytes:{}", usage.reserved_bytes));
     push(text, &format!("tiering_committed_bytes:{}", usage.committed_bytes));
@@ -628,7 +647,8 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
                  dead_bytes={},user_bytes={},wal_bytes={},flush_bytes={},compaction_bytes={},\
                  write_amp_milli={},blob_user_bytes={},blob_bytes={},blob_write_amp_milli={},\
                  blob_extents_live={},blob_disk_bytes={},disk_used_bytes={},disk_full={},\
-                 diskfull_refusals={},compact_idle_pressure={}",
+                 diskfull_refusals={},compact_idle_pressure={},promotions={},\
+                 promoted_bytes={}",
                 ns.0,
                 space.head().to_raw(),
                 space.flushed().to_raw(),
@@ -659,6 +679,8 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
                 },
                 table.diskfull_refusals(),
                 table.compact_idle_pressure(),
+                table.promotion_counters().promotions,
+                table.promotion_counters().promoted_bytes,
             ),
         );
     }
@@ -896,6 +918,9 @@ pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
         .get("tiered-reserved-va-limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(inf_store::TIERED_VA_LIMIT_DEFAULT);
+    // M4.5-S30 (ADR-0085 D6): promotion admission rides the same
+    // hot-per-cell sweep — a boolean, so no per-cell division.
+    let promote = cfg.get("tiered-promote-on-read").is_none_or(|v| v != "no");
     drop(cfg);
     let cells = u64::from(node.cells.get().max(1));
     // Per-namespace MAXMEMORY shares divide by the same symmetric cell
@@ -904,6 +929,7 @@ pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
     ks.set_budget_shares(cells);
     ks.set_pressure(PressureConfig { limit_bytes: maxmemory / cells, policy, samples });
     ks.set_tiered_va_limit(va_limit / cells);
+    ks.set_tier_promote(promote);
 }
 
 // ---- INF.NS (M1-S08) -----------------------------------------------------------
@@ -1782,6 +1808,18 @@ mod tests {
             "tiering_blob_write_amp_undefined_ns",
             "tiering_blob_reclaimable",
             "tiering_blob_reclaim_deferred",
+            // M4.5-S30 (ADR-0085 D6): no table, no promotion path — the
+            // read-promotion observables and the filter's L5 term read
+            // zero for the same structural reason.
+            "tiering_promotions",
+            "tiering_promoted_bytes",
+            "tiering_promote_first_touch",
+            "tiering_promote_skip_window",
+            "tiering_promote_skip_pinned",
+            "tiering_promote_skip_disk",
+            "tiering_promote_skip_stale",
+            "tiering_promote_skip_cap",
+            "tiering_promote_filter_bytes",
         ] {
             assert!(text.contains(&format!("{name}:0")), "missing {name}: {text}");
         }
