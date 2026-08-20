@@ -20,6 +20,7 @@
 //! and WAL wiring arrive with the stories that own them (S07, S11).
 
 pub mod compact;
+pub mod promote;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -169,6 +170,17 @@ pub struct TieredTable {
     /// dead byte — ADR-0059 D1's `nothing_compactable` verdict, counted
     /// (ADR-0063 D5: the honest "genuinely full of live data" alarm).
     compact_idle_pressure: u64,
+    /// Read-driven promotion admission (M4.5-S30, ADR-0085 D6): the
+    /// `tiered-promote-on-read` CONFIG key, pushed per cell. Disabled
+    /// is fully inert (no filter traffic — the pre-S30 read path).
+    promote_enabled: bool,
+    /// The second-touch admission filter (ADR-0085 D2): 64 KiB fixed,
+    /// direct-mapped, no per-record metadata — the bounded form of the
+    /// LRU machinery §9 refuses.
+    promote_filter: promote::PromoteFilter,
+    /// Promotion observability (ADR-0085 D6) — `INFO tiering` renders
+    /// these; the A/B and the DST oracles read them.
+    promote_stats: promote::PromotionCounters,
 }
 
 /// Cached disk-admission state (M4-S21, ADR-0063 D2). Two legs: the
@@ -257,6 +269,9 @@ impl TieredTable {
             disk_budget_bytes: 0,
             disk_admit: DiskAdmission::default(),
             compact_idle_pressure: 0,
+            promote_enabled: true,
+            promote_filter: promote::PromoteFilter::new(),
+            promote_stats: promote::PromotionCounters::default(),
         })
     }
 

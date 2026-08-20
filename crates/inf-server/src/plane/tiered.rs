@@ -74,17 +74,19 @@ enum Resolved {
         version: u32,
         encoded_len: usize,
     },
-    /// Intermediate: a cold-fetched, key-verified extent record whose
-    /// value fetch still has to run (the decode happens inside a borrow;
-    /// the fetch awaits after it).
-    ColdExtent {
-        addr: LogicalAddr,
-        ext: inf_store::ExtentRef,
-        version: u32,
-        encoded_len: usize,
-    },
     /// Terminal typed reply (I/O error, saturation, dropped namespace).
     Fail(&'static str),
+}
+
+/// Whether a verified cold fetch feeds the ADR-0085 promotion hook.
+/// Reads do; the write funnels' resolves never do — a write's
+/// `overwrite` already copies to the tail, so promoting first would
+/// double-place the record — and a deletion's fetch is a kill, not an
+/// access. `SCAN`'s enumeration (`fetch_key`) never reaches `resolve`.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum PromoteOnCold {
+    Read,
+    Never,
 }
 
 /// Why a write could not complete this attempt.
@@ -285,6 +287,45 @@ fn probe<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     }
 }
 
+/// Serves a verified cold record image: the ADR-0085 promotion offer
+/// first (reads only — `promote`), then the inline value or the extent
+/// fetch. `image` is the verbatim record the resolve loop fetched and
+/// key-verified; promotion relocates exactly these bytes, so a
+/// re-encode can never re-type the record (the ADR-0059 D2 rule).
+async fn serve_cold_image<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    hash: u64,
+    addr: LogicalAddr,
+    image: Vec<u8>,
+    promote: PromoteOnCold,
+) -> Resolved {
+    let (version, encoded_len, ext) = {
+        let parts = TieredTable::decode_record(&image);
+        (parts.version, parts.encoded_len, parts.extent_ref())
+    };
+    if promote == PromoteOnCold::Read {
+        // No await separates the loop's verify from this borrow, so the
+        // pair is still current on this single-threaded cell — and
+        // `try_promote` re-verifies it anyway (best-effort: a skip of
+        // any kind is exactly the pre-S30 behavior).
+        let mut ks = shared.store.borrow_mut();
+        if let Some(table) = ks.tiered_store_mut(ns) {
+            table.try_promote(hash, addr, &image);
+        }
+    }
+    match ext {
+        Some(ext) => match fetch_extent(shared, ns, ext).await {
+            Some(value) => Resolved::Extent { addr, value, version, encoded_len },
+            None => Resolved::Fail(ERR_BLOB_READ),
+        },
+        None => {
+            let value = TieredTable::decode_record(&image).value.to_vec();
+            Resolved::Cold { addr, value, version, encoded_len }
+        }
+    }
+}
+
 /// Resolves one key: RAM hit, verified cold fetch, or miss — the S08
 /// hardened loop (re-resolve after every resume; exclude on mismatch).
 async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -292,6 +333,7 @@ async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     key: &[u8],
     hash: u64,
+    promote: PromoteOnCold,
 ) -> Resolved {
     let mut exclude: Vec<LogicalAddr> = Vec::new();
     let mut replans: u8 = 0;
@@ -340,8 +382,16 @@ async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         // Re-resolve after the resume; decode inside the borrow.
         enum After {
             Serve(Resolved),
+            /// Key-verified single-window fetch: the verbatim image
+            /// serves (and may promote) outside the borrow.
+            ServeCold {
+                image: Vec<u8>,
+            },
             Retry,
-            Stage { total: usize, assembled: Vec<u8> },
+            Stage {
+                total: usize,
+                assembled: Vec<u8>,
+            },
         }
         let after = {
             let ks = shared.store.borrow();
@@ -371,23 +421,8 @@ async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                         if inf_log::tier_extract(window, skip, total, &mut record).is_err() {
                             return After::Serve(Resolved::Fail(ERR_COLD_IO));
                         }
-                        let parts = TieredTable::decode_record(&record);
-                        if parts.key == key {
-                            if parts.type_tag == inf_store::TypeTag::StringExtent {
-                                After::Serve(Resolved::ColdExtent {
-                                    addr,
-                                    ext: inf_store::ExtentRef::decode(parts.value),
-                                    version: parts.version,
-                                    encoded_len: parts.encoded_len,
-                                })
-                            } else {
-                                After::Serve(Resolved::Cold {
-                                    addr,
-                                    value: parts.value.to_vec(),
-                                    version: parts.version,
-                                    encoded_len: parts.encoded_len,
-                                })
-                            }
+                        if TieredTable::decode_record(&record).key == key {
+                            After::ServeCold { image: record }
                         } else {
                             After::Retry
                         }
@@ -404,11 +439,8 @@ async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         };
         drop(done); // custody home before any further await
         match after {
-            After::Serve(Resolved::ColdExtent { addr, ext, version, encoded_len }) => {
-                return match fetch_extent(shared, ns, ext).await {
-                    Some(value) => Resolved::Extent { addr, value, version, encoded_len },
-                    None => Resolved::Fail(ERR_BLOB_READ),
-                };
+            After::ServeCold { image } => {
+                return serve_cold_image(shared, ns, hash, addr, image, promote).await;
             }
             After::Serve(resolved) => return resolved,
             After::Retry => {
@@ -458,22 +490,8 @@ async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                         continue 'attempt;
                     }
                 }
-                let parts = TieredTable::decode_record(&assembled);
-                if parts.key == key {
-                    if parts.type_tag == inf_store::TypeTag::StringExtent {
-                        let ext = inf_store::ExtentRef::decode(parts.value);
-                        let (version, encoded_len) = (parts.version, parts.encoded_len);
-                        return match fetch_extent(shared, ns, ext).await {
-                            Some(value) => Resolved::Extent { addr, value, version, encoded_len },
-                            None => Resolved::Fail(ERR_BLOB_READ),
-                        };
-                    }
-                    return Resolved::Cold {
-                        addr,
-                        value: parts.value.to_vec(),
-                        version: parts.version,
-                        encoded_len: parts.encoded_len,
-                    };
+                if TieredTable::decode_record(&assembled).key == key {
+                    return serve_cold_image(shared, ns, hash, addr, assembled, promote).await;
                 }
                 if !exclude.contains(&addr) {
                     exclude.push(addr);
@@ -758,7 +776,7 @@ async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     let deadline = stall_deadline(shared, ns);
     loop {
         let (old, old_value): (Displaced, Option<Vec<u8>>) =
-            match resolve(shared, ns, key, hash).await {
+            match resolve(shared, ns, key, hash, PromoteOnCold::Never).await {
                 Resolved::Miss => (None, None),
                 Resolved::Ram(addr) => {
                     let ks = shared.store.borrow();
@@ -770,7 +788,6 @@ async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
                 | Resolved::Extent { addr, value, version, encoded_len } => {
                     (Some((addr, encoded_len, version)), Some(value))
                 }
-                Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
                 Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
             };
         let value = compute(old_value.as_deref(), old.map(|(_, _, v)| v))?;
@@ -828,7 +845,7 @@ async fn read_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let hash = TieredTable::hash_key(key);
     let mut reply = shared.take_reply_buf();
     let mut w = RespWriter::new(&mut reply, proto);
-    match resolve(shared, ns, key, hash).await {
+    match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Miss => w.null(),
         Resolved::Ram(addr) => {
             let ks = shared.store.borrow();
@@ -836,7 +853,6 @@ async fn read_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             w.bulk(table.record(addr).value);
         }
         Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => w.bulk(&value),
-        Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
         Resolved::Fail(message) => w.error(message),
     }
     TieredReply::Done(reply)
@@ -853,7 +869,7 @@ async fn mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     for key in &argv[1..] {
         let hash = TieredTable::hash_key(key);
         let mut w = RespWriter::new(&mut reply, proto);
-        match resolve(shared, ns, key, hash).await {
+        match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
             Resolved::Ram(addr) => {
                 let ks = shared.store.borrow();
                 let table = ks.tiered_store(ns).expect("resolved on this table");
@@ -875,7 +891,7 @@ async fn exists<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let mut count = 0i64;
     for key in &argv[1..] {
         let hash = TieredTable::hash_key(key);
-        match resolve(shared, ns, key, hash).await {
+        match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
             Resolved::Ram(_) | Resolved::Cold { .. } | Resolved::Extent { .. } => count += 1,
             _ => {}
         }
@@ -894,7 +910,7 @@ async fn strlen<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let hash = TieredTable::hash_key(key);
     let mut reply = shared.take_reply_buf();
     let mut w = RespWriter::new(&mut reply, proto);
-    match resolve(shared, ns, key, hash).await {
+    match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Miss => w.int(0),
         Resolved::Ram(addr) => {
             let ks = shared.store.borrow();
@@ -904,7 +920,6 @@ async fn strlen<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => {
             w.int(value.len() as i64);
         }
-        Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
         Resolved::Fail(message) => w.error(message),
     }
     TieredReply::Done(reply)
@@ -919,9 +934,8 @@ async fn type_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let hash = TieredTable::hash_key(key);
     let mut reply = shared.take_reply_buf();
     let mut w = RespWriter::new(&mut reply, proto);
-    match resolve(shared, ns, key, hash).await {
+    match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Ram(_) | Resolved::Cold { .. } | Resolved::Extent { .. } => w.simple("string"),
-        Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
         Resolved::Miss => w.simple("none"),
         Resolved::Fail(message) => w.error(message),
     }
@@ -937,10 +951,9 @@ async fn ttl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let hash = TieredTable::hash_key(key);
     let mut reply = shared.take_reply_buf();
     let mut w = RespWriter::new(&mut reply, proto);
-    match resolve(shared, ns, key, hash).await {
+    match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         // No expiry on tiered namespaces in M4: live keys never expire.
         Resolved::Ram(_) | Resolved::Cold { .. } | Resolved::Extent { .. } => w.int(-1),
-        Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
         Resolved::Miss => w.int(-2),
         Resolved::Fail(message) => w.error(message),
     }
@@ -970,7 +983,7 @@ async fn getrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             w.bulk(&value[from as usize..=(to as usize)]);
         }
     };
-    match resolve(shared, ns, key, hash).await {
+    match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Miss => w.bulk(b""),
         Resolved::Ram(addr) => {
             let ks = shared.store.borrow();
@@ -978,7 +991,6 @@ async fn getrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             slice_of(table.record(addr).value, &mut w);
         }
         Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => slice_of(&value, &mut w),
-        Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
         Resolved::Fail(message) => w.error(message),
     }
     TieredReply::Done(reply)
@@ -1222,7 +1234,7 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     let deadline = stall_deadline(shared, ns);
     loop {
         let (old, old_value): (Displaced, Option<Vec<u8>>) =
-            match resolve(shared, ns, key, hash).await {
+            match resolve(shared, ns, key, hash, PromoteOnCold::Never).await {
                 Resolved::Miss => (None, None),
                 Resolved::Ram(addr) => {
                     let ks = shared.store.borrow();
@@ -1234,7 +1246,6 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
                 | Resolved::Extent { addr, value, version, encoded_len } => {
                     (Some((addr, encoded_len, version)), Some(value))
                 }
-                Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
                 Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
             };
         if (nx && old.is_some()) || (xx && old.is_none()) {
@@ -1552,7 +1563,7 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let hash = TieredTable::hash_key(key);
     loop {
         let (old, old_value): (Displaced, Option<Vec<u8>>) =
-            match resolve(shared, ns, key, hash).await {
+            match resolve(shared, ns, key, hash, PromoteOnCold::Never).await {
                 Resolved::Miss => return Ok(None),
                 Resolved::Ram(addr) => {
                     let ks = shared.store.borrow();
@@ -1565,7 +1576,6 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 | Resolved::Extent { addr, value, version, encoded_len } => {
                     (Some((addr, encoded_len, version)), Some(value))
                 }
-                Resolved::ColdExtent { .. } => unreachable!("resolve post-processes extents"),
                 Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
             };
         let Some((addr, len, _)) = old else { return Ok(None) };

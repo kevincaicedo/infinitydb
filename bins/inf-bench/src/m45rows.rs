@@ -545,9 +545,16 @@ fn write_leg(
     // on the tiered legs (ADR-0084 D6; absent on pre-S31 binaries).
     let rounds =
         sum_field(&after, "tiering_flush_rounds") - sum_field(&before, "tiering_flush_rounds");
+    // M4.5-S30 (ADR-0085 D5): the parity residual's discriminators —
+    // how many of the leg's writes paid a foreground cold resolve, and
+    // whether read promotion engaged at all (it must read 0 on this
+    // 100%-write shape; absent on pre-S30 binaries).
+    let cold = sum_field(&after, "cold_reads_issued") - sum_field(&before, "cold_reads_issued");
+    let promos = sum_field(&after, "tiering_promotions") - sum_field(&before, "tiering_promotions");
     raw.push_str(&format!(
         "rep{rep} {ns:<9} c{conns:<3} ops/s={:<8.0} p50_us={:<6} p99_us={:<7} p999_us={:<7} \
-         busy={} acks/fsync={group:.2} flush_rounds={rounds}\n",
+         busy={} acks/fsync={group:.2} flush_rounds={rounds} cold_reads={cold} \
+         promotions={promos}\n",
         report.ops_per_sec, report.p50_us, report.p99_us, report.p999_us, report.busy_retryable
     ));
     Ok(LegSample {
