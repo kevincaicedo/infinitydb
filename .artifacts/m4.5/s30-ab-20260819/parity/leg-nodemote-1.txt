@@ -1,0 +1,10 @@
+ops = 519635
+errors = 0
+busy_retryable = 0
+elapsed_s = 10.008
+ops_per_sec = 51921
+p50_us = 5119
+p99_us = 7807
+p999_us = 14591
+p9999_us = 17182
+max_us = 17182
