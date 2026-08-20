@@ -550,15 +550,26 @@ fn try_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         None => table.insert(key, value, hash),
         Some((addr, len, version)) => table.update(key, value, hash, addr, len, version),
     };
-    if let Err(err) = applied {
-        return Err(write_block_of(shared, table, key, value, err, proto));
-    }
-    stage_displacements(cell, table, ns, hash, old, class);
+    let new_addr = match applied {
+        Ok(addr) => addr,
+        Err(err) => return Err(write_block_of(shared, table, key, value, err, proto)),
+    };
+    // M4.5-S31 rider (ADR-0084 D5): an in-place rewrite (same address)
+    // displaces no slot — replay's key-verified upsert re-covers it, so
+    // the current-address marker is dropped. Moved overwrites keep it.
+    let moved = old.is_none_or(|(addr, _, _)| addr != new_addr);
+    stage_displacements(cell, table, ns, hash, old, class, moved);
     Ok(cell.stage_tiered(table, &MutationEffect::StringSet { ns, key, value }, class))
 }
 
 /// Stages the ADR-0059 D9 origin markers + the ADR-0057 D4 current-
 /// address marker, in that order, ahead of the mutation record.
+///
+/// `moved = false` (an in-place rewrite — M4.5-S31 rider, ADR-0084 D5)
+/// drops the current-address marker: the record's address is unchanged
+/// and replay's rule-2 upsert resolves it by key (imaged or WAL-born in
+/// RAM; the one unlogged path — compaction relocation — is exactly what
+/// the origin markers repair, so those stage unconditionally).
 fn stage_displacements<F: SegmentFs>(
     cell: &mut DurableCell<F>,
     table: &mut TieredTable,
@@ -566,14 +577,17 @@ fn stage_displacements<F: SegmentFs>(
     hash: u64,
     old: Displaced,
     class: FsyncClass,
+    moved: bool,
 ) {
     if let Some((addr, _, _)) = old {
         for (origin_addr, _stamp) in table.take_displacement_origins(hash, addr) {
             let marker = MutationEffect::ColdDisplace { ns, old_addr: origin_addr };
             let _ = cell.stage_tiered(table, &marker, class);
         }
-        let marker = MutationEffect::ColdDisplace { ns, old_addr: addr.to_raw() };
-        let _ = cell.stage_tiered(table, &marker, class);
+        if moved {
+            let marker = MutationEffect::ColdDisplace { ns, old_addr: addr.to_raw() };
+            let _ = cell.stage_tiered(table, &marker, class);
+        }
     }
 }
 
@@ -653,7 +667,9 @@ fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     if let Some(fd) = fd {
         tier.queue_extent_sync(fd, ticket);
     }
-    stage_displacements(cell, table, ns, hash, old, class);
+    // Extent updates are never in-place (ADR-0061 D4 — the branch is
+    // structurally excluded), so the displacement marker always stages.
+    stage_displacements(cell, table, ns, hash, old, class, true);
     let effect = MutationEffect::StringSetExtent {
         ns,
         key,

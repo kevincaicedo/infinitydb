@@ -54,6 +54,7 @@ const CONNS_HIGH: usize = 256;
 struct LegSample {
     ops_per_sec: f64,
     p99_us: f64,
+    p999_us: f64,
 }
 
 pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
@@ -70,7 +71,13 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
 
     // `--only-s27` runs just the S27 backpressure row (the `gate-run m2
     // --only-always` precedent) — the A/B arms don't need the S29 legs.
+    // `--only-s29` is the mirror (M4.5-S31: the tier-flush driver-op
+    // A/B re-runs the scaling/parity row without the S27 legs).
     let only_s27 = flags.bool("only-s27");
+    let only_s29 = flags.bool("only-s29");
+    if only_s27 && only_s29 {
+        return Err("--only-s27 and --only-s29 exclude each other".into());
+    }
 
     let env_ok = env_gate(flags)?;
     let mut m = Measurements::new();
@@ -109,6 +116,8 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
     let mut f_high: Vec<f64> = Vec::new();
     let mut t_high_p99: Vec<f64> = Vec::new();
     let mut f_high_p99: Vec<f64> = Vec::new();
+    let mut t_high_p999: Vec<f64> = Vec::new();
+    let mut f_high_p999: Vec<f64> = Vec::new();
     let mut raw = String::new();
 
     for rep in 0..replicates {
@@ -179,6 +188,7 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
                 ("s29tiered", _) => {
                     t_high.push(sample.ops_per_sec);
                     t_high_p99.push(sample.p99_us);
+                    t_high_p999.push(sample.p999_us);
                 }
                 (_, CONNS_LOW) => {
                     f_low.push(sample.ops_per_sec);
@@ -186,6 +196,7 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
                 _ => {
                     f_high.push(sample.ops_per_sec);
                     f_high_p99.push(sample.p99_us);
+                    f_high_p999.push(sample.p999_us);
                 }
             }
         }
@@ -199,6 +210,10 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
     m.set("s29:tiered_flat_ratio_c64", t64 / f64_);
     m.set("s29:tiered_flat_ratio_c256", t256 / f256);
     m.set("s29:tiered_flat_p99_ratio_c256", median(&mut t_high_p99) / median(&mut f_high_p99));
+    // M4.5-S31 informational keys (no gate row): the foreground tail
+    // during active sealing, per arm — the A/B's acceptance signal.
+    m.set("s31:tiered_p999_c256_us", median(&mut t_high_p999));
+    m.set("s31:flat_p999_c256_us", median(&mut f_high_p999));
     m.note(format!(
         "medians (ops/s): tiered {t64:.0} @{CONNS_LOW} → {t256:.0} @{CONNS_HIGH}; \
          flat {f64_:.0} @{CONNS_LOW} → {f256:.0} @{CONNS_HIGH}"
@@ -210,7 +225,11 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
     );
     m.raw_section("per-leg samples", &raw);
 
-    s27_write_repeat_row(flags, &infinityd, cells, duration, &data_root, &mut m)?;
+    if only_s29 {
+        m.note("--only-s29: the S27 backpressure row was skipped; its gate keys are absent");
+    } else {
+        s27_write_repeat_row(flags, &infinityd, cells, duration, &data_root, &mut m)?;
+    }
 
     finish_report(
         "m4.5",
@@ -521,10 +540,19 @@ fn write_leg(
     let acks = sum_field(&after, "acks_gated") - sum_field(&before, "acks_gated");
     let fsyncs = sum_field(&after, "fsyncs_completed") - sum_field(&before, "fsyncs_completed");
     let group = if fsyncs > 0 { acks as f64 / fsyncs as f64 } else { 0.0 };
+    // M4.5-S31: the leg's sealing activity, from the reactor-drive round
+    // counter — a tail claim about "during sealing" needs this nonzero
+    // on the tiered legs (ADR-0084 D6; absent on pre-S31 binaries).
+    let rounds =
+        sum_field(&after, "tiering_flush_rounds") - sum_field(&before, "tiering_flush_rounds");
     raw.push_str(&format!(
-        "rep{rep} {ns:<9} c{conns:<3} ops/s={:<8.0} p50_us={:<6} p99_us={:<7} busy={} \
-         acks/fsync={group:.2}\n",
-        report.ops_per_sec, report.p50_us, report.p99_us, report.busy_retryable
+        "rep{rep} {ns:<9} c{conns:<3} ops/s={:<8.0} p50_us={:<6} p99_us={:<7} p999_us={:<7} \
+         busy={} acks/fsync={group:.2} flush_rounds={rounds}\n",
+        report.ops_per_sec, report.p50_us, report.p99_us, report.p999_us, report.busy_retryable
     ));
-    Ok(LegSample { ops_per_sec: report.ops_per_sec, p99_us: report.p99_us as f64 })
+    Ok(LegSample {
+        ops_per_sec: report.ops_per_sec,
+        p99_us: report.p99_us as f64,
+        p999_us: report.p999_us as f64,
+    })
 }

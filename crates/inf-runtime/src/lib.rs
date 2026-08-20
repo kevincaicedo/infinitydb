@@ -42,7 +42,7 @@ pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate, WatermarkW
 pub use reactor::{CellLoop, CellPlane, IterStats, LoopConfig, LoopCx};
 pub use sched::{GroupClass, GroupScheduler};
 pub use timer::{TimerId, TimerWheel};
-pub use token::{CompletionToken, TokenClass};
+pub use token::{CompletionToken, MAX_SLOT, TokenClass};
 
 #[cfg(target_os = "macos")]
 pub use kqueue::KqueueDriver;

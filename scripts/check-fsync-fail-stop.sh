@@ -38,6 +38,14 @@ cd "$(dirname "$0")/.."
 #                          (M4-S17 review)
 #   inf-server/durable.rs — on_log_error/fail_stop: eprintln + exit(3),
 #                          the terminal handler
+#   inf-server/tier_cell.rs — drive_flush_round: a reactor-drive flush
+#                          barrier's error completion re-surfaces as
+#                          TierFlushError::Fsync at the next MAINTAIN;
+#                          the watermark froze by construction (effects
+#                          apply only on success) and maintain_ns
+#                          propagates it to the plane's fatal arm →
+#                          DurableCell::fail_stop. Construction only,
+#                          never caught (M4.5-S31 review, ADR-0084 D4)
 ALLOW=(
     crates/inf-log/src/segment.rs
     crates/inf-log/src/commit.rs
@@ -48,6 +56,7 @@ ALLOW=(
     crates/inf-log/src/flush.rs
     crates/inf-log/src/blob.rs
     crates/inf-server/src/durable.rs
+    crates/inf-server/src/tier_cell.rs
 )
 
 fail=0

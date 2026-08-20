@@ -66,6 +66,11 @@ pub struct NodeInfo {
     /// `INFO` renders them absent-with-disclosure while tiered is live,
     /// never as numbers (v0.4.0-alpha instrument fix).
     pub tiering_split: Cell<[u64; 15]>,
+    /// Reactor-drive flush gauges (M4.5-S31, ADR-0084 D6), flushed by
+    /// MAINTAIN: rounds, write_retries, stale_completions, round_p50_us,
+    /// round_p99_us, rounds_inflight, files_sealed, files_active.
+    /// Identically zero on nodes that never created a tiered namespace.
+    pub tier_flush: Cell<[u64; 8]>,
     /// Raw lifetime counters (submits, sqes, cqes, iterations, commands,
     /// fabric_msgs) — scrapers diff two snapshots for under-load ratios.
     pub raw_counters: Cell<[u64; 6]>,
