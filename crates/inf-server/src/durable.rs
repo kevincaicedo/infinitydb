@@ -373,7 +373,7 @@ impl<F: SegmentFs> DurableCell<F> {
         };
         slices[IoClass::ColdReadMaintain.index()] =
             ClassSlice { bytes: crate::tier_cell::COLD_POOL_BUF as u64, ops: 1 };
-        let budget = DeviceBudget::new(device.model_share, slices, Nanos(0));
+        let budget = DeviceBudget::new(device.model_share, slices, ckpt.cfg.alpha, Nanos(0));
         let seal_pace = SealPace::new(
             device.seal_barriers_per_s,
             u32::from(staging.frames_in_flight()),

@@ -1492,10 +1492,14 @@ fn budget_oracles(scenario: &DurableScenario, node: &Node, now: Nanos, report: &
         // (b) Rate bound — the budget's contract: background bytes over
         // the run never exceed the share's grant plus two burst horizons
         // (the class caps plus the pool) plus one slice per class (the
-        // cap floor). Foreground subtraction only lowers the grant.
+        // cap floor) plus the checkpoint keep-up floor (the log's bytes
+        // over α — ADR-0088 D2 amended). Foreground subtraction only
+        // lowers the weighted grant.
         let horizon_bytes = share.write_bytes_per_s as f64 * BURST_HORIZON_NS as f64 / 1e9;
         let slices = 256.0 * 1024.0 + ckpt_slice + 1024.0 * 1024.0 + 16.0 * 1024.0;
-        let bound = share.write_bytes_per_s as f64 * elapsed_s + 2.0 * horizon_bytes + slices;
+        let keepup = stats.log_frame_bytes as f64 / 2.0;
+        let bound =
+            share.write_bytes_per_s as f64 * elapsed_s + 2.0 * horizon_bytes + slices + keepup;
         let background: u64 = IoClass::ALL
             .iter()
             .filter(|c| !c.is_foreground() && !c.is_read())
@@ -1508,13 +1512,20 @@ fn budget_oracles(scenario: &DurableScenario, node: &Node, now: Nanos, report: &
                 share.write_bytes_per_s
             ));
         }
-        // (c) Engagement: the regime is not vacuous — the checkpoint
+        // (c) Engagement: the regime is not vacuous — some background
         // class was deferred at least once (the S27 lesson: a pressure
-        // row whose counter stayed at 0 measured nothing).
-        if stats.io_budget[IoClass::Checkpoint.index()].deferrals == 0 {
+        // row whose counter stayed at 0 measured nothing). The checkpoint
+        // class itself is floored to keep up with the log (ADR-0088 D2
+        // amended), so its deferrals are not the signal; zero-fill's are.
+        let background_deferrals: u64 = IoClass::ALL
+            .iter()
+            .filter(|c| !c.is_foreground())
+            .map(|c| stats.io_budget[c.index()].deferrals)
+            .sum();
+        if background_deferrals == 0 {
             let ckpt = node.plane(cell).ckpt_stats_for_sim();
             report.violations.push(format!(
-                "cell {cell}: the budget never deferred a checkpoint block — the scenario's \
+                "cell {cell}: the budget never deferred a background block — the scenario's \
                  offered load did not exceed the share (vacuous regime); ckpts completed {} \
                  aborted {} in_progress {} interval {} records_since_begin {} log_frame_bytes {} \
                  ckpt_bytes {} zero_fill {} rotations_unzeroed {} waits_pace {} \
