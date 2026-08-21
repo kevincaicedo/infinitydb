@@ -46,7 +46,7 @@ fn run_schedule(seed: u64, dir: &Path) {
     // Small segments: rotation + seal fsyncs interleave with linked ones.
     let mut plane = DurablePlane::new(
         dir,
-        StagingConfig { capacity_bytes: 16 << 10 },
+        StagingConfig::with_capacity(16 << 10),
         SegmentConfig { segment_bytes: 16 << 10, ..Default::default() },
     );
     plane.jobs_per_iter = 1 + rng.below(24) as usize;
@@ -71,7 +71,7 @@ fn run_schedule(seed: u64, dir: &Path) {
         assert!(iters < 200_000, "schedule {seed:#x} failed to quiesce");
         let quiesced = plane.jobs.is_empty()
             && plane.staging.is_empty()
-            && plane.in_flight.is_none()
+            && plane.in_flight.is_empty()
             && plane.commit.pending_fsyncs() == 0;
         idle = if quiesced { idle + 1 } else { 0 };
     }

@@ -68,7 +68,13 @@ its own completion, independent of the other cells. The device decides
 (`inf probe-device` → `io-properties.toml`), the default stays FLUSH
 until the reference-box A/B, and a frame takes the FUA class only when
 it extends the durable prefix — a FUA write persists itself, never the
-un-barriered frames before it. Everything else — the hash index, document trees,
+un-barriered frames before it. Frames ride a **bounded pipeline**
+(ADR-0087): the staging domain is a ring of K + 1 frame buffers, up to K
+sealed frames are in flight at once, the ledger advances its written and
+durable watermarks over completion-ordered prefixes, and a frame whose
+due barrier cannot yet be honest — a linked fdatasync with earlier writes
+still in flight, a rotation's seal — waits one write latency rather than
+claiming coverage it does not have. Everything else — the hash index, document trees,
 secondary indexes, stream offsets, vector graphs — is a rebuildable
 projection over that log. Checkpoints are fuzzy snapshots streamed by the
 owning cell in budgeted background slices (no fork, no stop-the-world);

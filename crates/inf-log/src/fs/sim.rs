@@ -129,6 +129,15 @@ pub struct StallConfig {
     /// heavy tail as fsyncs (`tail_permille`/`tail_mult` over this base).
     /// 0 completes inline (every pre-S34 trace stays byte-identical).
     pub through_base_ns: u64,
+    /// Plain (barrier-less) write service time (ns, M4.5-S35 / ADR-0087
+    /// D7): the page-cache copy, or under `O_DIRECT` the device write
+    /// without a barrier. Drawn independently per write, never on the
+    /// serial flush timeline — so with K frames in flight plain writes
+    /// complete in any order and a write can land **after** an fdatasync
+    /// issued later, the shape the linked-sync drain rule must survive.
+    /// Same heavy tail and stall-episode inheritance as the other
+    /// classes. 0 completes inline (every pre-S35 trace byte-identical).
+    pub write_base_ns: u64,
 }
 
 impl Default for StallConfig {
@@ -143,6 +152,7 @@ impl Default for StallConfig {
             episode_ms_min: 0,
             episode_ms_max: 0,
             through_base_ns: 0,
+            write_base_ns: 0,
         }
     }
 }
@@ -208,11 +218,24 @@ impl StallModel {
     /// the flush unit. A stall episode still wedges it (the whole device
     /// is wedged), which is what keeps the model honest about tails.
     fn schedule_through(&mut self, now_ns: u64) -> u64 {
-        let mut service_ns = self.cfg.through_base_ns;
+        self.schedule_off_timeline(now_ns, self.cfg.through_base_ns)
+    }
+
+    /// One plain write's absolute completion time (ADR-0087 D7): the same
+    /// off-timeline draw as write-through over `write_base_ns`.
+    fn schedule_write(&mut self, now_ns: u64) -> u64 {
+        self.schedule_off_timeline(now_ns, self.cfg.write_base_ns)
+    }
+
+    /// A per-op service time that does not queue on the serial flush
+    /// timeline: base + the seeded heavy tail, inheriting a straddled
+    /// stall episode's remainder (the device wedges for every class).
+    fn schedule_off_timeline(&mut self, now_ns: u64, base_ns: u64) -> u64 {
+        let mut service_ns = base_ns;
         if self.cfg.tail_permille > 0
             && self.rng.next_below(1_000) < u64::from(self.cfg.tail_permille)
         {
-            service_ns += self.rng.next_below(self.cfg.through_base_ns.max(1) * self.cfg.tail_mult);
+            service_ns += self.rng.next_below(base_ns.max(1) * self.cfg.tail_mult);
         }
         while self.next_episode_at.saturating_add(self.episode_dur_ns) <= now_ns {
             self.arm_next_episode();
@@ -483,6 +506,19 @@ impl SimDisk {
             return None;
         }
         Some(model.schedule_through(now_ns))
+    }
+
+    /// Draws one plain write's absolute completion time (ADR-0087 D7).
+    /// `None` when no model is armed **or** `write_base_ns` is 0 — inline
+    /// completion, byte-identical traces.
+    #[must_use]
+    pub fn schedule_write(&self, now_ns: u64) -> Option<u64> {
+        let mut state = self.state.borrow_mut();
+        let model = state.stall.as_mut()?;
+        if model.cfg.write_base_ns == 0 {
+            return None;
+        }
+        Some(model.schedule_write(now_ns))
     }
 
     /// Arms the dead switch: `n` more mutating ops succeed, then every
@@ -988,7 +1024,28 @@ mod stall_tests {
             episode_ms_min: 50,
             episode_ms_max: 90,
             through_base_ns: 0,
+            write_base_ns: 0,
         }
+    }
+
+    #[test]
+    fn plain_writes_defer_only_when_armed_and_off_the_flush_timeline() {
+        // ADR-0087 D7: `write_base_ns = 0` keeps plain writes inline
+        // (every pre-S35 trace byte-identical); armed, each write draws
+        // its own service time without advancing the serial flush
+        // timeline, so a write issued after an fsync can be due before
+        // or after it — the reorder the written prefix must survive.
+        let off = SimDisk::with_stall(SimDiskConfig::default(), armed_cfg(), 7);
+        assert_eq!(off.schedule_write(1_000), None);
+        let mut cfg = armed_cfg();
+        cfg.write_base_ns = 8_000;
+        let on = SimDisk::with_stall(SimDiskConfig::default(), cfg, 7);
+        let sync_due = on.schedule_fsync(1_000).expect("armed");
+        let write_due = on.schedule_write(1_000).expect("armed");
+        assert!(write_due >= 1_000 + 8_000, "base service time");
+        assert!(write_due < sync_due, "a plain write does not queue behind the flush unit");
+        let next_sync = on.schedule_fsync(1_000).expect("armed");
+        assert!(next_sync >= sync_due, "the flush timeline stays serial");
     }
 
     #[test]

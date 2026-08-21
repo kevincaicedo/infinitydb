@@ -176,6 +176,22 @@ impl Node {
         )
     }
 
+    /// A Direct node with `frames_in_flight = k` (M4.5-S35, ADR-0087).
+    fn start_durable_pipeline(cells: u16, data_dir: &std::path::Path, k: u8) -> Node {
+        Node::start_cfg(
+            cells,
+            Some(data_dir.to_path_buf()),
+            0,
+            inf_server::RecoverConfig::default(),
+            Vec::new(),
+            true,
+            true,
+            false,
+            Some(inf_log::StagingConfig { frames_in_flight: k, ..Default::default() }),
+            inf_log::SegmentIoMode::Direct,
+        )
+    }
+
     fn start_durable_small_staging(
         cells: u16,
         data_dir: &std::path::Path,
@@ -190,7 +206,7 @@ impl Node {
             false,
             false,
             false,
-            Some(staging_bytes),
+            Some(inf_log::StagingConfig::with_capacity(staging_bytes)),
             inf_log::SegmentIoMode::Buffered,
         )
     }
@@ -206,7 +222,7 @@ impl Node {
         apply_prefetch: bool,
         parse_prefetch: bool,
         deasync_dispatch: bool,
-        staging_bytes: Option<u32>,
+        staging: Option<inf_log::StagingConfig>,
         io_mode: inf_log::SegmentIoMode,
     ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
@@ -260,9 +276,7 @@ impl Node {
                     }
                     let cfg = inf_server::DurableConfig {
                         data_dir: dir.clone(),
-                        staging: staging_bytes
-                            .map(|capacity_bytes| inf_log::StagingConfig { capacity_bytes })
-                            .unwrap_or_default(),
+                        staging: staging.unwrap_or_default(),
                         segment: inf_log::SegmentConfig {
                             segment_bytes: 8 << 20, // small: tests rotate
                             io_mode,
@@ -275,7 +289,7 @@ impl Node {
                             ..Default::default()
                         },
                         recover,
-                        sync_pipeline: 1,
+                        flush_bound: 1,
                         fua_p50_us_probed: 0,
                     };
                     durable = Some((cfg, Arc::clone(control)));
@@ -2887,6 +2901,88 @@ fn direct_segments_converge_to_fua_and_survive_restart() {
     let info = info_persistence(&mut c);
     assert!(info.contains("barrier_class:fua"), "reopened tail is pre-zeroed:\n{info}");
     assert!(info_field(&info, "fsyncs_fua") >= 1, "{info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M4.5-S35 (ADR-0087): with `frames_in_flight = 4` on a Direct cell,
+/// concurrent `always` writers fill the pipeline (INFO proves it reached
+/// ≥ 2 frames in flight), every write is a write-through frame, acks stay
+/// a prefix (every acked key is back after a restart), and the pipeline
+/// gauges are exported. Real io_uring; run with `TMPDIR` on the NVMe for
+/// the device tier (tmpfs swallows `O_DIRECT`/FUA).
+#[test]
+fn frame_pipeline_fills_under_concurrent_always_writers_and_survives_restart() {
+    let dir = temp_data_dir("s35-pipeline");
+    let node = Node::start_durable_pipeline(1, &dir, 4);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"pipe", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"pipe"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // Wait for the class-upgrade rotation (segment 1 pre-zeroed).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut writes = 0u32;
+    loop {
+        writes += 1;
+        let key = format!("k:{writes}");
+        c.write_all(&cmd(&[b"SET", key.as_bytes(), b"v"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let info = info_persistence(&mut c);
+        if info.contains("barrier_class:fua") {
+            assert_eq!(info_field(&info, "frames_in_flight"), 4, "{info}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "never upgraded to fua after {writes} writes:\n{info}");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let before = info_persistence(&mut c);
+    let linked_before = info_field(&before, "fsyncs_linked");
+    let fua_before = info_field(&before, "fsyncs_fua");
+    // Eight concurrent always writers: frames seal every iteration while
+    // earlier ones are still in flight — the pipeline fills.
+    const WRITERS: u32 = 8;
+    const PER_WRITER: u32 = 200;
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let mut c = connect_use(&node, b"pipe");
+            std::thread::spawn(move || {
+                for i in 0..PER_WRITER {
+                    let key = format!("p:{w}:{i}");
+                    c.write_all(&cmd(&[b"SET", key.as_bytes(), b"through"])).expect("write");
+                    read_exactly(&mut c, b"+OK\r\n");
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("writer");
+    }
+    let after = info_persistence(&mut c);
+    assert_eq!(info_field(&after, "fsyncs_linked"), linked_before, "every frame write-through");
+    assert!(info_field(&after, "fsyncs_fua") > fua_before, "{after}");
+    assert!(info_field(&after, "frames_in_flight_max") >= 2, "the pipeline filled:\n{after}");
+    assert_eq!(info_field(&after, "frame_waits_barrier"), 0, "pure always never waits:\n{after}");
+    assert_eq!(info_field(&after, "barrier_class_degraded"), 0);
+    drop(c);
+    node.stop();
+
+    // Restart: every acked key is back; the pipeline config persists.
+    let node = Node::start_durable_pipeline(1, &dir, 4);
+    let mut c = connect_use(&node, b"pipe");
+    for w in 0..WRITERS {
+        for i in 0..PER_WRITER {
+            let key = format!("p:{w}:{i}");
+            c.write_all(&cmd(&[b"GET", key.as_bytes()])).expect("write");
+            read_exactly(&mut c, b"$7\r\nthrough\r\n");
+        }
+    }
+    let info = info_persistence(&mut c);
+    assert!(info.contains("barrier_class:fua"), "{info}");
+    assert_eq!(info_field(&info, "frames_in_flight"), 4);
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();

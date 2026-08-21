@@ -513,7 +513,17 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         // artifacts (values measured by campaign tooling; provenance is
         // mandatory via --campaign-note), and the provenance note itself.
         "attribution-keys",
+        // Retired by ADR-0087 D5 (accepted for one campaign, logged as a
+        // no-op, never forwarded — the S27 recipe must not break mid-run).
         "sync-pipeline",
+        // M4.5-S35 (ADR-0087 D5/D8) A/B arms, forwarded to every durable
+        // spawn and disclosed in the report notes: the frame pipeline
+        // depth, the barrier class, and the per-buffer staging size the
+        // L5-neutral pairing needs (`--frames-in-flight 3
+        // --log-staging-mib 2`).
+        "frames-in-flight",
+        "barrier-class",
+        "staging-mib",
         "only-always",
         "only-s27",
         "only-s29",

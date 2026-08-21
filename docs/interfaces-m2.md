@@ -347,6 +347,22 @@ enum MutationEffect<'a> {
 The §7.1 "log staging ring": a double-buffered frame pair (contiguity for
 one-writev — ADR-0012), fixed capacity, allocated once per cell.
 
+**M4.5-S35 amendment (ADR-0087 D1):** the pair is a **ring of
+`frames_in_flight + 1` whole frame buffers** (`StagingConfig { capacity_bytes,
+frames_in_flight: 1..=MAX_FRAMES_IN_FLIGHT (8) }`, default 1 — the pair,
+byte-identical). Up to K sealed frames stay leased at once; `release(lease)`
+frees its buffer by generation in **any order** (completions reorder);
+`seal` takes any free buffer; `can_seal()` = records pending ∧ a free buffer;
+`backlogged()` = every in-flight slot taken; `drained()` = no lease out (the
+rotation precondition, ADR-0087 D4); `in_flight()`, `frames_in_flight()`.
+`capacity_bytes` keeps its per-buffer meaning (so `max_record_len`, a
+user-visible admission contract, does not move with K); `resident_bytes` =
+(K + 1) × (capacity + 2 × `FRAME_ALIGN`). `StagingStats::in_flight_max` is
+the observed high-water mark (`frames_in_flight_max`). Operator surface:
+`infinityd --frames-in-flight K`; the L5-neutral pairing is `--frames-in-flight
+3 --log-staging-mib 2` (4 × 2 MiB). `StagingConfig::with_capacity(bytes)`
+is the K = 1 constructor tests and tooling use.
+
 - EXECUTE: `stage(&MutationEffect) -> Result<StagedAt, StagingFull>` —
   in-place encode, zero steady-state allocation (counting-allocator
   enforced); `StagingFull{needed, available}` is the typed backpressure
@@ -496,7 +512,14 @@ discipline:
   step's linked sync; at bound 1 the completion path never issues.
   `register_standalone_fsync` now clears the always due exactly when the
   covered range discharges it (previously it was kept whenever always
-  traffic was pending).
+  traffic was pending). **Retired 2026-08-21 (M4.5-S35, ADR-0087 D5):**
+  the constructor is `GroupCommit::with_flush_bound(1|2)` and the field
+  `DurableConfig::flush_bound` (FLUSH-class barriers in flight — the
+  ADR-0022 D3 constant, 1 shipped); `infinityd --sync-pipeline` is refused
+  with a pointer to `--frames-in-flight`; `inf-bench` accepts
+  `sync-pipeline` for one campaign as a logged no-op and forwards
+  `frames-in-flight` / `barrier-class` / `staging-mib` instead. The
+  two-in-flight arm stays reachable by construction (tests, harness).
 - **Formation observables**: `CommitStats` gains `fsyncs_completion`,
   `fsyncs_boot_barrier`, `fsyncs_prealloc_barrier`; `DurableStats`/`INFO
   persistence` gain `fsync_group_p50`/`fsync_group_p99` (records newly
@@ -505,6 +528,29 @@ discipline:
   `tripwire:spawn_retries` (must read zero post-S01).
 
 ## Group commit + durability watermark (`inf-log::commit`, M2-S05/S06)
+
+**M4.5-S35 amendment (ADR-0087 D2/D3):** `note_frame_queued(end, len) ->
+FrameId` pushes a bounded queued-frame FIFO; `note_frame_written(FrameId)`
+marks that frame written and advances `written_up_to`/`written_bytes` over
+the **completion-ordered written prefix** (a later frame landing first
+advances nothing — what an fdatasync can honestly cover). `frame_plan(
+write_through_ok, seal_ahead) -> FramePlan::{Plain, WriteThrough,
+LinkedFsync, Wait}` decides the next frame's barrier **before the seal**:
+write-through under the prefix rule (pending write-through tickets of
+earlier in-flight frames count as coverage; `seal_ahead` = a rotation's
+seal entry will precede the frame and covers every queued byte);
+`LinkedFsync` only when `drained()` (every earlier write completed —
+`IO_LINK` orders the sync after *this* frame's write alone; release-
+asserted in `register_linked_fsync`) and the FLUSH slot is free; `Wait`
+when a sync is due, write-through is inadmissible, and frames are still in
+flight below (the frame is held ≤ one write latency — sealing it
+barrier-less would starve the due); `Plain` otherwise (FLUSH slot busy:
+the due accumulates, §8.2). `write_through_due()` / `frame_fsync_due()`
+are now pre-seal predicates (the next base is `queued_bytes`).
+`register_seal_fsync` asserts `drained()` — rotation is a drain point
+(ADR-0087 D4; the plane holds a frame that needs rotation until no write is
+in flight; `SegmentRotor::{rotation_due, next_frame_write_through_ok}` are
+the pre-seal queries). `sync_due()`, `drained()`, `frames_unwritten()`.
 
 **M4.5-S34 amendment (ADR-0086 D5):** `SyncReason::WriteThrough` (ticket
 registered at seal via `register_write_through`, completed from
@@ -530,7 +576,8 @@ the module docs; `inf-server` adopts it at S08):
   iteration — §8.2 group commit); `standalone_fsync_due()` →
   `register_standalone_fsync()` (dirty bytes, no frame; covers
   written-at-submission, never queued).
-- REAP: `note_frame_written()` (lease release point);
+- REAP: `note_frame_written(FrameId)` (lease release point; written
+  prefix, ADR-0087 D2);
   `on_fsync_complete(ticket) -> Option<Lsn>` — submission-ordered ledger,
   **done-prefix** advance (completions may cross fds out of order);
   `on_fsync_error(ticket)` freezes the watermark forever (§8.4 — caller
@@ -1050,6 +1097,17 @@ durable-state corruption** (an ack for a byte that was never fsync-covered).
 are still debug-only (1.1–1.3) are the promotion headline — all per-batch,
 so promotion is free.
 
+**M4.5-S35 additions (ADR-0087 D2/D3/D4, 2026-08-21):**
+
+| # | Invariant (identifiers) | Why it must hold | Enforcement | Disposition |
+|---|---|---|---|---|
+| 1.13 | `note_frame_written(id)`: `written_up_to`/`written_bytes` advance only over the contiguous written prefix of the queued-frame FIFO; a later frame landing first advances nothing | A standalone/completion fdatasync covers `written_up_to`; claiming a frame whose write has not completed is ack-before-durable | by-construction (prefix loop) + `expect`/`assert!` **release** on unknown/double ids; pinned by `written_prefix_is_completion_ordered` | keep |
+| 1.14 | `register_linked_fsync`: the only queued-unwritten frame is this one (`drained()` held at `frame_plan`) | `IO_LINK` orders the sync after *this* frame's write only; an earlier frame still in flight sits outside the sync's coverage | `assert!` **release** (per linked frame, free) + the `Wait` arm of `frame_plan` | keep — the 1.4 rule generalized from rotation to every linked sync |
+| 1.15 | `register_seal_fsync`: `drained()` — rotation is a pipeline drain point | 1.4 restated for K > 1: the plane holds a frame needing rotation until no write is in flight | `assert!` **release**; plane predicate `rotation_due && !staging.drained() ⇒ hold`; pinned by the K = 4 reference-plane test (seal syncs == rotations) | keep |
+| 1.16 | `note_frame_queued`: `queued.len() < MAX_FRAMES_IN_FLIGHT` — the queued-frame FIFO is bounded by the ring | An unbounded in-flight count is a queue (L3) and a plane bug | `assert!` **release** (per frame, free) | keep |
+| 1.17 | `register_write_through`: coverage tail == this frame's base (the prefix rule, ADR-0086 D2.5) with the base read from the FIFO (`queued.iter().rev().nth(1)`, else `written_bytes`) | A FUA ticket claiming bytes it did not write | `assert_eq!` **release** | keep (S34's assert, base re-derived for K > 1) |
+| 1.18 | `frame_plan`: a due frame that cannot take write-through while writes are in flight below is **held** (`Wait`), never sealed barrier-less | Sealing it plain lets every later frame find the same shape — the due starves under load (livelock) | by-construction (decision order) ; pinned by `a_due_frame_waits_behind_in_flight_plain_frames_then_links`; `frame_waits_barrier` counts episodes | keep |
+
 ---
 
 ## 2. `WatermarkGate` — LSN-keyed ack gate (`inf-runtime/src/gate.rs`)
@@ -1082,7 +1140,9 @@ mis-address a record → wrong data acked as durable).
 | 3.1 | `lsn_of`: `at.generation == self.generation` — token belongs to this lease | A cross-generation token resolves a record to a bogus LSN → an ack gates on the wrong watermark | `assert_eq!` **release** staging.rs:138 | keep (the custody invariant; already release — exemplary) |
 | 3.2 | `leased_frame`: `in_flight.generation == lease.generation` | Writing the wrong buffer's bytes to the segment | `assert_eq!` **release** staging.rs:349 | keep |
 | 3.3 | `release`: `in_flight.generation == lease.generation` | Releasing the wrong buffer resurrects in-flight bytes | `assert_eq!` **release** staging.rs:357 | keep |
-| 3.4 | `seal`: `!is_empty()` and `in_flight.is_none()` — at most one frame in flight, no empty seal | A second seal while a lease is outstanding aliases the in-flight buffer (memory > 2×capacity, torn write) | two `assert!` **release** staging.rs:328, 329 | keep |
+| 3.4 | `seal`: `!is_empty()` and `in_flight.is_none()` — at most one frame in flight, no empty seal | A second seal while a lease is outstanding aliases the in-flight buffer (memory > 2×capacity, torn write) | two `assert!` **release** staging.rs:328, 329 | keep — **amended M4.5-S35 (ADR-0087 D1):** `!backlogged()` (a free buffer exists; ≤ `frames_in_flight` leases out); the seal takes a `Free` buffer, never one in `InFlight`/`Staging` (typestate per buffer) |
+| 3.8 | `leased_index`/`release` (M4.5-S35): exactly one buffer is `InFlight { generation }` for a live lease; release moves it to `Free` in any order | A stale or double-released lease would free a buffer still leased to a write | `expect` **release** (position by generation) | keep |
+| 3.9 | `new` (M4.5-S35): `frames_in_flight ∈ 1..=MAX_FRAMES_IN_FLIGHT`; buffers = K + 1 allocated once; `resident_bytes` = (K + 1) × (capacity + 2 × FRAME_ALIGN) | The ring is bounded and attributed (L5); no allocation after construction (pinned at K = 4 by `staging_alloc`) | two `assert!` **release** | keep (per-boot) |
 | 3.5 | `new`: `capacity_bytes ∈ [min_frame, DEFAULT_MAX_FRAME_LEN]` | A capacity below a minimal frame or above the reader bound writes frames no default reader can replay | two `assert!` **release** staging.rs:204, 206 | keep (per-boot) |
 | 3.6 | `stage`: record over remaining capacity → typed `StagingFull`, effect not partially staged | Backpressure is an operating condition, not an invariant (L: bounded queue) | checked-error staging.rs:227–230 | keep |
 | 3.7 | oversized record (`> max_record_len`) is admission's problem, never retried here | Retrying an un-stageable record is a livelock | by-construction + doc (admission checks `max_record_len` up front) staging.rs:254–260 | keep — verify S08 admission actually calls `max_record_len` (out of scope here; note for cross-check) |
@@ -1118,6 +1178,23 @@ crash and a corrupt recovery unit are debug-only. Promote both — free.
 ---
 
 ## 5. `Recovery` state steps (`inf-server/src/recover.rs`)
+
+**M4.5-S35 amendment (ADR-0087 D6, amends ADR-0031 D4):** the slack audit of
+segment `idx` runs immediately after its replay (`Replay{idx} → Audit{idx}`);
+the first slack holding a validating frame is the **hole**, after which
+every later segment is `Probe`d for stamp evidence and never replayed. `Finish`
+applies the one evidence rule at the resume point (the hole's segment when it
+holds data, else the last data-bearing segment before it): a v1 frame or a
+`covered_lsn` attestation past the hole refuses (covered data lost — the
+device lied); otherwise truncate there, remove every later segment, resume
+under a fresh epoch. Invariants: `ends.len() == evidence.len() ==
+segments.len()` at `Finish` (debug-asserted); `Probe` only behind a hole
+(debug-asserted); the end-of-replay checks (tiered, sidecar) run exactly once
+on the first transition out of `Replay`. Taxonomy pins: `recover_torn.rs`
+(`unattested_hole_in_a_sealed_segment_truncates_and_discards_later_segments`,
+`unattested_hole_at_a_sealed_segments_first_frame_resumes_in_the_previous_segment`,
+`attested_hole_in_a_sealed_segment_refuses_to_start`), crash row
+`seal-flush-x-fua-plain-tail`.
 
 Resumable boot machine (`Phase`: Start→Ick→Replay→Audit→Finish→Complete).
 Recovery is where a wrong decision **is** durable corruption made visible;

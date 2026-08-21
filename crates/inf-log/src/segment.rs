@@ -637,7 +637,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// A class-upgrade rotation is due (ADR-0086 D4): the active segment
     /// cannot write write-through frames and a pre-zeroed next segment is
     /// ready. Checked at `begin_frame_deferred` — rotation happens only
-    /// while no frame is in flight.
+    /// while no frame is in flight (ADR-0087 D4).
     fn upgrade_due(&self) -> bool {
         self.cfg.io_mode == SegmentIoMode::Direct
             && !self.active.prezeroed
@@ -741,7 +741,8 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// here; the reactor tier ships with `seal_after_ms = None` (the M2
     /// cut line — time seals remain a synchronous-tier feature until their
     /// config lands). A class-upgrade rotation (ADR-0086 D4) also lands
-    /// here — the one place rotation is known to find no frame in flight.
+    /// here — callers establish no frame is in flight first
+    /// (`rotation_due` + drain, ADR-0087 D4).
     pub fn begin_frame_deferred(
         &mut self,
         frame_len: u32,
@@ -756,6 +757,39 @@ impl<F: SegmentFs> SegmentRotor<F> {
             None
         };
         Ok((self.reserve(frame_len, now_ms), handoff))
+    }
+
+    /// Would `begin_frame_deferred` rotate for a frame of `frame_len`
+    /// (unpadded) bytes — it does not fit the active segment, or a
+    /// class-upgrade rotation is due (ADR-0086 D4)? The LOG step asks
+    /// before reserving: rotation is a pipeline drain point (ADR-0087
+    /// D4), so a frame that needs it waits until no frame is in flight.
+    /// Pure: performs nothing.
+    #[must_use]
+    pub fn rotation_due(&self, frame_len: u32) -> bool {
+        !self.fits(frame_len) || self.upgrade_due()
+    }
+
+    /// Would a frame of `frame_len` (unpadded) bytes be write-through
+    /// eligible on the segment it will land in (ADR-0086 D1: `Direct` ∧
+    /// pre-zeroed ∧ padded length ≤ `fua_max_frame_bytes`)? Asked before
+    /// the seal so the barrier plan (ADR-0087 D3) is decided before any
+    /// state moves. When a rotation is due the answer is for the *next*
+    /// segment, which the reservation will also report in
+    /// `FrameSlot::write_through_ok` — the two agree by construction
+    /// (both read the same segment state; asserted at the plane).
+    #[must_use]
+    pub fn next_frame_write_through_ok(&self, frame_len: u32) -> bool {
+        if self.rotation_due(frame_len) {
+            let Some(next) = self.next.as_ref() else { return false };
+            let prezeroed = next.state == NextState::Ready { prezeroed: true };
+            let padded = FrameLayout::Aligned.padded_len(frame_len);
+            return next.io_mode == SegmentIoMode::Direct
+                && prezeroed
+                && padded <= self.cfg.fua_max_frame_bytes;
+        }
+        let padded = self.active.layout().padded_len(frame_len);
+        self.active_write_through() && padded <= self.cfg.fua_max_frame_bytes
     }
 
     /// The largest on-device length a frame of `frame_len` bytes can take
@@ -818,9 +852,10 @@ impl<F: SegmentFs> SegmentRotor<F> {
 
     /// Deferred rotation: swap in the next segment WITHOUT the seal fsync —
     /// the caller owns sealing through the driver. Sound only because the
-    /// LOG step rotates exclusively while no write is in flight (the
-    /// staging lease serializes writes; `can_seal` implies the previous
-    /// write's CQE arrived), so the handed-off segment is complete.
+    /// LOG step rotates exclusively while no write is in flight (rotation
+    /// is a pipeline drain point, ADR-0087 D4: the plane checks
+    /// `rotation_due` and waits for `StagingRing::drained`), so the
+    /// handed-off segment is complete.
     ///
     /// A next segment still zero-filling is taken anyway once no zero
     /// slice is in flight (a slice could otherwise land over the first

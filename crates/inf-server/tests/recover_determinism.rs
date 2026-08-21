@@ -50,7 +50,7 @@ fn cfg() -> DurableConfig {
         segment: SegmentConfig { segment_bytes: 8 << 10, ..Default::default() },
         ckpt: CkptConfig::default(),
         recover: Default::default(),
-        sync_pipeline: 1,
+        flush_bound: 1,
         fua_p50_us_probed: 0,
     }
 }

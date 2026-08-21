@@ -85,7 +85,7 @@ impl Rng {
 fn million_random_writes_replay_byte_identically() {
     let fs = MemFs::new();
     let (mut rotor, log_dir) = mem_rotor(&fs, 1 << 20);
-    let mut ring = StagingRing::new(StagingConfig { capacity_bytes: 64 << 10 });
+    let mut ring = StagingRing::new(StagingConfig::with_capacity(64 << 10));
     let mut rng = Rng(0x1AF1_D8A5_0DB5_EED1);
 
     const TOTAL: usize = 1_000_000;
@@ -184,7 +184,7 @@ proptest! {
     ) {
         let fs = MemFs::new();
         let (mut rotor, log_dir) = mem_rotor(&fs, segment_bytes.max(1024));
-        let mut ring = StagingRing::new(StagingConfig { capacity_bytes: 512 });
+        let mut ring = StagingRing::new(StagingConfig::with_capacity(512));
 
         let mut expected: Vec<(Lsn, Vec<u8>)> = Vec::new();
         let mut pending = Vec::new();

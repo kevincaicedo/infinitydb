@@ -64,7 +64,7 @@ fn append_path_performs_zero_heap_allocations() {
     // rotation/prealloc is MAINTAIN work, not the append path.
     let cfg = SegmentConfig { segment_bytes: 32 << 20, ..Default::default() };
     let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg).expect("rotor");
-    let mut ring = StagingRing::new(StagingConfig { capacity_bytes: 64 << 10 });
+    let mut ring = StagingRing::new(StagingConfig::with_capacity(64 << 10));
 
     let value = [0x5A_u8; 64];
     let effects = [
@@ -101,4 +101,47 @@ fn append_path_performs_zero_heap_allocations() {
         0,
         "append path allocated: stage/seal/commit/release must be allocation-free (L5)"
     );
+    four_frames_in_flight_phase();
+}
+
+/// ADR-0087 D1: the ring of K + 1 buffers is allocated once; sealing
+/// into any free buffer and releasing leases out of order allocates
+/// nothing on the steady path. Runs inside the test above (one process-
+/// wide allocation counter: tests in parallel threads would pollute each
+/// other's measurement).
+fn four_frames_in_flight_phase() {
+    let fs = MemFs::new();
+    let dirs = create_cell_dirs(&fs, &PathBuf::from("data/shard-1")).expect("dirs");
+    let cfg = SegmentConfig { segment_bytes: 32 << 20, ..Default::default() };
+    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg).expect("rotor");
+    let mut ring =
+        StagingRing::new(StagingConfig { capacity_bytes: 64 << 10, frames_in_flight: 4 });
+    let value = [0xA5_u8; 64];
+    let effect = MutationEffect::StringSet { ns: NsId(1), key: b"user:0042", value: &value };
+    // Fixed scaffolding: no per-iteration allocation in the test either.
+    let mut leases: [Option<inf_log::FrameLease>; 4] = Default::default();
+
+    let mut steady_iterations = || {
+        for _ in 0..500 {
+            for held in &mut leases {
+                for _ in 0..8 {
+                    ring.stage(&effect).expect("sized to fit");
+                }
+                let slot = rotor.begin_frame(ring.pending_frame_len(), 0).expect("reserve");
+                let lease = ring.seal(slot.first_record_lsn(), 0, slot.layout());
+                rotor.commit_frame(slot, ring.leased_frame(&lease)).expect("commit");
+                *held = Some(lease);
+            }
+            // Out-of-order release: 2, 0, 3, 1.
+            for index in [2usize, 0, 3, 1] {
+                ring.release(leases[index].take().expect("leased"));
+            }
+        }
+    };
+
+    steady_iterations();
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    steady_iterations();
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    assert_eq!(after - before, 0, "K-deep ring: stage/seal/release must be allocation-free (L5)");
 }

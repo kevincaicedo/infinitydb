@@ -2,22 +2,27 @@
 //! one iteration's [`MutationEffect`]s accumulate during EXECUTE and are
 //! drained into the active frame at LOG (L2, L3).
 //!
-//! The domain is realized as a **double-buffered frame pair**, not a
-//! wrap-around ring (ADR-0012): a frame must be physically contiguous for
-//! the one-`writev`-per-iteration rule (L3), and a wrap would split it.
-//! One buffer accepts appends (EXECUTE); the other may be sealed and
-//! **leased** to an in-flight write until its completion arrives (the
-//! M2-S05 write→fsync CQE). Both buffers are fixed-capacity, allocated
-//! once at cell construction — the append path performs zero heap
-//! allocation by construction (L5; asserted by `tests/staging_alloc.rs`).
+//! The domain is realized as a **ring of whole frame buffers**, not a
+//! wrap-around ring of bytes (ADR-0012): a frame must be physically
+//! contiguous for the one-write-per-iteration rule (L3), and a wrap would
+//! split it. One buffer accepts appends (EXECUTE); up to
+//! `frames_in_flight` others may be sealed and **leased** to in-flight
+//! writes until their completions arrive (M2-S05; K > 1 since M4.5-S35,
+//! ADR-0087 D1). All `K + 1` buffers are fixed-capacity, allocated once
+//! at cell construction — the append path performs zero heap allocation
+//! by construction (L5; asserted by `tests/staging_alloc.rs`).
 //!
 //! Backpressure is explicit and bounded (never an unbounded queue):
 //! - [`StagingRing::stage`] refuses with typed [`StagingFull`] when the
 //!   record would overflow the staging buffer — the signal the server
 //!   layer uses to stop re-arming reads on connections writing to durable
 //!   namespaces that iteration (wired with S05/S08).
-//! - [`StagingRing::seal`] requires the previous lease released: at most
-//!   one frame is in flight, so domain memory is `2 × capacity`, always.
+//! - [`StagingRing::seal`] requires a free buffer: at most `K` frames are
+//!   in flight, so domain memory is `(K + 1) × capacity`, always.
+//!   Completions arrive in any order (io_uring orders nothing between
+//!   independent SQEs; the SimDisk draws write-through due times
+//!   independently), so leases are released by generation into a free
+//!   list — never by position.
 //!
 //! LSN handoff: [`stage`](StagingRing::stage) returns a [`StagedAt`]
 //! generation token; after LOG reserves the frame's base, the
@@ -41,17 +46,39 @@ use crate::segment::{LogError, SegmentRotor};
 /// hit only under pathological pipelining, where it *must* push back.
 pub const DEFAULT_STAGING_BYTES: u32 = 4 << 20;
 
+/// Largest legal `frames_in_flight` (ADR-0087 D1): beyond ~4 the device
+/// queue, not the cell, is the bound, and the plane's in-flight table is
+/// sized from this at construction — never a growing queue.
+pub const MAX_FRAMES_IN_FLIGHT: u8 = 8;
+
 /// Log-staging domain configuration (per cell).
 #[derive(Copy, Clone, Debug)]
 pub struct StagingConfig {
-    /// Capacity of each staging buffer: the maximum frame (header + records
-    /// + trailer) one iteration may emit.
+    /// Capacity of each staging buffer: the maximum frame (header, records,
+    /// trailer) one iteration may emit and, through
+    /// [`StagingRing::max_record_len`], the largest durable record
+    /// admission accepts. Its meaning does not move with
+    /// `frames_in_flight` (ADR-0087 D1: a performance knob must not
+    /// silently shrink a user-visible admission contract).
     pub capacity_bytes: u32,
+    /// Frames that may be sealed and in flight at once (`1..=8`, ADR-0087
+    /// D1). Buffers = `frames_in_flight + 1`; resident bytes scale with
+    /// it and are attributed (`log_staging_bytes`).
+    pub frames_in_flight: u8,
 }
 
 impl Default for StagingConfig {
     fn default() -> Self {
-        StagingConfig { capacity_bytes: DEFAULT_STAGING_BYTES }
+        StagingConfig { capacity_bytes: DEFAULT_STAGING_BYTES, frames_in_flight: 1 }
+    }
+}
+
+impl StagingConfig {
+    /// A configuration with `capacity_bytes` and the default pipeline
+    /// depth of one frame in flight (the M2-S03 pair).
+    #[must_use]
+    pub fn with_capacity(capacity_bytes: u32) -> StagingConfig {
+        StagingConfig { capacity_bytes, ..StagingConfig::default() }
     }
 }
 
@@ -96,11 +123,11 @@ pub struct StagedAt {
     body_offset: u32,
 }
 
-/// Exclusive handle on the sealed, in-flight frame: produced by
+/// Exclusive handle on one sealed, in-flight frame: produced by
 /// [`StagingRing::seal`], surrendered to [`StagingRing::release`] when the
-/// covering write completes. Not `Clone`: one frame, one lease. Dropping a
-/// lease without releasing blocks the next seal — a leak is loud, never a
-/// corruption.
+/// covering write completes — in any order relative to other leases. Not
+/// `Clone`: one frame, one lease. Dropping a lease without releasing
+/// blocks one buffer forever — a leak is loud, never a corruption.
 #[derive(Debug)]
 #[must_use = "an in-flight frame lease must be released on write completion"]
 pub struct FrameLease {
@@ -162,20 +189,35 @@ pub struct StagingStats {
     /// `log_padding_bytes` disclosure: write amplification the aligned
     /// layout adds, never hidden in `frame_bytes_queued`.
     pub padding_bytes: u64,
+    /// Most frames observed in flight at once (ADR-0087 D5:
+    /// `frames_in_flight_max`) — proves a gate run actually filled the
+    /// pipeline.
+    pub in_flight_max: u8,
 }
 
-struct InFlight {
-    buf: usize,
-    generation: u64,
+/// Per-buffer state: the ring's typestate, one owner per fact (L1 at
+/// function scale). `Staging` is the one buffer accepting appends;
+/// `InFlight(generation)` is leased to a write; `Free` awaits a seal.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum BufState {
+    Staging,
+    InFlight { generation: u64 },
+    Free,
 }
 
 /// The log-staging domain of one cell. Single-threaded by design (L1):
 /// EXECUTE appends, LOG seals and commits, the write completion releases —
 /// all on the cell thread.
 pub struct StagingRing {
-    bufs: [FrameBuilder; 2],
+    /// `frames_in_flight + 1` buffers, allocated once.
+    bufs: Vec<FrameBuilder>,
+    state: Vec<BufState>,
+    /// Index of the buffer in `BufState::Staging` (exactly one, always).
     staging: usize,
-    in_flight: Option<InFlight>,
+    /// Leases outstanding (buffers in `InFlight`) — kept as a counter so
+    /// `can_seal` is one compare, never a scan.
+    in_flight: u8,
+    frames_in_flight: u8,
     /// Generation of the buffer currently accepting appends; bumped at
     /// every seal so tokens and leases cannot cross iterations silently.
     generation: u64,
@@ -195,7 +237,7 @@ impl fmt::Debug for StagingRing {
             .field("capacity_bytes", &self.capacity_bytes)
             .field("staged_bytes", &self.staged_bytes())
             .field("pending_records", &self.pending_records())
-            .field("in_flight", &self.in_flight.is_some())
+            .field("in_flight", &self.in_flight)
             .field("generation", &self.generation)
             .field("stats", &self.stats)
             .finish()
@@ -203,17 +245,19 @@ impl fmt::Debug for StagingRing {
 }
 
 impl StagingRing {
-    /// Allocate the domain: two fixed buffers of `capacity_bytes` each
-    /// plus [`FRAME_ALIGN`] slack on both ends (`resident_bytes` =
-    /// 2 × (capacity + 2 × 4 KiB), attributed to the log-staging domain —
-    /// L5; the slack is what makes a sealed frame a legal `O_DIRECT`
-    /// source, ADR-0086 D6). This is cell construction, the one allowed
-    /// allocation point; the append path never allocates again.
+    /// Allocate the domain: `frames_in_flight + 1` fixed buffers of
+    /// `capacity_bytes` each plus [`FRAME_ALIGN`] slack on both ends
+    /// (`resident_bytes` = (K + 1) × (capacity + 2 × 4 KiB), attributed to
+    /// the log-staging domain — L5; the slack is what makes a sealed frame
+    /// a legal `O_DIRECT` source, ADR-0086 D6). This is cell construction,
+    /// the one allowed allocation point; the append path never allocates
+    /// again.
     ///
     /// # Panics
     /// If `capacity_bytes` cannot hold a minimal frame or exceeds
     /// [`DEFAULT_MAX_FRAME_LEN`] (every written frame must be readable by
-    /// a default-configured reader) — boot-configuration invariants.
+    /// a default-configured reader), or `frames_in_flight` is outside
+    /// `1..=MAX_FRAMES_IN_FLIGHT` — boot-configuration invariants.
     #[must_use]
     pub fn new(cfg: StagingConfig) -> StagingRing {
         let min = (FRAME_HEADER_LEN + FRAME_TRAILER_LEN + 4) as u32;
@@ -222,11 +266,22 @@ impl StagingRing {
             cfg.capacity_bytes <= DEFAULT_MAX_FRAME_LEN,
             "staging capacity exceeds the frame decoder bound"
         );
+        assert!(cfg.frames_in_flight >= 1, "at least one frame in flight");
+        assert!(
+            cfg.frames_in_flight <= MAX_FRAMES_IN_FLIGHT,
+            "frames in flight is bounded — never a queue"
+        );
         let capacity = cfg.capacity_bytes as usize;
+        let buffers = usize::from(cfg.frames_in_flight) + 1;
+        let bufs = (0..buffers).map(|_| FrameBuilder::with_capacity(capacity)).collect();
+        let mut state = vec![BufState::Free; buffers];
+        state[0] = BufState::Staging;
         StagingRing {
-            bufs: [FrameBuilder::with_capacity(capacity), FrameBuilder::with_capacity(capacity)],
+            bufs,
+            state,
             staging: 0,
-            in_flight: None,
+            in_flight: 0,
+            frames_in_flight: cfg.frames_in_flight,
             generation: 0,
             frame_epoch: 1,
             next_frame_seq: 1,
@@ -318,22 +373,43 @@ impl StagingRing {
         self.bufs[self.staging].frame_len()
     }
 
-    /// Bytes of the sealed in-flight frame (0 when none).
+    /// Bytes of every sealed in-flight frame (0 when none). O(K), K ≤ 8 —
+    /// an observability read, never on the append path.
     #[must_use]
     pub fn in_flight_bytes(&self) -> u32 {
-        match &self.in_flight {
-            Some(in_flight) => u32::try_from(self.bufs[in_flight.buf].sealed_frame().len())
-                .expect("frame fits u32"),
-            None => 0,
-        }
+        self.state
+            .iter()
+            .zip(&self.bufs)
+            .filter(|(state, _)| matches!(state, BufState::InFlight { .. }))
+            .map(|(_, buf)| u32::try_from(buf.sealed_frame().len()).expect("frame fits u32"))
+            .sum()
     }
 
-    /// Fixed domain memory: both buffers with their alignment slack,
+    /// Fixed domain memory: every buffer with its alignment slack,
     /// allocated at construction (L5 attribution: the log-staging domain
     /// line of `INFO memory`).
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
-        2 * (self.capacity_bytes as usize + 2 * FRAME_ALIGN as usize)
+        self.bufs.len() * (self.capacity_bytes as usize + 2 * FRAME_ALIGN as usize)
+    }
+
+    /// The configured pipeline depth (`frames_in_flight`).
+    #[must_use]
+    pub fn frames_in_flight(&self) -> u8 {
+        self.frames_in_flight
+    }
+
+    /// Leases outstanding right now (`0..=frames_in_flight`).
+    #[must_use]
+    pub fn in_flight(&self) -> u8 {
+        self.in_flight
+    }
+
+    /// True when no frame is in flight — the pipeline is drained. The
+    /// LOG step rotates segments only in this state (ADR-0087 D4).
+    #[must_use]
+    pub fn drained(&self) -> bool {
+        self.in_flight == 0
     }
 
     /// The configured per-buffer capacity — the admission bound the
@@ -343,18 +419,18 @@ impl StagingRing {
         self.capacity_bytes
     }
 
-    /// True when the previous frame is still in flight: sealing must wait
-    /// for its release (bounded: at most one in-flight frame).
+    /// True when every in-flight slot is taken: sealing must wait for a
+    /// release (bounded: at most `frames_in_flight` leases).
     #[must_use]
     pub fn backlogged(&self) -> bool {
-        self.in_flight.is_some()
+        self.in_flight == self.frames_in_flight
     }
 
-    /// True when the LOG step may seal now: records are pending and no
-    /// earlier frame is still in flight.
+    /// True when the LOG step may seal now: records are pending and a
+    /// free buffer exists.
     #[must_use]
     pub fn can_seal(&self) -> bool {
-        !self.is_empty() && self.in_flight.is_none()
+        !self.is_empty() && !self.backlogged()
     }
 
     /// Seal the pending records into a frame at `first_record_lsn` (from
@@ -362,14 +438,14 @@ impl StagingRing {
     /// `covered_lsn` — the group-commit durability watermark at this LOG
     /// step (`Lsn::to_u64`; 0 when nothing is covered yet — the ADR-0031
     /// D1 attestation) — under the active segment's `layout` (ADR-0086
-    /// D3: `Aligned` pads to the 4 KiB successor). Swaps staging to the
+    /// D3: `Aligned` pads to the 4 KiB successor). Moves staging to a
     /// free buffer. The sealed frame stays resident under the returned
     /// lease until [`release`](Self::release); `FrameLease::frame_len` is
     /// the on-device length, padding included.
     ///
     /// # Panics
-    /// If nothing is staged or the previous lease is unreleased — LOG-step
-    /// invariants; callers check [`can_seal`](Self::can_seal).
+    /// If nothing is staged or no buffer is free — LOG-step invariants;
+    /// callers check [`can_seal`](Self::can_seal).
     pub fn seal(
         &mut self,
         first_record_lsn: Lsn,
@@ -377,8 +453,14 @@ impl StagingRing {
         layout: FrameLayout,
     ) -> FrameLease {
         assert!(!self.is_empty(), "seal with no staged records");
-        assert!(self.in_flight.is_none(), "seal while a frame lease is outstanding");
+        assert!(!self.backlogged(), "seal with every in-flight slot taken");
         let sealed = self.staging;
+        debug_assert_eq!(self.state[sealed], BufState::Staging);
+        let free = self
+            .state
+            .iter()
+            .position(|state| *state == BufState::Free)
+            .expect("a free buffer exists when not backlogged");
         let generation = self.generation;
         let stamp = FrameStamp { epoch: self.frame_epoch, seq: self.next_frame_seq, covered_lsn };
         let builder = &mut self.bufs[sealed];
@@ -387,8 +469,11 @@ impl StagingRing {
         builder.finalize(first_record_lsn, stamp, layout);
         let frame_len = u32::try_from(builder.sealed_frame().len()).expect("frame fits u32");
         debug_assert_eq!(frame_len, layout.padded_len(unpadded), "padding follows the layout");
-        self.in_flight = Some(InFlight { buf: sealed, generation });
-        self.staging = 1 - sealed;
+        self.state[sealed] = BufState::InFlight { generation };
+        self.state[free] = BufState::Staging;
+        self.staging = free;
+        self.in_flight += 1;
+        self.stats.in_flight_max = self.stats.in_flight_max.max(self.in_flight);
         self.generation += 1;
         self.next_frame_seq += 1;
         self.stats.seals += 1;
@@ -396,22 +481,35 @@ impl StagingRing {
         FrameLease { generation, first_record_lsn, frame_len, record_count }
     }
 
+    /// Index of the buffer leased under `lease`'s generation. O(K), K ≤ 8;
+    /// once per seal and once per release.
+    ///
+    /// # Panics
+    /// If no in-flight buffer carries that generation — a stale or
+    /// double-released lease is an internal invariant violation.
+    fn leased_index(&self, lease: &FrameLease) -> usize {
+        self.state
+            .iter()
+            .position(|state| *state == BufState::InFlight { generation: lease.generation })
+            .expect("lease does not match any in-flight frame")
+    }
+
     /// The sealed frame's bytes — what the LOG step hands to the segment
     /// write. Borrowed only for the submission; the lease token, not this
     /// slice, crosses iteration boundaries.
     #[must_use]
     pub fn leased_frame(&self, lease: &FrameLease) -> &[u8] {
-        let in_flight = self.in_flight.as_ref().expect("no frame in flight");
-        assert_eq!(in_flight.generation, lease.generation, "lease does not match in-flight frame");
-        self.bufs[in_flight.buf].sealed_frame()
+        self.bufs[self.leased_index(lease)].sealed_frame()
     }
 
     /// Return the lease after the covering write completes; the buffer
-    /// rejoins the staging rotation.
+    /// rejoins the free list. Any order relative to other leases.
     pub fn release(&mut self, lease: FrameLease) {
-        let in_flight = self.in_flight.take().expect("release with no frame in flight");
-        assert_eq!(in_flight.generation, lease.generation, "lease does not match in-flight frame");
-        self.bufs[in_flight.buf].reset();
+        let index = self.leased_index(&lease);
+        self.bufs[index].reset();
+        self.state[index] = BufState::Free;
+        debug_assert!(self.in_flight > 0);
+        self.in_flight -= 1;
         self.stats.releases += 1;
     }
 
@@ -428,7 +526,7 @@ impl StagingRing {
     /// the cell anyway (§8.4).
     ///
     /// # Panics
-    /// If the previous lease is unreleased (see [`seal`](Self::seal)).
+    /// If every in-flight slot is taken (see [`seal`](Self::seal)).
     pub fn flush_into<F: SegmentFs>(
         &mut self,
         rotor: &mut SegmentRotor<F>,

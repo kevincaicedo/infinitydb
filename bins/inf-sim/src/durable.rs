@@ -112,6 +112,13 @@ pub struct DurableScenario {
     /// is the pre-S34 scenario byte-for-byte. `m2_durable` alternates by
     /// seed so every sweep covers both classes.
     pub io_mode: SegmentIoMode,
+    /// Frames in flight per cell (M4.5-S35, ADR-0087 D7): the staging
+    /// ring's pipeline depth. `m2_durable` varies it by seed so every
+    /// sweep covers K = 1 (the pre-S35 scenario byte-for-byte) and K > 1
+    /// under both barrier classes — out-of-order frame completions, the
+    /// hold-for-drain waits, and cuts between a later durable frame and
+    /// an earlier torn one.
+    pub frames_in_flight: u8,
 }
 
 /// The S14 reference stall device: ~120 µs base (warm NVMe fdatasync),
@@ -130,6 +137,12 @@ pub(crate) fn m2_stall_config() -> StallConfig {
         // the reference device (ADR-0086 D8); scenarios without `Direct`
         // segments never draw it.
         through_base_ns: 40_000,
+        // Plain writes pay a page-cache copy's worth (~8 µs base, same
+        // tail), drawn per write off the flush timeline (ADR-0087 D7):
+        // with K frames in flight they land in any order, and a cut
+        // between a later-landed and an earlier-pending frame is the
+        // shape the completion-ordered written prefix must survive.
+        write_base_ns: 8_000,
     }
 }
 
@@ -171,6 +184,16 @@ impl DurableScenario {
             // sweep exercises mixed write-through/FLUSH frames, zero-fill
             // barriers, and seal × write-through crossings under cuts.
             io_mode: if seed % 2 == 1 { SegmentIoMode::Direct } else { SegmentIoMode::Buffered },
+            // K = 1..=4 on Direct seeds (the class that pipelines
+            // barriers), 1 or 3 on Buffered seeds (barrier-less everysec
+            // frames pipeline; a due frame drains first) — ADR-0087 D7.
+            frames_in_flight: if seed % 2 == 1 {
+                1 + ((seed / 2) % 4) as u8
+            } else if (seed / 2) % 2 == 1 {
+                3
+            } else {
+                1
+            },
         }
     }
 
@@ -205,6 +228,7 @@ impl DurableScenario {
             stall: Some(m2_stall_config()),
             replay_canary: false,
             io_mode: SegmentIoMode::Buffered,
+            frames_in_flight: 1,
         }
     }
 }
@@ -248,6 +272,13 @@ pub struct DurableReport {
     /// Cut-boundary classes observed on the surviving image (ADR-0045
     /// D4): coverage is disclosed, never assumed.
     pub cut_classes: Vec<&'static str>,
+    /// Frame-pipeline coverage (M4.5-S35, ADR-0087 D7), scraped from the
+    /// cells at the cut: the deepest in-flight count any cell reached
+    /// and the two bounded waits — a sweep that never filled the pipeline
+    /// proves nothing about K > 1.
+    pub frames_in_flight_max: u64,
+    pub frame_waits_barrier: u64,
+    pub frame_waits_rotation: u64,
 }
 
 impl DurableReport {
@@ -536,7 +567,10 @@ pub(crate) fn boot(
         );
         let cfg = inf_server::DurableConfig {
             data_dir: data_dir.clone(),
-            staging: inf_server::StagingConfig::default(),
+            staging: inf_server::StagingConfig {
+                frames_in_flight: scenario.frames_in_flight,
+                ..Default::default()
+            },
             segment: inf_server::SegmentConfig {
                 segment_bytes: scenario.segment_bytes,
                 io_mode: scenario.io_mode,
@@ -550,7 +584,7 @@ pub(crate) fn boot(
                 ..Default::default()
             },
             recover: Default::default(),
-            sync_pipeline: 1,
+            flush_bound: 1,
             fua_p50_us_probed: 0,
         };
         plane.set_control(std::sync::Arc::clone(&control));
@@ -723,6 +757,9 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         documents_compared: 0,
         corpus_documents_used: 0,
         cut_classes: Vec::new(),
+        frames_in_flight_max: 0,
+        frame_waits_barrier: 0,
+        frame_waits_rotation: 0,
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -898,7 +935,17 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             writer.sent += 1;
             progress += 1;
         }
-        if quiesce && writers.iter().all(|w| !w.setup && w.inflight.is_none()) {
+        // The log must be quiescent too (ADR-0087 D7): an `everysec` ack
+        // precedes its frame landing, and under the stall model plain
+        // writes land later — the shadow replay reads the file, so every
+        // sealed frame must have its `LogWritten` and nothing may sit
+        // staged behind a bounded wait.
+        let log_quiet = (0..usize::from(scenario.cells)).all(|cell| {
+            node.plane(cell)
+                .durable_stats()
+                .is_none_or(|s| s.frames_in_flight_now == 0 && s.records_staged == 0)
+        });
+        if quiesce && log_quiet && writers.iter().all(|w| !w.setup && w.inflight.is_none()) {
             crate::document::equivalence_check(
                 scenario,
                 &format!("mid-run-{}", next_check + 1),
@@ -945,6 +992,14 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
 
     // ---- POWER CUT ----------------------------------------------------
     let cut_time = clock.now();
+    for cell in 0..usize::from(scenario.cells) {
+        if let Some(stats) = node.plane(cell).durable_stats() {
+            report.frames_in_flight_max =
+                report.frames_in_flight_max.max(stats.frames_in_flight_max);
+            report.frame_waits_barrier += stats.frame_waits_barrier;
+            report.frame_waits_rotation += stats.frame_waits_rotation;
+        }
+    }
     drop(node); // the process dies: in-flight state vanishes
     disk.power_cut(scenario.seed ^ 0x0FF5_EED0);
     if document_workload {

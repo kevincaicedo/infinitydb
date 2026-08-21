@@ -305,6 +305,13 @@ pub(crate) fn info(
         push(&mut text, &format!("rotations_unzeroed:{}", node.rotations_unzeroed.get()));
         push(&mut text, &format!("rotations_upgrade:{}", node.rotations_upgrade.get()));
         push(&mut text, &format!("barrier_class_degraded:{}", node.barrier_class_degraded.get()));
+        // M4.5-S35 (ADR-0087 D5): the frame pipeline — configured depth,
+        // the deepest it actually reached (a gate run proves it filled by
+        // the second number), and the two bounded waits it introduces.
+        push(&mut text, &format!("frames_in_flight:{}", node.frames_in_flight.get()));
+        push(&mut text, &format!("frames_in_flight_max:{}", node.frames_in_flight_max.get()));
+        push(&mut text, &format!("frame_waits_barrier:{}", node.frame_waits_barrier.get()));
+        push(&mut text, &format!("frame_waits_rotation:{}", node.frame_waits_rotation.get()));
         // Fuzzy-checkpoint gauges (M2-S10; `ckpt_age_s` derives at S21).
         push(&mut text, &format!("ckpts_completed:{}", node.ckpts_completed.get()));
         push(&mut text, &format!("ckpts_aborted:{}", node.ckpts_aborted.get()));

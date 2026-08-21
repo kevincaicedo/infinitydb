@@ -41,7 +41,7 @@ fn cell(
     );
     let plane = DurablePlane::new(
         dir,
-        StagingConfig { capacity_bytes: 64 << 10 },
+        StagingConfig::with_capacity(64 << 10),
         SegmentConfig { segment_bytes, ..Default::default() },
     );
     (lp, plane, clock)
@@ -65,7 +65,7 @@ fn run_until_quiesced(
         iters += 1;
         let quiesced = plane.jobs.is_empty()
             && plane.staging.is_empty()
-            && plane.in_flight.is_none()
+            && plane.in_flight.is_empty()
             && plane.commit.pending_fsyncs() == 0;
         if plane.cell_failed {
             break;
@@ -182,7 +182,7 @@ fn everysec_only_load_never_touches_the_gate() {
     let (mut lp, mut plane, clock) = cell(&dir, ScriptedDriver::new(IoMode::Real), 1 << 20);
     plane.push_jobs(200, FsyncClass::Everysec);
     let mut iters = 0;
-    while !(plane.jobs.is_empty() && plane.staging.is_empty() && plane.in_flight.is_none()) {
+    while !(plane.jobs.is_empty() && plane.staging.is_empty() && plane.in_flight.is_empty()) {
         lp.run_iteration(&mut plane).expect("iteration");
         // The fast path pays no gate registration for everysec (S06 AC).
         assert_eq!(plane.gate.waiting(), 0, "everysec must not register gate waiters");
@@ -191,6 +191,68 @@ fn everysec_only_load_never_touches_the_gate() {
         assert!(iters < 10_000);
     }
     assert!(plane.acks.borrow().is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- M4.5-S35: the bounded frame pipeline (ADR-0087) ------------------------
+
+#[test]
+fn four_frames_in_flight_pipeline_rotates_drained_and_replays_identically() {
+    let dir = test_dir("pipeline");
+    // Completions three iterations late: with K = 4 the ring fills, plain
+    // everysec frames pipeline, a due always frame is held until the
+    // pipeline drains (`Wait`), and every rotation (8 KiB segments) finds
+    // no write in flight — the `register_seal_fsync` drain assert is the
+    // pair check, exercised at every seal.
+    let mut driver = ScriptedDriver::new(IoMode::Real);
+    driver.delays = std::iter::repeat_n(3, 1 << 16).collect();
+    let clock = Rc::new(VirtualClock::new(Nanos::ZERO));
+    let mut lp = CellLoop::new(
+        driver,
+        Rc::clone(&clock),
+        BufferPool::new(4, 1024),
+        LoopConfig {
+            spin_iters: 4,
+            exec_budget: 1024,
+            park_default: Some(std::time::Duration::from_millis(1)),
+            remote_first_execute: false,
+        },
+    );
+    let mut plane = DurablePlane::new(
+        &dir,
+        StagingConfig { capacity_bytes: 64 << 10, frames_in_flight: 4 },
+        SegmentConfig { segment_bytes: 8 << 10, ..Default::default() },
+    );
+    plane.jobs_per_iter = 8;
+    for chunk in 0..60 {
+        let class = if chunk % 3 == 0 { FsyncClass::Always } else { FsyncClass::Everysec };
+        plane.push_jobs(40, class);
+    }
+
+    run_until_quiesced(&mut lp, &mut plane, &clock, Nanos::from_millis(5), 200_000);
+    let mut drain = 0;
+    while plane.commit.pending_log_bytes() > 0 {
+        lp.run_iteration(&mut plane).expect("iteration");
+        clock.advance(Nanos::from_millis(20));
+        drain += 1;
+        assert!(drain < 400, "everysec never covered the tail");
+    }
+
+    assert!(!plane.cell_failed, "unexpected I/O errors: {:?}", plane.io_errors);
+    assert_eq!(plane.staged_records(), 2400, "every job staged");
+    let stats = plane.staging.stats();
+    assert!(stats.in_flight_max >= 3, "the pipeline filled: max {} in flight", stats.in_flight_max);
+    let rotations = plane.rotor.stats().rotations;
+    assert!(rotations >= 10, "real rotation pressure, got {rotations}");
+    let seal_syncs =
+        plane.fsync_submits.iter().filter(|(r, _)| *r == SyncReason::Seal).count() as u64;
+    assert_eq!(seal_syncs, rotations, "every rotation found the pipeline drained and sealed");
+    let acks = plane.acks.borrow();
+    assert_eq!(acks.len(), 800, "every always write acked");
+    assert!(acks.windows(2).all(|w| w[0].0 < w[1].0), "acks FIFO by LSN under reordering");
+    drop(acks);
+    assert_eq!(plane.commit.watermark(), plane.commit.queued_up_to());
+    assert_replay_matches(&plane, &dir);
     std::fs::remove_dir_all(&dir).ok();
 }
 

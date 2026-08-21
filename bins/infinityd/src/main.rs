@@ -41,9 +41,11 @@ struct Args {
     ckpt_interval_bytes: u64,
     /// Segment prealloc/seal size.
     segment_bytes: u32,
-    /// Durability fsyncs in flight per cell (M2.5-S07 A/B knob): 1 = the
-    /// ADR-0022 D3 discipline, 2 = the bounded two-in-flight pipeline.
-    sync_pipeline: u8,
+    /// Frames in flight per cell (M4.5-S35, ADR-0087 D1/D5): the staging
+    /// ring holds `frames_in_flight + 1` buffers of `--log-staging-mib`
+    /// each; resident bytes are their product (L5-neutral pairing for the
+    /// reference arm: `--frames-in-flight 3 --log-staging-mib 2`).
+    frames_in_flight: u8,
     /// Log barrier class override (M4.5-S34, ADR-0086 D7): `None` reads
     /// `<data-dir>/io-properties.toml` (absent ⇒ `flush`, today's path);
     /// `Some` forces the class — the A/B arm switch. `fua` needs the
@@ -97,7 +99,7 @@ impl Default for Args {
             data_dir: None,
             ckpt_interval_bytes: inf_server::DEFAULT_CKPT_INTERVAL_BYTES,
             segment_bytes: inf_server::DEFAULT_SEGMENT_BYTES,
-            sync_pipeline: 1,
+            frames_in_flight: 1,
             barrier_class: None,
             log_staging_mib: 4,
             early_fabric_flush: false,
@@ -154,13 +156,24 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("--segment-bytes: {e}"))?;
             }
-            "--sync-pipeline" => {
-                args.sync_pipeline = take("--sync-pipeline")?
+            "--frames-in-flight" => {
+                args.frames_in_flight = take("--frames-in-flight")?
                     .parse()
-                    .map_err(|e| format!("--sync-pipeline: {e}"))?;
-                if !(1..=2).contains(&args.sync_pipeline) {
-                    return Err("--sync-pipeline is 1 or 2, never a queue".into());
+                    .map_err(|e| format!("--frames-in-flight: {e}"))?;
+                if !(1..=inf_server::MAX_FRAMES_IN_FLIGHT).contains(&args.frames_in_flight) {
+                    return Err(format!(
+                        "--frames-in-flight is 1..={} — bounded, never a queue",
+                        inf_server::MAX_FRAMES_IN_FLIGHT
+                    ));
                 }
+            }
+            "--sync-pipeline" => {
+                // Retired (ADR-0087 D5): the FLUSH-class bound is the
+                // ADR-0022 D3 constant; the measured two-in-flight arm is
+                // constructed by the harness, never a production flag.
+                return Err(
+                    "--sync-pipeline was retired by ADR-0087; use --frames-in-flight K".into()
+                );
             }
             "--barrier-class" => {
                 args.barrier_class = Some(match take("--barrier-class")?.as_str() {
@@ -188,7 +201,7 @@ fn parse_args() -> Result<Args, String> {
                 println!(
                     "infinityd [--port 6379] [--cells 4] [--buffers 4096] [--buf-size 4096] \
                      [--pin-start CORE] [--route-local-only] [--data-dir PATH] \
-                     [--ckpt-interval-bytes N] [--segment-bytes N] [--sync-pipeline 1|2] \
+                     [--ckpt-interval-bytes N] [--segment-bytes N] [--frames-in-flight 1] \
                      [--barrier-class flush|fua] [--log-staging-mib 4] [--early-fabric-flush] \
                      [--remote-first-execute] \
                      [--fabric-apply-prefetch|--no-fabric-apply-prefetch] \
@@ -298,8 +311,12 @@ fn main() {
         };
         eprintln!(
             "infinityd: log barrier class {class} (source: {source}; fua_max_frame_bytes {}; \
-             probed p50 fua {} µs / flush {} µs)",
-            io.fua_max_frame_bytes, io.fua_p50_us_4k, io.flush_p50_us_4k
+             probed p50 fua {} µs / flush {} µs); frames in flight {} × {} MiB staging",
+            io.fua_max_frame_bytes,
+            io.fua_p50_us_4k,
+            io.flush_p50_us_4k,
+            args.frames_in_flight,
+            args.log_staging_mib
         );
         if args.segment_bytes % inf_server::FRAME_ALIGN != 0
             && io.io_mode == inf_server::SegmentIoMode::Direct
@@ -445,7 +462,10 @@ fn cell_main(
         }
         let cfg = inf_server::DurableConfig {
             data_dir: dir.clone(),
-            staging: inf_server::StagingConfig { capacity_bytes: args.log_staging_mib << 20 },
+            staging: inf_server::StagingConfig {
+                capacity_bytes: args.log_staging_mib << 20,
+                frames_in_flight: args.frames_in_flight,
+            },
             segment: inf_server::SegmentConfig {
                 segment_bytes: args.segment_bytes,
                 io_mode: io.io_mode,
@@ -457,7 +477,7 @@ fn cell_main(
                 ..Default::default()
             },
             recover: inf_server::RecoverConfig::default(),
-            sync_pipeline: args.sync_pipeline,
+            flush_bound: 1,
             fua_p50_us_probed: io.fua_p50_us_4k,
         };
         durable = Some((cfg, std::sync::Arc::clone(control)));
