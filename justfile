@@ -61,6 +61,7 @@ sim-smoke:
     cargo run --release --bin inf-sim -- --scenario m4-recovery --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m4-diskfull --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m4-tiered --seed 0xC0FFEE --verify-determinism
+    cargo run --release --bin inf-sim -- --scenario m2-device-budget --seed 0xC0FFEE --verify-determinism
 
 # M2-S19 durability sweep (the §6 dst_sweep gate shape). Usage:
 #   just durable-sweep [seeds] [base]
@@ -71,6 +72,22 @@ durable-sweep seeds="10000" base="0xD5EE0000":
     out=$(mktemp -d)
     for i in 0 1 2 3 4 5 6 7; do
         ./target/release/inf-sim --scenario m2-durable --sweep {{seeds}} --seed {{base}} \
+            --shard "$i/8" --out "$out" & done
+    wait
+    cat "$out"/manifest-shard-*.txt
+
+# M4.5-S36 device-budget sweep (ADR-0088 D8): the m2 durable shape under
+# a tight budget model over a bandwidth-modeled disk — the accounting
+# identity, the rate bound, engagement, progress, the foreground bound,
+# and the durability oracle, per seed. Usage:
+#   just budget-sweep [seeds] [base]
+budget-sweep seeds="1000" base="0xB0D6E700":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --bin inf-sim
+    out=$(mktemp -d)
+    for i in 0 1 2 3 4 5 6 7; do
+        ./target/release/inf-sim --scenario m2-device-budget --sweep {{seeds}} --seed {{base}} \
             --shard "$i/8" --out "$out" & done
     wait
     cat "$out"/manifest-shard-*.txt

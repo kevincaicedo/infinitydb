@@ -41,6 +41,15 @@ pub struct LoadSpec {
     /// the load starts — connection state like `INF.NS USE` (M2-S12 durable
     /// rows). Never counted or timed.
     pub setup: Vec<Vec<Vec<u8>>>,
+    /// M4.5-S36 (ADR-0088 D7): an **offered rate** instead of the closed
+    /// loop — every connection sends on a fixed schedule
+    /// (`conns / target` seconds apart) up to `pipeline` in flight, and
+    /// latency is measured from the *intended* send instant, so queueing
+    /// behind a slow server counts (coordinated omission is not hidden).
+    /// A connection whose pipeline is full skips its slot; the achieved
+    /// rate against the target is the report's disclosure. `None` =
+    /// closed loop (every pre-S36 row byte-identical).
+    pub target_ops_per_sec: Option<u64>,
 }
 
 impl Default for LoadSpec {
@@ -63,6 +72,7 @@ impl Default for LoadSpec {
             ttl_range_ms: None,
             pxat_ms: None,
             setup: Vec::new(),
+            target_ops_per_sec: None,
         }
     }
 }
@@ -154,11 +164,51 @@ fn run_conn(
     let mut tx: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 64 * 1024];
     let mut done_sending = false;
+    // Offered-rate schedule (ADR-0088 D7): this connection's share of
+    // the target, staggered by index so the fleet does not send in
+    // lockstep; `None` = closed loop.
+    let pace = spec.target_ops_per_sec.filter(|t| *t > 0 && spec.fill.is_none()).map(|target| {
+        let per_conn = target.max(1) as f64 / spec.conns.max(1) as f64;
+        Duration::from_secs_f64(1.0 / per_conn)
+    });
+    let mut next_send_at = pace.map_or(Instant::now(), |interval| {
+        Instant::now() + interval.mul_f64(conn_index as f64 / spec.conns.max(1) as f64)
+    });
 
     loop {
         // Top up the pipeline.
         tx.clear();
         while inflight.len() < spec.pipeline && !done_sending {
+            if let Some(interval) = pace
+                && fill_range.is_none()
+            {
+                let now = Instant::now();
+                if now >= deadline {
+                    done_sending = true;
+                    break;
+                }
+                if now < next_send_at {
+                    if inflight.is_empty() {
+                        // Nothing to wait on: idle until the slot.
+                        #[allow(clippy::disallowed_methods)] // bench pacing, not cell code
+                        std::thread::sleep(next_send_at - now);
+                    } else {
+                        break; // replies first; the slot is still ahead
+                    }
+                }
+                let key = make_key(spec, rng.next_u64() % spec.keys);
+                let total = spec.set_weight + spec.get_weight;
+                if rng.next_u64() % total < spec.set_weight {
+                    tx.extend_from_slice(&encode_command(&[b"SET", &key, &value]));
+                } else {
+                    tx.extend_from_slice(&encode_command(&[b"GET", &key]));
+                }
+                // Latency from the *intended* instant (coordinated
+                // omission counted), never from the actual send.
+                inflight.push_back(next_send_at);
+                next_send_at += interval;
+                continue;
+            }
             match &mut fill_range {
                 Some(range) => match range.next() {
                     Some(i) => {

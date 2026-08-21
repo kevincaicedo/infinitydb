@@ -248,3 +248,42 @@ point = "torn_frame"
 tier = "node"
 test = "fua.rs"
 expect = "pipeline-later-durable-earlier-torn"
+
+# ---- M4.5-S36 `.ick` container v3 (ADR-0088 D3/D8) — the aligned,
+# direct-written checkpoint under the recovery driver's unchanged rules,
+# carried by tests/ickv3.rs ----
+#   v3-named-unit-loads    — the canary: a published v3 unit boots through
+#                            open_cell_log, every image loads, the tail
+#                            replays over it
+#   v3-mid-section-orphan  — the cut lands inside a section of a direct
+#                            .ick.new (an unaligned truncation): the old
+#                            unit stays authoritative, the orphan is GC'd
+#   v3-footer-before-fdatasync — the cut lands between the footer write
+#                            and its completion fdatasync: footer-complete
+#                            on disk, unnamed — boot replays the log alone
+#   v3-named-unit-damaged-padding — a non-zero byte in a named unit's
+#                            block padding fail-stops typed (Padding)
+
+[[row]]
+point = "power_cut_after_seal"
+tier = "node"
+test = "ickv3.rs"
+expect = "v3-named-unit-loads"
+
+[[row]]
+point = "torn_frame"
+tier = "node"
+test = "ickv3.rs"
+expect = "v3-mid-section-orphan"
+
+[[row]]
+point = "manifest_rename_fail"
+tier = "node"
+test = "ickv3.rs"
+expect = "v3-footer-before-fdatasync"
+
+[[row]]
+point = "torn_frame"
+tier = "node"
+test = "ickv3.rs"
+expect = "v3-named-unit-damaged-padding"

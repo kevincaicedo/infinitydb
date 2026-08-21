@@ -27,7 +27,8 @@ use inf_log::{
     RecordView, SegmentConfig, SegmentRotor, StagingConfig, StagingRing, ZERO_FILL_SLICE_BYTES,
 };
 use inf_runtime::{
-    CompletionToken, IoOp, LoopCx, TokenClass, WaitList, WatermarkGate, WriteBarrier,
+    Admission, ClassCounters, ClassSlice, CompletionToken, DeviceBudget, DeviceModel, IoClass,
+    IoOp, LoopCx, SealPace, TokenClass, WaitList, WatermarkGate, WriteBarrier,
 };
 use inf_store::{CheckpointImage, IndexId, Keyspace, WallAnchor};
 
@@ -81,6 +82,22 @@ pub struct DurableConfig {
     /// tripwire's reference. 0 = unknown (tripwire disarmed; the FLUSH
     /// class needs none).
     pub fua_p50_us_probed: u64,
+    /// M4.5-S36 (ADR-0088 D2/D2b/D6): the cell's static share of the
+    /// probed device model and the frame-seal pace. `Default` = absent
+    /// model = unbudgeted, unpaced — the pre-S36 behaviour byte-for-byte.
+    pub device: DeviceConfig,
+}
+
+/// The per-cell device budget inputs (ADR-0088 D6), computed once at
+/// boot from the device model and the cell count (L1: static shares).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceConfig {
+    /// The cell's share of the device model (`DeviceModel::share`).
+    pub model_share: DeviceModel,
+    /// The cell's share of the device's concurrent barrier rate
+    /// (`write_ops_per_s_4k_qd4 / cells`) — the seal pacer's refill
+    /// (ADR-0088 D2b). 0 = unpaced.
+    pub seal_barriers_per_s: u64,
 }
 
 /// Boot-recovery stepping policy (M2-S15). The default replays flat-out
@@ -202,6 +219,36 @@ pub struct DurableStats {
     /// shadow-replay oracle waits on exactly this (ADR-0087 D7).
     pub frames_in_flight_now: u64,
     pub records_staged: u64,
+    /// M4.5-S36 (ADR-0088 D7): the device budget's ledger — model
+    /// presence, the cell's byte shares, per-class spent bytes/ops and
+    /// deferrals (`IoClass::ALL` order) — and the seal pacer's wait
+    /// episodes.
+    pub io_budget_model_absent: u64,
+    pub io_budget_write_bytes_per_s: u64,
+    pub io_budget_read_bytes_per_s: u64,
+    pub io_budget: [ClassCounters; IoClass::COUNT],
+    pub frame_waits_pace: u64,
+    /// On-disk log frame bytes (`CommitStats::frame_bytes_queued`,
+    /// surfaced — header, trailer, v3 padding included), the checkpoint
+    /// domain's bytes, and the derived trigger (ADR-0088 D4/D7).
+    pub log_frame_bytes: u64,
+    pub ckpt_bytes_total: u64,
+    pub ckpt_bytes_last: u64,
+    pub ckpt_padding_bytes: u64,
+    pub manifest_bytes_total: u64,
+    pub ckpt_interval_bytes: u64,
+    pub ckpt_records_since_begin: u64,
+    /// `ceil_milli((log_frame_bytes + ckpt_bytes_total +
+    /// manifest_bytes_total) / append_bytes)` — cell scope, boot life;
+    /// undefined (0, with `_undefined = 1`) until the first checkpoint
+    /// publishes so a log-only ratio is never read as the figure.
+    /// Zero-fill is excluded and reported beside (`zero_fill_bytes`).
+    pub write_amp_milli_log_checkpoint: u64,
+    pub write_amp_log_checkpoint_undefined: u64,
+    /// The worst frame-write submit → `LogWritten` latency (µs) — the
+    /// `m2-device-budget` foreground-bound oracle's input (ADR-0088 D8);
+    /// percentiles under-read a bound violation rarer than 1/1000.
+    pub write_stall_max_us: u64,
 }
 
 /// One sealed frame awaiting its `LogWritten` (ADR-0087 D2): the lease
@@ -266,6 +313,13 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     frame_waits_barrier: u64,
     frame_waits_rotation: u64,
     frame_held: bool,
+    /// M4.5-S36 (ADR-0088 D2): the cell's device budget — refilled at
+    /// every MAINTAIN entry from the injected clock, consulted by the
+    /// background issuing sites, charged by the foreground ones.
+    budget: DeviceBudget,
+    /// ADR-0088 D2b: the frame-seal pacer (a due frame behind in-flight
+    /// frames seals only when the device's barrier rate allows).
+    seal_pace: SealPace,
     /// Last durable seq assigned (0 = none; the gate starts at 0).
     last_seq: u64,
     /// Last seq the ack gate advanced to (group-formation bookkeeping).
@@ -294,6 +348,7 @@ impl<F: SegmentFs> DurableCell<F> {
         staging: StagingConfig,
         flush_bound: u8,
         fua_p50_us_probed: u64,
+        device: DeviceConfig,
         rotor: SegmentRotor<F>,
         ckpt: CkptCell<F>,
         manifest: ManifestCell<F>,
@@ -303,6 +358,27 @@ impl<F: SegmentFs> DurableCell<F> {
         let mut staging = StagingRing::new(staging);
         staging.set_frame_epoch(rotor.resume_epoch());
         let in_flight = VecDeque::with_capacity(usize::from(staging.frames_in_flight()));
+        // ADR-0088 D2: each background class's smallest offer — its
+        // deficit cap can never be below one slice.
+        let mut slices = [ClassSlice { bytes: 0, ops: 0 }; IoClass::COUNT];
+        slices[IoClass::ZeroFill.index()] =
+            ClassSlice { bytes: u64::from(ZERO_FILL_SLICE_BYTES), ops: 1 };
+        slices[IoClass::TierFlush.index()] = ClassSlice {
+            bytes: inf_store::TierSpec::for_budget(0).maintain_slice_bytes,
+            ops: crate::tier_cell::TIER_ROUND_MAX_OPS,
+        };
+        slices[IoClass::Checkpoint.index()] = ClassSlice {
+            bytes: inf_log::ckpt::ick_align_up(ckpt.cfg.section_bytes as usize + 16) as u64,
+            ops: 1,
+        };
+        slices[IoClass::ColdReadMaintain.index()] =
+            ClassSlice { bytes: crate::tier_cell::COLD_POOL_BUF as u64, ops: 1 };
+        let budget = DeviceBudget::new(device.model_share, slices, Nanos(0));
+        let seal_pace = SealPace::new(
+            device.seal_barriers_per_s,
+            u32::from(staging.frames_in_flight()),
+            Nanos(0),
+        );
         DurableCell {
             staging,
             rotor,
@@ -323,6 +399,8 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_waits_barrier: 0,
             frame_waits_rotation: 0,
             frame_held: false,
+            budget,
+            seal_pace,
             last_seq: 0,
             acked_seq: 0,
             group_hist_records: inf_foundation::LogHistogram::new(),
@@ -354,10 +432,12 @@ impl<F: SegmentFs> DurableCell<F> {
             // writes survive by construction, so they carry no barriers.
             let Some(fd) = inf_log::fs::SegmentFile::raw_fd(&handle) else { continue };
             let ticket = self.commit.register_boot_barrier(floor, Some(handle), cx.now);
+            self.budget.charge(IoClass::LogFrame, 0, 1); // ledger-class barrier (ADR-0088 D7)
             cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
         }
         if let Some(fd) = self.rotor.active_raw_fd() {
             let ticket = self.commit.register_boot_barrier(floor, None, cx.now);
+            self.budget.charge(IoClass::LogFrame, 0, 1); // ledger-class barrier (ADR-0088 D7)
             cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
         }
     }
@@ -433,12 +513,15 @@ impl<F: SegmentFs> DurableCell<F> {
         if self.failed {
             return;
         }
+        // ADR-0088 D2: one refill per MAINTAIN entry, injected clock.
+        self.budget.refill(cx.now);
         match self.rotor.maintain_deferred(cx.now.as_millis()) {
             Ok((_report, Some(barrier))) => {
                 // Fd-less tiers (MemFs) have process-KILL physics — no
                 // barrier needed (completed writes survive by construction).
                 if let Some(fd) = inf_log::fs::SegmentFile::raw_fd(&barrier.dir) {
                     let ticket = self.commit.register_prealloc_barrier(barrier.dir, cx.now);
+                    self.budget.charge(IoClass::LogFrame, 0, 1); // ledger-class barrier (ADR-0088 D7)
                     cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
                 }
             }
@@ -459,7 +542,21 @@ impl<F: SegmentFs> DurableCell<F> {
     /// zero slice when none is in flight; register and issue the barrier
     /// once every zero byte landed.
     fn zero_fill(&mut self, cx: &mut LoopCx<'_>) {
-        if let Some(slice) = self.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) {
+        // ADR-0088 D5: the head-start bound says "no further"; the budget
+        // says "not this slice". The budget is asked with the slice bound
+        // *before* the slice is taken — `next_zero_slice` marks it in
+        // flight, and a taken-but-unissued slice is a phantom the
+        // rotation waits on forever (the sweep's finding) — and the
+        // unissued remainder of the bound is refunded.
+        let bound = u64::from(ZERO_FILL_SLICE_BYTES);
+        if self.rotor.zero_fill_pending()
+            && self.budget.admit(IoClass::ZeroFill, bound, 1) == Admission::Granted
+        {
+            let Some(slice) = self.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) else {
+                self.budget.refund(IoClass::ZeroFill, bound, 1);
+                return;
+            };
+            self.budget.refund(IoClass::ZeroFill, bound - u64::from(slice.len), 0);
             cx.push(IoOp::LogWrite {
                 fd: slice.fd,
                 offset: slice.offset,
@@ -473,6 +570,7 @@ impl<F: SegmentFs> DurableCell<F> {
         {
             let ticket = self.commit.register_zero_fill_barrier(cx.now);
             self.zero_fill_ticket = Some(ticket);
+            self.budget.charge(IoClass::LogFrame, 0, 1); // ledger-class barrier (ADR-0088 D7)
             cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
         }
     }
@@ -503,6 +601,12 @@ impl<F: SegmentFs> DurableCell<F> {
             // push, so the hold is one device sync; the frame waits
             // exactly like the ENOSPC branch below.
             if self.commit.extent_barrier_pending() {
+                return;
+            }
+            // ADR-0088 D2b: a second frame behind in-flight ones seals at
+            // the device's barrier rate; a drained cell always seals.
+            if !self.staging.drained() && !self.seal_pace.take(cx.now, self.frame_held) {
+                self.frame_held = true;
                 return;
             }
             let frame_len = self.staging.pending_frame_len();
@@ -550,12 +654,14 @@ impl<F: SegmentFs> DurableCell<F> {
             if let Some(handoff) = seal {
                 let fd = handoff.raw_fd().expect("std segment tier has fds");
                 let ticket = self.commit.register_seal_fsync(handoff, cx.now);
+                self.budget.charge(IoClass::LogFrame, 0, 1); // ledger-class barrier (ADR-0088 D7)
                 cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
             }
             self.queue_frame(cx, slot, plan);
         } else if self.commit.standalone_fsync_due() {
             let ticket = self.commit.register_standalone_fsync(cx.now);
             let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
+            self.budget.charge(IoClass::LogFrame, 0, 1); // ledger-class barrier (ADR-0088 D7)
             cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
         }
     }
@@ -595,6 +701,10 @@ impl<F: SegmentFs> DurableCell<F> {
         };
         let offset = u64::from(slot.base().offset);
         let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
+        // ADR-0088 D2: the foreground is metered (one write, plus the
+        // linked barrier when the plan carries one), never deferred.
+        let ops = 1 + u64::from(matches!(ticket, FrameBarrier::Linked(_)));
+        self.budget.charge(IoClass::LogFrame, u64::from(slot.len()), ops);
         self.rotor.commit_frame_queued(slot);
         self.write_seq += 1;
         debug_assert_eq!(self.write_seq, id.0, "write token sequence is the frame id");
@@ -687,6 +797,7 @@ impl<F: SegmentFs> DurableCell<F> {
         if self.commit.completion_fsync_due() {
             let ticket = self.commit.register_completion_fsync(cx.now);
             let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
+            self.budget.charge(IoClass::LogFrame, 0, 1); // ledger-class barrier (ADR-0088 D7)
             cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
         }
     }
@@ -778,8 +889,14 @@ impl<F: SegmentFs> DurableCell<F> {
         // ever (M2-S11 — the pending swap resolves within one everysec
         // window, so this never starves the trigger).
         if matches!(self.ckpt.phase, CkptPhase::Idle) {
-            let total = self.staging.stats().append_bytes;
-            if self.manifest.idle() && self.ckpt.should_begin(total) {
+            // ADR-0088 D4: the accumulator is on-disk frame bytes (header,
+            // trailer, v3 padding — what the device saw); the record cap
+            // rides beside it; before the first checkpoint the interval is
+            // the floor alone (the published file's size is the only
+            // measurement — a content estimate chased a growing dataset
+            // and never fired, the node_e2e threshold test's finding).
+            let total = self.commit.stats().frame_bytes_queued;
+            if self.manifest.idle() && self.ckpt.should_begin(total, self.records_appended) {
                 let id = self.ckpt.pending_id();
                 let effect = MutationEffect::CkptBegin { ckpt_id: id };
                 if self.staging.would_fit(effect.encoded_len()) {
@@ -795,6 +912,7 @@ impl<F: SegmentFs> DurableCell<F> {
                     // docs): everything staged after this instant is tail
                     // the new checkpoint does not cover.
                     self.ckpt.bytes_at_begin = total;
+                    self.ckpt.records_at_begin = self.records_appended;
                     self.ckpt.phase = CkptPhase::AwaitBeginLsn { id, at };
                 }
             }
@@ -818,6 +936,10 @@ impl<F: SegmentFs> DurableCell<F> {
             }
             let CkptPhase::Stream(st) = &mut self.ckpt.phase else { unreachable!("just opened") };
             let lease = st.in_flight.as_ref().expect("header staged by open_stream");
+            // The header is one block, charged unconditionally (the file
+            // is already created); the class deficit absorbs it and the
+            // first section offer pays for it (ADR-0088 D2).
+            self.budget.charge(IoClass::Checkpoint, u64::from(lease.len()), 1);
             st.write_seq += 1;
             cx.push(IoOp::LogWrite {
                 fd: st.fd,
@@ -883,7 +1005,13 @@ impl<F: SegmentFs> DurableCell<F> {
         // CQE path (the S12-measured foreground cliff). Injected time, so
         // DST compresses it (L7). Sidecar emission is walk output like
         // any other (M4.5-S06) and rides the same meter.
-        if !(*walk_done && *sidecar_done) && cfg.stream_bytes_per_sec > 0 {
+        // ADR-0088 D5: with a device model present the budget governs the
+        // rate (the pace's reason — writeback throttling — is gone with
+        // the direct `.ick`); the pace is the unprobed fallback only.
+        if self.budget.model_absent()
+            && !(*walk_done && *sidecar_done)
+            && cfg.stream_bytes_per_sec > 0
+        {
             let elapsed_ms = cx.now.saturating_sub(*opened_at).as_millis();
             let allowed = (u64::from(cfg.stream_bytes_per_sec) * elapsed_ms.max(1)) / 1000;
             if *streamed_bytes >= allowed {
@@ -895,6 +1023,7 @@ impl<F: SegmentFs> DurableCell<F> {
             if !*sync_issued {
                 *sync_issued = true;
                 *write_seq += 1;
+                self.budget.charge(IoClass::Checkpoint, 0, 1);
                 cx.push(IoOp::Fdatasync {
                     fd: *fd,
                     token: ckpt_token(TokenClass::CkptSync, *write_seq),
@@ -1020,10 +1149,19 @@ impl<F: SegmentFs> DurableCell<F> {
         // Queue at most one block per slice: a full (or final partial)
         // section, a class-boundary seal (M4-S26 tiered passes / S06
         // index boundaries), or — once everything drained — the footer.
+        // ADR-0088 D2/D3: each block is offered to the budget at its
+        // padded length *before* it seals — `Deferred` leaves the section
+        // staged (the walk simply does not advance past it this tick)
+        // and the offer repeats next slice.
         if stream.section_full()
             || (force_seal && stream.can_seal())
             || (*walk_done && *sidecar_done && stream.can_seal())
         {
+            let block = stream.pending_block_len() as u64;
+            if self.budget.admit(IoClass::Checkpoint, block, 1) != Admission::Granted {
+                *streamed_bytes += u64::from(emitted);
+                return emitted.div_ceil(1024).max(1);
+            }
             let lease = stream.seal_section();
             *write_seq += 1;
             cx.push(IoOp::LogWrite {
@@ -1035,6 +1173,10 @@ impl<F: SegmentFs> DurableCell<F> {
             });
             *in_flight = Some(lease);
         } else if *walk_done && *sidecar_done {
+            let block = stream.footer_block_len() as u64;
+            if self.budget.admit(IoClass::Checkpoint, block, 1) != Admission::Granted {
+                return 1;
+            }
             let lease = stream.finish();
             *write_seq += 1;
             cx.push(IoOp::LogWrite {
@@ -1110,8 +1252,21 @@ impl<F: SegmentFs> DurableCell<F> {
             return 0;
         }
         let watermark = self.commit.watermark().map(|l| l.to_u64());
+        let before = self.manifest.stats();
         let mut units =
             self.manifest.swap_slice(cx, watermark, self.rotor.active_segment(), ks, tier);
+        // ADR-0088 D5/D7: the swap's barriers and the MANIFEST envelope are
+        // metered under `Checkpoint`, never deferred (a checkpoint that
+        // wrote its bytes must publish).
+        // The envelope bytes ride a synchronous `SegmentFile::write_at`
+        // (not the driver): they are disclosed as `manifest_bytes_total`
+        // and enter the write-amplification figure, but not the class
+        // ledger, whose identity is "what the driver saw".
+        let after = self.manifest.stats();
+        let syncs = after.syncs_issued.saturating_sub(before.syncs_issued);
+        if syncs > 0 {
+            self.budget.charge(IoClass::Checkpoint, 0, syncs);
+        }
         // A MANIFEST just committed (dir-fsync durable): publish the
         // control-board slot — the `INF.CKPT WAIT`/`LASTSAVE` observable
         // (M2-S20, ADR-0021 D6).
@@ -1186,7 +1341,33 @@ impl<F: SegmentFs> DurableCell<F> {
 
     /// Checkpoint gauges for the MAINTAIN stats flush.
     pub fn ckpt_stats(&self) -> CkptStats {
-        self.ckpt.stats()
+        self.ckpt.stats(self.records_appended)
+    }
+
+    /// Tier-flush and compaction offer their slices here (ADR-0088 D5);
+    /// the plane owns the tier cell, the cell owns the budget.
+    pub fn admit_background(&mut self, class: IoClass, bytes: u64, ops: u64) -> Admission {
+        debug_assert!(!class.is_foreground(), "foreground classes charge, never ask");
+        self.budget.admit(class, bytes, ops)
+    }
+
+    /// Return a granted offer's unissued remainder (ADR-0088 D5).
+    pub fn refund_background(&mut self, class: IoClass, bytes: u64, ops: u64) {
+        debug_assert!(!class.is_foreground());
+        self.budget.refund(class, bytes, ops);
+    }
+
+    /// The cold-read drain's refund: either class (a foreground refund
+    /// only corrects the counters).
+    pub fn refund_background_or_foreground(&mut self, class: IoClass, bytes: u64, ops: u64) {
+        self.budget.refund(class, bytes, ops);
+    }
+
+    /// Foreground charges from the plane (cold reads, blob writes): metered,
+    /// never deferred.
+    pub fn charge_foreground(&mut self, class: IoClass, bytes: u64, ops: u64) {
+        debug_assert!(class.is_foreground(), "background classes ask, never charge");
+        self.budget.charge(class, bytes, ops);
     }
 
     /// Counters for the MAINTAIN stats flush (S21 vocabulary).
@@ -1194,6 +1375,26 @@ impl<F: SegmentFs> DurableCell<F> {
         let durable = self.commit.watermark().map_or(0, |l| l.to_u64());
         let queued = self.commit.queued_up_to().map_or(0, |l| l.to_u64());
         let manifest = self.manifest.stats();
+        let ckpt = self.ckpt.stats(self.records_appended);
+        let log_frame_bytes = self.commit.stats().frame_bytes_queued;
+        // ADR-0088 D7: undefined until a checkpoint published (a log-only
+        // ratio would read as the figure); ceiling milli-units (ADR-0060
+        // D1: a reported figure may overstate, never understate).
+        let append_bytes = self.staging.stats().append_bytes;
+        let (write_amp, undefined) = if ckpt.completed == 0 || append_bytes == 0 {
+            (0, 1)
+        } else {
+            let written = u128::from(log_frame_bytes)
+                + u128::from(ckpt.bytes_total)
+                + u128::from(manifest.bytes_written);
+            let milli = (written * 1000).div_ceil(u128::from(append_bytes));
+            (u64::try_from(milli).unwrap_or(u64::MAX), 0)
+        };
+        let mut io_budget = [ClassCounters::default(); IoClass::COUNT];
+        for class in IoClass::ALL {
+            io_budget[class.index()] = self.budget.counters(class);
+        }
+        let (write_share, read_share) = self.budget.share_bytes_per_s();
         DurableStats {
             records_appended: self.records_appended,
             acks_gated: self.acks_gated,
@@ -1242,6 +1443,21 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_waits_rotation: self.frame_waits_rotation,
             frames_in_flight_now: u64::from(self.staging.in_flight()),
             records_staged: u64::from(self.staging.pending_records()),
+            io_budget_model_absent: u64::from(self.budget.model_absent()),
+            io_budget_write_bytes_per_s: write_share,
+            io_budget_read_bytes_per_s: read_share,
+            io_budget,
+            frame_waits_pace: self.seal_pace.waits(),
+            log_frame_bytes,
+            ckpt_bytes_total: ckpt.bytes_total,
+            ckpt_bytes_last: ckpt.bytes_last,
+            ckpt_padding_bytes: ckpt.padding_bytes,
+            manifest_bytes_total: manifest.bytes_written,
+            ckpt_interval_bytes: ckpt.interval_bytes,
+            ckpt_records_since_begin: ckpt.records_since_begin,
+            write_amp_milli_log_checkpoint: write_amp,
+            write_amp_log_checkpoint_undefined: undefined,
+            write_stall_max_us: self.write_stall_hist.max(),
         }
     }
 

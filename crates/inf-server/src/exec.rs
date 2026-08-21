@@ -70,7 +70,7 @@ pub struct NodeInfo {
     /// MAINTAIN: rounds, write_retries, stale_completions, round_p50_us,
     /// round_p99_us, rounds_inflight, files_sealed, files_active.
     /// Identically zero on nodes that never created a tiered namespace.
-    pub tier_flush: Cell<[u64; 8]>,
+    pub tier_flush: Cell<[u64; 9]>,
     /// Raw lifetime counters (submits, sqes, cqes, iterations, commands,
     /// fabric_msgs) — scrapers diff two snapshots for under-load ratios.
     pub raw_counters: Cell<[u64; 6]>,
@@ -168,6 +168,25 @@ pub struct NodeInfo {
     /// observed high-water mark, and its two bounded waits.
     pub frames_in_flight: Cell<u64>,
     pub frames_in_flight_max: Cell<u64>,
+    /// M4.5-S36 (ADR-0088 D7): the device budget's ledger — slot order
+    /// frozen as `IoClass::ALL` × {bytes, ops, deferrals} — model
+    /// presence, the cell's byte shares, the seal pacer's wait episodes,
+    /// the checkpoint domain's bytes, the derived trigger and the
+    /// `write_amp_milli_log_checkpoint` figure (+ its undefined flag).
+    pub io_budget: Cell<[u64; 3 * inf_runtime::IoClass::COUNT]>,
+    pub io_budget_model_absent: Cell<u64>,
+    pub io_budget_write_bytes_per_s: Cell<u64>,
+    pub io_budget_read_bytes_per_s: Cell<u64>,
+    pub frame_waits_pace: Cell<u64>,
+    pub log_frame_bytes: Cell<u64>,
+    pub ckpt_bytes_total: Cell<u64>,
+    pub ckpt_bytes_last: Cell<u64>,
+    pub ckpt_padding_bytes: Cell<u64>,
+    pub manifest_bytes_total: Cell<u64>,
+    pub ckpt_interval_bytes: Cell<u64>,
+    pub ckpt_records_since_begin: Cell<u64>,
+    pub write_amp_milli_log_checkpoint: Cell<u64>,
+    pub write_amp_log_checkpoint_undefined: Cell<u64>,
     pub frame_waits_barrier: Cell<u64>,
     pub frame_waits_rotation: Cell<u64>,
     /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).

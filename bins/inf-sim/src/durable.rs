@@ -98,6 +98,11 @@ pub struct DurableScenario {
     /// a stream open across many scheduler steps so scenarios can storm
     /// the fuzzy window; `None` = the production default.
     pub ckpt_stream_bytes_per_sec: Option<u32>,
+    /// Checkpoint section target override (M4.5-S36): the budget's
+    /// per-class cap can never be below one slice, so a scenario whose
+    /// checkpoints are smaller than the 256 KiB default section never
+    /// engages the budget — `m2_device_budget` sets 8 KiB sections.
+    pub ckpt_section_bytes: Option<u32>,
     /// Device service-time model (M2.5-S14). `None` = instant fsyncs
     /// (the pre-S14 device); `m2_durable` arms the reference stall
     /// device so the fleet sees nonzero fsync latency every night.
@@ -119,6 +124,12 @@ pub struct DurableScenario {
     /// hold-for-drain waits, and cuts between a later durable frame and
     /// an earlier torn one.
     pub frames_in_flight: u8,
+    /// M4.5-S36 (ADR-0088 D8): the cell's device-budget inputs (`Default`
+    /// = model absent = unbudgeted, the pre-S36 behaviour) and whether
+    /// the budget oracles run at the cut (the `m2-device-budget`
+    /// scenario arms both; every other scenario stays byte-identical).
+    pub device: inf_server::DeviceConfig,
+    pub budget_oracle: bool,
 }
 
 /// The S14 reference stall device: ~120 µs base (warm NVMe fdatasync),
@@ -143,6 +154,10 @@ pub(crate) fn m2_stall_config() -> StallConfig {
         // between a later-landed and an earlier-pending frame is the
         // shape the completion-ordered written prefix must survive.
         write_base_ns: 8_000,
+        // No bandwidth term in the m2 shape (ADR-0088 D8): every m2 trace
+        // stays byte-identical; the `m2-device-budget` scenario arms it.
+        write_bytes_per_s: 0,
+        read_bytes_per_s: 0,
     }
 }
 
@@ -178,6 +193,7 @@ impl DurableScenario {
             segment_bytes: 16 << 10,
             ckpt_interval_bytes: 24 << 10,
             ckpt_stream_bytes_per_sec: None,
+            ckpt_section_bytes: None,
             stall: Some(m2_stall_config()),
             replay_canary: false,
             // Odd seeds run the FUA class (ADR-0086 D8): half of every
@@ -194,6 +210,69 @@ impl DurableScenario {
             } else {
                 1
             },
+            device: Default::default(),
+            budget_oracle: false,
+        }
+    }
+
+    /// M4.5-S36 (ADR-0088 D8) — `m2-device-budget`: the m2 durable shape
+    /// on `Direct` segments (zero-fill on) with K = 3, a dataset large
+    /// enough that every checkpoint streams several sections, the
+    /// checkpoint interval at the m2 24 KiB so checkpoints run
+    /// continuously, a **tight budget model** (128 KiB/s per device — the
+    /// background classes are offered orders of magnitude more than
+    /// their share by construction) over a **modest sim disk** (8 MiB/s
+    /// bandwidth on a shared byte timeline, no stall episodes so the
+    /// foreground bound is crisp), and the seal pacer at 2 000 barriers/s
+    /// per device. The oracles (`budget_oracles`) assert the accounting
+    /// identity, the rate bound, engagement, progress, and the
+    /// foreground bound; the m2 durability oracle runs unchanged.
+    #[must_use]
+    pub fn m2_device_budget(seed: u64) -> DurableScenario {
+        let mut stall = m2_stall_config();
+        stall.episode_gap_ns = u64::MAX;
+        stall.episode_ms_min = 0;
+        stall.episode_ms_max = 0;
+        stall.write_bytes_per_s = 8 << 20;
+        stall.read_bytes_per_s = 8 << 20;
+        // 128 KiB/s per device: the checkpoint class's share (2/10 of the
+        // per-cell 64 KiB/s) refills one ~140 KB checkpoint block every
+        // ~11 s against a run of ~7 sim-seconds — the second checkpoint is
+        // deferred by construction (the engagement oracle's regime), the
+        // first is granted from the boot-full deficit (progress).
+        let model = inf_runtime::DeviceModel {
+            write_bytes_per_s: 128 << 10,
+            write_ops_per_s: 4_000,
+            read_bytes_per_s: 128 << 10,
+            read_ops_per_s: 4_000,
+        };
+        let cells: u16 = 2;
+        DurableScenario {
+            seed,
+            workload: DurableWorkload::KeyValue,
+            cells,
+            always_writers: 3,
+            esec_writers: 3,
+            mem_writers: 1,
+            ops_per_writer: 160,
+            keys_per_writer: 40,
+            value_max: 512,
+            step_ns_max: 2_000_000,
+            double_cut: seed % 8 == 3,
+            plant: Plant::None,
+            segment_bytes: 64 << 10,
+            ckpt_interval_bytes: 24 << 10,
+            ckpt_stream_bytes_per_sec: None,
+            ckpt_section_bytes: Some(8 << 10),
+            stall: Some(stall),
+            replay_canary: false,
+            io_mode: SegmentIoMode::Direct,
+            frames_in_flight: 3,
+            device: inf_server::DeviceConfig {
+                model_share: model.share(cells),
+                seal_barriers_per_s: 2_000 / u64::from(cells),
+            },
+            budget_oracle: true,
         }
     }
 
@@ -225,10 +304,13 @@ impl DurableScenario {
             segment_bytes: 64 << 10,
             ckpt_interval_bytes: 24 << 10,
             ckpt_stream_bytes_per_sec: None,
+            ckpt_section_bytes: None,
             stall: Some(m2_stall_config()),
             replay_canary: false,
             io_mode: SegmentIoMode::Buffered,
             frames_in_flight: 1,
+            device: Default::default(),
+            budget_oracle: false,
         }
     }
 }
@@ -279,6 +361,14 @@ pub struct DurableReport {
     pub frames_in_flight_max: u64,
     pub frame_waits_barrier: u64,
     pub frame_waits_rotation: u64,
+    /// Device-budget coverage (M4.5-S36, ADR-0088 D8), scraped at the
+    /// cut: background bytes the budget granted, deferrals it issued
+    /// (a sweep whose budget never deferred proves nothing), the seal
+    /// pacer's wait episodes, and the worst frame-write latency.
+    pub budget_background_bytes: u64,
+    pub budget_deferrals: u64,
+    pub frame_waits_pace: u64,
+    pub write_stall_max_us: u64,
 }
 
 impl DurableReport {
@@ -581,11 +671,15 @@ pub(crate) fn boot(
                 stream_bytes_per_sec: scenario
                     .ckpt_stream_bytes_per_sec
                     .unwrap_or(inf_server::CkptConfig::default().stream_bytes_per_sec),
+                section_bytes: scenario
+                    .ckpt_section_bytes
+                    .unwrap_or(inf_server::CkptConfig::default().section_bytes),
                 ..Default::default()
             },
             recover: Default::default(),
             flush_bound: 1,
             fua_p50_us_probed: 0,
+            device: scenario.device,
         };
         plane.set_control(std::sync::Arc::clone(&control));
         plane.begin_recovery(disk.clone(), &cfg, i as u16, clock.now());
@@ -760,6 +854,10 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         frames_in_flight_max: 0,
         frame_waits_barrier: 0,
         frame_waits_rotation: 0,
+        budget_background_bytes: 0,
+        budget_deferrals: 0,
+        frame_waits_pace: 0,
+        write_stall_max_us: 0,
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -998,7 +1096,19 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                 report.frames_in_flight_max.max(stats.frames_in_flight_max);
             report.frame_waits_barrier += stats.frame_waits_barrier;
             report.frame_waits_rotation += stats.frame_waits_rotation;
+            report.frame_waits_pace += stats.frame_waits_pace;
+            report.write_stall_max_us = report.write_stall_max_us.max(stats.write_stall_max_us);
+            for class in inf_runtime::IoClass::ALL {
+                let c = stats.io_budget[class.index()];
+                if !class.is_foreground() {
+                    report.budget_background_bytes += c.spent_bytes;
+                }
+                report.budget_deferrals += c.deferrals;
+            }
         }
+    }
+    if scenario.budget_oracle {
+        budget_oracles(scenario, &node, clock.now(), &mut report);
     }
     drop(node); // the process dies: in-flight state vanishes
     disk.power_cut(scenario.seed ^ 0x0FF5_EED0);
@@ -1307,6 +1417,155 @@ pub(crate) fn survival_audit(
                     ));
                 }
             }
+        }
+    }
+}
+
+/// The device-budget oracles (M4.5-S36, ADR-0088 D8), evaluated per cell
+/// at the cut on the budget's own ledger and the sim driver's observed
+/// bytes. Every failure is a named violation; every disclosure rides the
+/// report.
+fn budget_oracles(scenario: &DurableScenario, node: &Node, now: Nanos, report: &mut DurableReport) {
+    use inf_runtime::{BURST_HORIZON_NS, IoClass};
+    let stall = scenario.stall.as_ref().expect("the budget scenario arms a disk model");
+    let share = scenario.device.model_share;
+    let elapsed_s = now.0.saturating_sub(1) as f64 / 1e9;
+    for cell in 0..usize::from(scenario.cells) {
+        let Some(stats) = node.plane(cell).durable_stats() else {
+            report.violations.push(format!("cell {cell}: no durable plane in the budget scenario"));
+            continue;
+        };
+        let observed = node.cells[cell].0.driver().observed_io();
+        let ckpt_slice = f64::from(scenario.ckpt_section_bytes.unwrap_or(256 << 10) + 4096);
+        // (a) Accounting identity: what the budget counted is what the
+        // driver saw, for every token-classed class — up to the ops the
+        // cut caught between push and submit (`LoopCx::push` queues; the
+        // driver drains at the *next* iteration's `submit_and_reap`, and
+        // the cut eats that queue by design): at most one op per class
+        // and one op's bytes (a segment for frames, a block for
+        // checkpoint and zero-fill), never fewer than the driver saw.
+        // The two cold-read classes together match the driver's reads.
+        let one_op_bytes = |class: IoClass| -> u64 {
+            match class {
+                IoClass::LogFrame => u64::from(scenario.segment_bytes),
+                IoClass::ZeroFill => 256 << 10,
+                IoClass::Checkpoint => ckpt_slice as u64,
+                _ => 0,
+            }
+        };
+        for class in IoClass::ALL {
+            let counted = stats.io_budget[class.index()];
+            match class {
+                IoClass::BlobWrite | IoClass::ColdReadForeground | IoClass::ColdReadMaintain => {}
+                _ => {
+                    let seen = observed.bytes[class.index()];
+                    let seen_ops = observed.ops[class.index()];
+                    let ops_slack = counted.spent_ops.wrapping_sub(seen_ops);
+                    let bytes_slack = counted.spent_bytes.wrapping_sub(seen);
+                    if counted.spent_bytes < seen || bytes_slack > one_op_bytes(class) {
+                        report.violations.push(format!(
+                            "cell {cell}: io_budget_bytes_{} = {} but the driver saw {seen} \
+                             (ADR-0088 D8 accounting identity; slack ≤ one op's bytes)",
+                            class.name(),
+                            counted.spent_bytes
+                        ));
+                    }
+                    if counted.spent_ops < seen_ops || ops_slack > 3 {
+                        report.violations.push(format!(
+                            "cell {cell}: io_budget_ops_{} = {} but the driver saw {seen_ops} \
+                             (slack ≤ one LOG step's pushed-unsubmitted ops)",
+                            class.name(),
+                            counted.spent_ops
+                        ));
+                    }
+                }
+            }
+        }
+        let reads_counted = stats.io_budget[IoClass::ColdReadForeground.index()].spent_bytes
+            + stats.io_budget[IoClass::ColdReadMaintain.index()].spent_bytes;
+        if reads_counted < observed.read_bytes || reads_counted - observed.read_bytes > 16 << 10 {
+            report.violations.push(format!(
+                "cell {cell}: cold-read bytes counted {reads_counted} but the driver saw {}",
+                observed.read_bytes
+            ));
+        }
+        // (b) Rate bound — the budget's contract: background bytes over
+        // the run never exceed the share's grant plus two burst horizons
+        // (the class caps plus the pool) plus one slice per class (the
+        // cap floor). Foreground subtraction only lowers the grant.
+        let horizon_bytes = share.write_bytes_per_s as f64 * BURST_HORIZON_NS as f64 / 1e9;
+        let slices = 256.0 * 1024.0 + ckpt_slice + 1024.0 * 1024.0 + 16.0 * 1024.0;
+        let bound = share.write_bytes_per_s as f64 * elapsed_s + 2.0 * horizon_bytes + slices;
+        let background: u64 = IoClass::ALL
+            .iter()
+            .filter(|c| !c.is_foreground() && !c.is_read())
+            .map(|c| stats.io_budget[c.index()].spent_bytes)
+            .sum();
+        if background as f64 > bound {
+            report.violations.push(format!(
+                "cell {cell}: background wrote {background} bytes in {elapsed_s:.3} s against a \
+                 share of {} B/s — bound {bound:.0} (ADR-0088 D2 rate bound)",
+                share.write_bytes_per_s
+            ));
+        }
+        // (c) Engagement: the regime is not vacuous — the checkpoint
+        // class was deferred at least once (the S27 lesson: a pressure
+        // row whose counter stayed at 0 measured nothing).
+        if stats.io_budget[IoClass::Checkpoint.index()].deferrals == 0 {
+            let ckpt = node.plane(cell).ckpt_stats_for_sim();
+            report.violations.push(format!(
+                "cell {cell}: the budget never deferred a checkpoint block — the scenario's \
+                 offered load did not exceed the share (vacuous regime); ckpts completed {} \
+                 aborted {} in_progress {} interval {} records_since_begin {} log_frame_bytes {} \
+                 ckpt_bytes {} zero_fill {} rotations_unzeroed {} waits_pace {} \
+                 deferrals[zero_fill {} tier_flush {} ckpt {}] frames_in_flight_max {}",
+                ckpt.0,
+                ckpt.1,
+                stats.ckpt_in_progress,
+                stats.ckpt_interval_bytes,
+                stats.ckpt_records_since_begin,
+                stats.log_frame_bytes,
+                stats.ckpt_bytes_total,
+                stats.zero_fill_bytes,
+                stats.rotations_unzeroed,
+                stats.frame_waits_pace,
+                stats.io_budget[IoClass::ZeroFill.index()].deferrals,
+                stats.io_budget[IoClass::TierFlush.index()].deferrals,
+                stats.io_budget[IoClass::Checkpoint.index()].deferrals,
+                stats.frames_in_flight_max,
+            ));
+        }
+        // (d) Progress: deferrals never starved the classes — a
+        // checkpoint published and the zero-fill landed its bytes.
+        if stats.io_budget[IoClass::Checkpoint.index()].spent_bytes == 0 {
+            report.violations.push(format!("cell {cell}: no checkpoint bytes reached the device"));
+        }
+        if stats.zero_fill_bytes == 0 {
+            report.violations.push(format!("cell {cell}: no zero-fill bytes reached the device"));
+        }
+        // (e) Foreground bound (physics, both modes): a frame waits for at
+        // most its own transfer, one background block ahead on the byte
+        // timeline, the budget's burst, the write-through base and tail,
+        // and one scheduler step of completion quantization.
+        let rate = stall.write_bytes_per_s as f64;
+        let frame_max = f64::from(scenario.segment_bytes);
+        let block_max = (256.0_f64 * 1024.0).max(ckpt_slice);
+        let service_us = (stall.through_base_ns * (1 + stall.tail_mult)) as f64 / 1e3;
+        let bound_us = (frame_max + block_max + horizon_bytes) / rate * 1e6
+            + service_us
+            + scenario.step_ns_max as f64 / 1e3
+            + 1_000.0;
+        if stats.write_stall_max_us as f64 > bound_us {
+            report.violations.push(format!(
+                "cell {cell}: worst frame write latency {} µs exceeds the foreground bound \
+                 {bound_us:.0} µs (ADR-0088 D8)",
+                stats.write_stall_max_us
+            ));
+        }
+        // Disclosures: the model must be present and the pipeline must
+        // have filled, or the scenario measured a different machine.
+        if stats.io_budget_model_absent == 1 {
+            report.violations.push(format!("cell {cell}: the budget model is absent"));
         }
     }
 }

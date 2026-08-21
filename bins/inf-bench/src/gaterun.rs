@@ -61,6 +61,29 @@ impl ServerGuard {
     }
 }
 
+/// CPU time (user + system, in clock ticks) the process has consumed —
+/// fields 14 and 15 of `/proc/<pid>/stat` (M4.5-S36, ADR-0088 D7: the
+/// server-busy tripwire of the pure-write row). Linux `USER_HZ` is 100
+/// on every mainstream kernel; [`CLOCK_TICKS_PER_S`] names it.
+pub(crate) fn cpu_ticks_of(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            // The comm field may contain spaces; split after its ')'.
+            let rest = s.rsplit_once(')').map(|(_, r)| r)?;
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            // After ')', field 3 (state) is index 0; utime is field 14 →
+            // index 11, stime field 15 → index 12.
+            let utime: u64 = fields.get(11)?.parse().ok()?;
+            let stime: u64 = fields.get(12)?.parse().ok()?;
+            Some(utime + stime)
+        })
+        .unwrap_or(0)
+}
+
+/// Linux `USER_HZ` (the `/proc/<pid>/stat` tick).
+pub(crate) const CLOCK_TICKS_PER_S: u64 = 100;
+
 /// Peak-VmRSS of `pid` (same parse as [`ServerGuard::rss_bytes`], usable
 /// from a sampler thread that must not borrow the guard).
 pub(crate) fn rss_bytes_of(pid: u32) -> u64 {
@@ -547,6 +570,8 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-s29",
         // M4.5 S35 frame-pipeline arms (the row alone, one report per arm).
         "only-s35",
+        // M4.5 S36 device-budget row (the row alone, one report per arm).
+        "only-s36",
     ],
     &[
         "allow-dirty",
@@ -617,9 +642,19 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-s27",
         "only-s29",
         "only-s35",
+        "only-s36",
         // M4.5-S35 row: seconds idled before every durable leg (the S34
         // drive-state rule; default 40, 0 for harness smoke).
         "leg-idle-s",
+        // M4.5-S36 row (ADR-0088 D7): the offered rate of the S27 D5
+        // `max` leg (comparator-matched, disclosed), the tmpfs control
+        // root (the 0.85× denominator — the one memory-fs root the
+        // admission rule exempts, labelled as a control), and the
+        // server's device-model override forwarded to every spawn.
+        "offered-ops",
+        "tmpfs-control-root",
+        "device-write-mbps",
+        "seal-pace",
         "recovery-gbps-per-cell",
         "recovery-boot-s",
         // ADR-0070 D7 (2026-08-16): Phase::Start overhead, split out of the

@@ -733,6 +733,88 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   persisted-epoch pattern). One checkpoint in flight per cell; triggers
   latch, never stack. `INF.CKPT`/`BGSAVE` ride this at S20.
 
+### `.ick` container v3 (M4.5-S36 — ADR-0088 D3) — aligned blocks, direct writes
+
+`ICK_VERSION_V3 = 3`: the v2 tag vocabulary (0x01–0x06) with **every
+block — header, each section, footer — starting on an `ICK_BLOCK_ALIGN`
+(= `FRAME_ALIGN`, 4096) boundary and zero-padded to the next one**.
+Field layouts are unchanged (`body_len` is still the body length); the
+reader hops `ick_align_up(SECTION_HEADER_LEN + body_len + CRC_LEN)` on v3
+and the exact length on v1/v2 — one version-gated rule per hop site, the
+footer probe included (it reads the last `ick_align_up(footer_len)`
+bytes; the footer sits at the block's head). Padding is outside every
+CRC's extent and **asserted zero** by every reader path
+(`IckReadError::Padding` — the CRC's fail-stop class). The reactor tier
+writes v3 on an `O_DIRECT` fd (`SegmentFs::create_meta_direct`, a
+required trait method — a default would be a buffered file wearing a
+direct label, ADR-0054 D3) from `Block` buffers whose content base is
+4 KiB-aligned (the `FrameBuilder` shape; every growth re-bases). The sync
+tier (`SyncIckWriter`) drives the same `IckStream` and produces
+byte-identical v3 files (tests). v1/v2 files stay readable; no tool
+writes them except tests and the sync tier on request. `ckpt_padding_
+bytes` discloses the cost (≤ 4095 per block, ≤ 1.6 % at the 256 KiB
+target). The release path shrinks an over-grown staging buffer back to
+its nominal capacity (the v0.4.0 soak's 4× `ckpt_buffer_bytes` ratchet).
+
+### Checkpoint trigger — derived (M4.5-S36 — ADR-0088 D4)
+
+```text
+interval_bytes = clamp(α × ckpt_bytes_last, floor, replay_bytes_per_s × replay_budget_s)
+trigger        = frame_bytes_queued − at_begin ≥ interval_bytes
+              ∨ records_appended − at_begin ≥ replay_records_per_s × replay_budget_s
+α = 2 (DEFAULT_CKPT_ALPHA) · floor = CkptConfig::interval_bytes (256 MiB default; 0 = manual only)
+replay_bytes_per_s = 1 GiB · replay_records_per_s = 400 k · replay_budget_s = 15 − 5 − 5
+```
+
+The accumulator is **on-disk frame bytes** (header, trailer, v3 padding
+— ADR-0086 D3's obligation), not staged record bytes; before the first
+checkpoint the estimate is the cell's live record + document bytes
+(an over-estimate for tiered cells delays the first checkpoint toward
+the cap, which bounds recovery); `derive_interval` release-asserts
+`floor ≤ interval ≤ cap`. INFO: `ckpt_interval_bytes`,
+`ckpt_records_since_begin`, `ckpt_bytes_total/last`, `ckpt_padding_
+bytes`, `manifest_bytes_total`, `log_frame_bytes`, and the figure
+`write_amp_milli_log_checkpoint` (+ `_undefined`, ADR-0060 D3 rule).
+
+## Device budget (`inf-runtime::budget`, M4.5-S36 — ADR-0088 D1/D2/D2b)
+
+```rust
+pub enum IoClass { LogFrame, BlobWrite, ColdReadForeground,      // foreground: charged, never deferred
+                   ZeroFill, TierFlush, Checkpoint, ColdReadMaintain } // background: priority order, weights 4:4:2:1
+pub struct DeviceModel { write_bytes_per_s, write_ops_per_s, read_bytes_per_s, read_ops_per_s } // 0 = unbudgeted
+pub enum Admission { Granted, Deferred { short_bytes, short_ops } }
+impl DeviceBudget { fn refill(&mut self, now: Nanos);            // once per MAINTAIN entry
+                    fn admit(&mut self, class, bytes, ops) -> Admission;
+                    fn refund(&mut self, class, bytes, ops); }
+pub struct SealPace;  // take(now, held) -> bool: a second frame seals at the cell's share of write_ops_per_s_4k_qd4
+```
+
+Per cell, per direction (write, read): the grant for the elapsed interval
+is the cell's share (`model / cells`, computed once at boot — L1) minus
+the foreground's spend since the last refill, clamped at `≥ share /
+FLOOR_DIVISOR` (8); split by weight into per-class deficits capped at
+`max(slice_c, share × w_c/Σw × BURST_HORIZON_NS)` (50 ms, derived from
+the S27 D5 bar); overflow pools per direction (cap `share × horizon`);
+a class draws its deficit then the pool. `Deferred` is "not this slice":
+the caller's own state machine re-offers next tick — nothing queues,
+nothing waits, no client reply is ever derived from it. Consult sites:
+zero-fill (`next_zero_slice` peek → admit → push), tier flush (round
+slice bound offered before `stage_flush_round`, unissued part refunded),
+checkpoint (header/section/footer block at its padded length, before
+the seal; completion fdatasync metered as one op), cold-read drain
+(`drain_budgeted`: maintain reads ask with the pool buffer bound and
+refund the unused window; foreground reads are charged). Charges:
+`queue_frame` (`LogFrame`, bytes + 1 op, +1 for a linked sync),
+`write_blob` (`BlobWrite`), MANIFEST envelope bytes + barriers
+(`Checkpoint`). Model absent ⇒ every admission `Granted`, every counter
+counts, the checkpoint keeps its 64 MiB/s pace (ADR-0017) — the pre-S36
+behaviour, reported as `io_budget_model:absent`.
+
+`SealPace` (ADR-0088 D2b): a token bucket at `write_ops_per_s_4k_qd4 /
+cells`, capacity K. The LOG step asks only when `!staging.drained()`;
+a refusal holds the frame (it keeps accumulating; `frame_waits_pace`
+per episode). A drained cell always seals — never slower than K = 1.
+
 ## Boot recovery orchestration (`inf-server::recover`/`plane`, M2-S15 — ADR-0019)
 
 - Recovery is a **resumable state machine**: `Recovery<F: SegmentFs>` with
@@ -1171,6 +1253,10 @@ short/torn checkpoint = **silent durable-state corruption**.
 | 4.6 | `open_stream`/streaming: at most one `SectionLease` in flight (`in_flight: Option`) | A second section write aliases the stream buffer | by-construction (`Option` + `if in_flight.is_some() return`) durable.rs:508, ckpt.rs:76 | keep |
 | 4.7 | abort leaves the old checkpoint + whole log valid; `.new` orphan GC'd next boot | Checkpoint failure must never touch the live recovery unit | by-construction + boot GC (recover.rs:706–713) ckpt.rs:239–252 | keep |
 | 4.8 | `swap_slice`: every arm does O(1) file ops and queues ≤ 1 barrier; no device barrier on the loop | A blocking dir-fsync on the reactor is the S12 foreground-stall / D7-wedge class | by-construction (barriers ride `TokenClass::ManifestSync`) ckpt.rs:508–659 | keep |
+| 4.9 | `derive_interval` (M4.5-S36, ADR-0088 D4): `floor ≤ interval ≤ max(cap, floor)`; `interval_bytes == 0` stays 0 (manual only) | An interval above the cap lets a replay tail escape the boot gate; below the floor is the pre-S36 trigger storm at small datasets | two `assert!` **release** (per publish, free) | keep (per-publish) |
+| 4.10 | `should_begin`: fires on on-disk frame bytes **or** the record cap since the last *begin* (never publish) | A staged-bytes accumulator under-counts the device (ADR-0086 D3); rebasing at publish lets a burst mid-walk escape | by-construction (two-term predicate, begin-anchored bases) | keep |
+| 4.11 | `lease_staging` (v3): the block is padded to `ICK_BLOCK_ALIGN`, its base is aligned, `file_offset` is aligned | A misaligned `O_DIRECT` write is `EINVAL` on the device and a silent memcpy on tmpfs; the sim tier asserts it on every direct inode | `debug_assert!` ×2 (writer) + **release** `assert_eq!` ×2 in `SimDisk::assert_direct_aligned` + the fdinfo verify at open | keep — the sim is the enforcement tier |
+| 4.12 | `Block::realign`: after any `Vec` growth the content base is re-aligned (`debug_assert` on the new base) | A record outrunning the section target reallocates the `Vec`; an unaligned base is 4.11's failure one step earlier | `debug_assert_eq!` + by-construction (`reserve` before the shift) | keep |
 
 **Verdict:** the two publication invariants (4.1, 4.2) that stand between a
 crash and a corrupt recovery unit are debug-only. Promote both — free.
@@ -1299,3 +1385,38 @@ The reactor-drive flush state machine (`TierFlush` round state in
   rejects cross-round routing); resubmitted write bytes are not
   re-CRC'd (windows are never written after stage — custody, not
   checksum).
+
+### A.8 — Device budget (M4.5-S36, ADR-0088 D2/D2b)
+
+`DeviceBudget` (`inf-runtime/src/budget.rs`) and `SealPace`:
+
+- **Foreground is never deferred** — by-construction (`admit` returns
+  `Granted` before any deficit arithmetic for `is_foreground()` classes);
+  the sim's `ObservedIo` and INFO `io_budget_deferrals_{foreground}`
+  read 0 by construction — a non-zero value there is an internal-
+  invariant bug, not a metric.
+- **Bounded everything**: every class deficit ≤ its cap, every pool ≤ its
+  cap (`min` on every refill); `admit` never allocates or waits —
+  by-construction; pinned by `caps_are_one_burst_horizon_and_never_below
+  _one_slice` and `a_class_past_its_cap_overflows_into_the_shared_pool`.
+- **Accounting identity** (`io_budget_bytes_c == bytes the driver saw
+  under class c`, ops likewise; the two cold-read classes together ==
+  the driver's reads) — asserted every seed by the `m2-device-budget`
+  oracle on the sim driver's `ObservedIo`; `refund` keeps it exact.
+- **Rate bound** (background bytes over a run ≤ `share × elapsed + 2 ×
+  horizon + Σ slices`) — the `m2-device-budget` oracle.
+- **Engagement, progress, foreground bound** — the same oracle: the
+  checkpoint class deferred ≥ 1 (non-vacuous), ≥ 1 checkpoint published
+  and zero-fill landed (no starvation), `write_stall_max_us ≤ (frame +
+  one background block + horizon bytes) / disk rate + base·(1 + tail) +
+  one scheduler step` (physics in both modes; guards a budget bug that
+  admits two blocks at once).
+- **Determinism** — pinned by `two_budgets_fed_the_same_sequence_agree_
+  exactly`; the sim's trace hash under `--verify-determinism`.
+- **Seal pace never defers a drained cell** — by-construction (the LOG
+  step asks only when `!staging.drained()`); pinned by
+  `seal_pace_paces_a_pipelined_cell_and_never_a_drained_one`.
+- **Deliberately unchecked**: the model's truth. A stale or optimistic
+  probe file makes the budget a ceiling the device cannot meet; the
+  tripwires are `barrier_class_degraded` and the deferral rates, both
+  visible, neither automatic (ADR-0088 D6).

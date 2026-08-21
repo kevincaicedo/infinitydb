@@ -38,6 +38,7 @@ fn cfg() -> DurableConfig {
         recover: Default::default(),
         flush_bound: 1,
         fua_p50_us_probed: 0,
+        device: Default::default(),
     }
 }
 

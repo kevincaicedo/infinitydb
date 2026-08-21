@@ -74,10 +74,15 @@ sealed frames are in flight at once, the ledger advances its written and
 durable watermarks over completion-ordered prefixes, and a frame whose
 due barrier cannot yet be honest — a linked fdatasync with earlier writes
 still in flight, a rotation's seal — waits one write latency rather than
-claiming coverage it does not have. Everything else — the hash index, document trees,
+claiming coverage it does not have; a pipelined cell seals at the
+device's measured barrier rate, so a saturated device sees fewer, larger
+frames rather than more, smaller ones (ADR-0088). Everything else — the hash index, document trees,
 secondary indexes, stream offsets, vector graphs — is a rebuildable
 projection over that log. Checkpoints are fuzzy snapshots streamed by the
-owning cell in budgeted background slices (no fork, no stop-the-world);
+owning cell in budgeted background slices (no fork, no stop-the-world)
+as 4 KiB-aligned `O_DIRECT` blocks — no page-cache lump the kernel repays
+at once — at an interval **derived** from the last checkpoint's size and
+bounded by the recovery gate in the same expression (ADR-0088);
 recovery is checkpoint + parallel per-cell log replay. There is no global
 LSN: each cell replays independently, and cross-cell atomicity is resolved
 by transaction decision records.
@@ -162,7 +167,14 @@ key (fabric hop), a cold read (NVMe), a durability-gated ack (fsync
 watermark), a blocking op (`BLPOP`). One scheduler model covers what would
 otherwise be five ad-hoc mechanisms, and background work (expiry, eviction,
 checkpoints, compaction, index backfill) runs in deficit-weighted budgeted
-slices so p99.9 is protected by construction.
+slices so p99.9 is protected by construction. Two budgets govern those
+slices: CPU in work units (the deficit scheduler) and the **device** in
+bytes and ops (ADR-0088) — every cell holds a static share of a measured
+device model (`inf probe-device`), foreground classes are metered and
+never deferred, background classes (zero-fill, tier flush, checkpoint,
+compaction reads — in that priority) are granted bounded, work-conserving
+deficits on the injected clock and told "not this slice" otherwise; never
+a queue, never a client-visible refusal.
 
 ### Determinism is a feature
 

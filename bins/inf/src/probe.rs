@@ -27,6 +27,17 @@
 //! the shape this guard exists for). Otherwise `flush` — today's path,
 //! byte-for-byte.
 //!
+//! **Schema 2 (M4.5-S36, ADR-0088 D6)** adds the device model the
+//! per-cell budget spends — `write_bytes_per_s_256k` and
+//! `write_ops_per_s_4k` are the direct rows' own throughput (measured
+//! here since S34 and previously written only as a comment) — and one
+//! new row, `write_ops_per_s_4k_qd4`: the direct 4 KiB barrier rate at
+//! **four concurrent writers** on disjoint regions, the concurrency the
+//! frame-seal pacer (ADR-0088 D2b) needs (the single-writer rate
+//! under-states a FUA device's aggregate 3–4×). Read rows are declared
+//! and left at 0 (a QD-1 read number is not an IOPS number; a probe
+//! story with concurrency owns them).
+//!
 //! Dev tool: `Instant::now()` is fine here (not cell code); the output is
 //! a boot input, never a claim (L10 — the A/B is the claim).
 
@@ -43,6 +54,10 @@ const SCRATCH_BYTES: u64 = 256 << 20;
 const ALIGN: usize = 4096;
 const SIZES: [usize; 4] = [4 << 10, 64 << 10, 256 << 10, 1 << 20];
 const DEFAULT_SECONDS_PER_ROW: u64 = 2;
+/// Writers of the concurrent barrier-rate row (ADR-0088 D2b/D6): four,
+/// not the cell count the probe cannot know — the number is divided by
+/// `cells` at boot, conservative in the direction that batches more.
+const QD_WRITERS: usize = 4;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Policy {
@@ -110,7 +125,9 @@ fn probe(dir: &Path, scratch: &Path, per_row: Duration) -> io::Result<()> {
             rows.push(row);
         }
     }
-    let verdict = recommend(&rows);
+    let qd4 = measure_concurrent(scratch, SIZES[0], per_row, QD_WRITERS)?;
+    eprintln!("fua   bytes={:<8} writers={QD_WRITERS} barriers/s={qd4:>6} (aggregate)", SIZES[0]);
+    let verdict = recommend(&rows, qd4);
     let text = render(&rows, &verdict);
     let path = dir.join("io-properties.toml");
     let tmp = dir.join("io-properties.toml.new");
@@ -211,11 +228,61 @@ fn measure(scratch: &Path, policy: Policy, bytes: usize, per_row: Duration) -> i
     })
 }
 
+/// The direct 4 KiB barrier rate at `writers` concurrent writers, each on
+/// its own quarter of the scratch file (ADR-0088 D6). Aggregate
+/// barriers/s — one thread per writer, the same loop as `measure` minus
+/// the latency histogram. Not cell code: `std::thread` is fine here.
+fn measure_concurrent(
+    scratch: &Path,
+    bytes: usize,
+    per_row: Duration,
+    writers: usize,
+) -> io::Result<u64> {
+    let region = SCRATCH_BYTES / writers as u64;
+    let mut handles = Vec::with_capacity(writers);
+    for w in 0..writers {
+        let scratch = scratch.to_path_buf();
+        handles.push(std::thread::spawn(move || -> io::Result<u64> {
+            let file = open(&scratch, Policy::Fua)?;
+            let mut raw = vec![0u8; bytes + ALIGN];
+            let at = raw.as_ptr().align_offset(ALIGN);
+            let buf = &mut raw[at..at + bytes];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = ((i + w) % 251) as u8;
+            }
+            let base = region * w as u64;
+            let started = Instant::now();
+            let mut offset = base;
+            let mut count = 0u64;
+            while started.elapsed() < per_row {
+                file.write_all_at(buf, offset)?;
+                count += 1;
+                offset += bytes as u64;
+                if offset + bytes as u64 > base + region {
+                    offset = base;
+                }
+            }
+            Ok(count)
+        }));
+    }
+    let started = Instant::now();
+    let mut total = 0u64;
+    for h in handles {
+        total += h.join().map_err(|_| io::Error::other("probe writer panicked"))??;
+    }
+    let elapsed = started.elapsed().max(per_row).as_secs_f64().max(1e-9);
+    Ok((total as f64 / elapsed) as u64)
+}
+
 struct Verdict {
     class: Policy,
     fua_max_frame_bytes: usize,
     fua_p50_us_4k: u64,
     flush_p50_us_4k: u64,
+    /// Schema 2 (ADR-0088 D6): the device model rows.
+    write_bytes_per_s_256k: u64,
+    write_ops_per_s_4k: u64,
+    write_ops_per_s_4k_qd4: u64,
 }
 
 fn row(rows: &[Row], policy: Policy, bytes: usize) -> Option<&Row> {
@@ -223,15 +290,24 @@ fn row(rows: &[Row], policy: Policy, bytes: usize) -> Option<&Row> {
 }
 
 /// The recommendation rule (module docs).
-fn recommend(rows: &[Row]) -> Verdict {
+fn recommend(rows: &[Row], write_ops_per_s_4k_qd4: u64) -> Verdict {
     let flush_4k = row(rows, Policy::Flush, SIZES[0]);
     let fua_4k = row(rows, Policy::Fua, SIZES[0]);
+    // The model rows (ADR-0088 D6): the direct 256 KiB row's throughput
+    // and the direct 4 KiB row's barrier rate — measured every run since
+    // S34, now written as keys instead of a comment.
+    let write_bytes_per_s_256k =
+        row(rows, Policy::Fua, SIZES[2]).map_or(0, |r| r.barriers_per_sec * r.bytes as u64);
+    let write_ops_per_s_4k = fua_4k.map_or(0, |r| r.barriers_per_sec);
     let (Some(flush), Some(fua)) = (flush_4k, fua_4k) else {
         return Verdict {
             class: Policy::Flush,
             fua_max_frame_bytes: 0,
             fua_p50_us_4k: 0,
             flush_p50_us_4k: 0,
+            write_bytes_per_s_256k,
+            write_ops_per_s_4k,
+            write_ops_per_s_4k_qd4,
         };
     };
     let wins_p50 = fua.p50_us * 4 <= flush.p50_us * 3;
@@ -251,6 +327,9 @@ fn recommend(rows: &[Row]) -> Verdict {
         fua_max_frame_bytes: fua_max.max(SIZES[0]),
         fua_p50_us_4k: fua.p50_us,
         flush_p50_us_4k: flush.p50_us,
+        write_bytes_per_s_256k,
+        write_ops_per_s_4k,
+        write_ops_per_s_4k_qd4,
     }
 }
 
@@ -282,6 +361,17 @@ fn render(rows: &[Row], verdict: &Verdict) -> String {
     out.push_str(&format!("fua_p50_us_4k = {}\n", verdict.fua_p50_us_4k));
     out.push_str(&format!("flush_p50_us_4k = {}\n", verdict.flush_p50_us_4k));
     out.push_str(&format!("probed_at_unix_s = {probed_at}\n"));
+    // Schema 2 (M4.5-S36, ADR-0088 D6): the device model. Read rows are
+    // declared at 0 (unbudgeted) until a probe story with concurrency
+    // measures them.
+    out.push_str("# schema 2 (ADR-0088 D6): the device model the per-cell budget spends;\n");
+    out.push_str("#   0 = not probed => that direction is unbudgeted (io_budget_model:absent).\n");
+    out.push_str("probe_schema = 2\n");
+    out.push_str(&format!("write_bytes_per_s_256k = {}\n", verdict.write_bytes_per_s_256k));
+    out.push_str(&format!("write_ops_per_s_4k = {}\n", verdict.write_ops_per_s_4k));
+    out.push_str(&format!("write_ops_per_s_4k_qd4 = {}\n", verdict.write_ops_per_s_4k_qd4));
+    out.push_str("read_bytes_per_s_256k = 0\n");
+    out.push_str("read_ops_per_s_4k = 0\n");
     out
 }
 
@@ -307,20 +397,41 @@ mod tests {
             r(Policy::Flush, 1 << 20, 1602, 3412),
             r(Policy::Fua, 1 << 20, 3058, 45311),
         ];
-        let v = recommend(&rows);
+        let v = recommend(&rows, 9_918);
         assert_eq!(v.class, Policy::Fua);
         assert_eq!(v.fua_max_frame_bytes, 256 << 10);
         assert_eq!(v.fua_p50_us_4k, 294);
+        assert_eq!(v.write_ops_per_s_4k_qd4, 9_918);
         // A device where fua's p99 is worse stays flush (the falsifier).
         let mut worse = rows;
         worse[1].p99_us = 2000;
-        assert_eq!(recommend(&worse).class, Policy::Flush);
+        assert_eq!(recommend(&worse, 0).class, Policy::Flush);
+    }
+
+    /// ADR-0088 D6: the model rows come from the direct rows' measured
+    /// throughput — bytes × barriers/s at 256 KiB, barriers/s at 4 KiB.
+    #[test]
+    fn schema_2_rows_derive_from_the_direct_rows() {
+        let mut rows =
+            vec![r(Policy::Flush, 4 << 10, 900, 1200), r(Policy::Fua, 4 << 10, 300, 600)];
+        rows[1].barriers_per_sec = 2_898;
+        let mut r256 = r(Policy::Fua, 256 << 10, 467, 1413);
+        r256.barriers_per_sec = 1_949;
+        rows.push(r256);
+        let v = recommend(&rows, 9_918);
+        assert_eq!(v.write_ops_per_s_4k, 2_898);
+        assert_eq!(v.write_bytes_per_s_256k, 1_949 * (256 << 10));
+        let text = render(&rows, &v);
+        assert!(text.contains("probe_schema = 2\n"));
+        assert!(text.contains(&format!("write_bytes_per_s_256k = {}\n", 1_949 * (256 << 10))));
+        assert!(text.contains("write_ops_per_s_4k_qd4 = 9918\n"));
+        assert!(text.contains("read_ops_per_s_4k = 0\n"));
     }
 
     #[test]
     fn rendered_file_parses_as_the_flat_subset() {
         let rows = vec![r(Policy::Flush, 4 << 10, 900, 1200), r(Policy::Fua, 4 << 10, 300, 600)];
-        let text = render(&rows, &recommend(&rows));
+        let text = render(&rows, &recommend(&rows, 0));
         let keys: Vec<&str> = text
             .lines()
             .filter(|l| !l.starts_with('#'))
@@ -333,7 +444,13 @@ mod tests {
                 "fua_max_frame_bytes",
                 "fua_p50_us_4k",
                 "flush_p50_us_4k",
-                "probed_at_unix_s"
+                "probed_at_unix_s",
+                "probe_schema",
+                "write_bytes_per_s_256k",
+                "write_ops_per_s_4k",
+                "write_ops_per_s_4k_qd4",
+                "read_bytes_per_s_256k",
+                "read_ops_per_s_4k",
             ]
         );
         assert!(text.contains("barrier_class = \"fua\""));

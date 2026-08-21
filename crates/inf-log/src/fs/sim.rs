@@ -138,6 +138,16 @@ pub struct StallConfig {
     /// Same heavy tail and stall-episode inheritance as the other
     /// classes. 0 completes inline (every pre-S35 trace byte-identical).
     pub write_base_ns: u64,
+    /// Device bandwidth (M4.5-S36, ADR-0088 D8): every write — plain,
+    /// write-through, zero-fill, checkpoint, tier — and every `TierRead`
+    /// takes `len × 1e9 / rate` on a **shared per-disk byte timeline**
+    /// (FIFO) in addition to its own off-timeline base draw; completion
+    /// = max(base due, timeline finish). Large background writes now
+    /// delay the foreground frame behind them — the contention the
+    /// device budget exists for. 0 = unlimited (every existing trace
+    /// byte-identical; reads stay inline).
+    pub write_bytes_per_s: u64,
+    pub read_bytes_per_s: u64,
 }
 
 impl Default for StallConfig {
@@ -153,6 +163,8 @@ impl Default for StallConfig {
             episode_ms_max: 0,
             through_base_ns: 0,
             write_base_ns: 0,
+            write_bytes_per_s: 0,
+            read_bytes_per_s: 0,
         }
     }
 }
@@ -165,6 +177,9 @@ struct StallModel {
     rng: SplitMix64,
     /// Serial device timeline: the next fsync starts no earlier than this.
     device_free_at: u64,
+    /// The byte timeline (ADR-0088 D8): the next transfer starts no
+    /// earlier than this; shared by every write and read class.
+    bandwidth_free_at: u64,
     /// Next scheduled stall episode starts here...
     next_episode_at: u64,
     /// ...and lasts this long (memoized with the start, one draw each).
@@ -177,6 +192,7 @@ impl StallModel {
             cfg,
             rng: SplitMix64::new(seed),
             device_free_at: 0,
+            bandwidth_free_at: 0,
             next_episode_at: 0,
             episode_dur_ns: 0,
         };
@@ -217,14 +233,38 @@ impl StallModel {
     /// advances `device_free_at` — a FUA write persists itself without
     /// the flush unit. A stall episode still wedges it (the whole device
     /// is wedged), which is what keeps the model honest about tails.
-    fn schedule_through(&mut self, now_ns: u64) -> u64 {
-        self.schedule_off_timeline(now_ns, self.cfg.through_base_ns)
+    fn schedule_through(&mut self, now_ns: u64, len: u64) -> u64 {
+        let due = self.schedule_off_timeline(now_ns, self.cfg.through_base_ns);
+        due.max(self.schedule_transfer(now_ns, len, self.cfg.write_bytes_per_s))
     }
 
     /// One plain write's absolute completion time (ADR-0087 D7): the same
-    /// off-timeline draw as write-through over `write_base_ns`.
-    fn schedule_write(&mut self, now_ns: u64) -> u64 {
-        self.schedule_off_timeline(now_ns, self.cfg.write_base_ns)
+    /// off-timeline draw as write-through over `write_base_ns`, then the
+    /// byte timeline (ADR-0088 D8).
+    fn schedule_write(&mut self, now_ns: u64, len: u64) -> u64 {
+        let due = self.schedule_off_timeline(now_ns, self.cfg.write_base_ns);
+        due.max(self.schedule_transfer(now_ns, len, self.cfg.write_bytes_per_s))
+    }
+
+    /// One tier read's absolute completion time (ADR-0088 D8): the byte
+    /// timeline alone (reads have no base draw — with the rate at 0 the
+    /// driver keeps completing them inline).
+    fn schedule_read(&mut self, now_ns: u64, len: u64) -> u64 {
+        self.schedule_transfer(now_ns, len, self.cfg.read_bytes_per_s)
+    }
+
+    /// The shared byte timeline: `len × 1e9 / rate` of transfer, FIFO
+    /// behind whatever is already queued. `now_ns` when the rate is 0.
+    fn schedule_transfer(&mut self, now_ns: u64, len: u64, rate: u64) -> u64 {
+        if rate == 0 {
+            return now_ns;
+        }
+        let transfer_ns =
+            u64::try_from(u128::from(len) * 1_000_000_000 / u128::from(rate)).unwrap_or(u64::MAX);
+        let start = now_ns.max(self.bandwidth_free_at);
+        let finish = start.saturating_add(transfer_ns);
+        self.bandwidth_free_at = finish;
+        finish
     }
 
     /// A per-op service time that does not queue on the serial flush
@@ -278,6 +318,11 @@ struct Inode {
     /// `fully_allocated` ⇔ the OS length reached it. 0 for every other
     /// file (always fully allocated — no sparse concept).
     prealloc_target: u64,
+    /// Opened `O_DIRECT` (segments and v3 checkpoints): every driver
+    /// write must be [`crate::ckpt::ICK_BLOCK_ALIGN`]-aligned in offset
+    /// and length, asserted here so the simulator catches what tmpfs
+    /// swallows (ADR-0088 D3).
+    direct: bool,
 }
 
 impl Inode {
@@ -499,26 +544,39 @@ impl SimDisk {
     /// (ADR-0086 D8). `None` when no model is armed **or** the model's
     /// `through_base_ns` is 0 — inline completion, byte-identical traces.
     #[must_use]
-    pub fn schedule_write_through(&self, now_ns: u64) -> Option<u64> {
+    pub fn schedule_write_through(&self, now_ns: u64, len: u64) -> Option<u64> {
         let mut state = self.state.borrow_mut();
         let model = state.stall.as_mut()?;
-        if model.cfg.through_base_ns == 0 {
+        if model.cfg.through_base_ns == 0 && model.cfg.write_bytes_per_s == 0 {
             return None;
         }
-        Some(model.schedule_through(now_ns))
+        Some(model.schedule_through(now_ns, len))
+    }
+
+    /// Draws one tier read's absolute completion time (ADR-0088 D8).
+    /// `None` when no model is armed or `read_bytes_per_s` is 0 — inline
+    /// completion, byte-identical traces.
+    #[must_use]
+    pub fn schedule_read(&self, now_ns: u64, len: u64) -> Option<u64> {
+        let mut state = self.state.borrow_mut();
+        let model = state.stall.as_mut()?;
+        if model.cfg.read_bytes_per_s == 0 {
+            return None;
+        }
+        Some(model.schedule_read(now_ns, len))
     }
 
     /// Draws one plain write's absolute completion time (ADR-0087 D7).
     /// `None` when no model is armed **or** `write_base_ns` is 0 — inline
     /// completion, byte-identical traces.
     #[must_use]
-    pub fn schedule_write(&self, now_ns: u64) -> Option<u64> {
+    pub fn schedule_write(&self, now_ns: u64, len: u64) -> Option<u64> {
         let mut state = self.state.borrow_mut();
         let model = state.stall.as_mut()?;
-        if model.cfg.write_base_ns == 0 {
+        if model.cfg.write_base_ns == 0 && model.cfg.write_bytes_per_s == 0 {
             return None;
         }
-        Some(model.schedule_write(now_ns))
+        Some(model.schedule_write(now_ns, len))
     }
 
     /// Arms the dead switch: `n` more mutating ops succeed, then every
@@ -623,6 +681,7 @@ impl SimDisk {
             .inodes
             .get_mut(&ino)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
+        assert_direct_aligned(inode, offset, data.len());
         inode.write(offset, data);
         Ok(())
     }
@@ -641,6 +700,7 @@ impl SimDisk {
             .inodes
             .get_mut(&ino)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
+        assert_direct_aligned(inode, offset, data.len());
         inode.write_through(offset, data);
         Ok(())
     }
@@ -695,7 +755,7 @@ impl SimDisk {
     }
 
     fn create_inode(&self, path: &Path, os: Vec<u8>, durable: Vec<u8>) -> io::Result<SimFile> {
-        self.create_inode_targeted(path, os, durable, 0)
+        self.create_inode_full(path, os, durable, 0, false)
     }
 
     fn create_inode_targeted(
@@ -704,6 +764,17 @@ impl SimDisk {
         os: Vec<u8>,
         durable: Vec<u8>,
         prealloc_target: u64,
+    ) -> io::Result<SimFile> {
+        self.create_inode_full(path, os, durable, prealloc_target, true)
+    }
+
+    fn create_inode_full(
+        &self,
+        path: &Path,
+        os: Vec<u8>,
+        durable: Vec<u8>,
+        prealloc_target: u64,
+        direct: bool,
     ) -> io::Result<SimFile> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
@@ -722,7 +793,9 @@ impl SimDisk {
         }
         state.next_ino += 1;
         let ino = state.next_ino;
-        state.inodes.insert(ino, Inode { durable, os, pending: Vec::new(), prealloc_target });
+        state
+            .inodes
+            .insert(ino, Inode { durable, os, pending: Vec::new(), prealloc_target, direct });
         state.os_names.insert(path.to_path_buf(), ino);
         state
             .pending_meta
@@ -730,6 +803,17 @@ impl SimDisk {
             .or_default()
             .push(MetaOp::Create { name: path.to_path_buf(), ino });
         Ok(SimFile { state: Rc::clone(&self.state), target: Target::Ino(ino) })
+    }
+}
+
+/// A direct inode takes only aligned writes — the `O_DIRECT` contract
+/// the kernel enforces with `EINVAL`, enforced here as an invariant so a
+/// misaligned block is a sim failure, never a device-only one.
+fn assert_direct_aligned(inode: &Inode, offset: u64, len: usize) {
+    if inode.direct {
+        let align = crate::ckpt::ICK_BLOCK_ALIGN as u64;
+        assert_eq!(offset % align, 0, "direct write offset {offset} is not {align}-aligned");
+        assert_eq!(len as u64 % align, 0, "direct write length {len} is not {align}-aligned");
     }
 }
 
@@ -933,6 +1017,12 @@ impl SegmentFs for SimDisk {
         self.create_inode(path, Vec::new(), Vec::new())
     }
 
+    fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File> {
+        // Volatile like `create_meta`, flagged direct: every driver write
+        // to it is alignment-asserted (ADR-0088 D3).
+        self.create_inode_full(path, Vec::new(), Vec::new(), 0, true)
+    }
+
     fn open_dir(&self, dir: &Path) -> io::Result<Self::File> {
         let mut state = self.state.borrow_mut();
         state.dead_check()?;
@@ -1025,6 +1115,8 @@ mod stall_tests {
             episode_ms_max: 90,
             through_base_ns: 0,
             write_base_ns: 0,
+            write_bytes_per_s: 0,
+            read_bytes_per_s: 0,
         }
     }
 
@@ -1036,16 +1128,42 @@ mod stall_tests {
         // timeline, so a write issued after an fsync can be due before
         // or after it — the reorder the written prefix must survive.
         let off = SimDisk::with_stall(SimDiskConfig::default(), armed_cfg(), 7);
-        assert_eq!(off.schedule_write(1_000), None);
+        assert_eq!(off.schedule_write(1_000, 4096), None);
         let mut cfg = armed_cfg();
         cfg.write_base_ns = 8_000;
         let on = SimDisk::with_stall(SimDiskConfig::default(), cfg, 7);
         let sync_due = on.schedule_fsync(1_000).expect("armed");
-        let write_due = on.schedule_write(1_000).expect("armed");
+        let write_due = on.schedule_write(1_000, 4096).expect("armed");
         assert!(write_due >= 1_000 + 8_000, "base service time");
         assert!(write_due < sync_due, "a plain write does not queue behind the flush unit");
         let next_sync = on.schedule_fsync(1_000).expect("armed");
         assert!(next_sync >= sync_due, "the flush timeline stays serial");
+    }
+
+    /// ADR-0088 D8: with a byte rate armed, every write and read queues
+    /// FIFO on one shared byte timeline by its length; with the rate at
+    /// 0 nothing changes (reads stay inline, writes keep their draws).
+    #[test]
+    fn bandwidth_term_queues_every_class_on_one_byte_timeline() {
+        let mut cfg = armed_cfg();
+        cfg.write_bytes_per_s = 1_000_000_000; // 1 byte per ns
+        cfg.read_bytes_per_s = 1_000_000_000;
+        let disk = SimDisk::with_stall(SimDiskConfig::default(), cfg, 11);
+        // A 1 MiB plain write takes ~1 ms of transfer (base is 0).
+        let w1 = disk.schedule_write(1_000, 1 << 20).expect("rate armed");
+        assert!(w1 >= 1_000 + (1 << 20), "transfer time at the rate");
+        // A 4 KiB write-through issued at the same instant queues behind it.
+        let w2 = disk.schedule_write_through(1_000, 4096).expect("rate armed");
+        assert!(w2 >= w1 + 4096, "FIFO behind the in-flight transfer");
+        // A read shares the same timeline.
+        let r = disk.schedule_read(1_000, 8192).expect("read rate armed");
+        assert!(r >= w2 + 8192);
+        // Idle timeline: a later op starts at `now`.
+        let later = disk.schedule_write(r + 1_000_000, 4096).expect("rate armed");
+        assert_eq!(later, r + 1_000_000 + 4096);
+        // The unarmed rate keeps reads inline.
+        let off = SimDisk::with_stall(SimDiskConfig::default(), armed_cfg(), 11);
+        assert_eq!(off.schedule_read(1_000, 8192), None);
     }
 
     #[test]

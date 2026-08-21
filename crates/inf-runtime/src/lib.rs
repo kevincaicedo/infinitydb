@@ -13,6 +13,7 @@
 //! [`BackendDriver`].
 
 mod affinity;
+mod budget;
 mod cold;
 mod driver;
 mod executor;
@@ -29,6 +30,10 @@ mod kqueue;
 mod uring;
 
 pub use affinity::unpin_current_thread;
+pub use budget::{
+    Admission, BURST_HORIZON_NS, ClassCounters, ClassSlice, DeviceBudget, DeviceModel,
+    FLOOR_DIVISOR, IoClass, SealPace,
+};
 pub use cold::{
     ColdDone, ColdLeak, ColdReadConfig, ColdReadCounters, ColdReads, ColdRefused, ColdWait,
     ReadClass, TierFileId,

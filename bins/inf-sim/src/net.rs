@@ -12,8 +12,8 @@ use inf_alloc::{BufferPool, LeaseKind};
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_runtime::{
-    BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken, IoOp, RawFd,
-    StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier,
+    BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken, IoClass, IoOp,
+    RawFd, StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier,
 };
 use inf_server::SimDisk;
 
@@ -147,6 +147,8 @@ pub struct SimDriver {
     pending_syncs: Vec<PendingSync>,
     ops: Vec<IoOp>,
     stats: SubmitStats,
+    /// Bytes/ops observed per class (ADR-0088 D8).
+    observed: ObservedIo,
 }
 
 /// One deferred op: applied AND completed only once the virtual clock
@@ -172,8 +174,42 @@ struct PendingSync {
 #[derive(Debug)]
 enum PendingKind {
     Fsync,
-    WriteThrough { offset: u64, data: StableBytes },
-    Write { offset: u64, data: StableBytes, linked: Option<CompletionToken> },
+    WriteThrough {
+        offset: u64,
+        data: StableBytes,
+    },
+    Write {
+        offset: u64,
+        data: StableBytes,
+        linked: Option<CompletionToken>,
+    },
+    /// A tier read under the bandwidth model (ADR-0088 D8): the buffer is
+    /// filled at its due time, never before.
+    Read {
+        offset: u64,
+        buf: StableBytesMut,
+    },
+}
+
+/// Device bytes and ops the driver observed per class (ADR-0088 D8 —
+/// the accounting oracle's other side of `io_budget_bytes_*`). Reads
+/// carry no class in their token: they are counted as `reads`, compared
+/// to the two cold-read classes together.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObservedIo {
+    pub bytes: [u64; IoClass::COUNT],
+    pub ops: [u64; IoClass::COUNT],
+    pub read_bytes: u64,
+    pub read_ops: u64,
+}
+
+impl ObservedIo {
+    fn note(&mut self, token: CompletionToken, bytes: u64) {
+        if let Some(class) = IoClass::of(token.class()) {
+            self.bytes[class.index()] = self.bytes[class.index()].saturating_add(bytes);
+            self.ops[class.index()] += 1;
+        }
+    }
 }
 
 impl SimDriver {
@@ -185,6 +221,7 @@ impl SimDriver {
             pending_syncs: Vec::new(),
             ops: Vec::new(),
             stats: SubmitStats::default(),
+            observed: ObservedIo::default(),
         }
     }
 
@@ -213,16 +250,28 @@ impl SimDriver {
 
     /// Draws a deferred completion time for one write-through barrier
     /// (ADR-0086 D8), `None` on the inline path.
-    fn schedule_through(&self, disk: &SimDisk) -> Option<Nanos> {
+    fn schedule_through(&self, disk: &SimDisk, len: u64) -> Option<Nanos> {
         let clock = self.clock.as_ref()?;
-        disk.schedule_write_through(clock.now().0).map(Nanos)
+        disk.schedule_write_through(clock.now().0, len).map(Nanos)
     }
 
     /// Draws a deferred completion time for one plain write (ADR-0087
     /// D7), `None` on the inline path.
-    fn schedule_write(&self, disk: &SimDisk) -> Option<Nanos> {
+    fn schedule_write(&self, disk: &SimDisk, len: u64) -> Option<Nanos> {
         let clock = self.clock.as_ref()?;
-        disk.schedule_write(clock.now().0).map(Nanos)
+        disk.schedule_write(clock.now().0, len).map(Nanos)
+    }
+
+    /// Draws a deferred completion time for one tier read (ADR-0088 D8),
+    /// `None` on the inline path (no read bandwidth modeled).
+    fn schedule_read(&self, disk: &SimDisk, len: u64) -> Option<Nanos> {
+        let clock = self.clock.as_ref()?;
+        disk.schedule_read(clock.now().0, len).map(Nanos)
+    }
+
+    /// The per-class device ledger (ADR-0088 D8 oracle input).
+    pub fn observed_io(&self) -> ObservedIo {
+        self.observed
     }
 }
 
@@ -342,6 +391,15 @@ impl BackendDriver for SimDriver {
                         }
                         result
                     }
+                    PendingKind::Read { offset, buf } => {
+                        let dest = stable_mut_slice(&buf);
+                        match disk.driver_read_at(fd, offset, dest) {
+                            Ok(n) if n == dest.len() => CompletionResult::TierRead,
+                            Ok(_) | Err(_) => {
+                                CompletionResult::Error { errno: libc::EIO, buf: None }
+                            }
+                        }
+                    }
                     // Plant::FsyncLies (ADR-0021 D4) holds here too: Synced
                     // without the flush — the canary the oracle must catch.
                     PendingKind::Fsync if net.plant == Plant::FsyncLies => CompletionResult::Synced,
@@ -400,12 +458,17 @@ impl BackendDriver for SimDriver {
                         .disk
                         .as_ref()
                         .expect("durable sim scenarios construct SimDriver::with_disk (M2-S18)");
+                    let len = u64::from(data.len());
+                    self.observed.note(token, len);
+                    if let Some(sync) = barrier.fsync_token() {
+                        self.observed.note(sync, 0);
+                    }
                     if matches!(barrier, WriteBarrier::WriteThrough) {
                         // Write-through (ADR-0086 D8): the write IS the
                         // barrier. Under the stall model it lands AND
                         // completes at its drawn time — nothing reaches
                         // the disk during the service window.
-                        if let Some(due) = self.schedule_through(disk) {
+                        if let Some(due) = self.schedule_through(disk, len) {
                             let kind = PendingKind::WriteThrough { offset, data };
                             defer(&mut self.pending_syncs, PendingSync { due, fd, token, kind });
                             continue;
@@ -418,7 +481,7 @@ impl BackendDriver for SimDriver {
                     // Plain write under the stall model (ADR-0087 D7): it
                     // lands at its own drawn time, independent of every
                     // other op; its linked sync is scheduled at landing.
-                    if let Some(due) = self.schedule_write(disk) {
+                    if let Some(due) = self.schedule_write(disk, len) {
                         let kind = PendingKind::Write { offset, data, linked: fsync_token };
                         defer(&mut self.pending_syncs, PendingSync { due, fd, token, kind });
                         continue;
@@ -483,6 +546,16 @@ impl BackendDriver for SimDriver {
                         .disk
                         .as_ref()
                         .expect("tiered sim scenarios construct SimDriver::with_disk (M4-S04)");
+                    self.observed.read_bytes += u64::from(buf.len());
+                    self.observed.read_ops += 1;
+                    // Bandwidth model (ADR-0088 D8): the read lands at its
+                    // drawn time; with no read rate it completes inline
+                    // exactly as before.
+                    if let Some(due) = self.schedule_read(disk, u64::from(buf.len())) {
+                        let kind = PendingKind::Read { offset, buf };
+                        defer(&mut self.pending_syncs, PendingSync { due, fd, token, kind });
+                        continue;
+                    }
                     let dest = stable_mut_slice(&buf);
                     // The op contract: `TierRead` means the buffer is
                     // FULL; EOF inside the flushed range is corruption.
@@ -497,6 +570,7 @@ impl BackendDriver for SimDriver {
                         .disk
                         .as_ref()
                         .expect("durable sim scenarios construct SimDriver::with_disk (M2-S18)");
+                    self.observed.note(token, 0);
                     // Stall device (M2.5-S14): standalone fsyncs (barrier
                     // dirs, everysec ticks) defer exactly like linked ones.
                     if let Some(due) = self.schedule_sync(disk) {

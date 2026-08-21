@@ -291,6 +291,7 @@ impl Node {
                         recover,
                         flush_bound: 1,
                         fua_p50_us_probed: 0,
+                        device: Default::default(),
                     };
                     durable = Some((cfg, Arc::clone(control)));
                 }
@@ -2070,6 +2071,24 @@ fn bytes_threshold_triggers_a_checkpoint() {
         }
     };
     assert!(!info.contains("ckpts_completed:0"), "threshold trigger produced a checkpoint: {info}");
+    // M4.5-S36 (ADR-0088 D4/D7): the trigger is derived and reported —
+    // the interval in force is at least the floor (16 KiB here) and, once
+    // a checkpoint published, twice its on-disk size or the floor; the
+    // write-amplification figure is defined only after the publish, and
+    // the checkpoint's bytes are counted (v3 blocks: a multiple of 4 KiB).
+    let interval = info_u64(&info, "ckpt_interval_bytes");
+    let last = info_u64(&info, "ckpt_bytes_last");
+    assert!(
+        last > 0 && last.is_multiple_of(4096),
+        "v3 checkpoint bytes are aligned blocks: {info}"
+    );
+    assert_eq!(interval, (2 * last).max(16 << 10), "interval = clamp(2 × last, floor, cap)");
+    assert_eq!(info_u64(&info, "write_amp_log_checkpoint_undefined"), 0, "{info}");
+    let amp = info_u64(&info, "write_amp_milli_log_checkpoint");
+    assert!(amp >= 1000, "device bytes can only exceed record bytes: {info}");
+    assert!(info_u64(&info, "log_frame_bytes") > 0, "{info}");
+    assert!(info_u64(&info, "ckpt_bytes_total") >= last, "the total counts every publish");
+    assert!(info.contains("io_budget_model:absent"), "no probe file in the test tree: {info}");
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();

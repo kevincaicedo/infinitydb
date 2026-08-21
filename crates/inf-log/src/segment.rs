@@ -565,12 +565,31 @@ impl<F: SegmentFs> SegmentRotor<F> {
         self.active.io_mode == SegmentIoMode::Direct && self.active.prezeroed
     }
 
+    /// True when `next_zero_slice` would hand out a slice now — a pure
+    /// peek (M4.5-S36, ADR-0088 D5): the device budget is consulted
+    /// *before* a slice is marked in flight, because a slice taken and
+    /// never issued is a phantom the rotation would wait on forever (the
+    /// `m2-device-budget` sweep found exactly that shape: an acked
+    /// `everysec` record behind a rotation that never came).
+    #[must_use]
+    pub fn zero_fill_pending(&self) -> bool {
+        let Some(next) = self.next.as_ref() else { return false };
+        let NextState::Filling { cursor, in_flight: 0 } = next.state else { return false };
+        if self.active.prezeroed {
+            let allowed =
+                self.active.written.saturating_mul(2).saturating_add(ZERO_FILL_HEAD_START);
+            if cursor >= allowed {
+                return false;
+            }
+        }
+        next.file.raw_fd().is_some()
+    }
+
     /// The next zero-fill write to issue, when the next segment is
     /// filling and no slice is in flight (ADR-0086 D4). Marks the slice
     /// in flight; the plane reports it back through
     /// [`note_zero_slice_written`](Self::note_zero_slice_written).
     /// `max_len` is the zero window's size.
-    #[must_use]
     pub fn next_zero_slice(&mut self, max_len: u32) -> Option<ZeroSlice> {
         debug_assert!(max_len.is_multiple_of(FRAME_ALIGN), "zero window is aligned");
         let paced = self.active.prezeroed;

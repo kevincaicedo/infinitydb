@@ -529,8 +529,8 @@ fn reactor_sealed_file_beyond_the_manifest_is_clamped_inert() {
 
 /// The m4.toml definition itself stays well-formed and every row names
 /// a carrying test file (self-policing, the m2 pattern; S12's rows are
-/// carried by `recovery_v2.rs`, M4.5-S34's by `fua.rs` — each polices
-/// its own subset).
+/// carried by `recovery_v2.rs`, M4.5-S34/S35's by `fua.rs`, M4.5-S36's
+/// by `ickv3.rs` — each polices its own subset).
 #[test]
 fn m4_rows_are_carried_here() {
     let def = load_matrix(&Path::new(env!("CARGO_MANIFEST_DIR")).join("m4.toml"));
@@ -541,7 +541,8 @@ fn m4_rows_are_carried_here() {
             row.test == "tier.rs"
                 || row.test == "recovery_v2.rs"
                 || row.test == "blob.rs"
-                || row.test == "fua.rs",
+                || row.test == "fua.rs"
+                || row.test == "ickv3.rs",
             "row {:?} names an unknown carrier {:?}",
             row.point,
             row.test

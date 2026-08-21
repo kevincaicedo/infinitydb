@@ -171,6 +171,9 @@ pub struct ColdReadCounters {
     /// High-water mark of queued intents across both classes (the
     /// overflow-depth tripwire input).
     pub queue_depth_high_water: u32,
+    /// `Maintain` reads the device budget deferred at drain (M4.5-S36,
+    /// ADR-0088 D5) — per drain, not per intent; the intents stay queued.
+    pub maintain_deferred: u64,
 }
 
 impl ColdReadCounters {
@@ -416,31 +419,64 @@ impl ColdReads {
     /// after the EXECUTE batch (and harmlessly more often — it is
     /// idempotent when nothing is admissible). Returns device reads
     /// issued.
-    pub fn drain(&self, mut push: impl FnMut(IoOp)) -> u32 {
+    pub fn drain(&self, push: impl FnMut(IoOp)) -> u32 {
+        self.drain_budgeted(|_, _| true, |_, _| {}, push)
+    }
+
+    /// [`drain`](Self::drain) under a device budget (M4.5-S36, ADR-0088
+    /// D2/D5): before a class's read is built, `admit(class, bytes)` is
+    /// asked with the pool buffer size (the window's bound); a refused
+    /// `Maintain` read stays queued and the drain continues with the
+    /// foreground only — "not this slice". `Foreground` is charged, never
+    /// refused (the caller's `admit` returns true for it by contract).
+    /// After the op is built, `refund(class, unused)` returns the bound
+    /// minus the issued window.
+    pub fn drain_budgeted(
+        &self,
+        mut admit: impl FnMut(ReadClass, u64) -> bool,
+        mut refund: impl FnMut(ReadClass, u64),
+        mut push: impl FnMut(IoOp),
+    ) -> u32 {
         let mut issued = 0u32;
-        while let Some(op) = self.drain_one() {
+        let mut maintain_allowed = true;
+        loop {
+            let mut state_ref = self.state.borrow_mut();
+            let state = &mut *state_ref;
+            if state.inflight.len() >= state.config.qd_cap {
+                break;
+            }
+            Self::purge_stale_heads(state, &self.gate);
+            if state.pending[0].is_empty() && (state.pending[1].is_empty() || !maintain_allowed) {
+                break;
+            }
+            let class = Self::pick_class(state, maintain_allowed);
+            let class_enum = if class == 0 { ReadClass::Foreground } else { ReadClass::Maintain };
+            let bound = state.pool.buf_size() as u64;
+            if !admit(class_enum, bound) {
+                debug_assert_eq!(
+                    class_enum,
+                    ReadClass::Maintain,
+                    "the foreground is never refused"
+                );
+                state.counters.maintain_deferred += 1;
+                maintain_allowed = false;
+                continue;
+            }
+            let Some(buf) = state.pool.try_lease() else {
+                state.counters.pool_dry += 1;
+                refund(class_enum, bound);
+                break;
+            };
+            let op = Self::admit(state, &self.gate, class, buf);
+            let IoOp::TierRead { buf: ref window, .. } = op else {
+                unreachable!("admit builds reads")
+            };
+            refund(class_enum, bound.saturating_sub(u64::from(window.len())));
+            drop(state_ref);
             push(op);
             issued += 1;
         }
         issued
-    }
-
-    fn drain_one(&self) -> Option<IoOp> {
-        let mut state_ref = self.state.borrow_mut();
-        let state = &mut *state_ref;
-        if state.inflight.len() >= state.config.qd_cap {
-            return None;
-        }
-        Self::purge_stale_heads(state, &self.gate);
-        if state.pending[0].is_empty() && state.pending[1].is_empty() {
-            return None;
-        }
-        let Some(buf) = state.pool.try_lease() else {
-            state.counters.pool_dry += 1;
-            return None;
-        };
-        let class = Self::pick_class(state);
-        Some(Self::admit(state, &self.gate, class, buf))
     }
 
     /// Drops cancelled-while-queued heads of both FIFOs (pins released,
@@ -463,9 +499,9 @@ impl ColdReads {
     /// Deficit pick over non-empty classes: work-conserving when one
     /// class is idle (its grants are forfeit, not banked); 3:1 metering
     /// only under contention (ADR-0055 D3).
-    fn pick_class(state: &mut ColdState) -> usize {
+    fn pick_class(state: &mut ColdState, maintain_allowed: bool) -> usize {
         let foreground = !state.pending[0].is_empty();
-        let maintain = !state.pending[1].is_empty();
+        let maintain = !state.pending[1].is_empty() && maintain_allowed;
         debug_assert!(foreground || maintain, "caller checked non-empty");
         if !maintain {
             return 0;

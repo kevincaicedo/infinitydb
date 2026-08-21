@@ -1145,6 +1145,9 @@ pub(crate) fn pipeline_args(flags: &Flags) -> Vec<String> {
         ("frames-in-flight", "--frames-in-flight"),
         ("barrier-class", "--barrier-class"),
         ("staging-mib", "--log-staging-mib"),
+        // M4.5-S36 (ADR-0088 D6/D2b): the device-model and seal-pace arms.
+        ("device-write-mbps", "--device-write-mbps"),
+        ("seal-pace", "--seal-pace"),
     ] {
         if let Some(value) = flags.get(flag) {
             args.push(server_flag.to_string());
@@ -1158,9 +1161,12 @@ pub(crate) fn pipeline_args(flags: &Flags) -> Vec<String> {
 /// K = 1 / flush row is never mistaken for an unknown configuration).
 pub(crate) fn pipeline_note(flags: &Flags) -> String {
     format!(
-        "frames-in-flight {} · barrier-class {} · staging-mib {}",
+        "frames-in-flight {} · barrier-class {} · staging-mib {} · device-write-mbps {} · \
+         seal-pace {}",
         flags.str_or("frames-in-flight", "1"),
         flags.str_or("barrier-class", "flush"),
-        flags.str_or("staging-mib", "4")
+        flags.str_or("staging-mib", "4"),
+        flags.str_or("device-write-mbps", "probe-file"),
+        flags.str_or("seal-pace", "off")
     )
 }

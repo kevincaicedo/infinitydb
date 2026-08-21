@@ -184,6 +184,14 @@ pub trait SegmentFs {
     /// fdatasync and its name durability from the publication dir-fsync —
     /// a create-time sync here is a wasted device barrier on the loop.
     fn create_meta(&self, path: &Path) -> io::Result<Self::File>;
+    /// `create_meta` with `O_DIRECT` (M4.5-S36, ADR-0088 D3): the `.ick`
+    /// staging file whose v3 blocks are written as aligned direct writes.
+    /// **Required, not defaulted** — a default falling back to
+    /// `create_meta` would be a buffered file wearing a direct label
+    /// (ADR-0054 D3). Std verifies the flag through fdinfo; the memory
+    /// and sim tiers record the mode and assert every write's alignment,
+    /// so the simulator catches what tmpfs swallows. Wrappers forward.
+    fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File>;
     /// Open a directory as a syncable handle (M2-S11/S12): `sync_data` on
     /// it is the dir-fsync, and `raw_fd` is the address a driver
     /// `Fdatasync` targets so publication barriers never block the loop.
@@ -387,6 +395,33 @@ impl SegmentFs for StdSegmentFs {
         let file =
             std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
         Ok(StdSegmentFile(file))
+    }
+
+    fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // No preallocation: plain `O_DIRECT` writes allocate as they
+            // go and the terminal fdatasync commits the metadata once
+            // (the FUA-on-unwritten-extent trap is an `O_DSYNC` trap;
+            // the checkpoint has no per-write barrier — ADR-0088 D3).
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)?;
+            verify_o_direct(&file, path)?;
+            Ok(StdSegmentFile(file))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "O_DIRECT checkpoint files are Linux-only (ADR-0088 D3)",
+            ))
+        }
     }
 
     fn open_dir(&self, dir: &Path) -> io::Result<Self::File> {
@@ -678,6 +713,13 @@ pub mod mem {
         fn create_meta(&self, path: &Path) -> io::Result<Self::File> {
             // Same create-new semantics, zero length, no capacity debit
             // (staging envelopes, not preallocated segments).
+            self.create_segment(path, 0)
+        }
+
+        fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File> {
+            // Direct ≡ buffered in memory; the alignment of every write
+            // is asserted by the caller's block layout (v3 sealer) and by
+            // the sim tier — this tier records nothing (ADR-0088 D3).
             self.create_segment(path, 0)
         }
 
