@@ -224,6 +224,93 @@ fn raw_counters(infos: &[BTreeMap<String, String>]) -> (u64, u64, u64) {
     (sum_field(infos, "raw_submits"), sum_field(infos, "raw_sqes"), sum_field(infos, "raw_cqes"))
 }
 
+/// The filesystem type a path resolves to, from `/proc/self/mounts`
+/// (longest mount-point prefix of the canonicalized path). `None` off
+/// Linux or when the table cannot be read — callers treat unknown as
+/// "not a memory filesystem" and say so.
+///
+/// The reason this is a table lookup and not a `/tmp` prefix test: the
+/// S35 reference-box arms (2026-08-21) wrote every FUA frame to tmpfs
+/// because the `m2` flow read only `--pressure-data-root` (default =
+/// the system temp dir) and the prefix heuristic was a *note*, not a
+/// refusal — three "binding" reports at 1.7 M ops/s with 113 µs
+/// "barriers" (tmpfs swallows `O_DIRECT` and `RWF_DSYNC`; the arm
+/// measured a memcpy).
+pub(crate) fn fs_type_of(path: &std::path::Path) -> Option<String> {
+    let probe = {
+        // The directory may not exist yet (rows create it); walk up to
+        // the nearest existing ancestor before canonicalizing.
+        let mut p = path.to_path_buf();
+        while !p.exists() {
+            p = p.parent()?.to_path_buf();
+        }
+        std::fs::canonicalize(p).ok()?
+    };
+    let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    let mut best: Option<(usize, String)> = None;
+    for line in table.lines() {
+        let mut cols = line.split_whitespace();
+        let (Some(_src), Some(target), Some(fstype)) = (cols.next(), cols.next(), cols.next())
+        else {
+            continue;
+        };
+        // /proc/self/mounts escapes spaces as `\040`; mount points with
+        // spaces are not a shape this harness runs on, so unescape the
+        // common case only.
+        let target = target.replace("\\040", " ");
+        let target_path = std::path::Path::new(&target);
+        if probe.starts_with(target_path)
+            && best.as_ref().is_none_or(|(len, _)| target.len() > *len)
+        {
+            best = Some((target.len(), fstype.to_string()));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+/// A memory-backed filesystem: a durable row on it measures the page
+/// cache (fsync ~77 µs) and a FUA-class row measures a memcpy.
+pub(crate) fn is_memory_fs(fstype: &str) -> bool {
+    matches!(fstype, "tmpfs" | "ramfs" | "devtmpfs" | "hugetlbfs")
+}
+
+/// The device-row admission rule, checked **before any row runs** (the
+/// M2-S24 lesson: a carrier validated after the rows is a report that
+/// cannot be un-written). Returns the fstype for the report header.
+///
+/// - binding (`--reference-box`) ⇒ refuse on a memory filesystem: a
+///   binding durable row must hit the device or it binds nothing;
+/// - `--barrier-class fua` ⇒ refuse on a memory filesystem in any tier:
+///   tmpfs accepts `O_DIRECT|RWF_DSYNC` and does nothing with them, so
+///   the arm's "barrier" is a memcpy and the A/B compares two memcpys;
+/// - otherwise a memory filesystem is disclosed as a note by the caller.
+pub(crate) fn admit_device_root(
+    flags: &Flags,
+    root: &std::path::Path,
+    reference_box: bool,
+) -> Result<String, String> {
+    let fstype = fs_type_of(root).unwrap_or_else(|| "unknown".to_string());
+    if is_memory_fs(&fstype) {
+        if reference_box {
+            return Err(format!(
+                "data root {} is {fstype}: a binding (--reference-box) durable row on a memory \
+                 filesystem measures the page cache, not the device — point --data-root at \
+                 the filesystem under test",
+                root.display()
+            ));
+        }
+        if flags.get("barrier-class").is_some_and(|c| c.eq_ignore_ascii_case("fua")) {
+            return Err(format!(
+                "data root {} is {fstype}: --barrier-class fua on a memory filesystem is a \
+                 memcpy (O_DIRECT|RWF_DSYNC are accepted and ignored) — the arm would measure \
+                 nothing; point --data-root at the filesystem under test",
+                root.display()
+            ));
+        }
+    }
+    Ok(fstype)
+}
+
 pub(crate) fn median(values: &mut [f64]) -> f64 {
     values.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
     values[values.len() / 2]
@@ -458,6 +545,8 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-s27",
         // M4.5 S31 A/B (the mirror: the S29 row without the S27 legs).
         "only-s29",
+        // M4.5 S35 frame-pipeline arms (the row alone, one report per arm).
+        "only-s35",
     ],
     &[
         "allow-dirty",
@@ -527,6 +616,10 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-always",
         "only-s27",
         "only-s29",
+        "only-s35",
+        // M4.5-S35 row: seconds idled before every durable leg (the S34
+        // drive-state rule; default 40, 0 for harness smoke).
+        "leg-idle-s",
         "recovery-gbps-per-cell",
         "recovery-boot-s",
         // ADR-0070 D7 (2026-08-16): Phase::Start overhead, split out of the
@@ -863,5 +956,42 @@ mod tests {
         finish_report("m4", &one_gate(), &m, true, false, root, "unit test").expect("reported");
         assert!(dir.exists(), "the reported run wrote its artifact");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M4.5-S35 (2026-08-21): a binding run or a FUA arm on a memory
+    /// filesystem refuses before any row runs; a non-memory root admits.
+    /// (Linux-only facts: `/proc/self/mounts` and the fstype of `/`.)
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn device_root_admission_refuses_memory_filesystems_for_binding_and_fua_runs() {
+        let root_fs = fs_type_of(std::path::Path::new("/")).expect("the root mount is listed");
+        assert!(!root_fs.is_empty());
+        // A path that does not exist yet resolves through its ancestors.
+        assert_eq!(fs_type_of(std::path::Path::new("/definitely/not/here")), Some(root_fs));
+        assert!(is_memory_fs("tmpfs") && is_memory_fs("ramfs") && !is_memory_fs("ext4"));
+
+        let (bools, values) = GATE_RUN_FLAGS;
+        let fua =
+            Flags::parse(&["--barrier-class".into(), "fua".into()], bools, values).expect("flags");
+        let plain = Flags::parse(&[], bools, values).expect("flags");
+        let Some(tmpfs) = ["/dev/shm", "/run", "/tmp"]
+            .into_iter()
+            .map(std::path::Path::new)
+            .find(|p| fs_type_of(p).is_some_and(|t| is_memory_fs(&t)))
+        else {
+            eprintln!("no memory filesystem mounted — refusal legs skipped");
+            return;
+        };
+        let err = admit_device_root(&plain, tmpfs, true).expect_err("binding on tmpfs refuses");
+        assert!(err.contains("binding"), "{err}");
+        let err = admit_device_root(&fua, tmpfs, false).expect_err("fua on tmpfs refuses");
+        assert!(err.contains("memcpy"), "{err}");
+        // Dev-tier non-FUA on tmpfs admits (disclosed by the caller).
+        assert!(is_memory_fs(&admit_device_root(&plain, tmpfs, false).expect("admitted")));
+        // A non-memory root admits in every mode.
+        let home = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        if !fs_type_of(home).is_some_and(|t| is_memory_fs(&t)) {
+            admit_device_root(&fua, home, true).expect("device root admits a binding fua run");
+        }
     }
 }

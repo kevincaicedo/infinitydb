@@ -890,19 +890,30 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
     let env_ok = env_gate(flags)?;
     // One resolution for every device-exercising row; sweep what a killed
     // prior run left behind before this one writes its own ~13 GB.
-    let data_root =
-        flags.get("pressure-data-root").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    // `--data-root` is the campaign-wide spelling (the m4.5 rows' flag);
+    // `--pressure-data-root` is this flow's older name — either resolves
+    // every device-exercising row here. The 2026-08-21 S35 arms passed
+    // `--data-root` to this flow and silently wrote to the temp dir.
+    let data_root = flags
+        .get("pressure-data-root")
+        .or_else(|| flags.get("data-root"))
+        .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    // Admission before any row: a binding run or a FUA arm on a memory
+    // filesystem refuses here (never a note the reader may miss).
+    let root_fstype = crate::gaterun::admit_device_root(flags, &data_root, reference_box)?;
     sweep_stale_row_dirs(&data_root);
     let mut m = Measurements::new();
     if !env_ok {
         m.note("env-check FAILED and was overridden (--unsafe-env): not citation-grade");
     }
-    if data_root.starts_with("/tmp") || data_root.starts_with("/dev/shm") {
-        m.note(
-            "pressure-data-root resolves under /tmp (tmpfs-likely): the everysec row writes \
-             ~13 GB with truncation disabled — a 16 GB tmpfs exhausts mid-row and the engine \
-             fail-stops per §8.4. Pass --pressure-data-root on a real filesystem.",
-        );
+    m.note(format!("data root: {} ({root_fstype})", data_root.display()));
+    if crate::gaterun::is_memory_fs(&root_fstype) {
+        m.note(format!(
+            "data root is {root_fstype} (memory-backed): the durable rows measure the page \
+             cache, not a device — dev-tier smoke only; the everysec row writes ~13 GB with \
+             truncation disabled and a 16 GB tmpfs exhausts mid-row (engine fail-stops per \
+             §8.4). Pass --data-root on the filesystem under test."
+        ));
     }
     if !reference_box {
         m.note("dev-tier run: reference-box gates report measured values, non-binding verdicts");
