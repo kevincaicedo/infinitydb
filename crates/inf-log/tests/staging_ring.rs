@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use inf_log::FRAME_ALIGN;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
     FRAME_HEADER_LEN, FRAME_TRAILER_LEN, Lsn, MutationEffect, NsId, ReaderConfig, SegmentConfig,
@@ -17,7 +18,7 @@ const FRAME_OVERHEAD: u32 = (FRAME_HEADER_LEN + FRAME_TRAILER_LEN) as u32;
 
 fn mem_rotor(fs: &MemFs, segment_bytes: u32) -> (SegmentRotor<MemFs>, PathBuf) {
     let dirs = create_cell_dirs(fs, &PathBuf::from("data/shard-0")).expect("dirs");
-    let cfg = SegmentConfig { segment_bytes, seal_after_ms: None };
+    let cfg = SegmentConfig { segment_bytes, ..Default::default() };
     let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg).expect("rotor");
     (rotor, dirs.log)
 }
@@ -54,7 +55,8 @@ fn accounting_is_exact_at_every_append_and_drain_site() {
 
     assert_eq!(ring.staged_bytes(), 0);
     assert_eq!(ring.pending_frame_len(), FRAME_OVERHEAD);
-    assert_eq!(ring.resident_bytes(), 2 * 4096);
+    // Two buffers plus the O_DIRECT alignment slack (ADR-0086 D6).
+    assert_eq!(ring.resident_bytes(), 2 * (4096 + 2 * FRAME_ALIGN as usize));
     // The never-fits bound admission must reject against (not retry).
     assert_eq!(ring.max_record_len(), 4096 - FRAME_OVERHEAD);
     assert!(ring.would_fit(ring.max_record_len() as usize));
@@ -88,7 +90,11 @@ fn accounting_is_exact_at_every_append_and_drain_site() {
 
     ring.release(lease);
     assert_eq!(ring.in_flight_bytes(), 0);
-    assert_eq!(ring.resident_bytes(), 2 * 4096, "domain memory is constant");
+    assert_eq!(
+        ring.resident_bytes(),
+        2 * (4096 + 2 * FRAME_ALIGN as usize),
+        "domain memory is constant"
+    );
 
     // Empty iterations emit no frame.
     assert!(ring.flush_into(&mut rotor, 0).expect("flush").is_none());
@@ -157,7 +163,7 @@ fn backlogged_ring_keeps_staging_and_stays_bounded() {
         }
     }
     assert!(refused > 0, "storm hit the bound");
-    assert_eq!(ring.resident_bytes(), 2 * 512);
+    assert_eq!(ring.resident_bytes(), 2 * (512 + 2 * FRAME_ALIGN as usize));
     assert!(ring.pending_frame_len() <= 512);
 
     // Release unblocks the next seal; nothing staged was lost.

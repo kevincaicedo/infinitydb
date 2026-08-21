@@ -19,13 +19,16 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+use inf_alloc::AlignedBox;
 use inf_foundation::time::Nanos;
 use inf_log::fs::SegmentFs;
 use inf_log::{
     FsyncClass, FsyncTicket, GroupCommit, IdxSidecarMeta, MutationEffect, NsId, RecordView,
-    SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
+    SegmentConfig, SegmentRotor, StagingConfig, StagingRing, ZERO_FILL_SLICE_BYTES,
 };
-use inf_runtime::{CompletionToken, IoOp, LoopCx, TokenClass, WaitList, WatermarkGate};
+use inf_runtime::{
+    CompletionToken, IoOp, LoopCx, TokenClass, WaitList, WatermarkGate, WriteBarrier,
+};
 use inf_store::{CheckpointImage, IndexId, Keyspace, WallAnchor};
 
 use crate::ckpt::{
@@ -69,8 +72,14 @@ pub struct DurableConfig {
     pub recover: RecoverConfig,
     /// Durability fsyncs allowed in flight per cell (M2.5-S07): 1 = the
     /// ADR-0022 D3 discipline; 2 = the bounded two-in-flight pipeline
-    /// under A/B evaluation. Never more.
+    /// under A/B evaluation. Never more. FLUSH-class only — write-through
+    /// frames (ADR-0086 D5) are bounded by the staging lease instead.
     pub sync_pipeline: u8,
+    /// The device's probed write-through p50 at 4 KiB (µs) from
+    /// `io-properties.toml` (ADR-0086 D7) — the `barrier_class_degraded`
+    /// tripwire's reference. 0 = unknown (tripwire disarmed; the FLUSH
+    /// class needs none).
+    pub fua_p50_us_probed: u64,
 }
 
 /// Boot-recovery stepping policy (M2-S15). The default replays flat-out
@@ -150,6 +159,29 @@ pub struct DurableStats {
     /// On-disk segments the rotor tracks (sealed + active + prealloc'd
     /// next) — the reclamation-bound observable.
     pub log_segments_live: u64,
+    /// M4.5-S34 (ADR-0086): 1 while the active segment writes
+    /// write-through (FUA-class) frames for due syncs, 0 under FLUSH.
+    pub barrier_class_fua: u64,
+    /// Write-through frame tickets completed (`fsyncs_fua`).
+    pub fsyncs_fua: u64,
+    /// Write-through barrier latency percentiles (µs) — submission →
+    /// `LogWritten`, the barrier an `always` client waits on.
+    pub fua_p50_us: u64,
+    pub fua_p99_us: u64,
+    /// v3 alignment padding sealed so far (`log_padding_bytes`) and zero
+    /// bytes written to pre-zero direct segments (`zero_fill_bytes`) —
+    /// the two write-amplification disclosures of the direct class.
+    pub log_padding_bytes: u64,
+    pub zero_fill_bytes: u64,
+    /// Rotations onto a not-yet-zeroed direct segment (FLUSH-class until
+    /// the next upgrade) and class-upgrade rotations.
+    pub rotations_unzeroed: u64,
+    pub rotations_upgrade: u64,
+    /// Tripwire (ADR-0086 D7): 1 once three consecutive everysec windows
+    /// measured a write-through p50 above 3× the probed value. The device
+    /// is not delivering the class it was probed for — visible, never an
+    /// automatic class flip.
+    pub barrier_class_degraded: u64,
 }
 
 /// One cell's durable plane state (plane-owned; `inf-store` never sees it).
@@ -174,6 +206,23 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     /// chain (ADR-0083 D4).
     write_submitted_at: Nanos,
     linked_ticket: Option<FsyncTicket>,
+    /// The in-flight frame's write-through ticket (ADR-0086 D5): its
+    /// `LogWritten` is the durability fact — `on_log_written` completes
+    /// the ticket and the watermark advances from there.
+    write_through_ticket: Option<FsyncTicket>,
+    /// The cell's zero window (ADR-0086 D4): 1 MiB of zeros, 4 KiB-aligned,
+    /// never written — the source of every zero-fill `LogWrite`.
+    /// Attributed to the log-staging domain.
+    zero_window: AlignedBox,
+    /// The zero-fill barrier's ticket while in flight: its `Synced` makes
+    /// the next segment ready.
+    zero_fill_ticket: Option<FsyncTicket>,
+    /// Tripwire state (ADR-0086 D7): the probed reference and the number
+    /// of consecutive everysec windows over 3× it.
+    fua_p50_us_probed: u64,
+    fua_degraded_windows: u32,
+    fua_tick_count_prev: u64,
+    fua_tick_window_sum_us: u64,
     /// Frame-write submit → `LogWritten` latency (µs) — the staging
     /// drain's binding variable (ADR-0083 D5).
     write_stall_hist: inf_foundation::LogHistogram,
@@ -206,6 +255,7 @@ impl<F: SegmentFs> DurableCell<F> {
     pub fn new(
         staging: StagingConfig,
         sync_pipeline: u8,
+        fua_p50_us_probed: u64,
         rotor: SegmentRotor<F>,
         ckpt: CkptCell<F>,
         manifest: ManifestCell<F>,
@@ -225,6 +275,13 @@ impl<F: SegmentFs> DurableCell<F> {
             in_flight: None,
             write_submitted_at: Nanos(0),
             linked_ticket: None,
+            write_through_ticket: None,
+            zero_window: AlignedBox::new(ZERO_FILL_SLICE_BYTES as usize),
+            zero_fill_ticket: None,
+            fua_p50_us_probed,
+            fua_degraded_windows: 0,
+            fua_tick_count_prev: 0,
+            fua_tick_window_sum_us: 0,
             write_stall_hist: inf_foundation::LogHistogram::new(),
             parked_total: 0,
             last_seq: 0,
@@ -329,7 +386,10 @@ impl<F: SegmentFs> DurableCell<F> {
     /// MAINTAIN slice: keep the next segment preallocated (rotation stays
     /// a pointer swap — S02). The prealloc is unsynced (M2.5-S01): its
     /// log-dir fdatasync rides the driver as a coverage-neutral ledger
-    /// barrier instead of blocking the reactor behind the journal.
+    /// barrier instead of blocking the reactor behind the journal. Under
+    /// `Direct` the next segment is then pre-zeroed through the driver,
+    /// one slice per completion, and its zero-fill barrier registered
+    /// coverage-neutral (ADR-0086 D4) — never a blocking write here.
     pub fn maintain(&mut self, cx: &mut LoopCx<'_>) {
         if self.failed {
             return;
@@ -353,6 +413,35 @@ impl<F: SegmentFs> DurableCell<F> {
                 }
             }
         }
+        self.zero_fill(cx);
+    }
+
+    /// Drive the next segment's pre-zeroing (ADR-0086 D4): issue the next
+    /// zero slice when none is in flight; register and issue the barrier
+    /// once every zero byte landed.
+    fn zero_fill(&mut self, cx: &mut LoopCx<'_>) {
+        if let Some(slice) = self.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) {
+            cx.push(IoOp::LogWrite {
+                fd: slice.fd,
+                offset: slice.offset,
+                data: log_bytes::zero_window(&self.zero_window, slice.len),
+                token: CompletionToken::new(TokenClass::ZeroFillWrite, 0, 0),
+                barrier: WriteBarrier::None,
+            });
+        }
+        if self.zero_fill_ticket.is_none()
+            && let Some(fd) = self.rotor.take_zero_fill_barrier()
+        {
+            let ticket = self.commit.register_zero_fill_barrier(cx.now);
+            self.zero_fill_ticket = Some(ticket);
+            cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
+        }
+    }
+
+    /// REAP: a zero-fill slice's `LogWritten` — advance the rotor's
+    /// cursor; the next slice issues at the next MAINTAIN.
+    pub fn on_zero_fill_written(&mut self) {
+        self.rotor.note_zero_slice_written();
     }
 
     /// The LOG step (ADR-0013 D2): seal at most one frame into one
@@ -377,6 +466,12 @@ impl<F: SegmentFs> DurableCell<F> {
             let frame_len = self.staging.pending_frame_len();
             let deferred = match self.rotor.begin_frame_deferred(frame_len, cx.now.as_millis()) {
                 Ok(deferred) => deferred,
+                Err(inf_log::LogError::NextNotReady { .. }) => {
+                    // A zero-fill op is in flight on the segment rotation
+                    // needs (ADR-0086 D4): the frame waits one completion,
+                    // exactly like the ENOSPC branch below.
+                    return;
+                }
                 Err(err) => {
                     if self.rotor.space_exhausted() {
                         // Typed refusal already gates new admissions; the
@@ -392,20 +487,33 @@ impl<F: SegmentFs> DurableCell<F> {
                 let ticket = self.commit.register_seal_fsync(handoff, cx.now);
                 cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
             }
-            let end = slot.base().advance(frame_len);
+            // The frame's on-device extent (padding included on aligned
+            // segments) is what the cursor, the ledger, and the barrier
+            // all advance by (ADR-0086 D3).
+            let end = slot.base().advance(slot.len());
             let covered = self.commit.watermark().map_or(0, |lsn| lsn.to_u64());
-            let lease = self.staging.seal(slot.first_record_lsn(), covered);
+            let lease = self.staging.seal(slot.first_record_lsn(), covered, slot.layout());
+            debug_assert_eq!(lease.frame_len(), slot.len(), "sealed bytes match the reservation");
             // A pending ckpt-begin marker rides this frame: its LSN is now
             // real (ADR-0016 D3).
             self.ckpt.on_frame_sealed(&lease);
             self.frame_seqs.push_back((end.to_u64(), self.last_seq));
-            self.commit.note_frame_queued(end, frame_len);
-            let linked =
-                self.commit.frame_fsync_due().then(|| self.commit.register_linked_fsync(cx.now));
-            let fsync = linked.map(fsync_token);
-            // The linked sync's clock rebases at `LogWritten` (ADR-0083
-            // D4): its SQE starts only after the covering write.
-            self.linked_ticket = linked;
+            self.commit.note_frame_queued(end, slot.len());
+            // Barrier class per frame (ADR-0086 D1): write-through when
+            // the segment allows it and a sync is due; else the linked
+            // fdatasync under the FLUSH-class pipeline bound; else none.
+            let barrier = if slot.write_through_ok() && self.commit.write_through_due() {
+                self.write_through_ticket = Some(self.commit.register_write_through(cx.now));
+                WriteBarrier::WriteThrough
+            } else if self.commit.frame_fsync_due() {
+                let ticket = self.commit.register_linked_fsync(cx.now);
+                // The linked sync's clock rebases at `LogWritten`
+                // (ADR-0083 D4): its SQE starts only after the write.
+                self.linked_ticket = Some(ticket);
+                WriteBarrier::LinkedFsync { fsync_token: fsync_token(ticket) }
+            } else {
+                WriteBarrier::None
+            };
             self.write_submitted_at = cx.now;
             let offset = u64::from(slot.base().offset);
             let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
@@ -418,7 +526,7 @@ impl<F: SegmentFs> DurableCell<F> {
                 offset,
                 data,
                 token: write_token(self.write_seq),
-                fsync_token: fsync,
+                barrier,
             });
         } else if self.commit.standalone_fsync_due() {
             let ticket = self.commit.register_standalone_fsync(cx.now);
@@ -433,7 +541,8 @@ impl<F: SegmentFs> DurableCell<F> {
     /// drain's binding variable) and rebases the linked sync's latency
     /// clock so the fsync histogram measures the sync, not the chain
     /// (M4.5-S27, ADR-0083 D4/D5).
-    pub fn on_log_written(&mut self, now: Nanos) {
+    pub fn on_log_written(&mut self, cx: &mut LoopCx<'_>) {
+        let now = cx.now;
         self.write_stall_hist.record(now.saturating_sub(self.write_submitted_at).as_micros());
         if let Some(ticket) = self.linked_ticket.take() {
             self.commit.rebase_clock(ticket, now);
@@ -442,6 +551,13 @@ impl<F: SegmentFs> DurableCell<F> {
         let lease = self.in_flight.take().expect("LogWritten with no in-flight lease");
         self.staging.release(lease);
         self.drained.wake_all(());
+        // Write-through (ADR-0086 D5): this completion IS the durability
+        // fact — complete the ticket through the same done-prefix path a
+        // `Synced` takes, so acks stay a prefix behind any earlier
+        // FLUSH-class entry.
+        if let Some(ticket) = self.write_through_ticket.take() {
+            self.on_synced(cx, fsync_token(ticket));
+        }
     }
 
     /// One admission park episode began (local pump or fabric pump) —
@@ -462,7 +578,14 @@ impl<F: SegmentFs> DurableCell<F> {
         if inf_foundation::fault::fire(crate::fault::DURABLE_FSYNC_EIO) {
             self.on_log_error(token, EIO);
         }
-        if let Some(end) = self.commit.on_fsync_complete(token_ticket(token), cx.now) {
+        let ticket = token_ticket(token);
+        if self.zero_fill_ticket == Some(ticket) {
+            // The next segment's extent metadata is committed: it is
+            // pre-zeroed and ready (ADR-0086 D4).
+            self.zero_fill_ticket = None;
+            self.rotor.note_zero_fill_synced();
+        }
+        if let Some(end) = self.commit.on_fsync_complete(ticket, cx.now) {
             let watermark = end.to_u64();
             let mut last_covered = None;
             while self.frame_seqs.front().is_some_and(|&(end_lsn, _)| end_lsn <= watermark) {
@@ -493,8 +616,38 @@ impl<F: SegmentFs> DurableCell<F> {
         self.tick_fsyncs_prev = fsyncs;
         self.acks_last_sec = self.acks_gated - self.tick_acks_prev;
         self.tick_acks_prev = self.acks_gated;
+        self.check_barrier_class_tripwire();
         self.commit.note_everysec_tick();
         cx.timers.insert(cx.now + Nanos::from_secs(1), EVERYSEC_TIMER_KEY);
+    }
+
+    /// `barrier_class_degraded` (ADR-0086 D7): the window's mean
+    /// write-through latency against 3× the probed p50, three consecutive
+    /// breaching windows set the flag, one healthy window clears it. The
+    /// histogram is cumulative, so the window is a sum/count delta (the
+    /// mean is the honest per-window statistic available without a
+    /// per-window histogram; it is ≥ the window's p50, so it trips no
+    /// later than a p50 rule would).
+    fn check_barrier_class_tripwire(&mut self) {
+        if self.fua_p50_us_probed == 0 {
+            return;
+        }
+        let hist = self.commit.write_through_latency_hist();
+        let count = hist.count();
+        let sum_us = hist.sum();
+        let window_count = count - self.fua_tick_count_prev;
+        let window_sum = sum_us - self.fua_tick_window_sum_us;
+        self.fua_tick_count_prev = count;
+        self.fua_tick_window_sum_us = sum_us;
+        if window_count == 0 {
+            return;
+        }
+        let mean_us = window_sum / window_count;
+        if mean_us > 3 * self.fua_p50_us_probed {
+            self.fua_degraded_windows = self.fua_degraded_windows.saturating_add(1);
+        } else {
+            self.fua_degraded_windows = 0;
+        }
     }
 
     /// §8.4 fail-stop: a terminal error on the durable path. The watermark
@@ -588,7 +741,7 @@ impl<F: SegmentFs> DurableCell<F> {
                 offset: lease.offset(),
                 data: log_bytes::ckpt_block(&st.stream, lease),
                 token: ckpt_token(TokenClass::CkptWrite, st.write_seq),
-                fsync_token: None,
+                barrier: WriteBarrier::None,
             });
             return 1;
         }
@@ -795,7 +948,7 @@ impl<F: SegmentFs> DurableCell<F> {
                 offset: lease.offset(),
                 data: log_bytes::ckpt_block(stream, &lease),
                 token: ckpt_token(TokenClass::CkptWrite, *write_seq),
-                fsync_token: None,
+                barrier: WriteBarrier::None,
             });
             *in_flight = Some(lease);
         } else if *walk_done && *sidecar_done {
@@ -806,7 +959,7 @@ impl<F: SegmentFs> DurableCell<F> {
                 offset: lease.offset(),
                 data: log_bytes::ckpt_block(stream, &lease),
                 token: ckpt_token(TokenClass::CkptWrite, *write_seq),
-                fsync_token: None,
+                barrier: WriteBarrier::None,
             });
             *in_flight = Some(lease);
             *footer_staged = true;
@@ -991,6 +1144,15 @@ impl<F: SegmentFs> DurableCell<F> {
             log_segments_live: self.rotor.sealed().len() as u64
                 + 1
                 + u64::from(self.rotor.next_ready().is_some()),
+            barrier_class_fua: u64::from(self.rotor.active_write_through()),
+            fsyncs_fua: self.commit.stats().fsyncs_write_through,
+            fua_p50_us: self.commit.write_through_latency_hist().percentile(50.0),
+            fua_p99_us: self.commit.write_through_latency_hist().percentile(99.0),
+            log_padding_bytes: self.staging.stats().padding_bytes,
+            zero_fill_bytes: self.rotor.stats().zero_fill_bytes,
+            rotations_unzeroed: self.rotor.stats().rotations_unzeroed,
+            rotations_upgrade: self.rotor.stats().rotations_upgrade,
+            barrier_class_degraded: u64::from(self.fua_degraded_windows >= 3),
         }
     }
 

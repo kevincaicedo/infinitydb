@@ -44,6 +44,12 @@ struct Args {
     /// Durability fsyncs in flight per cell (M2.5-S07 A/B knob): 1 = the
     /// ADR-0022 D3 discipline, 2 = the bounded two-in-flight pipeline.
     sync_pipeline: u8,
+    /// Log barrier class override (M4.5-S34, ADR-0086 D7): `None` reads
+    /// `<data-dir>/io-properties.toml` (absent ⇒ `flush`, today's path);
+    /// `Some` forces the class — the A/B arm switch. `fua` needs the
+    /// probe file for its `fua_max_frame_bytes`/tripwire reference or
+    /// runs on the defaults (logged).
+    barrier_class: Option<inf_server::SegmentIoMode>,
     /// Per-buffer log-staging capacity in MiB (M4.5-S27, ADR-0083 D3).
     /// The buffer absorbs `arrival_rate × frame-write stall`; the 4 MiB
     /// default is ~8.5 ms at 470 MB/s. With ADR-0083 D1 pacing the bound
@@ -92,6 +98,7 @@ impl Default for Args {
             ckpt_interval_bytes: inf_server::DEFAULT_CKPT_INTERVAL_BYTES,
             segment_bytes: inf_server::DEFAULT_SEGMENT_BYTES,
             sync_pipeline: 1,
+            barrier_class: None,
             log_staging_mib: 4,
             early_fabric_flush: false,
             remote_first_execute: false,
@@ -155,6 +162,13 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--sync-pipeline is 1 or 2, never a queue".into());
                 }
             }
+            "--barrier-class" => {
+                args.barrier_class = Some(match take("--barrier-class")?.as_str() {
+                    "flush" => inf_server::SegmentIoMode::Buffered,
+                    "fua" => inf_server::SegmentIoMode::Direct,
+                    other => return Err(format!("--barrier-class is flush|fua, got {other}")),
+                });
+            }
             "--log-staging-mib" => {
                 args.log_staging_mib = take("--log-staging-mib")?
                     .parse()
@@ -175,7 +189,8 @@ fn parse_args() -> Result<Args, String> {
                     "infinityd [--port 6379] [--cells 4] [--buffers 4096] [--buf-size 4096] \
                      [--pin-start CORE] [--route-local-only] [--data-dir PATH] \
                      [--ckpt-interval-bytes N] [--segment-bytes N] [--sync-pipeline 1|2] \
-                     [--log-staging-mib 4] [--early-fabric-flush] [--remote-first-execute] \
+                     [--barrier-class flush|fua] [--log-staging-mib 4] [--early-fabric-flush] \
+                     [--remote-first-execute] \
                      [--fabric-apply-prefetch|--no-fabric-apply-prefetch] \
                      [--parse-batch-prefetch|--no-parse-batch-prefetch] \
                      [--deasync-dispatch|--no-deasync-dispatch] [--version]"
@@ -258,7 +273,45 @@ fn main() {
             .unwrap_or(0);
         let control =
             inf_server::spawn_control(dir.clone(), catalog.as_ref(), args.cells, boot_unix_ms);
-        (dir, catalog, control)
+        // Barrier class (M4.5-S34, ADR-0086 D7): the probe file decides,
+        // the flag overrides, absence is today's FLUSH class. A malformed
+        // file is a refusal — never a silent fallback to the slow class.
+        let probed = match inf_server::IoProperties::load(&dir) {
+            Ok(probed) => probed,
+            Err(e) => {
+                eprintln!("infinityd: {e} (fail-stop: fix or remove the file)");
+                std::process::exit(1);
+            }
+        };
+        let mut io = probed.unwrap_or_default();
+        let source = match (args.barrier_class, probed.is_some()) {
+            (Some(forced), _) => {
+                io.io_mode = forced;
+                "--barrier-class"
+            }
+            (None, true) => inf_server::IO_PROPERTIES_FILE,
+            (None, false) => "default (no io-properties.toml)",
+        };
+        let class = match io.io_mode {
+            inf_server::SegmentIoMode::Direct => "fua",
+            inf_server::SegmentIoMode::Buffered => "flush",
+        };
+        eprintln!(
+            "infinityd: log barrier class {class} (source: {source}; fua_max_frame_bytes {}; \
+             probed p50 fua {} µs / flush {} µs)",
+            io.fua_max_frame_bytes, io.fua_p50_us_4k, io.flush_p50_us_4k
+        );
+        if args.segment_bytes % inf_server::FRAME_ALIGN != 0
+            && io.io_mode == inf_server::SegmentIoMode::Direct
+        {
+            eprintln!(
+                "infinityd: --segment-bytes {} is not a multiple of {} — required by the fua class",
+                args.segment_bytes,
+                inf_server::FRAME_ALIGN
+            );
+            std::process::exit(1);
+        }
+        (dir, catalog, control, io)
     });
 
     let mut handles = Vec::new();
@@ -320,6 +373,7 @@ type Boot = Option<(
     std::path::PathBuf,
     Option<inf_store::NsCatalog>,
     std::sync::Arc<inf_server::ControlHandle>,
+    inf_server::IoProperties,
 )>;
 
 fn cell_main(
@@ -335,7 +389,7 @@ fn cell_main(
     // setup step below publishes its phase so a kernel-side stall names
     // itself on the RecoveryBoard instead of wedging silently.
     let mark = |code: u8| {
-        if let Some((_, _, control)) = &boot {
+        if let Some((_, _, control, _)) = &boot {
             control.recovery_board().slot(cell).publish_phase(code);
         }
     };
@@ -385,7 +439,7 @@ fn cell_main(
     mark(14); // setup:keyspace
     let mut ks = Keyspace::new(StoreConfig::default());
     let mut durable = None;
-    if let Some((dir, catalog, control)) = &boot {
+    if let Some((dir, catalog, control, io)) = &boot {
         if let Some(catalog) = catalog {
             ks.seed_catalog(catalog).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
         }
@@ -394,6 +448,8 @@ fn cell_main(
             staging: inf_server::StagingConfig { capacity_bytes: args.log_staging_mib << 20 },
             segment: inf_server::SegmentConfig {
                 segment_bytes: args.segment_bytes,
+                io_mode: io.io_mode,
+                fua_max_frame_bytes: io.fua_max_frame_bytes,
                 ..Default::default()
             },
             ckpt: inf_server::CkptConfig {
@@ -402,6 +458,7 @@ fn cell_main(
             },
             recover: inf_server::RecoverConfig::default(),
             sync_pipeline: args.sync_pipeline,
+            fua_p50_us_probed: io.fua_p50_us_4k,
         };
         durable = Some((cfg, std::sync::Arc::clone(control)));
     }

@@ -1,0 +1,18 @@
+=== fua-1c-seg16m-r1 (class=fua cells=1 seg=16777216) ===
+throughput_ops_s=37915 p50_ms=0.762 p99_ms=1.894 max_ms=31.165 
+log_write_stall_p99_us:911  fsync_latency_p99_us:1375  fsync_latency_p999_us:3455  fsyncs_linked:0  fsyncs_seal:28  fsyncs_completion:0  fua_latency_p99_us:911  ckpts_completed:1  segments_truncated:18  log_segments_live:12  
+=== fua-1c-seg256m-r1 (class=fua cells=1 seg=268435456) ===
+throughput_ops_s=38961 p50_ms=0.722 p99_ms=1.656 max_ms=30.477 
+log_write_stall_p99_us:815  fsync_latency_p99_us:831  fsync_latency_p999_us:3071  fsyncs_linked:0  fsyncs_seal:2  fsyncs_completion:0  fua_latency_p99_us:815  ckpts_completed:1  segments_truncated:2  log_segments_live:2  
+=== fua-1c-seg1g-r1 (class=fua cells=1 seg=1073741824) ===
+throughput_ops_s=14365 p50_ms=0.758 p99_ms=25.624 max_ms=229.007 
+log_write_stall_p99_us:22015  fsync_latency_p99_us:22015  fsync_latency_p999_us:39935  fsyncs_linked:6  fsyncs_seal:1  fsyncs_completion:0  fua_latency_p99_us:22015  ckpts_completed:1  segments_truncated:1  log_segments_live:2  
+=== fua-1c-seg16m-r2 (class=fua cells=1 seg=16777216) ===
+throughput_ops_s=38643 p50_ms=0.733 p99_ms=1.867 max_ms=24.418 
+log_write_stall_p99_us:863  fsync_latency_p99_us:1343  fsync_latency_p999_us:3519  fsyncs_linked:0  fsyncs_seal:28  fsyncs_completion:0  fua_latency_p99_us:863  ckpts_completed:1  segments_truncated:18  log_segments_live:12  
+=== fua-1c-seg256m-r2 (class=fua cells=1 seg=268435456) ===
+throughput_ops_s=38114 p50_ms=0.758 p99_ms=1.585 max_ms=34.208 
+log_write_stall_p99_us:815  fsync_latency_p99_us:815  fsync_latency_p999_us:2239  fsyncs_linked:0  fsyncs_seal:2  fsyncs_completion:0  fua_latency_p99_us:815  ckpts_completed:1  segments_truncated:2  log_segments_live:2  
+=== fua-1c-seg1g-r2 (class=fua cells=1 seg=1073741824) ===
+throughput_ops_s=30002 p50_ms=0.757 p99_ms=12.233 max_ms=154.767 
+log_write_stall_p99_us:1503  fsync_latency_p99_us:1983  fsync_latency_p999_us:17919  fsyncs_linked:1  fsyncs_seal:1  fsyncs_completion:0  fua_latency_p99_us:831  ckpts_completed:1  segments_truncated:1  log_segments_live:2  

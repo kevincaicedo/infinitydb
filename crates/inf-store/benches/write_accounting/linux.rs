@@ -188,7 +188,7 @@ fn workload(dir: &Path, user_mib: u64, leg: Leg) -> Run {
     let mut rotor = SegmentRotor::create_fresh(
         StdSegmentFs,
         dirs.log.clone(),
-        SegmentConfig { segment_bytes: SEGMENT_BYTES, seal_after_ms: None },
+        SegmentConfig { segment_bytes: SEGMENT_BYTES, ..Default::default() },
     )
     .expect("fresh log");
     let mut ring = StagingRing::new(StagingConfig::default());

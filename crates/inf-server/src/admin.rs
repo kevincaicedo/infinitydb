@@ -289,6 +289,22 @@ pub(crate) fn info(
         push(&mut text, &format!("fsyncs_seal:{}", node.fsyncs_seal.get()));
         push(&mut text, &format!("fsyncs_standalone:{}", node.fsyncs_standalone.get()));
         push(&mut text, &format!("fsyncs_completion:{}", node.fsyncs_completion.get()));
+        // M4.5-S34 (ADR-0086): the barrier class the active segment runs
+        // (fua = write-through frames, flush = linked fdatasync), the
+        // write-through latency the `always` client actually waits on,
+        // the direct class's two write-amplification disclosures, and the
+        // tripwire that says the device is not delivering the class it
+        // was probed for (never an automatic flip — the operator decides).
+        let class = if node.barrier_class_fua.get() == 1 { "fua" } else { "flush" };
+        push(&mut text, &format!("barrier_class:{class}"));
+        push(&mut text, &format!("fsyncs_fua:{}", node.fsyncs_fua.get()));
+        push(&mut text, &format!("fua_latency_p50_us:{}", node.fua_p50_us.get()));
+        push(&mut text, &format!("fua_latency_p99_us:{}", node.fua_p99_us.get()));
+        push(&mut text, &format!("log_padding_bytes:{}", node.log_padding_bytes.get()));
+        push(&mut text, &format!("zero_fill_bytes:{}", node.zero_fill_bytes.get()));
+        push(&mut text, &format!("rotations_unzeroed:{}", node.rotations_unzeroed.get()));
+        push(&mut text, &format!("rotations_upgrade:{}", node.rotations_upgrade.get()));
+        push(&mut text, &format!("barrier_class_degraded:{}", node.barrier_class_degraded.get()));
         // Fuzzy-checkpoint gauges (M2-S10; `ckpt_age_s` derives at S21).
         push(&mut text, &format!("ckpts_completed:{}", node.ckpts_completed.get()));
         push(&mut text, &format!("ckpts_aborted:{}", node.ckpts_aborted.get()));

@@ -342,6 +342,9 @@ dependencies = [
 [[package]]
 name = "inf"
 version = "0.0.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "inf-alloc"

@@ -35,8 +35,8 @@ use inf_log::ckpt::{IckReaderConfig, ick_file_name, read_ick};
 use inf_log::{ReaderConfig, SegmentId, SegmentReader, read_manifest, scan_log_dir_from};
 use inf_runtime::{CellLoop, LoopConfig};
 use inf_server::{
-    ControlInbox, ExecOrigin, NodeInfo, PlaneObserver, ServerPlane, SimDisk, SimDiskConfig,
-    StallConfig, load_catalog_from,
+    ControlInbox, ExecOrigin, NodeInfo, PlaneObserver, SegmentIoMode, ServerPlane, SimDisk,
+    SimDiskConfig, StallConfig, load_catalog_from,
 };
 use inf_store::{Keyspace, NsId, StoreConfig, WallAnchor};
 
@@ -106,6 +106,12 @@ pub struct DurableScenario {
     /// replay skips the first `DocDelta` it sees — the planted bug the
     /// fleet must catch within 100 seeds.
     pub replay_canary: bool,
+    /// Log-segment I/O mode (M4.5-S34, ADR-0086 D8): `Direct` runs the
+    /// zero-fill state machine, v3 frames, write-through barriers, and
+    /// the class-upgrade/not-ready rotations on the sim disk; `Buffered`
+    /// is the pre-S34 scenario byte-for-byte. `m2_durable` alternates by
+    /// seed so every sweep covers both classes.
+    pub io_mode: SegmentIoMode,
 }
 
 /// The S14 reference stall device: ~120 µs base (warm NVMe fdatasync),
@@ -120,6 +126,10 @@ pub(crate) fn m2_stall_config() -> StallConfig {
         episode_gap_ns: 1_500_000_000,
         episode_ms_min: 50,
         episode_ms_max: 90,
+        // ~3× cheaper than the fsync base: the probed FUA/FLUSH ratio on
+        // the reference device (ADR-0086 D8); scenarios without `Direct`
+        // segments never draw it.
+        through_base_ns: 40_000,
     }
 }
 
@@ -157,6 +167,10 @@ impl DurableScenario {
             ckpt_stream_bytes_per_sec: None,
             stall: Some(m2_stall_config()),
             replay_canary: false,
+            // Odd seeds run the FUA class (ADR-0086 D8): half of every
+            // sweep exercises mixed write-through/FLUSH frames, zero-fill
+            // barriers, and seal × write-through crossings under cuts.
+            io_mode: if seed % 2 == 1 { SegmentIoMode::Direct } else { SegmentIoMode::Buffered },
         }
     }
 
@@ -190,6 +204,7 @@ impl DurableScenario {
             ckpt_stream_bytes_per_sec: None,
             stall: Some(m2_stall_config()),
             replay_canary: false,
+            io_mode: SegmentIoMode::Buffered,
         }
     }
 }
@@ -524,7 +539,8 @@ pub(crate) fn boot(
             staging: inf_server::StagingConfig::default(),
             segment: inf_server::SegmentConfig {
                 segment_bytes: scenario.segment_bytes,
-                seal_after_ms: None,
+                io_mode: scenario.io_mode,
+                ..Default::default()
             },
             ckpt: inf_server::CkptConfig {
                 interval_bytes: scenario.ckpt_interval_bytes,
@@ -535,6 +551,7 @@ pub(crate) fn boot(
             },
             recover: Default::default(),
             sync_pipeline: 1,
+            fua_p50_us_probed: 0,
         };
         plane.set_control(std::sync::Arc::clone(&control));
         plane.begin_recovery(disk.clone(), &cfg, i as u16, clock.now());

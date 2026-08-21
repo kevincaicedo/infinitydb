@@ -3,6 +3,7 @@
 //! is fatal, and the whole lifecycle behaves identically over the real
 //! filesystem (StdSegmentFs smoke) and the deterministic in-memory tier.
 
+use inf_log::FrameLayout;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, StdSegmentFs};
 use inf_log::{
@@ -21,7 +22,7 @@ fn stamp(seq: u64) -> FrameStamp {
 }
 
 fn cfg() -> SegmentConfig {
-    SegmentConfig { segment_bytes: SEGMENT_BYTES, seal_after_ms: None }
+    SegmentConfig { segment_bytes: SEGMENT_BYTES, ..Default::default() }
 }
 
 fn mem_rotor(fs: &MemFs) -> SegmentRotor<MemFs> {
@@ -36,7 +37,7 @@ fn append_frame(rotor: &mut SegmentRotor<MemFs>, filler: usize, now_ms: u64) -> 
     builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: &value });
     let slot = rotor.begin_frame(builder.frame_len(), now_ms).expect("reserve");
     let first_record_lsn = slot.first_record_lsn();
-    let frame = builder.finalize(first_record_lsn, stamp(1));
+    let frame = builder.finalize(first_record_lsn, stamp(1), FrameLayout::Packed);
     rotor.commit_frame(slot, frame).expect("commit")
 }
 
@@ -117,7 +118,7 @@ fn enospc_surfaces_in_maintain_before_writes_need_it() {
         match rotor.begin_frame(builder.frame_len(), 0) {
             Ok(slot) => {
                 let lsn = slot.first_record_lsn();
-                let bytes = builder.finalize(lsn, stamp(1));
+                let bytes = builder.finalize(lsn, stamp(1), FrameLayout::Packed);
                 rotor.commit_frame(slot, bytes).expect("commit within active");
             }
             Err(err) => break err,
@@ -159,7 +160,11 @@ fn fsync_failure_on_seal_is_fatal() {
 fn time_seal_fires_only_when_configured_and_dirty() {
     let fs = MemFs::new();
     let dirs = create_cell_dirs(&fs, &PathBuf::from("data/shard-0")).expect("dirs");
-    let config = SegmentConfig { segment_bytes: SEGMENT_BYTES, seal_after_ms: Some(1_000) };
+    let config = SegmentConfig {
+        segment_bytes: SEGMENT_BYTES,
+        seal_after_ms: Some(1_000),
+        ..Default::default()
+    };
     let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, config).expect("rotor");
 
     // Empty active segment never time-seals.
@@ -188,14 +193,14 @@ fn std_fs_lifecycle_smoke() {
     let fs = StdSegmentFs;
     let dirs = create_cell_dirs(&fs, &shard).expect("dirs");
 
-    let config = SegmentConfig { segment_bytes: 8192, seal_after_ms: None };
+    let config = SegmentConfig { segment_bytes: 8192, ..Default::default() };
     let mut rotor = SegmentRotor::create_fresh(fs, dirs.log.clone(), config).expect("fresh rotor");
     let mut builder = FrameBuilder::new();
     builder.append(&RecordView::StringPostImage { ns: NsId(0), key: b"boot", value: b"one" });
     let slot = rotor.begin_frame(builder.frame_len(), 0).expect("reserve");
     let lsn = slot.first_record_lsn();
     let first_end = {
-        let frame = builder.finalize(lsn, stamp(1));
+        let frame = builder.finalize(lsn, stamp(1), FrameLayout::Packed);
         let base = rotor.commit_frame(slot, frame).expect("commit");
         assert_eq!(base, Lsn::new(SegmentId(0), 0));
         rotor.active_written()
@@ -212,7 +217,7 @@ fn std_fs_lifecycle_smoke() {
     let slot = rotor.begin_frame(builder.frame_len(), 0).expect("reserve");
     let lsn = slot.first_record_lsn();
     assert_eq!(lsn, Lsn::new(SegmentId(0), first_end + FRAME_HEADER_LEN as u32));
-    let frame = builder.finalize(lsn, stamp(2));
+    let frame = builder.finalize(lsn, stamp(2), FrameLayout::Packed);
     rotor.commit_frame(slot, frame).expect("commit");
 
     // Replay the segment: exactly the two frames, in order.

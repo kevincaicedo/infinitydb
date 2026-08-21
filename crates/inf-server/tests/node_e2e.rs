@@ -87,17 +87,50 @@ impl Node {
     /// Node with the M2.5 Phase-H fabric-apply prefetch enabled (the A/B
     /// lever's on-arm correctness surface).
     fn start_with_apply_prefetch(cells: u16) -> Node {
-        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), true, false, false, None)
+        Node::start_cfg(
+            cells,
+            None,
+            0,
+            Default::default(),
+            Vec::new(),
+            true,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+        )
     }
 
     fn start_with_parse_prefetch(cells: u16) -> Node {
-        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, true, false, None)
+        Node::start_cfg(
+            cells,
+            None,
+            0,
+            Default::default(),
+            Vec::new(),
+            false,
+            true,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+        )
     }
 
     /// Node with the M2.5 Phase-H de-async dispatch enabled (ADR-0030 D4
     /// lever): the pump's sync fast path on-arm correctness surface.
     fn start_with_deasync(cells: u16) -> Node {
-        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, false, true, None)
+        Node::start_cfg(
+            cells,
+            None,
+            0,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            true,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+        )
     }
 
     fn start_full(
@@ -117,6 +150,7 @@ impl Node {
             false,
             false,
             None,
+            inf_log::SegmentIoMode::Buffered,
         )
     }
 
@@ -124,6 +158,24 @@ impl Node {
     /// the pressure-regime injector (ADR-0083 D3): headroom below one
     /// pipelined burst makes admission pressure deterministic on any
     /// device, no degraded drive required.
+    /// M4.5-S34 (ADR-0086): a durable node whose log segments are
+    /// `Direct` — v3 frames, driver zero-fill, write-through `always`
+    /// frames once pre-zeroed. Real `O_DIRECT` on the test directory.
+    fn start_durable_direct(cells: u16, data_dir: &std::path::Path) -> Node {
+        Node::start_cfg(
+            cells,
+            Some(data_dir.to_path_buf()),
+            0,
+            inf_server::RecoverConfig::default(),
+            Vec::new(),
+            true,
+            true,
+            false,
+            None,
+            inf_log::SegmentIoMode::Direct,
+        )
+    }
+
     fn start_durable_small_staging(
         cells: u16,
         data_dir: &std::path::Path,
@@ -139,6 +191,7 @@ impl Node {
             false,
             false,
             Some(staging_bytes),
+            inf_log::SegmentIoMode::Buffered,
         )
     }
 
@@ -154,6 +207,7 @@ impl Node {
         parse_prefetch: bool,
         deasync_dispatch: bool,
         staging_bytes: Option<u32>,
+        io_mode: inf_log::SegmentIoMode,
     ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
         // Bind cell 0 first on an ephemeral port, then the rest join it.
@@ -211,6 +265,7 @@ impl Node {
                             .unwrap_or_default(),
                         segment: inf_log::SegmentConfig {
                             segment_bytes: 8 << 20, // small: tests rotate
+                            io_mode,
                             ..Default::default()
                         },
                         // 0 = automatic trigger off: e2e checkpoints fire
@@ -221,6 +276,7 @@ impl Node {
                         },
                         recover,
                         sync_pipeline: 1,
+                        fua_p50_us_probed: 0,
                     };
                     durable = Some((cfg, Arc::clone(control)));
                 }
@@ -2750,4 +2806,88 @@ fn json_mget_gathers_across_cells() {
     client.write_all(&cmd(&[b"MGET", &k0, &k1])).expect("write");
     let line = read_line(&mut client);
     assert!(line.starts_with(b"-ERR multi-key commands"), "refusal stays: {line:?}");
+}
+
+// ---- M4.5-S34: FUA-class frames on pre-zeroed O_DIRECT segments (ADR-0086) ----
+
+/// On a `Direct` node (real `O_DIRECT` + `RWF_DSYNC` through io_uring) a
+/// fresh cell starts FLUSH-class, MAINTAIN pre-zeroes the next segment,
+/// the class-upgrade rotation flips it to `fua`, and from then on every
+/// `always` write rides a write-through frame (`fsyncs_fua` climbs while
+/// `fsyncs_linked` stops). Every acked write replays after a restart — the
+/// reopened tail reads its pre-zeroed fact from the file — and padding
+/// and zero-fill amplification are disclosed, never zero.
+#[test]
+fn direct_segments_converge_to_fua_and_survive_restart() {
+    let dir = temp_data_dir("s34-direct");
+    let node = Node::start_durable_direct(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"fua", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"fua"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+
+    // Segment 0 is sparse (FLUSH class); the 8 MiB next segment zero-fills
+    // in eight 1 MiB driver slices plus a barrier — wait for the upgrade
+    // rotation by writing until INFO reports the class.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut writes = 0u32;
+    loop {
+        writes += 1;
+        let key = format!("k:{writes}");
+        c.write_all(&cmd(&[b"SET", key.as_bytes(), b"v"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let info = info_persistence(&mut c);
+        let class = info
+            .lines()
+            .find_map(|l| l.strip_prefix("barrier_class:"))
+            .unwrap_or_else(|| panic!("barrier_class missing:\n{info}"));
+        if class == "fua" {
+            assert!(info_field(&info, "rotations_upgrade") >= 1, "{info}");
+            assert!(info_field(&info, "zero_fill_bytes") >= 8 << 20, "{info}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "never upgraded to fua after {writes} writes:\n{info}");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Now every always write is a write-through frame: the FUA counter
+    // climbs and the linked-fsync counter freezes.
+    let before = info_persistence(&mut c);
+    let linked_before = info_field(&before, "fsyncs_linked");
+    let fua_before = info_field(&before, "fsyncs_fua");
+    for i in 0..64u32 {
+        let key = format!("w:{i}");
+        c.write_all(&cmd(&[b"SET", key.as_bytes(), b"through"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    let after = info_persistence(&mut c);
+    assert_eq!(info_field(&after, "fsyncs_linked"), linked_before, "no FLUSH after the upgrade");
+    assert!(info_field(&after, "fsyncs_fua") >= fua_before + 64, "{after}");
+    assert!(info_field(&after, "fua_latency_p50_us") > 0, "{after}");
+    assert!(info_field(&after, "log_padding_bytes") > 0, "v3 padding is disclosed");
+    assert_eq!(info_field(&after, "barrier_class_degraded"), 0);
+    drop(c);
+    node.stop();
+
+    // Restart: the tail reopens Direct and pre-zeroed; every acked write
+    // is back; new writes are write-through from the first frame.
+    let node = Node::start_durable_direct(1, &dir);
+    let mut c = connect_use(&node, b"fua");
+    for i in 0..64u32 {
+        let key = format!("w:{i}");
+        c.write_all(&cmd(&[b"GET", key.as_bytes()])).expect("write");
+        read_exactly(&mut c, b"$7\r\nthrough\r\n");
+    }
+    c.write_all(&cmd(&[b"GET", b"k:1"])).expect("write");
+    read_exactly(&mut c, b"$1\r\nv\r\n");
+    c.write_all(&cmd(&[b"SET", b"after", b"restart"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let info = info_persistence(&mut c);
+    assert!(info.contains("barrier_class:fua"), "reopened tail is pre-zeroed:\n{info}");
+    assert!(info_field(&info, "fsyncs_fua") >= 1, "{info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
 }

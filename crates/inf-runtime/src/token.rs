@@ -46,6 +46,12 @@ pub enum TokenClass {
     /// ledger — flush watermarks advance at this completion, acks never
     /// wait on it (ADR-0022 D3 untouched).
     TierFlushSync = 12,
+    /// Zero-fill write on a preallocated next log segment (M4.5-S34,
+    /// ADR-0086 D4 — routing-only: the op is an ordinary `LogWrite` with
+    /// no barrier). A separate class from `LogWrite` because its
+    /// completion advances the rotor's zero cursor, never the staging
+    /// frame lease's custody.
+    ZeroFillWrite = 13,
 }
 
 impl TokenClass {
@@ -64,6 +70,7 @@ impl TokenClass {
             10 => Some(TokenClass::TierRead),
             11 => Some(TokenClass::TierFlushWrite),
             12 => Some(TokenClass::TierFlushSync),
+            13 => Some(TokenClass::ZeroFillWrite),
             _ => None,
         }
     }
@@ -143,6 +150,7 @@ mod tests {
             TokenClass::TierRead,
             TokenClass::TierFlushWrite,
             TokenClass::TierFlushSync,
+            TokenClass::ZeroFillWrite,
         ] {
             for (slot, generation) in
                 [(0, 0), (1, u32::MAX), (MAX_SLOT, 7u32), (0xAB_CDEF, 0xDEAD_BEEF)]

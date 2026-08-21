@@ -1,0 +1,31 @@
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling inf-sim v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/inf-sim)
+    Finished `release` profile [optimized + debuginfo] target(s) in 38.78s
+refused boot 2: log corruption in seg-000028 at 0x0: sealed slack holds real log data — a dropped-write gap or torn remnants precede it; a validating frame follows at seg-000028 offset 0x2000 — interior data would be lost by truncation, refusing to start (§8.4)
+inf-sim: m2-durable sweep shard 0/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes []
+inf-sim: sim_seconds=4704.272132 published=0 delivered=0
+inf-sim: m2-durable sweep shard 6/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes []
+inf-sim: sim_seconds=4790.183339 published=0 delivered=0
+inf-sim: m2-durable sweep shard 2/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes []
+inf-sim: sim_seconds=4805.132660 published=0 delivered=0
+inf-sim: m2-durable sweep shard 4/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes []
+inf-sim: sim_seconds=4770.349982 published=0 delivered=0
+inf-sim: m2-durable sweep shard 7/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes []
+inf-sim: sim_seconds=4810.043547 published=0 delivered=0
+inf-sim: m2-durable sweep shard 1/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes []
+inf-sim: sim_seconds=4797.144090 published=0 delivered=0
+inf-sim: m2-durable sweep shard 5/8: 1250 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes []
+inf-sim: sim_seconds=4990.707789 published=0 delivered=0
+inf-sim: m2-durable sweep shard 3/8: 1250 seeds, 0 violations, 1 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes []
+inf-sim: sim_seconds=5002.795345 published=0 delivered=0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=0/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[]
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=1/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[]
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=2/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[]
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=3/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=1 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[]
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=4/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[]
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=5/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[]
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=6/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[]
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=7/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[]
+exit=0

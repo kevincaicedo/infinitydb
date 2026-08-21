@@ -8,3 +8,8 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# `probe-device` (M4.5-S34, ADR-0086 D7): the `O_DIRECT`/`O_DSYNC` open
+# flags only — constants, no FFI; the crate stays `#![forbid(unsafe_code)]`.
+libc.workspace = true

@@ -46,10 +46,11 @@ fn cfg() -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
         staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 8 << 10, seal_after_ms: None },
+        segment: SegmentConfig { segment_bytes: 8 << 10, ..Default::default() },
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         sync_pipeline: 1,
+        fua_p50_us_probed: 0,
     }
 }
 
@@ -96,7 +97,7 @@ fn build_and_cut(disk: &SimDisk, seed: u64) -> Lsn {
                 // attests the watermark — here, the last explicit
                 // fdatasync's coverage.
                 let slot = rotor.begin_frame(ring.pending_frame_len(), 0).expect("reserve");
-                let lease = ring.seal(slot.first_record_lsn(), synced_end.to_u64());
+                let lease = ring.seal(slot.first_record_lsn(), synced_end.to_u64(), slot.layout());
                 let frame = ring.leased_frame(&lease).to_vec();
                 rotor.commit_frame(slot, &frame).expect("commit");
                 ring.release(lease);

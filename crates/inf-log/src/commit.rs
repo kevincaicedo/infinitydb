@@ -43,9 +43,32 @@
 //! submission-ordered with monotone coverage, and the watermark advances to
 //! the covers value of the longest **done prefix**.
 //!
+//! **Write-through frames** (M4.5-S34, ADR-0086 D5): on a pre-zeroed
+//! `O_DIRECT` segment an `always`-due frame is written `RWF_DSYNC` and is
+//! durable at its own `LogWritten`. The plane registers a
+//! [`SyncReason::WriteThrough`] ticket at seal and completes it from the
+//! write's completion — the same ledger, the same done-prefix rule, so a
+//! FUA frame completing ahead of an earlier FLUSH-class entry advances
+//! nothing until that entry lands. Write-through tickets do **not** count
+//! toward the sync-pipeline bound (ADR-0022 D3 re-scoped): they never
+//! queue on the device's flush unit, and the one-frame staging lease
+//! already bounds them at one per cell.
+//!
+//! **The prefix rule (load-bearing).** A FUA write persists *its own
+//! bytes*; an fdatasync persists the whole file. A write-through ticket
+//! may therefore claim coverage up to its frame's end **only if the frame
+//! extends the durable prefix** — every byte below its base is already
+//! durable or covered by a pending FLUSH-class entry ahead of it in the
+//! ledger. An `everysec`-only frame written with no barrier breaks that
+//! prefix; the next `always`-due frame then takes the linked fdatasync,
+//! which covers the gap. Found by the m2-durable sweep on the first
+//! `Direct` run (seed 0xd5ee00a7: an acked DEL replayed as its
+//! predecessor because the plain frame before it was lost to the cut).
+//!
 //! The pending set is bounded by construction: at most one write (and so
-//! one linked sync) is in flight, standalone syncs dedupe against the
-//! ledger tail, and seal syncs arrive at segment cadence.
+//! one linked sync or write-through ticket) is in flight, standalone syncs
+//! dedupe against the ledger tail, and seal/zero-fill syncs arrive at
+//! segment cadence.
 
 use core::fmt;
 use std::collections::VecDeque;
@@ -101,6 +124,14 @@ pub enum SyncReason {
     /// fsync — the done-prefix watermark rule then fences the ack
     /// mechanically; `on_fsync_error`'s freeze covers the failure half.
     ExtentSeal,
+    /// A write-through (FUA-class) frame (M4.5-S34, ADR-0086 D5): the
+    /// frame's own `RWF_DSYNC` write is the barrier; the ticket completes
+    /// at `LogWritten`. Does not occupy a sync-pipeline slot.
+    WriteThrough,
+    /// Zero-fill barrier (ADR-0086 D4): the fdatasync that commits a
+    /// pre-zeroed next segment's extent metadata before any frame lands
+    /// in it. Coverage-neutral like the prealloc dir barrier.
+    ZeroFill,
 }
 
 /// Ledger key for one submitted fsync. The plane maps tickets onto
@@ -139,6 +170,11 @@ pub struct CommitStats {
     pub fsyncs_boot_barrier: u64,
     /// Deferred-prealloc dir barriers (M2.5-S01).
     pub fsyncs_prealloc_barrier: u64,
+    /// Write-through (FUA-class) frame tickets (M4.5-S34, ADR-0086 D5) —
+    /// the `fsyncs_fua` observable.
+    pub fsyncs_write_through: u64,
+    /// Zero-fill barriers (ADR-0086 D4) — one per pre-zeroed segment.
+    pub fsyncs_zero_fill: u64,
     pub fsyncs_completed: u64,
     /// everysec ticks that found nothing dirty (proves idle ticks are free).
     pub idle_ticks: u64,
@@ -193,13 +229,20 @@ pub struct GroupCommit<File> {
     sync_pipeline_bound: usize,
     queued_up_to: Option<Lsn>,
     queued_bytes: u64,
+    /// `queued_bytes` before the last `note_frame_queued` — the last
+    /// frame's base in ledger-byte space, the prefix rule's input.
+    last_frame_base_bytes: u64,
     written_up_to: Option<Lsn>,
     written_bytes: u64,
     durable_up_to: Option<Lsn>,
     durable_bytes: u64,
     pending: VecDeque<PendingFsync<File>>,
     next_ticket: u64,
+    /// Every durability barrier's latency (all classes) — `fsync_latency_*`.
     fsync_hist_us: LogHistogram,
+    /// Write-through frames only (ADR-0086 D5/D7) — `fua_latency_*`, the
+    /// `barrier_class_degraded` tripwire's input.
+    write_through_hist_us: LogHistogram,
     stats: CommitStats,
 }
 
@@ -245,6 +288,7 @@ impl<File: SegmentFile> GroupCommit<File> {
             sync_pipeline_bound: bound,
             queued_up_to: None,
             queued_bytes: 0,
+            last_frame_base_bytes: 0,
             written_up_to: None,
             written_bytes: 0,
             durable_up_to: None,
@@ -252,6 +296,7 @@ impl<File: SegmentFile> GroupCommit<File> {
             pending: VecDeque::new(),
             next_ticket: 0,
             fsync_hist_us: LogHistogram::new(),
+            write_through_hist_us: LogHistogram::new(),
             stats: CommitStats::default(),
         }
     }
@@ -282,22 +327,40 @@ impl<File: SegmentFile> GroupCommit<File> {
 
     // ---- LOG-step decisions ------------------------------------------------
 
-    /// Registered fsyncs not yet completed. While the pipeline is full,
-    /// new dues accumulate instead of issuing — **group commit is a
-    /// bounded number of durability fsyncs in flight per cell** (§8.2:
+    /// Registered FLUSH-class fsyncs not yet completed. While the pipeline
+    /// is full, new dues accumulate instead of issuing — **group commit is
+    /// a bounded number of durability fsyncs in flight per cell** (§8.2:
     /// batch = what arrives during the sync window; the S22 campaign
     /// measured the per-iteration-fsync shape at ratio 16.7 / 106k w/s on
     /// a 5 ms-fsync device vs ratio ≥ 500 expected — the batch=1.0
     /// disease expressed at the device tier; ADR-0022 D3 fixed the bound
-    /// at 1, M2.5-S07 evaluates 2).
+    /// at 1, M2.5-S07 evaluates 2). Write-through tickets are excluded
+    /// (ADR-0086 D5): they never queue on the flush unit.
     fn syncs_in_flight(&self) -> usize {
-        self.pending.iter().filter(|p| !p.done && !p.failed).count()
+        self.pending
+            .iter()
+            .filter(|p| !p.done && !p.failed && p.reason != SyncReason::WriteThrough)
+            .count()
     }
 
-    /// Should this iteration's frame write chain an fdatasync?
+    /// Should this iteration's frame write chain an fdatasync (the
+    /// FLUSH-class barrier, bounded by the sync pipeline)?
     #[must_use]
     pub fn frame_fsync_due(&self) -> bool {
         self.sync_due && self.syncs_in_flight() < self.sync_pipeline_bound
+    }
+
+    /// Should the frame just queued be written write-through (ADR-0086
+    /// D5)? Unbounded by the sync pipeline — the one-frame staging lease
+    /// is the bound; the caller has already established the segment is
+    /// pre-zeroed `O_DIRECT` and the frame is inside `fua_max_frame_bytes`.
+    /// **The prefix rule:** true only when every byte below the frame's
+    /// base is durable or covered by a pending FLUSH-class entry — a FUA
+    /// write covers itself, never the un-barriered frames before it. Call
+    /// after `note_frame_queued`.
+    #[must_use]
+    pub fn write_through_due(&self) -> bool {
+        self.sync_due && self.coverage_tail().1 == self.last_frame_base_bytes
     }
 
     /// Is a standalone fdatasync due (sync owed, pipeline slot free, no
@@ -392,15 +455,7 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// log-data coverage), so it fences later acks by ledger order
     /// without ever advancing the watermark past real data syncs.
     pub fn register_prealloc_barrier(&mut self, dir: File, now: Nanos) -> FsyncTicket {
-        let (covers_up_to, covers_bytes) = self.pending.back().map_or_else(
-            || {
-                (
-                    self.durable_up_to.unwrap_or(Lsn::new(crate::lsn::SegmentId(0), 0)),
-                    self.durable_bytes,
-                )
-            },
-            |tail| (tail.covers_up_to, tail.covers_bytes),
-        );
+        let (covers_up_to, covers_bytes) = self.coverage_tail();
         self.stats.fsyncs_prealloc_barrier += 1;
         self.push_pending(
             covers_up_to,
@@ -418,15 +473,7 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// the referencing ack behind extent durability. The handle stays
     /// held until the `Synced` completion.
     pub fn register_extent_barrier(&mut self, extent: File, now: Nanos) -> FsyncTicket {
-        let (covers_up_to, covers_bytes) = self.pending.back().map_or_else(
-            || {
-                (
-                    self.durable_up_to.unwrap_or(Lsn::new(crate::lsn::SegmentId(0), 0)),
-                    self.durable_bytes,
-                )
-            },
-            |tail| (tail.covers_up_to, tail.covers_bytes),
-        );
+        let (covers_up_to, covers_bytes) = self.coverage_tail();
         self.push_pending(
             covers_up_to,
             covers_bytes,
@@ -436,13 +483,41 @@ impl<File: SegmentFile> GroupCommit<File> {
         )
     }
 
+    /// Register one zero-fill barrier (ADR-0086 D4): the fdatasync on a
+    /// pre-zeroed next segment's fd that commits its extent metadata.
+    /// **Coverage-neutral** like the prealloc dir barrier — it enters at
+    /// the current coverage tail and can never advance the watermark past
+    /// a real data sync. The rotor keeps the fd open (the segment becomes
+    /// active later), so nothing is held here.
+    pub fn register_zero_fill_barrier(&mut self, now: Nanos) -> FsyncTicket {
+        let (covers_up_to, covers_bytes) = self.coverage_tail();
+        self.stats.fsyncs_zero_fill += 1;
+        self.push_pending(covers_up_to, covers_bytes, now, SyncReason::ZeroFill, HeldHandle::None)
+    }
+
+    /// The ledger's current coverage tail — what a coverage-neutral
+    /// barrier registers at.
+    fn coverage_tail(&self) -> (Lsn, u64) {
+        self.pending.back().map_or_else(
+            || {
+                (
+                    self.durable_up_to.unwrap_or(Lsn::new(crate::lsn::SegmentId(0), 0)),
+                    self.durable_bytes,
+                )
+            },
+            |tail| (tail.covers_up_to, tail.covers_bytes),
+        )
+    }
+
     /// This iteration's frame was handed to the driver (`LogWrite` at the
-    /// slot's base). `end` is the frame's exclusive end LSN.
+    /// slot's base). `end` is the frame's exclusive end LSN (the
+    /// successor's base — padding included on aligned segments).
     pub fn note_frame_queued(&mut self, end: Lsn, frame_len: u32) {
         // Release assert (M2.5-S13): out-of-order queue breaks the LSN↔seq
         // FIFO the ack gate and reader rely on. Per-batch, free.
         assert!(self.queued_up_to.is_none_or(|q| q < end), "frames queue in append order");
         self.queued_up_to = Some(end);
+        self.last_frame_base_bytes = self.queued_bytes;
         self.queued_bytes += u64::from(frame_len);
         self.stats.frames_queued += 1;
         self.stats.frame_bytes_queued += u64::from(frame_len);
@@ -477,6 +552,37 @@ impl<File: SegmentFile> GroupCommit<File> {
             self.queued_bytes,
             now,
             SyncReason::Linked,
+            HeldHandle::None,
+        )
+    }
+
+    /// The queued frame is written write-through (ADR-0086 D5): the write
+    /// itself is the barrier, completed from `LogWritten`. Covers the
+    /// frame's exclusive end and discharges the whole due exactly like a
+    /// linked sync.
+    ///
+    /// # Panics
+    /// If no frame was queued first, or an `always` record is still
+    /// unqueued (the same sequencing invariants as the linked sync).
+    pub fn register_write_through(&mut self, now: Nanos) -> FsyncTicket {
+        let covers_up_to = self.queued_up_to.expect("write-through before any frame was queued");
+        assert!(!self.always_unqueued, "write-through with an unqueued always record");
+        // Release assert: the prefix rule (module docs). A FUA ticket
+        // claiming bytes it did not write is the ack-before-durable bug
+        // the sweep caught; per-frame, free.
+        assert_eq!(
+            self.coverage_tail().1,
+            self.last_frame_base_bytes,
+            "write-through frame must extend the durable prefix"
+        );
+        self.sync_due = false;
+        self.always_pending = false;
+        self.stats.fsyncs_write_through += 1;
+        self.push_pending(
+            covers_up_to,
+            self.queued_bytes,
+            now,
+            SyncReason::WriteThrough,
             HeldHandle::None,
         )
     }
@@ -603,6 +709,9 @@ impl<File: SegmentFile> GroupCommit<File> {
         entry.held = HeldHandle::None;
         let elapsed = now.saturating_sub(entry.submitted_at);
         self.fsync_hist_us.record(elapsed.as_micros());
+        if entry.reason == SyncReason::WriteThrough {
+            self.write_through_hist_us.record(elapsed.as_micros());
+        }
         self.stats.fsyncs_completed += 1;
 
         let before = self.durable_up_to;
@@ -675,10 +784,25 @@ impl<File: SegmentFile> GroupCommit<File> {
         self.pending.iter().filter(|p| !p.done).count()
     }
 
-    /// fdatasync completion latency, microseconds (`fsync_latency_hist`).
+    /// Durability-barrier completion latency, microseconds, all classes
+    /// (`fsync_latency_hist`).
     #[must_use]
     pub fn fsync_latency_hist(&self) -> &LogHistogram {
         &self.fsync_hist_us
+    }
+
+    /// Write-through (FUA-class) frame latency, microseconds (ADR-0086
+    /// D5) — submission → `LogWritten`, the barrier the client waits on.
+    #[must_use]
+    pub fn write_through_latency_hist(&self) -> &LogHistogram {
+        &self.write_through_hist_us
+    }
+
+    /// Write-through tickets whose completion has not arrived (0 or 1
+    /// under the one-frame staging lease).
+    #[must_use]
+    pub fn write_through_in_flight(&self) -> usize {
+        self.pending.iter().filter(|p| !p.done && p.reason == SyncReason::WriteThrough).count()
     }
 
     #[must_use]
@@ -986,6 +1110,106 @@ mod tests {
             "one sync covers the whole accumulated batch"
         );
         assert_eq!(gc.stats().fsyncs_linked, 2, "12 frames, 2 fsyncs — not 12");
+    }
+
+    #[test]
+    fn write_through_completes_at_log_written_and_skips_the_pipeline_bound() {
+        // ADR-0086 D5: a write-through ticket is a ledger entry like any
+        // other (done-prefix, monotone coverage) but does not occupy a
+        // sync-pipeline slot — a seal FLUSH in flight never defers it.
+        let mut gc = commit();
+        let fs = crate::fs::mem::MemFs::new();
+        fs.create_dir_all(std::path::Path::new("log")).expect("mem dir");
+        let dir = fs.open_dir(std::path::Path::new("log")).expect("mem dir handle");
+        let barrier = gc.register_prealloc_barrier(dir, Nanos::ZERO);
+        gc.note_staged(FsyncClass::Always);
+        gc.note_frame_queued(lsn(0, 4096), 4096);
+        assert!(!gc.frame_fsync_due(), "the FLUSH class is bounded behind the barrier");
+        assert!(gc.write_through_due(), "the write-through class is not");
+        let t = gc.register_write_through(Nanos::ZERO);
+        assert_eq!(gc.stats().fsyncs_write_through, 1);
+        assert!(!gc.frame_fsync_due(), "the due is discharged");
+        gc.note_frame_written();
+        // The FUA frame lands first: nothing advances past the barrier.
+        assert_eq!(gc.on_fsync_complete(t, Nanos::from_micros(300)), None);
+        assert_eq!(gc.watermark(), None);
+        assert_eq!(gc.on_fsync_complete(barrier, Nanos::from_micros(900)), Some(lsn(0, 4096)));
+        assert_eq!(gc.write_through_latency_hist().count(), 1);
+        assert_eq!(gc.fsync_latency_hist().count(), 2, "all-class histogram sees both");
+    }
+
+    #[test]
+    fn write_through_in_flight_does_not_block_a_flush_class_sync() {
+        // The bound counts FLUSH-class entries only: with a write-through
+        // ticket outstanding, a standalone everysec sync may still issue.
+        let mut gc = commit();
+        gc.note_staged(FsyncClass::Always);
+        gc.note_frame_queued(lsn(0, 4096), 4096);
+        let t = gc.register_write_through(Nanos::ZERO);
+        assert_eq!(gc.write_through_in_flight(), 1);
+        gc.note_frame_written();
+        gc.note_everysec_tick();
+        // Everything written is already promised by the write-through
+        // ticket (covers == written): the tick is deduped, not blocked.
+        assert!(!gc.standalone_fsync_due());
+        gc.on_fsync_complete(t, Nanos::from_micros(300));
+        assert_eq!(gc.write_through_in_flight(), 0);
+    }
+
+    #[test]
+    fn write_through_requires_the_durable_prefix() {
+        // The prefix rule (ADR-0086 D5, found by the sweep): an everysec-
+        // only frame written with no barrier sits un-covered; the next
+        // always frame must take the FLUSH-class linked fsync (which
+        // covers the gap), never a write-through that would claim it.
+        let mut gc = commit();
+        gc.note_staged(FsyncClass::Everysec);
+        gc.note_frame_queued(lsn(0, 4096), 4096);
+        assert!(!gc.write_through_due(), "no sync due");
+        gc.note_frame_written();
+        gc.note_staged(FsyncClass::Always);
+        gc.note_frame_queued(lsn(0, 8192), 4096);
+        assert!(!gc.write_through_due(), "un-covered bytes below the frame: FLUSH class");
+        assert!(gc.frame_fsync_due());
+        let t = gc.register_linked_fsync(Nanos::ZERO);
+        gc.note_frame_written();
+        assert_eq!(gc.on_fsync_complete(t, Nanos::from_micros(900)), Some(lsn(0, 8192)));
+        // Durable prefix restored: the next always frame is write-through.
+        gc.note_staged(FsyncClass::Always);
+        gc.note_frame_queued(lsn(0, 12288), 4096);
+        assert!(gc.write_through_due());
+        let w = gc.register_write_through(Nanos::ZERO);
+        gc.note_frame_written();
+        assert_eq!(gc.on_fsync_complete(w, Nanos::from_micros(300)), Some(lsn(0, 12288)));
+        // A pending FLUSH entry covering the gap also satisfies the rule.
+        gc.note_staged(FsyncClass::Everysec);
+        gc.note_frame_queued(lsn(0, 16384), 4096);
+        gc.note_frame_written();
+        gc.note_everysec_tick();
+        assert!(gc.standalone_fsync_due());
+        let s = gc.register_standalone_fsync(Nanos::ZERO);
+        gc.note_staged(FsyncClass::Always);
+        gc.note_frame_queued(lsn(0, 20480), 4096);
+        assert!(gc.write_through_due(), "the standalone in flight covers the gap");
+        let w2 = gc.register_write_through(Nanos::ZERO);
+        gc.note_frame_written();
+        assert_eq!(gc.on_fsync_complete(w2, Nanos::from_micros(300)), None, "prefix holds");
+        assert_eq!(gc.on_fsync_complete(s, Nanos::from_micros(900)), Some(lsn(0, 20480)));
+    }
+
+    #[test]
+    fn zero_fill_barrier_is_coverage_neutral() {
+        // ADR-0086 D4: the zero-fill fdatasync enters at the coverage tail
+        // and fences later data syncs without advancing anything itself.
+        let mut gc = commit();
+        gc.note_frame_queued(lsn(0, 100), 100);
+        let t1 = gc.register_linked_fsync(Nanos::ZERO);
+        gc.note_frame_written();
+        let z = gc.register_zero_fill_barrier(Nanos::ZERO);
+        assert_eq!(gc.stats().fsyncs_zero_fill, 1);
+        assert_eq!(gc.on_fsync_complete(t1, Nanos::from_micros(20)), Some(lsn(0, 100)));
+        assert_eq!(gc.on_fsync_complete(z, Nanos::from_micros(30)), None);
+        assert_eq!(gc.watermark(), Some(lsn(0, 100)));
     }
 
     #[test]

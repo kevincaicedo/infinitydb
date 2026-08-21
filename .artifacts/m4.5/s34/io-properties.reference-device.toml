@@ -1,0 +1,17 @@
+# io-properties — written by `inf probe-device` (ADR-0086 D7)
+# rule: fua iff fua p50 <= 0.75 x flush p50 and fua p99 <= flush p99 at 4 KiB;
+# fua_max_frame_bytes = largest probed size whose fua p50 still beats flush.
+# absent file => flush (today's path). `infinityd --barrier-class` overrides.
+# flush bytes=4096     p50_us=1202    p99_us=1590    barriers_per_sec=807
+# fua   bytes=4096     p50_us=299     p99_us=674     barriers_per_sec=2898
+# flush bytes=65536    p50_us=1258    p99_us=1571    barriers_per_sec=780
+# fua   bytes=65536    p50_us=370     p99_us=666     barriers_per_sec=2586
+# flush bytes=262144   p50_us=1417    p99_us=2093    barriers_per_sec=708
+# fua   bytes=262144   p50_us=467     p99_us=1413    barriers_per_sec=1949
+# flush bytes=1048576  p50_us=1861    p99_us=2969    barriers_per_sec=503
+# fua   bytes=1048576  p50_us=944     p99_us=2120    barriers_per_sec=940
+barrier_class = "fua"
+fua_max_frame_bytes = 1048576
+fua_p50_us_4k = 299
+flush_p50_us_4k = 1202
+probed_at_unix_s = 1787286691

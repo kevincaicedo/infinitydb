@@ -112,6 +112,7 @@ fn base(scenario: &BackfillScenario) -> DurableScenario {
         ckpt_stream_bytes_per_sec: None,
         stall: None,
         replay_canary: false,
+        io_mode: inf_server::SegmentIoMode::Buffered,
     }
 }
 

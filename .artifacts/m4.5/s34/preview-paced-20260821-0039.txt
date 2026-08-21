@@ -1,0 +1,84 @@
+=== flush-4c-r1 (class=flush cells=4) ===
+ops=128000 errors=0 secs=20.264
+throughput_ops_s=6317
+p50_ms=4.984
+p99_ms=8.488
+max_ms=17.945
+fsync_latency_p50_us:2687  fsync_group_p50:7  fsyncs_linked:296  barrier_class:flush  fsyncs_fua:0  fua_latency_p50_us:0  log_padding_bytes:0  zero_fill_bytes:0  rotations_unzeroed:0  rotations_upgrade:0  barrier_class_degraded:0  
+=== fua-4c-r1 (class=fua cells=4) ===
+ops=128000 errors=0 secs=6.991
+throughput_ops_s=18310
+p50_ms=1.132
+p99_ms=21.716
+max_ms=112.642
+fsync_latency_p50_us:591  fsync_group_p50:5  fsyncs_linked:0  barrier_class:fua  fsyncs_fua:16239  fua_latency_p50_us:591  log_padding_bytes:40239520  zero_fill_bytes:536870912  rotations_unzeroed:0  rotations_upgrade:1  barrier_class_degraded:0  
+=== flush-1c-r1 (class=flush cells=1) ===
+ops=128000 errors=0 secs=10.737
+throughput_ops_s=11922
+p50_ms=2.506
+p99_ms=4.361
+max_ms=68.754
+fsync_latency_p50_us:1343  fsync_group_p50:29  fsyncs_linked:25  barrier_class:flush  fsyncs_fua:0  fua_latency_p50_us:0  log_padding_bytes:0  zero_fill_bytes:0  rotations_unzeroed:0  rotations_upgrade:0  barrier_class_degraded:0  
+=== fua-1c-r1 (class=fua cells=1) ===
+ops=128000 errors=0 secs=3.312
+throughput_ops_s=38642
+p50_ms=0.732
+p99_ms=1.525
+max_ms=27.521
+fsync_latency_p50_us:383  fsync_group_p50:18  fsyncs_linked:0  barrier_class:fua  fsyncs_fua:19150  fua_latency_p50_us:383  log_padding_bytes:39631877  zero_fill_bytes:805306368  rotations_unzeroed:0  rotations_upgrade:1  barrier_class_degraded:0  
+=== flush-4c-r2 (class=flush cells=4) ===
+ops=128000 errors=0 secs=25.568
+throughput_ops_s=5006
+p50_ms=5.147
+p99_ms=31.817
+max_ms=63.122
+fsync_latency_p50_us:2623  fsync_group_p50:5  fsyncs_linked:703  barrier_class:flush  fsyncs_fua:0  fua_latency_p50_us:0  log_padding_bytes:0  zero_fill_bytes:0  rotations_unzeroed:0  rotations_upgrade:0  barrier_class_degraded:0  
+=== fua-4c-r2 (class=fua cells=4) ===
+ops=128000 errors=0 secs=4.426
+throughput_ops_s=28919
+p50_ms=1.069
+p99_ms=2.535
+max_ms=10.291
+fsync_latency_p50_us:591  fsync_group_p50:6  fsyncs_linked:3  barrier_class:fua  fsyncs_fua:15952  fua_latency_p50_us:591  log_padding_bytes:41520434  zero_fill_bytes:536870912  rotations_unzeroed:0  rotations_upgrade:1  barrier_class_degraded:0  
+=== flush-1c-r2 (class=flush cells=1) ===
+ops=128000 errors=0 secs=13.430
+throughput_ops_s=9531
+p50_ms=3.232
+p99_ms=4.610
+max_ms=46.474
+fsync_latency_p50_us:1631  fsync_group_p50:23  fsyncs_linked:33  barrier_class:flush  fsyncs_fua:0  fua_latency_p50_us:0  log_padding_bytes:0  zero_fill_bytes:0  rotations_unzeroed:0  rotations_upgrade:0  barrier_class_degraded:0  
+=== fua-1c-r2 (class=fua cells=1) ===
+ops=128000 errors=0 secs=5.762
+throughput_ops_s=22216
+p50_ms=0.756
+p99_ms=23.756
+max_ms=30.277
+fsync_latency_p50_us:399  fsync_group_p50:23  fsyncs_linked:1  barrier_class:fua  fsyncs_fua:16226  fua_latency_p50_us:399  log_padding_bytes:37683733  zero_fill_bytes:805306368  rotations_unzeroed:0  rotations_upgrade:1  barrier_class_degraded:0  
+=== flush-4c-r3 (class=flush cells=4) ===
+ops=128000 errors=0 secs=25.263
+throughput_ops_s=5067
+p50_ms=6.201
+p99_ms=10.414
+max_ms=19.636
+fsync_latency_p50_us:3263  fsync_group_p50:7  fsyncs_linked:254  barrier_class:flush  fsyncs_fua:0  fua_latency_p50_us:0  log_padding_bytes:0  zero_fill_bytes:0  rotations_unzeroed:0  rotations_upgrade:0  barrier_class_degraded:0  
+=== fua-4c-r3 (class=fua cells=4) ===
+ops=128000 errors=0 secs=11.277
+throughput_ops_s=11351
+p50_ms=1.135
+p99_ms=26.668
+max_ms=34.544
+fsync_latency_p50_us:623  fsync_group_p50:6  fsyncs_linked:0  barrier_class:fua  fsyncs_fua:16141  fua_latency_p50_us:623  log_padding_bytes:40453650  zero_fill_bytes:536870912  rotations_unzeroed:0  rotations_upgrade:1  barrier_class_degraded:0  
+=== flush-1c-r3 (class=flush cells=1) ===
+ops=128000 errors=0 secs=13.309
+throughput_ops_s=9617
+p50_ms=3.231
+p99_ms=4.670
+max_ms=51.338
+fsync_latency_p50_us:1663  fsync_group_p50:7  fsyncs_linked:23  barrier_class:flush  fsyncs_fua:0  fua_latency_p50_us:0  log_padding_bytes:0  zero_fill_bytes:0  rotations_unzeroed:0  rotations_upgrade:0  barrier_class_degraded:0  
+=== fua-1c-r3 (class=fua cells=1) ===
+ops=128000 errors=0 secs=3.384
+throughput_ops_s=37830
+p50_ms=0.763
+p99_ms=1.661
+max_ms=30.371
+fsync_latency_p50_us:391  fsync_group_p50:11  fsyncs_linked:0  barrier_class:fua  fsyncs_fua:19269  fua_latency_p50_us:391  log_padding_bytes:37857057  zero_fill_bytes:805306368  rotations_unzeroed:0  rotations_upgrade:1  barrier_class_degraded:0  

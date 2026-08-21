@@ -96,10 +96,11 @@ fn durable_config(root: &Path) -> DurableConfig {
     DurableConfig {
         data_dir: root.to_path_buf(),
         staging: StagingConfig { capacity_bytes: 128 << 10 },
-        segment: SegmentConfig { segment_bytes: 256 << 20, seal_after_ms: None },
+        segment: SegmentConfig { segment_bytes: 256 << 20, ..Default::default() },
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         sync_pipeline: 1,
+        fua_p50_us_probed: 0,
     }
 }
 

@@ -44,7 +44,7 @@ type DriverMap<K, V> = HashMap<K, V, BuildIntHasher>;
 
 use crate::driver::{
     BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
-    StableBytesMut, SubmitStats, Wait,
+    StableBytesMut, SubmitStats, Wait, WriteBarrier,
 };
 use crate::token::CompletionToken;
 
@@ -98,6 +98,9 @@ enum OpState {
     /// Positional log-frame write (M2-S05, ADR-0013). `fsync` carries the
     /// linked fdatasync's (consumer token, op id) so a short write can
     /// supersede it and a failed write's cancellation is attributable.
+    /// `write_through` re-arms a short write's remainder under the same
+    /// `RWF_DSYNC` flag (ADR-0086 D1) so `LogWritten` never names a
+    /// partially durable frame.
     LogWrite {
         fd: RawFd,
         token: CompletionToken,
@@ -105,6 +108,7 @@ enum OpState {
         offset: u64,
         written: u32,
         fsync: Option<(CompletionToken, u64)>,
+        write_through: bool,
     },
     /// fdatasync — linked behind a `LogWrite` or standalone. `superseded`
     /// marks a sync that raced a short write: its CQE is swallowed; a fresh
@@ -386,10 +390,12 @@ impl UringDriver {
         self.push_sqe(entry);
     }
 
-    /// Arm a positional log-frame write, optionally with a linked fdatasync
-    /// (ADR-0013 D1). `written` > 0 is the short-write resubmission path —
-    /// the remainder gets a FRESH linked sync so `Synced` can never cover a
-    /// prefix.
+    /// Arm a positional log-frame write under its barrier (ADR-0013 D1,
+    /// ADR-0086 D1): a linked fdatasync, `RWF_DSYNC` write-through, or
+    /// neither. `written` > 0 is the short-write resubmission path — a
+    /// `LinkedFsync` remainder gets a FRESH linked sync so `Synced` can
+    /// never cover a prefix; a `WriteThrough` remainder stays write-through
+    /// so `LogWritten` can never name a partially durable frame.
     fn arm_log_write(
         &mut self,
         fd: RawFd,
@@ -397,18 +403,35 @@ impl UringDriver {
         data: StableBytes,
         token: CompletionToken,
         written: u32,
-        fsync_token: Option<CompletionToken>,
+        barrier: WriteBarrier,
     ) {
-        let fsync = fsync_token.map(|ft| {
+        let fsync = barrier.fsync_token().map(|ft| {
             let fid = self.alloc_id(OpState::LogFsync { token: ft, superseded: false });
             (ft, fid)
         });
-        let wid = self.alloc_id(OpState::LogWrite { fd, token, data, offset, written, fsync });
+        let write_through = matches!(barrier, WriteBarrier::WriteThrough);
+        let wid = self.alloc_id(OpState::LogWrite {
+            fd,
+            token,
+            data,
+            offset,
+            written,
+            fsync,
+            write_through,
+        });
         // SAFETY: `data` upholds the StableBytes contract (live + stable
         // until terminal completion); `written` never exceeds `data.len()`.
         let ptr = unsafe { data.as_ptr().add(written as usize) };
+        // `RWF_DSYNC` on an `O_DIRECT` fd is the kernel's write-through
+        // path: a FUA-flagged write where the device supports it, write +
+        // cache FLUSH where it does not — durable at completion either way
+        // (ADR-0086 D2). On a buffered fd it degrades to write + range
+        // fdatasync (correct, FLUSH-class cost) — the plane never asks for
+        // that shape, the segment mode decides the fd.
+        let rw_flags = if write_through { libc::RWF_DSYNC } else { 0 };
         let entry = opcode::Write::new(Fd(fd), ptr, data.len() - written)
             .offset(offset + u64::from(written))
+            .rw_flags(rw_flags)
             .build()
             .user_data(wid);
         match fsync {
@@ -594,8 +617,8 @@ impl UringDriver {
                     let id = self.alloc_id(OpState::Close { fd });
                     self.push_sqe(opcode::Close::new(Fd(fd)).build().user_data(id));
                 }
-                IoOp::LogWrite { fd, offset, data, token, fsync_token } => {
-                    self.arm_log_write(fd, offset, data, token, 0, fsync_token);
+                IoOp::LogWrite { fd, offset, data, token, barrier } => {
+                    self.arm_log_write(fd, offset, data, token, 0, barrier);
                 }
                 IoOp::Fdatasync { fd, token } => {
                     let id = self.alloc_id(OpState::LogFsync { token, superseded: false });
@@ -837,13 +860,14 @@ impl UringDriver {
                     pool.unstage(buf);
                 }
             }
-            OpState::LogWrite { fd, token, data, offset, written, fsync } => {
+            OpState::LogWrite { fd, token, data, offset, written, fsync, write_through } => {
                 if result > 0 || (result == 0 && data.len() == written) {
                     let written = written + result as u32;
                     if written < data.len() {
                         // Short write: the already-linked fdatasync would
                         // cover a prefix only — supersede it; the remainder
-                        // re-links a fresh sync (ADR-0013 D1).
+                        // re-links a fresh sync (ADR-0013 D1). A write-
+                        // through remainder stays write-through.
                         let fsync_token = fsync.map(|(ft, fid)| {
                             if let Some(OpState::LogFsync { superseded, .. }) =
                                 self.states.get_mut(&fid)
@@ -852,7 +876,12 @@ impl UringDriver {
                             }
                             ft
                         });
-                        self.arm_log_write(fd, offset, data, token, written, fsync_token);
+                        let barrier = match fsync_token {
+                            Some(fsync_token) => WriteBarrier::LinkedFsync { fsync_token },
+                            None if write_through => WriteBarrier::WriteThrough,
+                            None => WriteBarrier::None,
+                        };
+                        self.arm_log_write(fd, offset, data, token, written, barrier);
                         return;
                     }
                     out.push(Completion { token, result: CompletionResult::LogWritten });

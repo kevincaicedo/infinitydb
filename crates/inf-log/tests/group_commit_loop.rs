@@ -42,7 +42,7 @@ fn cell(
     let plane = DurablePlane::new(
         dir,
         StagingConfig { capacity_bytes: 64 << 10 },
-        SegmentConfig { segment_bytes, seal_after_ms: None },
+        SegmentConfig { segment_bytes, ..Default::default() },
     );
     (lp, plane, clock)
 }

@@ -12,6 +12,7 @@ Formats defined by ADR-0011 unless noted.
 | Log record format v1 | `inf-log` | implemented (M2-S01) |
 | Batch frame layout v1 | `inf-log` | implemented (M2-S01); **read-only since M2.5-S12** (ADR-0031 — v2 is the written format; v1 accepted forever on the alpha line) |
 | Batch frame layout v2 (per-frame sequencing) | `inf-log` | implemented (M2.5-S12, ADR-0031 — epoch · seq · covered-LSN stamp under the CRC; the tail-scan attestation taxonomy consumes it) |
+| Batch frame layout v3 (aligned successor) | `inf-log` | implemented (M4.5-S34, ADR-0086 D3 — the v2 layout under `IFR3`; successor at the next 4 KiB boundary, zero padding written by the frame; written on `Direct` segments, v2 stays the buffered format) |
 | LSN addressing | `inf-log` | implemented (M2-S01) |
 | Segment naming + lifecycle | `inf-log` | implemented (M2-S02) |
 | `SegmentFs` injection seam | `inf-log` | implemented (M2-S02; extended by S05/S11/S16; sim-disk tier at S18) |
@@ -135,6 +136,43 @@ len-4  4    CRC32C(header·body): u32 LE
   frame in a replay prefix is a named refusal (append order — no
   downgrade after the first v2 frame).
 
+## Batch frame layout v3 (`inf-log::frame`, M4.5-S34 — ADR-0086 D3)
+
+Byte-identical to v2 from offset 4 on; the magic is `"IFR3"` and the
+**successor rule** changes: the next frame begins at
+`align_up(base + frame_len, FRAME_ALIGN = 4096)`, and the bytes between
+`base + frame_len` and that boundary are zeros **written by the frame's
+own write** (the `O_DIRECT` alignment unit — one aligned write-through
+write per frame is the point). `frame_len` excludes the padding;
+`FrameRef::padded_len()` is the reader's advance.
+
+- Readers (`SegmentReader`, `FrameIter`, the tail scanner) round up after
+  a v3 frame and apply the end-of-log rule at the boundary (zero magic ⇒
+  preallocated tail; a torn frame stops the read). The padding bytes are
+  **skipped, never validated** — a padding sector that did not land is
+  not evidence about the frame (the CRC is), and demanding zeros would
+  refuse honest torn tails on 512-byte-sector devices. `ReadEnd::at`
+  is the aligned boundary — the resume offset.
+- Which frames are v3: the writer emits v3 on `Direct` segments
+  (`FrameLayout::Aligned`) and v2 on `Buffered` segments
+  (`FrameLayout::Packed`); `FrameSlot::layout()` carries the choice from
+  the rotor to `StagingRing::seal(first_record_lsn, covered_lsn, layout)`
+  and `FrameBuilder::finalize(first_lsn, stamp, layout)`. v2 and v3 may
+  interleave in either order (a mode change across lives); the "v1 after
+  v2" refusal is unchanged.
+- ADR-0031 D3's continuity rule "frame n+1 begins exactly where frame n
+  ends" reads "at frame n's successor"; seq/epoch/attestation rules and
+  the beyond-data-end audit are otherwise unchanged (the audit scans
+  *from* the aligned data end, so a valid frame's padding is never
+  mistaken for slack).
+- Disclosure: `StagingStats::padding_bytes` (`log_padding_bytes` in
+  INFO) counts every padding byte sealed; the watermark, `queued_up_to`,
+  and the rotor's cursor advance by the padded length.
+- The staging buffers carry `FRAME_ALIGN` slack on both ends and build
+  the frame at an aligned base (`FrameBuilder::with_capacity`, the
+  ADR-0054 D2 `align_offset` shape — no unsafe); `resident_bytes` =
+  2 × (capacity + 8 KiB).
+
 ## `first_lsn` bound — post-M2-exit amendment (ADR-0072, 2026-08-17)
 
 Post-exit change to a frozen surface, ADR-gated per the freeze discipline.
@@ -216,6 +254,38 @@ those driver ops against the same `SimDisk`.
   dir-fsync, CRC32C-enveloped, payload-opaque). First consumer: the
   namespace catalog, single-written by `inf-server::control`; S11's
   MANIFEST reuses the protocol.
+
+### M4.5-S34 additions (ADR-0086 D4) — `Direct` log segments
+
+- `SegmentIoMode::{Buffered, Direct}` on `SegmentConfig::io_mode`
+  (default `Buffered` — the M2 path byte-for-byte) plus
+  `fua_max_frame_bytes` (the probed write-through crossover, default
+  256 KiB). `Direct` requires `segment_bytes % 4096 == 0`
+  (`SegmentConfig::assert_valid`).
+- `SegmentFs::create_segment_direct(path, prealloc)` — `O_DIRECT`
+  (verified), sparse, unsynced; `SegmentFs::open_segment_append(path,
+  mode)` — the recovered tail reopens in the configured mode;
+  `SegmentFile::fully_allocated()` — the **read, never remembered**
+  pre-zeroing fact (`st_blocks × 512 ≥ st_size` on the std tier; `true`
+  on `MemFs`; length ≥ preallocation target on the sim disk). Wrappers
+  (`ReadAheadFs`) forward explicitly, as for `create_tier`.
+- Rotor zero-fill state machine (driver-ridden, never a blocking write):
+  `next_zero_slice(max_len) → ZeroSlice{fd, offset, len}` (paced against
+  `2 × active.written + ZERO_FILL_HEAD_START` while the active segment
+  is pre-zeroed; unpaced otherwise), `note_zero_slice_written()`,
+  `take_zero_fill_barrier() → fd`, `note_zero_fill_synced()`;
+  `FrameSlot::{len (padded), layout, write_through_ok}`;
+  `LogError::NextNotReady` (a zero-fill op is in flight on the segment
+  rotation needs — the frame waits one completion); class-upgrade
+  rotation at `begin_frame_deferred` when a pre-zeroed next segment is
+  ready and the active one is not; `RotorStats::{zero_fill_bytes,
+  rotations_unzeroed, rotations_upgrade}`;
+  `active_io_mode()`/`active_write_through()`.
+- Sim disk: `create_segment_direct` creates an empty inode with a
+  preallocation target; `driver_write_through(fd, offset, data)` is
+  durable at completion and supersedes overlapping earlier pending
+  writes; `StallConfig::through_base_ns` (0 = inline) and
+  `schedule_write_through(now)`.
 
 ### M4-S09/S11 additions (ADR-0054, ADR-0056)
 
@@ -327,18 +397,30 @@ Extension of the frozen M0 `BackendDriver` contract (recorded per the §3.2
 freeze discipline). The token *layout* is unchanged; `TokenClass` gains
 `LogWrite = 5` and `Fsync = 6`.
 
-- `IoOp::LogWrite { fd, offset, data: StableBytes, token, fsync_token }`
-  — positional write of one sealed frame (the contiguous frame makes "one
-  writev" a single-iovec write). Short writes resubmit internally:
-  `CompletionResult::LogWritten` ⇒ ALL bytes reached the fd (page cache —
-  the staging-lease release point, never an ack point).
-- `fsync_token: Some(_)` chains an fdatasync — `IOSQE_IO_LINK` on uring
-  (kept unsplittable across submit boundaries), issued after the write's
-  completion on fallback tiers. `CompletionResult::Synced` is the ONLY
-  durability fact (L2) and is delivered exactly once, only after every byte
-  of the write is both written and covered (a sync that raced a short write
-  is superseded internally); a failed write cancels it
-  (`Error{ECANCELED}` on `fsync_token` — no sync-past-failed-write).
+- `IoOp::LogWrite { fd, offset, data: StableBytes, token, barrier:
+  WriteBarrier }` — positional write of one sealed frame (the contiguous
+  frame makes "one writev" a single-iovec write). Short writes resubmit
+  internally: `CompletionResult::LogWritten` ⇒ ALL bytes reached the fd.
+  **Amended 2026-08-21 (M4.5-S34, ADR-0086 D1):** the former
+  `fsync_token: Option<CompletionToken>` became the `WriteBarrier` enum —
+  `None` (page cache / device cache, the staging-lease release point,
+  never an ack point), `WriteThrough` (`RWF_DSYNC` on an `O_DIRECT` fd:
+  `LogWritten` is delivered only once the bytes are on stable media — the
+  frame's durability fact, no `Synced` follows; a short write re-arms its
+  remainder write-through), `LinkedFsync { fsync_token }` (below). The
+  state "write-through and a linked sync" is unrepresentable.
+- `WriteBarrier::LinkedFsync { fsync_token }` chains an fdatasync —
+  `IOSQE_IO_LINK` on uring (kept unsplittable across submit boundaries),
+  issued after the write's completion on fallback tiers.
+  `CompletionResult::Synced` is the durability fact for this class (L2)
+  and is delivered exactly once, only after every byte of the write is
+  both written and covered (a sync that raced a short write is superseded
+  internally); a failed write cancels it (`Error{ECANCELED}` on
+  `fsync_token` — no sync-past-failed-write). kqueue executes
+  `WriteThrough` as write + fsync (the correctness tier).
+- `TokenClass::ZeroFillWrite = 13` (routing-only, ADR-0086 D4): a plain
+  `LogWrite` zero-filling a preallocated next segment; its completion
+  advances `SegmentRotor`'s zero cursor, never the staging lease.
 - `IoOp::Fdatasync { fd, token }` — standalone barrier (everysec tick,
   deferred seal).
 - `StableBytes::new(&[u8])` is the one `unsafe` seam: bytes must stay
@@ -423,6 +505,18 @@ discipline:
   `tripwire:spawn_retries` (must read zero post-S01).
 
 ## Group commit + durability watermark (`inf-log::commit`, M2-S05/S06)
+
+**M4.5-S34 amendment (ADR-0086 D5):** `SyncReason::WriteThrough` (ticket
+registered at seal via `register_write_through`, completed from
+`LogWritten`; `write_through_due()` = `sync_due` ∧ **the prefix rule** —
+the frame's base equals the ledger's coverage tail, i.e. every byte below
+it is durable or covered by a pending FLUSH-class entry; a FUA write
+persists itself, never the un-barriered frames before it) and
+`SyncReason::ZeroFill` (coverage-neutral, `register_zero_fill_barrier`).
+`syncs_in_flight()` — the ADR-0022 D3 pipeline bound — counts FLUSH-class
+entries only. `write_through_latency_hist()` is the class-split
+histogram; `CommitStats::{fsyncs_write_through, fsyncs_zero_fill}`.
+
 
 `GroupCommit<File>` — cell-local policy engine + fsync ledger; never names
 ops or sockets. The plane translates (choreography table in ADR-0013 D2 and

@@ -56,10 +56,11 @@ fn cfg() -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
         staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 64 << 10, seal_after_ms: None },
+        segment: SegmentConfig { segment_bytes: 64 << 10, ..Default::default() },
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         sync_pipeline: 1,
+        fua_p50_us_probed: 0,
     }
 }
 
@@ -166,7 +167,7 @@ fn build_shard(fs: &MemFs, tail_ops: u64) -> Vec<u8> {
     rotor.maintain(0).expect("maintain");
     let slot = rotor.begin_frame(ring.pending_frame_len(), 0).expect("reserve");
     let begin_lsn = slot.first_record_lsn();
-    let lease = ring.seal(begin_lsn, 0);
+    let lease = ring.seal(begin_lsn, 0, slot.layout());
     let frame = ring.leased_frame(&lease).to_vec();
     rotor.commit_frame(slot, &frame).expect("commit");
     ring.release(lease);

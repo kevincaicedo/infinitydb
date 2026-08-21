@@ -21,7 +21,7 @@ use inf_alloc::BufferPool;
 use inf_foundation::LogHistogram;
 use inf_runtime::{
     BackendDriver, CompletionResult, CompletionToken, IoOp, StableBytes, TokenClass, UringDriver,
-    Wait,
+    Wait, WriteBarrier,
 };
 
 const FILE_BYTES: u64 = 1 << 30;
@@ -83,7 +83,9 @@ fn main() {
                 offset,
                 data,
                 token: CompletionToken::new(TokenClass::LogWrite, 1, 0),
-                fsync_token: Some(CompletionToken::new(TokenClass::Fsync, 1, 0)),
+                barrier: WriteBarrier::LinkedFsync {
+                    fsync_token: CompletionToken::new(TokenClass::Fsync, 1, 0),
+                },
             });
             let mut got = 0;
             while got < 2 {

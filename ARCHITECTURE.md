@@ -59,7 +59,16 @@ suspends until the reply arrives.
 Durability is the **log spine**: every durable fact is an append to a
 per-cell, per-namespace segmented log, group-committed once per reactor
 iteration with an fsync policy chosen per namespace (`always` /
-`everysec` / `memory`). Everything else — the hash index, document trees,
+`everysec` / `memory`). The durable barrier comes in two classes, chosen
+per segment and per frame (ADR-0086): the **FLUSH class** — a buffered
+frame write with a linked `fdatasync`, ending in a device-wide cache
+flush every cell queues on — and the **FUA class** — a 4 KiB-aligned
+frame written `RWF_DSYNC` on a pre-zeroed `O_DIRECT` segment, durable at
+its own completion, independent of the other cells. The device decides
+(`inf probe-device` → `io-properties.toml`), the default stays FLUSH
+until the reference-box A/B, and a frame takes the FUA class only when
+it extends the durable prefix — a FUA write persists itself, never the
+un-barriered frames before it. Everything else — the hash index, document trees,
 secondary indexes, stream offsets, vector graphs — is a rebuildable
 projection over that log. Checkpoints are fuzzy snapshots streamed by the
 owning cell in budgeted background slices (no fork, no stop-the-world);
@@ -130,8 +139,8 @@ make correct, not five.
 Syscalls, fabric hops, fsyncs, and cache misses are paid per *batch*, never
 per operation. The reactor produces every SQE of an iteration into a single
 `io_uring_enter`; the log writer seals one batch frame per iteration;
-`always`-mode writers share one group-commit fsync; index probes are
-prefetched a batch at a time. The always-on tripwire metrics
+`always`-mode writers share one group-commit barrier (one fsync, or one
+write-through frame); index probes are prefetched a batch at a time. The always-on tripwire metrics
 (`sqes/submit`, `cmds/iteration`, grouping ratio) have CI gates — a
 benchmark run with red tripwires is invalid for claims by definition,
 because it means the architecture wasn't exercising the thing that makes it

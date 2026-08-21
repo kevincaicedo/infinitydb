@@ -162,6 +162,7 @@ impl TieredScenario {
             ckpt_stream_bytes_per_sec: None,
             stall: self.stall.clone(),
             replay_canary: false,
+            io_mode: inf_server::SegmentIoMode::Buffered,
         }
     }
 }

@@ -17,6 +17,7 @@ mod durable;
 mod exec;
 pub mod fault;
 mod glob;
+mod io_properties;
 #[cfg(feature = "doc")]
 mod json;
 mod log_bytes;
@@ -56,7 +57,11 @@ pub use json::{JSON_REPLY_SHAPES, ReplyShape};
 // assembly/simulator tier exactly like `StdSegmentFs` above — bins name
 // `inf-server` only (dep-DAG).
 pub use inf_log::fs::sim::{SimDisk, SimDiskConfig, StallConfig};
-pub use inf_log::{CkptConfig, DEFAULT_SEGMENT_BYTES, SegmentConfig, StagingConfig};
+pub use inf_log::{
+    CkptConfig, DEFAULT_FUA_MAX_FRAME_BYTES, DEFAULT_SEGMENT_BYTES, FRAME_ALIGN, SegmentConfig,
+    SegmentIoMode, StagingConfig,
+};
+pub use io_properties::{IO_PROPERTIES_FILE, IoProperties, IoPropertiesError};
 pub use plane::{ExecOrigin, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane};
 pub use readahead::{ReadAheadFile, ReadAheadFs};
 pub use recover::{RecoverStats, RecoveredManifest, Recovery, RecoveryProgress, open_cell_log};

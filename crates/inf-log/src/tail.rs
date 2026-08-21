@@ -213,8 +213,9 @@ fn zero_run(w: &[u8]) -> usize {
     i
 }
 
-/// A validating frame the scanner probed at the current offset: its total
-/// length (to skip) and its stamp facts.
+/// A validating frame the scanner probed at the current offset: its
+/// on-device length (to skip — the aligned extent for v3, ADR-0086 D3)
+/// and its stamp facts.
 struct ProbedFrame {
     frame_len: usize,
     stamp: Option<FrameStamp>,
@@ -325,8 +326,12 @@ impl<File: SegmentFile> RegionScanner<File> {
         match decode_frame(self.window(), self.cfg.max_frame_len) {
             Ok((frame, _)) => {
                 let expected = Lsn::new(self.segment, self.offset + frame.header_len() as u32);
+                // Skip the padded extent: the padding is the frame's own
+                // write, never independent evidence. A window shorter
+                // than the padding is consumed like any other skip.
+                let skip = (frame.padded_len() as usize).min(self.window().len());
                 Ok((frame.first_lsn() == expected)
-                    .then_some(ProbedFrame { frame_len, stamp: frame.stamp() }))
+                    .then_some(ProbedFrame { frame_len: skip, stamp: frame.stamp() }))
             }
             Err(_) => Ok(None),
         }

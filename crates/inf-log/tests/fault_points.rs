@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use inf_foundation::fault::{self, FaultSpec};
+use inf_log::FrameLayout;
 use inf_log::fs::mem::MemFs;
 use inf_log::meta::{read_meta, write_meta};
 use inf_log::{
@@ -28,7 +29,7 @@ fn stamp(seq: u64) -> FrameStamp {
 const SEGMENT_BYTES: u32 = 4096;
 
 fn cfg() -> SegmentConfig {
-    SegmentConfig { segment_bytes: SEGMENT_BYTES, seal_after_ms: None }
+    SegmentConfig { segment_bytes: SEGMENT_BYTES, ..Default::default() }
 }
 
 fn mem_rotor(fs: &MemFs) -> SegmentRotor<MemFs> {
@@ -42,7 +43,7 @@ fn append_frame(rotor: &mut SegmentRotor<MemFs>, filler: usize) -> Result<Lsn, L
     builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: &value });
     let slot = rotor.begin_frame(builder.frame_len(), 0)?;
     let first_record_lsn = slot.first_record_lsn();
-    let frame = builder.finalize(first_record_lsn, stamp(1));
+    let frame = builder.finalize(first_record_lsn, stamp(1), FrameLayout::Packed);
     rotor.commit_frame(slot, frame)
 }
 

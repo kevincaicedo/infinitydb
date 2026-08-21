@@ -4,8 +4,13 @@
 //! Speaks RESP2/RESP3 replies (the server decides per HELLO; we print both).
 //! Intentionally tiny and dependency-thin: this is a smoke-test tool, not a
 //! product surface (`redis-cli` remains the reference client — L8).
+//!
+//! `inf probe-device <data-dir>` (M4.5-S34, ADR-0086 D7) measures the
+//! data directory's device and writes `io-properties.toml` — the file
+//! `infinityd` reads at boot to choose the log barrier class.
 #![forbid(unsafe_code)]
 
+mod probe;
 mod reply;
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -90,6 +95,7 @@ fn split_line(line: &str) -> Vec<String> {
 fn usage() -> ExitCode {
     eprintln!("usage: inf [-h HOST] [-p PORT] [COMMAND [ARG ...]]");
     eprintln!("       no COMMAND starts a REPL");
+    eprintln!("       inf probe-device <data-dir> [--seconds N]   (ADR-0086 D7)");
     ExitCode::from(2)
 }
 
@@ -101,6 +107,16 @@ fn main() -> ExitCode {
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         match arg.as_str() {
+            "probe-device" => {
+                let args: Vec<String> = argv.by_ref().collect();
+                return match probe::run(&args) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("inf probe-device: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
             "-h" => match argv.next() {
                 Some(v) => host = v,
                 None => return usage(),

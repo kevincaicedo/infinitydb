@@ -10,11 +10,14 @@ pub struct LogHistogram {
     counts: Box<[u64; BUCKETS]>,
     count: u64,
     max: u64,
+    /// Exact running sum (saturating) — the window-mean input for
+    /// tripwires that compare consecutive tick windows (ADR-0086 D7).
+    sum: u64,
 }
 
 impl LogHistogram {
     pub fn new() -> LogHistogram {
-        LogHistogram { counts: Box::new([0; BUCKETS]), count: 0, max: 0 }
+        LogHistogram { counts: Box::new([0; BUCKETS]), count: 0, max: 0, sum: 0 }
     }
 
     #[inline]
@@ -44,10 +47,16 @@ impl LogHistogram {
         self.counts[Self::index_of(value)] += 1;
         self.count += 1;
         self.max = self.max.max(value);
+        self.sum = self.sum.saturating_add(value);
     }
 
     pub fn count(&self) -> u64 {
         self.count
+    }
+
+    /// Exact sum of every recorded value (saturating at `u64::MAX`).
+    pub fn sum(&self) -> u64 {
+        self.sum
     }
 
     pub fn max(&self) -> u64 {
@@ -78,12 +87,14 @@ impl LogHistogram {
         }
         self.count += other.count;
         self.max = self.max.max(other.max);
+        self.sum = self.sum.saturating_add(other.sum);
     }
 
     pub fn clear(&mut self) {
         self.counts.fill(0);
         self.count = 0;
         self.max = 0;
+        self.sum = 0;
     }
 }
 

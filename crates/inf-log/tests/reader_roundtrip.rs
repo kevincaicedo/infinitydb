@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use inf_log::FrameLayout;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
@@ -25,7 +26,7 @@ fn stamp(seq: u64) -> FrameStamp {
 
 fn mem_rotor(fs: &MemFs, segment_bytes: u32) -> (SegmentRotor<MemFs>, PathBuf) {
     let dirs = create_cell_dirs(fs, &PathBuf::from("data/shard-0")).expect("dirs");
-    let cfg = SegmentConfig { segment_bytes, seal_after_ms: None };
+    let cfg = SegmentConfig { segment_bytes, ..Default::default() };
     let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg).expect("rotor");
     (rotor, dirs.log)
 }
@@ -240,7 +241,7 @@ fn write_frame(rotor: &mut SegmentRotor<MemFs>, records: &[RecordView<'_>]) -> L
     }
     let slot = rotor.begin_frame(builder.frame_len(), 0).expect("reserve");
     let first = slot.first_record_lsn();
-    let bytes = builder.finalize(first, stamp(1));
+    let bytes = builder.finalize(first, stamp(1), FrameLayout::Packed);
     rotor.commit_frame(slot, bytes).expect("commit")
 }
 
@@ -378,7 +379,7 @@ fn misdirected_frame_is_an_lsn_mismatch() {
     builder.append(&RecordView::Delete { ns: NsId(1), key: b"x" });
     let slot = rotor.begin_frame(builder.frame_len(), 0).expect("reserve");
     let lied = Lsn::new(SegmentId(9), 0x400);
-    let bytes = builder.finalize(lied, stamp(1));
+    let bytes = builder.finalize(lied, stamp(1), FrameLayout::Packed);
     rotor.commit_frame(slot, bytes).expect("commit");
 
     let mut reader =
@@ -402,7 +403,7 @@ fn read_end_feeds_open_existing_round_trip() {
     let fs = MemFs::new();
     let (mut rotor, log_dir) = mem_rotor(&fs, 4096);
     write_frame(&mut rotor, &[RecordView::Delete { ns: NsId(1), key: b"pre" }]);
-    let cfg = SegmentConfig { segment_bytes: 4096, seal_after_ms: None };
+    let cfg = SegmentConfig { segment_bytes: 4096, ..Default::default() };
     drop(rotor);
 
     let scan = scan_log_dir(&fs, &log_dir).expect("scan");

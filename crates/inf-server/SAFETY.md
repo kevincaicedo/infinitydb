@@ -77,3 +77,26 @@ seam-vs-reactor equivalence storm (`tiered_flush_reactor.rs`,
 byte-identical file images), the crash-matrix cut-window tests, and the
 `m4-tiered` DST scenario (full plane over the sim driver, power cuts
 with rounds in flight).
+
+## `src/log_bytes.rs` — `zero_window` (M4.5-S34, ADR-0086 D4)
+
+Fourth `unsafe` block, same contract class: `StableBytes::new` over a
+prefix of the cell's zero window for a zero-fill `LogWrite` on the next
+segment's fd (the pre-zeroing that makes `O_DIRECT` write-through frames
+fast). The proof is simpler than the lease chains above:
+
+1. The window is one `inf_alloc::AlignedBox` (4 KiB-aligned, zeroed at
+   birth) owned by `DurableCell` for the cell's whole life; nothing ever
+   writes to it, so there is no writer to race — immutability is the
+   stability argument.
+2. `SegmentRotor::next_zero_slice` hands out at most one slice at a time
+   and the next only after the previous slice's `LogWritten`
+   (`note_zero_slice_written`), so every op's terminal completion
+   precedes the next submission.
+3. The box is dropped with the durable plane, after the reactor's last
+   reap — every op has completed by then.
+
+Verified by: the segment-lifecycle direct-mode tests (tempdir, real
+`O_DIRECT`), the `m2-durable` DST scenarios with `Direct` segments on
+the sim disk (zero-fill slices, barrier, power cuts in between), and the
+crash-matrix `fua_in_flight` rows.

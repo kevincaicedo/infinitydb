@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use inf_alloc::BufferPool;
 use inf_runtime::{
     BackendDriver, Completion, CompletionResult, CompletionToken, IoOp, StableBytes, TokenClass,
-    Wait,
+    Wait, WriteBarrier,
 };
 
 #[cfg(target_os = "macos")]
@@ -75,7 +75,7 @@ fn log_write_with_linked_fsync_orders_write_before_sync() {
         offset: 4096,
         data,
         token: wtoken(1),
-        fsync_token: Some(ftoken(1)),
+        barrier: WriteBarrier::LinkedFsync { fsync_token: ftoken(1) },
     });
 
     let out = reap(&mut driver, &mut pool, 2);
@@ -116,7 +116,7 @@ fn failed_write_cancels_the_linked_fsync() {
         offset: 0,
         data,
         token: wtoken(2),
-        fsync_token: Some(ftoken(2)),
+        barrier: WriteBarrier::LinkedFsync { fsync_token: ftoken(2) },
     });
 
     let out = reap(&mut driver, &mut pool, 2);
@@ -161,7 +161,7 @@ fn standalone_fdatasync_and_sequential_offsets() {
             offset,
             data,
             token: wtoken(10 + i as u32),
-            fsync_token: None,
+            barrier: WriteBarrier::None,
         });
         let out = reap(&mut driver, &mut pool, 1);
         assert!(matches!(out[0].result, CompletionResult::LogWritten));
@@ -176,6 +176,83 @@ fn standalone_fdatasync_and_sequential_offsets() {
         let at = i * 100;
         assert_eq!(&written[at..at + 100], &frame[..], "frame {i} at its reserved offset");
     }
+    // SAFETY: fd came from into_raw_fd above; closing it exactly once.
+    unsafe { libc::close(fd) };
+    std::fs::remove_file(&path).ok();
+}
+
+/// A write-through `LogWrite` (M4.5-S34, ADR-0086 D1): `RWF_DSYNC` on an
+/// `O_DIRECT` fd from a 4 KiB-aligned source completes `LogWritten` alone
+/// — no `Synced` follows — and the bytes are on the file. kqueue executes
+/// the same contract as write + fsync. Skips where the filesystem refuses
+/// `O_DIRECT` (typed, never a silent fallback).
+#[test]
+fn write_through_completes_alone_and_lands() {
+    let path = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("inf-runtime-fileops-through-{}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECT);
+    }
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("skipping: O_DIRECT open refused: {err}");
+            return;
+        }
+    };
+    // Pre-written extents (ADR-0086 D4): zero two blocks first so the
+    // write-through write is an overwrite of allocated, written storage.
+    let mut window = inf_alloc::AlignedBox::new(8192);
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(window.bytes(), 0).expect("pre-zero");
+        file.sync_data().expect("commit the mapping");
+    }
+    window.bytes_mut()[..32].copy_from_slice(b"IFR3-write-through-frame-bytes!!");
+    let fd = file.into_raw_fd();
+
+    let mut driver = make_driver();
+    let mut pool = BufferPool::new(4, 1024);
+    // SAFETY: `window` outlives the reap loop below; the op is terminal
+    // before this function returns.
+    let data = unsafe { StableBytes::new(&window.bytes()[..4096]) };
+    driver.push(IoOp::LogWrite {
+        fd,
+        offset: 4096,
+        data,
+        token: wtoken(7),
+        barrier: WriteBarrier::WriteThrough,
+    });
+    let out = reap(&mut driver, &mut pool, 1);
+    assert_eq!(out.len(), 1, "write-through is one completion: {out:?}");
+    assert!(
+        matches!(
+            (&out[0].result, out[0].token.class()),
+            (CompletionResult::LogWritten, TokenClass::LogWrite)
+        ),
+        "{out:?}"
+    );
+    // Nothing else arrives: no Synced rides a write-through frame.
+    let mut extra = Vec::new();
+    driver
+        .submit_and_reap(
+            &mut pool,
+            Wait::Park { timeout: Some(std::time::Duration::from_millis(20)) },
+            &mut extra,
+        )
+        .expect("submit");
+    assert!(extra.is_empty(), "unexpected completions: {extra:?}");
+
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(&written[4096..4096 + 32], b"IFR3-write-through-frame-bytes!!");
+    assert!(written[4096 + 32..8192].iter().all(|&b| b == 0));
+    drop(window);
     // SAFETY: fd came from into_raw_fd above; closing it exactly once.
     unsafe { libc::close(fd) };
     std::fs::remove_file(&path).ok();

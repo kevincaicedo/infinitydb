@@ -125,7 +125,7 @@ impl Rig {
         let rotor = SegmentRotor::create_fresh(
             fs.clone(),
             dirs.log,
-            SegmentConfig { segment_bytes: 8 << 20, seal_after_ms: None },
+            SegmentConfig { segment_bytes: 8 << 20, ..Default::default() },
         )
         .expect("fresh log");
         Rig {
