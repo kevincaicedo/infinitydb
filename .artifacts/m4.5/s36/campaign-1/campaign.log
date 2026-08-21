@@ -1,0 +1,100 @@
+# 2026-08-21T16:13:59-04:00 host=HomeLab kernel=7.0.0-30-generic
+# governor=performance epp=performance
+# binary=infinityd b1f4bf4 (git b1f4bf491490, x86_64-unknown-linux-gnu) git=b1f4bf4 dirty=0
+# data=/home/kcaicedo/bench-data/s35-gate/data fstype=ext4 device=/dev/nvme0n1p3
+# probe: barrier_class = "fua" probe_schema = 2 write_bytes_per_s_256k = 510132224 write_ops_per_s_4k = 2540 write_ops_per_s_4k_qd4 = 3597 
+# thermal: 27800 38000 40000 
+=== 2026-08-21T16:13:59-04:00 s36-budget-on: --only-s36 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before s36 device leg (4 cells)
+  s35: 40s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell always p50 ratio (S34's F2 AC) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: log + checkpoint write amplification on the RAM-resident durable shape PASS
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) FAIL
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-s36/s36-budget-on/1787343365-gate-run/report.md
+inf-bench: 3 binding gate(s) FAILED
+=== exit 1 2026-08-21T16:16:05-04:00 ===
+=== 2026-08-21T16:16:05-04:00 s36-budget-off: --only-s36 --model-absent ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before s36 device leg (4 cells)
+  s35: 40s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell always p50 ratio (S34's F2 AC) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: log + checkpoint write amplification on the RAM-resident durable shape PASS
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) FAIL
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-s36/s36-budget-off/1787343492-gate-run/report.md
+inf-bench: 3 binding gate(s) FAILED
+=== exit 1 2026-08-21T16:18:12-04:00 ===
+=== 2026-08-21T16:18:12-04:00 s36-seal-pace: --only-s36 --seal-pace probe ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before s36 device leg (4 cells)
+  s35: 40s drive-state idle before s36 offered-rate leg
+inf-bench: server on 45671 exited before ready (exit status: 1) — fail-stop (stderr: infinityd-45671.stderr)
+=== exit 1 2026-08-21T16:20:06-04:00 ===
+=== 2026-08-21T16:20:06-04:00 s35-seal-pace: --only-s35 --seal-pace probe ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+inf-bench: server on 43993 exited before ready (exit status: 1) — fail-stop (stderr: infinityd-43993.stderr)
+=== exit 1 2026-08-21T16:20:46-04:00 ===
+# done 2026-08-21T16:20:46-04:00 thermal: 27800 37000 41000 

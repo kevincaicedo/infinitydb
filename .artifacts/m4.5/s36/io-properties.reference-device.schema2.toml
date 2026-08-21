@@ -1,0 +1,26 @@
+# io-properties — written by `inf probe-device` (ADR-0086 D7)
+# rule: fua iff fua p50 <= 0.75 x flush p50 and fua p99 <= flush p99 at 4 KiB;
+# fua_max_frame_bytes = largest probed size whose fua p50 beats flush's and
+#   whose fua p99 stays within 2x flush's p99 (the large-write tail guard).
+# absent file => flush (today's path). `infinityd --barrier-class` overrides.
+# flush bytes=4096     p50_us=924     p99_us=1278    barriers_per_sec=923
+# fua   bytes=4096     p50_us=330     p99_us=652     barriers_per_sec=2540
+# flush bytes=65536    p50_us=897     p99_us=1385    barriers_per_sec=1048
+# fua   bytes=65536    p50_us=364     p99_us=685     barriers_per_sec=2740
+# flush bytes=262144   p50_us=1136    p99_us=1983    barriers_per_sec=866
+# fua   bytes=262144   p50_us=467     p99_us=1450    barriers_per_sec=1946
+# flush bytes=1048576  p50_us=1613    p99_us=2979    barriers_per_sec=576
+# fua   bytes=1048576  p50_us=952     p99_us=23981   barriers_per_sec=344
+barrier_class = "fua"
+fua_max_frame_bytes = 262144
+fua_p50_us_4k = 330
+flush_p50_us_4k = 924
+probed_at_unix_s = 1787342174
+# schema 2 (ADR-0088 D6): the device model the per-cell budget spends;
+#   0 = not probed => that direction is unbudgeted (io_budget_model:absent).
+probe_schema = 2
+write_bytes_per_s_256k = 510132224
+write_ops_per_s_4k = 2540
+write_ops_per_s_4k_qd4 = 3597
+read_bytes_per_s_256k = 0
+read_ops_per_s_4k = 0

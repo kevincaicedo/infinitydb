@@ -775,7 +775,7 @@ fn s36_device_budget_row(
     let (server, port) = s36_spawn(flags, infinityd, cells, &dir, None)?;
     let device = s36_write_leg(&server, port, cells, 2 * duration, None)?;
     raw.push_str(&format!(
-        "device closed-loop c32 everysec ops/s={:<8.0} p99_us={:<7.0} max_us={:<8.0}          server_cpu_pct={:<5.0} parked={} write_stall_p99_us={}
+        "device closed-loop c32 everysec ops/s={:<8.0} p99_us={:<7.0} max_us={:<8.0} server_cpu_pct={:<5.0} parked={} write_stall_p99_us={}
 ",
         device.ops_per_sec,
         device.p99_us,
@@ -790,12 +790,26 @@ fn s36_device_budget_row(
     let ckpts = sum_field(&infos, "ckpts_completed");
     let model_absent =
         infos.iter().any(|c| c.get("io_budget_model").is_some_and(|v| v == "absent"));
+    // The decomposition (ADR-0088 D9 amended by the first campaign): the
+    // checkpoint term S36 owns — checkpoint + MANIFEST bytes over log
+    // frame bytes, design bound 1/α = 0.5 — and the v3 padding share of
+    // the log, S34's disclosed cost, which at small groups dominates the
+    // combined figure (2.2 records per 4 KiB frame at K = 3 × 32 conns).
+    let log_frame_bytes = sum_field(&infos, "log_frame_bytes");
+    let ckpt_and_manifest =
+        sum_field(&infos, "ckpt_bytes_total") + sum_field(&infos, "manifest_bytes_total");
+    let padding = sum_field(&infos, "log_padding_bytes");
+    let ckpt_over_log_milli =
+        (ckpt_and_manifest as f64 * 1000.0 / log_frame_bytes.max(1) as f64).ceil();
+    let padding_pct = padding as f64 * 100.0 / log_frame_bytes.max(1) as f64;
     raw.push_str(&format!(
-        "device arm: io_budget_model={} ckpts_completed={ckpts} write_amp_milli_log_checkpoint={}          (undefined={undefined}) log_frame_bytes={} ckpt_bytes_total={} zero_fill_bytes={}          ckpt_interval_bytes(max)={} deferrals[zero_fill={} tier_flush={} checkpoint={}]          frame_waits_pace={}
-",
+        "device arm: io_budget_model={} ckpts_completed={ckpts} \
+         write_amp_milli_log_checkpoint={write_amp} (undefined={undefined}) \
+         checkpoint_over_log_milli={ckpt_over_log_milli:.0} log_padding_pct={padding_pct:.1} \
+         log_frame_bytes={log_frame_bytes} ckpt_bytes_total={} zero_fill_bytes={} \
+         ckpt_interval_bytes(max)={} deferrals[zero_fill={} tier_flush={} checkpoint={}] \
+         frame_waits_pace={}\n",
         if model_absent { "absent" } else { "probed" },
-        write_amp,
-        sum_field(&infos, "log_frame_bytes"),
         sum_field(&infos, "ckpt_bytes_total"),
         sum_field(&infos, "zero_fill_bytes"),
         crate::gaterun::max_field(&infos, "ckpt_interval_bytes"),
@@ -806,6 +820,8 @@ fn s36_device_budget_row(
     ));
     if undefined == 0 && ckpts > 0 {
         m.set("s36:write_amp_milli_log_checkpoint", write_amp as f64);
+        m.set("s36:checkpoint_over_log_milli", ckpt_over_log_milli);
+        m.set("s36:log_padding_pct", padding_pct);
     } else {
         m.note(
             "s36: write_amp_milli_log_checkpoint is UNDEFINED (no checkpoint published during              the leg) — the gate reads PENDING (ADR-0060 D3), never PASS",
@@ -819,7 +835,7 @@ fn s36_device_budget_row(
     s35_idle(idle_s, "s36 offered-rate leg");
     let paced = s36_write_leg(&server, port, cells, duration, Some(offered))?;
     raw.push_str(&format!(
-        "device offered-rate c32 P16 target={offered} everysec achieved ops/s={:<8.0}          p99_us={:<7.0} max_us={:<8.0} server_cpu_pct={:<5.0} parked={}
+        "device offered-rate c32 P16 target={offered} everysec achieved ops/s={:<8.0} p99_us={:<7.0} max_us={:<8.0} server_cpu_pct={:<5.0} parked={}
 ",
         paced.ops_per_sec, paced.p99_us, paced.max_us, paced.cpu_pct, paced.parked
     ));
@@ -832,7 +848,7 @@ fn s36_device_budget_row(
     let (server, port) = s36_spawn(flags, infinityd, cells, &control_dir_s, Some("flush"))?;
     let control = s36_write_leg(&server, port, cells, duration, None)?;
     raw.push_str(&format!(
-        "tmpfs control ({control_fstype}) closed-loop c32 everysec ops/s={:<8.0} p99_us={:<7.0}          max_us={:<8.0} server_cpu_pct={:<5.0}
+        "tmpfs control ({control_fstype}) closed-loop c32 everysec ops/s={:<8.0} p99_us={:<7.0} max_us={:<8.0} server_cpu_pct={:<5.0}
 ",
         control.ops_per_sec, control.p99_us, control.max_us, control.cpu_pct
     ));
