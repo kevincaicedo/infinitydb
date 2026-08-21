@@ -30,6 +30,20 @@
 //! delay behind background bytes to one such burst (the class bound the
 //! `m2-device-budget` oracle asserts).
 //!
+//! **The checkpoint keep-up floor** (ADR-0088 D2, amended by the S36
+//! row's first run): under foreground saturation a weighted share alone
+//! starved the checkpoint class (340 k deferrals, no publish in 20 s of
+//! 270 k ops/s) — a retained log that grows for as long as saturation
+//! lasts, i.e. an unbounded recovery tail. The checkpoint's grant is
+//! therefore floored at `foreground_write_bytes_since_refill / α`, the
+//! bytes a checkpoint must write to stay inside the interval it is
+//! triggered at (`interval = α × ckpt_bytes_last`, ADR-0088 D4): the
+//! device's write capacity splits `α : 1` between the log and the
+//! checkpoint at saturation — the 1.5× write-amplification model made
+//! arithmetic — and the checkpoint always completes within α intervals.
+//! Zero-fill has no such floor: its shortfall is a visible class
+//! downgrade (`rotations_unzeroed`), never a correctness term.
+//!
 //! A model field of 0 means "not probed": that direction is unbudgeted
 //! — every admission is `Granted`, every counter still counts — which
 //! is the pre-S36 behaviour byte-for-byte and is reported as
@@ -267,6 +281,8 @@ pub struct DeviceBudget {
     meters: [Meter; IoClass::COUNT],
     last_refill: Nanos,
     model_absent: bool,
+    /// The checkpoint keep-up divisor (the trigger's α; 0 = no floor).
+    checkpoint_alpha: u64,
 }
 
 /// Per-class counters for INFO (ADR-0088 D7).
@@ -280,9 +296,15 @@ pub struct ClassCounters {
 impl DeviceBudget {
     /// `share` is the cell's share (`DeviceModel::share`); `slices`
     /// names each class's smallest offer (foreground entries are
-    /// ignored). `now` is the refill origin.
+    /// ignored); `checkpoint_alpha` is the trigger's α (the keep-up
+    /// floor's divisor; 0 = no floor). `now` is the refill origin.
     #[must_use]
-    pub fn new(share: DeviceModel, slices: [ClassSlice; IoClass::COUNT], now: Nanos) -> Self {
+    pub fn new(
+        share: DeviceModel,
+        slices: [ClassSlice; IoClass::COUNT],
+        checkpoint_alpha: u64,
+        now: Nanos,
+    ) -> Self {
         let mut write = Direction {
             rate_bytes: share.write_bytes_per_s,
             rate_ops: share.write_ops_per_s,
@@ -321,7 +343,14 @@ impl DeviceBudget {
             m.deficit_bytes = m.cap_bytes;
             m.deficit_ops = m.cap_ops;
         }
-        DeviceBudget { write, read, meters, last_refill: now, model_absent: share.is_absent() }
+        DeviceBudget {
+            write,
+            read,
+            meters,
+            last_refill: now,
+            model_absent: share.is_absent(),
+            checkpoint_alpha,
+        }
     }
 
     /// True when no direction is budgeted (INFO `io_budget_model:absent`).
@@ -353,6 +382,13 @@ impl DeviceBudget {
             }
             let grant_bytes = grant(dir.rate_bytes, elapsed, dir.fg_bytes);
             let grant_ops = grant(dir.rate_ops, elapsed, dir.fg_ops);
+            // The checkpoint keep-up floor (module docs): what the log
+            // wrote since the last refill, over α.
+            let keepup_bytes = if is_read || self.checkpoint_alpha == 0 {
+                0
+            } else {
+                dir.fg_bytes / self.checkpoint_alpha
+            };
             dir.fg_bytes = 0;
             dir.fg_ops = 0;
             let mut overflow_bytes: u64 = 0;
@@ -362,8 +398,14 @@ impl DeviceBudget {
                     continue;
                 }
                 let m = &mut self.meters[class.index()];
-                let add_bytes = mul_div(grant_bytes, class.weight(), dir.weights);
-                let add_ops = mul_div(grant_ops, class.weight(), dir.weights);
+                let mut add_bytes = mul_div(grant_bytes, class.weight(), dir.weights);
+                let mut add_ops = mul_div(grant_ops, class.weight(), dir.weights);
+                if class == IoClass::Checkpoint && keepup_bytes > add_bytes {
+                    add_bytes = keepup_bytes;
+                    // One op per slice the floor adds, so the ops axis
+                    // never starves a floored byte grant.
+                    add_ops = add_ops.max(keepup_bytes.div_ceil(m.slice_bytes.max(1)));
+                }
                 let room_bytes = m.cap_bytes.saturating_sub(m.deficit_bytes);
                 let room_ops = m.cap_ops.saturating_sub(m.deficit_ops);
                 m.deficit_bytes += add_bytes.min(room_bytes);
@@ -620,7 +662,7 @@ mod tests {
     }
 
     fn budget() -> DeviceBudget {
-        DeviceBudget::new(model().share(4), slices(), Nanos(0))
+        DeviceBudget::new(model().share(4), slices(), 0, Nanos(0))
     }
 
     #[test]
@@ -636,7 +678,7 @@ mod tests {
 
     #[test]
     fn an_absent_model_grants_everything_and_still_counts() {
-        let mut b = DeviceBudget::new(DeviceModel::ABSENT, slices(), Nanos(0));
+        let mut b = DeviceBudget::new(DeviceModel::ABSENT, slices(), 2, Nanos(0));
         assert!(b.model_absent());
         for _ in 0..1_000 {
             assert_eq!(b.admit(IoClass::Checkpoint, 64 * MIB, 1), Admission::Granted);
@@ -736,6 +778,31 @@ mod tests {
         assert!(matches!(b.admit(IoClass::Checkpoint, 4096, 1), Admission::Deferred { .. }));
     }
 
+    /// The checkpoint keep-up floor: under foreground saturation the
+    /// checkpoint class still receives `foreground bytes / α` per refill
+    /// (and the ops to issue it), so it completes within α intervals.
+    #[test]
+    fn the_checkpoint_keeps_up_with_the_log_at_foreground_saturation() {
+        let mut b = DeviceBudget::new(model().share(4), slices(), 2, Nanos(0));
+        // Drain the checkpoint class and the pool.
+        b.admit(IoClass::Checkpoint, b.deficit(IoClass::Checkpoint).0, 0);
+        b.admit(IoClass::ZeroFill, b.deficit(IoClass::ZeroFill).0, 0);
+        // The log writes 10× the share in 10 ms: the weighted grant is the
+        // floor (128 KiB × 2/10 = 25.6 KiB); the keep-up floor is 5 MiB.
+        b.charge(IoClass::LogFrame, 10 * MIB, 100);
+        b.refill(Nanos(10_000_000));
+        let (bytes, ops) = b.deficit(IoClass::Checkpoint);
+        let cap = horizon_of(100 * MIB, 2, 10).max(256 << 10);
+        assert_eq!(bytes, (5 * MIB).min(cap), "keep-up floor, capped at the class cap");
+        assert!(ops >= 1);
+        // Without α there is no floor: the weighted share alone.
+        let mut plain = DeviceBudget::new(model().share(4), slices(), 0, Nanos(0));
+        plain.admit(IoClass::Checkpoint, plain.deficit(IoClass::Checkpoint).0, 0);
+        plain.charge(IoClass::LogFrame, 10 * MIB, 100);
+        plain.refill(Nanos(10_000_000));
+        assert_eq!(plain.deficit(IoClass::Checkpoint).0, mul_div((100 * MIB / 100) / 8, 2, 10));
+    }
+
     #[test]
     fn reads_and_writes_are_separate_directions() {
         let mut b = budget();
@@ -749,7 +816,7 @@ mod tests {
     #[test]
     fn an_unbudgeted_dimension_never_defers_on_that_axis() {
         let m = DeviceModel { write_bytes_per_s: 100 * MIB, ..DeviceModel::ABSENT };
-        let mut b = DeviceBudget::new(m, slices(), Nanos(0));
+        let mut b = DeviceBudget::new(m, slices(), 0, Nanos(0));
         // ops rate is 0: a million ops is fine, bytes still bind.
         assert_eq!(b.admit(IoClass::Checkpoint, 4096, 1_000_000), Admission::Granted);
         let left = b.deficit(IoClass::Checkpoint).0;
