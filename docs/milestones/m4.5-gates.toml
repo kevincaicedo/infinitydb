@@ -161,13 +161,32 @@ tier = "linux-reference-box"
 source = "s36:everysec_vs_tmpfs_x"
 measured_by = "gate-run m4.5 device-budget row, closed-loop legs on both roots"
 
+# Amended 2026-08-21 with the first S36 campaign's evidence (L10 — the
+# amendment is recorded in the plan's S36 section and ADR-0088 D9): the
+# combined figure conflated the checkpoint term S36 owns with the v3
+# frame padding S34 disclosed, and at the row's own shape (K = 3, 32
+# conns, 2.2 records per 4 KiB frame) the padding alone is ~1.7×. The
+# binding gate is now the checkpoint term over the log bytes (design
+# bound 1/α = 500 milli; measured 140–170); the combined figure stays as
+# an informational row with the padding share beside it.
+[[gate]]
+id = "s36_checkpoint_over_log_milli"
+name = "S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound)"
+threshold = 500.0
+comparator = "<="
+unit = "milli-x (ADR-0088 D4: interval = α × last checkpoint ⇒ checkpoint ≤ log / α; UNDEFINED until a checkpoint publishes)"
+tier = "linux-reference-box"
+source = "s36:checkpoint_over_log_milli"
+measured_by = "gate-run m4.5 device-budget row, INFO persistence scrape at the end of the device leg (cells summed)"
+
 [[gate]]
 id = "s36_write_amp_milli_log_checkpoint"
-name = "S36: log + checkpoint write amplification on the RAM-resident durable shape"
+name = "S36: log + checkpoint write amplification (informational — the padding term is shape-dependent)"
 threshold = 1600.0
 comparator = "<="
-unit = "milli-x ((log frames + checkpoint + MANIFEST bytes) / encoded record bytes; UNDEFINED until a checkpoint publishes)"
-tier = "linux-reference-box"
+unit = "milli-x ((log frames + checkpoint + MANIFEST bytes) / encoded record bytes; log_padding_pct disclosed beside it)"
+tier = "any"
+informational = true
 source = "s36:write_amp_milli_log_checkpoint"
 measured_by = "gate-run m4.5 device-budget row, INFO persistence scrape at the end of the device leg (worst cell)"
 
