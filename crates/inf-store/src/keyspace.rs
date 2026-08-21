@@ -1153,6 +1153,15 @@ impl Keyspace {
         if spec.mode == NsMode::Durable { spec.fsync } else { None }
     }
 
+    /// True when any durable namespace runs `FSYNC always` — the only
+    /// consumer of write-through frames, and therefore of segment
+    /// pre-zeroing (M4.5-S36, ADR-0088 D5 amended: an `everysec`-only
+    /// cell never pays the zero-fill's second write).
+    #[must_use]
+    pub fn has_always_namespace(&self) -> bool {
+        self.ns_iter().any(|s| s.mode == NsMode::Durable && s.fsync == Some(FsyncClass::Always))
+    }
+
     /// Ascending ids of durable namespaces — the checkpoint walk order
     /// (M2-S10, ADR-0016 D2; memory namespaces have a null log and null
     /// checkpoint coverage).

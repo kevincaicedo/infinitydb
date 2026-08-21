@@ -320,6 +320,9 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     /// ADR-0088 D2b: the frame-seal pacer (a due frame behind in-flight
     /// frames seals only when the device's barrier rate allows).
     seal_pace: SealPace,
+    /// Whether a write-through consumer (an `always` namespace) exists on
+    /// the cell this tick — the zero-fill gate (ADR-0088 D5 amended).
+    write_through_wanted: bool,
     /// Last durable seq assigned (0 = none; the gate starts at 0).
     last_seq: u64,
     /// Last seq the ack gate advanced to (group-formation bookkeeping).
@@ -401,6 +404,7 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_held: false,
             budget,
             seal_pace,
+            write_through_wanted: true,
             last_seq: 0,
             acked_seq: 0,
             group_hist_records: inf_foundation::LogHistogram::new(),
@@ -509,12 +513,22 @@ impl<F: SegmentFs> DurableCell<F> {
     /// `Direct` the next segment is then pre-zeroed through the driver,
     /// one slice per completion, and its zero-fill barrier registered
     /// coverage-neutral (ADR-0086 D4) — never a blocking write here.
-    pub fn maintain(&mut self, cx: &mut LoopCx<'_>) {
+    /// `write_through_wanted` is whether any `always` namespace exists on
+    /// the cell (ADR-0088 D5 amended): pre-zeroing exists to make frames
+    /// write-through eligible, so a cell with no write-through consumer
+    /// skips it — the next segment is taken un-zeroed (`rotations_
+    /// unzeroed`, FLUSH-class seal syncs, plain `O_DIRECT` frames), and
+    /// the first `always` namespace created later restarts the fill and
+    /// upgrades the class at the next rotation (ADR-0086 D4's machinery).
+    /// The S36 row measured the second write at 35–50 % of the device's
+    /// bytes on an `everysec`-only cell.
+    pub fn maintain(&mut self, cx: &mut LoopCx<'_>, write_through_wanted: bool) {
         if self.failed {
             return;
         }
         // ADR-0088 D2: one refill per MAINTAIN entry, injected clock.
         self.budget.refill(cx.now);
+        self.write_through_wanted = write_through_wanted;
         match self.rotor.maintain_deferred(cx.now.as_millis()) {
             Ok((_report, Some(barrier))) => {
                 // Fd-less tiers (MemFs) have process-KILL physics — no
@@ -549,7 +563,8 @@ impl<F: SegmentFs> DurableCell<F> {
         // rotation waits on forever (the sweep's finding) — and the
         // unissued remainder of the bound is refunded.
         let bound = u64::from(ZERO_FILL_SLICE_BYTES);
-        if self.rotor.zero_fill_pending()
+        if self.write_through_wanted
+            && self.rotor.zero_fill_pending()
             && self.budget.admit(IoClass::ZeroFill, bound, 1) == Admission::Granted
         {
             let Some(slice) = self.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) else {
