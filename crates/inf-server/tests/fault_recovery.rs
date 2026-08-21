@@ -33,10 +33,11 @@ fn cfg() -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
         staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 1 << 16, seal_after_ms: None },
+        segment: SegmentConfig { segment_bytes: 1 << 16, ..Default::default() },
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         sync_pipeline: 1,
+        fua_p50_us_probed: 0,
     }
 }
 
@@ -116,7 +117,7 @@ fn power_cut_after_seal_recovers_at_the_seal_boundary() {
     fault::disarm_all();
     let fs = MemFs::new();
     let config = DurableConfig {
-        segment: SegmentConfig { segment_bytes: 4096, seal_after_ms: None },
+        segment: SegmentConfig { segment_bytes: 4096, ..Default::default() },
         ..cfg()
     };
     let mut log = LogBuilder::new(&fs, &config);

@@ -22,7 +22,7 @@ use inf_alloc::{BufferId, BufferPool, LeaseKind};
 
 use crate::driver::{
     BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
-    StableBytesMut, SubmitStats, Wait,
+    StableBytesMut, SubmitStats, Wait, WriteBarrier,
 };
 use crate::token::CompletionToken;
 
@@ -161,11 +161,26 @@ impl KqueueDriver {
                 // "ready" — the readiness tier executes them synchronously
                 // at submit, delivering the same completion contract as the
                 // uring tier (fsync only after the full write; a failed
-                // write cancels the chained sync).
-                IoOp::LogWrite { fd, offset, data, token, fsync_token } => {
+                // write cancels the chained sync). `WriteThrough` is write
+                // + fsync here — the same durability promise at FLUSH-class
+                // cost: the correctness tier, never a gate artifact
+                // (ADR-0086 D1).
+                IoOp::LogWrite { fd, offset, data, token, barrier } => {
+                    let fsync_token = barrier.fsync_token();
+                    let write_through = matches!(barrier, WriteBarrier::WriteThrough);
                     match log_pwrite_all(fd, offset, data, &mut self.stats) {
                         Ok(()) => {
-                            out.push(Completion { token, result: CompletionResult::LogWritten });
+                            let through = if write_through {
+                                // The write's own token is the durability
+                                // fact: a failed sync is the write's error.
+                                match sync_file(fd, token, &mut self.stats).result {
+                                    CompletionResult::Synced => CompletionResult::LogWritten,
+                                    failed => failed,
+                                }
+                            } else {
+                                CompletionResult::LogWritten
+                            };
+                            out.push(Completion { token, result: through });
                             if let Some(ft) = fsync_token {
                                 out.push(sync_file(fd, ft, &mut self.stats));
                             }

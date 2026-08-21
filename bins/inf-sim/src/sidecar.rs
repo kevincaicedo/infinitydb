@@ -117,6 +117,7 @@ fn base(scenario: &SidecarScenario) -> DurableScenario {
         ckpt_stream_bytes_per_sec: Some(2 << 20),
         stall: None,
         replay_canary: false,
+        io_mode: inf_server::SegmentIoMode::Buffered,
     }
 }
 

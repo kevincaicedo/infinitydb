@@ -200,3 +200,26 @@ expect = "blob-write-fails-typed"
 #     (footer write completed, seal fdatasync did not → reseal-at-watermark)
 #   reactor_sealed_file_beyond_the_manifest_is_clamped_inert
 #     (seal completed, MANIFEST never named it → manifested-prefix clamp)
+
+# ---- M4.5-S34 write-through (FUA-class) frames on Direct segments
+# (ADR-0086 D8) — sim-disk physics, carried by tests/fua.rs ----
+#   fua-in-flight     — the cut lands with a write-through frame issued
+#                       but not executed: every acked key recovers
+#                       exactly, the in-flight frame and after are gone,
+#                       the tail reopens Direct at the aligned boundary
+#   seal-flush-x-fua  — a rotation's seal FLUSH never completes while a
+#                       write-through frame in the new segment does: the
+#                       done-prefix keeps it un-acked; recovery admits
+#                       either outcome for it and every acked key exactly
+
+[[row]]
+point = "torn_frame"
+tier = "node"
+test = "fua.rs"
+expect = "fua-in-flight"
+
+[[row]]
+point = "power_cut_after_seal"
+tier = "node"
+test = "fua.rs"
+expect = "seal-flush-x-fua"

@@ -34,7 +34,7 @@ use inf_alloc::BufferPool;
 use inf_foundation::LogHistogram;
 use inf_runtime::{
     BackendDriver, CompletionResult, CompletionToken, IoOp, RawFd, StableBytes, TokenClass,
-    UringDriver, Wait,
+    UringDriver, Wait, WriteBarrier,
 };
 
 const FILE_BYTES: u64 = 1 << 30;
@@ -159,15 +159,21 @@ fn commit_frame(
     // SAFETY: `frame` is live and unmodified until both completions below
     // are reaped in this same call (one frame in flight — lease discipline).
     let data = unsafe { StableBytes::new(frame) };
-    let fsync_token =
-        (!policy.write_is_barrier()).then(|| CompletionToken::new(TokenClass::Fsync, 1, 0));
+    // The O_DSYNC policy opens the fd with the flag, so the write itself
+    // is the barrier and carries none (the pre-ADR-0086 bench shape, kept
+    // so its rows stay comparable with the M2 artifact).
+    let barrier = if policy.write_is_barrier() {
+        WriteBarrier::None
+    } else {
+        WriteBarrier::LinkedFsync { fsync_token: CompletionToken::new(TokenClass::Fsync, 1, 0) }
+    };
     let expected = if policy.write_is_barrier() { 1 } else { 2 };
     driver.push(IoOp::LogWrite {
         fd,
         offset,
         data,
         token: CompletionToken::new(TokenClass::LogWrite, 1, 0),
-        fsync_token,
+        barrier,
     });
     let mut got = 0;
     while got < expected {

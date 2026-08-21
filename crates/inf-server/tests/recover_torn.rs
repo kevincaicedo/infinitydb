@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use inf_foundation::time::Nanos;
+use inf_log::FrameLayout;
 use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
@@ -35,10 +36,11 @@ fn cfg() -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
         staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 1 << 16, seal_after_ms: None },
+        segment: SegmentConfig { segment_bytes: 1 << 16, ..Default::default() },
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         sync_pipeline: 1,
+        fua_p50_us_probed: 0,
     }
 }
 
@@ -83,7 +85,7 @@ impl LogBuilder {
         self.rotor.maintain(0).expect("maintain");
         let slot = self.rotor.begin_frame(self.ring.pending_frame_len(), 0).expect("reserve");
         let covered = slot.base().to_u64();
-        let lease = self.ring.seal(slot.first_record_lsn(), covered);
+        let lease = self.ring.seal(slot.first_record_lsn(), covered, slot.layout());
         let frame = self.ring.leased_frame(&lease).to_vec();
         self.rotor.commit_frame(slot, &frame).expect("commit");
         let lsns: Vec<Lsn> = staged.iter().map(|&at| lease.lsn_of(at)).collect();
@@ -292,8 +294,13 @@ fn attesting_survivor_after_a_zero_gap_refuses_to_start() {
     b.append(&RecordView::StringPostImage { ns: NS, key: b"ghost", value: b"stale" });
     let stamp =
         FrameStamp { epoch: 1, seq: 9, covered_lsn: Lsn::new(SegmentId(0), survivor_at).to_u64() };
-    let bytes =
-        b.finalize(Lsn::new(SegmentId(0), survivor_at + FRAME_HEADER_LEN as u32), stamp).to_vec();
+    let bytes = b
+        .finalize(
+            Lsn::new(SegmentId(0), survivor_at + FRAME_HEADER_LEN as u32),
+            stamp,
+            FrameLayout::Packed,
+        )
+        .to_vec();
     log.poke(SegmentId(0), survivor_at, &bytes);
 
     let mut ks = fresh_keyspace();
@@ -320,8 +327,13 @@ fn unattested_survivor_after_a_zero_gap_truncates_and_is_counted() {
     let mut b = FrameBuilder::new();
     b.append(&RecordView::StringPostImage { ns: NS, key: b"ghost", value: b"stale" });
     let stamp = FrameStamp { epoch: 3, seq: 9, covered_lsn: 0 };
-    let bytes =
-        b.finalize(Lsn::new(SegmentId(0), survivor_at + FRAME_HEADER_LEN as u32), stamp).to_vec();
+    let bytes = b
+        .finalize(
+            Lsn::new(SegmentId(0), survivor_at + FRAME_HEADER_LEN as u32),
+            stamp,
+            FrameLayout::Packed,
+        )
+        .to_vec();
     log.poke(SegmentId(0), survivor_at, &bytes);
 
     let mut ks = fresh_keyspace();

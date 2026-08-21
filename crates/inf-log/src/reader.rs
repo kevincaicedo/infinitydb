@@ -18,7 +18,9 @@
 //! [`ReadEnd::ZeroTail`] (preallocated, never-written bytes) or
 //! [`ReadEnd::FileEnd`]; anything else surfaces as a typed [`ReadError`]
 //! with the exact segment offset. `ReadEnd::at` is the byte after the
-//! last valid frame — precisely the `tail_offset` that
+//! last valid frame — its aligned successor when that frame is v3
+//! (ADR-0086 D3; the padding bytes are skipped, never validated) —
+//! precisely the `tail_offset` that
 //! [`SegmentRotor::open_existing`](crate::SegmentRotor::open_existing)
 //! resumes appending at.
 
@@ -267,7 +269,7 @@ impl<File: SegmentFile> SegmentReader<File> {
             return Ok(None);
         }
         let frame_len = loop {
-            let window = &self.buf[self.start..self.valid];
+            let window = &self.buf[self.start.min(self.valid)..self.valid];
             match peek(window, self.cfg.max_frame_len) {
                 Peek::Ready(frame_len) => break frame_len,
                 Peek::ZeroTail => {
@@ -320,8 +322,14 @@ impl<File: SegmentFile> SegmentReader<File> {
                         expected,
                     });
                 }
-                self.start += consumed;
-                self.next_offset += consumed as u32;
+                // v3: skip to the aligned successor (ADR-0086 D3). The
+                // padding may extend past the window — `start` may run
+                // ahead of `valid`; the next peek's refill compacts from
+                // the boundary (a file ending inside the padding is a
+                // clean `FileEnd`, like any other short tail).
+                let advance = frame.padded_len() as usize;
+                self.start += advance;
+                self.next_offset += advance as u32;
                 Ok(Some(frame))
             }
             Err(error) => {
@@ -369,6 +377,14 @@ impl<File: SegmentFile> SegmentReader<File> {
     /// `chunk_bytes` strides. The buffer grows only when one frame
     /// exceeds it — bounded by `max_frame_len`.
     fn refill(&mut self, needed: usize) -> Result<(), ReadError> {
+        if self.start > self.valid {
+            // A v3 frame's padding ran past the bytes read so far: the
+            // successor lies `start - valid` bytes beyond the window.
+            // Skip them in the file position (they are never consumed
+            // as data) and start an empty window at the boundary.
+            self.file_pos += (self.start - self.valid) as u64;
+            self.start = self.valid;
+        }
         self.buf.copy_within(self.start..self.valid, 0);
         self.valid -= self.start;
         self.start = 0;

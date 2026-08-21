@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use inf_foundation::time::Nanos;
+use inf_log::FrameLayout;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
@@ -35,10 +36,11 @@ fn cfg() -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
         staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 1 << 16, seal_after_ms: None },
+        segment: SegmentConfig { segment_bytes: 1 << 16, ..Default::default() },
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         sync_pipeline: 1,
+        fua_p50_us_probed: 0,
     }
 }
 
@@ -91,7 +93,7 @@ impl HandLog {
         let mut b = FrameBuilder::new();
         b.append(&RecordView::StringPostImage { ns: NS, key, value });
         let first = Lsn::new(SegmentId(0), self.offset + FRAME_HEADER_LEN as u32);
-        let bytes = b.finalize(first, stamp).to_vec();
+        let bytes = b.finalize(first, stamp, FrameLayout::Packed).to_vec();
         let at = self.offset;
         self.poke(at, &bytes);
         self.offset += u32::try_from(bytes.len()).expect("fits u32");

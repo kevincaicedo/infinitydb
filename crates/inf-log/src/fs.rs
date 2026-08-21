@@ -40,6 +40,22 @@ pub enum TierIoMode {
     Direct,
 }
 
+/// Log-segment I/O mode (M4.5-S34, ADR-0086 D1) — fixed at segment
+/// creation, carried by the segment. `Buffered` is the M2 path byte-for-
+/// byte (sparse prealloc, frame format v2, buffered write + linked
+/// fdatasync). `Direct` opens the segment `O_DIRECT`, writes 4 KiB-aligned
+/// v3 frames, and — once the segment is pre-zeroed — makes `always`
+/// frames write-through (FUA-class) instead of FLUSH-class. Durability is
+/// mode-independent (ADR-0086 D2); the mode decides the barrier's *cost*.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum SegmentIoMode {
+    /// Kernel page cache + fdatasync (the M2 default).
+    #[default]
+    Buffered,
+    /// `O_DIRECT`, verified at open — never a silent fallback.
+    Direct,
+}
+
 /// One open segment file. Offsets are absolute; the caller (the rotor)
 /// owns position bookkeeping.
 pub trait SegmentFile {
@@ -67,6 +83,15 @@ pub trait SegmentFile {
     /// sim tier implements the driver ops themselves. `inf-log` never
     /// performs a syscall on it.
     fn raw_fd(&self) -> Option<std::os::fd::RawFd>;
+    /// True when every byte of the file's length is backed by allocated,
+    /// written storage — the **read, never remembered** pre-zeroing fact
+    /// (ADR-0086 D4): a `Direct` segment writes write-through frames only
+    /// while this holds; a sparse tail, a zero-fill whose barrier a crash
+    /// lost, or a filesystem that elides zero blocks all read `false` and
+    /// run FLUSH-class barriers — correct, slower, visible. The std tier
+    /// reads `st_blocks`; in-memory tiers have no sparse concept (`true`);
+    /// the sim tier compares its length to the preallocation target.
+    fn fully_allocated(&self) -> io::Result<bool>;
     /// Advisory (M2.5-S08 read/apply overlap): the caller will soon read
     /// `[offset, offset + len)` sequentially. Tiers that can prefetch pull
     /// that window toward the page cache in the background, so the device
@@ -130,6 +155,29 @@ pub trait SegmentFs {
     fn create_segment_unsynced(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
         self.create_segment(path, prealloc_bytes)
     }
+    /// Create a `Direct`-mode segment (ADR-0086 D4): `O_DIRECT` (verified
+    /// on the std tier, `Unsupported` off Linux — never a silent
+    /// fallback), **sparse** at `prealloc_bytes`, no durability side
+    /// effects (the M2.5-S01 deferred shape). The rotor zero-fills it
+    /// through the driver before its first frame; until the zero-fill
+    /// barrier lands, [`SegmentFile::fully_allocated`] is `false`. The
+    /// default delegates to the synced buffered create — honest on tiers
+    /// without a page cache to bypass (`Buffered ≡ Direct` there, and a
+    /// zero-filled in-memory vector is "fully allocated"); wrappers must
+    /// forward explicitly.
+    fn create_segment_direct(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
+        self.create_segment(path, prealloc_bytes)
+    }
+    /// Open an **existing** segment for append in `mode` (ADR-0086 D4 —
+    /// the recovered tail): `Direct` opens `O_DIRECT` (verified);
+    /// `Buffered` is [`open_write`](Self::open_write). Whether the
+    /// reopened file is pre-zeroed is the caller's
+    /// [`SegmentFile::fully_allocated`] question, not this method's. The
+    /// default ignores the mode (in-memory/sim tiers); wrappers forward.
+    fn open_segment_append(&self, path: &Path, mode: SegmentIoMode) -> io::Result<Self::File> {
+        let _ = mode;
+        self.open_write(path)
+    }
     /// Create a new *staging* file (create-new semantics) with **no
     /// durability side effects** (M2-S11/S12): META/MANIFEST `.new` and
     /// `.ick.new` staging gets its data durability from an explicit
@@ -188,6 +236,17 @@ impl SegmentFile for StdSegmentFile {
     fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
         Some(std::os::fd::AsRawFd::as_raw_fd(&self.0))
     }
+
+    fn fully_allocated(&self) -> io::Result<bool> {
+        let meta = self.0.metadata()?;
+        // `st_blocks` is in 512-byte units regardless of the block size.
+        // Our writer allocates only as a prefix (sequential zero-fill or
+        // sequential frames), so "all blocks present" ⇔ "no sparse tail".
+        // `fallocate`d unwritten extents would also count, which is why
+        // the writer never uses `fallocate` (ADR-0086 D4).
+        let allocated = std::os::unix::fs::MetadataExt::blocks(&meta).saturating_mul(512);
+        Ok(allocated >= meta.len())
+    }
 }
 
 impl SegmentFs for StdSegmentFs {
@@ -226,6 +285,56 @@ impl SegmentFs for StdSegmentFs {
             std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
         file.set_len(prealloc_bytes)?;
         Ok(StdSegmentFile(file))
+    }
+
+    fn create_segment_direct(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Sparse + unsynced like `create_segment_unsynced`: the zero-
+            // fill through the driver allocates the extents and its
+            // barrier commits them; the dir entry rides the prealloc dir
+            // barrier (ADR-0086 D4).
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)?;
+            verify_o_direct(&file, path)?;
+            file.set_len(prealloc_bytes)?;
+            Ok(StdSegmentFile(file))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (path, prealloc_bytes);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "O_DIRECT log segments are Linux-only (ADR-0086 D1); configure Buffered",
+            ))
+        }
+    }
+
+    fn open_segment_append(&self, path: &Path, mode: SegmentIoMode) -> io::Result<Self::File> {
+        match mode {
+            SegmentIoMode::Buffered => self.open_write(path),
+            #[cfg(target_os = "linux")]
+            SegmentIoMode::Direct => {
+                use std::os::unix::fs::OpenOptionsExt;
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(path)?;
+                verify_o_direct(&file, path)?;
+                Ok(StdSegmentFile(file))
+            }
+            #[cfg(not(target_os = "linux"))]
+            SegmentIoMode::Direct => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "O_DIRECT log segments are Linux-only (ADR-0086 D1); configure Buffered",
+            )),
+        }
     }
 
     fn create_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
@@ -487,6 +596,11 @@ pub mod mem {
 
         fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
             None
+        }
+
+        fn fully_allocated(&self) -> io::Result<bool> {
+            // No sparse concept: a vector's bytes all exist.
+            Ok(true)
         }
     }
 

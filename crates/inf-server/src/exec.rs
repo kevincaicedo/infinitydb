@@ -150,6 +150,20 @@ pub struct NodeInfo {
     pub fsyncs_seal: Cell<u64>,
     pub fsyncs_standalone: Cell<u64>,
     pub fsyncs_completion: Cell<u64>,
+    /// M4.5-S34 (ADR-0086): barrier class of the active log segment (1 =
+    /// write-through/FUA, 0 = FLUSH), write-through ticket count and
+    /// latency, the two write-amplification disclosures of the direct
+    /// class (v3 padding, pre-zeroing), rotation shape, and the
+    /// `barrier_class_degraded` tripwire.
+    pub barrier_class_fua: Cell<u64>,
+    pub fsyncs_fua: Cell<u64>,
+    pub fua_p50_us: Cell<u64>,
+    pub fua_p99_us: Cell<u64>,
+    pub log_padding_bytes: Cell<u64>,
+    pub zero_fill_bytes: Cell<u64>,
+    pub rotations_unzeroed: Cell<u64>,
+    pub rotations_upgrade: Cell<u64>,
+    pub barrier_class_degraded: Cell<u64>,
     /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).
     pub ckpts_completed: Cell<u64>,
     pub ckpts_aborted: Cell<u64>,

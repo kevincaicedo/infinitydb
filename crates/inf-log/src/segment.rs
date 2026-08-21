@@ -15,19 +15,57 @@
 //! unrepresentable: [`SegmentRotor::begin_frame`] performs any rotation
 //! and reserves the frame's base LSN (returned in a must-use
 //! [`FrameSlot`]), the caller finalizes its `FrameBuilder` against
-//! `slot.first_record_lsn()`, then [`SegmentRotor::commit_frame`] writes
-//! the bytes at the reserved base.
+//! `slot.first_record_lsn()` under `slot.layout()`, then
+//! [`SegmentRotor::commit_frame`] writes the bytes at the reserved base.
+//!
+//! **I/O mode and barrier class** (M4.5-S34, ADR-0086): every segment
+//! carries the [`SegmentIoMode`] it was created with. `Direct` segments
+//! take 4 KiB-aligned v3 frames and, once **pre-zeroed**, write-through
+//! (FUA-class) barriers. Pre-zeroing is the rotor's job and runs through
+//! the driver (never a blocking write on the cell): the plane pulls zero
+//! slices from [`SegmentRotor::next_zero_slice`], reports each
+//! completion, issues the zero-fill barrier the rotor asks for, and the
+//! next segment becomes *ready*. Pre-zeroed is **read, never
+//! remembered** — `SegmentFile::fully_allocated` at every create/open —
+//! so a sparse tail or a lost barrier degrades loudly to FLUSH-class
+//! barriers instead of silently entering the unwritten-extent trap.
 
 use core::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::frame::FRAME_HEADER_LEN;
-use crate::fs::{SegmentFile, SegmentFs};
+use crate::frame::{FRAME_ALIGN, FRAME_HEADER_LEN, FrameLayout};
+use crate::fs::{SegmentFile, SegmentFs, SegmentIoMode};
 use crate::lsn::{Lsn, SegmentId};
 use crate::scan::SegmentScan;
 
 pub const DEFAULT_SEGMENT_BYTES: u32 = 256 << 20;
+
+/// Default largest padded frame written write-through on a `Direct`
+/// segment (ADR-0086 D1/D7): the reference device's probed crossover sits
+/// between 256 KiB (FUA still 4× cheaper than FLUSH) and 1 MiB (FUA
+/// loses); `io-properties.toml` overrides it per device.
+pub const DEFAULT_FUA_MAX_FRAME_BYTES: u32 = 256 << 10;
+
+/// Bytes per driver-ridden zero-fill write (ADR-0086 D4): large enough
+/// to run near the device's sequential rate, small enough that a
+/// write-through frame queued behind one slice waits ~0.25 ms and a
+/// not-ready rotation waits at most one slice completion. The first
+/// dev-tier A/B ran 1 MiB slices unpaced and paid for it in `always` p99
+/// (8 → 19–23 ms at 4 cells): the zero-fill burst is background I/O on
+/// the same device as the barrier.
+pub const ZERO_FILL_SLICE_BYTES: u32 = 256 << 10;
+
+/// Zero-fill head start (ADR-0086 D4 pacing): while the active segment
+/// is pre-zeroed, the next segment's fill cursor may run ahead of
+/// `2 × active.written + ZERO_FILL_HEAD_START` and no further — the fill
+/// finishes at half the active segment's life with 2× headroom over the
+/// log's own rate, spread across it instead of a burst. Derived from
+/// bytes, not tuned from a clock (L7-neutral). An active segment that is
+/// *not* pre-zeroed (a fresh cell, a reopened sparse tail, a not-ready
+/// rotation) fills unpaced: the FLUSH class it is running costs more
+/// than the burst.
+pub const ZERO_FILL_HEAD_START: u32 = 16 << 20;
 
 /// File name of a segment: `seg-{:06}.ilog` (wider ids grow digits
 /// naturally; the parser accepts 6–10 digits).
@@ -59,11 +97,43 @@ pub struct SegmentConfig {
     /// Seal the active segment once this many milliseconds have passed
     /// since its first append (checked in MAINTAIN). `None` = size-only.
     pub seal_after_ms: Option<u64>,
+    /// I/O mode of every segment created from here on (ADR-0086 D1).
+    /// `Buffered` is the M2 path byte-for-byte and the default until the
+    /// reference-box A/B; `Direct` requires `segment_bytes` to be a
+    /// multiple of [`FRAME_ALIGN`].
+    pub io_mode: SegmentIoMode,
+    /// Largest padded frame written write-through on a pre-zeroed
+    /// `Direct` segment; larger frames keep the linked fdatasync (the
+    /// device-probed crossover, ADR-0086 D7).
+    pub fua_max_frame_bytes: u32,
 }
 
 impl Default for SegmentConfig {
     fn default() -> Self {
-        SegmentConfig { segment_bytes: DEFAULT_SEGMENT_BYTES, seal_after_ms: None }
+        SegmentConfig {
+            segment_bytes: DEFAULT_SEGMENT_BYTES,
+            seal_after_ms: None,
+            io_mode: SegmentIoMode::Buffered,
+            fua_max_frame_bytes: DEFAULT_FUA_MAX_FRAME_BYTES,
+        }
+    }
+}
+
+impl SegmentConfig {
+    /// Boot-configuration invariant (ADR-0086 D3): aligned frames need an
+    /// aligned segment end, or the last frame's padding would run past
+    /// the preallocation.
+    ///
+    /// # Panics
+    /// If `Direct` is configured with a `segment_bytes` that is not a
+    /// multiple of [`FRAME_ALIGN`].
+    pub fn assert_valid(&self) {
+        if self.io_mode == SegmentIoMode::Direct {
+            assert!(
+                self.segment_bytes.is_multiple_of(FRAME_ALIGN),
+                "Direct segments need segment_bytes to be a multiple of {FRAME_ALIGN}"
+            );
+        }
     }
 }
 
@@ -104,6 +174,12 @@ pub enum LogError {
         len: u32,
         max: u32,
     },
+    /// Rotation is due but the next segment has a zero-fill slice or
+    /// barrier in flight (ADR-0086 D4): the frame waits one completion.
+    /// Retryable — the LOG step returns and re-tries next iteration.
+    NextNotReady {
+        segment: SegmentId,
+    },
     Fsync(FsyncFailed),
     Io {
         segment: SegmentId,
@@ -119,6 +195,9 @@ impl fmt::Display for LogError {
             }
             LogError::FrameTooLarge { len, max } => {
                 write!(f, "frame of {len} bytes exceeds segment capacity {max}")
+            }
+            LogError::NextNotReady { segment } => {
+                write!(f, "next segment {segment} has a zero-fill op in flight: frame waits")
             }
             LogError::Fsync(err) => err.fmt(f),
             LogError::Io { segment, source } => write!(f, "log I/O error on {segment}: {source}"),
@@ -138,12 +217,15 @@ impl std::error::Error for LogError {
 
 /// Reservation for exactly one frame append, produced by
 /// [`SegmentRotor::begin_frame`]. Not `Copy`/`Clone`: one reservation, one
-/// commit.
+/// commit. `len` is the **on-device** length (padding included under
+/// [`FrameLayout::Aligned`]); `barrier` is the class this frame may use.
 #[derive(Debug)]
 #[must_use = "a reserved frame slot must be committed"]
 pub struct FrameSlot {
     base: Lsn,
     len: u32,
+    layout: FrameLayout,
+    write_through_ok: bool,
 }
 
 impl FrameSlot {
@@ -157,6 +239,29 @@ impl FrameSlot {
     #[must_use]
     pub fn first_record_lsn(&self) -> Lsn {
         self.base.advance(FRAME_HEADER_LEN as u32)
+    }
+
+    /// On-device frame length (padding included) — the append-cursor
+    /// advance and the exclusive end the frame's barrier covers.
+    #[must_use]
+    #[allow(clippy::len_without_is_empty)] // a reservation is never empty
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    /// The layout the frame must be sealed under (the active segment's).
+    #[must_use]
+    pub fn layout(&self) -> FrameLayout {
+        self.layout
+    }
+
+    /// True when this frame may be written write-through (ADR-0086 D1):
+    /// the active segment is `Direct` **and** pre-zeroed, and the padded
+    /// frame is inside `fua_max_frame_bytes`. Otherwise a due sync rides
+    /// the linked fdatasync.
+    #[must_use]
+    pub fn write_through_ok(&self) -> bool {
+        self.write_through_ok
     }
 }
 
@@ -213,6 +318,15 @@ pub struct RotorStats {
     pub inline_preallocs: u64,
     pub prealloc_failures: u64,
     pub time_seals: u64,
+    /// Zero bytes written to pre-zero `Direct` segments (ADR-0086 D4) —
+    /// the second write of every direct log byte, disclosed.
+    pub zero_fill_bytes: u64,
+    /// Rotations onto a `Direct` segment whose zero-fill had not finished
+    /// (the active filled first): the segment runs FLUSH-class barriers.
+    pub rotations_unzeroed: u64,
+    /// Class-upgrade rotations (a pre-zeroed segment was ready while the
+    /// active one was not) — how a fresh or recovered cell converges.
+    pub rotations_upgrade: u64,
 }
 
 /// What one MAINTAIN slice did (observability + tests).
@@ -228,6 +342,56 @@ struct ActiveSegment<File> {
     file: File,
     written: u32,
     first_append_at_ms: Option<u64>,
+    io_mode: SegmentIoMode,
+    /// Every byte backed by written storage (ADR-0086 D4) — read at
+    /// create/open, never assumed. Decides write-through eligibility.
+    prezeroed: bool,
+}
+
+impl<File> ActiveSegment<File> {
+    fn layout(&self) -> FrameLayout {
+        match self.io_mode {
+            SegmentIoMode::Buffered => FrameLayout::Packed,
+            SegmentIoMode::Direct => FrameLayout::Aligned,
+        }
+    }
+}
+
+/// Where a preallocated next segment stands on its way to ready
+/// (ADR-0086 D4). `Buffered` segments are born `Ready { prezeroed: false }`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum NextState {
+    /// Zero slices are being written through the driver; `in_flight` is
+    /// the length of the slice awaiting its `LogWritten` (0 = none).
+    Filling {
+        cursor: u32,
+        in_flight: u32,
+    },
+    /// Every zero byte landed; the barrier is owed (the plane registers
+    /// and issues it).
+    AwaitBarrier,
+    /// The barrier is in flight.
+    BarrierInFlight,
+    Ready {
+        prezeroed: bool,
+    },
+}
+
+struct NextSegment<File> {
+    id: SegmentId,
+    file: File,
+    io_mode: SegmentIoMode,
+    state: NextState,
+}
+
+/// One zero-fill write for the plane to issue (ADR-0086 D4): `fd` of the
+/// next segment, absolute `offset`, `len` bytes of zeros from the cell's
+/// aligned zero window.
+#[derive(Copy, Clone, Debug)]
+pub struct ZeroSlice {
+    pub fd: std::os::fd::RawFd,
+    pub offset: u64,
+    pub len: u32,
 }
 
 /// Owner of one cell's active + preallocated-next segments. Sealed
@@ -239,7 +403,7 @@ pub struct SegmentRotor<F: SegmentFs> {
     log_dir: PathBuf,
     cfg: SegmentConfig,
     active: ActiveSegment<F::File>,
-    next: Option<(SegmentId, F::File)>,
+    next: Option<NextSegment<F::File>>,
     sealed: Vec<SegmentId>,
     space_exhausted: bool,
     /// The log life frames appended through this rotor belong to
@@ -258,7 +422,9 @@ impl<F: SegmentFs> fmt::Debug for SegmentRotor<F> {
             .field("log_dir", &self.log_dir)
             .field("active", &self.active.id)
             .field("written", &self.active.written)
-            .field("next", &self.next.as_ref().map(|(id, _)| *id))
+            .field("io_mode", &self.active.io_mode)
+            .field("prezeroed", &self.active.prezeroed)
+            .field("next", &self.next.as_ref().map(|next| (next.id, next.state)))
             .field("sealed", &self.sealed)
             .field("stats", &self.stats)
             .finish()
@@ -269,13 +435,15 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// First boot of a cell: create `seg-000000.ilog` preallocated in an
     /// existing (already dir-fsynced — see `create_cell_dirs`) log dir.
     pub fn create_fresh(fs: F, log_dir: PathBuf, cfg: SegmentConfig) -> Result<Self, LogError> {
+        cfg.assert_valid();
         let id = SegmentId(0);
         let file = create_prealloc(&fs, &log_dir, id, &cfg)?;
+        let active = activate(id, file, 0, cfg.io_mode)?;
         Ok(SegmentRotor {
             fs,
             log_dir,
             cfg,
-            active: ActiveSegment { id, file, written: 0, first_append_at_ms: None },
+            active,
             next: None,
             sealed: Vec::new(),
             space_exhausted: false,
@@ -291,18 +459,24 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// head of the group-commit ledger, fencing every durable ack behind
     /// them. `PREALLOC_NO_SPACE` still fires: ENOSPC admission is not a
     /// durability side effect.
+    /// Under `Direct` (ADR-0086 D4) segment 0 is created sparse — zero
+    /// boot cost, no boot-path blocking — and runs FLUSH-class barriers
+    /// until the class-upgrade rotation onto the first pre-zeroed next
+    /// segment MAINTAIN produces.
     pub fn create_fresh_deferred(
         fs: F,
         log_dir: PathBuf,
         cfg: SegmentConfig,
     ) -> Result<Self, LogError> {
+        cfg.assert_valid();
         let id = SegmentId(0);
         let file = create_prealloc_deferred(&fs, &log_dir, id, &cfg)?;
+        let active = activate(id, file, 0, cfg.io_mode)?;
         Ok(SegmentRotor {
             fs,
             log_dir,
             cfg,
-            active: ActiveSegment { id, file, written: 0, first_append_at_ms: None },
+            active,
             next: None,
             sealed: Vec::new(),
             space_exhausted: false,
@@ -336,7 +510,12 @@ impl<F: SegmentFs> SegmentRotor<F> {
 
     /// Reopen after a boot scan: the highest-numbered segment is the tail;
     /// recovery (M2-S13/S14) computes `tail_offset` — the byte after the
-    /// last valid frame — and hands it here.
+    /// last valid frame (the aligned successor when that frame was v3) —
+    /// and hands it here. The tail reopens in the configured mode
+    /// (ADR-0086 D4): `Direct` needs an aligned `tail_offset` (a v2 tail
+    /// resumed under `Direct` rounds up — the skipped bytes are zeros or
+    /// un-covered residue, both legal slack) and is pre-zeroed only if the
+    /// file says so.
     pub fn open_existing(
         fs: F,
         log_dir: PathBuf,
@@ -344,29 +523,128 @@ impl<F: SegmentFs> SegmentRotor<F> {
         scan: &SegmentScan,
         tail_offset: u32,
     ) -> Result<Self, LogError> {
+        cfg.assert_valid();
         let Some(tail) = scan.tail() else {
             return Self::create_fresh(fs, log_dir, cfg);
         };
         let path = log_dir.join(segment_file_name(tail));
-        let file = fs.open_write(&path).map_err(|source| LogError::Io { segment: tail, source })?;
+        let file = fs
+            .open_segment_append(&path, cfg.io_mode)
+            .map_err(|source| LogError::Io { segment: tail, source })?;
+        let written = match cfg.io_mode {
+            SegmentIoMode::Buffered => tail_offset,
+            SegmentIoMode::Direct => crate::frame::align_up_frame(tail_offset),
+        };
+        let active = activate(tail, file, written, cfg.io_mode)?;
         let sealed =
             scan.segments().split_last().map(|(_, rest)| rest.to_vec()).unwrap_or_default();
         Ok(SegmentRotor {
             fs,
             log_dir,
             cfg,
-            active: ActiveSegment {
-                id: tail,
-                file,
-                written: tail_offset,
-                first_append_at_ms: None,
-            },
+            active,
             next: None,
             sealed,
             space_exhausted: false,
             resume_epoch: 1,
             stats: RotorStats::default(),
         })
+    }
+
+    /// The active segment's I/O mode.
+    #[must_use]
+    pub fn active_io_mode(&self) -> SegmentIoMode {
+        self.active.io_mode
+    }
+
+    /// True while the active segment writes write-through frames for
+    /// due syncs (`Direct` and pre-zeroed — ADR-0086 D4): the
+    /// `barrier_class` observable.
+    #[must_use]
+    pub fn active_write_through(&self) -> bool {
+        self.active.io_mode == SegmentIoMode::Direct && self.active.prezeroed
+    }
+
+    /// The next zero-fill write to issue, when the next segment is
+    /// filling and no slice is in flight (ADR-0086 D4). Marks the slice
+    /// in flight; the plane reports it back through
+    /// [`note_zero_slice_written`](Self::note_zero_slice_written).
+    /// `max_len` is the zero window's size.
+    #[must_use]
+    pub fn next_zero_slice(&mut self, max_len: u32) -> Option<ZeroSlice> {
+        debug_assert!(max_len.is_multiple_of(FRAME_ALIGN), "zero window is aligned");
+        let paced = self.active.prezeroed;
+        let active_written = self.active.written;
+        let next = self.next.as_mut()?;
+        let NextState::Filling { cursor, in_flight: 0 } = next.state else { return None };
+        if paced {
+            let allowed = active_written.saturating_mul(2).saturating_add(ZERO_FILL_HEAD_START);
+            if cursor >= allowed {
+                return None;
+            }
+        }
+        let fd = next.file.raw_fd()?;
+        let len = max_len.min(self.cfg.segment_bytes - cursor);
+        debug_assert!(len > 0, "a filling segment has bytes left");
+        next.state = NextState::Filling { cursor, in_flight: len };
+        Some(ZeroSlice { fd, offset: u64::from(cursor), len })
+    }
+
+    /// The in-flight zero slice's `LogWritten` arrived.
+    ///
+    /// # Panics
+    /// If no slice was in flight — a completion-routing bug.
+    pub fn note_zero_slice_written(&mut self) {
+        let next = self.next.as_mut().expect("zero slice written with no next segment");
+        let NextState::Filling { cursor, in_flight } = next.state else {
+            panic!("zero slice written while not filling")
+        };
+        assert!(in_flight > 0, "zero slice written with none in flight");
+        let cursor = cursor + in_flight;
+        self.stats.zero_fill_bytes += u64::from(in_flight);
+        next.state = if cursor == self.cfg.segment_bytes {
+            NextState::AwaitBarrier
+        } else {
+            NextState::Filling { cursor, in_flight: 0 }
+        };
+    }
+
+    /// The next segment's fd when its zero-fill barrier is owed (every
+    /// zero byte landed, barrier not yet issued). Marks it in flight; the
+    /// plane registers the ledger entry and issues the fdatasync.
+    #[must_use]
+    pub fn take_zero_fill_barrier(&mut self) -> Option<std::os::fd::RawFd> {
+        let next = self.next.as_mut()?;
+        if next.state != NextState::AwaitBarrier {
+            return None;
+        }
+        let fd = next.file.raw_fd()?;
+        next.state = NextState::BarrierInFlight;
+        Some(fd)
+    }
+
+    /// The zero-fill barrier's `Synced` arrived: the next segment is
+    /// pre-zeroed and ready.
+    ///
+    /// # Panics
+    /// If no barrier was in flight.
+    pub fn note_zero_fill_synced(&mut self) {
+        let next = self.next.as_mut().expect("zero-fill synced with no next segment");
+        assert_eq!(next.state, NextState::BarrierInFlight, "zero-fill synced out of order");
+        next.state = NextState::Ready { prezeroed: true };
+    }
+
+    /// A class-upgrade rotation is due (ADR-0086 D4): the active segment
+    /// cannot write write-through frames and a pre-zeroed next segment is
+    /// ready. Checked at `begin_frame_deferred` — rotation happens only
+    /// while no frame is in flight.
+    fn upgrade_due(&self) -> bool {
+        self.cfg.io_mode == SegmentIoMode::Direct
+            && !self.active.prezeroed
+            && self
+                .next
+                .as_ref()
+                .is_some_and(|next| next.state == NextState::Ready { prezeroed: true })
     }
 
     /// MAINTAIN slice: preallocate the next segment if missing and perform
@@ -416,7 +694,9 @@ impl<F: SegmentFs> SegmentRotor<F> {
                             .map_err(|source| LogError::Io { segment: id, source })?;
                         barrier = Some(PreallocBarrier { segment: id, dir });
                     }
-                    self.next = Some((id, file));
+                    let io_mode = self.cfg.io_mode;
+                    let state = next_state(&file, id, io_mode)?;
+                    self.next = Some(NextSegment { id, file, io_mode, state });
                     self.stats.preallocs += 1;
                     self.space_exhausted = false;
                     report.preallocated = Some(id);
@@ -440,21 +720,18 @@ impl<F: SegmentFs> SegmentRotor<F> {
         self.space_exhausted
     }
 
-    /// Reserve space for one frame of `frame_len` bytes, rotating first if
-    /// it does not fit the active segment. Hot path: the fit check is one
-    /// compare; rotation itself is a pointer swap onto the preallocated
-    /// next segment.
+    /// Reserve space for one frame of `frame_len` (unpadded) bytes,
+    /// rotating first if its padded length does not fit the active
+    /// segment. Hot path: the fit check is one compare; rotation itself is
+    /// a pointer swap onto the preallocated next segment.
     pub fn begin_frame(&mut self, frame_len: u32, now_ms: u64) -> Result<FrameSlot, LogError> {
-        if frame_len > self.cfg.segment_bytes {
+        if self.padded_bound(frame_len) > self.cfg.segment_bytes {
             return Err(LogError::FrameTooLarge { len: frame_len, max: self.cfg.segment_bytes });
         }
-        if self.active.written.saturating_add(frame_len) > self.cfg.segment_bytes {
+        if !self.fits(frame_len) {
             self.rotate()?;
         }
-        if self.active.first_append_at_ms.is_none() {
-            self.active.first_append_at_ms = Some(now_ms);
-        }
-        Ok(FrameSlot { base: Lsn::new(self.active.id, self.active.written), len: frame_len })
+        Ok(self.reserve(frame_len, now_ms))
     }
 
     /// `begin_frame` for the reactor tier (M2-S05): rotation, when due, is
@@ -463,27 +740,63 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// blocking the append path (ADR-0013 D4). Only the size seal rotates
     /// here; the reactor tier ships with `seal_after_ms = None` (the M2
     /// cut line — time seals remain a synchronous-tier feature until their
-    /// config lands).
+    /// config lands). A class-upgrade rotation (ADR-0086 D4) also lands
+    /// here — the one place rotation is known to find no frame in flight.
     pub fn begin_frame_deferred(
         &mut self,
         frame_len: u32,
         now_ms: u64,
     ) -> Result<DeferredBegin<F::File>, LogError> {
-        if frame_len > self.cfg.segment_bytes {
+        if self.padded_bound(frame_len) > self.cfg.segment_bytes {
             return Err(LogError::FrameTooLarge { len: frame_len, max: self.cfg.segment_bytes });
         }
-        let handoff = if self.active.written.saturating_add(frame_len) > self.cfg.segment_bytes {
+        let handoff = if !self.fits(frame_len) || self.upgrade_due() {
             Some(self.rotate_deferred()?)
         } else {
             None
         };
+        Ok((self.reserve(frame_len, now_ms), handoff))
+    }
+
+    /// The largest on-device length a frame of `frame_len` bytes can take
+    /// in this rotor — the active layout's, or the aligned one when the
+    /// configured mode could rotate it onto a `Direct` segment. Bounds the
+    /// `FrameTooLarge` refusal so a rotation never discovers a frame that
+    /// fit the old segment but not the new.
+    fn padded_bound(&self, frame_len: u32) -> u32 {
+        let here = self.active.layout().padded_len(frame_len);
+        match self.cfg.io_mode {
+            SegmentIoMode::Direct => here.max(FrameLayout::Aligned.padded_len(frame_len)),
+            SegmentIoMode::Buffered => here,
+        }
+    }
+
+    /// Does a frame of `frame_len` (unpadded) bytes fit the active
+    /// segment under its layout?
+    fn fits(&self, frame_len: u32) -> bool {
+        let padded = self.active.layout().padded_len(frame_len);
+        self.active.written.saturating_add(padded) <= self.cfg.segment_bytes
+    }
+
+    /// The reservation itself: padded length under the active layout,
+    /// write-through eligibility from the active segment's state.
+    fn reserve(&mut self, frame_len: u32, now_ms: u64) -> FrameSlot {
         if self.active.first_append_at_ms.is_none() {
             self.active.first_append_at_ms = Some(now_ms);
         }
-        Ok((
-            FrameSlot { base: Lsn::new(self.active.id, self.active.written), len: frame_len },
-            handoff,
-        ))
+        let layout = self.active.layout();
+        let len = layout.padded_len(frame_len);
+        debug_assert!(self.active.written.saturating_add(len) <= self.cfg.segment_bytes);
+        if layout == FrameLayout::Aligned {
+            debug_assert!(self.active.written.is_multiple_of(FRAME_ALIGN), "aligned cursor");
+        }
+        let write_through_ok = self.active_write_through() && len <= self.cfg.fua_max_frame_bytes;
+        FrameSlot {
+            base: Lsn::new(self.active.id, self.active.written),
+            len,
+            layout,
+            write_through_ok,
+        }
     }
 
     /// Advance the append cursor for a frame whose bytes ride the driver
@@ -508,23 +821,74 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// LOG step rotates exclusively while no write is in flight (the
     /// staging lease serializes writes; `can_seal` implies the previous
     /// write's CQE arrived), so the handed-off segment is complete.
+    ///
+    /// A next segment still zero-filling is taken anyway once no zero
+    /// slice is in flight (a slice could otherwise land over the first
+    /// frame) — it then runs FLUSH-class barriers (`rotations_unzeroed`,
+    /// ADR-0086 D4); while a slice is in flight the frame waits
+    /// (`NextNotReady`).
     fn rotate_deferred(&mut self) -> Result<SealHandoff<F::File>, LogError> {
-        let (next_id, next_file) = match self.next.take() {
-            Some(ready) => ready,
-            None => {
-                let id = self.active.id.next();
-                let file = create_prealloc(&self.fs, &self.log_dir, id, &self.cfg)?;
-                self.stats.inline_preallocs += 1;
-                (id, file)
-            }
+        let next = match self.next.take() {
+            Some(next) => next,
+            None => self.inline_prealloc()?,
         };
+        let next = match next.state {
+            NextState::Filling { in_flight, .. } if in_flight > 0 => {
+                let id = next.id;
+                self.next = Some(next);
+                return Err(LogError::NextNotReady { segment: id });
+            }
+            NextState::BarrierInFlight => {
+                // The fd has a sync in flight; taking it is harmless (the
+                // barrier covers zeros only) but the ledger entry would
+                // then name the *active* fd — keep the state machine
+                // honest and wait one completion instead.
+                let id = next.id;
+                self.next = Some(next);
+                return Err(LogError::NextNotReady { segment: id });
+            }
+            NextState::Filling { .. } | NextState::AwaitBarrier => {
+                self.stats.rotations_unzeroed += 1;
+                next
+            }
+            NextState::Ready { .. } => next,
+        };
+        if self.upgrade_due_for(&next) {
+            self.stats.rotations_upgrade += 1;
+        }
+        let prezeroed = matches!(next.state, NextState::Ready { prezeroed: true });
         let old = core::mem::replace(
             &mut self.active,
-            ActiveSegment { id: next_id, file: next_file, written: 0, first_append_at_ms: None },
+            ActiveSegment {
+                id: next.id,
+                file: next.file,
+                written: 0,
+                first_append_at_ms: None,
+                io_mode: next.io_mode,
+                prezeroed,
+            },
         );
         self.sealed.push(old.id);
         self.stats.rotations += 1;
         Ok(SealHandoff { segment: old.id, file: old.file, end_offset: old.written })
+    }
+
+    /// The slow path: rotation found no preallocated next segment (a
+    /// MAINTAIN cadence miss, counted). Under `Direct` the fresh file is
+    /// sparse, so it starts `Filling` — and is taken un-zeroed right away
+    /// by the caller (FLUSH class until the next upgrade).
+    fn inline_prealloc(&mut self) -> Result<NextSegment<F::File>, LogError> {
+        let id = self.active.id.next();
+        let file = create_prealloc(&self.fs, &self.log_dir, id, &self.cfg)?;
+        self.stats.inline_preallocs += 1;
+        let io_mode = self.cfg.io_mode;
+        let state = next_state(&file, id, io_mode)?;
+        Ok(NextSegment { id, file, io_mode, state })
+    }
+
+    /// Was this rotation a class upgrade (active not pre-zeroed, next is)?
+    fn upgrade_due_for(&self, next: &NextSegment<F::File>) -> bool {
+        !self.active.prezeroed && next.state == NextState::Ready { prezeroed: true }
     }
 
     /// The active segment's platform fd for driver-tier writes (`None` on
@@ -611,18 +975,22 @@ impl<F: SegmentFs> SegmentRotor<F> {
                 source: crate::fault::injected(crate::fault::POWER_CUT_AFTER_SEAL),
             });
         }
-        let (next_id, next_file) = match self.next.take() {
-            Some(ready) => ready,
-            None => {
-                let id = self.active.id.next();
-                let file = create_prealloc(&self.fs, &self.log_dir, id, &self.cfg)?;
-                self.stats.inline_preallocs += 1;
-                (id, file)
-            }
+        let next = match self.next.take() {
+            Some(next) => next,
+            None => self.inline_prealloc()?,
         };
+        // The synchronous tier never drives a zero-fill (no driver): a
+        // `Direct` next segment is ready iff its tier is born allocated.
+        let prezeroed = matches!(next.state, NextState::Ready { prezeroed: true });
         self.sealed.push(self.active.id);
-        self.active =
-            ActiveSegment { id: next_id, file: next_file, written: 0, first_append_at_ms: None };
+        self.active = ActiveSegment {
+            id: next.id,
+            file: next.file,
+            written: 0,
+            first_append_at_ms: None,
+            io_mode: next.io_mode,
+            prezeroed,
+        };
         self.stats.rotations += 1;
         Ok(())
     }
@@ -645,9 +1013,17 @@ impl<F: SegmentFs> SegmentRotor<F> {
         self.active.written
     }
 
+    /// The preallocated next segment, if any (ready or still filling).
     #[must_use]
     pub fn next_ready(&self) -> Option<SegmentId> {
-        self.next.as_ref().map(|(id, _)| *id)
+        self.next.as_ref().map(|next| next.id)
+    }
+
+    /// True while the next segment is still being pre-zeroed (filling or
+    /// awaiting its barrier) — the zero-fill observable.
+    #[must_use]
+    pub fn next_zero_filling(&self) -> bool {
+        self.next.as_ref().is_some_and(|next| !matches!(next.state, NextState::Ready { .. }))
     }
 
     #[must_use]
@@ -726,13 +1102,58 @@ fn create_prealloc_deferred<F: SegmentFs>(
     if inf_foundation::fault::fire(crate::fault::PREALLOC_NO_SPACE) {
         return Err(LogError::NoSpace { segment: id });
     }
-    fs.create_segment_unsynced(&path, u64::from(cfg.segment_bytes)).map_err(|source| {
+    let created = match cfg.io_mode {
+        SegmentIoMode::Buffered => fs.create_segment_unsynced(&path, u64::from(cfg.segment_bytes)),
+        SegmentIoMode::Direct => fs.create_segment_direct(&path, u64::from(cfg.segment_bytes)),
+    };
+    created.map_err(|source| {
         if source.kind() == io::ErrorKind::StorageFull || source.raw_os_error() == Some(28) {
             LogError::NoSpace { segment: id }
         } else {
             LogError::Io { segment: id, source }
         }
     })
+}
+
+/// Where a freshly created next segment starts (ADR-0086 D4): `Buffered`
+/// is ready (and never write-through); `Direct` is ready only if the tier
+/// says every byte is allocated — read, never assumed (an in-memory tier
+/// is born allocated; a real sparse file needs the driver fill) — and
+/// fd-less tiers cannot be filled at all.
+fn next_state<File: SegmentFile>(
+    file: &File,
+    id: SegmentId,
+    io_mode: SegmentIoMode,
+) -> Result<NextState, LogError> {
+    match io_mode {
+        SegmentIoMode::Buffered => Ok(NextState::Ready { prezeroed: false }),
+        SegmentIoMode::Direct => {
+            let allocated =
+                file.fully_allocated().map_err(|source| LogError::Io { segment: id, source })?;
+            if allocated || file.raw_fd().is_none() {
+                Ok(NextState::Ready { prezeroed: allocated })
+            } else {
+                Ok(NextState::Filling { cursor: 0, in_flight: 0 })
+            }
+        }
+    }
+}
+
+/// Build the active-segment record, reading the pre-zeroed fact from the
+/// file (ADR-0086 D4 — never assumed).
+fn activate<File: SegmentFile>(
+    id: SegmentId,
+    file: File,
+    written: u32,
+    io_mode: SegmentIoMode,
+) -> Result<ActiveSegment<File>, LogError> {
+    let prezeroed = match io_mode {
+        SegmentIoMode::Buffered => false,
+        SegmentIoMode::Direct => {
+            file.fully_allocated().map_err(|source| LogError::Io { segment: id, source })?
+        }
+    };
+    Ok(ActiveSegment { id, file, written, first_append_at_ms: None, io_mode, prezeroed })
 }
 
 fn create_prealloc<F: SegmentFs>(
@@ -748,7 +1169,11 @@ fn create_prealloc<F: SegmentFs>(
     if inf_foundation::fault::fire(crate::fault::PREALLOC_NO_SPACE) {
         return Err(LogError::NoSpace { segment: id });
     }
-    let file = fs.create_segment(&path, u64::from(cfg.segment_bytes)).map_err(|source| {
+    let created = match cfg.io_mode {
+        SegmentIoMode::Buffered => fs.create_segment(&path, u64::from(cfg.segment_bytes)),
+        SegmentIoMode::Direct => fs.create_segment_direct(&path, u64::from(cfg.segment_bytes)),
+    };
+    let file = created.map_err(|source| {
         if source.kind() == io::ErrorKind::StorageFull || source.raw_os_error() == Some(28) {
             LogError::NoSpace { segment: id }
         } else {

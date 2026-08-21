@@ -1586,8 +1586,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 begin_lsn: m.begin_lsn,
             }),
         );
-        *self.shared.durable.borrow_mut() =
-            Some(DurableCell::new(cfg.staging, cfg.sync_pipeline, rotor, ckpt, manifest));
+        *self.shared.durable.borrow_mut() = Some(DurableCell::new(
+            cfg.staging,
+            cfg.sync_pipeline,
+            cfg.fua_p50_us_probed,
+            rotor,
+            ckpt,
+            manifest,
+        ));
         Ok(())
     }
 
@@ -1982,8 +1988,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     return;
                 }
                 // Log-op failures are fail-stop territory (§8.4), never
-                // connection housekeeping.
-                if matches!(c.token.class(), TokenClass::LogWrite | TokenClass::Fsync) {
+                // connection housekeeping. A zero-fill write failing is
+                // the same class: the device refused a log write.
+                if matches!(
+                    c.token.class(),
+                    TokenClass::LogWrite | TokenClass::Fsync | TokenClass::ZeroFillWrite
+                ) {
                     let mut durable = self.shared.durable.borrow_mut();
                     let cell = durable.as_mut().expect("log completion without durable plane");
                     cell.on_log_error(c.token, errno);
@@ -2048,10 +2058,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 }
                 let mut durable = self.shared.durable.borrow_mut();
                 let cell = durable.as_mut().expect("LogWritten without durable plane");
-                if c.token.class() == TokenClass::CkptWrite {
-                    cell.on_ckpt_written();
-                } else {
-                    cell.on_log_written(cx.now);
+                match c.token.class() {
+                    TokenClass::CkptWrite => cell.on_ckpt_written(),
+                    // ADR-0086 D4: a zero slice landed on the next
+                    // segment — the rotor's cursor, never the frame lease.
+                    TokenClass::ZeroFillWrite => cell.on_zero_fill_written(),
+                    _ => cell.on_log_written(cx),
                 }
             }
             CompletionResult::Synced => {
@@ -2726,6 +2738,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.fsyncs_linked.set(stats.fsyncs_linked);
             node.fsyncs_seal.set(stats.fsyncs_seal);
             node.fsyncs_standalone.set(stats.fsyncs_standalone);
+            node.barrier_class_fua.set(stats.barrier_class_fua);
+            node.fsyncs_fua.set(stats.fsyncs_fua);
+            node.fua_p50_us.set(stats.fua_p50_us);
+            node.fua_p99_us.set(stats.fua_p99_us);
+            node.log_padding_bytes.set(stats.log_padding_bytes);
+            node.zero_fill_bytes.set(stats.zero_fill_bytes);
+            node.rotations_unzeroed.set(stats.rotations_unzeroed);
+            node.rotations_upgrade.set(stats.rotations_upgrade);
+            node.barrier_class_degraded.set(stats.barrier_class_degraded);
             node.fsyncs_completion.set(stats.fsyncs_completion);
             node.log_segments_live.set(stats.log_segments_live);
             let ckpt = cell.ckpt_stats();

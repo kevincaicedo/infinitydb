@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use inf_log::FrameLayout;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
@@ -38,7 +39,12 @@ fn prealloc(fs: &MemFs, dir: &Path, id: u32) {
 fn frame_at(seg: u32, offset: u32, key: &[u8]) -> Vec<u8> {
     let mut b = FrameBuilder::new();
     b.append(&RecordView::StringPostImage { ns: NsId(9), key, value: b"v" });
-    b.finalize(Lsn::new(SegmentId(seg), offset + FRAME_HEADER_LEN as u32), stamp(1)).to_vec()
+    b.finalize(
+        Lsn::new(SegmentId(seg), offset + FRAME_HEADER_LEN as u32),
+        stamp(1),
+        FrameLayout::Packed,
+    )
+    .to_vec()
 }
 
 fn write_at(fs: &MemFs, dir: &Path, id: u32, offset: u32, bytes: &[u8]) {
@@ -160,8 +166,13 @@ fn frame_spanning_the_chunk_boundary_is_found() {
     let value = vec![0xAB; 300];
     b.append(&RecordView::StringPostImage { ns: NsId(9), key: b"fat", value: &value });
     let offset = 50u32;
-    let frame =
-        b.finalize(Lsn::new(SegmentId(0), offset + FRAME_HEADER_LEN as u32), stamp(1)).to_vec();
+    let frame = b
+        .finalize(
+            Lsn::new(SegmentId(0), offset + FRAME_HEADER_LEN as u32),
+            stamp(1),
+            FrameLayout::Packed,
+        )
+        .to_vec();
     assert!(frame.len() > 64, "frame must exceed the scan chunk");
     write_at(&fs, &dir, 0, offset, &frame);
 

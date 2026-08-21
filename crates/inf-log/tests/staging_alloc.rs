@@ -62,7 +62,7 @@ fn append_path_performs_zero_heap_allocations() {
     let dirs = create_cell_dirs(&fs, &PathBuf::from("data/shard-0")).expect("dirs");
     // Segment large enough that the measured loop never rotates —
     // rotation/prealloc is MAINTAIN work, not the append path.
-    let cfg = SegmentConfig { segment_bytes: 32 << 20, seal_after_ms: None };
+    let cfg = SegmentConfig { segment_bytes: 32 << 20, ..Default::default() };
     let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg).expect("rotor");
     let mut ring = StagingRing::new(StagingConfig { capacity_bytes: 64 << 10 });
 

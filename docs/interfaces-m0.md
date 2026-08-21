@@ -110,6 +110,14 @@ impl Arena {
 > means the buffer is FULL), `CompletionResult` gains `TierRead`,
 > `TokenClass` gains `TierRead = 10`, and `StableBytesMut` joins
 > `StableBytes` as the writable stable-range handoff. Layouts unchanged.
+>
+> **Amended at M4.5-S34 under the same discipline (ADR-0086 D1):**
+> `IoOp::LogWrite`'s `fsync_token: Option<CompletionToken>` became
+> `barrier: WriteBarrier { None | WriteThrough | LinkedFsync { fsync_token } }`
+> — one frame, one barrier; `WriteThrough` (`RWF_DSYNC` on `O_DIRECT`,
+> the FUA class) makes `LogWritten` the frame's durability fact.
+> `TokenClass` gains `ZeroFillWrite = 13` (routing-only). Layouts
+> unchanged; the surface is documented in `interfaces-m2.md`.
 > The first real consumer of the `IoGate` seam; the cold-read path
 > freezes at M4 exit (M4 plan §3.2) after S08 hardens it.
 >

@@ -32,10 +32,11 @@ fn config() -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
         staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 1 << 16, seal_after_ms: None },
+        segment: SegmentConfig { segment_bytes: 1 << 16, ..Default::default() },
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         sync_pipeline: 1,
+        fua_p50_us_probed: 0,
     }
 }
 

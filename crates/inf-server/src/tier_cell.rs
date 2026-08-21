@@ -33,6 +33,7 @@ use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{NsId, TierDrive, TierFileMeta, TierFlush, TierFlushConfig, TierFlushError};
 use inf_runtime::{
     ColdReadConfig, ColdReads, CompletionToken, IoOp, TierFileId, TokenClass, WaitList,
+    WriteBarrier,
 };
 use inf_store::{Keyspace, LogicalAddr, TierSpec, TieredTable};
 
@@ -810,7 +811,7 @@ fn emit_round_wave<F: SegmentFs>(
                 offset: view.offset,
                 data: crate::log_bytes::tier_round_bytes(&view),
                 token,
-                fsync_token: None,
+                barrier: WriteBarrier::None,
             });
         }
         round.states[index] = OpState::Sent;

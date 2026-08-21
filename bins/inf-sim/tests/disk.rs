@@ -11,7 +11,7 @@ use inf_alloc::BufferPool;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_runtime::{
     BackendDriver, Completion, CompletionResult, CompletionToken, IoOp, StableBytes, TokenClass,
-    Wait,
+    Wait, WriteBarrier,
 };
 use inf_server::SimDisk;
 use inf_sim::net::{CellNet, Plant, SimDriver};
@@ -60,7 +60,7 @@ fn log_write_is_buffered_until_the_linked_sync() {
         offset: 0,
         data: stable(b"frame-one"),
         token: token(TokenClass::LogWrite, 1),
-        fsync_token: Some(token(TokenClass::Fsync, 2)),
+        barrier: WriteBarrier::LinkedFsync { fsync_token: token(TokenClass::Fsync, 2) },
     });
     let done = reap(&mut driver, &mut pool);
     assert_eq!(done.len(), 2);
@@ -73,7 +73,7 @@ fn log_write_is_buffered_until_the_linked_sync() {
         offset: 512,
         data: stable(b"frame-two-unsynced"),
         token: token(TokenClass::LogWrite, 3),
-        fsync_token: None,
+        barrier: WriteBarrier::None,
     });
     let done = reap(&mut driver, &mut pool);
     assert_eq!(done.len(), 1);
@@ -120,7 +120,7 @@ fn failed_write_cancels_the_linked_sync() {
         offset: 0,
         data: stable(b"never-lands"),
         token: token(TokenClass::LogWrite, 1),
-        fsync_token: Some(token(TokenClass::Fsync, 2)),
+        barrier: WriteBarrier::LinkedFsync { fsync_token: token(TokenClass::Fsync, 2) },
     });
     driver.push(IoOp::Fdatasync { fd: dir_fd, token: token(TokenClass::ManifestSync, 3) });
     let done = reap(&mut driver, &mut pool);

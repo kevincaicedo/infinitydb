@@ -117,6 +117,38 @@ impl StableBytesMut {
     }
 }
 
+/// The durability contract riding one [`IoOp::LogWrite`] (M4.5-S34,
+/// ADR-0086 D1). One frame, one barrier: the state "write-through *and* a
+/// linked fsync" is unrepresentable.
+#[derive(Copy, Clone, Debug)]
+pub enum WriteBarrier {
+    /// No barrier: `LogWritten` means the bytes reached the fd — the page
+    /// cache on a buffered fd, the device's volatile cache on `O_DIRECT`.
+    /// Never durable; a later `Fdatasync` covers them.
+    None,
+    /// Write-through (`RWF_DSYNC` on an `O_DIRECT` fd — the FUA class):
+    /// `LogWritten` is delivered only once the bytes are on stable media.
+    /// The durability fact for this frame; no `Synced` follows. Fallback
+    /// tiers (kqueue) execute it as write + fdatasync — same promise,
+    /// FLUSH-class cost (the correctness tier, ADR-0086 D1).
+    WriteThrough,
+    /// Linked fdatasync (the FLUSH class, ADR-0013 D1): `Synced` on
+    /// `fsync_token` is the durability fact; `LogWritten` on the write's
+    /// own token is the staging lease's release point only.
+    LinkedFsync { fsync_token: CompletionToken },
+}
+
+impl WriteBarrier {
+    /// The linked sync's token, when the barrier is one.
+    #[must_use]
+    pub fn fsync_token(self) -> Option<CompletionToken> {
+        match self {
+            WriteBarrier::LinkedFsync { fsync_token } => Some(fsync_token),
+            WriteBarrier::None | WriteBarrier::WriteThrough => None,
+        }
+    }
+}
+
 /// Operations a cell may queue. `push` never performs a syscall — everything
 /// goes out in the single `submit_and_reap` per loop iteration (L3).
 #[derive(Debug)]
@@ -142,19 +174,23 @@ pub enum IoOp {
     Close { fd: RawFd, token: CompletionToken },
     /// Positional write of one sealed log frame (M2-S05, ADR-0013). Short
     /// writes are resubmitted internally: `LogWritten` means ALL bytes hit
-    /// the fd. With `fsync_token`, an fdatasync is chained after the write
-    /// — `IOSQE_IO_LINK` on io_uring (ordering enforced in-kernel), issued
+    /// the fd — what that promises about durability is the
+    /// [`WriteBarrier`] the op carries (M4.5-S34, ADR-0086 D1). Under
+    /// `LinkedFsync`, an fdatasync is chained after the write —
+    /// `IOSQE_IO_LINK` on io_uring (ordering enforced in-kernel), issued
     /// after the write's completion on fallback tiers. The chained sync's
     /// `Synced` is delivered only once every byte of THIS write is both
     /// written and covered (a sync that raced a short write is superseded
-    /// internally); a failed write cancels it (`Error{ECANCELED}` on
-    /// `fsync_token` — never a sync-past-failed-write).
+    /// internally); a failed write cancels it (`Error{ECANCELED}` on the
+    /// fsync token — never a sync-past-failed-write). A short
+    /// `WriteThrough` write re-arms its remainder write-through, so
+    /// `LogWritten` never names a partially durable frame.
     LogWrite {
         fd: RawFd,
         offset: u64,
         data: StableBytes,
         token: CompletionToken,
-        fsync_token: Option<CompletionToken>,
+        barrier: WriteBarrier,
     },
     /// Standalone fdatasync-class barrier (everysec tick, segment seal —
     /// M2-S05). `Synced` on completion is the durability fact (L2).
@@ -199,8 +235,12 @@ pub enum CompletionResult {
     Sent {
         buf: BufferId,
     },
-    /// Every byte of a `LogWrite` reached the fd (page cache, NOT durable).
-    /// This is the staging lease's release point — never an ack point.
+    /// Every byte of a `LogWrite` reached the fd. Under
+    /// [`WriteBarrier::None`]/[`WriteBarrier::LinkedFsync`] that is the
+    /// page cache (NOT durable) — the staging lease's release point, never
+    /// an ack point. Under [`WriteBarrier::WriteThrough`] it is the frame's
+    /// durability fact (ADR-0086 D2): the consumer completes the frame's
+    /// write-through ledger ticket here.
     LogWritten,
     /// An fdatasync completed: everything it covers is durable. The ONLY
     /// event that may advance the durability watermark (§8.2, ADR-0013).

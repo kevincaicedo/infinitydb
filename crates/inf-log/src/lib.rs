@@ -54,11 +54,12 @@ pub use flush::{
     TierFlushConfig, TierFlushError,
 };
 pub use frame::{
-    DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN, FRAME_HEADER_LEN_V1, FRAME_MAGIC, FRAME_MAGIC_V1,
-    FRAME_TRAILER_LEN, FrameBuilder, FrameDecodeError, FrameIter, FrameRecordError, FrameRef,
-    FrameStamp, MIN_FRAME_LEN, MIN_FRAME_LEN_V1, RecordIter, decode_frame, frame_header_len,
+    DEFAULT_MAX_FRAME_LEN, FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_HEADER_LEN_V1, FRAME_MAGIC,
+    FRAME_MAGIC_V1, FRAME_MAGIC_V3, FRAME_TRAILER_LEN, FrameBuilder, FrameDecodeError, FrameIter,
+    FrameLayout, FrameRecordError, FrameRef, FrameStamp, MIN_FRAME_LEN, MIN_FRAME_LEN_V1,
+    RecordIter, align_up_frame, decode_frame, frame_header_len,
 };
-pub use fs::TierIoMode;
+pub use fs::{SegmentIoMode, TierIoMode};
 pub use lsn::{Lsn, SegmentId};
 pub use manifest::{
     Manifest, ManifestDecodeError, TierFileRange, TierNsManifest, manifest_envelope, read_manifest,
@@ -73,8 +74,9 @@ pub use scan::{
     scan_log_dir, scan_log_dir_from,
 };
 pub use segment::{
-    DEFAULT_SEGMENT_BYTES, DeferredBegin, FrameSlot, FsyncFailed, LogError, MaintainReport,
-    RotorStats, SealHandoff, SegmentConfig, SegmentRotor, parse_segment_file_name,
+    DEFAULT_FUA_MAX_FRAME_BYTES, DEFAULT_SEGMENT_BYTES, DeferredBegin, FrameSlot, FsyncFailed,
+    LogError, MaintainReport, RotorStats, SealHandoff, SegmentConfig, SegmentRotor,
+    ZERO_FILL_HEAD_START, ZERO_FILL_SLICE_BYTES, ZeroSlice, parse_segment_file_name,
     segment_file_name,
 };
 pub use staging::{

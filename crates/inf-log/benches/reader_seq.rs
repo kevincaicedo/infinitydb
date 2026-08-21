@@ -67,7 +67,7 @@ fn payload(len: usize) -> Vec<u8> {
 fn write_segment(root: &Path, segment_bytes: u32) -> (PathBuf, u64, u64) {
     let fs = StdSegmentFs;
     let dirs = create_cell_dirs(&fs, &root.join("shard-0")).expect("dirs");
-    let cfg = SegmentConfig { segment_bytes, seal_after_ms: None };
+    let cfg = SegmentConfig { segment_bytes, ..Default::default() };
     let mut rotor = SegmentRotor::create_fresh(fs, dirs.log.clone(), cfg).expect("rotor");
     let mut ring = StagingRing::new(StagingConfig { capacity_bytes: 1 << 20 });
 

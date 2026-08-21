@@ -1,11 +1,13 @@
 //! The **only** unsafe constructions in `inf-server` (M2-S08 ADR-0015 D4,
-//! extended by M2-S10 ADR-0016 D4 and M4.5-S31 ADR-0084 D3; contract
-//! shape from ADR-0013 D1): erasing a sealed, lease-guarded buffer's
-//! borrow lifetime so the kernel can read it after the queueing borrow
-//! ends. Everything else in this crate is `#![deny(unsafe_code)]`-clean;
-//! this module is the whole audit surface (see `SAFETY.md`).
+//! extended by M2-S10 ADR-0016 D4, M4.5-S31 ADR-0084 D3, and M4.5-S34
+//! ADR-0086 D4; contract shape from ADR-0013 D1): erasing a sealed,
+//! lease-guarded buffer's borrow lifetime so the kernel can read it after
+//! the queueing borrow ends. Everything else in this crate is
+//! `#![deny(unsafe_code)]`-clean; this module is the whole audit surface
+//! (see `SAFETY.md`).
 #![allow(unsafe_code)]
 
+use inf_alloc::AlignedBox;
 use inf_log::{FrameLease, IckStream, SectionLease, StagingRing, TierOpView};
 use inf_runtime::StableBytes;
 
@@ -62,4 +64,20 @@ pub(crate) fn tier_round_bytes(view: &TierOpView<'_>) -> StableBytes {
     // heap-stable, and unmodified until `finish_round`, which is gated
     // on the terminal completion of every op in the round.
     unsafe { StableBytes::new(view.bytes) }
+}
+
+/// Captures `len` bytes of the cell's zero window for a zero-fill
+/// `LogWrite` (M4.5-S34, ADR-0086 D4).
+///
+/// The window is the stability proof: one `AlignedBox` owned by the
+/// `DurableCell` for the cell's whole life, zeroed at birth and never
+/// written — there is no writer to race, and the allocation never moves.
+/// At most one zero slice is in flight per cell (`SegmentRotor` hands out
+/// the next only after the previous `LogWritten`), and the box outlives
+/// every op because the cell outlives its durable plane.
+pub(crate) fn zero_window(window: &AlignedBox, len: u32) -> StableBytes {
+    let bytes = &window.bytes()[..len as usize];
+    // SAFETY: per the window argument above — the pointee is immutable,
+    // heap-stable for the cell's lifetime, and outlives the op.
+    unsafe { StableBytes::new(bytes) }
 }

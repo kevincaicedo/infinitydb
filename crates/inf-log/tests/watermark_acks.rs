@@ -47,7 +47,7 @@ fn run_schedule(seed: u64, dir: &Path) {
     let mut plane = DurablePlane::new(
         dir,
         StagingConfig { capacity_bytes: 16 << 10 },
-        SegmentConfig { segment_bytes: 16 << 10, seal_after_ms: None },
+        SegmentConfig { segment_bytes: 16 << 10, ..Default::default() },
     );
     plane.jobs_per_iter = 1 + rng.below(24) as usize;
     let mut always = 0;

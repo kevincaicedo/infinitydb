@@ -29,7 +29,8 @@ use core::fmt;
 
 use crate::effect::MutationEffect;
 use crate::frame::{
-    DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN, FRAME_TRAILER_LEN, FrameBuilder, FrameStamp,
+    DEFAULT_MAX_FRAME_LEN, FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_TRAILER_LEN, FrameBuilder,
+    FrameLayout, FrameStamp,
 };
 use crate::fs::SegmentFs;
 use crate::lsn::Lsn;
@@ -116,7 +117,8 @@ impl FrameLease {
         self.first_record_lsn
     }
 
-    /// Total sealed frame bytes (header + records + trailer).
+    /// Total sealed frame bytes on the device (header + records + trailer
+    /// + v3 padding).
     #[must_use]
     pub fn frame_len(&self) -> u32 {
         self.frame_len
@@ -156,6 +158,10 @@ pub struct StagingStats {
     pub refusals: u64,
     pub seals: u64,
     pub releases: u64,
+    /// Zero bytes sealed as v3 alignment padding (ADR-0086 D3) — the
+    /// `log_padding_bytes` disclosure: write amplification the aligned
+    /// layout adds, never hidden in `frame_bytes_queued`.
+    pub padding_bytes: u64,
 }
 
 struct InFlight {
@@ -198,9 +204,11 @@ impl fmt::Debug for StagingRing {
 
 impl StagingRing {
     /// Allocate the domain: two fixed buffers of `capacity_bytes` each
-    /// (`resident_bytes` = 2 × capacity, attributed to the log-staging
-    /// domain — L5). This is cell construction, the one allowed allocation
-    /// point; the append path never allocates again.
+    /// plus [`FRAME_ALIGN`] slack on both ends (`resident_bytes` =
+    /// 2 × (capacity + 2 × 4 KiB), attributed to the log-staging domain —
+    /// L5; the slack is what makes a sealed frame a legal `O_DIRECT`
+    /// source, ADR-0086 D6). This is cell construction, the one allowed
+    /// allocation point; the append path never allocates again.
     ///
     /// # Panics
     /// If `capacity_bytes` cannot hold a minimal frame or exceeds
@@ -320,11 +328,12 @@ impl StagingRing {
         }
     }
 
-    /// Fixed domain memory: both buffers, allocated at construction (L5
-    /// attribution: the log-staging domain line of `INFO memory`).
+    /// Fixed domain memory: both buffers with their alignment slack,
+    /// allocated at construction (L5 attribution: the log-staging domain
+    /// line of `INFO memory`).
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
-        2 * self.capacity_bytes as usize
+        2 * (self.capacity_bytes as usize + 2 * FRAME_ALIGN as usize)
     }
 
     /// The configured per-buffer capacity — the admission bound the
@@ -352,14 +361,21 @@ impl StagingRing {
     /// the rotor's reserved slot), stamped with the current epoch/seq and
     /// `covered_lsn` — the group-commit durability watermark at this LOG
     /// step (`Lsn::to_u64`; 0 when nothing is covered yet — the ADR-0031
-    /// D1 attestation). Swaps staging to the free buffer. The sealed frame
-    /// stays resident under the returned lease until
-    /// [`release`](Self::release).
+    /// D1 attestation) — under the active segment's `layout` (ADR-0086
+    /// D3: `Aligned` pads to the 4 KiB successor). Swaps staging to the
+    /// free buffer. The sealed frame stays resident under the returned
+    /// lease until [`release`](Self::release); `FrameLease::frame_len` is
+    /// the on-device length, padding included.
     ///
     /// # Panics
     /// If nothing is staged or the previous lease is unreleased — LOG-step
     /// invariants; callers check [`can_seal`](Self::can_seal).
-    pub fn seal(&mut self, first_record_lsn: Lsn, covered_lsn: u64) -> FrameLease {
+    pub fn seal(
+        &mut self,
+        first_record_lsn: Lsn,
+        covered_lsn: u64,
+        layout: FrameLayout,
+    ) -> FrameLease {
         assert!(!self.is_empty(), "seal with no staged records");
         assert!(self.in_flight.is_none(), "seal while a frame lease is outstanding");
         let sealed = self.staging;
@@ -367,13 +383,16 @@ impl StagingRing {
         let stamp = FrameStamp { epoch: self.frame_epoch, seq: self.next_frame_seq, covered_lsn };
         let builder = &mut self.bufs[sealed];
         let record_count = builder.record_count();
-        builder.finalize(first_record_lsn, stamp);
+        let unpadded = builder.frame_len();
+        builder.finalize(first_record_lsn, stamp, layout);
         let frame_len = u32::try_from(builder.sealed_frame().len()).expect("frame fits u32");
+        debug_assert_eq!(frame_len, layout.padded_len(unpadded), "padding follows the layout");
         self.in_flight = Some(InFlight { buf: sealed, generation });
         self.staging = 1 - sealed;
         self.generation += 1;
         self.next_frame_seq += 1;
         self.stats.seals += 1;
+        self.stats.padding_bytes += u64::from(frame_len - unpadded);
         FrameLease { generation, first_record_lsn, frame_len, record_count }
     }
 
@@ -419,7 +438,7 @@ impl StagingRing {
             return Ok(None);
         }
         let slot = rotor.begin_frame(self.pending_frame_len(), now_ms)?;
-        let lease = self.seal(slot.first_record_lsn(), 0);
+        let lease = self.seal(slot.first_record_lsn(), 0, slot.layout());
         rotor.commit_frame(slot, self.leased_frame(&lease))?;
         Ok(Some(lease))
     }

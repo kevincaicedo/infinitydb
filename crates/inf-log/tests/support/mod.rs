@@ -26,7 +26,7 @@ use inf_log::{
 };
 use inf_runtime::{
     BackendDriver, Capabilities, CellPlane, Completion, CompletionResult, CompletionToken, IoOp,
-    LoopCx, RawFd, StableBytes, SubmitStats, TokenClass, Wait, WatermarkGate,
+    LoopCx, RawFd, StableBytes, SubmitStats, TokenClass, Wait, WatermarkGate, WriteBarrier,
 };
 
 /// Fresh per-test directory under the system temp dir (the pattern the S02
@@ -177,10 +177,10 @@ impl BackendDriver for ScriptedDriver {
         // (see `held`): the op keeps executing on the dup'd fd even if the
         // app closes its own copy before a delayed schedule runs the op.
         let op = match op {
-            IoOp::LogWrite { fd, offset, data, token, fsync_token }
+            IoOp::LogWrite { fd, offset, data, token, barrier }
                 if self.mode != IoMode::Recorded =>
             {
-                IoOp::LogWrite { fd: self.hold(fd), offset, data, token, fsync_token }
+                IoOp::LogWrite { fd: self.hold(fd), offset, data, token, barrier }
             }
             IoOp::Fdatasync { fd, token } if self.mode != IoMode::Recorded => {
                 IoOp::Fdatasync { fd: self.hold(fd), token }
@@ -201,8 +201,15 @@ impl BackendDriver for ScriptedDriver {
         for op in std::mem::take(&mut self.queued) {
             let delay = self.next_delay();
             let kind = match op {
-                IoOp::LogWrite { fd, offset, data, token, fsync_token } => {
+                IoOp::LogWrite { fd, offset, data, token, barrier } => {
                     self.log_writes_submitted += 1;
+                    // This harness drives buffered segments only: a
+                    // write-through frame would be a plane bug here.
+                    assert!(
+                        !matches!(barrier, WriteBarrier::WriteThrough),
+                        "scripted driver models FLUSH-class barriers only"
+                    );
+                    let fsync_token = barrier.fsync_token();
                     if fsync_token.is_some() {
                         self.fsyncs_submitted += 1;
                     }
@@ -505,9 +512,9 @@ impl CellPlane for DurablePlane {
                 self.fsync_submits.push((SyncReason::Seal, cx.now));
                 cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
             }
-            let end = slot.base().advance(frame_len);
+            let end = slot.base().advance(slot.len());
             let covered = self.commit.watermark().map_or(0, |lsn| lsn.to_u64());
-            let lease = self.staging.seal(slot.first_record_lsn(), covered);
+            let lease = self.staging.seal(slot.first_record_lsn(), covered, slot.layout());
             // Records have LSNs now: resolve the replay log + spawn gated
             // ack futures for `always` records (S06).
             for (at, idx) in self.pending_lsn_resolve.drain(..) {
@@ -527,12 +534,14 @@ impl CellPlane for DurablePlane {
                     acks.borrow_mut().push((lsn, watermark));
                 });
             }
-            self.commit.note_frame_queued(end, frame_len);
-            let fsync = self.commit.frame_fsync_due().then(|| {
+            self.commit.note_frame_queued(end, lease.frame_len());
+            let barrier = if self.commit.frame_fsync_due() {
                 let ticket = self.commit.register_linked_fsync(cx.now);
                 self.fsync_submits.push((SyncReason::Linked, cx.now));
-                fsync_token(ticket)
-            });
+                WriteBarrier::LinkedFsync { fsync_token: fsync_token(ticket) }
+            } else {
+                WriteBarrier::None
+            };
             let offset = u64::from(slot.base().offset);
             let fd = self.rotor.active_raw_fd().expect("std tier has fds");
             self.rotor.commit_frame_queued(slot);
@@ -549,7 +558,7 @@ impl CellPlane for DurablePlane {
                 offset,
                 data,
                 token: write_token(self.write_seq),
-                fsync_token: fsync,
+                barrier,
             });
         } else if self.commit.standalone_fsync_due() {
             let ticket = self.commit.register_standalone_fsync(cx.now);

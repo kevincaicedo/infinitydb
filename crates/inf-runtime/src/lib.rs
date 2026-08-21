@@ -35,7 +35,7 @@ pub use cold::{
 };
 pub use driver::{
     BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
-    StableBytesMut, SubmitStats, Wait,
+    StableBytesMut, SubmitStats, Wait, WriteBarrier,
 };
 pub use executor::{CellExecutor, PollImmediate, TaskId};
 pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate, WatermarkWait};
