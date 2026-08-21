@@ -149,26 +149,31 @@ pub struct SimDriver {
     stats: SubmitStats,
 }
 
-/// One deferred barrier: applied AND completed only once the virtual
-/// clock passes `due` — during the service window the bytes stay
-/// volatile, so a power cut eats them (the honest-stall invariant).
-/// Dir-vs-file routing happens at release time via `driver_fdatasync`,
-/// which already branches on dir fds. A write-through barrier (ADR-0086
-/// D8) carries its payload: the bytes reach the disk at `due`, never
-/// earlier — a cut inside the service window loses the whole frame,
-/// exactly the un-acked shape the oracle must tolerate.
+/// One deferred op: applied AND completed only once the virtual clock
+/// passes `due` — during the service window the bytes stay volatile, so
+/// a power cut eats them (the honest-stall invariant). Dir-vs-file
+/// routing happens at release time via `driver_fdatasync`, which already
+/// branches on dir fds. A write-through barrier (ADR-0086 D8) carries its
+/// payload: the bytes reach the disk at `due`, never earlier — a cut
+/// inside the service window loses the whole frame, exactly the un-acked
+/// shape the oracle must tolerate. A plain write (ADR-0087 D7) lands in
+/// the volatile layer at `due`; its linked fsync, if any, is scheduled on
+/// the flush timeline only then (`IO_LINK`: the sync starts after the
+/// write), so a standalone fdatasync issued *earlier* can run before the
+/// write lands — the coverage hole the drain rule exists for.
 #[derive(Debug)]
 struct PendingSync {
     due: Nanos,
     fd: i32,
     token: CompletionToken,
-    through: Option<PendingThrough>,
+    kind: PendingKind,
 }
 
 #[derive(Debug)]
-struct PendingThrough {
-    offset: u64,
-    data: StableBytes,
+enum PendingKind {
+    Fsync,
+    WriteThrough { offset: u64, data: StableBytes },
+    Write { offset: u64, data: StableBytes, linked: Option<CompletionToken> },
 }
 
 impl SimDriver {
@@ -212,12 +217,19 @@ impl SimDriver {
         let clock = self.clock.as_ref()?;
         disk.schedule_write_through(clock.now().0).map(Nanos)
     }
+
+    /// Draws a deferred completion time for one plain write (ADR-0087
+    /// D7), `None` on the inline path.
+    fn schedule_write(&self, disk: &SimDisk) -> Option<Nanos> {
+        let clock = self.clock.as_ref()?;
+        disk.schedule_write(clock.now().0).map(Nanos)
+    }
 }
 
-/// Queue a deferred barrier in due order. Write-through draws do not ride
-/// the serial flush timeline, so they may be due before an earlier-queued
-/// fsync — insert, never append. A free function over the field so the
-/// drain loop's `net` borrow stays disjoint.
+/// Queue a deferred op in due order. Write-through and plain-write draws
+/// do not ride the serial flush timeline, so they may be due before an
+/// earlier-queued fsync — insert, never append. A free function over the
+/// field so the drain loop's `net` borrow stays disjoint.
 fn defer(pending_syncs: &mut Vec<PendingSync>, pending: PendingSync) {
     let at = pending_syncs.partition_point(|p| p.due <= pending.due);
     pending_syncs.insert(at, pending);
@@ -239,6 +251,15 @@ fn write_through(
         disk.driver_write_through(fd, offset, stable_slice(data))
     };
     match result {
+        Ok(()) => CompletionResult::LogWritten,
+        Err(_) => CompletionResult::Error { errno: libc::EIO, buf: None },
+    }
+}
+
+/// Execute one deferred plain write against the disk's volatile layer
+/// (ADR-0087 D7): `LogWritten` means reached the file, never durable.
+fn plain_write(disk: &SimDisk, fd: i32, offset: u64, data: &StableBytes) -> CompletionResult {
+    match disk.driver_write_at(fd, offset, stable_slice(data)) {
         Ok(()) => CompletionResult::LogWritten,
         Err(_) => CompletionResult::Error { errno: libc::EIO, buf: None },
     }
@@ -292,16 +313,39 @@ impl BackendDriver for SimDriver {
         if !self.pending_syncs.is_empty() {
             let now = self.clock.as_ref().expect("pending syncs imply a stall clock").now();
             while self.pending_syncs.first().is_some_and(|sync| sync.due <= now) {
-                let PendingSync { fd, token, through, .. } = self.pending_syncs.remove(0);
+                let PendingSync { fd, token, kind, .. } = self.pending_syncs.remove(0);
                 let disk = self.disk.as_ref().expect("pending syncs imply a disk");
-                let result = match through {
-                    Some(PendingThrough { offset, data }) => {
+                let result = match kind {
+                    PendingKind::WriteThrough { offset, data } => {
                         write_through(disk, net.plant, fd, offset, &data)
+                    }
+                    PendingKind::Write { offset, data, linked } => {
+                        let result = plain_write(disk, fd, offset, &data);
+                        // The linked sync starts only now (IO_LINK) —
+                        // and only if the write succeeded (a failed write
+                        // cancels its chain, ADR-0013).
+                        if let Some(sync) = linked {
+                            if matches!(result, CompletionResult::LogWritten) {
+                                let due = disk.schedule_fsync(now.0).map(Nanos).unwrap_or(now);
+                                let pending =
+                                    PendingSync { due, fd, token: sync, kind: PendingKind::Fsync };
+                                defer(&mut self.pending_syncs, pending);
+                            } else {
+                                out.push(Completion {
+                                    token: sync,
+                                    result: CompletionResult::Error {
+                                        errno: libc::ECANCELED,
+                                        buf: None,
+                                    },
+                                });
+                            }
+                        }
+                        result
                     }
                     // Plant::FsyncLies (ADR-0021 D4) holds here too: Synced
                     // without the flush — the canary the oracle must catch.
-                    None if net.plant == Plant::FsyncLies => CompletionResult::Synced,
-                    None => match disk.driver_fdatasync(fd) {
+                    PendingKind::Fsync if net.plant == Plant::FsyncLies => CompletionResult::Synced,
+                    PendingKind::Fsync => match disk.driver_fdatasync(fd) {
                         Ok(()) => CompletionResult::Synced,
                         Err(_) => CompletionResult::Error { errno: libc::EIO, buf: None },
                     },
@@ -362,8 +406,8 @@ impl BackendDriver for SimDriver {
                         // completes at its drawn time — nothing reaches
                         // the disk during the service window.
                         if let Some(due) = self.schedule_through(disk) {
-                            let through = Some(PendingThrough { offset, data });
-                            defer(&mut self.pending_syncs, PendingSync { due, fd, token, through });
+                            let kind = PendingKind::WriteThrough { offset, data };
+                            defer(&mut self.pending_syncs, PendingSync { due, fd, token, kind });
                             continue;
                         }
                         let result = write_through(disk, net.plant, fd, offset, &data);
@@ -371,6 +415,14 @@ impl BackendDriver for SimDriver {
                         continue;
                     }
                     let fsync_token = barrier.fsync_token();
+                    // Plain write under the stall model (ADR-0087 D7): it
+                    // lands at its own drawn time, independent of every
+                    // other op; its linked sync is scheduled at landing.
+                    if let Some(due) = self.schedule_write(disk) {
+                        let kind = PendingKind::Write { offset, data, linked: fsync_token };
+                        defer(&mut self.pending_syncs, PendingSync { due, fd, token, kind });
+                        continue;
+                    }
                     match disk.driver_write_at(fd, offset, stable_slice(&data)) {
                         Ok(()) => {
                             out.push(Completion { token, result: CompletionResult::LogWritten });
@@ -381,7 +433,12 @@ impl BackendDriver for SimDriver {
                                 if let Some(due) = self.schedule_sync(disk) {
                                     defer(
                                         &mut self.pending_syncs,
-                                        PendingSync { due, fd, token: sync, through: None },
+                                        PendingSync {
+                                            due,
+                                            fd,
+                                            token: sync,
+                                            kind: PendingKind::Fsync,
+                                        },
                                     );
                                     continue;
                                 }
@@ -445,7 +502,7 @@ impl BackendDriver for SimDriver {
                     if let Some(due) = self.schedule_sync(disk) {
                         defer(
                             &mut self.pending_syncs,
-                            PendingSync { due, fd, token, through: None },
+                            PendingSync { due, fd, token, kind: PendingKind::Fsync },
                         );
                         continue;
                     }

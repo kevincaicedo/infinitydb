@@ -223,3 +223,28 @@ point = "power_cut_after_seal"
 tier = "node"
 test = "fua.rs"
 expect = "seal-flush-x-fua"
+
+# ---- M4.5-S35 bounded frame pipeline (ADR-0087 D6/D7) — sim-disk
+# physics, carried by tests/fua.rs ----
+#   seal-flush-x-fua-plain-tail — segment N ends in barrier-less everysec
+#                       frames, rotates (seal FLUSH pending), a write-
+#                       through frame lands in N+1, the cut eats N's tail:
+#                       a hole in a *sealed* segment with durable data
+#                       beyond — boot truncates at the hole (un-attested),
+#                       never refuses; every acked key exact
+#   pipeline-later-durable-earlier-torn — K = 4 write-through frames in
+#                       flight, only the third lands before the cut:
+#                       nothing acked, replay ends at the first frame's
+#                       base, the third is discarded as un-attested
+
+[[row]]
+point = "power_cut_after_seal"
+tier = "node"
+test = "fua.rs"
+expect = "seal-flush-x-fua-plain-tail"
+
+[[row]]
+point = "torn_frame"
+tier = "node"
+test = "fua.rs"
+expect = "pipeline-later-durable-earlier-torn"

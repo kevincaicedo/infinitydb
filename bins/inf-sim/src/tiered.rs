@@ -163,6 +163,7 @@ impl TieredScenario {
             stall: self.stall.clone(),
             replay_canary: false,
             io_mode: inf_server::SegmentIoMode::Buffered,
+            frames_in_flight: 1,
         }
     }
 }

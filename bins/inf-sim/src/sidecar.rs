@@ -118,6 +118,7 @@ fn base(scenario: &SidecarScenario) -> DurableScenario {
         stall: None,
         replay_canary: false,
         io_mode: inf_server::SegmentIoMode::Buffered,
+        frames_in_flight: 1,
     }
 }
 

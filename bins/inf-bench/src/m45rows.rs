@@ -382,13 +382,18 @@ fn s27_spawn(
         extra.push("--pin-start".into());
         extra.push(pin.to_string());
     }
-    // ADR-0081 D4 / ADR-0083 D6: the sync-pipeline A/B arm rides this
-    // row (`--sync-pipeline 2` re-runs the M2.5-S07 matrix in the
-    // slow-regime shape it never measured).
-    if let Some(pipeline) = flags.get("sync-pipeline") {
-        extra.push("--sync-pipeline".into());
-        extra.push(pipeline.to_string());
+    // M4.5-S35 (ADR-0087 D5): the frame-pipeline / barrier-class arms
+    // ride this row (the retired `--sync-pipeline` is a no-op — the
+    // FLUSH-class overlap it measured dissolves under write-through).
+    // An explicit `staging_mib` (the provoked regime) wins over the
+    // campaign-wide `--staging-mib`.
+    let mut arms = crate::m2rows::pipeline_args(flags);
+    if staging_mib.is_some()
+        && let Some(at) = arms.iter().position(|a| a == "--log-staging-mib")
+    {
+        arms.drain(at..at + 2);
     }
+    extra.extend(arms);
     let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
     let server = spawn_infinityd(infinityd, cells, &extra_refs)?;
     let port = server.port;

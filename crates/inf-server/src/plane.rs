@@ -1588,7 +1588,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         );
         *self.shared.durable.borrow_mut() = Some(DurableCell::new(
             cfg.staging,
-            cfg.sync_pipeline,
+            cfg.flush_bound,
             cfg.fua_p50_us_probed,
             rotor,
             ckpt,
@@ -2063,7 +2063,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     // ADR-0086 D4: a zero slice landed on the next
                     // segment — the rotor's cursor, never the frame lease.
                     TokenClass::ZeroFillWrite => cell.on_zero_fill_written(),
-                    _ => cell.on_log_written(cx),
+                    _ => cell.on_log_written(cx, c.token),
                 }
             }
             CompletionResult::Synced => {
@@ -2747,6 +2747,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.rotations_unzeroed.set(stats.rotations_unzeroed);
             node.rotations_upgrade.set(stats.rotations_upgrade);
             node.barrier_class_degraded.set(stats.barrier_class_degraded);
+            node.frames_in_flight.set(stats.frames_in_flight);
+            node.frames_in_flight_max.set(stats.frames_in_flight_max);
+            node.frame_waits_barrier.set(stats.frame_waits_barrier);
+            node.frame_waits_rotation.set(stats.frame_waits_rotation);
             node.fsyncs_completion.set(stats.fsyncs_completion);
             node.log_segments_live.set(stats.log_segments_live);
             let ckpt = cell.ckpt_stats();

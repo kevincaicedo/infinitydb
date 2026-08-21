@@ -67,7 +67,7 @@ fn cfg(data_dir: PathBuf) -> DurableConfig {
         segment: SegmentConfig { segment_bytes: 64 << 20, ..Default::default() },
         ckpt: CkptConfig::default(),
         recover: Default::default(),
-        sync_pipeline: 1,
+        flush_bound: 1,
         fua_p50_us_probed: 0,
     }
 }

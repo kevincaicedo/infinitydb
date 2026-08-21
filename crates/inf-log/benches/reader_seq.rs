@@ -69,7 +69,7 @@ fn write_segment(root: &Path, segment_bytes: u32) -> (PathBuf, u64, u64) {
     let dirs = create_cell_dirs(&fs, &root.join("shard-0")).expect("dirs");
     let cfg = SegmentConfig { segment_bytes, ..Default::default() };
     let mut rotor = SegmentRotor::create_fresh(fs, dirs.log.clone(), cfg).expect("rotor");
-    let mut ring = StagingRing::new(StagingConfig { capacity_bytes: 1 << 20 });
+    let mut ring = StagingRing::new(StagingConfig::with_capacity(1 << 20));
 
     let value = payload(256);
     let mut key = *b"user:0000000000000000";

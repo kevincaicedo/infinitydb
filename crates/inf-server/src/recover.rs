@@ -20,23 +20,27 @@
 //!   the MANIFEST swap) are garbage-collected here, before the cell
 //!   serves.
 //!
-//! End-of-log policy (M2-S14, ADR-0018): after replay, every segment's
-//! slack — the bytes beyond its last valid frame — is scanned. A
-//! validating, self-located frame there means interior data would be
-//! silently lost (a gap the replay skipped, or a survivor a future append
-//! could resurrect out of order): fail-stop with a named
-//! [`inf_log::LogCorruption`]. In the resume region (the last data-bearing
-//! segment and everything after it — where future appends flow), torn
-//! remnants or a failed final frame classify as a torn tail: the tail
-//! *pointer* is
-//! truncated to the last valid frame (bytes are never rewritten), trailing
-//! segments — verified frame-free — are removed to restore the pristine
-//! prealloc invariant, and the cell continues. In sealed slack behind the
-//! resume point, non-validating remnants are the inert residue of an
-//! earlier torn-tail resume: tolerated and counted, never fatal. A torn
-//! tail may never truncate below the manifest's `begin-LSN`: everything
-//! the manifest names was durable at publication, so a shorter log is
-//! disk lying.
+//! End-of-log policy (M2-S14, ADR-0018; ADR-0031 D4 as amended by
+//! ADR-0087 D6): every segment's slack — the bytes beyond its last valid
+//! frame — is scanned **right after that segment replays**. The first
+//! slack holding a validating, self-located frame marks a **hole**: a
+//! frame the writer queued below surviving data and the device lost. A
+//! hole exists only if the barrier that would have covered those bytes
+//! never completed, so the watermark never passed it and nothing at or
+//! past it was acked — everything later is un-acked residue. The v2
+//! stamps decide the one remaining question, whether the device is
+//! lying: a later frame whose `covered_lsn` attests coverage at or past
+//! the hole (or a v1 frame, which cannot attest) proves covered data was
+//! lost — fail-stop with a named [`inf_log::LogCorruption`]. Otherwise
+//! the tail *pointer* is truncated at the hole (bytes are never
+//! rewritten), every later segment — probed for evidence, never replayed
+//! — is removed to restore the pristine prealloc invariant, and the cell
+//! continues under a fresh epoch. With no hole, the last data-bearing
+//! segment's clean end is the resume point; non-validating remnants
+//! behind it are the inert residue of an earlier torn-tail resume:
+//! tolerated and counted, never fatal. A torn tail may never truncate
+//! below the manifest's `begin-LSN`: everything the manifest names was
+//! durable at publication, so a shorter log is disk lying.
 //!
 //! In the floor segment, records below `begin-LSN` are skipped: the
 //! checkpoint already holds their final state, and replaying an older
@@ -62,7 +66,7 @@ use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
     FrameStamp, LogCorruption, Lsn, Manifest, ReadError, ReaderConfig, RegionEvidence, RegionScan,
     SegmentId, SegmentReader, SegmentRotor, SegmentScan, create_cell_dirs,
-    create_cell_dirs_deferred, read_manifest, scan_log_dir_from, scan_region, scan_region_evidence,
+    create_cell_dirs_deferred, read_manifest, scan_log_dir_from, scan_region_evidence,
     segment_file_name,
 };
 use inf_store::{Keyspace, ReplayOutcome, WallAnchor};
@@ -105,10 +109,12 @@ pub struct RecoverStats {
     /// never crosses a segment's data end, so they can never replay).
     /// Tolerated, but counted: never silent (§8.4).
     pub sealed_slack_remnants: u64,
-    /// M2.5-S12 (ADR-0031 D4): validating frames beyond the data end that
-    /// the stamp evidence proved un-covered (no surviving attestation
-    /// reaches them) — discarded with the torn tail instead of refusing.
-    /// The retired ADR-0021 D3 refusal class, counted, never silent.
+    /// M2.5-S12 (ADR-0031 D4, ADR-0087 D6): validating frames beyond a
+    /// hole that the stamp evidence proved un-covered (no surviving
+    /// attestation reaches them) — discarded with the torn tail instead
+    /// of refusing. The retired ADR-0021 D3 refusal class, counted, never
+    /// silent. Since ADR-0087 D6 this includes frames in later segments
+    /// behind a hole in a sealed one (probed, never replayed).
     pub beyond_frames_discarded: u64,
     /// Epoch-regressed frames ending replay early (discarded-life residue
     /// resurfacing at the data end — ADR-0031 D3/D5). Counted per boot.
@@ -183,8 +189,15 @@ enum Phase<File: SegmentFile> {
         idx: usize,
         reader: Option<Box<SegmentReader<File>>>,
     },
-    /// M2-S14 slack audit, one segment per step.
+    /// M2-S14 slack audit of segment `idx`, right after its replay
+    /// (ADR-0087 D6); one segment per step.
     Audit {
+        idx: usize,
+    },
+    /// A hole was found in an earlier segment: segment `idx` is scanned
+    /// whole for stamp evidence and never replayed (ADR-0087 D6); one
+    /// segment per step.
+    Probe {
         idx: usize,
     },
     /// Torn-tail resolution, begin guard, boot GC, rotor reopen.
@@ -249,14 +262,16 @@ pub struct Recovery<F: SegmentFs> {
     /// Highest epoch observed in the valid prefix (the ADR-0031 D5
     /// derivation input, joined with the audit's beyond-frame evidence).
     max_prefix_epoch: u32,
-    /// Aggregate stamp evidence over the resume region's slack (tail
-    /// segment + trailing segments), gathered by the audit (ADR-0031 D4).
-    resume_evidence: RegionEvidence,
-    /// First validating beyond-frame in the resume region — the refusal
-    /// message anchor.
-    resume_evidence_anchor: Option<(SegmentId, u32)>,
-    /// Index of the last data-bearing segment, fixed when the audit phase
-    /// opens (every segment's end is known by then).
+    /// Stamp evidence per segment's slack (whole segment once probed),
+    /// gathered by the audit/probe steps (ADR-0031 D4, ADR-0087 D6); the
+    /// Finish phase aggregates it from the resume point on.
+    evidence: Vec<RegionEvidence>,
+    /// Index of the first segment whose slack held a validating frame —
+    /// the hole (ADR-0087 D6). Every later segment is probed, never
+    /// replayed.
+    hole: Option<usize>,
+    /// Index of the resume segment, fixed in the Finish phase: the hole's
+    /// segment when it holds data, else the last data-bearing segment.
     last_data: usize,
     finished: Option<(SegmentRotor<F>, Option<RecoveredManifest>)>,
     /// Recovered tiered namespaces' plane half (M4-S26, ADR-0057 D6):
@@ -319,8 +334,8 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             saw_v2: false,
             residue_stop: false,
             max_prefix_epoch: 0,
-            resume_evidence: RegionEvidence::default(),
-            resume_evidence_anchor: None,
+            evidence: Vec::new(),
+            hole: None,
             last_data: 0,
             finished: None,
             recovered_tiers: Vec::new(),
@@ -360,7 +375,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             Phase::Start => 1,
             Phase::Ick { .. } => 2,
             Phase::Replay { .. } => 3,
-            Phase::Audit { .. } => 4,
+            Phase::Audit { .. } | Phase::Probe { .. } => 4,
             Phase::Finish => 5,
             Phase::Complete => 6,
         }
@@ -392,8 +407,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     pub fn segments_progress(&self) -> (u64, u64) {
         let done = match &self.phase {
             Phase::Start | Phase::Ick { .. } => 0,
-            Phase::Replay { idx, .. } => *idx as u64,
-            Phase::Audit { .. } | Phase::Finish | Phase::Complete => self.segments.len() as u64,
+            Phase::Replay { idx, .. } | Phase::Probe { idx } => *idx as u64,
+            Phase::Audit { idx } => *idx as u64 + 1,
+            Phase::Finish | Phase::Complete => self.segments.len() as u64,
         };
         (done, self.segments.len() as u64)
     }
@@ -421,14 +437,17 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             Phase::Start => self.step_start(ks),
             Phase::Ick { reader } => self.step_ick(ks, reader, budget_bytes),
             Phase::Replay { idx, reader } => self.step_replay(ks, idx, reader, budget_bytes),
-            Phase::Audit { idx } => {
-                if !self.tier_replay_checked {
-                    self.finish_tier_replay(ks)?;
-                    self.finish_index_replay(ks);
-                }
-                self.step_audit(idx)
+            Phase::Audit { idx } => self.step_audit(idx),
+            // Replay is over once probing starts or Finish is reached:
+            // the end-of-replay checks run exactly once, here.
+            Phase::Probe { idx } => {
+                self.end_of_replay_checks(ks)?;
+                self.step_probe(idx)
             }
-            Phase::Finish => self.step_finish(),
+            Phase::Finish => {
+                self.end_of_replay_checks(ks)?;
+                self.step_finish()
+            }
             Phase::Complete => Ok(RecoveryProgress::Complete),
         }
     }
@@ -551,6 +570,15 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         self.scan = Some(scan);
         self.phase = next;
         Ok(RecoveryProgress::Working)
+    }
+
+    /// The end-of-replay checks (tiered state, sidecar commit), once.
+    fn end_of_replay_checks(&mut self, ks: &mut Keyspace) -> io::Result<()> {
+        if !self.tier_replay_checked {
+            self.finish_tier_replay(ks)?;
+            self.finish_index_replay(ks);
+        }
+        Ok(())
     }
 
     /// Recovers every manifested tiered namespace (M4-S26, ADR-0057
@@ -806,7 +834,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     fn step_replay(
         &mut self,
         ks: &mut Keyspace,
-        mut idx: usize,
+        idx: usize,
         reader: Option<Box<SegmentReader<F::File>>>,
         budget_bytes: u64,
     ) -> io::Result<RecoveryProgress> {
@@ -817,12 +845,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             self.stats.segments += 1;
             self.ends.push((0, None));
             self.bytes_done += self.seg_sizes[idx];
-            idx += 1;
-            self.phase = if idx == self.segments.len() {
-                Phase::Audit { idx: 0 }
-            } else {
-                Phase::Replay { idx, reader: None }
-            };
+            self.phase = Phase::Audit { idx };
             return Ok(RecoveryProgress::Working);
         }
         let mut reader = match reader {
@@ -873,12 +896,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                             self.bytes_consumed += consumed;
                             self.bytes_done +=
                                 self.seg_sizes[idx].saturating_sub(u64::from(frame_base));
-                            idx += 1;
-                            self.phase = if idx == self.segments.len() {
-                                Phase::Audit { idx: 0 }
-                            } else {
-                                Phase::Replay { idx, reader: None }
-                            };
+                            self.phase = Phase::Audit { idx };
                             return Ok(RecoveryProgress::Working);
                         }
                     }
@@ -940,12 +958,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     self.bytes_consumed += consumed;
                     self.bytes_done +=
                         self.seg_sizes[idx].saturating_sub(u64::from(reader.offset()));
-                    idx += 1;
-                    self.phase = if idx == self.segments.len() {
-                        Phase::Audit { idx: 0 }
-                    } else {
-                        Phase::Replay { idx, reader: None }
-                    };
+                    self.phase = Phase::Audit { idx };
                     return Ok(RecoveryProgress::Working);
                 }
                 Err(err @ ReadError::Io { .. }) => return Err(io_invalid(err)),
@@ -967,12 +980,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     self.bytes_done += consumed;
                     self.bytes_consumed += consumed;
                     self.bytes_done += self.seg_sizes[idx].saturating_sub(u64::from(offset));
-                    idx += 1;
-                    self.phase = if idx == self.segments.len() {
-                        Phase::Audit { idx: 0 }
-                    } else {
-                        Phase::Replay { idx, reader: None }
-                    };
+                    self.phase = Phase::Audit { idx };
                     return Ok(RecoveryProgress::Working);
                 }
             }
@@ -1069,84 +1077,90 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         Ok(StampVerdict::Replay)
     }
 
+    /// Slack audit of segment `idx`, immediately after its replay
+    /// (ADR-0087 D6 — the order is the point: a later segment is never
+    /// applied to the keyspace before this segment's slack is known
+    /// clean). `scan_region_evidence` aggregates the v2 stamp facts in
+    /// O(1) memory. A validating frame marks the hole: every later segment
+    /// is probed for evidence instead of replayed, and the Finish phase
+    /// decides refuse-or-truncate at the hole. Non-validating residue
+    /// classifies by position there as before: torn final write at the
+    /// resume point, tolerated inert remnants behind it.
     fn step_audit(&mut self, idx: usize) -> io::Result<RecoveryProgress> {
-        // M2-S14 slack scan, ADR-0031 D4 evidence rules: beyond a *sealed*
-        // segment's data end (behind the resume region), a validating
-        // self-located frame is unreachable interior data — fail-stop
-        // (seals fsync, so that slack is covered territory). In the
-        // *resume region* (the last data-bearing segment and everything
-        // after it), validating frames are aggregated as stamp evidence:
-        // the Finish phase refuses if any attests coverage past the data
-        // end (or cannot attest — v1), and truncates them with the torn
-        // tail otherwise. Every other residue classifies by position as
-        // before: torn final write in the resume region, tolerated inert
-        // remnants behind it — treating those as corruption would poison
-        // every boot after a benign torn tail seals.
-        if idx == 0 {
-            let ends = &self.ends;
-            self.last_data = (0..ends.len()).rev().find(|&i| ends[i].0 > 0).unwrap_or(0);
-        }
         let segment = self.segments[idx];
         let (end, failed) = &self.ends[idx];
-        if idx < self.last_data {
-            match scan_region(self.fs(), &self.log_dir, segment, *end, ReaderConfig::default())? {
-                RegionScan::ValidFrame { offset } => {
-                    return Err(io_msg(
-                        LogCorruption {
-                            segment,
-                            offset: *end,
-                            evidence_segment: segment,
-                            evidence_offset: offset,
-                            detail: failed.as_ref().map_or_else(
-                                || {
-                                    "sealed slack holds real log data — a dropped-write gap or \
-                                     torn remnants precede it"
-                                        .to_owned()
-                                },
-                                ToString::to_string,
-                            ),
-                        }
-                        .to_string(),
-                    ));
-                }
-                RegionScan::Garbage { .. } => self.residue.push(true),
-                RegionScan::AllZero => self.residue.push(failed.is_some()),
-            }
-        } else {
-            let evidence = scan_region_evidence(
-                self.fs(),
-                &self.log_dir,
-                segment,
-                *end,
-                ReaderConfig::default(),
-            )?;
-            if self.resume_evidence_anchor.is_none()
-                && let Some(offset) = evidence.first_valid
-            {
-                self.resume_evidence_anchor = Some((segment, offset));
-            }
-            self.resume_evidence.absorb(&evidence);
-            match evidence.summary() {
-                RegionScan::ValidFrame { .. } | RegionScan::Garbage { .. } => {
-                    self.residue.push(true);
-                }
-                RegionScan::AllZero => self.residue.push(failed.is_some()),
-            }
-        }
-        self.phase = if idx + 1 == self.segments.len() {
+        let evidence =
+            scan_region_evidence(self.fs(), &self.log_dir, segment, *end, ReaderConfig::default())?;
+        let residue = match evidence.summary() {
+            RegionScan::ValidFrame { .. } | RegionScan::Garbage { .. } => true,
+            RegionScan::AllZero => failed.is_some(),
+        };
+        self.residue.push(residue);
+        self.evidence.push(evidence);
+        let next = idx + 1;
+        self.phase = if evidence.valid_frames > 0 {
+            self.hole = Some(idx);
+            if next == self.segments.len() { Phase::Finish } else { Phase::Probe { idx: next } }
+        } else if next == self.segments.len() {
             Phase::Finish
         } else {
-            Phase::Audit { idx: idx + 1 }
+            Phase::Replay { idx: next, reader: None }
         };
         Ok(RecoveryProgress::Working)
     }
 
+    /// Evidence-only scan of segment `idx`, behind a hole (ADR-0087 D6):
+    /// the whole file is residue by construction (nothing at or past the
+    /// hole was acked), so it is never replayed — scanned for the stamp
+    /// facts the Finish decision needs, then removed there. Records an
+    /// empty data end and credits the segment's bytes to progress.
+    fn step_probe(&mut self, idx: usize) -> io::Result<RecoveryProgress> {
+        debug_assert!(self.hole.is_some_and(|hole| hole < idx), "probe only behind a hole");
+        let segment = self.segments[idx];
+        let evidence =
+            scan_region_evidence(self.fs(), &self.log_dir, segment, 0, ReaderConfig::default())?;
+        self.stats.segments += 1;
+        self.ends.push((0, None));
+        self.residue.push(!matches!(evidence.summary(), RegionScan::AllZero));
+        self.evidence.push(evidence);
+        self.bytes_done += self.seg_sizes[idx];
+        let next = idx + 1;
+        self.phase =
+            if next == self.segments.len() { Phase::Finish } else { Phase::Probe { idx: next } };
+        Ok(RecoveryProgress::Working)
+    }
+
     fn step_finish(&mut self) -> io::Result<RecoveryProgress> {
+        debug_assert_eq!(self.ends.len(), self.segments.len(), "every segment has an end");
+        debug_assert_eq!(self.evidence.len(), self.segments.len(), "every segment was audited");
         let ends = &self.ends;
-        let last_data = self.last_data;
+        // The resume segment (ADR-0087 D6): the hole's, when it holds
+        // data; else the last data-bearing segment before it (a hole at
+        // offset 0 keeps nothing of its own — the previous data end is
+        // the resume point and the segment is removed like any trailing
+        // one). With no hole: the last data-bearing segment.
+        let last_with_data = |upto: usize| (0..upto).rev().find(|&i| ends[i].0 > 0).unwrap_or(0);
+        let last_data = match self.hole {
+            Some(hole) if ends[hole].0 > 0 => hole,
+            Some(hole) => last_with_data(hole),
+            None => last_with_data(ends.len()),
+        };
+        self.last_data = last_data;
         let torn = self.residue[last_data..].iter().any(|&r| r);
         self.stats.sealed_slack_remnants =
             self.residue[..last_data].iter().filter(|&&r| r).count() as u64;
+        // Evidence from the resume segment's slack and everything after
+        // it — the frames a truncation at the resume point would discard.
+        let mut resume_evidence = RegionEvidence::default();
+        let mut resume_evidence_anchor = None;
+        for (i, evidence) in self.evidence.iter().enumerate().skip(last_data) {
+            if resume_evidence_anchor.is_none()
+                && let Some(offset) = evidence.first_valid
+            {
+                resume_evidence_anchor = Some((self.segments[i], offset));
+            }
+            resume_evidence.absorb(evidence);
+        }
 
         let scan = self.scan.as_ref().expect("scan set in start");
         let (resume_segment, resume_offset) = if torn {
@@ -1161,9 +1175,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // proof the gap sat in covered territory. Otherwise they are the
         // legal remainder of a reorder hole in the un-covered suffix and
         // truncate with the torn tail (the retired ADR-0021 D3 refusal).
-        if self.resume_evidence.valid_frames > 0 {
+        if resume_evidence.valid_frames > 0 {
             let (evidence_segment, evidence_offset) =
-                self.resume_evidence_anchor.expect("evidence anchor set with a valid frame");
+                resume_evidence_anchor.expect("evidence anchor set with a valid frame");
             let corruption = |detail: String| {
                 io_msg(
                     LogCorruption {
@@ -1176,22 +1190,22 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     .to_string(),
                 )
             };
-            if self.resume_evidence.any_v1 {
+            if resume_evidence.any_v1 {
                 return Err(corruption(
                     "a format-v1 frame beyond the data end cannot attest whether the gap \
                      before it was fsync-covered (ADR-0031 D4)"
                         .to_owned(),
                 ));
             }
-            if self.resume_evidence.max_covered_lsn > resume.to_u64() {
+            if resume_evidence.max_covered_lsn > resume.to_u64() {
                 return Err(corruption(format!(
                     "a surviving frame attests fsync coverage up to {:#x}, past the valid \
                      data end {} — covered data was lost (ADR-0031 D4)",
-                    self.resume_evidence.max_covered_lsn, resume
+                    resume_evidence.max_covered_lsn, resume
                 )));
             }
             debug_assert!(torn, "beyond-frame evidence implies resume-region residue");
-            self.stats.beyond_frames_discarded = self.resume_evidence.valid_frames;
+            self.stats.beyond_frames_discarded = resume_evidence.valid_frames;
         }
         // Everything the manifest names was durable at publication (the
         // watermark-≥-begin staging guard): a log ending below begin is
@@ -1206,9 +1220,10 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         }
         if torn {
             self.stats.torn_truncated_at = Some(resume);
-            // Trailing segments hold no validating frame (the audit) —
-            // remove them so appends resume in the truncated segment with
-            // the pristine-prealloc invariant restored.
+            // Every later segment is un-acked residue (frame-free, or
+            // probed and proven un-covered above) — remove them so appends
+            // resume in the truncated segment with the pristine-prealloc
+            // invariant restored.
             for &trailing in &self.segments[last_data + 1..] {
                 self.fs().remove_file(&self.log_dir.join(segment_file_name(trailing)))?;
                 self.stats.torn_segments_removed += 1;
@@ -1259,7 +1274,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // audit saw it). Discarded-life residue that later resurfaces at
         // the new data end then fails the prefix's epoch-monotonicity rule
         // instead of replaying.
-        let observed = self.max_prefix_epoch.max(self.resume_evidence.max_epoch);
+        let observed = self.max_prefix_epoch.max(resume_evidence.max_epoch);
         let epoch = observed.checked_add(1).ok_or_else(|| {
             io_msg(format!("log epoch space exhausted at {observed} — refusing to start"))
         })?;

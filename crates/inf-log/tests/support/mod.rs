@@ -352,7 +352,9 @@ pub struct DurablePlane {
     pub rotor: SegmentRotor<StdSegmentFs>,
     pub commit: GroupCommit<<StdSegmentFs as SegmentFs>::File>,
     pub gate: WatermarkGate,
-    pub in_flight: Option<inf_log::FrameLease>,
+    /// Frames sealed and awaiting `LogWritten` (ADR-0087 D2): any
+    /// completion order; keyed by the write token's sequence == `FrameId`.
+    pub in_flight: VecDeque<(u64, inf_log::FrameLease)>,
     /// Workload script: staged up to `jobs_per_iter` per EXECUTE.
     pub jobs: VecDeque<Job>,
     pub jobs_per_iter: usize,
@@ -385,7 +387,7 @@ impl DurablePlane {
             rotor,
             commit: GroupCommit::new(),
             gate: WatermarkGate::new(),
-            in_flight: None,
+            in_flight: VecDeque::new(),
             jobs: VecDeque::new(),
             jobs_per_iter: 8,
             staged_always: Vec::new(),
@@ -421,8 +423,14 @@ impl CellPlane for DurablePlane {
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion) {
         match (c.token.class(), c.result) {
             (TokenClass::LogWrite, CompletionResult::LogWritten) => {
-                self.commit.note_frame_written();
-                let lease = self.in_flight.take().expect("LogWritten with no in-flight lease");
+                let seq = u64::from(c.token.slot()) | (u64::from(c.token.generation()) << 24);
+                let index = self
+                    .in_flight
+                    .iter()
+                    .position(|(id, _)| *id == seq)
+                    .expect("LogWritten with no in-flight lease");
+                let (_, lease) = self.in_flight.remove(index).expect("index from position");
+                self.commit.note_frame_written(inf_log::FrameId(seq));
                 self.staging.release(lease);
             }
             (TokenClass::Fsync, CompletionResult::Synced) => {
@@ -440,7 +448,9 @@ impl CellPlane for DurablePlane {
                 } else {
                     // The write's lease is terminal — release so teardown
                     // asserts stay meaningful; the cell is failed regardless.
-                    if let Some(lease) = self.in_flight.take() {
+                    let seq = u64::from(c.token.slot()) | (u64::from(c.token.generation()) << 24);
+                    if let Some(index) = self.in_flight.iter().position(|(id, _)| *id == seq) {
+                        let (_, lease) = self.in_flight.remove(index).expect("index");
                         self.staging.release(lease);
                     }
                 }
@@ -504,6 +514,17 @@ impl CellPlane for DurablePlane {
         }
         if self.staging.can_seal() {
             let frame_len = self.staging.pending_frame_len();
+            // ADR-0087 D3/D4: rotation drains the pipeline; a due frame
+            // that cannot carry its barrier yet waits. This harness drives
+            // buffered segments only, so write-through is never offered.
+            let rotation_due = self.rotor.rotation_due(frame_len);
+            if rotation_due && !self.staging.drained() {
+                return;
+            }
+            let plan = self.commit.frame_plan(false, rotation_due);
+            if plan == inf_log::FramePlan::Wait {
+                return;
+            }
             let (slot, seal) =
                 self.rotor.begin_frame_deferred(frame_len, cx.now.as_millis()).expect("reserve");
             if let Some(handoff) = seal {
@@ -534,8 +555,8 @@ impl CellPlane for DurablePlane {
                     acks.borrow_mut().push((lsn, watermark));
                 });
             }
-            self.commit.note_frame_queued(end, lease.frame_len());
-            let barrier = if self.commit.frame_fsync_due() {
+            let id = self.commit.note_frame_queued(end, lease.frame_len());
+            let barrier = if plan == inf_log::FramePlan::LinkedFsync {
                 let ticket = self.commit.register_linked_fsync(cx.now);
                 self.fsync_submits.push((SyncReason::Linked, cx.now));
                 WriteBarrier::LinkedFsync { fsync_token: fsync_token(ticket) }
@@ -546,13 +567,14 @@ impl CellPlane for DurablePlane {
             let fd = self.rotor.active_raw_fd().expect("std tier has fds");
             self.rotor.commit_frame_queued(slot);
             self.write_seq += 1;
+            assert_eq!(self.write_seq, id.0, "write token sequence is the frame id");
             self.writes_this_iter += 1;
             let bytes = self.staging.leased_frame(&lease);
             // SAFETY: the FrameLease is held in `self.in_flight` until the
             // LogWritten completion releases it (ADR-0013 D1) — the sealed
             // buffer neither moves nor resets while this op is in flight.
             let data = unsafe { StableBytes::new(bytes) };
-            self.in_flight = Some(lease);
+            self.in_flight.push_back((id.0, lease));
             cx.push(IoOp::LogWrite {
                 fd,
                 offset,
@@ -573,7 +595,7 @@ impl CellPlane for DurablePlane {
     fn fabric_out(&mut self, _cx: &mut LoopCx<'_>) -> bool {
         !self.jobs.is_empty()
             || !self.staging.is_empty()
-            || self.in_flight.is_some()
+            || !self.in_flight.is_empty()
             || self.commit.pending_fsyncs() > 0
     }
 }

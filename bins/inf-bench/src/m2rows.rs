@@ -877,12 +877,14 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
         .get("pin-start")
         .map(|v| vec!["--pin-start".to_string(), v.to_string()])
         .unwrap_or_default();
-    // M2.5-S07 A/B knob: the durability-sync pipeline bound rides every
-    // durable spawn in this campaign (disclosed in the report notes).
-    if let Some(bound) = flags.get("sync-pipeline") {
-        pin_args.push("--sync-pipeline".to_string());
-        pin_args.push(bound.to_string());
+    // `--sync-pipeline` was retired by ADR-0087 D5: accepted, announced,
+    // never forwarded (the server refuses it).
+    if flags.get("sync-pipeline").is_some() {
+        println!("note: --sync-pipeline is retired (ADR-0087 D5) — no-op; use --frames-in-flight");
     }
+    // M4.5-S35 A/B arms (ADR-0087 D5/D8) ride every durable spawn in this
+    // campaign and are disclosed in the report notes.
+    pin_args.extend(pipeline_args(flags));
     let server_extra: Vec<&str> = pin_args.iter().map(String::as_str).collect();
 
     let env_ok = env_gate(flags)?;
@@ -958,9 +960,8 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
             reference_box,
             &artifacts_root,
             &format!(
-                "cells: {cells} · duration: {duration}s · ONLY-ALWAYS (M2.5-S07 A/B leg; \
-                 sync-pipeline {})",
-                flags.str_or("sync-pipeline", "1")
+                "cells: {cells} · duration: {duration}s · ONLY-ALWAYS (A/B leg; {})",
+                pipeline_note(flags)
             ),
         );
     }
@@ -1121,5 +1122,34 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
         reference_box,
         &artifacts_root,
         &format!("cells: {cells} · replicates: {replicates} · duration: {duration}s"),
+    )
+}
+
+/// The M4.5-S35 server arms (ADR-0087 D5): `--frames-in-flight K`,
+/// `--barrier-class flush|fua`, `--log-staging-mib N` from the campaign
+/// flags, forwarded verbatim to every durable spawn.
+pub(crate) fn pipeline_args(flags: &Flags) -> Vec<String> {
+    let mut args = Vec::new();
+    for (flag, server_flag) in [
+        ("frames-in-flight", "--frames-in-flight"),
+        ("barrier-class", "--barrier-class"),
+        ("staging-mib", "--log-staging-mib"),
+    ] {
+        if let Some(value) = flags.get(flag) {
+            args.push(server_flag.to_string());
+            args.push(value.to_string());
+        }
+    }
+    args
+}
+
+/// The same arms for the report notes (defaults spelled out, so a
+/// K = 1 / flush row is never mistaken for an unknown configuration).
+pub(crate) fn pipeline_note(flags: &Flags) -> String {
+    format!(
+        "frames-in-flight {} · barrier-class {} · staging-mib {}",
+        flags.str_or("frames-in-flight", "1"),
+        flags.str_or("barrier-class", "flush"),
+        flags.str_or("staging-mib", "4")
     )
 }

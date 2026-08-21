@@ -47,7 +47,9 @@ pub use ckpt::{
     IckLiveSetSection, IckRefSection, IckStream, IckSummary, IdxSidecarMeta, LiveSetFileEntry,
     SectionLease, SyncIckWriter, read_ick, read_ick_hybrid,
 };
-pub use commit::{CommitStats, FsyncClass, FsyncTicket, GroupCommit, SyncReason};
+pub use commit::{
+    CommitStats, FrameId, FramePlan, FsyncClass, FsyncTicket, GroupCommit, SyncReason,
+};
 pub use effect::MutationEffect;
 pub use flush::{
     PendingSealView, TIER_FILE_CAPACITY_DEFAULT, TierDrive, TierFileMeta, TierFlush,
@@ -80,8 +82,8 @@ pub use segment::{
     segment_file_name,
 };
 pub use staging::{
-    DEFAULT_STAGING_BYTES, FrameLease, StagedAt, StagingConfig, StagingFull, StagingRing,
-    StagingStats,
+    DEFAULT_STAGING_BYTES, FrameLease, MAX_FRAMES_IN_FLIGHT, StagedAt, StagingConfig, StagingFull,
+    StagingRing, StagingStats,
 };
 pub use tail::{LogCorruption, RegionEvidence, RegionScan, scan_region, scan_region_evidence};
 pub use tier::{

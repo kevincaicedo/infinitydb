@@ -164,6 +164,12 @@ pub struct NodeInfo {
     pub rotations_unzeroed: Cell<u64>,
     pub rotations_upgrade: Cell<u64>,
     pub barrier_class_degraded: Cell<u64>,
+    /// M4.5-S35 (ADR-0087 D5): the frame pipeline's configured depth, its
+    /// observed high-water mark, and its two bounded waits.
+    pub frames_in_flight: Cell<u64>,
+    pub frames_in_flight_max: Cell<u64>,
+    pub frame_waits_barrier: Cell<u64>,
+    pub frame_waits_rotation: Cell<u64>,
     /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).
     pub ckpts_completed: Cell<u64>,
     pub ckpts_aborted: Cell<u64>,

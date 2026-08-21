@@ -166,7 +166,7 @@ fn direct_rotor_on_memfs_writes_aligned_write_through_frames() {
         SegmentRotor::create_fresh(fs.clone(), dir.clone(), direct_cfg(16 << 10)).expect("fresh");
     assert_eq!(rotor.active_io_mode(), SegmentIoMode::Direct);
     assert!(rotor.active_write_through(), "MemFs is fully allocated at birth");
-    let mut ring = StagingRing::new(StagingConfig { capacity_bytes: 8 << 10 });
+    let mut ring = StagingRing::new(StagingConfig::with_capacity(8 << 10));
     let mut unpadded_total = 0u64;
     for i in 0..6u8 {
         let value = [i; 100];

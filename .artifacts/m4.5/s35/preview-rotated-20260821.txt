@@ -1,0 +1,32 @@
+# 2026-08-21T09:32:59-04:00 host=HomeLab kernel=7.0.0-30-generic
+# governor=performance
+# binary=infinityd 71bb130 (git 71bb13006b07-dirty, x86_64-unknown-linux-gnu)
+# git=71bb130 dirty=48
+=== k4 (cells=4 frames-in-flight=4 staging-mib=4 rep=1, 40s idle before) ===
+ops=128000 errors=0 secs=3.143 throughput_ops_s=40730 p50_ms=0.721 p99_ms=1.734 max_ms=10.776 
+log_staging_bytes:21012480  log_admission_parked_total:0  log_write_stall_p99_us:1887  fsync_latency_p50_us:639  fsync_latency_p99_us:2751  fsyncs_linked:13  fsyncs_fua:45298  fua_latency_p50_us:623  fua_latency_p99_us:1535  zero_fill_bytes:536870912  frames_in_flight:4  frames_in_flight_max:4  frame_waits_barrier:45809  frame_waits_rotation:0  
+=== k1 (cells=4 frames-in-flight=1 staging-mib=4 rep=1, 40s idle before) ===
+ops=128000 errors=0 secs=4.546 throughput_ops_s=28156 p50_ms=1.106 p99_ms=2.530 max_ms=11.497 
+log_staging_bytes:8404992  log_admission_parked_total:0  log_write_stall_p99_us:1951  fsync_latency_p50_us:591  fsync_latency_p99_us:3391  fsyncs_linked:6  fsyncs_fua:16456  fua_latency_p50_us:591  fua_latency_p99_us:1375  zero_fill_bytes:536870912  frames_in_flight:1  frames_in_flight_max:1  frame_waits_barrier:0  frame_waits_rotation:0  
+=== k3s2 (cells=4 frames-in-flight=3 staging-mib=2 rep=1, 40s idle before) ===
+ops=128000 errors=0 secs=3.212 throughput_ops_s=39848 p50_ms=0.712 p99_ms=1.913 max_ms=10.511 
+log_staging_bytes:8421376  log_admission_parked_total:0  log_write_stall_p99_us:15871  fsync_latency_p50_us:607  fsync_latency_p99_us:16383  fsyncs_linked:4  fsyncs_fua:36174  fua_latency_p50_us:591  fua_latency_p99_us:2623  zero_fill_bytes:536870912  frames_in_flight:3  frames_in_flight_max:3  frame_waits_barrier:39082  frame_waits_rotation:0  
+=== k4 (cells=4 frames-in-flight=4 staging-mib=4 rep=2, 40s idle before) ===
+ops=128000 errors=0 secs=3.143 throughput_ops_s=40725 p50_ms=0.719 p99_ms=1.668 max_ms=10.934 
+log_staging_bytes:21012480  log_admission_parked_total:0  log_write_stall_p99_us:1855  fsync_latency_p50_us:655  fsync_latency_p99_us:2047  fsyncs_linked:10  fsyncs_fua:44571  fua_latency_p50_us:655  fua_latency_p99_us:1471  zero_fill_bytes:536870912  frames_in_flight:4  frames_in_flight_max:4  frame_waits_barrier:28348  frame_waits_rotation:94  
+=== k1 (cells=4 frames-in-flight=1 staging-mib=4 rep=2, 40s idle before) ===
+ops=128000 errors=0 secs=4.476 throughput_ops_s=28595 p50_ms=1.088 p99_ms=2.528 max_ms=11.198 
+log_staging_bytes:8404992  log_admission_parked_total:0  log_write_stall_p99_us:2175  fsync_latency_p50_us:591  fsync_latency_p99_us:3775  fsyncs_linked:11  fsyncs_fua:16476  fua_latency_p50_us:591  fua_latency_p99_us:1375  zero_fill_bytes:536870912  frames_in_flight:1  frames_in_flight_max:1  frame_waits_barrier:0  frame_waits_rotation:0  
+=== k3s2 (cells=4 frames-in-flight=3 staging-mib=2 rep=2, 40s idle before) ===
+ops=128000 errors=0 secs=3.242 throughput_ops_s=39477 p50_ms=0.733 p99_ms=1.902 max_ms=11.029 
+log_staging_bytes:8421376  log_admission_parked_total:0  log_write_stall_p99_us:1887  fsync_latency_p50_us:607  fsync_latency_p99_us:2879  fsyncs_linked:17  fsyncs_fua:36965  fua_latency_p50_us:607  fua_latency_p99_us:1503  zero_fill_bytes:536870912  frames_in_flight:3  frames_in_flight_max:3  frame_waits_barrier:45642  frame_waits_rotation:0  
+=== k4 (cells=4 frames-in-flight=4 staging-mib=4 rep=3, 40s idle before) ===
+ops=128000 errors=0 secs=3.161 throughput_ops_s=40496 p50_ms=0.719 p99_ms=1.799 max_ms=9.993 
+log_staging_bytes:21012480  log_admission_parked_total:0  log_write_stall_p99_us:1695  fsync_latency_p50_us:639  fsync_latency_p99_us:2431  fsyncs_linked:20  fsyncs_fua:45533  fua_latency_p50_us:639  fua_latency_p99_us:1535  zero_fill_bytes:536870912  frames_in_flight:4  frames_in_flight_max:4  frame_waits_barrier:44891  frame_waits_rotation:0  
+=== k1 (cells=4 frames-in-flight=1 staging-mib=4 rep=3, 40s idle before) ===
+ops=128000 errors=0 secs=4.467 throughput_ops_s=28653 p50_ms=1.089 p99_ms=2.521 max_ms=10.734 
+log_staging_bytes:8404992  log_admission_parked_total:0  log_write_stall_p99_us:1663  fsync_latency_p50_us:591  fsync_latency_p99_us:3071  fsyncs_linked:12  fsyncs_fua:16176  fua_latency_p50_us:591  fua_latency_p99_us:1407  zero_fill_bytes:536870912  frames_in_flight:1  frames_in_flight_max:1  frame_waits_barrier:0  frame_waits_rotation:0  
+=== k3s2 (cells=4 frames-in-flight=3 staging-mib=2 rep=3, 40s idle before) ===
+ops=128000 errors=0 secs=3.231 throughput_ops_s=39621 p50_ms=0.733 p99_ms=1.913 max_ms=10.079 
+log_staging_bytes:8421376  log_admission_parked_total:0  log_write_stall_p99_us:2047  fsync_latency_p50_us:591  fsync_latency_p99_us:2879  fsyncs_linked:5  fsyncs_fua:36715  fua_latency_p50_us:591  fua_latency_p99_us:1471  zero_fill_bytes:536870912  frames_in_flight:3  frames_in_flight_max:3  frame_waits_barrier:49580  frame_waits_rotation:0  
+# done 2026-08-21T09:41:19-04:00

@@ -741,10 +741,20 @@ fn run_durable(
     let mut corpus_documents = 0u64;
     let mut cut_classes: std::collections::BTreeMap<&'static str, u64> =
         std::collections::BTreeMap::new();
+    // Frame-pipeline coverage (ADR-0087 D7): seeds whose cells reached
+    // ≥ 2 frames in flight, the deepest seen, and the bounded waits.
+    let mut pipelined_seeds = 0u64;
+    let mut depth_max = 0u64;
+    let mut waits_barrier = 0u64;
+    let mut waits_rotation = 0u64;
     for i in (shard_i..sweep).step_by(shard_k as usize) {
         let seed = seed.wrapping_add(i);
         let report = run_one(seed);
         ran += 1;
+        pipelined_seeds += u64::from(report.frames_in_flight_max >= 2);
+        depth_max = depth_max.max(report.frames_in_flight_max);
+        waits_barrier += report.frame_waits_barrier;
+        waits_rotation += report.frame_waits_rotation;
         sim_seconds += report.sim_seconds;
         equivalence_checks += report.equivalence_checks;
         documents_compared += report.documents_compared;
@@ -773,7 +783,9 @@ fn run_durable(
     println!(
         "inf-sim: {scenario_name} sweep shard {shard_i}/{shard_k}: {ran} seeds, {violations} \
          violations, {refused} legal taxonomy refusals, {equivalence_checks} equivalence \
-         checks, {documents_compared} documents compared, cut classes [{}]",
+         checks, {documents_compared} documents compared, cut classes [{}], frame pipeline \
+         [pipelined_seeds:{pipelined_seeds} depth_max:{depth_max} waits_barrier:{waits_barrier} \
+         waits_rotation:{waits_rotation}]",
         classes.join(" ")
     );
     println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
@@ -784,7 +796,8 @@ fn run_durable(
              plant={plant:?} replay_canary={replay_canary} seeds_run={ran} \
              violations={violations} refused={refused} equivalence_checks={equivalence_checks} \
              documents_compared={documents_compared} corpus_documents={corpus_documents} \
-             cut_classes=[{}]\n",
+             cut_classes=[{}] pipelined_seeds={pipelined_seeds} depth_max={depth_max} \
+             waits_barrier={waits_barrier} waits_rotation={waits_rotation}\n",
             classes.join(" ")
         );
         std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest).expect("manifest");

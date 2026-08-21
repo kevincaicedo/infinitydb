@@ -82,7 +82,7 @@ fn start_node(
             segment: inf_log::SegmentConfig::default(),
             ckpt: inf_log::CkptConfig { interval_bytes: 0, ..Default::default() },
             recover: Default::default(),
-            sync_pipeline: 1,
+            flush_bound: 1,
             fua_p50_us_probed: 0,
         };
         let mut plane = ServerPlane::new(
