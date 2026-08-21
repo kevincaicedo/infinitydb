@@ -2931,6 +2931,70 @@ fn direct_segments_converge_to_fua_and_survive_restart() {
 /// a prefix (every acked key is back after a restart), and the pipeline
 /// gauges are exported. Real io_uring; run with `TMPDIR` on the NVMe for
 /// the device tier (tmpfs swallows `O_DIRECT`/FUA).
+/// M4.5-S36 (ADR-0088 D5 amended): a `Direct` cell with only `everysec`
+/// namespaces never pre-zeroes — no write-through consumer, no second
+/// write (`zero_fill_bytes` stays 0 while segments rotate un-zeroed and
+/// the class reads `flush`); the first `always` namespace starts the fill
+/// and the class upgrades at the next rotation (ADR-0086 D4's machinery).
+#[test]
+fn everysec_only_cell_skips_pre_zeroing_until_an_always_namespace_exists() {
+    let dir = temp_data_dir("s36-zero-fill-gate");
+    let node = Node::start_durable_pipeline(1, &dir, 3);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"esec", b"MODE", b"durable", b"FSYNC", b"everysec"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"esec"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // Drive past several segment rotations (the test node's segments are
+    // small): no zero byte is ever written, the class stays flush.
+    let value = vec![b'z'; 4096];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let info = loop {
+        for i in 0..256 {
+            let key = format!("e:{i:05}");
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), &value])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        let info = info_persistence(&mut c);
+        if info_field(&info, "rotations_unzeroed") >= 2 || Instant::now() > deadline {
+            break info;
+        }
+    };
+    assert!(info_field(&info, "rotations_unzeroed") >= 2, "segments rotated un-zeroed:\n{info}");
+    assert_eq!(info_field(&info, "zero_fill_bytes"), 0, "no write-through consumer:\n{info}");
+    assert!(info.contains("barrier_class:flush"), "{info}");
+    assert_eq!(info_field(&info, "io_budget_bytes_zero_fill"), 0, "{info}");
+
+    // An `always` namespace appears: the fill starts and the class
+    // upgrades at the next rotation.
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"alw", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut i = 0u32;
+    let info = loop {
+        for _ in 0..64 {
+            let key = format!("f:{i:05}");
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), &value])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+            i += 1;
+        }
+        let info = info_persistence(&mut c);
+        if info.contains("barrier_class:fua") || Instant::now() > deadline {
+            break info;
+        }
+    };
+    assert!(
+        info.contains("barrier_class:fua"),
+        "the class upgraded once an always ns exists:\n{info}"
+    );
+    assert!(info_field(&info, "zero_fill_bytes") > 0, "{info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn frame_pipeline_fills_under_concurrent_always_writers_and_survives_restart() {
     let dir = temp_data_dir("s35-pipeline");

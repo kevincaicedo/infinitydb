@@ -1145,9 +1145,9 @@ pub(crate) fn pipeline_args(flags: &Flags) -> Vec<String> {
         ("frames-in-flight", "--frames-in-flight"),
         ("barrier-class", "--barrier-class"),
         ("staging-mib", "--log-staging-mib"),
-        // M4.5-S36 (ADR-0088 D6/D2b): the device-model and seal-pace arms.
+        // M4.5-S36 (ADR-0088 D6): the device-model arm. `--seal-pace`
+        // rides only the spawns that carry a probe file (`seal_pace_args`).
         ("device-write-mbps", "--device-write-mbps"),
-        ("seal-pace", "--seal-pace"),
     ] {
         if let Some(value) = flags.get(flag) {
             args.push(server_flag.to_string());
@@ -1155,6 +1155,36 @@ pub(crate) fn pipeline_args(flags: &Flags) -> Vec<String> {
         }
     }
     args
+}
+
+/// The M4.5-S36 seal-pace arm (ADR-0088 D2b), forwarded only when the
+/// spawn can honour it: `--seal-pace probe` needs a schema-2 probe file
+/// in the spawn's data dir (`probe_present`), a numeric rate needs none.
+pub(crate) fn seal_pace_args(flags: &Flags, probe_present: bool) -> Vec<String> {
+    match flags.get("seal-pace") {
+        Some(value) if value != "probe" || probe_present => {
+            vec!["--seal-pace".to_string(), value.to_string()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Copies the campaign root's `io-properties.toml` into a spawn's data
+/// dir (ADR-0088 D6: `infinityd` reads its own data dir; every spawn is
+/// fresh). Returns whether a file was copied. `--model-absent` skips it
+/// — the unbudgeted baseline arm, disclosed in the report.
+pub(crate) fn copy_probe_file(flags: &Flags, dir: &std::path::Path) -> Result<bool, String> {
+    if flags.bool("model-absent") {
+        return Ok(false);
+    }
+    let root = flags.str_or("data-root", ".artifacts/m4.5/s29-gate-data");
+    let probe = std::path::Path::new(&root).join("io-properties.toml");
+    if !probe.exists() {
+        return Ok(false);
+    }
+    std::fs::copy(&probe, dir.join("io-properties.toml"))
+        .map_err(|e| format!("copy {}: {e}", probe.display()))?;
+    Ok(true)
 }
 
 /// The same arms for the report notes (defaults spelled out, so a

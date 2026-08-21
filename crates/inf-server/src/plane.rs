@@ -2725,7 +2725,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         // (rotation stays a pointer swap — S02); durable counters flush
         // into NodeInfo for INFO persistence (S21 vocabulary).
         if let Some(cell) = self.shared.durable.borrow_mut().as_mut() {
-            cell.maintain(cx);
+            let write_through_wanted = self.shared.store.borrow().has_always_namespace();
+            cell.maintain(cx, write_through_wanted);
             // Manual checkpoint requests ride the control handle (one
             // relaxed load — the persisted-epoch pattern, ADR-0016 D7).
             if let Some(control) = self.shared.control.borrow().as_ref() {
