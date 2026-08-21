@@ -434,22 +434,35 @@ struct S35Leg {
     /// drive-state discriminator, disclosed per leg.
     barrier_p99_us: f64,
     frames_in_flight_max: u64,
+    /// Group size (gated acks per barrier) and frames issued — the
+    /// @256 discriminator.
+    acks_per_fsync: f64,
+    frames: u64,
+    parked: u64,
 }
 
 /// The M4.5-S35 frame-pipeline row (ADR-0087 D8). Per replicate: a
 /// fresh N-cell server with the campaign's durable arms → one flat
-/// `always` namespace → deterministic fill → a 32-conn closed-loop
-/// 100 %-write leg (the AC: client p50 ÷ barrier p50) → a 256-conn
-/// leg (the `max` row) → a pipelined 100 %-GET leg (the ±2 % read
-/// row, compared across arm reports). Then a fresh 1-cell server, same
-/// fill, the 32-conn leg (the 4c ÷ 1c p50 ratio — S34's F2 AC, owned
-/// here). Every durable leg is preceded by the drive-state idle.
+/// `always` namespace → a 32-conn closed-loop 100 %-write leg (the AC:
+/// client p50 ÷ barrier p50) → a 256-conn leg (the `max` row) → a
+/// pipelined 100 %-GET leg over the keyspace the two write legs
+/// populated (the ±2 % read row, compared across arm reports; `nils`
+/// disclosed). Then a fresh 1-cell server, the 32-conn leg (the 4c ÷ 1c
+/// p50 ratio — S34's F2 AC, owned here). Every durable leg is preceded
+/// by the drive-state idle.
 ///
-/// The barrier p50 is a whole-session histogram (the fill's frames are
-/// in it: ~780 frames/cell at 64 × 4 in flight vs ~10k from the leg —
-/// ≤ 10 % of samples, disclosed). `frames_in_flight_max` must equal the
-/// configured K on the N-cell leg or the pipeline never filled and the
-/// row is a K = 1 row in disguise (a note, never silent).
+/// **No fill leg**: the barrier p50 is a whole-session histogram, and
+/// the first campaign (2026-08-21, `.artifacts/m4.5/s35-gate/`) showed
+/// a 64 × 4 pipelined fill's larger frames lifting it above the AC
+/// leg's own client p50 (1-cell `p50/barrier = 0.97`, physically
+/// impossible for the leg alone). The AC leg now runs first on a fresh
+/// server, so the histogram it is scraped against holds only its own
+/// frames. Each leg also reports its group size (`acks/fsync`), frames
+/// issued, and parked admissions — the discriminators for the @256
+/// finding (a deeper pipeline sealing smaller frames). `frames_in_
+/// flight_max` must equal the configured K on the N-cell leg or the
+/// pipeline never filled and the row is a K = 1 row in disguise (a
+/// note, never silent).
 #[allow(clippy::too_many_arguments)] // orchestration script
 fn s35_frame_pipeline_row(
     flags: &Flags,
@@ -478,6 +491,8 @@ fn s35_frame_pipeline_row(
     let mut ops_256: Vec<f64> = Vec::new();
     let mut p99_256: Vec<f64> = Vec::new();
     let mut max_256: Vec<f64> = Vec::new();
+    let mut group_256: Vec<f64> = Vec::new();
+    let mut group_n: Vec<f64> = Vec::new();
     let mut read_ops: Vec<f64> = Vec::new();
     let mut read_p999: Vec<f64> = Vec::new();
     let mut p50_one: Vec<f64> = Vec::new();
@@ -488,14 +503,6 @@ fn s35_frame_pipeline_row(
         let dir = format!("{data_root}/s35-{cells}c-rep{rep}");
         s35_idle(idle_s, &format!("{cells}c rep{rep} c{S35_CONNS_AC}"));
         let (server, port) = s35_spawn(flags, infinityd, cells, &dir)?;
-        let fill = run_load(&fill_spec(port, "s35alw"))?;
-        if fill.errors > 0 {
-            return Err(format!(
-                "s35 rep{rep} fill: {} errors (first: {:?})",
-                fill.errors,
-                fill.error_samples.first()
-            ));
-        }
         let ac = s35_write_leg(port, cells, S35_CONNS_AC, duration, p50_key, p99_key)?;
         fill_max_seen = fill_max_seen.max(ac.frames_in_flight_max);
         if ac.barrier_p99_us > 10_000.0 {
@@ -504,7 +511,7 @@ fn s35_frame_pipeline_row(
         raw.push_str(&format!(
             "rep{rep} {cells}c c{S35_CONNS_AC:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
              max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} p50/barrier={:.2} \
-             frames_in_flight_max={}\n",
+             frames_in_flight_max={} acks/fsync={:.1} frames={} parked={}\n",
             ac.ops_per_sec,
             ac.p50_us,
             ac.p99_us,
@@ -512,7 +519,10 @@ fn s35_frame_pipeline_row(
             ac.barrier_p50_us,
             ac.barrier_p99_us,
             ac.p50_us / ac.barrier_p50_us.max(1.0),
-            ac.frames_in_flight_max
+            ac.frames_in_flight_max,
+            ac.acks_per_fsync,
+            ac.frames,
+            ac.parked
         ));
         ratio.push(ac.p50_us / ac.barrier_p50_us.max(1.0));
         p50_n.push(ac.p50_us);
@@ -520,6 +530,7 @@ fn s35_frame_pipeline_row(
         p99_n.push(ac.p99_us);
         max_n.push(ac.max_us);
         barrier_n.push(ac.barrier_p50_us);
+        group_n.push(ac.acks_per_fsync);
 
         s35_idle(idle_s, &format!("{cells}c rep{rep} c{CONNS_HIGH}"));
         let hi = s35_write_leg(port, cells, CONNS_HIGH, duration, p50_key, p99_key)?;
@@ -529,18 +540,22 @@ fn s35_frame_pipeline_row(
         raw.push_str(&format!(
             "rep{rep} {cells}c c{CONNS_HIGH:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
              max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} \
-             frames_in_flight_max={}\n",
+             frames_in_flight_max={} acks/fsync={:.1} frames={} parked={}\n",
             hi.ops_per_sec,
             hi.p50_us,
             hi.p99_us,
             hi.max_us,
             hi.barrier_p50_us,
             hi.barrier_p99_us,
-            hi.frames_in_flight_max
+            hi.frames_in_flight_max,
+            hi.acks_per_fsync,
+            hi.frames,
+            hi.parked
         ));
         ops_256.push(hi.ops_per_sec);
         p99_256.push(hi.p99_us);
         max_256.push(hi.max_us);
+        group_256.push(hi.acks_per_fsync);
 
         // The read row: pipelined GETs over the filled keyspace (the
         // M0 zero-cost shape on a durable namespace). No idle — reads
@@ -584,10 +599,6 @@ fn s35_frame_pipeline_row(
             let dir = format!("{data_root}/s35-1c-rep{rep}");
             s35_idle(idle_s, &format!("1c rep{rep} c{S35_CONNS_AC}"));
             let (server, port) = s35_spawn(flags, infinityd, 1, &dir)?;
-            let fill = run_load(&fill_spec(port, "s35alw"))?;
-            if fill.errors > 0 {
-                return Err(format!("s35 1c rep{rep} fill: {} errors", fill.errors));
-            }
             let one = s35_write_leg(port, 1, S35_CONNS_AC, duration, p50_key, p99_key)?;
             if one.barrier_p99_us > 10_000.0 {
                 device_tail_legs += 1;
@@ -595,7 +606,7 @@ fn s35_frame_pipeline_row(
             raw.push_str(&format!(
                 "rep{rep} 1c c{S35_CONNS_AC:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
                  max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} p50/barrier={:.2} \
-                 frames_in_flight_max={}\n",
+                 frames_in_flight_max={} acks/fsync={:.1} frames={} parked={}\n",
                 one.ops_per_sec,
                 one.p50_us,
                 one.p99_us,
@@ -603,7 +614,10 @@ fn s35_frame_pipeline_row(
                 one.barrier_p50_us,
                 one.barrier_p99_us,
                 one.p50_us / one.barrier_p50_us.max(1.0),
-                one.frames_in_flight_max
+                one.frames_in_flight_max,
+                one.acks_per_fsync,
+                one.frames,
+                one.parked
             ));
             p50_one.push(one.p50_us);
             drop(server);
@@ -622,6 +636,8 @@ fn s35_frame_pipeline_row(
     m.set("s35:always_c256_ops_per_sec", median(&mut ops_256));
     m.set("s35:always_c256_p99_us", median(&mut p99_256));
     m.set("s35:always_c256_max_us", median(&mut max_256));
+    m.set("s35:always_c256_acks_per_fsync", median(&mut group_256));
+    m.set("s35:always_c32_acks_per_fsync", median(&mut group_n));
     m.set("s35:read_c64p16_ops_per_sec", median(&mut read_ops));
     m.set("s35:read_c64p16_p999_us", median(&mut read_p999));
     m.set("s35:frames_in_flight_max", fill_max_seen as f64);
@@ -645,11 +661,13 @@ fn s35_frame_pipeline_row(
         ));
     }
     m.note(format!(
-        "s35 row: flat always, {FILL_KEYS} keys × 1 KiB fill, {duration}s legs, median of \
-         {replicates}; AC leg {S35_CONNS_AC} conns pipeline 1 on {cells} cells then on 1 cell; \
-         max leg {CONNS_HIGH} conns; read leg 64 conns × P16 100% GET; {idle_s}s idle before \
-         every durable leg; barrier = {p50_key} (cell median, whole-session histogram incl. \
-         the fill's frames); device tail = {p99_key} (worst cell)"
+        "s35 row: flat always, no fill (the AC leg runs first on a fresh server so its \
+         barrier histogram holds only its own frames), {FILL_KEYS}-key space × 1 KiB, \
+         {duration}s legs, median of {replicates}; AC leg {S35_CONNS_AC} conns pipeline 1 on \
+         {cells} cells then on 1 cell; max leg {CONNS_HIGH} conns; read leg 64 conns × P16 \
+         100% GET over the keys the write legs populated (nils disclosed); {idle_s}s idle \
+         before every durable leg; barrier = {p50_key} (cell median, whole-session \
+         histogram); device tail = {p99_key} (worst cell)"
     ));
     m.row_open("frame-pipeline");
     m.row_write_amp(
@@ -704,6 +722,7 @@ fn s35_write_leg(
     p50_key: &str,
     p99_key: &str,
 ) -> Result<S35Leg, String> {
+    let before = scrape_cells(port, cells)?;
     let report = run_load(&LoadSpec {
         port,
         conns,
@@ -726,6 +745,13 @@ fn s35_write_leg(
         ));
     }
     let infos = scrape_cells(port, cells)?;
+    let acks = sum_field(&infos, "acks_gated").saturating_sub(sum_field(&before, "acks_gated"));
+    let fsyncs = sum_field(&infos, "fsyncs_completed")
+        .saturating_sub(sum_field(&before, "fsyncs_completed"));
+    let frames = sum_field(&infos, "log_frames_queued")
+        .saturating_sub(sum_field(&before, "log_frames_queued"));
+    let parked = sum_field(&infos, "log_admission_parked_total")
+        .saturating_sub(sum_field(&before, "log_admission_parked_total"));
     let mut p50s: Vec<f64> =
         infos.iter().filter_map(|c| c.get(p50_key).and_then(|v| v.parse::<f64>().ok())).collect();
     if p50s.is_empty() {
@@ -739,6 +765,9 @@ fn s35_write_leg(
         barrier_p50_us: median(&mut p50s),
         barrier_p99_us: crate::gaterun::max_field(&infos, p99_key) as f64,
         frames_in_flight_max: crate::gaterun::max_field(&infos, "frames_in_flight_max"),
+        acks_per_fsync: if fsyncs > 0 { acks as f64 / fsyncs as f64 } else { 0.0 },
+        frames,
+        parked,
     })
 }
 
