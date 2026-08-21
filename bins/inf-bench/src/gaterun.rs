@@ -570,8 +570,10 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-s29",
         // M4.5 S35 frame-pipeline arms (the row alone, one report per arm).
         "only-s35",
-        // M4.5 S36 device-budget row (the row alone, one report per arm).
+        // M4.5 S36 device-budget row (the row alone, one report per arm),
+        // and its unbudgeted baseline arm (no probe file copied in).
         "only-s36",
+        "model-absent",
     ],
     &[
         "allow-dirty",
@@ -643,6 +645,7 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-s29",
         "only-s35",
         "only-s36",
+        "model-absent",
         // M4.5-S35 row: seconds idled before every durable leg (the S34
         // drive-state rule; default 40, 0 for harness smoke).
         "leg-idle-s",

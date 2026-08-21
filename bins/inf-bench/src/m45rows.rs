@@ -884,6 +884,20 @@ fn s36_spawn(
 ) -> Result<(crate::gaterun::ServerGuard, u16), String> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
+    // The device model (ADR-0088 D6): `infinityd` reads `<data-dir>/
+    // io-properties.toml`, and every spawn gets a fresh dir — so the
+    // campaign root's probe file is copied in for the device arm
+    // (`inf probe-device <data-root>` once per campaign). `--model-absent`
+    // skips the copy: the pre-S36 unbudgeted baseline arm, disclosed.
+    // The tmpfs control never gets it (a memory fs has no device to model).
+    if barrier_override.is_none() && !flags.bool("model-absent") {
+        let root = flags.str_or("data-root", ".artifacts/m4.5/s29-gate-data");
+        let probe = std::path::Path::new(&root).join("io-properties.toml");
+        if probe.exists() {
+            std::fs::copy(&probe, std::path::Path::new(dir).join("io-properties.toml"))
+                .map_err(|e| format!("copy {}: {e}", probe.display()))?;
+        }
+    }
     let mut extra: Vec<String> = vec!["--data-dir".into(), dir.to_string()];
     if let Some(pin) = flags.get("pin-start") {
         extra.push("--pin-start".into());
