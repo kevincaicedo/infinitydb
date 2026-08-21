@@ -115,10 +115,13 @@ fn base(scenario: &SidecarScenario) -> DurableScenario {
         // spans many scheduler steps — the storm has a real window to
         // land inside, and mid-write cuts land across every phase.
         ckpt_stream_bytes_per_sec: Some(2 << 20),
+        ckpt_section_bytes: None,
         stall: None,
         replay_canary: false,
         io_mode: inf_server::SegmentIoMode::Buffered,
         frames_in_flight: 1,
+        device: Default::default(),
+        budget_oracle: false,
     }
 }
 

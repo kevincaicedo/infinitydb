@@ -111,6 +111,15 @@ pub struct CkptStats {
     pub last_begin_lsn: u64,
     /// Live checkpoint-buffer domain bytes (0 when idle — L5).
     pub buffer_bytes: u64,
+    /// M4.5-S36 (ADR-0088 D4/D7): on-disk bytes of every published
+    /// checkpoint, the last one's, the v3 padding inside them, the
+    /// derived trigger interval, and records staged since the current
+    /// (or last) begin — the write-amplification and trigger observables.
+    pub bytes_total: u64,
+    pub bytes_last: u64,
+    pub padding_bytes: u64,
+    pub interval_bytes: u64,
+    pub records_since_begin: u64,
 }
 
 pub(crate) struct CkptCell<F: SegmentFs> {
@@ -126,16 +135,24 @@ pub(crate) struct CkptCell<F: SegmentFs> {
     /// stages, published to the control board at the MANIFEST commit.
     pub req_epoch: u64,
     pub epoch_in_flight: u64,
-    /// `StagingStats::append_bytes` at the last completed checkpoint's
-    /// **begin** — the bytes-appended-since trigger base. Begin, not
-    /// publish: a paced walk (ADR-0017) can lag a write burst by a full
-    /// dataset, and rebasing at publish would let everything staged
-    /// mid-walk escape the trigger — an unbounded retained log if writes
-    /// then quiesce.
+    /// `CommitStats::frame_bytes_queued` — on-disk frame bytes, header,
+    /// trailer and v3 padding included (ADR-0088 D4; ADR-0086 D3's
+    /// obligation) — at the last completed checkpoint's **begin**: the
+    /// bytes-since trigger base. Begin, not publish: a paced walk
+    /// (ADR-0017) can lag a write burst by a full dataset, and rebasing
+    /// at publish would let everything staged mid-walk escape the
+    /// trigger — an unbounded retained log if writes then quiesce.
     pub bytes_at_last: u64,
-    /// The staged-bytes total captured when the current checkpoint's
+    /// The frame-bytes total captured when the current checkpoint's
     /// begin marker was staged (becomes `bytes_at_last` at publish).
     pub bytes_at_begin: u64,
+    /// Records staged at the last begin — the record-cap trigger base
+    /// (recovery is bound by record count, ADR-0088 D4).
+    pub records_at_last: u64,
+    pub records_at_begin: u64,
+    /// The derived interval in force (`CkptConfig::derive_interval` of
+    /// the last checkpoint's bytes; the floor before the first).
+    pub interval_bytes: u64,
     pub phase: CkptPhase<F::File>,
     stats: CkptStats,
 }
@@ -162,6 +179,9 @@ impl<F: SegmentFs> CkptCell<F> {
             epoch_in_flight: 0,
             bytes_at_last: 0,
             bytes_at_begin: 0,
+            records_at_last: 0,
+            records_at_begin: 0,
+            interval_bytes: cfg.derive_interval(0),
             phase: CkptPhase::Idle,
             stats: CkptStats::default(),
         })
@@ -172,12 +192,30 @@ impl<F: SegmentFs> CkptCell<F> {
         self.next_id
     }
 
-    /// Trigger check (Idle only): manual request, or the bytes-appended
-    /// threshold (`interval_bytes = 0` disables the automatic trigger).
-    pub fn should_begin(&self, staged_bytes_total: u64) -> bool {
-        self.requested
-            || (self.cfg.interval_bytes > 0
-                && staged_bytes_total.saturating_sub(self.bytes_at_last) >= self.cfg.interval_bytes)
+    /// Trigger check (Idle only): manual request, the derived on-disk
+    /// frame-bytes threshold, or the record cap (ADR-0088 D4 — either
+    /// bound alone lets the other shape's replay escape the boot gate).
+    /// `interval_bytes = 0` (the floor) disables the automatic trigger
+    /// entirely, record cap included — manual checkpoints only.
+    pub fn should_begin(&self, frame_bytes_total: u64, records_total: u64) -> bool {
+        if self.requested {
+            return true;
+        }
+        if self.cfg.interval_bytes == 0 {
+            return false;
+        }
+        let bytes_since = frame_bytes_total.saturating_sub(self.bytes_at_last);
+        let records_since = records_total.saturating_sub(self.records_at_last);
+        let cap_records = self.cfg.cap_records();
+        bytes_since >= self.interval_bytes || (cap_records > 0 && records_since >= cap_records)
+    }
+
+    /// Re-derives the interval from the bytes the last checkpoint wrote
+    /// (ADR-0088 D4) — called at publish; before the first checkpoint the
+    /// interval is the floor (`derive_interval(0)`).
+    fn rederive_interval(&mut self, ckpt_bytes_last: u64) {
+        self.interval_bytes = self.cfg.derive_interval(ckpt_bytes_last);
+        self.stats.interval_bytes = self.interval_bytes;
     }
 
     /// `LOG` sealed the frame carrying the begin marker: resolve its LSN.
@@ -213,8 +251,13 @@ impl<F: SegmentFs> CkptCell<F> {
         // convergence, drives the version — it must be fixed at header
         // time). Cells with neither keep producing v1 byte-identically
         // (the S03 zero-change posture).
-        let mut stream = if v2 { IckStream::new_v2(&self.cfg) } else { IckStream::new(&self.cfg) };
-        let file = self.fs.create_meta(&self.dir.join(ick_staging_file_name(id)))?;
+        // M4.5-S36 (ADR-0088 D3): every reactor-tier checkpoint is the v3
+        // container on an `O_DIRECT` fd — aligned blocks, no page-cache
+        // lump. `v2` keeps selecting the *walk* (tiered passes, sidecars);
+        // the v3 vocabulary is a superset, so a v1-shaped cell writes the
+        // same sections on aligned blocks.
+        let mut stream = IckStream::new_v3(&self.cfg);
+        let file = self.fs.create_meta_direct(&self.dir.join(ick_staging_file_name(id)))?;
         let fd = file.raw_fd().ok_or_else(|| io::Error::other("std segment tier has fds"))?;
         let lease = stream.begin(self.cell, id, begin_lsn, &ns_ids);
         self.phase = CkptPhase::Stream(Box::new(Streaming {
@@ -264,11 +307,20 @@ impl<F: SegmentFs> CkptCell<F> {
         assert!(st.in_flight.is_none(), "publish with a section write still in flight");
         let id = st.id;
         let begin = st.begin_lsn;
+        let ick_bytes = st.stream.file_bytes();
+        let padding = st.stream.padding_bytes();
         drop(st); // closes the fd before rename (write handle no longer needed)
         self.fs
             .rename(&self.dir.join(ick_staging_file_name(id)), &self.dir.join(ick_file_name(id)))?;
         self.next_id = id + 1;
         self.bytes_at_last = self.bytes_at_begin;
+        self.records_at_last = self.records_at_begin;
+        self.stats.bytes_total += ick_bytes;
+        self.stats.bytes_last = ick_bytes;
+        self.stats.padding_bytes += padding;
+        // The next interval is derived from what this checkpoint actually
+        // wrote (ADR-0088 D4): the file's size is the measurement.
+        self.rederive_interval(ick_bytes);
         self.stats.completed += 1;
         self.stats.last_unix_ms = unix_now_ms;
         self.stats.last_begin_lsn = begin.to_u64();
@@ -295,12 +347,24 @@ impl<F: SegmentFs> CkptCell<F> {
         }
     }
 
-    pub fn stats(&self) -> CkptStats {
+    /// `records_total` is the cell's records-staged counter (the record
+    /// cap's numerator reads against the last begin).
+    pub fn stats(&self, records_total: u64) -> CkptStats {
         let buffer_bytes = match &self.phase {
             CkptPhase::Stream(st) => st.stream.resident_bytes() as u64,
             _ => 0,
         };
-        CkptStats { buffer_bytes, ..self.stats }
+        let base = if matches!(self.phase, CkptPhase::Idle) {
+            self.records_at_last
+        } else {
+            self.records_at_begin
+        };
+        CkptStats {
+            buffer_bytes,
+            interval_bytes: self.interval_bytes,
+            records_since_begin: records_total.saturating_sub(base),
+            ..self.stats
+        }
     }
 }
 
@@ -324,6 +388,10 @@ pub(crate) struct PendingManifest {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ManifestStats {
     pub published: u64,
+    /// M4.5-S36 (ADR-0088 D7): MANIFEST bytes written and barriers
+    /// issued (metered under `IoClass::Checkpoint`, never deferred).
+    pub bytes_written: u64,
+    pub syncs_issued: u64,
     /// Failed swaps (counted, old recovery unit kept — never fail-stop:
     /// nothing was acked against the new manifest, ADR-0017).
     pub aborted: u64,
@@ -586,6 +654,7 @@ impl<F: SegmentFs> ManifestCell<F> {
                 Ok(dir) => {
                     let fd = dir.raw_fd().expect("std tier has fds");
                     let token = self.next_token();
+                    self.stats.syncs_issued += 1;
                     cx.push(inf_runtime::IoOp::Fdatasync { fd, token });
                     self.phase = SwapPhase::IckDirQueued { pending, dir };
                     1
@@ -641,13 +710,16 @@ impl<F: SegmentFs> ManifestCell<F> {
                     tiers,
                 };
                 let staged_write = self.fs.create_meta(&staged).and_then(|mut file| {
-                    file.write_at(0, &inf_log::manifest_envelope(&manifest))?;
-                    Ok(file)
+                    let envelope = inf_log::manifest_envelope(&manifest);
+                    file.write_at(0, &envelope)?;
+                    Ok((file, envelope.len() as u64))
                 });
                 match staged_write {
-                    Ok(file) => {
+                    Ok((file, bytes)) => {
                         let fd = file.raw_fd().expect("std tier has fds");
                         let token = self.next_token();
+                        self.stats.bytes_written += bytes;
+                        self.stats.syncs_issued += 1;
                         cx.push(inf_runtime::IoOp::Fdatasync { fd, token });
                         self.phase = SwapPhase::StageQueued { manifest, file };
                         3
@@ -683,6 +755,7 @@ impl<F: SegmentFs> ManifestCell<F> {
                     Ok(dir) => {
                         let fd = dir.raw_fd().expect("std tier has fds");
                         let token = self.next_token();
+                        self.stats.syncs_issued += 1;
                         cx.push(inf_runtime::IoOp::Fdatasync { fd, token });
                         self.phase = SwapPhase::DirQueued { manifest, dir };
                         2

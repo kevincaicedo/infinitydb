@@ -653,6 +653,11 @@ fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         writer.append_chunk(value).map_err(std::io::Error::other)?;
         writer.finish_deferred().map_err(std::io::Error::other)
     });
+    // ADR-0088 D1/D5 (recorded limitation 2): the extent write is
+    // synchronous foreground device I/O outside the driver — metered as
+    // `BlobWrite` so the budget's foreground term is complete, never
+    // deferred (the M5 blob story owns the `IoOp` path).
+    cell.charge_foreground(inf_runtime::IoClass::BlobWrite, value.len() as u64, 1);
     let (sealed, handle) = match sealed {
         Ok(pair) => pair,
         // The failed extent is abandoned (never referenced, id never

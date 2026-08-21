@@ -46,6 +46,21 @@ const EIO: i32 = 5;
 /// continuation windows (the S08 `cold_hardened` shape).
 pub(crate) const COLD_POOL_BUF: usize = 4 * inf_log::TIER_FRAME_BYTES;
 
+/// The most driver ops one flush round can carry (the ADR-0084 D3
+/// token op-index bound) — the tier-flush class's ops slice for the
+/// device budget (ADR-0088 D2).
+pub(crate) const TIER_ROUND_MAX_OPS: u64 = 256;
+
+/// The device budget's answer to "may a flush round of up to `bytes`
+/// bytes and `ops` ops stage now?" plus the refund of the unissued part
+/// (ADR-0088 D5). Generic, not `dyn`: one monomorphized closure per
+/// plane. `None` = no durable plane (the MemFs test tier) — always
+/// granted, nothing metered.
+pub(crate) trait FlushAdmission {
+    fn admit(&mut self, bytes: u64, ops: u64) -> bool;
+    fn refund(&mut self, bytes: u64, ops: u64);
+}
+
 /// Extent-reclaim candidates examined per MAINTAIN slice (ADR-0061 D5
 /// — reclaim is a background sweep, never a burst).
 const EXTENT_RECLAIM_PER_SLICE: usize = 8;
@@ -145,6 +160,9 @@ pub(crate) struct TierFlushStats {
     pub write_retries: u64,
     pub stale_completions: u64,
     pub round_us: LogHistogram,
+    /// Rounds the device budget deferred (ADR-0088 D5) — the tier-flush
+    /// face of `io_budget_deferrals_tier_flush`, per namespace tick.
+    pub rounds_deferred: u64,
 }
 
 impl<F: SegmentFs> TierNs<F> {
@@ -460,6 +478,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
     /// the executor; this module owns no `Rc<Shared>`). `durable_mark`
     /// is `(last staged seq, fsync watermark seq)` from the durable
     /// cell — the extent-reclaim epoch handoff (ADR-0061 D5).
+    #[allow(clippy::too_many_arguments)] // the MAINTAIN driver's split inputs (ADR-0088 D5)
     pub fn maintain_ns(
         &mut self,
         ks: &mut Keyspace,
@@ -468,6 +487,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         transition_idle: bool,
         now_us: u64,
         ops: &mut Vec<IoOp>,
+        admission: &mut impl FlushAdmission,
     ) -> Result<(u32, Option<CompactRead>), TierFlushError> {
         let cold = self.cold.clone();
         let stats = &mut self.flush_stats;
@@ -495,7 +515,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         // completions REAP recorded, apply its effects at the last
         // barrier CQE — the reactor never waits on the device here.
         let sealed = if table.demote_due() { table.seal_slice() } else { 0 };
-        let flush_bytes = drive_flush_round(table, t, stats, now_us, ops)?;
+        let flush_bytes = drive_flush_round(table, t, stats, now_us, ops, admission)?;
         for (id, handle) in t.flush.take_sealed_handles() {
             t.files.push((id, handle));
         }
@@ -716,6 +736,7 @@ fn drive_flush_round<F: SegmentFs>(
     stats: &mut TierFlushStats,
     now_us: u64,
     ops: &mut Vec<IoOp>,
+    admission: &mut impl FlushAdmission,
 ) -> Result<u64, TierFlushError> {
     if let Some(round) = &mut t.round {
         if let Some(errno) = round.fatal {
@@ -753,8 +774,23 @@ fn drive_flush_round<F: SegmentFs>(
         stats.round_us.record(now_us.saturating_sub(round.staged_at_us));
         return Ok(0);
     }
+    // ADR-0088 D5: the round's byte bound is offered to the device budget
+    // before anything stages; `Deferred` ⇒ not this tick — the sealed
+    // backlog waits where it is (no state moved), re-offered next tick.
+    // The bound is the slice; the unissued remainder is refunded after
+    // staging reports the exact bytes.
+    let slice_bound = t.flush.slice_bytes();
+    if !admission.admit(slice_bound, TIER_ROUND_MAX_OPS) {
+        stats.rounds_deferred += 1;
+        return Ok(0);
+    }
     let stage_result = table.stage_flush_round(&mut t.flush);
     let staged_bytes = *stage_result.as_ref().unwrap_or(&0);
+    let issued_ops = if t.flush.round_active() { t.flush.round_op_count() as u64 } else { 0 };
+    admission.refund(
+        slice_bound.saturating_sub(staged_bytes),
+        TIER_ROUND_MAX_OPS.saturating_sub(issued_ops),
+    );
     if t.flush.round_active() {
         let op_count = t.flush.round_op_count();
         assert!(op_count <= 256, "flush round exceeds the token op-index bound (ADR-0084 D3)");

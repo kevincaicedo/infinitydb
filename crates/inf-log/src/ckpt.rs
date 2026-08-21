@@ -56,6 +56,22 @@ pub const ICK_VERSION: u16 = 1;
 /// Format version once address-reference sections may appear (M4-S12,
 /// ADR-0057 D3). v2 readers read v1 files; v1 readers refuse v2 typed.
 pub const ICK_VERSION_V2: u16 = 2;
+/// Format v3 (M4.5-S36, ADR-0088 D3): the v2 vocabulary with every block
+/// — header, sections, footer — starting on an [`ICK_BLOCK_ALIGN`]
+/// boundary and zero-padded to the next one, so a sealed block is one
+/// legal `O_DIRECT` write. Field layouts are unchanged; only the hop
+/// rule differs (`align_up(len)` instead of `len`), and the padding is
+/// outside every CRC's extent and asserted zero by the reader.
+pub const ICK_VERSION_V3: u16 = 3;
+/// Block alignment of the v3 container — the log's frame alignment
+/// (`O_DIRECT` needs offsets, lengths, and buffer bases on it).
+pub const ICK_BLOCK_ALIGN: usize = crate::frame::FRAME_ALIGN as usize;
+
+/// Rounds a block length up to the next [`ICK_BLOCK_ALIGN`] boundary.
+#[must_use]
+pub const fn ick_align_up(len: usize) -> usize {
+    len.div_ceil(ICK_BLOCK_ALIGN) * ICK_BLOCK_ALIGN
+}
 
 const BLOCK_SECTION: u8 = 1;
 const BLOCK_FOOTER: u8 = 2;
@@ -132,6 +148,24 @@ pub const DEFAULT_SECTION_BYTES: u32 = 256 << 10;
 pub const DEFAULT_CKPT_INTERVAL_BYTES: u64 = 256 << 20;
 /// Default hard per-slice streamed-byte cap.
 pub const DEFAULT_CKPT_SLICE_BYTES: u32 = 64 << 10;
+/// The derived checkpoint interval (M4.5-S36, ADR-0088 D4):
+/// `interval = clamp(α × ckpt_bytes_last, floor, replay_bytes_per_s ×
+/// replay_budget_s)`, and a second trigger on records staged since the
+/// last begin at `replay_records_per_s × replay_budget_s`. α = 2 bounds
+/// the checkpoint's share of device writes to half the log's — (log +
+/// checkpoint) / log ≤ 1.5 by construction; the two caps keep recovery
+/// inside the boot gate in the same expression (recovery is bound by
+/// record count — 476 k records/s/cell measured — and the M2 replay row
+/// by bytes; either alone lets the other shape escape).
+pub const DEFAULT_CKPT_ALPHA: u64 = 2;
+/// The M2 replay gate's rate (≥ 1 GB/s/cell replay).
+pub const DEFAULT_REPLAY_BYTES_PER_S: u64 = 1 << 30;
+/// The measured record replay rate, rounded down (ops doc: 476 k/s/cell).
+pub const DEFAULT_REPLAY_RECORDS_PER_S: u64 = 400_000;
+/// The replay share of the 15 s boot gate: 15 s minus the `Start` row's
+/// 5 s bar minus a 5 s `.ick` load allowance — three named terms.
+pub const DEFAULT_REPLAY_BUDGET_S: u64 = 15 - 5 - 5;
+
 /// Default streaming pace (bytes/second of wall — injected — time). The
 /// per-slice cap bounds one MAINTAIN visit; this bounds the *rate*: an
 /// unpaced walk dirties pages at memcpy speed, and the kernel's
@@ -152,7 +186,16 @@ pub struct CkptConfig {
     /// the deficit scheduler's units convert against this, ADR-0016 D5).
     pub slice_bytes: u32,
     /// Streaming pace in bytes/second (0 = unpaced — tests/sync tier).
+    /// With a device model present the budget governs instead (ADR-0088
+    /// D5): the server zeroes this when `DeviceModel` is probed.
     pub stream_bytes_per_sec: u32,
+    /// ADR-0088 D4: the interval derivation's α (0 = the floor alone,
+    /// i.e. the pre-S36 fixed trigger), the replay rates and budget the
+    /// caps derive from.
+    pub alpha: u64,
+    pub replay_bytes_per_s: u64,
+    pub replay_records_per_s: u64,
+    pub replay_budget_s: u64,
 }
 
 impl Default for CkptConfig {
@@ -162,7 +205,51 @@ impl Default for CkptConfig {
             interval_bytes: DEFAULT_CKPT_INTERVAL_BYTES,
             slice_bytes: DEFAULT_CKPT_SLICE_BYTES,
             stream_bytes_per_sec: DEFAULT_CKPT_STREAM_BYTES_PER_SEC,
+            alpha: DEFAULT_CKPT_ALPHA,
+            replay_bytes_per_s: DEFAULT_REPLAY_BYTES_PER_S,
+            replay_records_per_s: DEFAULT_REPLAY_RECORDS_PER_S,
+            replay_budget_s: DEFAULT_REPLAY_BUDGET_S,
         }
+    }
+}
+
+impl CkptConfig {
+    /// The byte cap of the derived interval: `replay_bytes_per_s ×
+    /// replay_budget_s` (0 = uncapped when either term is 0).
+    #[must_use]
+    pub const fn cap_bytes(&self) -> u64 {
+        self.replay_bytes_per_s.saturating_mul(self.replay_budget_s)
+    }
+
+    /// The record cap: records staged since the last begin that force a
+    /// checkpoint regardless of bytes (0 = disabled).
+    #[must_use]
+    pub const fn cap_records(&self) -> u64 {
+        self.replay_records_per_s.saturating_mul(self.replay_budget_s)
+    }
+
+    /// The derived interval (ADR-0088 D4): `clamp(α × ckpt_bytes_last,
+    /// interval_bytes, cap_bytes)`. `interval_bytes == 0` (manual only)
+    /// stays 0; `alpha == 0` or no prior checkpoint yields the floor.
+    /// Release-asserted inside `[floor, cap]` — the S27 lesson in code.
+    #[must_use]
+    pub fn derive_interval(&self, ckpt_bytes_last: u64) -> u64 {
+        let floor = self.interval_bytes;
+        if floor == 0 {
+            return 0;
+        }
+        let cap = self.cap_bytes();
+        let wanted = self.alpha.saturating_mul(ckpt_bytes_last);
+        let mut interval = wanted.max(floor);
+        if cap > 0 {
+            interval = interval.min(cap.max(floor));
+        }
+        assert!(interval >= floor, "derived checkpoint interval below its floor");
+        assert!(
+            cap == 0 || interval <= cap.max(floor),
+            "derived checkpoint interval above its cap"
+        );
+        interval
     }
 }
 
@@ -255,6 +342,110 @@ struct InFlight {
     generation: u64,
 }
 
+/// One checkpoint block buffer whose content base is [`ICK_BLOCK_ALIGN`]-
+/// aligned (ADR-0088 D3 — the `FrameBuilder` shape: a `Vec` with one
+/// alignment of leading slack, the content at `at..`, no unsafe). Every
+/// growth goes through [`Block::with_vec`], which re-bases the content
+/// if the `Vec` moved — so a staged record that outruns the section
+/// target (the documented growth case) never leaves the base unaligned.
+/// Derefs to the content slice, so slice reads/writes are unchanged.
+struct Block {
+    buf: Vec<u8>,
+    at: usize,
+}
+
+impl Block {
+    fn with_capacity(capacity: usize) -> Block {
+        let mut buf: Vec<u8> = Vec::with_capacity(capacity + 2 * ICK_BLOCK_ALIGN);
+        let at = buf.as_ptr().align_offset(ICK_BLOCK_ALIGN);
+        debug_assert!(at < ICK_BLOCK_ALIGN, "an aligned base fits the leading slack");
+        buf.resize(at, 0);
+        Block { buf, at }
+    }
+
+    /// Run a `Vec`-mutating closure, then re-base the content if the
+    /// allocation moved (the alignment offset of a new allocation is
+    /// arbitrary).
+    fn with_vec(&mut self, f: impl FnOnce(&mut Vec<u8>)) {
+        f(&mut self.buf);
+        self.realign();
+    }
+
+    fn realign(&mut self) {
+        // One alignment of headroom first, so the shift below cannot
+        // itself reallocate (which would move the base again).
+        self.buf.reserve(ICK_BLOCK_ALIGN);
+        let want = self.buf.as_ptr().align_offset(ICK_BLOCK_ALIGN);
+        if want == self.at {
+            return;
+        }
+        let content = self.buf.len() - self.at;
+        if want > self.at {
+            self.buf.resize(want + content, 0);
+        }
+        self.buf.copy_within(self.at..self.at + content, want);
+        self.buf.truncate(want + content);
+        self.at = want;
+        debug_assert_eq!(self.buf[self.at..].as_ptr().align_offset(ICK_BLOCK_ALIGN), 0);
+    }
+
+    fn clear(&mut self) {
+        self.buf.truncate(self.at);
+    }
+
+    /// Drop a buffer that grew past its nominal capacity back to it (the
+    /// v0.4.0 soak found `ckpt_buffer_bytes` ratcheting to 4× — L5).
+    fn shrink_to(&mut self, nominal: usize) {
+        debug_assert_eq!(self.buf.len(), self.at, "shrink on a non-empty block");
+        if self.buf.capacity() > nominal + 2 * ICK_BLOCK_ALIGN {
+            self.buf = Vec::<u8>::with_capacity(nominal + 2 * ICK_BLOCK_ALIGN);
+            self.at = self.buf.as_ptr().align_offset(ICK_BLOCK_ALIGN);
+            self.buf.resize(self.at, 0);
+        }
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.with_vec(|v| v.extend_from_slice(bytes));
+    }
+
+    fn push(&mut self, byte: u8) {
+        self.with_vec(|v| v.push(byte));
+    }
+
+    /// Resize the *content* to `len` bytes.
+    fn resize(&mut self, len: usize, value: u8) {
+        let at = self.at;
+        self.with_vec(|v| v.resize(at + len, value));
+    }
+
+    /// Zero-pad the content to the next [`ICK_BLOCK_ALIGN`] boundary;
+    /// returns the padding bytes added.
+    fn pad_to_alignment(&mut self) -> usize {
+        let len = self.len();
+        let padded = ick_align_up(len);
+        self.resize(padded, 0);
+        padded - len
+    }
+
+    fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+}
+
+impl std::ops::Deref for Block {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.buf[self.at..]
+    }
+}
+
+impl std::ops::DerefMut for Block {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        let at = self.at;
+        &mut self.buf[at..]
+    }
+}
+
 /// What the pending (staging) section holds — sections are homogeneous
 /// by class, sealed at class or namespace boundaries (ADR-0057 D3).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -297,7 +488,13 @@ pub struct IdxSidecarMeta {
 /// the *leased* buffer is immutable until release. `resident_bytes` is the
 /// exact `ckpt_buffer_bytes` gauge (L5).
 pub struct IckStream {
-    bufs: [Vec<u8>; 2],
+    bufs: [Block; 2],
+    /// The nominal per-buffer capacity (`release` shrinks back to it).
+    nominal_capacity: usize,
+    /// v3: blocks are padded to [`ICK_BLOCK_ALIGN`] at seal.
+    aligned: bool,
+    /// Zero bytes sealed as v3 block padding (`ckpt_padding_bytes`).
+    padding_bytes: u64,
     staging: usize,
     in_flight: Option<InFlight>,
     generation: u64,
@@ -340,10 +537,59 @@ impl IckStream {
         Self::with_version(cfg, ICK_VERSION_V2)
     }
 
+    /// A v3 stream (M4.5-S36, ADR-0088 D3): the v2 vocabulary on
+    /// [`ICK_BLOCK_ALIGN`]-aligned, zero-padded blocks — what the reactor
+    /// tier writes `O_DIRECT`.
+    #[must_use]
+    pub fn new_v3(cfg: &CkptConfig) -> IckStream {
+        Self::with_version(cfg, ICK_VERSION_V3)
+    }
+
+    /// The stream's container version.
+    #[must_use]
+    pub fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Zero bytes sealed as v3 padding so far.
+    #[must_use]
+    pub fn padding_bytes(&self) -> u64 {
+        self.padding_bytes
+    }
+
+    /// Header block length for `ns_count` namespaces, padded under v3 —
+    /// what the driver offers the device budget before `begin`.
+    #[must_use]
+    pub fn header_block_len(&self, ns_count: usize) -> usize {
+        let raw = HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN;
+        if self.aligned { ick_align_up(raw) } else { raw }
+    }
+
+    /// The pending section's sealed length (header + body + CRC, padded
+    /// under v3) — what the driver offers the device budget before
+    /// `seal_section`.
+    #[must_use]
+    pub fn pending_block_len(&self) -> usize {
+        let raw = self.bufs[self.staging].len() + CRC_LEN;
+        if self.aligned { ick_align_up(raw) } else { raw }
+    }
+
+    /// The footer block length, padded under v3.
+    #[must_use]
+    pub fn footer_block_len(&self) -> usize {
+        let raw = FOOTER_FIXED_LEN + self.entries_per_ns.len() * 12 + 8 + CRC_LEN;
+        if self.aligned { ick_align_up(raw) } else { raw }
+    }
+
     fn with_version(cfg: &CkptConfig, version: u16) -> IckStream {
-        let capacity = cfg.section_bytes as usize + SECTION_HEADER_LEN + CRC_LEN;
+        let raw = cfg.section_bytes as usize + SECTION_HEADER_LEN + CRC_LEN;
+        let aligned = version >= ICK_VERSION_V3;
+        let capacity = if aligned { ick_align_up(raw) } else { raw };
         IckStream {
-            bufs: [Vec::with_capacity(capacity), Vec::with_capacity(capacity)],
+            bufs: [Block::with_capacity(capacity), Block::with_capacity(capacity)],
+            nominal_capacity: capacity,
+            aligned,
+            padding_bytes: 0,
             staging: 0,
             in_flight: None,
             generation: 0,
@@ -416,7 +662,7 @@ impl IckStream {
             buf.resize(SECTION_HEADER_LEN, 0); // header placeholder, filled at seal
         }
         assert_eq!(self.staged_class, Some(SectionClass::Images), "seal before switching class");
-        view.encode_into(buf);
+        buf.with_vec(|v| view.encode_into(v));
         self.staged_records += 1;
         if let RecordView::StringPostImage { ns, .. } | RecordView::DocFull { ns, .. } = view {
             match self.entries_per_ns.iter_mut().find(|(id, _)| *id == ns.0) {
@@ -437,7 +683,7 @@ impl IckStream {
     /// watermark or the 48-bit space (walker bugs, never input).
     pub fn stage_addr_ref(&mut self, ns: u32, walk_watermark: u64, hash: u64, addr: u64) {
         assert!(self.header_written && !self.finished, "stage outside header..finish");
-        assert_eq!(self.version, ICK_VERSION_V2, "addr refs are a v2 vocabulary");
+        assert!(self.version >= ICK_VERSION_V2, "addr refs are a v2 vocabulary");
         assert!(addr < walk_watermark, "a ref must sit below its walk watermark");
         assert!(walk_watermark < ADDR_LIMIT, "watermarks are 48-bit");
         let buf = &mut self.bufs[self.staging];
@@ -483,7 +729,7 @@ impl IckStream {
         byte_exact: bool,
     ) {
         assert!(self.header_written && !self.finished, "stage outside header..finish");
-        assert_eq!(self.version, ICK_VERSION_V2, "live-set sections are a v2 vocabulary");
+        assert!(self.version >= ICK_VERSION_V2, "live-set sections are a v2 vocabulary");
         assert!(dead_bytes <= data_len, "dead bytes exceed the file's data bytes");
         let buf = &mut self.bufs[self.staging];
         if self.staged_class.is_none() {
@@ -518,7 +764,7 @@ impl IckStream {
     /// addresses — walker bugs, never input.
     pub fn stage_blob_ref(&mut self, ns: u32, addr: u64, extent_id: u64, len: u64) {
         assert!(self.header_written && !self.finished, "stage outside header..finish");
-        assert_eq!(self.version, ICK_VERSION_V2, "blob-ref sections are a v2 vocabulary");
+        assert!(self.version >= ICK_VERSION_V2, "blob-ref sections are a v2 vocabulary");
         assert!(addr < ADDR_LIMIT, "logical addresses are 48-bit");
         assert!(len > 0, "an extent reference names at least one byte");
         let buf = &mut self.bufs[self.staging];
@@ -566,7 +812,7 @@ impl IckStream {
         entry_ref: u64,
     ) {
         assert!(self.header_written && !self.finished, "stage outside header..finish");
-        assert_eq!(self.version, ICK_VERSION_V2, "index sidecars are a v2 vocabulary");
+        assert!(self.version >= ICK_VERSION_V2, "index sidecars are a v2 vocabulary");
         if meta.fixed8 {
             assert!(key.len() == 8, "Fixed8 sidecar keys are exactly 8 bytes");
         } else {
@@ -628,7 +874,7 @@ impl IckStream {
     /// index.
     pub fn stage_idx_final(&mut self, meta: &IdxSidecarMeta, total_entries: u64) {
         assert!(self.header_written && !self.finished, "stage outside header..finish");
-        assert_eq!(self.version, ICK_VERSION_V2, "index sidecars are a v2 vocabulary");
+        assert!(self.version >= ICK_VERSION_V2, "index sidecars are a v2 vocabulary");
         let class = SectionClass::IdxSidecar {
             ns: meta.ns,
             index_id: meta.index_id,
@@ -801,6 +1047,14 @@ impl IckStream {
     fn lease_staging(&mut self) -> SectionLease {
         let sealed = self.staging;
         let generation = self.generation;
+        if self.aligned {
+            // ADR-0088 D3: the block is one aligned `O_DIRECT` write —
+            // every padding byte is written as zero, never left over.
+            let pad = self.bufs[sealed].pad_to_alignment();
+            self.padding_bytes += pad as u64;
+            debug_assert_eq!(self.file_offset % ICK_BLOCK_ALIGN as u64, 0, "aligned offset");
+            debug_assert_eq!(self.bufs[sealed].as_ptr().align_offset(ICK_BLOCK_ALIGN), 0);
+        }
         let len = u32::try_from(self.bufs[sealed].len()).expect("block fits u32");
         let offset = self.file_offset;
         self.file_offset += u64::from(len);
@@ -825,6 +1079,7 @@ impl IckStream {
         let in_flight = self.in_flight.take().expect("release with no section in flight");
         assert_eq!(in_flight.generation, lease.generation, "lease does not match in-flight block");
         self.bufs[in_flight.buf].clear();
+        self.bufs[in_flight.buf].shrink_to(self.nominal_capacity);
     }
 
     /// True once `finish`'s lease was released — the fdatasync may go out.
@@ -912,6 +1167,33 @@ impl<F: SegmentFs> SyncIckWriter<F> {
             fs,
             ckpt_dir,
             IckStream::new_v2(cfg),
+            cell,
+            ckpt_id,
+            begin_lsn,
+            ns_ids,
+        )
+    }
+
+    /// Creates a **v3** checkpoint writer (M4.5-S36, ADR-0088 D3): the v2
+    /// vocabulary on aligned, zero-padded blocks — what the reactor tier
+    /// writes `O_DIRECT`; the sync tier writes it buffered and
+    /// byte-identical (tests).
+    ///
+    /// # Errors
+    /// File creation or write failure.
+    pub fn create_v3(
+        fs: F,
+        ckpt_dir: &Path,
+        cfg: &CkptConfig,
+        cell: u16,
+        ckpt_id: u64,
+        begin_lsn: Lsn,
+        ns_ids: &[u32],
+    ) -> io::Result<SyncIckWriter<F>> {
+        Self::create_with_stream(
+            fs,
+            ckpt_dir,
+            IckStream::new_v3(cfg),
             cell,
             ckpt_id,
             begin_lsn,
@@ -1192,6 +1474,10 @@ pub enum IckReadError {
     TrailingData {
         at: u64,
     },
+    /// A v3 block's alignment padding is not zero (ADR-0088 D3).
+    Padding {
+        at: u64,
+    },
     MissingFooter,
 }
 
@@ -1261,6 +1547,9 @@ impl std::fmt::Display for IckReadError {
             IckReadError::TrailingData { at } => {
                 write!(f, "trailing bytes after ick footer ({at})")
             }
+            IckReadError::Padding { at } => {
+                write!(f, "ick v3 block padding is not zero at offset {at}")
+            }
             IckReadError::MissingFooter => write!(f, "ick has no footer (incomplete checkpoint)"),
         }
     }
@@ -1305,6 +1594,21 @@ impl Default for IckReaderConfig {
     fn default() -> IckReaderConfig {
         IckReaderConfig { max_section_bytes: crate::frame::DEFAULT_MAX_FRAME_LEN }
     }
+}
+
+/// v3 block padding must be zero (ADR-0088 D3): every padding byte was
+/// written by the sealer, so a non-zero one is damage, not slack.
+fn verify_padding<File: SegmentFile>(file: &File, at: u64, len: usize) -> Result<(), IckReadError> {
+    if len == 0 {
+        return Ok(());
+    }
+    debug_assert!(len < ICK_BLOCK_ALIGN);
+    let mut pad = [0u8; ICK_BLOCK_ALIGN];
+    read_exact_at(file, at, &mut pad[..len])?;
+    if pad[..len].iter().any(|b| *b != 0) {
+        return Err(IckReadError::Padding { at });
+    }
+    Ok(())
 }
 
 fn read_exact_at<File: SegmentFile>(
@@ -1360,7 +1664,7 @@ pub fn read_ick_counts<F: SegmentFs>(
         return Err(IckReadError::BadMagic);
     }
     let version = u16::from_le_bytes([fixed[8], fixed[9]]);
-    if version != ICK_VERSION && version != ICK_VERSION_V2 {
+    if !(ICK_VERSION..=ICK_VERSION_V3).contains(&version) {
         return Err(IckReadError::UnsupportedVersion(version));
     }
     let ns_count = le_u32(&fixed[28..32]) as usize;
@@ -1368,7 +1672,13 @@ pub fn read_ick_counts<F: SegmentFs>(
         return Err(IckReadError::Truncated { at: 28 });
     }
     let file_size = file.file_size()?;
-    let mut offset = (HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN) as u64;
+    let aligned = version >= ICK_VERSION_V3;
+    let hop = |len: usize| if aligned { ick_align_up(len) } else { len };
+    let header_len = HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN;
+    if aligned {
+        verify_padding(&file, header_len as u64, hop(header_len) - header_len)?;
+    }
+    let mut offset = hop(header_len) as u64;
     // Direct footer probe (M2.5-S08): a well-formed `.ick` ends exactly at
     // its footer, whose length is computable from the header's `ns_count` —
     // two reads instead of hopping every section header (a chain of
@@ -1376,14 +1686,19 @@ pub fn read_ick_counts<F: SegmentFs>(
     // measured as the dominant cold ick cost). The footer CRC validates the
     // probe; any mismatch falls back to the hop below, and a wrong hint
     // could only ever cost memory geometry (the streaming pass re-audits).
+    // Under v3 the footer block is padded: the probe reads the padded
+    // length and the footer sits at its head (ADR-0088 D3).
     let probe_len = FOOTER_FIXED_LEN + ns_count * 12 + 8 + CRC_LEN;
-    if file_size >= offset + probe_len as u64 {
-        let probe_at = file_size - probe_len as u64;
-        let mut block = vec![0u8; probe_len];
+    let probe_block = hop(probe_len);
+    if file_size >= offset + probe_block as u64 {
+        let probe_at = file_size - probe_block as u64;
+        let mut block = vec![0u8; probe_block];
         if read_exact_at(&file, probe_at, &mut block).is_ok()
             && block[0] == BLOCK_FOOTER
             && le_u32(&block[13..17]) as usize == ns_count
-            && crc32c(&block[..probe_len - CRC_LEN]) == le_u32(&block[probe_len - CRC_LEN..])
+            && crc32c(&block[..probe_len - CRC_LEN])
+                == le_u32(&block[probe_len - CRC_LEN..probe_len])
+            && block[probe_len..].iter().all(|b| *b == 0)
         {
             return Ok(block[FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + ns_count * 12]
                 .chunks_exact(12)
@@ -1407,7 +1722,7 @@ pub fn read_ick_counts<F: SegmentFs>(
             // 0x05 was missing until M4.5-S00's audit).
             BLOCK_SECTION | BLOCK_ADDR_SECTION | BLOCK_LIVESET | BLOCK_BLOBREF
             | BLOCK_IDXSIDECAR => {
-                if head[0] != BLOCK_SECTION && version != ICK_VERSION_V2 {
+                if head[0] != BLOCK_SECTION && version < ICK_VERSION_V2 {
                     return Err(IckReadError::UnknownBlock { tag: head[0], at: offset });
                 }
                 let body_len = le_u32(&head[1..5]);
@@ -1417,7 +1732,7 @@ pub fn read_ick_counts<F: SegmentFs>(
                         max: cfg.max_section_bytes,
                     });
                 }
-                offset += (SECTION_HEADER_LEN + body_len as usize + CRC_LEN) as u64;
+                offset += hop(SECTION_HEADER_LEN + body_len as usize + CRC_LEN) as u64;
             }
             BLOCK_FOOTER => {
                 let mut fixed = [0u8; FOOTER_FIXED_LEN];
@@ -1432,6 +1747,9 @@ pub fn read_ick_counts<F: SegmentFs>(
                 let stored_crc = le_u32(&block[block_len - CRC_LEN..]);
                 if crc32c(&block[..block_len - CRC_LEN]) != stored_crc {
                     return Err(IckReadError::FooterCrc { at: offset });
+                }
+                if aligned {
+                    verify_padding(&file, offset + block_len as u64, hop(block_len) - block_len)?;
                 }
                 return Ok(block[FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + footer_ns * 12]
                     .chunks_exact(12)
@@ -1793,7 +2111,7 @@ impl<File: SegmentFile> IckReader<File> {
             return Err(IckReadError::BadMagic);
         }
         let version = u16::from_le_bytes([fixed[8], fixed[9]]);
-        if version != ICK_VERSION && version != ICK_VERSION_V2 {
+        if !(ICK_VERSION..=ICK_VERSION_V3).contains(&version) {
             return Err(IckReadError::UnsupportedVersion(version));
         }
         let cell = u16::from_le_bytes([fixed[10], fixed[11]]);
@@ -1814,12 +2132,22 @@ impl<File: SegmentFile> IckReader<File> {
         }
         let ns_ids: Vec<u32> = rest[..ns_count * 4].chunks_exact(4).map(le_u32).collect();
         let file_size = file.file_size()?;
+        let header_len = HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN;
+        if version >= ICK_VERSION_V3 {
+            // The header block's padding is zero like every other block's
+            // (ADR-0088 D3).
+            verify_padding(&file, header_len as u64, ick_align_up(header_len) - header_len)?;
+        }
         Ok(IckReader {
             file,
             cfg,
             info: IckInfo { version, cell, ckpt_id, begin_lsn, ns_ids },
             file_size,
-            offset: (HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN) as u64,
+            offset: if version >= ICK_VERSION_V3 {
+                ick_align_up(HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN) as u64
+            } else {
+                (HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN) as u64
+            },
             sections: 0,
             records_total: 0,
             entries_seen: Vec::new(),
@@ -1833,6 +2161,18 @@ impl<File: SegmentFile> IckReader<File> {
     #[must_use]
     pub fn info(&self) -> &IckInfo {
         &self.info
+    }
+
+    /// The distance to the next block: the exact length on v1/v2, the
+    /// aligned length on v3 — whose padding must read back as zeros
+    /// (ADR-0088 D3; a non-zero pad byte is the CRC's fail-stop class).
+    fn hop(&self, block_len: usize) -> Result<u64, IckReadError> {
+        if self.info.version < ICK_VERSION_V3 {
+            return Ok(block_len as u64);
+        }
+        let padded = ick_align_up(block_len);
+        verify_padding(&self.file, self.offset + block_len as u64, padded - block_len)?;
+        Ok(padded as u64)
     }
 
     /// Total file bytes (the progress denominator).
@@ -1954,10 +2294,11 @@ impl<File: SegmentFile> IckReader<File> {
                 }
                 self.sections += 1;
                 self.records_total += u64::from(record_count);
-                self.offset += block_len as u64;
-                Ok(IckStep::Section { bytes: block_len as u64 })
+                let hop = self.hop(block_len)?;
+                self.offset += hop;
+                Ok(IckStep::Section { bytes: hop })
             }
-            BLOCK_ADDR_SECTION if self.info.version == ICK_VERSION_V2 => {
+            BLOCK_ADDR_SECTION if self.info.version >= ICK_VERSION_V2 => {
                 let mut head = [0u8; SECTION_HEADER_LEN];
                 read_exact_at(&self.file, self.offset, &mut head)?;
                 let body_len = le_u32(&head[1..5]);
@@ -2030,10 +2371,11 @@ impl<File: SegmentFile> IckReader<File> {
                     .map_err(|error| IckApplyError::Apply { section: self.sections, error })?;
                 self.sections += 1;
                 self.records_total += u64::from(record_count);
-                self.offset += block_len as u64;
-                Ok(IckStep::Section { bytes: block_len as u64 })
+                let hop = self.hop(block_len)?;
+                self.offset += hop;
+                Ok(IckStep::Section { bytes: hop })
             }
-            BLOCK_LIVESET if self.info.version == ICK_VERSION_V2 => {
+            BLOCK_LIVESET if self.info.version >= ICK_VERSION_V2 => {
                 let mut head = [0u8; SECTION_HEADER_LEN];
                 read_exact_at(&self.file, self.offset, &mut head)?;
                 let body_len = le_u32(&head[1..5]);
@@ -2098,10 +2440,11 @@ impl<File: SegmentFile> IckReader<File> {
                     .map_err(|error| IckApplyError::Apply { section: self.sections, error })?;
                 self.sections += 1;
                 self.records_total += u64::from(record_count);
-                self.offset += block_len as u64;
-                Ok(IckStep::Section { bytes: block_len as u64 })
+                let hop = self.hop(block_len)?;
+                self.offset += hop;
+                Ok(IckStep::Section { bytes: hop })
             }
-            BLOCK_BLOBREF if self.info.version == ICK_VERSION_V2 => {
+            BLOCK_BLOBREF if self.info.version >= ICK_VERSION_V2 => {
                 let mut head = [0u8; SECTION_HEADER_LEN];
                 read_exact_at(&self.file, self.offset, &mut head)?;
                 let body_len = le_u32(&head[1..5]);
@@ -2170,10 +2513,11 @@ impl<File: SegmentFile> IckReader<File> {
                     .map_err(|error| IckApplyError::Apply { section: self.sections, error })?;
                 self.sections += 1;
                 self.records_total += u64::from(record_count);
-                self.offset += block_len as u64;
-                Ok(IckStep::Section { bytes: block_len as u64 })
+                let hop = self.hop(block_len)?;
+                self.offset += hop;
+                Ok(IckStep::Section { bytes: hop })
             }
-            BLOCK_IDXSIDECAR if self.info.version == ICK_VERSION_V2 => {
+            BLOCK_IDXSIDECAR if self.info.version >= ICK_VERSION_V2 => {
                 let mut head = [0u8; SECTION_HEADER_LEN];
                 read_exact_at(&self.file, self.offset, &mut head)?;
                 let body_len = le_u32(&head[1..5]);
@@ -2218,8 +2562,9 @@ impl<File: SegmentFile> IckReader<File> {
                 // no soft-class body byte may be load-bearing for the
                 // footer audit.
                 self.sections += 1;
-                self.offset += block_len as u64;
-                Ok(IckStep::Section { bytes: block_len as u64 })
+                let hop = self.hop(block_len)?;
+                self.offset += hop;
+                Ok(IckStep::Section { bytes: hop })
             }
             BLOCK_FOOTER => {
                 let mut fixed = [0u8; FOOTER_FIXED_LEN];
@@ -2262,7 +2607,7 @@ impl<File: SegmentFile> IckReader<File> {
                 if seen_sorted != footer_sorted {
                     return Err(IckReadError::FooterMismatch { field: "entries_per_ns" }.into());
                 }
-                let end = self.offset + block_len as u64;
+                let end = self.offset + self.hop(block_len)?;
                 if end != self.file_size {
                     return Err(IckReadError::TrailingData { at: end }.into());
                 }
@@ -2509,6 +2854,245 @@ mod tests {
         let counts =
             read_ick_counts(&pad, &path, IckReaderConfig::default()).expect("hop fallback");
         assert_eq!(counts, summary.entries_per_ns, "fallback hint matches the footer");
+    }
+
+    /// M4.5-S36 (ADR-0088 D3): the v3 container — every block starts on
+    /// an `ICK_BLOCK_ALIGN` boundary, the file ends on one, records
+    /// round-trip byte-identically, the audit reproduces the summary, the
+    /// footer probe finds the padded footer, and `info.version` is 3.
+    #[test]
+    fn v3_round_trips_on_aligned_blocks_and_audits() {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let mut w = SyncIckWriter::create_v3(
+            fs.clone(),
+            dir,
+            &small_cfg(),
+            3,
+            7,
+            Lsn::new(crate::lsn::SegmentId(2), 4096),
+            &[16, 17],
+        )
+        .expect("create v3");
+        for (key, value, exp) in sample_records() {
+            let ns = NsId(16);
+            w.append(&RecordView::StringPostImage { ns, key: &key, value: &value })
+                .expect("append");
+            if let Some(at) = exp {
+                w.append(&RecordView::ExpireAt { ns, at_unix_ms: at, key: &key }).expect("append");
+            }
+        }
+        let summary = w.finish().expect("finish");
+        assert!(summary.sections > 1, "sample must span sections");
+        assert_eq!(summary.bytes % ICK_BLOCK_ALIGN as u64, 0, "the file ends on a boundary");
+        let path = dir.join(ick_file_name(7));
+        let bytes = fs.contents(&path).expect("ick bytes");
+        assert_eq!(bytes.len() as u64, summary.bytes);
+        // Every block boundary carries a block tag or the magic.
+        let mut at = 0usize;
+        assert_eq!(&bytes[..8], &ICK_MAGIC);
+        at += ick_align_up(HEADER_FIXED_LEN + 2 * 4 + CRC_LEN);
+        let mut sections = 0u32;
+        while bytes[at] != BLOCK_FOOTER {
+            assert_eq!(bytes[at], BLOCK_SECTION, "a section tag on the boundary at {at}");
+            let body_len = le_u32(&bytes[at + 1..at + 5]) as usize;
+            let block = SECTION_HEADER_LEN + body_len + CRC_LEN;
+            assert!(bytes[at + block..at + ick_align_up(block)].iter().all(|b| *b == 0));
+            at += ick_align_up(block);
+            sections += 1;
+        }
+        assert_eq!(sections, summary.sections);
+
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let (info, audit) = read_ick(&fs, &path, IckReaderConfig::default(), |view| {
+            if let RecordView::StringPostImage { key, value, .. } = view {
+                got.push((key.to_vec(), value.to_vec()));
+            }
+            Ok::<(), ()>(())
+        })
+        .expect("load");
+        assert_eq!(info.version, ICK_VERSION_V3);
+        assert_eq!(info.ns_ids, vec![16, 17]);
+        assert_eq!(audit, summary, "loader audit reproduces the writer summary");
+        let want: Vec<(Vec<u8>, Vec<u8>)> =
+            sample_records().into_iter().map(|(k, v, _)| (k, v)).collect();
+        assert_eq!(got, want, "records replay in file order, byte-identical");
+        let counts = read_ick_counts(&fs, &path, IckReaderConfig::default()).expect("probe");
+        assert_eq!(counts, summary.entries_per_ns, "the padded footer probe finds the footer");
+        // The hop fallback across aligned hops agrees too.
+        let mut padded = bytes.clone();
+        padded.extend_from_slice(b"junk");
+        let pad = MemFs::new();
+        pad.create_dir_all(dir).unwrap();
+        use crate::fs::{SegmentFile, SegmentFs as _};
+        let mut f = pad.create_meta(&path).expect("create");
+        f.write_at(0, &padded).expect("write");
+        let counts =
+            read_ick_counts(&pad, &path, IckReaderConfig::default()).expect("hop fallback");
+        assert_eq!(counts, summary.entries_per_ns);
+    }
+
+    /// ADR-0088 D3: v3 padding is written, never left over — a non-zero
+    /// pad byte is damage (`IckReadError::Padding`), the CRC's class.
+    #[test]
+    fn v3_refuses_a_non_zero_padding_byte() {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let mut w = SyncIckWriter::create_v3(
+            fs.clone(),
+            dir,
+            &small_cfg(),
+            0,
+            9,
+            Lsn::new(crate::lsn::SegmentId(1), 64),
+            &[16],
+        )
+        .expect("create v3");
+        w.append(&RecordView::StringPostImage { ns: NsId(16), key: b"k", value: b"v" })
+            .expect("image");
+        w.finish().expect("finish");
+        let path = dir.join(ick_file_name(9));
+        let bytes = fs.contents(&path).expect("ick bytes");
+        let header_len = HEADER_FIXED_LEN + 4 + CRC_LEN;
+        for at in [header_len, ICK_BLOCK_ALIGN - 1, bytes.len() - 1] {
+            assert_eq!(bytes[at], 0, "byte {at} is padding");
+            let mut damaged = bytes.clone();
+            damaged[at] = 0x5A;
+            let dmg = MemFs::new();
+            dmg.create_dir_all(dir).unwrap();
+            use crate::fs::{SegmentFile, SegmentFs as _};
+            let mut f = dmg.create_meta(&path).expect("create");
+            f.write_at(0, &damaged).expect("write");
+            let err = read_ick(&dmg, &path, IckReaderConfig::default(), |_| Ok::<(), ()>(()))
+                .expect_err("non-zero padding is damage");
+            assert!(
+                matches!(err, IckApplyError::Read(IckReadError::Padding { .. })),
+                "byte {at}: {err:?}"
+            );
+        }
+    }
+
+    /// ADR-0088 D3: every section class rides aligned blocks, and the v3
+    /// reader's hybrid path replays a v2-vocabulary file written as v3.
+    #[test]
+    fn v3_covers_every_section_class() {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let mut w = SyncIckWriter::create_v3(
+            fs.clone(),
+            dir,
+            &small_cfg(),
+            0,
+            22,
+            Lsn::new(crate::lsn::SegmentId(1), 64),
+            &[16],
+        )
+        .expect("create v3");
+        w.append(&RecordView::StringPostImage { ns: NsId(16), key: b"k", value: b"v" })
+            .expect("image");
+        w.append_ref(16, 4096, 0xfeed_beef, 128).expect("addr ref");
+        w.append_live_set(16, 1, 4096, 0, true).expect("live set");
+        w.append_blob_ref(16, 100, 7, 4096).expect("blob ref");
+        let meta = IdxSidecarMeta {
+            ns: 16,
+            index_id: 1,
+            generation: 1,
+            key_encoding_version: 1,
+            fixed8: true,
+        };
+        w.append_idx_entry(&meta, 0, &7u64.to_be_bytes(), 42).expect("idx entry");
+        w.append_idx_final(&meta, 1).expect("idx final");
+        let summary = w.finish().expect("finish");
+        assert_eq!(summary.bytes % ICK_BLOCK_ALIGN as u64, 0);
+        let path = dir.join(ick_file_name(22));
+        let counts = read_ick_counts(&fs, &path, IckReaderConfig::default()).expect("probe");
+        assert_eq!(counts, summary.entries_per_ns);
+        let mut padded = fs.contents(&path).expect("ick bytes");
+        padded.extend_from_slice(b"junk");
+        let pad = MemFs::new();
+        pad.create_dir_all(dir).unwrap();
+        use crate::fs::{SegmentFile, SegmentFs as _};
+        let mut f = pad.create_meta(&path).expect("create");
+        f.write_at(0, &padded).expect("write");
+        let counts =
+            read_ick_counts(&pad, &path, IckReaderConfig::default()).expect("hop fallback");
+        assert_eq!(counts, summary.entries_per_ns, "the aligned hop visits every class");
+    }
+
+    /// ADR-0088 D3: the growth case — a record larger than the section
+    /// target reallocates the staging `Block`; the sealed block's base is
+    /// still aligned and the record round-trips.
+    #[test]
+    fn v3_block_stays_aligned_when_a_record_outruns_the_section_target() {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let mut w = SyncIckWriter::create_v3(
+            fs.clone(),
+            dir,
+            &small_cfg(), // 64-byte sections
+            0,
+            23,
+            Lsn::new(crate::lsn::SegmentId(1), 64),
+            &[16],
+        )
+        .expect("create v3");
+        let big = vec![b'x'; 40 << 10]; // 40 KiB — ten alignments past the target
+        w.append(&RecordView::StringPostImage { ns: NsId(16), key: b"big", value: &big })
+            .expect("image");
+        w.append(&RecordView::StringPostImage { ns: NsId(16), key: b"k", value: b"v" })
+            .expect("image");
+        let summary = w.finish().expect("finish");
+        assert_eq!(summary.bytes % ICK_BLOCK_ALIGN as u64, 0);
+        let mut got = Vec::new();
+        let (_, audit) =
+            read_ick(&fs, &dir.join(ick_file_name(23)), IckReaderConfig::default(), |view| {
+                if let RecordView::StringPostImage { value, .. } = view {
+                    got.push(value.len());
+                }
+                Ok::<(), ()>(())
+            })
+            .expect("load");
+        assert_eq!(audit, summary);
+        assert_eq!(got, vec![40 << 10, 1]);
+    }
+
+    /// ADR-0088 D4: the derived interval is inside `[floor, cap]` for
+    /// every input, the floor alone before the first checkpoint, the cap
+    /// when the dataset outgrows the replay budget, `0` when manual-only;
+    /// the record cap and byte cap are the replay rates × the budget.
+    #[test]
+    fn derived_checkpoint_interval_is_clamped_to_the_recovery_gate() {
+        let cfg = CkptConfig::default();
+        let floor = cfg.interval_bytes;
+        let cap = cfg.cap_bytes();
+        assert_eq!(cap, (1 << 30) * 5);
+        assert_eq!(cfg.cap_records(), 400_000 * 5);
+        assert_eq!(cfg.derive_interval(0), floor, "no prior checkpoint ⇒ the floor");
+        assert_eq!(cfg.derive_interval(floor / 4), floor, "small dataset ⇒ the floor");
+        assert_eq!(cfg.derive_interval(300 << 20), 600 << 20, "α = 2 above the floor");
+        assert_eq!(cfg.derive_interval(cap), cap, "cap binds");
+        assert_eq!(cfg.derive_interval(u64::MAX), cap, "saturating, never above the cap");
+        let mut seed = 0x5EED_1234_ABCD_EF01u64;
+        for _ in 0..10_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let interval = cfg.derive_interval(seed % (8 << 30));
+            assert!((floor..=cap).contains(&interval));
+        }
+        let manual = CkptConfig { interval_bytes: 0, ..cfg };
+        assert_eq!(manual.derive_interval(1 << 40), 0, "manual-only stays manual");
+        // A floor above the cap: the floor wins (the operator asked for
+        // it; the cap is a derivation, the floor an override).
+        let tall = CkptConfig { interval_bytes: cap * 2, ..cfg };
+        assert_eq!(tall.derive_interval(0), cap * 2);
+        // α = 0 is the pre-S36 fixed trigger.
+        let fixed = CkptConfig { alpha: 0, ..cfg };
+        assert_eq!(fixed.derive_interval(1 << 40), floor);
     }
 
     #[test]
@@ -3271,7 +3855,7 @@ mod tests {
         write_sample(&fs, dir);
         let path = dir.join(ick_file_name(7));
         let mut image = fs.contents(&path).expect("image");
-        image[8] = 3; // version 3: unknown to this reader
+        image[8] = 4; // version 4: unknown to this reader (v3 is M4.5-S36's)
         let fs2 = MemFs::new();
         fs2.create_dir_all(dir).unwrap();
         let mut f = fs2.create_segment(&path, 0).unwrap();
@@ -3279,7 +3863,7 @@ mod tests {
         drop(f);
         let err = read_ick(&fs2, &path, IckReaderConfig::default(), |_| Ok::<(), ()>(()))
             .expect_err("unknown version");
-        assert!(matches!(err, IckApplyError::Read(IckReadError::UnsupportedVersion(3))));
+        assert!(matches!(err, IckApplyError::Read(IckReadError::UnsupportedVersion(4))));
 
         let result = std::panic::catch_unwind(|| {
             let mut stream = IckStream::new(&small_cfg());

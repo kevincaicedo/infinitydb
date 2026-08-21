@@ -312,6 +312,58 @@ pub(crate) fn info(
         push(&mut text, &format!("frames_in_flight_max:{}", node.frames_in_flight_max.get()));
         push(&mut text, &format!("frame_waits_barrier:{}", node.frame_waits_barrier.get()));
         push(&mut text, &format!("frame_waits_rotation:{}", node.frame_waits_rotation.get()));
+        // M4.5-S36 (ADR-0088 D7): the device budget's ledger (names per
+        // INFINITY_STYLE — units and qualifiers last), the seal pacer's
+        // waits, the checkpoint domain's bytes, the derived trigger, and
+        // the cell-scope write-amplification figure — undefined (0 with
+        // the flag set) until the first checkpoint publishes.
+        push(
+            &mut text,
+            &format!(
+                "io_budget_model:{}",
+                if node.io_budget_model_absent.get() == 1 { "absent" } else { "probed" }
+            ),
+        );
+        push(
+            &mut text,
+            &format!("io_budget_write_bytes_per_s:{}", node.io_budget_write_bytes_per_s.get()),
+        );
+        push(
+            &mut text,
+            &format!("io_budget_read_bytes_per_s:{}", node.io_budget_read_bytes_per_s.get()),
+        );
+        let budget = node.io_budget.get();
+        for class in inf_runtime::IoClass::ALL {
+            let at = 3 * class.index();
+            push(&mut text, &format!("io_budget_bytes_{}:{}", class.name(), budget[at]));
+            push(&mut text, &format!("io_budget_ops_{}:{}", class.name(), budget[at + 1]));
+            push(&mut text, &format!("io_budget_deferrals_{}:{}", class.name(), budget[at + 2]));
+        }
+        push(&mut text, &format!("frame_waits_pace:{}", node.frame_waits_pace.get()));
+        push(&mut text, &format!("log_frame_bytes:{}", node.log_frame_bytes.get()));
+        push(&mut text, &format!("ckpt_bytes_total:{}", node.ckpt_bytes_total.get()));
+        push(&mut text, &format!("ckpt_bytes_last:{}", node.ckpt_bytes_last.get()));
+        push(&mut text, &format!("ckpt_padding_bytes:{}", node.ckpt_padding_bytes.get()));
+        push(&mut text, &format!("manifest_bytes_total:{}", node.manifest_bytes_total.get()));
+        push(&mut text, &format!("ckpt_interval_bytes:{}", node.ckpt_interval_bytes.get()));
+        push(
+            &mut text,
+            &format!("ckpt_records_since_begin:{}", node.ckpt_records_since_begin.get()),
+        );
+        push(
+            &mut text,
+            &format!(
+                "write_amp_milli_log_checkpoint:{}",
+                node.write_amp_milli_log_checkpoint.get()
+            ),
+        );
+        push(
+            &mut text,
+            &format!(
+                "write_amp_log_checkpoint_undefined:{}",
+                node.write_amp_log_checkpoint_undefined.get()
+            ),
+        );
         // Fuzzy-checkpoint gauges (M2-S10; `ckpt_age_s` derives at S21).
         push(&mut text, &format!("ckpts_completed:{}", node.ckpts_completed.get()));
         push(&mut text, &format!("ckpts_aborted:{}", node.ckpts_aborted.get()));
@@ -576,6 +628,8 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tiering_flush_rounds_inflight:{}", flush[5]));
     push(text, &format!("tiering_files_sealed:{}", flush[6]));
     push(text, &format!("tiering_files_active:{}", flush[7]));
+    // M4.5-S36 (ADR-0088 D5): rounds the device budget deferred.
+    push(text, &format!("tiering_flush_rounds_deferred:{}", flush[8]));
     // M4-S15: copy-forward slices — same zero contract.
     push(text, &format!("tiering_compact_slices:{}", tiering.compact_slices));
     // M4.5-S30 (ADR-0085 D6): read-driven promotion — engagement, the

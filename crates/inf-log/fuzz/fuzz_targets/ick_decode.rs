@@ -29,6 +29,11 @@
 //!    the soft class; the records-only loader refuses the tag typed;
 //!    sidecar entries never count into `records_total` or the per-ns
 //!    presize hint.
+//! 8. v3 (M4.5-S36, ADR-0088 D3): aligned blocks decode without panic;
+//!    a cleanly-loading v3 image's length is a multiple of the block
+//!    alignment, and every padding byte the reader hopped was zero (the
+//!    reader refuses otherwise — asserted by the clean-load branch); the
+//!    hint path's padded footer probe agrees with the audit.
 #![no_main]
 
 use std::path::Path;
@@ -133,7 +138,14 @@ fuzz_target!(|data: &[u8]| {
     // that loaded cleanly it refuses typed at the first ref section.
     let v1_result = read_ick(&fs, &path, IckReaderConfig::default(), |_| Ok::<(), ()>(()));
     if let Ok((info, summary)) = result {
-        assert!(info.version == 1 || info.version == 2, "only known versions load");
+        assert!((1..=3).contains(&info.version), "only known versions load");
+        if info.version == 3 {
+            assert_eq!(
+                data.len() % inf_log::ckpt::ICK_BLOCK_ALIGN,
+                0,
+                "a clean v3 image ends on a block boundary"
+            );
+        }
         if info.version == 1 {
             assert_eq!(refs, 0, "v1 images carry no ref sections");
             assert_eq!(live_entries, 0, "v1 images carry no live-set sections");

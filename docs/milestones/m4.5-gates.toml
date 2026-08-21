@@ -126,3 +126,57 @@ unit = "x (N-cell p50 / 1-cell p50 at 32 conns; FLUSH read 1.8, FUA K = 1 1.45)"
 tier = "linux-reference-box"
 source = "s35:multi_vs_one_cell_p50_x"
 measured_by = "gate-run m4.5 frame-pipeline row, median of replicates per cell count"
+
+# M4.5-S36 (ADR-0088 D7/D9, 2026-08-21) — the device-budget row. The D2
+# mechanism: the KV pure-write `everysec` row idled the engine at
+# 123–185 % of 400 % CPU behind a buffered checkpoint and un-budgeted
+# background I/O. Gated as the server's CPU across the closed-loop leg,
+# the leg's throughput against a same-session tmpfs control (the
+# device-free arm), the cell-scope write-amplification figure with
+# checkpoints active (the plan's 1.5× is the checkpoint term alone —
+# `(2D + D) / 2D`; v3 frame padding and framing at the 1 KiB/~50-record
+# shape add ≈ 4 %, so the bar is 1.6 and the gate says so rather than
+# reading a derived number as a measured one), and the S27 D5 `max` bar
+# at a comparator-matched offered rate (ADR-0081 D5 was written for
+# closed-loop saturation; the comparators were measured at an offered
+# rate — the row discloses both and this gate binds on the latter).
+
+[[gate]]
+id = "s36_server_cpu_pct"
+name = "S36: server CPU across the pure-write everysec leg"
+threshold = 300.0
+comparator = ">="
+unit = "% of one core (400 = four cells flat out; pre-S36 read 123–185)"
+tier = "linux-reference-box"
+source = "s36:server_cpu_pct"
+measured_by = "gate-run m4.5 device-budget row, /proc/<pid>/stat across the closed-loop device leg"
+
+[[gate]]
+id = "s36_everysec_vs_tmpfs"
+name = "S36: everysec pure-write throughput vs the same-session tmpfs control"
+threshold = 0.85
+comparator = ">="
+unit = "x (device arm ops/s / tmpfs control ops/s, same binary, same session)"
+tier = "linux-reference-box"
+source = "s36:everysec_vs_tmpfs_x"
+measured_by = "gate-run m4.5 device-budget row, closed-loop legs on both roots"
+
+[[gate]]
+id = "s36_write_amp_milli_log_checkpoint"
+name = "S36: log + checkpoint write amplification on the RAM-resident durable shape"
+threshold = 1600.0
+comparator = "<="
+unit = "milli-x ((log frames + checkpoint + MANIFEST bytes) / encoded record bytes; UNDEFINED until a checkpoint publishes)"
+tier = "linux-reference-box"
+source = "s36:write_amp_milli_log_checkpoint"
+measured_by = "gate-run m4.5 device-budget row, INFO persistence scrape at the end of the device leg (worst cell)"
+
+[[gate]]
+id = "s36_max_latency_ms_offered_rate"
+name = "S36: everysec max latency at the comparator-matched offered rate (S27 D5)"
+threshold = 50.0
+comparator = "<="
+unit = "ms (ADR-0081 D5 bar at an offered rate; latency from the intended send instant)"
+tier = "linux-reference-box"
+source = "s36:max_ms_offered_rate"
+measured_by = "gate-run m4.5 device-budget row, offered-rate leg (--offered-ops, pipeline 16)"

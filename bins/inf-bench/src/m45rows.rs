@@ -14,6 +14,14 @@
 //! leg and a pipelined read leg (the ±2 % non-regression row, compared
 //! across arm reports). The S34/S35 arms (`--frames-in-flight`,
 //! `--barrier-class`, `--staging-mib`) ride every spawn in this flow.
+//! Row 4 (M4.5-S36, ADR-0088 D7/D9): the device-budget row — the leg A
+//! pure-write `everysec` shape with the **server's CPU** measured across
+//! the leg (an engine idle behind its device is a device row, not an
+//! engine row), a same-session **tmpfs control** (the 0.85× denominator),
+//! the `write_amp_milli_log_checkpoint` figure scraped with checkpoints
+//! active, and the S27 D5 `max` leg at a **comparator-matched offered
+//! rate** (ADR-0081 D5 was written for closed-loop saturation; the bar
+//! binds at the rate the comparators were measured at).
 //!
 //! The defect this row pins (2026-08-19 finding,
 //! `reviews/tiered-always-group-commit-finding-20260819.md`): fabric
@@ -86,8 +94,12 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
     // `--only-s35` (M4.5-S35): the frame-pipeline A/B arms run just
     // their own row (K = 1 / 3 / 4 × barrier class, one report each).
     let only_s35 = flags.bool("only-s35");
-    if usize::from(only_s27) + usize::from(only_s29) + usize::from(only_s35) > 1 {
-        return Err("--only-s27, --only-s29 and --only-s35 exclude each other".into());
+    // `--only-s36` (M4.5-S36): the device-budget arms run just their row.
+    let only_s36 = flags.bool("only-s36");
+    if usize::from(only_s27) + usize::from(only_s29) + usize::from(only_s35) + usize::from(only_s36)
+        > 1
+    {
+        return Err("--only-s27, --only-s29, --only-s35 and --only-s36 exclude each other".into());
     }
 
     let env_ok = env_gate(flags)?;
@@ -125,6 +137,19 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
             reference_box,
             &artifacts_root,
             &format!("binary {infinityd} · cells {cells} · S27 row only · {arms_note}"),
+        );
+    }
+    if only_s36 {
+        m.note("--only-s36: the S29, S27 and S35 rows were skipped; their gate keys are absent");
+        s36_device_budget_row(flags, &infinityd, cells, duration, &data_root, &mut m)?;
+        return finish_report(
+            "m4.5",
+            &gates_list,
+            &m,
+            env_ok,
+            reference_box,
+            &artifacts_root,
+            &format!("binary {infinityd} · cells {cells} · S36 row only · {arms_note}"),
         );
     }
     if only_s35 {
@@ -280,6 +305,7 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
     } else {
         s27_write_repeat_row(flags, &infinityd, cells, duration, &data_root, &mut m)?;
         s35_frame_pipeline_row(flags, &infinityd, cells, duration, replicates, &data_root, &mut m)?;
+        s36_device_budget_row(flags, &infinityd, cells, duration, &data_root, &mut m)?;
     }
 
     finish_report(
@@ -439,6 +465,9 @@ struct S35Leg {
     acks_per_fsync: f64,
     frames: u64,
     parked: u64,
+    /// The staging drain's binding variable (ADR-0083 D5), worst cell —
+    /// a client tail with a healthy device tail points here.
+    write_stall_p99_us: u64,
 }
 
 /// The M4.5-S35 frame-pipeline row (ADR-0087 D8). Per replicate: a
@@ -498,6 +527,7 @@ fn s35_frame_pipeline_row(
     let mut p50_one: Vec<f64> = Vec::new();
     let mut fill_max_seen: u64 = 0;
     let mut device_tail_legs: usize = 0;
+    let mut engine_tail_legs: usize = 0;
 
     for rep in 0..replicates {
         let dir = format!("{data_root}/s35-{cells}c-rep{rep}");
@@ -508,10 +538,13 @@ fn s35_frame_pipeline_row(
         if ac.barrier_p99_us > 10_000.0 {
             device_tail_legs += 1;
         }
+        if ac.p99_us > 10.0 * ac.barrier_p99_us.max(1.0) {
+            engine_tail_legs += 1;
+        }
         raw.push_str(&format!(
             "rep{rep} {cells}c c{S35_CONNS_AC:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
              max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} p50/barrier={:.2} \
-             frames_in_flight_max={} acks/fsync={:.1} frames={} parked={}\n",
+             frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} write_stall_p99_us={}\n",
             ac.ops_per_sec,
             ac.p50_us,
             ac.p99_us,
@@ -522,7 +555,8 @@ fn s35_frame_pipeline_row(
             ac.frames_in_flight_max,
             ac.acks_per_fsync,
             ac.frames,
-            ac.parked
+            ac.parked,
+            ac.write_stall_p99_us
         ));
         ratio.push(ac.p50_us / ac.barrier_p50_us.max(1.0));
         p50_n.push(ac.p50_us);
@@ -540,7 +574,7 @@ fn s35_frame_pipeline_row(
         raw.push_str(&format!(
             "rep{rep} {cells}c c{CONNS_HIGH:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
              max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} \
-             frames_in_flight_max={} acks/fsync={:.1} frames={} parked={}\n",
+             frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} write_stall_p99_us={}\n",
             hi.ops_per_sec,
             hi.p50_us,
             hi.p99_us,
@@ -550,7 +584,8 @@ fn s35_frame_pipeline_row(
             hi.frames_in_flight_max,
             hi.acks_per_fsync,
             hi.frames,
-            hi.parked
+            hi.parked,
+            hi.write_stall_p99_us
         ));
         ops_256.push(hi.ops_per_sec);
         p99_256.push(hi.p99_us);
@@ -606,7 +641,7 @@ fn s35_frame_pipeline_row(
             raw.push_str(&format!(
                 "rep{rep} 1c c{S35_CONNS_AC:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
                  max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} p50/barrier={:.2} \
-                 frames_in_flight_max={} acks/fsync={:.1} frames={} parked={}\n",
+                 frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} write_stall_p99_us={}\n",
                 one.ops_per_sec,
                 one.p50_us,
                 one.p99_us,
@@ -617,7 +652,8 @@ fn s35_frame_pipeline_row(
                 one.frames_in_flight_max,
                 one.acks_per_fsync,
                 one.frames,
-                one.parked
+                one.parked,
+                one.write_stall_p99_us
             ));
             p50_one.push(one.p50_us);
             drop(server);
@@ -660,6 +696,14 @@ fn s35_frame_pipeline_row(
              longer --leg-idle-s before citing"
         ));
     }
+    if engine_tail_legs > 0 {
+        m.note(format!(
+            "s35: {engine_tail_legs} AC leg(s) saw a client p99 above 10× the device barrier \
+             p99 — a tail the device does not explain (write stall, parking, or a drive-state \
+             mode the barrier histogram missed); the leg's write_stall_p99_us is in the raw \
+             rows; do not cite without attributing it"
+        ));
+    }
     m.note(format!(
         "s35 row: flat always, no fill (the AC leg runs first on a fresh server so its \
          barrier histogram holds only its own frames), {FILL_KEYS}-key space × 1 KiB, \
@@ -677,6 +721,241 @@ fn s35_frame_pipeline_row(
     );
     m.raw_section("s35 per-leg samples", &raw);
     Ok(())
+}
+
+/// The S36 row's offered rate when `--offered-ops` is absent: the
+/// same-drive comparator median of the 2026-08-20 leg A KV 100 %-write
+/// row (disclosed in the report; the ledger names the run it matched).
+const S36_DEFAULT_OFFERED_OPS: u64 = 100_000;
+
+/// One S36 write leg's facts.
+struct S36Leg {
+    ops_per_sec: f64,
+    p99_us: f64,
+    max_us: f64,
+    /// Server CPU across the leg, percent of one core (400 = four cores
+    /// flat out).
+    cpu_pct: f64,
+    parked: u64,
+    write_stall_p99_us: u64,
+}
+
+/// The M4.5-S36 device-budget row (ADR-0088 D7/D9). On the device root:
+/// a fresh server with the campaign's arms → one flat `everysec`
+/// namespace → the leg A closed-loop 100 %-write leg (32 conns, 1 KiB)
+/// for `2 × duration` with the server's CPU sampled across it (the
+/// pure-write tripwire: an engine below 300 % of 400 % is waiting on its
+/// device) and the write-amplification figure scraped at its end
+/// (checkpoints run during it: `2 × duration` of ~100 MB/s is several
+/// derived intervals) → after the drive-state idle, the S27 D5 `max`
+/// leg at the comparator-matched **offered** rate (`--offered-ops`,
+/// pipeline 16, latency from the intended send instant). Then the same
+/// closed-loop leg on a **tmpfs control** server (the one memory-fs
+/// root the admission rule exempts, labelled): the 0.85× denominator.
+fn s36_device_budget_row(
+    flags: &Flags,
+    infinityd: &str,
+    cells: u16,
+    duration: u64,
+    data_root: &str,
+    m: &mut Measurements,
+) -> Result<(), String> {
+    let idle_s = flags.u64_or("leg-idle-s", S35_LEG_IDLE_S)?;
+    let offered = flags.u64_or("offered-ops", S36_DEFAULT_OFFERED_OPS)?;
+    let control_root =
+        flags.get("tmpfs-control-root").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    let control_fstype =
+        crate::gaterun::fs_type_of(&control_root).unwrap_or_else(|| "unknown".to_string());
+    let mut raw = String::new();
+
+    // ---- device arm: the CPU/throughput leg, the write-amp scrape, the
+    // offered-rate max leg.
+    let dir = format!("{data_root}/s36-device");
+    s35_idle(idle_s, &format!("s36 device leg ({cells} cells)"));
+    let (server, port) = s36_spawn(flags, infinityd, cells, &dir, None)?;
+    let device = s36_write_leg(&server, port, cells, 2 * duration, None)?;
+    raw.push_str(&format!(
+        "device closed-loop c32 everysec ops/s={:<8.0} p99_us={:<7.0} max_us={:<8.0}          server_cpu_pct={:<5.0} parked={} write_stall_p99_us={}
+",
+        device.ops_per_sec,
+        device.p99_us,
+        device.max_us,
+        device.cpu_pct,
+        device.parked,
+        device.write_stall_p99_us
+    ));
+    let infos = scrape_cells(port, cells)?;
+    let undefined = crate::gaterun::max_field(&infos, "write_amp_log_checkpoint_undefined");
+    let write_amp = crate::gaterun::max_field(&infos, "write_amp_milli_log_checkpoint");
+    let ckpts = sum_field(&infos, "ckpts_completed");
+    let model_absent =
+        infos.iter().any(|c| c.get("io_budget_model").is_some_and(|v| v == "absent"));
+    raw.push_str(&format!(
+        "device arm: io_budget_model={} ckpts_completed={ckpts} write_amp_milli_log_checkpoint={}          (undefined={undefined}) log_frame_bytes={} ckpt_bytes_total={} zero_fill_bytes={}          ckpt_interval_bytes(max)={} deferrals[zero_fill={} tier_flush={} checkpoint={}]          frame_waits_pace={}
+",
+        if model_absent { "absent" } else { "probed" },
+        write_amp,
+        sum_field(&infos, "log_frame_bytes"),
+        sum_field(&infos, "ckpt_bytes_total"),
+        sum_field(&infos, "zero_fill_bytes"),
+        crate::gaterun::max_field(&infos, "ckpt_interval_bytes"),
+        sum_field(&infos, "io_budget_deferrals_zero_fill"),
+        sum_field(&infos, "io_budget_deferrals_tier_flush"),
+        sum_field(&infos, "io_budget_deferrals_checkpoint"),
+        sum_field(&infos, "frame_waits_pace"),
+    ));
+    if undefined == 0 && ckpts > 0 {
+        m.set("s36:write_amp_milli_log_checkpoint", write_amp as f64);
+    } else {
+        m.note(
+            "s36: write_amp_milli_log_checkpoint is UNDEFINED (no checkpoint published during              the leg) — the gate reads PENDING (ADR-0060 D3), never PASS",
+        );
+    }
+    if model_absent {
+        m.note(
+            "s36: the device model is ABSENT on the device arm (no schema-2 io-properties.toml              and no --device-write-mbps): background I/O unbudgeted — this is the pre-S36              baseline arm, not the budgeted one",
+        );
+    }
+    s35_idle(idle_s, "s36 offered-rate leg");
+    let paced = s36_write_leg(&server, port, cells, duration, Some(offered))?;
+    raw.push_str(&format!(
+        "device offered-rate c32 P16 target={offered} everysec achieved ops/s={:<8.0}          p99_us={:<7.0} max_us={:<8.0} server_cpu_pct={:<5.0} parked={}
+",
+        paced.ops_per_sec, paced.p99_us, paced.max_us, paced.cpu_pct, paced.parked
+    ));
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // ---- tmpfs control arm (the denominator).
+    let control_dir = control_root.join(format!("inf-s36-control-{}", std::process::id()));
+    let control_dir_s = control_dir.to_string_lossy().into_owned();
+    let (server, port) = s36_spawn(flags, infinityd, cells, &control_dir_s, Some("flush"))?;
+    let control = s36_write_leg(&server, port, cells, duration, None)?;
+    raw.push_str(&format!(
+        "tmpfs control ({control_fstype}) closed-loop c32 everysec ops/s={:<8.0} p99_us={:<7.0}          max_us={:<8.0} server_cpu_pct={:<5.0}
+",
+        control.ops_per_sec, control.p99_us, control.max_us, control.cpu_pct
+    ));
+    drop(server);
+    let _ = std::fs::remove_dir_all(&control_dir);
+
+    m.set("s36:everysec_ops_per_sec", device.ops_per_sec);
+    m.set("s36:everysec_max_us", device.max_us);
+    m.set("s36:server_cpu_pct", device.cpu_pct);
+    m.set("s36:everysec_tmpfs_ops_per_sec", control.ops_per_sec);
+    m.set("s36:everysec_vs_tmpfs_x", device.ops_per_sec / control.ops_per_sec.max(1.0));
+    m.set("s36:max_ms_offered_rate", paced.max_us / 1000.0);
+    m.set("s36:offered_rate_achieved_x", paced.ops_per_sec / offered.max(1) as f64);
+    m.set("s36:offered_ops", offered as f64);
+    if paced.ops_per_sec < 0.9 * offered as f64 {
+        m.note(format!(
+            "s36: the offered-rate leg achieved {:.0} of {offered} ops/s (< 90 %) — the server              could not absorb the offered rate; its max is a saturation number, disclosed",
+            paced.ops_per_sec
+        ));
+    }
+    if !crate::gaterun::is_memory_fs(&control_fstype) {
+        m.note(format!(
+            "s36: WARNING — the tmpfs control root is {control_fstype}, not a memory filesystem;              the 0.85× denominator is not the device-free arm it is meant to be"
+        ));
+    }
+    m.note(format!(
+        "s36 row: flat everysec, {FILL_KEYS}-key space × 1 KiB, 32 conns; device leg          {}s closed-loop with server CPU from /proc/<pid>/stat ({} ticks/s); write-amp scraped          at its end; offered-rate leg {duration}s at {offered} ops/s (pipeline 16, latency from          the intended send); tmpfs control {duration}s on {} ({control_fstype}, flush class);          {idle_s}s idle before every device leg",
+        2 * duration,
+        crate::gaterun::CLOCK_TICKS_PER_S,
+        control_root.display()
+    ));
+    m.row_open("device-budget");
+    m.row_write_amp(
+        "measured by this row as write_amp_milli_log_checkpoint (ADR-0088 D7: log frames +          checkpoint + MANIFEST bytes over encoded record bytes, cell scope, boot life; zero-fill          disclosed beside it) — the tier figure stays the M4 S16 row's",
+    );
+    m.raw_section("s36 per-leg samples", &raw);
+    Ok(())
+}
+
+/// Spawns the S36 row's server: the campaign's arms, plus a barrier-
+/// class override for the tmpfs control (FUA on tmpfs is a memcpy; the
+/// control runs the flush class and says so).
+fn s36_spawn(
+    flags: &Flags,
+    infinityd: &str,
+    cells: u16,
+    dir: &str,
+    barrier_override: Option<&str>,
+) -> Result<(crate::gaterun::ServerGuard, u16), String> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
+    let mut extra: Vec<String> = vec!["--data-dir".into(), dir.to_string()];
+    if let Some(pin) = flags.get("pin-start") {
+        extra.push("--pin-start".into());
+        extra.push(pin.to_string());
+    }
+    let mut arms = crate::m2rows::pipeline_args(flags);
+    if let Some(class) = barrier_override {
+        if let Some(at) = arms.iter().position(|a| a == "--barrier-class") {
+            arms.drain(at..at + 2);
+        }
+        arms.push("--barrier-class".into());
+        arms.push(class.to_string());
+    }
+    extra.extend(arms);
+    let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
+    let server = spawn_infinityd(infinityd, cells, &extra_refs)?;
+    let port = server.port;
+    create_ns(
+        port,
+        &[b"INF.NS", b"CREATE", b"s36esec", b"MODE", b"durable", b"FSYNC", b"everysec"],
+    )?;
+    await_fan(port, "s36esec", cells)?;
+    Ok((server, port))
+}
+
+/// One S36 100 %-write leg (32 conns, 1 KiB) — closed loop, or at an
+/// offered rate with pipeline 16 — with the server's CPU sampled across
+/// it and the parked/stall counters scraped.
+fn s36_write_leg(
+    server: &crate::gaterun::ServerGuard,
+    port: u16,
+    cells: u16,
+    duration: u64,
+    offered: Option<u64>,
+) -> Result<S36Leg, String> {
+    let before = scrape_cells(port, cells)?;
+    let ticks_before = crate::gaterun::cpu_ticks_of(server.pid());
+    let wall = Instant::now();
+    let report = run_load(&LoadSpec {
+        port,
+        conns: 32,
+        pipeline: if offered.is_some() { 16 } else { 1 },
+        duration: Duration::from_secs(duration),
+        warmup: Duration::from_secs(2),
+        set_weight: 1,
+        get_weight: 0,
+        keys: FILL_KEYS,
+        key_prefix: "s36esec:".into(),
+        value_size: 1024,
+        setup: vec![vec![b"INF.NS".to_vec(), b"USE".to_vec(), b"s36esec".to_vec()]],
+        target_ops_per_sec: offered,
+        ..LoadSpec::default()
+    })?;
+    let elapsed = wall.elapsed().as_secs_f64().max(1e-9);
+    let ticks = crate::gaterun::cpu_ticks_of(server.pid()).saturating_sub(ticks_before);
+    if report.errors > report.busy_retryable {
+        return Err(format!(
+            "s36 leg: {} non-BUSY errors (first: {:?})",
+            report.errors - report.busy_retryable,
+            report.error_samples.first()
+        ));
+    }
+    let after = scrape_cells(port, cells)?;
+    Ok(S36Leg {
+        ops_per_sec: report.ops_per_sec,
+        p99_us: report.p99_us as f64,
+        max_us: report.max_us as f64,
+        cpu_pct: ticks as f64 / crate::gaterun::CLOCK_TICKS_PER_S as f64 / elapsed * 100.0,
+        parked: sum_field(&after, "log_admission_parked_total")
+            .saturating_sub(sum_field(&before, "log_admission_parked_total")),
+        write_stall_p99_us: crate::gaterun::max_field(&after, "log_write_stall_p99_us"),
+    })
 }
 
 /// Drive-state idle before a durable leg (disclosed on stdout so a
@@ -768,6 +1047,7 @@ fn s35_write_leg(
         acks_per_fsync: if fsyncs > 0 { acks as f64 / fsyncs as f64 } else { 0.0 },
         frames,
         parked,
+        write_stall_p99_us: crate::gaterun::max_field(&infos, "log_write_stall_p99_us"),
     })
 }
 

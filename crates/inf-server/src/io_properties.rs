@@ -16,15 +16,28 @@
 //! fua_p50_us_4k = 294
 //! flush_p50_us_4k = 915
 //! probed_at_unix_s = 1755648000
+//! # schema 2 (M4.5-S36, ADR-0088 D6): the device model the per-cell
+//! # budget and the seal pacer spend. 0 / absent = not probed ⇒ that
+//! # direction is unbudgeted (`io_budget_model:absent`).
+//! probe_schema = 2
+//! write_bytes_per_s_256k = 489000000
+//! write_ops_per_s_4k = 2898
+//! write_ops_per_s_4k_qd4 = 9918
+//! read_bytes_per_s_256k = 0
+//! read_ops_per_s_4k = 0
 //! ```
 //!
 //! A malformed file is a typed boot refusal ([`IoPropertiesError`]) —
 //! never a silent fallback to the slow class the operator did not choose.
+//! Unknown keys are ignored (a schema-1 binary reads a schema-2 file;
+//! a schema-2 binary reads a schema-1 file with the model absent and
+//! the boot log says so).
 
 use std::fmt;
 use std::path::Path;
 
 use inf_log::{DEFAULT_FUA_MAX_FRAME_BYTES, FRAME_ALIGN, SegmentIoMode};
+use inf_runtime::DeviceModel;
 
 /// File name under the data directory.
 pub const IO_PROPERTIES_FILE: &str = "io-properties.toml";
@@ -41,16 +54,26 @@ pub struct IoProperties {
     pub fua_p50_us_4k: u64,
     /// Probed buffered+fdatasync p50 at 4 KiB (µs), for the boot log line.
     pub flush_p50_us_4k: u64,
+    /// Schema 2 (ADR-0088 D6): the probe file's schema (1 when absent —
+    /// a pre-S36 file), the device model (per device; the cell share is
+    /// computed at boot), and the concurrent barrier rate the seal pacer
+    /// refills from (`write_ops_per_s_4k_qd4`; 0 = unpaced).
+    pub probe_schema: u64,
+    pub device: DeviceModel,
+    pub write_ops_per_s_4k_qd4: u64,
 }
 
 impl Default for IoProperties {
-    /// The absent-file default: today's FLUSH class.
+    /// The absent-file default: today's FLUSH class, no device model.
     fn default() -> IoProperties {
         IoProperties {
             io_mode: SegmentIoMode::Buffered,
             fua_max_frame_bytes: DEFAULT_FUA_MAX_FRAME_BYTES,
             fua_p50_us_4k: 0,
             flush_p50_us_4k: 0,
+            probe_schema: 1,
+            device: DeviceModel::ABSENT,
+            write_ops_per_s_4k_qd4: 0,
         }
     }
 }
@@ -141,6 +164,23 @@ impl IoProperties {
                 }
                 "fua_p50_us_4k" => props.fua_p50_us_4k = parse_u64("fua_p50_us_4k", value)?,
                 "flush_p50_us_4k" => props.flush_p50_us_4k = parse_u64("flush_p50_us_4k", value)?,
+                // Schema 2 (ADR-0088 D6) — each typed, none required.
+                "probe_schema" => props.probe_schema = parse_u64("probe_schema", value)?,
+                "write_bytes_per_s_256k" => {
+                    props.device.write_bytes_per_s = parse_u64("write_bytes_per_s_256k", value)?;
+                }
+                "write_ops_per_s_4k" => {
+                    props.device.write_ops_per_s = parse_u64("write_ops_per_s_4k", value)?;
+                }
+                "write_ops_per_s_4k_qd4" => {
+                    props.write_ops_per_s_4k_qd4 = parse_u64("write_ops_per_s_4k_qd4", value)?;
+                }
+                "read_bytes_per_s_256k" => {
+                    props.device.read_bytes_per_s = parse_u64("read_bytes_per_s_256k", value)?;
+                }
+                "read_ops_per_s_4k" => {
+                    props.device.read_ops_per_s = parse_u64("read_ops_per_s_4k", value)?;
+                }
                 // Provenance keys are informational; unknown keys are a
                 // forward-compatibility allowance, not an error.
                 _ => {}
@@ -188,6 +228,34 @@ mod tests {
         assert_eq!(props.fua_max_frame_bytes, 262_144);
         assert_eq!(props.fua_p50_us_4k, 294);
         assert_eq!(props.flush_p50_us_4k, 915);
+        // A schema-1 file: the model is absent and says so (ADR-0088 D6).
+        assert_eq!(props.probe_schema, 1);
+        assert!(props.device.is_absent());
+        assert_eq!(props.write_ops_per_s_4k_qd4, 0);
+    }
+
+    /// ADR-0088 D6: schema 2 carries the device model; a zero or absent
+    /// direction stays unbudgeted; a malformed value is a typed refusal.
+    #[test]
+    fn schema_2_carries_the_device_model() {
+        let text = "barrier_class = \"fua\"\n\
+                    probe_schema = 2\n\
+                    write_bytes_per_s_256k = 489_000_000\n\
+                    write_ops_per_s_4k = 2898\n\
+                    write_ops_per_s_4k_qd4 = 9_918\n\
+                    read_bytes_per_s_256k = 0\n";
+        let props = IoProperties::parse(text).expect("valid");
+        assert_eq!(props.probe_schema, 2);
+        assert_eq!(props.device.write_bytes_per_s, 489_000_000);
+        assert_eq!(props.device.write_ops_per_s, 2_898);
+        assert_eq!(props.write_ops_per_s_4k_qd4, 9_918);
+        assert_eq!(props.device.read_bytes_per_s, 0);
+        assert_eq!(props.device.read_ops_per_s, 0);
+        assert!(!props.device.is_absent());
+        assert!(matches!(
+            IoProperties::parse("barrier_class = \"fua\"\nwrite_bytes_per_s_256k = fast\n"),
+            Err(IoPropertiesError::Value { key: "write_bytes_per_s_256k", .. })
+        ));
     }
 
     #[test]

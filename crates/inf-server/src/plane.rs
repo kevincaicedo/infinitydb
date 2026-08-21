@@ -49,8 +49,8 @@ use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{FsyncClass, MutationEffect, SegmentRotor};
 use inf_runtime::GroupClass;
 use inf_runtime::{
-    CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoOp, LoopCx,
-    RawFd, TokenClass, WaitList,
+    Admission, CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait,
+    IoClass, IoOp, LoopCx, RawFd, TokenClass, WaitList,
 };
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
@@ -1590,6 +1590,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             cfg.staging,
             cfg.flush_bound,
             cfg.fua_p50_us_probed,
+            cfg.device,
             rotor,
             ckpt,
             manifest,
@@ -1605,6 +1606,27 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// reactor iteration (the S10 admission rule). Zero-cost when no
     /// tiered namespace was ever created: one `None` check.
     fn tier_maintain(&mut self, cx: &mut LoopCx<'_>) {
+        /// The plane's flush admission: a short borrow of the durable
+        /// cell per offer (the tier borrow is held by the caller; the
+        /// durable cell is not — no nested `RefCell` conflict).
+        struct DurableFlushAdmission<'a, F: SegmentFs> {
+            durable: &'a RefCell<Option<DurableCell<F>>>,
+        }
+        impl<F: SegmentFs> crate::tier_cell::FlushAdmission for DurableFlushAdmission<'_, F> {
+            fn admit(&mut self, bytes: u64, ops: u64) -> bool {
+                match self.durable.borrow_mut().as_mut() {
+                    Some(cell) => {
+                        cell.admit_background(IoClass::TierFlush, bytes, ops) == Admission::Granted
+                    }
+                    None => true,
+                }
+            }
+            fn refund(&mut self, bytes: u64, ops: u64) {
+                if let Some(cell) = self.durable.borrow_mut().as_mut() {
+                    cell.refund_background(IoClass::TierFlush, bytes, ops);
+                }
+            }
+        }
         let mut compact_reads: Vec<crate::tier_cell::CompactRead> = Vec::new();
         let mut flush_ops: Vec<IoOp> = Vec::new();
         let cold = {
@@ -1626,6 +1648,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let mut units = 0u32;
             let mut fatal: Option<String> = None;
             let now_us = cx.now.as_micros();
+            // ADR-0088 D5: flush rounds offer their slice to the durable
+            // cell's device budget (the tier cell has no budget of its
+            // own — one owner per fact). No durable plane ⇒ admit all.
+            let mut admission = DurableFlushAdmission { durable: &self.shared.durable };
             for at in 0..tier.namespaces.len() {
                 match tier.maintain_ns(
                     &mut ks,
@@ -1634,6 +1660,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                     transition_idle,
                     now_us,
                     &mut flush_ops,
+                    &mut admission,
                 ) {
                     Ok((used, work)) => {
                         units += used;
@@ -1672,6 +1699,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 tier.flush_rounds_inflight(),
                 files_sealed,
                 tier.namespaces.iter().filter(|t| t.flush.active().is_some()).count() as u64,
+                stats.rounds_deferred,
             ]);
             tier.cold.clone()
         };
@@ -1698,7 +1726,34 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             cx.push(IoOp::Fdatasync { fd, token: crate::durable::fsync_token(ticket) });
         }
         if let Some(cold) = cold {
-            cold.drain(|op| cx.push(op));
+            // ADR-0088 D2/D5: maintain-class reads consult the durable
+            // cell's budget; foreground reads are charged, never refused.
+            let durable = &self.shared.durable;
+            cold.drain_budgeted(
+                |class, bytes| match durable.borrow_mut().as_mut() {
+                    Some(cell) => match class {
+                        inf_runtime::ReadClass::Foreground => {
+                            cell.charge_foreground(IoClass::ColdReadForeground, bytes, 1);
+                            true
+                        }
+                        inf_runtime::ReadClass::Maintain => {
+                            cell.admit_background(IoClass::ColdReadMaintain, bytes, 1)
+                                == Admission::Granted
+                        }
+                    },
+                    None => true,
+                },
+                |class, unused| {
+                    if let Some(cell) = durable.borrow_mut().as_mut() {
+                        let io_class = match class {
+                            inf_runtime::ReadClass::Foreground => IoClass::ColdReadForeground,
+                            inf_runtime::ReadClass::Maintain => IoClass::ColdReadMaintain,
+                        };
+                        cell.refund_background_or_foreground(io_class, unused, 0);
+                    }
+                },
+                |op| cx.push(op),
+            );
             // The ADR-0064 D3 split scrape + ADR-0055 cold counters,
             // flushed into per-cell gauges (`INFO tiering` renders them;
             // the worst cell binds harness-side).
@@ -1752,6 +1807,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// Durable counters for tests/stats (`None` = memory-only cell).
     pub fn durable_stats(&self) -> Option<crate::durable::DurableStats> {
         self.shared.durable.borrow().as_ref().map(DurableCell::stats)
+    }
+
+    /// Checkpoint `(completed, aborted)` for the simulator's oracles
+    /// (M4.5-S36) — used only between scheduler steps.
+    pub fn ckpt_stats_for_sim(&self) -> (u64, u64) {
+        self.shared.durable.borrow().as_ref().map_or((0, 0), |cell| {
+            let s = cell.ckpt_stats();
+            (s.completed, s.aborted)
+        })
     }
 
     /// Wires this plane's slot of the doorbell-wakeup park board (the same
@@ -2753,6 +2817,29 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.frame_waits_rotation.set(stats.frame_waits_rotation);
             node.fsyncs_completion.set(stats.fsyncs_completion);
             node.log_segments_live.set(stats.log_segments_live);
+            // M4.5-S36 (ADR-0088 D7): the device budget's ledger, the
+            // checkpoint domain's bytes, the derived trigger, the figure.
+            let mut io_budget = [0u64; 3 * IoClass::COUNT];
+            for class in IoClass::ALL {
+                let c = stats.io_budget[class.index()];
+                io_budget[3 * class.index()] = c.spent_bytes;
+                io_budget[3 * class.index() + 1] = c.spent_ops;
+                io_budget[3 * class.index() + 2] = c.deferrals;
+            }
+            node.io_budget.set(io_budget);
+            node.io_budget_model_absent.set(stats.io_budget_model_absent);
+            node.io_budget_write_bytes_per_s.set(stats.io_budget_write_bytes_per_s);
+            node.io_budget_read_bytes_per_s.set(stats.io_budget_read_bytes_per_s);
+            node.frame_waits_pace.set(stats.frame_waits_pace);
+            node.log_frame_bytes.set(stats.log_frame_bytes);
+            node.ckpt_bytes_total.set(stats.ckpt_bytes_total);
+            node.ckpt_bytes_last.set(stats.ckpt_bytes_last);
+            node.ckpt_padding_bytes.set(stats.ckpt_padding_bytes);
+            node.manifest_bytes_total.set(stats.manifest_bytes_total);
+            node.ckpt_interval_bytes.set(stats.ckpt_interval_bytes);
+            node.ckpt_records_since_begin.set(stats.ckpt_records_since_begin);
+            node.write_amp_milli_log_checkpoint.set(stats.write_amp_milli_log_checkpoint);
+            node.write_amp_log_checkpoint_undefined.set(stats.write_amp_log_checkpoint_undefined);
             let ckpt = cell.ckpt_stats();
             let unix_now_ms = self.shared.wall_anchor().unix_from_internal(cx.now);
             node.ckpt_age_s.set(if ckpt.last_unix_ms == 0 {

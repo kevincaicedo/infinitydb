@@ -52,6 +52,18 @@ struct Args {
     /// probe file for its `fua_max_frame_bytes`/tripwire reference or
     /// runs on the defaults (logged).
     barrier_class: Option<inf_server::SegmentIoMode>,
+    /// M4.5-S36 (ADR-0088 D6): override the probed device write model
+    /// (MiB/s of the whole device; 0 = unbudgeted) — the A/B arm switch
+    /// like `--barrier-class`. `None` = the probe file's model, or
+    /// absent.
+    device_write_mbps: Option<u64>,
+    /// M4.5-S36 (ADR-0088 D2b): the frame-seal pacer — `None` = off (the
+    /// shipped default: the S35 reference-box campaign did not reproduce
+    /// the @256 shape it was designed for, so it is an A/B arm, not a
+    /// behaviour); `Some(None)` = the probe file's `write_ops_per_s_4k_
+    /// qd4` (`--seal-pace probe`); `Some(Some(n))` = `n` barriers/s per
+    /// device (`--seal-pace N`).
+    seal_pace: Option<Option<u64>>,
     /// Per-buffer log-staging capacity in MiB (M4.5-S27, ADR-0083 D3).
     /// The buffer absorbs `arrival_rate × frame-write stall`; the 4 MiB
     /// default is ~8.5 ms at 470 MB/s. With ADR-0083 D1 pacing the bound
@@ -101,6 +113,8 @@ impl Default for Args {
             segment_bytes: inf_server::DEFAULT_SEGMENT_BYTES,
             frames_in_flight: 1,
             barrier_class: None,
+            device_write_mbps: None,
+            seal_pace: None,
             log_staging_mib: 4,
             early_fabric_flush: false,
             remote_first_execute: false,
@@ -182,6 +196,20 @@ fn parse_args() -> Result<Args, String> {
                     other => return Err(format!("--barrier-class is flush|fua, got {other}")),
                 });
             }
+            "--device-write-mbps" => {
+                args.device_write_mbps = Some(
+                    take("--device-write-mbps")?
+                        .parse()
+                        .map_err(|e| format!("--device-write-mbps: {e}"))?,
+                );
+            }
+            "--seal-pace" => {
+                args.seal_pace = Some(match take("--seal-pace")?.as_str() {
+                    "probe" => None,
+                    "off" => return Err("--seal-pace off: omit the flag instead".into()),
+                    n => Some(n.parse().map_err(|e| format!("--seal-pace: {e}"))?),
+                });
+            }
             "--log-staging-mib" => {
                 args.log_staging_mib = take("--log-staging-mib")?
                     .parse()
@@ -202,7 +230,9 @@ fn parse_args() -> Result<Args, String> {
                     "infinityd [--port 6379] [--cells 4] [--buffers 4096] [--buf-size 4096] \
                      [--pin-start CORE] [--route-local-only] [--data-dir PATH] \
                      [--ckpt-interval-bytes N] [--segment-bytes N] [--frames-in-flight 1] \
-                     [--barrier-class flush|fua] [--log-staging-mib 4] [--early-fabric-flush] \
+                     [--barrier-class flush|fua] [--device-write-mbps N] [--seal-pace probe|N] \
+                     [--log-staging-mib 4] \
+                     [--early-fabric-flush] \
                      [--remote-first-execute] \
                      [--fabric-apply-prefetch|--no-fabric-apply-prefetch] \
                      [--parse-batch-prefetch|--no-parse-batch-prefetch] \
@@ -318,6 +348,53 @@ fn main() {
             args.frames_in_flight,
             args.log_staging_mib
         );
+        // Device model (M4.5-S36, ADR-0088 D6): the probe file's schema-2
+        // rows, the flag overriding the write rate, absence named loudly
+        // — an unbudgeted cell is today's behaviour, never a silent one.
+        if let Some(mbps) = args.device_write_mbps {
+            io.device.write_bytes_per_s = mbps << 20;
+        }
+        if io.device.is_absent() {
+            eprintln!(
+                "infinityd: device model absent (io-properties schema {}): background I/O is \
+                 unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the \
+                 device budget (ADR-0088)",
+                io.probe_schema
+            );
+        } else {
+            let share = io.device.share(args.cells);
+            eprintln!(
+                "infinityd: device model probed (schema {}): write {} MiB/s, {} ops/s (qd4 \
+                 barriers {}/s); per-cell share write {} MiB/s",
+                io.probe_schema,
+                io.device.write_bytes_per_s >> 20,
+                io.device.write_ops_per_s,
+                io.write_ops_per_s_4k_qd4,
+                share.write_bytes_per_s >> 20,
+            );
+        }
+        // The seal pacer (ADR-0088 D2b) is an explicit arm: off unless asked.
+        let seal_barriers_per_s = match args.seal_pace {
+            None => 0,
+            Some(None) => {
+                if io.write_ops_per_s_4k_qd4 == 0 {
+                    eprintln!(
+                        "infinityd: --seal-pace probe needs a schema-2 io-properties.toml with \
+                         write_ops_per_s_4k_qd4 (run `inf probe-device`)"
+                    );
+                    std::process::exit(1);
+                }
+                io.write_ops_per_s_4k_qd4
+            }
+            Some(Some(n)) => n,
+        };
+        if seal_barriers_per_s > 0 {
+            eprintln!(
+                "infinityd: seal pace {} barriers/s per device → {} per cell (ADR-0088 D2b arm)",
+                seal_barriers_per_s,
+                seal_barriers_per_s / u64::from(args.cells.max(1))
+            );
+        }
         if args.segment_bytes % inf_server::FRAME_ALIGN != 0
             && io.io_mode == inf_server::SegmentIoMode::Direct
         {
@@ -328,7 +405,7 @@ fn main() {
             );
             std::process::exit(1);
         }
-        (dir, catalog, control, io)
+        (dir, catalog, control, io, seal_barriers_per_s)
     });
 
     let mut handles = Vec::new();
@@ -391,6 +468,8 @@ type Boot = Option<(
     Option<inf_store::NsCatalog>,
     std::sync::Arc<inf_server::ControlHandle>,
     inf_server::IoProperties,
+    // The seal pacer's device rate (ADR-0088 D2b arm; 0 = off).
+    u64,
 )>;
 
 fn cell_main(
@@ -406,7 +485,7 @@ fn cell_main(
     // setup step below publishes its phase so a kernel-side stall names
     // itself on the RecoveryBoard instead of wedging silently.
     let mark = |code: u8| {
-        if let Some((_, _, control, _)) = &boot {
+        if let Some((_, _, control, _, _)) = &boot {
             control.recovery_board().slot(cell).publish_phase(code);
         }
     };
@@ -456,7 +535,7 @@ fn cell_main(
     mark(14); // setup:keyspace
     let mut ks = Keyspace::new(StoreConfig::default());
     let mut durable = None;
-    if let Some((dir, catalog, control, io)) = &boot {
+    if let Some((dir, catalog, control, io, seal_barriers_per_s)) = &boot {
         if let Some(catalog) = catalog {
             ks.seed_catalog(catalog).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
         }
@@ -479,6 +558,12 @@ fn cell_main(
             recover: inf_server::RecoverConfig::default(),
             flush_bound: 1,
             fua_p50_us_probed: io.fua_p50_us_4k,
+            // ADR-0088 D2/D2b: static per-cell shares, computed once here
+            // (L1). Absent ⇒ `Default` ⇒ unbudgeted and unpaced.
+            device: inf_server::DeviceConfig {
+                model_share: io.device.share(args.cells),
+                seal_barriers_per_s: seal_barriers_per_s / u64::from(args.cells.max(1)),
+            },
         };
         durable = Some((cfg, std::sync::Arc::clone(control)));
     }

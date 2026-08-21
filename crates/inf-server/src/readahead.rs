@@ -224,6 +224,11 @@ impl<F: SegmentFs> SegmentFs for ReadAheadFs<F> {
         self.inner.create_meta(path).map(ReadAheadFile::plain)
     }
 
+    fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File> {
+        // Explicit forward (ADR-0088 D3): the mode must not be dropped.
+        self.inner.create_meta_direct(path).map(ReadAheadFile::plain)
+    }
+
     fn open_dir(&self, dir: &Path) -> io::Result<Self::File> {
         self.inner.open_dir(dir).map(ReadAheadFile::plain)
     }

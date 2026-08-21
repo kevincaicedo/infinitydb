@@ -160,10 +160,13 @@ impl TieredScenario {
             segment_bytes: self.segment_bytes,
             ckpt_interval_bytes: self.ckpt_interval_bytes,
             ckpt_stream_bytes_per_sec: None,
+            ckpt_section_bytes: None,
             stall: self.stall.clone(),
             replay_canary: false,
             io_mode: inf_server::SegmentIoMode::Buffered,
             frames_in_flight: 1,
+            device: Default::default(),
+            budget_oracle: false,
         }
     }
 }
