@@ -658,6 +658,12 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "tmpfs-control-root",
         "device-write-mbps",
         "seal-pace",
+        // M4.5-S39a: the frame-fill arms, forwarded to every durable spawn
+        // through `pipeline_args` (window in µs, target in KiB, and the
+        // arm-B switch that extends the hold to barrier-carrying frames).
+        "fill-window-us",
+        "fill-target-kib",
+        "fill-window-always",
         "recovery-gbps-per-cell",
         "recovery-boot-s",
         // ADR-0070 D7 (2026-08-16): Phase::Start overhead, split out of the

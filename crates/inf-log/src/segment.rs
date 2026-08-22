@@ -576,6 +576,25 @@ impl<F: SegmentFs> SegmentRotor<F> {
         self.active.io_mode
     }
 
+    /// The layout the next frame seals under if no rotation intervenes
+    /// (the active segment's) — M4.5-S39a asks it before the reservation.
+    #[must_use]
+    pub fn active_layout(&self) -> FrameLayout {
+        self.active.layout()
+    }
+
+    /// The layout a frame takes on the segment a due rotation lands it
+    /// in: the preallocated next segment's, else the configured class's
+    /// (a fresh segment is created in the configured mode).
+    #[must_use]
+    pub fn next_layout(&self) -> FrameLayout {
+        let mode = self.next.as_ref().map_or(self.cfg.io_mode, |next| next.io_mode);
+        match mode {
+            SegmentIoMode::Buffered => FrameLayout::Packed,
+            SegmentIoMode::Direct => FrameLayout::Aligned,
+        }
+    }
+
     /// True while the active segment writes write-through frames for
     /// due syncs (`Direct` and pre-zeroed — ADR-0086 D4): the
     /// `barrier_class` observable.

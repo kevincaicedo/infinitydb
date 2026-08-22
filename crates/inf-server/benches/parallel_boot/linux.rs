@@ -102,6 +102,7 @@ fn durable_config(root: &Path) -> DurableConfig {
         flush_bound: 1,
         fua_p50_us_probed: 0,
         device: Default::default(),
+        fill: Default::default(),
     }
 }
 

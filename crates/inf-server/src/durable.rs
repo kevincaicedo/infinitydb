@@ -40,6 +40,11 @@ use crate::log_bytes;
 
 /// Timer-wheel key for the everysec tick (plane-armed, injected clock).
 pub(crate) const EVERYSEC_TIMER_KEY: u64 = 0xE5EC_0001;
+/// Timer-wheel key for the frame-fill window (M4.5-S39a): armed once per
+/// hold episode at the window's deadline so a parked loop wakes to seal
+/// the held frame; the handler is a no-op — the LOG step of that
+/// iteration does the sealing.
+pub(crate) const FILL_TIMER_KEY: u64 = 0xF111_0001;
 
 /// POSIX `EIO` (this crate carries no libc dep): the errno the
 /// `durable_fsync_eio` fault point injects (M2-S17).
@@ -90,6 +95,84 @@ pub struct DurableConfig {
     /// probed device model and the frame-seal pace. `Default` = absent
     /// model = unbudgeted, unpaced — the pre-S36 behaviour byte-for-byte.
     pub device: DeviceConfig,
+    /// M4.5-S39a: the frame-fill policy on aligned segments. `Default` =
+    /// off — one seal per LOG step, the pre-S39a cadence byte-for-byte.
+    pub fill: FillConfig,
+}
+
+/// The frame-fill policy (M4.5-S39a). On an aligned (`Direct`, v3)
+/// segment every frame pads to the next 4 KiB, and a LOG step that seals
+/// whatever arrived emits ~2.4 KiB payloads into 4 KiB blocks at small
+/// groups — 32–42 % of log bytes as padding (ADR-0088 amendment,
+/// 2026-08-21). A **barrier-less** pending frame (plan `Plain`: no sync
+/// due, no ack waiting on it) is held until it reaches `target_bytes`
+/// on-device or `window` elapses since the LOG step first saw it; the
+/// window is timer-armed so an idle park never outlives it. A frame
+/// whose plan carries a barrier is never held — an `always` ack waits on
+/// it and the E4.7 rejection of a batch window on the barrier path
+/// stands — unless `hold_due` (the measured arm B, never a default)
+/// extends the hold to due frames while earlier frames are in flight.
+/// Packed (v2) segments have no padding and keep the per-step cadence.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FillConfig {
+    /// Hold bound since the first LOG step that saw the pending frame.
+    /// `Nanos(0)` = policy off.
+    pub window: Nanos,
+    /// The on-device frame length (padded) at which a held frame seals.
+    pub target_bytes: u32,
+    /// Arm B: hold barrier-carrying frames too while frames are in
+    /// flight (a drained pipeline always seals). Measured on the S35
+    /// row; predicted to fail its p50 ÷ barrier gate.
+    pub hold_due: bool,
+}
+
+impl FillConfig {
+    /// The policy is engaged.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.window.0 > 0
+    }
+
+    /// The pure decision (unit-pinned; the LOG step adds the timer):
+    /// hold the pending frame when the policy is on, the frame lands on
+    /// an aligned segment, its plan carries no barrier (or arm B applies
+    /// and frames are in flight), it is below `target_bytes` on-device,
+    /// and — once the episode's clock `since` is running — the window
+    /// has not elapsed. `since == None` is the episode's first sight:
+    /// the hold starts now.
+    #[must_use]
+    pub fn decide(
+        &self,
+        plan: FramePlan,
+        drained: bool,
+        layout: inf_log::FrameLayout,
+        frame_len: u32,
+        since: Option<Nanos>,
+        now: Nanos,
+    ) -> FillDecision {
+        if !self.enabled() || layout != inf_log::FrameLayout::Aligned {
+            return FillDecision::Seal;
+        }
+        let holdable = match plan {
+            FramePlan::Plain => true,
+            FramePlan::WriteThrough | FramePlan::LinkedFsync => self.hold_due && !drained,
+            FramePlan::Wait => false,
+        };
+        if !holdable || layout.padded_len(frame_len) >= self.target_bytes {
+            return FillDecision::Seal;
+        }
+        match since {
+            Some(since) if now >= since + self.window => FillDecision::Seal,
+            _ => FillDecision::Hold,
+        }
+    }
+}
+
+/// What the fill policy says about the pending frame this LOG step.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FillDecision {
+    Seal,
+    Hold,
 }
 
 /// The per-cell device budget inputs (ADR-0088 D6), computed once at
@@ -226,6 +309,11 @@ pub struct DurableStats {
     /// episode like the other two; a non-zero value names a wedging
     /// device, never an engine regression.
     pub frame_waits_reorder: u64,
+    /// M4.5-S39a: frames held by the fill policy (per episode), and the
+    /// policy in force (`fill_window_us` 0 = off).
+    pub frame_waits_fill: u64,
+    pub fill_window_us: u64,
+    pub fill_target_bytes: u64,
     /// Instantaneous log quiescence gauges: frames sealed and awaiting
     /// `LogWritten`, and records staged but not yet sealed. Both zero ⇒
     /// every executed durable effect has reached the file — the DST's
@@ -331,6 +419,12 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     frame_waits_rotation: u64,
     frame_waits_reorder: u64,
     frame_held: bool,
+    /// M4.5-S39a: the fill policy and the hold it is in — `fill_since`
+    /// is the instant the LOG step first saw the pending frame (set at
+    /// the first hold decision, cleared at the seal).
+    fill: FillConfig,
+    fill_since: Option<Nanos>,
+    frame_waits_fill: u64,
     /// M4.5-S36 (ADR-0088 D2): the cell's device budget — refilled at
     /// every MAINTAIN entry from the injected clock, consulted by the
     /// background issuing sites, charged by the foreground ones.
@@ -366,14 +460,13 @@ pub(crate) struct DurableCell<F: SegmentFs> {
 
 impl<F: SegmentFs> DurableCell<F> {
     pub fn new(
-        staging: StagingConfig,
-        flush_bound: u8,
-        fua_p50_us_probed: u64,
-        device: DeviceConfig,
+        cfg: &DurableConfig,
         rotor: SegmentRotor<F>,
         ckpt: CkptCell<F>,
         manifest: ManifestCell<F>,
     ) -> DurableCell<F> {
+        let (staging, flush_bound, fua_p50_us_probed, device, fill) =
+            (cfg.staging, cfg.flush_bound, cfg.fua_p50_us_probed, cfg.device, cfg.fill);
         // ADR-0031 D5/D6: frames sealed here stamp the recovery-derived
         // log life (1 on fresh logs).
         let mut staging = StagingRing::new(staging);
@@ -421,6 +514,9 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_waits_rotation: 0,
             frame_waits_reorder: 0,
             frame_held: false,
+            fill,
+            fill_since: None,
+            frame_waits_fill: 0,
             budget,
             seal_pace,
             write_through_wanted: true,
@@ -670,6 +766,13 @@ impl<F: SegmentFs> DurableCell<F> {
                 self.frame_held = true;
                 return;
             }
+            // M4.5-S39a: the fill policy — the last hold, after every
+            // correctness hold above, on aligned segments only.
+            if self.fill_holds(cx, plan, frame_len, rotation_due) {
+                self.frame_waits_fill += u64::from(!self.frame_held);
+                self.frame_held = true;
+                return;
+            }
             self.frame_held = false;
             let deferred = match self.rotor.begin_frame_deferred(frame_len, cx.now.as_millis()) {
                 Ok(deferred) => deferred,
@@ -709,11 +812,46 @@ impl<F: SegmentFs> DurableCell<F> {
         }
     }
 
+    /// M4.5-S39a: should the pending frame be held for fill? The pure
+    /// decision is [`FillConfig::decide`]; this adds the episode clock
+    /// (`fill_since`, the instant the LOG step first saw the frame) and,
+    /// at the first hold of an episode, arms the fill timer at the
+    /// deadline so a parked loop wakes to seal. Asked last, after every
+    /// correctness hold — a frame the plan would `Wait` never gets here.
+    fn fill_holds(
+        &mut self,
+        cx: &mut LoopCx<'_>,
+        plan: FramePlan,
+        frame_len: u32,
+        rotation_due: bool,
+    ) -> bool {
+        if !self.fill.enabled() {
+            return false;
+        }
+        let layout =
+            if rotation_due { self.rotor.next_layout() } else { self.rotor.active_layout() };
+        let drained = self.staging.drained();
+        match self.fill.decide(plan, drained, layout, frame_len, self.fill_since, cx.now) {
+            FillDecision::Seal => false,
+            FillDecision::Hold => {
+                if self.fill_since.is_none() {
+                    self.fill_since = Some(cx.now);
+                    cx.timers.insert(cx.now + self.fill.window, FILL_TIMER_KEY);
+                }
+                true
+            }
+        }
+    }
+
     /// Seal the pending records into `slot`, register the planned barrier,
     /// and hand the frame to the driver. The frame's on-device extent
     /// (padding included on aligned segments) is what the cursor, the
     /// ledger, and the barrier all advance by (ADR-0086 D3).
     fn queue_frame(&mut self, cx: &mut LoopCx<'_>, slot: inf_log::FrameSlot, plan: FramePlan) {
+        // The fill episode (M4.5-S39a) ends at the seal, not at the
+        // decision: a reservation that waits (zero-fill in flight, space)
+        // keeps the same episode clock.
+        self.fill_since = None;
         let end = slot.base().advance(slot.len());
         let covered = self.commit.watermark().map_or(0, |lsn| lsn.to_u64());
         let lease = self.staging.seal(slot.first_record_lsn(), covered, slot.layout());
@@ -1498,6 +1636,9 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_waits_barrier: self.frame_waits_barrier,
             frame_waits_rotation: self.frame_waits_rotation,
             frame_waits_reorder: self.frame_waits_reorder,
+            frame_waits_fill: self.frame_waits_fill,
+            fill_window_us: self.fill.window.as_micros(),
+            fill_target_bytes: u64::from(self.fill.target_bytes),
             frames_in_flight_now: u64::from(self.staging.in_flight()),
             records_staged: u64::from(self.staging.pending_records()),
             io_budget_model_absent: u64::from(self.budget.model_absent()),
@@ -1799,4 +1940,82 @@ fn write_token(seq: u64) -> CompletionToken {
 /// Inverse of [`write_token`]: the frame's write sequence (== `FrameId`).
 fn write_seq_of(token: CompletionToken) -> u64 {
     u64::from(token.slot()) | (u64::from(token.generation()) << 24)
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+    use inf_log::FrameLayout;
+
+    fn policy(hold_due: bool) -> FillConfig {
+        FillConfig { window: Nanos::from_micros(1_000), target_bytes: 16 << 10, hold_due }
+    }
+
+    /// Arm A (M4.5-S39a): a barrier-less frame below the target holds
+    /// inside the window and seals at the target, at the window, off the
+    /// policy, and on a packed segment.
+    #[test]
+    fn barrier_less_frame_holds_until_target_or_window() {
+        let fill = policy(false);
+        let t0 = Nanos::from_micros(10);
+        let d = |frame_len: u32, since: Option<Nanos>, now: Nanos| {
+            fill.decide(FramePlan::Plain, false, FrameLayout::Aligned, frame_len, since, now)
+        };
+        assert_eq!(d(2_400, None, t0), FillDecision::Hold, "first sight: the hold starts");
+        assert_eq!(d(2_400, Some(t0), t0 + Nanos::from_micros(999)), FillDecision::Hold);
+        assert_eq!(d(2_400, Some(t0), t0 + Nanos::from_micros(1_000)), FillDecision::Seal);
+        assert_eq!(d(16 << 10, None, t0), FillDecision::Seal, "at the target");
+        assert_eq!(d((16 << 10) - 100, None, t0), FillDecision::Seal, "padded to the target");
+        assert_eq!(d((8 << 10) + 1, None, t0), FillDecision::Hold, "padded to 12 KiB: below");
+        assert_eq!(d((12 << 10) + 1, None, t0), FillDecision::Seal, "padded to 16 KiB: at");
+        assert_eq!(
+            FillConfig::default().decide(
+                FramePlan::Plain,
+                false,
+                FrameLayout::Aligned,
+                100,
+                None,
+                t0
+            ),
+            FillDecision::Seal,
+            "policy off"
+        );
+        assert_eq!(
+            fill.decide(FramePlan::Plain, false, FrameLayout::Packed, 100, None, t0),
+            FillDecision::Seal,
+            "no padding on a packed segment — nothing to fill against"
+        );
+    }
+
+    /// A frame whose plan carries a barrier is never held under arm A;
+    /// arm B holds it only while frames are in flight, and a drained
+    /// pipeline always seals.
+    #[test]
+    fn barrier_carrying_frames_are_never_held_unless_arm_b_behind_in_flight_frames() {
+        let t0 = Nanos::from_micros(10);
+        for plan in [FramePlan::WriteThrough, FramePlan::LinkedFsync] {
+            for drained in [true, false] {
+                assert_eq!(
+                    policy(false).decide(plan, drained, FrameLayout::Aligned, 100, None, t0),
+                    FillDecision::Seal,
+                    "arm A never holds a due frame ({plan:?}, drained {drained})"
+                );
+            }
+            assert_eq!(
+                policy(true).decide(plan, true, FrameLayout::Aligned, 100, None, t0),
+                FillDecision::Seal,
+                "arm B: a drained pipeline seals"
+            );
+            assert_eq!(
+                policy(true).decide(plan, false, FrameLayout::Aligned, 100, None, t0),
+                FillDecision::Hold,
+                "arm B: held behind in-flight frames"
+            );
+        }
+        assert_eq!(
+            policy(true).decide(FramePlan::Wait, false, FrameLayout::Aligned, 100, None, t0),
+            FillDecision::Seal,
+            "a waiting frame is the plan's hold, never the policy's"
+        );
+    }
 }

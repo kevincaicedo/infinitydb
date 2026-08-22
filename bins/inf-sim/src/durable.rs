@@ -144,6 +144,12 @@ pub struct DurableScenario {
     /// publishes a checkpoint before the cut. `None` = direct writes
     /// always succeed, every existing trace byte-identical.
     pub ckpt_direct_refused_after: Option<u64>,
+    /// M4.5-S39a: the frame-fill policy (`Default` = off, every existing
+    /// trace byte-identical). `m2_durable` arms it on a quarter of its
+    /// seeds; `m2_reorder_window` arms it everywhere and asserts it
+    /// engaged on the aligned class (every frame there is barrier-less
+    /// and far below the target).
+    pub fill: inf_server::FillConfig,
     /// A first life in another barrier class (ADR-0086 D4 as amended,
     /// 2026-08-21): the cell boots in `prelude.io_mode`, the writers run
     /// `prelude.ops_per_writer` ops, the log quiesces to full durability,
@@ -246,6 +252,12 @@ impl DurableScenario {
             budget_oracle: false,
             reorder_oracle: false,
             ckpt_direct_refused_after: None,
+            // M4.5-S39a: seeds ≡ 3 (mod 4) — odd, so the `Direct` class
+            // whose aligned frames the policy holds (on packed segments
+            // it never engages) — run the fill policy at its design
+            // point (1 ms window, 16 KiB target); the m2 durability and
+            // log-quiescence oracles hold unchanged.
+            fill: if seed % 4 == 3 { m2_fill_config() } else { Default::default() },
             prelude: None,
         }
     }
@@ -304,6 +316,7 @@ impl DurableScenario {
         // window's, on both classes.
         scenario.segment_bytes = 256 << 10;
         scenario.reorder_oracle = true;
+        scenario.fill = m2_fill_config();
         scenario
     }
 
@@ -356,6 +369,12 @@ impl DurableScenario {
         if seed.is_multiple_of(4) {
             scenario.ckpt_interval_bytes = 0;
         }
+        // M4.5-S39a: the fill policy rides the seeds whose *main* life is
+        // the aligned class (even seeds go FLUSH → FUA) — a quarter of the
+        // sweep, the FUA tail reopened packed then upgraded under a held
+        // frame. (`m2_durable`'s odd-seed arming would land in the
+        // prelude, whose counters the cut never scrapes.)
+        scenario.fill = if seed.is_multiple_of(4) { m2_fill_config() } else { Default::default() };
         scenario
     }
 
@@ -419,6 +438,7 @@ impl DurableScenario {
             budget_oracle: true,
             reorder_oracle: false,
             ckpt_direct_refused_after: None,
+            fill: Default::default(),
             prelude: None,
         }
     }
@@ -460,8 +480,19 @@ impl DurableScenario {
             budget_oracle: false,
             reorder_oracle: false,
             ckpt_direct_refused_after: None,
+            fill: Default::default(),
             prelude: None,
         }
+    }
+}
+
+/// The S39a fill policy at its design point (1 ms window, 16 KiB
+/// target, arm A).
+pub(crate) fn m2_fill_config() -> inf_server::FillConfig {
+    inf_server::FillConfig {
+        window: Nanos::from_micros(1_000),
+        target_bytes: 16 << 10,
+        hold_due: false,
     }
 }
 
@@ -518,6 +549,9 @@ pub struct DurableReport {
     /// as amended), scraped at the cut — the `m2-ckpt-refused` oracle's
     /// coverage disclosure.
     pub ckpt_downgrades: u64,
+    /// M4.5-S39a: fill-policy hold episodes, scraped at the cut — the
+    /// manifest's coverage disclosure and the reorder scenario's oracle.
+    pub frame_waits_fill: u64,
     /// Device-budget coverage (M4.5-S36, ADR-0088 D8), scraped at the
     /// cut: background bytes the budget granted, deferrals it issued
     /// (a sweep whose budget never deferred proves nothing), the seal
@@ -925,6 +959,7 @@ pub(crate) fn boot(
             flush_bound: 1,
             fua_p50_us_probed: 0,
             device: scenario.device,
+            fill: scenario.fill,
         };
         plane.set_control(std::sync::Arc::clone(&control));
         plane.begin_recovery(disk.clone(), &cfg, i as u16, clock.now());
@@ -1104,6 +1139,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         frame_waits_rotation: 0,
         frame_waits_reorder: 0,
         ckpt_downgrades: 0,
+        frame_waits_fill: 0,
         budget_background_bytes: 0,
         budget_deferrals: 0,
         frame_waits_pace: 0,
@@ -1411,6 +1447,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             report.frame_waits_barrier += stats.frame_waits_barrier;
             report.frame_waits_rotation += stats.frame_waits_rotation;
             report.frame_waits_reorder += stats.frame_waits_reorder;
+            report.frame_waits_fill += stats.frame_waits_fill;
             report.frame_waits_pace += stats.frame_waits_pace;
             report.write_stall_max_us = report.write_stall_max_us.max(stats.write_stall_max_us);
             for class in inf_runtime::IoClass::ALL {
@@ -1455,6 +1492,23 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                 );
             }
         }
+    }
+    // M4.5-S39a: on the aligned class every frame of the everysec-only
+    // reorder shape is barrier-less and far below the target — the
+    // policy must have held at least once, or the arm measured nothing.
+    if scenario.reorder_oracle
+        && scenario.fill.enabled()
+        && scenario.io_mode == SegmentIoMode::Direct
+        && report.frame_waits_fill == 0
+    {
+        fail(
+            &mut report,
+            format!(
+                "FILL POLICY NOT ENGAGED seed {:#x}: the aligned everysec-only shape never held \
+                 a frame",
+                scenario.seed
+            ),
+        );
     }
     if scenario.reorder_oracle && report.frame_waits_reorder == 0 {
         let depth = report.frames_in_flight_max;

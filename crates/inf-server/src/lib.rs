@@ -41,7 +41,7 @@ pub use control::{
     CellRecoverySlot, ControlHandle, ControlInbox, INDEX_SLOTS, IndexBoard, RecoveryBoard,
     load_catalog, load_catalog_from, spawn as spawn_control,
 };
-pub use durable::{DeviceConfig, DurableConfig, DurableStats, RecoverConfig};
+pub use durable::{DeviceConfig, DurableConfig, DurableStats, FillConfig, RecoverConfig};
 // Durable-config vocabulary re-exported for the assembly tier: bins name
 // `inf-server` only (dep-DAG), and `DurableConfig`'s fields are these
 // types — an assembly cannot fill one without naming them.
