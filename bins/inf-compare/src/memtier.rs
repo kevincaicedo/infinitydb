@@ -19,6 +19,16 @@ pub struct Metrics {
     pub p50_ms: f64,
     pub p99_ms: f64,
     pub p999_ms: f64,
+    /// Worst request latency memtier reported (`Max Latency`), when the
+    /// build exposes it — the S27 D5 figure an offered-rate row is
+    /// measured by (M4.5-S40); `None` on builds without it.
+    pub max_ms: Option<f64>,
+    /// The offered rate this row was paced at (total ops/s, all
+    /// connections), `None` for a closed-loop row. Latency under a
+    /// pacer is measured by memtier from the intended send instant of
+    /// each request only insofar as its pacer sleeps between requests —
+    /// the achieved/offered ratio beside it is the saturation check.
+    pub offered_ops_per_sec: Option<u64>,
 }
 
 /// Parameters shared by every memtier run in a campaign.
@@ -31,6 +41,19 @@ pub struct Plan<'a> {
     pub duration: u64,
     pub data_size: usize,
     pub keyspace: u64,
+    /// Offered rate in total ops/s across every connection (M4.5-S40):
+    /// memtier's `--rate-limiting` is *per connection*, so the row
+    /// divides by `threads × clients` (rounded up — the achieved figure
+    /// is disclosed, never assumed). `None` = closed loop.
+    pub rate: Option<u64>,
+}
+
+impl Plan<'_> {
+    /// memtier's per-connection rate for the plan's offered rate.
+    pub fn per_conn_rate(&self) -> Option<u64> {
+        let conns = u64::from(self.threads) * self.clients as u64;
+        self.rate.map(|rate| rate.div_ceil(conns.max(1)))
+    }
 }
 
 /// Run one timed workload at `pipeline` depth; parse `json_path`.
@@ -74,13 +97,16 @@ pub fn run(plan: &Plan, wl: &Workload, pipeline: u32, json_path: &Path) -> Resul
         p50_ms: json.num_at(&[pct[0], pct[1], pct[2], "p50.00"])?,
         p99_ms: json.num_at(&[pct[0], pct[1], pct[2], "p99.00"])?,
         p999_ms: json.num_at(&[pct[0], pct[1], pct[2], "p99.90"])?,
+        max_ms: json.num_at(&["ALL STATS", "Totals", "Max Latency"]).ok(),
+        offered_ops_per_sec: plan.rate,
     })
 }
 
 /// Sequential write pass to populate the keyspace (GET fill, memory fill). No
-/// JSON parsed — this is setup, not a measured row.
+/// JSON parsed — this is setup, not a measured row. Never paced: the
+/// fill is setup, the rate belongs to the measured row alone.
 pub fn fill(plan: &Plan, secs: u64) -> Result<(), String> {
-    let mut args = base_args(plan);
+    let mut args = base_args(&Plan { rate: None, ..*plan });
     if let Some(pos) = args.iter().position(|a| a == "--test-time") {
         args[pos + 1] = secs.to_string();
     }
@@ -90,7 +116,7 @@ pub fn fill(plan: &Plan, secs: u64) -> Result<(), String> {
 
 /// Flags every run shares: target, concurrency, time, value size, keyspace.
 fn base_args(plan: &Plan) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "-s".into(),
         plan.host.to_string(),
         "-p".into(),
@@ -109,7 +135,11 @@ fn base_args(plan: &Plan) -> Vec<String> {
         plan.keyspace.to_string(),
         "--random-data".into(),
         "--hide-histogram".into(),
-    ]
+    ];
+    if let Some(per_conn) = plan.per_conn_rate() {
+        args.extend(["--rate-limiting".into(), per_conn.to_string()]);
+    }
+    args
 }
 
 fn invoke(args: &[String]) -> Result<(), String> {

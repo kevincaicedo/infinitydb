@@ -89,6 +89,38 @@ impl Mode {
     }
 }
 
+/// Durability class every engine in a run is configured for (M4.5-S40):
+/// `None` is the in-memory row (redis `--appendonly no`, infinitydb's
+/// default dbs); `Everysec` is redis `--appendonly yes --appendfsync
+/// everysec` against an infinitydb `FSYNC everysec` namespace every
+/// connection starts in (`--conn-default-ns`) — the same loss window on
+/// both sides, each engine's own mechanism.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Durability {
+    None,
+    Everysec,
+}
+
+impl Durability {
+    pub fn parse(s: &str) -> Result<Durability, String> {
+        match s {
+            "none" => Ok(Durability::None),
+            "everysec" => Ok(Durability::Everysec),
+            other => Err(format!("--durability {other}: expected none|everysec")),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Durability::None => "none (in-memory)",
+            Durability::Everysec => "everysec",
+        }
+    }
+}
+
+/// The namespace infinitydb's connections start in under a durable run.
+pub const DURABLE_NS: &str = "cmp";
+
 /// How to launch one engine.
 #[derive(Clone, Debug)]
 pub struct Spec {
@@ -98,6 +130,13 @@ pub struct Spec {
     pub threads: u16,
     pub pin_start: Option<usize>,
     pub maxmemory_mb: Option<u64>,
+    pub durability: Durability,
+    /// Per-engine durable state directory (wiped at launch); `None`
+    /// under `Durability::None`.
+    pub data_dir: Option<PathBuf>,
+    /// `io-properties.toml` copied into infinitydb's data dir (the
+    /// probed barrier class and device model); absent = FLUSH class.
+    pub probe_file: Option<PathBuf>,
 }
 
 /// Docker image references (defaults overridable on the CLI).
@@ -137,12 +176,14 @@ impl Target {
 
 /// Spawn `spec` as a host child process, wait until it answers `PING`.
 pub fn launch_host(spec: &Spec, log_dir: &Path) -> Result<Target, String> {
+    prepare_data_dir(spec)?;
     let (program, argv) = host_argv(spec)?;
     let launch_cmd = render_cmd(&program, &argv);
     let child = spawn(&program, &argv, log_dir, spec.kind.label())?;
     let pid = child.id();
     wait_ready(&spec.host, spec.port, Duration::from_secs(20))
         .map_err(|e| format!("{} (host): {e}", spec.kind.label()))?;
+    durable_setup(spec)?;
     let version = host_version(&program, &argv);
     Ok(Target {
         kind: spec.kind,
@@ -157,8 +198,82 @@ pub fn launch_host(spec: &Spec, log_dir: &Path) -> Result<Target, String> {
     })
 }
 
+/// A fresh durable state directory for the engine (M4.5-S40): wiped and
+/// recreated so every run starts from an empty log/AOF; the probe file
+/// is copied in for infinitydb.
+fn prepare_data_dir(spec: &Spec) -> Result<(), String> {
+    let Some(dir) = &spec.data_dir else { return Ok(()) };
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if spec.kind == EngineKind::InfinityDb
+        && let Some(probe) = &spec.probe_file
+    {
+        std::fs::copy(probe, dir.join("io-properties.toml"))
+            .map_err(|e| format!("copy {}: {e}", probe.display()))?;
+    }
+    Ok(())
+}
+
+/// Post-launch durable setup (M4.5-S40): infinitydb's `everysec`
+/// namespace, created before any generator connection is opened so
+/// `--conn-default-ns` puts every one of them in it. Redis needs
+/// nothing: its AOF is a server-wide setting.
+fn durable_setup(spec: &Spec) -> Result<(), String> {
+    if spec.durability == Durability::Everysec && spec.kind == EngineKind::InfinityDb {
+        let reply = resp::command(
+            &spec.host,
+            spec.port,
+            &[
+                b"INF.NS",
+                b"CREATE",
+                DURABLE_NS.as_bytes(),
+                b"MODE",
+                b"durable",
+                b"FSYNC",
+                b"everysec",
+            ],
+        )?;
+        if !reply.starts_with(b"+OK") {
+            return Err(format!(
+                "infinitydb INF.NS CREATE {DURABLE_NS}: {}",
+                String::from_utf8_lossy(&reply).trim()
+            ));
+        }
+        // Prove a fresh connection lands in the namespace (the knob is
+        // what makes a memtier row durable at all): a probe SET on a
+        // fresh connection must be visible under `cmp` and absent from
+        // db0 — then it is removed.
+        resp::command(&spec.host, spec.port, &[b"SET", b"__inf_compare_probe", b"1"])?;
+        let in_db0 = resp::commands(
+            &spec.host,
+            spec.port,
+            &[&[b"INF.NS", b"USE", b"db0"], &[b"EXISTS", b"__inf_compare_probe"]],
+        )?;
+        let in_ns = resp::commands(
+            &spec.host,
+            spec.port,
+            &[&[b"INF.NS", b"USE", DURABLE_NS.as_bytes()], &[b"EXISTS", b"__inf_compare_probe"]],
+        )?;
+        if !in_db0.starts_with(b":0") || !in_ns.starts_with(b":1") {
+            return Err(format!(
+                "infinitydb --conn-default-ns {DURABLE_NS} did not take (probe in db0: {}, in \
+                 {DURABLE_NS}: {})",
+                String::from_utf8_lossy(&in_db0).trim(),
+                String::from_utf8_lossy(&in_ns).trim()
+            ));
+        }
+        resp::command(&spec.host, spec.port, &[b"DEL", b"__inf_compare_probe"])?;
+    }
+    Ok(())
+}
+
 /// `docker run -d` `spec` as a container; wait until it answers `PING`.
 pub fn launch_docker(spec: &Spec, images: &Images, log_dir: &Path) -> Result<Target, String> {
+    if spec.durability != Durability::None {
+        return Err("--durability is a host-launch row (the data dir is a host path); drop \
+                    --docker or attach"
+            .into());
+    }
     let name = format!("inf-compare-{}-{}", spec.kind.label(), spec.port);
     // Best-effort: clear a stale container of the same name from a prior run.
     let _ = Command::new("docker")
@@ -328,14 +443,19 @@ fn host_argv(spec: &Spec) -> Result<(String, Vec<String>), String> {
 
 fn redis_argv(spec: &Spec, in_docker: bool) -> (String, Vec<String>) {
     let port = if in_docker { 6379 } else { spec.port };
-    let mut argv = vec![
-        "--port".to_string(),
-        port.to_string(),
-        "--save".to_string(),
-        String::new(),
-        "--appendonly".to_string(),
-        "no".to_string(),
-    ];
+    let mut argv =
+        vec!["--port".to_string(), port.to_string(), "--save".to_string(), String::new()];
+    match (spec.durability, &spec.data_dir) {
+        (Durability::Everysec, Some(dir)) => argv.extend([
+            "--appendonly".to_string(),
+            "yes".to_string(),
+            "--appendfsync".to_string(),
+            "everysec".to_string(),
+            "--dir".to_string(),
+            dir.display().to_string(),
+        ]),
+        _ => argv.extend(["--appendonly".to_string(), "no".to_string()]),
+    }
     if let Some(mb) = spec.maxmemory_mb {
         argv.extend([
             "--maxmemory".to_string(),
@@ -399,7 +519,36 @@ fn infinity_host_argv(spec: &Spec) -> Result<(String, Vec<String>), String> {
     if let Some(core) = spec.pin_start {
         argv.extend(["--pin-start".to_string(), core.to_string()]);
     }
+    if let (Durability::Everysec, Some(dir)) = (spec.durability, &spec.data_dir) {
+        argv.extend([
+            "--data-dir".to_string(),
+            dir.display().to_string(),
+            "--conn-default-ns".to_string(),
+            DURABLE_NS.to_string(),
+        ]);
+    }
     Ok((bin.to_string_lossy().into_owned(), argv))
+}
+
+/// CPU time (user + system, clock ticks of 1/100 s) a host-launched
+/// engine has consumed — `/proc/<pid>/stat` fields 14 + 15; `None` for
+/// docker/attach targets. The S40 row discloses server CPU per leg.
+pub fn cpu_ticks(target: &Target) -> Option<u64> {
+    let pid = target.pid?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// Sectors written on `/sys/block/<dev>/stat` (field 7): the block
+/// device's view of a leg, journal and metadata included.
+pub fn device_sectors_written(dev: &str) -> Option<u64> {
+    std::fs::read_to_string(format!("/sys/block/{dev}/stat"))
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(6).and_then(|v| v.parse().ok()))
 }
 
 // ---- docker argv --------------------------------------------------------

@@ -1967,10 +1967,26 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 }
 
+impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
+    /// The namespace a fresh connection starts in (M4.5-S40,
+    /// `--conn-default-ns`): resolved by name against the catalog at
+    /// accept time, `None` when unset, unknown, or a topic (the same
+    /// refusal `INF.NS USE` gives topics). One `RefCell` borrow per
+    /// accept — nothing on the command path.
+    fn conn_default_ns(&self) -> Option<inf_store::NsId> {
+        let name = self.shared.node.conn_default_ns.borrow();
+        let name = name.as_deref()?;
+        let store = self.shared.store.borrow();
+        let spec = store.ns_get(name)?;
+        (spec.mode != inf_store::NsMode::Topic).then_some(spec.id)
+    }
+}
+
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for ServerPlane<O, F> {
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion) {
         match c.result {
             CompletionResult::Accepted { fd } => {
+                let ns = self.conn_default_ns();
                 let key = self.shared.conns.borrow_mut().insert(Conn {
                     fd,
                     parser: ConnParser::new(ParserLimits::default()),
@@ -1978,7 +1994,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                         proto: Protocol::Resp2,
                         id: 0,
                         db: 0,
-                        ns: None,
+                        ns,
                         sub_channels: Vec::new(),
                         sub_patterns: Vec::new(),
                         node: Rc::clone(&self.shared.node),
@@ -2860,6 +2876,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.recycle_misses.set(stats.recycle_misses);
             node.recycle_fallbacks.set(stats.recycle_fallbacks);
             node.recycle_pool_bytes.set(stats.recycle_pool_bytes);
+            node.recycle_pool_full.set(stats.recycle_pool_full);
             node.segment_rotations.set(stats.segment_rotations);
             node.segment_preallocs.set(stats.segment_preallocs);
             let ckpt = cell.ckpt_stats();

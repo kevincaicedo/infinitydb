@@ -41,6 +41,10 @@ struct Args {
     ckpt_interval_bytes: u64,
     /// Segment prealloc/seal size.
     segment_bytes: u32,
+    /// M4.5-S40: every accepted connection starts in this named
+    /// namespace (as if it had sent `INF.NS USE`) — the opt-in for
+    /// clients without a per-connection prelude. `None` = default dbs.
+    conn_default_ns: Option<String>,
     /// Segment recycling (M4.5-S39b, ADR-0090 D1): covered pre-zeroed
     /// `Direct` segments kept for reuse by rename instead of unlinked —
     /// the zero-fill paid once per generation. `0` = off
@@ -130,6 +134,7 @@ impl Default for Args {
             data_dir: None,
             ckpt_interval_bytes: inf_server::DEFAULT_CKPT_INTERVAL_BYTES,
             segment_bytes: inf_server::DEFAULT_SEGMENT_BYTES,
+            conn_default_ns: None,
             segment_recycle_slots: inf_server::DEFAULT_RECYCLE_SLOTS,
             frames_in_flight: inf_server::FramesInFlight::Auto,
             barrier_class: None,
@@ -203,6 +208,13 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--no-segment-recycle" => args.segment_recycle_slots = 0,
+            "--conn-default-ns" => {
+                let name = take("--conn-default-ns")?;
+                if name.is_empty() {
+                    return Err("--conn-default-ns needs a namespace name".into());
+                }
+                args.conn_default_ns = Some(name);
+            }
             "--frames-in-flight" => {
                 let raw = take("--frames-in-flight")?;
                 args.frames_in_flight = if raw == "auto" {
@@ -286,7 +298,7 @@ fn parse_args() -> Result<Args, String> {
                     "infinityd [--port 6379] [--cells 4] [--buffers 4096] [--buf-size 4096] \
                      [--pin-start CORE] [--route-local-only] [--data-dir PATH] \
                      [--ckpt-interval-bytes N] [--segment-bytes N] [--segment-recycle-slots 1] \
-                     [--no-segment-recycle] [--frames-in-flight auto|K] \
+                     [--no-segment-recycle] [--conn-default-ns NAME] [--frames-in-flight auto|K] \
                      [--barrier-class flush|fua] [--device-write-mbps N] [--seal-pace probe|N] \
                      [--fill-window-us 1000] [--fill-target-kib 16] \
                      [--log-staging-mib 4] \
@@ -600,6 +612,9 @@ fn cell_main(
     node.wall_anchor.set((0, unix_ms));
     node.rng_state.set(unix_ms ^ (u64::from(cell) << 48) ^ 0x9E37_79B9_7F4A_7C15);
     node.tcp_port.set(args.port);
+    if let Some(name) = &args.conn_default_ns {
+        *node.conn_default_ns.borrow_mut() = Some(name.clone().into_bytes());
+    }
     // Durable boot (M2-S08/S11/S15): the catalog seeds the keyspace, then
     // the cell serves from its first iteration — answering `-LOADING` —
     // while MAINTAIN replays MANIFEST → checkpoint → tail in bounded

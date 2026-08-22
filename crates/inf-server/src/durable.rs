@@ -373,6 +373,10 @@ pub struct DurableStats {
     pub recycle_misses: u64,
     pub recycle_fallbacks: u64,
     pub recycle_pool_bytes: u64,
+    /// Covered candidates offered to a full pool (unlinked) — a nonzero
+    /// count with misses beside it says truncation comes in bursts the
+    /// bound cannot hold (ADR-0090 A5), not that the pool never fills.
+    pub recycle_pool_full: u64,
     /// Rotations and preallocs (MAINTAIN + inline) this boot life — the
     /// denominators the S39b row and the `m2-recycle` oracle read
     /// `segments_recycled` against.
@@ -1705,6 +1709,7 @@ impl<F: SegmentFs> DurableCell<F> {
             recycle_misses: rotor.recycle_misses,
             recycle_fallbacks: rotor.recycle_fallbacks,
             recycle_pool_bytes: self.rotor.recycle_pool_bytes(),
+            recycle_pool_full: rotor.recycle_pool_full,
             segment_rotations: rotor.rotations,
             segment_preallocs: rotor.preallocs + rotor.inline_preallocs,
             write_stall_max_us: self.write_stall_hist.max(),
