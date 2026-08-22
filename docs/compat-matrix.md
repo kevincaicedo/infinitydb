@@ -265,6 +265,16 @@ namespaces route values at or above `BLOB-THRESHOLD` out of line and are
 not bound by it. The barrier class (`--barrier-class`, ADR-0086) and the
 frame pipeline depth do not move the bound; only the staging buffer size does.
 
+`FSYNC everysec` namespaces ack on apply and fsync on the 1 s tick — the
+`appendfsync everysec` loss window (≤ 1 s on power loss). With the frame-fill
+policy on (`--fill-window-us N`, M4.5-S39a; off by default until its A/B), a
+barrier-less frame on an aligned segment may hold un-sealed for up to `N` µs
+(design point 1 000) before it reaches the device: the **process-crash**
+exposure of `everysec` records is then ≤ `N` µs of writes per cell, where
+Redis's AOF buffer reaches the page cache every event loop. The power-loss
+window is unchanged; `always` acks are never held (their frames carry the
+barrier the ack waits on).
+
 ## Absent (owner milestone)
 
 | Family | Arrives |

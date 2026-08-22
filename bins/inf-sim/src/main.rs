@@ -761,6 +761,7 @@ fn run_durable(
     let mut waits_rotation = 0u64;
     let mut waits_reorder = 0u64;
     let mut ckpt_downgrades = 0u64;
+    let mut waits_fill = 0u64;
     // Device-budget coverage (ADR-0088 D8): background bytes granted,
     // deferrals issued, seal-pace waits, worst frame-write latency.
     let mut budget_bytes = 0u64;
@@ -780,6 +781,7 @@ fn run_durable(
         waits_rotation += report.frame_waits_rotation;
         waits_reorder += report.frame_waits_reorder;
         ckpt_downgrades += report.ckpt_downgrades;
+        waits_fill += report.frame_waits_fill;
         budget_bytes += report.budget_background_bytes;
         budget_deferrals += report.budget_deferrals;
         waits_pace += report.frame_waits_pace;
@@ -817,7 +819,8 @@ fn run_durable(
          [pipelined_seeds:{pipelined_seeds} depth_max:{depth_max} waits_barrier:{waits_barrier} \
          waits_rotation:{waits_rotation} waits_reorder:{waits_reorder}], device budget [background_bytes:{budget_bytes} \
          deferrals:{budget_deferrals} waits_pace:{waits_pace} write_stall_max_us:{stall_max_us}], \
-         reopened_packed_tails:{reopened_packed_tails} ckpt_downgrades:{ckpt_downgrades}",
+         reopened_packed_tails:{reopened_packed_tails} ckpt_downgrades:{ckpt_downgrades} \
+         waits_fill:{waits_fill}",
         classes.join(" ")
     );
     println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
@@ -832,7 +835,8 @@ fn run_durable(
              waits_barrier={waits_barrier} waits_rotation={waits_rotation} \
              waits_reorder={waits_reorder} budget_background_bytes={budget_bytes} budget_deferrals={budget_deferrals} \
              waits_pace={waits_pace} write_stall_max_us={stall_max_us} \
-             reopened_packed_tails={reopened_packed_tails} ckpt_downgrades={ckpt_downgrades}\n",
+             reopened_packed_tails={reopened_packed_tails} ckpt_downgrades={ckpt_downgrades} \
+             waits_fill={waits_fill}\n",
             classes.join(" ")
         );
         std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest).expect("manifest");

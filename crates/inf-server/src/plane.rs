@@ -1586,15 +1586,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 begin_lsn: m.begin_lsn,
             }),
         );
-        *self.shared.durable.borrow_mut() = Some(DurableCell::new(
-            cfg.staging,
-            cfg.flush_bound,
-            cfg.fua_p50_us_probed,
-            cfg.device,
-            rotor,
-            ckpt,
-            manifest,
-        ));
+        *self.shared.durable.borrow_mut() = Some(DurableCell::new(cfg, rotor, ckpt, manifest));
         Ok(())
     }
 
@@ -2169,6 +2161,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         {
             cell.on_everysec_tick(cx);
         }
+        // `FILL_TIMER_KEY` (M4.5-S39a) needs no handler: the wake is the
+        // effect — this iteration's LOG step seals the held frame.
     }
 
     fn before_park(&mut self) -> bool {
@@ -2818,6 +2812,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.frame_waits_barrier.set(stats.frame_waits_barrier);
             node.frame_waits_rotation.set(stats.frame_waits_rotation);
             node.frame_waits_reorder.set(stats.frame_waits_reorder);
+            node.frame_waits_fill.set(stats.frame_waits_fill);
+            node.fill_window_us.set(stats.fill_window_us);
+            node.fill_target_bytes.set(stats.fill_target_bytes);
             node.fsyncs_completion.set(stats.fsyncs_completion);
             node.log_segments_live.set(stats.log_segments_live);
             // M4.5-S36 (ADR-0088 D7): the device budget's ledger, the

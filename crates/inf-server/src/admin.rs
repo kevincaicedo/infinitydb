@@ -314,6 +314,10 @@ pub(crate) fn info(
         push(&mut text, &format!("frame_waits_barrier:{}", node.frame_waits_barrier.get()));
         push(&mut text, &format!("frame_waits_rotation:{}", node.frame_waits_rotation.get()));
         push(&mut text, &format!("frame_waits_reorder:{}", node.frame_waits_reorder.get()));
+        // M4.5-S39a: the fill policy in force and its hold episodes.
+        push(&mut text, &format!("frame_waits_fill:{}", node.frame_waits_fill.get()));
+        push(&mut text, &format!("fill_window_us:{}", node.fill_window_us.get()));
+        push(&mut text, &format!("fill_target_bytes:{}", node.fill_target_bytes.get()));
         // M4.5-S36 (ADR-0088 D7): the device budget's ledger (names per
         // INFINITY_STYLE — units and qualifiers last), the seal pacer's
         // waits, the checkpoint domain's bytes, the derived trigger, and

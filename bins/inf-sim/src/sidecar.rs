@@ -124,6 +124,7 @@ fn base(scenario: &SidecarScenario) -> DurableScenario {
         budget_oracle: false,
         reorder_oracle: false,
         ckpt_direct_refused_after: None,
+        fill: Default::default(),
         prelude: None,
     }
 }

@@ -468,6 +468,12 @@ struct S35Leg {
     /// The staging drain's binding variable (ADR-0083 D5), worst cell —
     /// a client tail with a healthy device tail points here.
     write_stall_p99_us: u64,
+    /// M4.5-S39a: the leg's v3 padding share of its frame bytes (the
+    /// leg's own delta of `log_padding_bytes` / `log_frame_bytes`, summed
+    /// over cells; 0 on packed segments by construction) and the fill
+    /// policy's hold episodes during the leg.
+    padding_pct: f64,
+    waits_fill: u64,
 }
 
 /// The M4.5-S35 frame-pipeline row (ADR-0087 D8). Per replicate: a
@@ -528,6 +534,8 @@ fn s35_frame_pipeline_row(
     let mut read_ops: Vec<f64> = Vec::new();
     let mut read_p999: Vec<f64> = Vec::new();
     let mut p50_one: Vec<f64> = Vec::new();
+    let mut padding_n: Vec<f64> = Vec::new();
+    let mut padding_256: Vec<f64> = Vec::new();
     let mut fill_max_seen: u64 = 0;
     let mut device_tail_legs: usize = 0;
     let mut engine_tail_legs: usize = 0;
@@ -547,7 +555,8 @@ fn s35_frame_pipeline_row(
         raw.push_str(&format!(
             "rep{rep} {cells}c c{S35_CONNS_AC:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
              max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} p50/barrier={:.2} \
-             frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} write_stall_p99_us={}\n",
+             frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} write_stall_p99_us={} \
+             padding_pct={:.1} waits_fill={}\n",
             ac.ops_per_sec,
             ac.p50_us,
             ac.p99_us,
@@ -559,7 +568,9 @@ fn s35_frame_pipeline_row(
             ac.acks_per_fsync,
             ac.frames,
             ac.parked,
-            ac.write_stall_p99_us
+            ac.write_stall_p99_us,
+            ac.padding_pct,
+            ac.waits_fill
         ));
         ratio.push(ac.p50_us / ac.barrier_p50_us.max(1.0));
         p50_n.push(ac.p50_us);
@@ -568,6 +579,7 @@ fn s35_frame_pipeline_row(
         max_n.push(ac.max_us);
         barrier_n.push(ac.barrier_p50_us);
         group_n.push(ac.acks_per_fsync);
+        padding_n.push(ac.padding_pct);
 
         s35_idle(idle_s, &format!("{cells}c rep{rep} c{CONNS_HIGH}"));
         let hi = s35_write_leg(port, cells, CONNS_HIGH, duration, p50_key, p99_key)?;
@@ -577,7 +589,8 @@ fn s35_frame_pipeline_row(
         raw.push_str(&format!(
             "rep{rep} {cells}c c{CONNS_HIGH:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
              max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} \
-             frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} write_stall_p99_us={}\n",
+             frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} write_stall_p99_us={} \
+             padding_pct={:.1} waits_fill={}\n",
             hi.ops_per_sec,
             hi.p50_us,
             hi.p99_us,
@@ -588,12 +601,15 @@ fn s35_frame_pipeline_row(
             hi.acks_per_fsync,
             hi.frames,
             hi.parked,
-            hi.write_stall_p99_us
+            hi.write_stall_p99_us,
+            hi.padding_pct,
+            hi.waits_fill
         ));
         ops_256.push(hi.ops_per_sec);
         p99_256.push(hi.p99_us);
         max_256.push(hi.max_us);
         group_256.push(hi.acks_per_fsync);
+        padding_256.push(hi.padding_pct);
 
         // The read row: pipelined GETs over the filled keyspace (the
         // M0 zero-cost shape on a durable namespace). No idle — reads
@@ -645,7 +661,8 @@ fn s35_frame_pipeline_row(
             raw.push_str(&format!(
                 "rep{rep} 1c c{S35_CONNS_AC:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
                  max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} p50/barrier={:.2} \
-                 frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} write_stall_p99_us={}\n",
+                 frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} \
+                 write_stall_p99_us={} padding_pct={:.1} waits_fill={}\n",
                 one.ops_per_sec,
                 one.p50_us,
                 one.p99_us,
@@ -657,7 +674,9 @@ fn s35_frame_pipeline_row(
                 one.acks_per_fsync,
                 one.frames,
                 one.parked,
-                one.write_stall_p99_us
+                one.write_stall_p99_us,
+                one.padding_pct,
+                one.waits_fill
             ));
             p50_one.push(one.p50_us);
             drop(server);
@@ -679,6 +698,10 @@ fn s35_frame_pipeline_row(
     m.set("s35:always_c256_max_us", median(&mut max_256));
     m.set("s35:always_c256_acks_per_fsync", median(&mut group_256));
     m.set("s35:always_c32_acks_per_fsync", median(&mut group_n));
+    // M4.5-S39a: the padding share per leg shape (raw, beside the latency
+    // it is traded against — the fill policy's bytes row).
+    m.set("s35:always_c32_padding_pct", median(&mut padding_n));
+    m.set("s35:always_c256_padding_pct", median(&mut padding_256));
     m.set("s35:read_c64p16_ops_per_sec", median(&mut read_ops));
     m.set("s35:read_c64p16_p999_us", median(&mut read_p999));
     m.set("s35:frames_in_flight_max", fill_max_seen as f64);
@@ -1065,6 +1088,12 @@ fn s35_write_leg(
         .saturating_sub(sum_field(&before, "log_frames_queued"));
     let parked = sum_field(&infos, "log_admission_parked_total")
         .saturating_sub(sum_field(&before, "log_admission_parked_total"));
+    let frame_bytes =
+        sum_field(&infos, "log_frame_bytes").saturating_sub(sum_field(&before, "log_frame_bytes"));
+    let padding = sum_field(&infos, "log_padding_bytes")
+        .saturating_sub(sum_field(&before, "log_padding_bytes"));
+    let waits_fill = sum_field(&infos, "frame_waits_fill")
+        .saturating_sub(sum_field(&before, "frame_waits_fill"));
     let mut p50s: Vec<f64> =
         infos.iter().filter_map(|c| c.get(p50_key).and_then(|v| v.parse::<f64>().ok())).collect();
     if p50s.is_empty() {
@@ -1082,6 +1111,8 @@ fn s35_write_leg(
         frames,
         parked,
         write_stall_p99_us: crate::gaterun::max_field(&infos, "log_write_stall_p99_us"),
+        padding_pct: padding as f64 * 100.0 / frame_bytes.max(1) as f64,
+        waits_fill,
     })
 }
 

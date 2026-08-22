@@ -639,6 +639,16 @@ pub fn render() -> String {
     push("not bound by it. The barrier class (`--barrier-class`, ADR-0086) and the");
     push("frame pipeline depth do not move the bound; only the staging buffer size does.");
     push("");
+    push("`FSYNC everysec` namespaces ack on apply and fsync on the 1 s tick — the");
+    push("`appendfsync everysec` loss window (≤ 1 s on power loss). With the frame-fill");
+    push("policy on (`--fill-window-us N`, M4.5-S39a; off by default until its A/B), a");
+    push("barrier-less frame on an aligned segment may hold un-sealed for up to `N` µs");
+    push("(design point 1 000) before it reaches the device: the **process-crash**");
+    push("exposure of `everysec` records is then ≤ `N` µs of writes per cell, where");
+    push("Redis's AOF buffer reaches the page cache every event loop. The power-loss");
+    push("window is unchanged; `always` acks are never held (their frames carry the");
+    push("barrier the ack waits on).");
+    push("");
     push("## Absent (owner milestone)");
     push("");
     push("| Family | Arrives |");

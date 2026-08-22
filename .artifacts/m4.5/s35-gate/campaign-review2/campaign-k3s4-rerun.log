@@ -1,0 +1,53 @@
+# 2026-08-21T23:16:05-04:00 host=HomeLab kernel=7.0.0-30-generic
+# governor=performance epp=performance
+# binary=infinityd 6fb1f01 (git 6fb1f01aae81, x86_64-unknown-linux-gnu) git=6fb1f01 dirty=0
+# data=/home/kcaicedo/bench-data/s35-gate/data fstype=ext4 device=/dev/nvme0n1p3
+# thermal: 27800 37000 39000 
+# fstrim: run by the owner before this session (disclosed, not verified)
+=== 2026-08-21T23:16:05-04:00 m4.5 --only-s35 arm k3s4 rerun (K=3 staging-mib=4, 5 replicates, interleaved 1c) — 60 s idle first ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+  s35: 40s drive-state idle before 4c rep1 c32
+  s35: 40s drive-state idle before 4c rep1 c256
+  s35: 40s drive-state idle before 1c rep1 c32
+  s35: 40s drive-state idle before 4c rep2 c32
+  s35: 40s drive-state idle before 4c rep2 c256
+  s35: 40s drive-state idle before 1c rep2 c32
+  s35: 40s drive-state idle before 4c rep3 c32
+  s35: 40s drive-state idle before 4c rep3 c256
+  s35: 40s drive-state idle before 1c rep3 c32
+  s35: 40s drive-state idle before 4c rep4 c32
+  s35: 40s drive-state idle before 4c rep4 c256
+  s35: 40s drive-state idle before 1c rep4 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell always p50 ratio (S34's F2 AC) FAIL
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review2/k3s4-rerun/1787369466-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-21T23:31:06-04:00 ===
+# done 2026-08-21T23:31:06-04:00 thermal: 27800 36000 40000 

@@ -193,6 +193,9 @@ pub struct NodeInfo {
     pub frame_waits_barrier: Cell<u64>,
     pub frame_waits_rotation: Cell<u64>,
     pub frame_waits_reorder: Cell<u64>,
+    pub frame_waits_fill: Cell<u64>,
+    pub fill_window_us: Cell<u64>,
+    pub fill_target_bytes: Cell<u64>,
     /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).
     pub ckpts_completed: Cell<u64>,
     pub ckpts_aborted: Cell<u64>,
