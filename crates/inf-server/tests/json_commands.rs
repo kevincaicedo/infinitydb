@@ -448,11 +448,11 @@ fn durable_namespace_json_surface_is_reachable_after_s17() {
         tier: None,
     };
     db.ks.ns_create(spec).expect("namespace registers");
-    db.cx.ns = Some(inf_store::NsId(inf_store::FIRST_NAMED_NS_ID));
+    db.cx.ns = inf_server::ConnNamespace::Named(inf_store::NsId(inf_store::FIRST_NAMED_NS_ID));
     assert_reply(&mut db, &["JSON.SET", "k", "$", "{}"], "+OK\r\n");
     assert_reply(&mut db, &["JSON.GET", "k"], &bulk("{}"));
     // Memory-class connections are untouched.
-    db.cx.ns = None;
+    db.cx.ns = inf_server::ConnNamespace::Default;
     assert_reply(&mut db, &["JSON.SET", "k", "$", "{}"], "+OK\r\n");
 }
 
@@ -725,7 +725,7 @@ fn new_write_commands_run_in_durable_namespaces_after_s17() {
         tier: None,
     };
     db.ks.ns_create(spec).expect("namespace registers");
-    db.cx.ns = Some(inf_store::NsId(inf_store::FIRST_NAMED_NS_ID));
+    db.cx.ns = inf_server::ConnNamespace::Named(inf_store::NsId(inf_store::FIRST_NAMED_NS_ID));
     assert_reply(&mut db, &["JSON.MERGE", "k", "$", r#"{"a":[1]}"#], "+OK\r\n");
     assert_reply(&mut db, &["JSON.ARRAPPEND", "k", "$.a", "2"], "*1\r\n:2\r\n");
     assert_reply(&mut db, &["JSON.ARRPOP", "k", "$.a"], "*1\r\n$1\r\n2\r\n");

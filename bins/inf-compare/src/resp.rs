@@ -26,6 +26,28 @@ pub fn command(host: &str, port: u16, argv: &[&[u8]]) -> Result<Vec<u8>, String>
     Ok(reply)
 }
 
+/// Decode a non-null RESP bulk reply into its payload. INFO uses this form
+/// on both Redis and InfinityDB.
+pub fn bulk_text(reply: &[u8]) -> Result<String, String> {
+    if reply.first() != Some(&b'$') {
+        return Err(format!("expected bulk reply, got {:?}", String::from_utf8_lossy(reply)));
+    }
+    let Some(header_end) = reply.windows(2).position(|w| w == b"\r\n") else {
+        return Err("bulk reply has no header terminator".into());
+    };
+    let len: usize = core::str::from_utf8(&reply[1..header_end])
+        .map_err(|e| format!("bulk length utf8: {e}"))?
+        .parse()
+        .map_err(|e| format!("bulk length: {e}"))?;
+    let start = header_end + 2;
+    let end = start.checked_add(len).ok_or("bulk length overflow")?;
+    let payload = reply.get(start..end).ok_or("truncated bulk reply")?;
+    if reply.get(end..end + 2) != Some(b"\r\n") {
+        return Err("bulk reply has no payload terminator".into());
+    }
+    String::from_utf8(payload.to_vec()).map_err(|e| format!("INFO utf8: {e}"))
+}
+
 /// Send `argvs` in order on **one** connection and return the last reply
 /// (connection-state commands — `INF.NS USE` then a probe — need the
 /// same socket). Errors like [`command`].
@@ -170,4 +192,16 @@ fn line_end(buf: &[u8], at: usize) -> Option<usize> {
 
 fn parse_len(digits: &[u8]) -> Option<i64> {
     core::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bulk_text;
+
+    #[test]
+    fn decodes_info_bulk_payload_exactly() {
+        assert_eq!(bulk_text(b"$6\r\na:1\r\nb\r\n").unwrap(), "a:1\r\nb");
+        assert!(bulk_text(b"+OK\r\n").is_err());
+        assert!(bulk_text(b"$4\r\nabc\r\n").is_err());
+    }
 }

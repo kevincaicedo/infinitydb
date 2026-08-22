@@ -43,6 +43,26 @@ impl Node {
         Node::start_with(cells, Some(data_dir.to_path_buf()), 0)
     }
 
+    fn start_durable_with_default_ns(
+        cells: u16,
+        data_dir: &std::path::Path,
+        default_ns: &[u8],
+    ) -> Node {
+        Node::start_cfg_default(
+            cells,
+            Some(data_dir.to_path_buf()),
+            0,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            Some(default_ns.to_vec()),
+        )
+    }
+
     /// Durable node with the bytes-appended checkpoint trigger armed
     /// (M2-S10, ADR-0016 D7).
     fn start_durable_auto_ckpt(
@@ -225,6 +245,35 @@ impl Node {
         staging: Option<inf_log::StagingConfig>,
         io_mode: inf_log::SegmentIoMode,
     ) -> Node {
+        Node::start_cfg_default(
+            cells,
+            data_dir,
+            ckpt_interval_bytes,
+            recover,
+            faults,
+            apply_prefetch,
+            parse_prefetch,
+            deasync_dispatch,
+            staging,
+            io_mode,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // test harness assembly, not an API surface
+    fn start_cfg_default(
+        cells: u16,
+        data_dir: Option<std::path::PathBuf>,
+        ckpt_interval_bytes: u64,
+        recover: inf_server::RecoverConfig,
+        faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
+        apply_prefetch: bool,
+        parse_prefetch: bool,
+        deasync_dispatch: bool,
+        staging: Option<inf_log::StagingConfig>,
+        io_mode: inf_log::SegmentIoMode,
+        default_ns: Option<Vec<u8>>,
+    ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
         // Bind cell 0 first on an ephemeral port, then the rest join it.
         let first = listen_reuseport(0).expect("listen");
@@ -251,6 +300,7 @@ impl Node {
             let stop = Arc::clone(&stop);
             let boot = boot.clone();
             let faults = faults.clone();
+            let default_ns = default_ns.clone();
             handles.push(std::thread::spawn(move || {
                 // M2-S16: arm this cell's fault plan before recovery — the
                 // registry is thread-local (cells are single-threaded, L1).
@@ -261,6 +311,7 @@ impl Node {
                 let mut driver = UringDriver::new(256).expect("uring");
                 driver.register_pool(&mut pool).expect("register");
                 let node = Rc::new(NodeInfo::default());
+                *node.conn_default_ns.borrow_mut() = default_ns;
                 // Real wall anchor (the infinityd boot pattern): LASTSAVE/
                 // rdb_last_save_time report true unix seconds (M2-S20).
                 let unix_ms = std::time::SystemTime::now()
@@ -1064,6 +1115,67 @@ fn durable_namespace_survives_restart() {
     c.write_all(&cmd(&[b"TTL", b"sess:9"])).expect("write");
     let ttl = read_line(&mut c);
     assert!(ttl.starts_with(b":") && ttl != b":-1\r\n" && ttl != b":-2\r\n", "{ttl:?}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `--conn-default-ns` is an operator requirement, not a best-effort hint:
+/// an unresolved name must never route a command to db0. Namespace DDL and
+/// explicit selection remain available, and an `always` ack written after
+/// recovery from the fail-closed state survives a full node restart.
+#[test]
+fn configured_default_namespace_fails_closed_and_durable_ack_survives_restart() {
+    let dir = temp_data_dir("conn-default-ns");
+    let node = Node::start_durable_with_default_ns(2, &dir, b"ledger");
+    let mut c = node.connect();
+    let unavailable =
+        b"-ERR configured default namespace is unavailable; use SELECT or INF.NS USE\r\n";
+
+    c.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut c, b"+PONG\r\n");
+    c.write_all(&cmd(&[b"SET", b"must-not-leak", b"db0"])).expect("write");
+    read_exactly(&mut c, unavailable);
+    c.write_all(&cmd(&[b"GET", b"must-not-leak"])).expect("write");
+    read_exactly(&mut c, unavailable);
+    let k0 = key_for_cell(2, 0);
+    let k1 = key_for_cell(2, 1);
+    for key in [&k0, &k1] {
+        c.write_all(&cmd(&[b"SET", key, b"routed-must-not-leak"])).expect("write");
+        read_exactly(&mut c, unavailable);
+    }
+
+    // DDL is a recovery command. The existing connection stays fail-closed
+    // until it explicitly selects the namespace; new accepts resolve it.
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"still-closed", b"x"])).expect("write");
+    read_exactly(&mut c, unavailable);
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"ledger"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"durable-key", b"survives"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n"); // `always`: the ack is the durability fence.
+
+    let mut auto = node.connect();
+    auto.write_all(&cmd(&[b"GET", b"durable-key"])).expect("write");
+    read_exactly(&mut auto, b"$8\r\nsurvives\r\n");
+    drop(auto);
+    drop(c);
+    node.stop();
+
+    let node = Node::start_durable_with_default_ns(2, &dir, b"ledger");
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"GET", b"durable-key"])).expect("write");
+    read_exactly(&mut c, b"$8\r\nsurvives\r\n");
+    c.write_all(&cmd(&[b"SELECT", b"0"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"must-not-leak"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    for key in [&k0, &k1] {
+        c.write_all(&cmd(&[b"GET", key])).expect("write");
+        read_exactly(&mut c, b"$-1\r\n");
+    }
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();

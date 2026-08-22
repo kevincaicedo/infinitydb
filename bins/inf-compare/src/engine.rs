@@ -11,6 +11,7 @@
 //! configs" section (master plan §22: no comparison without the competitor in
 //! the run, configs published).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -137,6 +138,9 @@ pub struct Spec {
     /// `io-properties.toml` copied into infinitydb's data dir (the
     /// probed barrier class and device model); absent = FLUSH class.
     pub probe_file: Option<PathBuf>,
+    /// Diagnostic-only Redis arm: disable automatic AOF rewrites. Never a
+    /// production comparison and always disclosed in the report.
+    pub redis_no_auto_rewrite: bool,
 }
 
 /// Docker image references (defaults overridable on the CLI).
@@ -203,7 +207,11 @@ pub fn launch_host(spec: &Spec, log_dir: &Path) -> Result<Target, String> {
 /// is copied in for infinitydb.
 fn prepare_data_dir(spec: &Spec) -> Result<(), String> {
     let Some(dir) = &spec.data_dir else { return Ok(()) };
-    let _ = std::fs::remove_dir_all(dir);
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("remove {}: {e}", dir.display())),
+    }
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     if spec.kind == EngineKind::InfinityDb
         && let Some(probe) = &spec.probe_file
@@ -427,7 +435,10 @@ fn host_argv(spec: &Spec) -> Result<(String, Vec<String>), String> {
     match spec.kind {
         EngineKind::Redis => {
             let (p, a) = redis_argv(spec, false);
-            Ok(maybe_pin(p, a, spec.pin_start, 1)) // redis is single-threaded
+            // Redis executes commands on one thread, but AOF rewrite children
+            // need the same CPU allowance as InfinityDB's cells or they
+            // contend with the parent on a single pinned CPU.
+            Ok(maybe_pin(p, a, spec.pin_start, spec.threads as usize))
         }
         EngineKind::RedisStack => {
             Err("redis-stack is docker-only (no host binary); pass --docker".into())
@@ -455,6 +466,9 @@ fn redis_argv(spec: &Spec, in_docker: bool) -> (String, Vec<String>) {
             dir.display().to_string(),
         ]),
         _ => argv.extend(["--appendonly".to_string(), "no".to_string()]),
+    }
+    if spec.redis_no_auto_rewrite {
+        argv.extend(["--auto-aof-rewrite-percentage".to_string(), "0".to_string()]);
     }
     if let Some(mb) = spec.maxmemory_mb {
         argv.extend([
@@ -541,6 +555,132 @@ pub fn cpu_ticks(target: &Target) -> Option<u64> {
     let utime: u64 = fields.get(11)?.parse().ok()?;
     let stime: u64 = fields.get(12)?.parse().ok()?;
     Some(utime + stime)
+}
+
+/// One before/after observability sample. `cpu_seconds` covers the host
+/// process plus Redis's completed AOF children and any live descendants;
+/// INFO is retained raw and parsed for report deltas.
+pub struct Observation {
+    pub cpu_seconds: Option<f64>,
+    pub raw_info: String,
+    pub fields: BTreeMap<String, String>,
+}
+
+pub fn observe(target: &Target) -> Result<Observation, String> {
+    let section = if target.kind == EngineKind::Redis { b"all".as_slice() } else { b"persistence" };
+    let reply = resp::command(&target.host, target.port, &[b"INFO", section])?;
+    let raw_info = resp::bulk_text(&reply)?;
+    let fields = parse_info(&raw_info);
+    let parent = cpu_ticks(target).map(|ticks| ticks as f64 / 100.0);
+    let completed_children = if target.kind == EngineKind::Redis {
+        info_f64(&fields, "used_cpu_sys_children") + info_f64(&fields, "used_cpu_user_children")
+    } else {
+        0.0
+    };
+    let live_children = target.pid.map(descendant_ticks).unwrap_or(0) as f64 / 100.0;
+    Ok(Observation {
+        cpu_seconds: parent.map(|v| v + completed_children + live_children),
+        raw_info,
+        fields,
+    })
+}
+
+pub fn observation_delta(kind: EngineKind, before: &Observation, after: &Observation) -> String {
+    match kind {
+        EngineKind::Redis => format!(
+            "aof_rewrites +{}; aof_delayed_fsync +{}; aof_last_status {}; child_cpu_s +{:.3}",
+            info_delta(&before.fields, &after.fields, "aof_rewrites"),
+            info_delta(&before.fields, &after.fields, "aof_delayed_fsync"),
+            after.fields.get("aof_last_bgrewrite_status").map_or("n/a", String::as_str),
+            (info_f64(&after.fields, "used_cpu_sys_children")
+                + info_f64(&after.fields, "used_cpu_user_children")
+                - info_f64(&before.fields, "used_cpu_sys_children")
+                - info_f64(&before.fields, "used_cpu_user_children"))
+            .max(0.0)
+        ),
+        EngineKind::InfinityDb => format!(
+            "parks +{}; ckpt_bytes +{}; stall_p99_us {}; stall_p999_us {}",
+            info_delta(&before.fields, &after.fields, "log_admission_parked_total"),
+            info_delta(&before.fields, &after.fields, "ckpt_bytes_total"),
+            after.fields.get("log_write_stall_p99_us").map_or("n/a", String::as_str),
+            after.fields.get("log_write_stall_p999_us").map_or("n/a", String::as_str)
+        ),
+        EngineKind::RedisStack | EngineKind::Dragonfly => "raw INFO captured".into(),
+    }
+}
+
+fn parse_info(raw: &str) -> BTreeMap<String, String> {
+    raw.lines()
+        .filter_map(|line| {
+            let (key, value) = line.trim_end_matches('\r').split_once(':')?;
+            (!key.is_empty()).then(|| (key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn info_f64(fields: &BTreeMap<String, String>, key: &str) -> f64 {
+    fields.get(key).and_then(|v| v.parse().ok()).unwrap_or(0.0)
+}
+
+fn info_delta(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+    key: &str,
+) -> u64 {
+    let value = |m: &BTreeMap<String, String>| -> u64 {
+        m.get(key).and_then(|v| v.parse().ok()).unwrap_or(0)
+    };
+    value(after).saturating_sub(value(before))
+}
+
+fn descendant_ticks(pid: u32) -> u64 {
+    const PROCESS_TREE_CAP: usize = 4096;
+    let mut total = 0u64;
+    let mut pending = vec![pid];
+    let mut visited = 0usize;
+    while let Some(parent) = pending.pop() {
+        if visited == PROCESS_TREE_CAP {
+            break;
+        }
+        visited += 1;
+        let children = std::fs::read_to_string(format!("/proc/{parent}/task/{parent}/children"))
+            .unwrap_or_default();
+        for child in children.split_whitespace().filter_map(|v| v.parse::<u32>().ok()) {
+            total = total.saturating_add(proc_ticks(child).unwrap_or(0));
+            if pending.len() < PROCESS_TREE_CAP {
+                pending.push(child);
+            }
+        }
+    }
+    total
+}
+
+fn proc_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    Some(fields.get(11)?.parse::<u64>().ok()?.saturating_add(fields.get(12)?.parse().ok()?))
+}
+
+/// Ambient Redis processes invalidate an in-run comparison because their
+/// background work and page cache are not attributable to either leg.
+pub fn ambient_redis_processes() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        if comm.trim() != "redis-server" {
+            continue;
+        }
+        let cmd = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .map(|v| String::from_utf8_lossy(&v).replace('\0', " "))
+            .unwrap_or_else(|| "redis-server".into());
+        found.push(format!("pid {pid}: {}", cmd.trim()));
+    }
+    found.sort();
+    found
 }
 
 /// Sectors written on `/sys/block/<dev>/stat` (field 7): the block
@@ -778,4 +918,29 @@ fn on_path(program: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EngineKind, Observation, observation_delta, parse_info};
+
+    #[test]
+    fn info_parser_and_selected_deltas_are_explicit() {
+        let before_raw = "aof_rewrites:2\r\naof_delayed_fsync:1\r\nused_cpu_sys_children:0.5\r\nused_cpu_user_children:1.0\r\n";
+        let after_raw = "aof_rewrites:5\r\naof_delayed_fsync:2\r\naof_last_bgrewrite_status:ok\r\nused_cpu_sys_children:1.0\r\nused_cpu_user_children:2.0\r\n";
+        let before = Observation {
+            cpu_seconds: Some(0.0),
+            raw_info: before_raw.into(),
+            fields: parse_info(before_raw),
+        };
+        let after = Observation {
+            cpu_seconds: Some(0.0),
+            raw_info: after_raw.into(),
+            fields: parse_info(after_raw),
+        };
+        assert_eq!(
+            observation_delta(EngineKind::Redis, &before, &after),
+            "aof_rewrites +3; aof_delayed_fsync +1; aof_last_status ok; child_cpu_s +1.500"
+        );
+    }
 }

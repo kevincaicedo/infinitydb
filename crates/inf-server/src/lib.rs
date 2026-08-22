@@ -47,7 +47,7 @@ pub use durable::{DeviceConfig, DurableConfig, DurableStats, FillConfig, Recover
 // types — an assembly cannot fill one without naming them.
 #[doc(hidden)]
 pub use exec::parse_cursor;
-pub use exec::{ConnCx, NodeInfo, execute, execute_slices, stall_request};
+pub use exec::{ConnCx, ConnNamespace, NodeInfo, execute, execute_slices, stall_request};
 pub use glob::glob_match;
 pub use inf_log::ckpt::DEFAULT_CKPT_INTERVAL_BYTES;
 pub use inf_log::fs::StdSegmentFs;

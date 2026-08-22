@@ -60,6 +60,7 @@ OPTIONS (run):
     --data-root     DIR             # durable state root (per-engine subdirs, wiped); default: .artifacts/compare-data
     --probe-file    PATH            # io-properties.toml copied into infinitydb's data dir (barrier class)
     --device-stat   DEV             # /sys/block/DEV/stat sectors-written sampled per row (e.g. nvme0n1)
+    --redis-no-auto-rewrite         # diagnostic only: Redis auto-aof-rewrite-percentage 0
 
   Placement:
     --docker        # run servers in containers; generator stays on host
@@ -105,7 +106,7 @@ fn main() -> ExitCode {
     }
 }
 
-const BOOL_FLAGS: &[&str] = &["docker", "reference-box", "unsafe-env"];
+const BOOL_FLAGS: &[&str] = &["docker", "reference-box", "unsafe-env", "redis-no-auto-rewrite"];
 const VALUE_FLAGS: &[&str] = &[
     "engines",
     "generator",
@@ -154,6 +155,7 @@ struct LoadParams {
     data_root: PathBuf,
     probe_file: Option<PathBuf>,
     device_stat: Option<String>,
+    redis_no_auto_rewrite: bool,
 }
 
 fn cmd_run(args: &[String]) -> Result<(), String> {
@@ -193,6 +195,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         data_root: PathBuf::from(flags.str_or("data-root", ".artifacts/compare-data")),
         probe_file: flags.get("probe-file").map(PathBuf::from),
         device_stat: flags.get("device-stat").map(str::to_string),
+        redis_no_auto_rewrite: flags.bool("redis-no-auto-rewrite"),
     };
     let pipelines = flags.u32_list_or("pipeline", &[1, 16])?;
     let maxmemory_mb = flags.opt_u64("maxmemory-mb")?;
@@ -218,6 +221,19 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             "refusing a binding run on a non-clean box:\n  - {}\nfix the box, or pass --unsafe-env to proceed non-citably",
             environment.reasons.join("\n  - ")
         ));
+    }
+    if !docker
+        && attach.is_empty()
+        && lp.durability != engine::Durability::None
+        && engines.contains(&EngineKind::Redis)
+    {
+        let ambient = engine::ambient_redis_processes();
+        if !ambient.is_empty() {
+            return Err(format!(
+                "refusing durable comparison with unrelated redis-server process(es):\n  - {}\nstop them before the campaign",
+                ambient.join("\n  - ")
+            ));
+        }
     }
 
     // --- artifact layout ---
@@ -307,6 +323,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         data_root: (lp.durability != engine::Durability::None)
             .then(|| lp.data_root.display().to_string()),
         device_stat: lp.device_stat.clone(),
+        redis_no_auto_rewrite: lp.redis_no_auto_rewrite,
     };
     let md = report::render(&environment, &params, &configs, &cells, &mems);
     let report_path = run_dir.join("report.md");
@@ -350,6 +367,7 @@ fn bring_up(
         data_dir: (lp.durability != engine::Durability::None)
             .then(|| lp.data_root.join(kind.label())),
         probe_file: lp.probe_file.clone(),
+        redis_no_auto_rewrite: lp.redis_no_auto_rewrite,
     };
     if docker {
         eprintln!("inf-compare: launching {} (docker) on :{port}", kind.label());
@@ -423,7 +441,13 @@ fn bench_engine(
                 eprintln!("inf-compare:   {label} {} populate ({fill_secs}s)", wl.name);
                 memtier::fill(&mt_plan, fill_secs)?;
             }
-            let cpu_before = engine::cpu_ticks(target);
+            let observation_before = engine::observe(target)?;
+            let info_tag = format!("{label}-{}-p{pipeline}{rate_tag}", wl.name);
+            std::fs::write(
+                raw_dir.join(format!("{info_tag}.info.before.txt")),
+                &observation_before.raw_info,
+            )
+            .map_err(|e| format!("write INFO before: {e}"))?;
             let sectors_before = lp.device_stat.as_deref().and_then(engine::device_sectors_written);
             let wall = std::time::Instant::now();
             let memtier_m = if gens.memtier {
@@ -440,12 +464,17 @@ fn bench_engine(
             // Server CPU across the memtier row (host launches) and the
             // block device's sectors written — the S40 disclosures.
             let wall_s = wall.elapsed().as_secs_f64();
-            let server_cpu_pct = match (cpu_before, engine::cpu_ticks(target)) {
-                (Some(a), Some(b)) if wall_s > 0.0 => {
-                    Some((b.saturating_sub(a)) as f64 / 100.0 / wall_s * 100.0)
-                }
-                _ => None,
-            };
+            let observation_after = engine::observe(target)?;
+            std::fs::write(
+                raw_dir.join(format!("{info_tag}.info.after.txt")),
+                &observation_after.raw_info,
+            )
+            .map_err(|e| format!("write INFO after: {e}"))?;
+            let server_cpu_pct =
+                match (observation_before.cpu_seconds, observation_after.cpu_seconds) {
+                    (Some(a), Some(b)) if wall_s > 0.0 => Some((b - a).max(0.0) / wall_s * 100.0),
+                    _ => None,
+                };
             let device_mib_written = match (
                 sectors_before,
                 lp.device_stat.as_deref().and_then(engine::device_sectors_written),
@@ -485,6 +514,11 @@ fn bench_engine(
                 rss_mib: engine::rss_now_mib(target),
                 server_cpu_pct,
                 device_mib_written,
+                persistence_delta: Some(engine::observation_delta(
+                    target.kind,
+                    &observation_before,
+                    &observation_after,
+                )),
             });
         }
     }
