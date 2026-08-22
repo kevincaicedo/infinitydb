@@ -1981,12 +1981,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let name = self.shared.node.conn_default_ns.borrow();
         let Some(name) = name.as_deref() else { return ConnNamespace::Default };
         let store = self.shared.store.borrow();
-        let Some(spec) = store.ns_get(name) else { return ConnNamespace::RequiredUnavailable };
-        if spec.mode == inf_store::NsMode::Topic {
-            ConnNamespace::RequiredUnavailable
-        } else {
-            ConnNamespace::Named(spec.id)
-        }
+        resolve_conn_default(store.ns_get(name).map(|spec| (spec.id, spec.mode)))
+    }
+}
+
+fn resolve_conn_default(spec: Option<(NsId, NsMode)>) -> ConnNamespace {
+    match spec {
+        Some((_, NsMode::Topic)) | None => ConnNamespace::RequiredUnavailable,
+        Some((id, NsMode::Memory | NsMode::Durable)) => ConnNamespace::Named(id),
     }
 }
 
@@ -6017,4 +6019,21 @@ async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
     }
     Ok(waiter)
+}
+
+#[cfg(test)]
+mod conn_default_tests {
+    use super::{ConnNamespace, NsId, NsMode, resolve_conn_default};
+
+    #[test]
+    fn configured_default_resolves_named_modes_and_refuses_missing_or_topic() {
+        let id = NsId(42);
+        assert_eq!(resolve_conn_default(None), ConnNamespace::RequiredUnavailable);
+        assert_eq!(
+            resolve_conn_default(Some((id, NsMode::Topic))),
+            ConnNamespace::RequiredUnavailable
+        );
+        assert_eq!(resolve_conn_default(Some((id, NsMode::Memory))), ConnNamespace::Named(id));
+        assert_eq!(resolve_conn_default(Some((id, NsMode::Durable))), ConnNamespace::Named(id));
+    }
 }
