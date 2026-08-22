@@ -78,7 +78,7 @@ fn main() {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m2-device-budget|m2-mode-transition|m3-document|m2-combined|boot-storm \
+                        "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m2-device-budget|m2-mode-transition|m2-reorder-window|m2-ckpt-refused|m3-document|m2-combined|boot-storm \
                          [--seed N|0xN] [--verify-determinism] \
                          [--plant lost-wakeup|fsync-lies] [--replay-canary] [--cells N] \
                          [--connections N] [--commands N] [--trace-out FILE] \
@@ -100,7 +100,12 @@ fn main() {
     // durability oracle, the sweep mode).
     if matches!(
         scenario_name.as_str(),
-        "m2-durable" | "m2-device-budget" | "m2-mode-transition" | "m3-document"
+        "m2-durable"
+            | "m2-device-budget"
+            | "m2-mode-transition"
+            | "m2-reorder-window"
+            | "m2-ckpt-refused"
+            | "m3-document"
     ) {
         run_durable(
             &scenario_name,
@@ -683,6 +688,8 @@ fn run_durable(
             "m2-durable" => DurableScenario::m2_durable(seed),
             "m2-device-budget" => DurableScenario::m2_device_budget(seed),
             "m2-mode-transition" => DurableScenario::m2_mode_transition(seed),
+            "m2-reorder-window" => DurableScenario::m2_reorder_window(seed),
+            "m2-ckpt-refused" => DurableScenario::m2_ckpt_refused(seed),
             "m3-document" => DurableScenario::m3_document(seed),
             _ => unreachable!("the caller filters durable scenario names"),
         };
@@ -752,6 +759,8 @@ fn run_durable(
     let mut depth_max = 0u64;
     let mut waits_barrier = 0u64;
     let mut waits_rotation = 0u64;
+    let mut waits_reorder = 0u64;
+    let mut ckpt_downgrades = 0u64;
     // Device-budget coverage (ADR-0088 D8): background bytes granted,
     // deferrals issued, seal-pace waits, worst frame-write latency.
     let mut budget_bytes = 0u64;
@@ -769,6 +778,8 @@ fn run_durable(
         depth_max = depth_max.max(report.frames_in_flight_max);
         waits_barrier += report.frame_waits_barrier;
         waits_rotation += report.frame_waits_rotation;
+        waits_reorder += report.frame_waits_reorder;
+        ckpt_downgrades += report.ckpt_downgrades;
         budget_bytes += report.budget_background_bytes;
         budget_deferrals += report.budget_deferrals;
         waits_pace += report.frame_waits_pace;
@@ -804,9 +815,9 @@ fn run_durable(
          violations, {refused} legal taxonomy refusals, {equivalence_checks} equivalence \
          checks, {documents_compared} documents compared, cut classes [{}], frame pipeline \
          [pipelined_seeds:{pipelined_seeds} depth_max:{depth_max} waits_barrier:{waits_barrier} \
-         waits_rotation:{waits_rotation}], device budget [background_bytes:{budget_bytes} \
+         waits_rotation:{waits_rotation} waits_reorder:{waits_reorder}], device budget [background_bytes:{budget_bytes} \
          deferrals:{budget_deferrals} waits_pace:{waits_pace} write_stall_max_us:{stall_max_us}], \
-         reopened_packed_tails:{reopened_packed_tails}",
+         reopened_packed_tails:{reopened_packed_tails} ckpt_downgrades:{ckpt_downgrades}",
         classes.join(" ")
     );
     println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
@@ -819,9 +830,9 @@ fn run_durable(
              documents_compared={documents_compared} corpus_documents={corpus_documents} \
              cut_classes=[{}] pipelined_seeds={pipelined_seeds} depth_max={depth_max} \
              waits_barrier={waits_barrier} waits_rotation={waits_rotation} \
-             budget_background_bytes={budget_bytes} budget_deferrals={budget_deferrals} \
+             waits_reorder={waits_reorder} budget_background_bytes={budget_bytes} budget_deferrals={budget_deferrals} \
              waits_pace={waits_pace} write_stall_max_us={stall_max_us} \
-             reopened_packed_tails={reopened_packed_tails}\n",
+             reopened_packed_tails={reopened_packed_tails} ckpt_downgrades={ckpt_downgrades}\n",
             classes.join(" ")
         );
         std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest).expect("manifest");

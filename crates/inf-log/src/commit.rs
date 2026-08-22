@@ -83,6 +83,21 @@
 //! K write-through tickets, or one linked sync — a linked sync needs the
 //! pipeline drained) are in flight, standalone syncs dedupe against the
 //! ledger tail, and seal/zero-fill syncs arrive at segment cadence.
+//!
+//! **The reorder window (ADR-0087 D2 as amended, 2026-08-22).** The
+//! staging ring bounds *unwritten* frames at K, but a frame that landed
+//! behind an earlier one still in flight stays in the queue until the
+//! prefix reaches it — and its released buffer lets the next frame in.
+//! One wedged plain write at the front with barrier-less frames landing
+//! behind it would therefore grow the queue without bound (the review of
+//! `2cb6074`: memory, a linear completion search, eventually the cell).
+//! The queue is bounded at [`REORDER_WINDOW_FRAMES`] by construction:
+//! [`GroupCommit::frame_plan`] answers `Wait` while the window is full,
+//! so the next frame holds until the front lands (≤ one write latency —
+//! the same bound the barrier `Wait` already carries), the staging
+//! builder absorbs the hold, and the existing staging backpressure
+//! (admission parking, M4.5-S27) takes over from there. Release-asserted
+//! at the queue; frames are found by ordinal arithmetic, never a scan.
 
 use core::fmt;
 use std::collections::VecDeque;
@@ -94,6 +109,15 @@ use crate::fs::SegmentFile;
 use crate::lsn::Lsn;
 use crate::segment::SealHandoff;
 use crate::staging::MAX_FRAMES_IN_FLIGHT;
+
+/// The most frames the completion ledger holds behind the written prefix
+/// — unwritten ones plus those that landed ahead of an earlier one still
+/// in flight (ADR-0087 D2 as amended). Twice the ring's in-flight cap:
+/// one late write with a full pipeline landing behind it, twice over,
+/// reorders without a hold; beyond that the next frame waits for the
+/// front. Fixed, independent of the configured K, so the ledger's memory
+/// is a constant (16 × 32 B) and never a function of device behaviour.
+pub const REORDER_WINDOW_FRAMES: usize = 2 * MAX_FRAMES_IN_FLIGHT as usize;
 
 /// Durability class of a staged effect's namespace (§8.2). `memory`
 /// namespaces never reach the log, so they have no representation here —
@@ -282,8 +306,12 @@ pub struct GroupCommit<File> {
     flush_bound: usize,
     queued_up_to: Option<Lsn>,
     queued_bytes: u64,
-    /// Frames queued and not yet written, in queue order (ADR-0087 D2) —
-    /// bounded by the staging ring's `frames_in_flight`, release-asserted.
+    /// Frames queued and not yet part of the written prefix, in queue
+    /// order (ADR-0087 D2 as amended): the unwritten ones plus those that
+    /// landed ahead of an earlier one still in flight. Bounded at
+    /// `REORDER_WINDOW_FRAMES` by `frame_plan`'s `Wait`, release-asserted
+    /// at the queue; ids are consecutive ordinals, so a frame's index is
+    /// `id − front.id` (O(1) completion routing, never a scan).
     queued: VecDeque<QueuedFrame>,
     /// Queued frames without their `LogWritten` yet — bounded by the
     /// staging ring's in-flight slots (`MAX_FRAMES_IN_FLIGHT`).
@@ -350,7 +378,7 @@ impl<File: SegmentFile> GroupCommit<File> {
             flush_bound: bound,
             queued_up_to: None,
             queued_bytes: 0,
-            queued: VecDeque::with_capacity(usize::from(MAX_FRAMES_IN_FLIGHT) + 1),
+            queued: VecDeque::with_capacity(REORDER_WINDOW_FRAMES),
             unwritten: 0,
             next_frame_id: 0,
             written_up_to: None,
@@ -421,6 +449,17 @@ impl<File: SegmentFile> GroupCommit<File> {
         self.written_bytes == self.queued_bytes
     }
 
+    /// True while the ledger holds `REORDER_WINDOW_FRAMES` frames behind
+    /// the written prefix — the front write is late and the frames that
+    /// landed behind it have filled the window. [`frame_plan`](Self::frame_plan)
+    /// answers `Wait` in this state; the plane counts the episode
+    /// (`frame_waits_reorder`) so a wedging device is visible, never
+    /// absorbed.
+    #[must_use]
+    pub fn reorder_window_full(&self) -> bool {
+        self.queued.len() >= REORDER_WINDOW_FRAMES
+    }
+
     /// Should this iteration's frame write chain an fdatasync (the
     /// FLUSH-class barrier, bounded by the FLUSH pipeline)? A linked
     /// fdatasync is ordered after *its own* write only (`IO_LINK`), so it
@@ -460,6 +499,12 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// accumulates while the pipeline is drained but the slot is busy).
     #[must_use]
     pub fn frame_plan(&self, write_through_ok: bool, seal_ahead: bool) -> FramePlan {
+        // The reorder window (ADR-0087 D2 as amended) bounds the queue
+        // before any barrier question: a frame sealed now could not be
+        // queued, whatever barrier it carried.
+        if self.reorder_window_full() {
+            return FramePlan::Wait;
+        }
         if !self.sync_due {
             return FramePlan::Plain;
         }
@@ -501,6 +546,26 @@ impl<File: SegmentFile> GroupCommit<File> {
             && self.written_bytes > self.durable_bytes
             && self.always_discharged_at_written()
             && self.pending.back().is_none_or(|p| p.covers_bytes < self.written_bytes)
+    }
+
+    /// A sync covering `written_up_to` is being registered: settle what
+    /// it discharges. The `always` half survives unless every owed record
+    /// is inside the covered range (M2.5-S07). The `everysec` half
+    /// survives while a queued frame is still in flight **outside** the
+    /// coverage (ADR-0013 D3 as amended, 2026-08-22): the tick's promise
+    /// is every record staged before it, and a frame landing after this
+    /// sync would otherwise wait for the *next* tick — a ~2 s loss window
+    /// the `m2-reorder-window` sweep found (seed `0x2e0d0179`: one plain
+    /// write in flight at the tick, its frame acked 1.11 s before the
+    /// cut, lost). Kept due, the next LOG step drains and covers it: a
+    /// linked sync on the next frame or another standalone once the
+    /// write lands — one write latency, once per tick, never a spin
+    /// (`standalone_fsync_due` needs new written bytes).
+    fn settle_due_at_written(&mut self) {
+        let always_owed = self.always_pending && !self.always_discharged_at_written();
+        let in_flight_uncovered = self.written_bytes < self.queued_bytes;
+        self.sync_due = always_owed || in_flight_uncovered;
+        self.always_pending = always_owed;
     }
 
     /// Every owed `always` record sits in a written frame — a standalone
@@ -626,24 +691,26 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// the frame's id for [`note_frame_written`](Self::note_frame_written).
     ///
     /// # Panics
-    /// If more than `MAX_FRAMES_IN_FLIGHT` frames are queued unwritten —
-    /// the staging ring bounds this; exceeding it is a plane bug.
+    /// If more than `MAX_FRAMES_IN_FLIGHT` frames are queued unwritten
+    /// (the staging ring bounds this) or the reorder window is full
+    /// (`frame_plan` answered `Wait`) — either is a plane bug.
     pub fn note_frame_queued(&mut self, end: Lsn, frame_len: u32) -> FrameId {
         // Release assert (M2.5-S13): out-of-order queue breaks the LSN↔seq
         // FIFO the ack gate and reader rely on. Per-batch, free.
         assert!(self.queued_up_to.is_none_or(|q| q < end), "frames queue in append order");
-        // The bound is on *unwritten* frames — what the staging ring holds
-        // in flight. The queue itself also holds frames that landed ahead
-        // of an earlier one still in flight (ADR-0087 D2: completions in
-        // any order, the written prefix waits for the front), so under a
-        // device tail that wedges one plain write while barrier-less
-        // frames keep landing it legitimately grows past K (the
-        // `m2-mode-transition` sweep found this release-assert mis-scoped:
-        // seven `everysec` frames behind one late write crashed the cell).
+        // Two bounds, both release-asserted, per frame, free. Unwritten
+        // frames: what the staging ring holds in flight. The whole queue:
+        // the reorder window (ADR-0087 D2 as amended) — frames that
+        // landed ahead of an earlier one still in flight stay queued
+        // until the prefix reaches them (the `m2-mode-transition` sweep
+        // found the first bound mis-scoped to the queue: seven `everysec`
+        // frames behind one late write crashed the cell; the review of
+        // that fix found the queue then unbounded).
         assert!(
             self.unwritten < MAX_FRAMES_IN_FLIGHT,
             "more frames in flight than the ring can hold"
         );
+        assert!(!self.reorder_window_full(), "frame queued into a full reorder window");
         self.queued_up_to = Some(end);
         self.queued_bytes += u64::from(frame_len);
         self.next_frame_id += 1;
@@ -745,8 +812,7 @@ impl<File: SegmentFile> GroupCommit<File> {
         // The always due survives unless everything owed is inside the
         // covered range (M2.5-S07 made this exact; the pre-S07 shape kept
         // the due whenever always traffic was pending).
-        self.sync_due = self.always_pending && !self.always_discharged_at_written();
-        self.always_pending = self.sync_due;
+        self.settle_due_at_written();
         self.stats.fsyncs_standalone += 1;
         self.push_pending(
             covers_up_to,
@@ -767,8 +833,7 @@ impl<File: SegmentFile> GroupCommit<File> {
     pub fn register_completion_fsync(&mut self, now: Nanos) -> FsyncTicket {
         let covers_up_to = self.written_up_to.expect("completion fsync with nothing written");
         debug_assert!(self.always_discharged_at_written());
-        self.sync_due = false;
-        self.always_pending = false;
+        self.settle_due_at_written();
         self.stats.fsyncs_completion += 1;
         self.push_pending(
             covers_up_to,
@@ -820,11 +885,16 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// # Panics
     /// On an unknown or already-written id — completions are exactly-once.
     pub fn note_frame_written(&mut self, id: FrameId) {
-        let frame = self
-            .queued
-            .iter_mut()
-            .find(|f| f.id == id)
+        // Ids are consecutive ordinals and the queue pops only at the
+        // front, so the frame's index is its distance from the front —
+        // O(1) whatever the window holds (ADR-0087 D2 as amended).
+        let front = self.queued.front().expect("LogWritten with nothing queued").id;
+        let index = id.0.checked_sub(front.0).expect("LogWritten for a frame already written");
+        let frame = usize::try_from(index)
+            .ok()
+            .and_then(|index| self.queued.get_mut(index))
             .expect("LogWritten for a frame that was not queued");
+        debug_assert_eq!(frame.id, id, "queue ordinals are consecutive");
         assert!(!frame.written, "frame written twice");
         frame.written = true;
         self.unwritten -= 1;
@@ -1008,20 +1078,26 @@ mod tests {
         GroupCommit::new()
     }
 
-    /// One late plain write at the front with many barrier-less frames
-    /// landing behind it (the `m2-mode-transition` seed `0x7a4e01cb`
-    /// shape): the queue grows past `MAX_FRAMES_IN_FLIGHT` while the
-    /// in-flight count never exceeds the ring's K — the ledger must keep
-    /// them, not assert. The prefix then advances past all of them at once.
+    /// One late plain write at the front with barrier-less frames landing
+    /// behind it (the `m2-mode-transition` seed `0x7a4e01cb` shape): the
+    /// queue grows past `MAX_FRAMES_IN_FLIGHT` while the in-flight count
+    /// never exceeds the ring's K — the ledger keeps them — **up to the
+    /// reorder window**, where the plan holds the next frame (ADR-0087
+    /// D2 as amended) whether or not a sync is due. The front landing
+    /// advances the prefix past all of them at once and reopens the
+    /// window.
     #[test]
-    fn late_front_write_with_many_landed_behind_it_is_kept_not_asserted() {
+    fn late_front_write_fills_the_reorder_window_then_the_plan_waits() {
         let mut gc = commit();
+        let window = u32::try_from(REORDER_WINDOW_FRAMES).expect("small constant");
+        assert!(window > u32::from(MAX_FRAMES_IN_FLIGHT), "the window admits a full pipeline");
         let mut ids = Vec::new();
-        for i in 1..=(u32::from(MAX_FRAMES_IN_FLIGHT) + 4) {
+        for i in 1..=window {
             gc.note_staged(FsyncClass::Everysec);
+            assert!(!gc.reorder_window_full(), "frame {i}");
             assert_eq!(gc.frame_plan(false, false), FramePlan::Plain, "frame {i}");
             ids.push(gc.note_frame_queued(lsn(0, i * 64), 64));
-            // Every frame but the first lands at once: K = 2 in flight.
+            // Every frame but the first lands at once: ≤ 2 in flight.
             if i > 1 {
                 gc.note_frame_written(ids[i as usize - 1]);
             }
@@ -1029,10 +1105,79 @@ mod tests {
             assert_eq!(gc.frames_behind_prefix(), i as usize);
             assert_eq!(gc.written_up_to, None, "the prefix waits for the front");
         }
+        // The window is full: no barrier question is asked — plain,
+        // write-through-eligible, or sync-due frames all wait.
+        assert!(gc.reorder_window_full());
+        assert_eq!(gc.frame_plan(false, false), FramePlan::Wait);
+        gc.note_staged(FsyncClass::Always);
+        assert_eq!(gc.frame_plan(true, false), FramePlan::Wait);
+        assert_eq!(gc.frame_plan(true, true), FramePlan::Wait, "even ahead of a seal");
+        // The front lands: the prefix jumps past every frame, the window
+        // reopens, and the due barrier is planned as before.
         gc.note_frame_written(ids[0]);
         assert_eq!(gc.frames_behind_prefix(), 0);
         assert_eq!(gc.frames_unwritten(), 0);
-        assert_eq!(gc.written_up_to, Some(lsn(0, (u32::from(MAX_FRAMES_IN_FLIGHT) + 4) * 64)));
+        assert_eq!(gc.written_up_to, Some(lsn(0, window * 64)));
+        assert!(!gc.reorder_window_full());
+        assert_eq!(gc.frame_plan(false, false), FramePlan::LinkedFsync);
+    }
+
+    /// ADR-0013 D3 as amended: a standalone issued while a barrier-less
+    /// frame is still in flight covers the written prefix only — and the
+    /// due **survives** it, so the in-flight frame is covered within the
+    /// tick (a linked sync on the next frame, or another standalone once
+    /// it lands) instead of waiting for the next tick.
+    #[test]
+    fn everysec_due_survives_a_standalone_that_leaves_a_frame_in_flight() {
+        let mut gc = commit();
+        gc.note_staged(FsyncClass::Everysec);
+        let a = gc.note_frame_queued(lsn(0, 64), 64);
+        gc.note_staged(FsyncClass::Everysec);
+        let b = gc.note_frame_queued(lsn(0, 128), 64);
+        gc.note_frame_written(a);
+        // The tick fires with B in flight: the standalone covers A only.
+        gc.note_everysec_tick();
+        assert!(gc.standalone_fsync_due());
+        let t1 = gc.register_standalone_fsync(Nanos::ZERO);
+        assert!(gc.sync_due(), "B's bytes are queued outside the coverage — the due stays");
+        assert!(!gc.standalone_fsync_due(), "nothing new written: no second standalone yet");
+        assert_eq!(gc.frame_plan(false, false), FramePlan::Wait, "a next frame drains first");
+        assert_eq!(gc.on_fsync_complete(t1, Nanos::ZERO), Some(lsn(0, 64)));
+        // B lands: the due is still owed and now coverable.
+        gc.note_frame_written(b);
+        assert!(gc.standalone_fsync_due());
+        let t2 = gc.register_standalone_fsync(Nanos::ZERO);
+        assert!(!gc.sync_due(), "everything queued is inside the coverage");
+        assert_eq!(gc.on_fsync_complete(t2, Nanos::ZERO), Some(lsn(0, 128)));
+        assert_eq!(gc.frame_plan(false, false), FramePlan::Plain);
+    }
+
+    /// Queueing into a full window is a plane bug, release-asserted.
+    #[test]
+    #[should_panic(expected = "full reorder window")]
+    fn queueing_into_a_full_reorder_window_panics() {
+        let mut gc = commit();
+        let window = u32::try_from(REORDER_WINDOW_FRAMES).expect("small constant");
+        let mut ids = Vec::new();
+        for i in 1..=window {
+            ids.push(gc.note_frame_queued(lsn(0, i * 64), 64));
+            if i > 1 {
+                gc.note_frame_written(ids[i as usize - 1]);
+            }
+        }
+        gc.note_frame_queued(lsn(0, (window + 1) * 64), 64);
+    }
+
+    /// Completion routing is ordinal arithmetic: the window's last frame
+    /// is found without a scan, an already-popped id is refused.
+    #[test]
+    #[should_panic(expected = "already written")]
+    fn written_for_a_popped_frame_panics() {
+        let mut gc = commit();
+        let a = gc.note_frame_queued(lsn(0, 64), 64);
+        let _b = gc.note_frame_queued(lsn(0, 128), 64);
+        gc.note_frame_written(a);
+        gc.note_frame_written(a);
     }
 
     /// `LogWritten` for the oldest frame still unwritten — the K = 1

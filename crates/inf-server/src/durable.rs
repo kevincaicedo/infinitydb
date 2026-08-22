@@ -44,6 +44,10 @@ pub(crate) const EVERYSEC_TIMER_KEY: u64 = 0xE5EC_0001;
 /// POSIX `EIO` (this crate carries no libc dep): the errno the
 /// `durable_fsync_eio` fault point injects (M2-S17).
 const EIO: i32 = 5;
+/// POSIX `EINVAL`: the kernel's refusal of a direct write the filesystem
+/// cannot take (ADR-0088 D3 as amended) — the checkpoint's in-band
+/// downgrade signal, never a fault.
+const EINVAL: i32 = 22;
 
 /// Pinned retryable reply for staging backpressure the caller cannot
 /// park on. After ADR-0083 D1 (M4.5-S27) the only emitter left is the
@@ -216,6 +220,12 @@ pub struct DurableStats {
     /// and never inflated by the loop's iteration rate.
     pub frame_waits_barrier: u64,
     pub frame_waits_rotation: u64,
+    /// A staged frame held because the ledger's reorder window is full
+    /// (ADR-0087 D2 as amended): the front write is late and
+    /// `REORDER_WINDOW_FRAMES` frames landed behind it. Counted per
+    /// episode like the other two; a non-zero value names a wedging
+    /// device, never an engine regression.
+    pub frame_waits_reorder: u64,
     /// Instantaneous log quiescence gauges: frames sealed and awaiting
     /// `LogWritten`, and records staged but not yet sealed. Both zero ⇒
     /// every executed durable effect has reached the file — the DST's
@@ -244,6 +254,7 @@ pub struct DurableStats {
     /// 1 when checkpoint staging runs buffered (the probed `O_DIRECT`
     /// fallback, ADR-0088 D3 as amended).
     pub ckpt_io_mode_buffered: u64,
+    pub ckpt_io_mode_downgrades: u64,
     /// `ceil_milli((log_frame_bytes + ckpt_bytes_total +
     /// manifest_bytes_total) / append_bytes)` — cell scope, boot life;
     /// undefined (0, with `_undefined = 1`) until the first checkpoint
@@ -318,6 +329,7 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     /// that held the staged frame until it seals.
     frame_waits_barrier: u64,
     frame_waits_rotation: u64,
+    frame_waits_reorder: u64,
     frame_held: bool,
     /// M4.5-S36 (ADR-0088 D2): the cell's device budget — refilled at
     /// every MAINTAIN entry from the injected clock, consulted by the
@@ -407,6 +419,7 @@ impl<F: SegmentFs> DurableCell<F> {
             parked_total: 0,
             frame_waits_barrier: 0,
             frame_waits_rotation: 0,
+            frame_waits_reorder: 0,
             frame_held: false,
             budget,
             seal_pace,
@@ -606,8 +619,10 @@ impl<F: SegmentFs> DurableCell<F> {
     /// into one positional write carrying the barrier the ledger's plan
     /// allows, or issue a standalone fdatasync for a frameless everysec
     /// tick. A frame waits — bounded, one write latency — when it needs
-    /// a rotation while frames are in flight, or when a sync is due that
-    /// neither write-through nor a linked fdatasync may carry yet.
+    /// a rotation while frames are in flight, when a sync is due that
+    /// neither write-through nor a linked fdatasync may carry yet, or
+    /// when the ledger's reorder window is full behind a late front
+    /// write (ADR-0087 D2 as amended).
     pub fn seal_log(&mut self, cx: &mut LoopCx<'_>) {
         if self.failed {
             return;
@@ -644,7 +659,14 @@ impl<F: SegmentFs> DurableCell<F> {
             let write_through_ok = self.rotor.next_frame_write_through_ok(frame_len);
             let plan = self.commit.frame_plan(write_through_ok, rotation_due);
             if plan == FramePlan::Wait {
-                self.frame_waits_barrier += u64::from(!self.frame_held);
+                // Two reasons, two counters: the reorder window is full
+                // (ADR-0087 D2 as amended — a device row), or the due
+                // barrier is inadmissible behind in-flight writes (D3).
+                if self.commit.reorder_window_full() {
+                    self.frame_waits_reorder += u64::from(!self.frame_held);
+                } else {
+                    self.frame_waits_barrier += u64::from(!self.frame_held);
+                }
                 self.frame_held = true;
                 return;
             }
@@ -1238,8 +1260,17 @@ impl<F: SegmentFs> DurableCell<F> {
 
     /// REAP: a checkpoint op failed — abort the checkpoint, never the
     /// process (the old checkpoint and the whole log stay valid; the
-    /// milestone's "checkpoints abort cleanly" rule).
+    /// milestone's "checkpoints abort cleanly" rule). `EINVAL` under
+    /// `Direct` is the filesystem refusing the direct write the boot
+    /// probe could not foresee: the cell downgrades to `Buffered` for
+    /// good and retries at once (ADR-0088 D3 as amended); every other
+    /// errno — and `EINVAL` under `Buffered` — is an ordinary abort with
+    /// the backoff.
     pub fn on_ckpt_error(&mut self, errno: i32) {
+        if errno == EINVAL && self.ckpt.io_mode_direct() {
+            self.ckpt.abort_refused_direct("I/O");
+            return;
+        }
         self.ckpt.abort("I/O", &format!("errno {errno}"));
     }
 
@@ -1466,6 +1497,7 @@ impl<F: SegmentFs> DurableCell<F> {
             frames_in_flight_max: u64::from(self.staging.stats().in_flight_max),
             frame_waits_barrier: self.frame_waits_barrier,
             frame_waits_rotation: self.frame_waits_rotation,
+            frame_waits_reorder: self.frame_waits_reorder,
             frames_in_flight_now: u64::from(self.staging.in_flight()),
             records_staged: u64::from(self.staging.pending_records()),
             io_budget_model_absent: u64::from(self.budget.model_absent()),
@@ -1481,6 +1513,7 @@ impl<F: SegmentFs> DurableCell<F> {
             ckpt_interval_bytes: ckpt.interval_bytes,
             ckpt_records_since_begin: ckpt.records_since_begin,
             ckpt_io_mode_buffered: ckpt.io_mode_buffered,
+            ckpt_io_mode_downgrades: ckpt.io_mode_downgrades,
             write_amp_milli_log_checkpoint: write_amp,
             write_amp_log_checkpoint_undefined: undefined,
             write_stall_max_us: self.write_stall_hist.max(),

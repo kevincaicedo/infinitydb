@@ -148,6 +148,16 @@ pub struct StallConfig {
     /// byte-identical; reads stay inline).
     pub write_bytes_per_s: u64,
     pub read_bytes_per_s: u64,
+    /// Wedged plain writes (ADR-0087 D2 as amended): every
+    /// `wedge_every_writes`-th plain write (0 = never) completes
+    /// `wedge_ns` later than its draw — one write held at the front of
+    /// the pipeline while every later frame lands behind it, the shape
+    /// that fills the completion ledger's reorder window. Off the flush
+    /// timeline like every plain write: nothing else waits on it, only
+    /// the written prefix does. 0 keeps every existing trace
+    /// byte-identical.
+    pub wedge_every_writes: u64,
+    pub wedge_ns: u64,
 }
 
 impl Default for StallConfig {
@@ -165,6 +175,8 @@ impl Default for StallConfig {
             write_base_ns: 0,
             write_bytes_per_s: 0,
             read_bytes_per_s: 0,
+            wedge_every_writes: 0,
+            wedge_ns: 0,
         }
     }
 }
@@ -184,6 +196,8 @@ struct StallModel {
     next_episode_at: u64,
     /// ...and lasts this long (memoized with the start, one draw each).
     episode_dur_ns: u64,
+    /// Plain writes drawn so far — the wedge cadence's counter.
+    plain_writes: u64,
 }
 
 impl StallModel {
@@ -195,6 +209,7 @@ impl StallModel {
             bandwidth_free_at: 0,
             next_episode_at: 0,
             episode_dur_ns: 0,
+            plain_writes: 0,
         };
         model.arm_next_episode();
         model
@@ -243,7 +258,14 @@ impl StallModel {
     /// byte timeline (ADR-0088 D8).
     fn schedule_write(&mut self, now_ns: u64, len: u64) -> u64 {
         let due = self.schedule_off_timeline(now_ns, self.cfg.write_base_ns);
-        due.max(self.schedule_transfer(now_ns, len, self.cfg.write_bytes_per_s))
+        let due = due.max(self.schedule_transfer(now_ns, len, self.cfg.write_bytes_per_s));
+        self.plain_writes += 1;
+        if self.cfg.wedge_every_writes > 0
+            && self.plain_writes.is_multiple_of(self.cfg.wedge_every_writes)
+        {
+            return due.saturating_add(self.cfg.wedge_ns);
+        }
+        due
     }
 
     /// One tier read's absolute completion time (ADR-0088 D8): the byte
@@ -323,9 +345,30 @@ struct Inode {
     /// and length, asserted here so the simulator catches what tmpfs
     /// swallows (ADR-0088 D3).
     direct: bool,
+    /// Direct-meta refusal budget (ADR-0088 D3 as amended): `Some(n)` on
+    /// a `create_meta_direct` inode while the disk's refusal is armed —
+    /// `n` more direct writes to *this file* succeed, every later one
+    /// answers `InvalidInput`. `None` on every other inode.
+    direct_writes_left: Option<u64>,
 }
 
 impl Inode {
+    /// The direct-write gate: counts this inode's budget down, then
+    /// refuses with `InvalidInput` (the kernel's `EINVAL`).
+    fn direct_write_gate(&mut self) -> io::Result<()> {
+        match self.direct_writes_left {
+            None => Ok(()),
+            Some(0) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SimDisk: O_DIRECT write refused (refuse_direct_writes_after)",
+            )),
+            Some(ref mut n) => {
+                *n -= 1;
+                Ok(())
+            }
+        }
+    }
+
     fn write(&mut self, offset: u64, data: &[u8]) {
         let offset_usize = usize::try_from(offset).expect("offset fits usize");
         let end = offset_usize + data.len();
@@ -461,6 +504,16 @@ struct DiskState {
     /// `O_DIRECT` (ADR-0088 D3 as amended): the checkpoint's probed
     /// buffered fallback under the reactor tier.
     refuse_direct_meta: bool,
+    /// `Some(n)`: every `create_meta_direct` file from now on takes `n`
+    /// direct writes and answers `InvalidInput` (the kernel's `EINVAL`
+    /// for a direct write the filesystem cannot take) to every later one
+    /// — ADR-0088 D3 as amended: `Some(0)` fails the boot probe's own
+    /// block (the open passed), `Some(1)` passes the one-block probe and
+    /// refuses the checkpoint file's second block, the in-band
+    /// downgrade's shape. Meta files only — the model is a ckpt
+    /// directory whose filesystem cannot take direct writes; `Direct`
+    /// log segments are untouched. `None` = every direct write succeeds.
+    direct_meta_writes_allowed: Option<u64>,
     /// Cumulative **blocking** `SegmentFs::sync_dir` calls (M2.5-S01):
     /// the boot-storm oracle's observable — the ready path must issue
     /// zero of these (driver-ridden barrier syncs on dir handles do not
@@ -589,6 +642,16 @@ impl SimDisk {
         self.state.borrow_mut().refuse_direct_meta = true;
     }
 
+    /// Model a ckpt-dir filesystem that takes the `O_DIRECT` open but
+    /// refuses direct writes (ADR-0088 D3 as amended): every
+    /// `create_meta_direct` file from now on takes `n` direct writes and
+    /// refuses every later one with `InvalidInput`. `0` fails the boot
+    /// probe's own block; `1` lets the one-block probe pass and refuses
+    /// the checkpoint file's second block — the in-band downgrade.
+    pub fn refuse_direct_writes_after(&self, n: u64) {
+        self.state.borrow_mut().direct_meta_writes_allowed = Some(n);
+    }
+
     /// Arms the dead switch: `n` more mutating ops succeed, then every
     /// operation fails with a named error until [`Self::power_cut`].
     pub fn cut_after_ops(&self, n: u64) {
@@ -692,6 +755,7 @@ impl SimDisk {
             .get_mut(&ino)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
         assert_direct_aligned(inode, offset, data.len());
+        inode.direct_write_gate()?;
         inode.write(offset, data);
         Ok(())
     }
@@ -711,6 +775,7 @@ impl SimDisk {
             .get_mut(&ino)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
         assert_direct_aligned(inode, offset, data.len());
+        inode.direct_write_gate()?;
         inode.write_through(offset, data);
         Ok(())
     }
@@ -765,7 +830,7 @@ impl SimDisk {
     }
 
     fn create_inode(&self, path: &Path, os: Vec<u8>, durable: Vec<u8>) -> io::Result<SimFile> {
-        self.create_inode_full(path, os, durable, 0, false)
+        self.create_inode_full(path, os, durable, 0, false, false)
     }
 
     fn create_inode_targeted(
@@ -775,7 +840,7 @@ impl SimDisk {
         durable: Vec<u8>,
         prealloc_target: u64,
     ) -> io::Result<SimFile> {
-        self.create_inode_full(path, os, durable, prealloc_target, true)
+        self.create_inode_full(path, os, durable, prealloc_target, true, false)
     }
 
     fn create_inode_full(
@@ -785,6 +850,7 @@ impl SimDisk {
         durable: Vec<u8>,
         prealloc_target: u64,
         direct: bool,
+        meta: bool,
     ) -> io::Result<SimFile> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
@@ -803,9 +869,12 @@ impl SimDisk {
         }
         state.next_ino += 1;
         let ino = state.next_ino;
-        state
-            .inodes
-            .insert(ino, Inode { durable, os, pending: Vec::new(), prealloc_target, direct });
+        let direct_writes_left =
+            if direct && meta { state.direct_meta_writes_allowed } else { None };
+        state.inodes.insert(
+            ino,
+            Inode { durable, os, pending: Vec::new(), prealloc_target, direct, direct_writes_left },
+        );
         state.os_names.insert(path.to_path_buf(), ino);
         state
             .pending_meta
@@ -861,6 +930,11 @@ impl SegmentFile for SimFile {
         match &self.target {
             Target::Ino(ino) => {
                 let inode = state.inodes.get_mut(ino).expect("open handle pins its inode");
+                // The blocking tier sees the same direct-write physics as
+                // the driver tier (ADR-0088 D3 as amended): alignment
+                // asserted, the refusal gate consulted.
+                assert_direct_aligned(inode, offset, data.len());
+                inode.direct_write_gate()?;
                 inode.write(offset, data);
                 Ok(())
             }
@@ -1035,8 +1109,9 @@ impl SegmentFs for SimDisk {
             ));
         }
         // Volatile like `create_meta`, flagged direct: every driver write
-        // to it is alignment-asserted (ADR-0088 D3).
-        self.create_inode_full(path, Vec::new(), Vec::new(), 0, true)
+        // to it is alignment-asserted (ADR-0088 D3) and gated by the
+        // meta refusal budget (D3 as amended).
+        self.create_inode_full(path, Vec::new(), Vec::new(), 0, true, true)
     }
 
     fn open_dir(&self, dir: &Path) -> io::Result<Self::File> {
@@ -1148,7 +1223,32 @@ mod stall_tests {
             write_base_ns: 0,
             write_bytes_per_s: 0,
             read_bytes_per_s: 0,
+            wedge_every_writes: 0,
+            wedge_ns: 0,
         }
+    }
+
+    /// ADR-0087 D2 as amended: every Nth plain write is wedged by a fixed
+    /// term on top of its draw; the writes around it are untouched and
+    /// the flush timeline never sees it.
+    #[test]
+    fn wedge_delays_every_nth_plain_write_only() {
+        let mut cfg = armed_cfg();
+        cfg.write_base_ns = 8_000;
+        cfg.tail_permille = 0;
+        cfg.wedge_every_writes = 3;
+        cfg.wedge_ns = 150_000_000;
+        let disk = SimDisk::with_stall(SimDiskConfig::default(), cfg, 7);
+        let w1 = disk.schedule_write(1_000, 4096).expect("armed");
+        let w2 = disk.schedule_write(1_000, 4096).expect("armed");
+        let w3 = disk.schedule_write(1_000, 4096).expect("armed");
+        let w4 = disk.schedule_write(1_000, 4096).expect("armed");
+        assert_eq!(w1, 9_000);
+        assert_eq!(w2, 9_000);
+        assert_eq!(w3, 9_000 + 150_000_000, "the third write is wedged");
+        assert_eq!(w4, 9_000, "the next one is not");
+        let sync = disk.schedule_fsync(1_000).expect("armed");
+        assert!(sync < w3, "the wedge never rides the flush timeline");
     }
 
     #[test]

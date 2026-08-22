@@ -48,7 +48,8 @@ pub use ckpt::{
     SectionLease, SyncIckWriter, read_ick, read_ick_hybrid,
 };
 pub use commit::{
-    CommitStats, FrameId, FramePlan, FsyncClass, FsyncTicket, GroupCommit, SyncReason,
+    CommitStats, FrameId, FramePlan, FsyncClass, FsyncTicket, GroupCommit, REORDER_WINDOW_FRAMES,
+    SyncReason,
 };
 pub use effect::MutationEffect;
 pub use flush::{

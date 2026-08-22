@@ -476,9 +476,12 @@ struct S35Leg {
 /// client p50 ÷ barrier p50) → a 256-conn leg (the `max` row) → a
 /// pipelined 100 %-GET leg over the keyspace the two write legs
 /// populated (the ±2 % read row, compared across arm reports; `nils`
-/// disclosed). Then a fresh 1-cell server, the 32-conn leg (the 4c ÷ 1c
-/// p50 ratio — S34's F2 AC, owned here). Every durable leg is preceded
-/// by the drive-state idle.
+/// disclosed). Then, **inside the same replicate**, a fresh 1-cell
+/// server and the 32-conn leg (the 4c ÷ 1c p50 ratio — S34's F2 AC,
+/// owned here): the arms of the ratio are interleaved so drive-state
+/// drift across the campaign lands on both, never on whichever block
+/// ran last (review of `2cb6074`). Every durable leg is preceded by the
+/// drive-state idle.
 ///
 /// **No fill leg**: the barrier p50 is a whole-session histogram, and
 /// the first campaign (2026-08-21, `.artifacts/m4.5/s35-gate/`) showed
@@ -625,12 +628,13 @@ fn s35_frame_pipeline_row(
         read_p999.push(rd.p999_us as f64);
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    // The 1-cell arm of the F2 ratio (same binary, same arms, same
-    // shape; only `--cells` differs).
-    if cells > 1 {
-        for rep in 0..replicates {
+        // The 1-cell arm of the F2 ratio (same binary, same arms, same
+        // shape; only `--cells` differs) — **interleaved** with its
+        // N-cell replicate (review of `2cb6074`): drive-state drift
+        // across a campaign then lands on both arms of the ratio, not
+        // on whichever ran last.
+        if cells > 1 {
             let dir = format!("{data_root}/s35-1c-rep{rep}");
             s35_idle(idle_s, &format!("1c rep{rep} c{S35_CONNS_AC}"));
             let (server, port) = s35_spawn(flags, infinityd, 1, &dir)?;
@@ -659,7 +663,8 @@ fn s35_frame_pipeline_row(
             drop(server);
             let _ = std::fs::remove_dir_all(&dir);
         }
-    } else {
+    }
+    if cells == 1 {
         m.note("s35: --cells 1 — the multi-vs-one-cell ratio key is absent (nothing to compare)");
     }
 
@@ -708,8 +713,9 @@ fn s35_frame_pipeline_row(
         "s35 row: flat always, no fill (the AC leg runs first on a fresh server so its \
          barrier histogram holds only its own frames), {FILL_KEYS}-key space × 1 KiB, \
          {duration}s legs, median of {replicates}; AC leg {S35_CONNS_AC} conns pipeline 1 on \
-         {cells} cells then on 1 cell; max leg {CONNS_HIGH} conns; read leg 64 conns × P16 \
-         100% GET over the keys the write legs populated (nils disclosed); {idle_s}s idle \
+         {cells} cells then on 1 cell (interleaved per replicate); max leg {CONNS_HIGH} conns; \
+         read leg 64 conns × P16 100% GET over the keys the write legs populated (nils \
+         disclosed); {idle_s}s idle \
          before every durable leg; barrier = {p50_key} (cell median, whole-session \
          histogram); device tail = {p99_key} (worst cell)"
     ));

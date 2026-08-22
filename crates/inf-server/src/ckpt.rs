@@ -16,7 +16,8 @@ use std::io;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
-use inf_log::ckpt::{ick_file_name, ick_staging_file_name, parse_ick_file_name};
+use inf_alloc::AlignedBox;
+use inf_log::ckpt::{ICK_BLOCK_ALIGN, ick_file_name, ick_staging_file_name, parse_ick_file_name};
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{CkptConfig, IckStream, Lsn, Manifest, SectionLease, SegmentId, StagedAt};
 use inf_runtime::{CompletionToken, TokenClass};
@@ -107,9 +108,11 @@ pub(crate) struct Streaming<File: SegmentFile> {
 pub struct CkptStats {
     pub completed: u64,
     pub aborted: u64,
-    /// 1 when the probed staging mode is `Buffered` (ADR-0088 D3 as
-    /// amended) — the disclosed fallback.
+    /// 1 when the staging mode in force is `Buffered` (ADR-0088 D3 as
+    /// amended) — the disclosed fallback, probed at boot or downgraded
+    /// in-band (`io_mode_downgrades`, 0 or 1 per cell life).
     pub io_mode_buffered: u64,
+    pub io_mode_downgrades: u64,
     pub last_unix_ms: u64,
     pub last_begin_lsn: u64,
     /// Live checkpoint-buffer domain bytes (0 when idle — L5).
@@ -130,10 +133,18 @@ pub struct CkptStats {
 /// `Buffered` is the **probed** fallback where the filesystem or platform
 /// refuses `O_DIRECT` (macOS, some Linux filesystems) — the same v3
 /// container, aligned blocks and all, on a buffered fd. Decided once per
-/// cell at boot by creating and removing a probe file in the ckpt dir;
-/// never per checkpoint (a per-checkpoint failure would retry every slice
-/// and never complete — the unbounded-retained-log posture the review
-/// named). Disclosed: a boot line and INFO `ckpt_io_mode`.
+/// cell at boot by creating a probe file in the ckpt dir, **writing one
+/// aligned block to it and syncing it** (an open can succeed where the
+/// first direct write is refused — the review of `2cb6074`), then
+/// removing it; never per checkpoint (a per-checkpoint failure would
+/// retry every slice and never complete — the unbounded-retained-log
+/// posture the review named). One in-band rule backs the probe: a
+/// checkpoint op refused with `EINVAL` under `Direct` downgrades the cell
+/// to `Buffered` for good and retries at once — a refusal the probe could
+/// not see (a per-write constraint) never loops; a real error (`EIO`,
+/// `ENOSPC`) aborts with the ordinary backoff and never changes the
+/// mode. Disclosed: a boot line, INFO `ckpt_io_mode`, and
+/// `ckpt_io_mode_downgrades`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CkptIoMode {
     Direct,
@@ -152,6 +163,9 @@ pub(crate) struct CkptCell<F: SegmentFs> {
     cell: u16,
     fs: F,
     io_mode: CkptIoMode,
+    /// In-band `Direct` → `Buffered` downgrades (ADR-0088 D3 as amended):
+    /// 0 or 1 per cell life, surfaced as `ckpt_io_mode_downgrades`.
+    io_mode_downgrades: u64,
     /// Slices left before an aborted checkpoint may be retried.
     backoff_slices: u32,
     next_id: u64,
@@ -202,6 +216,7 @@ impl<F: SegmentFs> CkptCell<F> {
             cell,
             fs,
             io_mode,
+            io_mode_downgrades: 0,
             backoff_slices: 0,
             next_id,
             requested: false,
@@ -222,10 +237,40 @@ impl<F: SegmentFs> CkptCell<F> {
         self.next_id
     }
 
-    /// The probed staging-file I/O mode (boot-fixed).
+    /// The staging-file I/O mode in force: probed at boot, downgraded at
+    /// most once by [`abort_refused_direct`](Self::abort_refused_direct).
     #[cfg(test)]
     pub fn io_mode(&self) -> CkptIoMode {
         self.io_mode
+    }
+
+    /// A checkpoint op was refused with `EINVAL` under `Direct` (ADR-0088
+    /// D3 as amended): the filesystem took the probe's aligned block but
+    /// refuses this write — per-write constraints the probe cannot see.
+    /// Downgrade the cell to `Buffered` for the rest of its life, abort
+    /// the checkpoint, and clear the abort backoff so the next MAINTAIN
+    /// slice retries immediately in the new mode; the trigger state is
+    /// untouched. Under `Buffered` an `EINVAL` is an ordinary abort (the
+    /// caller routes it there). Never silent: a log line and the
+    /// `ckpt_io_mode_downgrades` counter.
+    pub fn abort_refused_direct(&mut self, what: &str) {
+        debug_assert_eq!(self.io_mode, CkptIoMode::Direct);
+        self.io_mode = CkptIoMode::Buffered;
+        self.io_mode_downgrades += 1;
+        eprintln!(
+            "cell {}: checkpoint staging downgraded to buffered I/O — O_DIRECT {what} refused \
+             (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once \
+             (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:{})",
+            self.cell, self.io_mode_downgrades
+        );
+        self.abort(what, "EINVAL under O_DIRECT");
+        self.backoff_slices = 0;
+    }
+
+    /// True while the staging mode is `Direct` — the caller's guard for
+    /// routing an `EINVAL` to [`abort_refused_direct`](Self::abort_refused_direct).
+    pub fn io_mode_direct(&self) -> bool {
+        self.io_mode == CkptIoMode::Direct
     }
 
     /// One MAINTAIN slice of abort backoff elapsed; `true` while the
@@ -415,28 +460,37 @@ impl<F: SegmentFs> CkptCell<F> {
             interval_bytes: self.interval_bytes,
             records_since_begin: records_total.saturating_sub(base),
             io_mode_buffered: u64::from(self.io_mode == CkptIoMode::Buffered),
+            io_mode_downgrades: self.io_mode_downgrades,
             ..self.stats
         }
     }
 }
 
 /// Boot-time `O_DIRECT` probe for the ckpt dir (ADR-0088 D3 as amended):
-/// create a probe file direct, remove it. `Unsupported` / `InvalidInput`
-/// (the kernel's `EINVAL` for a filesystem without `O_DIRECT`) select
-/// `Buffered`, loudly; any other error is the boot's (a ckpt dir that
-/// cannot take a file cannot take a checkpoint either).
+/// create a probe file direct, **write one aligned block and sync it**,
+/// remove it. `Unsupported` / `InvalidInput` (the kernel's `EINVAL` for a
+/// filesystem without `O_DIRECT`, at the open or at the first write)
+/// select `Buffered`, loudly; any other error is the boot's (a ckpt dir
+/// that cannot take a file cannot take a checkpoint either). Boot-time,
+/// blocking, before the cell loop runs — the same class as the create
+/// and remove beside it.
 fn probe_direct<F: SegmentFs>(fs: &F, dir: &Path, cell: u16) -> io::Result<CkptIoMode> {
     let probe = dir.join(".direct-probe");
     let _ = fs.remove_file(&probe);
-    match fs.create_meta_direct(&probe) {
-        Ok(file) => {
-            drop(file);
+    let refused = |err: &io::Error| {
+        matches!(err.kind(), io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput)
+    };
+    let attempt = fs.create_meta_direct(&probe).and_then(|mut file| {
+        let block = AlignedBox::new(ICK_BLOCK_ALIGN);
+        file.write_at(0, block.bytes())?;
+        file.sync_data()
+    });
+    match attempt {
+        Ok(()) => {
             fs.remove_file(&probe)?;
             Ok(CkptIoMode::Direct)
         }
-        Err(err)
-            if matches!(err.kind(), io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput) =>
-        {
+        Err(err) if refused(&err) => {
             let _ = fs.remove_file(&probe);
             eprintln!(
                 "cell {cell}: checkpoint staging falls back to buffered I/O — O_DIRECT refused \
@@ -446,7 +500,10 @@ fn probe_direct<F: SegmentFs>(fs: &F, dir: &Path, cell: u16) -> io::Result<CkptI
             );
             Ok(CkptIoMode::Buffered)
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            let _ = fs.remove_file(&probe);
+            Err(err)
+        }
     }
 }
 
@@ -989,6 +1046,52 @@ mod tests {
         let direct = cell(&SimDisk::new());
         assert_eq!(direct.io_mode(), CkptIoMode::Direct);
         assert_eq!(direct.stats(0).io_mode_buffered, 0);
+    }
+
+    /// The probe writes (ADR-0088 D3 as amended): a filesystem that takes
+    /// the `O_DIRECT` open but refuses the first direct write selects
+    /// `Buffered` at boot — and the probe's own block is what catches it.
+    #[test]
+    fn probe_writes_a_block_so_a_refused_direct_write_selects_buffered() {
+        let fs = SimDisk::new();
+        fs.refuse_direct_writes_after(0);
+        let ckpt = cell(&fs);
+        assert_eq!(ckpt.io_mode(), CkptIoMode::Buffered);
+        assert_eq!(ckpt.stats(0).io_mode_downgrades, 0, "a boot decision, not a downgrade");
+        assert!(
+            fs.list_dir(Path::new("data/shard-0/ckpt")).expect("dir").is_empty(),
+            "no probe file left behind"
+        );
+        // One allowed write: the probe's block passes, the mode is Direct.
+        let fs = SimDisk::new();
+        fs.refuse_direct_writes_after(1);
+        assert_eq!(cell(&fs).io_mode(), CkptIoMode::Direct);
+    }
+
+    /// The in-band downgrade (ADR-0088 D3 as amended): `EINVAL` on a
+    /// checkpoint op under `Direct` flips the cell to `Buffered` for
+    /// good, aborts without the backoff, and the next stream opens
+    /// buffered — `create_meta`, which the refusing disk accepts.
+    #[test]
+    fn refused_direct_write_downgrades_once_and_retries_at_once() {
+        let fs = SimDisk::new();
+        fs.refuse_direct_writes_after(1);
+        let mut ckpt = cell(&fs);
+        assert!(ckpt.io_mode_direct());
+        ckpt.requested = true;
+        ckpt.open_stream(1, Lsn::new(SegmentId(0), 40), vec![16], false, Nanos::ZERO)
+            .expect("direct stream");
+        ckpt.abort_refused_direct("I/O");
+        assert!(matches!(ckpt.phase, CkptPhase::Idle));
+        assert!(!ckpt.io_mode_direct());
+        assert_eq!(ckpt.io_mode(), CkptIoMode::Buffered);
+        let stats = ckpt.stats(0);
+        assert_eq!((stats.aborted, stats.io_mode_buffered, stats.io_mode_downgrades), (1, 1, 1));
+        assert!(!ckpt.tick_backoff(), "no backoff: the mode changed, retry now");
+        assert!(ckpt.should_begin(0, 0), "the trigger state is untouched");
+        ckpt.open_stream(2, Lsn::new(SegmentId(0), 80), vec![16], false, Nanos::ZERO)
+            .expect("buffered stream after the downgrade");
+        assert!(matches!(ckpt.phase, CkptPhase::Stream(_)));
     }
 
     /// An aborted checkpoint holds the trigger for a backoff of slices —

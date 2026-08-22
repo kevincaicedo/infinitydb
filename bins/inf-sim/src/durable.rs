@@ -130,6 +130,20 @@ pub struct DurableScenario {
     /// scenario arms both; every other scenario stays byte-identical).
     pub device: inf_server::DeviceConfig,
     pub budget_oracle: bool,
+    /// The reorder-window oracle (ADR-0087 D2 as amended): the scenario
+    /// wedges plain writes, so the cut must find the window engaged
+    /// (`frame_waits_reorder ≥ 1` on some cell) — a sweep whose window
+    /// never filled proves nothing about the bound — while the ledger's
+    /// release assert and the m2 durability oracle hold as they are.
+    pub reorder_oracle: bool,
+    /// The checkpoint direct-write refusal (ADR-0088 D3 as amended):
+    /// `Some(n)` lets the disk take `n` direct writes, then refuse every
+    /// later one with `EINVAL`. `Some(1)` passes the boot probe's block
+    /// and refuses the first checkpoint write — the in-band downgrade —
+    /// and arms the oracle: every cell downgrades exactly once and still
+    /// publishes a checkpoint before the cut. `None` = direct writes
+    /// always succeed, every existing trace byte-identical.
+    pub ckpt_direct_refused_after: Option<u64>,
     /// A first life in another barrier class (ADR-0086 D4 as amended,
     /// 2026-08-21): the cell boots in `prelude.io_mode`, the writers run
     /// `prelude.ops_per_writer` ops, the log quiesces to full durability,
@@ -174,6 +188,8 @@ pub(crate) fn m2_stall_config() -> StallConfig {
         // stays byte-identical; the `m2-device-budget` scenario arms it.
         write_bytes_per_s: 0,
         read_bytes_per_s: 0,
+        wedge_every_writes: 0,
+        wedge_ns: 0,
     }
 }
 
@@ -228,8 +244,67 @@ impl DurableScenario {
             },
             device: Default::default(),
             budget_oracle: false,
+            reorder_oracle: false,
+            ckpt_direct_refused_after: None,
             prelude: None,
         }
+    }
+
+    /// `m2-ckpt-refused` (ADR-0088 D3 as amended, 2026-08-22): the m2
+    /// durable shape on a disk that takes the `O_DIRECT` open and the
+    /// boot probe's aligned block, then refuses the first checkpoint
+    /// write with `EINVAL` — the per-write refusal the boot probe cannot
+    /// see. The oracle: every cell downgrades its staging mode exactly
+    /// once, retries at once, and **publishes a checkpoint** before the
+    /// cut (the 24 KiB interval fires several times per run) — never the
+    /// abort-and-back-off loop the review named. The m2 durability oracle
+    /// runs unchanged across the downgrade. Both segment classes by seed
+    /// parity; the checkpoint probe is class-independent.
+    #[must_use]
+    pub fn m2_ckpt_refused(seed: u64) -> DurableScenario {
+        let mut scenario = DurableScenario::m2_durable(seed);
+        scenario.ckpt_direct_refused_after = Some(1);
+        // A packed (v2) life writes ~20 KiB of frames in the m2 span —
+        // under the 24 KiB trigger, so `Buffered` seeds would never start
+        // a checkpoint and prove nothing. 4 KiB fires on both classes.
+        scenario.ckpt_interval_bytes = 4 << 10;
+        scenario
+    }
+
+    /// `m2-reorder-window` (ADR-0087 D2 as amended, 2026-08-22): the m2
+    /// durable shape with every 40th plain write **wedged 150 ms** on a
+    /// K ≥ 2 pipeline — one late frame at the front while the frames
+    /// behind it land in 8 µs, so the completion ledger's reorder window
+    /// fills within ~16 iterations and the next frame holds for the rest
+    /// of the wedge. Before the bound the queue grew by one frame per
+    /// iteration for the whole wedge (the review of `2cb6074`). The
+    /// oracle asserts the window engaged; the ledger release-asserts the
+    /// bound; the m2 durability oracle is unchanged. **`everysec`-only
+    /// writers**: the window is reachable only across barrier-less
+    /// frames — a due `always` record behind a late write already holds
+    /// the frame at the barrier `Wait` (D3), which `m2_durable` covers —
+    /// so the everysec tick is the one sync this shape sees. K = 2..=4
+    /// by seed (a K = 1 ring cannot reorder: the wedged write holds the
+    /// only slot), both segment classes by seed parity as in `m2_durable`,
+    /// on 256 KiB segments (below).
+    #[must_use]
+    pub fn m2_reorder_window(seed: u64) -> DurableScenario {
+        let mut scenario = DurableScenario::m2_durable(seed);
+        let mut stall = m2_stall_config();
+        stall.wedge_every_writes = 40;
+        stall.wedge_ns = 150_000_000;
+        scenario.stall = Some(stall);
+        scenario.always_writers = 0;
+        scenario.esec_writers = 6;
+        scenario.frames_in_flight = 2 + ((seed / 2) % 3) as u8;
+        // Rotation is a drain point (D4): on the 16 KiB m2 segment an
+        // aligned `Direct` frame pipeline rotates every four frames and
+        // the rotation wait lands before the window can fill. 256 KiB
+        // segments hold 64 aligned frames — the wedge shape is the
+        // window's, on both classes.
+        scenario.segment_bytes = 256 << 10;
+        scenario.reorder_oracle = true;
+        scenario
     }
 
     /// `m2-mode-transition` (ADR-0086 D4 as amended, 2026-08-21): the m2
@@ -342,6 +417,8 @@ impl DurableScenario {
                 seal_barriers_per_s: 2_000 / u64::from(cells),
             },
             budget_oracle: true,
+            reorder_oracle: false,
+            ckpt_direct_refused_after: None,
             prelude: None,
         }
     }
@@ -381,6 +458,8 @@ impl DurableScenario {
             frames_in_flight: 1,
             device: Default::default(),
             budget_oracle: false,
+            reorder_oracle: false,
+            ckpt_direct_refused_after: None,
             prelude: None,
         }
     }
@@ -432,6 +511,13 @@ pub struct DurableReport {
     pub frames_in_flight_max: u64,
     pub frame_waits_barrier: u64,
     pub frame_waits_rotation: u64,
+    /// Reorder-window hold episodes (ADR-0087 D2 as amended), scraped at
+    /// the cut — the `m2-reorder-window` oracle's observable.
+    pub frame_waits_reorder: u64,
+    /// Checkpoint `Direct` → `Buffered` in-band downgrades (ADR-0088 D3
+    /// as amended), scraped at the cut — the `m2-ckpt-refused` oracle's
+    /// coverage disclosure.
+    pub ckpt_downgrades: u64,
     /// Device-budget coverage (M4.5-S36, ADR-0088 D8), scraped at the
     /// cut: background bytes the budget granted, deferrals it issued
     /// (a sweep whose budget never deferred proves nothing), the seal
@@ -991,6 +1077,9 @@ impl AuditTally {
 pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
     let disk = build_disk(scenario.seed, scenario.stall.as_ref());
+    if let Some(allowed) = scenario.ckpt_direct_refused_after {
+        disk.refuse_direct_writes_after(allowed);
+    }
     let observer = TraceObserver::default();
     let mut rng = SplitMix64::new(scenario.seed ^ 0xD07A_B1E5);
     let mut report = DurableReport {
@@ -1013,6 +1102,8 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         frames_in_flight_max: 0,
         frame_waits_barrier: 0,
         frame_waits_rotation: 0,
+        frame_waits_reorder: 0,
+        ckpt_downgrades: 0,
         budget_background_bytes: 0,
         budget_deferrals: 0,
         frame_waits_pace: 0,
@@ -1319,6 +1410,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                 report.frames_in_flight_max.max(stats.frames_in_flight_max);
             report.frame_waits_barrier += stats.frame_waits_barrier;
             report.frame_waits_rotation += stats.frame_waits_rotation;
+            report.frame_waits_reorder += stats.frame_waits_reorder;
             report.frame_waits_pace += stats.frame_waits_pace;
             report.write_stall_max_us = report.write_stall_max_us.max(stats.write_stall_max_us);
             for class in inf_runtime::IoClass::ALL {
@@ -1332,6 +1424,49 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
     }
     if scenario.budget_oracle {
         budget_oracles(scenario, &node, clock.now(), &mut report);
+    }
+    if scenario.ckpt_direct_refused_after.is_some() {
+        for cell in 0..usize::from(scenario.cells) {
+            let (downgrades, frame_bytes) = node
+                .plane(cell)
+                .durable_stats()
+                .map_or((0, 0), |s| (s.ckpt_io_mode_downgrades, s.log_frame_bytes));
+            let (completed, aborted) = node.plane(cell).ckpt_stats_for_sim();
+            report.ckpt_downgrades += downgrades;
+            // A cell cut before four intervals of frames may not have
+            // reached its retry's publish (one refused attempt, the
+            // immediate retry, a few slices of walk): not a verdict.
+            // The manifest discloses how many cells exercised the
+            // downgrade (`ckpt_downgrades`), so a sweep that never did
+            // is visible.
+            if frame_bytes < 4 * scenario.ckpt_interval_bytes {
+                continue;
+            }
+            if downgrades != 1 || completed == 0 {
+                fail(
+                    &mut report,
+                    format!(
+                        "CHECKPOINT LIVENESS VIOLATION seed {:#x} cell {cell}: direct writes \
+                         refused after the probe — downgrades {downgrades} (want 1), \
+                         checkpoints completed {completed} (want ≥ 1), aborted {aborted}, \
+                         log frame bytes {frame_bytes}",
+                        scenario.seed
+                    ),
+                );
+            }
+        }
+    }
+    if scenario.reorder_oracle && report.frame_waits_reorder == 0 {
+        let depth = report.frames_in_flight_max;
+        fail(
+            &mut report,
+            format!(
+                "REORDER WINDOW NOT ENGAGED seed {:#x}: the wedged device never filled the \
+                 completion ledger's window (frames_in_flight_max {depth}) — the scenario \
+                 proves nothing about the bound",
+                scenario.seed
+            ),
+        );
     }
     drop(node); // the process dies: in-flight state vanishes
     disk.power_cut(scenario.seed ^ 0x0FF5_EED0);

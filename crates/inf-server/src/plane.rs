@@ -2817,6 +2817,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.frames_in_flight_max.set(stats.frames_in_flight_max);
             node.frame_waits_barrier.set(stats.frame_waits_barrier);
             node.frame_waits_rotation.set(stats.frame_waits_rotation);
+            node.frame_waits_reorder.set(stats.frame_waits_reorder);
             node.fsyncs_completion.set(stats.fsyncs_completion);
             node.log_segments_live.set(stats.log_segments_live);
             // M4.5-S36 (ADR-0088 D7): the device budget's ledger, the
@@ -2841,6 +2842,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.ckpt_interval_bytes.set(stats.ckpt_interval_bytes);
             node.ckpt_records_since_begin.set(stats.ckpt_records_since_begin);
             node.ckpt_io_mode_buffered.set(stats.ckpt_io_mode_buffered);
+            node.ckpt_io_mode_downgrades.set(stats.ckpt_io_mode_downgrades);
             node.write_amp_milli_log_checkpoint.set(stats.write_amp_milli_log_checkpoint);
             node.write_amp_log_checkpoint_undefined.set(stats.write_amp_log_checkpoint_undefined);
             let ckpt = cell.ckpt_stats();
