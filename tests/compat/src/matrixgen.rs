@@ -638,6 +638,11 @@ pub fn render() -> String {
     push("namespaces route values at or above `BLOB-THRESHOLD` out of line and are");
     push("not bound by it. The barrier class (`--barrier-class`, ADR-0086) and the");
     push("frame pipeline depth do not move the bound; only the staging buffer size does.");
+    push("The pipeline depth is class-derived since the ADR-0087 fourth amendment");
+    push("(2026-08-22): `--frames-in-flight auto` resolves to 3 under the FUA class and 1");
+    push("under FLUSH, both at 4 MiB buffers — the record bound is the same in either.");
+    push("Segment recycling (M4.5-S39b, ADR-0090; `--no-segment-recycle` turns it off)");
+    push("changes which file the next log segment is, never a client-visible semantic.");
     push("");
     push("`FSYNC everysec` namespaces ack on apply and fsync on the 1 s tick — the");
     push("`appendfsync everysec` loss window (≤ 1 s on power loss). Under the frame-fill");

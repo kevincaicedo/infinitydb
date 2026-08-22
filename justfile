@@ -65,6 +65,7 @@ sim-smoke:
     cargo run --release --bin inf-sim -- --scenario m2-mode-transition --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m2-reorder-window --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m2-ckpt-refused --seed 0xC0FFEE --verify-determinism
+    cargo run --release --bin inf-sim -- --scenario m2-recycle --seed 0xC0FFEE --verify-determinism
 
 # M2-S19 durability sweep (the §6 dst_sweep gate shape). Usage:
 #   just durable-sweep [seeds] [base]
@@ -126,6 +127,26 @@ reorder-sweep seeds="2000" base="0x2E0D0000":
     out=$(mktemp -d)
     for i in 0 1 2 3 4 5 6 7; do
         ./target/release/inf-sim --scenario m2-reorder-window --sweep {{seeds}} --seed {{base}} \
+            --shard "$i/8" --out "$out" & done
+    wait
+    cat "$out"/manifest-shard-*.txt
+
+# M4.5-S39b segment-recycling sweep (ADR-0090 D5): the m2 durable shape
+# under the FUA class with an `always` namespace on every seed, small
+# segments and a checkpoint interval at the segment size (many rotations,
+# checkpoints, truncations and recyclings per run); the recycle oracle
+# (rotated + truncated ⇒ recycled; zero-fill ≤ unserved preallocs ×
+# segment), a refused boot is a finding, the m2 durability oracle holds.
+# The planted-bug canary: `RUSTFLAGS="--cfg inf_canary_foreign_segment"`
+# on a scratch target dir must turn this sweep red. Usage:
+#   just recycle-sweep [seeds] [base]
+recycle-sweep seeds="10000" base="0xD5EE0000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --bin inf-sim
+    out=$(mktemp -d)
+    for i in 0 1 2 3 4 5 6 7; do
+        ./target/release/inf-sim --scenario m2-recycle --sweep {{seeds}} --seed {{base}} \
             --shard "$i/8" --out "$out" & done
     wait
     cat "$out"/manifest-shard-*.txt

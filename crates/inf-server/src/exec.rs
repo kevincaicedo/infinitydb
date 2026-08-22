@@ -190,6 +190,19 @@ pub struct NodeInfo {
     pub ckpt_io_mode_downgrades: Cell<u64>,
     pub write_amp_milli_log_checkpoint: Cell<u64>,
     pub write_amp_log_checkpoint_undefined: Cell<u64>,
+    /// M4.5-S39b (ADR-0090 D4 as amended): the accounted host-write
+    /// figure (zero-fill included) and its ratio, the recycle pool's
+    /// counters, and the two recovery facts of this cell's boot.
+    pub accounted_host_write_bytes: Cell<u64>,
+    pub write_amp_milli_accounted_host: Cell<u64>,
+    pub segments_recycled: Cell<u64>,
+    pub recycle_misses: Cell<u64>,
+    pub recycle_fallbacks: Cell<u64>,
+    pub recycle_pool_bytes: Cell<u64>,
+    pub segment_rotations: Cell<u64>,
+    pub segment_preallocs: Cell<u64>,
+    pub recover_segment_residue_stops: Cell<u64>,
+    pub recover_recycled_residue_slacks: Cell<u64>,
     pub frame_waits_barrier: Cell<u64>,
     pub frame_waits_rotation: Cell<u64>,
     pub frame_waits_reorder: Cell<u64>,

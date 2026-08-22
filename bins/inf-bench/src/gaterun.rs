@@ -573,6 +573,7 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         // M4.5 S36 device-budget row (the row alone, one report per arm),
         // and its unbudgeted baseline arm (no probe file copied in).
         "only-s36",
+        "only-s39b",
         "model-absent",
     ],
     &[
@@ -638,6 +639,13 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         // L5-neutral pairing needs (`--frames-in-flight 3
         // --log-staging-mib 2`).
         "frames-in-flight",
+        // M4.5-S39b (ADR-0090 D6): the recycling row's knobs — segment
+        // size, the checkpoint floor that follows it, the pool bound,
+        // and the block device whose sectors-written the row samples.
+        "segment-bytes",
+        "ckpt-interval-bytes",
+        "segment-recycle-slots",
+        "device-stat",
         "barrier-class",
         "staging-mib",
         "only-always",
@@ -645,6 +653,7 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-s29",
         "only-s35",
         "only-s36",
+        "only-s39b",
         "model-absent",
         // M4.5-S35 row: seconds idled before every durable leg (the S34
         // drive-state rule; default 40, 0 for harness smoke).

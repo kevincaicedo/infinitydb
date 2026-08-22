@@ -1,0 +1,11 @@
+=== recycle-10k m2-recycle 10000 @ 0xD5EE0000 2026-08-22T14:47:32-04:00
+=== done recycle-10k 2026-08-22T14:48:11-04:00 violations=0
+=== durable-10k m2-durable 10000 @ 0xD5EE0000 2026-08-22T14:48:12-04:00
+=== done durable-10k 2026-08-22T14:48:40-04:00 violations=0
+=== transition-4k m2-mode-transition 4000 @ 0x7A4E0000 2026-08-22T14:48:40-04:00
+=== done transition-4k 2026-08-22T14:48:55-04:00 violations=0
+=== reorder-2k m2-reorder-window 2000 @ 0x2E0D0000 2026-08-22T14:48:55-04:00
+=== done reorder-2k 2026-08-22T14:49:00-04:00 violations=0
+=== budget-1k m2-device-budget 1000 @ 0xB0D6E700 2026-08-22T14:49:00-04:00
+=== done budget-1k 2026-08-22T14:49:03-04:00 violations=0
+ALL DONE 2026-08-22T14:49:03-04:00

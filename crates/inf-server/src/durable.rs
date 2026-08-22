@@ -24,7 +24,8 @@ use inf_foundation::time::Nanos;
 use inf_log::fs::SegmentFs;
 use inf_log::{
     FrameId, FramePlan, FsyncClass, FsyncTicket, GroupCommit, IdxSidecarMeta, MutationEffect, NsId,
-    RecordView, SegmentConfig, SegmentRotor, StagingConfig, StagingRing, ZERO_FILL_SLICE_BYTES,
+    RecordView, SealedDisposal, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
+    ZERO_FILL_SLICE_BYTES,
 };
 use inf_runtime::{
     Admission, ClassCounters, ClassSlice, CompletionToken, DeviceBudget, DeviceModel, IoClass,
@@ -350,6 +351,33 @@ pub struct DurableStats {
     /// Zero-fill is excluded and reported beside (`zero_fill_bytes`).
     pub write_amp_milli_log_checkpoint: u64,
     pub write_amp_log_checkpoint_undefined: u64,
+    /// M4.5-S39b (ADR-0090 D4 as amended): every byte this cell handed
+    /// the host for its durable state — log frames + zero-fill +
+    /// checkpoint + MANIFEST. **Not** device traffic: journal/metadata,
+    /// rename and extent work, SSD garbage collection and NAND
+    /// amplification are invisible here (the S39b row samples the block
+    /// device's sectors-written beside it). Cell scope, boot life.
+    pub accounted_host_write_bytes: u64,
+    /// `ceil_milli(accounted_host_write_bytes / append_bytes)` — the
+    /// figure segment recycling is measured by (zero-fill included, which
+    /// `write_amp_milli_log_checkpoint` excludes by ADR-0088 D7); 0 with
+    /// `write_amp_log_checkpoint_undefined = 1` until the first
+    /// checkpoint publishes, by the same rule.
+    pub write_amp_milli_accounted_host: u64,
+    /// Segment recycling (ADR-0090 D1/D4): next segments produced by
+    /// renaming a covered pre-zeroed sealed segment; preallocs that found
+    /// the pool empty (each followed by a zero-fill); pooled files that
+    /// could not be reused ready (rename failed or read sparse); disk
+    /// held by the pool now (`pooled × segment_bytes`).
+    pub segments_recycled: u64,
+    pub recycle_misses: u64,
+    pub recycle_fallbacks: u64,
+    pub recycle_pool_bytes: u64,
+    /// Rotations and preallocs (MAINTAIN + inline) this boot life — the
+    /// denominators the S39b row and the `m2-recycle` oracle read
+    /// `segments_recycled` against.
+    pub segment_rotations: u64,
+    pub segment_preallocs: u64,
     /// The worst frame-write submit → `LogWritten` latency (µs) — the
     /// `m2-device-budget` foreground-bound oracle's input (ADR-0088 D8);
     /// percentiles under-read a bound violation rarer than 1/1000.
@@ -1477,32 +1505,39 @@ impl<F: SegmentFs> DurableCell<F> {
                 .rotor
                 .sealed_below(floor)
                 .iter()
-                .filter(|&&id| !self.manifest.truncation_exempt(id))
+                .filter(|meta| !self.manifest.truncation_exempt(meta.id))
                 .count();
             let budget =
                 MAX_UNLINKS_PER_SLICE.max(backlog.div_ceil(2)).min(MAX_TRUNC_PER_SLICE_ADAPTIVE);
             for _ in 0..budget {
-                let Some(&id) = self
+                let Some(id) = self
                     .rotor
                     .sealed_below(floor)
                     .iter()
-                    .find(|&&id| !self.manifest.truncation_exempt(id))
+                    .map(|meta| meta.id)
+                    .find(|&id| !self.manifest.truncation_exempt(id))
                 else {
                     break;
                 };
-                // Forget-then-unlink: the rotor drops the segment first so
-                // a failed/late unlink can never resurrect it in the live
-                // set (boot GC re-collects survivors below the floor).
-                let path = self.rotor.forget_sealed(id);
-                match control {
-                    Some(control) => {
-                        if !control.request_unlink(path.clone()) {
-                            // Queue full: the path joins the GC queue and
-                            // retries next slice (bounded, never a stall).
-                            self.manifest.defer_unlink(path);
+                // Forget-then-recycle-or-unlink (ADR-0090 D1): the rotor
+                // drops the segment from the live set first so a failed/
+                // late unlink can never resurrect it there (boot GC
+                // re-collects survivors below the floor — pooled files
+                // included). A pooled segment costs no file op here; it
+                // is renamed into the next id by a later MAINTAIN prealloc.
+                match self.rotor.forget_sealed(id) {
+                    SealedDisposal::Recycled => {}
+                    SealedDisposal::Unlink(path) => match control {
+                        Some(control) => {
+                            if !control.request_unlink(path.clone()) {
+                                // Queue full: the path joins the GC queue
+                                // and retries next slice (bounded, never
+                                // a stall).
+                                self.manifest.defer_unlink(path);
+                            }
                         }
-                    }
-                    None => self.manifest.unlink_now(&path),
+                        None => self.manifest.unlink_now(&path),
+                    },
                 }
                 self.manifest.note_truncated(1);
                 units += 1;
@@ -1573,14 +1608,22 @@ impl<F: SegmentFs> DurableCell<F> {
         // ratio would read as the figure); ceiling milli-units (ADR-0060
         // D1: a reported figure may overstate, never understate).
         let append_bytes = self.staging.stats().append_bytes;
-        let (write_amp, undefined) = if ckpt.completed == 0 || append_bytes == 0 {
-            (0, 1)
+        let rotor = self.rotor.stats();
+        let accounted_host_write_bytes = log_frame_bytes
+            .saturating_add(rotor.zero_fill_bytes)
+            .saturating_add(ckpt.bytes_total)
+            .saturating_add(manifest.bytes_written);
+        let milli_of = |written: u64| {
+            let milli = (u128::from(written) * 1000).div_ceil(u128::from(append_bytes));
+            u64::try_from(milli).unwrap_or(u64::MAX)
+        };
+        let (write_amp, write_amp_host, undefined) = if ckpt.completed == 0 || append_bytes == 0 {
+            (0, 0, 1)
         } else {
-            let written = u128::from(log_frame_bytes)
-                + u128::from(ckpt.bytes_total)
-                + u128::from(manifest.bytes_written);
-            let milli = (written * 1000).div_ceil(u128::from(append_bytes));
-            (u64::try_from(milli).unwrap_or(u64::MAX), 0)
+            let log_ckpt = log_frame_bytes
+                .saturating_add(ckpt.bytes_total)
+                .saturating_add(manifest.bytes_written);
+            (milli_of(log_ckpt), milli_of(accounted_host_write_bytes), 0)
         };
         let mut io_budget = [ClassCounters::default(); IoClass::COUNT];
         for class in IoClass::ALL {
@@ -1656,6 +1699,14 @@ impl<F: SegmentFs> DurableCell<F> {
             ckpt_io_mode_downgrades: ckpt.io_mode_downgrades,
             write_amp_milli_log_checkpoint: write_amp,
             write_amp_log_checkpoint_undefined: undefined,
+            accounted_host_write_bytes,
+            write_amp_milli_accounted_host: write_amp_host,
+            segments_recycled: rotor.segments_recycled,
+            recycle_misses: rotor.recycle_misses,
+            recycle_fallbacks: rotor.recycle_fallbacks,
+            recycle_pool_bytes: self.rotor.recycle_pool_bytes(),
+            segment_rotations: rotor.rotations,
+            segment_preallocs: rotor.preallocs + rotor.inline_preallocs,
             write_stall_max_us: self.write_stall_hist.max(),
         }
     }

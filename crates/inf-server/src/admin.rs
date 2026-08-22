@@ -377,6 +377,37 @@ pub(crate) fn info(
                 node.write_amp_log_checkpoint_undefined.get()
             ),
         );
+        // M4.5-S39b (ADR-0090 D4 as amended): the host-write figure with
+        // zero-fill inside it (what recycling removes), the pool's
+        // counters, and what recovery proved about recycled residue.
+        push(
+            &mut text,
+            &format!("accounted_host_write_bytes:{}", node.accounted_host_write_bytes.get()),
+        );
+        push(
+            &mut text,
+            &format!(
+                "write_amp_milli_accounted_host:{}",
+                node.write_amp_milli_accounted_host.get()
+            ),
+        );
+        push(&mut text, &format!("segments_recycled:{}", node.segments_recycled.get()));
+        push(&mut text, &format!("recycle_misses:{}", node.recycle_misses.get()));
+        push(&mut text, &format!("recycle_fallbacks:{}", node.recycle_fallbacks.get()));
+        push(&mut text, &format!("recycle_pool_bytes:{}", node.recycle_pool_bytes.get()));
+        push(&mut text, &format!("segment_rotations:{}", node.segment_rotations.get()));
+        push(&mut text, &format!("segment_preallocs:{}", node.segment_preallocs.get()));
+        push(
+            &mut text,
+            &format!("recover_segment_residue_stops:{}", node.recover_segment_residue_stops.get()),
+        );
+        push(
+            &mut text,
+            &format!(
+                "recover_recycled_residue_slacks:{}",
+                node.recover_recycled_residue_slacks.get()
+            ),
+        );
         // Fuzzy-checkpoint gauges (M2-S10; `ckpt_age_s` derives at S21).
         push(&mut text, &format!("ckpts_completed:{}", node.ckpts_completed.get()));
         push(&mut text, &format!("ckpts_aborted:{}", node.ckpts_aborted.get()));

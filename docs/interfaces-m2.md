@@ -220,6 +220,26 @@ offset of its length prefix within its segment. **No global LSN exists**
   swap; seal = fdatasync + write-handle drop (sealed segments are
   immutable by construction). Seal at `segment_bytes` (default 256 MiB)
   or optional `seal_after_ms` (default off — M2 cut line).
+- **Segment recycling (M4.5-S39b, ADR-0090):** a sealed `Direct` segment
+  that was pre-zeroed (`SealedMeta { id, prezeroed }`, recorded at seal)
+  and falls below the MANIFEST floor is offered to a bounded per-cell
+  pool at truncation instead of being unlinked —
+  `SegmentRotor::forget_sealed(id) -> SealedDisposal::{Recycled,
+  Unlink(PathBuf)}`, bound `SegmentConfig::recycle_slots` (default 1;
+  0 = off, `infinityd --no-segment-recycle`). The MAINTAIN prealloc
+  consults the pool before creating a file: `rename(seg-M → seg-N)`,
+  open `N` direct, `fully_allocated()` **re-read** (ADR-0086 D4 — a
+  pooled file that reads sparse falls through to the zero-fill,
+  `recycle_fallbacks`), and on the deferred tier the rename's directory
+  entry rides the **same `PreallocBarrier`** a fresh prealloc's does —
+  registered coverage-neutral in the ledger in the slice that renamed,
+  so every write-through ticket of `N`'s frames sits behind it and no
+  record of `N` is acknowledged before the rename is durable (ADR-0090
+  D3 as amended; pinned in `commit.rs`, the rotor tests, `m2-recycle`).
+  Counters: `segments_recycled`, `recycle_misses` (prealloc found the
+  pool empty), `recycle_fallbacks`, `recycle_pool_bytes`. Ids are never
+  reissued: `N = active.next()` — a recycled file's residue is stamped
+  with every previous id it carried, all ≠ `N`.
 - ENOSPC discipline: prealloc failure raises `space_exhausted()` *before*
   writes need the space (the S08 admission hook); appends that outrun it
   get typed `LogError::NoSpace`. fsync failure is the distinct,
@@ -398,7 +418,15 @@ the `SegmentFs` seam (→ `BackendDriver` at S05):
   `apply_frames(callback) -> Result<ReadEnd, ApplyError>` (the replay
   batch-apply shape).
 - Stored `first_lsn` cross-checked against physical offset per frame —
-  `ReadError::LsnMismatch` on misdirected writes (ADR-0011 D2).
+  `ReadError::LsnMismatch` on misdirected writes (ADR-0011 D2). **M4.5-S39b
+  (ADR-0090 D2 as amended):** a frame that decodes in full (magic, length,
+  record count, CRC32C) whose stored **offset equals** the physical offset
+  while its stored **segment id differs** from the file's is the typed
+  `ReadError::ForeignSegment { segment, offset, stored_segment }` — the
+  residue a recycled segment carries from its previous life. Both
+  variants are terminal for the reader: it never yields, skips or
+  truncates a misplaced frame (the invariant every consumer relies on is
+  unchanged); only recovery classifies the distinction.
 - Tail = facts, not policy (S14 owns the taxonomy):
   `ReadEnd::{ZeroTail, FileEnd}` with `.at()` = byte after the last valid
   frame (the `SegmentRotor::open_existing` tail_offset); torn/corrupt
@@ -930,6 +958,22 @@ per episode). A drained cell always seals — never slower than K = 1.
   region = torn-tail truncation of the tail pointer + trailing-segment GC;
   sealed-slack residue tolerated + counted) → begin-LSN guard (valid data
   ending below `begin` = missing covered state, fail-stop) → boot GC.
+  **Recycled-life residue (M4.5-S39b, ADR-0090 D2 as amended):** replay
+  ends a segment's data at the first `ForeignSegment` frame (a classified
+  end like `ZeroTail`; `RecoverStats::segment_residue_stops`; replay
+  continues in the next segment — unlike the epoch residue stop). The
+  audit's `RegionEvidence` carries `foreign_frames` / `max_foreign_epoch`
+  beside the self-located facts; foreign frames never contribute
+  attestation, epoch or hole evidence and are skipped by their padded
+  extent **only after their CRC passed** (a stale header over a partly
+  overwritten body fails the CRC and is scanned byte-wise, so a same-
+  segment frame can never hide behind a foreign length field). A slack
+  with no self-located frame and ≥ 1 foreign frame is **proven recycled
+  residue** (`recycled_residue_slacks`): never a hole, never torn —
+  trailing segments behind the resume point are removed as stale. A slack
+  with a self-located frame is a hole of this life at that frame exactly
+  as before, foreign frames or not. The resume epoch is `1 + max(prefix,
+  beyond-frame, foreign)` epochs.
   Manifest present but named state missing/corrupt = fail-stop, never a
   full-replay fallback. `open_cell_log` is generic over `SegmentFs` (DST
   seam); recovery is digest-deterministic (`Keyspace::state_digest`,

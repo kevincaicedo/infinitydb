@@ -277,7 +277,7 @@ fn every_seal_gets_its_fsync_and_segments_replay() {
     assert_eq!(seal_syncs, rotations, "fsync-on-seal observed at EVERY seal");
     assert_eq!(plane.rotor.stats().inline_preallocs, 0, "MAINTAIN kept the next segment ready");
     // The watermark reached at least the last sealed segment's end.
-    let last_sealed = plane.rotor.sealed().last().copied().expect("sealed segments");
+    let last_sealed = plane.rotor.sealed().last().map(|m| m.id).expect("sealed segments");
     assert!(plane.commit.watermark().expect("watermark") >= Lsn::new(last_sealed, 0));
     assert_replay_matches(&plane, &dir);
     std::fs::remove_dir_all(&dir).ok();

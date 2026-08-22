@@ -58,6 +58,10 @@ toml = "1"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "allow"
+# Planted-bug canaries (ADR-0090 D5): compile-time `--cfg` switches that
+# disable one load-bearing rule so a DST sweep can prove the rule has
+# teeth. Never a Cargo feature, never reachable from a shipped binary.
+unexpected_cfgs = { level = "deny", check-cfg = ['cfg(inf_canary_foreign_segment)'] }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"

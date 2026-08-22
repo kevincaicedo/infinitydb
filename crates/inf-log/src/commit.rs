@@ -1504,6 +1504,43 @@ mod tests {
     }
 
     #[test]
+    fn recycled_segment_frames_are_fenced_behind_the_rename_barrier() {
+        // ADR-0090 D3 as amended: the rename's dir barrier registers in
+        // the MAINTAIN slice that renamed (coverage-neutral, at the
+        // ledger's tail); every write-through ticket of the renamed
+        // segment's frames enters behind it, so a FUA frame completing
+        // first advances nothing — the ack waits for the directory entry
+        // that makes the segment findable after a power cut.
+        let mut gc = commit();
+        let fs = crate::fs::mem::MemFs::new();
+        fs.create_dir_all(std::path::Path::new("log")).expect("mem dir");
+        // The active segment's last frame, durable.
+        gc.note_staged(FsyncClass::Always);
+        gc.note_frame_queued(lsn(2, 4096), 4096);
+        let t0 = gc.register_write_through(Nanos::ZERO);
+        write_oldest(&mut gc);
+        assert_eq!(gc.on_fsync_complete(t0, Nanos::from_micros(300)), Some(lsn(2, 4096)));
+        // MAINTAIN: seg-1 renamed to seg-3, barrier registered.
+        let dir = fs.open_dir(std::path::Path::new("log")).expect("mem dir handle");
+        let rename_barrier = gc.register_prealloc_barrier(dir, Nanos::ZERO);
+        // LOG: rotation onto seg-3, its first frame write-through.
+        gc.note_staged(FsyncClass::Always);
+        assert_eq!(gc.frame_plan(true, false), FramePlan::WriteThrough);
+        gc.note_frame_queued(lsn(3, 4096), 4096);
+        let t1 = gc.register_write_through(Nanos::ZERO);
+        write_oldest(&mut gc);
+        // The FUA frame lands before the directory barrier: no ack.
+        assert_eq!(gc.on_fsync_complete(t1, Nanos::from_micros(600)), None);
+        assert_eq!(gc.watermark(), Some(lsn(2, 4096)), "nothing of seg-3 is acknowledged");
+        // The barrier lands: the prefix reaches the frame, the ack may go.
+        assert_eq!(
+            gc.on_fsync_complete(rename_barrier, Nanos::from_micros(900)),
+            Some(lsn(3, 4096))
+        );
+        assert_eq!(gc.watermark(), Some(lsn(3, 4096)));
+    }
+
+    #[test]
     fn write_through_in_flight_does_not_block_a_flush_class_sync() {
         // The bound counts FLUSH-class entries only: with a write-through
         // ticket outstanding, a standalone everysec sync may still issue.
