@@ -451,6 +451,9 @@ const S35_CONNS_AC: usize = 32;
 struct S35Leg {
     ops_per_sec: f64,
     p50_us: f64,
+    /// Exact client mean — disclosed beside the p50 (ADR-0087 D8 as
+    /// amended 2026-08-22: never the gate's statistic on its own).
+    mean_us: f64,
     p99_us: f64,
     max_us: f64,
     /// The barrier the client waited on: write-through p50 under the
@@ -534,6 +537,13 @@ fn s35_frame_pipeline_row(
     let mut read_ops: Vec<f64> = Vec::new();
     let mut read_p999: Vec<f64> = Vec::new();
     let mut p50_one: Vec<f64> = Vec::new();
+    let mut barrier_one: Vec<f64> = Vec::new();
+    // ADR-0087 D8 as amended 2026-08-22: the N-cell ÷ 1-cell quantities are
+    // **per-replicate** ratios (each 4-cell leg against the 1-cell leg
+    // interleaved with it), summarized by their median — never a ratio of
+    // two medians, which pairs legs that never ran together.
+    let mut ratio_client_rep: Vec<f64> = Vec::new();
+    let mut ratio_barrier_rep: Vec<f64> = Vec::new();
     let mut padding_n: Vec<f64> = Vec::new();
     let mut padding_256: Vec<f64> = Vec::new();
     let mut fill_max_seen: u64 = 0;
@@ -553,12 +563,13 @@ fn s35_frame_pipeline_row(
             engine_tail_legs += 1;
         }
         raw.push_str(&format!(
-            "rep{rep} {cells}c c{S35_CONNS_AC:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
-             max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} p50/barrier={:.2} \
-             frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} write_stall_p99_us={} \
-             padding_pct={:.1} waits_fill={}\n",
+            "rep{rep} {cells}c c{S35_CONNS_AC:<3} ops/s={:<8.0} p50_us={:<6.0} mean_us={:<6.0} \
+             p99_us={:<7.0} max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} \
+             p50/barrier={:.2} frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} \
+             write_stall_p99_us={} padding_pct={:.1} waits_fill={}\n",
             ac.ops_per_sec,
             ac.p50_us,
+            ac.mean_us,
             ac.p99_us,
             ac.max_us,
             ac.barrier_p50_us,
@@ -587,12 +598,13 @@ fn s35_frame_pipeline_row(
             device_tail_legs += 1;
         }
         raw.push_str(&format!(
-            "rep{rep} {cells}c c{CONNS_HIGH:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
-             max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} \
+            "rep{rep} {cells}c c{CONNS_HIGH:<3} ops/s={:<8.0} p50_us={:<6.0} mean_us={:<6.0} \
+             p99_us={:<7.0} max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} \
              frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} write_stall_p99_us={} \
              padding_pct={:.1} waits_fill={}\n",
             hi.ops_per_sec,
             hi.p50_us,
+            hi.mean_us,
             hi.p99_us,
             hi.max_us,
             hi.barrier_p50_us,
@@ -659,12 +671,14 @@ fn s35_frame_pipeline_row(
                 device_tail_legs += 1;
             }
             raw.push_str(&format!(
-                "rep{rep} 1c c{S35_CONNS_AC:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
-                 max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} p50/barrier={:.2} \
-                 frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} \
-                 write_stall_p99_us={} padding_pct={:.1} waits_fill={}\n",
+                "rep{rep} 1c c{S35_CONNS_AC:<3} ops/s={:<8.0} p50_us={:<6.0} mean_us={:<6.0} \
+                 p99_us={:<7.0} max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} \
+                 p50/barrier={:.2} frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} \
+                 write_stall_p99_us={} padding_pct={:.1} waits_fill={} \
+                 4c/1c: p50={:.3} barrier={:.3}\n",
                 one.ops_per_sec,
                 one.p50_us,
+                one.mean_us,
                 one.p99_us,
                 one.max_us,
                 one.barrier_p50_us,
@@ -676,9 +690,14 @@ fn s35_frame_pipeline_row(
                 one.parked,
                 one.write_stall_p99_us,
                 one.padding_pct,
-                one.waits_fill
+                one.waits_fill,
+                ac.p50_us / one.p50_us.max(1.0),
+                ac.barrier_p50_us / one.barrier_p50_us.max(1.0)
             ));
+            ratio_client_rep.push(ac.p50_us / one.p50_us.max(1.0));
+            ratio_barrier_rep.push(ac.barrier_p50_us / one.barrier_p50_us.max(1.0));
             p50_one.push(one.p50_us);
+            barrier_one.push(one.barrier_p50_us);
             drop(server);
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -706,9 +725,33 @@ fn s35_frame_pipeline_row(
     m.set("s35:read_c64p16_p999_us", median(&mut read_p999));
     m.set("s35:frames_in_flight_max", fill_max_seen as f64);
     if !p50_one.is_empty() {
-        let one = median(&mut p50_one);
-        m.set("s35:one_cell_c32_p50_us", one);
-        m.set("s35:multi_vs_one_cell_p50_x", median(&mut p50_n) / one.max(1.0));
+        m.set("s35:one_cell_c32_p50_us", median(&mut p50_one));
+        m.set("s35:one_cell_barrier_p50_us", median(&mut barrier_one));
+        // The F2 contention term (S34's finding: fsync p50 1,535 µs at 1
+        // cell → 2,751 at 4 under FLUSH) measured directly — the barrier
+        // the N-cell legs waited on over the barrier the 1-cell leg waited
+        // on, per replicate. Binding (`s35_multi_vs_one_cell_barrier`).
+        m.set("s35:multi_vs_one_cell_barrier_x", median(&mut ratio_barrier_rep));
+        // The client-visible ratio at the same shape, per replicate —
+        // disclosed (informational since the 2026-08-22 amendment): at
+        // K ≥ 2 the 4-cell leg runs 8 conns per cell at 2.2 acks per
+        // frame against a 1-cell leg at 32 conns and ~20 acks per frame,
+        // so the ratio carries the pipeline's own seal wait (~0.2 ×) on
+        // top of the contention term it was written to catch.
+        m.set("s35:multi_vs_one_cell_p50_x", median(&mut ratio_client_rep));
+        let spread = |v: &[f64]| {
+            let lo = v.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            format!("{lo:.3}–{hi:.3}")
+        };
+        m.note(format!(
+            "s35 4c/1c per-replicate ratios (median of {}; spread): barrier {} · client p50 {} \
+             — client histogram 256 sub-buckets/octave (≈ 0.4 %, 2 µs at 512–1024 µs); the \
+             barrier p50 is the server's 32-sub-bucket histogram (≈ 3 %, 16 µs at that octave)",
+            ratio_barrier_rep.len(),
+            spread(&ratio_barrier_rep),
+            spread(&ratio_client_rep)
+        ));
     }
     if fill_max_seen < configured_k {
         m.note(format!(
@@ -740,7 +783,9 @@ fn s35_frame_pipeline_row(
          read leg 64 conns × P16 100% GET over the keys the write legs populated (nils \
          disclosed); {idle_s}s idle \
          before every durable leg; barrier = {p50_key} (cell median, whole-session \
-         histogram); device tail = {p99_key} (worst cell)"
+         histogram); device tail = {p99_key} (worst cell); 4c/1c ratios are medians of \
+         per-replicate ratios — the barrier ratio binds (F2's contention term), the client \
+         ratio is informational (ADR-0087 D8, amended 2026-08-22)"
     ));
     m.row_open("frame-pipeline");
     m.row_write_amp(
@@ -1102,6 +1147,7 @@ fn s35_write_leg(
     Ok(S35Leg {
         ops_per_sec: report.ops_per_sec,
         p50_us: report.p50_us as f64,
+        mean_us: report.mean_us,
         p99_us: report.p99_us as f64,
         max_us: report.max_us as f64,
         barrier_p50_us: median(&mut p50s),

@@ -117,15 +117,41 @@ tier = "linux-reference-box"
 source = "s35:p50_over_barrier_x"
 measured_by = "gate-run m4.5 frame-pipeline row, median of replicates, N cells, 32 conns closed-loop"
 
+# Amended 2026-08-22 (ADR-0087 D8, third amendment — recorded before the
+# rerun it governs): the F2 finding is a *barrier* contention term (fsync
+# p50 1,535 µs at 1 cell → 2,751 at 4 under FLUSH — the device-wide flush
+# unit), and the binding gate now measures it directly as the N-cell ÷
+# 1-cell ratio of the barrier the clients waited on, per replicate. The
+# client-p50 ratio stays on the row as an informational tripwire: at K ≥ 2
+# it carries the pipeline's own seal wait (8 conns/cell at 2.2 acks per
+# frame vs 32 conns on one cell at ~20 acks per frame — a different
+# closed-loop shape per cell, ~0.2 × by structure) on top of the
+# contention term, and with the 3 % client histogram it read 1.28 / 1.31 /
+# 1.35 / 1.38 across four campaigns with the 4-cell p50 pinned — the
+# denominator moving by one 16 µs bucket each time. Both ratios are
+# medians of per-replicate ratios (interleaved legs), the client one on
+# the 0.4 % instrument.
+
 [[gate]]
-id = "s35_multi_vs_one_cell_p50"
-name = "S35: N-cell vs 1-cell always p50 ratio (S34's F2 AC)"
+id = "s35_multi_vs_one_cell_barrier"
+name = "S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term)"
 threshold = 1.3
 comparator = "<="
-unit = "x (N-cell p50 / 1-cell p50 at 32 conns; FLUSH read 1.8, FUA K = 1 1.45)"
+unit = "x (N-cell barrier p50 / 1-cell barrier p50 at 32 conns, per-replicate median; FLUSH read ~1.8, FUA K = 3 read 1.09–1.15 on 08-22)"
+tier = "linux-reference-box"
+source = "s35:multi_vs_one_cell_barrier_x"
+measured_by = "gate-run m4.5 frame-pipeline row, median of per-replicate ratios (1-cell leg interleaved)"
+
+[[gate]]
+id = "s35_multi_vs_one_cell_p50"
+name = "S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2)"
+threshold = 1.3
+comparator = "<="
+unit = "x (N-cell p50 / 1-cell p50 at 32 conns, per-replicate median on the 0.4 % client histogram; FLUSH read 1.8, FUA K = 1 1.45, K = 3 1.25–1.38 on the 3 % instrument)"
 tier = "linux-reference-box"
 source = "s35:multi_vs_one_cell_p50_x"
-measured_by = "gate-run m4.5 frame-pipeline row, median of replicates per cell count"
+measured_by = "gate-run m4.5 frame-pipeline row, median of per-replicate ratios (1-cell leg interleaved)"
+informational = true
 
 # M4.5-S36 (ADR-0088 D7/D9, 2026-08-21) — the device-budget row. The D2
 # mechanism: the KV pure-write `everysec` row idled the engine at

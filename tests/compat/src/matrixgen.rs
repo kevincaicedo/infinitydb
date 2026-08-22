@@ -641,8 +641,9 @@ pub fn render() -> String {
     push("");
     push("`FSYNC everysec` namespaces ack on apply and fsync on the 1 s tick — the");
     push("`appendfsync everysec` loss window (≤ 1 s on power loss). Under the frame-fill");
-    push("policy (M4.5-S39a, ADR-0089; on by default at `--fill-window-us 1000`, 0 turns");
-    push("it off) a barrier-less frame on an aligned segment may hold un-sealed for up to");
+    push("policy (M4.5-S39a, ADR-0089; `--fill-window-us 1000` is the design point, the");
+    push("default is 0 = off while its default evidence is pending — second amendment of");
+    push("2026-08-22) a barrier-less frame on an aligned segment may hold un-sealed for up to");
     push("the window before it reaches the device: the **process-crash** exposure of");
     push("`everysec` records is then ≤ 1 ms of writes per cell, where Redis's AOF buffer");
     push("reaches the page cache every event loop. The power-loss window is unchanged;");

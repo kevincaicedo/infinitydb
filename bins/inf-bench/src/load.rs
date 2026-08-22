@@ -1,13 +1,15 @@
 //! Native pipelined RESP load generator (M0-S18): N blocking connections on
 //! N threads, fixed pipeline depth, seeded SET/GET mix, per-command latency
-//! into merged `LogHistogram`s. Also the deterministic fill mode (each
-//! connection SETs a partitioned key range exactly once) for the RSS gate.
+//! into merged `FineHistogram`s (256 sub-buckets/octave ≈ 0.4 % — the
+//! 2026-08-22 instrument; before it the kernel's 3 % `LogHistogram`). Also
+//! the deterministic fill mode (each connection SETs a partitioned key
+//! range exactly once) for the RSS gate.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
-use inf_foundation::LogHistogram;
+use crate::finehist::FineHistogram;
 use inf_foundation::rng::{Entropy, SplitMix64};
 
 use crate::cli::Flags;
@@ -105,6 +107,9 @@ pub struct LoadReport {
     pub p999_us: u64,
     pub p9999_us: u64,
     pub max_us: u64,
+    /// Exact mean of the leg's latencies — disclosed beside the
+    /// percentiles (never a gate input on its own).
+    pub mean_us: f64,
 }
 
 struct ConnResult {
@@ -113,7 +118,7 @@ struct ConnResult {
     busy: u64,
     nils: u64,
     error_samples: Vec<String>,
-    hist_us: LogHistogram,
+    hist_us: FineHistogram,
 }
 
 pub(crate) fn make_key(spec: &LoadSpec, index: u64) -> Vec<u8> {
@@ -147,7 +152,7 @@ fn run_conn(
         busy: 0,
         nils: 0,
         error_samples: Vec::new(),
-        hist_us: LogHistogram::new(),
+        hist_us: FineHistogram::new(),
     };
 
     // Fill mode: a partitioned range, exactly once, pipelined.
@@ -325,7 +330,7 @@ pub fn run(spec: &LoadSpec) -> Result<LoadReport, String> {
     let elapsed = started.elapsed().saturating_sub(warmup);
 
     let mut report = LoadReport { elapsed_s: elapsed.as_secs_f64(), ..Default::default() };
-    let mut hist = LogHistogram::new();
+    let mut hist = FineHistogram::new();
     for result in results {
         let conn = result?;
         report.ops += conn.ops;
@@ -347,6 +352,7 @@ pub fn run(spec: &LoadSpec) -> Result<LoadReport, String> {
     report.p999_us = hist.percentile(99.9);
     report.p9999_us = hist.percentile(99.99);
     report.max_us = hist.max();
+    report.mean_us = hist.mean();
     Ok(report)
 }
 
