@@ -1148,8 +1148,8 @@ pub(crate) fn pipeline_args(flags: &Flags) -> Vec<String> {
         // M4.5-S36 (ADR-0088 D6): the device-model arm. `--seal-pace`
         // rides only the spawns that carry a probe file (`seal_pace_args`).
         ("device-write-mbps", "--device-write-mbps"),
-        // M4.5-S39a: the frame-fill arms (window µs, target KiB; the
-        // arm-B switch below is a bare flag).
+        // M4.5-S39a: the frame-fill arms (window µs — 0 is the
+        // pre-S39a cadence, the baseline arm — and target KiB).
         ("fill-window-us", "--fill-window-us"),
         ("fill-target-kib", "--fill-target-kib"),
     ] {
@@ -1157,9 +1157,6 @@ pub(crate) fn pipeline_args(flags: &Flags) -> Vec<String> {
             args.push(server_flag.to_string());
             args.push(value.to_string());
         }
-    }
-    if flags.bool("fill-window-always") {
-        args.push("--fill-window-always".to_string());
     }
     args
 }
