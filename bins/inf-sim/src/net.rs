@@ -301,7 +301,7 @@ fn write_through(
     };
     match result {
         Ok(()) => CompletionResult::LogWritten,
-        Err(_) => CompletionResult::Error { errno: libc::EIO, buf: None },
+        Err(err) => CompletionResult::Error { errno: write_errno(&err), buf: None },
     }
 }
 
@@ -310,8 +310,16 @@ fn write_through(
 fn plain_write(disk: &SimDisk, fd: i32, offset: u64, data: &StableBytes) -> CompletionResult {
     match disk.driver_write_at(fd, offset, stable_slice(data)) {
         Ok(()) => CompletionResult::LogWritten,
-        Err(_) => CompletionResult::Error { errno: libc::EIO, buf: None },
+        Err(err) => CompletionResult::Error { errno: write_errno(&err), buf: None },
     }
+}
+
+/// The errno a failed sim write reports, as a kernel would: the disk's
+/// `InvalidInput` (a direct write the filesystem refuses — ADR-0088 D3 as
+/// amended, the checkpoint's in-band downgrade signal) is `EINVAL`;
+/// everything else (the dead switch, a bad fd) is `EIO`.
+fn write_errno(err: &std::io::Error) -> i32 {
+    if err.kind() == std::io::ErrorKind::InvalidInput { libc::EINVAL } else { libc::EIO }
 }
 
 /// Audited unsafe (see `SAFETY.md`): a backend driver executing an op
@@ -521,13 +529,16 @@ impl BackendDriver for SimDriver {
                                 out.push(Completion { token: sync, result });
                             }
                         }
-                        Err(_) => {
+                        Err(err) => {
                             // Uring linked-chain contract: the failed write
                             // cancels its linked sync — `Synced` can never
                             // cover a failed prefix (ADR-0013).
                             out.push(Completion {
                                 token,
-                                result: CompletionResult::Error { errno: libc::EIO, buf: None },
+                                result: CompletionResult::Error {
+                                    errno: write_errno(&err),
+                                    buf: None,
+                                },
                             });
                             if let Some(sync) = fsync_token {
                                 out.push(Completion {

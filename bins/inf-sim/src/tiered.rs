@@ -167,6 +167,8 @@ impl TieredScenario {
             frames_in_flight: 1,
             device: Default::default(),
             budget_oracle: false,
+            reorder_oracle: false,
+            ckpt_direct_refused_after: None,
             prelude: None,
         }
     }

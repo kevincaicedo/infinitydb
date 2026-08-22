@@ -63,6 +63,8 @@ sim-smoke:
     cargo run --release --bin inf-sim -- --scenario m4-tiered --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m2-device-budget --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m2-mode-transition --seed 0xC0FFEE --verify-determinism
+    cargo run --release --bin inf-sim -- --scenario m2-reorder-window --seed 0xC0FFEE --verify-determinism
+    cargo run --release --bin inf-sim -- --scenario m2-ckpt-refused --seed 0xC0FFEE --verify-determinism
 
 # M2-S19 durability sweep (the §6 dst_sweep gate shape). Usage:
 #   just durable-sweep [seeds] [base]
@@ -106,6 +108,24 @@ transition-sweep seeds="4000" base="0x7A4E0000":
     out=$(mktemp -d)
     for i in 0 1 2 3 4 5 6 7; do
         ./target/release/inf-sim --scenario m2-mode-transition --sweep {{seeds}} --seed {{base}} \
+            --shard "$i/8" --out "$out" & done
+    wait
+    cat "$out"/manifest-shard-*.txt
+
+# Completion-ledger reorder-window sweep (ADR-0087 D2 as amended,
+# 2026-08-22): every 40th plain write wedged 150 ms on a K ≥ 2 pipeline
+# of everysec-only frames, so the ledger's reorder window fills and the
+# next frame holds — the window must engage on every seed (oracle), the
+# ledger's bound is release-asserted, the m2 durability oracle holds.
+# Usage:
+#   just reorder-sweep [seeds] [base]
+reorder-sweep seeds="2000" base="0x2E0D0000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --bin inf-sim
+    out=$(mktemp -d)
+    for i in 0 1 2 3 4 5 6 7; do
+        ./target/release/inf-sim --scenario m2-reorder-window --sweep {{seeds}} --seed {{base}} \
             --shard "$i/8" --out "$out" & done
     wait
     cat "$out"/manifest-shard-*.txt

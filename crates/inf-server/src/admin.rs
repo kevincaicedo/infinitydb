@@ -313,6 +313,7 @@ pub(crate) fn info(
         push(&mut text, &format!("frames_in_flight_max:{}", node.frames_in_flight_max.get()));
         push(&mut text, &format!("frame_waits_barrier:{}", node.frame_waits_barrier.get()));
         push(&mut text, &format!("frame_waits_rotation:{}", node.frame_waits_rotation.get()));
+        push(&mut text, &format!("frame_waits_reorder:{}", node.frame_waits_reorder.get()));
         // M4.5-S36 (ADR-0088 D7): the device budget's ledger (names per
         // INFINITY_STYLE — units and qualifiers last), the seal pacer's
         // waits, the checkpoint domain's bytes, the derived trigger, and

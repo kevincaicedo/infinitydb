@@ -187,10 +187,12 @@ pub struct NodeInfo {
     pub ckpt_interval_bytes: Cell<u64>,
     pub ckpt_records_since_begin: Cell<u64>,
     pub ckpt_io_mode_buffered: Cell<u64>,
+    pub ckpt_io_mode_downgrades: Cell<u64>,
     pub write_amp_milli_log_checkpoint: Cell<u64>,
     pub write_amp_log_checkpoint_undefined: Cell<u64>,
     pub frame_waits_barrier: Cell<u64>,
     pub frame_waits_rotation: Cell<u64>,
+    pub frame_waits_reorder: Cell<u64>,
     /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).
     pub ckpts_completed: Cell<u64>,
     pub ckpts_aborted: Cell<u64>,
