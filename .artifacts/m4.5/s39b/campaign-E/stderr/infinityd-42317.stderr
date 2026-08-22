@@ -1,0 +1,16 @@
+infinityd: log barrier class fua (source: --barrier-class; fua_max_frame_bytes 262144; probed p50 fua 330 µs / flush 924 µs); frames in flight 3 (auto: fua) × 4 MiB staging
+infinityd: segment recycling on, 2 slot(s) × 256 MiB per cell (ADR-0090)
+infinityd: device model probed (schema 2): write 486 MiB/s, 2540 ops/s (qd4 barriers 3597/s); per-cell share write 121 MiB/s
+infinityd a2a96d3 (git a2a96d3e6968, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 42317, backend io_uring, route natural
+infinityd: listening on 42317
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: recovery 0/4 cells ready, 714063872/3431936000 bytes (20.8%), eta 4s
+control: recovery 0/4 cells ready, 1376739328/3431936000 bytes (40.1%), eta 3s
+control: recovery 0/4 cells ready, 2106572800/3431936000 bytes (61.4%), eta 2s
+control: recovery 0/4 cells ready, 3431936000/3431936000 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 3431936000/3431936000 bytes (100.0%), eta 0s
+control: cell 0 not ready — in audit (857956352/857956352 bytes) for 5s
+control: cell 1 not ready — in audit (858009600/858009600 bytes) for 5s
+control: cell 2 not ready — in audit (857993216/857993216 bytes) for 5s
+control: cell 3 not ready — in audit (857976832/857976832 bytes) for 5s
