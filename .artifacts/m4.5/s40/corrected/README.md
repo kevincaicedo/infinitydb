@@ -28,3 +28,9 @@ not rescued by percentile wins.
 After the production rows, one Redis-only
 `--redis-no-auto-rewrite` run quantifies automatic rewrite cost. It is explicitly
 non-production, cannot enter C42, and must be labelled diagnostic in the report.
+
+Outcome: all six production legs were valid and every pair ordered p50, p99 and
+p99.9 the same way. The corrected median Redis/InfinityDB ratios are 2.60x,
+2.06x and 3.32x respectively. C42 may return only with these narrowed figures;
+the old ratios stay withdrawn. InfinityDB exceeded the separate 50 ms maximum
+bar in one of three legs, so D5 remains open. See `VERDICT.md`.
