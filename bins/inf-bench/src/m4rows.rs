@@ -285,8 +285,9 @@ pub fn cmd_gate_run_m4(flags: &Flags) -> Result<(), String> {
         );
     }
     m.note(
-        "p99.9 deltas are quantized by LogHistogram (32 sub-buckets/octave ≈ 3%): \
-         0.0% = same bucket; any non-zero delta spans ≥ 1 bucket",
+        "p99.9 deltas are quantized by the client histogram (256 sub-buckets/octave ≈ 0.4% \
+         since 2026-08-22; 32 ≈ 3% before): 0.0% = same bucket; any non-zero delta spans \
+         ≥ 1 bucket",
     );
     m.note(format!("m4 binary {}: {}", infinityd, binary_fingerprint(&infinityd)));
     match &baseline_bin {

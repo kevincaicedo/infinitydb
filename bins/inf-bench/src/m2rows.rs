@@ -8,10 +8,11 @@
 //! Tier honesty (L10): identical to the m0/m1 flows — dev runs report
 //! measured values with non-binding verdicts on reference-box gates; the
 //! `log_records_appended` tripwire is box-independent and always binds.
-//! Resolution honesty: p99.9 comes from `LogHistogram` (32 linear
-//! sub-buckets per octave ⇒ ~3% quantization); a 0.0% delta means "same
-//! bucket", and any non-zero delta is at least one bucket (~3%) — disclosed
-//! as a note in every report this command writes.
+//! Resolution honesty: p99.9 comes from the client `FineHistogram` (256
+//! linear sub-buckets per octave ⇒ ~0.4% quantization since 2026-08-22;
+//! the 32-sub-bucket ~3% `LogHistogram` before); a 0.0% delta means "same
+//! bucket", and any non-zero delta is at least one bucket — disclosed as a
+//! note in every report this command writes.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -919,8 +920,9 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
         m.note("dev-tier run: reference-box gates report measured values, non-binding verdicts");
     }
     m.note(
-        "p99.9 deltas are quantized by LogHistogram (32 sub-buckets/octave ≈ 3%): \
-         0.0% = same bucket; any non-zero delta spans ≥ 1 bucket",
+        "p99.9 deltas are quantized by the client histogram (256 sub-buckets/octave ≈ 0.4% \
+         since 2026-08-22; 32 ≈ 3% before): 0.0% = same bucket; any non-zero delta spans \
+         ≥ 1 bucket",
     );
     m.note(
         "M2 leg of the zero-cost rows runs without --data-dir (the memory-only assembly — \

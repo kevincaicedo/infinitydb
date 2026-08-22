@@ -65,8 +65,13 @@ struct Args {
     /// device (`--seal-pace N`).
     seal_pace: Option<Option<u64>>,
     /// M4.5-S39a (ADR-0089): the frame-fill policy on aligned segments —
-    /// the hold window in µs (1 000 = the accepted design point; 0 = off)
-    /// and the on-device target in KiB (16).
+    /// the hold window in µs (1 000 = the design point; 0 = off) and the
+    /// on-device target in KiB (16). **Default 0 — `Evidence-pending`
+    /// (ADR-0089, second amendment 2026-08-22):** the reference-box A/B
+    /// ran at K = 3 / 2 MiB, not the shipping K = 1 / 4 MiB, and one
+    /// arm-A offered leg tripped falsifier (d) as written; the default
+    /// flips to 1 000 only by the predeclared rerun rule in that
+    /// amendment.
     fill_window_us: u64,
     fill_target_kib: u32,
     /// Per-buffer log-staging capacity in MiB (M4.5-S27, ADR-0083 D3).
@@ -120,7 +125,7 @@ impl Default for Args {
             barrier_class: None,
             device_write_mbps: None,
             seal_pace: None,
-            fill_window_us: 1_000,
+            fill_window_us: 0,
             fill_target_kib: 16,
             log_staging_mib: 4,
             early_fabric_flush: false,
@@ -257,7 +262,7 @@ fn parse_args() -> Result<Args, String> {
                      [--pin-start CORE] [--route-local-only] [--data-dir PATH] \
                      [--ckpt-interval-bytes N] [--segment-bytes N] [--frames-in-flight 1] \
                      [--barrier-class flush|fua] [--device-write-mbps N] [--seal-pace probe|N] \
-                     [--fill-window-us 1000] [--fill-target-kib 16] \
+                     [--fill-window-us 0] [--fill-target-kib 16] \
                      [--log-staging-mib 4] \
                      [--early-fabric-flush] \
                      [--remote-first-execute] \
@@ -591,8 +596,9 @@ fn cell_main(
                 model_share: io.device.share(args.cells),
                 seal_barriers_per_s: seal_barriers_per_s / u64::from(args.cells.max(1)),
             },
-            // M4.5-S39a (ADR-0089): the fill policy, design point by
-            // default; `--fill-window-us 0` turns it off.
+            // M4.5-S39a (ADR-0089): the fill policy — off by default until
+            // the predeclared rerun rule flips it (`--fill-window-us 1000`
+            // is the design point).
             fill: inf_server::FillConfig {
                 window: inf_foundation::time::Nanos::from_micros(args.fill_window_us),
                 target_bytes: args.fill_target_kib << 10,

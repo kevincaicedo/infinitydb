@@ -19,6 +19,7 @@ mod bootstorm;
 mod cli;
 mod doc_corpus;
 mod envcheck;
+mod finehist;
 mod gaterun;
 mod gates;
 mod load;
