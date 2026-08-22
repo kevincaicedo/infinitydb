@@ -77,7 +77,7 @@ use std::rc::Rc;
 use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
 
-use super::{SegmentFile, SegmentFs};
+use super::{SegmentFile, SegmentFs, SegmentIoMode};
 
 /// Fake-fd base for inode handles (dir handles sit above it). High
 /// enough that no simulated socket fd space collides.
@@ -457,6 +457,10 @@ struct DiskState {
     /// `Some(n)`: n more mutating ops succeed, then everything fails
     /// until [`SimDisk::power_cut`] (the dead switch).
     ops_until_cut: Option<u64>,
+    /// `create_meta_direct` answers `Unsupported` — a filesystem without
+    /// `O_DIRECT` (ADR-0088 D3 as amended): the checkpoint's probed
+    /// buffered fallback under the reactor tier.
+    refuse_direct_meta: bool,
     /// Cumulative **blocking** `SegmentFs::sync_dir` calls (M2.5-S01):
     /// the boot-storm oracle's observable — the ready path must issue
     /// zero of these (driver-ridden barrier syncs on dir handles do not
@@ -577,6 +581,12 @@ impl SimDisk {
             return None;
         }
         Some(model.schedule_write(now_ns, len))
+    }
+
+    /// Model a filesystem without `O_DIRECT`: every `create_meta_direct`
+    /// answers `Unsupported` from now on (ADR-0088 D3 as amended).
+    pub fn refuse_direct_meta(&self) {
+        self.state.borrow_mut().refuse_direct_meta = true;
     }
 
     /// Arms the dead switch: `n` more mutating ops succeed, then every
@@ -1018,6 +1028,12 @@ impl SegmentFs for SimDisk {
     }
 
     fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File> {
+        if self.state.borrow().refuse_direct_meta {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "SimDisk: O_DIRECT refused (refuse_direct_meta)",
+            ));
+        }
         // Volatile like `create_meta`, flagged direct: every driver write
         // to it is alignment-asserted (ADR-0088 D3).
         self.create_inode_full(path, Vec::new(), Vec::new(), 0, true)
@@ -1047,6 +1063,21 @@ impl SegmentFs for SimDisk {
 
     fn open_read(&self, path: &Path) -> io::Result<Self::File> {
         self.open_write(path)
+    }
+
+    /// The reopened tail takes the mode of *this* open (ADR-0086 D4 as
+    /// amended): `O_DIRECT` is a property of the open file description,
+    /// not the inode, so a segment created direct and reopened `Buffered`
+    /// (the FUA → FLUSH transition, packed frames at the v3 tail's
+    /// aligned end) takes packed writes, and a buffered segment reopened
+    /// `Direct` asserts alignment from here on.
+    fn open_segment_append(&self, path: &Path, mode: SegmentIoMode) -> io::Result<Self::File> {
+        let file = self.open_write(path)?;
+        let mut state = self.state.borrow_mut();
+        let ino = state.ino_of(path)?;
+        let inode = state.inodes.get_mut(&ino).expect("ino_of resolved the inode");
+        inode.direct = mode == SegmentIoMode::Direct;
+        Ok(file)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {

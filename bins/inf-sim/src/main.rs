@@ -78,7 +78,7 @@ fn main() {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m2-device-budget|m3-document|m2-combined|boot-storm \
+                        "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m2-device-budget|m2-mode-transition|m3-document|m2-combined|boot-storm \
                          [--seed N|0xN] [--verify-determinism] \
                          [--plant lost-wakeup|fsync-lies] [--replay-canary] [--cells N] \
                          [--connections N] [--commands N] [--trace-out FILE] \
@@ -98,7 +98,10 @@ fn main() {
 
     // The M2-S19 durable scenario has its own runner (power cuts, the
     // durability oracle, the sweep mode).
-    if matches!(scenario_name.as_str(), "m2-durable" | "m2-device-budget" | "m3-document") {
+    if matches!(
+        scenario_name.as_str(),
+        "m2-durable" | "m2-device-budget" | "m2-mode-transition" | "m3-document"
+    ) {
         run_durable(
             &scenario_name,
             seed,
@@ -679,6 +682,7 @@ fn run_durable(
         let mut scenario = match scenario_name {
             "m2-durable" => DurableScenario::m2_durable(seed),
             "m2-device-budget" => DurableScenario::m2_device_budget(seed),
+            "m2-mode-transition" => DurableScenario::m2_mode_transition(seed),
             "m3-document" => DurableScenario::m3_document(seed),
             _ => unreachable!("the caller filters durable scenario names"),
         };
@@ -754,6 +758,9 @@ fn run_durable(
     let mut budget_deferrals = 0u64;
     let mut waits_pace = 0u64;
     let mut stall_max_us = 0u64;
+    // Transition coverage (ADR-0086 D4 as amended): packed tails reopened
+    // under a `Direct` rotor at the `m2-mode-transition` restart.
+    let mut reopened_packed_tails = 0u64;
     for i in (shard_i..sweep).step_by(shard_k as usize) {
         let seed = seed.wrapping_add(i);
         let report = run_one(seed);
@@ -766,6 +773,7 @@ fn run_durable(
         budget_deferrals += report.budget_deferrals;
         waits_pace += report.frame_waits_pace;
         stall_max_us = stall_max_us.max(report.write_stall_max_us);
+        reopened_packed_tails += report.reopened_packed_tails;
         sim_seconds += report.sim_seconds;
         equivalence_checks += report.equivalence_checks;
         documents_compared += report.documents_compared;
@@ -797,7 +805,8 @@ fn run_durable(
          checks, {documents_compared} documents compared, cut classes [{}], frame pipeline \
          [pipelined_seeds:{pipelined_seeds} depth_max:{depth_max} waits_barrier:{waits_barrier} \
          waits_rotation:{waits_rotation}], device budget [background_bytes:{budget_bytes} \
-         deferrals:{budget_deferrals} waits_pace:{waits_pace} write_stall_max_us:{stall_max_us}]",
+         deferrals:{budget_deferrals} waits_pace:{waits_pace} write_stall_max_us:{stall_max_us}], \
+         reopened_packed_tails:{reopened_packed_tails}",
         classes.join(" ")
     );
     println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
@@ -811,7 +820,8 @@ fn run_durable(
              cut_classes=[{}] pipelined_seeds={pipelined_seeds} depth_max={depth_max} \
              waits_barrier={waits_barrier} waits_rotation={waits_rotation} \
              budget_background_bytes={budget_bytes} budget_deferrals={budget_deferrals} \
-             waits_pace={waits_pace} write_stall_max_us={stall_max_us}\n",
+             waits_pace={waits_pace} write_stall_max_us={stall_max_us} \
+             reopened_packed_tails={reopened_packed_tails}\n",
             classes.join(" ")
         );
         std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest).expect("manifest");

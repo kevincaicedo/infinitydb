@@ -195,6 +195,9 @@ pub struct DurableStats {
     /// the next upgrade) and class-upgrade rotations.
     pub rotations_unzeroed: u64,
     pub rotations_upgrade: u64,
+    /// A packed tail reopened `Buffered` under a `Direct` rotor (ADR-0086
+    /// D4 as amended): the FLUSH→FUA transition on an existing log.
+    pub reopened_packed_tails: u64,
     /// Tripwire (ADR-0086 D7): 1 once three consecutive everysec windows
     /// measured a write-through p50 above 3× the probed value. The device
     /// is not delivering the class it was probed for — visible, never an
@@ -238,6 +241,9 @@ pub struct DurableStats {
     pub manifest_bytes_total: u64,
     pub ckpt_interval_bytes: u64,
     pub ckpt_records_since_begin: u64,
+    /// 1 when checkpoint staging runs buffered (the probed `O_DIRECT`
+    /// fallback, ADR-0088 D3 as amended).
+    pub ckpt_io_mode_buffered: u64,
     /// `ceil_milli((log_frame_bytes + ckpt_bytes_total +
     /// manifest_bytes_total) / append_bytes)` — cell scope, boot life;
     /// undefined (0, with `_undefined = 1`) until the first checkpoint
@@ -911,6 +917,9 @@ impl<F: SegmentFs> DurableCell<F> {
             // measurement — a content estimate chased a growing dataset
             // and never fired, the node_e2e threshold test's finding).
             let total = self.commit.stats().frame_bytes_queued;
+            if self.ckpt.tick_backoff() {
+                return 0;
+            }
             if self.manifest.idle() && self.ckpt.should_begin(total, self.records_appended) {
                 let id = self.ckpt.pending_id();
                 let effect = MutationEffect::CkptBegin { ckpt_id: id };
@@ -1451,6 +1460,7 @@ impl<F: SegmentFs> DurableCell<F> {
             zero_fill_bytes: self.rotor.stats().zero_fill_bytes,
             rotations_unzeroed: self.rotor.stats().rotations_unzeroed,
             rotations_upgrade: self.rotor.stats().rotations_upgrade,
+            reopened_packed_tails: self.rotor.stats().reopened_packed_tails,
             barrier_class_degraded: u64::from(self.fua_degraded_windows >= 3),
             frames_in_flight: u64::from(self.staging.frames_in_flight()),
             frames_in_flight_max: u64::from(self.staging.stats().in_flight_max),
@@ -1470,6 +1480,7 @@ impl<F: SegmentFs> DurableCell<F> {
             manifest_bytes_total: manifest.bytes_written,
             ckpt_interval_bytes: ckpt.interval_bytes,
             ckpt_records_since_begin: ckpt.records_since_begin,
+            ckpt_io_mode_buffered: ckpt.io_mode_buffered,
             write_amp_milli_log_checkpoint: write_amp,
             write_amp_log_checkpoint_undefined: undefined,
             write_stall_max_us: self.write_stall_hist.max(),

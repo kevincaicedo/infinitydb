@@ -501,6 +501,10 @@ pub mod mem {
         /// `create_segment` — the ENOSPC injection point.
         capacity: Option<u64>,
         fail_next_sync_data: bool,
+        /// `create_meta_direct` answers `Unsupported` — the filesystem /
+        /// platform without `O_DIRECT` (ADR-0088 D3 as amended): the
+        /// checkpoint's probed buffered fallback is exercised here.
+        refuse_direct_meta: bool,
         /// Crash-at-step injection (M2-S11): `Some(n)` allows `n` more
         /// mutating operations, then **every** further mutating op fails —
         /// modeling a dead process whose best-effort cleanup also never
@@ -554,6 +558,12 @@ pub mod mem {
         /// fsyncgate probe (§8.4).
         pub fn fail_next_sync_data(&self) {
             self.state.borrow_mut().fail_next_sync_data = true;
+        }
+
+        /// Model a filesystem without `O_DIRECT`: every
+        /// `create_meta_direct` answers `Unsupported` from now on.
+        pub fn refuse_direct_meta(&self) {
+            self.state.borrow_mut().refuse_direct_meta = true;
         }
 
         /// Crash-at-step injection (M2-S11 swap matrix): allow `n` more
@@ -717,6 +727,12 @@ pub mod mem {
         }
 
         fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File> {
+            if self.state.borrow().refuse_direct_meta {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "MemFs: O_DIRECT refused (refuse_direct_meta)",
+                ));
+            }
             // Direct ≡ buffered in memory; the alignment of every write
             // is asserted by the caller's block layout (v3 sealer) and by
             // the sim tier — this tier records nothing (ADR-0088 D3).

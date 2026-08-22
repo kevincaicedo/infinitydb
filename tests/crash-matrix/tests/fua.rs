@@ -31,7 +31,21 @@
 //!   four was acked (the done-prefix), replay ends at the first frame's
 //!   base, the third is discarded as an un-attested beyond-frame.
 //!
-//! Both rows drive the rotor + staging ring + commit ledger exactly as
+//! Review row (ADR-0086 D4 as amended, 2026-08-21):
+//!
+//! - `flush-to-fua-packed-tail` — a cell writes packed (v2) frames under
+//!   the FLUSH class, restarts with the FUA class configured, accepts and
+//!   **acks** `always` writes, restarts again. Before the amendment the
+//!   reopened tail was rounded up to 4 KiB, the zero gap read as
+//!   end-of-log on the next boot, and the acked frame beyond it — whose
+//!   own `covered_lsn` attests exactly the gap offset, "at" not "past"
+//!   the data end — was discarded as un-attested residue. The row pins
+//!   the amended rule: the packed tail keeps packing, the class upgrades
+//!   at the next rotation, every acked key recovers exactly across both
+//!   restarts and a seeded power cut in the third life; the reverse
+//!   transition (FUA → FLUSH → FUA) rides the same row.
+//!
+//! Every row drives the rotor + staging ring + commit ledger exactly as
 //! the plane does (the `inf-log/tests/support` choreography), executing
 //! each op against the disk by hand so the cut can land at a chosen
 //! point. Seeds vary the cut's sector coin; the per-key oracle is the
@@ -105,6 +119,21 @@ impl Rig {
         };
         rig.prepare_next();
         rig
+    }
+
+    /// A rig over a recovered cell (the plane's assembly order: the
+    /// staging ring stamps the recovery-derived log life), carrying the
+    /// previous life's model forward so acked keys stay acked.
+    fn recovered(
+        disk: SimDisk,
+        rotor: SegmentRotor<SimDisk>,
+        model: BTreeMap<Vec<u8>, (Vec<u8>, bool)>,
+        seq: u32,
+    ) -> Rig {
+        let mut ring =
+            StagingRing::new(StagingConfig { capacity_bytes: 16 << 10, frames_in_flight: 4 });
+        ring.set_frame_epoch(rotor.resume_epoch());
+        Rig { disk, rotor, ring, commit: GroupCommit::new(), model, frame_keys: Vec::new(), seq }
     }
 
     /// MAINTAIN's job: preallocate the next segment and pre-zero it to
@@ -251,16 +280,28 @@ fn recover_and_audit(
     model: &BTreeMap<Vec<u8>, (Vec<u8>, bool)>,
     context: &str,
 ) -> inf_server::RecoverStats {
-    let mut ks = fresh_keyspace(FsyncClass::Always);
-    let mut cfg = config(SEGMENT_BYTES);
-    cfg.segment.io_mode = SegmentIoMode::Direct;
-    let (rotor, stats, _) =
-        open_cell_log(disk.clone(), &mut ks, CELL, &cfg, anchor(), now()).expect("recovers");
+    let (rotor, stats) = recover_in(disk, model, SegmentIoMode::Direct, context);
     assert_eq!(rotor.active_io_mode(), SegmentIoMode::Direct);
     assert!(
         rotor.active_written().is_multiple_of(FRAME_ALIGN),
         "{context}: resume cursor is aligned"
     );
+    stats
+}
+
+/// Recover the cell in `mode`, audit the per-key oracle, and hand the
+/// rotor back for a next life.
+fn recover_in(
+    disk: &SimDisk,
+    model: &BTreeMap<Vec<u8>, (Vec<u8>, bool)>,
+    mode: SegmentIoMode,
+    context: &str,
+) -> (SegmentRotor<SimDisk>, inf_server::RecoverStats) {
+    let mut ks = fresh_keyspace(FsyncClass::Always);
+    let mut cfg = config(SEGMENT_BYTES);
+    cfg.segment.io_mode = mode;
+    let (rotor, stats, _) =
+        open_cell_log(disk.clone(), &mut ks, CELL, &cfg, anchor(), now()).expect("recovers");
     let store = ks.ns_store_mut(NS).expect("ns");
     for (key, (value, acked)) in model {
         let got = store.get(key, now()).map(<[u8]>::to_vec);
@@ -281,7 +322,7 @@ fn recover_and_audit(
             );
         }
     }
-    stats
+    (rotor, stats)
 }
 
 /// `fua_in_flight`: frames 1..=k execute write-through; frame k+1 is
@@ -366,6 +407,7 @@ fn s34_rows_are_carried_here() {
         "seal-flush-x-fua",
         "seal-flush-x-fua-plain-tail",
         "pipeline-later-durable-earlier-torn",
+        "flush-to-fua-packed-tail",
     ] {
         assert!(
             def.rows.iter().any(|r| r.test == "fua.rs" && r.expect == expect),
@@ -487,5 +529,101 @@ fn later_frame_durable_earlier_torn_acks_nothing_and_truncates_at_the_first() {
         );
         assert_eq!(stats.torn_truncated_at, Some(first_base), "seed {seed}: resume at frame 1");
         assert_eq!(stats.beyond_frames_discarded, 1, "seed {seed}: the third frame, discarded");
+    }
+}
+
+/// `flush-to-fua-packed-tail` (ADR-0086 D4 as amended): life 1 writes
+/// packed frames under FLUSH and restarts cleanly; life 2 is configured
+/// FUA, reopens the packed tail **Buffered at its exact end**, acks
+/// `always` writes there, upgrades onto a pre-zeroed segment, acks
+/// write-through frames, and restarts cleanly; life 3 is FLUSH again
+/// (packed frames at an aligned offset), then life 4 reopens FUA on that
+/// packed tail and the seeded cut lands. Every acked key recovers exactly
+/// at every boot — the pre-amendment rounding lost life 2's first acked
+/// frame at the life-3 boot.
+#[test]
+fn flush_to_fua_transition_keeps_every_acked_record() {
+    for seed in 0..24u64 {
+        let mut rng = SplitMix64::new(seed ^ 0xF1A7);
+        let disk = SimDisk::new();
+        // Life 1: FLUSH class, packed frames, clean restart.
+        let (model, seq) = {
+            let dirs = create_cell_dirs(&disk, Path::new("data/shard-0")).expect("dirs");
+            let cfg = SegmentConfig { segment_bytes: SEGMENT_BYTES, ..Default::default() };
+            let rotor =
+                SegmentRotor::create_fresh_deferred(disk.clone(), dirs.log, cfg).expect("rotor");
+            let mut rig = Rig::recovered(disk.clone(), rotor, BTreeMap::new(), 0);
+            for _ in 0..1 + rng.next_below(3) {
+                let (op, h) = rig.seal_frame(1 + rng.next_below(3) as u32);
+                assert!(h.is_none());
+                assert!(matches!(op, Issued::Linked { .. }), "FLUSH class: linked fsync");
+                rig.execute(op);
+            }
+            assert!(
+                !rig.rotor.active_written().is_multiple_of(FRAME_ALIGN),
+                "packed frames end unaligned"
+            );
+            assert!(rig.model.values().all(|(_, acked)| *acked), "everything acked and durable");
+            (rig.model.clone(), rig.seq)
+        };
+        // Life 2: FUA configured on the packed tail.
+        let context = format!("flush-to-fua seed {seed} life 2");
+        let (rotor, stats) = recover_in(&disk, &model, SegmentIoMode::Direct, &context);
+        assert_eq!(stats.beyond_frames_discarded, 0, "{context}");
+        assert_eq!(rotor.active_io_mode(), SegmentIoMode::Buffered, "{context}: packed tail");
+        assert!(!rotor.active_written().is_multiple_of(FRAME_ALIGN), "{context}: no slack");
+        assert_eq!(rotor.stats().reopened_packed_tails, 1);
+        let (model, seq) = {
+            let mut rig = Rig::recovered(disk.clone(), rotor, model, seq);
+            // Acked always writes on the packed tail: FLUSH class still.
+            for _ in 0..1 + rng.next_below(2) {
+                let (op, h) = rig.seal_frame(1 + rng.next_below(3) as u32);
+                assert!(h.is_none());
+                assert!(matches!(op, Issued::Linked { .. }), "{context}: not pre-zeroed");
+                rig.execute(op);
+            }
+            // The upgrade rotation onto the pre-zeroed next segment.
+            rig.prepare_next();
+            let (op, seal) = rig.seal_frame(2);
+            rig.execute_seal(seal.expect("upgrade rotation"));
+            assert!(matches!(op, Issued::Through { .. }), "{context}: write-through after upgrade");
+            rig.execute(op);
+            assert_eq!(rig.rotor.stats().rotations_upgrade, 1);
+            assert!(rig.model.values().all(|(_, acked)| *acked));
+            (rig.model.clone(), rig.seq)
+        };
+        // Life 3: back to FLUSH on the aligned v3 tail — packed frames at
+        // an aligned offset, then a clean restart.
+        let context = format!("flush-to-fua seed {seed} life 3");
+        let (rotor, stats) = recover_in(&disk, &model, SegmentIoMode::Buffered, &context);
+        assert_eq!(stats.beyond_frames_discarded, 0, "{context}");
+        assert_eq!(rotor.active_io_mode(), SegmentIoMode::Buffered);
+        assert!(rotor.active_written().is_multiple_of(FRAME_ALIGN), "{context}: v3 tail");
+        let (model, seq) = {
+            let mut rig = Rig::recovered(disk.clone(), rotor, model, seq);
+            let (op, h) = rig.seal_frame(1 + rng.next_below(3) as u32);
+            assert!(h.is_none());
+            rig.execute(op);
+            (rig.model.clone(), rig.seq)
+        };
+        // Life 4: FUA again on a packed tail; the seeded cut lands with a
+        // frame in flight.
+        let context = format!("flush-to-fua seed {seed} life 4");
+        let (rotor, stats) = recover_in(&disk, &model, SegmentIoMode::Direct, &context);
+        assert_eq!(stats.beyond_frames_discarded, 0, "{context}");
+        assert_eq!(rotor.active_io_mode(), SegmentIoMode::Buffered, "{context}: packed tail");
+        let model = {
+            let mut rig = Rig::recovered(disk.clone(), rotor, model, seq);
+            let (op, h) = rig.seal_frame(1);
+            assert!(h.is_none());
+            rig.execute(op);
+            let (_in_flight, h) = rig.seal_frame(2);
+            assert!(h.is_none());
+            rig.model.clone()
+        };
+        disk.power_cut(seed);
+        let context = format!("flush-to-fua seed {seed} life 5");
+        let (rotor, _) = recover_in(&disk, &model, SegmentIoMode::Direct, &context);
+        assert_eq!(rotor.stats().reopened_packed_tails, 1, "{context}");
     }
 }

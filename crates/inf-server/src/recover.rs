@@ -119,6 +119,17 @@ pub struct RecoverStats {
     /// Epoch-regressed frames ending replay early (discarded-life residue
     /// resurfacing at the data end — ADR-0031 D3/D5). Counted per boot.
     pub epoch_residue_stops: u64,
+    /// Segment slacks holding **validating discarded-life residue** —
+    /// frames of an earlier life left beyond a data end that a torn-tail
+    /// resume truncated the pointer at and never rewrote (ADR-0031 D4's
+    /// "bytes are never rewritten"), then sealed past by a later life
+    /// that rotated away before overwriting them (the ADR-0086 D4
+    /// class-upgrade rotation makes this routine). Proven residue by
+    /// epoch — below the replayed prefix's, or below a life observed
+    /// beyond it — never a hole: excluded from the attestation decision,
+    /// replay continues past it. Counted per boot (ADR-0031 D5 as amended
+    /// 2026-08-21).
+    pub stale_residue_slacks: u64,
 }
 
 /// The recovered manifest — hands the recovery-time floor + named
@@ -232,6 +243,10 @@ pub struct Recovery<F: SegmentFs> {
     seg_sizes: Vec<u64>,
     ends: Vec<(u32, Option<ReadError>)>,
     residue: Vec<bool>,
+    /// Per segment: its slack's validating frames are discarded-life
+    /// residue (ADR-0031 D5 as amended) — counted as remnants, excluded
+    /// from the hole/attestation decision.
+    stale_slack: Vec<bool>,
     bytes_total: u64,
     bytes_done: u64,
     /// Bytes actually read+validated (frames, checkpoint blocks) — the
@@ -324,6 +339,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             seg_sizes: Vec::new(),
             ends: Vec::new(),
             residue: Vec::new(),
+            stale_slack: Vec::new(),
             bytes_total: 0,
             bytes_done: 0,
             bytes_consumed: 0,
@@ -1095,10 +1111,28 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             RegionScan::ValidFrame { .. } | RegionScan::Garbage { .. } => true,
             RegionScan::AllZero => failed.is_some(),
         };
+        // ADR-0031 D5 as amended (2026-08-21): validating frames whose
+        // epochs all sit below the replayed prefix's are discarded-life
+        // residue — a recovery already resumed past them and a later life
+        // wrote the prefix above them — never a hole of this life. (A hole
+        // of the current life carries its own epoch; a lying device that
+        // lost covered bytes of this life leaves this life's frames, or
+        // attestations in later segments the cross-segment check refuses.)
+        // The residue-stop that may have ended this segment's replay at
+        // such a frame is lifted with it: the segments after it are the
+        // live log, not residue.
+        let stale = evidence.valid_frames > 0
+            && !evidence.any_v1
+            && evidence.max_epoch < self.max_prefix_epoch;
+        if stale {
+            self.stats.stale_residue_slacks += 1;
+            self.residue_stop = false;
+        }
         self.residue.push(residue);
+        self.stale_slack.push(stale);
         self.evidence.push(evidence);
         let next = idx + 1;
-        self.phase = if evidence.valid_frames > 0 {
+        self.phase = if evidence.valid_frames > 0 && !stale {
             self.hole = Some(idx);
             if next == self.segments.len() { Phase::Finish } else { Phase::Probe { idx: next } }
         } else if next == self.segments.len() {
@@ -1122,6 +1156,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         self.stats.segments += 1;
         self.ends.push((0, None));
         self.residue.push(!matches!(evidence.summary(), RegionScan::AllZero));
+        self.stale_slack.push(false);
         self.evidence.push(evidence);
         self.bytes_done += self.seg_sizes[idx];
         let next = idx + 1;
@@ -1133,6 +1168,35 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     fn step_finish(&mut self) -> io::Result<RecoveryProgress> {
         debug_assert_eq!(self.ends.len(), self.segments.len(), "every segment has an end");
         debug_assert_eq!(self.evidence.len(), self.segments.len(), "every segment was audited");
+        // ADR-0031 D5 as amended (2026-08-21), the non-local half: a hole
+        // whose slack frames all carry an epoch below one probed *beyond*
+        // it is discarded-life residue the later life resumed past (the
+        // prefix and the residue share a life, so the audit could not tell
+        // locally; the later segments can). The probed segments are the
+        // live log: drop their probe bookkeeping and replay them — nothing
+        // of theirs was applied, so the replay order ADR-0087 D6 fixes is
+        // kept (this segment's slack is now known to be residue).
+        if let Some(hole) = self.hole {
+            let later_max_epoch =
+                self.evidence[hole + 1..].iter().map(|e| e.max_epoch).max().unwrap_or(0);
+            let at_hole = &self.evidence[hole];
+            if !at_hole.any_v1 && at_hole.max_epoch < later_max_epoch {
+                self.stats.stale_residue_slacks += 1;
+                self.stale_slack[hole] = true;
+                self.hole = None;
+                self.residue_stop = false;
+                for idx in hole + 1..self.segments.len() {
+                    self.stats.segments -= 1;
+                    self.bytes_done -= self.seg_sizes[idx];
+                }
+                self.ends.truncate(hole + 1);
+                self.residue.truncate(hole + 1);
+                self.stale_slack.truncate(hole + 1);
+                self.evidence.truncate(hole + 1);
+                self.phase = Phase::Replay { idx: hole + 1, reader: None };
+                return Ok(RecoveryProgress::Working);
+            }
+        }
         let ends = &self.ends;
         // The resume segment (ADR-0087 D6): the hole's, when it holds
         // data; else the last data-bearing segment before it (a hole at
@@ -1146,14 +1210,25 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             None => last_with_data(ends.len()),
         };
         self.last_data = last_data;
-        let torn = self.residue[last_data..].iter().any(|&r| r);
+        // Residue beyond the resume point: torn (this life's, or
+        // garbage) or stale (a discarded life's validating frames — a
+        // remnant, removed with the trailing segments but never a
+        // truncation of this life's data).
+        let torn = (last_data..self.residue.len()).any(|i| self.residue[i] && !self.stale_slack[i]);
+        let stale_trailing =
+            (last_data..self.residue.len()).any(|i| self.residue[i] && self.stale_slack[i]);
         self.stats.sealed_slack_remnants =
             self.residue[..last_data].iter().filter(|&&r| r).count() as u64;
         // Evidence from the resume segment's slack and everything after
         // it — the frames a truncation at the resume point would discard.
+        // Stale residue attests a discarded life's watermark, not this
+        // one's: excluded.
         let mut resume_evidence = RegionEvidence::default();
         let mut resume_evidence_anchor = None;
         for (i, evidence) in self.evidence.iter().enumerate().skip(last_data) {
+            if self.stale_slack[i] {
+                continue;
+            }
             if resume_evidence_anchor.is_none()
                 && let Some(offset) = evidence.first_valid
             {
@@ -1220,10 +1295,12 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         }
         if torn {
             self.stats.torn_truncated_at = Some(resume);
-            // Every later segment is un-acked residue (frame-free, or
-            // probed and proven un-covered above) — remove them so appends
-            // resume in the truncated segment with the pristine-prealloc
-            // invariant restored.
+        }
+        if torn || stale_trailing {
+            // Every later segment is un-acked residue (frame-free, probed
+            // and proven un-covered above, or a discarded life's) — remove
+            // them so appends resume in the truncated segment with the
+            // pristine-prealloc invariant restored.
             for &trailing in &self.segments[last_data + 1..] {
                 self.fs().remove_file(&self.log_dir.join(segment_file_name(trailing)))?;
                 self.stats.torn_segments_removed += 1;

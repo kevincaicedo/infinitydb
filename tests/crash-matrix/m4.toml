@@ -249,6 +249,21 @@ tier = "node"
 test = "fua.rs"
 expect = "pipeline-later-durable-earlier-torn"
 
+# ---- Review row (ADR-0086 D4 as amended, 2026-08-21) — the FLUSH → FUA
+# transition on an existing log, carried by tests/fua.rs ----
+#   flush-to-fua-packed-tail — packed (v2) frames under FLUSH, restart
+#                       with FUA configured, acked always writes, restart:
+#                       the packed tail reopens Buffered at its exact end
+#                       (no alignment slack the reader cannot cross), the
+#                       class upgrades at the next rotation, every acked
+#                       key exact at every boot and after the seeded cut
+
+[[row]]
+point = "torn_frame"
+tier = "node"
+test = "fua.rs"
+expect = "flush-to-fua-packed-tail"
+
 # ---- M4.5-S36 `.ick` container v3 (ADR-0088 D3/D8) — the aligned,
 # direct-written checkpoint under the recovery driver's unchanged rules,
 # carried by tests/ickv3.rs ----

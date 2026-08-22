@@ -327,6 +327,11 @@ pub struct RotorStats {
     /// Class-upgrade rotations (a pre-zeroed segment was ready while the
     /// active one was not) — how a fresh or recovered cell converges.
     pub rotations_upgrade: u64,
+    /// A packed (v2, unaligned) tail reopened `Buffered` under a `Direct`
+    /// rotor (ADR-0086 D4 as amended): the FLUSH→FUA transition on an
+    /// existing log keeps packing until the next rotation instead of
+    /// inserting alignment slack the reader cannot cross. 0 or 1 per boot.
+    pub reopened_packed_tails: u64,
 }
 
 /// What one MAINTAIN slice did (observability + tests).
@@ -512,10 +517,19 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// recovery (M2-S13/S14) computes `tail_offset` — the byte after the
     /// last valid frame (the aligned successor when that frame was v3) —
     /// and hands it here. The tail reopens in the configured mode
-    /// (ADR-0086 D4): `Direct` needs an aligned `tail_offset` (a v2 tail
-    /// resumed under `Direct` rounds up — the skipped bytes are zeros or
-    /// un-covered residue, both legal slack) and is pre-zeroed only if the
-    /// file says so.
+    /// (ADR-0086 D4 as amended 2026-08-21): `Direct` requires an aligned
+    /// `tail_offset`; a **packed tail** (the last frame was v2, its end
+    /// unaligned) reopens `Buffered` and keeps packing — the rotor never
+    /// inserts alignment slack into an active segment, because the reader
+    /// stops at the first zero word after a v2 frame and a frame written
+    /// past such a gap is unreachable on the next boot (its own
+    /// `covered_lsn` cannot attest it: a frame sealed right after a fully
+    /// covered tail stamps exactly the gap offset, and the ADR-0031 D4
+    /// rule reads "at or past" as un-covered residue — an acked record
+    /// lost). The class upgrades at the next rotation, onto the first
+    /// pre-zeroed `Direct` segment MAINTAIN produces (the
+    /// `create_fresh_deferred` convergence path; `reopened_packed_tails`
+    /// counts it). A `Direct` tail is pre-zeroed only if the file says so.
     pub fn open_existing(
         fs: F,
         log_dir: PathBuf,
@@ -528,16 +542,21 @@ impl<F: SegmentFs> SegmentRotor<F> {
             return Self::create_fresh(fs, log_dir, cfg);
         };
         let path = log_dir.join(segment_file_name(tail));
-        let file = fs
-            .open_segment_append(&path, cfg.io_mode)
-            .map_err(|source| LogError::Io { segment: tail, source })?;
-        let written = match cfg.io_mode {
-            SegmentIoMode::Buffered => tail_offset,
-            SegmentIoMode::Direct => crate::frame::align_up_frame(tail_offset),
+        let packed_tail = !tail_offset.is_multiple_of(FRAME_ALIGN);
+        let tail_mode = match cfg.io_mode {
+            SegmentIoMode::Direct if !packed_tail => SegmentIoMode::Direct,
+            SegmentIoMode::Direct | SegmentIoMode::Buffered => SegmentIoMode::Buffered,
         };
-        let active = activate(tail, file, written, cfg.io_mode)?;
+        let file = fs
+            .open_segment_append(&path, tail_mode)
+            .map_err(|source| LogError::Io { segment: tail, source })?;
+        let active = activate(tail, file, tail_offset, tail_mode)?;
         let sealed =
             scan.segments().split_last().map(|(_, rest)| rest.to_vec()).unwrap_or_default();
+        let mut stats = RotorStats::default();
+        if cfg.io_mode == SegmentIoMode::Direct && packed_tail {
+            stats.reopened_packed_tails += 1;
+        }
         Ok(SegmentRotor {
             fs,
             log_dir,
@@ -547,7 +566,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
             sealed,
             space_exhausted: false,
             resume_epoch: 1,
-            stats: RotorStats::default(),
+            stats,
         })
     }
 
