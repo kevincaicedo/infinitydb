@@ -95,8 +95,11 @@ pub struct DurableConfig {
     /// probed device model and the frame-seal pace. `Default` = absent
     /// model = unbudgeted, unpaced — the pre-S36 behaviour byte-for-byte.
     pub device: DeviceConfig,
-    /// M4.5-S39a: the frame-fill policy on aligned segments. `Default` =
-    /// off — one seal per LOG step, the pre-S39a cadence byte-for-byte.
+    /// M4.5-S39a (ADR-0089): the frame-fill policy on aligned segments.
+    /// `Default` = off — one seal per LOG step, the pre-S39a cadence
+    /// byte-for-byte; the product default is [`FillConfig::DESIGN_POINT`]
+    /// (`infinityd --fill-window-us 1000`), accepted on the reference box
+    /// 2026-08-22.
     pub fill: FillConfig,
 }
 
@@ -108,11 +111,12 @@ pub struct DurableConfig {
 /// due, no ack waiting on it) is held until it reaches `target_bytes`
 /// on-device or `window` elapses since the LOG step first saw it; the
 /// window is timer-armed so an idle park never outlives it. A frame
-/// whose plan carries a barrier is never held — an `always` ack waits on
-/// it and the E4.7 rejection of a batch window on the barrier path
-/// stands — unless `hold_due` (the measured arm B, never a default)
-/// extends the hold to due frames while earlier frames are in flight.
-/// Packed (v2) segments have no padding and keep the per-step cadence.
+/// whose plan carries a barrier is **never** held — an `always` ack
+/// waits on it, the E4.7 rejection of a batch window on the barrier
+/// path stands, and the measured arm that held such frames behind
+/// in-flight ones (ADR-0089 D2, "arm B") read p50 ÷ barrier 1.84–1.89
+/// against the 1.3 gate and was `Rejected` with its flag. Packed (v2)
+/// segments have no padding and keep the per-step cadence.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FillConfig {
     /// Hold bound since the first LOG step that saw the pending frame.
@@ -120,13 +124,16 @@ pub struct FillConfig {
     pub window: Nanos,
     /// The on-device frame length (padded) at which a held frame seals.
     pub target_bytes: u32,
-    /// Arm B: hold barrier-carrying frames too while frames are in
-    /// flight (a drained pipeline always seals). Measured on the S35
-    /// row; predicted to fail its p50 ÷ barrier gate.
-    pub hold_due: bool,
 }
 
 impl FillConfig {
+    /// The accepted default (ADR-0089 D6, reference box 2026-08-22): a
+    /// 1 ms window and a 16 KiB target — padding 24–30 % → 12.5 % and
+    /// +17–38 % `everysec` throughput on the S36 row, the `always` row
+    /// untouched.
+    pub const DESIGN_POINT: FillConfig =
+        FillConfig { window: Nanos::from_micros(1_000), target_bytes: 16 << 10 };
+
     /// The policy is engaged.
     #[must_use]
     pub const fn enabled(&self) -> bool {
@@ -135,16 +142,14 @@ impl FillConfig {
 
     /// The pure decision (unit-pinned; the LOG step adds the timer):
     /// hold the pending frame when the policy is on, the frame lands on
-    /// an aligned segment, its plan carries no barrier (or arm B applies
-    /// and frames are in flight), it is below `target_bytes` on-device,
-    /// and — once the episode's clock `since` is running — the window
-    /// has not elapsed. `since == None` is the episode's first sight:
-    /// the hold starts now.
+    /// an aligned segment, its plan is `Plain` (no barrier to carry), it
+    /// is below `target_bytes` on-device, and — once the episode's clock
+    /// `since` is running — the window has not elapsed. `since == None`
+    /// is the episode's first sight: the hold starts now.
     #[must_use]
     pub fn decide(
         &self,
         plan: FramePlan,
-        drained: bool,
         layout: inf_log::FrameLayout,
         frame_len: u32,
         since: Option<Nanos>,
@@ -153,12 +158,7 @@ impl FillConfig {
         if !self.enabled() || layout != inf_log::FrameLayout::Aligned {
             return FillDecision::Seal;
         }
-        let holdable = match plan {
-            FramePlan::Plain => true,
-            FramePlan::WriteThrough | FramePlan::LinkedFsync => self.hold_due && !drained,
-            FramePlan::Wait => false,
-        };
-        if !holdable || layout.padded_len(frame_len) >= self.target_bytes {
+        if plan != FramePlan::Plain || layout.padded_len(frame_len) >= self.target_bytes {
             return FillDecision::Seal;
         }
         match since {
@@ -830,8 +830,7 @@ impl<F: SegmentFs> DurableCell<F> {
         }
         let layout =
             if rotation_due { self.rotor.next_layout() } else { self.rotor.active_layout() };
-        let drained = self.staging.drained();
-        match self.fill.decide(plan, drained, layout, frame_len, self.fill_since, cx.now) {
+        match self.fill.decide(plan, layout, frame_len, self.fill_since, cx.now) {
             FillDecision::Seal => false,
             FillDecision::Hold => {
                 if self.fill_since.is_none() {
@@ -1947,19 +1946,15 @@ mod fill_tests {
     use super::*;
     use inf_log::FrameLayout;
 
-    fn policy(hold_due: bool) -> FillConfig {
-        FillConfig { window: Nanos::from_micros(1_000), target_bytes: 16 << 10, hold_due }
-    }
-
-    /// Arm A (M4.5-S39a): a barrier-less frame below the target holds
-    /// inside the window and seals at the target, at the window, off the
+    /// ADR-0089 D1: a barrier-less frame below the target holds inside
+    /// the window and seals at the target, at the window, off the
     /// policy, and on a packed segment.
     #[test]
     fn barrier_less_frame_holds_until_target_or_window() {
-        let fill = policy(false);
+        let fill = FillConfig::DESIGN_POINT;
         let t0 = Nanos::from_micros(10);
         let d = |frame_len: u32, since: Option<Nanos>, now: Nanos| {
-            fill.decide(FramePlan::Plain, false, FrameLayout::Aligned, frame_len, since, now)
+            fill.decide(FramePlan::Plain, FrameLayout::Aligned, frame_len, since, now)
         };
         assert_eq!(d(2_400, None, t0), FillDecision::Hold, "first sight: the hold starts");
         assert_eq!(d(2_400, Some(t0), t0 + Nanos::from_micros(999)), FillDecision::Hold);
@@ -1969,53 +1964,29 @@ mod fill_tests {
         assert_eq!(d((8 << 10) + 1, None, t0), FillDecision::Hold, "padded to 12 KiB: below");
         assert_eq!(d((12 << 10) + 1, None, t0), FillDecision::Seal, "padded to 16 KiB: at");
         assert_eq!(
-            FillConfig::default().decide(
-                FramePlan::Plain,
-                false,
-                FrameLayout::Aligned,
-                100,
-                None,
-                t0
-            ),
+            FillConfig::default().decide(FramePlan::Plain, FrameLayout::Aligned, 100, None, t0),
             FillDecision::Seal,
             "policy off"
         );
         assert_eq!(
-            fill.decide(FramePlan::Plain, false, FrameLayout::Packed, 100, None, t0),
+            fill.decide(FramePlan::Plain, FrameLayout::Packed, 100, None, t0),
             FillDecision::Seal,
             "no padding on a packed segment — nothing to fill against"
         );
     }
 
-    /// A frame whose plan carries a barrier is never held under arm A;
-    /// arm B holds it only while frames are in flight, and a drained
-    /// pipeline always seals.
+    /// A frame whose plan carries a barrier is never held (ADR-0089 D1;
+    /// the arm that held them was measured and `Rejected`), and a
+    /// waiting frame is the plan's hold, never the policy's.
     #[test]
-    fn barrier_carrying_frames_are_never_held_unless_arm_b_behind_in_flight_frames() {
+    fn barrier_carrying_and_waiting_frames_are_never_held() {
         let t0 = Nanos::from_micros(10);
-        for plan in [FramePlan::WriteThrough, FramePlan::LinkedFsync] {
-            for drained in [true, false] {
-                assert_eq!(
-                    policy(false).decide(plan, drained, FrameLayout::Aligned, 100, None, t0),
-                    FillDecision::Seal,
-                    "arm A never holds a due frame ({plan:?}, drained {drained})"
-                );
-            }
+        for plan in [FramePlan::WriteThrough, FramePlan::LinkedFsync, FramePlan::Wait] {
             assert_eq!(
-                policy(true).decide(plan, true, FrameLayout::Aligned, 100, None, t0),
+                FillConfig::DESIGN_POINT.decide(plan, FrameLayout::Aligned, 100, None, t0),
                 FillDecision::Seal,
-                "arm B: a drained pipeline seals"
-            );
-            assert_eq!(
-                policy(true).decide(plan, false, FrameLayout::Aligned, 100, None, t0),
-                FillDecision::Hold,
-                "arm B: held behind in-flight frames"
+                "{plan:?}"
             );
         }
-        assert_eq!(
-            policy(true).decide(FramePlan::Wait, false, FrameLayout::Aligned, 100, None, t0),
-            FillDecision::Seal,
-            "a waiting frame is the plan's hold, never the policy's"
-        );
     }
 }

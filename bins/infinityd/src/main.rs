@@ -64,13 +64,11 @@ struct Args {
     /// qd4` (`--seal-pace probe`); `Some(Some(n))` = `n` barriers/s per
     /// device (`--seal-pace N`).
     seal_pace: Option<Option<u64>>,
-    /// M4.5-S39a: the frame-fill policy on aligned segments — the hold
-    /// window in µs (0 = off, the shipped default until the A/B), the
-    /// on-device target in KiB (16), and the arm-B switch that extends
-    /// the hold to barrier-carrying frames behind in-flight ones.
+    /// M4.5-S39a (ADR-0089): the frame-fill policy on aligned segments —
+    /// the hold window in µs (1 000 = the accepted design point; 0 = off)
+    /// and the on-device target in KiB (16).
     fill_window_us: u64,
     fill_target_kib: u32,
-    fill_window_always: bool,
     /// Per-buffer log-staging capacity in MiB (M4.5-S27, ADR-0083 D3).
     /// The buffer absorbs `arrival_rate × frame-write stall`; the 4 MiB
     /// default is ~8.5 ms at 470 MB/s. With ADR-0083 D1 pacing the bound
@@ -122,9 +120,8 @@ impl Default for Args {
             barrier_class: None,
             device_write_mbps: None,
             seal_pace: None,
-            fill_window_us: 0,
+            fill_window_us: 1_000,
             fill_target_kib: 16,
-            fill_window_always: false,
             log_staging_mib: 4,
             early_fabric_flush: false,
             remote_first_execute: false,
@@ -239,7 +236,6 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--fill-target-kib is 4..=1024 (one block to the FUA bound)".into());
                 }
             }
-            "--fill-window-always" => args.fill_window_always = true,
             "--log-staging-mib" => {
                 args.log_staging_mib = take("--log-staging-mib")?
                     .parse()
@@ -261,7 +257,7 @@ fn parse_args() -> Result<Args, String> {
                      [--pin-start CORE] [--route-local-only] [--data-dir PATH] \
                      [--ckpt-interval-bytes N] [--segment-bytes N] [--frames-in-flight 1] \
                      [--barrier-class flush|fua] [--device-write-mbps N] [--seal-pace probe|N] \
-                     [--fill-window-us 0] [--fill-target-kib 16] [--fill-window-always] \
+                     [--fill-window-us 1000] [--fill-target-kib 16] \
                      [--log-staging-mib 4] \
                      [--early-fabric-flush] \
                      [--remote-first-execute] \
@@ -595,11 +591,11 @@ fn cell_main(
                 model_share: io.device.share(args.cells),
                 seal_barriers_per_s: seal_barriers_per_s / u64::from(args.cells.max(1)),
             },
-            // M4.5-S39a: the fill policy (off unless `--fill-window-us`).
+            // M4.5-S39a (ADR-0089): the fill policy, design point by
+            // default; `--fill-window-us 0` turns it off.
             fill: inf_server::FillConfig {
                 window: inf_foundation::time::Nanos::from_micros(args.fill_window_us),
                 target_bytes: args.fill_target_kib << 10,
-                hold_due: args.fill_window_always,
             },
         };
         durable = Some((cfg, std::sync::Arc::clone(control)));

@@ -574,10 +574,6 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         // and its unbudgeted baseline arm (no probe file copied in).
         "only-s36",
         "model-absent",
-        // M4.5-S39a arm B: the bare switch that extends the fill hold to
-        // barrier-carrying frames (a value-less flag — listed here or the
-        // parser eats the next flag as its value).
-        "fill-window-always",
     ],
     &[
         "allow-dirty",
@@ -663,11 +659,10 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "device-write-mbps",
         "seal-pace",
         // M4.5-S39a: the frame-fill arms, forwarded to every durable spawn
-        // through `pipeline_args` (window in µs, target in KiB, and the
-        // arm-B switch that extends the hold to barrier-carrying frames).
+        // through `pipeline_args` (window in µs — 0 = the baseline arm —
+        // and target in KiB).
         "fill-window-us",
         "fill-target-kib",
-        "fill-window-always",
         "recovery-gbps-per-cell",
         "recovery-boot-s",
         // ADR-0070 D7 (2026-08-16): Phase::Start overhead, split out of the

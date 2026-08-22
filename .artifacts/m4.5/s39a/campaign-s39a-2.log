@@ -1,0 +1,71 @@
+# 2026-08-22T00:20:50-04:00 binary=infinityd 22af6ed (git 22af6ede3d02, x86_64-unknown-linux-gnu) git=22af6ed dirty=0 thermal: 27800 37000 38000 
+=== 2026-08-22T00:20:50-04:00 s36 fillA-4 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before s36 device leg (4 cells)
+  s35: 40s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell always p50 ratio (S34's F2 AC) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review2/s39a/s36-fillA-4/1787372576-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T00:22:56-04:00 ===
+=== 2026-08-22T00:22:56-04:00 s36 base-4 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T00:22:56-04:00 ===
+=== 2026-08-22T00:22:56-04:00 s36 fillA-5 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T00:22:56-04:00 ===
+=== 2026-08-22T00:22:56-04:00 s36 base-5 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T00:22:56-04:00 ===
+# done 2026-08-22T00:22:56-04:00

@@ -486,14 +486,9 @@ impl DurableScenario {
     }
 }
 
-/// The S39a fill policy at its design point (1 ms window, 16 KiB
-/// target, arm A).
+/// The S39a fill policy at its accepted design point (ADR-0089).
 pub(crate) fn m2_fill_config() -> inf_server::FillConfig {
-    inf_server::FillConfig {
-        window: Nanos::from_micros(1_000),
-        target_bytes: 16 << 10,
-        hold_due: false,
-    }
+    inf_server::FillConfig::DESIGN_POINT
 }
 
 /// What one seeded run produced. `trace` is the determinism artifact
