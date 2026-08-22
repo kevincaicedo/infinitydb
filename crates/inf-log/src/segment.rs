@@ -67,12 +67,11 @@ pub const ZERO_FILL_SLICE_BYTES: u32 = 256 << 10;
 /// than the burst.
 pub const ZERO_FILL_HEAD_START: u32 = 16 << 20;
 
-/// Recycle-pool bound (ADR-0090 D1): one pooled segment per cell is the
-/// measured hypothesis — truncation runs at least as often as rotation
-/// at the row's shape, so one slot should serve every prealloc after the
-/// first generation; falsifier (a) names the 2-slot pool as the next
-/// hypothesis, by amendment with the artifact.
-pub const DEFAULT_RECYCLE_SLOTS: u8 = 1;
+/// Recycle-pool bound (ADR-0090 D1): recycling remains explicit opt-in.
+/// The corrected campaign-F first-boot recovery gate read 1.29x at one
+/// slot, so ADR-0090 D9 must close the miss/recovery term before a future
+/// default change.
+pub const DEFAULT_RECYCLE_SLOTS: u8 = 0;
 
 /// File name of a segment: `seg-{:06}.ilog` (wider ids grow digits
 /// naturally; the parser accepts 6–10 digits).

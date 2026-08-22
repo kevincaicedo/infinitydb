@@ -48,7 +48,7 @@ struct Args {
     /// Segment recycling (M4.5-S39b, ADR-0090 D1): covered pre-zeroed
     /// `Direct` segments kept for reuse by rename instead of unlinked —
     /// the zero-fill paid once per generation. `0` = off
-    /// (`--no-segment-recycle`, the A/B baseline arm); default 1.
+    /// (`--no-segment-recycle`, the A/B baseline arm); default 0.
     segment_recycle_slots: u8,
     /// Frames in flight per cell (M4.5-S35, ADR-0087 D1/D5 as amended
     /// 2026-08-22): `auto` (the default) derives K from the resolved
@@ -297,7 +297,7 @@ fn parse_args() -> Result<Args, String> {
                 println!(
                     "infinityd [--port 6379] [--cells 4] [--buffers 4096] [--buf-size 4096] \
                      [--pin-start CORE] [--route-local-only] [--data-dir PATH] \
-                     [--ckpt-interval-bytes N] [--segment-bytes N] [--segment-recycle-slots 1] \
+                     [--ckpt-interval-bytes N] [--segment-bytes N] [--segment-recycle-slots 0] \
                      [--no-segment-recycle] [--conn-default-ns NAME] [--frames-in-flight auto|K] \
                      [--barrier-class flush|fua] [--device-write-mbps N] [--seal-pace probe|N] \
                      [--fill-window-us 1000] [--fill-target-kib 16] \

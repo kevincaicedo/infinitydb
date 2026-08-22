@@ -20,3 +20,7 @@ measured 0.38); it remains `Revised` onto ADR-0090 D9 and is not a condition for
 this narrowly scoped default-ratification decision. All other S39b columns stay
 visible as controls. The block-device counter is host sectors written, not NAND
 wear. No recovery number from campaigns D/E is reused.
+
+Outcome: the corrected paired recovery median was 1.293x, so the condition did
+not hold and the product default returned to zero. See `VERDICT.md`; the
+nonzero gate-run exit is the declared red result, not an incomplete campaign.

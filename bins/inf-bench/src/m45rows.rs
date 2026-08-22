@@ -1732,7 +1732,7 @@ fn s39b_leg(
 /// The M4.5-S39b segment-recycling row (ADR-0090 D6 as amended): the
 /// S35 shape — a flat `always` namespace so zero-fill engages — run long
 /// enough for ≥ 8 rotations per cell, baseline (`--no-segment-recycle`)
-/// against the arm (`--segment-recycle-slots N`, default 1), interleaved
+/// against the arm (`--segment-recycle-slots N`, row default 1), interleaved
 /// per replicate (ABBA), every counter snapshotted at the end of the
 /// first generation and at the end of the leg so the warmed figures are
 /// **deltas**; the block device's sectors-written sampled beside the
