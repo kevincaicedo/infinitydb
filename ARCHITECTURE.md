@@ -82,9 +82,8 @@ predeclares the rule and the class-derived outcome). Background I/O
 per-cell share of a **measured device budget** (ADR-0088; the seal
 pacer that ADR proposed is an A/B arm, off). On aligned segments a
 **barrier-less** frame may hold until it fills 16 KiB or 1 ms elapses
-(ADR-0089's fill policy — `--fill-window-us`; off by default until its
-rerun at the shipping configuration passes); a frame that carries a
-barrier is never held. Everything else — the hash index, document trees,
+(ADR-0089's fill policy — on by default, `--fill-window-us 0` is the
+per-iteration cadence); a frame that carries a barrier is never held. Everything else — the hash index, document trees,
 secondary indexes, stream offsets, vector graphs — is a rebuildable
 projection over that log. Checkpoints are fuzzy snapshots streamed by the
 owning cell in budgeted background slices (no fork, no stop-the-world)

@@ -1,0 +1,1770 @@
+# 2026-08-22T10:51:48-04:00 binary=infinityd 5e162b7 (git 5e162b77a9f8, x86_64-unknown-linux-gnu) git=5e162b7 dirty=0 thermal: 27800 37000 38000  gov=performance strays=0
+=== 2026-08-22T10:51:48-04:00 A s36 base-1 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/A-s36-base-1/1787410474-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T10:54:34-04:00 ===
+=== 2026-08-22T10:54:34-04:00 A s36 fillA-1 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/A-s36-fillA-1/1787410640-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T10:57:20-04:00 ===
+=== 2026-08-22T10:57:20-04:00 A s36 fillA-2 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/A-s36-fillA-2/1787410807-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:00:07-04:00 ===
+=== 2026-08-22T11:00:07-04:00 A s36 base-2 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/A-s36-base-2/1787410973-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 A s36 base-3 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 A s36 fillA-3 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 A s36 fillA-4 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 A s36 base-4 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 A s36 base-5 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 A s36 fillA-5 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round0 k1s4 (--frames-in-flight 1 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round0 k3s2 (--frames-in-flight 3 --staging-mib 2) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round0 k3s4 (--frames-in-flight 3 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round1 k3s2 (--frames-in-flight 3 --staging-mib 2) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round1 k3s4 (--frames-in-flight 3 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round1 k1s4 (--frames-in-flight 1 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round2 k3s4 (--frames-in-flight 3 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round2 k1s4 (--frames-in-flight 1 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round2 k3s2 (--frames-in-flight 3 --staging-mib 2) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round3 k1s4 (--frames-in-flight 1 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round3 k3s2 (--frames-in-flight 3 --staging-mib 2) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round3 k3s4 (--frames-in-flight 3 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round4 k3s2 (--frames-in-flight 3 --staging-mib 2) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round4 k3s4 (--frames-in-flight 3 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+=== 2026-08-22T11:02:53-04:00 B s35 round4 k1s4 (--frames-in-flight 1 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 1 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-22T11:02:53-04:00 ===
+# 2026-08-22T11:02:53-04:00 binary=infinityd 5e162b7 (git 5e162b77a9f8, x86_64-unknown-linux-gnu) git=5e162b7 dirty=1 thermal: 27800 37000 43000  gov=performance strays=0
+# done 2026-08-22T11:02:53-04:00
+# 2026-08-22T11:04:04-04:00 RESUME binary=infinityd 4d7678f (git 4d7678f98757, x86_64-unknown-linux-gnu) git=4d7678f dirty=0 thermal: 27800 37000 38000  gov=performance strays=0
+=== 2026-08-22T11:04:04-04:00 A s36 base-3 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/A-s36-base-3/1787411210-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:06:50-04:00 ===
+=== 2026-08-22T11:06:50-04:00 A s36 fillA-3 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/A-s36-fillA-3/1787411377-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:09:37-04:00 ===
+=== 2026-08-22T11:09:37-04:00 A s36 fillA-4 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/A-s36-fillA-4/1787411543-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:12:23-04:00 ===
+=== 2026-08-22T11:12:23-04:00 A s36 base-4 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/A-s36-base-4/1787411709-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:15:09-04:00 ===
+=== 2026-08-22T11:15:09-04:00 A s36 base-5 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/A-s36-base-5/1787411875-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:17:55-04:00 ===
+=== 2026-08-22T11:17:55-04:00 A s36 fillA-5 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/A-s36-fillA-5/1787412041-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:20:41-04:00 ===
+=== 2026-08-22T11:20:41-04:00 B s35 round0 k1s4 (--frames-in-flight 1 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns FAIL
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k1s4-r0/1787412209-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:23:29-04:00 ===
+=== 2026-08-22T11:23:29-04:00 B s35 round0 k3s2 (--frames-in-flight 3 --staging-mib 2) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k3s2-r0/1787412378-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:26:18-04:00 ===
+=== 2026-08-22T11:26:18-04:00 B s35 round0 k3s4 (--frames-in-flight 3 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k3s4-r0/1787412546-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:29:06-04:00 ===
+=== 2026-08-22T11:29:06-04:00 B s35 round1 k3s2 (--frames-in-flight 3 --staging-mib 2) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k3s2-r1/1787412714-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:31:54-04:00 ===
+=== 2026-08-22T11:31:54-04:00 B s35 round1 k3s4 (--frames-in-flight 3 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k3s4-r1/1787412882-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:34:42-04:00 ===
+=== 2026-08-22T11:34:42-04:00 B s35 round1 k1s4 (--frames-in-flight 1 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns FAIL
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k1s4-r1/1787413050-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:37:30-04:00 ===
+=== 2026-08-22T11:37:30-04:00 B s35 round2 k3s4 (--frames-in-flight 3 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k3s4-r2/1787413218-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:40:18-04:00 ===
+=== 2026-08-22T11:40:18-04:00 B s35 round2 k1s4 (--frames-in-flight 1 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns FAIL
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k1s4-r2/1787413386-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:43:06-04:00 ===
+=== 2026-08-22T11:43:06-04:00 B s35 round2 k3s2 (--frames-in-flight 3 --staging-mib 2) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k3s2-r2/1787413555-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:45:55-04:00 ===
+=== 2026-08-22T11:45:55-04:00 B s35 round3 k1s4 (--frames-in-flight 1 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns FAIL
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k1s4-r3/1787413723-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:48:43-04:00 ===
+=== 2026-08-22T11:48:43-04:00 B s35 round3 k3s2 (--frames-in-flight 3 --staging-mib 2) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k3s2-r3/1787413891-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:51:31-04:00 ===
+=== 2026-08-22T11:51:31-04:00 B s35 round3 k3s4 (--frames-in-flight 3 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k3s4-r3/1787414059-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:54:19-04:00 ===
+=== 2026-08-22T11:54:19-04:00 B s35 round4 k3s2 (--frames-in-flight 3 --staging-mib 2) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k3s2-r4/1787414227-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:57:07-04:00 ===
+=== 2026-08-22T11:57:07-04:00 B s35 round4 k3s4 (--frames-in-flight 3 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k3s4-r4/1787414395-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-22T11:59:55-04:00 ===
+=== 2026-08-22T11:59:55-04:00 B s35 round4 k1s4 (--frames-in-flight 1 --staging-mib 4) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns FAIL
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/B-s35-k1s4-r4/1787414563-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:02:43-04:00 ===
+# 2026-08-22T12:02:43-04:00 RESUME binary=infinityd 4d7678f (git 4d7678f98757, x86_64-unknown-linux-gnu) git=4d7678f dirty=0 thermal: 27800 36000 42000  gov=performance strays=0
+# done-resume 2026-08-22T12:02:43-04:00
+# 2026-08-22T12:03:45-04:00 C(K=1,S=4) binary=infinityd 4d7678f (git 4d7678f98757, x86_64-unknown-linux-gnu) git=4d7678f dirty=0 thermal: 27800 37000 37000  gov=performance strays=0
+=== 2026-08-22T12:03:45-04:00 C s36 k1s4 base-1 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k1s4-base-1/1787414791-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:06:31-04:00 ===
+=== 2026-08-22T12:06:31-04:00 C s36 k1s4 fillA-1 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k1s4-fillA-1/1787414957-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:09:17-04:00 ===
+=== 2026-08-22T12:09:17-04:00 C s36 k1s4 fillA-2 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k1s4-fillA-2/1787415123-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:12:03-04:00 ===
+=== 2026-08-22T12:12:03-04:00 C s36 k1s4 base-2 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k1s4-base-2/1787415290-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:14:50-04:00 ===
+=== 2026-08-22T12:14:50-04:00 C s36 k1s4 base-3 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k1s4-base-3/1787415456-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:17:36-04:00 ===
+=== 2026-08-22T12:17:36-04:00 C s36 k1s4 fillA-3 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k1s4-fillA-3/1787415622-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:20:22-04:00 ===
+=== 2026-08-22T12:20:22-04:00 C s35 k1s4 fill 1000 (3 reps) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+  s35: 40s drive-state idle before 4c rep1 c32
+  s35: 40s drive-state idle before 4c rep1 c256
+  s35: 40s drive-state idle before 1c rep1 c32
+  s35: 40s drive-state idle before 4c rep2 c32
+  s35: 40s drive-state idle before 4c rep2 c256
+  s35: 40s drive-state idle before 1c rep2 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns FAIL
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s35-k1s4-fill1000/1787416126-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:28:46-04:00 ===
+=== 2026-08-22T12:28:46-04:00 C s35 k1s4 fill 0 (3 reps) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+  s35: 40s drive-state idle before 4c rep1 c32
+  s35: 40s drive-state idle before 4c rep1 c256
+  s35: 40s drive-state idle before 1c rep1 c32
+  s35: 40s drive-state idle before 4c rep2 c32
+  s35: 40s drive-state idle before 4c rep2 c256
+  s35: 40s drive-state idle before 1c rep2 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns FAIL
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s35-k1s4-fill0/1787416631-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:37:11-04:00 ===
+# 2026-08-22T12:37:11-04:00 C(K=1,S=4) binary=infinityd 4d7678f (git 4d7678f98757, x86_64-unknown-linux-gnu) git=4d7678f dirty=0 thermal: 27800 35000 42000  gov=performance strays=0
+# done-C 2026-08-22T12:37:11-04:00
+# 2026-08-22T12:37:11-04:00 C(K=3,S=4) binary=infinityd 4d7678f (git 4d7678f98757, x86_64-unknown-linux-gnu) git=4d7678f dirty=0 thermal: 27800 35000 40000  gov=performance strays=0
+=== 2026-08-22T12:37:11-04:00 C s36 k3s4 base-1 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) FAIL (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k3s4-base-1/1787416797-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:39:57-04:00 ===
+=== 2026-08-22T12:39:57-04:00 C s36 k3s4 fillA-1 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k3s4-fillA-1/1787416963-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:42:43-04:00 ===
+=== 2026-08-22T12:42:43-04:00 C s36 k3s4 fillA-2 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k3s4-fillA-2/1787417129-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:45:29-04:00 ===
+=== 2026-08-22T12:45:29-04:00 C s36 k3s4 base-2 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) FAIL (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k3s4-base-2/1787417295-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:48:15-04:00 ===
+=== 2026-08-22T12:48:15-04:00 C s36 k3s4 base-3 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) FAIL (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k3s4-base-3/1787417462-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:51:02-04:00 ===
+=== 2026-08-22T12:51:02-04:00 C s36 k3s4 fillA-3 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k3s4-fillA-3/1787417628-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:53:48-04:00 ===
+=== 2026-08-22T12:53:48-04:00 C s36 control k1s4 ctl-base-1 (fill-window-us 0) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k1s4-ctl-base-1/1787417794-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:56:34-04:00 ===
+=== 2026-08-22T12:56:34-04:00 C s36 control k1s4 ctl-fillA-1 (fill-window-us 1000) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 60s drive-state idle before s36 device leg (4 cells)
+  s35: 60s drive-state idle before s36 offered-rate leg
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg FAIL
+  S36: everysec pure-write throughput vs the same-session tmpfs control FAIL
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PASS
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PASS (informational)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s36-k1s4-ctl-fillA-1/1787417961-gate-run/report.md
+inf-bench: 2 binding gate(s) FAILED
+=== exit 1 2026-08-22T12:59:21-04:00 ===
+=== 2026-08-22T12:59:21-04:00 C s35 k3s4 fill 1000 (3 reps) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+  s35: 40s drive-state idle before 4c rep1 c32
+  s35: 40s drive-state idle before 4c rep1 c256
+  s35: 40s drive-state idle before 1c rep1 c32
+  s35: 40s drive-state idle before 4c rep2 c32
+  s35: 40s drive-state idle before 4c rep2 c256
+  s35: 40s drive-state idle before 1c rep2 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s35-k3s4-fill1000/1787418465-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-22T13:07:45-04:00 ===
+=== 2026-08-22T13:07:45-04:00 C s35 k3s4 fill 0 (3 reps) ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 1c rep0 c32
+  s35: 40s drive-state idle before 4c rep1 c32
+  s35: 40s drive-state idle before 4c rep1 c256
+  s35: 40s drive-state idle before 1c rep1 c32
+  s35: 40s drive-state idle before 4c rep2 c32
+  s35: 40s drive-state idle before 4c rep2 c256
+  s35: 40s drive-state idle before 1c rep2 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term) FAIL
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s35-gate/artifacts-review3/C-s35-k3s4-fill0/1787418969-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-22T13:16:09-04:00 ===
+# 2026-08-22T13:16:09-04:00 C(K=3,S=4) binary=infinityd 4d7678f (git 4d7678f98757, x86_64-unknown-linux-gnu) git=4d7678f dirty=0 thermal: 27800 34000 40000  gov=performance strays=0
+# done-C 2026-08-22T13:16:09-04:00
+# done-C-all 2026-08-22T13:16:09-04:00
