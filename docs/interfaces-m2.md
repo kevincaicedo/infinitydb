@@ -225,8 +225,9 @@ offset of its length prefix within its segment. **No global LSN exists**
   and falls below the MANIFEST floor is offered to a bounded per-cell
   pool at truncation instead of being unlinked —
   `SegmentRotor::forget_sealed(id) -> SealedDisposal::{Recycled,
-  Unlink(PathBuf)}`, bound `SegmentConfig::recycle_slots` (default 1;
-  0 = off, `infinityd --no-segment-recycle`). The MAINTAIN prealloc
+  Unlink(PathBuf)}`, bound `SegmentConfig::recycle_slots` (default 0 after
+  corrected campaign F measured 1.29x first-boot recovery at one slot;
+  `--segment-recycle-slots 1` is the opt-in arm). The MAINTAIN prealloc
   consults the pool before creating a file: `rename(seg-M → seg-N)`,
   open `N` direct, `fully_allocated()` **re-read** (ADR-0086 D4 — a
   pooled file that reads sparse falls through to the zero-fill,
