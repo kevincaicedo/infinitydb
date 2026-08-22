@@ -22,6 +22,16 @@ use inf_log::fs::StdSegmentFs;
 use inf_log::meta::{read_meta, write_meta};
 use inf_store::{FIRST_INDEX_GENERATION, FIRST_INDEX_ID, FIRST_NAMED_NS_ID, NsCatalog};
 
+/// Recycled-life residue recovery proved at boot (M4.5-S39b, ADR-0090
+/// D2/D4 as amended): how many segments ended their data at a foreign-
+/// segment frame and how many slacks the audit classified as recycled
+/// residue. Zero on every log that never recycled.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoveredResidue {
+    pub segment_residue_stops: u64,
+    pub recycled_residue_slacks: u64,
+}
+
 /// One cell's boot-recovery slot on the [`RecoveryBoard`] (M2-S15).
 /// Single writer (the owning cell, relaxed stores); readers are the
 /// control thread's progress printer and any cell's `INFO persistence`
@@ -39,6 +49,13 @@ pub struct CellRecoverySlot {
     records: AtomicU64,
     /// Packed torn-truncation LSN + 1 (0 = no torn tail) for the boot line.
     torn_at: AtomicU64,
+    /// M4.5-S39b (ADR-0090 D2 as amended): recycled-life residue the
+    /// audit proved — replay ends at a foreign-segment frame, slacks
+    /// classified as recycled residue. The boot line and `INFO
+    /// persistence` (`recover_segment_residue_stops`,
+    /// `recover_recycled_residue_slacks`) carry them.
+    segment_residue_stops: AtomicU64,
+    recycled_residue_slacks: AtomicU64,
     /// Recovery phase about to run (M2.5-S01): published *before* each
     /// step so a step stalled inside the kernel names itself — the
     /// ADR-0022 D7 wedge was invisible precisely because nothing was
@@ -57,11 +74,26 @@ impl CellRecoverySlot {
     }
 
     /// Marks this cell recovered (owning cell only, once).
-    pub fn mark_ready(&self, records: u64, torn_truncated_at: Option<inf_log::Lsn>) {
+    pub fn mark_ready(
+        &self,
+        records: u64,
+        torn_truncated_at: Option<inf_log::Lsn>,
+        residue: RecoveredResidue,
+    ) {
         debug_assert_eq!(self.state.load(Ordering::Relaxed), 0, "mark_ready called twice");
         self.records.store(records, Ordering::Relaxed);
         self.torn_at.store(torn_truncated_at.map_or(0, |lsn| lsn.to_u64() + 1), Ordering::Relaxed);
+        self.segment_residue_stops.store(residue.segment_residue_stops, Ordering::Relaxed);
+        self.recycled_residue_slacks.store(residue.recycled_residue_slacks, Ordering::Relaxed);
         self.state.store(1, Ordering::Release);
+    }
+
+    /// The recycled-residue facts of this cell's boot (ADR-0090 D4).
+    pub fn residue(&self) -> RecoveredResidue {
+        RecoveredResidue {
+            segment_residue_stops: self.segment_residue_stops.load(Ordering::Relaxed),
+            recycled_residue_slacks: self.recycled_residue_slacks.load(Ordering::Relaxed),
+        }
     }
 
     /// Publishes the phase the next recovery step will run (owning cell).
@@ -834,8 +866,18 @@ fn control_main(
                     let torn = slot.torn_truncated_at().map_or(String::new(), |lsn| {
                         format!(", torn tail truncated at {lsn} (M2-S14)")
                     });
+                    let residue = slot.residue();
+                    let recycled = if residue == RecoveredResidue::default() {
+                        String::new()
+                    } else {
+                        format!(
+                            ", recycled residue: {} segment stops, {} slacks (ADR-0090)",
+                            residue.segment_residue_stops, residue.recycled_residue_slacks
+                        )
+                    };
                     eprintln!(
-                        "control: cell {cell} recovered ({segs} segments, {total} bytes, {} records{torn})",
+                        "control: cell {cell} recovered ({segs} segments, {total} bytes, {} \
+                         records{torn}{recycled})",
                         slot.records()
                     );
                 }

@@ -104,6 +104,20 @@ pub enum ReadError {
         stored: Lsn,
         expected: Lsn,
     },
+    /// The frame decodes in full (magic, length, record count, CRC32C)
+    /// and its stored **offset equals** the physical offset, but its
+    /// stored **segment id is not this file's** (M4.5-S39b, ADR-0090 D2
+    /// as amended): the residue a recycled segment carries from its
+    /// previous life — bytes written when this file had another id. No
+    /// honest writer emits it into the segment its LSN names, so the
+    /// reader still refuses it (terminal, like every misplaced frame);
+    /// only recovery gives the distinction a meaning (a classified data
+    /// end, never data, never a hole).
+    ForeignSegment {
+        segment: SegmentId,
+        offset: u32,
+        stored_segment: SegmentId,
+    },
 }
 
 impl fmt::Display for ReadError {
@@ -120,6 +134,11 @@ impl fmt::Display for ReadError {
                 "misdirected frame in {segment} at {offset:#x}: stored LSN {stored}, \
                  physical position implies {expected}"
             ),
+            ReadError::ForeignSegment { segment, offset, stored_segment } => write!(
+                f,
+                "foreign-segment frame in {segment} at {offset:#x}: stamped for {stored_segment} \
+                 at the same offset — recycled-life residue (ADR-0090 D2)"
+            ),
         }
     }
 }
@@ -129,7 +148,7 @@ impl std::error::Error for ReadError {
         match self {
             ReadError::Io { source, .. } => Some(source),
             ReadError::Frame { error, .. } => Some(error),
-            ReadError::LsnMismatch { .. } => None,
+            ReadError::LsnMismatch { .. } | ReadError::ForeignSegment { .. } => None,
         }
     }
 }
@@ -313,12 +332,29 @@ impl<File: SegmentFile> SegmentReader<File> {
             Ok((frame, consumed)) => {
                 debug_assert_eq!(consumed, frame_len, "peek and decode_frame disagree");
                 let expected = Lsn::new(self.segment, at + frame.header_len() as u32);
-                if frame.first_lsn() != expected {
+                let stored = frame.first_lsn();
+                // Planted-bug canary (ADR-0090 D5): a reader blind to the
+                // segment id replays recycled residue as data — the
+                // `m2-recycle` sweep must catch it. Build-time only.
+                #[cfg(inf_canary_foreign_segment)]
+                let expected = Lsn::new(stored.segment, expected.offset);
+                if stored != expected {
                     self.failed = true;
+                    // Offset equal, segment different: the one mismatch
+                    // a recycled file produces by construction (ADR-0090
+                    // D2 as amended). Any offset disagreement is the
+                    // ADR-0011 misdirected-write class, segment or not.
+                    if stored.offset == expected.offset {
+                        return Err(ReadError::ForeignSegment {
+                            segment: self.segment,
+                            offset: at,
+                            stored_segment: stored.segment,
+                        });
+                    }
                     return Err(ReadError::LsnMismatch {
                         segment: self.segment,
                         offset: at,
-                        stored: frame.first_lsn(),
+                        stored,
                         expected,
                     });
                 }

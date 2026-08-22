@@ -171,6 +171,8 @@ impl TieredScenario {
             ckpt_direct_refused_after: None,
             fill: Default::default(),
             prelude: None,
+            recycle_slots: 0,
+            recycle_oracle: false,
         }
     }
 }

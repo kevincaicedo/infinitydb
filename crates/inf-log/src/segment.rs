@@ -67,6 +67,13 @@ pub const ZERO_FILL_SLICE_BYTES: u32 = 256 << 10;
 /// than the burst.
 pub const ZERO_FILL_HEAD_START: u32 = 16 << 20;
 
+/// Recycle-pool bound (ADR-0090 D1): one pooled segment per cell is the
+/// measured hypothesis — truncation runs at least as often as rotation
+/// at the row's shape, so one slot should serve every prealloc after the
+/// first generation; falsifier (a) names the 2-slot pool as the next
+/// hypothesis, by amendment with the artifact.
+pub const DEFAULT_RECYCLE_SLOTS: u8 = 1;
+
 /// File name of a segment: `seg-{:06}.ilog` (wider ids grow digits
 /// naturally; the parser accepts 6–10 digits).
 #[must_use]
@@ -106,6 +113,14 @@ pub struct SegmentConfig {
     /// `Direct` segment; larger frames keep the linked fdatasync (the
     /// device-probed crossover, ADR-0086 D7).
     pub fua_max_frame_bytes: u32,
+    /// Segment recycling (M4.5-S39b, ADR-0090 D1): how many sealed,
+    /// pre-zeroed `Direct` segments the rotor may keep below the MANIFEST
+    /// floor instead of unlinking them, to become the next segments by
+    /// rename — the zero-fill paid once per generation. `0` = off (every
+    /// covered segment is unlinked, the pre-S39b path byte-for-byte);
+    /// the default is [`DEFAULT_RECYCLE_SLOTS`]. Disk attribution is
+    /// `recycle_slots × segment_bytes` at most (`recycle_pool_bytes`).
+    pub recycle_slots: u8,
 }
 
 impl Default for SegmentConfig {
@@ -115,6 +130,7 @@ impl Default for SegmentConfig {
             seal_after_ms: None,
             io_mode: SegmentIoMode::Buffered,
             fua_max_frame_bytes: DEFAULT_FUA_MAX_FRAME_BYTES,
+            recycle_slots: DEFAULT_RECYCLE_SLOTS,
         }
     }
 }
@@ -332,6 +348,19 @@ pub struct RotorStats {
     /// existing log keeps packing until the next rotation instead of
     /// inserting alignment slack the reader cannot cross. 0 or 1 per boot.
     pub reopened_packed_tails: u64,
+    /// Next segments produced by renaming a pooled sealed segment
+    /// (ADR-0090 D1) — each one a zero-fill not paid.
+    pub segments_recycled: u64,
+    /// Preallocs that found the pool empty while recycling was on and
+    /// the class was `Direct` — the zero-fill that follows is the miss's
+    /// cost (`zero_fill_bytes`).
+    pub recycle_misses: u64,
+    /// Pooled segments that could not be reused as ready: the rename
+    /// failed (fresh prealloc instead) or the file read not fully
+    /// allocated at reuse (ADR-0086 D4: read, never assumed — it fills).
+    pub recycle_fallbacks: u64,
+    /// Covered sealed segments offered to a full pool (unlinked as before).
+    pub recycle_pool_full: u64,
 }
 
 /// What one MAINTAIN slice did (observability + tests).
@@ -399,6 +428,36 @@ pub struct ZeroSlice {
     pub len: u32,
 }
 
+/// What the rotor remembers of a sealed segment (ADR-0090 D1): its id and
+/// whether every byte of it was backed by written storage when it was
+/// active — the fact that makes it a recycling candidate. Read from the
+/// file at activation (ADR-0086 D4), carried here, and **re-read** at
+/// reuse.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct SealedMeta {
+    pub id: SegmentId,
+    pub prezeroed: bool,
+}
+
+/// A covered sealed segment kept for reuse (ADR-0090 D1): the file still
+/// sits in the log dir under its old name, below the MANIFEST floor (boot
+/// GC re-collects it as stale if a crash intervenes).
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct PooledSegment {
+    id: SegmentId,
+    path: PathBuf,
+}
+
+/// What truncation does with a sealed segment it forgets
+/// ([`SegmentRotor::forget_sealed`]): the rotor pooled it for reuse, or
+/// the caller owns its unlink (the pre-S39b contract).
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[must_use = "an unlinked path must be handed to the unlink queue"]
+pub enum SealedDisposal {
+    Recycled,
+    Unlink(PathBuf),
+}
+
 /// Owner of one cell's active + preallocated-next segments. Sealed
 /// segments retain **no write handle at all** — immutability is enforced
 /// by construction (stronger than the plan's debug-only read-only reopen;
@@ -409,7 +468,10 @@ pub struct SegmentRotor<F: SegmentFs> {
     cfg: SegmentConfig,
     active: ActiveSegment<F::File>,
     next: Option<NextSegment<F::File>>,
-    sealed: Vec<SegmentId>,
+    sealed: Vec<SealedMeta>,
+    /// The recycle pool (ADR-0090 D1): at most `cfg.recycle_slots`
+    /// covered, pre-zeroed sealed segments awaiting reuse, FIFO.
+    pool: Vec<PooledSegment>,
     space_exhausted: bool,
     /// The log life frames appended through this rotor belong to
     /// (ADR-0031 D5): 1 on fresh logs; recovery derives max-observed + 1
@@ -431,6 +493,7 @@ impl<F: SegmentFs> fmt::Debug for SegmentRotor<F> {
             .field("prezeroed", &self.active.prezeroed)
             .field("next", &self.next.as_ref().map(|next| (next.id, next.state)))
             .field("sealed", &self.sealed)
+            .field("pool", &self.pool)
             .field("stats", &self.stats)
             .finish()
     }
@@ -451,6 +514,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
             active,
             next: None,
             sealed: Vec::new(),
+            pool: Vec::new(),
             space_exhausted: false,
             resume_epoch: 1,
             stats: RotorStats::default(),
@@ -484,6 +548,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
             active,
             next: None,
             sealed: Vec::new(),
+            pool: Vec::new(),
             space_exhausted: false,
             resume_epoch: 1,
             stats: RotorStats::default(),
@@ -551,8 +616,15 @@ impl<F: SegmentFs> SegmentRotor<F> {
             .open_segment_append(&path, tail_mode)
             .map_err(|source| LogError::Io { segment: tail, source })?;
         let active = activate(tail, file, tail_offset, tail_mode)?;
-        let sealed =
-            scan.segments().split_last().map(|(_, rest)| rest.to_vec()).unwrap_or_default();
+        // Sealed segments of an earlier life: never recycling candidates
+        // (whether their bytes were all written is not known here, and
+        // the pool refills from this life's seals within one checkpoint
+        // cycle — ADR-0090 D3's "first generation after a crash").
+        let sealed = scan
+            .segments()
+            .split_last()
+            .map(|(_, rest)| rest.iter().map(|&id| SealedMeta { id, prezeroed: false }).collect())
+            .unwrap_or_default();
         let mut stats = RotorStats::default();
         if cfg.io_mode == SegmentIoMode::Direct && packed_tail {
             stats.reopened_packed_tails += 1;
@@ -564,6 +636,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
             active,
             next: None,
             sealed,
+            pool: Vec::new(),
             space_exhausted: false,
             resume_epoch: 1,
             stats,
@@ -737,10 +810,29 @@ impl<F: SegmentFs> SegmentRotor<F> {
         }
         if self.next.is_none() {
             let id = self.active.id.next();
-            let created = if deferred {
-                create_prealloc_deferred(&self.fs, &self.log_dir, id, &self.cfg)
-            } else {
-                create_prealloc(&self.fs, &self.log_dir, id, &self.cfg)
+            // ADR-0090 D1: a pooled segment becomes the next one by
+            // rename — no data write. Its directory entry needs the same
+            // barrier a fresh prealloc's does (D3 as amended: no frame of
+            // `id` may be acknowledged before the rename is durable —
+            // the deferred tier registers `barrier` in this slice, ahead
+            // of every ticket the segment's frames will take; the
+            // synchronous tier syncs the dir inline, like `create_
+            // prealloc`). A rename that fails falls through to a fresh
+            // prealloc and counts a fallback; the pooled file is then an
+            // ordinary below-floor orphan for boot GC.
+            let recycling = self.cfg.recycle_slots > 0 && self.cfg.io_mode == SegmentIoMode::Direct;
+            let (created, recycled) = match self.take_recycled(id, deferred) {
+                Some(Ok(file)) => (Ok(file), true),
+                Some(Err(_)) => {
+                    self.stats.recycle_fallbacks += 1;
+                    (self.create_next(id, deferred), false)
+                }
+                None => {
+                    if recycling {
+                        self.stats.recycle_misses += 1;
+                    }
+                    (self.create_next(id, deferred), false)
+                }
             };
             match created {
                 Ok(file) => {
@@ -753,6 +845,16 @@ impl<F: SegmentFs> SegmentRotor<F> {
                     }
                     let io_mode = self.cfg.io_mode;
                     let state = next_state(&file, id, io_mode)?;
+                    if recycled {
+                        // Read, never assumed (ADR-0086 D4): a pooled file
+                        // that does not read fully allocated fills like
+                        // a fresh one and is a fallback, not a recycle.
+                        if state == (NextState::Ready { prezeroed: true }) {
+                            self.stats.segments_recycled += 1;
+                        } else {
+                            self.stats.recycle_fallbacks += 1;
+                        }
+                    }
                     self.next = Some(NextSegment { id, file, io_mode, state });
                     self.stats.preallocs += 1;
                     self.space_exhausted = false;
@@ -767,6 +869,50 @@ impl<F: SegmentFs> SegmentRotor<F> {
             }
         }
         Ok((report, barrier))
+    }
+
+    fn create_next(&self, id: SegmentId, deferred: bool) -> Result<F::File, LogError> {
+        if deferred {
+            create_prealloc_deferred(&self.fs, &self.log_dir, id, &self.cfg)
+        } else {
+            create_prealloc(&self.fs, &self.log_dir, id, &self.cfg)
+        }
+    }
+
+    /// ADR-0090 D1: take the oldest pooled segment as `id` by rename.
+    /// `None` when recycling is off or the pool is empty (a miss); `Some
+    /// (Err)` when the rename, the dir sync (synchronous tier) or the
+    /// open failed — the caller falls back to a fresh prealloc and the
+    /// pooled file, if it still exists, is a below-floor orphan boot GC
+    /// re-collects (one segment of disk until the next boot, counted).
+    fn take_recycled(
+        &mut self,
+        id: SegmentId,
+        deferred: bool,
+    ) -> Option<Result<F::File, LogError>> {
+        if self.cfg.recycle_slots == 0 || self.cfg.io_mode != SegmentIoMode::Direct {
+            return None;
+        }
+        if self.pool.is_empty() {
+            return None;
+        }
+        let pooled = self.pool.remove(0);
+        let to = self.log_dir.join(segment_file_name(id));
+        let renamed = self
+            .fs
+            .rename(&pooled.path, &to)
+            .map_err(|source| LogError::Io { segment: id, source });
+        if let Err(err) = renamed {
+            return Some(Err(err));
+        }
+        if !deferred && let Err(err) = sync_log_dir(&self.fs, &self.log_dir, id) {
+            return Some(Err(err));
+        }
+        Some(
+            self.fs
+                .open_segment_append(&to, SegmentIoMode::Direct)
+                .map_err(|source| LogError::Io { segment: id, source }),
+        )
     }
 
     /// True once preallocation has failed for lack of space and no next
@@ -960,7 +1106,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
                 prezeroed,
             },
         );
-        self.sealed.push(old.id);
+        self.sealed.push(SealedMeta { id: old.id, prezeroed: old.prezeroed });
         self.stats.rotations += 1;
         Ok(SealHandoff { segment: old.id, file: old.file, end_offset: old.written })
     }
@@ -1074,7 +1220,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
         // The synchronous tier never drives a zero-fill (no driver): a
         // `Direct` next segment is ready iff its tier is born allocated.
         let prezeroed = matches!(next.state, NextState::Ready { prezeroed: true });
-        self.sealed.push(self.active.id);
+        self.sealed.push(SealedMeta { id: self.active.id, prezeroed: self.active.prezeroed });
         self.active = ActiveSegment {
             id: next.id,
             file: next.file,
@@ -1119,7 +1265,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
     }
 
     #[must_use]
-    pub fn sealed(&self) -> &[SegmentId] {
+    pub fn sealed(&self) -> &[SealedMeta] {
         &self.sealed
     }
 
@@ -1127,30 +1273,58 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// fully covered by a durable manifest, deletable. Ascending (the
     /// sealed list is append-ordered).
     #[must_use]
-    pub fn sealed_below(&self, floor: SegmentId) -> &[SegmentId] {
-        let end = self.sealed.partition_point(|&id| id < floor);
+    pub fn sealed_below(&self, floor: SegmentId) -> &[SealedMeta] {
+        let end = self.sealed.partition_point(|meta| meta.id < floor);
         &self.sealed[..end]
     }
 
-    /// Truncation (M2-S11): forget one sealed segment and return its file
-    /// path — the **caller** owns the unlink. On the reactor tier the
-    /// unlink is delegated to the control thread (ADR-0017): freeing a
-    /// segment's pages is O(size) in the kernel, a measured multi-ms loop
-    /// stall when done in MAINTAIN. No dir-fsync follows the unlink: a
-    /// power cut may resurrect the file, but it stays below the durable
-    /// manifest's floor and is re-collected as stale at the next boot.
+    /// Truncation (M2-S11, ADR-0090 D1): forget one sealed segment. It
+    /// leaves the live set first, so nothing later can resurrect it.
+    /// Then either the rotor **pools** it for reuse — recycling on, the
+    /// rotor in `Direct` mode, the segment pre-zeroed when sealed, a
+    /// slot free — or the **caller** owns the unlink (the pre-S39b
+    /// contract). On the reactor tier the unlink is delegated to the
+    /// control thread (ADR-0017): freeing a segment's pages is O(size)
+    /// in the kernel, a measured multi-ms loop stall when done in
+    /// MAINTAIN. No dir-fsync follows the unlink: a power cut may
+    /// resurrect the file, but it stays below the durable manifest's
+    /// floor and is re-collected as stale at the next boot — and so does
+    /// a pooled file, which keeps its below-floor name until reuse.
     ///
     /// # Panics
     /// If `id` is not in the sealed list — truncating the active or next
     /// segment is an internal invariant violation.
-    pub fn forget_sealed(&mut self, id: SegmentId) -> PathBuf {
+    pub fn forget_sealed(&mut self, id: SegmentId) -> SealedDisposal {
         let pos = self
             .sealed
             .iter()
-            .position(|&s| s == id)
+            .position(|meta| meta.id == id)
             .expect("forget_sealed targets a sealed segment");
-        self.sealed.remove(pos);
-        self.log_dir.join(segment_file_name(id))
+        let meta = self.sealed.remove(pos);
+        let path = self.log_dir.join(segment_file_name(id));
+        let recycling = self.cfg.recycle_slots > 0 && self.cfg.io_mode == SegmentIoMode::Direct;
+        if !recycling || !meta.prezeroed {
+            return SealedDisposal::Unlink(path);
+        }
+        if self.pool.len() >= usize::from(self.cfg.recycle_slots) {
+            self.stats.recycle_pool_full += 1;
+            return SealedDisposal::Unlink(path);
+        }
+        self.pool.push(PooledSegment { id, path });
+        SealedDisposal::Recycled
+    }
+
+    /// Disk held by the recycle pool (`recycle_pool_bytes`, ADR-0090 D4):
+    /// `pooled × segment_bytes`, attributed beside the live log.
+    #[must_use]
+    pub fn recycle_pool_bytes(&self) -> u64 {
+        self.pool.len() as u64 * u64::from(self.cfg.segment_bytes)
+    }
+
+    /// Pooled segment ids, oldest first (tests / INFO).
+    #[must_use]
+    pub fn pooled(&self) -> Vec<SegmentId> {
+        self.pool.iter().map(|p| p.id).collect()
     }
 
     #[must_use]
@@ -1274,14 +1448,21 @@ fn create_prealloc<F: SegmentFs>(
     })?;
     // The segment must exist durably before anything refers to it: sync
     // the directory entry now (M2-S16 `dir_fsync_fail`).
+    sync_log_dir(fs, log_dir, id)?;
+    Ok(file)
+}
+
+/// Blocking log-dir sync of the synchronous tier (`create_prealloc`, the
+/// recycled rename): the directory entry is durable before anything
+/// refers to the segment. Honours the M2-S16 `dir_fsync_fail` fault.
+fn sync_log_dir<F: SegmentFs>(fs: &F, log_dir: &Path, id: SegmentId) -> Result<(), LogError> {
     if inf_foundation::fault::fire(crate::fault::DIR_FSYNC_FAIL) {
         return Err(LogError::Fsync(FsyncFailed {
             segment: id,
             source: crate::fault::injected(crate::fault::DIR_FSYNC_FAIL),
         }));
     }
-    fs.sync_dir(log_dir).map_err(|source| LogError::Fsync(FsyncFailed { segment: id, source }))?;
-    Ok(file)
+    fs.sync_dir(log_dir).map_err(|source| LogError::Fsync(FsyncFailed { segment: id, source }))
 }
 
 #[cfg(test)]

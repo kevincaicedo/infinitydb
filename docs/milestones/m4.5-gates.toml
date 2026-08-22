@@ -132,15 +132,29 @@ measured_by = "gate-run m4.5 frame-pipeline row, median of replicates, N cells, 
 # medians of per-replicate ratios (interleaved legs), the client one on
 # the 0.4 % instrument.
 
+# Amended 2026-08-22 (ADR-0087 fourth amendment — the owner's K decision):
+# campaign B read this ratio red at every K (K = 1 1.54, K = 3/2 1.35,
+# K = 3/4 1.44) with the 4-cell barrier pinned at 591–623 µs and the
+# 1-cell barrier moving with the queue depth one cell runs (qd1 383 µs at
+# K = 1, qd3 423–463 at K = 3, 543–559 by drive state) — it measures the
+# device's qd4-vs-qd1 FUA latency, which K does not control, and reads
+# worst at the K it would select. A gate that cannot discriminate the
+# quantity it decides binds nothing: informational, a device-
+# characterization row (a FLUSH-class regression to ≈ 1.8 would still
+# show on it). K is decided on s35_p50_over_barrier + the tail, read and
+# throughput rules; the class-derived default is FUA → K = 3 / 4 MiB,
+# FLUSH → K = 1 / 4 MiB (`--frames-in-flight auto`).
+
 [[gate]]
 id = "s35_multi_vs_one_cell_barrier"
-name = "S35: N-cell vs 1-cell barrier p50 ratio (S34's F2 contention term)"
+name = "S35: N-cell vs 1-cell barrier p50 ratio (device characterization — informational since the ADR-0087 fourth amendment, 2026-08-22)"
 threshold = 1.3
 comparator = "<="
-unit = "x (N-cell barrier p50 / 1-cell barrier p50 at 32 conns, per-replicate median; FLUSH read ~1.8, FUA K = 3 read 1.09–1.15 on 08-22)"
+unit = "x (N-cell barrier p50 / 1-cell barrier p50 at 32 conns, per-replicate median; FLUSH read ~1.8, FUA read 1.35–1.54 at every K on 08-22 — qd4 vs qd1 on the device)"
 tier = "linux-reference-box"
 source = "s35:multi_vs_one_cell_barrier_x"
 measured_by = "gate-run m4.5 frame-pipeline row, median of per-replicate ratios (1-cell leg interleaved)"
+informational = true
 
 [[gate]]
 id = "s35_multi_vs_one_cell_p50"
@@ -225,3 +239,122 @@ unit = "ms (ADR-0081 D5 bar at an offered rate; latency from the intended send i
 tier = "linux-reference-box"
 source = "s36:max_ms_offered_rate"
 measured_by = "gate-run m4.5 device-budget row, offered-rate leg (--offered-ops, pipeline 16)"
+
+# M4.5-S39b (ADR-0090 D6 as amended, 2026-08-22) — the segment-recycling
+# row. The S35 shape (a flat `always` namespace, so zero-fill engages and
+# the baseline's `zero_fill_bytes / log_frame_bytes` ≈ 1.0 — ADR-0088's
+# recorded limitation 1), baseline `--no-segment-recycle` against the
+# one-slot arm, interleaved per replicate (ABBA). Every counter is
+# snapshotted twice — at the end of the first generation (every cell
+# truncated ≥ 1 and rotated ≥ 2) and at the leg's end — and the warmed
+# figures are **deltas** (A4). Binding: the warmed zero-fill share
+# (falsifier (a) at > 0.3: the 1-slot bound starves), the per-cell
+# recycle deficit (`rotations − recycled ≤ 2` over the warmed window),
+# the padding control (S39c's term must not move — A1/D7), the `always`
+# p50 / p99 and read ratios (falsifier (b)), the crash-restart recovery
+# ratio (falsifier (c)), and the row's own validity (≥ 8 rotations per
+# cell). Informational: host bytes per log byte (accounted: log +
+# zero-fill + checkpoint + MANIFEST — A3) and the block device's sectors
+# written per log byte (journal and metadata included, NAND not).
+
+[[gate]]
+id = "s39b_warmed_zero_fill_share"
+name = "S39b: warmed zero-fill bytes per log frame byte under recycling (arm)"
+threshold = 0.10
+comparator = "<="
+unit = "x (Δzero_fill_bytes / Δlog_frame_bytes after the first generation, per-replicate median; baseline ≈ 1.0; > 0.3 = falsifier (a))"
+tier = "linux-reference-box"
+source = "s39b:warmed_zero_fill_share_arm"
+measured_by = "gate-run m4.5 --only-s39b, warmed window (end − first-generation snapshot), N cells, 32 conns closed-loop always"
+
+[[gate]]
+id = "s39b_recycle_deficit_per_cell"
+name = "S39b: rotations not served by the pool over the warmed window, worst cell"
+threshold = 2.0
+comparator = "<="
+unit = "segments (Δrotations − Δrecycled, worst cell, per-replicate median; ADR-0090 D6: recycled ≥ rotations − 2)"
+tier = "linux-reference-box"
+source = "s39b:recycle_deficit_per_cell"
+measured_by = "gate-run m4.5 --only-s39b, warmed window"
+
+[[gate]]
+id = "s39b_padding_delta_pts"
+name = "S39b: padding share moved by recycling (the S39c control)"
+threshold = 3.0
+comparator = "<="
+unit = "percentage points (|arm − baseline| warmed log_padding_pct, per-replicate median; recycling must not touch the 2.2-record frame's block)"
+tier = "linux-reference-box"
+source = "s39b:padding_delta_pts"
+measured_by = "gate-run m4.5 --only-s39b, warmed window"
+
+[[gate]]
+id = "s39b_always_c32_p50_x"
+name = "S39b: always c32 p50 under recycling over baseline"
+threshold = 1.05
+comparator = "<="
+unit = "x (arm / baseline, per-replicate median; falsifier (b): the rename or the residue read costs loop latency)"
+tier = "linux-reference-box"
+source = "s39b:always_c32_p50_x"
+measured_by = "gate-run m4.5 --only-s39b, whole write leg"
+
+[[gate]]
+id = "s39b_always_c32_p99_x"
+name = "S39b: always c32 p99 under recycling over baseline"
+threshold = 1.10
+comparator = "<="
+unit = "x (arm / baseline, per-replicate median)"
+tier = "linux-reference-box"
+source = "s39b:always_c32_p99_x"
+measured_by = "gate-run m4.5 --only-s39b, whole write leg"
+
+[[gate]]
+id = "s39b_read_c64p16_x"
+name = "S39b: read leg under recycling over baseline (the E4.7 ±2 % rule)"
+threshold = 0.98
+comparator = ">="
+unit = "x (arm / baseline GET ops/s at 64 conns × pipeline 16, per-replicate median)"
+tier = "linux-reference-box"
+source = "s39b:read_c64p16_x"
+measured_by = "gate-run m4.5 --only-s39b, read leg after the write leg"
+
+[[gate]]
+id = "s39b_recovery_time_x"
+name = "S39b: crash-restart recovery time on the recycled log over baseline"
+threshold = 1.05
+comparator = "<="
+unit = "x (arm / baseline seconds to loading:0 after SIGKILL, per-replicate median; falsifier (c): the residue scan is not O(frame)"
+tier = "linux-reference-box"
+source = "s39b:recovery_time_x"
+measured_by = "gate-run m4.5 --only-s39b, SIGKILL + respawn on the same data dir"
+
+[[gate]]
+id = "s39b_rotations_per_cell_min"
+name = "S39b: rotations per cell the row actually performed (validity)"
+threshold = 8.0
+comparator = ">="
+unit = "rotations (min over cells and arms, per-replicate min; ADR-0090 D6 asks ≥ 8)"
+tier = "linux-reference-box"
+source = "s39b:rotations_per_cell_min"
+measured_by = "gate-run m4.5 --only-s39b"
+
+[[gate]]
+id = "s39b_host_bytes_per_log_byte_arm"
+name = "S39b: accounted host bytes per log frame byte under recycling (informational)"
+threshold = 2.0
+comparator = "<="
+unit = "x (Δ(log + zero-fill + ckpt + MANIFEST) / Δlog_frame_bytes, warmed; baseline ≈ 2.2 with the zero-fill term)"
+tier = "linux-reference-box"
+source = "s39b:host_bytes_per_log_byte_arm"
+measured_by = "gate-run m4.5 --only-s39b, warmed window"
+informational = true
+
+[[gate]]
+id = "s39b_device_bytes_per_log_byte_arm"
+name = "S39b: block-device sectors written per log frame byte under recycling (informational)"
+threshold = 2.0
+comparator = "<="
+unit = "x (Δsectors_written × 512 / Δlog_frame_bytes, warmed; /sys/block/<dev>/stat — journal + metadata included, NAND amplification not)"
+tier = "linux-reference-box"
+source = "s39b:device_bytes_per_log_byte_arm"
+measured_by = "gate-run m4.5 --only-s39b --device-stat <dev>, warmed window"
+informational = true

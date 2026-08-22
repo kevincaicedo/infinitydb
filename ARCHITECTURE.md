@@ -74,10 +74,18 @@ sealed frames are in flight at once, the ledger advances its written and
 durable watermarks over completion-ordered prefixes, and a frame whose
 due barrier cannot yet be honest — a linked fdatasync with earlier writes
 still in flight, a rotation's seal — waits one write latency rather than
-claiming coverage it does not have. The pipeline depth K is an
-operator knob (`--frames-in-flight`; K = 1 is the shipped default while
-the reference-box K decision is pending — ADR-0087's third amendment
-predeclares the rule and the class-derived outcome). Background I/O
+claiming coverage it does not have. The pipeline depth K is
+**class-derived** (ADR-0087's fourth amendment, 2026-08-22:
+`--frames-in-flight auto` resolves to 3 under the FUA class and 1 under
+FLUSH, both with 4 MiB buffers, after the barrier class is known and
+before the ring is sized; an explicit K overrides either). Where an
+`always` namespace exists, a FUA-class next segment is pre-zeroed before
+it takes frames; a covered, pre-zeroed segment below the MANIFEST floor
+is **recycled** into the next one by rename instead of unlinked
+(ADR-0090; a bounded one-slot pool per cell, `--no-segment-recycle`
+off), so that second write is paid once per generation — the reader
+proves the recycled file's previous-life frames inert by their own
+segment stamp, never a hole, never data. Background I/O
 (zero-fill, tier flush, checkpoints, compaction, backfill) spends a
 per-cell share of a **measured device budget** (ADR-0088; the seal
 pacer that ADR proposed is an A/B arm, off). On aligned segments a

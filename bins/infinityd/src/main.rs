@@ -41,11 +41,19 @@ struct Args {
     ckpt_interval_bytes: u64,
     /// Segment prealloc/seal size.
     segment_bytes: u32,
-    /// Frames in flight per cell (M4.5-S35, ADR-0087 D1/D5): the staging
-    /// ring holds `frames_in_flight + 1` buffers of `--log-staging-mib`
-    /// each; resident bytes are their product (L5-neutral pairing for the
-    /// reference arm: `--frames-in-flight 3 --log-staging-mib 2`).
-    frames_in_flight: u8,
+    /// Segment recycling (M4.5-S39b, ADR-0090 D1): covered pre-zeroed
+    /// `Direct` segments kept for reuse by rename instead of unlinked —
+    /// the zero-fill paid once per generation. `0` = off
+    /// (`--no-segment-recycle`, the A/B baseline arm); default 1.
+    segment_recycle_slots: u8,
+    /// Frames in flight per cell (M4.5-S35, ADR-0087 D1/D5 as amended
+    /// 2026-08-22): `auto` (the default) derives K from the resolved
+    /// barrier class — FUA → 3, FLUSH → 1 — after the class is known and
+    /// before the staging ring is sized; `K` forces it for either class.
+    /// The ring holds `K + 1` buffers of `--log-staging-mib` each;
+    /// resident bytes are their product (the shipped FUA pairing is
+    /// `3 × 4 MiB`, keeping the ≈ 4 MiB durable-record bound).
+    frames_in_flight: inf_server::FramesInFlight,
     /// Log barrier class override (M4.5-S34, ADR-0086 D7): `None` reads
     /// `<data-dir>/io-properties.toml` (absent ⇒ `flush`, today's path);
     /// `Some` forces the class — the A/B arm switch. `fua` needs the
@@ -122,7 +130,8 @@ impl Default for Args {
             data_dir: None,
             ckpt_interval_bytes: inf_server::DEFAULT_CKPT_INTERVAL_BYTES,
             segment_bytes: inf_server::DEFAULT_SEGMENT_BYTES,
-            frames_in_flight: 1,
+            segment_recycle_slots: inf_server::DEFAULT_RECYCLE_SLOTS,
+            frames_in_flight: inf_server::FramesInFlight::Auto,
             barrier_class: None,
             device_write_mbps: None,
             seal_pace: None,
@@ -183,16 +192,31 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("--segment-bytes: {e}"))?;
             }
-            "--frames-in-flight" => {
-                args.frames_in_flight = take("--frames-in-flight")?
+            "--segment-recycle-slots" => {
+                args.segment_recycle_slots = take("--segment-recycle-slots")?
                     .parse()
-                    .map_err(|e| format!("--frames-in-flight: {e}"))?;
-                if !(1..=inf_server::MAX_FRAMES_IN_FLIGHT).contains(&args.frames_in_flight) {
-                    return Err(format!(
-                        "--frames-in-flight is 1..={} — bounded, never a queue",
-                        inf_server::MAX_FRAMES_IN_FLIGHT
-                    ));
+                    .map_err(|e| format!("--segment-recycle-slots: {e}"))?;
+                if args.segment_recycle_slots > 8 {
+                    return Err(
+                        "--segment-recycle-slots is 0..=8 (disk is a product surface)".into()
+                    );
                 }
+            }
+            "--no-segment-recycle" => args.segment_recycle_slots = 0,
+            "--frames-in-flight" => {
+                let raw = take("--frames-in-flight")?;
+                args.frames_in_flight = if raw == "auto" {
+                    inf_server::FramesInFlight::Auto
+                } else {
+                    let k: u8 = raw.parse().map_err(|e| format!("--frames-in-flight: {e}"))?;
+                    if !(1..=inf_server::MAX_FRAMES_IN_FLIGHT).contains(&k) {
+                        return Err(format!(
+                            "--frames-in-flight is auto or 1..={} — bounded, never a queue",
+                            inf_server::MAX_FRAMES_IN_FLIGHT
+                        ));
+                    }
+                    inf_server::FramesInFlight::Fixed(k)
+                };
             }
             "--sync-pipeline" => {
                 // Retired (ADR-0087 D5): the FLUSH-class bound is the
@@ -261,7 +285,8 @@ fn parse_args() -> Result<Args, String> {
                 println!(
                     "infinityd [--port 6379] [--cells 4] [--buffers 4096] [--buf-size 4096] \
                      [--pin-start CORE] [--route-local-only] [--data-dir PATH] \
-                     [--ckpt-interval-bytes N] [--segment-bytes N] [--frames-in-flight 1] \
+                     [--ckpt-interval-bytes N] [--segment-bytes N] [--segment-recycle-slots 1] \
+                     [--no-segment-recycle] [--frames-in-flight auto|K] \
                      [--barrier-class flush|fua] [--device-write-mbps N] [--seal-pace probe|N] \
                      [--fill-window-us 1000] [--fill-target-kib 16] \
                      [--log-staging-mib 4] \
@@ -372,15 +397,29 @@ fn main() {
             inf_server::SegmentIoMode::Direct => "fua",
             inf_server::SegmentIoMode::Buffered => "flush",
         };
+        // K (ADR-0087 D5 as amended 2026-08-22): resolved from the class
+        // just decided, before the staging ring is sized — the resolver
+        // takes the class, the config takes the resolver's answer.
+        let frames_in_flight = args.frames_in_flight.resolve(io.io_mode);
         eprintln!(
             "infinityd: log barrier class {class} (source: {source}; fua_max_frame_bytes {}; \
-             probed p50 fua {} µs / flush {} µs); frames in flight {} × {} MiB staging",
+             probed p50 fua {} µs / flush {} µs); frames in flight {} ({}) × {} MiB staging",
             io.fua_max_frame_bytes,
             io.fua_p50_us_4k,
             io.flush_p50_us_4k,
-            args.frames_in_flight,
+            frames_in_flight,
+            args.frames_in_flight.source(io.io_mode),
             args.log_staging_mib
         );
+        if io.io_mode == inf_server::SegmentIoMode::Direct {
+            eprintln!(
+                "infinityd: segment recycling {} (ADR-0090)",
+                match args.segment_recycle_slots {
+                    0 => "off".to_owned(),
+                    n => format!("on, {n} slot(s) × {} MiB per cell", args.segment_bytes >> 20),
+                }
+            );
+        }
         // Device model (M4.5-S36, ADR-0088 D6): the probe file's schema-2
         // rows, the flag overriding the write rate, absence named loudly
         // — an unbudgeted cell is today's behaviour, never a silent one.
@@ -438,7 +477,7 @@ fn main() {
             );
             std::process::exit(1);
         }
-        (dir, catalog, control, io, seal_barriers_per_s)
+        (dir, catalog, control, io, seal_barriers_per_s, frames_in_flight)
     });
 
     let mut handles = Vec::new();
@@ -503,6 +542,8 @@ type Boot = Option<(
     inf_server::IoProperties,
     // The seal pacer's device rate (ADR-0088 D2b arm; 0 = off).
     u64,
+    // K, resolved from the barrier class at boot (ADR-0087 D5 as amended).
+    u8,
 )>;
 
 fn cell_main(
@@ -518,7 +559,7 @@ fn cell_main(
     // setup step below publishes its phase so a kernel-side stall names
     // itself on the RecoveryBoard instead of wedging silently.
     let mark = |code: u8| {
-        if let Some((_, _, control, _, _)) = &boot {
+        if let Some((_, _, control, _, _, _)) = &boot {
             control.recovery_board().slot(cell).publish_phase(code);
         }
     };
@@ -568,7 +609,7 @@ fn cell_main(
     mark(14); // setup:keyspace
     let mut ks = Keyspace::new(StoreConfig::default());
     let mut durable = None;
-    if let Some((dir, catalog, control, io, seal_barriers_per_s)) = &boot {
+    if let Some((dir, catalog, control, io, seal_barriers_per_s, frames_in_flight)) = &boot {
         if let Some(catalog) = catalog {
             ks.seed_catalog(catalog).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
         }
@@ -576,12 +617,13 @@ fn cell_main(
             data_dir: dir.clone(),
             staging: inf_server::StagingConfig {
                 capacity_bytes: args.log_staging_mib << 20,
-                frames_in_flight: args.frames_in_flight,
+                frames_in_flight: *frames_in_flight,
             },
             segment: inf_server::SegmentConfig {
                 segment_bytes: args.segment_bytes,
                 io_mode: io.io_mode,
                 fua_max_frame_bytes: io.fua_max_frame_bytes,
+                recycle_slots: args.segment_recycle_slots,
                 ..Default::default()
             },
             ckpt: inf_server::CkptConfig {

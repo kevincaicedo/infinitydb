@@ -1199,7 +1199,7 @@ pub(crate) fn pipeline_note(flags: &Flags) -> String {
     format!(
         "frames-in-flight {} · barrier-class {} · staging-mib {} · device-write-mbps {} · \
          seal-pace {}",
-        flags.str_or("frames-in-flight", "1"),
+        flags.str_or("frames-in-flight", "auto (fua 3 / flush 1)"),
         flags.str_or("barrier-class", "flush"),
         flags.str_or("staging-mib", "4"),
         flags.str_or("device-write-mbps", "probe-file"),

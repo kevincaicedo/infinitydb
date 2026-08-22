@@ -159,6 +159,19 @@ pub struct DurableScenario {
     /// `Buffered`) under the same durability oracle. `None` = one life,
     /// byte-identical to the pre-amendment scenarios.
     pub prelude: Option<Prelude>,
+    /// M4.5-S39b (ADR-0090 D5): the recycle-pool bound (`0` = off, the
+    /// pre-S39b truncation path byte-for-byte; the product default is 1).
+    /// `m2_durable` runs the default on three of every four `Direct`
+    /// seeds and off on the fourth (the baseline arm stays covered);
+    /// `m2_recycle` runs it everywhere with the recycle oracle armed.
+    pub recycle_slots: u8,
+    /// The recycle oracle (ADR-0090 D5): every cell that rotated ≥ 3
+    /// times and truncated ≥ 2 segments must have recycled ≥ 1, and the
+    /// zero-fill accounting identity must hold — `zero_fill_bytes ≤
+    /// (preallocs − recycled) × segment_bytes` (every fill is a prealloc
+    /// the pool did not serve). The m2 durability and log-quiescence
+    /// oracles hold unchanged.
+    pub recycle_oracle: bool,
 }
 
 /// The transition prelude (see [`DurableScenario::prelude`]).
@@ -259,7 +272,40 @@ impl DurableScenario {
             // log-quiescence oracles hold unchanged.
             fill: if seed % 4 == 3 { m2_fill_config() } else { Default::default() },
             prelude: None,
+            // M4.5-S39b: the default pool on `Direct` seeds, off on every
+            // fourth of them (seeds ≡ 5 mod 8) so the unlink path stays
+            // in every sweep; `Buffered` rotors never pool regardless.
+            recycle_slots: if seed % 8 == 5 { 0 } else { inf_server::DEFAULT_RECYCLE_SLOTS },
+            recycle_oracle: false,
         }
+    }
+
+    /// `m2-recycle` (M4.5-S39b, ADR-0090 D5): the m2 durable shape under
+    /// the FUA class with an `always` namespace on every seed (zero-fill
+    /// and so recycling engaged), small segments and a checkpoint
+    /// interval at the segment size so a run performs many rotations,
+    /// checkpoints and truncations — and the recycle oracle armed: a cell
+    /// that rotated and truncated must have recycled, and the zero-fill
+    /// accounting identity must hold. The cut lands anywhere in the
+    /// rename → dir-barrier → first-frame protocol (the sim disk keeps a
+    /// seeded prefix of the directory's metadata ops, so a lost rename
+    /// resurrects the old name with the new life's frames inside it); the
+    /// durability oracle refuses any acked `always` record that does not
+    /// replay. K and the fill policy vary by seed as in `m2_durable`.
+    #[must_use]
+    pub fn m2_recycle(seed: u64) -> DurableScenario {
+        let mut scenario = DurableScenario::m2_durable(seed);
+        scenario.io_mode = SegmentIoMode::Direct;
+        scenario.frames_in_flight = 1 + ((seed / 2) % 4) as u8;
+        scenario.always_writers = 4;
+        scenario.esec_writers = 2;
+        scenario.ops_per_writer = 200;
+        scenario.segment_bytes = 16 << 10;
+        scenario.ckpt_interval_bytes = 16 << 10;
+        scenario.fill = if seed % 2 == 1 { m2_fill_config() } else { Default::default() };
+        scenario.recycle_slots = if seed % 16 == 7 { 2 } else { 1 };
+        scenario.recycle_oracle = true;
+        scenario
     }
 
     /// `m2-ckpt-refused` (ADR-0088 D3 as amended, 2026-08-22): the m2
@@ -440,6 +486,10 @@ impl DurableScenario {
             ckpt_direct_refused_after: None,
             fill: Default::default(),
             prelude: None,
+            // The budget scenario's zero-fill class must keep engaging
+            // (its oracle counts deferrals): recycling off.
+            recycle_slots: 0,
+            recycle_oracle: false,
         }
     }
 
@@ -482,6 +532,8 @@ impl DurableScenario {
             ckpt_direct_refused_after: None,
             fill: Default::default(),
             prelude: None,
+            recycle_slots: 0,
+            recycle_oracle: false,
         }
     }
 }
@@ -559,6 +611,15 @@ pub struct DurableReport {
     /// transition boot (ADR-0086 D4 as amended) — the `m2-mode-transition`
     /// FLUSH → FUA seeds report ≥ 1 per cell that had a v2 tail.
     pub reopened_packed_tails: u64,
+    /// M4.5-S39b (ADR-0090 D5): recycling coverage scraped at the cut —
+    /// segments recycled, pool misses, fallbacks, rotations — and what
+    /// the reboot proved about the residue (segment stops + slacks). A
+    /// sweep whose cells never recycled proves nothing about the rule.
+    pub segments_recycled: u64,
+    pub recycle_misses: u64,
+    pub recycle_fallbacks: u64,
+    pub segment_rotations: u64,
+    pub recycled_residue_slacks: u64,
 }
 
 impl DurableReport {
@@ -938,6 +999,7 @@ pub(crate) fn boot(
             segment: inf_server::SegmentConfig {
                 segment_bytes: scenario.segment_bytes,
                 io_mode: scenario.io_mode,
+                recycle_slots: scenario.recycle_slots,
                 ..Default::default()
             },
             ckpt: inf_server::CkptConfig {
@@ -1140,6 +1202,11 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         frame_waits_pace: 0,
         write_stall_max_us: 0,
         reopened_packed_tails: 0,
+        segments_recycled: 0,
+        recycle_misses: 0,
+        recycle_fallbacks: 0,
+        segment_rotations: 0,
+        recycled_residue_slacks: 0,
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -1445,6 +1512,47 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             report.frame_waits_fill += stats.frame_waits_fill;
             report.frame_waits_pace += stats.frame_waits_pace;
             report.write_stall_max_us = report.write_stall_max_us.max(stats.write_stall_max_us);
+            report.segments_recycled += stats.segments_recycled;
+            report.recycle_misses += stats.recycle_misses;
+            report.recycle_fallbacks += stats.recycle_fallbacks;
+            report.segment_rotations += stats.segment_rotations;
+            // ADR-0090 D5, the recycle oracle (per cell, at the cut).
+            if scenario.recycle_oracle
+                && scenario.recycle_slots > 0
+                && scenario.io_mode == SegmentIoMode::Direct
+            {
+                let truncated = stats.segments_truncated;
+                if stats.segment_rotations >= 3 && truncated >= 2 && stats.segments_recycled == 0 {
+                    fail(
+                        &mut report,
+                        format!(
+                            "RECYCLING NEVER ENGAGED seed {:#x} cell {cell}: {} rotations, {} \
+                             truncations, 0 recycled ({} misses, {} fallbacks)",
+                            scenario.seed,
+                            stats.segment_rotations,
+                            truncated,
+                            stats.recycle_misses,
+                            stats.recycle_fallbacks
+                        ),
+                    );
+                }
+                let unserved = stats.segment_preallocs.saturating_sub(stats.segments_recycled);
+                let bound = unserved * u64::from(scenario.segment_bytes);
+                if stats.zero_fill_bytes > bound {
+                    fail(
+                        &mut report,
+                        format!(
+                            "ZERO-FILL ACCOUNTING VIOLATION seed {:#x} cell {cell}: zero_fill_bytes \
+                             {} > (preallocs {} − recycled {}) × segment_bytes {}",
+                            scenario.seed,
+                            stats.zero_fill_bytes,
+                            stats.segment_preallocs,
+                            stats.segments_recycled,
+                            scenario.segment_bytes
+                        ),
+                    );
+                }
+            }
             for class in inf_runtime::IoClass::ALL {
                 let c = stats.io_budget[class.index()];
                 if !class.is_foreground() {
@@ -1574,6 +1682,22 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                     return finish(report, &observer, &clock);
                 }
                 report.refused_boot = true;
+                // ADR-0090 D5: on the recycling scenario a refusal *is*
+                // the refusal failure mode the residue rule exists to
+                // close (residue taken for a seq gap or a hole) — a
+                // finding, not a legal outcome. The planted-bug canary
+                // (`--cfg inf_canary_foreign_segment`) must turn this red.
+                if scenario.recycle_oracle {
+                    fail(
+                        &mut report,
+                        format!(
+                            "RECYCLED RESIDUE REFUSED seed {:#x}: honest power-cut image of a \
+                             recycling log refused boot: {err}",
+                            scenario.seed
+                        ),
+                    );
+                    return finish(report, &observer, &clock);
+                }
                 // Refusals are counted in the sweep manifest; the *class*
                 // must be visible too (§8.4 never-silent, M2.5-S12: the
                 // residual-refusal taxonomy after ADR-0031 is a ledger
@@ -1598,6 +1722,13 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         disk.power_cut(scenario.seed ^ 0x0FF5_EED1 ^ boots);
     };
     let mut node = node;
+    // ADR-0090 D4: what the reboot proved about recycled residue — the
+    // sweep's coverage disclosure (a sweep whose reboots never met
+    // residue never exercised the rule).
+    for cell in 0..usize::from(scenario.cells) {
+        let residue = node.control.recovery_board().slot(cell as u16).residue();
+        report.recycled_residue_slacks += residue.recycled_residue_slacks;
+    }
 
     // ---- the "at end" equivalence check (M3-S23) -----------------------
     // Runs post-recovery by design: recovered live state must equal an

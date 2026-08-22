@@ -78,7 +78,7 @@ fn main() {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m2-device-budget|m2-mode-transition|m2-reorder-window|m2-ckpt-refused|m3-document|m2-combined|boot-storm \
+                        "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m2-device-budget|m2-mode-transition|m2-reorder-window|m2-ckpt-refused|m2-recycle|m3-document|m2-combined|boot-storm \
                          [--seed N|0xN] [--verify-determinism] \
                          [--plant lost-wakeup|fsync-lies] [--replay-canary] [--cells N] \
                          [--connections N] [--commands N] [--trace-out FILE] \
@@ -105,6 +105,7 @@ fn main() {
             | "m2-mode-transition"
             | "m2-reorder-window"
             | "m2-ckpt-refused"
+            | "m2-recycle"
             | "m3-document"
     ) {
         run_durable(
@@ -690,6 +691,7 @@ fn run_durable(
             "m2-mode-transition" => DurableScenario::m2_mode_transition(seed),
             "m2-reorder-window" => DurableScenario::m2_reorder_window(seed),
             "m2-ckpt-refused" => DurableScenario::m2_ckpt_refused(seed),
+            "m2-recycle" => DurableScenario::m2_recycle(seed),
             "m3-document" => DurableScenario::m3_document(seed),
             _ => unreachable!("the caller filters durable scenario names"),
         };
@@ -771,6 +773,13 @@ fn run_durable(
     // Transition coverage (ADR-0086 D4 as amended): packed tails reopened
     // under a `Direct` rotor at the `m2-mode-transition` restart.
     let mut reopened_packed_tails = 0u64;
+    // Recycling coverage (ADR-0090 D5): segments recycled, pool misses +
+    // fallbacks, rotations, and residue the reboots proved.
+    let mut recycled = 0u64;
+    let mut recycle_misses = 0u64;
+    let mut recycle_fallbacks = 0u64;
+    let mut rotations = 0u64;
+    let mut residue_slacks = 0u64;
     for i in (shard_i..sweep).step_by(shard_k as usize) {
         let seed = seed.wrapping_add(i);
         let report = run_one(seed);
@@ -787,6 +796,11 @@ fn run_durable(
         waits_pace += report.frame_waits_pace;
         stall_max_us = stall_max_us.max(report.write_stall_max_us);
         reopened_packed_tails += report.reopened_packed_tails;
+        recycled += report.segments_recycled;
+        recycle_misses += report.recycle_misses;
+        recycle_fallbacks += report.recycle_fallbacks;
+        rotations += report.segment_rotations;
+        residue_slacks += report.recycled_residue_slacks;
         sim_seconds += report.sim_seconds;
         equivalence_checks += report.equivalence_checks;
         documents_compared += report.documents_compared;
@@ -820,7 +834,8 @@ fn run_durable(
          waits_rotation:{waits_rotation} waits_reorder:{waits_reorder}], device budget [background_bytes:{budget_bytes} \
          deferrals:{budget_deferrals} waits_pace:{waits_pace} write_stall_max_us:{stall_max_us}], \
          reopened_packed_tails:{reopened_packed_tails} ckpt_downgrades:{ckpt_downgrades} \
-         waits_fill:{waits_fill}",
+         waits_fill:{waits_fill}, recycling [recycled:{recycled} misses:{recycle_misses} \
+         fallbacks:{recycle_fallbacks} rotations:{rotations} residue_slacks:{residue_slacks}]",
         classes.join(" ")
     );
     println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
@@ -836,7 +851,9 @@ fn run_durable(
              waits_reorder={waits_reorder} budget_background_bytes={budget_bytes} budget_deferrals={budget_deferrals} \
              waits_pace={waits_pace} write_stall_max_us={stall_max_us} \
              reopened_packed_tails={reopened_packed_tails} ckpt_downgrades={ckpt_downgrades} \
-             waits_fill={waits_fill}\n",
+             waits_fill={waits_fill} segments_recycled={recycled} recycle_misses={recycle_misses} \
+             recycle_fallbacks={recycle_fallbacks} segment_rotations={rotations} \
+             recycled_residue_slacks={residue_slacks}\n",
             classes.join(" ")
         );
         std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest).expect("manifest");

@@ -366,3 +366,35 @@ fn a_hole_of_the_current_life_with_later_attestation_still_refuses() {
     let err = recover(&fs, &mut ks).expect_err("covered data lost is fail-stop");
     assert!(err.to_string().contains("covered data was lost"), "{err}");
 }
+
+#[test]
+fn stale_trailing_segment_beyond_the_last_data_resumes_at_that_data_end() {
+    // A trailing segment whose every frame is discarded-life residue
+    // (a resurrected trailing file: unlinks carry no dir-fsync, ADR-0017)
+    // behind a live segment of a higher epoch. The live segment's data
+    // end is the resume point; the stale file is removed. Found while
+    // writing M4.5-S39b (ADR-0090): the resume offset was read from the
+    // removed segment — the live segment would have been reopened at
+    // offset 0 and its data overwritten.
+    let fs = MemFs::new();
+    let mut log = HandLog::new(&fs);
+    log.v2_frame(b"a", b"1", stamp(3, 1, 0));
+    let end = {
+        log.v2_frame(b"b", b"2", stamp(3, 2, 0));
+        log.offset
+    };
+    log.prealloc(SegmentId(1));
+    log.v2_frame_in(SegmentId(1), 0, b"ghost", b"stale", stamp(1, 7, 0));
+
+    let mut ks = fresh_keyspace();
+    let (rotor, stats) = recover(&fs, &mut ks).expect("stale trailing residue never refuses");
+    assert_eq!(get(&mut ks, b"a").as_deref(), Some(&b"1"[..]));
+    assert_eq!(get(&mut ks, b"b").as_deref(), Some(&b"2"[..]));
+    assert_eq!(get(&mut ks, b"ghost"), None);
+    assert_eq!(stats.stale_residue_slacks, 1);
+    assert_eq!(stats.torn_truncated_at, None, "residue, not a torn tail");
+    assert_eq!(stats.torn_segments_removed, 1, "the stale trailing file is removed");
+    assert_eq!(rotor.active_segment(), SegmentId(0), "resume in the live segment");
+    assert_eq!(rotor.active_written(), end, "at its data end — never offset 0");
+    assert_eq!(rotor.resume_epoch(), 4);
+}

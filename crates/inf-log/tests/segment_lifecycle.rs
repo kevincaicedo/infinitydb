@@ -54,7 +54,8 @@ fn rotation_is_pointer_swap_with_preallocated_next() {
         rotor.maintain(0).expect("maintain");
     }
     assert!(appended > 3, "several frames per segment");
-    assert_eq!(rotor.sealed(), &[SegmentId(0), SegmentId(1), SegmentId(2)]);
+    let sealed_ids: Vec<SegmentId> = rotor.sealed().iter().map(|m| m.id).collect();
+    assert_eq!(sealed_ids, [SegmentId(0), SegmentId(1), SegmentId(2)]);
     assert_eq!(rotor.active_segment(), SegmentId(3));
     let stats = rotor.stats();
     assert_eq!(stats.rotations, 3);
@@ -63,7 +64,7 @@ fn rotation_is_pointer_swap_with_preallocated_next() {
     assert_eq!(rotor.next_ready(), Some(SegmentId(4)));
 
     // Every sealed segment replays cleanly through the frame iterator.
-    for &sealed in rotor.sealed() {
+    for sealed in sealed_ids {
         let file = rotor.open_segment_read(sealed).expect("open sealed");
         let len = file.file_size().expect("len");
         let mut image = vec![0u8; usize::try_from(len).expect("fits")];

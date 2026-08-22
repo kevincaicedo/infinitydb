@@ -130,6 +130,19 @@ pub struct RecoverStats {
     /// replay continues past it. Counted per boot (ADR-0031 D5 as amended
     /// 2026-08-21).
     pub stale_residue_slacks: u64,
+    /// M4.5-S39b (ADR-0090 D2 as amended): replay ended a segment's data
+    /// at a **foreign-segment frame** — a decoded frame at its stored
+    /// offset but stamped for another segment id, the residue a recycled
+    /// file carries from its previous life. A classified end like a zero
+    /// tail (replay continues in the next segment), never data, never a
+    /// hole. Counted per boot.
+    pub segment_residue_stops: u64,
+    /// Segment slacks proven **recycled-life residue** by the audit: no
+    /// self-located frame, ≥ 1 foreign-segment frame (garbage beside it
+    /// allowed — a torn tail over residue is indistinguishable from
+    /// residue and nothing acked can sit past a data end). Never torn,
+    /// never a hole; trailing ones are removed as stale. Counted per boot.
+    pub recycled_residue_slacks: u64,
 }
 
 /// The recovered manifest — hands the recovery-time floor + named
@@ -978,12 +991,32 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     return Ok(RecoveryProgress::Working);
                 }
                 Err(err @ ReadError::Io { .. }) => return Err(io_invalid(err)),
+                Err(ReadError::ForeignSegment { offset, .. }) => {
+                    // ADR-0090 D2 as amended: a decoded frame at its own
+                    // offset stamped for another segment id is recycled-
+                    // life residue — this segment's data ends here, as
+                    // cleanly as at a zero tail. Replay goes on in the
+                    // next segment (a foreign frame says nothing about
+                    // the segments after it); the audit proves the slack.
+                    self.prev_stamp = None;
+                    self.stats.segments += 1;
+                    self.stats.segment_residue_stops += 1;
+                    self.ends.push((offset, None));
+                    let consumed = u64::from(offset).saturating_sub(start_offset);
+                    self.bytes_done += consumed;
+                    self.bytes_consumed += consumed;
+                    self.bytes_done += self.seg_sizes[idx].saturating_sub(u64::from(offset));
+                    self.phase = Phase::Audit { idx };
+                    return Ok(RecoveryProgress::Working);
+                }
                 Err(err) => {
                     let offset = match &err {
                         ReadError::Frame { offset, .. } | ReadError::LsnMismatch { offset, .. } => {
                             *offset
                         }
-                        ReadError::Io { .. } => unreachable!("Io read errors fail-stop above"),
+                        ReadError::Io { .. } | ReadError::ForeignSegment { .. } => {
+                            unreachable!("Io and foreign-segment reads are handled above")
+                        }
                     };
                     // The contiguity run breaks here (ADR-0031 D3): frames
                     // in later segments are a fresh baseline — the audit
@@ -1121,18 +1154,37 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // The residue-stop that may have ended this segment's replay at
         // such a frame is lifted with it: the segments after it are the
         // live log, not residue.
-        let stale = evidence.valid_frames > 0
+        let stale_by_epoch = evidence.valid_frames > 0
             && !evidence.any_v1
             && evidence.max_epoch < self.max_prefix_epoch;
-        if stale {
+        if stale_by_epoch {
             self.stats.stale_residue_slacks += 1;
             self.residue_stop = false;
         }
+        // ADR-0090 D2 as amended: a slack with no self-located frame and
+        // at least one foreign-segment frame is recycled-life residue —
+        // proven by the frames' own stamps, never a hole (there is no
+        // frame of this life to be a hole *to*), never torn. Same
+        // disposition as the epoch-proven class: excluded from the
+        // attestation decision, trailing ones removed as stale.
+        let recycled = evidence.is_recycled_residue();
+        if recycled {
+            self.stats.recycled_residue_slacks += 1;
+        }
+        // Proven residue is treated exactly like pre-zeroed slack for the
+        // torn/trailing decisions: an empty recycled next segment stays
+        // the tail (resume at 0, write-through from the first frame —
+        // the file is fully allocated), a recycled tail resumes at its
+        // data end, and nothing is reported torn. The reader's
+        // foreign-segment stop makes the bytes behind the data end
+        // unreachable on every later boot, which is the property zeros
+        // gave (ADR-0090 D2/D3 as amended).
+        let residue = residue && !recycled;
         self.residue.push(residue);
-        self.stale_slack.push(stale);
+        self.stale_slack.push(stale_by_epoch);
         self.evidence.push(evidence);
         let next = idx + 1;
-        self.phase = if evidence.valid_frames > 0 && !stale {
+        self.phase = if evidence.valid_frames > 0 && !stale_by_epoch {
             self.hole = Some(idx);
             if next == self.segments.len() { Phase::Finish } else { Phase::Probe { idx: next } }
         } else if next == self.segments.len() {
@@ -1238,7 +1290,14 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         }
 
         let scan = self.scan.as_ref().expect("scan set in start");
-        let (resume_segment, resume_offset) = if torn {
+        // The resume point: the last data-bearing segment's data end
+        // whenever anything is truncated or removed behind it (torn, or
+        // stale trailing residue — every later segment goes, so the tail
+        // *is* that segment); otherwise the scan's tail at its own end (a
+        // clean empty next segment resumes at 0 — pinned in
+        // `recover_stamp.rs`: reading the removed segment's end here once
+        // reopened the live segment at offset 0).
+        let (resume_segment, resume_offset) = if torn || stale_trailing {
             (self.segments[last_data], ends[last_data].0)
         } else {
             (scan.tail().expect("non-empty scan"), ends.last().expect("non-empty scan").0)
@@ -1351,7 +1410,14 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // audit saw it). Discarded-life residue that later resurfaces at
         // the new data end then fails the prefix's epoch-monotonicity rule
         // instead of replaying.
-        let observed = self.max_prefix_epoch.max(resume_evidence.max_epoch);
+        // ADR-0090 D2 as amended: foreign-segment frames carry epochs at or
+        // below the prefix's by append order (a recycled file was sealed
+        // before every segment above the floor); folding them in makes the
+        // "every epoch observed this boot" rule literal at the cost of one
+        // max over the audited segments.
+        let max_foreign_epoch =
+            self.evidence.iter().map(|e| e.max_foreign_epoch).max().unwrap_or(0);
+        let observed = self.max_prefix_epoch.max(resume_evidence.max_epoch).max(max_foreign_epoch);
         let epoch = observed.checked_add(1).ok_or_else(|| {
             io_msg(format!("log epoch space exhausted at {observed} — refusing to start"))
         })?;

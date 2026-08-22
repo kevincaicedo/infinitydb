@@ -1534,11 +1534,23 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         if let Some(cell) = self.shared.durable.borrow_mut().as_mut() {
                             cell.arm_boot_barriers(cx, barrier_dirs);
                         }
+                        self.shared
+                            .node
+                            .recover_segment_residue_stops
+                            .set(stats.segment_residue_stops);
+                        self.shared
+                            .node
+                            .recover_recycled_residue_slacks
+                            .set(stats.recycled_residue_slacks);
                         if let Some(board) = &self.loading_board {
                             let slot = board.slot(boot.cell_id);
                             slot.mark_ready(
                                 stats.ckpt_records + stats.records_applied,
                                 stats.torn_truncated_at,
+                                crate::control::RecoveredResidue {
+                                    segment_residue_stops: stats.segment_residue_stops,
+                                    recycled_residue_slacks: stats.recycled_residue_slacks,
+                                },
                             );
                         }
                     }
@@ -2842,6 +2854,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.ckpt_io_mode_downgrades.set(stats.ckpt_io_mode_downgrades);
             node.write_amp_milli_log_checkpoint.set(stats.write_amp_milli_log_checkpoint);
             node.write_amp_log_checkpoint_undefined.set(stats.write_amp_log_checkpoint_undefined);
+            node.accounted_host_write_bytes.set(stats.accounted_host_write_bytes);
+            node.write_amp_milli_accounted_host.set(stats.write_amp_milli_accounted_host);
+            node.segments_recycled.set(stats.segments_recycled);
+            node.recycle_misses.set(stats.recycle_misses);
+            node.recycle_fallbacks.set(stats.recycle_fallbacks);
+            node.recycle_pool_bytes.set(stats.recycle_pool_bytes);
+            node.segment_rotations.set(stats.segment_rotations);
+            node.segment_preallocs.set(stats.segment_preallocs);
             let ckpt = cell.ckpt_stats();
             let unix_now_ms = self.shared.wall_anchor().unix_from_internal(cx.now);
             node.ckpt_age_s.set(if ckpt.last_unix_ms == 0 {

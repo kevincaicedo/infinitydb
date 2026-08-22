@@ -37,7 +37,7 @@ use crate::frame::{
     DEFAULT_MAX_FRAME_LEN, FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_TRAILER_LEN, FrameBuilder,
     FrameLayout, FrameStamp,
 };
-use crate::fs::SegmentFs;
+use crate::fs::{SegmentFs, SegmentIoMode};
 use crate::lsn::Lsn;
 use crate::segment::{LogError, SegmentRotor};
 
@@ -50,6 +50,56 @@ pub const DEFAULT_STAGING_BYTES: u32 = 4 << 20;
 /// queue, not the cell, is the bound, and the plane's in-flight table is
 /// sized from this at construction — never a growing queue.
 pub const MAX_FRAMES_IN_FLIGHT: u8 = 8;
+
+/// The pipeline depth the FUA (`Direct`) class defaults to (ADR-0087 D5 as
+/// amended 2026-08-22, the fourth amendment): K = 3 with 4 MiB buffers —
+/// p50 ÷ barrier 1.85 → 1.21, c32 p50 −33 %, ops +35 % on the S35 row,
+/// +8 MiB/cell paid only where concurrent write-through frames have a
+/// measured benefit.
+pub const FUA_DEFAULT_FRAMES_IN_FLIGHT: u8 = 3;
+
+/// The pipeline depth the FLUSH (`Buffered`) class defaults to: K = 1 — a
+/// linked fdatasync needs the pipeline drained (ADR-0087 D3), so K > 1
+/// buys nothing there and would cost the memory.
+pub const FLUSH_DEFAULT_FRAMES_IN_FLIGHT: u8 = 1;
+
+/// How `frames_in_flight` was asked for (`infinityd --frames-in-flight
+/// auto|K`, ADR-0087 D5 as amended): `Auto` derives K from the barrier
+/// class, `Fixed` forces it for either class (the A/B arm and the
+/// operator's knob). Resolution takes the **resolved** class as input
+/// and its output is the only way to build a [`StagingConfig`] from
+/// this value — so by construction the choice happens after the class is
+/// known and before the ring is sized.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FramesInFlight {
+    Auto,
+    Fixed(u8),
+}
+
+impl FramesInFlight {
+    /// The pipeline depth for `io_mode`: `Direct → 3`, `Buffered → 1`
+    /// under `Auto`; `K` regardless of class under `Fixed(K)`.
+    #[must_use]
+    pub fn resolve(self, io_mode: SegmentIoMode) -> u8 {
+        match self {
+            FramesInFlight::Fixed(k) => k,
+            FramesInFlight::Auto => match io_mode {
+                SegmentIoMode::Direct => FUA_DEFAULT_FRAMES_IN_FLIGHT,
+                SegmentIoMode::Buffered => FLUSH_DEFAULT_FRAMES_IN_FLIGHT,
+            },
+        }
+    }
+
+    /// Where the resolved value came from, for the boot line.
+    #[must_use]
+    pub fn source(self, io_mode: SegmentIoMode) -> &'static str {
+        match (self, io_mode) {
+            (FramesInFlight::Fixed(_), _) => "--frames-in-flight",
+            (FramesInFlight::Auto, SegmentIoMode::Direct) => "auto: fua",
+            (FramesInFlight::Auto, SegmentIoMode::Buffered) => "auto: flush",
+        }
+    }
+}
 
 /// Log-staging domain configuration (per cell).
 #[derive(Copy, Clone, Debug)]
@@ -544,5 +594,35 @@ impl StagingRing {
     #[must_use]
     pub fn stats(&self) -> StagingStats {
         self.stats
+    }
+}
+
+#[cfg(test)]
+mod frames_in_flight_tests {
+    use super::*;
+
+    /// ADR-0087 D5 as amended (2026-08-22): `auto` is class-derived —
+    /// FUA → 3, FLUSH → 1 — and an explicit K wins for either class.
+    /// The resolver is the only path from the flag to a `StagingConfig`,
+    /// so taking the resolved class as its input is what pins "after the
+    /// barrier class, before the ring is sized".
+    #[test]
+    fn auto_is_class_derived_and_fixed_wins() {
+        assert_eq!(FramesInFlight::Auto.resolve(SegmentIoMode::Direct), 3);
+        assert_eq!(FramesInFlight::Auto.resolve(SegmentIoMode::Buffered), 1);
+        for k in 1..=MAX_FRAMES_IN_FLIGHT {
+            assert_eq!(FramesInFlight::Fixed(k).resolve(SegmentIoMode::Direct), k);
+            assert_eq!(FramesInFlight::Fixed(k).resolve(SegmentIoMode::Buffered), k);
+        }
+        assert_eq!(FramesInFlight::Auto.source(SegmentIoMode::Direct), "auto: fua");
+        assert_eq!(FramesInFlight::Auto.source(SegmentIoMode::Buffered), "auto: flush");
+        assert_eq!(FramesInFlight::Fixed(2).source(SegmentIoMode::Direct), "--frames-in-flight");
+        // The resolved value builds a ring of K + 1 buffers — the
+        // allocation consumes the resolver's answer, never the flag.
+        let cfg = StagingConfig {
+            capacity_bytes: 64 << 10,
+            frames_in_flight: FramesInFlight::Auto.resolve(SegmentIoMode::Direct),
+        };
+        assert_eq!(StagingRing::new(cfg).frames_in_flight(), 3);
     }
 }
