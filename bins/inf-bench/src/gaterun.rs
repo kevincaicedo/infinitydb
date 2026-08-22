@@ -574,6 +574,10 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         // and its unbudgeted baseline arm (no probe file copied in).
         "only-s36",
         "model-absent",
+        // M4.5-S39a arm B: the bare switch that extends the fill hold to
+        // barrier-carrying frames (a value-less flag — listed here or the
+        // parser eats the next flag as its value).
+        "fill-window-always",
     ],
     &[
         "allow-dirty",
