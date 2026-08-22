@@ -272,10 +272,10 @@ impl DurableScenario {
             // log-quiescence oracles hold unchanged.
             fill: if seed % 4 == 3 { m2_fill_config() } else { Default::default() },
             prelude: None,
-            // M4.5-S39b: the default pool on `Direct` seeds, off on every
-            // fourth of them (seeds ≡ 5 mod 8) so the unlink path stays
-            // in every sweep; `Buffered` rotors never pool regardless.
-            recycle_slots: if seed % 8 == 5 { 0 } else { inf_server::DEFAULT_RECYCLE_SLOTS },
+            // M4.5-S39b campaign F: the product default is off after the
+            // corrected recovery gate. The dedicated `m2-recycle` scenario
+            // below owns explicit one/two-slot crash coverage.
+            recycle_slots: inf_server::DEFAULT_RECYCLE_SLOTS,
             recycle_oracle: false,
         }
     }
