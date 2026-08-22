@@ -100,3 +100,45 @@ owed before it is carried into the claim ledger.
   `--pressure-data-root`, not `--data-root`) and are **invalid for any
   device claim** — kept with a README saying so; the tooling now refuses
   that shape (`0f990be`).
+
+## Campaign "review" (2026-08-21 evening, `campaign-review/`, binary `2cb6074` — the review-fix tree)
+
+Same box, governor `performance` / EPP `performance`, clean tree,
+`env-check` OK; **`fstrim` run by the owner before this campaign** (a
+manual run leaves no journal entry — disclosed, not verified by the
+agent); 40 s idle before every durable leg. Two purposes: the three
+replicates of the K = 3 / 2 MiB `m2` `always` row the claim ledger owed,
+and the **K = 3 / 4 MiB** arm the default-K decision lacked.
+
+### `gate-run m2 --only-always`, K = 3 / 2 MiB, three replicates (64 conns × P16)
+
+| replicate | w/s | p50 | p99 | p99.9 | max | verdict (≥ 300k) |
+|---|---|---|---|---|---|---|
+| r1 | **634 776** | 1.50 ms | 3.8 ms | 6.5 ms | 14.1 ms | PASS |
+| r2 | **541 119** | 1.50 ms | 17.4 ms | 31.7 ms | 56.9 ms | PASS |
+| r3 | **572 150** | 1.54 ms | 5.6 ms | 29.2 ms | 69.6 ms | PASS |
+
+Median 572k, min 541k — with campaign 1's 639k, four reference-box
+readings of this arm, every one ≥ 1.8× the ADR-0022 D3 gate. p50 is flat
+across replicates; the p99/max spread is the device's write-through tail
+(the S34 drive-state mode: r2's barrier histogram carries a 17 ms p99),
+which `fstrim` did not remove. The ADR-0022 D3 `always ≥ 300k w/s` gate is
+**met on the reference box with three replicates** (claim ledger C18).
+
+### `gate-run m4.5 --only-s35`, K = 3 / 4 MiB (`k3s4`, 20 MiB/cell resident: +12 MiB attributed)
+
+| gate | measured | verdict | note |
+|---|---|---|---|
+| p50 ÷ barrier (≤ 1.3) | **1.21** (1.17 / 1.21 / 1.24) | PASS | identical to K = 3 / 2 MiB (1.19–1.21) — the buffer size does not enter at 2.2 records per frame |
+| 4c/1c p50 (≤ 1.3) | 1.38 | FAIL — **device row** | the 4-cell legs read p50 735–767 µs, the same as the 2 MiB arm's 735; the 1-cell legs read **543 µs** (barrier p50 431–471 µs) against campaign 2's 575 (barrier 559–575): a faster device for the 1-cell legs, not a slower engine at 4 cells. The harness flagged one leg's barrier p99 at 16 ms (rep2 @256: 103k ops/s, p99 25.6 ms) — "a device row, not an engine row; re-run with fstrim + a longer idle before citing" |
+| reads | 1.58–1.60 M ops/s | ±1 % | (rep2 read leg 5 457 nils — the @256 leg before it ran 103k under the bad mode and populated fewer keys) |
+| @256 | 201k / 201k / 103k; p99 2.9 / 2.9 / 25.6 ms | — | bimodal again, the third repeat in the bad mode |
+
+**Reading for the default-K decision:** K = 3 behaves the same at 2 MiB
+and 4 MiB buffers on every engine-attributable figure (4-cell p50 735 µs,
+39.1–39.3k ops/s at 32 conns, 1.21 × barrier). The 4 MiB pairing keeps
+the durable record bound at **4 MiB − 56 B** for +8 MiB/cell resident
+over the 2 MiB pairing (12 MiB over K = 1's 8 MiB); the 2 MiB pairing is
+L5-neutral and moves the bound to 2 MiB − 56 B (now disclosed in the
+compat matrix). The 4c/1c gate's 1.38 on this arm is a device-state
+reading and is not cited; the arm's p50/barrier gate is.
