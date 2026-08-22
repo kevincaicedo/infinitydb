@@ -52,6 +52,14 @@ OPTIONS (run):
     --maxmemory-mb  N               # cap all engines (allkeys-lru); enables `eviction`
     --rb-requests   N               # redis-benchmark request count (-n); default: 1000000
     --crosscheck-threshold PCT      # flag memtier/redis-benchmark divergence; default: 25
+    --rate          OPS_PER_SEC     # offered rate, total across connections (memtier --rate-limiting
+                                    # per connection = rate / (threads × clients)); default: closed loop
+    --durability    none|everysec   # everysec: redis --appendonly yes --appendfsync everysec,
+                                    # infinitydb FSYNC everysec namespace every connection starts in
+                                    # (--conn-default-ns); host launches only; default: none
+    --data-root     DIR             # durable state root (per-engine subdirs, wiped); default: .artifacts/compare-data
+    --probe-file    PATH            # io-properties.toml copied into infinitydb's data dir (barrier class)
+    --device-stat   DEV             # /sys/block/DEV/stat sectors-written sampled per row (e.g. nvme0n1)
 
   Placement:
     --docker        # run servers in containers; generator stays on host
@@ -111,6 +119,11 @@ const VALUE_FLAGS: &[&str] = &[
     "maxmemory-mb",
     "rb-requests",
     "crosscheck-threshold",
+    "rate",
+    "durability",
+    "data-root",
+    "probe-file",
+    "device-stat",
     "attach",
     "port-base",
     "pin-start",
@@ -135,6 +148,12 @@ struct LoadParams {
     data_size: usize,
     keyspace: u64,
     rb_requests: u64,
+    /// M4.5-S40: offered rate (total ops/s), `None` = closed loop.
+    rate: Option<u64>,
+    durability: engine::Durability,
+    data_root: PathBuf,
+    probe_file: Option<PathBuf>,
+    device_stat: Option<String>,
 }
 
 fn cmd_run(args: &[String]) -> Result<(), String> {
@@ -169,6 +188,11 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         data_size: flags.usize_or("data-size", 64)?,
         keyspace: flags.u64_or("keyspace", 1_000_000)?,
         rb_requests: flags.u64_or("rb-requests", 1_000_000)?,
+        rate: flags.opt_u64("rate")?,
+        durability: engine::Durability::parse(&flags.str_or("durability", "none"))?,
+        data_root: PathBuf::from(flags.str_or("data-root", ".artifacts/compare-data")),
+        probe_file: flags.get("probe-file").map(PathBuf::from),
+        device_stat: flags.get("device-stat").map(str::to_string),
     };
     let pipelines = flags.u32_list_or("pipeline", &[1, 16])?;
     let maxmemory_mb = flags.opt_u64("maxmemory-mb")?;
@@ -278,6 +302,11 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         rb_requests: lp.rb_requests,
         crosscheck_pct,
         maxmemory_mb,
+        rate: lp.rate,
+        durability: lp.durability.label().to_string(),
+        data_root: (lp.durability != engine::Durability::None)
+            .then(|| lp.data_root.display().to_string()),
+        device_stat: lp.device_stat.clone(),
     };
     let md = report::render(&environment, &params, &configs, &cells, &mems);
     let report_path = run_dir.join("report.md");
@@ -317,6 +346,10 @@ fn bring_up(
         threads: lp.threads,
         pin_start,
         maxmemory_mb,
+        durability: lp.durability,
+        data_dir: (lp.durability != engine::Durability::None)
+            .then(|| lp.data_root.join(kind.label())),
+        probe_file: lp.probe_file.clone(),
     };
     if docker {
         eprintln!("inf-compare: launching {} (docker) on :{port}", kind.label());
@@ -349,7 +382,9 @@ fn bench_engine(
         duration: lp.duration,
         data_size: lp.data_size,
         keyspace: lp.keyspace,
+        rate: lp.rate,
     };
+    let rate_tag = lp.rate.map_or(String::new(), |r| format!("-r{r}"));
 
     let mut cells = Vec::new();
     let mut mems = Vec::new();
@@ -366,7 +401,19 @@ fn bench_engine(
             continue;
         }
         for &pipeline in pipelines {
-            engine::flushall(target)?;
+            // A durable run starts every engine on a wiped data dir and
+            // runs one row per engine (the offered-rate row); infinitydb
+            // refuses FLUSHALL on a node with durable namespaces (M2),
+            // and a FLUSHALL under redis's AOF is a rewrite the row did
+            // not ask for — so the durable run skips it and the report
+            // says so (the populate, when a lane needs one, still runs).
+            if lp.durability == engine::Durability::None {
+                engine::flushall(target)?;
+            } else if pipelines.len() > 1 || workloads.len() > 1 {
+                return Err("--durability runs one workload at one pipeline depth per invocation \
+                            (no FLUSHALL between durable rows); pass --workload X --pipeline N"
+                    .into());
+            }
             if wl.needs_fill && wl.requires_json {
                 // Document preload: every key in the keyspace holds the
                 // lane document, so the read lane never measures misses.
@@ -376,12 +423,35 @@ fn bench_engine(
                 eprintln!("inf-compare:   {label} {} populate ({fill_secs}s)", wl.name);
                 memtier::fill(&mt_plan, fill_secs)?;
             }
+            let cpu_before = engine::cpu_ticks(target);
+            let sectors_before = lp.device_stat.as_deref().and_then(engine::device_sectors_written);
+            let wall = std::time::Instant::now();
             let memtier_m = if gens.memtier {
-                eprintln!("inf-compare:   {label} {} memtier pipeline={pipeline}", wl.name);
-                let json = raw_dir.join(format!("{label}-{}-p{pipeline}.memtier.json", wl.name));
+                eprintln!(
+                    "inf-compare:   {label} {} memtier pipeline={pipeline}{rate_tag}",
+                    wl.name
+                );
+                let json =
+                    raw_dir.join(format!("{label}-{}-p{pipeline}{rate_tag}.memtier.json", wl.name));
                 Some(memtier::run(&mt_plan, wl, pipeline, &json)?)
             } else {
                 None
+            };
+            // Server CPU across the memtier row (host launches) and the
+            // block device's sectors written — the S40 disclosures.
+            let wall_s = wall.elapsed().as_secs_f64();
+            let server_cpu_pct = match (cpu_before, engine::cpu_ticks(target)) {
+                (Some(a), Some(b)) if wall_s > 0.0 => {
+                    Some((b.saturating_sub(a)) as f64 / 100.0 / wall_s * 100.0)
+                }
+                _ => None,
+            };
+            let device_mib_written = match (
+                sectors_before,
+                lp.device_stat.as_deref().and_then(engine::device_sectors_written),
+            ) {
+                (Some(a), Some(b)) => Some((b.saturating_sub(a) * 512) as f64 / (1024.0 * 1024.0)),
+                _ => None,
             };
             let redisbench_m = match (gens.redisbench, wl.redisbench_test) {
                 (true, Some(test)) => {
@@ -397,8 +467,8 @@ fn bench_engine(
                         data_size: lp.data_size,
                         keyspace: lp.keyspace,
                     };
-                    let csv =
-                        raw_dir.join(format!("{label}-{}-p{pipeline}.redisbench.csv", wl.name));
+                    let csv = raw_dir
+                        .join(format!("{label}-{}-p{pipeline}{rate_tag}.redisbench.csv", wl.name));
                     Some(redisbench::run(&rb_plan, test, pipeline, &csv)?)
                 }
                 _ => None,
@@ -413,6 +483,8 @@ fn bench_engine(
                 memtier: memtier_m,
                 redisbench: redisbench_m,
                 rss_mib: engine::rss_now_mib(target),
+                server_cpu_pct,
+                device_mib_written,
             });
         }
     }

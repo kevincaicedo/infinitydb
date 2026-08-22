@@ -1431,6 +1431,7 @@ struct S39bSnap {
     rotations: u64,
     misses: u64,
     fallbacks: u64,
+    pool_full: u64,
     truncated: u64,
     /// Minimum over cells — the per-cell validity facts.
     rotations_min_cell: u64,
@@ -1464,6 +1465,7 @@ fn s39b_snap(
         rotations: rotations.iter().sum(),
         misses: sum_field(&infos, "recycle_misses"),
         fallbacks: sum_field(&infos, "recycle_fallbacks"),
+        pool_full: sum_field(&infos, "recycle_pool_full"),
         truncated: truncated.iter().sum(),
         rotations_min_cell: rotations.iter().copied().min().unwrap_or(0),
         truncated_min_cell: truncated.iter().copied().min().unwrap_or(0),
@@ -1505,7 +1507,13 @@ struct S39bLeg {
     /// `None` when the trigger never fired (the leg was too short for
     /// a truncation + rotation on every cell — the row is then invalid).
     warmed: bool,
+    /// Crash-restart recovery timed twice: immediately after the read
+    /// leg (drive state as the leg left it) and again after the row's
+    /// idle (`--leg-idle-s`) — the boot `Phase::Start` is device-state
+    /// sensitive (C38f), so the idle boot is the one the recovery gate
+    /// binds on and the immediate one is disclosed beside it.
     recovery_s: f64,
+    recovery_idle_s: f64,
     recover_residue_slacks: u64,
     recover_residue_stops: u64,
 }
@@ -1627,6 +1635,7 @@ fn s39b_leg(
     infinityd: &str,
     cells: u16,
     duration: u64,
+    idle_s: u64,
     dir: &str,
     arm: &'static str,
     arm_args: &[&str],
@@ -1698,10 +1707,13 @@ fn s39b_leg(
         setup: vec![vec![b"INF.NS".to_vec(), b"USE".to_vec(), b"s39alw".to_vec()]],
         ..LoadSpec::default()
     })?;
-    // Crash (SIGKILL) and time the recovery on the recycled log.
+    // Crash (SIGKILL) and time the recovery on the recycled log — once
+    // at once, once after the drive-state idle (the binding one).
     drop(server);
     let (recovery_s, recover_residue_slacks, recover_residue_stops) =
         s39b_recovery(flags, infinityd, cells, dir, arm_args)?;
+    s35_idle(idle_s, &format!("s39b {arm} idle-state recovery boot"));
+    let (recovery_idle_s, _, _) = s39b_recovery(flags, infinityd, cells, dir, arm_args)?;
     Ok(S39bLeg {
         arm,
         ops_per_sec: report.ops_per_sec,
@@ -1716,6 +1728,7 @@ fn s39b_leg(
         end,
         warmed,
         recovery_s,
+        recovery_idle_s,
         recover_residue_slacks,
         recover_residue_stops,
     })
@@ -1778,6 +1791,7 @@ fn s39b_recycle_row(
                 infinityd,
                 cells,
                 duration,
+                idle_s,
                 &dir,
                 arm,
                 args,
@@ -1786,12 +1800,13 @@ fn s39b_recycle_row(
             raw.push_str(&format!(
                 "rep{rep} {arm} c32 ops={:.0} p50_us={:.0} p99_us={:.0} max_us={:.0} \
                  barrier_p50_us={:.0} barrier_p99_us={:.0} parked={} read_ops={:.0} \
-                 rotations={} recycled={} misses={} fallbacks={} truncated={} \
+                 rotations={} recycled={} misses={} fallbacks={} pool_full={} truncated={} \
                  rotations_min_cell={} trigger_at_s={:.1} warmed={} \
                  firstgen[zero_fill={} frame_bytes={} share={:.3}] \
                  warmed[zero_fill={} frame_bytes={} share={:.3} padding_pct={:.1} \
                  host_per_log={:.3} device_per_log={:.3} ckpt={} deficit={}] \
-                 recovery_s={:.3} recover_residue_slacks={} recover_residue_stops={}\n",
+                 recovery_s={:.3} recovery_idle_s={:.3} recover_residue_slacks={} \
+                 recover_residue_stops={}\n",
                 leg.ops_per_sec,
                 leg.p50_us,
                 leg.p99_us,
@@ -1804,6 +1819,7 @@ fn s39b_recycle_row(
                 leg.end.recycled,
                 leg.end.misses,
                 leg.end.fallbacks,
+                leg.end.pool_full,
                 leg.end.truncated,
                 leg.end.rotations_min_cell,
                 leg.first_gen.at_s,
@@ -1820,6 +1836,7 @@ fn s39b_recycle_row(
                 leg.d(|s| s.ckpt_bytes),
                 leg.warmed_deficit(),
                 leg.recovery_s,
+                leg.recovery_idle_s,
                 leg.recover_residue_slacks,
                 leg.recover_residue_stops,
             ));
@@ -1843,6 +1860,7 @@ fn s39b_recycle_row(
     let mut ops_x = Vec::new();
     let mut read_x = Vec::new();
     let mut rec_x = Vec::new();
+    let mut rec_now_x = Vec::new();
     let mut host_arm = Vec::new();
     let mut host_base = Vec::new();
     let mut dev_arm = Vec::new();
@@ -1867,7 +1885,8 @@ fn s39b_recycle_row(
         barrier_x.push(a.barrier_p50_us / b.barrier_p50_us.max(1.0));
         ops_x.push(a.ops_per_sec / b.ops_per_sec.max(1.0));
         read_x.push(a.read_ops_per_sec / b.read_ops_per_sec.max(1.0));
-        rec_x.push(a.recovery_s / b.recovery_s.max(1e-6));
+        rec_x.push(a.recovery_idle_s / b.recovery_idle_s.max(1e-6));
+        rec_now_x.push(a.recovery_s / b.recovery_s.max(1e-6));
         host_arm.push(a.warmed_host_per_log());
         host_base.push(b.warmed_host_per_log());
         dev_arm.push(a.warmed_device_per_log());
@@ -1896,6 +1915,7 @@ fn s39b_recycle_row(
         m.set("s39b:always_c32_ops_x", median(&mut ops_x));
         m.set("s39b:read_c64p16_x", median(&mut read_x));
         m.set("s39b:recovery_time_x", median(&mut rec_x));
+        m.set("s39b:recovery_time_immediate_x", median(&mut rec_now_x));
         m.set("s39b:host_bytes_per_log_byte_arm", median(&mut host_arm));
         m.set("s39b:host_bytes_per_log_byte_base", median(&mut host_base));
         m.set("s39b:device_bytes_per_log_byte_arm", median(&mut dev_arm));

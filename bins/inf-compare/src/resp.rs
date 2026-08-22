@@ -26,6 +26,22 @@ pub fn command(host: &str, port: u16, argv: &[&[u8]]) -> Result<Vec<u8>, String>
     Ok(reply)
 }
 
+/// Send `argvs` in order on **one** connection and return the last reply
+/// (connection-state commands — `INF.NS USE` then a probe — need the
+/// same socket). Errors like [`command`].
+pub fn commands(host: &str, port: u16, argvs: &[&[&[u8]]]) -> Result<Vec<u8>, String> {
+    let mut stream = connect(host, port)?;
+    let mut last = Vec::new();
+    for argv in argvs {
+        last = request(&mut stream, argv)?;
+        if last.first() == Some(&b'-') {
+            let line = String::from_utf8_lossy(&last);
+            return Err(format!("server error: {}", line.trim()));
+        }
+    }
+    Ok(last)
+}
+
 /// Preload every key of the JSON lanes' keyspace with `doc` via one
 /// pipelined connection (`JSON.SET k:<i> $ <doc>`) — the read lane then
 /// never measures misses. Replies are drained in bulk and each must be

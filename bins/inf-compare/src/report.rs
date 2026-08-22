@@ -25,6 +25,11 @@ pub struct Cell {
     pub memtier: Option<memtier::Metrics>,
     pub redisbench: Option<redisbench::Metrics>,
     pub rss_mib: Option<f64>,
+    /// M4.5-S40 disclosures: the server's CPU across the memtier row
+    /// (% of one core; host launches only) and the block device's bytes
+    /// written during it (`--device-stat`).
+    pub server_cpu_pct: Option<f64>,
+    pub device_mib_written: Option<f64>,
 }
 
 /// One bytes/key attribution row.
@@ -52,6 +57,13 @@ pub struct Params {
     pub rb_requests: u64,
     pub crosscheck_pct: f64,
     pub maxmemory_mb: Option<u64>,
+    /// M4.5-S40: the offered rate (`None` = closed loop), the durability
+    /// class every engine ran in, the durable data root, the device
+    /// sampled.
+    pub rate: Option<u64>,
+    pub durability: String,
+    pub data_root: Option<String>,
+    pub device_stat: Option<String>,
 }
 
 pub fn render(
@@ -98,6 +110,18 @@ pub fn render(
         "| Parameters | duration={}s · threads={} · clients={} · value={} B · keyspace={} · pipeline={} · maxmemory={} |",
         p.duration, p.threads, p.clients, p.data_size, p.keyspace, pipelines, maxmem
     );
+    let _ = writeln!(
+        md,
+        "| Load shape | {} · durability={}{}{} |",
+        p.rate.map_or("closed loop".to_string(), |r| format!(
+            "offered {r} ops/s (memtier --rate-limiting {} per connection × {} connections)",
+            r.div_ceil((u64::from(p.threads) * p.clients as u64).max(1)),
+            u64::from(p.threads) * p.clients as u64
+        )),
+        p.durability,
+        p.data_root.as_deref().map_or(String::new(), |d| format!(" · data root `{d}`")),
+        p.device_stat.as_deref().map_or(String::new(), |d| format!(" · device `{d}`"))
+    );
     let _ = writeln!(md);
 
     // ---- published configs ----
@@ -122,22 +146,30 @@ pub fn render(
         let _ = writeln!(md, "## Results — memtier_benchmark\n");
         let _ = writeln!(
             md,
-            "| Engine | Workload | Pipe | Throughput (ops/s) | avg (ms) | p50 (ms) | p99 (ms) | p99.9 (ms) | RSS (MiB) |"
+            "| Engine | Workload | Pipe | Throughput (ops/s) | achieved/offered | avg (ms) | p50 (ms) | p99 (ms) | p99.9 (ms) | max (ms) | server CPU (%) | device MiB written | RSS (MiB) |"
         );
-        let _ = writeln!(md, "|---|---|---:|---:|---:|---:|---:|---:|---:|");
+        let _ = writeln!(md, "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
         for c in cells {
             let Some(m) = c.memtier else { continue };
+            let achieved = m.offered_ops_per_sec.map(|offered| {
+                let x = m.ops_per_sec / offered.max(1) as f64;
+                if x < 0.9 { format!("{x:.2} ⚠ generator short") } else { format!("{x:.2}") }
+            });
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {:.0} | {:.3} | {:.3} | {:.3} | {:.3} | {} |",
+                "| {} | {} | {} | {:.0} | {} | {:.3} | {:.3} | {:.3} | {:.3} | {} | {} | {} | {} |",
                 c.engine,
                 c.workload,
                 c.pipeline,
                 m.ops_per_sec,
+                achieved.unwrap_or_else(|| "closed loop".to_string()),
                 m.avg_ms,
                 m.p50_ms,
                 m.p99_ms,
                 m.p999_ms,
+                fmt_opt(m.max_ms, 3),
+                fmt_opt(c.server_cpu_pct, 0),
+                fmt_opt(c.device_mib_written, 1),
                 fmt_opt(c.rss_mib, 1)
             );
         }
@@ -247,6 +279,19 @@ pub fn render(
         let _ = writeln!(
             md,
             "- Under docker, RSS is the container's `docker stats` memory (no separate peak); infinitydb runs with the io_uring seccomp profile because Docker's default seccomp denies io_uring."
+        );
+    }
+    if p.rate.is_some() {
+        let _ = writeln!(
+            md,
+            "- **Offered-rate row (M4.5-S40).** memtier paces each connection at `--rate-limiting` = rate ÷ connections; `achieved/offered` below 0.90 means the generator (or the server) could not hold the rate and the latency columns are not an offered-rate measurement. `max (ms)` is memtier's worst request; server CPU is the engine process's utime+stime over the row's wall time (host launches only); device MiB written is the block device's sectors-written delta across the row (journal and metadata included, NAND amplification not)."
+        );
+    }
+    if p.durability != "none (in-memory)" {
+        let _ = writeln!(
+            md,
+            "- **Durability {}.** redis ran `--appendonly yes --appendfsync everysec` (its AOF under the data root); infinitydb ran `--data-dir` with every connection starting in an `FSYNC everysec` namespace (`--conn-default-ns cmp`, proven by a probe key before the row) — the same ≤ 1 s power-loss window on both sides, each engine's own mechanism, both on the same device.",
+            p.durability
         );
     }
     let _ =

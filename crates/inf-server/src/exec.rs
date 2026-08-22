@@ -98,6 +98,15 @@ pub struct NodeInfo {
     /// assembly layer, deterministic under DST (L7).
     pub rng_state: Cell<u64>,
     pub tcp_port: Cell<u16>,
+    /// M4.5-S40 (`infinityd --conn-default-ns NAME`): every accepted
+    /// connection starts as if it had sent `INF.NS USE NAME` — the
+    /// operator's opt-in for clients that cannot send a per-connection
+    /// prelude (`memtier_benchmark`, drop-in Redis clients wanting a
+    /// durable default). Resolved by name at accept time against the
+    /// cell's catalog; a name that does not (yet) exist, or names a
+    /// topic, leaves the connection on the default db — `SELECT` and
+    /// `INF.NS USE` work as always. `None` (the default) changes nothing.
+    pub conn_default_ns: RefCell<Option<Vec<u8>>>,
     pub total_connections: Cell<u64>,
     /// Pub/sub gauges + counters (M1-S10/S11), flushed by the plane's
     /// MAINTAIN: channels this cell owns with live subscribers, live
@@ -199,6 +208,7 @@ pub struct NodeInfo {
     pub recycle_misses: Cell<u64>,
     pub recycle_fallbacks: Cell<u64>,
     pub recycle_pool_bytes: Cell<u64>,
+    pub recycle_pool_full: Cell<u64>,
     pub segment_rotations: Cell<u64>,
     pub segment_preallocs: Cell<u64>,
     pub recover_segment_residue_stops: Cell<u64>,
