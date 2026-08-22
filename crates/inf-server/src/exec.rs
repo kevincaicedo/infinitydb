@@ -163,6 +163,7 @@ pub struct NodeInfo {
     pub zero_fill_bytes: Cell<u64>,
     pub rotations_unzeroed: Cell<u64>,
     pub rotations_upgrade: Cell<u64>,
+    pub reopened_packed_tails: Cell<u64>,
     pub barrier_class_degraded: Cell<u64>,
     /// M4.5-S35 (ADR-0087 D5): the frame pipeline's configured depth, its
     /// observed high-water mark, and its two bounded waits.
@@ -185,6 +186,7 @@ pub struct NodeInfo {
     pub manifest_bytes_total: Cell<u64>,
     pub ckpt_interval_bytes: Cell<u64>,
     pub ckpt_records_since_begin: Cell<u64>,
+    pub ckpt_io_mode_buffered: Cell<u64>,
     pub write_amp_milli_log_checkpoint: Cell<u64>,
     pub write_amp_log_checkpoint_undefined: Cell<u64>,
     pub frame_waits_barrier: Cell<u64>,

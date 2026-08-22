@@ -14,7 +14,7 @@
 
 use std::io;
 use std::os::fd::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use inf_log::ckpt::{ick_file_name, ick_staging_file_name, parse_ick_file_name};
 use inf_log::fs::{SegmentFile, SegmentFs};
@@ -107,6 +107,9 @@ pub(crate) struct Streaming<File: SegmentFile> {
 pub struct CkptStats {
     pub completed: u64,
     pub aborted: u64,
+    /// 1 when the probed staging mode is `Buffered` (ADR-0088 D3 as
+    /// amended) — the disclosed fallback.
+    pub io_mode_buffered: u64,
     pub last_unix_ms: u64,
     pub last_begin_lsn: u64,
     /// Live checkpoint-buffer domain bytes (0 when idle — L5).
@@ -122,11 +125,35 @@ pub struct CkptStats {
     pub records_since_begin: u64,
 }
 
+/// How the `.ick.new` staging file is written (ADR-0088 D3 as amended
+/// 2026-08-21): `Direct` is the design (`O_DIRECT`, no page-cache lump);
+/// `Buffered` is the **probed** fallback where the filesystem or platform
+/// refuses `O_DIRECT` (macOS, some Linux filesystems) — the same v3
+/// container, aligned blocks and all, on a buffered fd. Decided once per
+/// cell at boot by creating and removing a probe file in the ckpt dir;
+/// never per checkpoint (a per-checkpoint failure would retry every slice
+/// and never complete — the unbounded-retained-log posture the review
+/// named). Disclosed: a boot line and INFO `ckpt_io_mode`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CkptIoMode {
+    Direct,
+    Buffered,
+}
+
+/// MAINTAIN slices between a checkpoint abort and the next trigger
+/// (the manifest's `RETRY_BACKOFF_SLICES` shape): a persistent create or
+/// I/O fault otherwise re-fires the trigger every slice, staging one
+/// `CkptBegin` record into the log per attempt.
+const ABORT_BACKOFF_SLICES: u32 = RETRY_BACKOFF_SLICES;
+
 pub(crate) struct CkptCell<F: SegmentFs> {
     pub cfg: CkptConfig,
     dir: PathBuf,
     cell: u16,
     fs: F,
+    io_mode: CkptIoMode,
+    /// Slices left before an aborted checkpoint may be retried.
+    backoff_slices: u32,
     next_id: u64,
     /// Manual trigger latch (`INF.CKPT` via the control handle — S20).
     pub requested: bool,
@@ -168,11 +195,14 @@ impl<F: SegmentFs> CkptCell<F> {
             .filter_map(|name| parse_ick_file_name(name))
             .max()
             .map_or(1, |max| max + 1);
+        let io_mode = probe_direct(&fs, &dir, cell)?;
         Ok(CkptCell {
             cfg,
             dir,
             cell,
             fs,
+            io_mode,
+            backoff_slices: 0,
             next_id,
             requested: false,
             req_epoch: 0,
@@ -190,6 +220,22 @@ impl<F: SegmentFs> CkptCell<F> {
     /// The id the next checkpoint will carry.
     pub fn pending_id(&self) -> u64 {
         self.next_id
+    }
+
+    /// The probed staging-file I/O mode (boot-fixed).
+    #[cfg(test)]
+    pub fn io_mode(&self) -> CkptIoMode {
+        self.io_mode
+    }
+
+    /// One MAINTAIN slice of abort backoff elapsed; `true` while the
+    /// trigger is still held.
+    pub fn tick_backoff(&mut self) -> bool {
+        if self.backoff_slices > 0 {
+            self.backoff_slices -= 1;
+            return true;
+        }
+        false
     }
 
     /// Trigger check (Idle only): manual request, the derived on-disk
@@ -257,7 +303,11 @@ impl<F: SegmentFs> CkptCell<F> {
         // the v3 vocabulary is a superset, so a v1-shaped cell writes the
         // same sections on aligned blocks.
         let mut stream = IckStream::new_v3(&self.cfg);
-        let file = self.fs.create_meta_direct(&self.dir.join(ick_staging_file_name(id)))?;
+        let path = self.dir.join(ick_staging_file_name(id));
+        let file = match self.io_mode {
+            CkptIoMode::Direct => self.fs.create_meta_direct(&path)?,
+            CkptIoMode::Buffered => self.fs.create_meta(&path)?,
+        };
         let fd = file.raw_fd().ok_or_else(|| io::Error::other("std segment tier has fds"))?;
         let lease = stream.begin(self.cell, id, begin_lsn, &ns_ids);
         self.phase = CkptPhase::Stream(Box::new(Streaming {
@@ -344,6 +394,7 @@ impl<F: SegmentFs> CkptCell<F> {
             let _ = self.fs.remove_file(&self.dir.join(ick_staging_file_name(id)));
             self.next_id = id + 1;
             self.stats.aborted += 1;
+            self.backoff_slices = ABORT_BACKOFF_SLICES;
         }
     }
 
@@ -363,8 +414,39 @@ impl<F: SegmentFs> CkptCell<F> {
             buffer_bytes,
             interval_bytes: self.interval_bytes,
             records_since_begin: records_total.saturating_sub(base),
+            io_mode_buffered: u64::from(self.io_mode == CkptIoMode::Buffered),
             ..self.stats
         }
+    }
+}
+
+/// Boot-time `O_DIRECT` probe for the ckpt dir (ADR-0088 D3 as amended):
+/// create a probe file direct, remove it. `Unsupported` / `InvalidInput`
+/// (the kernel's `EINVAL` for a filesystem without `O_DIRECT`) select
+/// `Buffered`, loudly; any other error is the boot's (a ckpt dir that
+/// cannot take a file cannot take a checkpoint either).
+fn probe_direct<F: SegmentFs>(fs: &F, dir: &Path, cell: u16) -> io::Result<CkptIoMode> {
+    let probe = dir.join(".direct-probe");
+    let _ = fs.remove_file(&probe);
+    match fs.create_meta_direct(&probe) {
+        Ok(file) => {
+            drop(file);
+            fs.remove_file(&probe)?;
+            Ok(CkptIoMode::Direct)
+        }
+        Err(err)
+            if matches!(err.kind(), io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput) =>
+        {
+            let _ = fs.remove_file(&probe);
+            eprintln!(
+                "cell {cell}: checkpoint staging falls back to buffered I/O — O_DIRECT refused \
+                 on {} ({err}); v3 blocks stay aligned, the page-cache lump ADR-0088 D3 removes \
+                 is back for this cell (INFO ckpt_io_mode:buffered)",
+                dir.display()
+            );
+            Ok(CkptIoMode::Buffered)
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -865,5 +947,69 @@ impl<F: SegmentFs> ManifestCell<F> {
 
     pub fn stats(&self) -> ManifestStats {
         self.stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inf_foundation::time::Nanos;
+    use inf_log::create_cell_dirs;
+    use inf_log::fs::sim::SimDisk;
+
+    fn cell(fs: &SimDisk) -> CkptCell<SimDisk> {
+        let dirs = create_cell_dirs(fs, Path::new("data/shard-0")).expect("dirs");
+        CkptCell::new(fs.clone(), dirs.ckpt, 0, CkptConfig::default()).expect("cell")
+    }
+
+    /// The boot probe decides the staging mode once (ADR-0088 D3 as
+    /// amended): a filesystem that refuses `O_DIRECT` selects `Buffered`
+    /// and the stream is still created — on `create_meta` — instead of
+    /// aborting every checkpoint; a filesystem that takes it stays
+    /// `Direct`. The probe file never survives the decision.
+    #[test]
+    fn probe_selects_buffered_where_direct_is_refused_and_still_opens_streams() {
+        let fs = SimDisk::new();
+        fs.refuse_direct_meta();
+        let mut ckpt = cell(&fs);
+        assert_eq!(ckpt.io_mode(), CkptIoMode::Buffered);
+        assert_eq!(ckpt.stats(0).io_mode_buffered, 1);
+        assert!(
+            fs.list_dir(Path::new("data/shard-0/ckpt")).expect("dir").is_empty(),
+            "no probe file left behind"
+        );
+        ckpt.open_stream(1, Lsn::new(SegmentId(0), 40), vec![16], false, Nanos::ZERO)
+            .expect("buffered staging file");
+        assert!(matches!(ckpt.phase, CkptPhase::Stream(_)));
+        assert_eq!(
+            fs.list_dir(Path::new("data/shard-0/ckpt")).expect("dir"),
+            vec![ick_staging_file_name(1)]
+        );
+
+        let direct = cell(&SimDisk::new());
+        assert_eq!(direct.io_mode(), CkptIoMode::Direct);
+        assert_eq!(direct.stats(0).io_mode_buffered, 0);
+    }
+
+    /// An aborted checkpoint holds the trigger for a backoff of slices —
+    /// a persistent fault no longer stages one `CkptBegin` per slice.
+    #[test]
+    fn abort_backs_off_before_the_trigger_refires() {
+        let fs = SimDisk::new();
+        let mut ckpt = cell(&fs);
+        assert!(!ckpt.tick_backoff(), "fresh cell: no backoff");
+        ckpt.requested = true;
+        ckpt.open_stream(1, Lsn::new(SegmentId(0), 40), vec![16], false, Nanos::ZERO)
+            .expect("stream");
+        ckpt.abort("test", "injected");
+        assert!(matches!(ckpt.phase, CkptPhase::Idle));
+        assert_eq!(ckpt.stats(0).aborted, 1);
+        let mut held = 0;
+        while ckpt.tick_backoff() {
+            held += 1;
+        }
+        assert_eq!(held, ABORT_BACKOFF_SLICES);
+        assert!(ckpt.should_begin(0, 0), "the manual request survives the backoff");
+        assert!(!ckpt.tick_backoff(), "backoff is one-shot per abort");
     }
 }

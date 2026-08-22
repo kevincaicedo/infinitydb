@@ -62,6 +62,7 @@ sim-smoke:
     cargo run --release --bin inf-sim -- --scenario m4-diskfull --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m4-tiered --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m2-device-budget --seed 0xC0FFEE --verify-determinism
+    cargo run --release --bin inf-sim -- --scenario m2-mode-transition --seed 0xC0FFEE --verify-determinism
 
 # M2-S19 durability sweep (the §6 dst_sweep gate shape). Usage:
 #   just durable-sweep [seeds] [base]
@@ -88,6 +89,23 @@ budget-sweep seeds="1000" base="0xB0D6E700":
     out=$(mktemp -d)
     for i in 0 1 2 3 4 5 6 7; do
         ./target/release/inf-sim --scenario m2-device-budget --sweep {{seeds}} --seed {{base}} \
+            --shard "$i/8" --out "$out" & done
+    wait
+    cat "$out"/manifest-shard-*.txt
+
+# Barrier-class transition sweep (ADR-0086 D4 / ADR-0031 D5 as amended,
+# 2026-08-21): two lives per seed — FLUSH → FUA on even seeds (a packed
+# tail reopened under a Direct rotor after a dirty cut), FUA → FLUSH on
+# odd — under the m2 durability oracle, with the stale-residue recovery
+# rule exercised by the no-checkpoint half. Usage:
+#   just transition-sweep [seeds] [base]
+transition-sweep seeds="4000" base="0x7A4E0000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --bin inf-sim
+    out=$(mktemp -d)
+    for i in 0 1 2 3 4 5 6 7; do
+        ./target/release/inf-sim --scenario m2-mode-transition --sweep {{seeds}} --seed {{base}} \
             --shard "$i/8" --out "$out" & done
     wait
     cat "$out"/manifest-shard-*.txt

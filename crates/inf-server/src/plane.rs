@@ -2811,6 +2811,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.zero_fill_bytes.set(stats.zero_fill_bytes);
             node.rotations_unzeroed.set(stats.rotations_unzeroed);
             node.rotations_upgrade.set(stats.rotations_upgrade);
+            node.reopened_packed_tails.set(stats.reopened_packed_tails);
             node.barrier_class_degraded.set(stats.barrier_class_degraded);
             node.frames_in_flight.set(stats.frames_in_flight);
             node.frames_in_flight_max.set(stats.frames_in_flight_max);
@@ -2839,6 +2840,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.manifest_bytes_total.set(stats.manifest_bytes_total);
             node.ckpt_interval_bytes.set(stats.ckpt_interval_bytes);
             node.ckpt_records_since_begin.set(stats.ckpt_records_since_begin);
+            node.ckpt_io_mode_buffered.set(stats.ckpt_io_mode_buffered);
             node.write_amp_milli_log_checkpoint.set(stats.write_amp_milli_log_checkpoint);
             node.write_amp_log_checkpoint_undefined.set(stats.write_amp_log_checkpoint_undefined);
             let ckpt = cell.ckpt_stats();

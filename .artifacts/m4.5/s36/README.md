@@ -43,11 +43,11 @@ and campaign 1 already runs with it (14–20 publishes per 20 s).
 
 | arm | closed-loop ops/s | CPU % of 400 | max | ckpts / 20 s | ckpt ÷ log (milli) | padding % of log | write-amp (milli) | offered 100k: achieved · p99 · max |
 |---|---|---|---|---|---|---|---|---|
-| budget on (1) | 200 k | 228 | 419 ms | 20 | 144 | ~70 | 1 874 | 99 998 · 135 µs · **6.3 ms** |
-| budget off (1) | 258 k | 267 | 158 ms | 29 | 169 | ~70 | 1 891 | 99 997 · 139 µs · **4.2 ms** |
-| budget on (2) | 298 k | **307** | 113 ms | 34 | 166 | ~70 | 2 002 | 99 997 · 127 µs · **3.5 ms** |
-| budget off (2) | 191 k | 204 | 408 ms | 19 | 146 | ~70 | 1 689 | 99 997 · 135 µs · **3.8 ms** |
-| seal pace (probe rate) | 276 k | 261 | 185 ms | 29 | 182 | lower (larger frames) | 1 586 | 99 997 · 131 µs · **5.1 ms** |
+| budget on (1) | 200 k | 228 | 419 ms | 20 | 144 | 39 (derived) | 1 874 | 99 998 · 135 µs · **6.3 ms** |
+| budget off (1) | 258 k | 267 | 158 ms | 29 | 169 | 38 (derived) | 1 891 | 99 997 · 139 µs · **4.2 ms** |
+| budget on (2) | 298 k | **307** | 113 ms | 34 | 166 | 42 (derived) | 2 002 | 99 997 · 127 µs · **3.5 ms** |
+| budget off (2) | 191 k | 204 | 408 ms | 19 | 146 | 32 (derived) | 1 689 | 99 997 · 135 µs · **3.8 ms** |
+| seal pace (probe rate) | 276 k | 261 | 185 ms | 29 | 182 | 25 (derived; larger frames) | 1 586 | 99 997 · 131 µs · **5.1 ms** |
 
 tmpfs control (flush class, every arm): 462–468 k ops/s at 402–403 %.
 `zero_fill_bytes = 0` in every device arm (the gate); `parked` 3.3–6.9 k
@@ -66,8 +66,16 @@ per closed-loop leg, 0 at the offered rate.
    200 k / 298 k vs off 258 k / 191 k — the repeat-to-repeat variance
    (drive state without `fstrim`) exceeds any budget effect; the engine
    is device-bound at closed-loop saturation in every arm (204–307 %,
-   0.41–0.64 × tmpfs), with log bytes at 340–540 MB/s of which ~70 % is
-   v3 frame padding (2.2 records per 4 KiB frame at K = 3 × 32 conns).
+   0.41–0.64 × tmpfs), with log bytes at 340–540 MB/s of which **32–42 %**
+   is v3 frame padding + framing (2.2 records × ~1.05 KiB per 4 KiB frame
+   at K = 3 × 32 conns). **Correction (2026-08-21, review):** this README
+   first said "~70 %"; that number was never in the reports (the row's
+   `log_padding_pct` field landed in `417c821`, after these runs) and it
+   does not reconcile with the combined figure (70 % padding would put the
+   log term alone at ≥ 3.3×). The column above is *derived* per arm as
+   `1 − append_bytes / log_frame_bytes` with `append_bytes = (log_frame_
+   bytes + ckpt_bytes_total) / write_amp_milli`; the next S36 row emits
+   `log_padding_bytes` and `log_padding_pct` raw.
    ADR-0088 D9's falsifier fired as written: the binding variable is the
    device's own write floor at this offered rate, not background I/O —
    the row is a device row; the comparator claim is "device-bound where

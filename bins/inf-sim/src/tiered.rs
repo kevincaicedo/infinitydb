@@ -167,6 +167,7 @@ impl TieredScenario {
             frames_in_flight: 1,
             device: Default::default(),
             budget_oracle: false,
+            prelude: None,
         }
     }
 }

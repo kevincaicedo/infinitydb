@@ -285,6 +285,9 @@ pub struct GroupCommit<File> {
     /// Frames queued and not yet written, in queue order (ADR-0087 D2) —
     /// bounded by the staging ring's `frames_in_flight`, release-asserted.
     queued: VecDeque<QueuedFrame>,
+    /// Queued frames without their `LogWritten` yet — bounded by the
+    /// staging ring's in-flight slots (`MAX_FRAMES_IN_FLIGHT`).
+    unwritten: u8,
     next_frame_id: u64,
     /// Exclusive end of the completion-ordered written prefix: every
     /// frame below it has its `LogWritten`. What an fdatasync can cover.
@@ -348,6 +351,7 @@ impl<File: SegmentFile> GroupCommit<File> {
             queued_up_to: None,
             queued_bytes: 0,
             queued: VecDeque::with_capacity(usize::from(MAX_FRAMES_IN_FLIGHT) + 1),
+            unwritten: 0,
             next_frame_id: 0,
             written_up_to: None,
             written_bytes: 0,
@@ -628,14 +632,23 @@ impl<File: SegmentFile> GroupCommit<File> {
         // Release assert (M2.5-S13): out-of-order queue breaks the LSN↔seq
         // FIFO the ack gate and reader rely on. Per-batch, free.
         assert!(self.queued_up_to.is_none_or(|q| q < end), "frames queue in append order");
+        // The bound is on *unwritten* frames — what the staging ring holds
+        // in flight. The queue itself also holds frames that landed ahead
+        // of an earlier one still in flight (ADR-0087 D2: completions in
+        // any order, the written prefix waits for the front), so under a
+        // device tail that wedges one plain write while barrier-less
+        // frames keep landing it legitimately grows past K (the
+        // `m2-mode-transition` sweep found this release-assert mis-scoped:
+        // seven `everysec` frames behind one late write crashed the cell).
         assert!(
-            self.queued.len() < usize::from(MAX_FRAMES_IN_FLIGHT),
-            "more frames queued than the ring can hold in flight"
+            self.unwritten < MAX_FRAMES_IN_FLIGHT,
+            "more frames in flight than the ring can hold"
         );
         self.queued_up_to = Some(end);
         self.queued_bytes += u64::from(frame_len);
         self.next_frame_id += 1;
         let id = FrameId(self.next_frame_id);
+        self.unwritten += 1;
         self.queued.push_back(QueuedFrame {
             id,
             end,
@@ -814,6 +827,7 @@ impl<File: SegmentFile> GroupCommit<File> {
             .expect("LogWritten for a frame that was not queued");
         assert!(!frame.written, "frame written twice");
         frame.written = true;
+        self.unwritten -= 1;
         while let Some(front) = self.queued.front() {
             if !front.written {
                 break;
@@ -824,9 +838,18 @@ impl<File: SegmentFile> GroupCommit<File> {
         }
     }
 
-    /// Frames queued and not yet known written (`0..=frames_in_flight`).
+    /// Frames queued and not yet known written (`0..=frames_in_flight`) —
+    /// the in-flight count, not the queue's length (the queue also holds
+    /// written frames waiting behind an unwritten earlier one).
     #[must_use]
     pub fn frames_unwritten(&self) -> usize {
+        usize::from(self.unwritten)
+    }
+
+    /// Frames queued and not yet part of the written prefix: the
+    /// unwritten ones plus those that landed ahead of an earlier one.
+    #[must_use]
+    pub fn frames_behind_prefix(&self) -> usize {
         self.queued.len()
     }
 
@@ -983,6 +1006,33 @@ mod tests {
 
     fn commit() -> GroupCommit<MemFile> {
         GroupCommit::new()
+    }
+
+    /// One late plain write at the front with many barrier-less frames
+    /// landing behind it (the `m2-mode-transition` seed `0x7a4e01cb`
+    /// shape): the queue grows past `MAX_FRAMES_IN_FLIGHT` while the
+    /// in-flight count never exceeds the ring's K — the ledger must keep
+    /// them, not assert. The prefix then advances past all of them at once.
+    #[test]
+    fn late_front_write_with_many_landed_behind_it_is_kept_not_asserted() {
+        let mut gc = commit();
+        let mut ids = Vec::new();
+        for i in 1..=(u32::from(MAX_FRAMES_IN_FLIGHT) + 4) {
+            gc.note_staged(FsyncClass::Everysec);
+            assert_eq!(gc.frame_plan(false, false), FramePlan::Plain, "frame {i}");
+            ids.push(gc.note_frame_queued(lsn(0, i * 64), 64));
+            // Every frame but the first lands at once: K = 2 in flight.
+            if i > 1 {
+                gc.note_frame_written(ids[i as usize - 1]);
+            }
+            assert!(gc.frames_unwritten() <= 1);
+            assert_eq!(gc.frames_behind_prefix(), i as usize);
+            assert_eq!(gc.written_up_to, None, "the prefix waits for the front");
+        }
+        gc.note_frame_written(ids[0]);
+        assert_eq!(gc.frames_behind_prefix(), 0);
+        assert_eq!(gc.frames_unwritten(), 0);
+        assert_eq!(gc.written_up_to, Some(lsn(0, (u32::from(MAX_FRAMES_IN_FLIGHT) + 4) * 64)));
     }
 
     /// `LogWritten` for the oldest frame still unwritten — the K = 1

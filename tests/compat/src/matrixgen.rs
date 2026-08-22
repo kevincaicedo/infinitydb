@@ -630,7 +630,14 @@ pub fn render() -> String {
     push("not designed behaviour. A durable write whose record can never fit the");
     push("staging domain refuses up front with typed");
     push("`ERR write exceeds durable log staging capacity` — non-retryable by");
-    push("design (ADR-0083 D2; retrying it is a livelock).");
+    push("design (ADR-0083 D2; retrying it is a livelock). That bound is the");
+    push("staging buffer minus the frame framing: **4 MiB − 56 B per record at the");
+    push("default `--log-staging-mib 4`** (2 MiB − 56 B under the measured");
+    push("`--frames-in-flight 3 --log-staging-mib 2` arm, ADR-0087 D1) — below the");
+    push("16 MiB − 1 record-format cap memory namespaces honour in full; tiered");
+    push("namespaces route values at or above `BLOB-THRESHOLD` out of line and are");
+    push("not bound by it. The barrier class (`--barrier-class`, ADR-0086) and the");
+    push("frame pipeline depth do not move the bound; only the staging buffer size does.");
     push("");
     push("## Absent (owner milestone)");
     push("");

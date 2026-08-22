@@ -548,3 +548,115 @@ fn zero_fill_is_paced_by_the_active_segments_fill() {
     assert_eq!(total, bound(rotor.active_written()), "2× gain over the log's own rate");
     assert!(rotor.next_zero_filling());
 }
+
+// ---- FLUSH → FUA on an existing log (ADR-0086 D4 as amended, 2026-08-21) ----
+
+/// A packed (v2) tail reopened under a `Direct` rotor keeps packing —
+/// `Buffered` at its exact end, no alignment slack — and upgrades at the
+/// next rotation; the reader then walks v2 → v2 → v3 without a gap. The
+/// review finding this pins: rounding the tail up to 4 KiB left a zero
+/// word the reader took for end-of-log, and the frame beyond it (an
+/// acked `always` record) was discarded as un-attested residue on the
+/// following boot.
+#[test]
+fn packed_tail_reopens_buffered_under_a_direct_rotor_and_upgrades_at_rotation() {
+    let disk = SimDisk::new();
+    let dir = PathBuf::from("log");
+    disk.create_dir_all(&dir).expect("dir");
+    let segment_bytes = 16 << 10;
+    let buffered_cfg =
+        SegmentConfig { segment_bytes, io_mode: SegmentIoMode::Buffered, ..Default::default() };
+    let frame = |seq: u64, first: Lsn, layout: FrameLayout| {
+        let mut b = FrameBuilder::new();
+        b.append(&record(seq as u8));
+        b.finalize(first, stamp(seq), layout).to_vec()
+    };
+    let frame_len = |seq: u8| {
+        let mut b = FrameBuilder::new();
+        b.append(&record(seq));
+        b.frame_len()
+    };
+    // Life 1 (FLUSH class): one packed frame; its end is not aligned.
+    let packed_end = {
+        let mut rotor =
+            SegmentRotor::create_fresh(disk.clone(), dir.clone(), buffered_cfg).expect("fresh");
+        let slot = rotor.begin_frame(frame_len(1), 0).expect("reserve");
+        assert_eq!(slot.layout(), FrameLayout::Packed);
+        let bytes = frame(1, slot.first_record_lsn(), FrameLayout::Packed);
+        rotor.commit_frame(slot, &bytes).expect("commit");
+        rotor.active_written()
+    };
+    assert!(!packed_end.is_multiple_of(FRAME_ALIGN), "a ~250-byte v2 frame ends unaligned");
+
+    // Life 2 (FUA class configured): the tail reopens Buffered, at its end.
+    let scan = inf_log::scan_log_dir(&disk, &dir).expect("scan");
+    let mut rotor = SegmentRotor::open_existing(
+        disk.clone(),
+        dir.clone(),
+        direct_cfg(segment_bytes),
+        &scan,
+        packed_end,
+    )
+    .expect("reopen");
+    assert_eq!(rotor.active_io_mode(), SegmentIoMode::Buffered, "packed tail keeps packing");
+    assert_eq!(rotor.active_written(), packed_end, "no alignment slack inserted");
+    assert!(!rotor.active_write_through());
+    assert_eq!(rotor.stats().reopened_packed_tails, 1);
+    // The second frame lands packed, contiguous with the first.
+    let len = frame_len(2);
+    let (slot, handoff) = rotor.begin_frame_deferred(len, 0).expect("reserve");
+    assert!(handoff.is_none());
+    assert_eq!(slot.layout(), FrameLayout::Packed);
+    assert_eq!(slot.base().offset, packed_end);
+    let second = frame(2, slot.first_record_lsn(), FrameLayout::Packed);
+    disk.driver_write_at(rotor.active_raw_fd().expect("fd"), u64::from(packed_end), &second)
+        .expect("write");
+    rotor.commit_frame_queued(slot);
+    let second_end = rotor.active_written();
+    // MAINTAIN pre-zeroes segment 1; the next frame is the upgrade rotation.
+    rotor.maintain_deferred(0).expect("maintain");
+    disk.sync_dir(&dir).expect("names");
+    zero_fill_to_ready(&mut rotor, &disk, segment_bytes);
+    let (slot, handoff) = rotor.begin_frame_deferred(len, 0).expect("reserve");
+    let handoff = handoff.expect("upgrade rotation seals segment 0");
+    assert_eq!(handoff.end_offset(), second_end, "segment 0 seals at its packed end");
+    assert_eq!(slot.base(), Lsn::new(SegmentId(1), 0));
+    assert_eq!(slot.layout(), FrameLayout::Aligned);
+    assert!(slot.write_through_ok());
+    assert_eq!(rotor.active_io_mode(), SegmentIoMode::Direct);
+    assert_eq!(rotor.stats().rotations_upgrade, 1);
+    let third = frame(3, slot.first_record_lsn(), FrameLayout::Aligned);
+    disk.driver_write_through(rotor.active_raw_fd().expect("fd"), 0, &third).expect("through");
+    rotor.commit_frame_queued(slot);
+    drop(handoff);
+
+    // Every frame is reachable: segment 0 reads two packed frames to a
+    // clean end at `second_end`; segment 1 reads the aligned one.
+    let mut reader =
+        SegmentReader::open(&disk, &dir, SegmentId(0), ReaderConfig::default()).expect("open");
+    let mut seen = 0;
+    while reader.next_frame().expect("frame").is_some() {
+        seen += 1;
+    }
+    assert_eq!(seen, 2);
+    assert_eq!(reader.read_end(), Some(ReadEnd::ZeroTail { at: second_end }));
+    let mut reader =
+        SegmentReader::open(&disk, &dir, SegmentId(1), ReaderConfig::default()).expect("open");
+    assert!(reader.next_frame().expect("frame").is_some());
+    assert!(reader.next_frame().expect("frame").is_none());
+    assert_eq!(reader.read_end(), Some(ReadEnd::ZeroTail { at: FRAME_ALIGN }));
+
+    // An aligned tail (the v3 end) reopens Direct — the transition rule
+    // binds on the tail's shape, not on the log's history.
+    let scan = inf_log::scan_log_dir(&disk, &dir).expect("scan");
+    let rotor = SegmentRotor::open_existing(
+        disk.clone(),
+        dir.clone(),
+        direct_cfg(segment_bytes),
+        &scan,
+        FRAME_ALIGN,
+    )
+    .expect("reopen");
+    assert_eq!(rotor.active_io_mode(), SegmentIoMode::Direct);
+    assert_eq!(rotor.stats().reopened_packed_tails, 0);
+}

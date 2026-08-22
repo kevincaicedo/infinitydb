@@ -130,6 +130,22 @@ pub struct DurableScenario {
     /// scenario arms both; every other scenario stays byte-identical).
     pub device: inf_server::DeviceConfig,
     pub budget_oracle: bool,
+    /// A first life in another barrier class (ADR-0086 D4 as amended,
+    /// 2026-08-21): the cell boots in `prelude.io_mode`, the writers run
+    /// `prelude.ops_per_writer` ops, the log quiesces to full durability,
+    /// the node restarts cleanly into `io_mode`, and the scenario proper
+    /// runs from there — the FLUSH ↔ FUA transition on an existing log
+    /// (a packed tail reopened under a `Direct` rotor, a v3 tail reopened
+    /// `Buffered`) under the same durability oracle. `None` = one life,
+    /// byte-identical to the pre-amendment scenarios.
+    pub prelude: Option<Prelude>,
+}
+
+/// The transition prelude (see [`DurableScenario::prelude`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Prelude {
+    pub io_mode: SegmentIoMode,
+    pub ops_per_writer: u64,
 }
 
 /// The S14 reference stall device: ~120 µs base (warm NVMe fdatasync),
@@ -212,7 +228,60 @@ impl DurableScenario {
             },
             device: Default::default(),
             budget_oracle: false,
+            prelude: None,
         }
+    }
+
+    /// `m2-mode-transition` (ADR-0086 D4 as amended, 2026-08-21): the m2
+    /// durable shape with a **prelude life in the other barrier class**.
+    /// Even seeds go FLUSH → FUA (the packed tail reopened under a
+    /// `Direct` rotor — the review's lost-acked-record shape: the
+    /// prelude's last frame is v2, its end unaligned, and the main life
+    /// acks `always` writes on that tail before the cut); odd seeds go
+    /// FUA → FLUSH (packed frames at a v3 tail's aligned end). K varies
+    /// as in `m2_durable`; the stall device and the double cut ride
+    /// along. The prelude quiesces to full durability before its clean
+    /// restart, so the one loss window the oracle reasons about is the
+    /// main life's cut.
+    #[must_use]
+    pub fn m2_mode_transition(seed: u64) -> DurableScenario {
+        let mut scenario = DurableScenario::m2_durable(seed);
+        let (first, second) = if seed.is_multiple_of(2) {
+            (SegmentIoMode::Buffered, SegmentIoMode::Direct)
+        } else {
+            (SegmentIoMode::Direct, SegmentIoMode::Buffered)
+        };
+        scenario.io_mode = second;
+        scenario.prelude = Some(Prelude { io_mode: first, ops_per_writer: 40 });
+        // The device budget (ADR-0088 D2) at the `m2-device-budget`
+        // model, 32 KiB/s per device: the zero-fill class's share grants
+        // the 16 KiB next-segment fill only after ~1–2 sim-seconds, so
+        // the first frames of a `Direct` life land in the reopened tail
+        // *before* the class-upgrade rotation — the production window (a
+        // 256 MiB zero-fill is ~0.5–1 s; an `everysec`-only cell never
+        // upgrades at all) where the pre-amendment round-up lost acked
+        // records. Foreground frames are metered, never deferred, so the
+        // durability oracle's timing stays the m2 shape's.
+        let model = inf_runtime::DeviceModel {
+            write_bytes_per_s: 32 << 10,
+            write_ops_per_s: 4_000,
+            read_bytes_per_s: 32 << 10,
+            read_ops_per_s: 4_000,
+        };
+        scenario.device = inf_server::DeviceConfig {
+            model_share: model.share(scenario.cells),
+            seal_barriers_per_s: 0,
+        };
+        // Half of the FLUSH → FUA seeds run without automatic checkpoints:
+        // the reopened segment then stays inside the replayed log until
+        // the main life's cut, so the boot after it must cross the
+        // transition point — with the 24 KiB interval the segment is
+        // checkpointed and truncated away first, and the other half keeps
+        // that (checkpoint + truncation across the transition) covered.
+        if seed.is_multiple_of(4) {
+            scenario.ckpt_interval_bytes = 0;
+        }
+        scenario
     }
 
     /// M4.5-S36 (ADR-0088 D8) — `m2-device-budget`: the m2 durable shape
@@ -273,6 +342,7 @@ impl DurableScenario {
                 seal_barriers_per_s: 2_000 / u64::from(cells),
             },
             budget_oracle: true,
+            prelude: None,
         }
     }
 
@@ -311,6 +381,7 @@ impl DurableScenario {
             frames_in_flight: 1,
             device: Default::default(),
             budget_oracle: false,
+            prelude: None,
         }
     }
 }
@@ -369,6 +440,10 @@ pub struct DurableReport {
     pub budget_deferrals: u64,
     pub frame_waits_pace: u64,
     pub write_stall_max_us: u64,
+    /// Packed tails reopened `Buffered` under a `Direct` rotor at the
+    /// transition boot (ADR-0086 D4 as amended) — the `m2-mode-transition`
+    /// FLUSH → FUA seeds report ≥ 1 per cell that had a v2 tail.
+    pub reopened_packed_tails: u64,
 }
 
 impl DurableReport {
@@ -557,6 +632,90 @@ impl Writer {
 
     pub(crate) fn last_state(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.ledger.get(key).and_then(|ops| ops.last()).and_then(|op| op.state_after.clone())
+    }
+
+    /// Absorb one reply: the USE handshake, then the in-flight op's
+    /// expectation, its ledger ack, and the class latency oracles (the
+    /// everysec deferral bound, the always ack maximum).
+    pub(crate) fn absorb_reply(
+        &mut self,
+        reply: Vec<u8>,
+        now: Nanos,
+        seed: u64,
+        report: &mut DurableReport,
+    ) {
+        if self.setup {
+            if reply != b"+OK\r\n" {
+                report.violations.push(format!("writer {}: USE answered {reply:?}", self.id));
+            }
+            self.setup = false;
+            return;
+        }
+        let Some(pending) = self.inflight.take() else {
+            report.violations.push(format!("writer {}: unsolicited reply {reply:?}", self.id));
+            return;
+        };
+        if reply != pending.expect {
+            report.violations.push(format!(
+                "writer {} key {:?}: expected {:?}, got {:?}",
+                self.id,
+                String::from_utf8_lossy(&pending.key),
+                String::from_utf8_lossy(&pending.expect),
+                String::from_utf8_lossy(&reply)
+            ));
+        }
+        if pending.mutates {
+            let ops = self.ledger.entry(pending.key.clone()).or_default();
+            let rec = ops.last_mut().expect("sent op has a ledger entry");
+            rec.acked_at = Some(now);
+            // The group-commit-class oracle (M2.5-S14, §1.5): an everysec
+            // ack is deferred, never device-gated — under a stall a gated
+            // ack inherits the episode.
+            let latency = now.saturating_sub(rec.sent_at);
+            match self.class {
+                NsClass::Everysec if latency > EVERYSEC_ACK_BOUND => {
+                    report.violations.push(format!(
+                        "EVERYSEC DEFERRAL VIOLATION seed {:#x} writer {} key {:?}: ack \
+                         latency {} ms exceeds {} ms — everysec acked behind the device",
+                        seed,
+                        self.id,
+                        String::from_utf8_lossy(&pending.key),
+                        latency.as_millis(),
+                        EVERYSEC_ACK_BOUND.as_millis()
+                    ));
+                }
+                NsClass::Always => {
+                    report.always_ack_latency_ms_max =
+                        report.always_ack_latency_ms_max.max(latency.as_millis());
+                }
+                _ => {}
+            }
+        }
+        self.replied += 1;
+        report.commands_done += 1;
+    }
+
+    /// Re-attach to a rebooted node (the prelude's clean restart): a fresh
+    /// connection, the USE handshake again, the quota reset for the next
+    /// life; the ledger carries forward.
+    pub(crate) fn reconnect(&mut self, node: &mut Node, quota: u64) {
+        debug_assert!(self.inflight.is_none(), "reconnect after quiescence only");
+        self.fd = node.nets[self.cell].borrow_mut().connect();
+        self.setup = self.class != NsClass::Memory;
+        if self.setup {
+            node.nets[self.cell]
+                .borrow_mut()
+                .client_send(self.fd, &encode(&[b"INF.NS", b"USE", self.class.name()]));
+        }
+        self.sent = 0;
+        self.replied = 0;
+        self.quota = quota;
+        // A memory namespace holds nothing across a restart: the model
+        // starts empty, as the keyspace does (the durable ledgers carry
+        // forward — they are what the final audit binds).
+        if self.class == NsClass::Memory {
+            self.ledger.clear();
+        }
     }
 
     /// Builds the next command + its exact expected reply.
@@ -858,13 +1017,25 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         budget_deferrals: 0,
         frame_waits_pace: 0,
         write_stall_max_us: 0,
+        reopened_packed_tails: 0,
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
     };
 
     // ---- boot 1 + DDL ------------------------------------------------
-    let mut node = match boot(scenario, PathBuf::from("node"), &disk, &clock, &observer) {
+    // With a prelude the first life runs in the prelude's barrier class
+    // (ADR-0086 D4 as amended); the scenario's own class boots at the
+    // clean restart below.
+    let first_life = match scenario.prelude {
+        Some(prelude) => {
+            let mut first = scenario.clone();
+            first.io_mode = prelude.io_mode;
+            first
+        }
+        None => scenario.clone(),
+    };
+    let mut node = match boot(&first_life, PathBuf::from("node"), &disk, &clock, &observer) {
         Ok(node) => node,
         Err(err) => {
             fail(&mut report, format!("boot 1 failed: {err}"));
@@ -912,7 +1083,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                 fd,
                 class,
                 scenario.seed,
-                scenario.ops_per_writer,
+                scenario.prelude.map_or(scenario.ops_per_writer, |p| p.ops_per_writer),
                 class != NsClass::Memory,
                 0,
             );
@@ -923,6 +1094,111 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             }
             writers.push(writer);
             id += 1;
+        }
+    }
+
+    // ---- the transition prelude (ADR-0086 D4 as amended) ---------------
+    // One life in the other barrier class, cut **dirty** at a seeded step
+    // inside its traffic window — the shape that reopens a data-bearing
+    // tail: a torn tail truncates at the last valid frame's end (a v2
+    // frame's unaligned end under FLUSH), MAINTAIN's empty next segment is
+    // removed with the residue, and the next life's rotor resumes *there*.
+    // (A clean quiesce leaves the empty next segment as the tail and the
+    // transition never touches packed data.) The prelude's ledgers are
+    // audited against this cut at the transition boot, then rebased to
+    // the recovered state, so the final audit binds the main life's cut
+    // with the recovered prefix required.
+    if scenario.prelude.is_some() {
+        assert_eq!(scenario.workload, DurableWorkload::KeyValue, "prelude is a KV-only shape");
+        let prelude_ops: u64 = writers.iter().map(|w| w.quota).sum();
+        let prelude_cut = 100 + rng.next_below(prelude_ops * 6);
+        for _ in 0..prelude_cut {
+            report.scheduler_steps += 1;
+            if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
+                fail(&mut report, format!("prelude phase: {err}"));
+                return finish(report, &observer, &clock);
+            }
+            for writer in &mut writers {
+                let mut net = node.nets[writer.cell].borrow_mut();
+                let bytes = net.client_recv(writer.fd);
+                writer.rx.extend_from_slice(&bytes);
+                while let Some(n) = reply_len(&writer.rx) {
+                    let reply: Vec<u8> = writer.rx.drain(..n).collect();
+                    writer.absorb_reply(reply, clock.now(), scenario.seed, &mut report);
+                }
+                if writer.setup || writer.inflight.is_some() || writer.sent >= writer.quota {
+                    continue;
+                }
+                let (wire, pending) = writer.next_command(scenario);
+                if pending.mutates {
+                    writer.ledger.entry(pending.key.clone()).or_default().push(OpRec {
+                        state_after: pending.state_after.clone(),
+                        sent_at: clock.now(),
+                        acked_at: None,
+                    });
+                }
+                writer.inflight = Some(pending);
+                net.client_send(writer.fd, &wire);
+                writer.sent += 1;
+            }
+        }
+        let prelude_cut_time = clock.now();
+        drop(node);
+        disk.power_cut(scenario.seed ^ 0x0FF5_EED2);
+        node = match boot(scenario, PathBuf::from("node"), &disk, &clock, &observer) {
+            Ok(node) => node,
+            Err(err) => {
+                fail(&mut report, format!("transition boot refused: {err}"));
+                return finish(report, &observer, &clock);
+            }
+        };
+        let mut steps = 0u64;
+        while !node.ready() {
+            steps += 1;
+            report.scheduler_steps += 1;
+            if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
+                // A taxonomy refusal at the transition boot is a finding
+                // here, not a legal outcome: the transition must never
+                // turn a recoverable image into a refused one.
+                fail(&mut report, format!("transition boot failed: {err}"));
+                return finish(report, &observer, &clock);
+            }
+            if steps > STALL_STEPS {
+                report.stalled = true;
+                fail(&mut report, "recovery stalled on the transition boot".to_owned());
+                return finish(report, &observer, &clock);
+            }
+        }
+        // The transition's observable: packed tails reopened packed
+        // (FLUSH → FUA); FUA → FLUSH reopens at an aligned v3 end.
+        for cell in 0..usize::from(scenario.cells) {
+            if let Some(stats) = node.plane(cell).durable_stats() {
+                report.reopened_packed_tails += stats.reopened_packed_tails;
+            }
+        }
+        // Every writer's in-flight op is now unacked forever (the cut ate
+        // the reply path): the ledger already holds it with `acked_at:
+        // None`, which is exactly what the audit's admissible set expects.
+        for writer in &mut writers {
+            writer.inflight = None;
+        }
+        if audit_ledgers(
+            &mut node,
+            &mut writers,
+            &mut rng,
+            &clock,
+            &disk,
+            scenario,
+            prelude_cut_time,
+            Some(clock.now()),
+            &mut report,
+        )
+        .is_err()
+        {
+            return finish(report, &observer, &clock);
+        }
+        for writer in &mut writers {
+            writer.reconnect(&mut node, scenario.ops_per_writer);
         }
     }
 
@@ -958,60 +1234,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             writer.rx.extend_from_slice(&bytes);
             while let Some(n) = reply_len(&writer.rx) {
                 let reply: Vec<u8> = writer.rx.drain(..n).collect();
-                if writer.setup {
-                    if reply != b"+OK\r\n" {
-                        report
-                            .violations
-                            .push(format!("writer {}: USE answered {reply:?}", writer.id));
-                    }
-                    writer.setup = false;
-                    continue;
-                }
-                let Some(pending) = writer.inflight.take() else {
-                    report
-                        .violations
-                        .push(format!("writer {}: unsolicited reply {reply:?}", writer.id));
-                    continue;
-                };
-                if reply != pending.expect {
-                    report.violations.push(format!(
-                        "writer {} key {:?}: expected {:?}, got {:?}",
-                        writer.id,
-                        String::from_utf8_lossy(&pending.key),
-                        String::from_utf8_lossy(&pending.expect),
-                        String::from_utf8_lossy(&reply)
-                    ));
-                }
-                if pending.mutates {
-                    let ops = writer.ledger.entry(pending.key.clone()).or_default();
-                    let rec = ops.last_mut().expect("sent op has a ledger entry");
-                    rec.acked_at = Some(clock.now());
-                    // The group-commit-class oracle (M2.5-S14, §1.5): an
-                    // everysec ack is deferred, never device-gated —
-                    // under a stall a gated ack inherits the episode.
-                    let latency = clock.now().saturating_sub(rec.sent_at);
-                    match writer.class {
-                        NsClass::Everysec if latency > EVERYSEC_ACK_BOUND => {
-                            report.violations.push(format!(
-                                "EVERYSEC DEFERRAL VIOLATION seed {:#x} writer {} key {:?}: \
-                                 ack latency {} ms exceeds {} ms — everysec acked behind the \
-                                 device",
-                                scenario.seed,
-                                writer.id,
-                                String::from_utf8_lossy(&pending.key),
-                                latency.as_millis(),
-                                EVERYSEC_ACK_BOUND.as_millis()
-                            ));
-                        }
-                        NsClass::Always => {
-                            report.always_ack_latency_ms_max =
-                                report.always_ack_latency_ms_max.max(latency.as_millis());
-                        }
-                        _ => {}
-                    }
-                }
-                writer.replied += 1;
-                report.commands_done += 1;
+                writer.absorb_reply(reply, clock.now(), scenario.seed, &mut report);
             }
             if writer.setup || writer.inflight.is_some() || writer.sent >= writer.quota {
                 continue;
@@ -1212,22 +1435,62 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
     report.corpus_documents_used = writers.iter().map(|w| w.corpus_docs_used).sum();
 
     // ---- audit ----------------------------------------------------------
-    let mut audit = MiniClient::connect(&mut node, 0);
+    if audit_ledgers(
+        &mut node,
+        &mut writers,
+        &mut rng,
+        &clock,
+        &disk,
+        scenario,
+        cut_time,
+        None,
+        &mut report,
+    )
+    .is_err()
+    {
+        return finish(report, &observer, &clock);
+    }
+
+    finish(report, &observer, &clock)
+}
+
+/// The §8.2 audit of every durable ledger against the recovered node:
+/// per key, the required op (the last one acked inside the class's
+/// promise before `cut_time`) and the admissible states. With
+/// `rebase = Some(boot)` (the transition prelude, ADR-0086 D4 as
+/// amended) each audited ledger is then replaced by one synthetic op
+/// holding the **recovered** state, acked at `Nanos::ZERO` — recovered
+/// state came off the device, so it is required at the next cut
+/// regardless of the loss window; the main life's ops append behind it.
+/// `Err` = a transport failure already recorded in the report.
+#[allow(clippy::too_many_arguments)] // the scheduler tuple the MiniClient calls need
+fn audit_ledgers(
+    node: &mut Node,
+    writers: &mut [Writer],
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &SimDisk,
+    scenario: &DurableScenario,
+    cut_time: Nanos,
+    rebase: Option<Nanos>,
+    report: &mut DurableReport,
+) -> Result<(), ()> {
+    let mut audit = MiniClient::connect(node, 0);
     for class in [NsClass::Always, NsClass::Everysec] {
         let reply = audit.call(
-            &mut node,
-            &mut rng,
-            &clock,
-            &disk,
+            node,
+            rng,
+            clock,
+            disk,
             scenario.step_ns_max,
             &[b"INF.NS", b"USE", class.name()],
         );
         if !matches!(reply, Ok(Some(ref ok)) if ok == b"+OK\r\n") {
-            fail(&mut report, format!("audit USE {class:?} answered {reply:?}"));
-            return finish(report, &observer, &clock);
+            report.violations.push(format!("audit USE {class:?} answered {reply:?}"));
+            return Err(());
         }
-        for writer in writers.iter().filter(|w| w.class == class) {
-            for (key, ops) in &writer.ledger {
+        for writer in writers.iter_mut().filter(|w| w.class == class) {
+            for (key, ops) in &mut writer.ledger {
                 report.audited_keys += 1;
                 let required = required_index(class, ops, cut_time);
                 report.required_ops += required.map_or(0, |i| i as u64 + 1);
@@ -1236,18 +1499,12 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                     DurableWorkload::KeyValue => [b"GET", key],
                     DurableWorkload::Document => [b"JSON.GET", key],
                 };
-                let reply = match audit.call(
-                    &mut node,
-                    &mut rng,
-                    &clock,
-                    &disk,
-                    scenario.step_ns_max,
-                    &command,
-                ) {
+                let reply = match audit.call(node, rng, clock, disk, scenario.step_ns_max, &command)
+                {
                     Ok(Some(reply)) => reply,
                     other => {
-                        fail(&mut report, format!("audit GET {key:?} answered {other:?}"));
-                        return finish(report, &observer, &clock);
+                        report.violations.push(format!("audit GET {key:?} answered {other:?}"));
+                        return Err(());
                     }
                 };
                 let admissible: Vec<Vec<u8>> = admissible_states(ops, required)
@@ -1275,11 +1532,34 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                             .collect::<Vec<_>>()
                     ));
                 }
+                if let Some(boot) = rebase {
+                    debug_assert_eq!(scenario.workload, DurableWorkload::KeyValue);
+                    let recovered = parse_bulk(&reply).unwrap_or_else(|| {
+                        panic!("audit GET {key:?} answered a non-bulk reply {reply:?}")
+                    });
+                    *ops = vec![OpRec {
+                        state_after: recovered,
+                        sent_at: boot,
+                        acked_at: Some(Nanos::ZERO),
+                    }];
+                }
             }
         }
     }
+    Ok(())
+}
 
-    finish(report, &observer, &clock)
+/// A RESP bulk reply → the value (`None` for the null bulk); `None` for
+/// anything that is not a bulk string.
+fn parse_bulk(reply: &[u8]) -> Option<Option<Vec<u8>>> {
+    if reply == b"$-1\r\n" {
+        return Some(None);
+    }
+    let rest = reply.strip_prefix(b"$")?;
+    let nl = rest.iter().position(|&b| b == b'\r')?;
+    let len: usize = std::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
+    let body = rest.get(nl + 2..nl + 2 + len)?;
+    Some(Some(body.to_vec()))
 }
 
 /// The §8.2 survival audit for a legally-refused boot (ADR-0021 D3):

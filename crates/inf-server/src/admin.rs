@@ -304,6 +304,7 @@ pub(crate) fn info(
         push(&mut text, &format!("zero_fill_bytes:{}", node.zero_fill_bytes.get()));
         push(&mut text, &format!("rotations_unzeroed:{}", node.rotations_unzeroed.get()));
         push(&mut text, &format!("rotations_upgrade:{}", node.rotations_upgrade.get()));
+        push(&mut text, &format!("reopened_packed_tails:{}", node.reopened_packed_tails.get()));
         push(&mut text, &format!("barrier_class_degraded:{}", node.barrier_class_degraded.get()));
         // M4.5-S35 (ADR-0087 D5): the frame pipeline — configured depth,
         // the deepest it actually reached (a gate run proves it filled by
@@ -346,6 +347,13 @@ pub(crate) fn info(
         push(&mut text, &format!("ckpt_padding_bytes:{}", node.ckpt_padding_bytes.get()));
         push(&mut text, &format!("manifest_bytes_total:{}", node.manifest_bytes_total.get()));
         push(&mut text, &format!("ckpt_interval_bytes:{}", node.ckpt_interval_bytes.get()));
+        push(
+            &mut text,
+            &format!(
+                "ckpt_io_mode:{}",
+                if node.ckpt_io_mode_buffered.get() == 1 { "buffered" } else { "direct" }
+            ),
+        );
         push(
             &mut text,
             &format!("ckpt_records_since_begin:{}", node.ckpt_records_since_begin.get()),
