@@ -1100,7 +1100,7 @@ pub(crate) fn inf_ns(
         // `USE dbN` is SELECT symmetry: back to the default namespace.
         if let Some(db) = default_db_index(name) {
             cx.db = db as u16;
-            cx.ns = None;
+            cx.ns = crate::exec::ConnNamespace::Default;
             let _ = ks.db_mut(db);
             return w.simple("OK");
         }
@@ -1115,7 +1115,7 @@ pub(crate) fn inf_ns(
         // plane is wired (exec routing, cold-read suspension, WAL
         // staging with displacement origins, recovery composition).
         // `USE` of a tiered namespace now routes to the tiered arm.
-        cx.ns = Some(spec.id);
+        cx.ns = crate::exec::ConnNamespace::Named(spec.id);
         w.simple("OK")
     } else if sub.eq_ignore_ascii_case(b"SET") {
         // Planeless arm (unit tests, embedded); on a node the pump's DDL
@@ -2188,7 +2188,7 @@ mod tests {
         // exec fallback still refuses data commands (plane-resident).
         let r = run(&mut cx, &mut store, &[b"INF.NS", b"USE", b"tiered"]);
         assert_eq!(r, b"+OK\r\n");
-        cx.ns = None;
+        cx.ns = crate::exec::ConnNamespace::Default;
         let r =
             run(&mut cx, &mut store, &[b"INF.NS", b"SET", b"tiered", b"MUTABLE-FRACTION", b"300"]);
         assert_eq!(r, b"+OK\r\n");

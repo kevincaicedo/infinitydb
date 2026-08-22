@@ -647,8 +647,10 @@ pub fn render() -> String {
     push("accepted connection as if it had sent `INF.NS USE NAME` — an operator opt-in");
     push("for clients that cannot send a per-connection prelude (`memtier_benchmark`,");
     push("drop-in Redis clients wanting a durable default); `SELECT` and `INF.NS USE`");
-    push("still work, and a name that does not exist (or names a topic) leaves the");
-    push("connection on db0. Redis has no equivalent.");
+    push("still work. A name that does not exist (or names a topic) leaves the connection");
+    push("fail-closed: data commands error until `SELECT` or a successful `INF.NS USE`;");
+    push("inspection and `INF.NS CREATE` remain available. It never falls through to db0.");
+    push("Redis has no equivalent.");
     push("");
     push("`FSYNC everysec` namespaces ack on apply and fsync on the 1 s tick — the");
     push("`appendfsync everysec` loss window (≤ 1 s on power loss). Under the frame-fill");

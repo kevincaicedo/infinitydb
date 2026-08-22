@@ -30,6 +30,9 @@ pub struct Cell {
     /// written during it (`--device-stat`).
     pub server_cpu_pct: Option<f64>,
     pub device_mib_written: Option<f64>,
+    /// Selected before/after persistence facts; complete raw INFO snapshots
+    /// are stored beside the generator output.
+    pub persistence_delta: Option<String>,
 }
 
 /// One bytes/key attribution row.
@@ -64,6 +67,7 @@ pub struct Params {
     pub durability: String,
     pub data_root: Option<String>,
     pub device_stat: Option<String>,
+    pub redis_no_auto_rewrite: bool,
 }
 
 pub fn render(
@@ -174,6 +178,21 @@ pub fn render(
             );
         }
         let _ = writeln!(md);
+
+        let _ = writeln!(md, "### Persistence and stall deltas\n");
+        let _ = writeln!(md, "| Engine | Workload | Pipe | Before/after summary |");
+        let _ = writeln!(md, "|---|---|---:|---|");
+        for c in cells.iter().filter(|c| c.memtier.is_some()) {
+            let _ = writeln!(
+                md,
+                "| {} | {} | {} | {} |",
+                c.engine,
+                c.workload,
+                c.pipeline,
+                c.persistence_delta.as_deref().unwrap_or("n/a")
+            );
+        }
+        let _ = writeln!(md);
     }
 
     // ---- redis-benchmark results ----
@@ -258,7 +277,7 @@ pub fn render(
     }
     let _ = writeln!(
         md,
-        "- redis is single-threaded; dragonfly and infinitydb ran with {} threads/cells. Each engine kept its own best config (recorded above), per master plan §22.",
+        "- redis command execution is single-threaded, but its process tree was allowed the same {} CPUs as InfinityDB's cells so AOF rewrite children did not contend with the command thread on one pinned CPU. Each engine's config is recorded above.",
         p.threads
     );
     let _ = writeln!(
@@ -284,7 +303,13 @@ pub fn render(
     if p.rate.is_some() {
         let _ = writeln!(
             md,
-            "- **Offered-rate row (M4.5-S40).** memtier paces each connection at `--rate-limiting` = rate ÷ connections; `achieved/offered` below 0.90 means the generator (or the server) could not hold the rate and the latency columns are not an offered-rate measurement. `max (ms)` is memtier's worst request; server CPU is the engine process's utime+stime over the row's wall time (host launches only); device MiB written is the block device's sectors-written delta across the row (journal and metadata included, NAND amplification not)."
+            "- **Offered-rate row (M4.5-S40).** memtier paces each connection at `--rate-limiting` = rate ÷ connections; `achieved/offered` below 0.90 means the generator (or the server) could not hold the rate and the latency columns are not an offered-rate measurement. `max (ms)` is memtier's worst request; server CPU covers the host process plus Redis's completed AOF-child CPU and live descendants; device MiB written is the block device's sectors-written delta (journal and metadata included, NAND amplification not). Raw INFO before/after each row is under `raw/`."
+        );
+    }
+    if p.redis_no_auto_rewrite {
+        let _ = writeln!(
+            md,
+            "- **Non-production diagnostic arm.** Redis ran `auto-aof-rewrite-percentage 0`; this isolates automatic rewrite cost and cannot support a production/default-config comparison."
         );
     }
     if p.durability != "none (in-memory)" {

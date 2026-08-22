@@ -132,7 +132,7 @@ fn durable_full_fits(cx: &ConnCx, key: &[u8], idoc: &[u8], w: &mut RespWriter<'_
     let Some(admission) = cx.node.doc_log_admission.get() else {
         return true;
     };
-    let ns = cx.ns.expect("durable capture is named-namespace-only");
+    let ns = cx.ns.named().expect("durable capture is named-namespace-only");
     let full = inf_log::RecordView::DocFull {
         ns,
         key,
@@ -1824,7 +1824,10 @@ mod tests {
     use inf_wire::Protocol;
 
     fn durable_cx(budget: usize, record_max: usize) -> ConnCx {
-        let cx = ConnCx { ns: Some(inf_store::NsId(16)), ..ConnCx::default() };
+        let cx = ConnCx {
+            ns: crate::exec::ConnNamespace::Named(inf_store::NsId(16)),
+            ..ConnCx::default()
+        };
         cx.node.doc_log_admission.set(Some(crate::exec::DocLogAdmission { budget, record_max }));
         cx
     }

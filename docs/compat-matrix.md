@@ -273,8 +273,10 @@ changes which file the next log segment is, never a client-visible semantic.
 accepted connection as if it had sent `INF.NS USE NAME` — an operator opt-in
 for clients that cannot send a per-connection prelude (`memtier_benchmark`,
 drop-in Redis clients wanting a durable default); `SELECT` and `INF.NS USE`
-still work, and a name that does not exist (or names a topic) leaves the
-connection on db0. Redis has no equivalent.
+still work. A name that does not exist (or names a topic) leaves the connection
+fail-closed: data commands error until `SELECT` or a successful `INF.NS USE`;
+inspection and `INF.NS CREATE` remain available. It never falls through to db0.
+Redis has no equivalent.
 
 `FSYNC everysec` namespaces ack on apply and fsync on the 1 s tick — the
 `appendfsync everysec` loss window (≤ 1 s on power loss). Under the frame-fill

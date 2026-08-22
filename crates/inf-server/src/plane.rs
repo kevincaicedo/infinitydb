@@ -69,7 +69,10 @@ use crate::control::{ControlHandle, RecoveryBoard};
 use crate::durable::{DurableCell, DurableConfig, EVERYSEC_TIMER_KEY};
 #[cfg(feature = "doc")]
 use crate::exec::DocLogAdmission;
-use crate::exec::{ConnCx, NodeInfo, execute, execute_slices, stall_request};
+use crate::exec::{
+    ConnCx, ConnNamespace, NodeInfo, execute, execute_slices, stall_request,
+    unavailable_default_allows,
+};
 use crate::pubsub::{self, PubSubCell, SubKind};
 use crate::recover::{Recovery, RecoveryProgress};
 
@@ -505,7 +508,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
             proto,
             id,
             db,
-            ns,
+            ns: ns.map_or(ConnNamespace::Default, ConnNamespace::Named),
             sub_channels: Vec::new(),
             sub_patterns: Vec::new(),
             node: Rc::clone(&self.node),
@@ -1970,15 +1973,20 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
     /// The namespace a fresh connection starts in (M4.5-S40,
     /// `--conn-default-ns`): resolved by name against the catalog at
-    /// accept time, `None` when unset, unknown, or a topic (the same
-    /// refusal `INF.NS USE` gives topics). One `RefCell` borrow per
-    /// accept — nothing on the command path.
-    fn conn_default_ns(&self) -> Option<inf_store::NsId> {
+    /// accept time. An unknown name or a topic becomes a fail-closed
+    /// connection state; only inspection and explicit namespace recovery
+    /// commands run until `SELECT` or `INF.NS USE`. One `RefCell` borrow
+    /// per accept.
+    fn conn_default_ns(&self) -> ConnNamespace {
         let name = self.shared.node.conn_default_ns.borrow();
-        let name = name.as_deref()?;
+        let Some(name) = name.as_deref() else { return ConnNamespace::Default };
         let store = self.shared.store.borrow();
-        let spec = store.ns_get(name)?;
-        (spec.mode != inf_store::NsMode::Topic).then_some(spec.id)
+        let Some(spec) = store.ns_get(name) else { return ConnNamespace::RequiredUnavailable };
+        if spec.mode == inf_store::NsMode::Topic {
+            ConnNamespace::RequiredUnavailable
+        } else {
+            ConnNamespace::Named(spec.id)
+        }
     }
 }
 
@@ -2453,7 +2461,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                             let defer = pump_was_active
                                 || spawn_first.is_some()
                                 || !deferred.is_empty()
-                                || conn_cx.ns.is_some()
+                                || conn_cx.ns.named().is_some()
+                                || conn_cx.ns.unavailable()
                                 || self.needs_fabric(&argv);
                             if defer {
                                 // Pump replies emit after the fast-path
@@ -3602,14 +3611,29 @@ fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         *slot = owned.arg(i);
     }
     let argv: &[&[u8]] = &argv_inline[..argc];
-    let Some((proto, id, db, conn_ns, restricted)) = shared.with_conn(key, |c| {
-        (c.cx.proto, c.cx.id, c.cx.db, c.cx.ns, pubsub::subscriber_restricted(&c.cx))
+    let Some((proto, id, db, conn_ns, ns_unavailable, restricted)) = shared.with_conn(key, |c| {
+        (
+            c.cx.proto,
+            c.cx.id,
+            c.cx.db,
+            c.cx.ns.named(),
+            c.cx.ns.unavailable(),
+            pubsub::subscriber_restricted(&c.cx),
+        )
     }) else {
         return FastDispatch::ConnGone;
     };
     let origin = ExecOrigin::Conn(key.slot, key.generation);
     let meta = lookup(argv[0]);
     let well_formed = meta.is_some_and(|m| arity_ok(m, argv.len()));
+    if let Some(meta) = meta
+        && well_formed
+        && ns_unavailable
+        && !unavailable_default_allows(meta.id)
+    {
+        pending.push_back(PendingReply::Done(unavailable_default_reply(proto)));
+        return FastDispatch::Handled;
+    }
     if let Some(meta) = meta
         && well_formed
         && restricted
@@ -3891,8 +3915,15 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     };
     // One slab lookup per command: execution context + subscriber
     // restriction together (was two separate `with_conn` walks).
-    let Some((proto, id, db, conn_ns, restricted)) = shared.with_conn(key, |c| {
-        (c.cx.proto, c.cx.id, c.cx.db, c.cx.ns, pubsub::subscriber_restricted(&c.cx))
+    let Some((proto, id, db, conn_ns, ns_unavailable, restricted)) = shared.with_conn(key, |c| {
+        (
+            c.cx.proto,
+            c.cx.id,
+            c.cx.db,
+            c.cx.ns.named(),
+            c.cx.ns.unavailable(),
+            pubsub::subscriber_restricted(&c.cx),
+        )
     }) else {
         return false;
     };
@@ -3900,6 +3931,14 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
 
     let meta = lookup(argv[0]);
     let well_formed = meta.is_some_and(|m| arity_ok(m, argv.len()));
+    if let Some(meta) = meta
+        && well_formed
+        && ns_unavailable
+        && !unavailable_default_allows(meta.id)
+    {
+        pending.push_back(PendingReply::Done(unavailable_default_reply(proto)));
+        return true;
+    }
     // M1-S10: RESP2 subscriber-mode restriction for pump-dispatched
     // commands — the fast path checks inside `execute`, but commands
     // landing here would otherwise run under a synthesized ConnCx without
@@ -4223,6 +4262,13 @@ fn restricted_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         let sub = argv.get(1).copied();
         pubsub::restricted_error(meta.id, meta.name, sub, &mut RespWriter::new(&mut reply, proto));
     }
+    reply
+}
+
+fn unavailable_default_reply(proto: Protocol) -> Vec<u8> {
+    let mut reply = Vec::new();
+    RespWriter::new(&mut reply, proto)
+        .error("ERR configured default namespace is unavailable; use SELECT or INF.NS USE");
     reply
 }
 

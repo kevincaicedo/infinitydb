@@ -317,34 +317,20 @@ tier = "linux-reference-box"
 source = "s39b:read_c64p16_x"
 measured_by = "gate-run m4.5 --only-s39b, read leg after the write leg"
 
-# Recovery is timed twice per leg since campaign D (2026-08-22): the
-# immediate boot after the leg read 1.25× on the 1-slot arm while a
-# directed measurement of the residue scan itself reads +4 ms per 256 MiB
-# (30 vs 26 ms, `residue_scan_cost.rs`) and the boot unlink of the pooled
-# file 0.1 ms — the delta is not the reader's rule; the boot's
-# `Phase::Start` is device-state sensitive (C38f) and the two arms leave
-# the drive in different states. The binding figure is the boot after the
-# row's idle; the immediate boot stays on the row, informational.
+# Recovery is exactly one first boot per fresh crashed workload image. The
+# image waits through `--leg-idle-s` without being opened, then the timer
+# spans process launch through `loading:0`. Campaigns D/E timed a second
+# boot after the first had already classified and cleaned the image; those
+# recovery numbers are withdrawn and cannot bind this gate.
 [[gate]]
 id = "s39b_recovery_time_x"
-name = "S39b: crash-restart recovery time on the recycled log over baseline (idle-state boot)"
+name = "S39b: first crash-restart recovery boot on the recycled log over baseline"
 threshold = 1.05
 comparator = "<="
-unit = "x (arm / baseline seconds to loading:0 after SIGKILL, second boot after --leg-idle-s, per-replicate median; falsifier (c): the residue scan is not O(frame)"
+unit = "x (arm / baseline seconds from first process launch to loading:0 after SIGKILL and --leg-idle-s, per-replicate median; falsifier (c): the residue scan is not O(frame))"
 tier = "linux-reference-box"
 source = "s39b:recovery_time_x"
-measured_by = "gate-run m4.5 --only-s39b, SIGKILL + respawn on the same data dir after the drive-state idle"
-
-[[gate]]
-id = "s39b_recovery_time_immediate_x"
-name = "S39b: crash-restart recovery time, immediate boot after the leg (informational — drive state as the leg left it)"
-threshold = 1.05
-comparator = "<="
-unit = "x (arm / baseline, first boot right after the read leg; campaign D read 1.25 on the 1-slot arm)"
-tier = "linux-reference-box"
-source = "s39b:recovery_time_immediate_x"
-measured_by = "gate-run m4.5 --only-s39b"
-informational = true
+measured_by = "gate-run m4.5 --only-s39b, one first boot per fresh crashed image after the drive-state idle"
 
 [[gate]]
 id = "s39b_rotations_per_cell_min"

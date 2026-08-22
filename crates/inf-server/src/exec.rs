@@ -103,9 +103,9 @@ pub struct NodeInfo {
     /// operator's opt-in for clients that cannot send a per-connection
     /// prelude (`memtier_benchmark`, drop-in Redis clients wanting a
     /// durable default). Resolved by name at accept time against the
-    /// cell's catalog; a name that does not (yet) exist, or names a
-    /// topic, leaves the connection on the default db — `SELECT` and
-    /// `INF.NS USE` work as always. `None` (the default) changes nothing.
+    /// cell's catalog; a name that does not (yet) exist, or names a topic,
+    /// leaves the connection fail-closed until `SELECT` or `INF.NS USE`
+    /// explicitly recovers it. `None` (the default) changes nothing.
     pub conn_default_ns: RefCell<Option<Vec<u8>>>,
     pub total_connections: Cell<u64>,
     /// Pub/sub gauges + counters (M1-S10/S11), flushed by the plane's
@@ -337,6 +337,31 @@ impl NodeInfo {
     }
 }
 
+/// Namespace route selected for one connection. The third state is the
+/// fail-closed form of `--conn-default-ns`: an operator required a named
+/// namespace, but the catalog cannot currently resolve it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ConnNamespace {
+    Default,
+    Named(inf_store::NsId),
+    RequiredUnavailable,
+}
+
+impl ConnNamespace {
+    #[inline]
+    pub fn named(self) -> Option<inf_store::NsId> {
+        match self {
+            ConnNamespace::Named(ns) => Some(ns),
+            ConnNamespace::Default | ConnNamespace::RequiredUnavailable => None,
+        }
+    }
+
+    #[inline]
+    pub fn unavailable(self) -> bool {
+        self == ConnNamespace::RequiredUnavailable
+    }
+}
+
 /// Per-connection execution state (protocol negotiated via `HELLO`,
 /// database selected via `SELECT` — M1-S08, subscriptions via
 /// `(P)SUBSCRIBE` — M1-S10).
@@ -346,10 +371,9 @@ pub struct ConnCx {
     pub id: u64,
     /// Selected default namespace (`SELECT 0..15`); 0 unless SELECTed.
     pub db: u16,
-    /// Selected *named* namespace (`INF.NS USE`, M2-S08); `None` = the
-    /// default-db path. One `Option` load is the memory fast path's whole
-    /// cost for the durable feature (M2-S09).
-    pub ns: Option<inf_store::NsId>,
+    /// Selected namespace route. The ordinary memory path is `Default`;
+    /// `RequiredUnavailable` refuses data instead of silently using db0.
+    pub ns: ConnNamespace,
     /// Subscribed channels, in subscription order (M1-S10). Empty vectors
     /// never allocate, so a non-subscriber connection pays two length
     /// loads at most.
@@ -369,7 +393,7 @@ impl Default for ConnCx {
             proto: Protocol::Resp2,
             id: 1,
             db: 0,
-            ns: None,
+            ns: ConnNamespace::Default,
             sub_channels: Vec::new(),
             sub_patterns: Vec::new(),
             node: Rc::new(NodeInfo::default()),
@@ -415,6 +439,25 @@ impl Argv for [&[u8]] {
     }
 }
 
+/// Commands that can recover or inspect a connection whose configured
+/// default namespace was unavailable at accept time. No command in this set
+/// reads or mutates the implicit numbered database.
+pub(crate) fn unavailable_default_allows(id: CommandId) -> bool {
+    matches!(
+        id,
+        CommandId::Ping
+            | CommandId::Echo
+            | CommandId::Hello
+            | CommandId::Quit
+            | CommandId::Command
+            | CommandId::Client
+            | CommandId::Config
+            | CommandId::Info
+            | CommandId::Select
+            | CommandId::InfNs
+    )
+}
+
 /// Executes one parsed command against the cell's keyspace, appending the
 /// reply to `out`. `now` is injected (L7) — same clock the store's TTLs
 /// live on. Keyspace-level commands (SELECT, FLUSHALL, cross-db COPY,
@@ -435,6 +478,11 @@ pub fn execute(
         let mut w = RespWriter::new(out, cx.proto);
         return arity_error(meta.name, &mut w);
     }
+    if cx.ns.unavailable() && !unavailable_default_allows(meta.id) {
+        let mut w = RespWriter::new(out, cx.proto);
+        return w
+            .error("ERR configured default namespace is unavailable; use SELECT or INF.NS USE");
+    }
     // M1-S07 OOM gate: DENYOOM commands enter through metadata, never
     // per-handler checks (kernel rule). The first test is one branch on a
     // cached flag; only genuine pressure pays the inline eviction
@@ -445,7 +493,7 @@ pub fn execute(
     // `cx.ns`, state this path already resolved, so the numbered-DB arm
     // executes the M1 instructions unchanged (A/B: .artifacts/m4/s27/).
     if meta.flags.contains(CmdFlags::DENYOOM) {
-        let refused = match cx.ns {
+        let refused = match cx.ns.named() {
             Some(ns) => match ks.ns_free_for_write(ns, now) {
                 Some(verdict) => verdict.is_err(),
                 None => ks.over_limit() && ks.free_for_write(now).is_err(),
@@ -484,7 +532,7 @@ pub fn execute(
         CommandId::Flushdb => {
             let db = cx.db;
             let mut w = RespWriter::new(out, cx.proto);
-            if cx.ns.is_some() {
+            if cx.ns.named().is_some() {
                 return w
                     .error("ERR FLUSHDB on a named namespace is not yet supported (M2, ADR-0015)");
             }
@@ -493,7 +541,7 @@ pub fn execute(
         CommandId::Copy => {
             let db = cx.db;
             let mut w = RespWriter::new(out, cx.proto);
-            if cx.ns.is_some() {
+            if cx.ns.named().is_some() {
                 return w.error("ERR COPY within a named namespace is not yet supported (M2)");
             }
             copy(argv, ks, db, now, &mut w);
@@ -541,7 +589,7 @@ pub fn execute(
             pubsub::pubsub_fallback(&args, cx, out);
         }
         _ => {
-            if let Some(id) = cx.ns {
+            if let Some(id) = cx.ns.named() {
                 // Tiered namespaces are plane-resident (M4-S26): their
                 // command path needs the reactor (cold-read suspension,
                 // WAL staging), so the planeless fallback refuses rather
@@ -1360,7 +1408,7 @@ fn select(argv: &(impl Argv + ?Sized), ks: &mut Keyspace, cx: &mut ConnCx, w: &m
     match parse_i64(argv.arg(1)) {
         Ok(n @ 0..=15) => {
             cx.db = n as u16;
-            cx.ns = None; // SELECT returns the connection to the defaults
+            cx.ns = ConnNamespace::Default; // explicit escape from a required default
             // Materialize eagerly: a SELECTed db is about to be used.
             let _ = ks.db_mut(n as usize);
             w.simple("OK");
@@ -1929,9 +1977,9 @@ mod tests {
         assert!(reply.starts_with(b"-ERR FSYNC applies to MODE durable"), "{reply:?}");
         // INF.NS USE selects a named namespace; SELECT returns to defaults.
         assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"USE", b"cache"]), b"+OK\r\n");
-        assert!(cx.ns.is_some(), "USE selects the named namespace");
+        assert!(cx.ns.named().is_some(), "USE selects the named namespace");
         assert_eq!(run(&mut cx, &mut ks, &[b"SELECT", b"0"]), b"+OK\r\n");
-        assert!(cx.ns.is_none(), "SELECT returns to the defaults");
+        assert_eq!(cx.ns, ConnNamespace::Default, "SELECT returns to the defaults");
         let list = run(&mut cx, &mut ks, &[b"INF.NS", b"LIST"]);
         let text = String::from_utf8(list).expect("ascii");
         assert!(text.starts_with("*17\r\n"), "16 defaults + 1 named: {text}");
@@ -1948,6 +1996,19 @@ mod tests {
             run(&mut cx, &mut ks, &[b"INF.NS", b"DROP", b"db0"]),
             b"-ERR db0..db15 are reserved default namespaces (SELECT)\r\n"
         );
+    }
+
+    #[test]
+    fn unavailable_configured_default_refuses_data_until_explicit_selection() {
+        let mut cx = ConnCx { ns: ConnNamespace::RequiredUnavailable, ..ConnCx::default() };
+        let mut ks = Keyspace::new(StoreConfig::default());
+        let refusal =
+            b"-ERR configured default namespace is unavailable; use SELECT or INF.NS USE\r\n";
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"v"]), refusal);
+        assert_eq!(run(&mut cx, &mut ks, &[b"GET", b"k"]), refusal);
+        assert_eq!(run(&mut cx, &mut ks, &[b"PING"]), b"+PONG\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"SELECT", b"0"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"v"]), b"+OK\r\n");
     }
 
     // ---- M1-E5 · pub/sub (exec-layer fallback + subscriber mode) -----------------
