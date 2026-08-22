@@ -74,9 +74,17 @@ sealed frames are in flight at once, the ledger advances its written and
 durable watermarks over completion-ordered prefixes, and a frame whose
 due barrier cannot yet be honest — a linked fdatasync with earlier writes
 still in flight, a rotation's seal — waits one write latency rather than
-claiming coverage it does not have; a pipelined cell seals at the
-device's measured barrier rate, so a saturated device sees fewer, larger
-frames rather than more, smaller ones (ADR-0088). Everything else — the hash index, document trees,
+claiming coverage it does not have. The pipeline depth K is an
+operator knob (`--frames-in-flight`; K = 1 is the shipped default while
+the reference-box K decision is pending — ADR-0087's third amendment
+predeclares the rule and the class-derived outcome). Background I/O
+(zero-fill, tier flush, checkpoints, compaction, backfill) spends a
+per-cell share of a **measured device budget** (ADR-0088; the seal
+pacer that ADR proposed is an A/B arm, off). On aligned segments a
+**barrier-less** frame may hold until it fills 16 KiB or 1 ms elapses
+(ADR-0089's fill policy — `--fill-window-us`; off by default until its
+rerun at the shipping configuration passes); a frame that carries a
+barrier is never held. Everything else — the hash index, document trees,
 secondary indexes, stream offsets, vector graphs — is a rebuildable
 projection over that log. Checkpoints are fuzzy snapshots streamed by the
 owning cell in budgeted background slices (no fork, no stop-the-world)
