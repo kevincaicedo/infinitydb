@@ -103,6 +103,11 @@ pub struct RegionEvidence {
     /// resume-epoch derivation so "tops every epoch observed this boot"
     /// (ADR-0031 D5) is literal.
     pub max_foreign_epoch: u32,
+    /// Bytes the scan read from the file (M4.5-S39d): the audit's device
+    /// cost, so a boot's recovery time decomposes into phases with their
+    /// bytes beside them. Zero-run skipping consumes bytes it still had
+    /// to read, so this is the read extent, never the decoded one.
+    pub bytes_read: u64,
 }
 
 impl RegionEvidence {
@@ -128,6 +133,7 @@ impl RegionEvidence {
         self.any_v1 |= other.any_v1;
         self.foreign_frames += other.foreign_frames;
         self.max_foreign_epoch = self.max_foreign_epoch.max(other.max_foreign_epoch);
+        self.bytes_read += other.bytes_read;
     }
 
     /// Proven recycled-life residue (ADR-0090 D2 as amended): no frame
@@ -288,6 +294,13 @@ impl<File: SegmentFile> RegionScanner<File> {
     /// (interior sub-frames of a validated frame are body payload, not
     /// writer output — they carry no independent evidence).
     fn run(&mut self, stop_at_first_valid: bool) -> io::Result<RegionEvidence> {
+        let from = self.file_pos;
+        let mut evidence = self.walk(stop_at_first_valid)?;
+        evidence.bytes_read = self.file_pos - from;
+        Ok(evidence)
+    }
+
+    fn walk(&mut self, stop_at_first_valid: bool) -> io::Result<RegionEvidence> {
         let mut evidence = RegionEvidence::default();
         loop {
             if self.window().is_empty() {

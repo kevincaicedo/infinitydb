@@ -424,6 +424,27 @@ pub(crate) fn info(
                 node.recover_recycled_residue_slacks.get()
             ),
         );
+        // M4.5-S39d: the boot's recovery decomposed by phase (bytes read
+        // and loop-clock µs; the µs sum to `recover_total_us` exactly).
+        let phases = node.recover_phases.get();
+        for (field, value) in [
+            ("recover_start_us", phases.start_ns / 1000),
+            ("recover_ckpt_bytes", phases.ckpt_bytes),
+            ("recover_ckpt_us", phases.ckpt_ns / 1000),
+            ("recover_replay_bytes", phases.replay_bytes),
+            ("recover_replay_frames", phases.replay_frames),
+            ("recover_replay_us", phases.replay_ns / 1000),
+            ("recover_audit_bytes", phases.audit_bytes),
+            ("recover_audit_valid_frames", phases.audit_valid_frames),
+            ("recover_audit_foreign_frames", phases.audit_foreign_frames),
+            ("recover_audit_us", phases.audit_ns / 1000),
+            ("recover_finish_us", phases.finish_ns / 1000),
+            ("recover_stale_files_removed", node.recover_stale_files_removed.get()),
+            ("recover_records", node.recover_records.get()),
+            ("recover_total_us", phases.total_ns / 1000),
+        ] {
+            push(&mut text, &format!("{field}:{value}"));
+        }
         // Fuzzy-checkpoint gauges (M2-S10; `ckpt_age_s` derives at S21).
         push(&mut text, &format!("ckpts_completed:{}", node.ckpts_completed.get()));
         push(&mut text, &format!("ckpts_aborted:{}", node.ckpts_aborted.get()));

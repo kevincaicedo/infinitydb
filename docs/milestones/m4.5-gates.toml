@@ -409,3 +409,53 @@ tier = "linux-reference-box"
 source = "s39b:device_bytes_per_log_byte_arm"
 measured_by = "gate-run m4.5 --only-s39b --device-stat <dev>, warmed window"
 informational = true
+
+# M4.5-S39d (ADR-0090 A10, 2026-08-22): recovery attribution on a
+# fixed-work image — both arms receive the same records, the same
+# `INF.CKPT WAIT` boundary, the same tail, one fresh SIGKILLed image, the
+# same idle and exactly one boot; the engine reports the boot decomposed
+# by phase (loop-clock time + bytes per phase). The total ratio is
+# DIAGNOSTIC (informational): it names the phase to work on, it cannot
+# turn recycling off by itself — only the absolute S18 gate re-read on the
+# recycled log below can (the plan's S39d wording).
+[[gate]]
+id = "s39d_recovery_total_x"
+name = "S39d: fixed-work first-boot recovery, slowest cell's engine total, arm over baseline"
+threshold = 1.05
+comparator = "<="
+unit = "x (recover_total_us on the slowest cell, arm ÷ baseline, per-replicate median; diagnostic — the per-phase ratios name the term)"
+tier = "linux-reference-box"
+source = "s39d:recovery_total_x"
+measured_by = "gate-run m4.5 --only-s39d, one first boot per fresh crashed fixed-work image after the drive-state idle"
+informational = true
+
+[[gate]]
+id = "s39d_recovery_first_boot_s_arm"
+name = "S39d: absolute first-boot recovery wall on the recycled log (the S18 < 15 s STOP gate re-read)"
+threshold = 15.0
+comparator = "<="
+unit = "s (process launch to loading:0 on every cell, arm, per-replicate median; the dataset is the row's fixed work, disclosed in the report)"
+tier = "linux-reference-box"
+source = "s39d:recovery_first_boot_s_arm"
+measured_by = "gate-run m4.5 --only-s39d"
+
+[[gate]]
+id = "s39d_records_recovered_match"
+name = "S39d: both arms recovered exactly the records written (fixed-work validity)"
+threshold = 1.0
+comparator = ">="
+unit = "1 = every replicate pair recovered warm + tail records on both arms, 0 = a pair did not (the row is then not fixed-work)"
+tier = "linux-reference-box"
+source = "s39d:records_recovered_match"
+measured_by = "gate-run m4.5 --only-s39d, INFO recover_records summed over cells after loading:0"
+
+[[gate]]
+id = "s39d_phase_audit_x"
+name = "S39d: slack-audit phase time over the cell sums, arm over baseline (the recycling term, informational)"
+threshold = 1.5
+comparator = "<="
+unit = "x (Σcells recover_audit_us arm ÷ baseline, per-replicate median; residue is decoded and CRC-validated where zeros are skipped word-wise)"
+tier = "linux-reference-box"
+source = "s39d:phase_audit_x"
+measured_by = "gate-run m4.5 --only-s39d"
+informational = true

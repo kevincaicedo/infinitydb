@@ -56,6 +56,12 @@ pub struct CellRecoverySlot {
     /// `recover_recycled_residue_slacks`) carry them.
     segment_residue_stops: AtomicU64,
     recycled_residue_slacks: AtomicU64,
+    /// M4.5-S39d: the boot's per-phase loop-clock time (ns, pipeline
+    /// order: start, checkpoint, replay, audit, finish) and the bytes the
+    /// checkpoint, replay and audit phases read — the boot line's
+    /// decomposition.
+    phase_ns: [AtomicU64; 5],
+    phase_bytes: [AtomicU64; 3],
     /// Recovery phase about to run (M2.5-S01): published *before* each
     /// step so a step stalled inside the kernel names itself — the
     /// ADR-0022 D7 wedge was invisible precisely because nothing was
@@ -79,13 +85,33 @@ impl CellRecoverySlot {
         records: u64,
         torn_truncated_at: Option<inf_log::Lsn>,
         residue: RecoveredResidue,
+        phases: crate::recover::RecoverPhases,
     ) {
         debug_assert_eq!(self.state.load(Ordering::Relaxed), 0, "mark_ready called twice");
         self.records.store(records, Ordering::Relaxed);
         self.torn_at.store(torn_truncated_at.map_or(0, |lsn| lsn.to_u64() + 1), Ordering::Relaxed);
         self.segment_residue_stops.store(residue.segment_residue_stops, Ordering::Relaxed);
         self.recycled_residue_slacks.store(residue.recycled_residue_slacks, Ordering::Relaxed);
+        for (slot, ns) in self.phase_ns.iter().zip(phases.phase_ns()) {
+            slot.store(ns, Ordering::Relaxed);
+        }
+        for (slot, bytes) in self.phase_bytes.iter().zip([
+            phases.ckpt_bytes,
+            phases.replay_bytes,
+            phases.audit_bytes,
+        ]) {
+            slot.store(bytes, Ordering::Relaxed);
+        }
         self.state.store(1, Ordering::Release);
+    }
+
+    /// The boot's phase decomposition (M4.5-S39d), valid once ready:
+    /// `(phase_ns in pipeline order, [ckpt, replay, audit] bytes)`.
+    pub fn phases(&self) -> ([u64; 5], [u64; 3]) {
+        (
+            std::array::from_fn(|i| self.phase_ns[i].load(Ordering::Relaxed)),
+            std::array::from_fn(|i| self.phase_bytes[i].load(Ordering::Relaxed)),
+        )
     }
 
     /// The recycled-residue facts of this cell's boot (ADR-0090 D4).
@@ -875,10 +901,23 @@ fn control_main(
                             residue.segment_residue_stops, residue.recycled_residue_slacks
                         )
                     };
+                    let (ns, bytes) = slot.phases();
+                    let ms = |i: usize| ns[i] as f64 / 1e6;
                     eprintln!(
                         "control: cell {cell} recovered ({segs} segments, {total} bytes, {} \
-                         records{torn}{recycled})",
-                        slot.records()
+                         records{torn}{recycled}; phases ms: start {:.1}, ckpt {:.1} \
+                         [{} B], replay {:.1} [{} B], audit {:.1} [{} B], finish {:.1}, \
+                         total {:.1})",
+                        slot.records(),
+                        ms(0),
+                        ms(1),
+                        bytes[0],
+                        ms(2),
+                        bytes[1],
+                        ms(3),
+                        bytes[2],
+                        ms(4),
+                        ns.iter().sum::<u64>() as f64 / 1e6,
                     );
                 }
             }

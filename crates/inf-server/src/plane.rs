@@ -74,7 +74,7 @@ use crate::exec::{
     unavailable_default_allows,
 };
 use crate::pubsub::{self, PubSubCell, SubKind};
-use crate::recover::{Recovery, RecoveryProgress};
+use crate::recover::{RecoverPhase, Recovery, RecoveryProgress};
 
 /// Commands queued behind an active pump before recv is disarmed (bounded
 /// everything — the backpressure watermark).
@@ -1318,6 +1318,9 @@ struct BootRecovery<F: SegmentFs> {
     cell_id: u16,
     /// Earliest next step under the test-only throttle (`Nanos(0)` = now).
     next_due: Nanos,
+    /// M4.5-S39d: the phase the previous step ran and the loop instant it
+    /// ran at — the delta to the next step is that phase's time.
+    last_step: Option<(RecoverPhase, Nanos)>,
 }
 
 /// An owner-side reply produced during the FABRIC-IN drain (ranges index
@@ -1449,6 +1452,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             cfg: cfg.clone(),
             cell_id,
             next_due: Nanos(0),
+            last_step: None,
         });
         self.loading_board = Some(board);
         self.shared.loading.set(true);
@@ -1473,8 +1477,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         // inside the kernel leaves the board naming the stuck phase, so a
         // wedged cell is diagnosable from the control thread's narration
         // instead of silent (the ADR-0022 D7 signature).
+        // Per-phase time (M4.5-S39d): the loop clock between consecutive
+        // steps is the earlier step's phase — one injected instant per
+        // iteration, never an ambient clock in cell code (L7).
+        let phase = boot.rec.phase();
+        if let Some((prev, at)) = boot.last_step.replace((phase, cx.now)) {
+            boot.rec.credit_phase_time(prev, cx.now.0.saturating_sub(at.0));
+        }
         if let Some(board) = &self.loading_board {
-            board.slot(boot.cell_id).publish_phase(boot.rec.phase_code());
+            board.slot(boot.cell_id).publish_phase(phase.code());
         }
         let before = boot.rec.bytes_consumed();
         let step = {
@@ -1545,6 +1556,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                             .node
                             .recover_recycled_residue_slacks
                             .set(stats.recycled_residue_slacks);
+                        self.shared.node.recover_phases.set(stats.phases);
+                        self.shared.node.recover_stale_files_removed.set(stats.stale_files_removed);
+                        self.shared
+                            .node
+                            .recover_records
+                            .set(stats.ckpt_records + stats.records_applied);
                         if let Some(board) = &self.loading_board {
                             let slot = board.slot(boot.cell_id);
                             slot.mark_ready(
@@ -1554,6 +1571,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                                     segment_residue_stops: stats.segment_residue_stops,
                                     recycled_residue_slacks: stats.recycled_residue_slacks,
                                 },
+                                stats.phases,
                             );
                         }
                     }

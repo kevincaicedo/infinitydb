@@ -219,6 +219,13 @@ pub struct NodeInfo {
     pub recycle_wait_active_bytes_max: Cell<u64>,
     pub recover_segment_residue_stops: Cell<u64>,
     pub recover_recycled_residue_slacks: Cell<u64>,
+    /// M4.5-S39d: this cell's boot recovery decomposed (loop-resident
+    /// boots only; zero on a memory node).
+    pub recover_phases: Cell<crate::recover::RecoverPhases>,
+    pub recover_stale_files_removed: Cell<u64>,
+    /// Records recovered (checkpoint + tail applied) — the fixed-work
+    /// identity a recovery row checks across arms.
+    pub recover_records: Cell<u64>,
     pub frame_waits_barrier: Cell<u64>,
     pub frame_waits_rotation: Cell<u64>,
     pub frame_waits_reorder: Cell<u64>,

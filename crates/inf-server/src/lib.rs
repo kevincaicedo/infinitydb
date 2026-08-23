@@ -65,4 +65,7 @@ pub use inf_log::{
 pub use io_properties::{IO_PROPERTIES_FILE, IoProperties, IoPropertiesError};
 pub use plane::{ExecOrigin, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane};
 pub use readahead::{ReadAheadFile, ReadAheadFs};
-pub use recover::{RecoverStats, RecoveredManifest, Recovery, RecoveryProgress, open_cell_log};
+pub use recover::{
+    RecoverPhase, RecoverPhases, RecoverStats, RecoveredManifest, Recovery, RecoveryProgress,
+    open_cell_log,
+};
