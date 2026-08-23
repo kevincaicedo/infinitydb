@@ -2890,6 +2890,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.recycle_pool_full.set(stats.recycle_pool_full);
             node.segment_rotations.set(stats.segment_rotations);
             node.segment_preallocs.set(stats.segment_preallocs);
+            node.segment_inline_preallocs.set(stats.segment_inline_preallocs);
+            node.segment_prealloc_failures.set(stats.segment_prealloc_failures);
+            node.recycle_waits_started.set(stats.recycle_waits_started);
+            node.recycle_waits_satisfied.set(stats.recycle_waits_satisfied);
+            node.recycle_waits_expired.set(stats.recycle_waits_expired);
+            node.recycle_wait_active_bytes_max.set(stats.recycle_wait_active_bytes_max);
             let ckpt = cell.ckpt_stats();
             let unix_now_ms = self.shared.wall_anchor().unix_from_internal(cx.now);
             node.ckpt_age_s.set(if ckpt.last_unix_ms == 0 {

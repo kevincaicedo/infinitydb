@@ -642,7 +642,9 @@ pub fn render() -> String {
     push("(2026-08-22): `--frames-in-flight auto` resolves to 3 under the FUA class and 1");
     push("under FLUSH, both at 4 MiB buffers — the record bound is the same in either.");
     push("Segment recycling (M4.5-S39b, ADR-0090; `--no-segment-recycle` turns it off)");
-    push("changes which file the next log segment is, never a client-visible semantic.");
+    push("changes which file the next log segment is, never a client-visible semantic;");
+    push("its pool wait (ADR-0090 D9, `--recycle-wait off|quarter|eighth`) only moves");
+    push("when the next segment file is created.");
     push("`infinityd --conn-default-ns NAME` (M4.5-S40, off by default) starts every");
     push("accepted connection as if it had sent `INF.NS USE NAME` — an operator opt-in");
     push("for clients that cannot send a per-connection prelude (`memtier_benchmark`,");

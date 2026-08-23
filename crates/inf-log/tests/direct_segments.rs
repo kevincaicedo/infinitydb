@@ -506,9 +506,12 @@ fn zero_fill_is_paced_by_the_active_segments_fill() {
     let dir = PathBuf::from("log");
     disk.create_dir_all(&dir).expect("dir");
     let segment_bytes: u32 = 64 << 20;
-    let mut rotor =
-        SegmentRotor::create_fresh_deferred(disk.clone(), dir, direct_cfg(segment_bytes))
-            .expect("fresh");
+    // The pre-D9 prealloc (ADR-0090 D9 would wait for the pool after the
+    // upgrade rotation; its own pacing test lives in `segment_prealloc_
+    // wait.rs`).
+    let cfg =
+        SegmentConfig { prealloc: inf_log::PreallocPolicy::Immediate, ..direct_cfg(segment_bytes) };
+    let mut rotor = SegmentRotor::create_fresh_deferred(disk.clone(), dir, cfg).expect("fresh");
     // Segment 0 is un-zeroed: segment 1 fills unpaced, end to end.
     rotor.maintain_deferred(0).expect("maintain");
     zero_fill_to_ready(&mut rotor, &disk, segment_bytes);

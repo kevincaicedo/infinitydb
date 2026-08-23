@@ -1433,6 +1433,15 @@ struct S39bSnap {
     fallbacks: u64,
     pool_full: u64,
     truncated: u64,
+    /// ADR-0090 D9: the pool wait's three outcomes and the two MAINTAIN
+    /// facts the wait must never move (a rotation onto an un-zeroed
+    /// segment, a rotation that found no next segment), plus ENOSPC.
+    waits_started: u64,
+    waits_satisfied: u64,
+    waits_expired: u64,
+    rotations_unzeroed: u64,
+    inline_preallocs: u64,
+    prealloc_failures: u64,
     /// Minimum over cells — the per-cell validity facts.
     rotations_min_cell: u64,
     truncated_min_cell: u64,
@@ -1467,6 +1476,12 @@ fn s39b_snap(
         fallbacks: sum_field(&infos, "recycle_fallbacks"),
         pool_full: sum_field(&infos, "recycle_pool_full"),
         truncated: truncated.iter().sum(),
+        waits_started: sum_field(&infos, "recycle_waits_started"),
+        waits_satisfied: sum_field(&infos, "recycle_waits_satisfied"),
+        waits_expired: sum_field(&infos, "recycle_waits_expired"),
+        rotations_unzeroed: sum_field(&infos, "rotations_unzeroed"),
+        inline_preallocs: sum_field(&infos, "segment_inline_preallocs"),
+        prealloc_failures: sum_field(&infos, "segment_prealloc_failures"),
         rotations_min_cell: rotations.iter().copied().min().unwrap_or(0),
         truncated_min_cell: truncated.iter().copied().min().unwrap_or(0),
         deficit_max_cell: rotations
@@ -1534,6 +1549,13 @@ impl S39bLeg {
     fn warmed_device_per_log(&self) -> f64 {
         (self.d(|s| s.device_sectors_written) * 512) as f64
             / self.d(|s| s.frame_bytes).max(1) as f64
+    }
+    /// Waits ended `satisfied` over waits ended at all, warmed window
+    /// (ADR-0090 A9: "waits end predominantly satisfied"); `None` when no
+    /// wait ended (the wait-off arm, or recycling off).
+    fn warmed_wait_satisfied_share(&self) -> Option<f64> {
+        let ended = self.d(|s| s.waits_satisfied) + self.d(|s| s.waits_expired);
+        (ended > 0).then(|| self.d(|s| s.waits_satisfied) as f64 / ended as f64)
     }
     fn warmed_deficit(&self) -> u64 {
         // `rotations − recycled` over the warmed window, worst cell: the
@@ -1760,14 +1782,32 @@ fn s39b_recycle_row(
             .into());
     }
     let slots_arg = slots.to_string();
-    let arm_args: Vec<&str> = vec!["--segment-recycle-slots", &slots_arg];
-    let base_args: Vec<&str> = vec!["--no-segment-recycle"];
+    // ADR-0090 A9: the arm's pool wait (`--recycle-wait`, the server's
+    // default when absent) and which baseline the row pairs it with —
+    // `recycle-off` (D6: `--no-segment-recycle`) or `wait-off` (D9: the
+    // same pool bound with `--recycle-wait off`, the causal A/B for the
+    // wait alone).
+    let wait = flags.get("recycle-wait").map(str::to_string);
+    let baseline = flags.str_or("s39b-baseline", "recycle-off");
+    let mut arm_args: Vec<&str> = vec!["--segment-recycle-slots", &slots_arg];
+    if let Some(wait) = wait.as_deref() {
+        arm_args.extend(["--recycle-wait", wait]);
+    }
+    let base_args: Vec<&str> = match baseline.as_str() {
+        "recycle-off" => vec!["--no-segment-recycle"],
+        "wait-off" => vec!["--segment-recycle-slots", &slots_arg, "--recycle-wait", "off"],
+        other => {
+            return Err(format!("s39b: --s39b-baseline {other}: expected recycle-off|wait-off"));
+        }
+    };
     m.note(format!(
         "s39b row: {cells} cells · {replicates} replicates (ABBA) · write leg {duration} s at \
          {S35_CONNS_AC} conns · segment-bytes {segment_bytes} · ckpt floor {} · arm \
-         --segment-recycle-slots {slots} vs baseline --no-segment-recycle · device stat {} · \
+         --segment-recycle-slots {slots} --recycle-wait {} vs baseline {} · device stat {} · \
          first-generation trigger: every cell truncated ≥ 1 and rotated ≥ 2",
         flags.u64_or("ckpt-interval-bytes", segment_bytes)?,
+        wait.as_deref().unwrap_or("(server default)"),
+        base_args.join(" "),
         device_stat.as_deref().unwrap_or("(not sampled)")
     ));
     let mut raw = String::new();
@@ -1796,6 +1836,8 @@ fn s39b_recycle_row(
                 "rep{rep} {arm} c32 ops={:.0} p50_us={:.0} p99_us={:.0} max_us={:.0} \
                  barrier_p50_us={:.0} barrier_p99_us={:.0} parked={} read_ops={:.0} \
                  rotations={} recycled={} misses={} fallbacks={} pool_full={} truncated={} \
+                 waits[started={} satisfied={} expired={}] rotations_unzeroed={} \
+                 inline_preallocs={} prealloc_failures={} \
                  rotations_min_cell={} trigger_at_s={:.1} warmed={} \
                  firstgen[zero_fill={} frame_bytes={} share={:.3}] \
                  warmed[zero_fill={} frame_bytes={} share={:.3} padding_pct={:.1} \
@@ -1816,6 +1858,12 @@ fn s39b_recycle_row(
                 leg.end.fallbacks,
                 leg.end.pool_full,
                 leg.end.truncated,
+                leg.end.waits_started,
+                leg.end.waits_satisfied,
+                leg.end.waits_expired,
+                leg.end.rotations_unzeroed,
+                leg.end.inline_preallocs,
+                leg.end.prealloc_failures,
                 leg.end.rotations_min_cell,
                 leg.first_gen.at_s,
                 leg.warmed,
@@ -1859,6 +1907,10 @@ fn s39b_recycle_row(
     let mut dev_arm = Vec::new();
     let mut dev_base = Vec::new();
     let mut rot_min = Vec::new();
+    let mut wait_share = Vec::new();
+    let mut unzeroed_arm = Vec::new();
+    let mut inline_arm = Vec::new();
+    let mut nospace_arm = Vec::new();
     let mut invalid = 0usize;
     for rep in 0..replicates {
         let (Some((_, b)), Some((_, a))) = (pair(rep, "base"), pair(rep, "arm")) else { continue };
@@ -1884,6 +1936,12 @@ fn s39b_recycle_row(
         dev_arm.push(a.warmed_device_per_log());
         dev_base.push(b.warmed_device_per_log());
         rot_min.push(a.end.rotations_min_cell.min(b.end.rotations_min_cell) as f64);
+        if let Some(share) = a.warmed_wait_satisfied_share() {
+            wait_share.push(share);
+        }
+        unzeroed_arm.push(a.end.rotations_unzeroed as f64);
+        inline_arm.push(a.end.inline_preallocs as f64);
+        nospace_arm.push(a.end.prealloc_failures as f64);
     }
     if invalid > 0 {
         m.note(format!(
@@ -1912,6 +1970,18 @@ fn s39b_recycle_row(
         m.set("s39b:device_bytes_per_log_byte_arm", median(&mut dev_arm));
         m.set("s39b:device_bytes_per_log_byte_base", median(&mut dev_base));
         m.set("s39b:rotations_per_cell_min", rot_min.iter().copied().fold(f64::MAX, f64::min));
+        // ADR-0090 A9 (the D9 row): the wait's outcome and the three facts
+        // it must not move, worst replicate (a max, never a median — one
+        // un-zeroed rotation is the falsifier).
+        if wait_share.is_empty() {
+            m.note("s39b: no pool wait ended on the arm — the wait-satisfied share is absent");
+        } else {
+            m.set("s39b:wait_satisfied_share_arm", median(&mut wait_share));
+        }
+        let worst = |v: &[f64]| v.iter().copied().fold(0.0, f64::max);
+        m.set("s39b:rotations_unzeroed_arm_max", worst(&unzeroed_arm));
+        m.set("s39b:inline_preallocs_arm_max", worst(&inline_arm));
+        m.set("s39b:prealloc_failures_arm_max", worst(&nospace_arm));
     }
     if device_stat.is_none() {
         m.note("s39b: --device-stat not given — device bytes per log byte read 0 (not sampled)");

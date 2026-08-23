@@ -67,11 +67,81 @@ pub const ZERO_FILL_SLICE_BYTES: u32 = 256 << 10;
 /// than the burst.
 pub const ZERO_FILL_HEAD_START: u32 = 16 << 20;
 
-/// Recycle-pool bound (ADR-0090 D1): recycling remains explicit opt-in.
-/// The corrected campaign-F first-boot recovery gate read 1.29x at one
-/// slot, so ADR-0090 D9 must close the miss/recovery term before a future
-/// default change.
-pub const DEFAULT_RECYCLE_SLOTS: u8 = 0;
+/// Recycle-pool bound (ADR-0090 D1, A7.2 as amended 2026-08-22): one
+/// pooled segment per cell is the product default — campaign F measured
+/// the one-slot arm at 2.20 → 1.42 accounted host bytes per log byte and
+/// p99 0.20× with every correctness row green; its recovery gate was
+/// non-discriminating (A6) and is S39d's question, not this constant's.
+/// `0` = off (`infinityd --no-segment-recycle`, the A/B baseline arm).
+pub const DEFAULT_RECYCLE_SLOTS: u8 = 1;
+
+/// How the MAINTAIN prealloc behaves when recycling is on and the pool is
+/// empty at rotation (ADR-0090 D9 as built, A8).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PreallocPolicy {
+    /// Create a fresh next segment in the first MAINTAIN slice after
+    /// rotation (the pre-D9 path byte-for-byte; `--recycle-wait off`).
+    Immediate,
+    /// Re-check the pool each slice until the active segment holds
+    /// `bound` bytes, then fall back to a fresh prealloc. The miss the
+    /// pool pays today is a *phase* (the feeding truncation lands 1–3 s
+    /// into the new segment's life), so a bounded wait removes it where a
+    /// larger pool only masks it.
+    WaitForPool { bound: PoolWaitBound },
+}
+
+/// Where a pool wait expires, as a power-of-two fraction of the segment —
+/// a fraction rather than bytes so one policy serves the 16 KiB sim
+/// segments and the 256 MiB product ones alike.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PoolWaitBound {
+    /// `segment_bytes / 4` — the D9 hypothesis (≈ 3.7 s at the row's rate,
+    /// far beyond the 1–3 s feed slip; 75 % of the segment stays as
+    /// ENOSPC admission headroom).
+    Quarter,
+    /// `segment_bytes / 8` — the amendment path if the fallback fill
+    /// misses the rotation under `Quarter` (`rotations_unzeroed` rises).
+    Eighth,
+}
+
+impl PoolWaitBound {
+    /// The wait's expiry in bytes of the active segment. Exact: every
+    /// `Direct` segment size is a multiple of `FRAME_ALIGN` (4 KiB).
+    #[must_use]
+    pub fn bytes(self, segment_bytes: u32) -> u32 {
+        match self {
+            PoolWaitBound::Quarter => segment_bytes / 4,
+            PoolWaitBound::Eighth => segment_bytes / 8,
+        }
+    }
+}
+
+impl PreallocPolicy {
+    /// The product default (ADR-0090 A8): wait up to a quarter segment.
+    pub const DEFAULT: PreallocPolicy =
+        PreallocPolicy::WaitForPool { bound: PoolWaitBound::Quarter };
+
+    /// Parse the `--recycle-wait` spelling: `off | quarter | eighth`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<PreallocPolicy> {
+        match text {
+            "off" | "immediate" => Some(PreallocPolicy::Immediate),
+            "quarter" => Some(PreallocPolicy::WaitForPool { bound: PoolWaitBound::Quarter }),
+            "eighth" => Some(PreallocPolicy::WaitForPool { bound: PoolWaitBound::Eighth }),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for PreallocPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PreallocPolicy::Immediate => f.write_str("off"),
+            PreallocPolicy::WaitForPool { bound: PoolWaitBound::Quarter } => f.write_str("quarter"),
+            PreallocPolicy::WaitForPool { bound: PoolWaitBound::Eighth } => f.write_str("eighth"),
+        }
+    }
+}
 
 /// File name of a segment: `seg-{:06}.ilog` (wider ids grow digits
 /// naturally; the parser accepts 6–10 digits).
@@ -120,6 +190,10 @@ pub struct SegmentConfig {
     /// the default is [`DEFAULT_RECYCLE_SLOTS`]. Disk attribution is
     /// `recycle_slots × segment_bytes` at most (`recycle_pool_bytes`).
     pub recycle_slots: u8,
+    /// What the prealloc does with an empty pool (ADR-0090 D9): wait,
+    /// bounded, for the feeding truncation, or create at once. Moot when
+    /// `recycle_slots == 0` or the mode is `Buffered`.
+    pub prealloc: PreallocPolicy,
 }
 
 impl Default for SegmentConfig {
@@ -130,6 +204,7 @@ impl Default for SegmentConfig {
             io_mode: SegmentIoMode::Buffered,
             fua_max_frame_bytes: DEFAULT_FUA_MAX_FRAME_BYTES,
             recycle_slots: DEFAULT_RECYCLE_SLOTS,
+            prealloc: PreallocPolicy::DEFAULT,
         }
     }
 }
@@ -360,6 +435,18 @@ pub struct RotorStats {
     pub recycle_fallbacks: u64,
     /// Covered sealed segments offered to a full pool (unlinked as before).
     pub recycle_pool_full: u64,
+    /// Pool waits begun (ADR-0090 D9): rotations whose pool was empty and
+    /// whose prealloc was eligible to wait. Each ends exactly once, as
+    /// `recycle_waits_satisfied` or `recycle_waits_expired`.
+    pub recycle_waits_started: u64,
+    /// Waits the pool fed before the bound — the miss D9 removes.
+    pub recycle_waits_satisfied: u64,
+    /// Waits that reached the bound and fell back to a fresh prealloc —
+    /// each one a `recycle_miss` and a segment of zero-fill.
+    pub recycle_waits_expired: u64,
+    /// The largest `active.written` at which any wait ended — how deep
+    /// into a segment the pool's feed arrives at the row's cadence.
+    pub recycle_wait_active_bytes_max: u64,
 }
 
 /// What one MAINTAIN slice did (observability + tests).
@@ -415,6 +502,31 @@ struct NextSegment<File> {
     file: File,
     io_mode: SegmentIoMode,
     state: NextState,
+    /// `active.written` when this segment was created (ADR-0090 A8): the
+    /// zero-fill pacing runs from here, so a fallback created at the
+    /// wait's bound keeps ADR-0086 D4's 16 MiB head start instead of
+    /// bursting the whole deferred allowance at once. 0 for an immediate
+    /// prealloc — byte-identical to the pre-D9 pacing.
+    fill_origin: u32,
+}
+
+/// Where the MAINTAIN prealloc stands while `next` is absent (ADR-0090
+/// D9 as built, A8). Reset to `Immediate` at every rotation: each
+/// generation decides afresh.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Prealloc {
+    /// The next slice preallocates — pool first, else the wait or fresh.
+    Immediate,
+    /// The pool was empty at rotation and the wait was eligible: each
+    /// slice re-checks the pool until `active.written` reaches the bound.
+    WaitingForRecycle,
+    /// The wait expired (or was never eligible) and the fresh path owns
+    /// this generation; a pool arrival now is kept for the next one. A
+    /// fresh prealloc that failed with `NoSpace` retries from here
+    /// without a second wait or a second miss. `fill_origin` is where the
+    /// fallback's zero-fill paces from: 0 when no wait ran (the pre-D9
+    /// pacing, byte-identical), the active cursor at expiry otherwise.
+    FreshFallback { fill_origin: u32 },
 }
 
 /// One zero-fill write for the plane to issue (ADR-0086 D4): `fd` of the
@@ -467,6 +579,9 @@ pub struct SegmentRotor<F: SegmentFs> {
     cfg: SegmentConfig,
     active: ActiveSegment<F::File>,
     next: Option<NextSegment<F::File>>,
+    /// The prealloc state machine (ADR-0090 D9); meaningful only while
+    /// `next` is `None`.
+    prealloc: Prealloc,
     sealed: Vec<SealedMeta>,
     /// The recycle pool (ADR-0090 D1): at most `cfg.recycle_slots`
     /// covered, pre-zeroed sealed segments awaiting reuse, FIFO.
@@ -491,6 +606,7 @@ impl<F: SegmentFs> fmt::Debug for SegmentRotor<F> {
             .field("io_mode", &self.active.io_mode)
             .field("prezeroed", &self.active.prezeroed)
             .field("next", &self.next.as_ref().map(|next| (next.id, next.state)))
+            .field("prealloc", &self.prealloc)
             .field("sealed", &self.sealed)
             .field("pool", &self.pool)
             .field("stats", &self.stats)
@@ -512,6 +628,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
             cfg,
             active,
             next: None,
+            prealloc: Prealloc::Immediate,
             sealed: Vec::new(),
             pool: Vec::new(),
             space_exhausted: false,
@@ -546,6 +663,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
             cfg,
             active,
             next: None,
+            prealloc: Prealloc::Immediate,
             sealed: Vec::new(),
             pool: Vec::new(),
             space_exhausted: false,
@@ -634,6 +752,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
             cfg,
             active,
             next: None,
+            prealloc: Prealloc::Immediate,
             sealed,
             pool: Vec::new(),
             space_exhausted: false,
@@ -685,12 +804,8 @@ impl<F: SegmentFs> SegmentRotor<F> {
     pub fn zero_fill_pending(&self) -> bool {
         let Some(next) = self.next.as_ref() else { return false };
         let NextState::Filling { cursor, in_flight: 0 } = next.state else { return false };
-        if self.active.prezeroed {
-            let allowed =
-                self.active.written.saturating_mul(2).saturating_add(ZERO_FILL_HEAD_START);
-            if cursor >= allowed {
-                return false;
-            }
+        if self.active.prezeroed && cursor >= fill_allowed(self.active.written, next.fill_origin) {
+            return false;
         }
         next.file.raw_fd().is_some()
     }
@@ -706,11 +821,8 @@ impl<F: SegmentFs> SegmentRotor<F> {
         let active_written = self.active.written;
         let next = self.next.as_mut()?;
         let NextState::Filling { cursor, in_flight: 0 } = next.state else { return None };
-        if paced {
-            let allowed = active_written.saturating_mul(2).saturating_add(ZERO_FILL_HEAD_START);
-            if cursor >= allowed {
-                return None;
-            }
+        if paced && cursor >= fill_allowed(active_written, next.fill_origin) {
+            return None;
         }
         let fd = next.file.raw_fd()?;
         let len = max_len.min(self.cfg.segment_bytes - cursor);
@@ -801,73 +913,150 @@ impl<F: SegmentFs> SegmentRotor<F> {
         deferred: bool,
     ) -> Result<DeferredMaintain<F>, LogError> {
         let mut report = MaintainReport::default();
-        let mut barrier = None;
         if self.time_seal_due(now_ms) {
             self.rotate()?;
             self.stats.time_seals += 1;
             report.time_sealed = true;
         }
-        if self.next.is_none() {
-            let id = self.active.id.next();
-            // ADR-0090 D1: a pooled segment becomes the next one by
-            // rename — no data write. Its directory entry needs the same
-            // barrier a fresh prealloc's does (D3 as amended: no frame of
-            // `id` may be acknowledged before the rename is durable —
-            // the deferred tier registers `barrier` in this slice, ahead
-            // of every ticket the segment's frames will take; the
-            // synchronous tier syncs the dir inline, like `create_
-            // prealloc`). A rename that fails falls through to a fresh
-            // prealloc and counts a fallback; the pooled file is then an
-            // ordinary below-floor orphan for boot GC.
-            let recycling = self.cfg.recycle_slots > 0 && self.cfg.io_mode == SegmentIoMode::Direct;
-            let (created, recycled) = match self.take_recycled(id, deferred) {
-                Some(Ok(file)) => (Ok(file), true),
-                Some(Err(_)) => {
-                    self.stats.recycle_fallbacks += 1;
-                    (self.create_next(id, deferred), false)
+        if self.next.is_some() {
+            return Ok((report, None));
+        }
+        let id = self.active.id.next();
+        let Some((created, recycled)) = self.prealloc_source(id, deferred) else {
+            return Ok((report, None)); // waiting for the pool (ADR-0090 D9)
+        };
+        let mut barrier = None;
+        match created {
+            Ok(file) => {
+                if deferred {
+                    let dir = self
+                        .fs
+                        .open_dir(&self.log_dir)
+                        .map_err(|source| LogError::Io { segment: id, source })?;
+                    barrier = Some(PreallocBarrier { segment: id, dir });
                 }
-                None => {
+                let io_mode = self.cfg.io_mode;
+                let state = next_state(&file, id, io_mode)?;
+                if recycled {
+                    // Read, never assumed (ADR-0086 D4): a pooled file
+                    // that does not read fully allocated fills like
+                    // a fresh one and is a fallback, not a recycle.
+                    if state == (NextState::Ready { prezeroed: true }) {
+                        self.stats.segments_recycled += 1;
+                    } else {
+                        self.stats.recycle_fallbacks += 1;
+                    }
+                }
+                let fill_origin = match self.prealloc {
+                    Prealloc::FreshFallback { fill_origin } => fill_origin,
+                    Prealloc::Immediate | Prealloc::WaitingForRecycle => 0,
+                };
+                self.next = Some(NextSegment { id, file, io_mode, state, fill_origin });
+                self.stats.preallocs += 1;
+                self.space_exhausted = false;
+                report.preallocated = Some(id);
+            }
+            Err(LogError::NoSpace { .. }) => {
+                self.stats.prealloc_failures += 1;
+                self.space_exhausted = true;
+                report.prealloc_failed = true;
+            }
+            Err(other) => return Err(other),
+        }
+        Ok((report, barrier))
+    }
+
+    /// Where the next segment `id` comes from — the pool by rename, or a
+    /// fresh file — driven by the prealloc state machine (ADR-0090 D9);
+    /// `None` while the prealloc waits for the pool. The `bool` says the
+    /// file was recycled.
+    ///
+    /// ADR-0090 D1: a pooled segment becomes the next one by rename — no
+    /// data write. Its directory entry needs the same barrier a fresh
+    /// prealloc's does (D3 as amended: no frame of `id` may be
+    /// acknowledged before the rename is durable — the deferred tier
+    /// registers the barrier in this slice, ahead of every ticket the
+    /// segment's frames will take; the synchronous tier syncs the dir
+    /// inline, like `create_prealloc`). A rename that fails falls through
+    /// to a fresh prealloc and counts a fallback; the pooled file is then
+    /// an ordinary below-floor orphan for boot GC.
+    fn prealloc_source(
+        &mut self,
+        id: SegmentId,
+        deferred: bool,
+    ) -> Option<(Result<F::File, LogError>, bool)> {
+        match self.take_recycled(id, deferred) {
+            Some(Ok(file)) => {
+                if self.prealloc == Prealloc::WaitingForRecycle {
+                    self.note_wait_end();
+                    self.stats.recycle_waits_satisfied += 1;
+                    self.prealloc = Prealloc::Immediate;
+                }
+                Some((Ok(file), true))
+            }
+            Some(Err(_)) => {
+                self.stats.recycle_fallbacks += 1;
+                Some((self.create_next(id, deferred), false))
+            }
+            None => match self.prealloc {
+                Prealloc::Immediate if self.wait_eligible() => {
+                    self.prealloc = Prealloc::WaitingForRecycle;
+                    self.stats.recycle_waits_started += 1;
+                    None
+                }
+                Prealloc::WaitingForRecycle if !self.wait_expired() => None,
+                Prealloc::WaitingForRecycle => {
+                    self.note_wait_end();
+                    self.stats.recycle_waits_expired += 1;
+                    self.stats.recycle_misses += 1;
+                    self.prealloc = Prealloc::FreshFallback { fill_origin: self.active.written };
+                    Some((self.create_next(id, deferred), false))
+                }
+                Prealloc::Immediate => {
+                    let recycling =
+                        self.cfg.recycle_slots > 0 && self.cfg.io_mode == SegmentIoMode::Direct;
                     if recycling {
                         self.stats.recycle_misses += 1;
                     }
-                    (self.create_next(id, deferred), false)
+                    self.prealloc = Prealloc::FreshFallback { fill_origin: 0 };
+                    Some((self.create_next(id, deferred), false))
                 }
-            };
-            match created {
-                Ok(file) => {
-                    if deferred {
-                        let dir = self
-                            .fs
-                            .open_dir(&self.log_dir)
-                            .map_err(|source| LogError::Io { segment: id, source })?;
-                        barrier = Some(PreallocBarrier { segment: id, dir });
-                    }
-                    let io_mode = self.cfg.io_mode;
-                    let state = next_state(&file, id, io_mode)?;
-                    if recycled {
-                        // Read, never assumed (ADR-0086 D4): a pooled file
-                        // that does not read fully allocated fills like
-                        // a fresh one and is a fallback, not a recycle.
-                        if state == (NextState::Ready { prezeroed: true }) {
-                            self.stats.segments_recycled += 1;
-                        } else {
-                            self.stats.recycle_fallbacks += 1;
-                        }
-                    }
-                    self.next = Some(NextSegment { id, file, io_mode, state });
-                    self.stats.preallocs += 1;
-                    self.space_exhausted = false;
-                    report.preallocated = Some(id);
-                }
-                Err(LogError::NoSpace { .. }) => {
-                    self.stats.prealloc_failures += 1;
-                    self.space_exhausted = true;
-                    report.prealloc_failed = true;
-                }
-                Err(other) => return Err(other),
-            }
+                // A `NoSpace` retry: the miss was counted when this
+                // generation fell back, and a generation never waits twice.
+                Prealloc::FreshFallback { .. } => Some((self.create_next(id, deferred), false)),
+            },
         }
-        Ok((report, barrier))
+    }
+
+    /// ADR-0090 A8: may this generation's prealloc wait for the pool?
+    /// Every condition is a fact the rotor owns; the plane adds none. A
+    /// wait that nothing can satisfy is never started: the pool is fed
+    /// only by a sealed segment of this life that was pre-zeroed when
+    /// active, so a fresh cell's generation 2 (sealed: the sparse segment
+    /// 0) and a recovered cell's first generation (earlier lives' seals
+    /// carry `prezeroed: false`) preallocate at once.
+    fn wait_eligible(&self) -> bool {
+        let PreallocPolicy::WaitForPool { bound } = self.cfg.prealloc else { return false };
+        self.cfg.recycle_slots > 0
+            && self.cfg.io_mode == SegmentIoMode::Direct
+            && self.cfg.seal_after_ms.is_none()
+            && self.active.prezeroed
+            && self.stats.rotations >= 1
+            && self.sealed.iter().any(|meta| meta.prezeroed)
+            && self.pool.is_empty()
+            && self.active.written < bound.bytes(self.cfg.segment_bytes)
+    }
+
+    /// The wait's bound is reached (only asked while waiting).
+    fn wait_expired(&self) -> bool {
+        let PreallocPolicy::WaitForPool { bound } = self.cfg.prealloc else { return true };
+        self.active.written >= bound.bytes(self.cfg.segment_bytes)
+    }
+
+    /// A wait ended here: record how deep into the segment it ran.
+    fn note_wait_end(&mut self) {
+        self.stats.recycle_wait_active_bytes_max =
+            self.stats.recycle_wait_active_bytes_max.max(u64::from(self.active.written));
     }
 
     fn create_next(&self, id: SegmentId, deferred: bool) -> Result<F::File, LogError> {
@@ -1107,6 +1296,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
         );
         self.sealed.push(SealedMeta { id: old.id, prezeroed: old.prezeroed });
         self.stats.rotations += 1;
+        self.prealloc = Prealloc::Immediate;
         Ok(SealHandoff { segment: old.id, file: old.file, end_offset: old.written })
     }
 
@@ -1120,7 +1310,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
         self.stats.inline_preallocs += 1;
         let io_mode = self.cfg.io_mode;
         let state = next_state(&file, id, io_mode)?;
-        Ok(NextSegment { id, file, io_mode, state })
+        Ok(NextSegment { id, file, io_mode, state, fill_origin: 0 })
     }
 
     /// Was this rotation a class upgrade (active not pre-zeroed, next is)?
@@ -1229,6 +1419,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
             prezeroed,
         };
         self.stats.rotations += 1;
+        self.prealloc = Prealloc::Immediate;
         Ok(())
     }
 
@@ -1378,6 +1569,19 @@ fn create_prealloc_deferred<F: SegmentFs>(
             LogError::Io { segment: id, source }
         }
     })
+}
+
+/// The zero-fill pacing bound (ADR-0086 D4, ADR-0090 A8): the cursor may
+/// run to twice the active segment's progress **since the next segment
+/// was created** plus the head start — an immediate prealloc paces from
+/// 0 as before; a D9 fallback created at the wait's bound keeps the same
+/// 16 MiB burst and finishes by `origin + segment/2 − 8 MiB`.
+fn fill_allowed(active_written: u32, fill_origin: u32) -> u32 {
+    debug_assert!(active_written >= fill_origin, "the active cursor never moves back");
+    active_written
+        .saturating_sub(fill_origin)
+        .saturating_mul(2)
+        .saturating_add(ZERO_FILL_HEAD_START)
 }
 
 /// Where a freshly created next segment starts (ADR-0086 D4): `Buffered`

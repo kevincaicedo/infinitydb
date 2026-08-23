@@ -780,6 +780,12 @@ fn run_durable(
     let mut recycle_fallbacks = 0u64;
     let mut rotations = 0u64;
     let mut residue_slacks = 0u64;
+    // Pool-wait coverage (ADR-0090 D9): both outcomes must occur in a
+    // sweep that claims to cover the wait.
+    let mut waits_started = 0u64;
+    let mut waits_satisfied = 0u64;
+    let mut waits_expired = 0u64;
+    let mut inline_preallocs = 0u64;
     for i in (shard_i..sweep).step_by(shard_k as usize) {
         let seed = seed.wrapping_add(i);
         let report = run_one(seed);
@@ -801,6 +807,10 @@ fn run_durable(
         recycle_fallbacks += report.recycle_fallbacks;
         rotations += report.segment_rotations;
         residue_slacks += report.recycled_residue_slacks;
+        waits_started += report.recycle_waits_started;
+        waits_satisfied += report.recycle_waits_satisfied;
+        waits_expired += report.recycle_waits_expired;
+        inline_preallocs += report.segment_inline_preallocs;
         sim_seconds += report.sim_seconds;
         equivalence_checks += report.equivalence_checks;
         documents_compared += report.documents_compared;
@@ -835,7 +845,9 @@ fn run_durable(
          deferrals:{budget_deferrals} waits_pace:{waits_pace} write_stall_max_us:{stall_max_us}], \
          reopened_packed_tails:{reopened_packed_tails} ckpt_downgrades:{ckpt_downgrades} \
          waits_fill:{waits_fill}, recycling [recycled:{recycled} misses:{recycle_misses} \
-         fallbacks:{recycle_fallbacks} rotations:{rotations} residue_slacks:{residue_slacks}]",
+         fallbacks:{recycle_fallbacks} rotations:{rotations} residue_slacks:{residue_slacks} \
+         waits_started:{waits_started} waits_satisfied:{waits_satisfied} \
+         waits_expired:{waits_expired} inline_preallocs:{inline_preallocs}]",
         classes.join(" ")
     );
     println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
@@ -853,7 +865,9 @@ fn run_durable(
              reopened_packed_tails={reopened_packed_tails} ckpt_downgrades={ckpt_downgrades} \
              waits_fill={waits_fill} segments_recycled={recycled} recycle_misses={recycle_misses} \
              recycle_fallbacks={recycle_fallbacks} segment_rotations={rotations} \
-             recycled_residue_slacks={residue_slacks}\n",
+             recycled_residue_slacks={residue_slacks} recycle_waits_started={waits_started} \
+             recycle_waits_satisfied={waits_satisfied} recycle_waits_expired={waits_expired} \
+             segment_inline_preallocs={inline_preallocs}\n",
             classes.join(" ")
         );
         std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest).expect("manifest");

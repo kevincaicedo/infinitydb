@@ -382,6 +382,18 @@ pub struct DurableStats {
     /// `segments_recycled` against.
     pub segment_rotations: u64,
     pub segment_preallocs: u64,
+    /// The two MAINTAIN-cadence facts the D9 row reads beside the waits:
+    /// rotations that found no next segment (a blocking prealloc on the
+    /// loop) and preallocs refused for space.
+    pub segment_inline_preallocs: u64,
+    pub segment_prealloc_failures: u64,
+    /// The pool wait (ADR-0090 D9): waits begun, fed before the bound,
+    /// expired into a fresh prealloc, and how deep into the active
+    /// segment the latest-ending wait ran.
+    pub recycle_waits_started: u64,
+    pub recycle_waits_satisfied: u64,
+    pub recycle_waits_expired: u64,
+    pub recycle_wait_active_bytes_max: u64,
     /// The worst frame-write submit → `LogWritten` latency (µs) — the
     /// `m2-device-budget` foreground-bound oracle's input (ADR-0088 D8);
     /// percentiles under-read a bound violation rarer than 1/1000.
@@ -1712,6 +1724,12 @@ impl<F: SegmentFs> DurableCell<F> {
             recycle_pool_full: rotor.recycle_pool_full,
             segment_rotations: rotor.rotations,
             segment_preallocs: rotor.preallocs + rotor.inline_preallocs,
+            segment_inline_preallocs: rotor.inline_preallocs,
+            segment_prealloc_failures: rotor.prealloc_failures,
+            recycle_waits_started: rotor.recycle_waits_started,
+            recycle_waits_satisfied: rotor.recycle_waits_satisfied,
+            recycle_waits_expired: rotor.recycle_waits_expired,
+            recycle_wait_active_bytes_max: rotor.recycle_wait_active_bytes_max,
             write_stall_max_us: self.write_stall_hist.max(),
         }
     }

@@ -165,6 +165,9 @@ pub struct DurableScenario {
     /// seeds and off on the fourth (the baseline arm stays covered);
     /// `m2_recycle` runs it everywhere with the recycle oracle armed.
     pub recycle_slots: u8,
+    /// The pool wait (ADR-0090 D9): `m2_recycle` varies it by seed so the
+    /// sweep covers the immediate path, expiry and satisfaction alike.
+    pub prealloc: inf_server::PreallocPolicy,
     /// The recycle oracle (ADR-0090 D5): every cell that rotated ≥ 3
     /// times and truncated ≥ 2 segments must have recycled ≥ 1, and the
     /// zero-fill accounting identity must hold — `zero_fill_bytes ≤
@@ -272,10 +275,12 @@ impl DurableScenario {
             // log-quiescence oracles hold unchanged.
             fill: if seed % 4 == 3 { m2_fill_config() } else { Default::default() },
             prelude: None,
-            // M4.5-S39b campaign F: the product default is off after the
-            // corrected recovery gate. The dedicated `m2-recycle` scenario
-            // below owns explicit one/two-slot crash coverage.
-            recycle_slots: inf_server::DEFAULT_RECYCLE_SLOTS,
+            // M4.5-S39b (ADR-0090 A7.5): the product default on `Direct`
+            // seeds, off on every fourth of them (seeds ≡ 5 mod 8) so the
+            // unlink path stays in every sweep; `Buffered` rotors never
+            // pool regardless. The product pool wait rides the default.
+            recycle_slots: if seed % 8 == 5 { 0 } else { inf_server::DEFAULT_RECYCLE_SLOTS },
+            prealloc: inf_server::PreallocPolicy::DEFAULT,
             recycle_oracle: false,
         }
     }
@@ -304,6 +309,30 @@ impl DurableScenario {
         scenario.ckpt_interval_bytes = 16 << 10;
         scenario.fill = if seed % 2 == 1 { m2_fill_config() } else { Default::default() };
         scenario.recycle_slots = if seed % 16 == 7 { 2 } else { 1 };
+        // ADR-0090 D9: the pool wait by seed — a third each of immediate,
+        // quarter and eighth. A 16 KiB segment's quarter is the rotating
+        // frame itself (never eligible: the slice runs after it, and a
+        // LOG step lands up to K frames before the next slice), so every
+        // other waiting seed runs 128 KiB segments (bound eight / four
+        // aligned frames) at twice the ops, with a checkpoint every half
+        // segment, so the feeding truncation lands inside the bound on
+        // some generations and after it on others: both wait outcomes
+        // occur in every sweep (the manifest counts them) and the cut
+        // meets both.
+        scenario.prealloc = match seed % 3 {
+            0 => inf_server::PreallocPolicy::Immediate,
+            1 => inf_server::PreallocPolicy::WaitForPool {
+                bound: inf_server::PoolWaitBound::Quarter,
+            },
+            _ => {
+                inf_server::PreallocPolicy::WaitForPool { bound: inf_server::PoolWaitBound::Eighth }
+            }
+        };
+        if !seed.is_multiple_of(3) && (seed / 3) % 2 == 1 {
+            scenario.segment_bytes = 128 << 10;
+            scenario.ckpt_interval_bytes = 64 << 10;
+            scenario.ops_per_writer = 400;
+        }
         scenario.recycle_oracle = true;
         scenario
     }
@@ -489,6 +518,7 @@ impl DurableScenario {
             // The budget scenario's zero-fill class must keep engaging
             // (its oracle counts deferrals): recycling off.
             recycle_slots: 0,
+            prealloc: inf_server::PreallocPolicy::DEFAULT,
             recycle_oracle: false,
         }
     }
@@ -533,6 +563,7 @@ impl DurableScenario {
             fill: Default::default(),
             prelude: None,
             recycle_slots: 0,
+            prealloc: inf_server::PreallocPolicy::DEFAULT,
             recycle_oracle: false,
         }
     }
@@ -620,6 +651,13 @@ pub struct DurableReport {
     pub recycle_fallbacks: u64,
     pub segment_rotations: u64,
     pub recycled_residue_slacks: u64,
+    /// ADR-0090 D9 coverage: pool waits begun / fed / expired across the
+    /// cells at the cut, and inline preallocs (a rotation that found no
+    /// next segment — the wait must never cause one).
+    pub recycle_waits_started: u64,
+    pub recycle_waits_satisfied: u64,
+    pub recycle_waits_expired: u64,
+    pub segment_inline_preallocs: u64,
 }
 
 impl DurableReport {
@@ -1000,6 +1038,7 @@ pub(crate) fn boot(
                 segment_bytes: scenario.segment_bytes,
                 io_mode: scenario.io_mode,
                 recycle_slots: scenario.recycle_slots,
+                prealloc: scenario.prealloc,
                 ..Default::default()
             },
             ckpt: inf_server::CkptConfig {
@@ -1207,6 +1246,10 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         recycle_fallbacks: 0,
         segment_rotations: 0,
         recycled_residue_slacks: 0,
+        recycle_waits_started: 0,
+        recycle_waits_satisfied: 0,
+        recycle_waits_expired: 0,
+        segment_inline_preallocs: 0,
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -1516,6 +1559,40 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             report.recycle_misses += stats.recycle_misses;
             report.recycle_fallbacks += stats.recycle_fallbacks;
             report.segment_rotations += stats.segment_rotations;
+            report.recycle_waits_started += stats.recycle_waits_started;
+            report.recycle_waits_satisfied += stats.recycle_waits_satisfied;
+            report.recycle_waits_expired += stats.recycle_waits_expired;
+            report.segment_inline_preallocs += stats.segment_inline_preallocs;
+            // ADR-0090 A8: every wait ends exactly once, and a wait never
+            // strands a rotation without a next segment.
+            if stats.recycle_waits_started
+                < stats.recycle_waits_satisfied + stats.recycle_waits_expired
+            {
+                fail(
+                    &mut report,
+                    format!(
+                        "POOL-WAIT ACCOUNTING VIOLATION seed {:#x} cell {cell}: started {} < \
+                         satisfied {} + expired {}",
+                        scenario.seed,
+                        stats.recycle_waits_started,
+                        stats.recycle_waits_satisfied,
+                        stats.recycle_waits_expired
+                    ),
+                );
+            }
+            if scenario.recycle_oracle
+                && scenario.prealloc != inf_server::PreallocPolicy::Immediate
+                && stats.segment_inline_preallocs > 0
+            {
+                fail(
+                    &mut report,
+                    format!(
+                        "POOL WAIT STRANDED A ROTATION seed {:#x} cell {cell}: {} inline \
+                         preallocs under {:?}",
+                        scenario.seed, stats.segment_inline_preallocs, scenario.prealloc
+                    ),
+                );
+            }
             // ADR-0090 D5, the recycle oracle (per cell, at the cut).
             if scenario.recycle_oracle
                 && scenario.recycle_slots > 0

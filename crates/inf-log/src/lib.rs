@@ -78,9 +78,9 @@ pub use scan::{
 };
 pub use segment::{
     DEFAULT_FUA_MAX_FRAME_BYTES, DEFAULT_RECYCLE_SLOTS, DEFAULT_SEGMENT_BYTES, DeferredBegin,
-    FrameSlot, FsyncFailed, LogError, MaintainReport, RotorStats, SealHandoff, SealedDisposal,
-    SealedMeta, SegmentConfig, SegmentRotor, ZERO_FILL_HEAD_START, ZERO_FILL_SLICE_BYTES,
-    ZeroSlice, parse_segment_file_name, segment_file_name,
+    FrameSlot, FsyncFailed, LogError, MaintainReport, PoolWaitBound, PreallocPolicy, RotorStats,
+    SealHandoff, SealedDisposal, SealedMeta, SegmentConfig, SegmentRotor, ZERO_FILL_HEAD_START,
+    ZERO_FILL_SLICE_BYTES, ZeroSlice, parse_segment_file_name, segment_file_name,
 };
 pub use staging::{
     DEFAULT_STAGING_BYTES, FLUSH_DEFAULT_FRAMES_IN_FLIGHT, FUA_DEFAULT_FRAMES_IN_FLIGHT,

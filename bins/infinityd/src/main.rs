@@ -48,8 +48,14 @@ struct Args {
     /// Segment recycling (M4.5-S39b, ADR-0090 D1): covered pre-zeroed
     /// `Direct` segments kept for reuse by rename instead of unlinked —
     /// the zero-fill paid once per generation. `0` = off
-    /// (`--no-segment-recycle`, the A/B baseline arm); default 0.
+    /// (`--no-segment-recycle`, the A/B baseline arm); default 1 (ADR-0090
+    /// A7.2).
     segment_recycle_slots: u8,
+    /// The pool wait (ADR-0090 D9): `quarter` (the default) re-checks the
+    /// pool each MAINTAIN slice until the active segment is a quarter
+    /// full before creating a fresh next segment; `eighth` bounds it
+    /// tighter; `off` preallocates at rotation (the D9 A/B baseline arm).
+    recycle_wait: inf_server::PreallocPolicy,
     /// Frames in flight per cell (M4.5-S35, ADR-0087 D1/D5 as amended
     /// 2026-08-22): `auto` (the default) derives K from the resolved
     /// barrier class — FUA → 3, FLUSH → 1 — after the class is known and
@@ -136,6 +142,7 @@ impl Default for Args {
             segment_bytes: inf_server::DEFAULT_SEGMENT_BYTES,
             conn_default_ns: None,
             segment_recycle_slots: inf_server::DEFAULT_RECYCLE_SLOTS,
+            recycle_wait: inf_server::PreallocPolicy::DEFAULT,
             frames_in_flight: inf_server::FramesInFlight::Auto,
             barrier_class: None,
             device_write_mbps: None,
@@ -208,6 +215,11 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--no-segment-recycle" => args.segment_recycle_slots = 0,
+            "--recycle-wait" => {
+                let text = take("--recycle-wait")?;
+                args.recycle_wait = inf_server::PreallocPolicy::parse(&text)
+                    .ok_or_else(|| format!("--recycle-wait {text}: expected off|quarter|eighth"))?;
+            }
             "--conn-default-ns" => {
                 let name = take("--conn-default-ns")?;
                 if name.is_empty() {
@@ -297,8 +309,9 @@ fn parse_args() -> Result<Args, String> {
                 println!(
                     "infinityd [--port 6379] [--cells 4] [--buffers 4096] [--buf-size 4096] \
                      [--pin-start CORE] [--route-local-only] [--data-dir PATH] \
-                     [--ckpt-interval-bytes N] [--segment-bytes N] [--segment-recycle-slots 0] \
-                     [--no-segment-recycle] [--conn-default-ns NAME] [--frames-in-flight auto|K] \
+                     [--ckpt-interval-bytes N] [--segment-bytes N] [--segment-recycle-slots 1] \
+                     [--no-segment-recycle] [--recycle-wait off|quarter|eighth] \
+                     [--conn-default-ns NAME] [--frames-in-flight auto|K] \
                      [--barrier-class flush|fua] [--device-write-mbps N] [--seal-pace probe|N] \
                      [--fill-window-us 1000] [--fill-target-kib 16] \
                      [--log-staging-mib 4] \
@@ -428,7 +441,11 @@ fn main() {
                 "infinityd: segment recycling {} (ADR-0090)",
                 match args.segment_recycle_slots {
                     0 => "off".to_owned(),
-                    n => format!("on, {n} slot(s) × {} MiB per cell", args.segment_bytes >> 20),
+                    n => format!(
+                        "on, {n} slot(s) × {} MiB per cell, pool wait {}",
+                        args.segment_bytes >> 20,
+                        args.recycle_wait
+                    ),
                 }
             );
         }
@@ -639,6 +656,7 @@ fn cell_main(
                 io_mode: io.io_mode,
                 fua_max_frame_bytes: io.fua_max_frame_bytes,
                 recycle_slots: args.segment_recycle_slots,
+                prealloc: args.recycle_wait,
                 ..Default::default()
             },
             ckpt: inf_server::CkptConfig {

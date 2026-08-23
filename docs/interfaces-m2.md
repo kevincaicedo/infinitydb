@@ -225,10 +225,11 @@ offset of its length prefix within its segment. **No global LSN exists**
   and falls below the MANIFEST floor is offered to a bounded per-cell
   pool at truncation instead of being unlinked —
   `SegmentRotor::forget_sealed(id) -> SealedDisposal::{Recycled,
-  Unlink(PathBuf)}`, bound `SegmentConfig::recycle_slots` (default 0 after
-  corrected campaign F measured 1.29x first-boot recovery at one slot;
-  `--segment-recycle-slots 1` is the opt-in arm). The MAINTAIN prealloc
-  consults the pool before creating a file: `rename(seg-M → seg-N)`,
+  Unlink(PathBuf)}`, bound `SegmentConfig::recycle_slots` (**default 1**
+  — ADR-0090 A7.2; `0` / `--no-segment-recycle` is the baseline arm;
+  campaign F's recovery gate was non-discriminating and its attribution
+  is S39d's). The MAINTAIN prealloc consults the pool before creating a
+  file: `rename(seg-M → seg-N)`,
   open `N` direct, `fully_allocated()` **re-read** (ADR-0086 D4 — a
   pooled file that reads sparse falls through to the zero-fill,
   `recycle_fallbacks`), and on the deferred tier the rename's directory
@@ -241,6 +242,28 @@ offset of its length prefix within its segment. **No global LSN exists**
   pool empty), `recycle_fallbacks`, `recycle_pool_bytes`. Ids are never
   reissued: `N = active.next()` — a recycled file's residue is stamped
   with every previous id it carried, all ≠ `N`.
+- **The pool wait (ADR-0090 D9 / A8):** `SegmentConfig::prealloc =
+  PreallocPolicy::{Immediate, WaitForPool { bound: Quarter | Eighth }}`
+  (`infinityd --recycle-wait off|quarter|eighth`, default `quarter`).
+  The rotor keeps one explicit state while `next` is absent, reset to
+  `Immediate` at every rotation: `Immediate → WaitingForRecycle` when the
+  pool is empty and the wait is eligible (the rotor is `Direct`,
+  recycling on, the active segment pre-zeroed, ≥ 1 rotation this life, a
+  sealed pre-zeroed segment of this life exists, size-based sealing,
+  `active.written < bound`); each MAINTAIN slice re-checks the pool;
+  `→ FreshFallback { fill_origin }` at the bound (one `recycle_miss` per
+  generation, never per slice; a `NoSpace` retry neither waits nor counts
+  again). The fallback's zero-fill paces from `fill_origin` (`allowed =
+  2 × (written − origin) + 16 MiB`) so the head start stays ADR-0086
+  D4's burst and the fill completes by ¾ − 8 MiB; an immediate prealloc
+  has origin 0 and is byte-identical to the pre-D9 pacing. ENOSPC
+  surfaces at the bound with ¾ of the segment as admission headroom.
+  Counters: `recycle_waits_started` / `_satisfied` / `_expired`,
+  `recycle_wait_active_bytes_max`, `segment_inline_preallocs`,
+  `segment_prealloc_failures`. Invariants (pinned in
+  `segment_prealloc_wait.rs`, the `m2-recycle` oracles): every wait ends
+  exactly once; a waiting policy never strands a rotation
+  (`inline_preallocs = 0`); a wait nothing can feed is never started.
 - ENOSPC discipline: prealloc failure raises `space_exhausted()` *before*
   writes need the space (the S08 admission hook); appends that outrun it
   get typed `LogError::NoSpace`. fsync failure is the distinct,
