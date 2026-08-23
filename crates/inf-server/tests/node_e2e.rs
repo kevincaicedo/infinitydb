@@ -21,6 +21,42 @@ use inf_runtime::{BackendDriver, CellLoop, LoopConfig, UringDriver};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane};
 use inf_store::{Keyspace, SlotRouter, StoreConfig};
 
+/// The checkpoint trigger a test node boots with (ADR-0088 D4). The
+/// product derives its interval from the last checkpoint's size, which
+/// makes any retained-log bound a function of the dataset *and* of how
+/// fast the device completed the previous cycle — `truncation_bounds`
+/// learned this on the NVMe (2026-08-22): a 21 MiB checkpoint derives a
+/// 42 MiB trigger the test's 32 MiB trickle cannot reach, while tmpfs
+/// passed on cycle ordering alone. Tests that assert a bound therefore
+/// name the trigger they assert against instead of an integer.
+#[derive(Clone, Copy)]
+enum CkptTrigger {
+    /// Automatic trigger off: e2e checkpoints fire via the control
+    /// handle so tests own the timing.
+    Manual,
+    /// The product's derived trigger: `clamp(α × ckpt_bytes_last, floor,
+    /// cap)` with the default α.
+    Derived { floor_bytes: u64 },
+    /// The pre-S36 fixed trigger (α = 0): every `interval_bytes` staged
+    /// bytes, independent of checkpoint size and device speed.
+    Fixed { interval_bytes: u64 },
+}
+
+impl CkptTrigger {
+    fn config(self) -> inf_log::CkptConfig {
+        let base = inf_log::CkptConfig::default();
+        match self {
+            CkptTrigger::Manual => inf_log::CkptConfig { interval_bytes: 0, ..base },
+            CkptTrigger::Derived { floor_bytes } => {
+                inf_log::CkptConfig { interval_bytes: floor_bytes, ..base }
+            }
+            CkptTrigger::Fixed { interval_bytes } => {
+                inf_log::CkptConfig { interval_bytes, alpha: 0, ..base }
+            }
+        }
+    }
+}
+
 struct Node {
     port: u16,
     stop: Arc<AtomicBool>,
@@ -32,7 +68,7 @@ struct Node {
 
 impl Node {
     fn start(cells: u16) -> Node {
-        Node::start_with(cells, None, 0)
+        Node::start_with(cells, None, CkptTrigger::Manual)
     }
 
     /// A node with the durable plane enabled (M2-S08): catalog loaded and
@@ -40,7 +76,7 @@ impl Node {
     /// the catalog's single writer — the boot order infinityd adopts.
     /// Automatic checkpoints stay off (tests own the trigger).
     fn start_durable(cells: u16, data_dir: &std::path::Path) -> Node {
-        Node::start_with(cells, Some(data_dir.to_path_buf()), 0)
+        Node::start_with(cells, Some(data_dir.to_path_buf()), CkptTrigger::Manual)
     }
 
     fn start_durable_with_default_ns(
@@ -51,7 +87,7 @@ impl Node {
         Node::start_cfg_default(
             cells,
             Some(data_dir.to_path_buf()),
-            0,
+            CkptTrigger::Manual,
             Default::default(),
             Vec::new(),
             false,
@@ -64,21 +100,24 @@ impl Node {
     }
 
     /// Durable node with the bytes-appended checkpoint trigger armed
-    /// (M2-S10, ADR-0016 D7).
-    fn start_durable_auto_ckpt(
+    /// (M2-S10, ADR-0016 D7) in its product form: the S36 derived
+    /// interval above `floor_bytes`.
+    fn start_durable_auto_ckpt(cells: u16, data_dir: &std::path::Path, floor_bytes: u64) -> Node {
+        Node::start_with(cells, Some(data_dir.to_path_buf()), CkptTrigger::Derived { floor_bytes })
+    }
+
+    /// Durable node with a fixed `interval_bytes` trigger (α = 0) — for
+    /// tests whose bound is stated in multiples of the interval.
+    fn start_durable_fixed_ckpt(
         cells: u16,
         data_dir: &std::path::Path,
         interval_bytes: u64,
     ) -> Node {
-        Node::start_with(cells, Some(data_dir.to_path_buf()), interval_bytes)
+        Node::start_with(cells, Some(data_dir.to_path_buf()), CkptTrigger::Fixed { interval_bytes })
     }
 
-    fn start_with(
-        cells: u16,
-        data_dir: Option<std::path::PathBuf>,
-        ckpt_interval_bytes: u64,
-    ) -> Node {
-        Node::start_full(cells, data_dir, ckpt_interval_bytes, Default::default(), Vec::new())
+    fn start_with(cells: u16, data_dir: Option<std::path::PathBuf>, ckpt: CkptTrigger) -> Node {
+        Node::start_full(cells, data_dir, ckpt, Default::default(), Vec::new())
     }
 
     /// Durable node with a boot-recovery pacing override (M2-S15): the
@@ -87,10 +126,9 @@ impl Node {
     fn start_with_recover(
         cells: u16,
         data_dir: Option<std::path::PathBuf>,
-        ckpt_interval_bytes: u64,
         recover: inf_server::RecoverConfig,
     ) -> Node {
-        Node::start_full(cells, data_dir, ckpt_interval_bytes, recover, Vec::new())
+        Node::start_full(cells, data_dir, CkptTrigger::Manual, recover, Vec::new())
     }
 
     /// Durable node with named fault points armed on every cell thread at
@@ -101,7 +139,13 @@ impl Node {
         data_dir: &std::path::Path,
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
     ) -> Node {
-        Node::start_full(cells, Some(data_dir.to_path_buf()), 0, Default::default(), faults)
+        Node::start_full(
+            cells,
+            Some(data_dir.to_path_buf()),
+            CkptTrigger::Manual,
+            Default::default(),
+            faults,
+        )
     }
 
     /// Node with the M2.5 Phase-H fabric-apply prefetch enabled (the A/B
@@ -110,7 +154,7 @@ impl Node {
         Node::start_cfg(
             cells,
             None,
-            0,
+            CkptTrigger::Manual,
             Default::default(),
             Vec::new(),
             true,
@@ -125,7 +169,7 @@ impl Node {
         Node::start_cfg(
             cells,
             None,
-            0,
+            CkptTrigger::Manual,
             Default::default(),
             Vec::new(),
             false,
@@ -142,7 +186,7 @@ impl Node {
         Node::start_cfg(
             cells,
             None,
-            0,
+            CkptTrigger::Manual,
             Default::default(),
             Vec::new(),
             false,
@@ -156,14 +200,14 @@ impl Node {
     fn start_full(
         cells: u16,
         data_dir: Option<std::path::PathBuf>,
-        ckpt_interval_bytes: u64,
+        ckpt: CkptTrigger,
         recover: inf_server::RecoverConfig,
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
     ) -> Node {
         Node::start_cfg(
             cells,
             data_dir,
-            ckpt_interval_bytes,
+            ckpt,
             recover,
             faults,
             false,
@@ -185,7 +229,7 @@ impl Node {
         Node::start_cfg(
             cells,
             Some(data_dir.to_path_buf()),
-            0,
+            CkptTrigger::Manual,
             inf_server::RecoverConfig::default(),
             Vec::new(),
             true,
@@ -201,7 +245,7 @@ impl Node {
         Node::start_cfg(
             cells,
             Some(data_dir.to_path_buf()),
-            0,
+            CkptTrigger::Manual,
             inf_server::RecoverConfig::default(),
             Vec::new(),
             true,
@@ -220,7 +264,7 @@ impl Node {
         Node::start_cfg(
             cells,
             Some(data_dir.to_path_buf()),
-            0,
+            CkptTrigger::Manual,
             Default::default(),
             Vec::new(),
             false,
@@ -236,7 +280,7 @@ impl Node {
     fn start_cfg(
         cells: u16,
         data_dir: Option<std::path::PathBuf>,
-        ckpt_interval_bytes: u64,
+        ckpt: CkptTrigger,
         recover: inf_server::RecoverConfig,
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
         apply_prefetch: bool,
@@ -248,7 +292,7 @@ impl Node {
         Node::start_cfg_default(
             cells,
             data_dir,
-            ckpt_interval_bytes,
+            ckpt,
             recover,
             faults,
             apply_prefetch,
@@ -264,7 +308,7 @@ impl Node {
     fn start_cfg_default(
         cells: u16,
         data_dir: Option<std::path::PathBuf>,
-        ckpt_interval_bytes: u64,
+        ckpt: CkptTrigger,
         recover: inf_server::RecoverConfig,
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
         apply_prefetch: bool,
@@ -333,12 +377,7 @@ impl Node {
                             io_mode,
                             ..Default::default()
                         },
-                        // 0 = automatic trigger off: e2e checkpoints fire
-                        // via the control handle so tests own the timing.
-                        ckpt: inf_log::CkptConfig {
-                            interval_bytes: ckpt_interval_bytes,
-                            ..Default::default()
-                        },
+                        ckpt: ckpt.config(),
                         recover,
                         flush_bound: 1,
                         fua_p50_us_probed: 0,
@@ -2226,8 +2265,12 @@ fn info_u64(info: &str, field: &str) -> u64 {
 #[test]
 fn truncation_bounds_log_size_and_restart_recovers_from_checkpoint() {
     let dir = temp_data_dir("trunc");
-    // 8 MiB segments (harness), checkpoint every 1 MiB appended.
-    let node = Node::start_durable_auto_ckpt(1, &dir, 1 << 20);
+    // 8 MiB segments (harness), checkpoint every 1 MiB appended — the
+    // *fixed* trigger (α = 0): the bound below is stated in multiples of
+    // the interval, and the product's derived trigger would chase the
+    // dataset instead (a 21 MiB checkpoint → a 42 MiB interval the 32 MiB
+    // trickle cap never reaches on a real device; see `CkptTrigger`).
+    let node = Node::start_durable_fixed_ckpt(1, &dir, 1 << 20);
     let mut c = node.connect();
     c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"soak", b"MODE", b"durable", b"FSYNC", b"everysec"]))
         .expect("write");
@@ -2545,7 +2588,6 @@ fn loading_gate_byte_matches_redis_and_lifts() {
     let node = Node::start_with_recover(
         1,
         Some(dir.clone()),
-        0,
         inf_server::RecoverConfig { step_bytes: 32 << 10, throttle_bytes_per_sec: Some(128 << 10) },
     );
     let mut c = node.connect();
@@ -2670,7 +2712,6 @@ fn loading_lifts_only_when_every_cell_recovered() {
     let node = Node::start_with_recover(
         2,
         Some(dir.clone()),
-        0,
         inf_server::RecoverConfig { step_bytes: 32 << 10, throttle_bytes_per_sec: Some(128 << 10) },
     );
 
