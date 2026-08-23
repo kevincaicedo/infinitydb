@@ -250,6 +250,22 @@ struct Meter {
     spent_bytes: u64,
     spent_ops: u64,
     deferrals: u64,
+    /// Sub-unit remainders of the weighted share (mod `weights`), carried
+    /// across refills so a grant too small to divide still accrues.
+    carry_bytes: u64,
+    carry_ops: u64,
+}
+
+/// The sub-unit remainders one axis of a direction carries across
+/// refills (M4.5-S39d): `ns` is the unspent `rate × elapsed` product
+/// below one unit (mod 10⁹), `floor` the unspent eighths of the
+/// saturation floor (mod `FLOOR_DIVISOR`). A loop iterating faster than
+/// one unit per refill granted zero per refill and zero forever — the
+/// idle-node checkpoint starvation the S39d boundary checkpoint found.
+#[derive(Copy, Clone, Debug, Default)]
+struct Carry {
+    ns: u64,
+    floor: u64,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -265,6 +281,8 @@ struct Direction {
     fg_bytes: u64,
     fg_ops: u64,
     weights: u64,
+    carry_bytes: Carry,
+    carry_ops: Carry,
 }
 
 impl Direction {
@@ -380,8 +398,8 @@ impl DeviceBudget {
                 dir.fg_ops = 0;
                 continue;
             }
-            let grant_bytes = grant(dir.rate_bytes, elapsed, dir.fg_bytes);
-            let grant_ops = grant(dir.rate_ops, elapsed, dir.fg_ops);
+            let grant_bytes = grant(dir.rate_bytes, elapsed, dir.fg_bytes, &mut dir.carry_bytes);
+            let grant_ops = grant(dir.rate_ops, elapsed, dir.fg_ops, &mut dir.carry_ops);
             // The checkpoint keep-up floor (module docs): what the log
             // wrote since the last refill, over α.
             let keepup_bytes = if is_read || self.checkpoint_alpha == 0 {
@@ -398,8 +416,9 @@ impl DeviceBudget {
                     continue;
                 }
                 let m = &mut self.meters[class.index()];
-                let mut add_bytes = mul_div(grant_bytes, class.weight(), dir.weights);
-                let mut add_ops = mul_div(grant_ops, class.weight(), dir.weights);
+                let mut add_bytes =
+                    share(grant_bytes, class.weight(), dir.weights, &mut m.carry_bytes);
+                let mut add_ops = share(grant_ops, class.weight(), dir.weights, &mut m.carry_ops);
                 if class == IoClass::Checkpoint && keepup_bytes > add_bytes {
                     add_bytes = keepup_bytes;
                     // One op per slice the floor adds, so the ops axis
@@ -532,14 +551,33 @@ impl DeviceBudget {
 }
 
 /// `rate × elapsed_ns / 1e9 − foreground`, clamped at ≥ the floor share.
-fn grant(rate: u64, elapsed_ns: u64, foreground: u64) -> u64 {
+/// The axis grant for `elapsed_ns`: `rate × elapsed` less the foreground
+/// spend, never below the saturation floor (one eighth of the full
+/// grant). Both the product and the floor carry their remainders in
+/// `carry` so every refill interval, however short, grants its exact
+/// share over time (M4.5-S39d).
+fn grant(rate: u64, elapsed_ns: u64, foreground: u64, carry: &mut Carry) -> u64 {
     if rate == 0 {
+        *carry = Carry::default();
         return 0;
     }
-    let full =
-        u64::try_from(u128::from(rate) * u128::from(elapsed_ns) / NS_PER_S).unwrap_or(u64::MAX);
-    let floor = full / FLOOR_DIVISOR;
+    let scaled = u128::from(rate) * u128::from(elapsed_ns) + u128::from(carry.ns);
+    let full = u64::try_from(scaled / NS_PER_S).unwrap_or(u64::MAX);
+    carry.ns = u64::try_from(scaled % NS_PER_S).expect("remainder below 10^9");
+    let floored = full.saturating_add(carry.floor);
+    let floor = floored / FLOOR_DIVISOR;
+    carry.floor = floored % FLOOR_DIVISOR;
     full.saturating_sub(foreground).max(floor)
+}
+
+/// `grant × weight / weights` with the remainder (mod `weights`) carried.
+fn share(grant: u64, weight: u64, weights: u64, carry: &mut u64) -> u64 {
+    if weights == 0 {
+        return 0;
+    }
+    let scaled = u128::from(grant) * u128::from(weight) + u128::from(*carry);
+    *carry = u64::try_from(scaled % u128::from(weights)).expect("remainder below weights");
+    u64::try_from(scaled / u128::from(weights)).unwrap_or(u64::MAX)
 }
 
 /// `rate × weight / weights × BURST_HORIZON`.
@@ -861,6 +899,49 @@ mod tests {
         for class in IoClass::ALL {
             assert_eq!(a.counters(class), b.counters(class));
         }
+    }
+
+    /// M4.5-S39d's boundary checkpoint found the idle-loop starvation:
+    /// with the reference box's probe (2 540 write ops/s per device, two
+    /// cells) an idle loop iterating every ~430 µs granted
+    /// `1270 × 0.00043 = 0.55 → 0` ops per refill, then `0 × 2/10 = 0` to
+    /// the checkpoint class, forever — the keep-up floor that feeds it
+    /// under load is zero at idle. Grants carry their sub-unit remainder
+    /// across refills: one second of fast refills grants one second's
+    /// ops, exactly, for every class.
+    #[test]
+    fn a_fast_idle_loop_still_grants_ops_through_the_carry() {
+        let model = DeviceModel {
+            write_bytes_per_s: 510_132_224,
+            write_ops_per_s: 2_540,
+            read_bytes_per_s: 0,
+            read_ops_per_s: 0,
+        };
+        let mut b = DeviceBudget::new(model.share(2), slices(), 2, Nanos(0));
+        // Drain every background write class's ops (a spent burst).
+        for class in [IoClass::ZeroFill, IoClass::TierFlush, IoClass::Checkpoint] {
+            let (_, ops) = b.deficit(class);
+            assert_eq!(b.admit(class, 0, ops), Admission::Granted);
+            assert_eq!(b.deficit(class).1, 0);
+        }
+        let mut granted = 0u64;
+        let mut now = 0u64;
+        // 1 s of 430 µs refills, the checkpoint spending each op as soon
+        // as it is granted (the stuck block re-offered every slice).
+        while now < 1_000_000_000 {
+            now += 430_000;
+            b.refill(Nanos(now));
+            let (_, ops) = b.deficit(IoClass::Checkpoint);
+            if ops > 0 {
+                b.admit(IoClass::Checkpoint, 0, ops);
+                granted += ops;
+            }
+        }
+        // The class's share: 1270 × 2/10 = 254 ops/s (±1 for the carry).
+        assert!((253..=255).contains(&granted), "checkpoint ops over 1 s: {granted}");
+        // The other classes accrued to their caps, not to zero.
+        assert!(b.deficit(IoClass::ZeroFill).1 > 0);
+        assert!(b.deficit(IoClass::TierFlush).1 > 0);
     }
 
     #[test]

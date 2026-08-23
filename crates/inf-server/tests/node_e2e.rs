@@ -96,6 +96,31 @@ impl Node {
             None,
             inf_log::SegmentIoMode::Buffered,
             Some(default_ns.to_vec()),
+            Default::default(),
+        )
+    }
+
+    /// A durable node whose cells spend a **device budget** (ADR-0088
+    /// D2): `model` is the per-device model the harness shares across
+    /// `cells` — the product path when `io-properties.toml` is probed.
+    fn start_durable_with_device_model(
+        cells: u16,
+        data_dir: &std::path::Path,
+        model: inf_runtime::DeviceModel,
+    ) -> Node {
+        Node::start_cfg_default(
+            cells,
+            Some(data_dir.to_path_buf()),
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            None,
+            inf_server::DeviceConfig { model_share: model.share(cells), seal_barriers_per_s: 0 },
         )
     }
 
@@ -301,6 +326,7 @@ impl Node {
             staging,
             io_mode,
             None,
+            Default::default(),
         )
     }
 
@@ -317,6 +343,7 @@ impl Node {
         staging: Option<inf_log::StagingConfig>,
         io_mode: inf_log::SegmentIoMode,
         default_ns: Option<Vec<u8>>,
+        device: inf_server::DeviceConfig,
     ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
         // Bind cell 0 first on an ephemeral port, then the rest join it.
@@ -381,7 +408,7 @@ impl Node {
                         recover,
                         flush_bound: 1,
                         fua_p50_us_probed: 0,
-                        device: Default::default(),
+                        device,
                         fill: Default::default(),
                     };
                     durable = Some((cfg, Arc::clone(control)));
@@ -2241,6 +2268,133 @@ fn bytes_threshold_triggers_a_checkpoint() {
     assert!(info_u64(&info, "log_frame_bytes") > 0, "{info}");
     assert!(info_u64(&info, "ckpt_bytes_total") >= last, "the total counts every publish");
     assert!(info.contains("io_budget_model:absent"), "no probe file in the test tree: {info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M4.5-S39d: a loop-resident boot's recovery decomposes by phase — the
+/// checkpoint, the tail replay and the slack audit each report the bytes
+/// they read, and the loop-clock durations sum to the total within the
+/// µs rounding of five fields (every credited instant lands in exactly
+/// one phase). The boot line carries the same numbers.
+#[test]
+fn recovery_phases_report_bytes_and_sum_to_the_total() {
+    let dir = temp_data_dir("phases");
+    let value = vec![b'p'; 2048];
+    let tail_keys = 64u32;
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"ph", b"MODE", b"durable", b"FSYNC", b"always"]))
+            .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"ph"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        for i in 0..256u32 {
+            let key = format!("base:{i:04}");
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), &value])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        // The checkpoint boundary: everything above is checkpoint work,
+        // everything below is tail replay.
+        c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        for i in 0..tail_keys {
+            let key = format!("tail:{i:04}");
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), &value])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        drop(c);
+        node.stop();
+    }
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
+    let mut buf = vec![0u8; 8192];
+    let n = c.read(&mut buf).expect("read info");
+    let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let f = |field: &str| info_u64(&info, field);
+    assert!(f("recover_ckpt_bytes") > 256 * 2048, "the checkpoint's bytes were read: {info}");
+    assert!(f("recover_replay_bytes") >= u64::from(tail_keys) * 2048, "tail bytes: {info}");
+    // Frames, not records: the floor segment replays from its first
+    // frame and skips the pre-begin records, so frames ≥ the tail's.
+    assert!(f("recover_replay_frames") >= 1, "{info}");
+    // The audit scans the active segment's slack (8 MiB segments here)
+    // and the preallocated next one: far more than the data it follows.
+    assert!(f("recover_audit_bytes") >= 4 << 20, "the slack audit read the slack: {info}");
+    assert_eq!(f("recover_audit_foreign_frames"), 0, "no recycled life in a fresh log");
+    let phases = [
+        "recover_start_us",
+        "recover_ckpt_us",
+        "recover_replay_us",
+        "recover_audit_us",
+        "recover_finish_us",
+    ];
+    let sum: u64 = phases.iter().map(|p| f(p)).sum();
+    let total = f("recover_total_us");
+    assert!(total > 0, "the loop clock advanced across the boot: {info}");
+    assert!(
+        sum.abs_diff(total) <= phases.len() as u64,
+        "phases sum to the total within µs rounding: {sum} vs {total}: {info}"
+    );
+    assert!(f("recover_ckpt_us") > 0 && f("recover_audit_us") > 0, "timed phases: {info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0088 D2 as amended (M4.5-S39d's finding): a checkpoint requested
+/// on an **idle** node that spends a device budget completes. Before the
+/// carry, the reference box's probe (2 540 write ops/s per device) on a
+/// loop iterating every few hundred µs granted the checkpoint class
+/// `⌊1270 × 0.0004⌋ × 2/10 = 0` ops per refill forever — `INF.CKPT
+/// WAIT` after a fill never returned (the keep-up floor that feeds the
+/// class under load is zero at idle). The budget must grant its share
+/// over time whatever the refill interval.
+#[test]
+fn a_checkpoint_requested_on_an_idle_budgeted_node_completes() {
+    let dir = temp_data_dir("idle-ckpt");
+    // The harness loop parks 5 ms at idle (the product loop spun at
+    // ~430 µs), so the model's op rate is scaled to reproduce the same
+    // quantization: 100 ops/s per cell × 5 ms = 0.5 → 0 per refill, and
+    // 0 × 2/10 = 0 for the checkpoint class. With the carry the class
+    // accrues its 20 ops/s and the ~12-op checkpoint lands in < 1 s.
+    let model = inf_runtime::DeviceModel {
+        write_bytes_per_s: 510_132_224,
+        write_ops_per_s: 200,
+        read_bytes_per_s: 0,
+        read_ops_per_s: 0,
+    };
+    let node = Node::start_durable_with_device_model(2, &dir, model);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"idle", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"idle"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let value = vec![b'i'; 4096];
+    // ~4 MiB of images: a checkpoint of several 256 KiB sections — more
+    // than one op's worth on every cell, so a starved op axis shows.
+    for i in 0..1024u32 {
+        let key = format!("k:{i:05}");
+        c.write_all(&cmd(&[b"SET", key.as_bytes(), &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    // Idle now. The WAIT must return — the connection's 5 s read timeout
+    // is the failure.
+    c.set_read_timeout(Some(Duration::from_secs(20))).expect("timeout");
+    let t0 = Instant::now();
+    c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let took = t0.elapsed();
+    c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
+    let mut buf = vec![0u8; 8192];
+    let n = c.read(&mut buf).expect("read info");
+    let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+    assert!(info.contains("io_budget_model:probed"), "the budget was in force: {info}");
+    assert!(info_u64(&info, "ckpts_completed") >= 1, "{info}");
+    assert!(took < Duration::from_secs(10), "an idle checkpoint of ~2 MiB/cell took {took:?}");
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();

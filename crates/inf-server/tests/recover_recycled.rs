@@ -292,6 +292,37 @@ fn a_twice_recycled_file_classifies_the_same() {
     assert_eq!(rotor.resume_epoch(), 4);
 }
 
+/// M4.5-S39d: the per-phase accounting on the synchronous tier — the
+/// audit counted the slack's bytes and its foreign frames, replay counted
+/// this life's bytes and frames, and every duration is zero (no clock
+/// here: `open_cell_log` has nothing to credit — the loop tier does).
+#[test]
+fn phase_accounting_counts_audit_bytes_and_foreign_frames_without_a_clock() {
+    let fs = MemFs::new();
+    let log = HandLog::new(&fs);
+    let s0 = SegmentId(0);
+    log.frame(s0, s0, 0, b"a", b"1", stamp(3, 1, 0));
+    log.frame(s0, OLD, 1, b"ghost", b"x", stamp(2, 4, 0));
+    log.frame(s0, OLDER, 2, b"ghost2", b"y", stamp(1, 8, 0));
+
+    let mut ks = fresh_keyspace();
+    let (_rotor, stats) = recover(&fs, &mut ks).expect("residue never refuses");
+    let phases = stats.phases;
+    assert_eq!(phases.ckpt_bytes, 0, "no checkpoint in this image");
+    assert_eq!(phases.replay_frames, 1);
+    assert_eq!(phases.replay_frames, stats.frames);
+    assert!(phases.replay_bytes >= FRAME_ALIGN as u64, "this life's frame was read");
+    assert_eq!(phases.audit_foreign_frames, 2, "both residue frames CRC-validated in the audit");
+    assert_eq!(phases.audit_valid_frames, 0);
+    assert!(
+        phases.audit_bytes >= 2 * FRAME_ALIGN as u64,
+        "the audit read the slack behind the data end: {phases:?}"
+    );
+    assert_eq!(phases.phase_ns(), [0; 5], "no clock on the synchronous tier");
+    assert_eq!(phases.total_ns, 0);
+    assert_eq!(phases.dominating(), None);
+}
+
 /// Refusal row: a **same-segment** validating frame behind a hole of this
 /// life, attesting coverage past the data end, must still refuse through
 /// the new rule — foreign frames around it change nothing (ADR-0031 D4).

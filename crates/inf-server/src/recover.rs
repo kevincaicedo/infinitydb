@@ -73,9 +73,106 @@ use inf_store::{Keyspace, ReplayOutcome, WallAnchor};
 
 use crate::durable::DurableConfig;
 
+/// The recovery pipeline's phases as the outside sees them (M4.5-S39d):
+/// what each [`Recovery::step`] is about to do, typed so the driver can
+/// attribute the loop clock to it. Audit and probe share a phase — both
+/// are the slack/evidence scan — exactly as the board's phase code does.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RecoverPhase {
+    /// Dirs, MANIFEST, directory scan, floor checks, checkpoint open.
+    Start,
+    /// Checkpoint sections streamed into the store.
+    Ckpt,
+    /// Tail frames replayed.
+    Replay,
+    /// Slack audit / evidence probe of a segment.
+    Audit,
+    /// Torn-tail resolution, begin guard, boot GC (stale files), rotor
+    /// reopen.
+    Finish,
+    /// Nothing left: the next step reports completion.
+    Complete,
+}
+
+impl RecoverPhase {
+    /// The board's phase code (`CellRecoverySlot::phase_name`): 1 =
+    /// start, 2 = checkpoint, 3 = replay, 4 = audit, 5 = finish, 6 =
+    /// complete.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            RecoverPhase::Start => 1,
+            RecoverPhase::Ckpt => 2,
+            RecoverPhase::Replay => 3,
+            RecoverPhase::Audit => 4,
+            RecoverPhase::Finish => 5,
+            RecoverPhase::Complete => 6,
+        }
+    }
+}
+
+/// Per-phase recovery accounting (M4.5-S39d, ADR-0090 A10): the bytes
+/// each phase read and the time it took, so one boot's recovery figure
+/// decomposes instead of being compared as a sum. Bytes are counted by
+/// the machine itself; durations are credited by the driver from the
+/// **injected loop clock** between consecutive steps
+/// ([`Recovery::credit_phase_time`]) — cell code never reads an ambient
+/// clock (L7). The synchronous tier (`open_cell_log`) has no clock and
+/// leaves every duration zero. By construction every credited
+/// nanosecond lands in exactly one phase, so `phase_ns` sums to
+/// `total_ns` exactly — a property the e2e pins.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoverPhases {
+    pub start_ns: u64,
+    /// Checkpoint bytes read (sections + header/footer) and load time.
+    pub ckpt_bytes: u64,
+    pub ckpt_ns: u64,
+    /// Tail frame bytes read + validated, frames, and replay time.
+    pub replay_bytes: u64,
+    pub replay_frames: u64,
+    pub replay_ns: u64,
+    /// Slack/probe bytes the evidence scans read, the self-located and
+    /// foreign-segment frames they CRC-validated, and scan time.
+    pub audit_bytes: u64,
+    pub audit_valid_frames: u64,
+    pub audit_foreign_frames: u64,
+    pub audit_ns: u64,
+    /// Torn-tail resolution + boot GC + rotor reopen time (the stale
+    /// files removed are `RecoverStats::stale_files_removed`).
+    pub finish_ns: u64,
+    /// First step to completion, loop-clock.
+    pub total_ns: u64,
+}
+
+impl RecoverPhases {
+    /// The phase that took longest (ties resolve in pipeline order) —
+    /// the row's "dominating phase"; `None` before any time was credited.
+    #[must_use]
+    pub fn dominating(&self) -> Option<RecoverPhase> {
+        let phases = [
+            (RecoverPhase::Start, self.start_ns),
+            (RecoverPhase::Ckpt, self.ckpt_ns),
+            (RecoverPhase::Replay, self.replay_ns),
+            (RecoverPhase::Audit, self.audit_ns),
+            (RecoverPhase::Finish, self.finish_ns),
+        ];
+        let (phase, ns) =
+            phases.iter().fold(phases[0], |best, &p| if p.1 > best.1 { p } else { best });
+        (ns > 0).then_some(phase)
+    }
+
+    /// The durations in pipeline order (the sum-equals-total pin).
+    #[must_use]
+    pub const fn phase_ns(&self) -> [u64; 5] {
+        [self.start_ns, self.ckpt_ns, self.replay_ns, self.audit_ns, self.finish_ns]
+    }
+}
+
 /// What one cell's recovery did (log lines + `INFO persistence` inputs).
 #[derive(Copy, Clone, Debug, Default)]
 pub struct RecoverStats {
+    /// M4.5-S39d: per-phase bytes + loop-clock durations.
+    pub phases: RecoverPhases,
     pub segments: u64,
     pub frames: u64,
     pub records_applied: u64,
@@ -400,14 +497,39 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     /// 6 = complete.
     #[must_use]
     pub fn phase_code(&self) -> u8 {
+        self.phase().code()
+    }
+
+    /// The phase the next [`step`](Self::step) runs (M4.5-S39d).
+    #[must_use]
+    pub fn phase(&self) -> RecoverPhase {
         match &self.phase {
-            Phase::Start => 1,
-            Phase::Ick { .. } => 2,
-            Phase::Replay { .. } => 3,
-            Phase::Audit { .. } | Phase::Probe { .. } => 4,
-            Phase::Finish => 5,
-            Phase::Complete => 6,
+            Phase::Start => RecoverPhase::Start,
+            Phase::Ick { .. } => RecoverPhase::Ckpt,
+            Phase::Replay { .. } => RecoverPhase::Replay,
+            Phase::Audit { .. } | Phase::Probe { .. } => RecoverPhase::Audit,
+            Phase::Finish => RecoverPhase::Finish,
+            Phase::Complete => RecoverPhase::Complete,
         }
+    }
+
+    /// Credits `ns` of the driver's clock to `phase` (M4.5-S39d): the
+    /// driver samples its injected clock around consecutive steps and
+    /// attributes the delta to the phase the earlier step ran. Credits to
+    /// `Complete` are the sample after the last real step — nothing ran,
+    /// so they are dropped on the floor rather than invented as a phase.
+    pub fn credit_phase_time(&mut self, phase: RecoverPhase, ns: u64) {
+        let phases = &mut self.stats.phases;
+        let slot = match phase {
+            RecoverPhase::Start => &mut phases.start_ns,
+            RecoverPhase::Ckpt => &mut phases.ckpt_ns,
+            RecoverPhase::Replay => &mut phases.replay_ns,
+            RecoverPhase::Audit => &mut phases.audit_ns,
+            RecoverPhase::Finish => &mut phases.finish_ns,
+            RecoverPhase::Complete => return,
+        };
+        *slot += ns;
+        phases.total_ns += ns;
     }
 
     /// Progress numerator: bytes validated + applied so far (checkpoint
@@ -453,6 +575,16 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         self.fs.as_ref().expect("fs present until finish")
     }
 
+    /// Folds one evidence scan's cost into the audit phase's accounting
+    /// (M4.5-S39d). Cumulative: a probe later lifted into a replay still
+    /// read its bytes.
+    fn note_audit(&mut self, evidence: &RegionEvidence) {
+        let phases = &mut self.stats.phases;
+        phases.audit_bytes += evidence.bytes_read;
+        phases.audit_valid_frames += evidence.valid_frames;
+        phases.audit_foreign_frames += evidence.foreign_frames;
+    }
+
     /// Runs one bounded recovery step: at most ~`budget_bytes` of
     /// checkpoint/replay input (one whole-frame/section overshoot), or one
     /// audit/GC unit. Returns [`RecoveryProgress::Complete`] when
@@ -473,9 +605,15 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 self.end_of_replay_checks(ks)?;
                 self.step_probe(idx)
             }
+            // Finish reports `Working` and the *next* step `Complete`
+            // (M4.5-S39d): the driver samples its clock around every
+            // step, so the finish step's time is only attributable once a
+            // later call exists — one extra polling iteration at boot.
             Phase::Finish => {
                 self.end_of_replay_checks(ks)?;
-                self.step_finish()
+                // Either outcome (complete, or a lifted hole resuming
+                // replay) is more stepping from the driver's view.
+                self.step_finish().map(|_| RecoveryProgress::Working)
             }
             Phase::Complete => Ok(RecoveryProgress::Complete),
         }
@@ -853,6 +991,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     let rest = reader.file_size().saturating_sub(self.ick_credited);
                     self.bytes_done += rest;
                     self.bytes_consumed += rest;
+                    self.stats.phases.ckpt_bytes = self.bytes_consumed;
                     self.phase = Phase::Replay { idx: 0, reader: None };
                     return Ok(RecoveryProgress::Working);
                 }
@@ -1137,12 +1276,13 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     /// resume point, tolerated inert remnants behind it.
     fn step_audit(&mut self, idx: usize) -> io::Result<RecoveryProgress> {
         let segment = self.segments[idx];
-        let (end, failed) = &self.ends[idx];
+        let (end, failed) = (self.ends[idx].0, self.ends[idx].1.is_some());
         let evidence =
-            scan_region_evidence(self.fs(), &self.log_dir, segment, *end, ReaderConfig::default())?;
+            scan_region_evidence(self.fs(), &self.log_dir, segment, end, ReaderConfig::default())?;
+        self.note_audit(&evidence);
         let residue = match evidence.summary() {
             RegionScan::ValidFrame { .. } | RegionScan::Garbage { .. } => true,
-            RegionScan::AllZero => failed.is_some(),
+            RegionScan::AllZero => failed,
         };
         // ADR-0031 D5 as amended (2026-08-21): validating frames whose
         // epochs all sit below the replayed prefix's are discarded-life
@@ -1205,6 +1345,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         let segment = self.segments[idx];
         let evidence =
             scan_region_evidence(self.fs(), &self.log_dir, segment, 0, ReaderConfig::default())?;
+        self.note_audit(&evidence);
         self.stats.segments += 1;
         self.ends.push((0, None));
         self.residue.push(!matches!(evidence.summary(), RegionScan::AllZero));
@@ -1428,6 +1569,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             .map(|m| RecoveredManifest { ckpt_id: m.ckpt_id, begin_lsn: m.begin_lsn });
         self.finished = Some((rotor, seed));
         self.phase = Phase::Complete;
+        let phases = &mut self.stats.phases;
+        phases.replay_bytes = self.bytes_consumed.saturating_sub(phases.ckpt_bytes);
+        phases.replay_frames = self.stats.frames;
         Ok(RecoveryProgress::Complete)
     }
 }

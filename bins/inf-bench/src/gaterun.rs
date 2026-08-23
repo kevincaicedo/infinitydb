@@ -574,6 +574,7 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         // and its unbudgeted baseline arm (no probe file copied in).
         "only-s36",
         "only-s39b",
+        "only-s39d",
         "model-absent",
     ],
     &[
@@ -660,6 +661,12 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-s35",
         "only-s36",
         "only-s39b",
+        // M4.5-S39d (ADR-0090 A10): the fixed-work recovery row and its
+        // two record counts (warm = before the boundary checkpoint,
+        // tail = after it).
+        "only-s39d",
+        "s39d-warm-records",
+        "s39d-tail-records",
         "model-absent",
         // M4.5-S35 row: seconds idled before every durable leg (the S34
         // drive-state rule; default 40, 0 for harness smoke).
