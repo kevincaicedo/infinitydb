@@ -477,6 +477,9 @@ pub(crate) fn info(
         push(&mut text, &format!("evicted_keys:{}", stats.evicted_keys));
         push(&mut text, &format!("keyspace_hits:{}", stats.keyspace_hits));
         push(&mut text, &format!("keyspace_misses:{}", stats.keyspace_misses));
+        // M4.5-S40: stop-and-copy index grows on this cell's flat stores
+        // (a foreground latency step per doubling; the S40 timeline's event).
+        push(&mut text, &format!("index_grows:{}", stats.index_grows));
         // M3-S10: per-cell path-program cache (extension fields).
         #[cfg(feature = "doc")]
         {

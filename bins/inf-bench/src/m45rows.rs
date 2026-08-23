@@ -2614,6 +2614,10 @@ struct S40Sample {
     waits_rotation: u64,
     waits_pace: u64,
     ckpt_deferrals: u64,
+    /// Stop-and-copy index grows (`INFO stats index_grows`, summed over
+    /// cells): the deterministic 12–17 ms maxima campaign I saw at the
+    /// same seconds of every leg.
+    index_grows: u64,
     /// `/sys/block/<dev>/stat`: sectors written (7), ms writing (8),
     /// ms doing I/O (10) — 0 when not sampled.
     dev_sectors_written: u64,
@@ -2651,6 +2655,7 @@ fn s40_sample(port: u16, cells: u16, device_stat: Option<&str>, t0: Instant) -> 
         waits_rotation: sum_field(&infos, "frame_waits_rotation"),
         waits_pace: sum_field(&infos, "frame_waits_pace"),
         ckpt_deferrals: sum_field(&infos, "io_budget_deferrals_checkpoint"),
+        index_grows: sum_field(&infos, "index_grows"),
         dev_sectors_written: dev_field(6),
         dev_ms_writing: dev_field(7),
         dev_io_ms: dev_field(9),
@@ -2661,7 +2666,7 @@ fn s40_sample(port: u16, cells: u16, device_stat: Option<&str>, t0: Instant) -> 
 /// the client's maximum: every engine event is named, the device's
 /// write time over the window disclosed, and one attribution word
 /// chosen by precedence (checkpoint in flight → rotation → manifest/
-/// truncation → zero-fill → admission park → device-busy → none).
+/// truncation → zero-fill → index grow → device-busy → admission park → none).
 fn s40_attribute(before: &S40Sample, after: &S40Sample) -> (String, String) {
     let window_ms = ((after.at_s - before.at_s) * 1000.0).max(1.0);
     let d = |f: fn(&S40Sample) -> u64| f(after).saturating_sub(f(before));
@@ -2696,6 +2701,9 @@ fn s40_attribute(before: &S40Sample, after: &S40Sample) -> (String, String) {
     if d(|s| s.ckpt_deferrals) > 0 {
         events.push(format!("checkpoint offers deferred (+{})", d(|s| s.ckpt_deferrals)));
     }
+    if d(|s| s.index_grows) > 0 {
+        events.push(format!("index grow, stop-and-copy (+{})", d(|s| s.index_grows)));
+    }
     if d(|s| s.waits_rotation) > 0 || d(|s| s.waits_barrier) > 0 || d(|s| s.waits_pace) > 0 {
         events.push(format!(
             "frame waits (+{} barrier, +{} rotation, +{} pace)",
@@ -2725,10 +2733,17 @@ fn s40_attribute(before: &S40Sample, after: &S40Sample) -> (String, String) {
             "manifest/truncation"
         } else if d(|s| s.zero_fill) > 0 {
             "zero-fill"
+        } else if d(|s| s.index_grows) > 0 {
+            "index-grow"
+        } else if dev_busy_pct >= 50.0 {
+            // Campaign I's lesson (2026-08-23): the device outranks the
+            // parks — a park is the staging domain filling behind frames
+            // the device is not completing, a symptom of the cause above
+            // it (rep1: 92 % busy, 18.5 s of queued write time in a
+            // 253 ms window, 11 MiB of progress, +42 parks).
+            "device-busy"
         } else if d(|s| s.parked) > 0 {
             "admission-park"
-        } else if dev_busy_pct >= 50.0 {
-            "device-busy"
         } else {
             "unattributed"
         };
@@ -2962,8 +2977,8 @@ fn s40_stall_row(
     m.row_write_amp(
         "S40 stall attribution: the client's maximum is read against the 250 ms server/device \
          sample window its send instant fell in; the attribution word is by precedence \
-         (checkpoint → rotation → manifest/truncation → zero-fill → admission park → device \
-         busy ≥ 50 % → unattributed) and is a note, never a gate",
+         (checkpoint → rotation → manifest/truncation → zero-fill → index grow → device \
+         busy ≥ 50 % → admission park → unattributed) and is a note, never a gate",
     );
     m.raw_section("s40 per-leg samples", &raw);
     Ok(())
