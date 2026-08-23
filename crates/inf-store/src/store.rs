@@ -349,6 +349,10 @@ pub struct StoreStats {
     pub wheel_fallback: u64,
     /// Records evicted under memory pressure (M1-S06; `INFO evicted_keys`).
     pub evicted_keys: u64,
+    /// Stop-and-copy index grows (M4.5-S40 stall attribution): each one
+    /// re-places every live key on the foreground path — a deterministic
+    /// latency step at every capacity doubling (`INFO index_grows`).
+    pub index_grows: u64,
 }
 
 /// Frozen memory attribution domains (tripwire names, M0 §3.2; document
@@ -2007,6 +2011,7 @@ impl CellStore {
                 if self.index.needs_grow() {
                     let arena = &self.arena;
                     self.index.grow(|addr, _| Self::hash_key(record_at(arena, addr).key()));
+                    self.stats.index_grows += 1;
                 }
                 let new_addr = self.arena.alloc(new_len).ok_or(OpError::OutOfMemory)?;
                 spec.write(self.arena.bytes_mut(new_addr, new_len));
