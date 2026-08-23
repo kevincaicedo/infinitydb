@@ -1,0 +1,69 @@
+2026-08-22T21:11:10-04:00
+infinityd c284c48 (git c284c486e965, x86_64-unknown-linux-gnu)
+c284c48
+dirty=0
+performance
+infinityd running: 0 redis running: 1
+  611842    35629 130001943   666668 72528596  2510819 2134582874 63484738        0  4109260 64357818    64487        0 293792280    36082   188191   170328
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before s39b base rep0
+  s35: 40s drive-state idle before s39b base fresh-image recovery boot
+  s39b rep0 base: rep0 base c32 ops=32305 p50_us=711 p99_us=2679 max_us=108411 barrier_p50_us=591 barrier_p99_us=1759 parked=0 read_ops=1505783 rotations=41 recycled=27 misses=18 fallbacks=0 pool_full=2 truncated=37 waits[started=0 satisfied=0 expired=0] rotations_unzeroed=0 inline_preallocs=0 prealloc_failures=0 rotations_min_cell=10 trigger_at_s=15.0 warmed=true firstgen[zero_fill=2370830336 frame_bytes=1163575296 share=2.038] warmed[zero_fill=2461007872 frame_bytes=9583099904 share=0.257 padding_pct=51.7 host_per_log=1.438 device_per_log=1.442 ckpt=1736622080 deficit=3] recovery_first_boot_s=5.055 recover_residue_slacks=7 recover_residue_stops=7
+  s35: 40s drive-state idle before s39b arm rep0
+  s35: 40s drive-state idle before s39b arm fresh-image recovery boot
+  s39b rep0 arm: rep0 arm c32 ops=32525 p50_us=707 p99_us=2071 max_us=190200 barrier_p50_us=591 barrier_p99_us=1503 parked=0 read_ops=1591753 rotations=43 recycled=35 misses=12 fallbacks=0 pool_full=0 truncated=39 waits[started=38 satisfied=34 expired=4] rotations_unzeroed=0 inline_preallocs=0 prealloc_failures=0 rotations_min_cell=10 trigger_at_s=15.0 warmed=true firstgen[zero_fill=2147483648 frame_bytes=1203347456 share=1.785] warmed[zero_fill=1073741824 frame_bytes=9651822592 share=0.111 padding_pct=51.8 host_per_log=1.302 device_per_log=1.306 ckpt=1841971200 deficit=0] recovery_first_boot_s=5.144 recover_residue_slacks=9 recover_residue_stops=8
+  s35: 40s drive-state idle before s39b arm rep1
+  s35: 40s drive-state idle before s39b arm fresh-image recovery boot
+  s39b rep1 arm: rep1 arm c32 ops=34571 p50_us=705 p99_us=2027 max_us=101865 barrier_p50_us=591 barrier_p99_us=1471 parked=0 read_ops=1566856 rotations=45 recycled=36 misses=12 fallbacks=0 pool_full=0 truncated=40 waits[started=39 satisfied=34 expired=4] rotations_unzeroed=0 inline_preallocs=0 prealloc_failures=0 rotations_min_cell=11 trigger_at_s=15.0 warmed=true firstgen[zero_fill=2147483648 frame_bytes=1195765760 share=1.796] warmed[zero_fill=1073741824 frame_bytes=10277564416 share=0.104 padding_pct=51.5 host_per_log=1.289 device_per_log=1.296 ckpt=1894699008 deficit=1] recovery_first_boot_s=3.695 recover_residue_slacks=8 recover_residue_stops=8
+  s35: 40s drive-state idle before s39b base rep1
+  s35: 40s drive-state idle before s39b base fresh-image recovery boot
+  s39b rep1 base: rep1 base c32 ops=34003 p50_us=711 p99_us=2231 max_us=136242 barrier_p50_us=591 barrier_p99_us=1535 parked=0 read_ops=1556101 rotations=43 recycled=30 misses=17 fallbacks=0 pool_full=1 truncated=39 waits[started=0 satisfied=0 expired=0] rotations_unzeroed=0 inline_preallocs=0 prealloc_failures=0 rotations_min_cell=10 trigger_at_s=18.0 warmed=true firstgen[zero_fill=2549350400 frame_bytes=1252696064 share=2.035] warmed[zero_fill=2014052352 frame_bytes=9930031104 share=0.203 padding_pct=51.4 host_per_log=1.388 device_per_log=1.392 ckpt=1842069504 deficit=2] recovery_first_boot_s=3.725 recover_residue_slacks=7 recover_residue_stops=7
+  s35: 40s drive-state idle before s39b base rep2
+  s35: 40s drive-state idle before s39b base fresh-image recovery boot
+  s39b rep2 base: rep2 base c32 ops=32300 p50_us=711 p99_us=2159 max_us=190525 barrier_p50_us=591 barrier_p99_us=1535 parked=0 read_ops=1584812 rotations=42 recycled=25 misses=21 fallbacks=0 pool_full=5 truncated=37 waits[started=0 satisfied=0 expired=0] rotations_unzeroed=0 inline_preallocs=0 prealloc_failures=0 rotations_min_cell=10 trigger_at_s=15.0 warmed=true firstgen[zero_fill=2425880576 frame_bytes=1191051264 share=2.037] warmed[zero_fill=3211264000 frame_bytes=9574039552 share=0.335 padding_pct=51.7 host_per_log=1.517 device_per_log=1.523 ckpt=1736642560 deficit=3] recovery_first_boot_s=3.330 recover_residue_slacks=8 recover_residue_stops=7
+  s35: 40s drive-state idle before s39b arm rep2
+  s35: 40s drive-state idle before s39b arm fresh-image recovery boot
+  s39b rep2 arm: rep2 arm c32 ops=34980 p50_us=705 p99_us=1999 max_us=75263 barrier_p50_us=591 barrier_p99_us=1471 parked=0 read_ops=1564521 rotations=45 recycled=37 misses=12 fallbacks=0 pool_full=0 truncated=41 waits[started=40 satisfied=36 expired=4] rotations_unzeroed=0 inline_preallocs=0 prealloc_failures=0 rotations_min_cell=11 trigger_at_s=15.0 warmed=true firstgen[zero_fill=2147483648 frame_bytes=1200685056 share=1.789] warmed[zero_fill=1073741824 frame_bytes=10402754560 share=0.103 padding_pct=51.5 host_per_log=1.290 device_per_log=1.294 ckpt=1947418624 deficit=0] recovery_first_boot_s=3.592 recover_residue_slacks=8 recover_residue_stops=8
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (device characterization — informational since the ADR-0087 fourth amendment, 2026-08-22) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+  S39b: warmed zero-fill bytes per log frame byte under recycling (arm) FAIL
+  S39b: rotations not served by the pool over the warmed window, worst cell PASS
+  S39b: padding share moved by recycling (the S39c control) PASS
+  S39b: always c32 p50 under recycling over baseline PASS
+  S39b: always c32 p99 under recycling over baseline PASS
+  S39b: read leg under recycling over baseline (the E4.7 ±2 % rule) PASS
+  S39b: first crash-restart recovery boot on the recycled log over baseline PASS
+  S39b: rotations per cell the row actually performed (validity) PASS
+  S39b/D9: pool waits fed before the bound over waits ended (arm) PASS
+  S39b/D9: rotations onto an un-zeroed segment on the arm, worst replicate PASS
+  S39b/D9: rotations that found no next segment on the arm, worst replicate PASS
+  S39b/D9: preallocs refused for space on the arm, worst replicate PASS
+  S39b: accounted host bytes per log frame byte under recycling (informational) PASS (informational)
+  S39b: block-device sectors written per log frame byte under recycling (informational) PASS (informational)
+
+gate-run: report written to /home/kcaicedo/bench-data/s39b/campaign-G/run/1787448954-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED

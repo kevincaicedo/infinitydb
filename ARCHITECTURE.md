@@ -85,7 +85,11 @@ is **recycled** into the next one by rename instead of unlinked
 (ADR-0090; a bounded one-slot pool per cell, `--no-segment-recycle`
 off), so that second write is paid once per generation — the reader
 proves the recycled file's previous-life frames inert by their own
-segment stamp, never a hole, never data. Background I/O
+segment stamp, never a hole, never data. Because the segment that feeds
+the pool is truncated a checkpoint *after* the rotation that needs it,
+the prealloc **waits, bounded to a quarter segment**, for the pool
+before creating a fresh file (ADR-0090 D9; `--recycle-wait off|quarter|
+eighth`), and the fallback's zero-fill paces from its own origin. Background I/O
 (zero-fill, tier flush, checkpoints, compaction, backfill) spends a
 per-cell share of a **measured device budget** (ADR-0088; the seal
 pacer that ADR proposed is an A/B arm, off). On aligned segments a
