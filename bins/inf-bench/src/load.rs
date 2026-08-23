@@ -110,6 +110,12 @@ pub struct LoadReport {
     /// Exact mean of the leg's latencies — disclosed beside the
     /// percentiles (never a gate input on its own).
     pub mean_us: f64,
+    /// M4.5-S40 (stall attribution): when the `max_us` sample was *sent*,
+    /// in seconds after warmup — the instant a server-side timeline is
+    /// read against; and the per-second maxima over the leg (index =
+    /// whole seconds after warmup), so an isolated event is seen as one.
+    pub max_at_s: f64,
+    pub max_per_second: Vec<u64>,
 }
 
 struct ConnResult {
@@ -119,6 +125,9 @@ struct ConnResult {
     nils: u64,
     error_samples: Vec<String>,
     hist_us: FineHistogram,
+    max_us: u64,
+    max_at_s: f64,
+    max_per_second: Vec<u64>,
 }
 
 pub(crate) fn make_key(spec: &LoadSpec, index: u64) -> Vec<u8> {
@@ -153,6 +162,9 @@ fn run_conn(
         nils: 0,
         error_samples: Vec::new(),
         hist_us: FineHistogram::new(),
+        max_us: 0,
+        max_at_s: 0.0,
+        max_per_second: vec![0; spec.duration.as_secs() as usize + 2],
     };
 
     // Fill mode: a partitioned range, exactly once, pipelined.
@@ -282,6 +294,14 @@ fn run_conn(
                 let micros = sent.elapsed().as_micros() as u64;
                 result.hist_us.record(micros);
                 result.ops += 1;
+                let since = sent.duration_since(warmup_end);
+                if micros > result.max_us {
+                    result.max_us = micros;
+                    result.max_at_s = since.as_secs_f64();
+                }
+                if let Some(slot) = result.max_per_second.get_mut(since.as_secs() as usize) {
+                    *slot = (*slot).max(micros);
+                }
                 if rx[rx_at..].starts_with(b"$-1") {
                     result.nils += 1;
                 }
@@ -345,6 +365,16 @@ pub fn run(spec: &LoadSpec) -> Result<LoadReport, String> {
             }
         }
         hist.merge(&conn.hist_us);
+        if conn.max_us > report.max_us || report.max_per_second.is_empty() {
+            report.max_us = conn.max_us;
+            report.max_at_s = conn.max_at_s;
+        }
+        if report.max_per_second.len() < conn.max_per_second.len() {
+            report.max_per_second.resize(conn.max_per_second.len(), 0);
+        }
+        for (slot, m) in report.max_per_second.iter_mut().zip(&conn.max_per_second) {
+            *slot = (*slot).max(*m);
+        }
     }
     report.ops_per_sec = report.ops as f64 / report.elapsed_s;
     report.p50_us = hist.percentile(50.0);

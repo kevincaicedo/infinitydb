@@ -56,6 +56,10 @@ struct Args {
     /// full before creating a fresh next segment; `eighth` bounds it
     /// tighter; `off` preallocates at rotation (the D9 A/B baseline arm).
     recycle_wait: inf_server::PreallocPolicy,
+    /// M4.5-S37 step 1 (`bench-diagnostics` builds only): the blind-
+    /// overwrite ceiling arm — unsound measurement instrument.
+    #[cfg(feature = "bench-diagnostics")]
+    blind_overwrite_ceiling: bool,
     /// Frames in flight per cell (M4.5-S35, ADR-0087 D1/D5 as amended
     /// 2026-08-22): `auto` (the default) derives K from the resolved
     /// barrier class — FUA → 3, FLUSH → 1 — after the class is known and
@@ -143,6 +147,8 @@ impl Default for Args {
             conn_default_ns: None,
             segment_recycle_slots: inf_server::DEFAULT_RECYCLE_SLOTS,
             recycle_wait: inf_server::PreallocPolicy::DEFAULT,
+            #[cfg(feature = "bench-diagnostics")]
+            blind_overwrite_ceiling: false,
             frames_in_flight: inf_server::FramesInFlight::Auto,
             barrier_class: None,
             device_write_mbps: None,
@@ -215,6 +221,8 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--no-segment-recycle" => args.segment_recycle_slots = 0,
+            #[cfg(feature = "bench-diagnostics")]
+            "--blind-overwrite-ceiling" => args.blind_overwrite_ceiling = true,
             "--recycle-wait" => {
                 let text = take("--recycle-wait")?;
                 args.recycle_wait = inf_server::PreallocPolicy::parse(&text)
@@ -715,6 +723,13 @@ fn cell_main(
     plane.set_fabric_apply_prefetch(args.fabric_apply_prefetch);
     plane.set_parse_batch_prefetch(args.parse_batch_prefetch);
     plane.set_deasync_dispatch(args.deasync_dispatch);
+    #[cfg(feature = "bench-diagnostics")]
+    if args.blind_overwrite_ceiling {
+        eprintln!(
+            "infinityd: BLIND-OVERWRITE CEILING ARM (bench-diagnostics) — unsound, never serve"
+        );
+        plane.set_blind_overwrite_ceiling(true);
+    }
     #[cfg(target_os = "linux")]
     plane.set_park_flags(park_flags);
     #[cfg(not(target_os = "linux"))]

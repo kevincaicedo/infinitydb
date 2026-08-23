@@ -575,6 +575,8 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-s36",
         "only-s39b",
         "only-s39d",
+        "only-s40",
+        "only-s37",
         "model-absent",
     ],
     &[
@@ -667,6 +669,14 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-s39d",
         "s39d-warm-records",
         "s39d-tail-records",
+        // M4.5-S40: the stall-attribution row's key space (the memtier
+        // shape's `--keyspace`).
+        "only-s40",
+        "s40-keys",
+        // M4.5-S37 step 1: the ceiling row's key space (beyond-RAM by
+        // construction against the row's 128 MB budget).
+        "only-s37",
+        "s37-keys",
         "model-absent",
         // M4.5-S35 row: seconds idled before every durable leg (the S34
         // drive-state rule; default 40, 0 for harness smoke).

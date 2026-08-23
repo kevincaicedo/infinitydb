@@ -100,16 +100,22 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
     let only_s39b = flags.bool("only-s39b");
     // `--only-s39d` (M4.5-S39d): the fixed-work recovery attribution row.
     let only_s39d = flags.bool("only-s39d");
+    // `--only-s40` (M4.5-S40): the stall-attribution row at the memtier shape.
+    let only_s40 = flags.bool("only-s40");
+    // `--only-s37` (M4.5-S37 step 1): the cold-overwrite ceiling A/B.
+    let only_s37 = flags.bool("only-s37");
     if usize::from(only_s27)
         + usize::from(only_s29)
         + usize::from(only_s35)
         + usize::from(only_s36)
         + usize::from(only_s39b)
         + usize::from(only_s39d)
+        + usize::from(only_s40)
+        + usize::from(only_s37)
         > 1
     {
-        return Err("--only-s27, --only-s29, --only-s35, --only-s36, --only-s39b and --only-s39d \
-                    exclude each other"
+        return Err("--only-s27, --only-s29, --only-s35, --only-s36, --only-s37, --only-s39b, \
+                    --only-s39d and --only-s40 exclude each other"
             .into());
     }
 
@@ -166,6 +172,39 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
             &artifacts_root,
             &format!(
                 "binary {infinityd} · cells {cells} · {replicates} replicates · S39b row only · \
+                 {arms_note}"
+            ),
+        );
+    }
+    if only_s37 {
+        m.note("--only-s37: every other row was skipped; their gate keys are absent");
+        s37_ceiling_row(flags, &infinityd, cells, duration, replicates, &data_root, &mut m)?;
+        return finish_report(
+            "m4.5",
+            &gates_list,
+            &m,
+            env_ok,
+            reference_box,
+            &artifacts_root,
+            &format!(
+                "binary {infinityd} (bench-diagnostics) · cells {cells} · {replicates} \
+                 replicates · S37 ceiling row only · {arms_note}"
+            ),
+        );
+    }
+    if only_s40 {
+        m.note("--only-s40: every other row was skipped; their gate keys are absent");
+        let duration = if flags.get("duration").is_some() { duration } else { 60 };
+        s40_stall_row(flags, &infinityd, cells, duration, replicates, &data_root, &mut m)?;
+        return finish_report(
+            "m4.5",
+            &gates_list,
+            &m,
+            env_ok,
+            reference_box,
+            &artifacts_root,
+            &format!(
+                "binary {infinityd} · cells {cells} · {replicates} legs · S40 row only · \
                  {arms_note}"
             ),
         );
@@ -2543,5 +2582,609 @@ fn s39d_recovery_row(
          group formation allows",
     );
     m.raw_section("s39d per-leg samples", &raw);
+    Ok(())
+}
+
+// ---- M4.5-S40: stall attribution at the memtier shape (S27 D5 `max`) ---------
+
+/// Keys of the S40 memtier shape (`--keyspace 1000000`): random SETs
+/// over 1 M keys × 1 KiB grow the dataset to ~1 GB inside the leg, so
+/// the derived checkpoint trigger fires several times per minute at the
+/// product's floor — the checkpoint phases the 103 ms maximum may sit in.
+const S40_DEFAULT_KEYS: u64 = 1_000_000;
+
+/// One server-side timeline sample (every cell summed / maxed) taken
+/// every `S40_SAMPLE_MS` during the leg — the events a client maximum is
+/// read against.
+#[derive(Clone, Debug, Default)]
+struct S40Sample {
+    at_s: f64,
+    /// Cells with a checkpoint stream open (`ckpt_buffer_bytes > 0`).
+    ckpt_in_flight: u64,
+    ckpts_completed: u64,
+    ckpt_bytes: u64,
+    manifests_published: u64,
+    truncated: u64,
+    rotations: u64,
+    zero_fill: u64,
+    parked: u64,
+    stall_p99_us: u64,
+    stall_p999_us: u64,
+    waits_barrier: u64,
+    waits_rotation: u64,
+    waits_pace: u64,
+    ckpt_deferrals: u64,
+    /// `/sys/block/<dev>/stat`: sectors written (7), ms writing (8),
+    /// ms doing I/O (10) — 0 when not sampled.
+    dev_sectors_written: u64,
+    dev_ms_writing: u64,
+    dev_io_ms: u64,
+}
+
+const S40_SAMPLE_MS: u64 = 250;
+
+fn s40_sample(port: u16, cells: u16, device_stat: Option<&str>, t0: Instant) -> Option<S40Sample> {
+    let infos = scrape_cells(port, cells).ok()?;
+    let per = |f: &str| -> Vec<u64> {
+        infos.iter().map(|c| c.get(f).and_then(|v| v.parse().ok()).unwrap_or(0)).collect()
+    };
+    let dev =
+        device_stat.and_then(|d| std::fs::read_to_string(format!("/sys/block/{d}/stat")).ok());
+    let dev_field = |i: usize| -> u64 {
+        dev.as_deref()
+            .and_then(|s| s.split_whitespace().nth(i).and_then(|v| v.parse().ok()))
+            .unwrap_or(0)
+    };
+    Some(S40Sample {
+        at_s: t0.elapsed().as_secs_f64(),
+        ckpt_in_flight: per("ckpt_buffer_bytes").iter().filter(|&&b| b > 0).count() as u64,
+        ckpts_completed: sum_field(&infos, "ckpts_completed"),
+        ckpt_bytes: sum_field(&infos, "ckpt_bytes_total"),
+        manifests_published: sum_field(&infos, "manifests_published"),
+        truncated: sum_field(&infos, "segments_truncated"),
+        rotations: sum_field(&infos, "segment_rotations"),
+        zero_fill: sum_field(&infos, "zero_fill_bytes"),
+        parked: sum_field(&infos, "log_admission_parked_total"),
+        stall_p99_us: crate::gaterun::max_field(&infos, "log_write_stall_p99_us"),
+        stall_p999_us: crate::gaterun::max_field(&infos, "log_write_stall_p999_us"),
+        waits_barrier: sum_field(&infos, "frame_waits_barrier"),
+        waits_rotation: sum_field(&infos, "frame_waits_rotation"),
+        waits_pace: sum_field(&infos, "frame_waits_pace"),
+        ckpt_deferrals: sum_field(&infos, "io_budget_deferrals_checkpoint"),
+        dev_sectors_written: dev_field(6),
+        dev_ms_writing: dev_field(7),
+        dev_io_ms: dev_field(9),
+    })
+}
+
+/// What the timeline says happened in the sample window that brackets
+/// the client's maximum: every engine event is named, the device's
+/// write time over the window disclosed, and one attribution word
+/// chosen by precedence (checkpoint in flight → rotation → manifest/
+/// truncation → zero-fill → admission park → device-busy → none).
+fn s40_attribute(before: &S40Sample, after: &S40Sample) -> (String, String) {
+    let window_ms = ((after.at_s - before.at_s) * 1000.0).max(1.0);
+    let d = |f: fn(&S40Sample) -> u64| f(after).saturating_sub(f(before));
+    let mut events = Vec::new();
+    if before.ckpt_in_flight > 0 || after.ckpt_in_flight > 0 {
+        events.push(format!(
+            "checkpoint in flight ({}→{} cells, +{} bytes)",
+            before.ckpt_in_flight,
+            after.ckpt_in_flight,
+            d(|s| s.ckpt_bytes)
+        ));
+    }
+    if d(|s| s.ckpts_completed) > 0 {
+        events.push(format!("checkpoint published (+{})", d(|s| s.ckpts_completed)));
+    }
+    if d(|s| s.rotations) > 0 {
+        events.push(format!("rotation (+{})", d(|s| s.rotations)));
+    }
+    if d(|s| s.manifests_published) > 0 || d(|s| s.truncated) > 0 {
+        events.push(format!(
+            "manifest/truncation (+{} manifests, +{} segments)",
+            d(|s| s.manifests_published),
+            d(|s| s.truncated)
+        ));
+    }
+    if d(|s| s.zero_fill) > 0 {
+        events.push(format!("zero-fill (+{} bytes)", d(|s| s.zero_fill)));
+    }
+    if d(|s| s.parked) > 0 {
+        events.push(format!("admission parks (+{})", d(|s| s.parked)));
+    }
+    if d(|s| s.ckpt_deferrals) > 0 {
+        events.push(format!("checkpoint offers deferred (+{})", d(|s| s.ckpt_deferrals)));
+    }
+    if d(|s| s.waits_rotation) > 0 || d(|s| s.waits_barrier) > 0 || d(|s| s.waits_pace) > 0 {
+        events.push(format!(
+            "frame waits (+{} barrier, +{} rotation, +{} pace)",
+            d(|s| s.waits_barrier),
+            d(|s| s.waits_rotation),
+            d(|s| s.waits_pace)
+        ));
+    }
+    let dev_busy_pct = d(|s| s.dev_io_ms) as f64 * 100.0 / window_ms;
+    let dev_note = if after.dev_sectors_written > 0 {
+        format!(
+            "device: +{} MiB written, {} ms writing, io busy {:.0} % of the {:.0} ms window",
+            (d(|s| s.dev_sectors_written) * 512) >> 20,
+            d(|s| s.dev_ms_writing),
+            dev_busy_pct,
+            window_ms
+        )
+    } else {
+        "device: not sampled".to_string()
+    };
+    let word =
+        if before.ckpt_in_flight > 0 || after.ckpt_in_flight > 0 || d(|s| s.ckpts_completed) > 0 {
+            "checkpoint"
+        } else if d(|s| s.rotations) > 0 {
+            "rotation"
+        } else if d(|s| s.manifests_published) > 0 || d(|s| s.truncated) > 0 {
+            "manifest/truncation"
+        } else if d(|s| s.zero_fill) > 0 {
+            "zero-fill"
+        } else if d(|s| s.parked) > 0 {
+            "admission-park"
+        } else if dev_busy_pct >= 50.0 {
+            "device-busy"
+        } else {
+            "unattributed"
+        };
+    let detail = if events.is_empty() {
+        format!("no engine event in the window; {dev_note}")
+    } else {
+        format!("{}; {dev_note}", events.join(", "))
+    };
+    (word.to_string(), detail)
+}
+
+/// One S40 leg's facts.
+struct S40Leg {
+    ops_per_sec: f64,
+    p50_us: f64,
+    p99_us: f64,
+    p999_us: f64,
+    max_us: f64,
+    max_at_s: f64,
+    /// Seconds whose maximum exceeded 50 ms, and the top per-second maxima.
+    seconds_over_50ms: u64,
+    top_seconds: Vec<(usize, u64)>,
+    cpu_pct: f64,
+    attribution: String,
+    attribution_detail: String,
+    ckpts: u64,
+    ckpt_bytes: u64,
+    stall_p99_us: u64,
+    stall_p999_us: u64,
+    parked: u64,
+    dev_mib: u64,
+}
+
+/// The M4.5-S40 stall-attribution leg: the memtier shape on the in-house
+/// generator (1 M keys × 1 KiB, 32 conns, pipeline 1, `everysec`, an
+/// offered rate with latency from the intended send), the server's
+/// counters and the block device sampled every 250 ms across it, and
+/// the client's maximum read against the sample window it fell in.
+#[allow(clippy::too_many_arguments)]
+fn s40_leg(
+    flags: &Flags,
+    infinityd: &str,
+    cells: u16,
+    duration: u64,
+    offered: u64,
+    keys: u64,
+    dir: &str,
+    device_stat: Option<&str>,
+) -> Result<S40Leg, String> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
+    crate::m2rows::copy_probe_file(flags, std::path::Path::new(dir))?;
+    let mut extra: Vec<String> = vec!["--data-dir".into(), dir.to_string()];
+    if let Some(pin) = flags.get("pin-start") {
+        extra.push("--pin-start".into());
+        extra.push(pin.to_string());
+    }
+    extra.extend(crate::m2rows::pipeline_args(flags));
+    let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
+    let server = spawn_infinityd(infinityd, cells, &extra_refs)?;
+    let port = server.port;
+    create_ns(
+        port,
+        &[b"INF.NS", b"CREATE", b"s40esec", b"MODE", b"durable", b"FSYNC", b"everysec"],
+    )?;
+    await_fan(port, "s40esec", cells)?;
+    let warmup = Duration::from_secs(2);
+    let spec = LoadSpec {
+        port,
+        conns: 32,
+        pipeline: 1,
+        duration: Duration::from_secs(duration),
+        warmup,
+        set_weight: 1,
+        get_weight: 0,
+        keys,
+        key_prefix: "s40:".into(),
+        value_size: 1024,
+        setup: vec![vec![b"INF.NS".to_vec(), b"USE".to_vec(), b"s40esec".to_vec()]],
+        target_ops_per_sec: Some(offered),
+        ..LoadSpec::default()
+    };
+    let ticks_before = crate::gaterun::cpu_ticks_of(server.pid());
+    let t0 = Instant::now();
+    let load = std::thread::spawn(move || run_load(&spec));
+    let mut timeline: Vec<S40Sample> = Vec::new();
+    while !load.is_finished() {
+        if let Some(s) = s40_sample(port, cells, device_stat, t0) {
+            timeline.push(s);
+        }
+        #[allow(clippy::disallowed_methods)] // bench orchestration, not cell code
+        std::thread::sleep(Duration::from_millis(S40_SAMPLE_MS));
+    }
+    let wall = t0.elapsed().as_secs_f64().max(1e-9);
+    let ticks = crate::gaterun::cpu_ticks_of(server.pid()).saturating_sub(ticks_before);
+    let report = load.join().map_err(|_| "s40: load thread panicked".to_string())??;
+    if report.errors > report.busy_retryable {
+        return Err(format!(
+            "s40: {} non-BUSY errors (first: {:?})",
+            report.errors - report.busy_retryable,
+            report.error_samples.first()
+        ));
+    }
+    let (first, last) = match (timeline.first(), timeline.last()) {
+        (Some(f), Some(l)) => (f.clone(), l.clone()),
+        _ => return Err("s40: no timeline sample".into()),
+    };
+    // The max's send instant is measured from warmup's end; the timeline
+    // from the leg's start.
+    let max_at_leg = report.max_at_s + warmup.as_secs_f64();
+    let after_idx =
+        timeline.iter().position(|s| s.at_s >= max_at_leg).unwrap_or(timeline.len() - 1);
+    let before_idx = after_idx.saturating_sub(1);
+    let (attribution, attribution_detail) =
+        s40_attribute(&timeline[before_idx], &timeline[after_idx]);
+    let mut top: Vec<(usize, u64)> = report.max_per_second.iter().copied().enumerate().collect();
+    top.sort_by_key(|&(_, m)| std::cmp::Reverse(m));
+    top.truncate(5);
+    drop(server);
+    Ok(S40Leg {
+        ops_per_sec: report.ops_per_sec,
+        p50_us: report.p50_us as f64,
+        p99_us: report.p99_us as f64,
+        p999_us: report.p999_us as f64,
+        max_us: report.max_us as f64,
+        max_at_s: report.max_at_s,
+        seconds_over_50ms: report.max_per_second.iter().filter(|&&m| m > 50_000).count() as u64,
+        top_seconds: top,
+        cpu_pct: ticks as f64 / crate::gaterun::CLOCK_TICKS_PER_S as f64 / wall * 100.0,
+        attribution,
+        attribution_detail,
+        ckpts: last.ckpts_completed.saturating_sub(first.ckpts_completed),
+        ckpt_bytes: last.ckpt_bytes.saturating_sub(first.ckpt_bytes),
+        stall_p99_us: last.stall_p99_us,
+        stall_p999_us: last.stall_p999_us,
+        parked: last.parked.saturating_sub(first.parked),
+        dev_mib: (last.dev_sectors_written.saturating_sub(first.dev_sectors_written) * 512) >> 20,
+    })
+}
+
+/// The M4.5-S40 stall-attribution row: `--replicates` legs of the memtier
+/// shape on the in-house generator, the client maximum of each read
+/// against the server/device timeline window it fell in. Reports the
+/// worst and median maximum (the S27 D5 `max ≤ 50 ms` wording at this
+/// shape), the seconds over 50 ms per leg, and the attribution word per
+/// leg — a note, never a gate.
+fn s40_stall_row(
+    flags: &Flags,
+    infinityd: &str,
+    cells: u16,
+    duration: u64,
+    replicates: usize,
+    data_root: &str,
+    m: &mut Measurements,
+) -> Result<(), String> {
+    let idle_s = flags.u64_or("leg-idle-s", S35_LEG_IDLE_S)?;
+    let offered = flags.u64_or("offered-ops", 100_000)?;
+    let keys = flags.u64_or("s40-keys", S40_DEFAULT_KEYS)?;
+    let device_stat = flags.get("device-stat").map(str::to_string);
+    m.note(format!(
+        "s40 row: {cells} cells · {replicates} legs · memtier shape on the in-house generator: \
+         {keys} keys × 1 KiB, 32 conns, pipeline 1, everysec, {offered} offered ops/s for \
+         {duration} s (latency from the intended send) · INFO + device sampled every \
+         {S40_SAMPLE_MS} ms · {idle_s} s idle before every leg · device stat {}",
+        device_stat.as_deref().unwrap_or("(not sampled)")
+    ));
+    let mut raw = String::new();
+    let mut maxes = Vec::new();
+    let mut achieved = Vec::new();
+    let mut p99s = Vec::new();
+    let mut p999s = Vec::new();
+    let mut over = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    for rep in 0..replicates {
+        let dir = format!("{data_root}/s40-rep{rep}");
+        s35_idle(idle_s, &format!("s40 rep{rep}"));
+        let leg = s40_leg(
+            flags,
+            infinityd,
+            cells,
+            duration,
+            offered,
+            keys,
+            &dir,
+            device_stat.as_deref(),
+        )?;
+        raw.push_str(&format!(
+            "rep{rep} achieved={:.0} ({:.3} of offered) p50_us={:.0} p99_us={:.0} p999_us={:.0} \
+             max_us={:.0} max_at_s={:.2} seconds_over_50ms={} top_seconds={:?} cpu_pct={:.0} \
+             ckpts={} ckpt_bytes={} stall_p99_us={} stall_p999_us={} parked={} dev_mib={} \
+             attribution={} [{}]\n",
+            leg.ops_per_sec,
+            leg.ops_per_sec / offered.max(1) as f64,
+            leg.p50_us,
+            leg.p99_us,
+            leg.p999_us,
+            leg.max_us,
+            leg.max_at_s,
+            leg.seconds_over_50ms,
+            leg.top_seconds,
+            leg.cpu_pct,
+            leg.ckpts,
+            leg.ckpt_bytes,
+            leg.stall_p99_us,
+            leg.stall_p999_us,
+            leg.parked,
+            leg.dev_mib,
+            leg.attribution,
+            leg.attribution_detail,
+        ));
+        println!("  s40 rep{rep}: {}", raw.lines().last().unwrap_or(""));
+        let _ = std::fs::remove_dir_all(&dir);
+        maxes.push(leg.max_us / 1000.0);
+        achieved.push(leg.ops_per_sec / offered.max(1) as f64);
+        p99s.push(leg.p99_us);
+        p999s.push(leg.p999_us);
+        over.push(leg.seconds_over_50ms as f64);
+        words.push(leg.attribution);
+    }
+    m.set("s40:max_ms_worst", maxes.iter().copied().fold(0.0, f64::max));
+    m.set("s40:max_ms_median", median(&mut maxes));
+    m.set("s40:offered_rate_achieved_x_min", achieved.iter().copied().fold(f64::MAX, f64::min));
+    m.set("s40:p99_us_median", median(&mut p99s));
+    m.set("s40:p999_us_median", median(&mut p999s));
+    m.set("s40:seconds_over_50ms_total", over.iter().sum());
+    m.note(format!("s40 attribution per leg (max's sample window): {}", words.join(" / ")));
+    if achieved.iter().any(|a| *a < 0.9) {
+        m.note("s40: a leg achieved < 0.90 of the offered rate — its max is a saturation number");
+    }
+    m.row_open("stall-attribution");
+    m.row_write_amp(
+        "S40 stall attribution: the client's maximum is read against the 250 ms server/device \
+         sample window its send instant fell in; the attribution word is by precedence \
+         (checkpoint → rotation → manifest/truncation → zero-fill → admission park → device \
+         busy ≥ 50 % → unattributed) and is a note, never a gate",
+    );
+    m.raw_section("s40 per-leg samples", &raw);
+    Ok(())
+}
+
+// ---- M4.5-S37 step 1: the cold-overwrite ceiling (bench-diagnostics arm) ------
+
+/// Keys of the S37 ceiling row unless `--s37-keys` says otherwise:
+/// 1 M × 1 KiB ≈ 250 MB per cell against the row's 128 MB tiered budget
+/// — a beyond-RAM table where roughly half of every SET's candidates
+/// are cold, so the verifying read the ceiling arm skips is on the
+/// path of a large share of the leg (the share is measured, not
+/// assumed: `tiering_cold_resolves` on A, `blind_overwrites_ceiling`
+/// on B).
+const S37_DEFAULT_KEYS: u64 = 1_000_000;
+
+/// One S37 leg: the S29 tiered shape (closed loop, pipeline 1, 1 KiB)
+/// with the cold-resolve and blind-overwrite counts of the leg.
+struct S37Leg {
+    ops_per_sec: f64,
+    p50_us: f64,
+    p99_us: f64,
+    p999_us: f64,
+    sets: u64,
+    cold_resolves: u64,
+    blind: u64,
+}
+
+fn s37_leg(
+    port: u16,
+    cells: u16,
+    conns: usize,
+    duration: u64,
+    keys: u64,
+) -> Result<S37Leg, String> {
+    let before = scrape_cells(port, cells)?;
+    let report = run_load(&LoadSpec {
+        port,
+        conns,
+        pipeline: 1,
+        duration: Duration::from_secs(duration),
+        warmup: Duration::from_secs(2),
+        set_weight: 1,
+        get_weight: 0,
+        keys,
+        key_prefix: "s37tier:".into(),
+        value_size: 1024,
+        setup: vec![vec![b"INF.NS".to_vec(), b"USE".to_vec(), b"s37tier".to_vec()]],
+        ..LoadSpec::default()
+    })?;
+    if report.errors > report.busy_retryable {
+        return Err(format!(
+            "s37 c{conns}: {} non-BUSY errors (first: {:?})",
+            report.errors - report.busy_retryable,
+            report.error_samples.first()
+        ));
+    }
+    let after = scrape_cells(port, cells)?;
+    let d = |f: &str| sum_field(&after, f).saturating_sub(sum_field(&before, f));
+    Ok(S37Leg {
+        ops_per_sec: report.ops_per_sec,
+        p50_us: report.p50_us as f64,
+        p99_us: report.p99_us as f64,
+        p999_us: report.p999_us as f64,
+        sets: report.ops,
+        cold_resolves: d("tiering_cold_resolves"),
+        blind: d("blind_overwrites_ceiling"),
+    })
+}
+
+/// The M4.5-S37 step-1 row: the beyond-RAM tiered `always` write legs
+/// (64 and 256 conns) on the shipping path (A) against the blind-
+/// overwrite ceiling arm (B, `infinityd --blind-overwrite-ceiling` — a
+/// `bench-diagnostics` build, the same binary for both arms), ABBA per
+/// replicate, fresh server + fill per leg. B is an upper bound from an
+/// unsound build: its gain is what removing the verifying cold read
+/// could ever buy; the predeclared rule (plan S37) reads "< 15 %
+/// throughput and < 20 % p99 ⇒ step 2 `Rejected`".
+fn s37_ceiling_row(
+    flags: &Flags,
+    infinityd: &str,
+    cells: u16,
+    duration: u64,
+    replicates: usize,
+    data_root: &str,
+    m: &mut Measurements,
+) -> Result<(), String> {
+    let keys = flags.u64_or("s37-keys", S37_DEFAULT_KEYS)?;
+    let idle_s = flags.u64_or("leg-idle-s", 0)?;
+    m.note(format!(
+        "s37 row: {cells} cells · {replicates} replicates (ABBA) · tiered always, MEM-BUDGET \
+         {MEM_BUDGET}/cell, {keys} keys × 1 KiB filled per leg, then 100 % SET closed-loop \
+         pipeline 1 at {CONNS_LOW} and {CONNS_HIGH} conns for {duration} s · arm B = \
+         --blind-overwrite-ceiling (unsound ceiling instrument; bench-diagnostics build)"
+    ));
+    let mut raw = String::new();
+    let mut legs: Vec<(usize, &'static str, usize, S37Leg)> = Vec::new();
+    for rep in 0..replicates {
+        let order: [(&'static str, &[&str]); 2] = if rep % 2 == 0 {
+            [("A", &[]), ("B", &["--blind-overwrite-ceiling"])]
+        } else {
+            [("B", &["--blind-overwrite-ceiling"]), ("A", &[])]
+        };
+        for (arm, arm_args) in order {
+            let dir = format!("{data_root}/s37-{arm}-rep{rep}");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
+            crate::m2rows::copy_probe_file(flags, std::path::Path::new(&dir))?;
+            let mut extra: Vec<String> = vec!["--data-dir".into(), dir.clone()];
+            if let Some(pin) = flags.get("pin-start") {
+                extra.push("--pin-start".into());
+                extra.push(pin.to_string());
+            }
+            extra.extend(crate::m2rows::pipeline_args(flags));
+            extra.extend(arm_args.iter().map(|s| (*s).to_string()));
+            let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
+            s35_idle(idle_s, &format!("s37 {arm} rep{rep}"));
+            let server = spawn_infinityd(infinityd, cells, &extra_refs)?;
+            let port = server.port;
+            create_ns(
+                port,
+                &[
+                    b"INF.NS",
+                    b"CREATE",
+                    b"s37tier",
+                    b"MODE",
+                    b"durable",
+                    b"FSYNC",
+                    b"always",
+                    b"MEM-BUDGET",
+                    MEM_BUDGET.as_bytes(),
+                    b"DISK-BUDGET",
+                    b"10gb",
+                    b"TIER-IO-MODE",
+                    b"direct",
+                ],
+            )?;
+            await_fan(port, "s37tier", cells)?;
+            let infos = scrape_cells(port, cells)?;
+            if !infos.iter().all(|c| c.contains_key("blind_overwrites_ceiling")) {
+                return Err("s37: INFO has no blind_overwrites_ceiling — the binary is not a \
+                            bench-diagnostics build (cargo build --release --features \
+                            bench-diagnostics -p infinityd)"
+                    .into());
+            }
+            let fill = run_load(&LoadSpec {
+                port,
+                conns: 64,
+                pipeline: 4,
+                fill: Some(keys),
+                keys,
+                key_prefix: "s37tier:".into(),
+                value_size: 1024,
+                setup: vec![vec![b"INF.NS".to_vec(), b"USE".to_vec(), b"s37tier".to_vec()]],
+                ..LoadSpec::default()
+            })?;
+            if fill.errors > 0 {
+                return Err(format!("s37 {arm} rep{rep} fill: {} errors", fill.errors));
+            }
+            for conns in [CONNS_LOW, CONNS_HIGH] {
+                let leg = s37_leg(port, cells, conns, duration, keys)?;
+                raw.push_str(&format!(
+                    "rep{rep} {arm} c{conns:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
+                     p999_us={:<7.0} sets={} cold_resolves={} ({:.3}/set) blind={} ({:.3}/set)\n",
+                    leg.ops_per_sec,
+                    leg.p50_us,
+                    leg.p99_us,
+                    leg.p999_us,
+                    leg.sets,
+                    leg.cold_resolves,
+                    leg.cold_resolves as f64 / leg.sets.max(1) as f64,
+                    leg.blind,
+                    leg.blind as f64 / leg.sets.max(1) as f64,
+                ));
+                println!("  s37 {}", raw.lines().last().unwrap_or(""));
+                legs.push((rep, arm, conns, leg));
+            }
+            drop(server);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    let find = |rep: usize, arm: &str, conns: usize| {
+        legs.iter().find(|(r, a, c, _)| *r == rep && *a == arm && *c == conns).map(|(_, _, _, l)| l)
+    };
+    for conns in [CONNS_LOW, CONNS_HIGH] {
+        let mut ops_x = Vec::new();
+        let mut p50_gain = Vec::new();
+        let mut p99_gain = Vec::new();
+        let mut blind_share = Vec::new();
+        let mut cold_share = Vec::new();
+        for rep in 0..replicates {
+            let (Some(a), Some(b)) = (find(rep, "A", conns), find(rep, "B", conns)) else {
+                continue;
+            };
+            ops_x.push(b.ops_per_sec / a.ops_per_sec.max(1.0));
+            p50_gain.push(a.p50_us / b.p50_us.max(1.0));
+            p99_gain.push(a.p99_us / b.p99_us.max(1.0));
+            blind_share.push(b.blind as f64 / b.sets.max(1) as f64);
+            cold_share.push(a.cold_resolves as f64 / a.sets.max(1) as f64);
+        }
+        if ops_x.is_empty() {
+            continue;
+        }
+        let tag: &'static str = if conns == CONNS_LOW { "c64" } else { "c256" };
+        let key = |name: &str| -> &'static str {
+            Box::leak(format!("s37:{name}_{tag}").into_boxed_str())
+        };
+        m.set(key("ceiling_ops_x"), median(&mut ops_x));
+        m.set(key("ceiling_p50_gain_x"), median(&mut p50_gain));
+        m.set(key("ceiling_p99_gain_x"), median(&mut p99_gain));
+        m.set(key("blind_share_arm_b"), median(&mut blind_share));
+        m.set(key("cold_resolve_share_arm_a"), median(&mut cold_share));
+    }
+    m.row_open("cold-overwrite-ceiling");
+    m.row_write_amp(
+        "S37 step 1 (plan rule): B ÷ A throughput and A ÷ B p99 on the beyond-RAM tiered \
+         always write legs; B is an UNSOUND upper bound (the cold record is orphaned) — \
+         \"< 15 % throughput and < 20 % p99 ⇒ step 2 Rejected\"; `blind_share_arm_b` is the \
+         share of B's SETs that skipped a cold read (0 = the instrument never engaged), \
+         `cold_resolve_share_arm_a` the share of A's SETs that paid one",
+    );
+    m.raw_section("s37 per-leg samples", &raw);
     Ok(())
 }

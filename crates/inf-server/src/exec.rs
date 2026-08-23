@@ -226,6 +226,10 @@ pub struct NodeInfo {
     /// Records recovered (checkpoint + tail applied) — the fixed-work
     /// identity a recovery row checks across arms.
     pub recover_records: Cell<u64>,
+    /// M4.5-S37 step 1 (`bench-diagnostics` only): plain SETs the
+    /// ceiling arm wrote blind over a cold candidate.
+    #[cfg(feature = "bench-diagnostics")]
+    pub blind_overwrites_ceiling: Cell<u64>,
     pub frame_waits_barrier: Cell<u64>,
     pub frame_waits_rotation: Cell<u64>,
     pub frame_waits_reorder: Cell<u64>,
