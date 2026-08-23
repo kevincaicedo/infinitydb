@@ -2991,8 +2991,7 @@ fn s40_stall_row(
 /// — a beyond-RAM table where roughly half of every SET's candidates
 /// are cold, so the verifying read the ceiling arm skips is on the
 /// path of a large share of the leg (the share is measured, not
-/// assumed: `tiering_cold_resolves` on A, `blind_overwrites_ceiling`
-/// on B).
+/// assumed: `cold_reads_issued` on A, `blind_overwrites_ceiling` on B).
 const S37_DEFAULT_KEYS: u64 = 1_000_000;
 
 /// One S37 leg: the S29 tiered shape (closed loop, pipeline 1, 1 KiB)
@@ -3044,7 +3043,10 @@ fn s37_leg(
         p99_us: report.p99_us as f64,
         p999_us: report.p999_us as f64,
         sets: report.ops,
-        cold_resolves: d("tiering_cold_resolves"),
+        // `cold_reads_issued`, never `tiering_cold_resolves` (that one
+        // counts address classifications — candidate probes and retries,
+        // ~2.9 per SET in campaign J — not reads).
+        cold_resolves: d("cold_reads_issued"),
         blind: d("blind_overwrites_ceiling"),
     })
 }
