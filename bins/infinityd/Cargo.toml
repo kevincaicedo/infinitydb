@@ -15,6 +15,11 @@ inf-runtime.workspace = true
 inf-store.workspace = true
 inf-server.workspace = true
 
+[features]
+# M4.5-S37 step 1: the blind-overwrite ceiling instrument
+# (`--blind-overwrite-ceiling`); unsound, never a shipping build.
+bench-diagnostics = ["inf-server/bench-diagnostics"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 inf-runtime = { workspace = true, features = ["uring"] }
 

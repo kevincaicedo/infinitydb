@@ -455,6 +455,12 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// near-zero-cost. Default off; kept as the A/B instrument for the
     /// S19 8-cell re-read (`--deasync-dispatch`).
     deasync_dispatch: Cell<bool>,
+    /// M4.5-S37 step 1 (`bench-diagnostics` only): the blind-overwrite
+    /// ceiling arm — a plain SET whose only candidate is cold skips the
+    /// verifying read and inserts as if absent. Unsound by construction
+    /// (the cold record is orphaned); it bounds the cold read's cost.
+    #[cfg(feature = "bench-diagnostics")]
+    pub(crate) blind_overwrite_ceiling: Cell<bool>,
 }
 
 /// One fabric-origin namespace apply parked for its origin's FIFO pump
@@ -1401,6 +1407,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 apply_prefetch: Cell::new(false),
                 parse_prefetch: Cell::new(false),
                 deasync_dispatch: Cell::new(false),
+                #[cfg(feature = "bench-diagnostics")]
+                blind_overwrite_ceiling: Cell::new(false),
             }),
             listener,
             started: false,
@@ -1874,6 +1882,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// the async `dispatch_one`.
     pub fn set_deasync_dispatch(&mut self, on: bool) {
         self.shared.deasync_dispatch.set(on);
+    }
+
+    /// M4.5-S37 step 1: arms the blind-overwrite ceiling instrument
+    /// (`bench-diagnostics` builds only — an unsound measurement arm,
+    /// never a serving configuration).
+    #[cfg(feature = "bench-diagnostics")]
+    pub fn set_blind_overwrite_ceiling(&mut self, on: bool) {
+        self.shared.blind_overwrite_ceiling.set(on);
     }
 
     /// Live connections (tests, stats).

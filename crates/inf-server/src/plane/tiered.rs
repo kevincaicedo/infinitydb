@@ -1238,7 +1238,31 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     let hash = TieredTable::hash_key(key);
     let deadline = stall_deadline(shared, ns);
     loop {
-        let (old, old_value): (Displaced, Option<Vec<u8>>) =
+        // M4.5-S37 step 1 (`bench-diagnostics` only): the ceiling arm —
+        // a plain SET (no NX/XX: the reply does not depend on the old
+        // state) whose only candidate is cold is written as an insert,
+        // the verifying cold read skipped. UNSOUND: the cold record is
+        // orphaned (two candidates for one key until the orphan's file
+        // retires) and a fingerprint collision would leave two live
+        // keys — ADR-0085 D5 is exactly why the product never does
+        // this. The instrument measures the read's cost; counted.
+        #[cfg(feature = "bench-diagnostics")]
+        let blind = !nx && !xx && shared.blind_overwrite_ceiling.get() && {
+            let ks = shared.store.borrow();
+            ks.tiered_store(ns).is_some_and(|table| {
+                matches!(table.lookup(key, hash, &[]), inf_store::TieredLookup::Cold(_))
+            })
+        };
+        #[cfg(not(feature = "bench-diagnostics"))]
+        let blind = false;
+        let (old, old_value): (Displaced, Option<Vec<u8>>) = if blind {
+            #[cfg(feature = "bench-diagnostics")]
+            shared
+                .node
+                .blind_overwrites_ceiling
+                .set(shared.node.blind_overwrites_ceiling.get() + 1);
+            (None, None)
+        } else {
             match resolve(shared, ns, key, hash, PromoteOnCold::Never).await {
                 Resolved::Miss => (None, None),
                 Resolved::Ram(addr) => {
@@ -1252,7 +1276,8 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
                     (Some((addr, encoded_len, version)), Some(value))
                 }
                 Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
-            };
+            }
+        };
         if (nx && old.is_some()) || (xx && old.is_none()) {
             return Ok((0, old_value, false));
         }

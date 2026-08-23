@@ -690,6 +690,11 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tiering_region_commit_pages:{}", tiering.region_commit_pages));
     push(text, &format!("tiering_region_decommit_pages:{}", tiering.region_decommit_pages));
     push(text, &format!("tiering_cold_resolves:{}", tiering.cold_resolves));
+    // M4.5-S37 step 1: the ceiling arm's count — present only in a
+    // `bench-diagnostics` build, so a shipping INFO cannot be mistaken
+    // for one.
+    #[cfg(feature = "bench-diagnostics")]
+    push(text, &format!("blind_overwrites_ceiling:{}", node.blind_overwrites_ceiling.get()));
     // M4-S07: demotion + backpressure counters and the L5 usage
     // attribution — same zero-in-memory-mode contract as above.
     push(text, &format!("tiering_tail_alloc_stalls:{}", tiering.tail_alloc_stalls));

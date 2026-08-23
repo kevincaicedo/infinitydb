@@ -459,3 +459,79 @@ tier = "linux-reference-box"
 source = "s39d:phase_audit_x"
 measured_by = "gate-run m4.5 --only-s39d"
 informational = true
+
+# M4.5-S40 (2026-08-22): the stall-attribution row — the memtier shape
+# (1 M keys × 1 KiB, 32 conns, pipeline 1, everysec, 100 k offered) on the
+# in-house generator with the server's counters and the block device
+# sampled every 250 ms, so a client maximum is read against the window it
+# fell in. The S27 D5 wording (`max ≤ 50 ms at everysec`) binds on the
+# worst leg; the attribution word is a report note.
+[[gate]]
+id = "s40_max_ms_worst"
+name = "S40: everysec max latency at the memtier shape, worst leg (S27 D5)"
+threshold = 50.0
+comparator = "<="
+unit = "ms (client max from the intended send instant, 32 conns pipeline 1 at 100 k offered over 1 M keys, worst of --replicates legs)"
+tier = "linux-reference-box"
+source = "s40:max_ms_worst"
+measured_by = "gate-run m4.5 --only-s40"
+
+[[gate]]
+id = "s40_offered_rate_achieved_x_min"
+name = "S40: achieved over offered rate, worst leg (validity — a saturated leg's max is a saturation number)"
+threshold = 0.9
+comparator = ">="
+unit = "x (achieved ops/s ÷ offered, min over legs)"
+tier = "linux-reference-box"
+source = "s40:offered_rate_achieved_x_min"
+measured_by = "gate-run m4.5 --only-s40"
+
+[[gate]]
+id = "s40_seconds_over_50ms_total"
+name = "S40: seconds whose per-second maximum exceeded 50 ms, summed over legs (informational)"
+threshold = 0.0
+comparator = "<="
+unit = "seconds (per-second client maxima; an isolated event reads 1, a regime reads many)"
+tier = "linux-reference-box"
+source = "s40:seconds_over_50ms_total"
+measured_by = "gate-run m4.5 --only-s40"
+informational = true
+
+# M4.5-S37 step 1 (2026-08-22): the cold-overwrite ceiling — arm B is an
+# UNSOUND bench-diagnostics instrument (a cold candidate treated as
+# absent) that bounds what removing ADR-0085 D5's verifying read could
+# buy. The plan's rule: "< 15 % throughput and < 20 % p99 ⇒ step 2
+# Rejected". PASS here means the ceiling clears the bar (step 2 opens);
+# FAIL means step 2 is Rejected with this artifact — informational both
+# ways, the decision is written in the ledger.
+[[gate]]
+id = "s37_ceiling_ops_x_c256"
+name = "S37 step 1: blind-overwrite ceiling throughput over the shipping path at 256 conns"
+threshold = 1.15
+comparator = ">="
+unit = "x (B ÷ A ops/s on the beyond-RAM tiered always write leg, per-replicate median; B unsound)"
+tier = "linux-reference-box"
+source = "s37:ceiling_ops_x_c256"
+measured_by = "gate-run m4.5 --only-s37 (bench-diagnostics binary)"
+informational = true
+
+[[gate]]
+id = "s37_ceiling_p99_gain_x_c256"
+name = "S37 step 1: blind-overwrite ceiling p99 gain at 256 conns"
+threshold = 1.2
+comparator = ">="
+unit = "x (A ÷ B p99, per-replicate median; B unsound)"
+tier = "linux-reference-box"
+source = "s37:ceiling_p99_gain_x_c256"
+measured_by = "gate-run m4.5 --only-s37 (bench-diagnostics binary)"
+informational = true
+
+[[gate]]
+id = "s37_blind_share_arm_b_c256"
+name = "S37 step 1: share of arm B's SETs that skipped a cold read (validity — 0 = the instrument never engaged)"
+threshold = 0.1
+comparator = ">="
+unit = "share (blind_overwrites_ceiling ÷ SETs, arm B at 256 conns, per-replicate median)"
+tier = "linux-reference-box"
+source = "s37:blind_share_arm_b_c256"
+measured_by = "gate-run m4.5 --only-s37 (bench-diagnostics binary)"
