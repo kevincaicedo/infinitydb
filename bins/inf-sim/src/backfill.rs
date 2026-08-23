@@ -122,6 +122,7 @@ fn base(scenario: &BackfillScenario) -> DurableScenario {
         fill: Default::default(),
         prelude: None,
         recycle_slots: 0,
+        prealloc: inf_server::PreallocPolicy::DEFAULT,
         recycle_oracle: false,
     }
 }

@@ -645,6 +645,12 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "segment-bytes",
         "ckpt-interval-bytes",
         "segment-recycle-slots",
+        // ADR-0090 D9 (A9): the arm's pool wait (`off|quarter|eighth`,
+        // forwarded to the arm spawn only) and the row's baseline
+        // (`recycle-off` = D6's `--no-segment-recycle`, `wait-off` = the
+        // same pool bound with the wait off — the causal D9 A/B).
+        "recycle-wait",
+        "s39b-baseline",
         "device-stat",
         "barrier-class",
         "staging-mib",

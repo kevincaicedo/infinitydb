@@ -268,7 +268,9 @@ The pipeline depth is class-derived since the ADR-0087 fourth amendment
 (2026-08-22): `--frames-in-flight auto` resolves to 3 under the FUA class and 1
 under FLUSH, both at 4 MiB buffers — the record bound is the same in either.
 Segment recycling (M4.5-S39b, ADR-0090; `--no-segment-recycle` turns it off)
-changes which file the next log segment is, never a client-visible semantic.
+changes which file the next log segment is, never a client-visible semantic;
+its pool wait (ADR-0090 D9, `--recycle-wait off|quarter|eighth`) only moves
+when the next segment file is created.
 `infinityd --conn-default-ns NAME` (M4.5-S40, off by default) starts every
 accepted connection as if it had sent `INF.NS USE NAME` — an operator opt-in
 for clients that cannot send a per-connection prelude (`memtier_benchmark`,

@@ -342,6 +342,52 @@ tier = "linux-reference-box"
 source = "s39b:rotations_per_cell_min"
 measured_by = "gate-run m4.5 --only-s39b"
 
+# ADR-0090 D9 (A9, 2026-08-22): the pool wait's row reads the S39b row
+# with `--s39b-baseline wait-off` (arm = one slot + `--recycle-wait
+# quarter`, baseline = one slot + `--recycle-wait off`). The wait's
+# outcome is a median; the three facts it must not move are worst-
+# replicate maxima — one un-zeroed rotation is the falsifier, not a
+# statistic. On a `recycle-off` row the arm also reports them.
+[[gate]]
+id = "s39b_wait_satisfied_share_arm"
+name = "S39b/D9: pool waits fed before the bound over waits ended (arm)"
+threshold = 0.5
+comparator = ">="
+unit = "share (Δrecycle_waits_satisfied / Δ(satisfied + expired), warmed; ADR-0090 A9: waits end predominantly satisfied; absent when no wait ended)"
+tier = "linux-reference-box"
+source = "s39b:wait_satisfied_share_arm"
+measured_by = "gate-run m4.5 --only-s39b --s39b-baseline wait-off, warmed window"
+
+[[gate]]
+id = "s39b_rotations_unzeroed_arm_max"
+name = "S39b/D9: rotations onto an un-zeroed segment on the arm, worst replicate"
+threshold = 0.0
+comparator = "<="
+unit = "rotations (cumulative at leg end, summed over cells, max over replicates; ADR-0090 D9 falsifier: the deferred fill missed the rotation)"
+tier = "linux-reference-box"
+source = "s39b:rotations_unzeroed_arm_max"
+measured_by = "gate-run m4.5 --only-s39b"
+
+[[gate]]
+id = "s39b_inline_preallocs_arm_max"
+name = "S39b/D9: rotations that found no next segment on the arm, worst replicate"
+threshold = 0.0
+comparator = "<="
+unit = "preallocs (cumulative at leg end, summed over cells, max over replicates; a blocking prealloc on the loop — the wait must never cause one)"
+tier = "linux-reference-box"
+source = "s39b:inline_preallocs_arm_max"
+measured_by = "gate-run m4.5 --only-s39b"
+
+[[gate]]
+id = "s39b_prealloc_failures_arm_max"
+name = "S39b/D9: preallocs refused for space on the arm, worst replicate"
+threshold = 0.0
+comparator = "<="
+unit = "failures (cumulative at leg end, summed over cells, max over replicates; ENOSPC is discovered at the bound with 3/4 of the segment as headroom)"
+tier = "linux-reference-box"
+source = "s39b:prealloc_failures_arm_max"
+measured_by = "gate-run m4.5 --only-s39b"
+
 [[gate]]
 id = "s39b_host_bytes_per_log_byte_arm"
 name = "S39b: accounted host bytes per log frame byte under recycling (informational)"

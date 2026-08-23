@@ -400,6 +400,21 @@ pub(crate) fn info(
         push(&mut text, &format!("segment_preallocs:{}", node.segment_preallocs.get()));
         push(
             &mut text,
+            &format!("segment_inline_preallocs:{}", node.segment_inline_preallocs.get()),
+        );
+        push(
+            &mut text,
+            &format!("segment_prealloc_failures:{}", node.segment_prealloc_failures.get()),
+        );
+        push(&mut text, &format!("recycle_waits_started:{}", node.recycle_waits_started.get()));
+        push(&mut text, &format!("recycle_waits_satisfied:{}", node.recycle_waits_satisfied.get()));
+        push(&mut text, &format!("recycle_waits_expired:{}", node.recycle_waits_expired.get()));
+        push(
+            &mut text,
+            &format!("recycle_wait_active_bytes_max:{}", node.recycle_wait_active_bytes_max.get()),
+        );
+        push(
+            &mut text,
             &format!("recover_segment_residue_stops:{}", node.recover_segment_residue_stops.get()),
         );
         push(
