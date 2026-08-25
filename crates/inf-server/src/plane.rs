@@ -2891,6 +2891,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.frame_waits_group.set(stats.frame_waits_group);
             node.flush_group_window_us.set(stats.flush_group_window_us);
             node.frame_records_last.set(stats.frame_records_last);
+            node.group_round_target.set(stats.group_round_target);
             node.io_provenance.set(stats.io_provenance);
             node.fsyncs_completion.set(stats.fsyncs_completion);
             node.log_segments_live.set(stats.log_segments_live);

@@ -323,6 +323,7 @@ pub(crate) fn info(
         push(&mut text, &format!("frame_waits_group:{}", node.frame_waits_group.get()));
         push(&mut text, &format!("flush_group_window_us:{}", node.flush_group_window_us.get()));
         push(&mut text, &format!("frame_records_last:{}", node.frame_records_last.get()));
+        push(&mut text, &format!("group_round_target:{}", node.group_round_target.get()));
         // M4.5-S42 (ADR-0091 D5): the device model's provenance — read
         // beside `barrier_class` and `io_budget_model`, these three lines
         // say whether the node runs the product configuration.

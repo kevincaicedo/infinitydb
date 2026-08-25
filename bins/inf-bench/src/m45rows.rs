@@ -566,6 +566,11 @@ struct S35Leg {
     /// policy's hold episodes during the leg.
     padding_pct: f64,
     waits_fill: u64,
+    /// M4.5-S43 (ADR-0092 D4 H5): the group hold's episodes during the
+    /// leg and the round target it last waited for (summed over cells —
+    /// a disclosure, never a gate statistic on its own).
+    waits_group: u64,
+    round_target: u64,
 }
 
 /// The M4.5-S35 frame-pipeline row (ADR-0087 D8). Per replicate: a
@@ -655,7 +660,7 @@ fn s35_frame_pipeline_row(
             "rep{rep} {cells}c c{S35_CONNS_AC:<3} ops/s={:<8.0} p50_us={:<6.0} mean_us={:<6.0} \
              p99_us={:<7.0} max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} \
              p50/barrier={:.2} frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} \
-             write_stall_p99_us={} padding_pct={:.1} waits_fill={}\n",
+             write_stall_p99_us={} padding_pct={:.1} waits_fill={} waits_group={} round_target={}\n",
             ac.ops_per_sec,
             ac.p50_us,
             ac.mean_us,
@@ -670,7 +675,9 @@ fn s35_frame_pipeline_row(
             ac.parked,
             ac.write_stall_p99_us,
             ac.padding_pct,
-            ac.waits_fill
+            ac.waits_fill,
+            ac.waits_group,
+            ac.round_target
         ));
         ratio.push(ac.p50_us / ac.barrier_p50_us.max(1.0));
         p50_n.push(ac.p50_us);
@@ -690,7 +697,7 @@ fn s35_frame_pipeline_row(
             "rep{rep} {cells}c c{CONNS_HIGH:<3} ops/s={:<8.0} p50_us={:<6.0} mean_us={:<6.0} \
              p99_us={:<7.0} max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} \
              frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} write_stall_p99_us={} \
-             padding_pct={:.1} waits_fill={}\n",
+             padding_pct={:.1} waits_fill={} waits_group={} round_target={}\n",
             hi.ops_per_sec,
             hi.p50_us,
             hi.mean_us,
@@ -704,7 +711,9 @@ fn s35_frame_pipeline_row(
             hi.parked,
             hi.write_stall_p99_us,
             hi.padding_pct,
-            hi.waits_fill
+            hi.waits_fill,
+            hi.waits_group,
+            hi.round_target
         ));
         ops_256.push(hi.ops_per_sec);
         p99_256.push(hi.p99_us);
@@ -763,7 +772,7 @@ fn s35_frame_pipeline_row(
                 "rep{rep} 1c c{S35_CONNS_AC:<3} ops/s={:<8.0} p50_us={:<6.0} mean_us={:<6.0} \
                  p99_us={:<7.0} max_us={:<8.0} barrier_p50_us={:<5.0} barrier_p99_us={:<6.0} \
                  p50/barrier={:.2} frames_in_flight_max={} acks/fsync={:.1} frames={} parked={} \
-                 write_stall_p99_us={} padding_pct={:.1} waits_fill={} \
+                 write_stall_p99_us={} padding_pct={:.1} waits_fill={} waits_group={} round_target={} \
                  4c/1c: p50={:.3} barrier={:.3}\n",
                 one.ops_per_sec,
                 one.p50_us,
@@ -780,6 +789,8 @@ fn s35_frame_pipeline_row(
                 one.write_stall_p99_us,
                 one.padding_pct,
                 one.waits_fill,
+                one.waits_group,
+                one.round_target,
                 ac.p50_us / one.p50_us.max(1.0),
                 ac.barrier_p50_us / one.barrier_p50_us.max(1.0)
             ));
@@ -1228,6 +1239,10 @@ fn s35_write_leg(
         .saturating_sub(sum_field(&before, "log_padding_bytes"));
     let waits_fill = sum_field(&infos, "frame_waits_fill")
         .saturating_sub(sum_field(&before, "frame_waits_fill"));
+    // M4.5-S43: the group hold's engagement (a pre-S43 binary reports 0).
+    let waits_group = sum_field(&infos, "frame_waits_group")
+        .saturating_sub(sum_field(&before, "frame_waits_group"));
+    let round_target = sum_field(&infos, "group_round_target");
     let mut p50s: Vec<f64> =
         infos.iter().filter_map(|c| c.get(p50_key).and_then(|v| v.parse::<f64>().ok())).collect();
     if p50s.is_empty() {
@@ -1248,6 +1263,8 @@ fn s35_write_leg(
         write_stall_p99_us: crate::gaterun::max_field(&infos, "log_write_stall_p99_us"),
         padding_pct: padding as f64 * 100.0 / frame_bytes.max(1) as f64,
         waits_fill,
+        waits_group,
+        round_target,
     })
 }
 
