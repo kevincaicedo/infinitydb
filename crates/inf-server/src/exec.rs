@@ -241,6 +241,7 @@ pub struct NodeInfo {
     pub frame_waits_group: Cell<u64>,
     pub flush_group_window_us: Cell<u64>,
     pub frame_records_last: Cell<u64>,
+    pub group_round_target: Cell<u64>,
     /// M4.5-S42 (ADR-0091 D5): where the device model came from.
     pub io_provenance: Cell<crate::IoProvenance>,
     /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).

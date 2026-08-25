@@ -196,10 +196,13 @@ pub enum FillDecision {
 /// client p50 6.17 ms ÷ in-band fdatasync p50 3.26 ms = 1.89; ≈ 3.7
 /// records per frame of ≈ 8 outstanding). A due `LinkedFsync` frame on
 /// a **packed** segment with a drained pipeline therefore holds while
-/// the round is still re-arriving — `pending_records < last_frame_
-/// records` (the last frame is the population's own measurement of
-/// itself; a trickle of one never holds) — bounded by `window`,
-/// timer-armed. Write-through plans are never held: ADR-0089's arm B
+/// the round is still re-arriving — `pending_records < round_target`,
+/// where the target is the **population** the cell last saw: the
+/// records of the frame that just completed *plus* the records pending
+/// at its completion (campaign A, 2026-08-25, ADR-0092 D1 amended: the
+/// last frame's size alone never holds in the steady alternation — the
+/// pending half and the last frame are the same size, n / 2 each; a
+/// trickle of one never holds) — bounded by `window`, timer-armed. Write-through plans are never held: ADR-0089's arm B
 /// measured that shape on the FUA class (p50 ÷ barrier 1.84–1.89) and
 /// the FUA class stays byte-identical. Off by default until the
 /// reference-box A/B (ADR-0092 D4).
@@ -226,26 +229,29 @@ impl GroupHoldConfig {
 
     /// The pure decision (unit-pinned; the LOG step adds the timer):
     /// hold iff the policy is on, the plan is `LinkedFsync`, the layout
-    /// is packed, the last frame held a group (`≥ MIN_GROUP`), the round
-    /// has not re-arrived (`pending < last`), and the window has not
-    /// elapsed since `since` (`None` = the episode's first sight).
+    /// is packed, the round is a group (`round_target ≥ MIN_GROUP`), the
+    /// round has not re-arrived (`pending < round_target`), and the
+    /// window has not elapsed since `since` (`None` = the episode's
+    /// first sight). `round_target` is the population the cell last
+    /// measured — the completed frame's records plus the records pending
+    /// at its completion (ADR-0092 D1 as amended).
     #[must_use]
     pub fn decide(
         &self,
         plan: FramePlan,
         layout: inf_log::FrameLayout,
         pending_records: u32,
-        last_frame_records: u32,
+        round_target: u32,
         since: Option<Nanos>,
         now: Nanos,
     ) -> GroupDecision {
         if !self.enabled() || layout != inf_log::FrameLayout::Packed {
             return GroupDecision::Seal;
         }
-        if plan != FramePlan::LinkedFsync || last_frame_records < Self::MIN_GROUP {
+        if plan != FramePlan::LinkedFsync || round_target < Self::MIN_GROUP {
             return GroupDecision::Seal;
         }
-        if pending_records >= last_frame_records {
+        if pending_records >= round_target {
             return GroupDecision::Seal;
         }
         match since {
@@ -411,6 +417,9 @@ pub struct DurableStats {
     pub frame_waits_group: u64,
     pub flush_group_window_us: u64,
     pub frame_records_last: u64,
+    /// The round target the hold waits for (the population the cell last
+    /// measured at a frame's completion, ADR-0092 D1 as amended).
+    pub group_round_target: u64,
     /// M4.5-S42 (ADR-0091 D5): the device model's provenance.
     pub io_provenance: IoProvenance,
     /// Instantaneous log quiescence gauges: frames sealed and awaiting
@@ -509,6 +518,9 @@ struct InFlightFrame {
     lease: inf_log::FrameLease,
     submitted_at: Nanos,
     barrier: FrameBarrier,
+    /// Records the frame carries — the group hold's population term at
+    /// this frame's completion (ADR-0092 D1 as amended).
+    records: u32,
 }
 
 /// The ticket a frame's `LogWritten` must settle, if any.
@@ -574,6 +586,9 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     group_since: Option<Nanos>,
     frame_waits_group: u64,
     last_frame_records: u32,
+    /// The population the cell last measured: a completed frame's records
+    /// plus the records pending at its completion (ADR-0092 D1 amended).
+    group_round_target: u32,
     /// M4.5-S42 (ADR-0091 D5): the device model's provenance.
     io_provenance: IoProvenance,
     /// M4.5-S36 (ADR-0088 D2): the cell's device budget — refilled at
@@ -672,6 +687,7 @@ impl<F: SegmentFs> DurableCell<F> {
             group_since: None,
             frame_waits_group: 0,
             last_frame_records: 0,
+            group_round_target: 0,
             io_provenance: device.provenance,
             budget,
             seal_pace,
@@ -1023,7 +1039,7 @@ impl<F: SegmentFs> DurableCell<F> {
             plan,
             layout,
             self.staging.pending_records(),
-            self.last_frame_records,
+            self.group_round_target,
             self.group_since,
             cx.now,
         );
@@ -1052,7 +1068,8 @@ impl<F: SegmentFs> DurableCell<F> {
         // count becomes the next hold's target (ADR-0092 D1: the last
         // frame is the population's own measurement of itself).
         self.group_since = None;
-        self.last_frame_records = self.staging.pending_records();
+        let records = self.staging.pending_records();
+        self.last_frame_records = records;
         let end = slot.base().advance(slot.len());
         let covered = self.commit.watermark().map_or(0, |lsn| lsn.to_u64());
         let lease = self.staging.seal(slot.first_record_lsn(), covered, slot.layout());
@@ -1100,6 +1117,7 @@ impl<F: SegmentFs> DurableCell<F> {
             lease,
             submitted_at: cx.now,
             barrier: ticket,
+            records,
         });
         cx.push(IoOp::LogWrite { fd, offset, data, token: write_token(self.write_seq), barrier });
     }
@@ -1125,6 +1143,10 @@ impl<F: SegmentFs> DurableCell<F> {
             .expect("LogWritten for a frame not in flight");
         let frame = self.in_flight.remove(index).expect("index from position");
         self.write_stall_hist.record(now.saturating_sub(frame.submitted_at).as_micros());
+        // ADR-0092 D1 (amended, campaign A): the round the group hold
+        // waits for is the population this completion reveals — the
+        // frame's own records plus what arrived during its flight.
+        self.group_round_target = frame.records.saturating_add(self.staging.pending_records());
         self.commit.note_frame_written(frame.id);
         self.staging.release(frame.lease);
         self.drained.wake_all(());
@@ -1858,6 +1880,7 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_waits_group: self.frame_waits_group,
             flush_group_window_us: self.group.window.as_micros(),
             frame_records_last: u64::from(self.last_frame_records),
+            group_round_target: u64::from(self.group_round_target),
             io_provenance: self.io_provenance,
             frames_in_flight_now: u64::from(self.staging.in_flight()),
             records_staged: u64::from(self.staging.pending_records()),
@@ -2260,11 +2283,25 @@ mod group_hold_tests {
         );
     }
 
-    /// A trickle (the last frame carried one record) never holds; a
-    /// round that has re-arrived seals at once; a round still arriving
-    /// holds from its first sight until the window elapses.
+    /// A trickle (a round of one) never holds; a round that has
+    /// re-arrived seals at once; a round still arriving holds from its
+    /// first sight until the window elapses. The steady K = 1
+    /// alternation is the case that matters: the last frame carried 4
+    /// of a population of 8 and 4 are pending — the target is the
+    /// population (campaign A found the last-frame target never held:
+    /// 4 pending against a target of 4 seals).
     #[test]
     fn holds_only_while_a_group_is_still_arriving_and_inside_the_window() {
+        // The alternation: pending 4, target 8 ⇒ hold; the last-frame
+        // target (4) would have sealed — pinned so the flaw cannot return.
+        assert_eq!(
+            ARM.decide(FramePlan::LinkedFsync, FrameLayout::Packed, 4, 8, None, T0),
+            GroupDecision::Hold
+        );
+        assert_eq!(
+            ARM.decide(FramePlan::LinkedFsync, FrameLayout::Packed, 4, 4, None, T0),
+            GroupDecision::Seal
+        );
         let plan = FramePlan::LinkedFsync;
         let packed = FrameLayout::Packed;
         assert_eq!(ARM.decide(plan, packed, 0, 1, None, T0), GroupDecision::Seal);
