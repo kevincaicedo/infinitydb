@@ -60,6 +60,11 @@ inf-server = [
     "inf-query",
 ]
 infinity-embedded = ["inf-foundation", "inf-server"]
+# inf-probe (M4.5-S42, ADR-0091): the device probe — `inf probe-device`
+# and infinityd's in-boot probe share it. Dev-tool tier (ambient clocks,
+# std::thread), never cell-resident; depends on inf-foundation alone (the
+# `DeviceIdentity` value the parser in inf-server reads back).
+inf-probe = ["inf-foundation"]
 
 # bins — infinityd assembles the node from the parts (cells, mesh, drivers),
 # which inf-server deliberately does not re-export.
@@ -70,8 +75,9 @@ infinityd = [
     "inf-runtime",
     "inf-store",
     "inf-server",
+    "inf-probe",
 ]
-inf = ["inf-foundation", "inf-wire"]
+inf = ["inf-foundation", "inf-wire", "inf-probe"]
 inf-bench = ["inf-foundation", "inf-wire"]
 # inf-sim → inf-log: the M2-S19 durability oracle's survival audit reads
 # the surviving disk image directly (ADR-0021 — DST tooling, not a kernel

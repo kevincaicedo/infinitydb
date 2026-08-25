@@ -31,6 +31,11 @@ inf-vector = { path = "crates/inf-vector" }
 inf-compute = { path = "crates/inf-compute" }
 inf-replica = { path = "crates/inf-replica" }
 inf-server = { path = "crates/inf-server" }
+# M4.5-S42 (ADR-0091): the device probe shared by `inf probe-device` and
+# the in-boot probe of `infinityd` — dev-tool code (ambient clocks,
+# threads), a leaf the two binaries share so `inf-server` stays cell-
+# resident and libc-free.
+inf-probe = { path = "crates/inf-probe" }
 infinity-embedded = { path = "crates/infinity-embedded" }
 
 # external — data plane allows libc (kqueue/mmap FFI), io-uring (Linux),

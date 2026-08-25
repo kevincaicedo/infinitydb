@@ -343,7 +343,7 @@ dependencies = [
 name = "inf"
 version = "0.0.0"
 dependencies = [
- "libc",
+ "inf-probe",
 ]
 
 [[package]]
@@ -409,6 +409,14 @@ dependencies = [
  "inf-simd",
  "libc",
  "proptest",
+]
+
+[[package]]
+name = "inf-probe"
+version = "0.0.0"
+dependencies = [
+ "inf-foundation",
+ "libc",
 ]
 
 [[package]]
@@ -526,6 +534,7 @@ dependencies = [
  "inf-alloc",
  "inf-fabric",
  "inf-foundation",
+ "inf-probe",
  "inf-runtime",
  "inf-server",
  "inf-store",

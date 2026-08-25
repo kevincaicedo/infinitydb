@@ -37,6 +37,7 @@ use crate::ckpt::{
     CkptCell, CkptPhase, CkptStats, MAX_TRUNC_PER_SLICE_ADAPTIVE, MAX_UNLINKS_PER_SLICE,
     ManifestCell, ManifestStats, SCAN_CHUNK_ENTRIES, ckpt_token,
 };
+use crate::io_properties::IoProvenance;
 use crate::log_bytes;
 
 /// Timer-wheel key for the everysec tick (plane-armed, injected clock).
@@ -46,6 +47,10 @@ pub(crate) const EVERYSEC_TIMER_KEY: u64 = 0xE5EC_0001;
 /// the held frame; the handler is a no-op — the LOG step of that
 /// iteration does the sealing.
 pub(crate) const FILL_TIMER_KEY: u64 = 0xF111_0001;
+/// Timer-wheel key for the FLUSH-class group hold (M4.5-S43, ADR-0092):
+/// armed once per hold episode at the window's deadline, the same
+/// no-op-handler shape as the fill timer — the wake is the effect.
+pub(crate) const GROUP_TIMER_KEY: u64 = 0x6A0B_0001;
 
 /// POSIX `EIO` (this crate carries no libc dep): the errno the
 /// `durable_fsync_eio` fault point injects (M2-S17).
@@ -102,6 +107,11 @@ pub struct DurableConfig {
     /// (`infinityd --fill-window-us 1000`), accepted on the reference box
     /// 2026-08-22.
     pub fill: FillConfig,
+    /// M4.5-S43 (ADR-0092): the FLUSH-class group hold — a measured arm,
+    /// `Default` = off (`infinityd --flush-group-window-us 0`); a due
+    /// frame on a packed segment waits, bounded, for the round it just
+    /// acked. Never engages on the FUA class (write-through plans).
+    pub group: GroupHoldConfig,
 }
 
 /// The frame-fill policy (M4.5-S39a). On an aligned (`Direct`, v3)
@@ -176,6 +186,82 @@ pub enum FillDecision {
     Hold,
 }
 
+/// The FLUSH-class group hold (M4.5-S43, ADR-0092 D1). At K = 1 with
+/// closed-loop clients the connections split into the set whose records
+/// are in the in-flight frame and the set whose records arrived during
+/// its flight; the LOG step seals the second set the instant the first
+/// completes — before the first set's acks have reached the clients —
+/// so every record waits two barrier windows and a cell frame carries
+/// half its population (v6 tri-bench, FLUSH default, 4 cells, 32 conns:
+/// client p50 6.17 ms ÷ in-band fdatasync p50 3.26 ms = 1.89; ≈ 3.7
+/// records per frame of ≈ 8 outstanding). A due `LinkedFsync` frame on
+/// a **packed** segment with a drained pipeline therefore holds while
+/// the round is still re-arriving — `pending_records < last_frame_
+/// records` (the last frame is the population's own measurement of
+/// itself; a trickle of one never holds) — bounded by `window`,
+/// timer-armed. Write-through plans are never held: ADR-0089's arm B
+/// measured that shape on the FUA class (p50 ÷ barrier 1.84–1.89) and
+/// the FUA class stays byte-identical. Off by default until the
+/// reference-box A/B (ADR-0092 D4).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupHoldConfig {
+    /// Hold bound since the first LOG step that saw the pending frame.
+    /// `Nanos(0)` = policy off.
+    pub window: Nanos,
+}
+
+impl GroupHoldConfig {
+    /// The measured arm (ADR-0092 D4): 250 µs — ≤ 8 % of the four-cell
+    /// FLUSH window the v6 rows read, ≥ 2 × the client round trip.
+    pub const ARM: GroupHoldConfig = GroupHoldConfig { window: Nanos::from_micros(250) };
+    /// Fewer records than this in the last frame is a trickle, never a
+    /// round to wait for.
+    pub const MIN_GROUP: u32 = 2;
+
+    /// The policy is engaged.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.window.0 > 0
+    }
+
+    /// The pure decision (unit-pinned; the LOG step adds the timer):
+    /// hold iff the policy is on, the plan is `LinkedFsync`, the layout
+    /// is packed, the last frame held a group (`≥ MIN_GROUP`), the round
+    /// has not re-arrived (`pending < last`), and the window has not
+    /// elapsed since `since` (`None` = the episode's first sight).
+    #[must_use]
+    pub fn decide(
+        &self,
+        plan: FramePlan,
+        layout: inf_log::FrameLayout,
+        pending_records: u32,
+        last_frame_records: u32,
+        since: Option<Nanos>,
+        now: Nanos,
+    ) -> GroupDecision {
+        if !self.enabled() || layout != inf_log::FrameLayout::Packed {
+            return GroupDecision::Seal;
+        }
+        if plan != FramePlan::LinkedFsync || last_frame_records < Self::MIN_GROUP {
+            return GroupDecision::Seal;
+        }
+        if pending_records >= last_frame_records {
+            return GroupDecision::Seal;
+        }
+        match since {
+            Some(since) if now >= since + self.window => GroupDecision::Seal,
+            _ => GroupDecision::Hold,
+        }
+    }
+}
+
+/// What the group hold says about the pending frame this LOG step.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GroupDecision {
+    Seal,
+    Hold,
+}
+
 /// The per-cell device budget inputs (ADR-0088 D6), computed once at
 /// boot from the device model and the cell count (L1: static shares).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -186,6 +272,10 @@ pub struct DeviceConfig {
     /// (`write_ops_per_s_4k_qd4 / cells`) — the seal pacer's refill
     /// (ADR-0088 D2b). 0 = unpaced.
     pub seal_barriers_per_s: u64,
+    /// M4.5-S42 (ADR-0091 D5): where the model came from — surfaced in
+    /// `INFO persistence` so a row on an unprobed node is never mistaken
+    /// for the product. `Default` = absent (the dev tier).
+    pub provenance: IoProvenance,
 }
 
 /// Boot-recovery stepping policy (M2-S15). The default replays flat-out
@@ -315,6 +405,14 @@ pub struct DurableStats {
     pub frame_waits_fill: u64,
     pub fill_window_us: u64,
     pub fill_target_bytes: u64,
+    /// M4.5-S43 (ADR-0092): the FLUSH-class group hold — episodes, the
+    /// window in force (0 = off) and the adaptive target (the records
+    /// the last sealed frame carried).
+    pub frame_waits_group: u64,
+    pub flush_group_window_us: u64,
+    pub frame_records_last: u64,
+    /// M4.5-S42 (ADR-0091 D5): the device model's provenance.
+    pub io_provenance: IoProvenance,
     /// Instantaneous log quiescence gauges: frames sealed and awaiting
     /// `LogWritten`, and records staged but not yet sealed. Both zero ⇒
     /// every executed durable effect has reached the file — the DST's
@@ -469,6 +567,15 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     fill: FillConfig,
     fill_since: Option<Nanos>,
     frame_waits_fill: u64,
+    /// M4.5-S43 (ADR-0092): the FLUSH-class group hold, its episode
+    /// clock, its episodes, and the adaptive target — the records the
+    /// last sealed frame carried.
+    group: GroupHoldConfig,
+    group_since: Option<Nanos>,
+    frame_waits_group: u64,
+    last_frame_records: u32,
+    /// M4.5-S42 (ADR-0091 D5): the device model's provenance.
+    io_provenance: IoProvenance,
     /// M4.5-S36 (ADR-0088 D2): the cell's device budget — refilled at
     /// every MAINTAIN entry from the injected clock, consulted by the
     /// background issuing sites, charged by the foreground ones.
@@ -509,8 +616,8 @@ impl<F: SegmentFs> DurableCell<F> {
         ckpt: CkptCell<F>,
         manifest: ManifestCell<F>,
     ) -> DurableCell<F> {
-        let (staging, flush_bound, fua_p50_us_probed, device, fill) =
-            (cfg.staging, cfg.flush_bound, cfg.fua_p50_us_probed, cfg.device, cfg.fill);
+        let (staging, flush_bound, fua_p50_us_probed, device, fill, group) =
+            (cfg.staging, cfg.flush_bound, cfg.fua_p50_us_probed, cfg.device, cfg.fill, cfg.group);
         // ADR-0031 D5/D6: frames sealed here stamp the recovery-derived
         // log life (1 on fresh logs).
         let mut staging = StagingRing::new(staging);
@@ -561,6 +668,11 @@ impl<F: SegmentFs> DurableCell<F> {
             fill,
             fill_since: None,
             frame_waits_fill: 0,
+            group,
+            group_since: None,
+            frame_waits_group: 0,
+            last_frame_records: 0,
+            io_provenance: device.provenance,
             budget,
             seal_pace,
             write_through_wanted: true,
@@ -817,6 +929,14 @@ impl<F: SegmentFs> DurableCell<F> {
                 self.frame_held = true;
                 return;
             }
+            // M4.5-S43 (ADR-0092): the FLUSH-class group hold — after the
+            // fill (which never holds a barrier frame), on packed
+            // segments only, off unless the arm is on.
+            if self.group_holds(cx, plan, rotation_due) {
+                self.frame_waits_group += u64::from(!self.frame_held);
+                self.frame_held = true;
+                return;
+            }
             self.frame_held = false;
             let deferred = match self.rotor.begin_frame_deferred(frame_len, cx.now.as_millis()) {
                 Ok(deferred) => deferred,
@@ -886,6 +1006,39 @@ impl<F: SegmentFs> DurableCell<F> {
         }
     }
 
+    /// M4.5-S43 (ADR-0092 D1): should the pending frame wait for the
+    /// round it just acked? The pure decision is
+    /// [`GroupHoldConfig::decide`]; this adds the episode clock and, at
+    /// the first hold of an episode, arms the group timer so a parked
+    /// loop wakes to seal. Asked last — after the fill policy, which
+    /// never holds a barrier-carrying frame, so the two holds never
+    /// compete for one frame.
+    fn group_holds(&mut self, cx: &mut LoopCx<'_>, plan: FramePlan, rotation_due: bool) -> bool {
+        if !self.group.enabled() {
+            return false;
+        }
+        let layout =
+            if rotation_due { self.rotor.next_layout() } else { self.rotor.active_layout() };
+        let decision = self.group.decide(
+            plan,
+            layout,
+            self.staging.pending_records(),
+            self.last_frame_records,
+            self.group_since,
+            cx.now,
+        );
+        match decision {
+            GroupDecision::Seal => false,
+            GroupDecision::Hold => {
+                if self.group_since.is_none() {
+                    self.group_since = Some(cx.now);
+                    cx.timers.insert(cx.now + self.group.window, GROUP_TIMER_KEY);
+                }
+                true
+            }
+        }
+    }
+
     /// Seal the pending records into `slot`, register the planned barrier,
     /// and hand the frame to the driver. The frame's on-device extent
     /// (padding included on aligned segments) is what the cursor, the
@@ -895,6 +1048,11 @@ impl<F: SegmentFs> DurableCell<F> {
         // decision: a reservation that waits (zero-fill in flight, space)
         // keeps the same episode clock.
         self.fill_since = None;
+        // The group-hold episode ends here too, and the frame's record
+        // count becomes the next hold's target (ADR-0092 D1: the last
+        // frame is the population's own measurement of itself).
+        self.group_since = None;
+        self.last_frame_records = self.staging.pending_records();
         let end = slot.base().advance(slot.len());
         let covered = self.commit.watermark().map_or(0, |lsn| lsn.to_u64());
         let lease = self.staging.seal(slot.first_record_lsn(), covered, slot.layout());
@@ -1697,6 +1855,10 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_waits_fill: self.frame_waits_fill,
             fill_window_us: self.fill.window.as_micros(),
             fill_target_bytes: u64::from(self.fill.target_bytes),
+            frame_waits_group: self.frame_waits_group,
+            flush_group_window_us: self.group.window.as_micros(),
+            frame_records_last: u64::from(self.last_frame_records),
+            io_provenance: self.io_provenance,
             frames_in_flight_now: u64::from(self.staging.in_flight()),
             records_staged: u64::from(self.staging.pending_records()),
             io_budget_model_absent: u64::from(self.budget.model_absent()),
@@ -2062,5 +2224,69 @@ mod fill_tests {
                 "{plan:?}"
             );
         }
+    }
+}
+
+/// M4.5-S43 (ADR-0092 D3): the group hold's pure decision, pinned.
+#[cfg(test)]
+mod group_hold_tests {
+    use super::*;
+    use inf_log::FrameLayout;
+
+    const ARM: GroupHoldConfig = GroupHoldConfig::ARM;
+    const T0: Nanos = Nanos(1_000_000);
+
+    /// Off, a non-barrier plan, a write-through plan, and an aligned
+    /// layout all seal: the FUA class and the fill policy's territory
+    /// are never touched.
+    #[test]
+    fn only_a_flush_class_barrier_on_a_packed_segment_can_hold() {
+        let off = GroupHoldConfig::default();
+        assert!(!off.enabled());
+        assert_eq!(
+            off.decide(FramePlan::LinkedFsync, FrameLayout::Packed, 1, 8, None, T0),
+            GroupDecision::Seal
+        );
+        for plan in [FramePlan::Plain, FramePlan::WriteThrough] {
+            assert_eq!(
+                ARM.decide(plan, FrameLayout::Packed, 1, 8, None, T0),
+                GroupDecision::Seal,
+                "{plan:?}"
+            );
+        }
+        assert_eq!(
+            ARM.decide(FramePlan::LinkedFsync, FrameLayout::Aligned, 1, 8, None, T0),
+            GroupDecision::Seal
+        );
+    }
+
+    /// A trickle (the last frame carried one record) never holds; a
+    /// round that has re-arrived seals at once; a round still arriving
+    /// holds from its first sight until the window elapses.
+    #[test]
+    fn holds_only_while_a_group_is_still_arriving_and_inside_the_window() {
+        let plan = FramePlan::LinkedFsync;
+        let packed = FrameLayout::Packed;
+        assert_eq!(ARM.decide(plan, packed, 0, 1, None, T0), GroupDecision::Seal);
+        assert_eq!(ARM.decide(plan, packed, 0, 0, None, T0), GroupDecision::Seal);
+        assert_eq!(ARM.decide(plan, packed, 8, 8, None, T0), GroupDecision::Seal);
+        assert_eq!(ARM.decide(plan, packed, 9, 8, None, T0), GroupDecision::Seal);
+        // The episode's first sight holds; inside the window holds; at
+        // the deadline seals whatever arrived.
+        assert_eq!(ARM.decide(plan, packed, 3, 8, None, T0), GroupDecision::Hold);
+        let since = Some(T0);
+        assert_eq!(
+            ARM.decide(plan, packed, 3, 8, since, T0 + Nanos::from_micros(249)),
+            GroupDecision::Hold
+        );
+        assert_eq!(
+            ARM.decide(plan, packed, 3, 8, since, T0 + Nanos::from_micros(250)),
+            GroupDecision::Seal
+        );
+        // The round arriving mid-window seals before the deadline.
+        assert_eq!(
+            ARM.decide(plan, packed, 8, 8, since, T0 + Nanos::from_micros(100)),
+            GroupDecision::Seal
+        );
     }
 }

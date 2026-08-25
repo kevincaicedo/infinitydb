@@ -41,7 +41,10 @@ pub use control::{
     CellRecoverySlot, ControlHandle, ControlInbox, INDEX_SLOTS, IndexBoard, RecoveryBoard,
     load_catalog, load_catalog_from, spawn as spawn_control,
 };
-pub use durable::{DeviceConfig, DurableConfig, DurableStats, FillConfig, RecoverConfig};
+pub use durable::{
+    DeviceConfig, DurableConfig, DurableStats, FillConfig, GroupDecision, GroupHoldConfig,
+    RecoverConfig,
+};
 // Durable-config vocabulary re-exported for the assembly tier: bins name
 // `inf-server` only (dep-DAG), and `DurableConfig`'s fields are these
 // types — an assembly cannot fill one without naming them.
@@ -62,7 +65,9 @@ pub use inf_log::{
     FRAME_ALIGN, FramesInFlight, MAX_FRAMES_IN_FLIGHT, PoolWaitBound, PreallocPolicy,
     SegmentConfig, SegmentIoMode, StagingConfig,
 };
-pub use io_properties::{IO_PROPERTIES_FILE, IoProperties, IoPropertiesError};
+pub use io_properties::{
+    IO_PROPERTIES_FILE, IoProperties, IoPropertiesError, IoPropertiesSource, IoProvenance,
+};
 pub use plane::{ExecOrigin, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane};
 pub use readahead::{ReadAheadFile, ReadAheadFs};
 pub use recover::{

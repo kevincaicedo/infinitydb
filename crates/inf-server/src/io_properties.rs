@@ -25,6 +25,12 @@
 //! write_ops_per_s_4k_qd4 = 9918
 //! read_bytes_per_s_256k = 0
 //! read_ops_per_s_4k = 0
+//! # schema 3 (M4.5-S42, ADR-0091 D2): the identity of the device the
+//! # model describes — a boot compares it to the data directory's device.
+//! fs_type = "ext4"
+//! fs_uuid = "c97c5418-…"
+//! device_path = "/dev/nvme0n1p3"
+//! block_logical_bytes = 512
 //! ```
 //!
 //! A malformed file is a typed boot refusal ([`IoPropertiesError`]) —
@@ -36,6 +42,7 @@
 use std::fmt;
 use std::path::Path;
 
+use inf_foundation::{DeviceIdentity, IdentityVerdict};
 use inf_log::{DEFAULT_FUA_MAX_FRAME_BYTES, FRAME_ALIGN, SegmentIoMode};
 use inf_runtime::DeviceModel;
 
@@ -43,7 +50,7 @@ use inf_runtime::DeviceModel;
 pub const IO_PROPERTIES_FILE: &str = "io-properties.toml";
 
 /// The probed device properties the log writer consumes.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct IoProperties {
     /// The segment I/O mode the probe recommends.
     pub io_mode: SegmentIoMode,
@@ -61,6 +68,77 @@ pub struct IoProperties {
     pub probe_schema: u64,
     pub device: DeviceModel,
     pub write_ops_per_s_4k_qd4: u64,
+    /// Schema 3 (ADR-0091 D2/D3): the identity of the device the model
+    /// describes (empty on a schema ≤ 2 file — unverifiable), and why
+    /// the direct class was not measured (`None` = it was).
+    pub identity: DeviceIdentity,
+    pub fua_unsupported: Option<String>,
+}
+
+/// Where the boot's `IoProperties` came from (ADR-0091 D5) — the fact
+/// `INFO persistence` and the boot line carry so a row measured on an
+/// unprobed node can never be mistaken for the product.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum IoPropertiesSource {
+    /// No file and no probe (`--device-probe off`): the FLUSH class,
+    /// unbudgeted — the dev tier.
+    #[default]
+    Absent,
+    /// The file found in the data directory.
+    File,
+    /// No file: the boot probed the device and wrote one (`auto`).
+    ProbedAtBoot,
+    /// A file whose identity mismatched the device: renamed `.stale`,
+    /// the boot probed again (`auto`).
+    Reprobed,
+}
+
+impl IoPropertiesSource {
+    /// The INFO / boot-line word.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            IoPropertiesSource::Absent => "absent",
+            IoPropertiesSource::File => "file",
+            IoPropertiesSource::ProbedAtBoot => "probed-at-boot",
+            IoPropertiesSource::Reprobed => "re-probed",
+        }
+    }
+}
+
+/// The provenance of the device model a cell runs on (ADR-0091 D5):
+/// source, the file's schema, and the identity verdict of the file in
+/// use. `Default` = absent, schema 1, unverifiable — the dev tier.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IoProvenance {
+    pub source: IoPropertiesSource,
+    pub schema: u64,
+    pub identity: IdentityVerdict,
+}
+
+impl Default for IoProvenance {
+    /// The absent-file shape: schema 1 (ADR-0088 D6 — a node without a
+    /// file is a schema-1 node), the same value `IoProperties::default`
+    /// reports, so INFO and the boot line never disagree.
+    fn default() -> IoProvenance {
+        IoProvenance {
+            source: IoPropertiesSource::Absent,
+            schema: IoProperties::default().probe_schema,
+            identity: IdentityVerdict::Unverifiable,
+        }
+    }
+}
+
+impl IoProvenance {
+    /// The INFO word for the identity verdict.
+    #[must_use]
+    pub const fn identity_str(self) -> &'static str {
+        match self.identity {
+            IdentityVerdict::Unverifiable => "unverifiable",
+            IdentityVerdict::Verified => "verified",
+            IdentityVerdict::Mismatch => "mismatch",
+        }
+    }
 }
 
 impl Default for IoProperties {
@@ -74,6 +152,8 @@ impl Default for IoProperties {
             probe_schema: 1,
             device: DeviceModel::ABSENT,
             write_ops_per_s_4k_qd4: 0,
+            identity: DeviceIdentity::default(),
+            fua_unsupported: None,
         }
     }
 }
@@ -181,8 +261,25 @@ impl IoProperties {
                 "read_ops_per_s_4k" => {
                     props.device.read_ops_per_s = parse_u64("read_ops_per_s_4k", value)?;
                 }
-                // Provenance keys are informational; unknown keys are a
-                // forward-compatibility allowance, not an error.
+                // Schema 3 (ADR-0091 D2/D3) — the identity block, each
+                // typed, none required; the strings are the kernel's own
+                // names (quoted, unescaped here).
+                "fs_type" => props.identity.fs_type = parse_string(value),
+                "fs_uuid" => props.identity.fs_uuid = parse_string(value),
+                "device_path" => props.identity.device_path = parse_string(value),
+                "device_major_minor" => props.identity.device_major_minor = parse_string(value),
+                "block_logical_bytes" => {
+                    props.identity.block_logical_bytes = parse_u32("block_logical_bytes", value)?;
+                }
+                "block_physical_bytes" => {
+                    props.identity.block_physical_bytes = parse_u32("block_physical_bytes", value)?;
+                }
+                "kernel_release" => props.identity.kernel_release = parse_string(value),
+                "fua_unsupported" => props.fua_unsupported = Some(parse_string(value)),
+                // Provenance keys (`probed_at_unix_s`, `probe_version`,
+                // `probe_seconds_per_row`, `fua_p50_us_512`, …) are
+                // informational; unknown keys are a forward-compatibility
+                // allowance, not an error.
                 _ => {}
             }
         }
@@ -200,6 +297,29 @@ fn parse_class(value: &str) -> Result<SegmentIoMode, IoPropertiesError> {
             detail: format!("expected \"fua\" or \"flush\", found {other:?}"),
         }),
     }
+}
+
+/// A double-quoted string (the probe's `quoted`): the quotes stripped,
+/// `\"` and `\\` unescaped. An unquoted value is taken verbatim.
+fn parse_string(value: &str) -> String {
+    let inner = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value);
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => out.push(chars.next().unwrap_or('\\')),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn parse_u32(key: &'static str, value: &str) -> Result<u32, IoPropertiesError> {
+    let raw = parse_u64(key, value)?;
+    u32::try_from(raw).map_err(|_| IoPropertiesError::Value {
+        key,
+        detail: format!("expected a u32, found {value:?}"),
+    })
 }
 
 fn parse_u64(key: &'static str, value: &str) -> Result<u64, IoPropertiesError> {
@@ -232,6 +352,57 @@ mod tests {
         assert_eq!(props.probe_schema, 1);
         assert!(props.device.is_absent());
         assert_eq!(props.write_ops_per_s_4k_qd4, 0);
+        // A schema-1 file carries no identity: unverifiable by rule.
+        assert!(props.identity.is_empty());
+        assert_eq!(
+            props.identity.mismatch(&DeviceIdentity::default()).0,
+            IdentityVerdict::Unverifiable
+        );
+    }
+
+    /// ADR-0091 D2: schema 3 carries the identity block; quoted strings
+    /// round-trip (including the probe's escapes); a mismatching UUID
+    /// against the live identity is a `Mismatch` verdict, a matching one
+    /// `Verified`.
+    #[test]
+    fn schema_3_carries_the_device_identity() {
+        let text = "barrier_class = \"fua\"\n\
+                    probe_schema = 3\n\
+                    write_bytes_per_s_256k = 300_000_000\n\
+                    fs_type = \"ext4\"\n\
+                    fs_uuid = \"c97c5418-ec09-40c5-ba6d-050ae172a1dc\"\n\
+                    device_path = \"/dev/nvme0n1p3\"\n\
+                    device_major_minor = \"259:3\"\n\
+                    block_logical_bytes = 512\n\
+                    block_physical_bytes = 4096\n\
+                    kernel_release = \"7.0.0-30-generic\"\n\
+                    probe_version = 3\n\
+                    probe_seconds_per_row = 1\n\
+                    fua_p50_us_512 = 380\n";
+        let props = IoProperties::parse(text).expect("valid");
+        assert_eq!(props.probe_schema, 3);
+        assert_eq!(props.identity.fs_type, "ext4");
+        assert_eq!(props.identity.fs_uuid, "c97c5418-ec09-40c5-ba6d-050ae172a1dc");
+        assert_eq!(props.identity.device_path, "/dev/nvme0n1p3");
+        assert_eq!(props.identity.device_major_minor, "259:3");
+        assert_eq!(props.identity.block_logical_bytes, 512);
+        assert_eq!(props.identity.block_physical_bytes, 4096);
+        assert_eq!(props.identity.kernel_release, "7.0.0-30-generic");
+        assert!(props.fua_unsupported.is_none());
+        let live = DeviceIdentity { fs_uuid: props.identity.fs_uuid.clone(), ..Default::default() };
+        assert_eq!(props.identity.mismatch(&live).0, IdentityVerdict::Verified);
+        let moved = DeviceIdentity { fs_uuid: "0000".into(), ..Default::default() };
+        assert_eq!(props.identity.mismatch(&moved).0, IdentityVerdict::Mismatch);
+        // The probe's escapes round-trip; a malformed block size refuses.
+        let props = IoProperties::parse(
+            "barrier_class = \"flush\"\nfua_unsupported = \"open: \\\"EINVAL\\\" (22)\"\n",
+        )
+        .expect("valid");
+        assert_eq!(props.fua_unsupported.as_deref(), Some("open: \"EINVAL\" (22)"));
+        assert!(matches!(
+            IoProperties::parse("barrier_class = \"fua\"\nblock_logical_bytes = 5000000000\n"),
+            Err(IoPropertiesError::Value { key: "block_logical_bytes", .. })
+        ));
     }
 
     /// ADR-0088 D6: schema 2 carries the device model; a zero or absent
@@ -256,6 +427,18 @@ mod tests {
             IoProperties::parse("barrier_class = \"fua\"\nwrite_bytes_per_s_256k = fast\n"),
             Err(IoPropertiesError::Value { key: "write_bytes_per_s_256k", .. })
         ));
+    }
+
+    /// ADR-0091 D5: the absent-file provenance reports the schema the
+    /// absent-file properties report (1) — one truth for INFO and the
+    /// boot line.
+    #[test]
+    fn absent_provenance_is_schema_1_and_unverifiable() {
+        let provenance = IoProvenance::default();
+        assert_eq!(provenance.source, IoPropertiesSource::Absent);
+        assert_eq!(provenance.schema, 1);
+        assert_eq!(provenance.identity_str(), "unverifiable");
+        assert_eq!(provenance.source.as_str(), "absent");
     }
 
     #[test]

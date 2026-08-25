@@ -54,6 +54,7 @@ fn cfg() -> DurableConfig {
         fua_p50_us_probed: 0,
         device: Default::default(),
         fill: Default::default(),
+        group: Default::default(),
     }
 }
 

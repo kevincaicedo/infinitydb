@@ -110,6 +110,7 @@ fn durable_config(root: &Path, segment_bytes: u32) -> DurableConfig {
         fua_p50_us_probed: 0,
         device: Default::default(),
         fill: Default::default(),
+        group: Default::default(),
     }
 }
 

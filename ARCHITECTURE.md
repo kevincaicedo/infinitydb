@@ -64,11 +64,17 @@ per segment and per frame (ADR-0086): the **FLUSH class** — a buffered
 frame write with a linked `fdatasync`, ending in a device-wide cache
 flush every cell queues on — and the **FUA class** — a 4 KiB-aligned
 frame written `RWF_DSYNC` on a pre-zeroed `O_DIRECT` segment, durable at
-its own completion, independent of the other cells. The device decides
-(`inf probe-device` → `io-properties.toml`), the default stays FLUSH
-until the reference-box A/B, and a frame takes the FUA class only when
-it extends the durable prefix — a FUA write persists itself, never the
-un-barriered frames before it. Frames ride a **bounded pipeline**
+its own completion, independent of the other cells. The device decides:
+the probe runs at the **first boot of a data directory** (`--device-probe
+auto`, the default — ≈ 10 s, once; ADR-0091) and writes
+`io-properties.toml`, whose identity block binds the model to the
+filesystem + device it measured (a moved directory is re-probed); the
+class is the probe's per-device verdict (`fua` where a write-through
+beats a FLUSH by the rule, `flush` otherwise); `--device-probe off` is
+the named dev tier (no file ⇒ FLUSH, loudly — never silently the slow
+class in production). A frame takes the FUA class only when it extends
+the durable prefix — a FUA write persists itself, never the un-barriered
+frames before it. Frames ride a **bounded pipeline**
 (ADR-0087): the staging domain is a ring of K + 1 frame buffers, up to K
 sealed frames are in flight at once, the ledger advances its written and
 durable watermarks over completion-ordered prefixes, and a frame whose
@@ -95,7 +101,12 @@ per-cell share of a **measured device budget** (ADR-0088; the seal
 pacer that ADR proposed is an A/B arm, off). On aligned segments a
 **barrier-less** frame may hold until it fills 16 KiB or 1 ms elapses
 (ADR-0089's fill policy — on by default, `--fill-window-us 0` is the
-per-iteration cadence); a frame that carries a barrier is never held. Everything else — the hash index, document trees,
+per-iteration cadence); a frame that carries a barrier is never held by
+the fill policy. On the FLUSH class a due frame may instead wait, bounded
+to a window, for the round of clients it just acked to re-arrive — the
+K = 1 alternation otherwise carries half the population per barrier
+(ADR-0092's group hold, a measured arm, `--flush-group-window-us`, off
+until its A/B; inert on the FUA class). Everything else — the hash index, document trees,
 secondary indexes, stream offsets, vector graphs — is a rebuildable
 projection over that log. Checkpoints are fuzzy snapshots streamed by the
 owning cell in budgeted background slices (no fork, no stop-the-world)

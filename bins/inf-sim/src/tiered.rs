@@ -170,6 +170,7 @@ impl TieredScenario {
             reorder_oracle: false,
             ckpt_direct_refused_after: None,
             fill: Default::default(),
+            group: Default::default(),
             prelude: None,
             recycle_slots: 0,
             prealloc: inf_server::PreallocPolicy::DEFAULT,

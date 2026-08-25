@@ -14,6 +14,8 @@ inf-fabric.workspace = true
 inf-runtime.workspace = true
 inf-store.workspace = true
 inf-server.workspace = true
+# M4.5-S42 (ADR-0091): the in-boot device probe (`--device-probe auto`).
+inf-probe.workspace = true
 
 [features]
 # M4.5-S37 step 1: the blind-overwrite ceiling instrument

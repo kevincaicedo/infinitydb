@@ -236,6 +236,13 @@ pub struct NodeInfo {
     pub frame_waits_fill: Cell<u64>,
     pub fill_window_us: Cell<u64>,
     pub fill_target_bytes: Cell<u64>,
+    /// M4.5-S43 (ADR-0092): the FLUSH-class group hold — episodes, the
+    /// window in force, the adaptive target.
+    pub frame_waits_group: Cell<u64>,
+    pub flush_group_window_us: Cell<u64>,
+    pub frame_records_last: Cell<u64>,
+    /// M4.5-S42 (ADR-0091 D5): where the device model came from.
+    pub io_provenance: Cell<crate::IoProvenance>,
     /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).
     pub ckpts_completed: Cell<u64>,
     pub ckpts_aborted: Cell<u64>,

@@ -150,6 +150,10 @@ pub struct DurableScenario {
     /// engaged on the aligned class (every frame there is barrier-less
     /// and far below the target).
     pub fill: inf_server::FillConfig,
+    /// M4.5-S43 (ADR-0092 D3): the FLUSH-class group hold, armed by
+    /// seed on `Buffered` K = 1 seeds (the class it targets); the
+    /// durability, quiescence and budget oracles run unchanged.
+    pub group: inf_server::GroupHoldConfig,
     /// A first life in another barrier class (ADR-0086 D4 as amended,
     /// 2026-08-21): the cell boots in `prelude.io_mode`, the writers run
     /// `prelude.ops_per_writer` ops, the log quiesces to full durability,
@@ -274,6 +278,13 @@ impl DurableScenario {
             // point (1 ms window, 16 KiB target); the m2 durability and
             // log-quiescence oracles hold unchanged.
             fill: if seed % 4 == 3 { m2_fill_config() } else { Default::default() },
+            // M4.5-S43 (ADR-0092 D3): seeds ≡ 0 (mod 4) — `Buffered`, K = 1 —
+            // run the FLUSH-class group hold at the measured arm's window.
+            group: if seed.is_multiple_of(4) {
+                inf_server::GroupHoldConfig::ARM
+            } else {
+                Default::default()
+            },
             prelude: None,
             // M4.5-S39b (ADR-0090 A7.5): the product default on `Direct`
             // seeds, off on every fourth of them (seeds ≡ 5 mod 8) so the
@@ -434,6 +445,7 @@ impl DurableScenario {
         scenario.device = inf_server::DeviceConfig {
             model_share: model.share(scenario.cells),
             seal_barriers_per_s: 0,
+            provenance: Default::default(),
         };
         // Half of the FLUSH → FUA seeds run without automatic checkpoints:
         // the reopened segment then stays inside the replayed log until
@@ -509,11 +521,13 @@ impl DurableScenario {
             device: inf_server::DeviceConfig {
                 model_share: model.share(cells),
                 seal_barriers_per_s: 2_000 / u64::from(cells),
+                provenance: Default::default(),
             },
             budget_oracle: true,
             reorder_oracle: false,
             ckpt_direct_refused_after: None,
             fill: Default::default(),
+            group: Default::default(),
             prelude: None,
             // The budget scenario's zero-fill class must keep engaging
             // (its oracle counts deferrals): recycling off.
@@ -561,6 +575,7 @@ impl DurableScenario {
             reorder_oracle: false,
             ckpt_direct_refused_after: None,
             fill: Default::default(),
+            group: Default::default(),
             prelude: None,
             recycle_slots: 0,
             prealloc: inf_server::PreallocPolicy::DEFAULT,
@@ -630,6 +645,8 @@ pub struct DurableReport {
     /// M4.5-S39a: fill-policy hold episodes, scraped at the cut — the
     /// manifest's coverage disclosure and the reorder scenario's oracle.
     pub frame_waits_fill: u64,
+    /// M4.5-S43: group-hold episodes, scraped at the cut (coverage).
+    pub frame_waits_group: u64,
     /// Device-budget coverage (M4.5-S36, ADR-0088 D8), scraped at the
     /// cut: background bytes the budget granted, deferrals it issued
     /// (a sweep whose budget never deferred proves nothing), the seal
@@ -1056,6 +1073,7 @@ pub(crate) fn boot(
             fua_p50_us_probed: 0,
             device: scenario.device,
             fill: scenario.fill,
+            group: scenario.group,
         };
         plane.set_control(std::sync::Arc::clone(&control));
         plane.begin_recovery(disk.clone(), &cfg, i as u16, clock.now());
@@ -1236,6 +1254,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         frame_waits_reorder: 0,
         ckpt_downgrades: 0,
         frame_waits_fill: 0,
+        frame_waits_group: 0,
         budget_background_bytes: 0,
         budget_deferrals: 0,
         frame_waits_pace: 0,
@@ -1553,6 +1572,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             report.frame_waits_rotation += stats.frame_waits_rotation;
             report.frame_waits_reorder += stats.frame_waits_reorder;
             report.frame_waits_fill += stats.frame_waits_fill;
+            report.frame_waits_group += stats.frame_waits_group;
             report.frame_waits_pace += stats.frame_waits_pace;
             report.write_stall_max_us = report.write_stall_max_us.max(stats.write_stall_max_us);
             report.segments_recycled += stats.segments_recycled;

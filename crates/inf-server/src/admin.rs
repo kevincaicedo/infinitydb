@@ -318,6 +318,18 @@ pub(crate) fn info(
         push(&mut text, &format!("frame_waits_fill:{}", node.frame_waits_fill.get()));
         push(&mut text, &format!("fill_window_us:{}", node.fill_window_us.get()));
         push(&mut text, &format!("fill_target_bytes:{}", node.fill_target_bytes.get()));
+        // M4.5-S43 (ADR-0092): the FLUSH-class group hold in force and
+        // its hold episodes; the adaptive target beside them.
+        push(&mut text, &format!("frame_waits_group:{}", node.frame_waits_group.get()));
+        push(&mut text, &format!("flush_group_window_us:{}", node.flush_group_window_us.get()));
+        push(&mut text, &format!("frame_records_last:{}", node.frame_records_last.get()));
+        // M4.5-S42 (ADR-0091 D5): the device model's provenance — read
+        // beside `barrier_class` and `io_budget_model`, these three lines
+        // say whether the node runs the product configuration.
+        let provenance = node.io_provenance.get();
+        push(&mut text, &format!("io_properties_source:{}", provenance.source.as_str()));
+        push(&mut text, &format!("io_properties_schema:{}", provenance.schema));
+        push(&mut text, &format!("io_properties_identity:{}", provenance.identity_str()));
         // M4.5-S36 (ADR-0088 D7): the device budget's ledger (names per
         // INFINITY_STYLE — units and qualifiers last), the seal pacer's
         // waits, the checkpoint domain's bytes, the derived trigger, and

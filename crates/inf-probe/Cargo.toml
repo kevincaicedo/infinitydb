@@ -1,0 +1,17 @@
+[package]
+name = "inf-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The device probe behind io-properties.toml (M4.5-S34/S36/S42) — shared by `inf probe-device` and infinityd's first boot"
+
+[lints]
+workspace = true
+
+[dependencies]
+inf-foundation.workspace = true
+# The `O_DIRECT`/`O_DSYNC` open flags only — constants, no FFI; the crate
+# stays `#![forbid(unsafe_code)]`.
+libc.workspace = true

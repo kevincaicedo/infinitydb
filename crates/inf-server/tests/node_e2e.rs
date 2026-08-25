@@ -120,7 +120,11 @@ impl Node {
             None,
             inf_log::SegmentIoMode::Buffered,
             None,
-            inf_server::DeviceConfig { model_share: model.share(cells), seal_barriers_per_s: 0 },
+            inf_server::DeviceConfig {
+                model_share: model.share(cells),
+                seal_barriers_per_s: 0,
+                provenance: Default::default(),
+            },
         )
     }
 
@@ -410,6 +414,7 @@ impl Node {
                         fua_p50_us_probed: 0,
                         device,
                         fill: Default::default(),
+                        group: Default::default(),
                     };
                     durable = Some((cfg, Arc::clone(control)));
                 }
