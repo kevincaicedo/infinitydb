@@ -195,14 +195,20 @@ pub enum FillDecision {
 /// half its population (v6 tri-bench, FLUSH default, 4 cells, 32 conns:
 /// client p50 6.17 ms ÷ in-band fdatasync p50 3.26 ms = 1.89; ≈ 3.7
 /// records per frame of ≈ 8 outstanding). A due `LinkedFsync` frame on
-/// a **packed** segment with a drained pipeline therefore holds while
-/// the round is still re-arriving — `pending_records < round_target`,
-/// where the target is the **population** the cell last saw: the
-/// records of the frame that just completed *plus* the records pending
-/// at its completion (campaign A, 2026-08-25, ADR-0092 D1 amended: the
-/// last frame's size alone never holds in the steady alternation — the
-/// pending half and the last frame are the same size, n / 2 each; a
-/// trickle of one never holds) — bounded by `window`, timer-armed. Write-through plans are never held: ADR-0089's arm B
+/// a **packed** segment with a drained pipeline — or the standalone
+/// fdatasync that would cover already-written plain frames — therefore
+/// holds while the round is still re-arriving: `uncovered_records <
+/// round_target`, where *uncovered* is every record assigned but not
+/// yet covered by a completed barrier (`last_seq − acked_seq`: the plain
+/// frames written while the FLUSH slot was busy plus the staging
+/// buffer) and the target is the **population** the last barrier's
+/// completion revealed — the records it acked plus the records assigned
+/// during its flight (campaigns A and B, 2026-08-25, ADR-0092 D1
+/// amended twice: the last frame's size never holds in the steady
+/// state, and `LogWritten` sees 1–2-record plain frames because the
+/// FLUSH slot's busy window seals arrivals at once and covers them with
+/// the *next* barrier; a trickle of one never holds) — bounded by
+/// `window`, timer-armed. Write-through plans are never held: ADR-0089's arm B
 /// measured that shape on the FUA class (p50 ÷ barrier 1.84–1.89) and
 /// the FUA class stays byte-identical. Off by default until the
 /// reference-box A/B (ADR-0092 D4).
@@ -217,9 +223,8 @@ impl GroupHoldConfig {
     /// The measured arm (ADR-0092 D4): 250 µs — ≤ 8 % of the four-cell
     /// FLUSH window the v6 rows read, ≥ 2 × the client round trip.
     pub const ARM: GroupHoldConfig = GroupHoldConfig { window: Nanos::from_micros(250) };
-    /// Fewer records than this in the last frame is a trickle, never a
-    /// round to wait for.
-    pub const MIN_GROUP: u32 = 2;
+    /// A round smaller than this is a trickle, never a round to wait for.
+    pub const MIN_GROUP: u64 = 2;
 
     /// The policy is engaged.
     #[must_use]
@@ -228,20 +233,21 @@ impl GroupHoldConfig {
     }
 
     /// The pure decision (unit-pinned; the LOG step adds the timer):
-    /// hold iff the policy is on, the plan is `LinkedFsync`, the layout
-    /// is packed, the round is a group (`round_target ≥ MIN_GROUP`), the
-    /// round has not re-arrived (`pending < round_target`), and the
-    /// window has not elapsed since `since` (`None` = the episode's
-    /// first sight). `round_target` is the population the cell last
-    /// measured — the completed frame's records plus the records pending
-    /// at its completion (ADR-0092 D1 as amended).
+    /// hold iff the policy is on, the barrier is FLUSH-class (`plan ==
+    /// LinkedFsync` — the standalone fdatasync passes the same plan), the
+    /// layout is packed, the round is a group (`round_target ≥
+    /// MIN_GROUP`), the round has not re-arrived (`uncovered_records <
+    /// round_target`), and the window has not elapsed since `since`
+    /// (`None` = the episode's first sight). `round_target` is the
+    /// population the last barrier's completion measured (ADR-0092 D1
+    /// as amended by campaigns A and B).
     #[must_use]
     pub fn decide(
         &self,
         plan: FramePlan,
         layout: inf_log::FrameLayout,
-        pending_records: u32,
-        round_target: u32,
+        uncovered_records: u64,
+        round_target: u64,
         since: Option<Nanos>,
         now: Nanos,
     ) -> GroupDecision {
@@ -251,7 +257,7 @@ impl GroupHoldConfig {
         if plan != FramePlan::LinkedFsync || round_target < Self::MIN_GROUP {
             return GroupDecision::Seal;
         }
-        if pending_records >= round_target {
+        if uncovered_records >= round_target {
             return GroupDecision::Seal;
         }
         match since {
@@ -518,9 +524,6 @@ struct InFlightFrame {
     lease: inf_log::FrameLease,
     submitted_at: Nanos,
     barrier: FrameBarrier,
-    /// Records the frame carries — the group hold's population term at
-    /// this frame's completion (ADR-0092 D1 as amended).
-    records: u32,
 }
 
 /// The ticket a frame's `LogWritten` must settle, if any.
@@ -586,9 +589,10 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     group_since: Option<Nanos>,
     frame_waits_group: u64,
     last_frame_records: u32,
-    /// The population the cell last measured: a completed frame's records
-    /// plus the records pending at its completion (ADR-0092 D1 amended).
-    group_round_target: u32,
+    /// The population the last barrier's completion measured: the records
+    /// it acked plus the records assigned during its flight (ADR-0092 D1
+    /// as amended by campaigns A and B).
+    group_round_target: u64,
     /// M4.5-S42 (ADR-0091 D5): the device model's provenance.
     io_provenance: IoProvenance,
     /// M4.5-S36 (ADR-0088 D2): the cell's device budget — refilled at
@@ -985,6 +989,16 @@ impl<F: SegmentFs> DurableCell<F> {
             }
             self.queue_frame(cx, slot, plan);
         } else if self.commit.standalone_fsync_due() {
+            // M4.5-S43 (ADR-0092 D1 as amended by campaign B): a barrier
+            // completing with nothing pending would issue a standalone
+            // fdatasync for the plain frames at once — the same round the
+            // linked-fsync frame waits for, so it waits by the same rule.
+            if self.group_holds(cx, FramePlan::LinkedFsync, false) {
+                self.frame_waits_group += u64::from(!self.frame_held);
+                self.frame_held = true;
+                return;
+            }
+            self.frame_held = false;
             let ticket = self.commit.register_standalone_fsync(cx.now);
             let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
             self.budget.charge(IoClass::LogFrame, 0, 1); // ledger-class barrier (ADR-0088 D7)
@@ -1035,10 +1049,11 @@ impl<F: SegmentFs> DurableCell<F> {
         }
         let layout =
             if rotation_due { self.rotor.next_layout() } else { self.rotor.active_layout() };
+        let uncovered = self.last_seq.saturating_sub(self.acked_seq);
         let decision = self.group.decide(
             plan,
             layout,
-            self.staging.pending_records(),
+            uncovered,
             self.group_round_target,
             self.group_since,
             cx.now,
@@ -1068,8 +1083,7 @@ impl<F: SegmentFs> DurableCell<F> {
         // count becomes the next hold's target (ADR-0092 D1: the last
         // frame is the population's own measurement of itself).
         self.group_since = None;
-        let records = self.staging.pending_records();
-        self.last_frame_records = records;
+        self.last_frame_records = self.staging.pending_records();
         let end = slot.base().advance(slot.len());
         let covered = self.commit.watermark().map_or(0, |lsn| lsn.to_u64());
         let lease = self.staging.seal(slot.first_record_lsn(), covered, slot.layout());
@@ -1117,7 +1131,6 @@ impl<F: SegmentFs> DurableCell<F> {
             lease,
             submitted_at: cx.now,
             barrier: ticket,
-            records,
         });
         cx.push(IoOp::LogWrite { fd, offset, data, token: write_token(self.write_seq), barrier });
     }
@@ -1143,10 +1156,6 @@ impl<F: SegmentFs> DurableCell<F> {
             .expect("LogWritten for a frame not in flight");
         let frame = self.in_flight.remove(index).expect("index from position");
         self.write_stall_hist.record(now.saturating_sub(frame.submitted_at).as_micros());
-        // ADR-0092 D1 (amended, campaign A): the round the group hold
-        // waits for is the population this completion reveals — the
-        // frame's own records plus what arrived during its flight.
-        self.group_round_target = frame.records.saturating_add(self.staging.pending_records());
         self.commit.note_frame_written(frame.id);
         self.staging.release(frame.lease);
         self.drained.wake_all(());
@@ -1194,6 +1203,12 @@ impl<F: SegmentFs> DurableCell<F> {
                 // ≥ 0.8× available-in-flight-writes gate.
                 debug_assert!(seq >= self.acked_seq, "ack seq regressed — frame_seqs FIFO broken");
                 self.group_hist_records.record(seq - self.acked_seq);
+                // ADR-0092 D1 (amended by campaigns A and B): the round the
+                // group hold waits for is the population this barrier's
+                // completion reveals — the records it acks plus every
+                // record assigned during its flight (the plain frames the
+                // busy FLUSH slot let through, and the staging buffer).
+                self.group_round_target = self.last_seq.saturating_sub(self.acked_seq);
                 self.acked_seq = seq;
                 self.ack_gate.advance(seq);
             }
@@ -1880,7 +1895,7 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_waits_group: self.frame_waits_group,
             flush_group_window_us: self.group.window.as_micros(),
             frame_records_last: u64::from(self.last_frame_records),
-            group_round_target: u64::from(self.group_round_target),
+            group_round_target: self.group_round_target,
             io_provenance: self.io_provenance,
             frames_in_flight_now: u64::from(self.staging.in_flight()),
             records_staged: u64::from(self.staging.pending_records()),
@@ -2285,15 +2300,17 @@ mod group_hold_tests {
 
     /// A trickle (a round of one) never holds; a round that has
     /// re-arrived seals at once; a round still arriving holds from its
-    /// first sight until the window elapses. The steady K = 1
-    /// alternation is the case that matters: the last frame carried 4
-    /// of a population of 8 and 4 are pending — the target is the
-    /// population (campaign A found the last-frame target never held:
-    /// 4 pending against a target of 4 seals).
+    /// first sight until the window elapses. The steady K = 1 FLUSH
+    /// cadence is the case that matters: a barrier acked 4 of a
+    /// population of 8 and the other 4 are uncovered (written as plain
+    /// frames while the slot was busy) — the target is the population
+    /// the completion measured, never the last frame's size (campaign
+    /// A) and never what `LogWritten` sees (campaign B).
     #[test]
     fn holds_only_while_a_group_is_still_arriving_and_inside_the_window() {
-        // The alternation: pending 4, target 8 ⇒ hold; the last-frame
-        // target (4) would have sealed — pinned so the flaw cannot return.
+        // Uncovered 4 against a population of 8 ⇒ hold; a target equal to
+        // the uncovered count (the flaws) ⇒ seal — pinned so neither can
+        // return.
         assert_eq!(
             ARM.decide(FramePlan::LinkedFsync, FrameLayout::Packed, 4, 8, None, T0),
             GroupDecision::Hold
