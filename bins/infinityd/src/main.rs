@@ -97,6 +97,20 @@ struct Args {
     /// (`.artifacts/m4.5/review3/`).
     fill_window_us: u64,
     fill_target_kib: u32,
+    /// M4.5-S43 (ADR-0092): the FLUSH-class group hold's window in µs
+    /// (0 = off, the shipped default until the reference-box A/B; 250 =
+    /// the measured arm). Inert on the FUA class by construction.
+    flush_group_window_us: u64,
+    /// M4.5-S42 (ADR-0091 D1): the device-model lifecycle. `auto` (the
+    /// product): no `io-properties.toml` ⇒ probe the device now, before
+    /// any cell starts, and write one; a file whose identity no longer
+    /// matches the device ⇒ rename it `.stale` and probe again. `off`
+    /// (the dev/test tier): absent ⇒ the FLUSH class unbudgeted, loudly;
+    /// a mismatched file ⇒ refusal.
+    device_probe: DeviceProbe,
+    /// Seconds per probe row for the in-boot probe (1..=60; `inf
+    /// probe-device` defaults to 2 — the boot pays ≈ 10 s at 1).
+    probe_seconds: u64,
     /// Per-buffer log-staging capacity in MiB (M4.5-S27, ADR-0083 D3).
     /// The buffer absorbs `arrival_rate × frame-write stall`; the 4 MiB
     /// default is ~8.5 ms at 470 MB/s. With ADR-0083 D1 pacing the bound
@@ -131,6 +145,13 @@ struct Args {
     deasync_dispatch: bool,
 }
 
+/// `--device-probe auto|off` (M4.5-S42, ADR-0091 D1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DeviceProbe {
+    Auto,
+    Off,
+}
+
 impl Default for Args {
     fn default() -> Args {
         Args {
@@ -155,6 +176,9 @@ impl Default for Args {
             seal_pace: None,
             fill_window_us: 1_000,
             fill_target_kib: 16,
+            flush_group_window_us: 0,
+            device_probe: DeviceProbe::Auto,
+            probe_seconds: inf_probe::BOOT_SECONDS_PER_ROW,
             log_staging_mib: 4,
             early_fabric_flush: false,
             remote_first_execute: false,
@@ -298,6 +322,31 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--fill-target-kib is 4..=1024 (one block to the FUA bound)".into());
                 }
             }
+            "--flush-group-window-us" => {
+                args.flush_group_window_us = take("--flush-group-window-us")?
+                    .parse()
+                    .map_err(|e| format!("--flush-group-window-us: {e}"))?;
+                // A hold is a fraction of a ≥ 1 ms FLUSH window, never a
+                // batch interval of its own (ADR-0092 D2).
+                if args.flush_group_window_us > 5_000 {
+                    return Err("--flush-group-window-us is 0..=5000 (µs)".into());
+                }
+            }
+            "--device-probe" => {
+                args.device_probe = match take("--device-probe")?.as_str() {
+                    "auto" => DeviceProbe::Auto,
+                    "off" => DeviceProbe::Off,
+                    other => return Err(format!("--device-probe is auto|off, got {other}")),
+                };
+            }
+            "--probe-seconds" => {
+                args.probe_seconds = take("--probe-seconds")?
+                    .parse()
+                    .map_err(|e| format!("--probe-seconds: {e}"))?;
+                if !inf_probe::SECONDS_PER_ROW_RANGE.contains(&args.probe_seconds) {
+                    return Err("--probe-seconds is 1..=60".into());
+                }
+            }
             "--log-staging-mib" => {
                 args.log_staging_mib = take("--log-staging-mib")?
                     .parse()
@@ -322,7 +371,8 @@ fn parse_args() -> Result<Args, String> {
                      [--conn-default-ns NAME] [--frames-in-flight auto|K] \
                      [--barrier-class flush|fua] [--device-write-mbps N] [--seal-pace probe|N] \
                      [--fill-window-us 1000] [--fill-target-kib 16] \
-                     [--log-staging-mib 4] \
+                     [--flush-group-window-us 0] [--device-probe auto|off] \
+                     [--probe-seconds 1] [--log-staging-mib 4] \
                      [--early-fabric-flush] \
                      [--remote-first-execute] \
                      [--fabric-apply-prefetch|--no-fabric-apply-prefetch] \
@@ -338,6 +388,168 @@ fn parse_args() -> Result<Args, String> {
         return Err("--cells must be >= 1".into());
     }
     Ok(args)
+}
+
+/// The device model a boot runs on (M4.5-S42, ADR-0091 D1/D2): the
+/// parsed file, where it came from, and the boot line's sentence.
+struct ResolvedIoProperties {
+    props: inf_server::IoProperties,
+    provenance: inf_server::IoProvenance,
+    note: String,
+}
+
+/// Load → identity → (probe) → the properties. Boot code, before any
+/// cell: blocking I/O and the probe's clocks are fine here.
+fn resolve_io_properties(
+    dir: &std::path::Path,
+    mode: DeviceProbe,
+    probe_seconds: u64,
+) -> Result<ResolvedIoProperties, String> {
+    use inf_foundation::IdentityVerdict;
+    use inf_server::{IoProperties, IoPropertiesSource, IoProvenance};
+    let loaded =
+        IoProperties::load(dir).map_err(|e| format!("{e} (fail-stop: fix or remove the file)"))?;
+    let Some(props) = loaded else {
+        return match mode {
+            DeviceProbe::Off => Ok(ResolvedIoProperties {
+                props: IoProperties::default(),
+                provenance: IoProvenance::default(),
+                note: "absent (--device-probe off): the FLUSH class, K = 1, no device budget — \
+                       the dev tier; `--device-probe auto` or `inf probe-device` enables the \
+                       probed classes (ADR-0091)"
+                    .to_owned(),
+            }),
+            DeviceProbe::Auto => {
+                probe_now(dir, probe_seconds, IoPropertiesSource::ProbedAtBoot, "absent")
+            }
+        };
+    };
+    let current = inf_probe::identity_of(dir);
+    let (verdict, reason) = if props.probe_schema >= 3 {
+        props.identity.mismatch(&current)
+    } else {
+        (IdentityVerdict::Unverifiable, None)
+    };
+    check_block_size(&props)?;
+    let identity_note = match verdict {
+        IdentityVerdict::Verified => format!(
+            "identity verified ({} {} {})",
+            props.identity.fs_type,
+            props.identity.device_path,
+            short_uuid(&props.identity.fs_uuid)
+        ),
+        IdentityVerdict::Unverifiable => {
+            format!("identity unverifiable (schema {})", props.probe_schema)
+        }
+        IdentityVerdict::Mismatch => reason.clone().unwrap_or_default(),
+    };
+    if verdict != IdentityVerdict::Mismatch {
+        return Ok(ResolvedIoProperties {
+            provenance: IoProvenance {
+                source: IoPropertiesSource::File,
+                schema: props.probe_schema,
+                identity: verdict,
+            },
+            note: format!(
+                "{} (schema {}, {identity_note})",
+                inf_server::IO_PROPERTIES_FILE,
+                props.probe_schema
+            ),
+            props,
+        });
+    }
+    match mode {
+        DeviceProbe::Off => Err(format!(
+            "{}: the model describes another device — {identity_note}; re-run `inf \
+             probe-device {}`, remove the file, or boot with `--device-probe auto` (fail-stop, \
+             ADR-0091 D1)",
+            inf_server::IO_PROPERTIES_FILE,
+            dir.display()
+        )),
+        DeviceProbe::Auto => {
+            let stale = dir.join("io-properties.toml.stale");
+            std::fs::rename(dir.join(inf_server::IO_PROPERTIES_FILE), &stale)
+                .map_err(|e| format!("rename stale io-properties.toml: {e}"))?;
+            probe_now(
+                dir,
+                probe_seconds,
+                IoPropertiesSource::Reprobed,
+                &format!("stale — {identity_note}; kept as {}", stale.display()),
+            )
+        }
+    }
+}
+
+/// Run the probe, write the file, read it back the way every later boot
+/// will (one parser, one truth).
+fn probe_now(
+    dir: &std::path::Path,
+    probe_seconds: u64,
+    source: inf_server::IoPropertiesSource,
+    why: &str,
+) -> Result<ResolvedIoProperties, String> {
+    use inf_foundation::IdentityVerdict;
+    use inf_server::{IoProperties, IoProvenance};
+    eprintln!(
+        "infinityd: io-properties {why}: probing the device under {} ({probe_seconds} s per row, \
+         256 MiB scratch) — once per data directory (ADR-0091 D1)",
+        dir.display()
+    );
+    let opts = inf_probe::ProbeOptions { seconds_per_row: probe_seconds };
+    let (path, report) = inf_probe::run_and_write(dir, opts).map_err(|e| {
+        format!(
+            "device probe failed under {}: {e} (fix the directory — the probe needs a 256 MiB \
+             scratch file — or boot with `--device-probe off`)",
+            dir.display()
+        )
+    })?;
+    for line in report.row_lines() {
+        eprintln!("infinityd: probe: {line}");
+    }
+    let props = IoProperties::load(dir)
+        .map_err(|e| format!("{e} (the probe wrote a file this binary cannot read)"))?
+        .ok_or_else(|| format!("the probe wrote no {}", path.display()))?;
+    check_block_size(&props)?;
+    Ok(ResolvedIoProperties {
+        provenance: IoProvenance {
+            source,
+            schema: props.probe_schema,
+            identity: IdentityVerdict::Verified,
+        },
+        note: format!(
+            "{} (schema {}, {:.1} s; identity {} {} {}) → barrier class {}",
+            source.as_str(),
+            props.probe_schema,
+            report.elapsed.as_secs_f64(),
+            if props.identity.fs_type.is_empty() { "?" } else { &props.identity.fs_type },
+            if props.identity.device_path.is_empty() { "?" } else { &props.identity.device_path },
+            short_uuid(&props.identity.fs_uuid),
+            report.verdict.class.name()
+        ),
+        props,
+    })
+}
+
+/// ADR-0091 D2: a logical block larger than `FRAME_ALIGN` would be a
+/// torn-write unit the frame reader's rule does not cover — refuse.
+fn check_block_size(props: &inf_server::IoProperties) -> Result<(), String> {
+    let logical = props.identity.block_logical_bytes;
+    if logical > inf_server::FRAME_ALIGN {
+        return Err(format!(
+            "io-properties: the device's logical block is {logical} bytes, larger than the \
+             {}-byte frame alignment — unsupported (ADR-0086 D3, ADR-0091 D2)",
+            inf_server::FRAME_ALIGN
+        ));
+    }
+    Ok(())
+}
+
+fn short_uuid(uuid: &str) -> String {
+    if uuid.is_empty() {
+        "(no uuid)".to_owned()
+    } else {
+        format!("uuid {}…", &uuid[..uuid.len().min(8)])
+    }
 }
 
 /// Build provenance (M1-S14): version + commit + target, stamped by
@@ -407,24 +619,27 @@ fn main() {
             .unwrap_or(0);
         let control =
             inf_server::spawn_control(dir.clone(), catalog.as_ref(), args.cells, boot_unix_ms);
-        // Barrier class (M4.5-S34, ADR-0086 D7): the probe file decides,
-        // the flag overrides, absence is today's FLUSH class. A malformed
-        // file is a refusal — never a silent fallback to the slow class.
-        let probed = match inf_server::IoProperties::load(&dir) {
-            Ok(probed) => probed,
+        // Device-model lifecycle (M4.5-S42, ADR-0091 D1): the file, the
+        // device's identity, and — under `auto` — the probe, before any
+        // cell starts. A malformed or foreign file is a refusal, never a
+        // silent fallback to the slow class.
+        let resolved = match resolve_io_properties(&dir, args.device_probe, args.probe_seconds) {
+            Ok(resolved) => resolved,
             Err(e) => {
-                eprintln!("infinityd: {e} (fail-stop: fix or remove the file)");
+                eprintln!("infinityd: {e}");
                 std::process::exit(1);
             }
         };
-        let mut io = probed.unwrap_or_default();
-        let source = match (args.barrier_class, probed.is_some()) {
-            (Some(forced), _) => {
+        eprintln!("infinityd: io-properties: {}", resolved.note);
+        let (mut io, provenance) = (resolved.props, resolved.provenance);
+        // Barrier class (M4.5-S34, ADR-0086 D7): the probe file decides,
+        // the flag overrides.
+        let source = match args.barrier_class {
+            Some(forced) => {
                 io.io_mode = forced;
                 "--barrier-class"
             }
-            (None, true) => inf_server::IO_PROPERTIES_FILE,
-            (None, false) => "default (no io-properties.toml)",
+            None => provenance.source.as_str(),
         };
         let class = match io.io_mode {
             inf_server::SegmentIoMode::Direct => "fua",
@@ -514,7 +729,7 @@ fn main() {
             );
             std::process::exit(1);
         }
-        (dir, catalog, control, io, seal_barriers_per_s, frames_in_flight)
+        (dir, catalog, control, io, seal_barriers_per_s, frames_in_flight, provenance)
     });
 
     let mut handles = Vec::new();
@@ -581,6 +796,7 @@ type Boot = Option<(
     u64,
     // K, resolved from the barrier class at boot (ADR-0087 D5 as amended).
     u8,
+    inf_server::IoProvenance,
 )>;
 
 fn cell_main(
@@ -596,7 +812,7 @@ fn cell_main(
     // setup step below publishes its phase so a kernel-side stall names
     // itself on the RecoveryBoard instead of wedging silently.
     let mark = |code: u8| {
-        if let Some((_, _, control, _, _, _)) = &boot {
+        if let Some((_, _, control, _, _, _, _)) = &boot {
             control.recovery_board().slot(cell).publish_phase(code);
         }
     };
@@ -649,7 +865,9 @@ fn cell_main(
     mark(14); // setup:keyspace
     let mut ks = Keyspace::new(StoreConfig::default());
     let mut durable = None;
-    if let Some((dir, catalog, control, io, seal_barriers_per_s, frames_in_flight)) = &boot {
+    if let Some((dir, catalog, control, io, seal_barriers_per_s, frames_in_flight, provenance)) =
+        &boot
+    {
         if let Some(catalog) = catalog {
             ks.seed_catalog(catalog).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
         }
@@ -679,6 +897,7 @@ fn cell_main(
             device: inf_server::DeviceConfig {
                 model_share: io.device.share(args.cells),
                 seal_barriers_per_s: seal_barriers_per_s / u64::from(args.cells.max(1)),
+                provenance: *provenance,
             },
             // M4.5-S39a (ADR-0089, third amendment): the fill policy at
             // the design point by default; `--fill-window-us 0` is the
@@ -686,6 +905,11 @@ fn cell_main(
             fill: inf_server::FillConfig {
                 window: inf_foundation::time::Nanos::from_micros(args.fill_window_us),
                 target_bytes: args.fill_target_kib << 10,
+            },
+            // M4.5-S43 (ADR-0092): the FLUSH-class group hold — off by
+            // default, the arm when asked.
+            group: inf_server::GroupHoldConfig {
+                window: inf_foundation::time::Nanos::from_micros(args.flush_group_window_us),
             },
         };
         durable = Some((cfg, std::sync::Arc::clone(control)));

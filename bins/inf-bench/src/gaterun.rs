@@ -125,9 +125,15 @@ pub(crate) fn spawn_infinityd(
 ) -> Result<ServerGuard, String> {
     let port = free_port();
     let mut cmd = Command::new(bin);
-    cmd.args(["--port", &port.to_string(), "--cells", &cells.to_string()])
-        .args(extra)
-        .stdout(Stdio::null());
+    cmd.args(["--port", &port.to_string(), "--cells", &cells.to_string()]);
+    // M4.5-S42 (ADR-0091 D4): a harness spawn never probes silently — arms
+    // are explicit (`copy_probe_file`, `--barrier-class`, `--model-absent`);
+    // a campaign measuring the shipped first boot forwards `--device-probe
+    // auto` itself.
+    if !extra.contains(&"--device-probe") {
+        cmd.args(["--device-probe", "off"]);
+    }
+    cmd.args(extra).stdout(Stdio::null());
     // S22 watch item ("server closed connection under load", stderr was
     // nulled in every sighting): INF_GATERUN_STDERR_DIR=<dir> captures
     // each spawned server's stderr as <dir>/infinityd-<port>.stderr.
@@ -695,6 +701,12 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         // and target in KiB).
         "fill-window-us",
         "fill-target-kib",
+        // M4.5-S43 (ADR-0092 D4): the FLUSH-class group-hold arm (window
+        // in µs — 0 = the baseline arm), forwarded through `pipeline_args`.
+        "flush-group-window-us",
+        // M4.5-S42 (ADR-0091 D4): every spawn names its tier — `off`
+        // unless a campaign measures the shipped first boot (`auto`).
+        "device-probe",
         "recovery-gbps-per-cell",
         "recovery-boot-s",
         // ADR-0070 D7 (2026-08-16): Phase::Start overhead, split out of the

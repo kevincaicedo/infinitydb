@@ -7,6 +7,7 @@
 
 mod addr;
 mod crc;
+mod device;
 pub mod fault;
 mod hash;
 mod hist;
@@ -19,6 +20,7 @@ pub mod varint;
 
 pub use addr::LogicalAddr;
 pub use crc::{crc16, hashtag};
+pub use device::{DeviceIdentity, IdentityVerdict};
 pub use hash::{BuildIntHasher, IntHasher, hash64};
 pub use hist::LogHistogram;
 pub use ids::{CellId, KeySlot, SLOT_COUNT};

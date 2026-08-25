@@ -529,6 +529,10 @@ fn infinity_host_argv(spec: &Spec) -> Result<(String, Vec<String>), String> {
         spec.port.to_string(),
         "--cells".to_string(),
         spec.threads.to_string(),
+        // M4.5-S42 (ADR-0091 D4): the comparator's arm is explicit
+        // (`--probe-file` copies the model in); never a silent probe.
+        "--device-probe".to_string(),
+        "off".to_string(),
     ];
     if let Some(core) = spec.pin_start {
         argv.extend(["--pin-start".to_string(), core.to_string()]);

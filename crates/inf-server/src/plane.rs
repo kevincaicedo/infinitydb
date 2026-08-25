@@ -2888,6 +2888,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.frame_waits_fill.set(stats.frame_waits_fill);
             node.fill_window_us.set(stats.fill_window_us);
             node.fill_target_bytes.set(stats.fill_target_bytes);
+            node.frame_waits_group.set(stats.frame_waits_group);
+            node.flush_group_window_us.set(stats.flush_group_window_us);
+            node.frame_records_last.set(stats.frame_records_last);
+            node.io_provenance.set(stats.io_provenance);
             node.fsyncs_completion.set(stats.fsyncs_completion);
             node.log_segments_live.set(stats.log_segments_live);
             // M4.5-S36 (ADR-0088 D7): the device budget's ledger, the

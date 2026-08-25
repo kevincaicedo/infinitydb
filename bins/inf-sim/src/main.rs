@@ -764,6 +764,7 @@ fn run_durable(
     let mut waits_reorder = 0u64;
     let mut ckpt_downgrades = 0u64;
     let mut waits_fill = 0u64;
+    let mut waits_group = 0u64;
     // Device-budget coverage (ADR-0088 D8): background bytes granted,
     // deferrals issued, seal-pace waits, worst frame-write latency.
     let mut budget_bytes = 0u64;
@@ -797,6 +798,7 @@ fn run_durable(
         waits_reorder += report.frame_waits_reorder;
         ckpt_downgrades += report.ckpt_downgrades;
         waits_fill += report.frame_waits_fill;
+        waits_group += report.frame_waits_group;
         budget_bytes += report.budget_background_bytes;
         budget_deferrals += report.budget_deferrals;
         waits_pace += report.frame_waits_pace;
@@ -844,7 +846,7 @@ fn run_durable(
          waits_rotation:{waits_rotation} waits_reorder:{waits_reorder}], device budget [background_bytes:{budget_bytes} \
          deferrals:{budget_deferrals} waits_pace:{waits_pace} write_stall_max_us:{stall_max_us}], \
          reopened_packed_tails:{reopened_packed_tails} ckpt_downgrades:{ckpt_downgrades} \
-         waits_fill:{waits_fill}, recycling [recycled:{recycled} misses:{recycle_misses} \
+         waits_fill:{waits_fill} waits_group:{waits_group}, recycling [recycled:{recycled} misses:{recycle_misses} \
          fallbacks:{recycle_fallbacks} rotations:{rotations} residue_slacks:{residue_slacks} \
          waits_started:{waits_started} waits_satisfied:{waits_satisfied} \
          waits_expired:{waits_expired} inline_preallocs:{inline_preallocs}]",
@@ -863,7 +865,7 @@ fn run_durable(
              waits_reorder={waits_reorder} budget_background_bytes={budget_bytes} budget_deferrals={budget_deferrals} \
              waits_pace={waits_pace} write_stall_max_us={stall_max_us} \
              reopened_packed_tails={reopened_packed_tails} ckpt_downgrades={ckpt_downgrades} \
-             waits_fill={waits_fill} segments_recycled={recycled} recycle_misses={recycle_misses} \
+             waits_fill={waits_fill} waits_group={waits_group} segments_recycled={recycled} recycle_misses={recycle_misses} \
              recycle_fallbacks={recycle_fallbacks} segment_rotations={rotations} \
              recycled_residue_slacks={residue_slacks} recycle_waits_started={waits_started} \
              recycle_waits_satisfied={waits_satisfied} recycle_waits_expired={waits_expired} \

@@ -1154,6 +1154,11 @@ pub(crate) fn pipeline_args(flags: &Flags) -> Vec<String> {
         // pre-S39a cadence, the baseline arm — and target KiB).
         ("fill-window-us", "--fill-window-us"),
         ("fill-target-kib", "--fill-target-kib"),
+        // M4.5-S43 (ADR-0092 D4): the FLUSH-class group-hold arm.
+        ("flush-group-window-us", "--flush-group-window-us"),
+        // M4.5-S42 (ADR-0091 D4): the probe tier (`spawn_infinityd`
+        // adds `off` when absent).
+        ("device-probe", "--device-probe"),
     ] {
         if let Some(value) = flags.get(flag) {
             args.push(server_flag.to_string());
@@ -1198,11 +1203,13 @@ pub(crate) fn copy_probe_file(flags: &Flags, dir: &std::path::Path) -> Result<bo
 pub(crate) fn pipeline_note(flags: &Flags) -> String {
     format!(
         "frames-in-flight {} · barrier-class {} · staging-mib {} · device-write-mbps {} · \
-         seal-pace {}",
+         seal-pace {} · flush-group-window-us {} · device-probe {}",
         flags.str_or("frames-in-flight", "auto (fua 3 / flush 1)"),
         flags.str_or("barrier-class", "flush"),
         flags.str_or("staging-mib", "4"),
         flags.str_or("device-write-mbps", "probe-file"),
-        flags.str_or("seal-pace", "off")
+        flags.str_or("seal-pace", "off"),
+        flags.str_or("flush-group-window-us", "0 (off)"),
+        flags.str_or("device-probe", "off")
     )
 }
