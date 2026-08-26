@@ -1,0 +1,13 @@
+infinityd: log barrier class fua (source: --barrier-class; fua_max_frame_bytes 262144; probed p50 fua 330 µs / flush 924 µs); frames in flight 3 (auto: fua) × 4 MiB staging
+infinityd: segment recycling off (ADR-0090)
+infinityd: device model probed (schema 2): write 486 MiB/s, 2540 ops/s (qd4 barriers 3597/s); per-cell share write 121 MiB/s
+infinityd 3bb32df (git 3bb32df29c59, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 44891, backend io_uring, route natural
+infinityd: listening on 44891
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: recovery 0/4 cells ready, 1485762560/5307723776 bytes (28.0%), eta 3s
+control: recovery 0/4 cells ready, 3015454720/5307723776 bytes (56.8%), eta 2s
+control: recovery 0/4 cells ready, 5307723776/5307723776 bytes (100.0%), eta 0s
+control: cell 0 recovered (2 segments, 1326981120 bytes, 800000 records; phases ms: start 4.1, ckpt 2062.8 [790110208 B], replay 404.7 [109907968 B], audit 990.2 [426962944 B], finish 0.1, total 3461.8)
+control: cell 2 recovered (2 segments, 1327009792 bytes, 800000 records; phases ms: start 3.9, ckpt 2052.0 [790138880 B], replay 391.9 [108134400 B], audit 979.8 [428736512 B], finish 0.1, total 3427.7)
+control: cell 3 recovered (2 segments, 1326813184 bytes, 800000 records; phases ms: start 3.8, ckpt 2054.6 [789942272 B], replay 394.3 [111697920 B], audit 988.2 [425172992 B], finish 0.1, total 3440.9)

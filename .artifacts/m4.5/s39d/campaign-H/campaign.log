@@ -1,0 +1,86 @@
+2026-08-22T23:23:23-04:00
+infinityd 3bb32df (git 3bb32df29c59, x86_64-unknown-linux-gnu)
+3bb32df
+dirty=0
+performance
+infinityd running: 0 redis running: 1
+  775116    35887 171171103   853641 86863529  2614685 2359700306 74201178        0  4977275 75295934   105384        0 367302032    64630   194438   176483
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before s39d base rep0
+  s39d base: warm 3000000 records at 134231 ops/s, boundary checkpoint 12.0 s, truncated 16 recycled 0 rotations_min_cell 4 (warmed=true)
+  s35: 40s drive-state idle before s39d base fresh-image recovery boot
+  s39d rep0 base: rep0 base warm_ops=134231 tail_ops=209457 warmed=true warm[rotations=16 recycled=0 truncated=16 rotations_min_cell=4 waits_expired=0] end[rotations=16 recycled=0 truncated=16 frame_bytes=3765198848 zero_fill=5244452864] boot_wall_s=3.517 proc_read_bytes=5183074304 records_recovered=3200000 slowest_cell[total_ms=3489.6 start_ms=3.9 ckpt_ms=2075.9 replay_ms=401.4 audit_ms=1008.3 finish_ms=0.1 dominating=ckpt] sum_cells[total_ms=13819.9 ckpt_ms=8245.2 replay_ms=1592.4 audit_ms=3966.5 finish_ms=0.3 ckpt_bytes=3160240128 replay_bytes=441008128 replay_frames=27682 audit_bytes=1706475520 audit_valid_frames=0 audit_foreign_frames=0 stale_files=0 residue_slacks=0 residue_stops=0]
+  s35: 40s drive-state idle before s39d arm rep0
+  s39d arm: warm 3000000 records at 133460 ops/s, boundary checkpoint 18.2 s, truncated 16 recycled 4 rotations_min_cell 4 (warmed=true)
+  s35: 40s drive-state idle before s39d arm fresh-image recovery boot
+  s39d rep0 arm: rep0 arm warm_ops=133460 tail_ops=283257 warmed=true warm[rotations=16 recycled=4 truncated=16 rotations_min_cell=4 waits_expired=8] end[rotations=16 recycled=4 truncated=16 frame_bytes=3766304768 zero_fill=4294967296] boot_wall_s=3.919 proc_read_bytes=5307330560 records_recovered=3200000 slowest_cell[total_ms=3884.6 start_ms=3.9 ckpt_ms=2126.0 replay_ms=413.4 audit_ms=1283.3 finish_ms=58.0 dominating=ckpt] sum_cells[total_ms=15009.2 ckpt_ms=8519.0 replay_ms=1637.5 audit_ms=4777.8 finish_ms=59.2 ckpt_bytes=3160240128 replay_bytes=442593280 replay_frames=28586 audit_bytes=1704890368 audit_valid_frames=0 audit_foreign_frames=51974 stale_files=4 residue_slacks=4 residue_stops=4]
+  s35: 40s drive-state idle before s39d arm rep1
+  s39d arm: warm 3000000 records at 84572 ops/s, boundary checkpoint 16.6 s, truncated 16 recycled 4 rotations_min_cell 4 (warmed=true)
+  s35: 40s drive-state idle before s39d arm fresh-image recovery boot
+  s39d rep1 arm: rep1 arm warm_ops=84572 tail_ops=291513 warmed=true warm[rotations=16 recycled=4 truncated=16 rotations_min_cell=4 waits_expired=8] end[rotations=16 recycled=4 truncated=16 frame_bytes=3769974784 zero_fill=4294967296] boot_wall_s=3.642 proc_read_bytes=5307330560 records_recovered=3200000 slowest_cell[total_ms=3591.5 start_ms=3.9 ckpt_ms=2072.0 replay_ms=453.2 audit_ms=1062.3 finish_ms=0.1 dominating=ckpt] sum_cells[total_ms=14344.2 ckpt_ms=8263.3 replay_ms=1840.1 audit_ms=4225.5 finish_ms=0.5 ckpt_bytes=3160240128 replay_bytes=474947584 replay_frames=30088 audit_bytes=1672536064 audit_valid_frames=0 audit_foreign_frames=52107 stale_files=4 residue_slacks=4 residue_stops=4]
+  s35: 40s drive-state idle before s39d base rep1
+  s39d base: warm 3000000 records at 97051 ops/s, boundary checkpoint 12.3 s, truncated 16 recycled 0 rotations_min_cell 4 (warmed=true)
+  s35: 40s drive-state idle before s39d base fresh-image recovery boot
+  s39d rep1 base: rep1 base warm_ops=97051 tail_ops=206942 warmed=true warm[rotations=16 recycled=0 truncated=16 rotations_min_cell=4 waits_expired=0] end[rotations=16 recycled=0 truncated=16 frame_bytes=3765702656 zero_fill=5319163904] boot_wall_s=3.573 proc_read_bytes=5257785344 records_recovered=3200000 slowest_cell[total_ms=3543.1 start_ms=3.7 ckpt_ms=2056.2 replay_ms=439.7 audit_ms=1043.4 finish_ms=0.1 dominating=ckpt] sum_cells[total_ms=14047.5 ckpt_ms=8226.8 replay_ms=1724.6 audit_ms=4080.2 finish_ms=0.2 ckpt_bytes=3160240128 replay_bytes=478363648 replay_frames=29394 audit_bytes=1669120000 audit_valid_frames=0 audit_foreign_frames=0 stale_files=0 residue_slacks=0 residue_stops=0]
+  s35: 40s drive-state idle before s39d base rep2
+  s39d base: warm 3000000 records at 133404 ops/s, boundary checkpoint 12.8 s, truncated 16 recycled 0 rotations_min_cell 4 (warmed=true)
+  s35: 40s drive-state idle before s39d base fresh-image recovery boot
+  s39d rep2 base: rep2 base warm_ops=133404 tail_ops=35342 warmed=true warm[rotations=16 recycled=0 truncated=16 rotations_min_cell=4 waits_expired=0] end[rotations=16 recycled=0 truncated=16 frame_bytes=3768512512 zero_fill=5270405120] boot_wall_s=4.057 proc_read_bytes=5209026560 records_recovered=3200000 slowest_cell[total_ms=3906.0 start_ms=4.2 ckpt_ms=2087.5 replay_ms=429.6 audit_ms=1384.7 finish_ms=0.1 dominating=ckpt] sum_cells[total_ms=14612.7 ckpt_ms=8364.3 replay_ms=1674.5 audit_ms=4556.4 finish_ms=0.4 ckpt_bytes=3160240128 replay_bytes=453943296 replay_frames=29286 audit_bytes=1693540352 audit_valid_frames=0 audit_foreign_frames=0 stale_files=0 residue_slacks=0 residue_stops=0]
+  s35: 40s drive-state idle before s39d arm rep2
+  s39d arm: warm 3000000 records at 129966 ops/s, boundary checkpoint 23.4 s, truncated 16 recycled 4 rotations_min_cell 4 (warmed=true)
+  s35: 40s drive-state idle before s39d arm fresh-image recovery boot
+  s39d rep2 arm: rep2 arm warm_ops=129966 tail_ops=286810 warmed=true warm[rotations=16 recycled=4 truncated=16 rotations_min_cell=4 waits_expired=8] end[rotations=16 recycled=4 truncated=16 frame_bytes=3767037952 zero_fill=4294967296] boot_wall_s=3.576 proc_read_bytes=5307330560 records_recovered=3200000 slowest_cell[total_ms=3547.1 start_ms=4.1 ckpt_ms=2120.4 replay_ms=330.0 audit_ms=1092.4 finish_ms=0.1 dominating=ckpt] sum_cells[total_ms=14137.9 ckpt_ms=8472.9 replay_ms=1331.3 audit_ms=4317.3 finish_ms=0.5 ckpt_bytes=3160240128 replay_bytes=446435328 replay_frames=28657 audit_bytes=1701048320 audit_valid_frames=0 audit_foreign_frames=51913 stale_files=4 residue_slacks=4 residue_stops=4]
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (device characterization — informational since the ADR-0087 fourth amendment, 2026-08-22) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+  S39b: warmed zero-fill bytes per log frame byte under recycling (arm) PENDING (tooling)
+  S39b: rotations not served by the pool over the warmed window, worst cell PENDING (tooling)
+  S39b: padding share moved by recycling (the S39c control) PENDING (tooling)
+  S39b: always c32 p50 under recycling over baseline PENDING (tooling)
+  S39b: always c32 p99 under recycling over baseline PENDING (tooling)
+  S39b: read leg under recycling over baseline (the E4.7 ±2 % rule) PENDING (tooling)
+  S39b: first crash-restart recovery boot on the recycled log over baseline PENDING (tooling)
+  S39b: rotations per cell the row actually performed (validity) PENDING (tooling)
+  S39b/D9: pool waits fed before the bound over waits ended (arm) PENDING (tooling)
+  S39b/D9: rotations onto an un-zeroed segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: rotations that found no next segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: preallocs refused for space on the arm, worst replicate PENDING (tooling)
+  S39b: accounted host bytes per log frame byte under recycling (informational) PENDING (tooling)
+  S39b: block-device sectors written per log frame byte under recycling (informational) PENDING (tooling)
+  S39d: fixed-work first-boot recovery, slowest cell's engine total, arm over baseline PASS (informational)
+  S39d: absolute first-boot recovery wall on the recycled log (the S18 < 15 s STOP gate re-read) PASS
+  S39d: both arms recovered exactly the records written (fixed-work validity) PASS
+  S39d: slack-audit phase time over the cell sums, arm over baseline (the recycling term, informational) PASS (informational)
+
+gate-run: report written to /home/kcaicedo/bench-data/s39d/campaign-H/run/1787456182-gate-run/report.md
+2026-08-22T23:36:22-04:00
+infinityd 3bb32df (git 3bb32df29c59, x86_64-unknown-linux-gnu)
+3bb32df
+dirty=4
+performance
+infinityd running: 0 redis running: 1
+ 1016717    36243 232862983  1005425 88622830  2693540 2531264378 77149314        0  5204695 78404457   105384        0 367302032    64630   200020   185088
+CAMPAIGN DONE

@@ -6,7 +6,7 @@
 //! range exactly once) for the RSS gate.
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::time::{Duration, Instant};
 
 use crate::finehist::FineHistogram;
@@ -46,11 +46,15 @@ pub struct LoadSpec {
     /// M4.5-S36 (ADR-0088 D7): an **offered rate** instead of the closed
     /// loop — every connection sends on a fixed schedule
     /// (`conns / target` seconds apart) up to `pipeline` in flight, and
-    /// latency is measured from the *intended* send instant, so queueing
-    /// behind a slow server counts (coordinated omission is not hidden).
-    /// A connection whose pipeline is full skips its slot; the achieved
-    /// rate against the target is the report's disclosure. `None` =
-    /// closed loop (every pre-S36 row byte-identical).
+    /// latency is measured from the *intended* send instant, so a late
+    /// wake-up counts as queueing (coordinated omission is not hidden).
+    /// A slot that comes due while the connection's pipeline is full is
+    /// **skipped, never sent late** (M4.5-S40 review, 2026-08-25: the
+    /// first implementation caught up after a stall — a burst above the
+    /// offered rate whose latencies were stamped from slots long past);
+    /// the report counts `offered` / `sent` / `skipped_pipeline_full`
+    /// and the achieved rate against the target is its disclosure.
+    /// `None` = closed loop (every pre-S36 row byte-identical).
     pub target_ops_per_sec: Option<u64>,
 }
 
@@ -110,12 +114,52 @@ pub struct LoadReport {
     /// Exact mean of the leg's latencies — disclosed beside the
     /// percentiles (never a gate input on its own).
     pub mean_us: f64,
-    /// M4.5-S40 (stall attribution): when the `max_us` sample was *sent*,
-    /// in seconds after warmup — the instant a server-side timeline is
-    /// read against; and the per-second maxima over the leg (index =
-    /// whole seconds after warmup), so an isolated event is seen as one.
-    pub max_at_s: f64,
+    /// M4.5-S40 (stall attribution): the `max_us` sample's three
+    /// instants in seconds after warmup — its *intended* send (the slot,
+    /// what the latency is measured from), its *actual* send, and its
+    /// completion — so a server-side timeline is read over the interval
+    /// the request was really outstanding, not a window around one
+    /// stamp; and the per-second maxima over the leg (index = whole
+    /// seconds after the warmup, by actual send), so an isolated event
+    /// is seen as one.
+    pub max_intended_at_s: f64,
+    pub max_sent_at_s: f64,
+    pub max_done_at_s: f64,
     pub max_per_second: Vec<u64>,
+    /// Offered-rate accounting inside the measured window (0 on a closed
+    /// loop): schedule slots offered = `sent + skipped_pipeline_full`;
+    /// a skipped slot is one that came due while the connection's
+    /// pipeline was full (the request was never sent — the achieved rate
+    /// falls by it, no later request carries its wait).
+    pub offered: u64,
+    pub sent: u64,
+    pub skipped_pipeline_full: u64,
+}
+
+/// One in-flight request's instants: the schedule slot it was sent for
+/// (latency counts from here) and when it actually left. Equal on a
+/// closed loop.
+#[derive(Copy, Clone, Debug)]
+struct SentAt {
+    intended: Instant,
+    sent: Instant,
+}
+
+/// Whole schedule slots in `[from, now]` — the slots a full pipeline let
+/// pass; at least one when `now >= from`.
+fn slots_elapsed(from: Instant, now: Instant, interval: Duration) -> u64 {
+    debug_assert!(now >= from);
+    (now.duration_since(from).as_nanos() / interval.as_nanos().max(1)) as u64 + 1
+}
+
+/// How many of `count` consecutive slots starting at `first` fall at or
+/// after `window_start` — the skipped slots inside the measured window.
+fn slots_in_window(first: Instant, interval: Duration, count: u64, window_start: Instant) -> u64 {
+    if first >= window_start {
+        return count;
+    }
+    let before = window_start.duration_since(first).as_nanos().div_ceil(interval.as_nanos().max(1));
+    count.saturating_sub(before as u64)
 }
 
 struct ConnResult {
@@ -126,8 +170,12 @@ struct ConnResult {
     error_samples: Vec<String>,
     hist_us: FineHistogram,
     max_us: u64,
-    max_at_s: f64,
+    max_intended_at_s: f64,
+    max_sent_at_s: f64,
+    max_done_at_s: f64,
     max_per_second: Vec<u64>,
+    sent: u64,
+    skipped_pipeline_full: u64,
 }
 
 pub(crate) fn make_key(spec: &LoadSpec, index: u64) -> Vec<u8> {
@@ -163,8 +211,12 @@ fn run_conn(
         error_samples: Vec::new(),
         hist_us: FineHistogram::new(),
         max_us: 0,
-        max_at_s: 0.0,
+        max_intended_at_s: 0.0,
+        max_sent_at_s: 0.0,
+        max_done_at_s: 0.0,
         max_per_second: vec![0; spec.duration.as_secs() as usize + 2],
+        sent: 0,
+        skipped_pipeline_full: 0,
     };
 
     // Fill mode: a partitioned range, exactly once, pipelined.
@@ -175,7 +227,7 @@ fn run_conn(
         start..end
     });
 
-    let mut inflight: VecDeque<Instant> = VecDeque::with_capacity(spec.pipeline);
+    let mut inflight: VecDeque<SentAt> = VecDeque::with_capacity(spec.pipeline);
     let mut rx: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut rx_at = 0usize;
     let mut tx: Vec<u8> = Vec::with_capacity(16 * 1024);
@@ -191,6 +243,11 @@ fn run_conn(
     let mut next_send_at = pace.map_or(Instant::now(), |interval| {
         Instant::now() + interval.mul_f64(conn_index as f64 / spec.conns.max(1) as f64)
     });
+    // Set when the sender stopped on a full pipeline: every slot that
+    // comes due before a reply frees it is skipped, never sent late
+    // (the contract — a catch-up burst exceeds the offered rate and
+    // stamps the skipped slots' wait onto requests sent afterwards).
+    let mut blocked_full = false;
 
     loop {
         // Top up the pipeline.
@@ -203,6 +260,15 @@ fn run_conn(
                 if now >= deadline {
                     done_sending = true;
                     break;
+                }
+                if blocked_full {
+                    blocked_full = false;
+                    if now >= next_send_at {
+                        let missed = slots_elapsed(next_send_at, now, interval);
+                        result.skipped_pipeline_full +=
+                            slots_in_window(next_send_at, interval, missed, warmup_end);
+                        next_send_at += Duration::from_nanos(interval.as_nanos() as u64 * missed);
+                    }
                 }
                 if now < next_send_at {
                     if inflight.is_empty() {
@@ -220,9 +286,14 @@ fn run_conn(
                 } else {
                     tx.extend_from_slice(&encode_command(&[b"GET", &key]));
                 }
-                // Latency from the *intended* instant (coordinated
-                // omission counted), never from the actual send.
-                inflight.push_back(next_send_at);
+                // Latency from the *intended* instant (a late wake-up
+                // is queueing and counts); the actual instant rides
+                // beside it for the timeline a maximum is read against.
+                let intended = next_send_at;
+                inflight.push_back(SentAt { intended, sent: Instant::now() });
+                if intended >= warmup_end {
+                    result.sent += 1;
+                }
                 next_send_at += interval;
                 continue;
             }
@@ -273,7 +344,8 @@ fn run_conn(
                     }
                 }
             }
-            inflight.push_back(Instant::now());
+            let now = Instant::now();
+            inflight.push_back(SentAt { intended: now, sent: now });
         }
         if !tx.is_empty() {
             stream.write_all(&tx).map_err(|e| format!("write: {e}"))?;
@@ -282,22 +354,53 @@ fn run_conn(
             break; // deadline passed and everything drained
         }
 
-        // Read replies; record latency per completed frame.
-        let n = stream.read(&mut chunk).map_err(|e| format!("read: {e}"))?;
+        // Read replies; record latency per completed frame. On the
+        // offered schedule a pipeline with room reads only until its
+        // next slot is due (a reply is not what the schedule waits
+        // for); a full pipeline reads until a reply frees a slot, and
+        // the slots that come due meanwhile are skipped above.
+        let full = inflight.len() >= spec.pipeline;
+        blocked_full = full && pace.is_some() && !done_sending;
+        let wait = if full || done_sending || pace.is_none() {
+            None
+        } else {
+            Some(
+                next_send_at
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_micros(1)),
+            )
+        };
+        stream.set_read_timeout(wait).map_err(|e| format!("read timeout: {e}"))?;
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e)
+                if wait.is_some()
+                    && matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                continue; // the slot is due; send, then read again
+            }
+            Err(e) => return Err(format!("read: {e}")),
+        };
         if n == 0 {
             return Err("server closed connection under load".into());
         }
         rx.extend_from_slice(&chunk[..n]);
         while let Some(end) = reply_len(&rx[rx_at..]) {
-            let sent = inflight.pop_front().ok_or("reply without a request")?;
-            if sent >= warmup_end {
-                let micros = sent.elapsed().as_micros() as u64;
+            let SentAt { intended, sent } =
+                inflight.pop_front().ok_or("reply without a request")?;
+            if intended >= warmup_end {
+                let done = Instant::now();
+                let micros = done.duration_since(intended).as_micros() as u64;
                 result.hist_us.record(micros);
                 result.ops += 1;
+                // `sent >= intended >= warmup_end`: a slot is sent at or
+                // after its instant, never before.
                 let since = sent.duration_since(warmup_end);
                 if micros > result.max_us {
                     result.max_us = micros;
-                    result.max_at_s = since.as_secs_f64();
+                    result.max_intended_at_s = intended.duration_since(warmup_end).as_secs_f64();
+                    result.max_sent_at_s = since.as_secs_f64();
+                    result.max_done_at_s = done.duration_since(warmup_end).as_secs_f64();
                 }
                 if let Some(slot) = result.max_per_second.get_mut(since.as_secs() as usize) {
                     *slot = (*slot).max(micros);
@@ -365,9 +468,13 @@ pub fn run(spec: &LoadSpec) -> Result<LoadReport, String> {
             }
         }
         hist.merge(&conn.hist_us);
+        report.sent += conn.sent;
+        report.skipped_pipeline_full += conn.skipped_pipeline_full;
         if conn.max_us > report.max_us || report.max_per_second.is_empty() {
             report.max_us = conn.max_us;
-            report.max_at_s = conn.max_at_s;
+            report.max_intended_at_s = conn.max_intended_at_s;
+            report.max_sent_at_s = conn.max_sent_at_s;
+            report.max_done_at_s = conn.max_done_at_s;
         }
         if report.max_per_second.len() < conn.max_per_second.len() {
             report.max_per_second.resize(conn.max_per_second.len(), 0);
@@ -376,6 +483,7 @@ pub fn run(spec: &LoadSpec) -> Result<LoadReport, String> {
             *slot = (*slot).max(*m);
         }
     }
+    report.offered = report.sent + report.skipped_pipeline_full;
     report.ops_per_sec = report.ops as f64 / report.elapsed_s;
     report.p50_us = hist.percentile(50.0);
     report.p99_us = hist.percentile(99.0);
@@ -401,6 +509,12 @@ pub fn render(report: &LoadReport) -> String {
         report.p9999_us,
         report.max_us
     );
+    if report.offered > 0 {
+        out.push_str(&format!(
+            "offered = {}\nsent = {}\nskipped_pipeline_full = {}\n",
+            report.offered, report.sent, report.skipped_pipeline_full
+        ));
+    }
     for sample in &report.error_samples {
         out.push_str(&format!("error_sample = {sample}\n"));
     }
@@ -491,4 +605,29 @@ pub fn cmd_load(args: &[String]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The skip rule's arithmetic: a pipeline freed `now` skips every
+    /// slot from the one that was due up to `now` (inclusive of a slot
+    /// exactly at `now`), and only the slots inside the measured window
+    /// are counted.
+    #[test]
+    fn skipped_slots_are_counted_from_the_due_slot_and_inside_the_window() {
+        let interval = Duration::from_micros(320);
+        let t0 = Instant::now();
+        // Due 1 ms ago: slots at 0, 320, 640, 960 µs have passed — four.
+        assert_eq!(slots_elapsed(t0, t0 + Duration::from_micros(1_000), interval), 4);
+        // Due exactly now: one slot.
+        assert_eq!(slots_elapsed(t0, t0, interval), 1);
+        // Window starts at 500 µs: of the four slots, 640 and 960 are in it.
+        assert_eq!(slots_in_window(t0, interval, 4, t0 + Duration::from_micros(500)), 2);
+        // Window starts at the first slot or before it: all of them.
+        assert_eq!(slots_in_window(t0, interval, 4, t0), 4);
+        // Window starts after every slot: none.
+        assert_eq!(slots_in_window(t0, interval, 4, t0 + Duration::from_secs(1)), 0);
+    }
 }

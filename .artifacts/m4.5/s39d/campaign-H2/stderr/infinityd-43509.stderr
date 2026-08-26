@@ -1,0 +1,16 @@
+infinityd: log barrier class fua (source: --barrier-class; fua_max_frame_bytes 262144; probed p50 fua 330 µs / flush 924 µs); frames in flight 3 (auto: fua) × 4 MiB staging
+infinityd: segment recycling on, 1 slot(s) × 256 MiB per cell, pool wait quarter (ADR-0090)
+infinityd: device model probed (schema 2): write 486 MiB/s, 2540 ops/s (qd4 barriers 3597/s); per-cell share write 121 MiB/s
+infinityd e123e83 (git e123e835d3f8, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 43509, backend io_uring, route natural
+infinityd: listening on 43509
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: recovery 0/4 cells ready, 1400971264/5307723776 bytes (26.4%), eta 3s
+control: recovery 0/4 cells ready, 2939133952/5307723776 bytes (55.4%), eta 2s
+control: recovery 0/4 cells ready, 5307723776/5307723776 bytes (100.0%), eta 0s
+control: cell 3 recovered (2 segments, 1326813184 bytes, 800000 records, recycled residue: 1 segment stops, 1 slacks (ADR-0090); phases ms: start 4.4, ckpt 2105.2 [789942272 B], replay 404.1 [112041984 B], audit 1074.3 [424828928 B], finish 0.2, total 3588.0)
+control: cell 1 recovered (2 segments, 1326919680 bytes, 800000 records, recycled residue: 1 segment stops, 1 slacks (ADR-0090); phases ms: start 3.9, ckpt 2103.9 [790048768 B], replay 419.5 [114003968 B], audit 1281.3 [422866944 B], finish 0.2, total 3808.7)
+control: recovery 2/4 cells ready, 5307723776/5307723776 bytes (100.0%), eta 0s
+control: cell 0 recovered (2 segments, 1326981120 bytes, 800000 records, recycled residue: 1 segment stops, 1 slacks (ADR-0090); phases ms: start 4.1, ckpt 2110.3 [790110208 B], replay 407.4 [110645248 B], audit 1288.5 [426225664 B], finish 0.1, total 3810.4)
+control: cell 2 recovered (2 segments, 1327009792 bytes, 800000 records, recycled residue: 1 segment stops, 1 slacks (ADR-0090); phases ms: start 4.1, ckpt 2112.8 [790138880 B], replay 420.9 [112672768 B], audit 1632.3 [424198144 B], finish 0.1, total 4170.2)
+control: recovery complete — 4 cells serving (4273 ms)

@@ -545,6 +545,7 @@ fn always_row(
 /// namespaces are *named* (both ride the pump — ADR-0015), so the row
 /// isolates the durability cost, not the named-ns dispatch cost.
 /// §8.2: the everysec legs attach their fsync histogram.
+#[allow(clippy::too_many_arguments)]
 fn everysec_row(
     m: &mut Measurements,
     infinityd: &str,
@@ -553,10 +554,19 @@ fn everysec_row(
     duration: u64,
     replicates: usize,
     data_root: &std::path::Path,
+    flags: &Flags,
 ) -> Result<(), String> {
     println!("\n== row: everysec penalty vs memory-mode ns (interleaved ABBA × {replicates}) ==");
     let guard =
         DataDirGuard::create(data_root.join(format!("inf-m2-esec-{}", std::process::id())))?;
+    // M4.5-S34 (2026-08-25): the barrier-class A/B rides this row — a
+    // `--barrier-class fua` arm carries the device model the S35 row
+    // carries (`<data-root>/io-properties.toml`), `--model-absent`
+    // withholds it.
+    let probe_present = copy_probe_file(flags, guard.path())?;
+    if probe_present {
+        m.note("everysec row: io-properties.toml copied into the row's data dir");
+    }
     let dir_s = guard.path().to_string_lossy().into_owned();
     let seg_s = PRESSURE_SEGMENT_BYTES.to_string();
     let mut extra: Vec<&str> = server_extra.to_vec();
@@ -979,6 +989,35 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
         );
     }
 
+    // M4.5-S34 (2026-08-25): the everysec penalty row alone — the
+    // barrier-class A/B (`--barrier-class flush|fua`, the probe file at
+    // `--data-root`) the S34 AC binds on, interleaved by the campaign
+    // script the way `--only-always` is.
+    if flags.bool("only-everysec") {
+        everysec_row(
+            &mut m,
+            &infinityd,
+            cells,
+            &server_extra,
+            duration,
+            replicates,
+            &data_root,
+            flags,
+        )?;
+        return finish_report(
+            "m2",
+            &gates_list,
+            &m,
+            env_ok,
+            reference_box,
+            &artifacts_root,
+            &format!(
+                "cells: {cells} · duration: {duration}s · ONLY-EVERYSEC (A/B leg; {})",
+                pipeline_note(flags)
+            ),
+        );
+    }
+
     // S09 rows — fresh servers per row (each row owns its keyspace state).
     type SpecFn = fn(u16, u64) -> LoadSpec;
     let rows: [(&str, RowKeys, SpecFn); 3] = [
@@ -1061,7 +1100,16 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
             false,
         )?;
         // §6 everysec penalty + the durable attribution rows (S22).
-        everysec_row(&mut m, &infinityd, cells, &server_extra, duration, replicates, &data_root)?;
+        everysec_row(
+            &mut m,
+            &infinityd,
+            cells,
+            &server_extra,
+            duration,
+            replicates,
+            &data_root,
+            flags,
+        )?;
         let attr_keys = flags.u64_or("attribution-keys", 2_000_000)?;
         attribution_row(&mut m, &infinityd, cells, &server_extra, attr_keys, &data_root)?;
     }

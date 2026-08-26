@@ -1,0 +1,86 @@
+2026-08-23T00:12:44-04:00
+infinityd 339943a (git 339943acd07c, x86_64-unknown-linux-gnu)
+339943a
+dirty=0
+performance
+infinityd running: 0 redis running: 1
+ 1259007    36698 294593079  1159516 91812301  2813427 2776661146 81907014        0  5500807 83323305   105384        0 367302032    64630   207053   192143
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 10s drive-state idle before s37 A rep0
+  s37 rep0 A c64  ops/s=12429    p50_us=2967   p99_us=29119   p999_us=34943   sets=248644 cold_resolves=710383 (2.857/set) blind=0 (0.000/set)
+  s37 rep0 A c256 ops/s=21975    p50_us=8927   p99_us=38527   p999_us=46207   sets=439950 cold_resolves=1254355 (2.851/set) blind=0 (0.000/set)
+  s35: 10s drive-state idle before s37 B rep0
+  s37 rep0 B c64  ops/s=38666    p50_us=791    p99_us=23807   p999_us=30655   sets=773372 cold_resolves=1267330 (1.639/set) blind=779403 (1.008/set)
+  s37 rep0 B c256 ops/s=90994    p50_us=1343   p99_us=27583   p999_us=55295   sets=1825973 cold_resolves=6835654 (3.744/set) blind=1871197 (1.025/set)
+  s35: 10s drive-state idle before s37 B rep1
+  s37 rep1 B c64  ops/s=39654    p50_us=799    p99_us=23615   p999_us=28735   sets=793127 cold_resolves=1301746 (1.641/set) blind=795106 (1.002/set)
+  s37 rep1 B c256 ops/s=100235   p50_us=1339   p99_us=25983   p999_us=31103   sets=2005074 cold_resolves=7610804 (3.796/set) blind=2016716 (1.006/set)
+  s35: 10s drive-state idle before s37 A rep1
+  s37 rep1 A c64  ops/s=18565    p50_us=2895   p99_us=9119    p999_us=12191   sets=371366 cold_resolves=1062420 (2.861/set) blind=0 (0.000/set)
+  s37 rep1 A c256 ops/s=13723    p50_us=11423  p99_us=72447   p999_us=88831   sets=275159 cold_resolves=799840 (2.907/set) blind=0 (0.000/set)
+  s35: 10s drive-state idle before s37 A rep2
+  s37 rep2 A c64  ops/s=10666    p50_us=3071   p99_us=33279   p999_us=43519   sets=213355 cold_resolves=655909 (3.074/set) blind=0 (0.000/set)
+  s37 rep2 A c256 ops/s=22042    p50_us=8607   p99_us=37759   p999_us=43007   sets=441459 cold_resolves=1259787 (2.854/set) blind=0 (0.000/set)
+  s35: 10s drive-state idle before s37 B rep2
+  s37 rep2 B c64  ops/s=23092    p50_us=841    p99_us=59391   p999_us=80383   sets=462045 cold_resolves=609484 (1.319/set) blind=436787 (0.945/set)
+  s37 rep2 B c256 ops/s=100917   p50_us=1323   p99_us=25983   p999_us=32319   sets=2018830 cold_resolves=6653492 (3.296/set) blind=2036163 (1.009/set)
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (device characterization — informational since the ADR-0087 fourth amendment, 2026-08-22) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+  S39b: warmed zero-fill bytes per log frame byte under recycling (arm) PENDING (tooling)
+  S39b: rotations not served by the pool over the warmed window, worst cell PENDING (tooling)
+  S39b: padding share moved by recycling (the S39c control) PENDING (tooling)
+  S39b: always c32 p50 under recycling over baseline PENDING (tooling)
+  S39b: always c32 p99 under recycling over baseline PENDING (tooling)
+  S39b: read leg under recycling over baseline (the E4.7 ±2 % rule) PENDING (tooling)
+  S39b: first crash-restart recovery boot on the recycled log over baseline PENDING (tooling)
+  S39b: rotations per cell the row actually performed (validity) PENDING (tooling)
+  S39b/D9: pool waits fed before the bound over waits ended (arm) PENDING (tooling)
+  S39b/D9: rotations onto an un-zeroed segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: rotations that found no next segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: preallocs refused for space on the arm, worst replicate PENDING (tooling)
+  S39b: accounted host bytes per log frame byte under recycling (informational) PENDING (tooling)
+  S39b: block-device sectors written per log frame byte under recycling (informational) PENDING (tooling)
+  S39d: fixed-work first-boot recovery, slowest cell's engine total, arm over baseline PENDING (tooling)
+  S39d: absolute first-boot recovery wall on the recycled log (the S18 < 15 s STOP gate re-read) PENDING (tooling)
+  S39d: both arms recovered exactly the records written (fixed-work validity) PENDING (tooling)
+  S39d: slack-audit phase time over the cell sums, arm over baseline (the recycling term, informational) PENDING (tooling)
+  S40: everysec max latency at the memtier shape, worst leg (S27 D5) PENDING (tooling)
+  S40: achieved over offered rate, worst leg (validity — a saturated leg's max is a saturation number) PENDING (tooling)
+  S40: seconds whose per-second maximum exceeded 50 ms, summed over legs (informational) PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling throughput over the shipping path at 256 conns PASS (informational)
+  S37 step 1: blind-overwrite ceiling p99 gain at 256 conns PASS (informational)
+  S37 step 1: share of arm B's SETs that skipped a cold read (validity — 0 = the instrument never engaged) PASS
+
+gate-run: report written to /home/kcaicedo/bench-data/s37/campaign-J/run/1787458775-gate-run/report.md
+2026-08-23T00:19:35-04:00
+infinityd 339943a (git 339943acd07c, x86_64-unknown-linux-gnu)
+339943a
+dirty=0
+performance
+infinityd running: 0 redis running: 1
+ 3175650    36709 355860567  3126167 94953037  2994597 2903259170 86281204        0  5794157 89685884   105384        0 367302032    64630   224561   213882
+CAMPAIGN DONE

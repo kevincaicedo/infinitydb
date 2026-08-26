@@ -23,6 +23,9 @@ use crate::resp::{connect, parse_info, request};
 pub(crate) struct ServerGuard {
     child: Child,
     pub port: u16,
+    /// Spawn to first accepted connection — the boot the M4.5-S42 row
+    /// times (a probing first boot against a file-backed second one).
+    pub boot: Duration,
 }
 
 impl ServerGuard {
@@ -147,15 +150,23 @@ pub(crate) fn spawn_infinityd(
             cmd.stderr(Stdio::null());
         }
     }
+    // A boot that probes (ADR-0091 D1: `--device-probe auto` on a fresh
+    // directory, ≈ 10 s on the reference device, bounded by
+    // `--probe-seconds` × nine rows) needs a longer ready deadline than
+    // the instant start every explicit arm gets.
+    let probes = extra.windows(2).any(|w| w[0] == "--device-probe" && w[1] == "auto");
+    let ready_within = Duration::from_secs(if probes { 180 } else { 10 });
+    let started = Instant::now();
     let child = cmd.spawn().map_err(|e| format!("spawn {bin}: {e}"))?;
-    let mut guard = ServerGuard { child, port };
+    let mut guard = ServerGuard { child, port, boot: Duration::ZERO };
     // Poll the child alongside the port: a fail-stopped server (M2.5-S01 —
     // e.g. io_uring_setup ENOMEM prints `cell N failed: …` and exits) is
     // detected in milliseconds and named, instead of burning the full TCP
     // deadline on a corpse and reporting an unclassified "never came up".
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = started + ready_within;
     loop {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            guard.boot = started.elapsed();
             return Ok(guard);
         }
         if let Some(status) = guard.child.try_wait().map_err(|e| e.to_string())? {
@@ -186,8 +197,10 @@ pub(crate) fn spawn_dragonfly(bin: &str, cells: u16) -> Result<ServerGuard, Stri
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn {bin}: {e}"))?;
-    let guard = ServerGuard { child, port };
+    let started = Instant::now();
+    let mut guard = ServerGuard { child, port, boot: Duration::ZERO };
     wait_ready(port)?;
+    guard.boot = started.elapsed();
     Ok(guard)
 }
 
@@ -211,8 +224,10 @@ pub(crate) fn spawn_redis(bin: &str) -> Result<ServerGuard, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn {bin}: {e}"))?;
-    let guard = ServerGuard { child, port };
+    let started = Instant::now();
+    let mut guard = ServerGuard { child, port, boot: Duration::ZERO };
     wait_ready(port)?;
+    guard.boot = started.elapsed();
     Ok(guard)
 }
 
@@ -583,6 +598,11 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-s39d",
         "only-s40",
         "only-s37",
+        // M4.5-S42 (ADR-0091 D6): the stock first-boot row.
+        "only-s42",
+        // M4.5-S34 (2026-08-25): the m2 everysec penalty row alone (the
+        // barrier-class A/B leg).
+        "only-everysec",
         "model-absent",
     ],
     &[
@@ -683,6 +703,14 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         // construction against the row's 128 MB budget).
         "only-s37",
         "s37-keys",
+        // M4.5-S37 step 2 discriminator: `COLD-READ-QD` arms, baseline first.
+        "s37-cold-read-qd",
+        // M4.5-S42 / M4.5-S34.
+        "only-s42",
+        "only-everysec",
+        // M4.5-S39d baseline: `recycling-off` (ADR-0090 A10) or
+        // `flush-class` (the S34 C38b replay clause).
+        "s39d-baseline",
         "model-absent",
         // M4.5-S35 row: seconds idled before every durable leg (the S34
         // drive-state rule; default 40, 0 for harness smoke).

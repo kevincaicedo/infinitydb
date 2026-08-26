@@ -102,8 +102,11 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
     let only_s39d = flags.bool("only-s39d");
     // `--only-s40` (M4.5-S40): the stall-attribution row at the memtier shape.
     let only_s40 = flags.bool("only-s40");
-    // `--only-s37` (M4.5-S37 step 1): the cold-overwrite ceiling A/B.
+    // `--only-s37` (M4.5-S37): the cold-overwrite ceiling A/B (step 1) or
+    // the `COLD-READ-QD` discriminator (`--s37-cold-read-qd`, step 2).
     let only_s37 = flags.bool("only-s37");
+    // `--only-s42` (M4.5-S42, ADR-0091 D6): the stock first-boot row.
+    let only_s42 = flags.bool("only-s42");
     if usize::from(only_s27)
         + usize::from(only_s29)
         + usize::from(only_s35)
@@ -112,10 +115,11 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
         + usize::from(only_s39d)
         + usize::from(only_s40)
         + usize::from(only_s37)
+        + usize::from(only_s42)
         > 1
     {
         return Err("--only-s27, --only-s29, --only-s35, --only-s36, --only-s37, --only-s39b, \
-                    --only-s39d and --only-s40 exclude each other"
+                    --only-s39d, --only-s40 and --only-s42 exclude each other"
             .into());
     }
 
@@ -176,9 +180,9 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
             ),
         );
     }
-    if only_s37 {
-        m.note("--only-s37: every other row was skipped; their gate keys are absent");
-        s37_ceiling_row(flags, &infinityd, cells, duration, replicates, &data_root, &mut m)?;
+    if only_s42 {
+        m.note("--only-s42: every other row was skipped; their gate keys are absent");
+        s42_first_boot_row(flags, &infinityd, cells, duration, replicates, &data_root, &mut m)?;
         return finish_report(
             "m4.5",
             &gates_list,
@@ -187,8 +191,30 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
             reference_box,
             &artifacts_root,
             &format!(
-                "binary {infinityd} (bench-diagnostics) · cells {cells} · {replicates} \
-                 replicates · S37 ceiling row only · {arms_note}"
+                "binary {infinityd} · cells {cells} · {replicates} replicates · S42 stock \
+                 first-boot row only · device-probe auto (the product default; no arms)"
+            ),
+        );
+    }
+    if only_s37 {
+        m.note("--only-s37: every other row was skipped; their gate keys are absent");
+        s37_row(flags, &infinityd, cells, duration, replicates, &data_root, &mut m)?;
+        return finish_report(
+            "m4.5",
+            &gates_list,
+            &m,
+            env_ok,
+            reference_box,
+            &artifacts_root,
+            &format!(
+                "binary {infinityd}{} · cells {cells} · {replicates} replicates · S37 {} row \
+                 only · {arms_note}",
+                if flags.get("s37-cold-read-qd").is_some() { "" } else { " (bench-diagnostics)" },
+                if flags.get("s37-cold-read-qd").is_some() {
+                    "cold-read-qd discriminator"
+                } else {
+                    "ceiling"
+                }
             ),
         );
     }
@@ -2403,7 +2429,30 @@ fn s39d_recovery_row(
     if let Some(wait) = wait.as_deref() {
         arm_args.extend(["--recycle-wait", wait]);
     }
-    let base_args: Vec<&str> = vec!["--no-segment-recycle"];
+    // `--s39d-baseline recycling-off` (ADR-0090 A10, the default) pairs
+    // the recycled log against an unrecycled one. `flush-class` (M4.5-S34
+    // AC, 2026-08-25) pairs the aligned FUA-class default against the
+    // packed FLUSH-class log the pre-S34 path wrote — the same fixed
+    // work replayed from both formats, the C38b "replay within 1 %"
+    // clause on the loop clock. The server's `--barrier-class` is
+    // last-wins, so the baseline's `flush` overrides the campaign's
+    // `fua`; the arm stays the server default.
+    let baseline = flags.str_or("s39d-baseline", "recycling-off");
+    let base_args: Vec<&str> = match baseline.as_str() {
+        "recycling-off" => vec!["--no-segment-recycle"],
+        "flush-class" => vec!["--barrier-class", "flush"],
+        other => {
+            return Err(format!("--s39d-baseline is recycling-off|flush-class, got {other}"));
+        }
+    };
+    if baseline == "flush-class" {
+        m.note(
+            "s39d --s39d-baseline flush-class: the baseline log is packed (no 4 KiB frame \
+             alignment), so `frame_bytes_x` reads above 1.0 by the arm's padding share by \
+             design — a format difference, not a fixed-work violation; the replay-phase keys \
+             compare the same records from both formats",
+        );
+    }
     m.note(format!(
         "s39d row: {cells} cells · {replicates} replicates (ABBA) · fixed work: {warm} warm + \
          {tail} tail records × 1 KiB at {S35_CONNS_AC} conns pipeline 16 · segment-bytes \
@@ -2506,6 +2555,13 @@ fn s39d_recovery_row(
     let mut dominating_arm = Vec::new();
     let mut dominating_base = Vec::new();
     let mut foreign_arm = Vec::new();
+    // The replay phase's rate on the slowest cell, per arm (bytes the
+    // cell replayed over its loop-clock replay time) — the C38b
+    // "≥ 1 GB/s per cell over the replay phase" statistic measured on
+    // the instrument that row said it lacked (1-second polls), at this
+    // row's shape; informational.
+    let mut replay_gbps_arm = Vec::new();
+    let mut replay_gbps_base = Vec::new();
     let mut invalid = 0usize;
     for rep in 0..replicates {
         let (Some((_, b)), Some((_, a))) = (pair(rep, "base"), pair(rep, "arm")) else { continue };
@@ -2515,6 +2571,9 @@ fn s39d_recovery_row(
         }
         let (sa, sb) = (a.slowest(), b.slowest());
         total_x.push(sa.total_us as f64 / sb.total_us.max(1) as f64);
+        let gbps = |p: &S39dPhases| p.replay_bytes as f64 / p.replay_us.max(1) as f64 * 1e6 / 1e9;
+        replay_gbps_arm.push(gbps(&sa));
+        replay_gbps_base.push(gbps(&sb));
         wall_x.push(a.boot_wall_s / b.boot_wall_s.max(1e-6));
         wall_arm.push(a.boot_wall_s);
         wall_base.push(b.boot_wall_s);
@@ -2573,6 +2632,8 @@ fn s39d_recovery_row(
         m.set("s39d:frame_bytes_x", median(&mut frame_bytes_x));
         m.set("s39d:records_recovered_match", records_match.iter().copied().fold(1.0, f64::min));
         m.set("s39d:audit_foreign_frames_arm", median(&mut foreign_arm));
+        m.set("s39d:replay_gbps_per_cell_arm", median(&mut replay_gbps_arm));
+        m.set("s39d:replay_gbps_per_cell_base", median(&mut replay_gbps_base));
         let name = |v: &[&str]| -> String {
             let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
             for d in v {
@@ -2679,11 +2740,15 @@ fn s40_sample(port: u16, cells: u16, device_stat: Option<&str>, t0: Instant) -> 
     })
 }
 
-/// What the timeline says happened in the sample window that brackets
-/// the client's maximum: every engine event is named, the device's
-/// write time over the window disclosed, and one attribution word
-/// chosen by precedence (checkpoint in flight → rotation → manifest/
-/// truncation → zero-fill → index grow → device-busy → admission park → none).
+/// What the timeline says happened over the interval that brackets the
+/// client's maximum (its actual send to its completion): every engine
+/// event is named, the device's write time over the interval disclosed,
+/// and **every** candidate class present is listed (checkpoint,
+/// rotation, manifest/truncation, zero-fill, index grow, device-busy
+/// ≥ 50 %, admission park — in that order, `+`-joined), or
+/// `unattributed`. A list, never a verdict: the precedence the first
+/// instrument chose one word by hid a co-occurring cause (review of
+/// campaigns I/I2, 2026-08-25).
 fn s40_attribute(before: &S40Sample, after: &S40Sample) -> (String, String) {
     let window_ms = ((after.at_s - before.at_s) * 1000.0).max(1.0);
     let d = |f: fn(&S40Sample) -> u64| f(after).saturating_sub(f(before));
@@ -2741,35 +2806,39 @@ fn s40_attribute(before: &S40Sample, after: &S40Sample) -> (String, String) {
     } else {
         "device: not sampled".to_string()
     };
+    let mut candidates: Vec<&str> = Vec::new();
+    if before.ckpt_in_flight > 0 || after.ckpt_in_flight > 0 || d(|s| s.ckpts_completed) > 0 {
+        candidates.push("checkpoint");
+    }
+    if d(|s| s.rotations) > 0 {
+        candidates.push("rotation");
+    }
+    if d(|s| s.manifests_published) > 0 || d(|s| s.truncated) > 0 {
+        candidates.push("manifest/truncation");
+    }
+    if d(|s| s.zero_fill) > 0 {
+        candidates.push("zero-fill");
+    }
+    if d(|s| s.index_grows) > 0 {
+        candidates.push("index-grow");
+    }
+    if dev_busy_pct >= 50.0 {
+        candidates.push("device-busy");
+    }
+    if d(|s| s.parked) > 0 {
+        // Campaign I's lesson (2026-08-23): a park is the staging domain
+        // filling behind frames the device is not completing — listed
+        // beside `device-busy`, never instead of it.
+        candidates.push("admission-park");
+    }
     let word =
-        if before.ckpt_in_flight > 0 || after.ckpt_in_flight > 0 || d(|s| s.ckpts_completed) > 0 {
-            "checkpoint"
-        } else if d(|s| s.rotations) > 0 {
-            "rotation"
-        } else if d(|s| s.manifests_published) > 0 || d(|s| s.truncated) > 0 {
-            "manifest/truncation"
-        } else if d(|s| s.zero_fill) > 0 {
-            "zero-fill"
-        } else if d(|s| s.index_grows) > 0 {
-            "index-grow"
-        } else if dev_busy_pct >= 50.0 {
-            // Campaign I's lesson (2026-08-23): the device outranks the
-            // parks — a park is the staging domain filling behind frames
-            // the device is not completing, a symptom of the cause above
-            // it (rep1: 92 % busy, 18.5 s of queued write time in a
-            // 253 ms window, 11 MiB of progress, +42 parks).
-            "device-busy"
-        } else if d(|s| s.parked) > 0 {
-            "admission-park"
-        } else {
-            "unattributed"
-        };
+        if candidates.is_empty() { "unattributed".to_string() } else { candidates.join("+") };
     let detail = if events.is_empty() {
-        format!("no engine event in the window; {dev_note}")
+        format!("no engine event in the interval; {dev_note}")
     } else {
         format!("{}; {dev_note}", events.join(", "))
     };
-    (word.to_string(), detail)
+    (word, detail)
 }
 
 /// One S40 leg's facts.
@@ -2779,7 +2848,19 @@ struct S40Leg {
     p99_us: f64,
     p999_us: f64,
     max_us: f64,
-    max_at_s: f64,
+    /// The maximum's intended send (its schedule slot), actual send and
+    /// completion, seconds after the warmup — the attribution interval
+    /// is `[sent, done]`, never one window around a stamp.
+    max_intended_at_s: f64,
+    max_sent_at_s: f64,
+    max_done_at_s: f64,
+    /// Offered-rate accounting (generator contract, ADR-0088 D7 as
+    /// corrected 2026-08-25): slots offered = sent + skipped on a full
+    /// pipeline; a skipped slot lowers the achieved rate and is never
+    /// sent late.
+    offered: u64,
+    sent: u64,
+    skipped_pipeline_full: u64,
     /// Seconds whose maximum exceeded 50 ms, and the top per-second maxima.
     seconds_over_50ms: u64,
     top_seconds: Vec<(usize, u64)>,
@@ -2868,12 +2949,22 @@ fn s40_leg(
         (Some(f), Some(l)) => (f.clone(), l.clone()),
         _ => return Err("s40: no timeline sample".into()),
     };
-    // The max's send instant is measured from warmup's end; the timeline
-    // from the leg's start.
-    let max_at_leg = report.max_at_s + warmup.as_secs_f64();
-    let after_idx =
-        timeline.iter().position(|s| s.at_s >= max_at_leg).unwrap_or(timeline.len() - 1);
-    let before_idx = after_idx.saturating_sub(1);
+    // The max's instants are measured from warmup's end; the timeline
+    // from the leg's start. The attribution interval is the request's
+    // whole outstanding life — the last sample at or before its actual
+    // send to the first sample at or after its completion — never one
+    // window around a stamp (a 2 s stall spans eight windows; review of
+    // campaigns I/I2, 2026-08-25).
+    let warmup_s = warmup.as_secs_f64();
+    let sent_at_leg = report.max_sent_at_s + warmup_s;
+    let done_at_leg = report.max_done_at_s + warmup_s;
+    let last_idx = timeline.len() - 1;
+    let before_idx = timeline.iter().rposition(|s| s.at_s <= sent_at_leg).unwrap_or(0);
+    let after_idx = timeline
+        .iter()
+        .position(|s| s.at_s >= done_at_leg)
+        .unwrap_or(last_idx)
+        .max((before_idx + 1).min(last_idx));
     let (attribution, attribution_detail) =
         s40_attribute(&timeline[before_idx], &timeline[after_idx]);
     let mut top: Vec<(usize, u64)> = report.max_per_second.iter().copied().enumerate().collect();
@@ -2886,7 +2977,12 @@ fn s40_leg(
         p99_us: report.p99_us as f64,
         p999_us: report.p999_us as f64,
         max_us: report.max_us as f64,
-        max_at_s: report.max_at_s,
+        max_intended_at_s: report.max_intended_at_s,
+        max_sent_at_s: report.max_sent_at_s,
+        max_done_at_s: report.max_done_at_s,
+        offered: report.offered,
+        sent: report.sent,
+        skipped_pipeline_full: report.skipped_pipeline_full,
         seconds_over_50ms: report.max_per_second.iter().filter(|&&m| m > 50_000).count() as u64,
         top_seconds: top,
         cpu_pct: ticks as f64 / crate::gaterun::CLOCK_TICKS_PER_S as f64 / wall * 100.0,
@@ -2923,8 +3019,9 @@ fn s40_stall_row(
     m.note(format!(
         "s40 row: {cells} cells · {replicates} legs · memtier shape on the in-house generator: \
          {keys} keys × 1 KiB, 32 conns, pipeline 1, everysec, {offered} offered ops/s for \
-         {duration} s (latency from the intended send) · INFO + device sampled every \
-         {S40_SAMPLE_MS} ms · {idle_s} s idle before every leg · device stat {}",
+         {duration} s (latency from the intended send; a slot due on a full pipeline is \
+         skipped and counted, never sent late) · INFO + device sampled every {S40_SAMPLE_MS} \
+         ms · {idle_s} s idle before every leg · device stat {}",
         device_stat.as_deref().unwrap_or("(not sampled)")
     ));
     let mut raw = String::new();
@@ -2948,17 +3045,23 @@ fn s40_stall_row(
             device_stat.as_deref(),
         )?;
         raw.push_str(&format!(
-            "rep{rep} achieved={:.0} ({:.3} of offered) p50_us={:.0} p99_us={:.0} p999_us={:.0} \
-             max_us={:.0} max_at_s={:.2} seconds_over_50ms={} top_seconds={:?} cpu_pct={:.0} \
-             ckpts={} ckpt_bytes={} stall_p99_us={} stall_p999_us={} parked={} dev_mib={} \
-             attribution={} [{}]\n",
+            "rep{rep} achieved={:.0} ({:.3} of offered) offered={} sent={} \
+             skipped_pipeline_full={} p50_us={:.0} p99_us={:.0} p999_us={:.0} max_us={:.0} \
+             max_intended_at_s={:.3} max_sent_at_s={:.3} max_done_at_s={:.3} \
+             seconds_over_50ms={} top_seconds={:?} cpu_pct={:.0} ckpts={} ckpt_bytes={} \
+             stall_p99_us={} stall_p999_us={} parked={} dev_mib={} attribution={} [{}]\n",
             leg.ops_per_sec,
             leg.ops_per_sec / offered.max(1) as f64,
+            leg.offered,
+            leg.sent,
+            leg.skipped_pipeline_full,
             leg.p50_us,
             leg.p99_us,
             leg.p999_us,
             leg.max_us,
-            leg.max_at_s,
+            leg.max_intended_at_s,
+            leg.max_sent_at_s,
+            leg.max_done_at_s,
             leg.seconds_over_50ms,
             leg.top_seconds,
             leg.cpu_pct,
@@ -2973,6 +3076,15 @@ fn s40_stall_row(
         ));
         println!("  s40 rep{rep}: {}", raw.lines().last().unwrap_or(""));
         let _ = std::fs::remove_dir_all(&dir);
+        if leg.skipped_pipeline_full > 0 {
+            m.note(format!(
+                "s40 rep{rep}: {} of {} offered slots skipped on a full pipeline ({:.4} share) \
+                 — never sent late; the achieved rate carries them",
+                leg.skipped_pipeline_full,
+                leg.offered,
+                leg.skipped_pipeline_full as f64 / leg.offered.max(1) as f64
+            ));
+        }
         maxes.push(leg.max_us / 1000.0);
         achieved.push(leg.ops_per_sec / offered.max(1) as f64);
         p99s.push(leg.p99_us);
@@ -2986,16 +3098,21 @@ fn s40_stall_row(
     m.set("s40:p99_us_median", median(&mut p99s));
     m.set("s40:p999_us_median", median(&mut p999s));
     m.set("s40:seconds_over_50ms_total", over.iter().sum());
-    m.note(format!("s40 attribution per leg (max's sample window): {}", words.join(" / ")));
+    m.note(format!(
+        "s40 attribution candidates per leg (over the max's send-to-completion interval): {}",
+        words.join(" / ")
+    ));
     if achieved.iter().any(|a| *a < 0.9) {
         m.note("s40: a leg achieved < 0.90 of the offered rate — its max is a saturation number");
     }
     m.row_open("stall-attribution");
     m.row_write_amp(
         "S40 stall attribution: the client's maximum is read against the 250 ms server/device \
-         sample window its send instant fell in; the attribution word is by precedence \
-         (checkpoint → rotation → manifest/truncation → zero-fill → index grow → device \
-         busy ≥ 50 % → admission park → unattributed) and is a note, never a gate",
+         samples spanning its actual send to its completion; every candidate class present in \
+         that interval is listed (checkpoint, rotation, manifest/truncation, zero-fill, index \
+         grow, device busy ≥ 50 %, admission park — `+`-joined) or `unattributed`; a note, \
+         never a gate. Offered slots that came due on a full pipeline are skipped, counted, and \
+         never sent late (the corrected ADR-0088 D7 generator, 2026-08-25)",
     );
     m.raw_section("s40 per-leg samples", &raw);
     Ok(())
@@ -3012,7 +3129,11 @@ fn s40_stall_row(
 const S37_DEFAULT_KEYS: u64 = 1_000_000;
 
 /// One S37 leg: the S29 tiered shape (closed loop, pipeline 1, 1 KiB)
-/// with the cold-resolve and blind-overwrite counts of the leg.
+/// with the cold-read and blind-overwrite counts of the leg and the
+/// shaper's own readings. `cold_read_qd_p99` is the device QD sampled
+/// at each issue (ADR-0055 D2) on a whole-session histogram — a later
+/// leg's reading carries the earlier legs' samples and is disclosed as
+/// such; the queue-full / pool-dry counters are per-leg deltas.
 struct S37Leg {
     ops_per_sec: f64,
     p50_us: f64,
@@ -3021,6 +3142,10 @@ struct S37Leg {
     sets: u64,
     cold_resolves: u64,
     blind: u64,
+    cold_qd_p99: u64,
+    cold_read_p99_us: u64,
+    cold_queue_full: u64,
+    cold_pool_dry: u64,
 }
 
 fn s37_leg(
@@ -3065,18 +3190,76 @@ fn s37_leg(
         // ~2.9 per SET in campaign J — not reads).
         cold_resolves: d("cold_reads_issued"),
         blind: d("blind_overwrites_ceiling"),
+        cold_qd_p99: crate::gaterun::max_field(&after, "cold_read_qd_p99"),
+        cold_read_p99_us: crate::gaterun::max_field(&after, "cold_read_p99_us"),
+        cold_queue_full: d("cold_queue_full"),
+        cold_pool_dry: d("cold_pool_dry"),
     })
 }
 
-/// The M4.5-S37 step-1 row: the beyond-RAM tiered `always` write legs
-/// (64 and 256 conns) on the shipping path (A) against the blind-
-/// overwrite ceiling arm (B, `infinityd --blind-overwrite-ceiling` — a
-/// `bench-diagnostics` build, the same binary for both arms), ABBA per
-/// replicate, fresh server + fill per leg. B is an upper bound from an
-/// unsound build: its gain is what removing the verifying cold read
-/// could ever buy; the predeclared rule (plan S37) reads "< 15 %
-/// throughput and < 20 % p99 ⇒ step 2 `Rejected`".
-fn s37_ceiling_row(
+/// An S37 arm: what the server is spawned with beyond the row's fixed
+/// flags, and what the namespace DDL carries beyond the fixed tier
+/// block. The first arm of a row is its baseline.
+struct S37Arm {
+    label: String,
+    server_args: Vec<String>,
+    ddl_extra: Vec<Vec<u8>>,
+}
+
+/// The row's arms. Without `--s37-cold-read-qd`: step 1's ceiling pair
+/// (A = the shipping path, B = `--blind-overwrite-ceiling`, a
+/// `bench-diagnostics` build). With `--s37-cold-read-qd 64,128,256`:
+/// step 2's first discriminator (plan S37, 2026-08-23) — the shipping
+/// binary with the ADR-0055 D2 cap widened through the namespace's
+/// `COLD-READ-QD` key, the first value the baseline (64 = the default).
+/// Memory per cell is the pool underneath the cap: `qd × 16 KiB`
+/// (`COLD_POOL_BUF`), disclosed in the row note.
+fn s37_arms(flags: &Flags) -> Result<(Vec<S37Arm>, bool), String> {
+    let Some(list) = flags.get("s37-cold-read-qd") else {
+        return Ok((
+            vec![
+                S37Arm { label: "A".into(), server_args: Vec::new(), ddl_extra: Vec::new() },
+                S37Arm {
+                    label: "B".into(),
+                    server_args: vec!["--blind-overwrite-ceiling".into()],
+                    ddl_extra: Vec::new(),
+                },
+            ],
+            true,
+        ));
+    };
+    let mut arms = Vec::new();
+    for item in list.split(',') {
+        let qd: u16 = item.trim().parse().map_err(|e| format!("--s37-cold-read-qd {item}: {e}"))?;
+        if qd == 0 {
+            return Err("--s37-cold-read-qd: a queue depth of 0 is refused by the server".into());
+        }
+        arms.push(S37Arm {
+            label: format!("qd{qd}"),
+            server_args: Vec::new(),
+            ddl_extra: vec![b"COLD-READ-QD".to_vec(), qd.to_string().into_bytes()],
+        });
+    }
+    if arms.len() < 2 {
+        return Err("--s37-cold-read-qd wants at least two values (baseline first)".into());
+    }
+    Ok((arms, false))
+}
+
+/// The M4.5-S37 row: the beyond-RAM tiered `always` write legs (64 and
+/// 256 conns) on every arm, each replicate rotating the arm order (two
+/// arms = ABBA), fresh server + fill per leg. **Step 1** (no
+/// `--s37-cold-read-qd`): B is an upper bound from an unsound build —
+/// its gain is what removing the verifying cold read could ever buy;
+/// the predeclared rule (plan S37) reads "< 15 % throughput and < 20 %
+/// p99 ⇒ step 2 `Rejected`". **Step 2's discriminator**
+/// (`--s37-cold-read-qd`): the same legs with the shaper's cap widened —
+/// if the widest cap recovers most of A's gap to the ceiling, the read's
+/// cost is queueing in the cap (optimize the shaper, no shadow slots);
+/// if it barely moves, the read itself is the cost (shadow slots,
+/// ADR-first). The baseline's `cold_read_qd_p99` says whether the cap
+/// bound at all (≈ the cap = saturated).
+fn s37_row(
     flags: &Flags,
     infinityd: &str,
     cells: u16,
@@ -3087,22 +3270,32 @@ fn s37_ceiling_row(
 ) -> Result<(), String> {
     let keys = flags.u64_or("s37-keys", S37_DEFAULT_KEYS)?;
     let idle_s = flags.u64_or("leg-idle-s", 0)?;
-    m.note(format!(
-        "s37 row: {cells} cells · {replicates} replicates (ABBA) · tiered always, MEM-BUDGET \
-         {MEM_BUDGET}/cell, {keys} keys × 1 KiB filled per leg, then 100 % SET closed-loop \
-         pipeline 1 at {CONNS_LOW} and {CONNS_HIGH} conns for {duration} s · arm B = \
-         --blind-overwrite-ceiling (unsound ceiling instrument; bench-diagnostics build)"
-    ));
+    let (arms, ceiling) = s37_arms(flags)?;
+    let labels: Vec<&str> = arms.iter().map(|a| a.label.as_str()).collect();
+    if ceiling {
+        m.note(format!(
+            "s37 row: {cells} cells · {replicates} replicates (ABBA) · tiered always, \
+             MEM-BUDGET {MEM_BUDGET}/cell, {keys} keys × 1 KiB filled per leg, then 100 % SET \
+             closed-loop pipeline 1 at {CONNS_LOW} and {CONNS_HIGH} conns for {duration} s · \
+             arm B = --blind-overwrite-ceiling (unsound ceiling instrument; bench-diagnostics \
+             build)"
+        ));
+    } else {
+        m.note(format!(
+            "s37 row (step 2 discriminator): {cells} cells · {replicates} replicates (arm order \
+             rotated per replicate) · tiered always, MEM-BUDGET {MEM_BUDGET}/cell, {keys} keys × \
+             1 KiB filled per leg, then 100 % SET closed-loop pipeline 1 at {CONNS_LOW} and \
+             {CONNS_HIGH} conns for {duration} s · arms = COLD-READ-QD {} on the shipping \
+             binary (baseline first; ADR-0055 D2 cap, pool = qd × 16 KiB per cell)",
+            labels.join(", ")
+        ));
+    }
     let mut raw = String::new();
-    let mut legs: Vec<(usize, &'static str, usize, S37Leg)> = Vec::new();
+    let mut legs: Vec<(usize, String, usize, S37Leg)> = Vec::new();
     for rep in 0..replicates {
-        let order: [(&'static str, &[&str]); 2] = if rep % 2 == 0 {
-            [("A", &[]), ("B", &["--blind-overwrite-ceiling"])]
-        } else {
-            [("B", &["--blind-overwrite-ceiling"]), ("A", &[])]
-        };
-        for (arm, arm_args) in order {
-            let dir = format!("{data_root}/s37-{arm}-rep{rep}");
+        for slot in 0..arms.len() {
+            let arm = &arms[(rep + slot) % arms.len()];
+            let dir = format!("{data_root}/s37-{}-rep{rep}", arm.label);
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
             crate::m2rows::copy_probe_file(flags, std::path::Path::new(&dir))?;
@@ -3112,36 +3305,37 @@ fn s37_ceiling_row(
                 extra.push(pin.to_string());
             }
             extra.extend(crate::m2rows::pipeline_args(flags));
-            extra.extend(arm_args.iter().map(|s| (*s).to_string()));
+            extra.extend(arm.server_args.iter().cloned());
             let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
-            s35_idle(idle_s, &format!("s37 {arm} rep{rep}"));
+            s35_idle(idle_s, &format!("s37 {} rep{rep}", arm.label));
             let server = spawn_infinityd(infinityd, cells, &extra_refs)?;
             let port = server.port;
-            create_ns(
-                port,
-                &[
-                    b"INF.NS",
-                    b"CREATE",
-                    b"s37tier",
-                    b"MODE",
-                    b"durable",
-                    b"FSYNC",
-                    b"always",
-                    b"MEM-BUDGET",
-                    MEM_BUDGET.as_bytes(),
-                    b"DISK-BUDGET",
-                    b"10gb",
-                    b"TIER-IO-MODE",
-                    b"direct",
-                ],
-            )?;
+            let mut ddl: Vec<&[u8]> = vec![
+                b"INF.NS",
+                b"CREATE",
+                b"s37tier",
+                b"MODE",
+                b"durable",
+                b"FSYNC",
+                b"always",
+                b"MEM-BUDGET",
+                MEM_BUDGET.as_bytes(),
+                b"DISK-BUDGET",
+                b"10gb",
+                b"TIER-IO-MODE",
+                b"direct",
+            ];
+            ddl.extend(arm.ddl_extra.iter().map(Vec::as_slice));
+            create_ns(port, &ddl)?;
             await_fan(port, "s37tier", cells)?;
-            let infos = scrape_cells(port, cells)?;
-            if !infos.iter().all(|c| c.contains_key("blind_overwrites_ceiling")) {
-                return Err("s37: INFO has no blind_overwrites_ceiling — the binary is not a \
-                            bench-diagnostics build (cargo build --release --features \
-                            bench-diagnostics -p infinityd)"
-                    .into());
+            if ceiling {
+                let infos = scrape_cells(port, cells)?;
+                if !infos.iter().all(|c| c.contains_key("blind_overwrites_ceiling")) {
+                    return Err("s37: INFO has no blind_overwrites_ceiling — the binary is not a \
+                                bench-diagnostics build (cargo build --release --features \
+                                bench-diagnostics -p infinityd)"
+                        .into());
+                }
             }
             let fill = run_load(&LoadSpec {
                 port,
@@ -3155,13 +3349,15 @@ fn s37_ceiling_row(
                 ..LoadSpec::default()
             })?;
             if fill.errors > 0 {
-                return Err(format!("s37 {arm} rep{rep} fill: {} errors", fill.errors));
+                return Err(format!("s37 {} rep{rep} fill: {} errors", arm.label, fill.errors));
             }
             for conns in [CONNS_LOW, CONNS_HIGH] {
                 let leg = s37_leg(port, cells, conns, duration, keys)?;
                 raw.push_str(&format!(
-                    "rep{rep} {arm} c{conns:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
-                     p999_us={:<7.0} sets={} cold_resolves={} ({:.3}/set) blind={} ({:.3}/set)\n",
+                    "rep{rep} {:<5} c{conns:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
+                     p999_us={:<7.0} sets={} cold_resolves={} ({:.3}/set) blind={} ({:.3}/set) \
+                     cold_qd_p99={} cold_read_p99_us={} cold_queue_full={} cold_pool_dry={}\n",
+                    arm.label,
                     leg.ops_per_sec,
                     leg.p50_us,
                     leg.p99_us,
@@ -3171,54 +3367,416 @@ fn s37_ceiling_row(
                     leg.cold_resolves as f64 / leg.sets.max(1) as f64,
                     leg.blind,
                     leg.blind as f64 / leg.sets.max(1) as f64,
+                    leg.cold_qd_p99,
+                    leg.cold_read_p99_us,
+                    leg.cold_queue_full,
+                    leg.cold_pool_dry,
                 ));
                 println!("  s37 {}", raw.lines().last().unwrap_or(""));
-                legs.push((rep, arm, conns, leg));
+                legs.push((rep, arm.label.clone(), conns, leg));
             }
             drop(server);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
     let find = |rep: usize, arm: &str, conns: usize| {
-        legs.iter().find(|(r, a, c, _)| *r == rep && *a == arm && *c == conns).map(|(_, _, _, l)| l)
+        legs.iter().find(|(r, a, c, _)| *r == rep && a == arm && *c == conns).map(|(.., l)| l)
     };
+    let key = |name: String| -> &'static str { Box::leak(name.into_boxed_str()) };
     for conns in [CONNS_LOW, CONNS_HIGH] {
-        let mut ops_x = Vec::new();
-        let mut p50_gain = Vec::new();
-        let mut p99_gain = Vec::new();
-        let mut blind_share = Vec::new();
-        let mut cold_share = Vec::new();
-        for rep in 0..replicates {
-            let (Some(a), Some(b)) = (find(rep, "A", conns), find(rep, "B", conns)) else {
+        let tag: &'static str = if conns == CONNS_LOW { "c64" } else { "c256" };
+        if ceiling {
+            let mut ops_x = Vec::new();
+            let mut p50_gain = Vec::new();
+            let mut p99_gain = Vec::new();
+            let mut blind_share = Vec::new();
+            let mut cold_share = Vec::new();
+            for rep in 0..replicates {
+                let (Some(a), Some(b)) = (find(rep, "A", conns), find(rep, "B", conns)) else {
+                    continue;
+                };
+                ops_x.push(b.ops_per_sec / a.ops_per_sec.max(1.0));
+                p50_gain.push(a.p50_us / b.p50_us.max(1.0));
+                p99_gain.push(a.p99_us / b.p99_us.max(1.0));
+                blind_share.push(b.blind as f64 / b.sets.max(1) as f64);
+                cold_share.push(a.cold_resolves as f64 / a.sets.max(1) as f64);
+            }
+            if ops_x.is_empty() {
                 continue;
-            };
-            ops_x.push(b.ops_per_sec / a.ops_per_sec.max(1.0));
-            p50_gain.push(a.p50_us / b.p50_us.max(1.0));
-            p99_gain.push(a.p99_us / b.p99_us.max(1.0));
-            blind_share.push(b.blind as f64 / b.sets.max(1) as f64);
-            cold_share.push(a.cold_resolves as f64 / a.sets.max(1) as f64);
-        }
-        if ops_x.is_empty() {
+            }
+            m.set(key(format!("s37:ceiling_ops_x_{tag}")), median(&mut ops_x));
+            m.set(key(format!("s37:ceiling_p50_gain_x_{tag}")), median(&mut p50_gain));
+            m.set(key(format!("s37:ceiling_p99_gain_x_{tag}")), median(&mut p99_gain));
+            m.set(key(format!("s37:blind_share_arm_b_{tag}")), median(&mut blind_share));
+            m.set(key(format!("s37:cold_resolve_share_arm_a_{tag}")), median(&mut cold_share));
             continue;
         }
-        let tag: &'static str = if conns == CONNS_LOW { "c64" } else { "c256" };
-        let key = |name: &str| -> &'static str {
-            Box::leak(format!("s37:{name}_{tag}").into_boxed_str())
-        };
-        m.set(key("ceiling_ops_x"), median(&mut ops_x));
-        m.set(key("ceiling_p50_gain_x"), median(&mut p50_gain));
-        m.set(key("ceiling_p99_gain_x"), median(&mut p99_gain));
-        m.set(key("blind_share_arm_b"), median(&mut blind_share));
-        m.set(key("cold_resolve_share_arm_a"), median(&mut cold_share));
+        // The discriminator: every wider cap against the baseline cap,
+        // per replicate, medians; the widest cap also under the fixed
+        // keys the gate rows read.
+        let base = labels[0];
+        let mut base_qd: Vec<f64> = Vec::new();
+        for rep in 0..replicates {
+            if let Some(b) = find(rep, base, conns) {
+                base_qd.push(b.cold_qd_p99 as f64);
+            }
+        }
+        if !base_qd.is_empty() {
+            m.set(key(format!("s37:qd_base_cold_qd_p99_{tag}")), median(&mut base_qd));
+        }
+        for (i, arm) in labels.iter().enumerate().skip(1) {
+            let mut ops_x = Vec::new();
+            let mut p50_x = Vec::new();
+            let mut p99_x = Vec::new();
+            let mut arm_qd = Vec::new();
+            let mut arm_read_p99 = Vec::new();
+            let mut queue_full = Vec::new();
+            let mut pool_dry = Vec::new();
+            for rep in 0..replicates {
+                let (Some(b), Some(a)) = (find(rep, base, conns), find(rep, arm, conns)) else {
+                    continue;
+                };
+                ops_x.push(a.ops_per_sec / b.ops_per_sec.max(1.0));
+                p50_x.push(a.p50_us / b.p50_us.max(1.0));
+                p99_x.push(a.p99_us / b.p99_us.max(1.0));
+                arm_qd.push(a.cold_qd_p99 as f64);
+                arm_read_p99.push(a.cold_read_p99_us as f64);
+                queue_full.push(a.cold_queue_full as f64);
+                pool_dry.push(a.cold_pool_dry as f64);
+            }
+            if ops_x.is_empty() {
+                continue;
+            }
+            let (ops, p50, p99) = (median(&mut ops_x), median(&mut p50_x), median(&mut p99_x));
+            m.set(key(format!("s37:{arm}_ops_x_{tag}")), ops);
+            m.set(key(format!("s37:{arm}_p50_x_{tag}")), p50);
+            m.set(key(format!("s37:{arm}_p99_x_{tag}")), p99);
+            m.note(format!(
+                "s37 {tag} {arm} vs {base}: ops {ops:.3} × · p50 {p50:.3} × · p99 {p99:.3} × · \
+                 cold_read_qd_p99 {:.0} (base {:.0}) · cold_read_p99_us {:.0} · queue_full {:.0} \
+                 · pool_dry {:.0} (medians of {} pairs)",
+                median(&mut arm_qd),
+                median(&mut base_qd.clone()),
+                median(&mut arm_read_p99),
+                median(&mut queue_full),
+                median(&mut pool_dry),
+                ops_x.len()
+            ));
+            if i == labels.len() - 1 {
+                m.set(key(format!("s37:qd_wide_ops_x_{tag}")), ops);
+                m.set(key(format!("s37:qd_wide_p99_x_{tag}")), p99);
+            }
+        }
     }
-    m.row_open("cold-overwrite-ceiling");
-    m.row_write_amp(
-        "S37 step 1 (plan rule): B ÷ A throughput and A ÷ B p99 on the beyond-RAM tiered \
-         always write legs; B is an UNSOUND upper bound (the cold record is orphaned) — \
-         \"< 15 % throughput and < 20 % p99 ⇒ step 2 Rejected\"; `blind_share_arm_b` is the \
-         share of B's SETs that skipped a cold read (0 = the instrument never engaged), \
-         `cold_resolve_share_arm_a` the share of A's SETs that paid one",
-    );
+    m.row_open(if ceiling { "cold-overwrite-ceiling" } else { "cold-read-qd-discriminator" });
+    if ceiling {
+        m.row_write_amp(
+            "S37 step 1 (plan rule): B ÷ A throughput and A ÷ B p99 on the beyond-RAM tiered \
+             always write legs; B is an UNSOUND upper bound (the cold record is orphaned) — \
+             \"< 15 % throughput and < 20 % p99 ⇒ step 2 Rejected\"; `blind_share_arm_b` is the \
+             share of B's SETs that skipped a cold read (0 = the instrument never engaged), \
+             `cold_resolve_share_arm_a` the share of A's SETs that paid one",
+        );
+    } else {
+        m.row_write_amp(
+            "S37 step 2 discriminator (plan S37, 2026-08-23): each wider COLD-READ-QD arm over \
+             the baseline cap on the beyond-RAM tiered always write legs — `qd_wide_ops_x` \
+             against the ceiling's gap decides queueing (shaper) vs the read (shadow slots); \
+             `qd_base_cold_qd_p99` ≈ the cap means the cap bound; a p99 ratio above 1.1 is a \
+             tail cost the wider cap charges; not a write-amplification row",
+        );
+    }
     m.raw_section("s37 per-leg samples", &raw);
+    Ok(())
+}
+
+// ---- M4.5-S42: the stock first boot (ADR-0091 D1) ----------------------------
+
+/// One S42 replicate's facts: the two boots of a fresh data directory
+/// under the product default (`--device-probe auto`), the provenance
+/// INFO reported after each, and the S35 AC leg + read leg run on the
+/// directory the first boot probed.
+struct S42Leg {
+    first_boot_s: f64,
+    second_boot_s: f64,
+    first_source: String,
+    second_source: String,
+    schema: u64,
+    identity: String,
+    /// The class the probe wrote, and INFO's active-segment class at
+    /// `loading:0` and after the AC leg (the upgrade rotation between).
+    file_class: String,
+    class_at_boot: String,
+    class_after_leg: String,
+    rotations_upgrade: u64,
+    budget_model: String,
+    ac: S35Leg,
+    read_ops_per_sec: f64,
+}
+
+/// The value of an INFO field every cell agrees on, or `mixed(...)` —
+/// a provenance the cells disagree on is a finding, never a median.
+fn s42_agreed(infos: &[std::collections::BTreeMap<String, String>], field: &str) -> String {
+    let mut values: Vec<&str> =
+        infos.iter().map(|c| c.get(field).map_or("", String::as_str)).collect();
+    values.sort_unstable();
+    values.dedup();
+    match values.as_slice() {
+        [one] => (*one).to_string(),
+        many => format!("mixed({})", many.join("|")),
+    }
+}
+
+/// Boots the stock server on `dir` — no arm flags, the probe lifecycle
+/// left to the binary — and returns the wall from spawn to `loading:0`
+/// on every cell with the INFO scraped at that instant. The listener
+/// accepts before recovery completes (`-LOADING`), so "ready" is the
+/// cells' word, never the port's — the first smoke read a 0.00 s
+/// second boot and a provenance the cells had not all published yet.
+fn s42_boot(flags: &Flags, infinityd: &str, cells: u16, dir: &str) -> Result<S42Boot, String> {
+    let mut extra: Vec<String> = vec!["--data-dir".into(), dir.to_string()];
+    if let Some(pin) = flags.get("pin-start") {
+        extra.push("--pin-start".into());
+        extra.push(pin.to_string());
+    }
+    // Named, so the harness rule (`off` unless the spawn says otherwise)
+    // does not turn the product's default into the dev tier.
+    extra.push("--device-probe".into());
+    extra.push("auto".into());
+    let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
+    let t0 = Instant::now();
+    let mut server = spawn_infinityd(infinityd, cells, &extra_refs)?;
+    let port = server.port;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        if let Some(status) = server.try_exited() {
+            return Err(format!("s42: server exited during boot ({status})"));
+        }
+        if let Ok(infos) = scrape_cells(port, cells)
+            && infos.len() == usize::from(cells)
+            && sum_field(&infos, "loading") == 0
+        {
+            let wall_s = t0.elapsed().as_secs_f64();
+            return Ok(S42Boot { server, port, wall_s, infos });
+        }
+        if Instant::now() >= deadline {
+            return Err("s42: boot never reached loading:0 on every cell within 300 s".into());
+        }
+        #[allow(clippy::disallowed_methods)] // bench orchestration, not cell code
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The class the probe wrote (`barrier_class = "fua" | "flush"` in the
+/// file the first boot left in `dir`), or `absent`. INFO's
+/// `barrier_class` is the *active segment's* class — `flush` on a fresh
+/// cell until ADR-0086 D4's upgrade rotation — so the configured class
+/// is read where it was decided.
+fn s42_file_class(dir: &str) -> String {
+    let path = std::path::Path::new(dir).join("io-properties.toml");
+    let Ok(text) = std::fs::read_to_string(path) else { return "absent".to_string() };
+    text.lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "barrier_class").then(|| value.trim().trim_matches('"').to_string())
+        })
+        .unwrap_or_else(|| "absent".to_string())
+}
+
+/// A booted stock server: the guard, its port, the wall to `loading:0`
+/// and the INFO every cell answered at that instant.
+struct S42Boot {
+    server: crate::gaterun::ServerGuard,
+    port: u16,
+    wall_s: f64,
+    infos: Vec<std::collections::BTreeMap<String, String>>,
+}
+
+/// The M4.5-S42 row (ADR-0091 D6): a fresh data directory booted twice
+/// under the product default — the first boot probes and writes the
+/// schema-3 model (`probed-at-boot`), the second reads it (`file`) —
+/// then the S35 AC leg (32 conns closed loop) and the pipelined read
+/// leg on that directory. Gates: the probe's cost (first − second boot
+/// ≤ 15 s), both provenances, the schema, and the AC leg's p50 over
+/// the barrier of the class the probe chose; throughput and reads are
+/// disclosed against the probed arm's replicate spread in the ledger.
+fn s42_first_boot_row(
+    flags: &Flags,
+    infinityd: &str,
+    cells: u16,
+    duration: u64,
+    replicates: usize,
+    data_root: &str,
+    m: &mut Measurements,
+) -> Result<(), String> {
+    // The row is the stock boot: an arm flag would measure another
+    // configuration under this row's name.
+    for arm in [
+        "barrier-class",
+        "frames-in-flight",
+        "device-probe",
+        "device-write-mbps",
+        "seal-pace",
+        "fill-window-us",
+        "fill-target-kib",
+        "flush-group-window-us",
+        "staging-mib",
+        "model-absent",
+    ] {
+        if flags.get(arm).is_some() {
+            return Err(format!("--only-s42 measures the stock boot; --{arm} is not an arm here"));
+        }
+    }
+    let idle_s = flags.u64_or("leg-idle-s", S35_LEG_IDLE_S)?;
+    m.note(format!(
+        "s42 row: stock boot — `infinityd --data-dir <fresh> --cells {cells}{}` (no arm flags; \
+         the binary's `--device-probe auto` default, named on the spawn) · {replicates} \
+         replicates · first boot timed to ready (the probe), second boot on the same directory \
+         timed to ready (the file), then the S35 AC leg ({S35_CONNS_AC} conns pipeline 1, \
+         {duration} s) and the read leg (64 conns × P16) on that directory · {idle_s} s idle \
+         before every durable leg",
+        flags.get("pin-start").map(|p| format!(" --pin-start {p}")).unwrap_or_default()
+    ));
+    let mut raw = String::new();
+    let mut legs: Vec<S42Leg> = Vec::new();
+    for rep in 0..replicates {
+        let dir = format!("{data_root}/s42-rep{rep}");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
+        s35_idle(idle_s, &format!("s42 rep{rep} first boot"));
+        let first = s42_boot(flags, infinityd, cells, &dir)?;
+        let first_boot_s = first.wall_s;
+        let first_source = s42_agreed(&first.infos, "io_properties_source");
+        let schema = crate::gaterun::max_field(&first.infos, "io_properties_schema");
+        let identity = s42_agreed(&first.infos, "io_properties_identity");
+        drop(first.server);
+        let file_class = s42_file_class(&dir);
+        let second = s42_boot(flags, infinityd, cells, &dir)?;
+        let second_boot_s = second.wall_s;
+        let second_source = s42_agreed(&second.infos, "io_properties_source");
+        let class_at_boot = s42_agreed(&second.infos, "barrier_class");
+        let budget_model = s42_agreed(&second.infos, "io_budget_model");
+        let server = second.server;
+        let port = second.port;
+        create_ns(
+            port,
+            &[b"INF.NS", b"CREATE", b"s35alw", b"MODE", b"durable", b"FSYNC", b"always"],
+        )?;
+        await_fan(port, "s35alw", cells)?;
+        let (p50_key, p99_key) = if file_class == "fua" {
+            ("fua_latency_p50_us", "fua_latency_p99_us")
+        } else {
+            ("fsync_latency_p50_us", "fsync_latency_p99_us")
+        };
+        s35_idle(idle_s, &format!("s42 rep{rep} c{S35_CONNS_AC}"));
+        let ac = s35_write_leg(port, cells, S35_CONNS_AC, duration, p50_key, p99_key)?;
+        let after = scrape_cells(port, cells)?;
+        let class_after_leg = s42_agreed(&after, "barrier_class");
+        let rotations_upgrade = sum_field(&after, "rotations_upgrade");
+        let rd = run_load(&LoadSpec {
+            port,
+            conns: 64,
+            pipeline: 16,
+            duration: Duration::from_secs(duration),
+            warmup: Duration::from_secs(2),
+            set_weight: 0,
+            get_weight: 1,
+            keys: FILL_KEYS,
+            key_prefix: "s35alw:".into(),
+            value_size: 1024,
+            setup: vec![vec![b"INF.NS".to_vec(), b"USE".to_vec(), b"s35alw".to_vec()]],
+            ..LoadSpec::default()
+        })?;
+        if rd.errors > 0 {
+            return Err(format!(
+                "s42 rep{rep} read leg: {} errors (first: {:?})",
+                rd.errors,
+                rd.error_samples.first()
+            ));
+        }
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+        raw.push_str(&format!(
+            "rep{rep} first_boot_s={first_boot_s:.2} second_boot_s={second_boot_s:.2} \
+             source={first_source}→{second_source} schema={schema} identity={identity} \
+             file_class={file_class} info_class={class_at_boot}→{class_after_leg} \
+             rotations_upgrade={rotations_upgrade} budget_model={budget_model} \
+             c{S35_CONNS_AC} ops/s={:<8.0} \
+             p50_us={:<6.0} p99_us={:<7.0} barrier_p50_us={:<5.0} p50/barrier={:.2} \
+             frames_in_flight_max={} acks/fsync={:.1} read c64 P16 ops/s={:.0}\n",
+            ac.ops_per_sec,
+            ac.p50_us,
+            ac.p99_us,
+            ac.barrier_p50_us,
+            ac.p50_us / ac.barrier_p50_us.max(1.0),
+            ac.frames_in_flight_max,
+            ac.acks_per_fsync,
+            rd.ops_per_sec
+        ));
+        println!("  s42 {}", raw.lines().last().unwrap_or(""));
+        legs.push(S42Leg {
+            first_boot_s,
+            second_boot_s,
+            first_source,
+            second_source,
+            schema,
+            identity,
+            file_class,
+            class_at_boot,
+            class_after_leg,
+            rotations_upgrade,
+            budget_model,
+            ac,
+            read_ops_per_sec: rd.ops_per_sec,
+        });
+    }
+    let col = |f: &dyn Fn(&S42Leg) -> f64| -> f64 {
+        let mut v: Vec<f64> = legs.iter().map(f).collect();
+        median(&mut v)
+    };
+    let all =
+        |pred: &dyn Fn(&S42Leg) -> bool| -> f64 { f64::from(u8::from(legs.iter().all(pred))) };
+    m.set("s42:first_boot_s", col(&|l| l.first_boot_s));
+    m.set("s42:second_boot_s", col(&|l| l.second_boot_s));
+    m.set("s42:probe_overhead_s", col(&|l| l.first_boot_s - l.second_boot_s));
+    m.set("s42:first_boot_probed", all(&|l| l.first_source == "probed-at-boot"));
+    m.set("s42:second_boot_from_file", all(&|l| l.second_source == "file"));
+    m.set("s42:identity_verified", all(&|l| l.identity == "verified"));
+    m.set("s42:schema", col(&|l| l.schema as f64));
+    m.set("s42:p50_over_barrier_x", col(&|l| l.ac.p50_us / l.ac.barrier_p50_us.max(1.0)));
+    m.set("s42:always_c32_ops_per_sec", col(&|l| l.ac.ops_per_sec));
+    m.set("s42:always_c32_p50_us", col(&|l| l.ac.p50_us));
+    m.set("s42:always_c32_p99_us", col(&|l| l.ac.p99_us));
+    m.set("s42:barrier_p50_us", col(&|l| l.ac.barrier_p50_us));
+    m.set("s42:read_c64p16_ops_per_sec", col(&|l| l.read_ops_per_sec));
+    m.set("s42:file_class_fua", all(&|l| l.file_class == "fua"));
+    let classes: Vec<String> = legs
+        .iter()
+        .map(|l| {
+            format!(
+                "file {} / INFO {}→{} ({} upgrade rotations; {})",
+                l.file_class,
+                l.class_at_boot,
+                l.class_after_leg,
+                l.rotations_upgrade,
+                l.budget_model
+            )
+        })
+        .collect();
+    m.note(format!(
+        "s42 class per replicate — the probe's verdict, then INFO's active-segment class at \
+         loading:0 → after the AC leg (ADR-0086 D4: a fresh cell upgrades at its first \
+         rotation; `flush` at loading:0 is the not-yet-zeroed first segment, not the verdict), \
+         the budget model: {}; every boot line is in the server stderr capture when \
+         INF_GATERUN_STDERR_DIR is set",
+        classes.join(" / ")
+    ));
+    m.row_open("first-boot-lifecycle");
+    m.row_write_amp(
+        "not measured by this row — S42 gates the probe lifecycle (ADR-0091 D6): the first \
+         boot's cost over the second, both provenances, the schema, and the S35 AC leg on the \
+         directory the boot probed; write amplification is S36's row",
+    );
+    m.raw_section("s42 per-replicate samples", &raw);
     Ok(())
 }
