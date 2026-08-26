@@ -603,6 +603,9 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         // M4.5-S34 (2026-08-25): the m2 everysec penalty row alone (the
         // barrier-class A/B leg).
         "only-everysec",
+        // M4.5-S34 (2026-08-26): the S35 read leg on a filled, quiesced
+        // namespace (both arms read the same keys, no misses).
+        "read-leg-fill",
         "model-absent",
     ],
     &[
@@ -711,6 +714,7 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         // M4.5-S39d baseline: `recycling-off` (ADR-0090 A10) or
         // `flush-class` (the S34 C38b replay clause).
         "s39d-baseline",
+        "read-leg-fill",
         "model-absent",
         // M4.5-S35 row: seconds idled before every durable leg (the S34
         // drive-state rule; default 40, 0 for harness smoke).

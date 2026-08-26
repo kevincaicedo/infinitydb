@@ -664,6 +664,15 @@ pub fn render() -> String {
     push("reaches the page cache every event loop. The power-loss window is unchanged;");
     push("`always` acks are never held (their frames carry the barrier the ack waits on).");
     push("");
+    push("On the FLUSH class (a device the probe ruled `flush`, or `--device-probe off`");
+    push("with no model) a due barrier frame on a packed segment may wait, bounded, for");
+    push("the round of clients it just acked to re-arrive (M4.5-S43, ADR-0092; on by");
+    push("default at `--flush-group-window-us 250` since the binding A/B of 2026-08-26;");
+    push("0 turns it off; inert under the FUA class): an `always` ack may then arrive up");
+    push("to 250 µs later than its barrier alone would allow, and `everysec` records");
+    push("riding that held frame carry the same ≤ 250 µs of extra process-crash exposure.");
+    push("The power-loss window is unchanged; durability semantics are unchanged.");
+    push("");
     push("## Absent (owner milestone)");
     push("");
     push("| Family | Arrives |");

@@ -176,7 +176,10 @@ impl Default for Args {
             seal_pace: None,
             fill_window_us: 1_000,
             fill_target_kib: 16,
-            flush_group_window_us: 0,
+            // M4.5-S43 (ADR-0092, campaign K 2026-08-26): the FLUSH-class
+            // group hold ships at the measured arm's window — 250 µs; `0`
+            // is the off arm; inert under the FUA class (rule 3).
+            flush_group_window_us: 250,
             device_probe: DeviceProbe::Auto,
             probe_seconds: inf_probe::BOOT_SECONDS_PER_ROW,
             log_staging_mib: 4,
@@ -371,7 +374,7 @@ fn parse_args() -> Result<Args, String> {
                      [--conn-default-ns NAME] [--frames-in-flight auto|K] \
                      [--barrier-class flush|fua] [--device-write-mbps N] [--seal-pace probe|N] \
                      [--fill-window-us 1000] [--fill-target-kib 16] \
-                     [--flush-group-window-us 0] [--device-probe auto|off] \
+                     [--flush-group-window-us 250] [--device-probe auto|off] \
                      [--probe-seconds 1] [--log-staging-mib 4] \
                      [--early-fabric-flush] \
                      [--remote-first-execute] \
@@ -906,8 +909,8 @@ fn cell_main(
                 window: inf_foundation::time::Nanos::from_micros(args.fill_window_us),
                 target_bytes: args.fill_target_kib << 10,
             },
-            // M4.5-S43 (ADR-0092): the FLUSH-class group hold — off by
-            // default, the arm when asked.
+            // M4.5-S43 (ADR-0092, campaign K): the FLUSH-class group hold —
+            // 250 µs by default since 2026-08-26, `0` the off arm.
             group: inf_server::GroupHoldConfig {
                 window: inf_foundation::time::Nanos::from_micros(args.flush_group_window_us),
             },
