@@ -535,3 +535,138 @@ unit = "share (blind_overwrites_ceiling ÷ SETs, arm B at 256 conns, per-replica
 tier = "linux-reference-box"
 source = "s37:blind_share_arm_b_c256"
 measured_by = "gate-run m4.5 --only-s37 (bench-diagnostics binary)"
+
+# M4.5-S37 step 2's first discriminator (plan S37, 2026-08-23; harness
+# 2026-08-25): the shipping binary with the ADR-0055 D2 cold-read cap
+# widened through `COLD-READ-QD` (baseline 64) on the same beyond-RAM
+# tiered always write legs. `qd_wide_ops_x` is the widest arm over the
+# baseline; read against campaign J's ceiling gap in the ledger (the
+# decision rule is written there, not here) — informational both ways.
+[[gate]]
+id = "s37_qd_wide_ops_x_c256"
+name = "S37 step 2 discriminator: widest COLD-READ-QD arm throughput over the baseline cap at 256 conns"
+threshold = 1.0
+comparator = ">="
+unit = "x (arm ÷ baseline ops/s on the beyond-RAM tiered always write leg, per-replicate median; the ledger reads it against the ceiling's gap)"
+tier = "linux-reference-box"
+source = "s37:qd_wide_ops_x_c256"
+measured_by = "gate-run m4.5 --only-s37 --s37-cold-read-qd <base>,...,<widest>"
+informational = true
+
+[[gate]]
+id = "s37_qd_wide_p99_x_c256"
+name = "S37 step 2 discriminator: widest COLD-READ-QD arm p99 over the baseline cap at 256 conns (the tail the wider cap charges)"
+threshold = 1.1
+comparator = "<="
+unit = "x (arm ÷ baseline p99, per-replicate median)"
+tier = "linux-reference-box"
+source = "s37:qd_wide_p99_x_c256"
+measured_by = "gate-run m4.5 --only-s37 --s37-cold-read-qd <base>,...,<widest>"
+informational = true
+
+[[gate]]
+id = "s37_qd_base_cold_qd_p99_c256"
+name = "S37 step 2 discriminator: the baseline's device QD p99 at issue (≈ the cap = the cap bound; validity of the discriminator)"
+threshold = 1.0
+comparator = ">="
+unit = "device reads in flight at the p99 issue (INFO cold_read_qd_p99, worst cell, whole-session histogram — carries the c64 leg's samples)"
+tier = "linux-reference-box"
+source = "s37:qd_base_cold_qd_p99_c256"
+measured_by = "gate-run m4.5 --only-s37 --s37-cold-read-qd"
+informational = true
+
+# M4.5-S42 (ADR-0091 D6, 2026-08-25): the stock first boot. A fresh data
+# directory booted twice under the product default: the first boot probes
+# (`probed-at-boot`, schema 3), the second reads the file (`file`); the
+# S35 AC leg and the read leg then run on that directory. The probe's
+# cost binds (first − second ≤ 15 s); the provenance and schema bind as
+# validity; the AC leg's p50 over its barrier binds at S35's bar (the
+# probed class on the reference device is FUA — its spread is the
+# ledger's comparison, the ops/s and reads are disclosed there).
+[[gate]]
+id = "s42_probe_overhead_s"
+name = "S42: first boot over second boot of a fresh data directory (the in-boot probe's cost)"
+threshold = 15.0
+comparator = "<="
+unit = "s (spawn to first accepted connection, first − second, per-replicate median)"
+tier = "linux-reference-box"
+source = "s42:probe_overhead_s"
+measured_by = "gate-run m4.5 --only-s42"
+
+[[gate]]
+id = "s42_first_boot_probed"
+name = "S42: every first boot reported io_properties_source=probed-at-boot on every cell (validity)"
+threshold = 1.0
+comparator = ">="
+unit = "1 = every replicate, 0 = a replicate did not"
+tier = "linux-reference-box"
+source = "s42:first_boot_probed"
+measured_by = "gate-run m4.5 --only-s42"
+
+[[gate]]
+id = "s42_second_boot_from_file"
+name = "S42: every second boot reported io_properties_source=file with the identity verified (validity)"
+threshold = 1.0
+comparator = ">="
+unit = "1 = every replicate, 0 = a replicate did not"
+tier = "linux-reference-box"
+source = "s42:second_boot_from_file"
+measured_by = "gate-run m4.5 --only-s42"
+
+[[gate]]
+id = "s42_schema"
+name = "S42: the file the first boot wrote is schema 3 (identity-bound)"
+threshold = 3.0
+comparator = ">="
+unit = "io_properties_schema (INFO)"
+tier = "linux-reference-box"
+source = "s42:schema"
+measured_by = "gate-run m4.5 --only-s42"
+
+[[gate]]
+id = "s42_p50_over_barrier"
+name = "S42: always p50 over the barrier p50 at 32 conns on the directory the first boot probed (S35's bar on the stock boot)"
+threshold = 1.3
+comparator = "<="
+unit = "x (client p50 / barrier p50 of the class the probe chose; S35's bar)"
+tier = "linux-reference-box"
+source = "s42:p50_over_barrier_x"
+measured_by = "gate-run m4.5 --only-s42"
+
+[[gate]]
+id = "s42_always_c32_ops_per_sec"
+name = "S42: always c32 ops/s on the stock boot (informational — read against the probed arm's replicate spread)"
+threshold = 0.0
+comparator = ">="
+unit = "ops/s (32 conns closed loop, per-replicate median)"
+tier = "linux-reference-box"
+source = "s42:always_c32_ops_per_sec"
+measured_by = "gate-run m4.5 --only-s42"
+informational = true
+
+# M4.5-S39d (2026-08-25): the replay phase's rate on the slowest cell,
+# per arm — the C38b "≥ 1 GB/s per cell over the replay phase" statistic
+# on the loop clock (the instrument that row said it lacked), at this
+# row's fixed-work shape; informational (C38b's own row is the 10 GB
+# tiered node).
+[[gate]]
+id = "s39d_replay_gbps_per_cell_arm"
+name = "S39d: replay-phase rate on the slowest cell, arm (C38b's statistic on the loop clock, this row's shape — informational)"
+threshold = 1.0
+comparator = ">="
+unit = "GB/s per cell (recover_replay_bytes ÷ recover_replay_us on the slowest cell, per-replicate median)"
+tier = "linux-reference-box"
+source = "s39d:replay_gbps_per_cell_arm"
+measured_by = "gate-run m4.5 --only-s39d"
+informational = true
+
+[[gate]]
+id = "s39d_replay_gbps_per_cell_base"
+name = "S39d: replay-phase rate on the slowest cell, baseline (informational)"
+threshold = 1.0
+comparator = ">="
+unit = "GB/s per cell (same statistic, baseline arm)"
+tier = "linux-reference-box"
+source = "s39d:replay_gbps_per_cell_base"
+measured_by = "gate-run m4.5 --only-s39d"
+informational = true
