@@ -1,0 +1,75 @@
+# 2026-08-26T01:04:21-04:00 binary=infinityd c42c475 (git c42c475986d2, x86_64-unknown-linux-gnu) git=c42c475 dirty=0 thermal: 27800 36000 40000  gov=performance no_turbo=1 strays=0 load=1.76 2.74 3.00 devstat= 6301779 48396 252747465 6212674 11077247 3350086 626094751 20291192 0 1622017 26944308 50118 0 200122912 25922 514310 414520
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before s40 rep0
+  s40 rep0: rep0 achieved=90397 (0.904 of offered) offered=6000022 sent=5423886 skipped_pipeline_full=576136 p50_us=66 p99_us=97 p999_us=181 max_us=804709 max_intended_at_s=47.107 max_sent_at_s=47.107 max_done_at_s=47.912 seconds_over_50ms=10 top_seconds=[(47, 804709), (34, 575357), (50, 527016), (46, 519903), (53, 394522)] cpu_pct=357 ckpts=16 ckpt_bytes=3519950848 stall_p99_us=18943 stall_p999_us=47103 parked=443 dev_mib=10270 attribution=checkpoint+device-busy+admission-park [checkpoint in flight (4→4 cells, +0 bytes), admission parks (+49), frame waits (+13 barrier, +0 rotation, +0 pace); device: +35 MiB written, 98649 ms writing, io busy 90 % of the 1007 ms window]
+  s35: 40s drive-state idle before s40 rep1
+  s40 rep1: rep1 achieved=99812 (0.998 of offered) offered=6000031 sent=5988792 skipped_pipeline_full=11239 p50_us=67 p99_us=99 p999_us=165 max_us=17507 max_intended_at_s=31.597 max_sent_at_s=31.597 max_done_at_s=31.614 seconds_over_50ms=0 top_seconds=[(31, 17507), (5, 15794), (20, 13268), (3, 7386), (0, 3329)] cpu_pct=392 ckpts=16 ckpt_bytes=3534770176 stall_p99_us=11519 stall_p999_us=27135 parked=0 dev_mib=11129 attribution=checkpoint+rotation+device-busy [checkpoint in flight (4→4 cells, +0 bytes), rotation (+4), checkpoint offers deferred (+20890), frame waits (+0 barrier, +3 rotation, +0 pace); device: +93 MiB written, 6803 ms writing, io busy 76 % of the 253 ms window]
+  s35: 40s drive-state idle before s40 rep2
+  s40 rep2: rep2 achieved=99830 (0.998 of offered) offered=6000027 sent=5989881 skipped_pipeline_full=10146 p50_us=68 p99_us=99 p999_us=173 max_us=25738 max_intended_at_s=20.270 max_sent_at_s=20.270 max_done_at_s=20.296 seconds_over_50ms=0 top_seconds=[(20, 25738), (46, 17665), (3, 8447), (5, 6451), (58, 3379)] cpu_pct=392 ckpts=16 ckpt_bytes=3521200128 stall_p99_us=2367 stall_p999_us=40959 parked=0 dev_mib=11106 attribution=index-grow [index grow, stop-and-copy (+3); device: +27 MiB written, 39 ms writing, io busy 12 % of the 253 ms window]
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (device characterization — informational since the ADR-0087 fourth amendment, 2026-08-22) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+  S39b: warmed zero-fill bytes per log frame byte under recycling (arm) PENDING (tooling)
+  S39b: rotations not served by the pool over the warmed window, worst cell PENDING (tooling)
+  S39b: padding share moved by recycling (the S39c control) PENDING (tooling)
+  S39b: always c32 p50 under recycling over baseline PENDING (tooling)
+  S39b: always c32 p99 under recycling over baseline PENDING (tooling)
+  S39b: read leg under recycling over baseline (the E4.7 ±2 % rule) PENDING (tooling)
+  S39b: first crash-restart recovery boot on the recycled log over baseline PENDING (tooling)
+  S39b: rotations per cell the row actually performed (validity) PENDING (tooling)
+  S39b/D9: pool waits fed before the bound over waits ended (arm) PENDING (tooling)
+  S39b/D9: rotations onto an un-zeroed segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: rotations that found no next segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: preallocs refused for space on the arm, worst replicate PENDING (tooling)
+  S39b: accounted host bytes per log frame byte under recycling (informational) PENDING (tooling)
+  S39b: block-device sectors written per log frame byte under recycling (informational) PENDING (tooling)
+  S39d: fixed-work first-boot recovery, slowest cell's engine total, arm over baseline PENDING (tooling)
+  S39d: absolute first-boot recovery wall on the recycled log (the S18 < 15 s STOP gate re-read) PENDING (tooling)
+  S39d: both arms recovered exactly the records written (fixed-work validity) PENDING (tooling)
+  S39d: slack-audit phase time over the cell sums, arm over baseline (the recycling term, informational) PENDING (tooling)
+  S40: everysec max latency at the memtier shape, worst leg (S27 D5) FAIL
+  S40: achieved over offered rate, worst leg (validity — a saturated leg's max is a saturation number) PASS
+  S40: seconds whose per-second maximum exceeded 50 ms, summed over legs (informational) FAIL (informational)
+  S37 step 1: blind-overwrite ceiling throughput over the shipping path at 256 conns PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling p99 gain at 256 conns PENDING (tooling)
+  S37 step 1: share of arm B's SETs that skipped a cold read (validity — 0 = the instrument never engaged) PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm throughput over the baseline cap at 256 conns PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm p99 over the baseline cap at 256 conns (the tail the wider cap charges) PENDING (tooling)
+  S37 step 2 discriminator: the baseline's device QD p99 at issue (≈ the cap = the cap bound; validity of the discriminator) PENDING (tooling)
+  S42: first boot over second boot of a fresh data directory (the in-boot probe's cost) PENDING (tooling)
+  S42: every first boot reported io_properties_source=probed-at-boot on every cell (validity) PENDING (tooling)
+  S42: every second boot reported io_properties_source=file with the identity verified (validity) PENDING (tooling)
+  S42: the file the first boot wrote is schema 3 (identity-bound) PENDING (tooling)
+  S42: always p50 over the barrier p50 at 32 conns on the directory the first boot probed (S35's bar on the stock boot) PENDING (tooling)
+  S42: always c32 ops/s on the stock boot (informational — read against the probed arm's replicate spread) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, arm (C38b's statistic on the loop clock, this row's shape — informational) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, baseline (informational) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s40/campaign-O/run/1787720968-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-26T01:09:28-04:00 ===
+# 2026-08-26T01:09:28-04:00 binary=infinityd c42c475 (git c42c475986d2, x86_64-unknown-linux-gnu) git=c42c475 dirty=0 thermal: 27800 35000 46000  gov=performance no_turbo=1 strays=0 load=5.28 3.48 3.19 devstat= 6301968 48396 252755761 6213427 12467871 3368053 692870303 21617661 0 1677118 28272576 50118 0 200122912 25922 515269 415565
+CAMPAIGN DONE

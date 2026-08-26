@@ -1,0 +1,9 @@
+infinityd: io-properties: io-properties.toml (schema 2, identity unverifiable (schema 2))
+infinityd: log barrier class flush (source: --barrier-class; fua_max_frame_bytes 262144; probed p50 fua 330 µs / flush 924 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model probed (schema 2): write 486 MiB/s, 2540 ops/s (qd4 barriers 3597/s); per-cell share write 121 MiB/s
+infinityd c42c475 (git c42c475986d2, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 39271, backend io_uring, route natural
+infinityd: listening on 39271
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: recovery 0/4 cells ready, 1460363264/6381465600 bytes (22.9%), eta 4s
+control: recovery 0/4 cells ready, 3023884288/6381465600 bytes (47.4%), eta 3s

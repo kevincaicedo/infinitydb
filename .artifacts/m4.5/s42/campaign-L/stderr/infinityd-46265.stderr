@@ -1,0 +1,52 @@
+infinityd: io-properties absent: probing the device under /home/kcaicedo/bench-data/s42/data-L/s42-rep0 (1 s per row, 256 MiB scratch) — once per data directory (ADR-0091 D1)
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 5s
+control: cell 1 not ready — in spawned (0/0 bytes) for 5s
+control: cell 2 not ready — in spawned (0/0 bytes) for 5s
+control: cell 3 not ready — in spawned (0/0 bytes) for 5s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 6s
+control: cell 1 not ready — in spawned (0/0 bytes) for 6s
+control: cell 2 not ready — in spawned (0/0 bytes) for 6s
+control: cell 3 not ready — in spawned (0/0 bytes) for 6s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 7s
+control: cell 1 not ready — in spawned (0/0 bytes) for 7s
+control: cell 2 not ready — in spawned (0/0 bytes) for 7s
+control: cell 3 not ready — in spawned (0/0 bytes) for 7s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 8s
+control: cell 1 not ready — in spawned (0/0 bytes) for 8s
+control: cell 2 not ready — in spawned (0/0 bytes) for 8s
+control: cell 3 not ready — in spawned (0/0 bytes) for 8s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 9s
+control: cell 1 not ready — in spawned (0/0 bytes) for 9s
+control: cell 2 not ready — in spawned (0/0 bytes) for 9s
+control: cell 3 not ready — in spawned (0/0 bytes) for 9s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 10s
+control: cell 1 not ready — in spawned (0/0 bytes) for 10s
+control: cell 2 not ready — in spawned (0/0 bytes) for 10s
+control: cell 3 not ready — in spawned (0/0 bytes) for 10s
+infinityd: probe: flush bytes=4096     p50=  1199 us  p99=  1551 us  barriers/s=   814
+infinityd: probe: fua   bytes=4096     p50=   294 us  p99=   646 us  barriers/s=  2967
+infinityd: probe: flush bytes=65536    p50=  1214 us  p99=  1665 us  barriers/s=   798
+infinityd: probe: fua   bytes=65536    p50=   327 us  p99=   688 us  barriers/s=  2756
+infinityd: probe: flush bytes=262144   p50=  1418 us  p99=  2547 us  barriers/s=   685
+infinityd: probe: fua   bytes=262144   p50=   441 us  p99=  1355 us  barriers/s=  2059
+infinityd: probe: flush bytes=1048576  p50=  1887 us  p99=  3709 us  barriers/s=   500
+infinityd: probe: fua   bytes=1048576  p50=   913 us  p99=  2824 us  barriers/s=   966
+infinityd: probe: fua   bytes=4096     writers=4 barriers/s= 10571 (aggregate)
+infinityd: io-properties: probed-at-boot (schema 3, 10.5 s; identity ext4 /dev/nvme0n1p3 uuid c97c5418…) → barrier class fua
+infinityd: log barrier class fua (source: probed-at-boot; fua_max_frame_bytes 1048576; probed p50 fua 294 µs / flush 1199 µs); frames in flight 3 (auto: fua) × 4 MiB staging
+infinityd: segment recycling on, 1 slot(s) × 256 MiB per cell, pool wait quarter (ADR-0090)
+infinityd: device model probed (schema 3): write 514 MiB/s, 2967 ops/s (qd4 barriers 10571/s); per-cell share write 128 MiB/s
+infinityd c42c475 (git c42c475986d2, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 46265, backend io_uring, route natural
+infinityd: listening on 46265
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }

@@ -1,0 +1,14 @@
+infinityd: io-properties: io-properties.toml (schema 2, identity unverifiable (schema 2))
+infinityd: log barrier class fua (source: --barrier-class; fua_max_frame_bytes 262144; probed p50 fua 330 µs / flush 924 µs); frames in flight 3 (auto: fua) × 4 MiB staging
+infinityd: segment recycling on, 1 slot(s) × 256 MiB per cell, pool wait quarter (ADR-0090)
+infinityd: device model probed (schema 2): write 486 MiB/s, 2540 ops/s (qd4 barriers 3597/s); per-cell share write 121 MiB/s
+infinityd c42c475 (git c42c475986d2, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 38653, backend io_uring, route natural
+infinityd: listening on 38653
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: recovery 0/4 cells ready, 1426419712/5307723776 bytes (26.9%), eta 3s
+control: recovery 0/4 cells ready, 2624569344/5307723776 bytes (49.4%), eta 3s
+control: recovery 0/4 cells ready, 4233981952/5307723776 bytes (79.8%), eta 1s
+control: cell 0 recovered (2 segments, 1326981120 bytes, 800000 records, recycled residue: 1 segment stops, 1 slacks (ADR-0090); phases ms: start 3.7, ckpt 2312.5 [790110208 B], replay 420.6 [113479680 B], audit 1074.1 [423391232 B], finish 0.1, total 3811.0)
+control: cell 2 recovered (2 segments, 1327009792 bytes, 800000 records, recycled residue: 1 segment stops, 1 slacks (ADR-0090); phases ms: start 3.8, ckpt 2312.6 [790138880 B], replay 426.0 [116031488 B], audit 1067.7 [420839424 B], finish 0.1, total 3810.3)
+control: cell 3 recovered (2 segments, 1326813184 bytes, 800000 records, recycled residue: 1 segment stops, 1 slacks (ADR-0090); phases ms: start 3.7, ckpt 2309.6 [789942272 B], replay 420.2 [114028544 B], audit 1074.7 [422842368 B], finish 0.2, total 3808.4)

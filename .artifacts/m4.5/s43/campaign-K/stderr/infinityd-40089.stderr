@@ -1,0 +1,12 @@
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: --barrier-class; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd c42c475 (git c42c475986d2, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 40089, backend io_uring, route natural
+infinityd: listening on 40089
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 2 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 4 cells serving (35 ms)

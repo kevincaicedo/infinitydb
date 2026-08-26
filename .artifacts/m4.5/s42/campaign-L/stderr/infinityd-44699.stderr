@@ -1,0 +1,13 @@
+infinityd: io-properties: io-properties.toml (schema 3, identity verified (ext4 /dev/nvme0n1p3 uuid c97c5418…))
+infinityd: log barrier class fua (source: file; fua_max_frame_bytes 1048576; probed p50 fua 293 µs / flush 1199 µs); frames in flight 3 (auto: fua) × 4 MiB staging
+infinityd: segment recycling on, 1 slot(s) × 256 MiB per cell, pool wait quarter (ADR-0090)
+infinityd: device model probed (schema 3): write 491 MiB/s, 3108 ops/s (qd4 barriers 10880/s); per-cell share write 122 MiB/s
+infinityd c42c475 (git c42c475986d2, x86_64-unknown-linux-gnu)
+infinityd: listening on 44699
+infinityd: 4 cells, port 44699, backend io_uring, route natural
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (2 segments, 536870912 bytes, 0 records; phases ms: start 0.1, ckpt 0.0 [0 B], replay 0.9 [0 B], audit 102.1 [536870912 B], finish 0.0, total 103.1)
+control: cell 1 recovered (2 segments, 536870912 bytes, 0 records; phases ms: start 0.1, ckpt 0.0 [0 B], replay 0.7 [0 B], audit 101.6 [536870912 B], finish 0.0, total 102.5)
+control: cell 2 recovered (2 segments, 536870912 bytes, 0 records; phases ms: start 0.1, ckpt 0.0 [0 B], replay 0.9 [0 B], audit 101.4 [536870912 B], finish 0.1, total 102.4)
+control: cell 3 recovered (2 segments, 536870912 bytes, 0 records; phases ms: start 0.1, ckpt 0.0 [0 B], replay 0.9 [0 B], audit 101.9 [536870912 B], finish 0.0, total 102.9)
+control: recovery complete — 4 cells serving (133 ms)

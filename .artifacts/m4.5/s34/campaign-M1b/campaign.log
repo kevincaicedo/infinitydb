@@ -1,0 +1,426 @@
+# 2026-08-26T01:21:42-04:00 binary=infinityd 6756643 (git 67566438e3df, x86_64-unknown-linux-gnu) git=6756643 dirty=0 thermal: 27800 36000 42000  gov=performance no_turbo=1 strays=0 load=1.58 1.49 2.09 devstat= 6305749 48396 253260785 6214883 12637892 3374799 715891356 21754835 0 1718164 28420730 50118 0 200122912 25922 526678 425089
+=== 2026-08-26T01:21:42-04:00 M1b s35 flush-0 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 4c rep0 read leg (post-fill quiescence)
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns FAIL
+  S35: N-cell vs 1-cell barrier p50 ratio (device characterization — informational since the ADR-0087 fourth amendment, 2026-08-22) FAIL (informational)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+  S39b: warmed zero-fill bytes per log frame byte under recycling (arm) PENDING (tooling)
+  S39b: rotations not served by the pool over the warmed window, worst cell PENDING (tooling)
+  S39b: padding share moved by recycling (the S39c control) PENDING (tooling)
+  S39b: always c32 p50 under recycling over baseline PENDING (tooling)
+  S39b: always c32 p99 under recycling over baseline PENDING (tooling)
+  S39b: read leg under recycling over baseline (the E4.7 ±2 % rule) PENDING (tooling)
+  S39b: first crash-restart recovery boot on the recycled log over baseline PENDING (tooling)
+  S39b: rotations per cell the row actually performed (validity) PENDING (tooling)
+  S39b/D9: pool waits fed before the bound over waits ended (arm) PENDING (tooling)
+  S39b/D9: rotations onto an un-zeroed segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: rotations that found no next segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: preallocs refused for space on the arm, worst replicate PENDING (tooling)
+  S39b: accounted host bytes per log frame byte under recycling (informational) PENDING (tooling)
+  S39b: block-device sectors written per log frame byte under recycling (informational) PENDING (tooling)
+  S39d: fixed-work first-boot recovery, slowest cell's engine total, arm over baseline PENDING (tooling)
+  S39d: absolute first-boot recovery wall on the recycled log (the S18 < 15 s STOP gate re-read) PENDING (tooling)
+  S39d: both arms recovered exactly the records written (fixed-work validity) PENDING (tooling)
+  S39d: slack-audit phase time over the cell sums, arm over baseline (the recycling term, informational) PENDING (tooling)
+  S40: everysec max latency at the memtier shape, worst leg (S27 D5) PENDING (tooling)
+  S40: achieved over offered rate, worst leg (validity — a saturated leg's max is a saturation number) PENDING (tooling)
+  S40: seconds whose per-second maximum exceeded 50 ms, summed over legs (informational) PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling throughput over the shipping path at 256 conns PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling p99 gain at 256 conns PENDING (tooling)
+  S37 step 1: share of arm B's SETs that skipped a cold read (validity — 0 = the instrument never engaged) PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm throughput over the baseline cap at 256 conns PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm p99 over the baseline cap at 256 conns (the tail the wider cap charges) PENDING (tooling)
+  S37 step 2 discriminator: the baseline's device QD p99 at issue (≈ the cap = the cap bound; validity of the discriminator) PENDING (tooling)
+  S42: first boot over second boot of a fresh data directory (the in-boot probe's cost) PENDING (tooling)
+  S42: every first boot reported io_properties_source=probed-at-boot on every cell (validity) PENDING (tooling)
+  S42: every second boot reported io_properties_source=file with the identity verified (validity) PENDING (tooling)
+  S42: the file the first boot wrote is schema 3 (identity-bound) PENDING (tooling)
+  S42: always p50 over the barrier p50 at 32 conns on the directory the first boot probed (S35's bar on the stock boot) PENDING (tooling)
+  S42: always c32 ops/s on the stock boot (informational — read against the probed arm's replicate spread) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, arm (C38b's statistic on the loop clock, this row's shape — informational) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, baseline (informational) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-M1b/s35-flush-0/1787721913-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-26T01:25:13-04:00 ===
+=== 2026-08-26T01:25:13-04:00 M1b s35 fua-0 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 4c rep0 read leg (post-fill quiescence)
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (device characterization — informational since the ADR-0087 fourth amendment, 2026-08-22) FAIL (informational)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+  S39b: warmed zero-fill bytes per log frame byte under recycling (arm) PENDING (tooling)
+  S39b: rotations not served by the pool over the warmed window, worst cell PENDING (tooling)
+  S39b: padding share moved by recycling (the S39c control) PENDING (tooling)
+  S39b: always c32 p50 under recycling over baseline PENDING (tooling)
+  S39b: always c32 p99 under recycling over baseline PENDING (tooling)
+  S39b: read leg under recycling over baseline (the E4.7 ±2 % rule) PENDING (tooling)
+  S39b: first crash-restart recovery boot on the recycled log over baseline PENDING (tooling)
+  S39b: rotations per cell the row actually performed (validity) PENDING (tooling)
+  S39b/D9: pool waits fed before the bound over waits ended (arm) PENDING (tooling)
+  S39b/D9: rotations onto an un-zeroed segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: rotations that found no next segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: preallocs refused for space on the arm, worst replicate PENDING (tooling)
+  S39b: accounted host bytes per log frame byte under recycling (informational) PENDING (tooling)
+  S39b: block-device sectors written per log frame byte under recycling (informational) PENDING (tooling)
+  S39d: fixed-work first-boot recovery, slowest cell's engine total, arm over baseline PENDING (tooling)
+  S39d: absolute first-boot recovery wall on the recycled log (the S18 < 15 s STOP gate re-read) PENDING (tooling)
+  S39d: both arms recovered exactly the records written (fixed-work validity) PENDING (tooling)
+  S39d: slack-audit phase time over the cell sums, arm over baseline (the recycling term, informational) PENDING (tooling)
+  S40: everysec max latency at the memtier shape, worst leg (S27 D5) PENDING (tooling)
+  S40: achieved over offered rate, worst leg (validity — a saturated leg's max is a saturation number) PENDING (tooling)
+  S40: seconds whose per-second maximum exceeded 50 ms, summed over legs (informational) PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling throughput over the shipping path at 256 conns PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling p99 gain at 256 conns PENDING (tooling)
+  S37 step 1: share of arm B's SETs that skipped a cold read (validity — 0 = the instrument never engaged) PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm throughput over the baseline cap at 256 conns PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm p99 over the baseline cap at 256 conns (the tail the wider cap charges) PENDING (tooling)
+  S37 step 2 discriminator: the baseline's device QD p99 at issue (≈ the cap = the cap bound; validity of the discriminator) PENDING (tooling)
+  S42: first boot over second boot of a fresh data directory (the in-boot probe's cost) PENDING (tooling)
+  S42: every first boot reported io_properties_source=probed-at-boot on every cell (validity) PENDING (tooling)
+  S42: every second boot reported io_properties_source=file with the identity verified (validity) PENDING (tooling)
+  S42: the file the first boot wrote is schema 3 (identity-bound) PENDING (tooling)
+  S42: always p50 over the barrier p50 at 32 conns on the directory the first boot probed (S35's bar on the stock boot) PENDING (tooling)
+  S42: always c32 ops/s on the stock boot (informational — read against the probed arm's replicate spread) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, arm (C38b's statistic on the loop clock, this row's shape — informational) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, baseline (informational) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-M1b/s35-fua-0/1787722121-gate-run/report.md
+=== exit 0 2026-08-26T01:28:41-04:00 ===
+=== 2026-08-26T01:28:41-04:00 M1b s35 fua-1 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 4c rep0 read leg (post-fill quiescence)
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (device characterization — informational since the ADR-0087 fourth amendment, 2026-08-22) FAIL (informational)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+  S39b: warmed zero-fill bytes per log frame byte under recycling (arm) PENDING (tooling)
+  S39b: rotations not served by the pool over the warmed window, worst cell PENDING (tooling)
+  S39b: padding share moved by recycling (the S39c control) PENDING (tooling)
+  S39b: always c32 p50 under recycling over baseline PENDING (tooling)
+  S39b: always c32 p99 under recycling over baseline PENDING (tooling)
+  S39b: read leg under recycling over baseline (the E4.7 ±2 % rule) PENDING (tooling)
+  S39b: first crash-restart recovery boot on the recycled log over baseline PENDING (tooling)
+  S39b: rotations per cell the row actually performed (validity) PENDING (tooling)
+  S39b/D9: pool waits fed before the bound over waits ended (arm) PENDING (tooling)
+  S39b/D9: rotations onto an un-zeroed segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: rotations that found no next segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: preallocs refused for space on the arm, worst replicate PENDING (tooling)
+  S39b: accounted host bytes per log frame byte under recycling (informational) PENDING (tooling)
+  S39b: block-device sectors written per log frame byte under recycling (informational) PENDING (tooling)
+  S39d: fixed-work first-boot recovery, slowest cell's engine total, arm over baseline PENDING (tooling)
+  S39d: absolute first-boot recovery wall on the recycled log (the S18 < 15 s STOP gate re-read) PENDING (tooling)
+  S39d: both arms recovered exactly the records written (fixed-work validity) PENDING (tooling)
+  S39d: slack-audit phase time over the cell sums, arm over baseline (the recycling term, informational) PENDING (tooling)
+  S40: everysec max latency at the memtier shape, worst leg (S27 D5) PENDING (tooling)
+  S40: achieved over offered rate, worst leg (validity — a saturated leg's max is a saturation number) PENDING (tooling)
+  S40: seconds whose per-second maximum exceeded 50 ms, summed over legs (informational) PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling throughput over the shipping path at 256 conns PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling p99 gain at 256 conns PENDING (tooling)
+  S37 step 1: share of arm B's SETs that skipped a cold read (validity — 0 = the instrument never engaged) PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm throughput over the baseline cap at 256 conns PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm p99 over the baseline cap at 256 conns (the tail the wider cap charges) PENDING (tooling)
+  S37 step 2 discriminator: the baseline's device QD p99 at issue (≈ the cap = the cap bound; validity of the discriminator) PENDING (tooling)
+  S42: first boot over second boot of a fresh data directory (the in-boot probe's cost) PENDING (tooling)
+  S42: every first boot reported io_properties_source=probed-at-boot on every cell (validity) PENDING (tooling)
+  S42: every second boot reported io_properties_source=file with the identity verified (validity) PENDING (tooling)
+  S42: the file the first boot wrote is schema 3 (identity-bound) PENDING (tooling)
+  S42: always p50 over the barrier p50 at 32 conns on the directory the first boot probed (S35's bar on the stock boot) PENDING (tooling)
+  S42: always c32 ops/s on the stock boot (informational — read against the probed arm's replicate spread) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, arm (C38b's statistic on the loop clock, this row's shape — informational) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, baseline (informational) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-M1b/s35-fua-1/1787722331-gate-run/report.md
+=== exit 0 2026-08-26T01:32:11-04:00 ===
+=== 2026-08-26T01:32:11-04:00 M1b s35 flush-1 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 4c rep0 read leg (post-fill quiescence)
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns FAIL
+  S35: N-cell vs 1-cell barrier p50 ratio (device characterization — informational since the ADR-0087 fourth amendment, 2026-08-22) FAIL (informational)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+  S39b: warmed zero-fill bytes per log frame byte under recycling (arm) PENDING (tooling)
+  S39b: rotations not served by the pool over the warmed window, worst cell PENDING (tooling)
+  S39b: padding share moved by recycling (the S39c control) PENDING (tooling)
+  S39b: always c32 p50 under recycling over baseline PENDING (tooling)
+  S39b: always c32 p99 under recycling over baseline PENDING (tooling)
+  S39b: read leg under recycling over baseline (the E4.7 ±2 % rule) PENDING (tooling)
+  S39b: first crash-restart recovery boot on the recycled log over baseline PENDING (tooling)
+  S39b: rotations per cell the row actually performed (validity) PENDING (tooling)
+  S39b/D9: pool waits fed before the bound over waits ended (arm) PENDING (tooling)
+  S39b/D9: rotations onto an un-zeroed segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: rotations that found no next segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: preallocs refused for space on the arm, worst replicate PENDING (tooling)
+  S39b: accounted host bytes per log frame byte under recycling (informational) PENDING (tooling)
+  S39b: block-device sectors written per log frame byte under recycling (informational) PENDING (tooling)
+  S39d: fixed-work first-boot recovery, slowest cell's engine total, arm over baseline PENDING (tooling)
+  S39d: absolute first-boot recovery wall on the recycled log (the S18 < 15 s STOP gate re-read) PENDING (tooling)
+  S39d: both arms recovered exactly the records written (fixed-work validity) PENDING (tooling)
+  S39d: slack-audit phase time over the cell sums, arm over baseline (the recycling term, informational) PENDING (tooling)
+  S40: everysec max latency at the memtier shape, worst leg (S27 D5) PENDING (tooling)
+  S40: achieved over offered rate, worst leg (validity — a saturated leg's max is a saturation number) PENDING (tooling)
+  S40: seconds whose per-second maximum exceeded 50 ms, summed over legs (informational) PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling throughput over the shipping path at 256 conns PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling p99 gain at 256 conns PENDING (tooling)
+  S37 step 1: share of arm B's SETs that skipped a cold read (validity — 0 = the instrument never engaged) PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm throughput over the baseline cap at 256 conns PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm p99 over the baseline cap at 256 conns (the tail the wider cap charges) PENDING (tooling)
+  S37 step 2 discriminator: the baseline's device QD p99 at issue (≈ the cap = the cap bound; validity of the discriminator) PENDING (tooling)
+  S42: first boot over second boot of a fresh data directory (the in-boot probe's cost) PENDING (tooling)
+  S42: every first boot reported io_properties_source=probed-at-boot on every cell (validity) PENDING (tooling)
+  S42: every second boot reported io_properties_source=file with the identity verified (validity) PENDING (tooling)
+  S42: the file the first boot wrote is schema 3 (identity-bound) PENDING (tooling)
+  S42: always p50 over the barrier p50 at 32 conns on the directory the first boot probed (S35's bar on the stock boot) PENDING (tooling)
+  S42: always c32 ops/s on the stock boot (informational — read against the probed arm's replicate spread) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, arm (C38b's statistic on the loop clock, this row's shape — informational) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, baseline (informational) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-M1b/s35-flush-1/1787722541-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-26T01:35:41-04:00 ===
+=== 2026-08-26T01:35:41-04:00 M1b s35 flush-2 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 4c rep0 read leg (post-fill quiescence)
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns FAIL
+  S35: N-cell vs 1-cell barrier p50 ratio (device characterization — informational since the ADR-0087 fourth amendment, 2026-08-22) FAIL (informational)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+  S39b: warmed zero-fill bytes per log frame byte under recycling (arm) PENDING (tooling)
+  S39b: rotations not served by the pool over the warmed window, worst cell PENDING (tooling)
+  S39b: padding share moved by recycling (the S39c control) PENDING (tooling)
+  S39b: always c32 p50 under recycling over baseline PENDING (tooling)
+  S39b: always c32 p99 under recycling over baseline PENDING (tooling)
+  S39b: read leg under recycling over baseline (the E4.7 ±2 % rule) PENDING (tooling)
+  S39b: first crash-restart recovery boot on the recycled log over baseline PENDING (tooling)
+  S39b: rotations per cell the row actually performed (validity) PENDING (tooling)
+  S39b/D9: pool waits fed before the bound over waits ended (arm) PENDING (tooling)
+  S39b/D9: rotations onto an un-zeroed segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: rotations that found no next segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: preallocs refused for space on the arm, worst replicate PENDING (tooling)
+  S39b: accounted host bytes per log frame byte under recycling (informational) PENDING (tooling)
+  S39b: block-device sectors written per log frame byte under recycling (informational) PENDING (tooling)
+  S39d: fixed-work first-boot recovery, slowest cell's engine total, arm over baseline PENDING (tooling)
+  S39d: absolute first-boot recovery wall on the recycled log (the S18 < 15 s STOP gate re-read) PENDING (tooling)
+  S39d: both arms recovered exactly the records written (fixed-work validity) PENDING (tooling)
+  S39d: slack-audit phase time over the cell sums, arm over baseline (the recycling term, informational) PENDING (tooling)
+  S40: everysec max latency at the memtier shape, worst leg (S27 D5) PENDING (tooling)
+  S40: achieved over offered rate, worst leg (validity — a saturated leg's max is a saturation number) PENDING (tooling)
+  S40: seconds whose per-second maximum exceeded 50 ms, summed over legs (informational) PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling throughput over the shipping path at 256 conns PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling p99 gain at 256 conns PENDING (tooling)
+  S37 step 1: share of arm B's SETs that skipped a cold read (validity — 0 = the instrument never engaged) PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm throughput over the baseline cap at 256 conns PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm p99 over the baseline cap at 256 conns (the tail the wider cap charges) PENDING (tooling)
+  S37 step 2 discriminator: the baseline's device QD p99 at issue (≈ the cap = the cap bound; validity of the discriminator) PENDING (tooling)
+  S42: first boot over second boot of a fresh data directory (the in-boot probe's cost) PENDING (tooling)
+  S42: every first boot reported io_properties_source=probed-at-boot on every cell (validity) PENDING (tooling)
+  S42: every second boot reported io_properties_source=file with the identity verified (validity) PENDING (tooling)
+  S42: the file the first boot wrote is schema 3 (identity-bound) PENDING (tooling)
+  S42: always p50 over the barrier p50 at 32 conns on the directory the first boot probed (S35's bar on the stock boot) PENDING (tooling)
+  S42: always c32 ops/s on the stock boot (informational — read against the probed arm's replicate spread) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, arm (C38b's statistic on the loop clock, this row's shape — informational) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, baseline (informational) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-M1b/s35-flush-2/1787722752-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-26T01:39:12-04:00 ===
+=== 2026-08-26T01:39:12-04:00 M1b s35 fua-2 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before 4c rep0 c32
+  s35: 40s drive-state idle before 4c rep0 c256
+  s35: 40s drive-state idle before 4c rep0 read leg (post-fill quiescence)
+  s35: 40s drive-state idle before 1c rep0 c32
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PASS
+  S35: N-cell vs 1-cell barrier p50 ratio (device characterization — informational since the ADR-0087 fourth amendment, 2026-08-22) FAIL (informational)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) FAIL (informational)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+  S39b: warmed zero-fill bytes per log frame byte under recycling (arm) PENDING (tooling)
+  S39b: rotations not served by the pool over the warmed window, worst cell PENDING (tooling)
+  S39b: padding share moved by recycling (the S39c control) PENDING (tooling)
+  S39b: always c32 p50 under recycling over baseline PENDING (tooling)
+  S39b: always c32 p99 under recycling over baseline PENDING (tooling)
+  S39b: read leg under recycling over baseline (the E4.7 ±2 % rule) PENDING (tooling)
+  S39b: first crash-restart recovery boot on the recycled log over baseline PENDING (tooling)
+  S39b: rotations per cell the row actually performed (validity) PENDING (tooling)
+  S39b/D9: pool waits fed before the bound over waits ended (arm) PENDING (tooling)
+  S39b/D9: rotations onto an un-zeroed segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: rotations that found no next segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: preallocs refused for space on the arm, worst replicate PENDING (tooling)
+  S39b: accounted host bytes per log frame byte under recycling (informational) PENDING (tooling)
+  S39b: block-device sectors written per log frame byte under recycling (informational) PENDING (tooling)
+  S39d: fixed-work first-boot recovery, slowest cell's engine total, arm over baseline PENDING (tooling)
+  S39d: absolute first-boot recovery wall on the recycled log (the S18 < 15 s STOP gate re-read) PENDING (tooling)
+  S39d: both arms recovered exactly the records written (fixed-work validity) PENDING (tooling)
+  S39d: slack-audit phase time over the cell sums, arm over baseline (the recycling term, informational) PENDING (tooling)
+  S40: everysec max latency at the memtier shape, worst leg (S27 D5) PENDING (tooling)
+  S40: achieved over offered rate, worst leg (validity — a saturated leg's max is a saturation number) PENDING (tooling)
+  S40: seconds whose per-second maximum exceeded 50 ms, summed over legs (informational) PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling throughput over the shipping path at 256 conns PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling p99 gain at 256 conns PENDING (tooling)
+  S37 step 1: share of arm B's SETs that skipped a cold read (validity — 0 = the instrument never engaged) PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm throughput over the baseline cap at 256 conns PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm p99 over the baseline cap at 256 conns (the tail the wider cap charges) PENDING (tooling)
+  S37 step 2 discriminator: the baseline's device QD p99 at issue (≈ the cap = the cap bound; validity of the discriminator) PENDING (tooling)
+  S42: first boot over second boot of a fresh data directory (the in-boot probe's cost) PENDING (tooling)
+  S42: every first boot reported io_properties_source=probed-at-boot on every cell (validity) PENDING (tooling)
+  S42: every second boot reported io_properties_source=file with the identity verified (validity) PENDING (tooling)
+  S42: the file the first boot wrote is schema 3 (identity-bound) PENDING (tooling)
+  S42: always p50 over the barrier p50 at 32 conns on the directory the first boot probed (S35's bar on the stock boot) PENDING (tooling)
+  S42: always c32 ops/s on the stock boot (informational — read against the probed arm's replicate spread) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, arm (C38b's statistic on the loop clock, this row's shape — informational) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, baseline (informational) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-M1b/s35-fua-2/1787722961-gate-run/report.md
+=== exit 0 2026-08-26T01:42:41-04:00 ===
+# 2026-08-26T01:42:41-04:00 binary=infinityd 6756643 (git 67566438e3df, x86_64-unknown-linux-gnu) git=6756643 dirty=0 thermal: 27800 34000 42000  gov=performance no_turbo=1 strays=0 load=1.84 2.05 2.09 devstat= 6305892 48396 253267081 6215187 14057664 4023119 781888276 22835691 0 1887256 29561927 50118 0 200122912 25922 614194 485126
+CAMPAIGN DONE
