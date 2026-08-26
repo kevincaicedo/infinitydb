@@ -138,7 +138,11 @@ fn a_fresh_data_directory_is_probed_once_and_the_model_is_identity_bound() {
         assert_eq!(field(&info, "io_properties_identity"), "unverifiable");
         assert_eq!(field(&info, "barrier_class"), "flush");
         assert_eq!(field(&info, "io_budget_model"), "absent");
-        assert_eq!(field(&info, "flush_group_window_us"), "0");
+        // The FLUSH class carries the ADR-0092 group hold by default
+        // since campaign K (2026-08-26): 250 µs unless `--flush-group-
+        // window-us 0` — the one line of the `off` tier that is not the
+        // pre-S42 boot byte-for-byte.
+        assert_eq!(field(&info, "flush_group_window_us"), "250");
         assert!(!dir.join("io-properties.toml").exists(), "off never writes the file");
     }
 

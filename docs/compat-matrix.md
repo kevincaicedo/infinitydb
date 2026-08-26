@@ -290,6 +290,15 @@ the window before it reaches the device: the **process-crash** exposure of
 reaches the page cache every event loop. The power-loss window is unchanged;
 `always` acks are never held (their frames carry the barrier the ack waits on).
 
+On the FLUSH class (a device the probe ruled `flush`, or `--device-probe off`
+with no model) a due barrier frame on a packed segment may wait, bounded, for
+the round of clients it just acked to re-arrive (M4.5-S43, ADR-0092; on by
+default at `--flush-group-window-us 250` since the binding A/B of 2026-08-26;
+0 turns it off; inert under the FUA class): an `always` ack may then arrive up
+to 250 µs later than its barrier alone would allow, and `everysec` records
+riding that held frame carry the same ≤ 250 µs of extra process-crash exposure.
+The power-loss window is unchanged; durability semantics are unchanged.
+
 ## Absent (owner milestone)
 
 | Family | Arrives |

@@ -105,8 +105,9 @@ per-iteration cadence); a frame that carries a barrier is never held by
 the fill policy. On the FLUSH class a due frame may instead wait, bounded
 to a window, for the round of clients it just acked to re-arrive — the
 K = 1 alternation otherwise carries half the population per barrier
-(ADR-0092's group hold, a measured arm, `--flush-group-window-us`, off
-until its A/B; inert on the FUA class). Everything else — the hash index, document trees,
+(ADR-0092's group hold — `--flush-group-window-us`, 250 µs by default
+since its binding A/B of 2026-08-26, `0` the off arm; inert on the FUA
+class). Everything else — the hash index, document trees,
 secondary indexes, stream offsets, vector graphs — is a rebuildable
 projection over that log. Checkpoints are fuzzy snapshots streamed by the
 owning cell in budgeted background slices (no fork, no stop-the-world)

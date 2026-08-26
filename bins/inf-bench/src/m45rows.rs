@@ -635,6 +635,7 @@ fn s35_frame_pipeline_row(
     m: &mut Measurements,
 ) -> Result<(), String> {
     let idle_s = flags.u64_or("leg-idle-s", S35_LEG_IDLE_S)?;
+    let read_leg_fill = flags.bool("read-leg-fill");
     let configured_k: u64 = flags.u64_or("frames-in-flight", 1)?;
     let class_fua = flags.str_or("barrier-class", "flush").eq_ignore_ascii_case("fua");
     let (p50_key, p99_key) = if class_fua {
@@ -749,7 +750,31 @@ fn s35_frame_pipeline_row(
 
         // The read row: pipelined GETs over the filled keyspace (the
         // M0 zero-cost shape on a durable namespace). No idle — reads
-        // do not move drive state.
+        // do not move drive state. `--read-leg-fill` (M4.5-S34, campaign
+        // M's lesson, 2026-08-26): the write legs populate the keyspace
+        // at their own rate, so a slower arm's read leg serves misses
+        // (4–7 % nils on the FLUSH class vs 0 on FUA — a cheaper reply)
+        // and a faster arm's carries more background work behind it;
+        // the fill makes every key present on both arms and the idle
+        // lets the checkpoint/zero-fill the write legs left behind
+        // settle, so the read leg compares the read path alone.
+        if read_leg_fill {
+            let fill = run_load(&LoadSpec {
+                port,
+                conns: S35_CONNS_AC,
+                pipeline: 16,
+                fill: Some(FILL_KEYS),
+                keys: FILL_KEYS,
+                key_prefix: "s35alw:".into(),
+                value_size: 1024,
+                setup: vec![vec![b"INF.NS".to_vec(), b"USE".to_vec(), b"s35alw".to_vec()]],
+                ..LoadSpec::default()
+            })?;
+            if fill.errors > 0 {
+                return Err(format!("s35 rep{rep} read-leg fill: {} errors", fill.errors));
+            }
+            s35_idle(idle_s, &format!("{cells}c rep{rep} read leg (post-fill quiescence)"));
+        }
         let rd = run_load(&LoadSpec {
             port,
             conns: 64,
@@ -773,8 +798,8 @@ fn s35_frame_pipeline_row(
         }
         raw.push_str(&format!(
             "rep{rep} {cells}c read c64 P16 ops/s={:<8.0} p50_us={:<6} p99_us={:<7} \
-             p999_us={:<7} nils={}\n",
-            rd.ops_per_sec, rd.p50_us, rd.p99_us, rd.p999_us, rd.nils
+             p999_us={:<7} nils={} filled={}\n",
+            rd.ops_per_sec, rd.p50_us, rd.p99_us, rd.p999_us, rd.nils, read_leg_fill
         ));
         read_ops.push(rd.ops_per_sec);
         read_p999.push(rd.p999_us as f64);
@@ -907,11 +932,17 @@ fn s35_frame_pipeline_row(
          {duration}s legs, median of {replicates}; AC leg {S35_CONNS_AC} conns pipeline 1 on \
          {cells} cells then on 1 cell (interleaved per replicate); max leg {CONNS_HIGH} conns; \
          read leg 64 conns × P16 100% GET over the keys the write legs populated (nils \
-         disclosed); {idle_s}s idle \
+         disclosed{}); {idle_s}s idle \
          before every durable leg; barrier = {p50_key} (cell median, whole-session \
          histogram); device tail = {p99_key} (worst cell); 4c/1c ratios are medians of \
          per-replicate ratios — the barrier ratio binds (F2's contention term), the client \
-         ratio is informational (ADR-0087 D8, amended 2026-08-22)"
+         ratio is informational (ADR-0087 D8, amended 2026-08-22)",
+        if read_leg_fill {
+            "; --read-leg-fill: every key filled once and the idle applied before the read leg, \
+             so both arms read a fully populated, quiesced namespace"
+        } else {
+            ""
+        }
     ));
     m.row_open("frame-pipeline");
     m.row_write_amp(
