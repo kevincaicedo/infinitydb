@@ -199,6 +199,13 @@ impl TieredTable {
             self.promote_stats.skip_stale += 1;
             return false;
         }
+        // A shadow ticket's cold address never relocates (ADR-0093 D6):
+        // a read of a collision key could reach it; moving it would
+        // orphan the ticket. Counted; that key re-offers next window.
+        if self.is_shadow_cold(addr) {
+            self.note_shadow_promote_skip();
+            return false;
+        }
         // Origin-cap deferral (D9-2): promoting would drop an origin,
         // which is unrepresentable; the record re-offers after its
         // covering swap drains the entry.

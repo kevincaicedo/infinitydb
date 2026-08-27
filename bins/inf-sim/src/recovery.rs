@@ -14,6 +14,16 @@
 //! misses. Content — canonical bytes — never addresses, and never
 //! string versions (per-life artifacts, ADR-0057 D3).
 //!
+//! **Shadow-slot ops (M4.5-S37, ADR-0093):** a seeded share of the
+//! SETs over a demoted key take the shadow path — the record appends,
+//! the cold twin stays slotted as a ticket, no marker is staged — and
+//! the harness reconciles tickets at seeded points (some are deliberately
+//! left open across the walk and the cut). Recovery re-forms the pairs
+//! from the checkpoint's ref + image and the tail's image (the D5
+//! rebuild), the harness reconciles them again, and the never-none
+//! oracle plus a **cardinality oracle** (`len()` equals the model's key
+//! count after reconciliation — no orphan slot) close the row.
+//!
 //! Seed classes (deterministic per seed, disclosed in the report):
 //! - **cut-before-publish** lives: the walk runs but the swap never
 //!   lands — recovery resolves the *previous* unit and the WAL tail
@@ -119,6 +129,13 @@ pub struct RecoveryReport {
     /// Extents reclaimed in-life (refcount zero, death durable) plus
     /// orphans swept at boot.
     pub blob_extents_reclaimed: u64,
+    /// M4.5-S37 (ADR-0093): shadow tickets opened by the op mix, left
+    /// open across a cut, re-formed by recovery, and the verdicts.
+    pub shadow_opened: u64,
+    pub shadow_open_at_cut: u64,
+    pub shadow_reformed: u64,
+    pub shadow_same_key: u64,
+    pub shadow_collision: u64,
     pub trace_hash: u64,
 }
 
@@ -151,6 +168,9 @@ struct Life {
 fn tiered_table(origin: u64) -> TieredTable {
     let mut table = TieredTable::new(space_config(origin), demote(), 1024).expect("ring");
     table.set_blob_config(BlobConfig { threshold_bytes: BLOB_THRESHOLD, max_bytes: 1 << 20 });
+    // The shadow arm (M4.5-S37, ADR-0093 D8) runs on in this harness —
+    // the store-level DST's authority over the mechanism.
+    table.set_shadow_enabled(true);
     table
 }
 
@@ -314,6 +334,108 @@ impl Run {
         }
     }
 
+    /// One reconciliation (ADR-0093 D4) played by the harness: the
+    /// ticket's cold record read through the catalog, the verdict
+    /// applied. A read that fails (a file the pin-analog unlink took —
+    /// impossible while the slot is live) is a violation.
+    fn reconcile_ticket(&mut self, life: &mut Life, ticket: inf_store::ShadowTicket, when: &str) {
+        let head = read_cold(
+            &self.disk,
+            &life.flush,
+            ticket.cold.to_raw(),
+            TieredTable::RECORD_HEADER_LEN,
+        );
+        let image = head
+            .map(|h| TieredTable::record_len_from_header(&h))
+            .and_then(|len| read_cold(&self.disk, &life.flush, ticket.cold.to_raw(), len));
+        let Some(image) = image else {
+            self.report.violations.push(format!(
+                "{when}: shadow twin at {} unreadable while its slot is live",
+                ticket.cold.to_raw()
+            ));
+            life.table.shadow_read_failed(ticket.cold);
+            return;
+        };
+        match life.table.resolve_shadow(ticket.hash, ticket.cold, ticket.winner, &image) {
+            inf_store::ShadowVerdict::SameKey => self.report.shadow_same_key += 1,
+            inf_store::ShadowVerdict::Collision => {
+                // No two real keys share a 64-bit hash at this corpus
+                // size: a collision verdict here is a wrong comparison.
+                self.report.shadow_collision += 1;
+                self.report
+                    .violations
+                    .push(format!("{when}: collision verdict on a same-key twin"));
+            }
+            inf_store::ShadowVerdict::Stale | inf_store::ShadowVerdict::Deferred => {}
+        }
+    }
+
+    /// The `DEL` path's verify (ADR-0093 D3): the twin read and
+    /// key-compared; a same-key twin is deleted through its own marker
+    /// (into the tail) and `delete` — never `resolve_shadow`, whose
+    /// death attribution is deferred under a pinned walk.
+    fn verify_twin_for_delete(
+        &mut self,
+        life: &mut Life,
+        ticket: inf_store::ShadowTicket,
+        when: &str,
+    ) {
+        let head = read_cold(
+            &self.disk,
+            &life.flush,
+            ticket.cold.to_raw(),
+            TieredTable::RECORD_HEADER_LEN,
+        );
+        let image = head
+            .map(|h| TieredTable::record_len_from_header(&h))
+            .and_then(|len| read_cold(&self.disk, &life.flush, ticket.cold.to_raw(), len));
+        let Some(image) = image else {
+            self.report.violations.push(format!(
+                "{when}: shadow twin at {} unreadable while its slot is live",
+                ticket.cold.to_raw()
+            ));
+            return;
+        };
+        match life.table.verify_shadow(ticket.hash, ticket.cold, ticket.winner, &image) {
+            inf_store::ShadowVerdict::SameKey => {
+                RecordView::ColdDisplace { ns: NS, old_addr: ticket.cold.to_raw() }
+                    .encode_into(&mut self.tail);
+                life.table.delete(ticket.hash, ticket.cold, image.len());
+                self.report.shadow_same_key += 1;
+            }
+            inf_store::ShadowVerdict::Collision => {
+                self.report.shadow_collision += 1;
+                self.report
+                    .violations
+                    .push(format!("{when}: collision verdict on a same-key twin"));
+            }
+            _ => {}
+        }
+    }
+
+    /// Reconciles up to `max` tickets (the MAINTAIN pump played by the
+    /// harness) — oldest winner first, the store's own work list.
+    fn reconcile(&mut self, life: &mut Life, max: usize, when: &str) {
+        for read in life.table.shadow_work(max) {
+            self.reconcile_ticket(life, read.ticket, when);
+        }
+    }
+
+    /// Reconciles every open ticket; a round that resolves nothing is a
+    /// wedged reconciler — a violation, never a spin.
+    fn reconcile_all(&mut self, life: &mut Life, when: &str) {
+        while life.table.shadow_pending() > 0 {
+            let before = life.table.shadow_pending();
+            self.reconcile(life, 16, when);
+            if life.table.shadow_pending() >= before {
+                self.report.violations.push(format!(
+                    "{when}: reconciliation made no progress with {before} tickets open"
+                ));
+                return;
+            }
+        }
+    }
+
     /// Reads one scan chunk of a sealed catalog file (compaction
     /// candidates are sealed by eligibility, so the range path resolves).
     fn read_scan_chunk(
@@ -332,6 +454,33 @@ impl Run {
     /// mutations).
     fn apply_op(&mut self, life: &mut Life, key: &[u8], op: Op) {
         let hash = TieredTable::hash_key(key);
+        // The shadow path (ADR-0093 D2): probe → admit → insert →
+        // register → the image alone into the tail (no marker). Any
+        // other probe answer or a refusal is a plain SET.
+        let op = match op {
+            Op::SetShadow(value) => {
+                let record_len = TieredTable::RECORD_HEADER_LEN + key.len() + value.len();
+                match life.table.shadow_probe(key, hash) {
+                    inf_store::ShadowProbe::One(cold)
+                        if life.table.shadow_admit(hash, cold, record_len).is_ok() =>
+                    {
+                        let winner = life.table.insert(key, &value, hash).expect("fits");
+                        life.table.register_shadow(hash, cold, winner);
+                        self.stage(life, &MutationEffect::StringSet { ns: NS, key, value: &value });
+                        RecordView::StringPostImage { ns: NS, key, value: &value }
+                            .encode_into(&mut self.tail);
+                        self.report.tail_records += 1;
+                        self.report.shadow_opened += 1;
+                        let encoded_len = life.table.record(winner).encoded_len;
+                        self.model
+                            .insert(key.to_vec(), Expect { value, encoded_len, extent: None });
+                        return;
+                    }
+                    _ => Op::Set(value),
+                }
+            }
+            other => other,
+        };
         let displaced = match life.table.lookup(key, hash, &[]) {
             TieredLookup::Ram(addr) => {
                 let parts = life.table.record(addr);
@@ -379,6 +528,7 @@ impl Run {
                 };
                 self.model.insert(key.to_vec(), Expect { value, encoded_len, extent: None });
             }
+            Op::SetShadow(_) => unreachable!("rewritten to Set above"),
             Op::SetBlob(value) => {
                 // M4-S17 (ADR-0061 D3): extent bytes → fdatasync →
                 // sealed token → only then the referencing record. The
@@ -447,6 +597,13 @@ impl Run {
             }
             Op::Del => {
                 if let Some((addr, len, _)) = displaced {
+                    // ADR-0093 D3: a winner's ticket is verified before
+                    // its delete and the same-key twin takes the marker
+                    // path (its own `ColdDisplace` + `delete`) — the
+                    // plane's `delete_one` rule, played here.
+                    if let Some(ticket) = life.table.shadow_of_winner(addr) {
+                        self.verify_twin_for_delete(life, ticket, "del");
+                    }
                     for (origin, _) in life.table.take_displacement_origins(hash, addr) {
                         RecordView::ColdDisplace { ns: NS, old_addr: origin }
                             .encode_into(&mut self.tail);
@@ -460,6 +617,62 @@ impl Run {
                     self.model.remove(key);
                 }
             }
+        }
+    }
+
+    /// The cardinality oracle (ADR-0093 I5): with no ticket open, the
+    /// keys the table counts are exactly the model's — an orphan slot
+    /// (a twin that survived its key) or a lost key would show here
+    /// before any read does.
+    fn audit_cardinality(&mut self, life: &Life, when: &str) {
+        if life.table.shadow_pending() != 0 {
+            return;
+        }
+        if life.table.len() != self.model.len() {
+            // Name the anomaly: every slot decoded (RAM directly, cold
+            // through the catalog), counted per key, compared to the
+            // model — the diagnosis a bare count cannot give.
+            let mut slots: Vec<(u64, LogicalAddr)> = Vec::new();
+            let mut cursor = 0u64;
+            loop {
+                cursor = life.table.scan_slots(cursor, 256, |hash, addr| slots.push((hash, addr)));
+                if cursor == 0 {
+                    break;
+                }
+            }
+            let mut per_key: BTreeMap<Vec<u8>, Vec<String>> = BTreeMap::new();
+            for (_, addr) in slots {
+                let (key, class) = if life.table.space().resolve(addr) == inf_store::AddrClass::Cold
+                {
+                    let head = read_cold(
+                        &self.disk,
+                        &life.flush,
+                        addr.to_raw(),
+                        TieredTable::RECORD_HEADER_LEN,
+                    );
+                    let image = head
+                        .map(|h| TieredTable::record_len_from_header(&h))
+                        .and_then(|len| read_cold(&self.disk, &life.flush, addr.to_raw(), len));
+                    match image {
+                        Some(image) => (TieredTable::decode_record(&image).key.to_vec(), "cold"),
+                        None => (b"<unreadable>".to_vec(), "cold"),
+                    }
+                } else {
+                    (life.table.record(addr).key.to_vec(), "ram")
+                };
+                per_key.entry(key).or_default().push(format!("{class}@{}", addr.to_raw()));
+            }
+            let anomalies: Vec<String> = per_key
+                .iter()
+                .filter(|(key, at)| at.len() != 1 || !self.model.contains_key(*key))
+                .map(|(key, at)| format!("{}: {at:?}", String::from_utf8_lossy(key)))
+                .take(6)
+                .collect();
+            self.report.violations.push(format!(
+                "{when}: cardinality — the table counts {} keys, the model {} — {anomalies:?}",
+                life.table.len(),
+                self.model.len()
+            ));
         }
     }
 
@@ -542,6 +755,9 @@ enum Op {
     Set(Vec<u8>),
     /// An out-of-line value (M4-S17): always at or above the threshold.
     SetBlob(Vec<u8>),
+    /// A SET that takes the shadow path when the key's only exact
+    /// candidate is cold (M4.5-S37); otherwise a plain `Set`.
+    SetShadow(Vec<u8>),
     Del,
 }
 
@@ -669,13 +885,18 @@ fn check_live_set(
 }
 
 fn seeded_op(rng: &mut SplitMix64) -> Op {
-    match rng.next_u64() % 6 {
+    match rng.next_u64() % 8 {
         0 => Op::Del,
         // The blob leg (M4-S17): values at or above the threshold, small
         // enough that the extent lifecycle churns at DST scale.
         1 => {
             let len = BLOB_THRESHOLD as usize + (rng.next_u64() % 300) as usize;
             Op::SetBlob(vec![(rng.next_u64() % 251) as u8; len])
+        }
+        // The shadow leg (M4.5-S37): a quarter of the inline SETs.
+        2 | 3 => {
+            let len = 24 + (rng.next_u64() % 140) as usize;
+            Op::SetShadow(vec![(rng.next_u64() % 251) as u8; len])
         }
         _ => {
             let len = 24 + (rng.next_u64() % 140) as usize;
@@ -722,6 +943,12 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             run.apply_op(&mut life, &key, op);
             if !life.flush_lag && rng.next_u64().is_multiple_of(32) {
                 run.maintain(&mut life);
+            }
+            // The reconciler's cadence (ADR-0093 D4), seeded: most
+            // tickets resolve in-life, some stay open into the walk and
+            // the cut.
+            if rng.next_u64().is_multiple_of(5) {
+                run.reconcile(&mut life, 2, &format!("life {life_index} phase A"));
             }
             // The seeded AC1 cut (M4-S17): occasionally an extent
             // reaches durability and the "process dies" before its
@@ -825,6 +1052,13 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             if !life.flush_lag && rng.next_u64().is_multiple_of(4) {
                 run.maintain(&mut life);
             }
+            // Mid-walk reconciliation (ADR-0093 D5): a resolution under
+            // a pinned walk records the walk's own id as the origin's
+            // stamp, so the ref this walk may have emitted for the twin
+            // is covered by the origin until the next checkpoint lands.
+            if rng.next_u64().is_multiple_of(3) {
+                run.reconcile(&mut life, 1, &format!("life {life_index} mid-walk"));
+            }
             // Mid-walk copy-forward attempt (ADR-0059 D9-1): the pin
             // pauses compaction — a mid-walk relocation would let this
             // walk emit a ref and an image for one key. The call
@@ -918,6 +1152,9 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             run.report.cut_before_publish += 1;
         }
 
+        // Tickets deliberately left open across the cut (ADR-0093 D5):
+        // recovery must re-form them from the checkpoint/tail.
+        run.report.shadow_open_at_cut += life.table.shadow_pending() as u64;
         // The cut: every un-fsynced byte tears (seeded physics).
         disk.power_cut(scenario.seed ^ (0xC07_0000 + life_index));
         drop(life);
@@ -1001,6 +1238,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             return run.report;
         }
         let mut table = table.into_inner();
+        table.set_shadow_enabled(true);
         // D4 tail replay: displacement markers pair with their mutation
         // — a bounded list since ADR-0059 D9 (origin markers stack atop
         // the ordinary one; each removal is exact-pair).
@@ -1043,6 +1281,10 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             }
             rest = &rest[consumed..];
         }
+        // M4.5-S37 (ADR-0093 D5): the shadow ticket set is rebuilt from
+        // the finished index at recovery-complete — the plane's
+        // `finish_tier_replay` does this; the harness plays it here.
+        table.rebuild_shadow_tickets();
         // The M4-S14 oracle (ADR-0058 D4): by replay-complete, every
         // recovered file's slot count equals the index's ground truth,
         // and byte counters never over-count dead — asserted per life,
@@ -1056,9 +1298,21 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             ring: StagingRing::new(StagingConfig::default()),
             flush_lag: false,
         };
+        // The D5 rebuild: every pair the checkpoint and the tail restored
+        // is a ticket again; the never-none audit runs with them open
+        // (the winner serves), then they reconcile and the cardinality
+        // oracle closes the life.
+        run.report.shadow_reformed += life.table.shadow_pending() as u64;
+        run.audit(&life, &format!("life {life_index} (tickets open)"));
+        run.reconcile_all(&mut life, &format!("life {life_index} post-recovery"));
+        run.audit_cardinality(&life, &format!("life {life_index}"));
         // The M4-S17 refcount reconciliation oracle + the boot sweep
         // (ADR-0061 D6): exact counts, orphans reclaimed, disk equals
-        // the live set.
+        // the live set. After reconciliation: an open ticket's twin may
+        // be a blob record whose extent stays referenced — legitimately
+        // live until the twin is verified — while the model already
+        // holds the key's inline winner (ADR-0093 D4: the death, and the
+        // refcount decrement, happen at the verdict).
         check_blob_refs(&mut run, &mut life, &recovered.extents_listed, life_index);
         run.audit(&life, &format!("life {life_index}"));
         run.report.trace_hash = hash64(
@@ -1072,6 +1326,9 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                 run.report.blobs_written.to_le_bytes(),
                 run.report.blob_extents_reclaimed.to_le_bytes(),
                 life.table.cold_floor().to_le_bytes(),
+                run.report.shadow_opened.to_le_bytes(),
+                run.report.shadow_reformed.to_le_bytes(),
+                run.report.shadow_same_key.to_le_bytes(),
             ]
             .concat(),
             run.report.trace_hash,

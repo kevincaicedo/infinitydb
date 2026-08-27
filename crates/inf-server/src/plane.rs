@@ -1661,6 +1661,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             }
         }
         let mut compact_reads: Vec<crate::tier_cell::CompactRead> = Vec::new();
+        let mut shadow_reads: Vec<(NsId, inf_store::ShadowRead)> = Vec::new();
         let mut flush_ops: Vec<IoOp> = Vec::new();
         let cold = {
             let mut tier_slot = self.shared.tier.borrow_mut();
@@ -1709,6 +1710,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                     Err(_) => {}
                 }
             }
+            // M4.5-S37 (ADR-0093 D4): the shadow reconciler's reads —
+            // oldest winner first, bounded per table, Foreground once
+            // the pinned suffix crosses half its cap.
+            for t in &tier.namespaces {
+                if let Some(table) = ks.tiered_store_mut(t.ns) {
+                    let reads = table.shadow_work(inf_store::SHADOW_READS_IN_FLIGHT);
+                    shadow_reads.extend(reads.into_iter().map(|read| (t.ns, read)));
+                }
+            }
             units += tier.maintain_teardown();
             if units > 0 {
                 cx.charge(GroupClass::Maintenance, units);
@@ -1745,6 +1755,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         for read in compact_reads {
             let shared = Rc::clone(&self.shared);
             let _ = cx.executor.poll_immediate(compact_pump(shared, read));
+        }
+        for (ns, read) in shadow_reads {
+            let shared = Rc::clone(&self.shared);
+            let _ = cx.executor.poll_immediate(shadow_pump(shared, ns, read));
         }
         // Extent-seal fdatasyncs (ADR-0061 D3): the barrier is already
         // in the ledger; the op rides the driver now.
@@ -5433,6 +5447,35 @@ async fn apply_tiered_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'st
     let class = shared.store.borrow().ns_fsync_class(ns);
     let origin_cell = ExecOrigin::Fabric(CellId(origin));
     tiered::dispatch_tiered(shared, origin_cell, ns, meta, argv, proto, class).await
+}
+
+/// One shadow reconciliation read (M4.5-S37, ADR-0093 D4): the ticket's
+/// cold record through `ColdReads` (`Maintain`, or `Foreground` when
+/// the pinned suffix asks), then — inside one borrow, after the
+/// suspension — the store re-validates the ticket and applies the
+/// verdict. A failed read leaves the ticket for the next round. No
+/// borrow is held across the await (§3.3).
+async fn shadow_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: Rc<Shared<O, F>>,
+    ns: NsId,
+    read: inf_store::ShadowRead,
+) {
+    let class = if read.foreground {
+        inf_runtime::ReadClass::Foreground
+    } else {
+        inf_runtime::ReadClass::Maintain
+    };
+    let image = tiered::read_cold_record(&shared, ns, read.ticket.cold, class).await;
+    let mut ks = shared.store.borrow_mut();
+    // A dropped namespace took its tickets with it.
+    let Some(table) = ks.tiered_store_mut(ns) else { return };
+    let ticket = read.ticket;
+    match image {
+        Ok(image) => {
+            let _ = table.resolve_shadow(ticket.hash, ticket.cold, ticket.winner, &image);
+        }
+        Err(_) => table.shadow_read_failed(ticket.cold),
+    }
 }
 
 /// One compaction read chain (M4-S26 driving ADR-0059 D2): chunked cold

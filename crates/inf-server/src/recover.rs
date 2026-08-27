@@ -818,6 +818,10 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         for tier in &self.recovered_tiers {
             if let Some(table) = ks.tiered_store_mut(tier.ns) {
                 table.extent_sweep_seed(&tier.extents_listed);
+                // M4.5-S37 (ADR-0093 D5): the shadow ticket set is a
+                // projection of the finished index — rebuild it once the
+                // checkpoint and WAL tail have replayed, before serving.
+                table.rebuild_shadow_tickets();
             }
         }
         Ok(())

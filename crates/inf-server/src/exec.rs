@@ -236,6 +236,10 @@ pub struct NodeInfo {
     /// ceiling arm wrote blind over a cold candidate.
     #[cfg(feature = "bench-diagnostics")]
     pub blind_overwrites_ceiling: Cell<u64>,
+    /// M4.5-S37 (ADR-0093 D2 step 7): eligible shadow writes refused at
+    /// the plane's staging/disk gate (the store's counters carry the
+    /// store-side refusals).
+    pub shadow_fallback_staging: Cell<u64>,
     pub frame_waits_barrier: Cell<u64>,
     pub frame_waits_rotation: Cell<u64>,
     pub frame_waits_reorder: Cell<u64>,

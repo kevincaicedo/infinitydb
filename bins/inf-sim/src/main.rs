@@ -310,10 +310,18 @@ fn main() {
             let mut blobs = 0u64;
             let mut blob_orphans = 0u64;
             let mut blob_reclaims = 0u64;
+            let mut shadow_opened = 0u64;
+            let mut shadow_at_cut = 0u64;
+            let mut shadow_reformed = 0u64;
+            let mut shadow_same_key = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
                 ran += 1;
+                shadow_opened += report.shadow_opened;
+                shadow_at_cut += report.shadow_open_at_cut;
+                shadow_reformed += report.shadow_reformed;
+                shadow_same_key += report.shadow_same_key;
                 refs += report.refs_emitted;
                 images += report.images_emitted;
                 cuts_before += report.cut_before_publish;
@@ -344,7 +352,9 @@ fn main() {
                  {live_entries} live-set entries, {relocations} relocations, \
                  {files_retired} retired, {files_unlinked} unlinked, \
                  {boot_gc} left-to-boot-gc, {blobs} blobs, {blob_orphans} orphans-planted, \
-                 {blob_reclaims} blob-reclaims"
+                 {blob_reclaims} blob-reclaims; shadow {shadow_opened} opened, \
+                 {shadow_at_cut} open at a cut, {shadow_reformed} re-formed by recovery, \
+                 {shadow_same_key} same-key verdicts"
             );
             if let Some(dir) = out_dir {
                 std::fs::create_dir_all(&dir).expect("--out dir");
@@ -355,7 +365,9 @@ fn main() {
                      flush_lag_lives={flush_lag} live_set_entries={live_entries} \
                      relocations={relocations} files_retired={files_retired} \
                      files_unlinked={files_unlinked} unlinks_boot_gc={boot_gc} \
-                     blobs={blobs} blob_orphans={blob_orphans} blob_reclaims={blob_reclaims}\n"
+                     blobs={blobs} blob_orphans={blob_orphans} blob_reclaims={blob_reclaims} \
+                     shadow_opened={shadow_opened} shadow_at_cut={shadow_at_cut} \
+                     shadow_reformed={shadow_reformed} shadow_same_key={shadow_same_key}\n"
                 );
                 std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
                     .expect("manifest");
@@ -372,7 +384,8 @@ fn main() {
             "inf-sim: m4-recovery seed {seed:#x}: {} lives, {} refs, {} images, {} tail \
              records, {} cut-before-publish, {} flush-lag, {} keys audited, {} live-set \
              entries, {} relocations, {} retired, {} unlinked, {} left-to-boot-gc, \
-             {} blobs, {} orphans-planted, {} blob-reclaims, trace {:#x}",
+             {} blobs, {} orphans-planted, {} blob-reclaims, shadow {} opened / {} open at a \
+             cut / {} re-formed / {} same-key, trace {:#x}",
             report.lives,
             report.refs_emitted,
             report.images_emitted,
@@ -388,6 +401,10 @@ fn main() {
             report.blobs_written,
             report.blob_orphans_planted,
             report.blob_extents_reclaimed,
+            report.shadow_opened,
+            report.shadow_open_at_cut,
+            report.shadow_reformed,
+            report.shadow_same_key,
             report.trace_hash
         );
         if verify {
@@ -428,10 +445,24 @@ fn main() {
             let mut diskfull_refusals = 0u64;
             let mut drop_values = 0u64;
             let mut drop_other = 0u64;
+            let mut shadow_seeds = 0u64;
+            let mut shadow_created = 0u64;
+            let mut shadow_same_key = 0u64;
+            let mut shadow_collision = 0u64;
+            let mut shadow_fallbacks = 0u64;
+            let mut shadow_stale = 0u64;
+            let mut shadow_at_cut = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
                 ran += 1;
+                shadow_seeds += u64::from(report.shadow_arm);
+                shadow_created += report.shadow_created;
+                shadow_same_key += report.shadow_resolved_same_key;
+                shadow_collision += report.shadow_resolved_collision;
+                shadow_fallbacks += report.shadow_fallbacks;
+                shadow_stale += report.shadow_stale;
+                shadow_at_cut += report.shadow_pending_at_cut;
                 sim_seconds += report.sim_seconds;
                 commands += report.commands_done;
                 audited += report.audited_keys;
@@ -461,7 +492,10 @@ fn main() {
                  violations, {refused} legal taxonomy refusals, {commands} commands, {audited} \
                  keys audited, {flushed_pre_cut} B flushed pre-cut, {cold_resolves} cold \
                  resolves, {blob_sets} blob sets, {diskfull_refusals} DISKFULL refusals, \
-                 drop-race {drop_values} values / {drop_other} typed-other"
+                 drop-race {drop_values} values / {drop_other} typed-other; shadow arm on \
+                 {shadow_seeds} seeds: {shadow_created} tickets ({shadow_at_cut} open at the \
+                 cut), {shadow_same_key} same-key / {shadow_collision} collision verdicts, \
+                 {shadow_stale} stale, {shadow_fallbacks} fallbacks"
             );
             println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
             if let Some(dir) = out_dir {
@@ -472,7 +506,11 @@ fn main() {
                      refused={refused} commands={commands} keys_audited={audited} \
                      flushed_pre_cut={flushed_pre_cut} cold_resolves={cold_resolves} \
                      blob_sets={blob_sets} diskfull_refusals={diskfull_refusals} \
-                     drop_values={drop_values} drop_other={drop_other}\n"
+                     drop_values={drop_values} drop_other={drop_other} \
+                     shadow_seeds={shadow_seeds} shadow_created={shadow_created} \
+                     shadow_at_cut={shadow_at_cut} shadow_same_key={shadow_same_key} \
+                     shadow_collision={shadow_collision} shadow_stale={shadow_stale} \
+                     shadow_fallbacks={shadow_fallbacks}\n"
                 );
                 std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
                     .expect("manifest");
@@ -489,7 +527,9 @@ fn main() {
             "inf-sim: m4-tiered seed {seed:#x}: {} commands, {} steps, {} keys audited, {} \
              required ops, {} allowed-lost, {} B flushed pre-cut, {} B flushed final, {} cold \
              resolves, {} blob sets, {} DISKFULL refusals (reopened: {}), drop-race {} values / \
-             {} typed-other, refused-boot {}, trace {} bytes, hash {:#018x}",
+             {} typed-other, refused-boot {}, shadow arm {} ({} tickets, {} open at the cut, \
+             {} same-key / {} collision, {} stale, {} fallbacks; phase 6b cold resolves {}), \
+             trace {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -504,6 +544,14 @@ fn main() {
             report.drop_replies_value,
             report.drop_replies_other,
             report.refused_boot,
+            report.shadow_arm,
+            report.shadow_created,
+            report.shadow_pending_at_cut,
+            report.shadow_resolved_same_key,
+            report.shadow_resolved_collision,
+            report.shadow_stale,
+            report.shadow_fallbacks,
+            report.phase6b_cold_resolves,
             report.trace.len(),
             report.trace_hash
         );

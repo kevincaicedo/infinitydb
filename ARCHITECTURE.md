@@ -72,7 +72,13 @@ filesystem + device it measured (a moved directory is re-probed); the
 class is the probe's per-device verdict (`fua` where a write-through
 beats a FLUSH by the rule, `flush` otherwise); `--device-probe off` is
 the named dev tier (no file ⇒ FLUSH, loudly — never silently the slow
-class in production). A frame takes the FUA class only when it extends
+class in production); `INFO persistence` reports both the configured
+class (`io_class_configured`) and the active segment's (`barrier_class`,
+which reads `flush` on a fresh cell until its class-upgrade rotation).
+The same model carries the device's cold sequential read rate, and the
+checkpoint interval's replay term is that rate divided across the cells
+(ADR-0088 D4 as amended) — a boot's replay budget is the device's, not
+a constant. A frame takes the FUA class only when it extends
 the durable prefix — a FUA write persists itself, never the un-barriered
 frames before it. Frames ride a **bounded pipeline**
 (ADR-0087): the staging domain is a ring of K + 1 frame buffers, up to K
@@ -203,9 +209,19 @@ slices: CPU in work units (the deficit scheduler) and the **device** in
 bytes and ops (ADR-0088) — every cell holds a static share of a measured
 device model (`inf probe-device`), foreground classes are metered and
 never deferred, background classes (zero-fill, tier flush, checkpoint,
-compaction reads — in that priority) are granted bounded, work-conserving
-deficits on the injected clock and told "not this slice" otherwise; never
-a queue, never a client-visible refusal.
+compaction and shadow-reconciliation reads — in that priority) are
+granted bounded, work-conserving deficits on the injected clock and told
+"not this slice" otherwise; never a queue, never a client-visible
+refusal. The tiered write path's one remaining foreground device read —
+verifying a cold candidate before a plain `SET` overwrites it — has a
+measured off-critical-path form (M4.5-S37, ADR-0093, shipped as an arm
+behind `tiered-shadow-overwrite`, default off): the new record wins at
+once by the index's own probe order, the candidate stays slotted as a
+*shadow* whose winner is pinned in RAM by the release ceiling, and a
+MAINTAIN reconciler reads and verifies it later with the same full-key
+comparison and the same exact death — nothing is ever removed on hash
+evidence, every bound falls back to the synchronous verify, and the
+shadow set is a projection of the index that recovery rebuilds.
 
 ### Determinism is a feature
 

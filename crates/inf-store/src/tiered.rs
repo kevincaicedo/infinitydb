@@ -21,6 +21,7 @@
 
 pub mod compact;
 pub mod promote;
+pub mod shadow;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -181,6 +182,10 @@ pub struct TieredTable {
     /// Promotion observability (ADR-0085 D6) — `INFO tiering` renders
     /// these; the A/B and the DST oracles read them.
     promote_stats: promote::PromotionCounters,
+    /// Shadow-slot tickets (M4.5-S37, ADR-0093): the open `(hash, cold,
+    /// winner)` pairs, the record pin's source, the reconciler's work
+    /// list — a projection of the index, rebuilt at recovery.
+    shadow: shadow::ShadowSet,
 }
 
 /// Cached disk-admission state (M4-S21, ADR-0063 D2). Two legs: the
@@ -272,6 +277,7 @@ impl TieredTable {
             promote_enabled: true,
             promote_filter: promote::PromoteFilter::new(),
             promote_stats: promote::PromotionCounters::default(),
+            shadow: shadow::ShadowSet::new(),
         })
     }
 
@@ -324,6 +330,14 @@ impl TieredTable {
             (None, Some(addr)) => TieredLookup::Cold(addr),
             (None, None) => TieredLookup::Miss,
         }
+    }
+
+    /// Whether the exact `(hash, addr)` pair is slotted — the sidecar's
+    /// 64-bit hash, never the fingerprint (the oracles' and the DST's
+    /// probe; ADR-0093's tickets are defined on this relation).
+    #[must_use]
+    pub fn contains_pair(&self, hash: u64, addr: LogicalAddr) -> bool {
+        self.index.contains_pair(hash, addr)
     }
 
     /// Reads a RAM-resident record (header first, then the exact slice —
@@ -454,6 +468,7 @@ impl TieredTable {
     ) -> Result<LogicalAddr, OpError> {
         let new_addr = self.append(key, value, old_version.wrapping_add(1))?;
         self.index.replace(hash, old, new_addr);
+        self.shadow_note_moved(hash, old, new_addr);
         self.note_death(old, old_len as u64);
         Ok(new_addr)
     }
@@ -461,8 +476,19 @@ impl TieredTable {
     /// Deletes the record at `addr` (key-verified by the caller's lookup).
     /// For a cold record this touches the index and accounting only —
     /// never a cold read (§3.3).
+    ///
+    /// # Panics
+    /// Panics when an open shadow ticket names `addr` as its winner
+    /// (ADR-0093 D3/I7): the caller resolves the ticket first — a
+    /// deleted key must never resurface with its unverified twin's
+    /// value, and the plane's obligation is mechanical here.
     pub fn delete(&mut self, hash: u64, addr: LogicalAddr, len: usize) {
+        assert!(
+            self.shadow_of_winner(addr).is_none(),
+            "delete of a shadow winner before its ticket resolved"
+        );
         self.index.remove(hash, addr);
+        self.shadow_note_removed(addr);
         self.note_death(addr, len as u64);
     }
 
@@ -536,6 +562,7 @@ impl TieredTable {
         let ext = ExtentRef { extent_id: sealed.extent_id().0, offset: 0, len: sealed.data_len() };
         let new_addr = self.append_extent(key, ext, old_version.wrapping_add(1))?;
         self.index.replace(hash, old, new_addr);
+        self.shadow_note_moved(hash, old, new_addr);
         self.note_death(old, old_len as u64);
         Ok(new_addr)
     }
@@ -693,6 +720,10 @@ impl TieredTable {
         }
         let addr = self.append_extent(key, ext, 0)?;
         self.index.insert(hash, addr);
+        // ADR-0093 D5: shadow tickets are rebuilt from the finished index
+        // by `rebuild_shadow_tickets` at recovery-complete, not tracked
+        // through replay (a winner's address moves under the ticket as
+        // images overwrite it — the incremental path orphaned slots).
         Ok(addr)
     }
 
@@ -763,10 +794,11 @@ impl TieredTable {
         self.extents.note_death(addr.to_raw());
     }
 
-    /// Live entries.
+    /// Live keys: the index minus the open shadow tickets (ADR-0093 D3
+    /// — each ticket is exactly one extra slot for one key).
     #[inline]
     pub fn len(&self) -> usize {
-        self.index.len()
+        self.index.len() - self.shadow_pending()
     }
 
     /// True when empty.
@@ -1475,6 +1507,13 @@ impl TieredTable {
         let mut emitted = 0usize;
         loop {
             self.index.scan_home_group_ext(cursor as usize, |addr, hash| {
+                // ADR-0093 D3: a ticket's cold slot is the key's unverified
+                // twin (or a collision key the winner's read has not yet
+                // told apart) — never a second name for the key.
+                if self.is_shadow_cold(addr) {
+                    self.note_shadow_scan_skipped();
+                    return;
+                }
                 emit(hash, addr);
                 emitted += 1;
             });
@@ -1514,6 +1553,9 @@ impl TieredTable {
         // surviving slot — the count-side reconciliation the plan's
         // lazy walk was for, done for free where the fact is born.
         self.live.note_ref(addr.to_raw());
+        // ADR-0093 D5: tickets are rebuilt from the finished index at
+        // recovery-complete (`rebuild_shadow_tickets`), never from the
+        // walk's home-group order here.
     }
 
     /// Applies one `ColdDisplace` marker (D4 rule 1): removes exactly
@@ -1524,6 +1566,10 @@ impl TieredTable {
         if !self.index.remove_if_present(hash, old_addr) {
             return false;
         }
+        // ADR-0093 D5: a marker that kills a ticket's slot ends the
+        // ticket (a resolved shadow's `ColdDisplace(A)` arriving from
+        // the tail, or a winner's own displacement).
+        self.shadow_note_removed(old_addr);
         if old_addr < self.space.life_origin() {
             // The counted case (M4-S14, ADR-0058 D4): a restored ref
             // slot died to the tail's displacement — uncount it. The
@@ -1572,6 +1618,8 @@ impl TieredTable {
             return self.overwrite(key, value, hash, addr, len, version);
         }
         self.insert(key, value, hash)
+        // ADR-0093 D5: tickets are rebuilt from the finished index at
+        // recovery-complete (`rebuild_shadow_tickets`), not here.
     }
 
     /// Tail-`DEL` replay (D4 rule 2's delete half): RAM-verified removal
@@ -1580,6 +1628,15 @@ impl TieredTable {
     pub fn apply_delete(&mut self, key: &[u8], hash: u64) -> bool {
         if let TieredLookup::Ram(addr) = self.lookup(key, hash, &[]) {
             let len = self.record(addr).encoded_len;
+            // ADR-0093 D5: a replayed `Delete` may find a re-formed pair
+            // whose twin the crashed life told apart as a *collision*
+            // (its `DEL` staged no marker for it — the twin is another
+            // key). The ticket ends and the twin stays slotted, which is
+            // exactly the crashed life's verdict; a same-key twin was
+            // killed by the `ColdDisplace(A)` the forced resolution's
+            // markers carried, before this record. Never the foreground
+            // `delete`'s assertion: replay cannot read.
+            self.shadow_drop_winner_tickets(addr);
             self.delete(hash, addr, len);
             return true;
         }

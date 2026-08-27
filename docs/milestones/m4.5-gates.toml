@@ -670,3 +670,40 @@ tier = "linux-reference-box"
 source = "s39d:replay_gbps_per_cell_base"
 measured_by = "gate-run m4.5 --only-s39d"
 informational = true
+
+# M4.5-S37 step 2 (ADR-0093 D9, 2026-08-27): the shadow-slot arm — the
+# hypothesis bars, informational until the reference-box campaign with
+# the rule predeclared decides the default (a correctness row decides
+# the arm, never these).
+[[gate]]
+id = "s37_shadow_ops_x_c256"
+name = "S37: shadow arm ops/s over the shipping path at 256 conns (ADR-0093 D9 hypothesis ≥ 1.5 ×)"
+threshold = 1.5
+comparator = ">="
+unit = "x (B ÷ A ops/s, per-replicate median)"
+tier = "linux-reference-box"
+source = "s37:shadow_ops_x_c256"
+measured_by = "gate-run m4.5 --only-s37 --s37-shadow"
+informational = true
+
+[[gate]]
+id = "s37_shadow_p50_x_c256"
+name = "S37: shadow arm p50 over the shipping path at 256 conns (ADR-0093 D9 hypothesis ≤ 0.5 ×)"
+threshold = 0.5
+comparator = "<="
+unit = "x (B ÷ A p50, per-replicate median)"
+tier = "linux-reference-box"
+source = "s37:shadow_p50_x_c256"
+measured_by = "gate-run m4.5 --only-s37 --s37-shadow"
+informational = true
+
+[[gate]]
+id = "s37_shadow_fallback_share_b_c256"
+name = "S37: share of the shadow arm's SETs that fell back to the synchronous verify (ADR-0093 D9 falsifier at 0.5)"
+threshold = 0.5
+comparator = "<="
+unit = "share (every fallback reason summed ÷ SETs, arm B, per-replicate median)"
+tier = "linux-reference-box"
+source = "s37:shadow_fallback_share_b_c256"
+measured_by = "gate-run m4.5 --only-s37 --s37-shadow"
+informational = true
