@@ -48,6 +48,7 @@ use crate::store::{
 };
 use crate::tiered::TieredTable;
 use crate::tiered::promote::PromotionCounters;
+use crate::tiered::shadow::ShadowCounters;
 use crate::wall::WallAnchor;
 use crate::wheel::ExpiryBudget;
 use crate::write_accounting::{WriteAccountingTotals, WriteAmpSummary};
@@ -171,6 +172,10 @@ pub struct Keyspace {
     /// `tiered-promote-on-read` CONFIG key's cell-local value, applied
     /// to every standing and future tiered table.
     tier_promote: bool,
+    /// Shadow-slot admission (M4.5-S37, ADR-0093 D8): the
+    /// `tiered-shadow-overwrite` CONFIG key's cell-local value — the
+    /// A/B arm, default off.
+    tier_shadow: bool,
     /// Replay displacement register (ADR-0057 D4, widened to a bounded
     /// list by ADR-0059 D9): `ColdDisplace` markers park here until the
     /// paired mutation record — the very next record, same namespace —
@@ -211,6 +216,7 @@ impl Keyspace {
             hand_db: 0,
             tiered_va_limit_bytes: TIERED_VA_LIMIT_DEFAULT,
             tier_promote: true,
+            tier_shadow: false,
             pending_displace: Vec::new(),
             indexes: IndexRegistry::default(),
             backfill: Vec::new(),
@@ -345,6 +351,7 @@ impl Keyspace {
         let mut table = TieredTable::new(config, demote, initial_keys)
             .ok_or(TieredCreateError::Unrepresentable)?;
         table.set_promote_enabled(self.tier_promote);
+        table.set_shadow_enabled(self.tier_shadow);
         self.tiered_stores.push((ns, Box::new(table)));
         Ok(())
     }
@@ -403,6 +410,7 @@ impl Keyspace {
         entry.1.set_blob_config(tier.blob_config());
         entry.1.set_disk_budget(tier.disk_budget_bytes);
         entry.1.set_promote_enabled(self.tier_promote);
+        entry.1.set_shadow_enabled(self.tier_shadow);
     }
 
     /// This cell's share of the node reserved-VA limit (ADR-0062 D4).
@@ -426,6 +434,28 @@ impl Keyspace {
         for (_, table) in &mut self.tiered_stores {
             table.set_promote_enabled(on);
         }
+    }
+
+    /// Pushes the shadow-slot admission flag (M4.5-S37, ADR-0093 D8 —
+    /// the `tiered-shadow-overwrite` CONFIG sweep) to every standing
+    /// tiered table; future tables inherit it. Off orphans nothing:
+    /// open tickets keep reconciling.
+    pub fn set_tier_shadow(&mut self, on: bool) {
+        self.tier_shadow = on;
+        for (_, table) in &mut self.tiered_stores {
+            table.set_shadow_enabled(on);
+        }
+    }
+
+    /// Aggregated shadow-slot counters across every tiered table on
+    /// this cell (M4.5-S37, ADR-0093 D8) — identically zero on a
+    /// memory-mode node (the §3.3 zero contract).
+    pub fn tiering_shadow(&self) -> ShadowCounters {
+        let mut total = ShadowCounters::default();
+        for (_, table) in &self.tiered_stores {
+            total.add(table.shadow_counters());
+        }
+        total
     }
 
     /// Aggregated read-promotion counters across every tiered table on

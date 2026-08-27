@@ -827,12 +827,20 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
     if markers {
         assert_eq!(table.len(), model.len(), "exactly one slot per live key — no stale twins");
     } else {
+        // The pre-D9 hazard reconstructed: without origin markers every
+        // overwritten relocation leaves a stale cold twin slotted. Since
+        // M4.5-S37 (ADR-0093 D5) the shadow ticket set is rebuilt from
+        // the *finished* index at recovery-complete — this replay-only
+        // harness never calls `rebuild_shadow_tickets`, so the twins are
+        // plain slots here, counted in `len()` exactly as they were
+        // before S37 (the reconciler would kill them after a real boot).
         assert_eq!(
             table.len(),
             model.len() + overwritten.len(),
             "without origin markers every overwritten relocation leaves a stale twin \
              (the pre-D9 hazard, reconstructed)"
         );
+        assert_eq!(table.shadow_pending(), 0, "the replay harness does not rebuild tickets");
         return; // the duplicate world has nothing more to prove
     }
 

@@ -23,6 +23,13 @@
 //!   the `EXPIRE` family refuse typed; `TTL` answers -1 for live keys.
 //! - **Values at or above `BLOB-THRESHOLD`** refuse typed until the
 //!   blob leg of this story lands (behind the same D8 refusal).
+//! - **Shadow-slot reconciliation (M4.5-S37, ADR-0093)**: a plain `SET`
+//!   whose only exact-hash candidate is cold appends its record and
+//!   registers the candidate as a shadow instead of reading it on the
+//!   command's critical path (`try_shadow_write`); the MAINTAIN
+//!   reconciler (`shadow_pump`) reads and verifies it later. `DEL`/
+//!   `GETDEL` resolve an open ticket synchronously first (`delete_one`)
+//!   — a deleted key must never resurface with its unverified twin.
 
 use super::*;
 use crate::exec::Argv;
@@ -605,6 +612,165 @@ fn stage_displacements<F: SegmentFs>(
         if moved {
             let marker = MutationEffect::ColdDisplace { ns, old_addr: addr.to_raw() };
             let _ = cell.stage_tiered(table, &marker, class);
+        }
+    }
+}
+
+/// One shadow-write attempt's outcome (M4.5-S37).
+enum ShadowAttempt {
+    /// The record is appended, the ticket registered, the SET staged.
+    Staged(u64),
+    /// Admitted in principle, blocked at the plane's gates — park/reply
+    /// exactly as the synchronous path would.
+    Blocked(WriteBlock),
+    /// Not the shadow shape (RAM hit, no exact candidate needing one,
+    /// a store-side refusal, the knob off): the synchronous resolve.
+    Ineligible,
+}
+
+/// The shadow write (ADR-0093 D2): inside one borrow, the exact-hash
+/// probe, every admission check in order, then insert + register +
+/// stage — or a counted refusal and the synchronous path. Never a
+/// cold read, never a `ColdDisplace`.
+fn try_shadow_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    class: Option<FsyncClass>,
+    key: &[u8],
+    hash: u64,
+    value: &[u8],
+    proto: Protocol,
+) -> ShadowAttempt {
+    let mut ks = shared.store.borrow_mut();
+    let Some(table) = ks.tiered_store_mut(ns) else { return ShadowAttempt::Ineligible };
+    if !table.shadow_enabled() {
+        return ShadowAttempt::Ineligible;
+    }
+    // Inline values only (D1): the extent path keeps its markers.
+    if value.len() >= table.blob_config().threshold_bytes as usize {
+        return ShadowAttempt::Ineligible;
+    }
+    let cold = match table.shadow_probe(key, hash) {
+        inf_store::ShadowProbe::One(cold) => Some(cold),
+        // No exact-hash cold slot: `lookup`'s candidate was another key
+        // (64-bit evidence — the sidecar, not the fingerprint); the
+        // insert is correct without a read and without a ticket.
+        inf_store::ShadowProbe::NoCandidate => None,
+        inf_store::ShadowProbe::Many => {
+            table.note_shadow_multi();
+            return ShadowAttempt::Ineligible;
+        }
+        // An absent key or a RAM hit: the ordinary paths, byte-for-byte.
+        inf_store::ShadowProbe::Miss | inf_store::ShadowProbe::RamHit(_) => {
+            return ShadowAttempt::Ineligible;
+        }
+    };
+    // The pinned-suffix arithmetic wants the RAM record's size (header
+    // + key + value — the TTL-less string layout); `would_fit` below
+    // wants the WAL record's.
+    let record_len = TieredTable::RECORD_HEADER_LEN + key.len() + value.len();
+    if let Some(cold) = cold
+        && table.shadow_admit(hash, cold, record_len).is_err()
+    {
+        return ShadowAttempt::Ineligible;
+    }
+    let encoded_len = MutationEffect::StringSet { ns, key, value }.encoded_len();
+    let mut durable = shared.durable.borrow_mut();
+    let Some(cell) = durable.as_mut() else {
+        return ShadowAttempt::Blocked(WriteBlock::Reply(error_bytes(shared, proto, ERR_FAILED)));
+    };
+    if cell.failed {
+        return ShadowAttempt::Blocked(WriteBlock::Reply(error_bytes(shared, proto, ERR_FAILED)));
+    }
+    // Staging (D2 step 7): the record alone — no markers are staged.
+    if !cell.would_fit(encoded_len) {
+        shared.node.shadow_fallback_staging.set(shared.node.shadow_fallback_staging.get() + 1);
+        return ShadowAttempt::Blocked(WriteBlock::StagingFull);
+    }
+    if let Some(cause) = table.disk_full() {
+        return ShadowAttempt::Blocked(WriteBlock::Reply(diskfull_bytes(shared, proto, cause)));
+    }
+    let class = class.expect("tiered namespaces always carry a durability class");
+    let new_addr = match table.insert(key, value, hash) {
+        Ok(addr) => addr,
+        Err(err) => {
+            return ShadowAttempt::Blocked(write_block_of(shared, table, key, value, err, proto));
+        }
+    };
+    match cold {
+        Some(cold) => table.register_shadow(hash, cold, new_addr),
+        None => table.note_shadow_exact_miss_insert(),
+    }
+    let seq = cell.stage_tiered(table, &MutationEffect::StringSet { ns, key, value }, class);
+    ShadowAttempt::Staged(seq)
+}
+
+/// Reads one whole cold record at `addr` — header window first, the
+/// exact remainder after (the S08 two-round contract) — through
+/// `ColdReads` in `class`, with no index involvement: the caller
+/// re-validates whatever the bytes are for (ADR-0093 D4). `Err` names
+/// the typed failure (I/O, CRC, the address outside every catalogued
+/// file, the queue saturated).
+pub(super) async fn read_cold_record<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    addr: LogicalAddr,
+    class: inf_runtime::ReadClass,
+) -> Result<Vec<u8>, &'static str> {
+    let mut image: Vec<u8> = Vec::new();
+    // 0 = unknown until the header decodes.
+    let mut total: usize = 0;
+    loop {
+        let want = if total == 0 { TieredTable::RECORD_HEADER_LEN } else { total - image.len() };
+        let at = addr.to_raw() + image.len() as u64;
+        let (wait, frames, skip) = {
+            let tier = shared.tier.borrow();
+            let Some(t) = tier.as_ref().and_then(|t| t.ns(ns)) else {
+                return Err("ERR the selected namespace was dropped (INF.NS USE again)");
+            };
+            let Some(cold) = tier.as_ref().and_then(|t| t.cold.clone()) else {
+                return Err(ERR_COLD_IO);
+            };
+            let Some(at) = LogicalAddr::from_raw(at) else { return Err(ERR_COLD_IO) };
+            let Some((fd, file, offset, frames, skip)) = t.plan_cold_read(at, want) else {
+                return Err(ERR_COLD_IO); // outside every catalogued file
+            };
+            let bytes = frames as usize * inf_log::TIER_FRAME_BYTES;
+            let now_us = shared.now.get().as_micros();
+            match cold.enqueue(fd, file, offset, bytes, class, now_us) {
+                Ok(wait) => (wait, frames, skip),
+                Err(_) => return Err(ERR_COLD_BUSY),
+            }
+        };
+        let done = wait.await;
+        if done.outcome().is_err() {
+            return Err(ERR_COLD_IO);
+        }
+        let extracted = done.bytes(|window| {
+            let window_data = frames as usize * inf_log::TIER_FRAME_DATA - skip;
+            if total == 0 {
+                let mut head = Vec::new();
+                inf_log::tier_extract(window, skip, TieredTable::RECORD_HEADER_LEN, &mut head)
+                    .ok()?;
+                let len = TieredTable::record_len_from_header(&head);
+                let take = len.min(window_data);
+                let mut piece = Vec::with_capacity(len);
+                inf_log::tier_extract(window, skip, take, &mut piece).ok()?;
+                Some((len, piece))
+            } else {
+                let take = want.min(window_data);
+                let mut piece = Vec::new();
+                inf_log::tier_extract(window, skip, take, &mut piece).ok()?;
+                Some((total, piece))
+            }
+        });
+        drop(done); // custody home before any further await
+        let Some((len, piece)) = extracted else { return Err(ERR_COLD_IO) };
+        total = len;
+        image.extend_from_slice(&piece);
+        if image.len() >= total {
+            image.truncate(total);
+            return Ok(image);
         }
     }
 }
@@ -1193,8 +1359,10 @@ async fn set_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         }
     }
     // Conditional SETs resolve first; the write helper re-resolves per
-    // attempt, so the condition is re-evaluated with it.
-    let outcome = write_conditional(shared, ns, class, key, proto, nx, xx, value).await;
+    // attempt, so the condition is re-evaluated with it. A SET with no
+    // option is the shadow-eligible shape (ADR-0093 D1).
+    let plain = !nx && !xx && !get_old;
+    let outcome = write_conditional(shared, ns, class, key, proto, nx, xx, value, plain).await;
     let mut reply = shared.take_reply_buf();
     let mut w = RespWriter::new(&mut reply, proto);
     match outcome {
@@ -1234,6 +1402,7 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     nx: bool,
     xx: bool,
     value: &[u8],
+    plain: bool,
 ) -> Result<(u64, Option<Vec<u8>>, bool), Vec<u8>> {
     let hash = TieredTable::hash_key(key);
     let deadline = stall_deadline(shared, ns);
@@ -1255,6 +1424,41 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
         };
         #[cfg(not(feature = "bench-diagnostics"))]
         let blind = false;
+        // M4.5-S37 (ADR-0093 D1/D2): the plain, unconditional, inline
+        // SET may take the shadow path — every refusal falls through to
+        // the synchronous resolve below, exactly as before.
+        if plain && !blind {
+            match try_shadow_write(shared, ns, class, key, hash, value, proto) {
+                ShadowAttempt::Staged(seq) => return Ok((seq, None, true)),
+                ShadowAttempt::Blocked(WriteBlock::StagingFull) => {
+                    let wait = {
+                        let durable = shared.durable.borrow();
+                        let Some(cell) = durable.as_ref() else {
+                            return Err(error_bytes(shared, proto, ERR_FAILED));
+                        };
+                        cell.drained.wait(())
+                    };
+                    wait.await;
+                    continue;
+                }
+                ShadowAttempt::Blocked(WriteBlock::Stall) => {
+                    if shared.now.get() >= deadline {
+                        return Err(error_bytes(shared, proto, ERR_STALLED));
+                    }
+                    let wait = {
+                        let tier = shared.tier.borrow();
+                        let Some(t) = tier.as_ref().and_then(|t| t.ns(ns)) else {
+                            return Err(error_bytes(shared, proto, ERR_STALLED));
+                        };
+                        t.stall_waiters.wait(())
+                    };
+                    wait.await;
+                    continue;
+                }
+                ShadowAttempt::Blocked(WriteBlock::Reply(reply)) => return Err(reply),
+                ShadowAttempt::Ineligible => {}
+            }
+        }
         let (old, old_value): (Displaced, Option<Vec<u8>>) = if blind {
             #[cfg(feature = "bench-diagnostics")]
             shared
@@ -1318,7 +1522,9 @@ async fn setnx<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     proto: Protocol,
     class: Option<FsyncClass>,
 ) -> TieredReply {
-    match write_conditional(shared, ns, class, argv.arg(1), proto, true, false, argv.arg(2)).await {
+    match write_conditional(shared, ns, class, argv.arg(1), proto, true, false, argv.arg(2), false)
+        .await
+    {
         Ok((seq, _, applied)) => {
             let mut reply = shared.take_reply_buf();
             RespWriter::new(&mut reply, proto).int(i64::from(applied));
@@ -1339,7 +1545,8 @@ async fn getset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     proto: Protocol,
     class: Option<FsyncClass>,
 ) -> TieredReply {
-    match write_conditional(shared, ns, class, argv.arg(1), proto, false, false, argv.arg(2)).await
+    match write_conditional(shared, ns, class, argv.arg(1), proto, false, false, argv.arg(2), false)
+        .await
     {
         Ok((seq, old_value, _)) => {
             let mut reply = shared.take_reply_buf();
@@ -1609,6 +1816,42 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
             };
         let Some((addr, len, _)) = old else { return Ok(None) };
+        // M4.5-S37 (ADR-0093 D3): a winner with an open ticket must not
+        // be deleted before its twin is verified — the one command that
+        // would leave the twin as the key's value. Read it now (the
+        // synchronous path's own read) and verify the key; a same-key
+        // twin is then deleted through the **marker path** below (its
+        // own `ColdDisplace` + `delete`, the synchronous shape — the
+        // death is attributed once whether or not a walk is pinned); a
+        // collision ends the ticket and leaves the other key alone.
+        let ticket = {
+            let ks = shared.store.borrow();
+            ks.tiered_store(ns).and_then(|table| table.shadow_of_winner(addr))
+        };
+        let mut verified_twin: Option<(LogicalAddr, usize)> = None;
+        if let Some(ticket) = ticket {
+            let image =
+                match read_cold_record(shared, ns, ticket.cold, inf_runtime::ReadClass::Foreground)
+                    .await
+                {
+                    Ok(image) => image,
+                    Err(message) => return Err(error_bytes(shared, proto, message)),
+                };
+            let verdict = {
+                let mut ks = shared.store.borrow_mut();
+                let Some(table) = ks.tiered_store_mut(ns) else { continue };
+                table.note_shadow_forced_delete();
+                table.verify_shadow(ticket.hash, ticket.cold, ticket.winner, &image)
+            };
+            match verdict {
+                inf_store::ShadowVerdict::SameKey => {
+                    verified_twin = Some((ticket.cold, image.len()));
+                }
+                inf_store::ShadowVerdict::Collision => {}
+                // Stale (`verify` never defers): re-resolve.
+                _ => continue,
+            }
+        }
         // Atomic block: fit check → apply → markers + Delete record.
         let staged = {
             let mut ks = shared.store.borrow_mut();
@@ -1621,7 +1864,9 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             }
             let marker =
                 MutationEffect::ColdDisplace { ns, old_addr: (1u64 << 48) - 1 }.encoded_len();
-            let worst = 4 * marker + MutationEffect::Delete { ns, key }.encoded_len();
+            // Five markers at most: the verified twin's, three origins,
+            // the current address (ADR-0093 D3 over ADR-0059 D9).
+            let worst = 5 * marker + MutationEffect::Delete { ns, key }.encoded_len();
             if !cell.would_fit(worst) {
                 None
             } else {
@@ -1636,9 +1881,20 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 // re-resolves (delete is index + accounting only).
                 match table.lookup(key, hash, &[]) {
                     TieredLookup::Ram(now) | TieredLookup::Cold(now) if now == addr => {
-                        table.delete(hash, addr, len);
                         let class =
                             class.expect("tiered namespaces always carry a durability class");
+                        // The verified same-key twin first (ADR-0093 D3):
+                        // its marker and its exact death, the ticket
+                        // ending with the slot — then the winner as any
+                        // deleted record.
+                        if let Some((twin, twin_len)) = verified_twin
+                            && table.contains_pair(hash, twin)
+                        {
+                            let m = MutationEffect::ColdDisplace { ns, old_addr: twin.to_raw() };
+                            cell.stage_tiered(table, &m, class);
+                            table.delete(hash, twin, twin_len);
+                        }
+                        table.delete(hash, addr, len);
                         for (origin_addr, _) in table.take_displacement_origins(hash, addr) {
                             let m = MutationEffect::ColdDisplace { ns, old_addr: origin_addr };
                             cell.stage_tiered(table, &m, class);
@@ -1692,6 +1948,7 @@ async fn mset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             false,
             false,
             argv.arg(i + 1),
+            true,
         )
         .await
         {

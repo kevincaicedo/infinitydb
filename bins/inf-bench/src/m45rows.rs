@@ -1432,6 +1432,17 @@ fn create_ns(port: u16, argv: &[&[u8]]) -> Result<(), String> {
     }
 }
 
+/// `CONFIG SET key value` (a hot-per-cell key fans to every cell —
+/// ADR-0085 D6 / ADR-0093 D8).
+fn config_set(port: u16, key: &str, value: &str) -> Result<(), String> {
+    let mut stream = connect("127.0.0.1", port)?;
+    let reply = request(&mut stream, &[b"CONFIG", b"SET", key.as_bytes(), value.as_bytes()])?;
+    if reply.starts_with(b"+OK") {
+        return Ok(());
+    }
+    Err(format!("CONFIG SET {key} {value} failed: {}", String::from_utf8_lossy(&reply)))
+}
+
 /// Waits until `INF.NS USE` succeeds on `4 × cells` consecutive fresh
 /// connections — the REUSEPORT-spread proof that the DDL fan reached
 /// every cell.
@@ -3241,6 +3252,16 @@ struct S37Leg {
     cold_read_p99_us: u64,
     cold_queue_full: u64,
     cold_pool_dry: u64,
+    /// M4.5-S37 (ADR-0093 D8/D9): the shadow arm's per-leg deltas —
+    /// tickets opened, the same-key verdicts, every fallback summed,
+    /// stale completions — and the whole-session peaks.
+    shadow_created: u64,
+    shadow_resolved: u64,
+    shadow_fallbacks: u64,
+    shadow_stale: u64,
+    shadow_pending_peak: u64,
+    shadow_pinned_peak: u64,
+    shadow_reads_foreground: u64,
 }
 
 fn s37_leg(
@@ -3289,16 +3310,32 @@ fn s37_leg(
         cold_read_p99_us: crate::gaterun::max_field(&after, "cold_read_p99_us"),
         cold_queue_full: d("cold_queue_full"),
         cold_pool_dry: d("cold_pool_dry"),
+        shadow_created: d("tiering_shadow_created"),
+        shadow_resolved: d("tiering_shadow_resolved_same_key")
+            + d("tiering_shadow_resolved_collision"),
+        shadow_fallbacks: d("tiering_shadow_fallback_off")
+            + d("tiering_shadow_fallback_multi")
+            + d("tiering_shadow_fallback_tickets")
+            + d("tiering_shadow_fallback_pin")
+            + d("tiering_shadow_fallback_origin")
+            + d("tiering_shadow_fallback_staging"),
+        shadow_stale: d("tiering_shadow_stale"),
+        shadow_pending_peak: crate::gaterun::max_field(&after, "tiering_shadow_pending_peak"),
+        shadow_pinned_peak: crate::gaterun::max_field(&after, "tiering_shadow_pinned_bytes_peak"),
+        shadow_reads_foreground: d("tiering_shadow_reads_foreground"),
     })
 }
 
 /// An S37 arm: what the server is spawned with beyond the row's fixed
-/// flags, and what the namespace DDL carries beyond the fixed tier
-/// block. The first arm of a row is its baseline.
+/// flags, what the namespace DDL carries beyond the fixed tier block,
+/// and the CONFIG keys set after the fan (ADR-0093 D8: the shadow arm
+/// is a hot key on the shipping binary). The first arm of a row is its
+/// baseline.
 struct S37Arm {
     label: String,
     server_args: Vec<String>,
     ddl_extra: Vec<Vec<u8>>,
+    config: Vec<(&'static str, &'static str)>,
 }
 
 /// The row's arms. Without `--s37-cold-read-qd`: step 1's ceiling pair
@@ -3310,14 +3347,45 @@ struct S37Arm {
 /// Memory per cell is the pool underneath the cap: `qd × 16 KiB`
 /// (`COLD_POOL_BUF`), disclosed in the row note.
 fn s37_arms(flags: &Flags) -> Result<(Vec<S37Arm>, bool), String> {
+    // M4.5-S37 step 2 (ADR-0093 D9): the shadow arm — A = the shipping
+    // path (knob off), B = `tiered-shadow-overwrite yes`; the same
+    // binary, no `bench-diagnostics`.
+    if flags.bool("s37-shadow") {
+        if flags.get("s37-cold-read-qd").is_some() {
+            return Err("--s37-shadow and --s37-cold-read-qd are different rows".into());
+        }
+        return Ok((
+            vec![
+                S37Arm {
+                    label: "A".into(),
+                    server_args: Vec::new(),
+                    ddl_extra: Vec::new(),
+                    config: vec![("tiered-shadow-overwrite", "no")],
+                },
+                S37Arm {
+                    label: "B".into(),
+                    server_args: Vec::new(),
+                    ddl_extra: Vec::new(),
+                    config: vec![("tiered-shadow-overwrite", "yes")],
+                },
+            ],
+            false,
+        ));
+    }
     let Some(list) = flags.get("s37-cold-read-qd") else {
         return Ok((
             vec![
-                S37Arm { label: "A".into(), server_args: Vec::new(), ddl_extra: Vec::new() },
+                S37Arm {
+                    label: "A".into(),
+                    server_args: Vec::new(),
+                    ddl_extra: Vec::new(),
+                    config: Vec::new(),
+                },
                 S37Arm {
                     label: "B".into(),
                     server_args: vec!["--blind-overwrite-ceiling".into()],
                     ddl_extra: Vec::new(),
+                    config: Vec::new(),
                 },
             ],
             true,
@@ -3333,6 +3401,7 @@ fn s37_arms(flags: &Flags) -> Result<(Vec<S37Arm>, bool), String> {
             label: format!("qd{qd}"),
             server_args: Vec::new(),
             ddl_extra: vec![b"COLD-READ-QD".to_vec(), qd.to_string().into_bytes()],
+            config: Vec::new(),
         });
     }
     if arms.len() < 2 {
@@ -3374,6 +3443,14 @@ fn s37_row(
              closed-loop pipeline 1 at {CONNS_LOW} and {CONNS_HIGH} conns for {duration} s · \
              arm B = --blind-overwrite-ceiling (unsound ceiling instrument; bench-diagnostics \
              build)"
+        ));
+    } else if flags.bool("s37-shadow") {
+        m.note(format!(
+            "s37 row (shadow-slot arm, ADR-0093 D9): {cells} cells · {replicates} replicates \
+             (ABBA) · tiered always, MEM-BUDGET {MEM_BUDGET}/cell, {keys} keys × 1 KiB filled \
+             per leg, then 100 % SET closed-loop pipeline 1 at {CONNS_LOW} and {CONNS_HIGH} \
+             conns for {duration} s · A = tiered-shadow-overwrite no (the shipping path), B = \
+             yes — the same binary; per-leg shadow counters on the raw line"
         ));
     } else {
         m.note(format!(
@@ -3423,6 +3500,9 @@ fn s37_row(
             ddl.extend(arm.ddl_extra.iter().map(Vec::as_slice));
             create_ns(port, &ddl)?;
             await_fan(port, "s37tier", cells)?;
+            for (key, value) in &arm.config {
+                config_set(port, key, value)?;
+            }
             if ceiling {
                 let infos = scrape_cells(port, cells)?;
                 if !infos.iter().all(|c| c.contains_key("blind_overwrites_ceiling")) {
@@ -3451,7 +3531,9 @@ fn s37_row(
                 raw.push_str(&format!(
                     "rep{rep} {:<5} c{conns:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
                      p999_us={:<7.0} sets={} cold_resolves={} ({:.3}/set) blind={} ({:.3}/set) \
-                     cold_qd_p99={} cold_read_p99_us={} cold_queue_full={} cold_pool_dry={}\n",
+                     cold_qd_p99={} cold_read_p99_us={} cold_queue_full={} cold_pool_dry={} \
+                     shadow[created={} ({:.3}/set) resolved={} fallbacks={} ({:.3}/set) \
+                     stale={} pending_peak={} pinned_peak={} reads_fg={}]\n",
                     arm.label,
                     leg.ops_per_sec,
                     leg.p50_us,
@@ -3466,6 +3548,15 @@ fn s37_row(
                     leg.cold_read_p99_us,
                     leg.cold_queue_full,
                     leg.cold_pool_dry,
+                    leg.shadow_created,
+                    leg.shadow_created as f64 / leg.sets.max(1) as f64,
+                    leg.shadow_resolved,
+                    leg.shadow_fallbacks,
+                    leg.shadow_fallbacks as f64 / leg.sets.max(1) as f64,
+                    leg.shadow_stale,
+                    leg.shadow_pending_peak,
+                    leg.shadow_pinned_peak,
+                    leg.shadow_reads_foreground,
                 ));
                 println!("  s37 {}", raw.lines().last().unwrap_or(""));
                 legs.push((rep, arm.label.clone(), conns, leg));
@@ -3504,6 +3595,55 @@ fn s37_row(
             m.set(key(format!("s37:ceiling_p99_gain_x_{tag}")), median(&mut p99_gain));
             m.set(key(format!("s37:blind_share_arm_b_{tag}")), median(&mut blind_share));
             m.set(key(format!("s37:cold_resolve_share_arm_a_{tag}")), median(&mut cold_share));
+            continue;
+        }
+        // The shadow arm (ADR-0093 D9): B over A per replicate, medians,
+        // plus B's own engagement — tickets per SET, the fallback share
+        // (the D9 falsifier at 0.5), stale completions, the pinned peak.
+        if flags.bool("s37-shadow") {
+            let mut ops_x = Vec::new();
+            let mut p50_x = Vec::new();
+            let mut p99_x = Vec::new();
+            let mut created = Vec::new();
+            let mut fallback = Vec::new();
+            let mut stale = Vec::new();
+            let mut pinned = Vec::new();
+            let mut cold_a = Vec::new();
+            for rep in 0..replicates {
+                let (Some(a), Some(b)) = (find(rep, "A", conns), find(rep, "B", conns)) else {
+                    continue;
+                };
+                ops_x.push(b.ops_per_sec / a.ops_per_sec.max(1.0));
+                p50_x.push(b.p50_us / a.p50_us.max(1.0));
+                p99_x.push(b.p99_us / a.p99_us.max(1.0));
+                created.push(b.shadow_created as f64 / b.sets.max(1) as f64);
+                fallback.push(b.shadow_fallbacks as f64 / b.sets.max(1) as f64);
+                stale.push(b.shadow_stale as f64 / b.shadow_resolved.max(1) as f64);
+                pinned.push(b.shadow_pinned_peak as f64);
+                cold_a.push(a.cold_resolves as f64 / a.sets.max(1) as f64);
+            }
+            if ops_x.is_empty() {
+                continue;
+            }
+            let (ops, p50, p99) = (median(&mut ops_x), median(&mut p50_x), median(&mut p99_x));
+            m.set(key(format!("s37:shadow_ops_x_{tag}")), ops);
+            m.set(key(format!("s37:shadow_p50_x_{tag}")), p50);
+            m.set(key(format!("s37:shadow_p99_x_{tag}")), p99);
+            m.set(key(format!("s37:shadow_created_share_b_{tag}")), median(&mut created));
+            m.set(key(format!("s37:shadow_fallback_share_b_{tag}")), median(&mut fallback));
+            m.set(key(format!("s37:shadow_stale_share_b_{tag}")), median(&mut stale));
+            m.set(key(format!("s37:shadow_pinned_peak_bytes_b_{tag}")), median(&mut pinned));
+            m.note(format!(
+                "s37 {tag} shadow B vs A: ops {ops:.3} × · p50 {p50:.3} × · p99 {p99:.3} × · \
+                 tickets/SET {:.3} · fallbacks/SET {:.3} · stale/resolved {:.3} · pinned peak \
+                 {:.0} B · A's cold reads/SET {:.3} (medians of {} pairs)",
+                median(&mut created.clone()),
+                median(&mut fallback.clone()),
+                median(&mut stale.clone()),
+                median(&mut pinned.clone()),
+                median(&mut cold_a),
+                ops_x.len()
+            ));
             continue;
         }
         // The discriminator: every wider cap against the baseline cap,
@@ -3563,8 +3703,22 @@ fn s37_row(
             }
         }
     }
-    m.row_open(if ceiling { "cold-overwrite-ceiling" } else { "cold-read-qd-discriminator" });
-    if ceiling {
+    m.row_open(if ceiling {
+        "cold-overwrite-ceiling"
+    } else if flags.bool("s37-shadow") {
+        "shadow-slot-arm"
+    } else {
+        "cold-read-qd-discriminator"
+    });
+    if flags.bool("s37-shadow") {
+        m.row_write_amp(
+            "S37 step 2 (ADR-0093 D9): the shadow arm B (tiered-shadow-overwrite yes) over \
+             the shipping path A on the beyond-RAM tiered always write legs — the same binary; \
+             the reconciler still pays the read off the critical path, so B's ceiling is the \
+             device's read rate, not the blind arm's; `shadow_fallback_share_b` above 0.5 is \
+             the predeclared falsifier (bimodal by construction); not a write-amplification row",
+        );
+    } else if ceiling {
         m.row_write_amp(
             "S37 step 1 (plan rule): B ÷ A throughput and A ÷ B p99 on the beyond-RAM tiered \
              always write legs; B is an UNSOUND upper bound (the cold record is orphaned) — \

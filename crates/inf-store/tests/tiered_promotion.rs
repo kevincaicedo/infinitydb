@@ -730,12 +730,19 @@ fn replay_and_check(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
     if markers {
         assert_eq!(table.len(), model.len(), "exactly one slot per live key — no stale twins");
     } else {
+        // The pre-D9 hazard reconstructed for the second producer:
+        // without origin markers every overwritten promotion leaves a
+        // stale cold twin. Since M4.5-S37 (ADR-0093 D5) the shadow ticket
+        // set is rebuilt from the *finished* index at recovery-complete,
+        // which this replay-only harness never invokes — so the twins are
+        // plain slots, counted in `len()` as before S37.
         assert_eq!(
             table.len(),
             model.len() + overwritten.len(),
             "without origin markers every overwritten promotion leaves a stale twin \
              (the pre-D9 hazard, reconstructed for the second producer)"
         );
+        assert_eq!(table.shadow_pending(), 0, "the replay harness does not rebuild tickets");
         return; // the duplicate world has nothing more to prove
     }
 

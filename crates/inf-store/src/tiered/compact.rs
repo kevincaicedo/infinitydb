@@ -210,6 +210,17 @@ impl TieredTable {
             // `life_origin` bounds every recovered file's end, so a
             // matching slot names exactly this record.
             if self.index.contains_pair(hash, old) {
+                // A shadow ticket's cold address defers (ADR-0093 D6):
+                // relocating it would place an unverified twin in RAM
+                // above the key's winner — the ADR-0085 D5 hazard, closed
+                // at the one site that could cause it. Re-offered after
+                // the ticket ends; blocks finalization like the cap.
+                if self.is_shadow_cold(old) {
+                    self.note_shadow_compaction_deferred();
+                    applied.deferred += 1;
+                    off += len;
+                    continue;
+                }
                 // A record at the origin cap defers (ADR-0059 D9-2):
                 // its entry drains at the next covering swap, and a
                 // deferred record blocks finalization, never soundness.

@@ -190,6 +190,13 @@ pub struct AddressSpace {
     /// posture); flush and seal stay unpinned, so backpressure targets
     /// keep waking.
     walk_pin: Option<u64>,
+    /// Record-release pin (M4.5-S37, ADR-0093 D3): while a shadow ticket
+    /// is open, the head must not pass its winner — the RAM-resident
+    /// record whose key-verified slot outranks the unverified cold
+    /// twin in lookup order. Set to the oldest unresolved winner by the
+    /// table (`sync_shadow_pin`); `None` when no ticket is open. Like
+    /// the walk pin: release clamps, flush and seal stay unpinned.
+    record_pin: Option<u64>,
     counters: TieringCounters,
     /// Interior-mutable: the resolver is `&self` on the hottest path.
     cold_resolves: LocalCounter,
@@ -232,6 +239,7 @@ impl AddressSpace {
             hole_marks: VecDeque::new(),
             flush_cuts: VecDeque::new(),
             walk_pin: None,
+            record_pin: None,
             counters: TieringCounters::default(),
             cold_resolves: LocalCounter::new(),
         })
@@ -270,11 +278,34 @@ impl AddressSpace {
     }
 
     /// How far the head may advance right now: `flushed`, clamped to the
-    /// walk pin while a hybrid walk is in flight (ADR-0057 D2). Release
-    /// drivers step toward this, never toward `flushed` directly.
+    /// walk pin while a hybrid walk is in flight (ADR-0057 D2) and to
+    /// the record pin while a shadow ticket is open (ADR-0093 D3).
+    /// Release drivers step toward this, never toward `flushed` directly.
     #[must_use]
     pub fn release_ceiling(&self) -> u64 {
-        self.walk_pin.map_or(self.flushed, |w| w.min(self.flushed))
+        let ceiling = self.walk_pin.map_or(self.flushed, |w| w.min(self.flushed));
+        self.record_pin.map_or(ceiling, |p| p.min(ceiling))
+    }
+
+    /// Pins page release at `at` (a RAM-resident record's address — the
+    /// oldest unresolved shadow winner, ADR-0093 D3) or lifts the pin.
+    /// The pin never names an address below the head: a winner is
+    /// registered while RAM-resident and the ceiling then keeps it so.
+    ///
+    /// # Panics
+    /// Debug-panics on a pin below the head (a winner that already went
+    /// cold — the invariant the pin exists to keep).
+    pub fn set_record_pin(&mut self, at: Option<LogicalAddr>) {
+        let pin = at.map(LogicalAddr::to_raw);
+        debug_assert!(pin.is_none_or(|p| p >= self.head), "record pin below the head");
+        debug_assert!(pin.is_none_or(|p| p < self.tail), "record pin past the tail");
+        self.record_pin = pin;
+    }
+
+    /// The record pin, if one is set (tests and `INFO`).
+    #[must_use]
+    pub fn record_pin(&self) -> Option<LogicalAddr> {
+        self.record_pin.map(|p| LogicalAddr::from_raw(p).expect("watermarks stay 48-bit"))
     }
 
     /// Tightens the committed-window admission bound to `bytes` (rounded
@@ -608,7 +639,7 @@ impl AddressSpace {
         let t = to.to_raw();
         assert!(t >= self.head, "head retreat");
         assert!(t <= self.flushed, "page release above flushed");
-        assert!(t <= self.release_ceiling(), "page release past the pinned walk watermark");
+        assert!(t <= self.release_ceiling(), "page release past a pinned watermark or record");
         self.head = t;
         let new_floor_rel = self.page_floor(t - self.life_origin);
         if new_floor_rel > self.commit_floor_rel {

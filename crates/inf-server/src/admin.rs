@@ -754,6 +754,39 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tiering_promote_skip_disk:{}", promo.skip_disk));
     push(text, &format!("tiering_promote_skip_stale:{}", promo.skip_stale));
     push(text, &format!("tiering_promote_skip_cap:{}", promo.skip_cap));
+    // M4.5-S37 (ADR-0093 D8): shadow-slot reconciliation — creation,
+    // the verdicts, the reads, the gauges (open tickets, the pinned RAM
+    // suffix and its cap), every bound's fallback, and the paths that
+    // consult the ticket set. Same zero contract; the A/B and the DST
+    // oracles read these.
+    let shadow = ks.tiering_shadow();
+    push(text, &format!("tiering_shadow_enabled:{}", shadow.enabled));
+    push(text, &format!("tiering_shadow_created:{}", shadow.created));
+    push(text, &format!("tiering_shadow_resolved_same_key:{}", shadow.resolved_same_key));
+    push(text, &format!("tiering_shadow_resolved_collision:{}", shadow.resolved_collision));
+    push(text, &format!("tiering_shadow_stale:{}", shadow.stale));
+    push(text, &format!("tiering_shadow_read_errors:{}", shadow.read_errors));
+    push(text, &format!("tiering_shadow_reads_issued:{}", shadow.reads_issued));
+    push(text, &format!("tiering_shadow_reads_foreground:{}", shadow.reads_foreground));
+    push(text, &format!("tiering_shadow_pending:{}", shadow.pending));
+    push(text, &format!("tiering_shadow_pending_peak:{}", shadow.pending_peak));
+    push(text, &format!("tiering_shadow_pinned_bytes:{}", shadow.pinned_bytes));
+    push(text, &format!("tiering_shadow_pinned_bytes_peak:{}", shadow.pinned_bytes_peak));
+    push(text, &format!("tiering_shadow_pin_cap_bytes:{}", shadow.pin_cap_bytes));
+    push(text, &format!("tiering_shadow_fallback_off:{}", shadow.fallback_off));
+    push(text, &format!("tiering_shadow_fallback_multi:{}", shadow.fallback_multi));
+    push(text, &format!("tiering_shadow_fallback_tickets:{}", shadow.fallback_tickets));
+    push(text, &format!("tiering_shadow_fallback_pin:{}", shadow.fallback_pin));
+    push(text, &format!("tiering_shadow_fallback_origin:{}", shadow.fallback_origin));
+    push(text, &format!("tiering_shadow_fallback_staging:{}", node.shadow_fallback_staging.get()));
+    push(text, &format!("tiering_shadow_exact_miss_inserts:{}", shadow.exact_miss_inserts));
+    push(text, &format!("tiering_shadow_compaction_deferred:{}", shadow.compaction_deferred));
+    push(text, &format!("tiering_shadow_promote_skip:{}", shadow.promote_skip));
+    push(text, &format!("tiering_shadow_scan_skipped:{}", shadow.scan_skipped));
+    push(text, &format!("tiering_shadow_forced_by_delete:{}", shadow.forced_by_delete));
+    push(text, &format!("tiering_shadow_retargeted:{}", shadow.retargeted));
+    push(text, &format!("tiering_shadow_dropped_by_removal:{}", shadow.dropped_by_removal));
+    push(text, &format!("tiering_shadow_bytes:{}", shadow.bytes));
     push(
         text,
         &format!(
@@ -835,7 +868,7 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
                  write_amp_milli={},blob_user_bytes={},blob_bytes={},blob_write_amp_milli={},\
                  blob_extents_live={},blob_disk_bytes={},disk_used_bytes={},disk_full={},\
                  diskfull_refusals={},compact_idle_pressure={},promotions={},\
-                 promoted_bytes={}",
+                 promoted_bytes={},shadow_pending={},shadow_pinned_bytes={}",
                 ns.0,
                 space.head().to_raw(),
                 space.flushed().to_raw(),
@@ -868,6 +901,8 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
                 table.compact_idle_pressure(),
                 table.promotion_counters().promotions,
                 table.promotion_counters().promoted_bytes,
+                table.shadow_pending(),
+                table.shadow_pinned_bytes(),
             ),
         );
     }
@@ -1108,6 +1143,9 @@ pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
     // M4.5-S30 (ADR-0085 D6): promotion admission rides the same
     // hot-per-cell sweep — a boolean, so no per-cell division.
     let promote = cfg.get("tiered-promote-on-read").is_none_or(|v| v != "no");
+    // M4.5-S37 (ADR-0093 D8): the shadow arm rides the same sweep;
+    // absent or anything but `yes` is off (the shipping default).
+    let shadow = cfg.get("tiered-shadow-overwrite").is_some_and(|v| v == "yes");
     drop(cfg);
     let cells = u64::from(node.cells.get().max(1));
     // Per-namespace MAXMEMORY shares divide by the same symmetric cell
@@ -1117,6 +1155,7 @@ pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
     ks.set_pressure(PressureConfig { limit_bytes: maxmemory / cells, policy, samples });
     ks.set_tiered_va_limit(va_limit / cells);
     ks.set_tier_promote(promote);
+    ks.set_tier_shadow(shadow);
 }
 
 // ---- INF.NS (M1-S08) -----------------------------------------------------------
@@ -2007,6 +2046,13 @@ mod tests {
             "tiering_promote_skip_stale",
             "tiering_promote_skip_cap",
             "tiering_promote_filter_bytes",
+            // M4.5-S37 (ADR-0093 D8): no table, no tickets.
+            "tiering_shadow_enabled",
+            "tiering_shadow_created",
+            "tiering_shadow_pending",
+            "tiering_shadow_pinned_bytes",
+            "tiering_shadow_fallback_pin",
+            "tiering_shadow_bytes",
         ] {
             assert!(text.contains(&format!("{name}:0")), "missing {name}: {text}");
         }

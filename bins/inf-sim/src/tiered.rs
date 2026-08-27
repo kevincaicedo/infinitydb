@@ -38,6 +38,23 @@
 //! 9. The S19 drop-race finale: pipelined cold GETs race `INF.NS DROP`;
 //!    every reply is typed, the node answers `PING` after.
 //!
+//! **Shadow-slot arm (M4.5-S37, ADR-0093 D8):** three of every four
+//! seeds run `tiered-shadow-overwrite yes` (the DST's authority over the
+//! mechanism before it is the default; the fourth seed is the shipping
+//! off arm). Phase 6b overwrites every audited phase-2 key — cold by
+//! then (the recovered life re-demoted them) — with exact expectations,
+//! and deletes every fifth one (the forced-resolution path), so the
+//! shadow write, the reconciler and `DEL`'s verify-first rule run
+//! through the wire against keys with a real cold twin; phase 7's cold
+//! re-read sweep then serves the new values, and phase 7b is the
+//! **quiescence oracle**: MAINTAIN pumped until no ticket is open, then
+//! `DBSIZE` must equal the model's live-key count (no orphan slot, no
+//! lost key) and `live + dead` the space's allocated bytes. Coverage
+//! (`shadow_created`, the verdicts, the fallbacks) is disclosed per
+//! seed and aggregated by the sweep; phase 2's own overwrites open
+//! tickets only on seeds whose flush ran before the cut (disclosed as
+//! `open at the cut`).
+//!
 //! Coverage is disclosed, never assumed (ADR-0045 D4): flushed bytes,
 //! cold resolves, blob sets, refusals, and drop-race reply classes are
 //! reported per seed and aggregated in sweep manifests. Every event
@@ -74,6 +91,12 @@ const MAINTAIN_SLICE: &[u8] = b"1mb";
 /// target: phase-2 traffic overflows it, so demotion, flush, and cold
 /// reads happen inside the run, not past its end.
 const MUTABLE_FRACTION: &[u8] = b"100";
+/// The shadow arm's phase-2 target (M4.5-S37): 20‰ ≈ 60 KiB per cell —
+/// the 144-key corpus (≈ 250 KiB per cell) sits mostly cold, so a SET
+/// over a demoted key — the shape ADR-0093 exists for — is the common
+/// case, not the exception (at 100‰ the sweep opened five tickets in
+/// 750 arm seeds; coverage is disclosed per seed either way).
+const MUTABLE_FRACTION_SHADOW: &[u8] = b"20";
 /// The phase-6 clamp (hot-reload): 10‰ = ~30 KiB — any recovered tail
 /// plus the re-pressure fill overflows it by construction, making the
 /// flush-liveness oracle structural rather than statistical.
@@ -108,6 +131,9 @@ pub struct TieredScenario {
     /// Device service-time model (the S14 reference stall device by
     /// default — fsync latency is part of the interleaving space).
     pub stall: Option<StallConfig>,
+    /// M4.5-S37 (ADR-0093 D8): the shadow arm — `CONFIG SET
+    /// tiered-shadow-overwrite yes` after the tiered DDL.
+    pub shadow: bool,
 }
 
 impl TieredScenario {
@@ -137,6 +163,7 @@ impl TieredScenario {
             segment_bytes: 64 << 10,
             ckpt_interval_bytes: 24 << 10,
             stall: Some(m2_stall_config()),
+            shadow: seed % 4 != 3,
         }
     }
 
@@ -215,6 +242,19 @@ pub struct TieredNodeReport {
     pub drop_replies_value: u64,
     /// Drop-race replies that answered typed errors/nils (drop won).
     pub drop_replies_other: u64,
+    /// M4.5-S37 (ADR-0093): the arm this seed ran, and the coverage the
+    /// quiescence oracle stood on — tickets created (both lives), the
+    /// verdicts, every fallback, and the ticket count at the cut.
+    pub shadow_arm: bool,
+    pub shadow_created: u64,
+    pub shadow_resolved_same_key: u64,
+    pub shadow_resolved_collision: u64,
+    pub shadow_fallbacks: u64,
+    pub shadow_stale: u64,
+    pub shadow_pending_at_cut: u64,
+    /// Phase 6b's cold resolves (both arms — how many of its overwrites
+    /// met a cold candidate; the shape's coverage, disclosed).
+    pub phase6b_cold_resolves: u64,
 }
 
 impl TieredNodeReport {
@@ -351,6 +391,19 @@ fn preview(reply: &[u8]) -> String {
     )
 }
 
+/// The first `tiering_ns<id>:` line's `head` and `flushed` watermarks
+/// (cell scope — the connection's cell).
+fn ns_watermarks(text: &str) -> Option<(u64, u64)> {
+    let line = text.lines().find(|l| l.starts_with("tiering_ns"))?;
+    let body = line.split_once(':')?.1;
+    let field = |name: &str| -> Option<u64> {
+        body.split(',')
+            .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+            .and_then(|v| v.parse().ok())
+    };
+    Some((field("head")?, field("flushed")?))
+}
+
 /// Extracts one `key:value` integer from an `INFO` section text.
 fn info_field(text: &str, key: &str) -> u64 {
     text.lines()
@@ -418,7 +471,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         b"MEM-BUDGET",
         MEM_BUDGET,
         b"MUTABLE-FRACTION",
-        MUTABLE_FRACTION,
+        if scenario.shadow { MUTABLE_FRACTION_SHADOW } else { MUTABLE_FRACTION },
         b"MAINTAIN-SLICE",
         MAINTAIN_SLICE,
         b"BLOB-THRESHOLD",
@@ -431,6 +484,29 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         other => {
             fail(&mut report, format!("tiered CREATE answered {other:?}"));
             return finish(report, &observer, &clock);
+        }
+    }
+    // The shadow arm (M4.5-S37, ADR-0093 D8): a CONFIG key, fanned to
+    // every cell like `tiered-promote-on-read`.
+    report.shadow_arm = scenario.shadow;
+    if scenario.shadow {
+        let knob: &[&[u8]] = &[b"CONFIG", b"SET", b"tiered-shadow-overwrite", b"yes"];
+        match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, knob) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("shadow CONFIG SET answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        // The fan's witness: the executing cell's table carries the arm
+        // (peers follow on the MAINTAIN version sweep).
+        match info_tiering(&mut setup, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
+            Ok(text) if info_field(&text, "tiering_shadow_enabled") == 0 => {
+                fail(&mut report, "shadow CONFIG SET did not reach the tiered table".to_string());
+                return finish(report, &observer, &clock);
+            }
+            Ok(_) => {}
+            Err(err) => fail(&mut report, format!("post-knob scrape: {err}")),
         }
     }
 
@@ -496,6 +572,8 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     match info_tiering(&mut setup, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
         Ok(text) => {
             report.flushed_pre_cut_bytes = info_field(&text, "tiering_flush_confirmed_bytes");
+            report.shadow_created = info_field(&text, "tiering_shadow_created");
+            report.shadow_pending_at_cut = info_field(&text, "tiering_shadow_pending");
         }
         Err(err) => fail(&mut report, format!("pre-cut scrape: {err}")),
     }
@@ -567,6 +645,28 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     if !matches!(reply, Ok(Some(ref ok)) if ok == b"+OK\r\n") {
         fail(&mut report, format!("acked tiered CREATE lost: audit USE answered {reply:?}"));
         return finish(report, &observer, &clock);
+    }
+    // CONFIG keys are not durable (no CONFIG REWRITE in the sim): the
+    // recovered node boots with the shipping default, so the arm
+    // re-applies its knob here — what an operator's config file does —
+    // and the fan's witness is checked again on the recovered table.
+    if scenario.shadow {
+        let knob: &[&[u8]] = &[b"CONFIG", b"SET", b"tiered-shadow-overwrite", b"yes"];
+        match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, knob) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("post-boot shadow CONFIG SET answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        match info_tiering(&mut audit, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
+            Ok(text) if info_field(&text, "tiering_shadow_enabled") == 0 => {
+                fail(&mut report, "post-boot shadow CONFIG SET did not reach the table".into());
+                return finish(report, &observer, &clock);
+            }
+            Ok(_) => {}
+            Err(err) => fail(&mut report, format!("post-boot knob scrape: {err}")),
+        }
     }
     // Observed post-recovery replies, kept for the phase-7 cold sweep
     // (phases 6–8 never touch phase-2 keys, so equality stays exact).
@@ -717,6 +817,78 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     }
     report.flushed_final_bytes = flushed_now;
 
+    // ---- phase 6b: overwrite + delete the cold phase-2 keys (M4.5-S37) --
+    // The recovered life re-demoted the audited keys (phase 6's fill
+    // overflowed the clamped target), so a plain SET over each meets a
+    // cold candidate — the ADR-0093 shape — on the shadow arm through
+    // the shadow path, on the off arm through the synchronous verify.
+    // Every fifth key is then deleted (a winner with an open ticket:
+    // `DEL` verifies the twin first). Exact expectations; phase 7
+    // re-reads the new state.
+    // Wait for demotion to finish on this cell: the head catches the
+    // flushed watermark and holds for eight polls (release runs a
+    // commit page per MAINTAIN slice behind the flush the liveness
+    // check saw). Bounded; a cell that never settles is disclosed by the
+    // cold-resolve delta below, not a violation.
+    let mut settled = 0u32;
+    let mut last_head = u64::MAX;
+    let mut cold_before = 0u64;
+    for _ in 0..512 {
+        match info_tiering(&mut audit, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
+            Ok(text) => {
+                cold_before = info_field(&text, "tiering_cold_resolves");
+                let Some((head, flushed)) = ns_watermarks(&text) else { break };
+                if head == flushed && head == last_head {
+                    settled += 1;
+                    if settled >= 8 {
+                        break;
+                    }
+                } else {
+                    settled = 0;
+                }
+                last_head = head;
+            }
+            Err(err) => {
+                fail(&mut report, format!("phase-6b settle scrape: {err}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    let mut shadow_writes = 0u64;
+    for (i, key) in observed.keys().cloned().collect::<Vec<_>>().into_iter().enumerate() {
+        let value = value_bytes(b's', 6, i as u64, 2048 + (i % 7) * 128);
+        let set: &[&[u8]] = &[b"SET", &key, &value];
+        match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("phase-6b SET {key:?} answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        shadow_writes += 1;
+        if i % 5 == 4 {
+            let del: &[&[u8]] = &[b"DEL", &key];
+            match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, del) {
+                Ok(Some(reply)) if reply == b":1\r\n" => {}
+                other => {
+                    fail(&mut report, format!("phase-6b DEL {key:?} answered {other:?}"));
+                    return finish(report, &observer, &clock);
+                }
+            }
+            observed.insert(key, b"$-1\r\n".to_vec());
+        } else {
+            observed.insert(key, bulk(&value));
+        }
+    }
+    report.commands_done += shadow_writes;
+    match info_tiering(&mut audit, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
+        Ok(text) => {
+            report.phase6b_cold_resolves =
+                info_field(&text, "tiering_cold_resolves").saturating_sub(cold_before);
+        }
+        Err(err) => fail(&mut report, format!("phase-6b scrape: {err}")),
+    }
+
     // ---- phase 7: cold re-read sweep (exact bytes after re-demotion) -----
     for (key, want) in &observed {
         let reply = match audit.call(
@@ -750,6 +922,113 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             report.flushed_final_bytes = info_field(&text, "tiering_flush_confirmed_bytes");
         }
         Err(err) => fail(&mut report, format!("post-sweep scrape: {err}")),
+    }
+
+    // ---- phase 7b: the shadow quiescence oracle (ADR-0093 I5) -----------
+    // Every ticket the recovered life re-formed or opened must resolve
+    // under MAINTAIN (bounded polls — a reconciler that never drains is
+    // the violation); then the key count the index serves must equal the
+    // model's live keys exactly — no orphan slot, no lost key — and the
+    // space identity must hold. Runs on every arm: the off arm proves
+    // the oracle itself against the shipping path.
+    let mut shadow_text = String::new();
+    for _ in 0..256 {
+        match info_tiering(&mut audit, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
+            Ok(text) => {
+                let pending = info_field(&text, "tiering_shadow_pending");
+                shadow_text = text;
+                if pending == 0 {
+                    break;
+                }
+            }
+            Err(err) => {
+                fail(&mut report, format!("shadow quiescence scrape: {err}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    let gauge = |key: &str| info_field(&shadow_text, key);
+    report.shadow_created += gauge("tiering_shadow_created");
+    report.shadow_resolved_same_key = gauge("tiering_shadow_resolved_same_key");
+    report.shadow_resolved_collision = gauge("tiering_shadow_resolved_collision");
+    report.shadow_stale = gauge("tiering_shadow_stale");
+    report.shadow_fallbacks = gauge("tiering_shadow_fallback_off")
+        + gauge("tiering_shadow_fallback_multi")
+        + gauge("tiering_shadow_fallback_tickets")
+        + gauge("tiering_shadow_fallback_pin")
+        + gauge("tiering_shadow_fallback_origin")
+        + gauge("tiering_shadow_fallback_staging");
+    if gauge("tiering_shadow_pending") != 0 {
+        fail(
+            &mut report,
+            format!(
+                "SHADOW QUIESCENCE VIOLATION: {} tickets still open after 256 MAINTAIN polls \
+                 (reads_issued={} read_errors={} pinned_bytes={})",
+                gauge("tiering_shadow_pending"),
+                gauge("tiering_shadow_reads_issued"),
+                gauge("tiering_shadow_read_errors"),
+                gauge("tiering_shadow_pinned_bytes"),
+            ),
+        );
+    }
+    // Live keys the harness knows: phase-2 keys as the audit observed
+    // them (nil = absent) plus phase-6 keys by their ledgers' last state.
+    let mut live_keys: u64 =
+        observed.values().filter(|reply| !reply.starts_with(b"$-1")).count() as u64;
+    for writer in &post_writers {
+        for ops in writer.ledger.values() {
+            if ops.last().is_some_and(|op| op.state_after.is_some()) {
+                live_keys += 1;
+            }
+        }
+    }
+    // DBSIZE answers per cell (the tiered table is cell-scoped): sum
+    // every cell's answer through a connection pinned to it.
+    let mut total_keys = 0u64;
+    for cell in 0..usize::from(scenario.cells) {
+        let mut probe = MiniClient::connect(&mut node, cell);
+        let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
+        match probe.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, use_ns) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("quiescence USE on cell {cell} answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        let dbsize: &[&[u8]] = &[b"DBSIZE"];
+        match probe.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, dbsize) {
+            Ok(Some(reply)) if reply.starts_with(b":") => {
+                total_keys +=
+                    String::from_utf8_lossy(&reply[1..]).trim().parse::<u64>().unwrap_or(0);
+            }
+            other => {
+                fail(&mut report, format!("quiescence DBSIZE on cell {cell} answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    if total_keys != live_keys {
+        fail(
+            &mut report,
+            format!(
+                "SHADOW CARDINALITY VIOLATION: DBSIZE {total_keys} over {} cells != {live_keys} \
+                 model-live keys (an orphan slot or a lost key)",
+                scenario.cells
+            ),
+        );
+    }
+    let (live, dead, allocated) = (
+        gauge("tiering_live_bytes"),
+        gauge("tiering_dead_bytes"),
+        gauge("tiering_allocated_bytes"),
+    );
+    if allocated != 0 && live + dead != allocated {
+        fail(
+            &mut report,
+            format!(
+                "SHADOW ACCOUNTING VIOLATION: live {live} + dead {dead} != allocated {allocated}"
+            ),
+        );
     }
 
     // ---- phase 8: DISKFULL clamp → typed refusal → reopen (ADR-0063) -----

@@ -1489,3 +1489,69 @@ The reactor-drive flush state machine (`TierFlush` round state in
   probe file makes the budget a ceiling the device cannot meet; the
   tripwires are `barrier_class_degraded` and the deferral rates, both
   visible, neither automatic (ADR-0088 D6).
+
+### A.9 — Shadow-slot tickets and the record pin (M4.5-S37, ADR-0093)
+
+`TieredTable::shadow` (`inf-store/src/tiered/shadow.rs`) and
+`AddressSpace::record_pin`:
+
+- **A ticket is an exact-hash pair** — `(hash, cold, winner)` with
+  `contains_pair(hash, cold)`, `contains_pair(hash, winner)`, `cold`
+  below the head and `winner` RAM-resident — asserted at
+  `register_shadow` (release asserts: a ticket over a slot that does
+  not exist or a record the pin cannot keep is a violated invariant);
+  the write path's candidate comes from `Index::each_exact` (the
+  sidecar's 64 bits), never `lookup`'s 22-bit fingerprint.
+- **The winner never goes cold while its ticket is open** — the record
+  pin is the oldest unresolved winner (`sync_shadow_pin` after every map
+  change) and `release_ceiling = min(flushed, walk pin, record pin)`;
+  `advance_head` asserts `to ≤ release_ceiling()` (release); pinned by
+  `the_record_pin_clamps_release_until_resolution` and
+  `a_shadowed_winner_never_goes_cold`; `resolve_shadow` release-asserts
+  the winner is not cold when it runs.
+- **Nothing is removed on hash evidence** — the only slot removal the
+  module performs (`resolve_shadow`, same key) follows
+  `decode_record(image).key == record(winner).key` on the verbatim cold
+  image, after re-validating the ticket, both pairs and the winner's
+  residency post-suspension; a foreign image is a `Collision` that
+  removes nothing (`a_foreign_image_is_a_collision_and_removes_nothing`).
+- **Exact death, bounded origin chain** — the same-key removal calls
+  `note_death(cold, image.len())` (the space identity and the per-file
+  counters move by the truth — `check_accounting` after every step in
+  the store suite) and chains the twin plus its own origins into the
+  winner's list, release-asserted `≤ RELOC_ORIGIN_CAP` (admission
+  refuses a candidate whose list has no room — `fallback_origin`).
+- **A winner is never deleted under an open ticket** — `TieredTable::
+  delete` release-asserts no ticket names the address; the plane's
+  `delete_one` resolves first (a Foreground read of the twin); replay's
+  `apply_delete` ends the ticket instead (the crashed life's `DEL`
+  already carried the same-key twin's marker, or told it apart as a
+  collision) — pinned by `deleting_a_winner_with_an_open_ticket_panics`
+  and the collision half of `recovery_appliers_reform_pairs_in_both_
+  orders`.
+- **A ticket's cold slot is never relocated** — `compaction_apply`
+  defers it (blocks finalization), `try_promote` skips it; pinned by
+  `compaction_defers_a_tickets_cold_slot_until_resolution` and
+  `promotion_skips_a_tickets_cold_slot`.
+- **The ticket set is a projection of the index** — re-formed by
+  `apply_image`/`apply_extent_image` (RAM insert over exact cold slots)
+  and `apply_ref` (cold ref beside an exact RAM slot), dropped by every
+  slot removal (`shadow_note_removed`) and retargeted by every repoint
+  (`shadow_note_moved`); pinned by `recovery_appliers_reform_pairs_in_
+  both_orders`, the `m4-recovery` cardinality oracle (`len() ==
+  model.len()` at quiescence) and the `m4-tiered` quiescence oracle
+  (Σcells `DBSIZE` == model live keys; `live + dead == allocated`).
+- **Bounded everything** — tickets ≤ `SHADOW_TICKETS_CAP`, the pinned
+  suffix ≤ `MEM-BUDGET / 8`, reads in flight ≤ `SHADOW_READS_IN_FLIGHT`;
+  each exhaustion is a counted refusal that leaves the synchronous
+  verify in force (`admission_refuses_at_every_bound_and_counts`,
+  `reads_in_flight_are_bounded_and_failures_retry`).
+- **Cardinality** — `len() == index.len() − open tickets`; pinned across
+  the store suite and both DST oracles.
+- **Deliberately unchecked**: a genuine 64-bit collision cannot be
+  constructed from real keys in a test (`lookup` asserts the hash is
+  the key's own); the probe order it relies on is pinned at the index
+  level with a forced pair (`ram_verified_slot_outranks_a_cold_twin`)
+  and the verdict with a foreign image. The reconciler's *liveness*
+  under sustained load is a campaign fact (the fallback counters), not
+  an invariant.

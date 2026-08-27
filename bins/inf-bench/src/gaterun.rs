@@ -602,6 +602,9 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "s39d-cold-boot",
         "only-s40",
         "only-s37",
+        // M4.5-S37 step 2 (ADR-0093 D9): the shadow-slot arm — the
+        // shipping binary, `tiered-shadow-overwrite yes` on arm B.
+        "s37-shadow",
         // M4.5-S42 (ADR-0091 D6): the stock first-boot row.
         "only-s42",
         // M4.5-S34 (2026-08-25): the m2 everysec penalty row alone (the
@@ -716,6 +719,7 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "s37-keys",
         // M4.5-S37 step 2 discriminator: `COLD-READ-QD` arms, baseline first.
         "s37-cold-read-qd",
+        "s37-shadow",
         // M4.5-S42 / M4.5-S34.
         "only-s42",
         "only-everysec",

@@ -116,6 +116,16 @@ impl Default for ConfigStore {
                     Kind::Enum(&["no", "yes"]),
                     "yes",
                 ),
+                // M4.5-S37 (ADR-0093 D8): shadow-slot reconciliation for
+                // cold overwrites — the same-binary A/B arm, default off
+                // until the reference-box campaign decides; `no` is inert
+                // for new writes and open tickets keep reconciling.
+                e(
+                    "tiered-shadow-overwrite",
+                    ReloadClass::HotPerCell,
+                    Kind::Enum(&["no", "yes"]),
+                    "no",
+                ),
                 // M4-S19 (ADR-0062 D4): the node bound on aggregate
                 // reserved tiered-Region VA — an explicit bounded
                 // default, never an inferred host maximum. Divided per

@@ -91,6 +91,10 @@ pub use store::{
 };
 pub use tiered::compact::{CompactionApplied, CompactionConfig, CompactionWork};
 pub use tiered::promote::PromotionCounters;
+pub use tiered::shadow::{
+    SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT, SHADOW_TICKETS_CAP, ShadowCounters,
+    ShadowProbe, ShadowRead, ShadowRefusal, ShadowTicket, ShadowVerdict,
+};
 pub use tiered::{RecordParts, TieredLookup, TieredTable};
 pub use tiered_recover::{
     RecoveredTier, TierRecoverStats, apply_blob_ref_section, apply_live_set_section,

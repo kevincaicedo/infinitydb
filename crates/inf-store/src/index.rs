@@ -297,6 +297,43 @@ impl<M: SlotMode> Index<M> {
         }
     }
 
+    /// Visits every slotted address whose **full** hash equals `hash`
+    /// (the tiered sidecar — `ext_matches`; on memory tables every
+    /// tag-matching slot, which is the same filter `find` applies), in
+    /// probe order, until the chain ends. The M4.5-S37 shadow probe
+    /// (ADR-0093 D2): a cold candidate is a *shadow* only when its
+    /// 64-bit hash equals the key's — a fingerprint-only match is another
+    /// key and is left alone. Diagnostics-class cost (one chain walk);
+    /// the eligible write pays it once, after `lookup` reported a cold
+    /// candidate.
+    pub fn each_exact(&self, hash: u64, mut visit: impl FnMut(M::Addr)) {
+        let (tag, fp) = (h2(hash), fp15(hash));
+        let mask = self.group_mask();
+        let mut group = (hash as usize) & mask;
+        let mut stride = 0;
+        loop {
+            let ctrl = self.ctrl_group(group);
+            let mut candidates = eq_mask16(ctrl, tag);
+            while candidates != 0 {
+                let i = candidates.trailing_zeros() as usize;
+                candidates &= candidates - 1;
+                let pos = group * GROUP + i;
+                let slot = self.slots[pos];
+                if slot.fp15() == fp && M::ext_matches(&self.ext, pos, hash) {
+                    visit(M::addr_from_raw(slot.addr_raw()));
+                }
+            }
+            if eq_mask16(ctrl, CTRL_EMPTY) != 0 {
+                return;
+            }
+            stride += 1;
+            if stride > mask {
+                return;
+            }
+            group = (group + stride) & mask;
+        }
+    }
+
     /// Diagnostics: groups visited until the probe for `hash` terminates
     /// (found-and-verified, or empty slot). Feeds the probe-length
     /// histogram artifact (M0-S14 AC) — not a hot-path API.
