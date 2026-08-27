@@ -1,0 +1,33 @@
+infinityd: io-properties: io-properties.toml (schema 3, identity verified (ext4 /dev/nvme0n1p3 uuid c97c5418…))
+infinityd: log barrier class fua (source: --barrier-class; fua_max_frame_bytes 1048576; probed p50 fua 295 µs / flush 988 µs); frames in flight 3 (auto: fua) × 4 MiB staging
+infinityd: segment recycling on, 1 slot(s) × 256 MiB per cell, pool wait quarter (ADR-0090)
+infinityd: device model probed (schema 3): write 347 MiB/s, 2905 ops/s (qd4 barriers 9071/s); per-cell share write 86 MiB/s
+infinityd: checkpoint cap replay term 230 MiB/s per cell (probed read row 922 MiB/s ÷ 4 cells; ADR-0088 D4 as amended)
+infinityd 9c75b94 (git 9c75b9449004, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 42045, backend io_uring, route natural
+infinityd: listening on 42045
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: recovery 0/4 cells ready, 1465765888/12684861440 bytes (11.6%), eta 8s
+control: recovery 0/4 cells ready, 2996867072/12684861440 bytes (23.6%), eta 7s
+control: recovery 0/4 cells ready, 4531064832/12684861440 bytes (35.7%), eta 6s
+control: recovery 0/4 cells ready, 6064607232/12684861440 bytes (47.8%), eta 5s
+control: recovery 0/4 cells ready, 7598944256/12684861440 bytes (59.9%), eta 4s
+control: cell 0 not ready — in checkpoint (1900625920/3171307520 bytes) for 5s
+control: cell 1 not ready — in checkpoint (1899773952/3171090432 bytes) for 5s
+control: cell 2 not ready — in checkpoint (1897435136/3171094528 bytes) for 5s
+control: cell 3 not ready — in checkpoint (1901109248/3171368960 bytes) for 5s
+control: recovery 0/4 cells ready, 9154945024/12684861440 bytes (72.2%), eta 3s
+control: cell 0 not ready — in checkpoint (2291449856/3171307520 bytes) for 6s
+control: cell 1 not ready — in checkpoint (2291027968/3171090432 bytes) for 6s
+control: cell 2 not ready — in checkpoint (2289197056/3171094528 bytes) for 6s
+control: cell 3 not ready — in checkpoint (2283270144/3171368960 bytes) for 6s
+control: recovery 0/4 cells ready, 10739007488/12684861440 bytes (84.7%), eta 2s
+control: cell 0 not ready — in replay (2684821504/3171307520 bytes) for 7s
+control: cell 1 not ready — in replay (2684657664/3171090432 bytes) for 7s
+control: cell 2 not ready — in replay (2684604416/3171094528 bytes) for 7s
+control: cell 3 not ready — in replay (2684923904/3171368960 bytes) for 7s
+control: recovery 0/4 cells ready, 12684861440/12684861440 bytes (100.0%), eta 0s
+control: cell 0 not ready — in audit (3171307520/3171307520 bytes) for 8s
+control: cell 1 not ready — in audit (3171090432/3171090432 bytes) for 8s
+control: cell 2 not ready — in audit (3171094528/3171094528 bytes) for 8s
+control: cell 3 not ready — in audit (3171368960/3171368960 bytes) for 8s

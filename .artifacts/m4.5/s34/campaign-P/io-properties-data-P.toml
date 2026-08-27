@@ -1,0 +1,44 @@
+# io-properties — written by `inf probe-device` (ADR-0086 D7)
+# rule: fua iff fua p50 <= 0.75 x flush p50 and fua p99 <= flush p99 at 4 KiB;
+# fua_max_frame_bytes = largest probed size whose fua p50 beats flush's and
+#   whose fua p99 stays within 2x flush's p99 (the large-write tail guard).
+# absent file => flush under `--device-probe off`, probed at boot under `auto`
+#   (ADR-0091). `infinityd --barrier-class` overrides.
+# flush bytes=4096     p50_us=988     p99_us=1292    barriers_per_sec=1020
+# fua   bytes=4096     p50_us=295     p99_us=643     barriers_per_sec=2905
+# flush bytes=65536    p50_us=893     p99_us=1389    barriers_per_sec=1054
+# fua   bytes=65536    p50_us=323     p99_us=675     barriers_per_sec=2818
+# flush bytes=262144   p50_us=1133    p99_us=2124    barriers_per_sec=878
+# fua   bytes=262144   p50_us=448     p99_us=1572    barriers_per_sec=1388
+# flush bytes=1048576  p50_us=1601    p99_us=3214    barriers_per_sec=587
+# fua   bytes=1048576  p50_us=920     p99_us=2905    barriers_per_sec=963
+barrier_class = "fua"
+fua_max_frame_bytes = 1048576
+fua_p50_us_4k = 295
+flush_p50_us_4k = 988
+probed_at_unix_s = 1787864163
+# schema 2 (ADR-0088 D6): the device model the per-cell budget spends;
+#   0 = not probed => that direction is unbudgeted (io_budget_model:absent).
+#   read_bytes_per_s_256k: four direct readers, aggregate — the checkpoint
+#   cap's replay term is this value / cells (ADR-0088 D4 as amended).
+probe_schema = 3
+write_bytes_per_s_256k = 363855872
+write_ops_per_s_4k = 2905
+write_ops_per_s_4k_qd4 = 9071
+read_bytes_per_s_256k = 967071032
+read_ops_per_s_4k = 0
+# schema 3 (ADR-0091 D2): the identity of the device this model describes.
+#   A boot compares it to the data directory's device; a mismatch is a
+#   stale model (re-probed under `auto`, refused under `off`). UUID decides
+#   when both sides have one, else device_path + fs_type; empty = unknown.
+fs_type = "ext4"
+fs_uuid = "c97c5418-ec09-40c5-ba6d-050ae172a1dc"
+device_path = "/dev/nvme0n1p3"
+device_major_minor = "259:3"
+block_logical_bytes = 512
+block_physical_bytes = 512
+kernel_release = "7.0.0-30-generic"
+probe_version = 3
+probe_seconds_per_row = 2
+fua_p50_us_512 = 417
+fua_p99_us_512 = 723

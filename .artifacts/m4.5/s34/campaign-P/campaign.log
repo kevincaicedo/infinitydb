@@ -1,0 +1,520 @@
+# 2026-08-27T16:55:40-04:00 binary=infinityd 9c75b94 (git 9c75b9449004, x86_64-unknown-linux-gnu) git=9c75b94 dirty=0 thermal: 27800 39000 41000  gov=performance no_turbo=1 strays=0 load=0.58 0.82 0.69 devstat= 215004 44450 25609639 209629 272407 80566 39327034 960466 0 113713 1213944 50995 0 198741560 29686 19881 14161 df=72%
+=== 2026-08-27T16:55:40-04:00 probe-device ===
+flush bytes=4096     p50=   988 us  p99=  1292 us  barriers/s=  1020
+fua   bytes=4096     p50=   295 us  p99=   643 us  barriers/s=  2905
+flush bytes=65536    p50=   893 us  p99=  1389 us  barriers/s=  1054
+fua   bytes=65536    p50=   323 us  p99=   675 us  barriers/s=  2818
+flush bytes=262144   p50=  1133 us  p99=  2124 us  barriers/s=   878
+fua   bytes=262144   p50=   448 us  p99=  1572 us  barriers/s=  1388
+flush bytes=1048576  p50=  1601 us  p99=  3214 us  barriers/s=   587
+fua   bytes=1048576  p50=   920 us  p99=  2905 us  barriers/s=   963
+fua   bytes=4096     writers=4 barriers/s=  9071 (aggregate)
+read  bytes=262144   readers=4 bytes/s= 967071032 (aggregate, direct)
+wrote /home/kcaicedo/bench-data/s34/data-P/io-properties.toml — barrier_class = "fua", fua_max_frame_bytes = 1048576 (schema 3, identity ext4 /dev/nvme0n1p3 c97c5418-ec09-40c5-ba6d-050ae172a1dc, 22.2 s)
+barrier_class = "fua"
+fua_max_frame_bytes = 1048576
+probe_schema = 3
+write_bytes_per_s_256k = 363855872
+read_bytes_per_s_256k = 967071032
+=== 2026-08-27T16:56:03-04:00 P0 durable-sweep 10000 ===
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=0/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=0 depth_max=1 waits_barrier=0 waits_rotation=0 waits_reorder=0 budget_background_bytes=0 budget_deferrals=0 waits_pace=0 write_stall_max_us=92553 reopened_packed_tails=0 ckpt_downgrades=0 waits_fill=0 waits_group=184427 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=2232 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=1/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=0 depth_max=1 waits_barrier=0 waits_rotation=0 waits_reorder=0 budget_background_bytes=2718674944 budget_deferrals=0 waits_pace=0 write_stall_max_us=91440 reopened_packed_tails=0 ckpt_downgrades=0 waits_fill=0 waits_group=0 segments_recycled=116264 recycle_misses=76607 recycle_fallbacks=0 segment_rotations=190387 recycled_residue_slacks=2960 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=2/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=1250 depth_max=3 waits_barrier=88873 waits_rotation=406 waits_reorder=0 budget_background_bytes=0 budget_deferrals=0 waits_pace=0 write_stall_max_us=90043 reopened_packed_tails=0 ckpt_downgrades=0 waits_fill=0 waits_group=0 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=2264 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=3/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=1250 depth_max=2 waits_barrier=35323 waits_rotation=60039 waits_reorder=0 budget_background_bytes=2283642880 budget_deferrals=0 waits_pace=0 write_stall_max_us=90011 reopened_packed_tails=0 ckpt_downgrades=0 waits_fill=296124 waits_group=0 segments_recycled=100985 recycle_misses=61520 recycle_fallbacks=0 segment_rotations=160026 recycled_residue_slacks=3031 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=4/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=0 depth_max=1 waits_barrier=0 waits_rotation=0 waits_reorder=0 budget_background_bytes=0 budget_deferrals=0 waits_pace=0 write_stall_max_us=92337 reopened_packed_tails=0 ckpt_downgrades=0 waits_fill=0 waits_group=184490 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=2220 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=5/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=1250 depth_max=3 waits_barrier=64248 waits_rotation=63650 waits_reorder=0 budget_background_bytes=4807593984 budget_deferrals=0 waits_pace=0 write_stall_max_us=88443 reopened_packed_tails=0 ckpt_downgrades=0 waits_fill=0 waits_group=0 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=198970 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=6/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=1250 depth_max=3 waits_barrier=88810 waits_rotation=379 waits_reorder=0 budget_background_bytes=0 budget_deferrals=0 waits_pace=0 write_stall_max_us=90788 reopened_packed_tails=0 ckpt_downgrades=0 waits_fill=0 waits_group=0 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=2252 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=10000 shard=7/8 plant=None replay_canary=false seeds_run=1250 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=1250 depth_max=3 waits_barrier=34804 waits_rotation=59165 waits_reorder=0 budget_background_bytes=2255826944 budget_deferrals=0 waits_pace=0 write_stall_max_us=90661 reopened_packed_tails=0 ckpt_downgrades=0 waits_fill=292787 waits_group=0 segments_recycled=99714 recycle_misses=60806 recycle_fallbacks=0 segment_rotations=158034 recycled_residue_slacks=3059 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0
+=== exit 0 2026-08-27T16:56:32-04:00 ===
+=== 2026-08-27T16:57:12-04:00 P1 everysec flush-0 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 2 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-27T16:57:52-04:00 ===
+=== 2026-08-27T16:57:52-04:00 P1 everysec fua-0 ===
+# RESTART (chain b): the 16:57 P1 legs flush-0/fua-0 were refused by env-check on a dirty tree (an S37 edit landed in the checkout mid-chain — stashed; development moved to a worktree); P0 stands, P1-P3 re-run from the top in the predeclared order
+# 2026-08-27T16:58:40-04:00 binary=infinityd 9c75b94 (git 9c75b9449004, x86_64-unknown-linux-gnu) git=9c75b94 dirty=0 thermal: 27800 40000 40000  gov=performance no_turbo=1 strays=0 load=0.36 0.92 0.78 devstat= 231007 44450 29412903 224663 355038 81290 49826468 1007543 0 135468 1281141 50995 0 198741560 29686 26995 19248 df=72%
+=== 2026-08-27T16:58:40-04:00 P1 everysec flush-0 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+
+== row: everysec penalty vs memory-mode ns (interleaved ABBA × 3) ==
+  rep 0 memory-ns: 2407187 ops/s, p999 829 µs
+  rep 0 everysec:  1914698 ops/s, p999 3839 µs
+  rep 1 everysec:  861871 ops/s, p999 295935 µs
+  rep 1 memory-ns: 2178747 ops/s, p999 961 µs
+  rep 2 memory-ns: 2357181 ops/s, p999 881 µs
+  rep 2 everysec:  1936320 ops/s, p999 12927 µs
+
+== gate verdicts ==
+  Zero-cost A/B: pipelined ops regression PENDING (tooling)
+  Zero-cost A/B: pipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: unpipelined 512-conn ops regression PENDING (tooling)
+  Zero-cost A/B: unpipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy write-mix ops regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Memory-only rows append zero log records PENDING (tooling)
+  everysec penalty vs memory mode        FAIL
+  always grouped writes                  PENDING (tooling)
+  Replay throughput per cell             PENDING (tooling)
+  10 GB node cold boot                   PENDING (tooling)
+  DST durability oracle: 10k seeds       PENDING (tooling)
+  Crash matrix green in CI               PENDING (tooling)
+  Checkpoint under full load: foreground p99.9 (anti-BGREWRITEAOF) PENDING (tooling)
+  RSS under continuous checkpoints vs no-checkpoint control (anti-2x) PENDING (tooling)
+  M0/M1 gates re-pass                    PENDING (tooling)
+  One log write per iteration            PENDING (tooling)
+  acks/fsync grouping ratio above floor  PENDING (tooling)
+  sum(domains) vs RSS divergence (with log domains) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-P/p1-esec-flush-0/1787864428-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-27T17:00:28-04:00 ===
+=== 2026-08-27T17:00:28-04:00 P1 everysec fua-0 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+
+== row: everysec penalty vs memory-mode ns (interleaved ABBA × 3) ==
+  rep 0 memory-ns: 2334881 ops/s, p999 877 µs
+  rep 0 everysec:  1634252 ops/s, p999 45311 µs
+  rep 1 everysec:  890903 ops/s, p999 153087 µs
+  rep 1 memory-ns: 2390255 ops/s, p999 843 µs
+  rep 2 memory-ns: 2356726 ops/s, p999 837 µs
+  rep 2 everysec:  1046163 ops/s, p999 136703 µs
+
+== gate verdicts ==
+  Zero-cost A/B: pipelined ops regression PENDING (tooling)
+  Zero-cost A/B: pipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: unpipelined 512-conn ops regression PENDING (tooling)
+  Zero-cost A/B: unpipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy write-mix ops regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Memory-only rows append zero log records PENDING (tooling)
+  everysec penalty vs memory mode        FAIL
+  always grouped writes                  PENDING (tooling)
+  Replay throughput per cell             PENDING (tooling)
+  10 GB node cold boot                   PENDING (tooling)
+  DST durability oracle: 10k seeds       PENDING (tooling)
+  Crash matrix green in CI               PENDING (tooling)
+  Checkpoint under full load: foreground p99.9 (anti-BGREWRITEAOF) PENDING (tooling)
+  RSS under continuous checkpoints vs no-checkpoint control (anti-2x) PENDING (tooling)
+  M0/M1 gates re-pass                    PENDING (tooling)
+  One log write per iteration            PENDING (tooling)
+  acks/fsync grouping ratio above floor  PENDING (tooling)
+  sum(domains) vs RSS divergence (with log domains) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-P/p1-esec-fua-0/1787864534-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-27T17:02:14-04:00 ===
+=== 2026-08-27T17:02:14-04:00 P1 everysec fua-1 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+
+== row: everysec penalty vs memory-mode ns (interleaved ABBA × 3) ==
+  rep 0 memory-ns: 2379807 ops/s, p999 897 µs
+  rep 0 everysec:  1687161 ops/s, p999 20287 µs
+  rep 1 everysec:  904208 ops/s, p999 141311 µs
+  rep 1 memory-ns: 2338065 ops/s, p999 879 µs
+  rep 2 memory-ns: 2367179 ops/s, p999 901 µs
+  rep 2 everysec:  952945 ops/s, p999 160255 µs
+
+== gate verdicts ==
+  Zero-cost A/B: pipelined ops regression PENDING (tooling)
+  Zero-cost A/B: pipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: unpipelined 512-conn ops regression PENDING (tooling)
+  Zero-cost A/B: unpipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy write-mix ops regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Memory-only rows append zero log records PENDING (tooling)
+  everysec penalty vs memory mode        FAIL
+  always grouped writes                  PENDING (tooling)
+  Replay throughput per cell             PENDING (tooling)
+  10 GB node cold boot                   PENDING (tooling)
+  DST durability oracle: 10k seeds       PENDING (tooling)
+  Crash matrix green in CI               PENDING (tooling)
+  Checkpoint under full load: foreground p99.9 (anti-BGREWRITEAOF) PENDING (tooling)
+  RSS under continuous checkpoints vs no-checkpoint control (anti-2x) PENDING (tooling)
+  M0/M1 gates re-pass                    PENDING (tooling)
+  One log write per iteration            PENDING (tooling)
+  acks/fsync grouping ratio above floor  PENDING (tooling)
+  sum(domains) vs RSS divergence (with log domains) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-P/p1-esec-fua-1/1787864641-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-27T17:04:01-04:00 ===
+=== 2026-08-27T17:04:01-04:00 P1 everysec flush-1 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+
+== row: everysec penalty vs memory-mode ns (interleaved ABBA × 3) ==
+  rep 0 memory-ns: 2369365 ops/s, p999 949 µs
+  rep 0 everysec:  1875796 ops/s, p999 13823 µs
+  rep 1 everysec:  988518 ops/s, p999 236031 µs
+  rep 1 memory-ns: 2375757 ops/s, p999 861 µs
+  rep 2 memory-ns: 2407215 ops/s, p999 809 µs
+  rep 2 everysec:  1020307 ops/s, p999 172543 µs
+
+== gate verdicts ==
+  Zero-cost A/B: pipelined ops regression PENDING (tooling)
+  Zero-cost A/B: pipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: unpipelined 512-conn ops regression PENDING (tooling)
+  Zero-cost A/B: unpipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy write-mix ops regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Memory-only rows append zero log records PENDING (tooling)
+  everysec penalty vs memory mode        FAIL
+  always grouped writes                  PENDING (tooling)
+  Replay throughput per cell             PENDING (tooling)
+  10 GB node cold boot                   PENDING (tooling)
+  DST durability oracle: 10k seeds       PENDING (tooling)
+  Crash matrix green in CI               PENDING (tooling)
+  Checkpoint under full load: foreground p99.9 (anti-BGREWRITEAOF) PENDING (tooling)
+  RSS under continuous checkpoints vs no-checkpoint control (anti-2x) PENDING (tooling)
+  M0/M1 gates re-pass                    PENDING (tooling)
+  One log write per iteration            PENDING (tooling)
+  acks/fsync grouping ratio above floor  PENDING (tooling)
+  sum(domains) vs RSS divergence (with log domains) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-P/p1-esec-flush-1/1787864750-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-27T17:05:50-04:00 ===
+=== 2026-08-27T17:05:50-04:00 P1 everysec flush-2 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+
+== row: everysec penalty vs memory-mode ns (interleaved ABBA × 3) ==
+  rep 0 memory-ns: 2407365 ops/s, p999 859 µs
+  rep 0 everysec:  1851123 ops/s, p999 4543 µs
+  rep 1 everysec:  344707 ops/s, p999 679935 µs
+  rep 1 memory-ns: 2368795 ops/s, p999 865 µs
+  rep 2 memory-ns: 2398645 ops/s, p999 827 µs
+  rep 2 everysec:  1404571 ops/s, p999 38783 µs
+
+== gate verdicts ==
+  Zero-cost A/B: pipelined ops regression PENDING (tooling)
+  Zero-cost A/B: pipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: unpipelined 512-conn ops regression PENDING (tooling)
+  Zero-cost A/B: unpipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy write-mix ops regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Memory-only rows append zero log records PENDING (tooling)
+  everysec penalty vs memory mode        FAIL
+  always grouped writes                  PENDING (tooling)
+  Replay throughput per cell             PENDING (tooling)
+  10 GB node cold boot                   PENDING (tooling)
+  DST durability oracle: 10k seeds       PENDING (tooling)
+  Crash matrix green in CI               PENDING (tooling)
+  Checkpoint under full load: foreground p99.9 (anti-BGREWRITEAOF) PENDING (tooling)
+  RSS under continuous checkpoints vs no-checkpoint control (anti-2x) PENDING (tooling)
+  M0/M1 gates re-pass                    PENDING (tooling)
+  One log write per iteration            PENDING (tooling)
+  acks/fsync grouping ratio above floor  PENDING (tooling)
+  sum(domains) vs RSS divergence (with log domains) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-P/p1-esec-flush-2/1787864860-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-27T17:07:40-04:00 ===
+=== 2026-08-27T17:07:40-04:00 P1 everysec fua-2 ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+
+== row: everysec penalty vs memory-mode ns (interleaved ABBA × 3) ==
+  rep 0 memory-ns: 2333980 ops/s, p999 949 µs
+  rep 0 everysec:  1738178 ops/s, p999 21183 µs
+  rep 1 everysec:  909706 ops/s, p999 140799 µs
+  rep 1 memory-ns: 2413678 ops/s, p999 781 µs
+  rep 2 memory-ns: 2406045 ops/s, p999 785 µs
+  rep 2 everysec:  1234546 ops/s, p999 101887 µs
+
+== gate verdicts ==
+  Zero-cost A/B: pipelined ops regression PENDING (tooling)
+  Zero-cost A/B: pipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: unpipelined 512-conn ops regression PENDING (tooling)
+  Zero-cost A/B: unpipelined p99.9 regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy write-mix ops regression PENDING (tooling)
+  Zero-cost A/B: ttl-heavy p99.9 regression PENDING (tooling)
+  Memory-only rows append zero log records PENDING (tooling)
+  everysec penalty vs memory mode        FAIL
+  always grouped writes                  PENDING (tooling)
+  Replay throughput per cell             PENDING (tooling)
+  10 GB node cold boot                   PENDING (tooling)
+  DST durability oracle: 10k seeds       PENDING (tooling)
+  Crash matrix green in CI               PENDING (tooling)
+  Checkpoint under full load: foreground p99.9 (anti-BGREWRITEAOF) PENDING (tooling)
+  RSS under continuous checkpoints vs no-checkpoint control (anti-2x) PENDING (tooling)
+  M0/M1 gates re-pass                    PENDING (tooling)
+  One log write per iteration            PENDING (tooling)
+  acks/fsync grouping ratio above floor  PENDING (tooling)
+  sum(domains) vs RSS divergence (with log domains) PENDING (tooling)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-P/p1-esec-fua-2/1787864966-gate-run/report.md
+inf-bench: 1 binding gate(s) FAILED
+=== exit 1 2026-08-27T17:09:26-04:00 ===
+=== 2026-08-27T17:09:26-04:00 P2 s39d cold replay flush-class vs fua ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before s39d base rep0
+  s39d base: warm 3000000 records at 69565 ops/s, boundary checkpoint 11.9 s, truncated 8 recycled 0 rotations_min_cell 2 (warmed=true)
+  s35: 40s drive-state idle before s39d base fresh-image recovery boot
+  s39d base: cold boot — cache-evict 22 files, 6381468064 bytes
+  s39d rep0 base: rep0 base warm_ops=69565 tail_ops=42232 warmed=true warm[rotations=8 recycled=0 truncated=8 rotations_min_cell=2 waits_expired=0] end[rotations=12 recycled=0 truncated=8 frame_bytes=3353837880 zero_fill=0] cold_boot=22files/6381468064B boot_wall_s=3.377 proc_read_bytes=4366766080 records_recovered=3200000 slowest_cell[total_ms=3310.5 start_ms=4.0 ckpt_ms=2056.5 replay_ms=1155.6 audit_ms=94.3 finish_ms=0.0 dominating=ckpt] sum_cells[total_ms=13191.0 ckpt_ms=8202.1 replay_ms=4605.3 audit_ms=367.3 finish_ms=0.1 ckpt_bytes=3160240128 replay_bytes=1206489098 replay_frames=54683 audit_bytes=2014736374 audit_valid_frames=0 audit_foreign_frames=0 stale_files=0 residue_slacks=0 residue_stops=0]
+  s35: 40s drive-state idle before s39d arm rep0
+  s39d arm: warm 3000000 records at 93205 ops/s, boundary checkpoint 8.6 s, truncated 20 recycled 4 rotations_min_cell 5 (warmed=true)
+  s35: 40s drive-state idle before s39d arm fresh-image recovery boot
+  s39d arm: cold boot — cache-evict 22 files, 6381468064 bytes
+  s39d rep0 arm: rep0 arm warm_ops=93205 tail_ops=278657 warmed=true warm[rotations=20 recycled=4 truncated=20 rotations_min_cell=5 waits_expired=8] end[rotations=20 recycled=4 truncated=20 frame_bytes=3764408320 zero_fill=5122555904] cold_boot=22files/6381468064B boot_wall_s=3.506 proc_read_bytes=5307748352 records_recovered=3200000 slowest_cell[total_ms=3475.7 start_ms=4.2 ckpt_ms=2061.6 replay_ms=219.3 audit_ms=1190.5 finish_ms=0.1 dominating=ckpt] sum_cells[total_ms=13844.8 ckpt_ms=8208.5 replay_ms=847.7 audit_ms=4771.3 finish_ms=0.6 ckpt_bytes=3160240128 replay_bytes=247173120 replay_frames=13821 audit_bytes=1900310528 audit_valid_frames=0 audit_foreign_frames=52348 stale_files=4 residue_slacks=4 residue_stops=4]
+  s35: 40s drive-state idle before s39d arm rep1
+  s39d arm: warm 3000000 records at 96345 ops/s, boundary checkpoint 19.4 s, truncated 16 recycled 4 rotations_min_cell 4 (warmed=true)
+  s35: 40s drive-state idle before s39d arm fresh-image recovery boot
+  s39d arm: cold boot — cache-evict 22 files, 6381468064 bytes
+  s39d rep1 arm: rep1 arm warm_ops=96345 tail_ops=298105 warmed=true warm[rotations=16 recycled=4 truncated=16 rotations_min_cell=4 waits_expired=8] end[rotations=16 recycled=4 truncated=16 frame_bytes=3767513088 zero_fill=4294967296] cold_boot=22files/6381468064B boot_wall_s=3.616 proc_read_bytes=5307748352 records_recovered=3200000 slowest_cell[total_ms=3579.9 start_ms=4.1 ckpt_ms=2109.0 replay_ms=321.9 audit_ms=1144.7 finish_ms=0.2 dominating=ckpt] sum_cells[total_ms=14280.1 ckpt_ms=8424.6 replay_ms=1358.8 audit_ms=4479.2 finish_ms=0.7 ckpt_bytes=3160240128 replay_bytes=382439424 replay_frames=25047 audit_bytes=1765044224 audit_valid_frames=0 audit_foreign_frames=52114 stale_files=4 residue_slacks=4 residue_stops=4]
+  s35: 40s drive-state idle before s39d base rep1
+  s39d base: warm 3000000 records at 78316 ops/s, boundary checkpoint 19.4 s, truncated 8 recycled 0 rotations_min_cell 2 (warmed=true)
+  s35: 40s drive-state idle before s39d base fresh-image recovery boot
+  s39d base: cold boot — cache-evict 22 files, 6381468064 bytes
+  s39d rep1 base: rep1 base warm_ops=78316 tail_ops=41545 warmed=true warm[rotations=8 recycled=0 truncated=8 rotations_min_cell=2 waits_expired=0] end[rotations=12 recycled=0 truncated=8 frame_bytes=3354122428 zero_fill=0] cold_boot=22files/6381468064B boot_wall_s=3.296 proc_read_bytes=4367036416 records_recovered=3200000 slowest_cell[total_ms=3268.6 start_ms=4.0 ckpt_ms=2081.9 replay_ms=1091.1 audit_ms=91.6 finish_ms=0.0 dominating=ckpt] sum_cells[total_ms=13017.6 ckpt_ms=8265.7 replay_ms=4372.4 audit_ms=363.5 finish_ms=0.1 ckpt_bytes=3160240128 replay_bytes=1206759112 replay_frames=59322 audit_bytes=2014466360 audit_valid_frames=0 audit_foreign_frames=0 stale_files=0 residue_slacks=0 residue_stops=0]
+  s35: 40s drive-state idle before s39d base rep2
+  s39d base: warm 3000000 records at 69305 ops/s, boundary checkpoint 8.7 s, truncated 8 recycled 0 rotations_min_cell 2 (warmed=true)
+  s35: 40s drive-state idle before s39d base fresh-image recovery boot
+  s39d base: cold boot — cache-evict 22 files, 6381468064 bytes
+  s39d rep2 base: rep2 base warm_ops=69305 tail_ops=42517 warmed=true warm[rotations=8 recycled=0 truncated=8 rotations_min_cell=2 waits_expired=0] end[rotations=12 recycled=0 truncated=8 frame_bytes=3353973048 zero_fill=0] cold_boot=22files/6381468064B boot_wall_s=3.325 proc_read_bytes=4366835712 records_recovered=3200000 slowest_cell[total_ms=3297.1 start_ms=4.1 ckpt_ms=2064.7 replay_ms=1137.7 audit_ms=90.6 finish_ms=0.0 dominating=ckpt] sum_cells[total_ms=13142.5 ckpt_ms=8237.6 replay_ms=4524.3 audit_ms=364.1 finish_ms=0.1 ckpt_bytes=3160240128 replay_bytes=1206561568 replay_frames=55498 audit_bytes=2014663904 audit_valid_frames=0 audit_foreign_frames=0 stale_files=0 residue_slacks=0 residue_stops=0]
+  s35: 40s drive-state idle before s39d arm rep2
+  s39d arm: warm 3000000 records at 117802 ops/s, boundary checkpoint 21.1 s, truncated 20 recycled 4 rotations_min_cell 5 (warmed=true)
+  s35: 40s drive-state idle before s39d arm fresh-image recovery boot
+  s39d arm: cold boot — cache-evict 22 files, 6381468064 bytes
+  s39d rep2 arm: rep2 arm warm_ops=117802 tail_ops=300269 warmed=true warm[rotations=20 recycled=4 truncated=20 rotations_min_cell=5 waits_expired=8] end[rotations=20 recycled=4 truncated=20 frame_bytes=3766083584 zero_fill=5139333120] cold_boot=22files/6381468064B boot_wall_s=3.511 proc_read_bytes=5307748352 records_recovered=3200000 slowest_cell[total_ms=3476.0 start_ms=3.8 ckpt_ms=2052.5 replay_ms=223.9 audit_ms=1195.7 finish_ms=0.1 dominating=ckpt] sum_cells[total_ms=13892.5 ckpt_ms=8204.5 replay_ms=888.2 audit_ms=4783.8 finish_ms=0.4 ckpt_bytes=3160240128 replay_bytes=252219392 replay_frames=14641 audit_bytes=1895264256 audit_valid_frames=0 audit_foreign_frames=52340 stale_files=4 residue_slacks=4 residue_stops=4]
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (device characterization — informational since the ADR-0087 fourth amendment, 2026-08-22) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+  S39b: warmed zero-fill bytes per log frame byte under recycling (arm) PENDING (tooling)
+  S39b: rotations not served by the pool over the warmed window, worst cell PENDING (tooling)
+  S39b: padding share moved by recycling (the S39c control) PENDING (tooling)
+  S39b: always c32 p50 under recycling over baseline PENDING (tooling)
+  S39b: always c32 p99 under recycling over baseline PENDING (tooling)
+  S39b: read leg under recycling over baseline (the E4.7 ±2 % rule) PENDING (tooling)
+  S39b: first crash-restart recovery boot on the recycled log over baseline PENDING (tooling)
+  S39b: rotations per cell the row actually performed (validity) PENDING (tooling)
+  S39b/D9: pool waits fed before the bound over waits ended (arm) PENDING (tooling)
+  S39b/D9: rotations onto an un-zeroed segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: rotations that found no next segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: preallocs refused for space on the arm, worst replicate PENDING (tooling)
+  S39b: accounted host bytes per log frame byte under recycling (informational) PENDING (tooling)
+  S39b: block-device sectors written per log frame byte under recycling (informational) PENDING (tooling)
+  S39d: fixed-work first-boot recovery, slowest cell's engine total, arm over baseline FAIL (informational)
+  S39d: absolute first-boot recovery wall on the recycled log (the S18 < 15 s STOP gate re-read) PASS
+  S39d: both arms recovered exactly the records written (fixed-work validity) PASS
+  S39d: slack-audit phase time over the cell sums, arm over baseline (the recycling term, informational) FAIL (informational)
+  S40: everysec max latency at the memtier shape, worst leg (S27 D5) PENDING (tooling)
+  S40: achieved over offered rate, worst leg (validity — a saturated leg's max is a saturation number) PENDING (tooling)
+  S40: seconds whose per-second maximum exceeded 50 ms, summed over legs (informational) PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling throughput over the shipping path at 256 conns PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling p99 gain at 256 conns PENDING (tooling)
+  S37 step 1: share of arm B's SETs that skipped a cold read (validity — 0 = the instrument never engaged) PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm throughput over the baseline cap at 256 conns PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm p99 over the baseline cap at 256 conns (the tail the wider cap charges) PENDING (tooling)
+  S37 step 2 discriminator: the baseline's device QD p99 at issue (≈ the cap = the cap bound; validity of the discriminator) PENDING (tooling)
+  S42: first boot over second boot of a fresh data directory (the in-boot probe's cost) PENDING (tooling)
+  S42: every first boot reported io_properties_source=probed-at-boot on every cell (validity) PENDING (tooling)
+  S42: every second boot reported io_properties_source=file with the identity verified (validity) PENDING (tooling)
+  S42: the file the first boot wrote is schema 3 (identity-bound) PENDING (tooling)
+  S42: always p50 over the barrier p50 at 32 conns on the directory the first boot probed (S35's bar on the stock boot) PENDING (tooling)
+  S42: always c32 ops/s on the stock boot (informational — read against the probed arm's replicate spread) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, arm (C38b's statistic on the loop clock, this row's shape — informational) FAIL (informational)
+  S39d: replay-phase rate on the slowest cell, baseline (informational) FAIL (informational)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-P/p2-s39d-cold/1787865800-gate-run/report.md
+=== exit 0 2026-08-27T17:23:20-04:00 ===
+=== 2026-08-27T17:24:00-04:00 P3 s39d S18 10 GB cold ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 2 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+inf-bench: env-check failed: git-dirty-tree
+gate-run refuses to run (pass --unsafe-env to record a non-citable dev run)
+=== exit 1 2026-08-27T17:24:00-04:00 ===
+# 2026-08-27T17:24:00-04:00 binary=infinityd 9c75b94 (git 9c75b9449004, x86_64-unknown-linux-gnu) git=9c75b94 dirty=2 thermal: 27800 40000 40000  gov=performance no_turbo=1 strays=0 load=0.68 1.95 2.77 devstat= 454410 44631 86188863 381656 3028361 853411 327028276 12667314 0 532077 13198059 50995 0 198741560 29686 116491 119401 df=72%
+CAMPAIGN DONE
+CHAIN DONE 2026-08-27T17:24:00-04:00
+# RESTART (chain c): P3 (17:24) was refused by env-check on a dirty tree — two governing-doc edits (ARCHITECTURE.md, ops-tiered-storage.md) landed in the checkout; moved to the worktree; P0-P2 stand
+# (chain b note kept:: the 16:57 P1 legs flush-0/fua-0 were refused by env-check on a dirty tree (an S37 edit landed in the checkout mid-chain — stashed; development moved to a worktree); P0 stands, P1-P3 re-run from the top in the predeclared order
+# 2026-08-27T17:24:23-04:00 binary=infinityd 9c75b94 (git 9c75b9449004, x86_64-unknown-linux-gnu) git=9c75b94 dirty=0 thermal: 27800 41000 40000  gov=performance no_turbo=1 strays=0 load=0.45 1.79 2.69 devstat= 454415 44631 86189063 381657 3028417 853463 327038932 12667336 0 532084 13198085 50995 0 198741560 29686 116495 119404 df=72%
+=== 2026-08-27T17:24:23-04:00 P3 s39d S18 10 GB cold ===
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       PASS
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     PASS
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+env-check: OK
+  s35: 40s drive-state idle before s39d base rep0
+  s39d base: warm 10000000 records at 47785 ops/s, boundary checkpoint 52.9 s, truncated 36 recycled 0 rotations_min_cell 9 (warmed=true)
+  s35: 40s drive-state idle before s39d base fresh-image recovery boot
+  s39d base: cold boot — cache-evict 18 files, 12684863904 bytes
+  s39d rep0 base: rep0 base warm_ops=47785 tail_ops=48418 warmed=true warm[rotations=36 recycled=0 truncated=36 rotations_min_cell=9 waits_expired=0] end[rotations=36 recycled=0 truncated=36 frame_bytes=10691616804 zero_fill=0] cold_boot=18files/12684863904B boot_wall_s=7.762 proc_read_bytes=11565846528 records_recovered=10200000 slowest_cell[total_ms=7730.6 start_ms=16.6 ckpt_ms=6930.7 replay_ms=731.9 audit_ms=51.4 finish_ms=0.0 dominating=ckpt] sum_cells[total_ms=30877.4 ckpt_ms=27640.7 replay_ms=2959.1 audit_ms=211.2 finish_ms=0.1 ckpt_bytes=10537377792 replay_bytes=1028421272 replay_frames=57062 audit_bytes=1119062376 audit_valid_frames=0 audit_foreign_frames=0 stale_files=0 residue_slacks=0 residue_stops=0]
+  s35: 40s drive-state idle before s39d arm rep0
+  s39d arm: warm 10000000 records at 80102 ops/s, boundary checkpoint 65.0 s, truncated 49 recycled 4 rotations_min_cell 12 (warmed=true)
+  s35: 40s drive-state idle before s39d arm fresh-image recovery boot
+  s39d arm: cold boot — cache-evict 22 files, 13758605728 bytes
+  s39d rep0 arm: rep0 arm warm_ops=80102 tail_ops=141275 warmed=true warm[rotations=49 recycled=4 truncated=49 rotations_min_cell=12 waits_expired=35] end[rotations=49 recycled=4 truncated=49 frame_bytes=12012441600 zero_fill=12664176640] cold_boot=22files/13758605728B boot_wall_s=8.343 proc_read_bytes=12684902400 records_recovered=10200000 slowest_cell[total_ms=8303.2 start_ms=16.6 ckpt_ms=6835.9 replay_ms=705.6 audit_ms=744.9 finish_ms=0.1 dominating=ckpt] sum_cells[total_ms=33174.7 ckpt_ms=27321.6 replay_ms=2778.6 audit_ms=3008.2 finish_ms=0.5 ckpt_bytes=10537377792 replay_bytes=985620480 replay_frames=66964 audit_bytes=1161863168 audit_valid_frames=0 audit_foreign_frames=0 stale_files=4 residue_slacks=0 residue_stops=0]
+  s35: 40s drive-state idle before s39d arm rep1
+  s39d arm: warm 10000000 records at 67098 ops/s, boundary checkpoint 43.8 s, truncated 52 recycled 4 rotations_min_cell 13 (warmed=true)
+  s35: 40s drive-state idle before s39d arm fresh-image recovery boot
+  s39d arm: cold boot — cache-evict 22 files, 13758605728 bytes
+  s39d rep1 arm: rep1 arm warm_ops=67098 tail_ops=18081 warmed=true warm[rotations=52 recycled=4 truncated=52 rotations_min_cell=13 waits_expired=36] end[rotations=52 recycled=4 truncated=52 frame_bytes=12005625856 zero_fill=13327663104] cold_boot=22files/13758605728B boot_wall_s=8.384 proc_read_bytes=12664455168 records_recovered=10200000 slowest_cell[total_ms=8351.9 start_ms=16.5 ckpt_ms=6875.9 replay_ms=542.6 audit_ms=916.7 finish_ms=0.1 dominating=ckpt] sum_cells[total_ms=33358.1 ckpt_ms=27506.2 replay_ms=2161.4 audit_ms=3625.3 finish_ms=0.6 ckpt_bytes=10537377792 replay_bytes=761200640 replay_frames=55796 audit_bytes=1386283008 audit_valid_frames=0 audit_foreign_frames=0 stale_files=4 residue_slacks=0 residue_stops=0]
+  s35: 40s drive-state idle before s39d base rep1
+  s39d base: warm 10000000 records at 51242 ops/s, boundary checkpoint 52.2 s, truncated 36 recycled 0 rotations_min_cell 9 (warmed=true)
+  s35: 40s drive-state idle before s39d base fresh-image recovery boot
+  s39d base: cold boot — cache-evict 18 files, 12684863904 bytes
+  s39d rep1 base: rep1 base warm_ops=51242 tail_ops=37510 warmed=true warm[rotations=36 recycled=0 truncated=36 rotations_min_cell=9 waits_expired=0] end[rotations=36 recycled=0 truncated=36 frame_bytes=10690689460 zero_fill=0] cold_boot=18files/12684863904B boot_wall_s=7.691 proc_read_bytes=11564986368 records_recovered=10200000 slowest_cell[total_ms=7657.9 start_ms=16.8 ckpt_ms=6889.1 replay_ms=699.3 audit_ms=52.6 finish_ms=0.0 dominating=ckpt] sum_cells[total_ms=30622.6 ckpt_ms=27520.0 replay_ms=2825.9 audit_ms=210.3 finish_ms=0.1 ckpt_bytes=10537377792 replay_bytes=1027557540 replay_frames=52884 audit_bytes=1119926108 audit_valid_frames=0 audit_foreign_frames=0 stale_files=0 residue_slacks=0 residue_stops=0]
+  s35: 40s drive-state idle before s39d base rep2
+  s39d base: warm 10000000 records at 48792 ops/s, boundary checkpoint 58.8 s, truncated 36 recycled 0 rotations_min_cell 9 (warmed=true)
+  s35: 40s drive-state idle before s39d base fresh-image recovery boot
+  s39d base: cold boot — cache-evict 18 files, 12684863904 bytes
+  s39d rep2 base: rep2 base warm_ops=48792 tail_ops=39908 warmed=true warm[rotations=36 recycled=0 truncated=36 rotations_min_cell=9 waits_expired=0] end[rotations=36 recycled=0 truncated=36 frame_bytes=10690590372 zero_fill=0] cold_boot=18files/12684863904B boot_wall_s=7.617 proc_read_bytes=11564941312 records_recovered=10200000 slowest_cell[total_ms=7584.8 start_ms=16.7 ckpt_ms=6821.8 replay_ms=695.6 audit_ms=50.6 finish_ms=0.1 dominating=ckpt] sum_cells[total_ms=30293.1 ckpt_ms=27187.5 replay_ms=2830.4 audit_ms=208.0 finish_ms=0.2 ckpt_bytes=10537377792 replay_bytes=1027512398 replay_frames=55210 audit_bytes=1119971250 audit_valid_frames=0 audit_foreign_frames=0 stale_files=0 residue_slacks=0 residue_stops=0]
+  s35: 40s drive-state idle before s39d arm rep2
+  s39d arm: warm 10000000 records at 75486 ops/s, boundary checkpoint 67.9 s, truncated 51 recycled 4 rotations_min_cell 12 (warmed=true)
+  s35: 40s drive-state idle before s39d arm fresh-image recovery boot
+  s39d arm: cold boot — cache-evict 22 files, 13758605728 bytes
+  s39d rep2 arm: rep2 arm warm_ops=75486 tail_ops=245194 warmed=true warm[rotations=51 recycled=4 truncated=51 rotations_min_cell=12 waits_expired=40] end[rotations=52 recycled=5 truncated=51 frame_bytes=12012367872 zero_fill=13433831424] cold_boot=22files/13758605728B boot_wall_s=9.017 proc_read_bytes=12953337856 records_recovered=10200000 slowest_cell[total_ms=8984.6 start_ms=17.2 ckpt_ms=6860.6 replay_ms=891.9 audit_ms=1214.8 finish_ms=0.2 dominating=ckpt] sum_cells[total_ms=34223.4 ckpt_ms=27415.3 replay_ms=2790.4 audit_ms=3950.1 finish_ms=0.6 ckpt_bytes=10537377792 replay_bytes=945938432 replay_frames=66014 audit_bytes=1469980672 audit_valid_frames=0 audit_foreign_frames=13405 stale_files=3 residue_slacks=1 residue_stops=1]
+
+== gate verdicts ==
+  S29: tiered always scaling slope (c256/c64) PENDING (tooling)
+  S29: tiered:flat always parity at 64 conns PENDING (tooling)
+  S29: tiered:flat always parity at 256 conns PENDING (tooling)
+  S29: tiered:flat always p99 ratio at 256 conns PENDING (tooling)
+  S27: client-visible -BUSY refusals under provoked staging pressure PENDING (tooling)
+  S27: last:first throughput across back-to-back write repeats PENDING (tooling)
+  S27: worst per-leg max latency at everysec under provoked pressure PENDING (tooling)
+  S35: always p50 over the barrier p50 at 32 conns PENDING (tooling)
+  S35: N-cell vs 1-cell barrier p50 ratio (device characterization — informational since the ADR-0087 fourth amendment, 2026-08-22) PENDING (tooling)
+  S35: N-cell vs 1-cell always client p50 ratio (informational since 2026-08-22 — carries the pipeline's seal wait at K ≥ 2) PENDING (tooling)
+  S36: server CPU across the pure-write everysec leg PENDING (tooling)
+  S36: everysec pure-write throughput vs the same-session tmpfs control PENDING (tooling)
+  S36: checkpoint + MANIFEST bytes over log frame bytes (the derived trigger's 1/α bound) PENDING (tooling)
+  S36: log + checkpoint write amplification (informational — the padding term is shape-dependent) PENDING (tooling)
+  S36: everysec max latency at the comparator-matched offered rate (S27 D5) PENDING (tooling)
+  S39b: warmed zero-fill bytes per log frame byte under recycling (arm) PENDING (tooling)
+  S39b: rotations not served by the pool over the warmed window, worst cell PENDING (tooling)
+  S39b: padding share moved by recycling (the S39c control) PENDING (tooling)
+  S39b: always c32 p50 under recycling over baseline PENDING (tooling)
+  S39b: always c32 p99 under recycling over baseline PENDING (tooling)
+  S39b: read leg under recycling over baseline (the E4.7 ±2 % rule) PENDING (tooling)
+  S39b: first crash-restart recovery boot on the recycled log over baseline PENDING (tooling)
+  S39b: rotations per cell the row actually performed (validity) PENDING (tooling)
+  S39b/D9: pool waits fed before the bound over waits ended (arm) PENDING (tooling)
+  S39b/D9: rotations onto an un-zeroed segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: rotations that found no next segment on the arm, worst replicate PENDING (tooling)
+  S39b/D9: preallocs refused for space on the arm, worst replicate PENDING (tooling)
+  S39b: accounted host bytes per log frame byte under recycling (informational) PENDING (tooling)
+  S39b: block-device sectors written per log frame byte under recycling (informational) PENDING (tooling)
+  S39d: fixed-work first-boot recovery, slowest cell's engine total, arm over baseline FAIL (informational)
+  S39d: absolute first-boot recovery wall on the recycled log (the S18 < 15 s STOP gate re-read) PASS
+  S39d: both arms recovered exactly the records written (fixed-work validity) PASS
+  S39d: slack-audit phase time over the cell sums, arm over baseline (the recycling term, informational) FAIL (informational)
+  S40: everysec max latency at the memtier shape, worst leg (S27 D5) PENDING (tooling)
+  S40: achieved over offered rate, worst leg (validity — a saturated leg's max is a saturation number) PENDING (tooling)
+  S40: seconds whose per-second maximum exceeded 50 ms, summed over legs (informational) PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling throughput over the shipping path at 256 conns PENDING (tooling)
+  S37 step 1: blind-overwrite ceiling p99 gain at 256 conns PENDING (tooling)
+  S37 step 1: share of arm B's SETs that skipped a cold read (validity — 0 = the instrument never engaged) PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm throughput over the baseline cap at 256 conns PENDING (tooling)
+  S37 step 2 discriminator: widest COLD-READ-QD arm p99 over the baseline cap at 256 conns (the tail the wider cap charges) PENDING (tooling)
+  S37 step 2 discriminator: the baseline's device QD p99 at issue (≈ the cap = the cap bound; validity of the discriminator) PENDING (tooling)
+  S42: first boot over second boot of a fresh data directory (the in-boot probe's cost) PENDING (tooling)
+  S42: every first boot reported io_properties_source=probed-at-boot on every cell (validity) PENDING (tooling)
+  S42: every second boot reported io_properties_source=file with the identity verified (validity) PENDING (tooling)
+  S42: the file the first boot wrote is schema 3 (identity-bound) PENDING (tooling)
+  S42: always p50 over the barrier p50 at 32 conns on the directory the first boot probed (S35's bar on the stock boot) PENDING (tooling)
+  S42: always c32 ops/s on the stock boot (informational — read against the probed arm's replicate spread) PENDING (tooling)
+  S39d: replay-phase rate on the slowest cell, arm (C38b's statistic on the loop clock, this row's shape — informational) FAIL (informational)
+  S39d: replay-phase rate on the slowest cell, baseline (informational) FAIL (informational)
+
+gate-run: report written to /home/kcaicedo/bench-data/s34/campaign-P/p3-s18-10g/1787867793-gate-run/report.md
+=== exit 0 2026-08-27T17:56:33-04:00 ===
+# 2026-08-27T17:56:33-04:00 binary=infinityd 9c75b94 (git 9c75b9449004, x86_64-unknown-linux-gnu) git=9c75b94 dirty=0 thermal: 27800 36000 42000  gov=performance no_turbo=1 strays=0 load=1.91 3.05 3.43 devstat= 1012197 44631 228787703 709027 7714225 3272139 846504780 26788018 0 1709483 27925915 50995 0 198741560 29686 380129 399182 df=72%
+CAMPAIGN DONE
+CHAIN DONE 2026-08-27T17:56:33-04:00

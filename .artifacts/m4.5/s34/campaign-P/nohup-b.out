@@ -1,0 +1,19 @@
+# RESTART (chain b): the 16:57 P1 legs flush-0/fua-0 were refused by env-check on a dirty tree (an S37 edit landed in the checkout mid-chain — stashed; development moved to a worktree); P0 stands, P1-P3 re-run from the top in the predeclared order
+# 2026-08-27T16:58:40-04:00 binary=infinityd 9c75b94 (git 9c75b9449004, x86_64-unknown-linux-gnu) git=9c75b94 dirty=0 thermal: 27800 40000 40000  gov=performance no_turbo=1 strays=0 load=0.36 0.92 0.78 devstat= 231007 44450 29412903 224663 355038 81290 49826468 1007543 0 135468 1281141 50995 0 198741560 29686 26995 19248 df=72%
+=== 2026-08-27T16:58:40-04:00 P1 everysec flush-0 ===
+=== exit 1 2026-08-27T17:00:28-04:00 ===
+=== 2026-08-27T17:00:28-04:00 P1 everysec fua-0 ===
+=== exit 1 2026-08-27T17:02:14-04:00 ===
+=== 2026-08-27T17:02:14-04:00 P1 everysec fua-1 ===
+=== exit 1 2026-08-27T17:04:01-04:00 ===
+=== 2026-08-27T17:04:01-04:00 P1 everysec flush-1 ===
+=== exit 1 2026-08-27T17:05:50-04:00 ===
+=== 2026-08-27T17:05:50-04:00 P1 everysec flush-2 ===
+=== exit 1 2026-08-27T17:07:40-04:00 ===
+=== 2026-08-27T17:07:40-04:00 P1 everysec fua-2 ===
+=== exit 1 2026-08-27T17:09:26-04:00 ===
+=== 2026-08-27T17:09:26-04:00 P2 s39d cold replay flush-class vs fua ===
+=== exit 0 2026-08-27T17:23:20-04:00 ===
+=== 2026-08-27T17:24:00-04:00 P3 s39d S18 10 GB cold ===
+=== exit 1 2026-08-27T17:24:00-04:00 ===
+# 2026-08-27T17:24:00-04:00 binary=infinityd 9c75b94 (git 9c75b9449004, x86_64-unknown-linux-gnu) git=9c75b94 dirty=2 thermal: 27800 40000 40000  gov=performance no_turbo=1 strays=0 load=0.68 1.95 2.77 devstat= 454410 44631 86188863 381656 3028361 853411 327028276 12667314 0 532077 13198059 50995 0 198741560 29686 116491 119401 df=72%

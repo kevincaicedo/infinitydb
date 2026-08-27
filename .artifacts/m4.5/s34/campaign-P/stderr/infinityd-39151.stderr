@@ -1,0 +1,12 @@
+infinityd: io-properties: io-properties.toml (schema 3, identity verified (ext4 /dev/nvme0n1p3 uuid c97c5418…))
+infinityd: log barrier class flush (source: --barrier-class; fua_max_frame_bytes 1048576; probed p50 fua 295 µs / flush 988 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model probed (schema 3): write 347 MiB/s, 2905 ops/s (qd4 barriers 9071/s); per-cell share write 86 MiB/s
+infinityd: checkpoint cap replay term 230 MiB/s per cell (probed read row 922 MiB/s ÷ 4 cells; ADR-0088 D4 as amended)
+infinityd 9c75b94 (git 9c75b9449004, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 39151, backend io_uring, route natural
+infinityd: listening on 39151
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: recovery 0/4 cells ready, 1460363264/6381465600 bytes (22.9%), eta 4s
+control: recovery 0/4 cells ready, 3023884288/6381465600 bytes (47.4%), eta 3s
+control: recovery 0/4 cells ready, 4118738458/6381465600 bytes (64.5%), eta 2s
+control: cell 2 recovered (3 segments, 1595445248 bytes, 800000 records; phases ms: start 4.3, ckpt 2058.3 [790138880 B], replay 1119.7 [301712335 B], audit 90.9 [503594033 B], finish 0.0, total 3273.3)

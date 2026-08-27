@@ -1,0 +1,6 @@
+# RESTART (chain c): P3 (17:24) was refused by env-check on a dirty tree — two governing-doc edits (ARCHITECTURE.md, ops-tiered-storage.md) landed in the checkout; moved to the worktree; P0-P2 stand
+# (chain b note kept:: the 16:57 P1 legs flush-0/fua-0 were refused by env-check on a dirty tree (an S37 edit landed in the checkout mid-chain — stashed; development moved to a worktree); P0 stands, P1-P3 re-run from the top in the predeclared order
+# 2026-08-27T17:24:23-04:00 binary=infinityd 9c75b94 (git 9c75b9449004, x86_64-unknown-linux-gnu) git=9c75b94 dirty=0 thermal: 27800 41000 40000  gov=performance no_turbo=1 strays=0 load=0.45 1.79 2.69 devstat= 454415 44631 86189063 381657 3028417 853463 327038932 12667336 0 532084 13198085 50995 0 198741560 29686 116495 119404 df=72%
+=== 2026-08-27T17:24:23-04:00 P3 s39d S18 10 GB cold ===
+=== exit 0 2026-08-27T17:56:33-04:00 ===
+# 2026-08-27T17:56:33-04:00 binary=infinityd 9c75b94 (git 9c75b9449004, x86_64-unknown-linux-gnu) git=9c75b94 dirty=0 thermal: 27800 36000 42000  gov=performance no_turbo=1 strays=0 load=1.91 3.05 3.43 devstat= 1012197 44631 228787703 709027 7714225 3272139 846504780 26788018 0 1709483 27925915 50995 0 198741560 29686 380129 399182 df=72%
