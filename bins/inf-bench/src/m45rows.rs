@@ -2233,6 +2233,10 @@ struct S39dLeg {
     boot_wall_s: f64,
     proc_read_bytes: u64,
     cells: Vec<S39dPhases>,
+    /// `--s39d-cold-boot`: the files and bytes `inf cache-evict` synced
+    /// and advised out of the page cache before the boot (`None` = the
+    /// step was not asked for — a warm boot where the log is buffered).
+    cold_boot: Option<(u64, u64)>,
 }
 
 impl S39dLeg {
@@ -2404,6 +2408,17 @@ fn s39d_leg(
     // drive-state idle, then time its first and only recovery boot.
     drop(server);
     s35_idle(idle_s, &format!("s39d {arm} fresh-image recovery boot"));
+    // M4.5-S34 (campaign M3's finding): a buffered log survives SIGKILL
+    // in the page cache while an `O_DIRECT` one does not, so a warm boot
+    // compares RAM to the device. The cold step evicts every file of
+    // the crashed image (sync + fadvise DONTNEED, `inf cache-evict`)
+    // after the idle and immediately before the boot — the power-loss
+    // shape on both arms.
+    let cold_boot = if flags.bool("s39d-cold-boot") {
+        Some(s39d_cache_evict(flags, infinityd, dir, arm)?)
+    } else {
+        None
+    };
     let (boot_wall_s, proc_read_bytes, cells_phases) =
         s39d_boot(flags, infinityd, cells, dir, arm_args)?;
     Ok(S39dLeg {
@@ -2416,7 +2431,47 @@ fn s39d_leg(
         boot_wall_s,
         proc_read_bytes,
         cells: cells_phases,
+        cold_boot,
     })
+}
+
+/// Runs `inf cache-evict <dir>` (the `inf` beside `--infinityd-bin`
+/// unless `--inf-bin` names one) and parses its one report line:
+/// `(files, bytes)`. A failure is the leg's — a boot after a partial
+/// eviction must never be read as cold.
+fn s39d_cache_evict(
+    flags: &Flags,
+    infinityd: &str,
+    dir: &str,
+    arm: &str,
+) -> Result<(u64, u64), String> {
+    let default = std::path::Path::new(infinityd)
+        .parent()
+        .map_or_else(|| "inf".to_string(), |p| p.join("inf").to_string_lossy().into_owned());
+    let inf = flags.str_or("inf-bin", &default);
+    let output = std::process::Command::new(&inf)
+        .args(["cache-evict", dir])
+        .output()
+        .map_err(|e| format!("s39d {arm}: spawn {inf} cache-evict: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "s39d {arm}: {inf} cache-evict {dir} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let field = |name: &str| -> Option<u64> {
+        stdout
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix(name).and_then(|v| v.strip_prefix('=')))
+            .and_then(|v| v.parse().ok())
+    };
+    let (Some(files), Some(bytes)) = (field("files"), field("bytes")) else {
+        return Err(format!("s39d {arm}: unparseable cache-evict report: {}", stdout.trim()));
+    };
+    println!("  s39d {arm}: cold boot — cache-evict {files} files, {bytes} bytes");
+    Ok((files, bytes))
 }
 
 /// The M4.5-S39d fixed-work recovery row (ADR-0090 A10): baseline
@@ -2488,9 +2543,16 @@ fn s39d_recovery_row(
         "s39d row: {cells} cells · {replicates} replicates (ABBA) · fixed work: {warm} warm + \
          {tail} tail records × 1 KiB at {S35_CONNS_AC} conns pipeline 16 · segment-bytes \
          {segment_bytes} · ckpt floor {} · boundary = INF.CKPT WAIT after the warm fill, \
-         truncation settled 2 s · SIGKILL after the tail's last ack · {idle_s} s idle · one \
-         boot · arm {} vs baseline {} · device stat {}",
+         truncation settled 2 s · SIGKILL after the tail's last ack · {idle_s} s idle · {} · \
+         one boot · arm {} vs baseline {} · device stat {}",
         flags.u64_or("ckpt-interval-bytes", segment_bytes)?,
+        if flags.bool("s39d-cold-boot") {
+            "cold boot (every file of the image sync + fadvise DONTNEED via `inf cache-evict` \
+             after the idle, both arms — the power-loss shape)"
+        } else {
+            "warm boot (the page cache as SIGKILL left it: a buffered log replays from RAM, \
+             a direct one from the device — not a format comparison)"
+        },
         if arm_args.is_empty() { "(server default)".to_string() } else { arm_args.join(" ") },
         base_args.join(" "),
         device_stat.as_deref().unwrap_or("(not sampled)")
@@ -2523,7 +2585,8 @@ fn s39d_recovery_row(
                 "rep{rep} {arm} warm_ops={:.0} tail_ops={:.0} warmed={} \
                  warm[rotations={} recycled={} truncated={} rotations_min_cell={} \
                  waits_expired={}] end[rotations={} recycled={} truncated={} frame_bytes={} \
-                 zero_fill={}] boot_wall_s={:.3} proc_read_bytes={} records_recovered={} \
+                 zero_fill={}] cold_boot={} boot_wall_s={:.3} proc_read_bytes={} \
+                 records_recovered={} \
                  slowest_cell[total_ms={:.1} start_ms={:.1} ckpt_ms={:.1} replay_ms={:.1} \
                  audit_ms={:.1} finish_ms={:.1} dominating={}] \
                  sum_cells[total_ms={:.1} ckpt_ms={:.1} replay_ms={:.1} audit_ms={:.1} \
@@ -2543,6 +2606,7 @@ fn s39d_recovery_row(
                 leg.end.truncated,
                 leg.end.frame_bytes,
                 leg.end.zero_fill,
+                leg.cold_boot.map_or("warm".to_string(), |(f, b)| format!("{f}files/{b}B")),
                 leg.boot_wall_s,
                 leg.proc_read_bytes,
                 leg.records_recovered(),

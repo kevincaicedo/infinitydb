@@ -794,6 +794,15 @@ impl<F: SegmentFs> SegmentRotor<F> {
         self.active.io_mode == SegmentIoMode::Direct && self.active.prezeroed
     }
 
+    /// True when the *configured* class is write-through (`Direct`):
+    /// the `io_class_configured` observable (M4.5-S42 follow-up) — a
+    /// fresh cell reports `barrier_class:flush` until its class-upgrade
+    /// rotation while this already says `fua`; read both.
+    #[must_use]
+    pub fn configured_write_through(&self) -> bool {
+        self.cfg.io_mode == SegmentIoMode::Direct
+    }
+
     /// True when `next_zero_slice` would hand out a slice now — a pure
     /// peek (M4.5-S36, ADR-0088 D5): the device budget is consulted
     /// *before* a slice is marked in flight, because a slice taken and

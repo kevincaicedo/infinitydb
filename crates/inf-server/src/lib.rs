@@ -52,7 +52,7 @@ pub use durable::{
 pub use exec::parse_cursor;
 pub use exec::{ConnCx, ConnNamespace, NodeInfo, execute, execute_slices, stall_request};
 pub use glob::glob_match;
-pub use inf_log::ckpt::DEFAULT_CKPT_INTERVAL_BYTES;
+pub use inf_log::ckpt::{DEFAULT_CKPT_INTERVAL_BYTES, DEFAULT_REPLAY_BYTES_PER_S};
 pub use inf_log::fs::StdSegmentFs;
 #[cfg(feature = "doc")]
 pub use json::{JSON_REPLY_SHAPES, ReplyShape};

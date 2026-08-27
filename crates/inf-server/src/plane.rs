@@ -2871,6 +2871,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.fsyncs_seal.set(stats.fsyncs_seal);
             node.fsyncs_standalone.set(stats.fsyncs_standalone);
             node.barrier_class_fua.set(stats.barrier_class_fua);
+            node.io_class_configured_fua.set(stats.io_class_configured_fua);
             node.fsyncs_fua.set(stats.fsyncs_fua);
             node.fua_p50_us.set(stats.fua_p50_us);
             node.fua_p99_us.set(stats.fua_p99_us);
@@ -2915,6 +2916,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.ckpt_padding_bytes.set(stats.ckpt_padding_bytes);
             node.manifest_bytes_total.set(stats.manifest_bytes_total);
             node.ckpt_interval_bytes.set(stats.ckpt_interval_bytes);
+            node.ckpt_replay_bytes_per_s.set(stats.ckpt_replay_bytes_per_s);
+            node.ckpt_cap_bytes.set(stats.ckpt_cap_bytes);
             node.ckpt_records_since_begin.set(stats.ckpt_records_since_begin);
             node.ckpt_io_mode_buffered.set(stats.ckpt_io_mode_buffered);
             node.ckpt_io_mode_downgrades.set(stats.ckpt_io_mode_downgrades);

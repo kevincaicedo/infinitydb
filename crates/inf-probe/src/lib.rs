@@ -33,8 +33,15 @@
 //! **Schema 2** (ADR-0088 D6) adds the device model the per-cell budget
 //! spends — `write_bytes_per_s_256k`, `write_ops_per_s_4k` (the direct
 //! rows' own throughput) and `write_ops_per_s_4k_qd4` (the direct 4 KiB
-//! barrier rate at four concurrent writers on disjoint regions). Read
-//! rows are declared and left at 0.
+//! barrier rate at four concurrent writers on disjoint regions).
+//! `read_bytes_per_s_256k` (ADR-0088 D4 as amended, M4.5-S34 campaign
+//! M3): the direct 256 KiB sequential read rate at four concurrent
+//! readers on disjoint regions — the aggregate a four-cell replay shares,
+//! which the boot divides by the cell count into the checkpoint cap's
+//! replay term. `read_ops_per_s_4k` stays declared at 0 (no consumer).
+//! The read row reads the scratch the probe just wrote: on a device with
+//! an SLC write cache it may read the cache, not the NAND — an upper
+//! bound the S18 recovery row measures against, never a claim.
 //!
 //! **Schema 3** (ADR-0091 D2/D3) adds the identity of the device the
 //! model describes ([`DeviceIdentity`]: filesystem type + UUID, mount
@@ -48,7 +55,18 @@
 //! Dev tool: `Instant::now()` and `std::thread` are fine here (not cell
 //! code — the crate is a leaf the two binaries share, ADR-0091); the
 //! output is a boot input, never a claim (L10 — the A/B is the claim).
-#![forbid(unsafe_code)]
+//!
+//! `deny(unsafe_code)` with exactly one audited exception: [`evict`]
+//! (`inf cache-evict`, M4.5-S34 — the page-cache eviction behind a cold
+//! recovery row) wraps `posix_fadvise(DONTNEED)`, a syscall `std` does
+//! not expose; the ADR-0049 module-allow shape, inventoried in
+//! `SAFETY.md`.
+#![deny(unsafe_code)]
+
+#[allow(unsafe_code)]
+mod evict;
+
+pub use evict::{EvictReport, evict_page_cache};
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -135,6 +153,11 @@ pub struct Verdict {
     pub write_bytes_per_s_256k: u64,
     pub write_ops_per_s_4k: u64,
     pub write_ops_per_s_4k_qd4: u64,
+    /// The direct 256 KiB sequential read rate at [`QD_WRITERS`]
+    /// concurrent readers, aggregate (ADR-0088 D4 as amended); 0 = not
+    /// probed (the direct class is unavailable) ⇒ the boot keeps the
+    /// D4 constant.
+    pub read_bytes_per_s_256k: u64,
     /// Schema 3 (ADR-0091 D3): why the direct class was not measured
     /// (`None` = it was), and the logical-block-size write-through row
     /// (`None` = not run: the logical block is ≥ 4 KiB or the class is
@@ -177,6 +200,10 @@ impl ProbeReport {
             out.push(format!(
                 "fua   bytes={:<8} writers={QD_WRITERS} barriers/s={:>6} (aggregate)",
                 SIZES[0], self.verdict.write_ops_per_s_4k_qd4
+            ));
+            out.push(format!(
+                "read  bytes={:<8} readers={QD_WRITERS} bytes/s={:>10} (aggregate, direct)",
+                SIZES[2], self.verdict.read_bytes_per_s_256k
             ));
         }
         out
@@ -262,6 +289,13 @@ fn probe_rows(dir: &Path, scratch: &Path, opts: ProbeOptions) -> io::Result<Prob
     } else {
         measure_concurrent(scratch, SIZES[0], per_row, QD_WRITERS)?
     };
+    // The replay term (ADR-0088 D4 as amended): four direct readers on
+    // disjoint quarters — the shape of four cells replaying at once.
+    let read_256k = if fua_unsupported.is_some() {
+        0
+    } else {
+        measure_read_concurrent(scratch, SIZES[2], per_row, QD_WRITERS)?
+    };
     // The logical-block row (ADR-0091 D3): informational, for S39c.
     let fua_512 = match (fua_unsupported.is_none(), identity.block_logical_bytes) {
         (true, logical) if logical > 0 && (logical as usize) < SIZES[0] => {
@@ -274,6 +308,7 @@ fn probe_rows(dir: &Path, scratch: &Path, opts: ProbeOptions) -> io::Result<Prob
         _ => None,
     };
     let mut verdict = recommend(&rows, qd4);
+    verdict.read_bytes_per_s_256k = read_256k;
     verdict.fua_unsupported = fua_unsupported;
     verdict.fua_512 = fua_512;
     Ok(ProbeReport {
@@ -418,6 +453,70 @@ fn measure_concurrent(
     Ok((total as f64 / elapsed) as u64)
 }
 
+/// The direct sequential read rate at `readers` concurrent readers, each
+/// on its own quarter of the scratch file (ADR-0088 D4 as amended):
+/// aggregate bytes/s. `O_DIRECT` reads bypass the page cache the buffered
+/// rows populated, so the row is page-cache-cold by construction; the
+/// device's own write cache is not controlled (disclosed in the module
+/// docs). Not cell code: `std::thread` is fine here.
+fn measure_read_concurrent(
+    scratch: &Path,
+    bytes: usize,
+    per_row: Duration,
+    readers: usize,
+) -> io::Result<u64> {
+    let region = SCRATCH_BYTES / readers as u64;
+    let mut handles = Vec::with_capacity(readers);
+    for r in 0..readers {
+        let scratch = scratch.to_path_buf();
+        handles.push(std::thread::spawn(move || -> io::Result<u64> {
+            let file = open_direct_read(&scratch)?;
+            let mut raw = vec![0u8; bytes + ALIGN];
+            let at = raw.as_ptr().align_offset(ALIGN);
+            let buf = &mut raw[at..at + bytes];
+            let base = region * r as u64;
+            let started = Instant::now();
+            let mut offset = base;
+            let mut total = 0u64;
+            while started.elapsed() < per_row {
+                file.read_exact_at(buf, offset)?;
+                total += bytes as u64;
+                offset += bytes as u64;
+                if offset + bytes as u64 > base + region {
+                    offset = base;
+                }
+            }
+            Ok(total)
+        }));
+    }
+    let started = Instant::now();
+    let mut total = 0u64;
+    for h in handles {
+        total += h.join().map_err(|_| io::Error::other("probe reader panicked"))??;
+    }
+    let elapsed = started.elapsed().max(per_row).as_secs_f64().max(1e-9);
+    Ok((total as f64 / elapsed) as u64)
+}
+
+/// A read-only `O_DIRECT` handle on the scratch (the read row's class).
+fn open_direct_read(scratch: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECT);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the direct read row is Linux-only (ADR-0086 D1)",
+        ));
+    }
+    options.open(scratch)
+}
+
 fn row(rows: &[Row], policy: Policy, bytes: usize) -> Option<&Row> {
     rows.iter().find(|r| r.policy == policy && r.bytes == bytes)
 }
@@ -441,6 +540,7 @@ pub fn recommend(rows: &[Row], write_ops_per_s_4k_qd4: u64) -> Verdict {
             write_bytes_per_s_256k,
             write_ops_per_s_4k,
             write_ops_per_s_4k_qd4,
+            read_bytes_per_s_256k: 0,
             fua_unsupported: None,
             fua_512: None,
         };
@@ -465,6 +565,7 @@ pub fn recommend(rows: &[Row], write_ops_per_s_4k_qd4: u64) -> Verdict {
         write_bytes_per_s_256k,
         write_ops_per_s_4k,
         write_ops_per_s_4k_qd4,
+        read_bytes_per_s_256k: 0,
         fua_unsupported: None,
         fua_512: None,
     }
@@ -520,16 +621,18 @@ fn render(rows: &[Row], verdict: &Verdict, identity: &DeviceIdentity, seconds: u
     out.push_str(&format!("fua_p50_us_4k = {}\n", verdict.fua_p50_us_4k));
     out.push_str(&format!("flush_p50_us_4k = {}\n", verdict.flush_p50_us_4k));
     out.push_str(&format!("probed_at_unix_s = {probed_at}\n"));
-    // Schema 2 (M4.5-S36, ADR-0088 D6): the device model. Read rows are
-    // declared at 0 (unbudgeted) until a probe story with concurrency
-    // measures them.
+    // Schema 2 (M4.5-S36, ADR-0088 D6): the device model. The 256 KiB
+    // read row (ADR-0088 D4 as amended) is the four-reader direct rate;
+    // `read_ops_per_s_4k` is declared at 0 (no consumer yet).
     out.push_str("# schema 2 (ADR-0088 D6): the device model the per-cell budget spends;\n");
     out.push_str("#   0 = not probed => that direction is unbudgeted (io_budget_model:absent).\n");
+    out.push_str("#   read_bytes_per_s_256k: four direct readers, aggregate — the checkpoint\n");
+    out.push_str("#   cap's replay term is this value / cells (ADR-0088 D4 as amended).\n");
     out.push_str(&format!("probe_schema = {PROBE_SCHEMA}\n"));
     out.push_str(&format!("write_bytes_per_s_256k = {}\n", verdict.write_bytes_per_s_256k));
     out.push_str(&format!("write_ops_per_s_4k = {}\n", verdict.write_ops_per_s_4k));
     out.push_str(&format!("write_ops_per_s_4k_qd4 = {}\n", verdict.write_ops_per_s_4k_qd4));
-    out.push_str("read_bytes_per_s_256k = 0\n");
+    out.push_str(&format!("read_bytes_per_s_256k = {}\n", verdict.read_bytes_per_s_256k));
     out.push_str("read_ops_per_s_4k = 0\n");
     // Schema 3 (M4.5-S42, ADR-0091 D2/D3): what the model describes.
     out.push_str("# schema 3 (ADR-0091 D2): the identity of the device this model describes.\n");
@@ -749,13 +852,16 @@ mod tests {
         let mut r256 = r(Policy::Fua, 256 << 10, 467, 1413);
         r256.barriers_per_sec = 1_949;
         rows.push(r256);
-        let v = recommend(&rows, 9_918);
+        let mut v = recommend(&rows, 9_918);
         assert_eq!(v.write_ops_per_s_4k, 2_898);
         assert_eq!(v.write_bytes_per_s_256k, 1_949 * (256 << 10));
+        assert_eq!(v.read_bytes_per_s_256k, 0, "the rule leaves the read row to the probe");
+        v.read_bytes_per_s_256k = 1_083_000_000;
         let text = render(&rows, &v, &DeviceIdentity::default(), 2);
         assert!(text.contains("probe_schema = 3\n"));
         assert!(text.contains(&format!("write_bytes_per_s_256k = {}\n", 1_949 * (256 << 10))));
         assert!(text.contains("write_ops_per_s_4k_qd4 = 9918\n"));
+        assert!(text.contains("read_bytes_per_s_256k = 1083000000\n"));
         assert!(text.contains("read_ops_per_s_4k = 0\n"));
     }
 

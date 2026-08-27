@@ -194,35 +194,94 @@ fn a_fresh_data_directory_is_probed_once_and_the_model_is_identity_bound() {
 
     // 4. A model that describes another device (a foreign uuid): `off`
     //    refuses with the reason; `auto` renames it `.stale` and probes.
+    //    The foreign file also carries a logical block the frame rule
+    //    refuses (8 KiB > FRAME_ALIGN) — the identity decides first
+    //    (review of 2026-08-26): `off` names the device, not the block,
+    //    and `auto` re-probes instead of refusing on the stale block.
     let path = dir.join("io-properties.toml");
     let original = std::fs::read_to_string(&path).expect("file");
-    let foreign = original
-        .lines()
-        .map(|line| {
-            if line.starts_with("fs_uuid = ") {
-                "fs_uuid = \"00000000-dead-beef-0000-000000000000\"".to_owned()
-            } else if line.starts_with("device_path = ") {
-                "device_path = \"/dev/definitely-not-this-device\"".to_owned()
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n";
+    let rewrite = |uuid: &str, device: &str, block: &str| -> String {
+        original
+            .lines()
+            .map(|line| {
+                if line.starts_with("fs_uuid = ") {
+                    format!("fs_uuid = \"{uuid}\"")
+                } else if line.starts_with("device_path = ") {
+                    format!("device_path = \"{device}\"")
+                } else if line.starts_with("block_logical_bytes = ") {
+                    format!("block_logical_bytes = {block}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    };
+    let foreign =
+        rewrite("00000000-dead-beef-0000-000000000000", "/dev/definitely-not-this-device", "8192");
     std::fs::write(&path, &foreign).expect("write foreign");
     let (code, stderr) = spawn(&dir, &["--device-probe", "off"]).err().expect("off refuses");
     assert_eq!(code, 1, "fail-stop exit code; stderr: {stderr}");
     assert!(stderr.contains("describes another device"), "{stderr}");
+    assert!(
+        !stderr.contains("logical block is 8192"),
+        "identity decides before the block: {stderr}"
+    );
     assert!(path.exists(), "a refusal leaves the file for the operator");
+    let (own_uuid, own_device) = {
+        let line = |prefix: &str| {
+            original
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix))
+                .map(|v| v.trim_matches('"').to_owned())
+                .expect("identity line")
+        };
+        (line("fs_uuid = "), line("device_path = "))
+    };
     {
-        let server = spawn(&dir, &[]).expect("auto re-probes");
+        let server = spawn(&dir, &[]).expect("auto re-probes past a stale block size");
         let info = info_when(server.port, "io_properties_source", "re-probed");
         assert_eq!(field(&info, "io_properties_source"), "re-probed");
         assert_eq!(field(&info, "io_properties_identity"), "verified");
-        assert!(dir.join("io-properties.toml.stale").exists(), "the stale model is kept");
+        // The configured class beside the active segment's (the
+        // campaign-L finding): `io_class_configured` is the verdict,
+        // `barrier_class` may still say `flush` before the upgrade.
         let fresh = std::fs::read_to_string(&path).expect("re-probed file");
+        let verdict = fresh
+            .lines()
+            .find_map(|l| l.strip_prefix("barrier_class = "))
+            .expect("class line")
+            .trim_matches('"')
+            .to_owned();
+        assert_eq!(field(&info, "io_class_configured"), verdict);
+        assert!(dir.join("io-properties.toml.stale").exists(), "the stale model is kept");
         assert!(!fresh.contains("dead-beef"), "the foreign identity is gone: {fresh}");
+        // The read row (ADR-0088 D4 as amended) is measured on a device
+        // that serves the direct class, and the boot's cap follows it.
+        if !fresh.contains("fua_unsupported") {
+            let read: u64 = fresh
+                .lines()
+                .find_map(|l| l.strip_prefix("read_bytes_per_s_256k = "))
+                .and_then(|v| v.parse().ok())
+                .expect("read row");
+            assert!(read > 0, "the probe measures the read row: {fresh}");
+            let per_cell: u64 = field(&info, "ckpt_replay_bytes_per_s").parse().expect("u64");
+            assert_eq!(per_cell, read, "one cell: the replay term is the probed row");
+        }
+    }
+
+    // 5. A model that describes *this* device but names a logical block
+    //    larger than the frame alignment: the block-size rule refuses it
+    //    under both modes (never a re-probe — the identity is right).
+    let wide = rewrite(&own_uuid, &own_device, "8192");
+    std::fs::write(&path, &wide).expect("write wide");
+    for mode in ["off", "auto"] {
+        let (code, stderr) =
+            spawn(&dir, &["--device-probe", mode]).err().expect("a wide block refuses");
+        assert_eq!(code, 1, "{mode}: fail-stop exit code; stderr: {stderr}");
+        assert!(stderr.contains("logical block is 8192"), "{mode}: {stderr}");
+        assert!(!stderr.contains("describes another device"), "{mode}: {stderr}");
     }
 
     let _ = std::fs::remove_dir_all(dir.parent().expect("root"));

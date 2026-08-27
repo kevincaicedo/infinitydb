@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 inf-foundation.workspace = true
-# The `O_DIRECT`/`O_DSYNC` open flags only — constants, no FFI; the crate
-# stays `#![forbid(unsafe_code)]`.
+# The `O_DIRECT`/`O_DSYNC` open flags (constants) and the one audited
+# FFI call — `posix_fadvise(DONTNEED)` behind `inf cache-evict` (M4.5-S34);
+# `deny(unsafe_code)` with the `evict` module allow, see `SAFETY.md`.
 libc.workspace = true

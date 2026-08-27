@@ -596,6 +596,10 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-s36",
         "only-s39b",
         "only-s39d",
+        // M4.5-S34 (2026-08-27): the S39d row's cold boot — every file of
+        // the crashed image evicted from the page cache (`inf cache-evict`)
+        // before the one recovery boot, both arms.
+        "s39d-cold-boot",
         "only-s40",
         "only-s37",
         // M4.5-S42 (ADR-0091 D6): the stock first-boot row.
@@ -698,6 +702,10 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "only-s39d",
         "s39d-warm-records",
         "s39d-tail-records",
+        // M4.5-S34 (2026-08-27): the `inf` binary the cold-boot step
+        // spawns (default: `inf` beside `--infinityd-bin`), and the step.
+        "inf-bin",
+        "s39d-cold-boot",
         // M4.5-S40: the stall-attribution row's key space (the memtier
         // shape's `--keyspace`).
         "only-s40",

@@ -297,6 +297,11 @@ pub(crate) fn info(
         // was probed for (never an automatic flip — the operator decides).
         let class = if node.barrier_class_fua.get() == 1 { "fua" } else { "flush" };
         push(&mut text, &format!("barrier_class:{class}"));
+        // M4.5-S42 follow-up (campaign L's finding): `barrier_class` is
+        // the *active segment's* class — a fresh cell says `flush` until
+        // its class-upgrade rotation. This is the configured verdict.
+        let configured = if node.io_class_configured_fua.get() == 1 { "fua" } else { "flush" };
+        push(&mut text, &format!("io_class_configured:{configured}"));
         push(&mut text, &format!("fsyncs_fua:{}", node.fsyncs_fua.get()));
         push(&mut text, &format!("fua_latency_p50_us:{}", node.fua_p50_us.get()));
         push(&mut text, &format!("fua_latency_p99_us:{}", node.fua_p99_us.get()));
@@ -365,6 +370,9 @@ pub(crate) fn info(
         push(&mut text, &format!("ckpt_padding_bytes:{}", node.ckpt_padding_bytes.get()));
         push(&mut text, &format!("manifest_bytes_total:{}", node.manifest_bytes_total.get()));
         push(&mut text, &format!("ckpt_interval_bytes:{}", node.ckpt_interval_bytes.get()));
+        // ADR-0088 D4 as amended: the cap's replay term and the cap.
+        push(&mut text, &format!("ckpt_replay_bytes_per_s:{}", node.ckpt_replay_bytes_per_s.get()));
+        push(&mut text, &format!("ckpt_cap_bytes:{}", node.ckpt_cap_bytes.get()));
         push(
             &mut text,
             &format!(

@@ -10,6 +10,7 @@
 //! `infinityd` reads at boot to choose the log barrier class.
 #![forbid(unsafe_code)]
 
+mod evict;
 mod probe;
 mod reply;
 
@@ -96,6 +97,7 @@ fn usage() -> ExitCode {
     eprintln!("usage: inf [-h HOST] [-p PORT] [COMMAND [ARG ...]]");
     eprintln!("       no COMMAND starts a REPL");
     eprintln!("       inf probe-device <data-dir> [--seconds N]   (ADR-0086 D7)");
+    eprintln!("       inf cache-evict <data-dir>                   (M4.5-S34: a cold boot)");
     ExitCode::from(2)
 }
 
@@ -113,6 +115,16 @@ fn main() -> ExitCode {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {
                         eprintln!("inf probe-device: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            "cache-evict" => {
+                let args: Vec<String> = argv.by_ref().collect();
+                return match evict::run(&args) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("inf cache-evict: {e}");
                         ExitCode::FAILURE
                     }
                 };

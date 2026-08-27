@@ -370,6 +370,10 @@ pub struct DurableStats {
     /// M4.5-S34 (ADR-0086): 1 while the active segment writes
     /// write-through (FUA-class) frames for due syncs, 0 under FLUSH.
     pub barrier_class_fua: u64,
+    /// The configured class (M4.5-S42 follow-up, `io_class_configured`):
+    /// 1 = the rotor creates `Direct` segments — what the probe/flag
+    /// decided, independent of the active segment's upgrade state.
+    pub io_class_configured_fua: u64,
     /// Write-through frame tickets completed (`fsyncs_fua`).
     pub fsyncs_fua: u64,
     /// Write-through barrier latency percentiles (µs) — submission →
@@ -453,6 +457,11 @@ pub struct DurableStats {
     pub manifest_bytes_total: u64,
     pub ckpt_interval_bytes: u64,
     pub ckpt_records_since_begin: u64,
+    /// ADR-0088 D4 as amended: the cap's replay term this cell runs
+    /// (probed read row ÷ cells, or the D4 constant) and the byte cap
+    /// it derives (`replay_bytes_per_s × replay_budget_s`).
+    pub ckpt_replay_bytes_per_s: u64,
+    pub ckpt_cap_bytes: u64,
     /// 1 when checkpoint staging runs buffered (the probed `O_DIRECT`
     /// fallback, ADR-0088 D3 as amended).
     pub ckpt_io_mode_buffered: u64,
@@ -1875,6 +1884,7 @@ impl<F: SegmentFs> DurableCell<F> {
                 + 1
                 + u64::from(self.rotor.next_ready().is_some()),
             barrier_class_fua: u64::from(self.rotor.active_write_through()),
+            io_class_configured_fua: u64::from(self.rotor.configured_write_through()),
             fsyncs_fua: self.commit.stats().fsyncs_write_through,
             fua_p50_us: self.commit.write_through_latency_hist().percentile(50.0),
             fua_p99_us: self.commit.write_through_latency_hist().percentile(99.0),
@@ -1911,6 +1921,8 @@ impl<F: SegmentFs> DurableCell<F> {
             manifest_bytes_total: manifest.bytes_written,
             ckpt_interval_bytes: ckpt.interval_bytes,
             ckpt_records_since_begin: ckpt.records_since_begin,
+            ckpt_replay_bytes_per_s: self.ckpt.cfg.replay_bytes_per_s,
+            ckpt_cap_bytes: self.ckpt.cfg.cap_bytes(),
             ckpt_io_mode_buffered: ckpt.io_mode_buffered,
             ckpt_io_mode_downgrades: ckpt.io_mode_downgrades,
             write_amp_milli_log_checkpoint: write_amp,
