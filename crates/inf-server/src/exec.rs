@@ -165,6 +165,9 @@ pub struct NodeInfo {
     /// class (v3 padding, pre-zeroing), rotation shape, and the
     /// `barrier_class_degraded` tripwire.
     pub barrier_class_fua: Cell<u64>,
+    /// The configured class beside the active segment's (M4.5-S42
+    /// follow-up): `io_class_configured`.
+    pub io_class_configured_fua: Cell<u64>,
     pub fsyncs_fua: Cell<u64>,
     pub fua_p50_us: Cell<u64>,
     pub fua_p99_us: Cell<u64>,
@@ -195,6 +198,9 @@ pub struct NodeInfo {
     pub manifest_bytes_total: Cell<u64>,
     pub ckpt_interval_bytes: Cell<u64>,
     pub ckpt_records_since_begin: Cell<u64>,
+    /// ADR-0088 D4 as amended: the replay term and the byte cap.
+    pub ckpt_replay_bytes_per_s: Cell<u64>,
+    pub ckpt_cap_bytes: Cell<u64>,
     pub ckpt_io_mode_buffered: Cell<u64>,
     pub ckpt_io_mode_downgrades: Cell<u64>,
     pub write_amp_milli_log_checkpoint: Cell<u64>,

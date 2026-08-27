@@ -408,7 +408,6 @@ fn resolve_io_properties(
     mode: DeviceProbe,
     probe_seconds: u64,
 ) -> Result<ResolvedIoProperties, String> {
-    use inf_foundation::IdentityVerdict;
     use inf_server::{IoProperties, IoPropertiesSource, IoProvenance};
     let loaded =
         IoProperties::load(dir).map_err(|e| format!("{e} (fail-stop: fix or remove the file)"))?;
@@ -428,13 +427,91 @@ fn resolve_io_properties(
         };
     };
     let current = inf_probe::identity_of(dir);
-    let (verdict, reason) = if props.probe_schema >= 3 {
-        props.identity.mismatch(&current)
-    } else {
-        (IdentityVerdict::Unverifiable, None)
-    };
-    check_block_size(&props)?;
-    let identity_note = match verdict {
+    // Identity first, then the block-size assertion on the file that
+    // will actually be used (review of 2026-08-26): a foreign model is
+    // decided by its identity alone — under `auto` it is re-probed even
+    // when its block size would have been refused, exactly as ADR-0091
+    // D1 promises; the block-size rule then judges the fresh file.
+    match existing_file_decision(&props, &current, mode) {
+        FileDecision::Use(verdict) => {
+            check_block_size(&props)?;
+            let identity_note = identity_note(&props, verdict);
+            Ok(ResolvedIoProperties {
+                provenance: IoProvenance {
+                    source: IoPropertiesSource::File,
+                    schema: props.probe_schema,
+                    identity: verdict,
+                },
+                note: format!(
+                    "{} (schema {}, {identity_note})",
+                    inf_server::IO_PROPERTIES_FILE,
+                    props.probe_schema
+                ),
+                props,
+            })
+        }
+        FileDecision::Refuse(reason) => Err(format!(
+            "{}: the model describes another device — {reason}; re-run `inf probe-device {}`, \
+             remove the file, or boot with `--device-probe auto` (fail-stop, ADR-0091 D1)",
+            inf_server::IO_PROPERTIES_FILE,
+            dir.display()
+        )),
+        FileDecision::Reprobe(reason) => {
+            let stale = dir.join("io-properties.toml.stale");
+            std::fs::rename(dir.join(inf_server::IO_PROPERTIES_FILE), &stale)
+                .map_err(|e| format!("rename stale io-properties.toml: {e}"))?;
+            probe_now(
+                dir,
+                probe_seconds,
+                IoPropertiesSource::Reprobed,
+                &format!("stale — {reason}; kept as {}", stale.display()),
+            )
+        }
+    }
+}
+
+/// What a boot does with the file it found (ADR-0091 D1, pure — the
+/// binary test pins the I/O around it, the unit tests pin the rule).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FileDecision {
+    /// Use the file; the identity verdict for `INFO`.
+    Use(inf_foundation::IdentityVerdict),
+    /// `auto`: rename `.stale` and probe again (the reason, for the log).
+    Reprobe(String),
+    /// `off`: refuse the boot (the reason, for the operator).
+    Refuse(String),
+}
+
+/// Identity before block size: a schema-3 file whose identity mismatches
+/// the device is stale whatever else it says; schema ≤ 2 files carry no
+/// identity and are used as-is (`unverifiable`).
+fn existing_file_decision(
+    props: &inf_server::IoProperties,
+    current: &inf_foundation::DeviceIdentity,
+    mode: DeviceProbe,
+) -> FileDecision {
+    use inf_foundation::IdentityVerdict;
+    if props.probe_schema < 3 {
+        return FileDecision::Use(IdentityVerdict::Unverifiable);
+    }
+    match props.identity.mismatch(current) {
+        (IdentityVerdict::Mismatch, reason) => {
+            let reason = reason.unwrap_or_else(|| "identity mismatch".to_owned());
+            match mode {
+                DeviceProbe::Off => FileDecision::Refuse(reason),
+                DeviceProbe::Auto => FileDecision::Reprobe(reason),
+            }
+        }
+        (verdict, _) => FileDecision::Use(verdict),
+    }
+}
+
+fn identity_note(
+    props: &inf_server::IoProperties,
+    verdict: inf_foundation::IdentityVerdict,
+) -> String {
+    use inf_foundation::IdentityVerdict;
+    match verdict {
         IdentityVerdict::Verified => format!(
             "identity verified ({} {} {})",
             props.identity.fs_type,
@@ -444,42 +521,28 @@ fn resolve_io_properties(
         IdentityVerdict::Unverifiable => {
             format!("identity unverifiable (schema {})", props.probe_schema)
         }
-        IdentityVerdict::Mismatch => reason.clone().unwrap_or_default(),
-    };
-    if verdict != IdentityVerdict::Mismatch {
-        return Ok(ResolvedIoProperties {
-            provenance: IoProvenance {
-                source: IoPropertiesSource::File,
-                schema: props.probe_schema,
-                identity: verdict,
-            },
-            note: format!(
-                "{} (schema {}, {identity_note})",
-                inf_server::IO_PROPERTIES_FILE,
-                props.probe_schema
-            ),
-            props,
-        });
+        IdentityVerdict::Mismatch => "identity mismatch".to_owned(),
     }
-    match mode {
-        DeviceProbe::Off => Err(format!(
-            "{}: the model describes another device — {identity_note}; re-run `inf \
-             probe-device {}`, remove the file, or boot with `--device-probe auto` (fail-stop, \
-             ADR-0091 D1)",
-            inf_server::IO_PROPERTIES_FILE,
-            dir.display()
+}
+
+/// The identity verdict of a file the probe just wrote, re-derived from
+/// the device rather than assumed (review of 2026-08-26): a host that
+/// exposes neither a filesystem UUID nor a device path writes an empty
+/// identity block, and that file is `unverifiable`, not `verified`. A
+/// mismatch here is a probe-integrity violation (the file names a device
+/// other than the one it was written on) — surfaced typed, fail-stop.
+fn probed_identity_verdict(
+    props: &inf_server::IoProperties,
+    current: &inf_foundation::DeviceIdentity,
+) -> Result<inf_foundation::IdentityVerdict, String> {
+    use inf_foundation::IdentityVerdict;
+    match props.identity.mismatch(current) {
+        (IdentityVerdict::Mismatch, reason) => Err(format!(
+            "the probe wrote a model whose identity does not match the device it ran on \
+             ({}) — fail-stop",
+            reason.unwrap_or_default()
         )),
-        DeviceProbe::Auto => {
-            let stale = dir.join("io-properties.toml.stale");
-            std::fs::rename(dir.join(inf_server::IO_PROPERTIES_FILE), &stale)
-                .map_err(|e| format!("rename stale io-properties.toml: {e}"))?;
-            probe_now(
-                dir,
-                probe_seconds,
-                IoPropertiesSource::Reprobed,
-                &format!("stale — {identity_note}; kept as {}", stale.display()),
-            )
-        }
+        (verdict, _) => Ok(verdict),
     }
 }
 
@@ -491,7 +554,6 @@ fn probe_now(
     source: inf_server::IoPropertiesSource,
     why: &str,
 ) -> Result<ResolvedIoProperties, String> {
-    use inf_foundation::IdentityVerdict;
     use inf_server::{IoProperties, IoProvenance};
     eprintln!(
         "infinityd: io-properties {why}: probing the device under {} ({probe_seconds} s per row, \
@@ -513,12 +575,9 @@ fn probe_now(
         .map_err(|e| format!("{e} (the probe wrote a file this binary cannot read)"))?
         .ok_or_else(|| format!("the probe wrote no {}", path.display()))?;
     check_block_size(&props)?;
+    let identity = probed_identity_verdict(&props, &inf_probe::identity_of(dir))?;
     Ok(ResolvedIoProperties {
-        provenance: IoProvenance {
-            source,
-            schema: props.probe_schema,
-            identity: IdentityVerdict::Verified,
-        },
+        provenance: IoProvenance { source, schema: props.probe_schema, identity },
         note: format!(
             "{} (schema {}, {:.1} s; identity {} {} {}) → barrier class {}",
             source.as_str(),
@@ -700,6 +759,19 @@ fn main() {
                 share.write_bytes_per_s >> 20,
             );
         }
+        eprintln!(
+            "infinityd: checkpoint cap replay term {} MiB/s per cell ({}; ADR-0088 D4 as amended)",
+            replay_bytes_per_s_per_cell(io.device.read_bytes_per_s, args.cells) >> 20,
+            if io.device.read_bytes_per_s == 0 {
+                "the D4 constant — no probed read row".to_owned()
+            } else {
+                format!(
+                    "probed read row {} MiB/s ÷ {} cells",
+                    io.device.read_bytes_per_s >> 20,
+                    args.cells.max(1)
+                )
+            }
+        );
         // The seal pacer (ADR-0088 D2b) is an explicit arm: off unless asked.
         let seal_barriers_per_s = match args.seal_pace {
             None => 0,
@@ -888,8 +960,15 @@ fn cell_main(
                 prealloc: args.recycle_wait,
                 ..Default::default()
             },
+            // ADR-0088 D4 as amended (M4.5-S34 campaign M3): the cap's
+            // replay term is the probed four-reader read rate ÷ cells
+            // when the model carries one, else the D4 constant.
             ckpt: inf_server::CkptConfig {
                 interval_bytes: args.ckpt_interval_bytes,
+                replay_bytes_per_s: replay_bytes_per_s_per_cell(
+                    io.device.read_bytes_per_s,
+                    args.cells,
+                ),
                 ..Default::default()
             },
             recover: inf_server::RecoverConfig::default(),
@@ -1046,4 +1125,122 @@ fn backend_name() -> &'static str {
     return "kqueue";
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     "none"
+}
+
+/// The checkpoint cap's replay term (ADR-0088 D4 as amended): the probed
+/// four-reader direct read rate divided by the cell count — four
+/// `O_DIRECT` logs replayed at once share one device's read bandwidth,
+/// which campaign M3 measured at a quarter of the D4 constant per cell —
+/// or the constant when the model carries no read row (0).
+fn replay_bytes_per_s_per_cell(probed_read_bytes_per_s: u64, cells: u16) -> u64 {
+    if probed_read_bytes_per_s == 0 {
+        return inf_server::DEFAULT_REPLAY_BYTES_PER_S;
+    }
+    probed_read_bytes_per_s / u64::from(cells.max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inf_foundation::{DeviceIdentity, IdentityVerdict};
+
+    fn props(schema: u64, uuid: &str, block: u32) -> inf_server::IoProperties {
+        inf_server::IoProperties {
+            probe_schema: schema,
+            identity: DeviceIdentity {
+                fs_type: "ext4".into(),
+                fs_uuid: uuid.into(),
+                device_path: "/dev/nvme0n1p3".into(),
+                block_logical_bytes: block,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn device(uuid: &str) -> DeviceIdentity {
+        DeviceIdentity {
+            fs_type: "ext4".into(),
+            fs_uuid: uuid.into(),
+            device_path: "/dev/nvme0n1p3".into(),
+            ..Default::default()
+        }
+    }
+
+    /// ADR-0091 D1 (review of 2026-08-26): a foreign model is decided by
+    /// its identity before its block size is judged — `auto` re-probes
+    /// it even when the stale file's block size would be refused; `off`
+    /// refuses naming the device, not the block.
+    #[test]
+    fn a_foreign_model_is_reprobed_or_refused_before_its_block_size_is_judged() {
+        let foreign = props(3, "0000-dead", 8192);
+        let here = device("c97c5418");
+        assert!(matches!(
+            existing_file_decision(&foreign, &here, DeviceProbe::Auto),
+            FileDecision::Reprobe(reason) if reason.contains("uuid")
+        ));
+        assert!(matches!(
+            existing_file_decision(&foreign, &here, DeviceProbe::Off),
+            FileDecision::Refuse(reason) if reason.contains("uuid")
+        ));
+    }
+
+    /// A model that describes this device is used, and only then does the
+    /// block-size rule apply (`check_block_size` refuses 8 KiB blocks).
+    #[test]
+    fn a_verified_model_is_used_and_its_block_size_is_then_checked() {
+        let here = device("c97c5418");
+        let ok = props(3, "c97c5418", 512);
+        assert_eq!(
+            existing_file_decision(&ok, &here, DeviceProbe::Off),
+            FileDecision::Use(IdentityVerdict::Verified)
+        );
+        assert!(check_block_size(&ok).is_ok());
+        let wide = props(3, "c97c5418", 8192);
+        assert_eq!(
+            existing_file_decision(&wide, &here, DeviceProbe::Auto),
+            FileDecision::Use(IdentityVerdict::Verified)
+        );
+        assert!(check_block_size(&wide).unwrap_err().contains("8192 bytes"));
+        // Schema ≤ 2 carries no identity: used, unverifiable, either mode.
+        let legacy = props(2, "", 512);
+        assert_eq!(
+            existing_file_decision(&legacy, &here, DeviceProbe::Off),
+            FileDecision::Use(IdentityVerdict::Unverifiable)
+        );
+    }
+
+    /// A freshly probed file's verdict is re-derived from the device: an
+    /// empty identity block is `unverifiable`, a matching one `verified`,
+    /// and a mismatch is a probe-integrity error, never a silent
+    /// `verified`.
+    #[test]
+    fn a_probed_file_reports_the_verdict_the_device_supports() {
+        let here = device("c97c5418");
+        let empty = props(3, "", 512);
+        let mut empty = empty;
+        empty.identity = DeviceIdentity::default();
+        assert_eq!(
+            probed_identity_verdict(&empty, &DeviceIdentity::default()),
+            Ok(IdentityVerdict::Unverifiable)
+        );
+        assert_eq!(
+            probed_identity_verdict(&props(3, "c97c5418", 512), &here),
+            Ok(IdentityVerdict::Verified)
+        );
+        assert!(
+            probed_identity_verdict(&props(3, "0000-dead", 512), &here)
+                .unwrap_err()
+                .contains("does not match the device")
+        );
+    }
+
+    /// ADR-0088 D4 as amended: the replay term is the probed read row
+    /// divided across the cells; no row keeps the constant.
+    #[test]
+    fn replay_term_is_the_probed_read_row_per_cell_or_the_constant() {
+        assert_eq!(replay_bytes_per_s_per_cell(0, 4), inf_server::DEFAULT_REPLAY_BYTES_PER_S);
+        assert_eq!(replay_bytes_per_s_per_cell(1_083_000_000, 4), 270_750_000);
+        assert_eq!(replay_bytes_per_s_per_cell(1_083_000_000, 0), 1_083_000_000);
+    }
 }
