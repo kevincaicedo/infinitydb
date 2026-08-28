@@ -1,0 +1,2 @@
+inf-sim: m4-tiered sweep shard 5/8: 125 seeds, 0 violations, 0 legal taxonomy refusals, 564771 commands, 17889 keys audited, 79826938 B flushed pre-cut, 21200 cold resolves, 54229 blob sets, 125 DISKFULL refusals, drop-race 2246 values / 1504 typed-other; shadow arm on 125 seeds: 7042 tickets (0 open at the cut), 7042 same-key / 0 collision verdicts, 0 stale, 0 fallbacks; forced collisions: 1000 tickets, 500 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins
+inf-sim: sim_seconds=2543.416015 published=0 delivered=0

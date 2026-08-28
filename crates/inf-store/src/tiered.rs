@@ -601,6 +601,7 @@ impl TieredTable {
         let cost = len as u64 + inf_log::blob::extent_device_bytes(ext.len);
         self.disk_admit_check(cost)?;
         let addr = self.space.alloc(len).ok_or(OpError::OutOfMemory)?;
+        self.shadow_note_alloc();
         self.disk_admit_debit(cost);
         self.note_seal_mark(addr);
         spec.write(self.space.bytes_mut(addr, len));
@@ -1507,12 +1508,14 @@ impl TieredTable {
         let mut emitted = 0usize;
         loop {
             self.index.scan_home_group_ext(cursor as usize, |addr, hash| {
-                // ADR-0093 D3: a ticket's cold slot is the key's unverified
-                // twin (or a collision key the winner's read has not yet
-                // told apart) — never a second name for the key.
+                // ADR-0093 A3: a ticket's cold slot is emitted like any
+                // cold slot — it is either the key's old record (the key
+                // is named twice within one scan, legal by the SCAN
+                // contract) or a collision key the winner's read has not
+                // yet told apart (which must be named). Hiding it hid a
+                // key; counted for the campaign.
                 if self.is_shadow_cold(addr) {
-                    self.note_shadow_scan_skipped();
-                    return;
+                    self.note_shadow_scan_twin();
                 }
                 emit(hash, addr);
                 emitted += 1;
@@ -1854,6 +1857,7 @@ impl TieredTable {
         self.disk_admit_check(len as u64)?;
         let addr = self.space.alloc(len).ok_or(OpError::OutOfMemory)?;
         self.disk_admit_debit(len as u64);
+        self.shadow_note_alloc();
         self.note_seal_mark(addr);
         spec.write(self.space.bytes_mut(addr, len));
         self.live_bytes += len as u64;
@@ -1909,6 +1913,7 @@ impl TieredTable {
             "relocation image is not exactly one record"
         );
         let addr = self.space.alloc(len)?;
+        self.shadow_note_alloc();
         self.note_seal_mark(addr);
         self.space.bytes_mut(addr, len).copy_from_slice(image);
         self.live_bytes += len as u64;

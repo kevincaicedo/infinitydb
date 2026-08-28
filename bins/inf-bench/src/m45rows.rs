@@ -3314,7 +3314,9 @@ fn s37_leg(
         shadow_resolved: d("tiering_shadow_resolved_same_key")
             + d("tiering_shadow_resolved_collision"),
         shadow_fallbacks: d("tiering_shadow_fallback_off")
+            + d("tiering_shadow_fallback_fence")
             + d("tiering_shadow_fallback_multi")
+            + d("tiering_shadow_fallback_ticketed")
             + d("tiering_shadow_fallback_tickets")
             + d("tiering_shadow_fallback_pin")
             + d("tiering_shadow_fallback_origin")
@@ -3843,7 +3845,7 @@ struct S42Boot {
 
 /// The M4.5-S42 row (ADR-0091 D6): a fresh data directory booted twice
 /// under the product default — the first boot probes and writes the
-/// schema-3 model (`probed-at-boot`), the second reads it (`file`) —
+/// schema-4 model (`probed-at-boot`), the second reads it (`file`) —
 /// then the S35 AC leg (32 conns closed loop) and the pipelined read
 /// leg on that directory. Gates: the probe's cost (first − second boot
 /// ≤ 15 s), both provenances, the schema, and the AC leg's p50 over

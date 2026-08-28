@@ -56,7 +56,7 @@ use inf_log::{
 use inf_store::{
     AddressSpaceConfig, BlobConfig, CompactionWork, DemotionConfig, ExtentRef, LogicalAddr,
     TieredLookup, TieredTable, apply_blob_ref_section, apply_live_set_section, apply_ref_section,
-    recover_tiered_ns,
+    forced_collision_pair, recover_tiered_ns,
 };
 
 const NS: NsId = NsId(88);
@@ -136,6 +136,14 @@ pub struct RecoveryReport {
     pub shadow_reformed: u64,
     pub shadow_same_key: u64,
     pub shadow_collision: u64,
+    /// ADR-0093 A7: ops on the crafted colliding pairs (two real keys
+    /// with one 64-bit hash), rebuilt slots the boot read and settled
+    /// by their full key (A4), and the `DBSIZE`-shaped drain checks
+    /// (A3: verify every unverified ticket, then `len()` must equal the
+    /// model with the verified tickets still open).
+    pub shadow_collide_ops: u64,
+    pub shadow_settled_at_boot: u64,
+    pub shadow_drain_checks: u64,
     pub trace_hash: u64,
 }
 
@@ -149,7 +157,6 @@ impl RecoveryReport {
 #[derive(Clone)]
 struct Expect {
     value: Vec<u8>,
-    encoded_len: usize,
     /// The referenced extent when the value is out of line (M4-S17).
     extent: Option<u64>,
 }
@@ -230,6 +237,30 @@ fn read_cold(disk: &SimDisk, flush: &TierFlush<SimDisk>, addr: u64, len: usize) 
     tier_extract(&window, skip, len, &mut out).ok()?;
     Some(out)
 }
+
+/// Reads one whole cold record: the header window sizes it, the exact
+/// span follows (never a model-length read — a colliding cold candidate
+/// is another key of another length, ADR-0093 A7).
+fn read_cold_record(disk: &SimDisk, flush: &TierFlush<SimDisk>, addr: u64) -> Option<Vec<u8>> {
+    let head = read_cold(disk, flush, addr, TieredTable::RECORD_HEADER_LEN)?;
+    let len = TieredTable::record_len_from_header(&head);
+    read_cold(disk, flush, addr, len)
+}
+
+/// The op mix's key (ADR-0093 A7): one in sixteen is a crafted colliding
+/// key — either side of one of `pairs` — so the shadow, `DEL`, walk and
+/// recovery paths meet two real keys with one hash on every seed.
+fn seeded_key(rng: &mut SplitMix64, keys: u64, pairs: &[([u8; 48], [u8; 48])]) -> Vec<u8> {
+    if rng.next_u64().is_multiple_of(16) {
+        let pair = &pairs[(rng.next_u64() % pairs.len() as u64) as usize];
+        return if rng.next_u64().is_multiple_of(2) { pair.0.to_vec() } else { pair.1.to_vec() };
+    }
+    let idx = rng.next_u64() % keys;
+    format!("rec:{idx:05}").into_bytes()
+}
+
+/// Tag spread for the crafted pairs (four unrelated pairs per seed).
+const P_TAG: u64 = 0x9E37_79B9_7F4A_7C15;
 
 struct Run {
     disk: SimDisk,
@@ -339,16 +370,7 @@ impl Run {
     /// applied. A read that fails (a file the pin-analog unlink took —
     /// impossible while the slot is live) is a violation.
     fn reconcile_ticket(&mut self, life: &mut Life, ticket: inf_store::ShadowTicket, when: &str) {
-        let head = read_cold(
-            &self.disk,
-            &life.flush,
-            ticket.cold.to_raw(),
-            TieredTable::RECORD_HEADER_LEN,
-        );
-        let image = head
-            .map(|h| TieredTable::record_len_from_header(&h))
-            .and_then(|len| read_cold(&self.disk, &life.flush, ticket.cold.to_raw(), len));
-        let Some(image) = image else {
+        let Some(image) = read_cold_record(&self.disk, &life.flush, ticket.cold.to_raw()) else {
             self.report.violations.push(format!(
                 "{when}: shadow twin at {} unreadable while its slot is live",
                 ticket.cold.to_raw()
@@ -356,18 +378,44 @@ impl Run {
             life.table.shadow_read_failed(ticket.cold);
             return;
         };
-        match life.table.resolve_shadow(ticket.hash, ticket.cold, ticket.winner, &image) {
-            inf_store::ShadowVerdict::SameKey => self.report.shadow_same_key += 1,
+        let same_key = self.twin_is_winner_key(life, &ticket, &image);
+        match life.table.resolve_shadow(ticket.hash, ticket.cold, &image) {
+            inf_store::ShadowVerdict::SameKey => {
+                self.report.shadow_same_key += 1;
+                if !same_key {
+                    self.report
+                        .violations
+                        .push(format!("{when}: same-key verdict on a collision twin"));
+                }
+            }
             inf_store::ShadowVerdict::Collision => {
-                // No two real keys share a 64-bit hash at this corpus
-                // size: a collision verdict here is a wrong comparison.
+                // ADR-0093 A7: legal exactly when the twin's full key is
+                // not the winner's — the crafted pairs; on equal keys it
+                // is a wrong comparison.
                 self.report.shadow_collision += 1;
-                self.report
-                    .violations
-                    .push(format!("{when}: collision verdict on a same-key twin"));
+                if same_key {
+                    self.report
+                        .violations
+                        .push(format!("{when}: collision verdict on a same-key twin"));
+                }
             }
             inf_store::ShadowVerdict::Stale | inf_store::ShadowVerdict::Deferred => {}
         }
+    }
+
+    /// The oracle's own comparison: the twin's decoded key against the
+    /// ticket's current winner's key (the verdict is checked, never
+    /// trusted).
+    fn twin_is_winner_key(
+        &self,
+        life: &Life,
+        ticket: &inf_store::ShadowTicket,
+        image: &[u8],
+    ) -> bool {
+        let Some(current) = life.table.shadow_tickets().find(|t| t.cold == ticket.cold) else {
+            return false;
+        };
+        TieredTable::decode_record(image).key == life.table.record(current.winner).key
     }
 
     /// The `DEL` path's verify (ADR-0093 D3): the twin read and
@@ -380,24 +428,30 @@ impl Run {
         ticket: inf_store::ShadowTicket,
         when: &str,
     ) {
-        let head = read_cold(
-            &self.disk,
-            &life.flush,
-            ticket.cold.to_raw(),
-            TieredTable::RECORD_HEADER_LEN,
-        );
-        let image = head
-            .map(|h| TieredTable::record_len_from_header(&h))
-            .and_then(|len| read_cold(&self.disk, &life.flush, ticket.cold.to_raw(), len));
-        let Some(image) = image else {
+        // A verified ticket needs no read (ADR-0093 A1): the exact
+        // length is on the ticket — the plane's `delete_one` rule.
+        if let Some(len) = ticket.verified_len {
+            RecordView::ColdDisplace { ns: NS, old_addr: ticket.cold.to_raw() }
+                .encode_into(&mut self.tail);
+            life.table.delete(ticket.hash, ticket.cold, len as usize);
+            self.report.shadow_same_key += 1;
+            return;
+        }
+        let Some(image) = read_cold_record(&self.disk, &life.flush, ticket.cold.to_raw()) else {
             self.report.violations.push(format!(
                 "{when}: shadow twin at {} unreadable while its slot is live",
                 ticket.cold.to_raw()
             ));
             return;
         };
-        match life.table.verify_shadow(ticket.hash, ticket.cold, ticket.winner, &image) {
+        let same_key = self.twin_is_winner_key(life, &ticket, &image);
+        match life.table.verify_shadow(ticket.hash, ticket.cold, &image) {
             inf_store::ShadowVerdict::SameKey => {
+                if !same_key {
+                    self.report
+                        .violations
+                        .push(format!("{when}: same-key verdict on a collision twin"));
+                }
                 RecordView::ColdDisplace { ns: NS, old_addr: ticket.cold.to_raw() }
                     .encode_into(&mut self.tail);
                 life.table.delete(ticket.hash, ticket.cold, image.len());
@@ -405,11 +459,60 @@ impl Run {
             }
             inf_store::ShadowVerdict::Collision => {
                 self.report.shadow_collision += 1;
-                self.report
-                    .violations
-                    .push(format!("{when}: collision verdict on a same-key twin"));
+                if same_key {
+                    self.report
+                        .violations
+                        .push(format!("{when}: collision verdict on a same-key twin"));
+                }
             }
             _ => {}
+        }
+    }
+
+    /// The `DBSIZE` drain played by the harness (ADR-0093 A3): verify
+    /// every unverified ticket (reads only — no settle, so a pinned walk
+    /// is no obstacle), then `len()` must equal the model with the
+    /// verified tickets still open. An unverified collision ticket that
+    /// survived verification, or a count off by one, is the review's
+    /// finding reconstructed.
+    fn audit_len_after_drain(&mut self, life: &mut Life, when: &str) {
+        for ticket in life.table.shadow_unverified_tickets() {
+            let Some(image) = read_cold_record(&self.disk, &life.flush, ticket.cold.to_raw())
+            else {
+                self.report.violations.push(format!(
+                    "{when}: drain — shadow twin at {} unreadable",
+                    ticket.cold.to_raw()
+                ));
+                return;
+            };
+            let same_key = self.twin_is_winner_key(life, &ticket, &image);
+            match life.table.verify_shadow(ticket.hash, ticket.cold, &image) {
+                inf_store::ShadowVerdict::SameKey if !same_key => self
+                    .report
+                    .violations
+                    .push(format!("{when}: drain — same-key verdict on a collision twin")),
+                inf_store::ShadowVerdict::Collision if same_key => self
+                    .report
+                    .violations
+                    .push(format!("{when}: drain — collision verdict on a same-key twin")),
+                inf_store::ShadowVerdict::Collision => self.report.shadow_collision += 1,
+                _ => {}
+            }
+        }
+        self.report.shadow_drain_checks += 1;
+        if life.table.shadow_unverified() != 0 {
+            self.report
+                .violations
+                .push(format!("{when}: drain left {} unverified", life.table.shadow_unverified()));
+        }
+        if life.table.len() != self.model.len() {
+            self.report.violations.push(format!(
+                "{when}: DBSIZE EXACTNESS VIOLATION — len {} vs model {} with {} verified \
+                 tickets open",
+                life.table.len(),
+                self.model.len(),
+                life.table.shadow_pending()
+            ));
         }
     }
 
@@ -454,6 +557,9 @@ impl Run {
     /// mutations).
     fn apply_op(&mut self, life: &mut Life, key: &[u8], op: Op) {
         let hash = TieredTable::hash_key(key);
+        if key.starts_with(inf_store::COLLISION_KEY_PREFIX) {
+            self.report.shadow_collide_ops += 1;
+        }
         // The shadow path (ADR-0093 D2): probe → admit → insert →
         // register → the image alone into the tail (no marker). Any
         // other probe answer or a refusal is a plain SET.
@@ -471,9 +577,7 @@ impl Run {
                             .encode_into(&mut self.tail);
                         self.report.tail_records += 1;
                         self.report.shadow_opened += 1;
-                        let encoded_len = life.table.record(winner).encoded_len;
-                        self.model
-                            .insert(key.to_vec(), Expect { value, encoded_len, extent: None });
+                        self.model.insert(key.to_vec(), Expect { value, extent: None });
                         return;
                     }
                     _ => Op::Set(value),
@@ -481,20 +585,28 @@ impl Run {
             }
             other => other,
         };
-        let displaced = match life.table.lookup(key, hash, &[]) {
-            TieredLookup::Ram(addr) => {
-                let parts = life.table.record(addr);
-                Some((addr, parts.encoded_len, parts.version))
+        // The plane's resolve: RAM verifies in place; a cold candidate is
+        // read and its full key compared, a mismatch (a fingerprint false
+        // positive, or a crafted collision — ADR-0093 A7) excluded and
+        // the probe retried.
+        let mut exclude: Vec<LogicalAddr> = Vec::new();
+        let displaced = loop {
+            match life.table.lookup(key, hash, &exclude) {
+                TieredLookup::Ram(addr) => {
+                    let parts = life.table.record(addr);
+                    break Some((addr, parts.encoded_len, parts.version));
+                }
+                TieredLookup::Cold(addr) => {
+                    let bytes = read_cold_record(&self.disk, &life.flush, addr.to_raw())
+                        .expect("cold record readable");
+                    let parts = TieredTable::decode_record(&bytes);
+                    if parts.key == key {
+                        break Some((addr, parts.encoded_len, parts.version));
+                    }
+                    exclude.push(addr);
+                }
+                TieredLookup::Miss => break None,
             }
-            TieredLookup::Cold(addr) => {
-                let expect = self.model.get(key).expect("cold candidate implies model entry");
-                let bytes = read_cold(&self.disk, &life.flush, addr.to_raw(), expect.encoded_len)
-                    .expect("cold record readable");
-                let parts = TieredTable::decode_record(&bytes);
-                assert_eq!(parts.key, key, "no full-hash collisions at this corpus size");
-                Some((addr, parts.encoded_len, parts.version))
-            }
-            TieredLookup::Miss => None,
         };
         match op {
             Op::Set(value) => {
@@ -522,11 +634,7 @@ impl Run {
                 RecordView::StringPostImage { ns: NS, key, value: &value }
                     .encode_into(&mut self.tail);
                 self.report.tail_records += 1;
-                let encoded_len = match life.table.lookup(key, hash, &[]) {
-                    TieredLookup::Ram(addr) => life.table.record(addr).encoded_len,
-                    _ => unreachable!("a fresh write is RAM-resident"),
-                };
-                self.model.insert(key.to_vec(), Expect { value, encoded_len, extent: None });
+                self.model.insert(key.to_vec(), Expect { value, extent: None });
             }
             Op::SetShadow(_) => unreachable!("rewritten to Set above"),
             Op::SetBlob(value) => {
@@ -588,12 +696,7 @@ impl Run {
                 .encode_into(&mut self.tail);
                 self.report.tail_records += 1;
                 self.report.blobs_written += 1;
-                let encoded_len = match life.table.lookup(key, hash, &[]) {
-                    TieredLookup::Ram(addr) => life.table.record(addr).encoded_len,
-                    _ => unreachable!("a fresh write is RAM-resident"),
-                };
-                self.model
-                    .insert(key.to_vec(), Expect { value, encoded_len, extent: Some(extent_id.0) });
+                self.model.insert(key.to_vec(), Expect { value, extent: Some(extent_id.0) });
             }
             Op::Del => {
                 if let Some((addr, len, _)) = displaced {
@@ -704,8 +807,7 @@ impl Run {
                         }
                     }
                     TieredLookup::Cold(addr) => {
-                        match read_cold(&self.disk, &life.flush, addr.to_raw(), expect.encoded_len)
-                        {
+                        match read_cold_record(&self.disk, &life.flush, addr.to_raw()) {
                             Some(bytes) => {
                                 let parts = TieredTable::decode_record(&bytes);
                                 if parts.key == key.as_slice() {
@@ -927,6 +1029,10 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         flush_lag: false,
     };
     let mut ckpt_id = 0u64;
+    // ADR-0093 A7: four crafted colliding pairs per seed — two real keys
+    // with one 64-bit hash each, routed by the shared hashtag.
+    let pairs: Vec<([u8; 48], [u8; 48])> =
+        (0..4u64).map(|i| forced_collision_pair(scenario.seed ^ i.wrapping_mul(P_TAG))).collect();
 
     for life_index in 0..scenario.lives {
         run.report.lives += 1;
@@ -937,8 +1043,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // Phase A: mutations (into the tail — everything since the last
         // durable publish replays).
         for _ in 0..scenario.ops_per_phase {
-            let idx = rng.next_u64() % scenario.keys;
-            let key = format!("rec:{idx:05}").into_bytes();
+            let key = seeded_key(&mut rng, scenario.keys, &pairs);
             let op = seeded_op(&mut rng);
             run.apply_op(&mut life, &key, op);
             if !life.flush_lag && rng.next_u64().is_multiple_of(32) {
@@ -1044,8 +1149,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                 break;
             }
             for _ in 0..4 {
-                let idx = rng.next_u64() % scenario.keys;
-                let key = format!("rec:{idx:05}").into_bytes();
+                let key = seeded_key(&mut rng, scenario.keys, &pairs);
                 let op = seeded_op(&mut rng);
                 run.apply_op(&mut life, &key, op);
             }
@@ -1140,8 +1244,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             run.audit(&life, &format!("life {life_index} post-retirement"));
             // Post-publish tail ops.
             for _ in 0..scenario.ops_per_phase / 4 {
-                let idx = rng.next_u64() % scenario.keys;
-                let key = format!("rec:{idx:05}").into_bytes();
+                let key = seeded_key(&mut rng, scenario.keys, &pairs);
                 let op = seeded_op(&mut rng);
                 run.apply_op(&mut life, &key, op);
             }
@@ -1281,10 +1384,26 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             }
             rest = &rest[consumed..];
         }
-        // M4.5-S37 (ADR-0093 D5): the shadow ticket set is rebuilt from
-        // the finished index at recovery-complete — the plane's
-        // `finish_tier_replay` does this; the harness plays it here.
-        table.rebuild_shadow_tickets();
+        // M4.5-S37 (ADR-0093 D5/A4): the shadow ticket set is rebuilt
+        // from the finished index at recovery-complete — the plane's
+        // `finish_tier_replay` does this; the harness plays it here,
+        // including the settle list: the slots the rebuild cannot pair
+        // by construction (two RAM keys with one hash beside a cold
+        // twin) or beyond the cap, read and settled by their full key
+        // before the life serves.
+        let settle = table.rebuild_shadow_tickets();
+        for slot in settle {
+            let Some(image) = read_cold_record(&disk, &recovered.flush, slot.cold.to_raw()) else {
+                run.report.violations.push(format!(
+                    "life {life_index}: settle slot at {} ({:?}) unreadable",
+                    slot.cold.to_raw(),
+                    slot.reason
+                ));
+                return run.report;
+            };
+            table.settle_rebuilt_slot(slot.hash, slot.cold, &image);
+            run.report.shadow_settled_at_boot += 1;
+        }
         // The M4-S14 oracle (ADR-0058 D4): by replay-complete, every
         // recovered file's slot count equals the index's ground truth,
         // and byte counters never over-count dead — asserted per life,
@@ -1304,6 +1423,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // oracle closes the life.
         run.report.shadow_reformed += life.table.shadow_pending() as u64;
         run.audit(&life, &format!("life {life_index} (tickets open)"));
+        run.audit_len_after_drain(&mut life, &format!("life {life_index} (tickets open)"));
         run.reconcile_all(&mut life, &format!("life {life_index} post-recovery"));
         run.audit_cardinality(&life, &format!("life {life_index}"));
         // The M4-S17 refcount reconciliation oracle + the boot sweep
@@ -1329,6 +1449,9 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                 run.report.shadow_opened.to_le_bytes(),
                 run.report.shadow_reformed.to_le_bytes(),
                 run.report.shadow_same_key.to_le_bytes(),
+                run.report.shadow_collision.to_le_bytes(),
+                run.report.shadow_settled_at_boot.to_le_bytes(),
+                run.report.shadow_collide_ops.to_le_bytes(),
             ]
             .concat(),
             run.report.trace_hash,

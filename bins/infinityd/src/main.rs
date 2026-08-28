@@ -761,16 +761,16 @@ fn main() {
         }
         eprintln!(
             "infinityd: checkpoint cap replay term {} MiB/s per cell ({}; ADR-0088 D4 as amended)",
-            replay_bytes_per_s_per_cell(io.device.read_bytes_per_s, args.cells) >> 20,
-            if io.device.read_bytes_per_s == 0 {
-                "the D4 constant — no probed read row".to_owned()
-            } else {
-                format!(
-                    "probed read row {} MiB/s ÷ {} cells",
-                    io.device.read_bytes_per_s >> 20,
-                    args.cells.max(1)
-                )
-            }
+            replay_bytes_per_s_per_cell(
+                io.device.read_bytes_per_s,
+                io.read_bytes_per_s_256k_qd1,
+                args.cells
+            ) >> 20,
+            replay_term_origin(
+                io.device.read_bytes_per_s,
+                io.read_bytes_per_s_256k_qd1,
+                args.cells
+            )
         );
         // The seal pacer (ADR-0088 D2b) is an explicit arm: off unless asked.
         let seal_barriers_per_s = match args.seal_pace {
@@ -960,13 +960,16 @@ fn cell_main(
                 prealloc: args.recycle_wait,
                 ..Default::default()
             },
-            // ADR-0088 D4 as amended (M4.5-S34 campaign M3): the cap's
-            // replay term is the probed four-reader read rate ÷ cells
-            // when the model carries one, else the D4 constant.
+            // ADR-0088 D4 as amended twice (M4.5-S34 campaign M3; the
+            // second amendment): the cap's replay term is `min(qd1, qd4 ÷
+            // cells)` when the model carries both read rows, `qd4 ÷
+            // max(cells, 4)` on a schema-3 file, else the D4 constant —
+            // conservative at every cell count.
             ckpt: inf_server::CkptConfig {
                 interval_bytes: args.ckpt_interval_bytes,
                 replay_bytes_per_s: replay_bytes_per_s_per_cell(
                     io.device.read_bytes_per_s,
+                    io.read_bytes_per_s_256k_qd1,
                     args.cells,
                 ),
                 ..Default::default()
@@ -1127,16 +1130,42 @@ fn backend_name() -> &'static str {
     "none"
 }
 
-/// The checkpoint cap's replay term (ADR-0088 D4 as amended): the probed
-/// four-reader direct read rate divided by the cell count — four
-/// `O_DIRECT` logs replayed at once share one device's read bandwidth,
-/// which campaign M3 measured at a quarter of the D4 constant per cell —
-/// or the constant when the model carries no read row (0).
-fn replay_bytes_per_s_per_cell(probed_read_bytes_per_s: u64, cells: u16) -> u64 {
-    if probed_read_bytes_per_s == 0 {
-        return inf_server::DEFAULT_REPLAY_BYTES_PER_S;
+/// The checkpoint cap's replay term (ADR-0088 D4 as amended, second
+/// amendment), conservative at every cell count. With both probed read
+/// rows: `min(qd1, qd4 ÷ cells)` — a one- or two-cell node is bounded by
+/// what one `O_DIRECT` reader gets (the four-reader aggregate overstates
+/// it there), a four-or-more-cell node by its share of the aggregate
+/// (campaign M3 measured it at a quarter of the D4 constant per cell).
+/// With the four-reader row only (a schema-3 file): `qd4 ÷ max(cells,
+/// 4)` — never more than one reader's quarter share. With the one-reader
+/// row only: `qd1 ÷ cells`. With neither: the D4 constant. `cells = 0`
+/// counts as one.
+fn replay_bytes_per_s_per_cell(read_qd4: u64, read_qd1: u64, cells: u16) -> u64 {
+    let cells = u64::from(cells.max(1));
+    match (read_qd4, read_qd1) {
+        (0, 0) => inf_server::DEFAULT_REPLAY_BYTES_PER_S,
+        (qd4, 0) => qd4 / cells.max(4),
+        (0, qd1) => qd1 / cells,
+        (qd4, qd1) => qd1.min(qd4 / cells),
     }
-    probed_read_bytes_per_s / u64::from(cells.max(1))
+}
+
+/// The boot line's account of the rows [`replay_bytes_per_s_per_cell`]
+/// used, so a schema-3 file's quarter-share rule is visible as such.
+fn replay_term_origin(read_qd4: u64, read_qd1: u64, cells: u16) -> String {
+    let cells = cells.max(1);
+    match (read_qd4, read_qd1) {
+        (0, 0) => "the D4 constant — no probed read row".to_owned(),
+        (qd4, 0) => {
+            format!("qd4 read row only {} MiB/s (schema-3 file) ÷ max({cells}, 4) cells", qd4 >> 20)
+        }
+        (0, qd1) => format!("qd1 read row only {} MiB/s ÷ {cells} cells", qd1 >> 20),
+        (qd4, qd1) => format!(
+            "min(probed read rows qd1 {} MiB/s, qd4 {} MiB/s ÷ {cells} cells)",
+            qd1 >> 20,
+            qd4 >> 20
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1235,12 +1264,39 @@ mod tests {
         );
     }
 
-    /// ADR-0088 D4 as amended: the replay term is the probed read row
-    /// divided across the cells; no row keeps the constant.
+    /// ADR-0088 D4 as amended twice: the replay term is conservative at
+    /// every cell count — `min(qd1, qd4 ÷ cells)` with both rows, the
+    /// quarter-share rule on a schema-3 file, `qd1 ÷ cells` with the
+    /// one-reader row alone, the constant with neither.
     #[test]
     fn replay_term_is_the_probed_read_row_per_cell_or_the_constant() {
-        assert_eq!(replay_bytes_per_s_per_cell(0, 4), inf_server::DEFAULT_REPLAY_BYTES_PER_S);
-        assert_eq!(replay_bytes_per_s_per_cell(1_083_000_000, 4), 270_750_000);
-        assert_eq!(replay_bytes_per_s_per_cell(1_083_000_000, 0), 1_083_000_000);
+        const QD4: u64 = 1_083_000_000;
+        const QD1: u64 = 612_000_000;
+        // Neither row: the D4 constant at every cell count.
+        assert_eq!(replay_bytes_per_s_per_cell(0, 0, 1), inf_server::DEFAULT_REPLAY_BYTES_PER_S);
+        assert_eq!(replay_bytes_per_s_per_cell(0, 0, 8), inf_server::DEFAULT_REPLAY_BYTES_PER_S);
+        // Both rows: one reader's rate bounds the small node, the
+        // aggregate's share the large one (they cross between 1 and 2).
+        assert_eq!(replay_bytes_per_s_per_cell(QD4, QD1, 1), QD1);
+        assert_eq!(replay_bytes_per_s_per_cell(QD4, QD1, 2), 541_500_000);
+        assert_eq!(replay_bytes_per_s_per_cell(QD4, QD1, 4), 270_750_000);
+        assert_eq!(replay_bytes_per_s_per_cell(QD4, QD1, 8), 135_375_000);
+        // The four-reader row only (a schema-3 file): never more than a
+        // quarter share, even at one cell.
+        assert_eq!(replay_bytes_per_s_per_cell(QD4, 0, 1), 270_750_000);
+        assert_eq!(replay_bytes_per_s_per_cell(QD4, 0, 4), 270_750_000);
+        assert_eq!(replay_bytes_per_s_per_cell(QD4, 0, 8), 135_375_000);
+        // The one-reader row only: divided across the cells.
+        assert_eq!(replay_bytes_per_s_per_cell(0, QD1, 1), QD1);
+        assert_eq!(replay_bytes_per_s_per_cell(0, QD1, 8), 76_500_000);
+        // Zero cells counts as one.
+        assert_eq!(replay_bytes_per_s_per_cell(QD4, QD1, 0), QD1);
+        assert_eq!(replay_bytes_per_s_per_cell(QD4, 0, 0), 270_750_000);
+        // The boot line names the rows it used.
+        assert!(replay_term_origin(0, 0, 4).contains("D4 constant"));
+        assert!(replay_term_origin(QD4, 0, 1).contains("schema-3 file"));
+        assert!(replay_term_origin(QD4, 0, 1).contains("max(1, 4)"));
+        assert!(replay_term_origin(0, QD1, 8).contains("qd1 read row only"));
+        assert!(replay_term_origin(QD4, QD1, 2).contains("min(probed read rows qd1"));
     }
 }

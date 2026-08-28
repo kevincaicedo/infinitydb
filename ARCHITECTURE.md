@@ -221,7 +221,17 @@ once by the index's own probe order, the candidate stays slotted as a
 MAINTAIN reconciler reads and verifies it later with the same full-key
 comparison and the same exact death — nothing is ever removed on hash
 evidence, every bound falls back to the synchronous verify, and the
-shadow set is a projection of the index that recovery rebuilds.
+shadow set is a projection of the index that recovery rebuilds. A
+ticket is **ambiguous until that read** (ADR-0093 as amended,
+2026-08-27): the twin may be the key's old record or a different key
+with the same 64 bits, so every answer derived from a ticket is exact
+or waits — `DBSIZE` verifies the unverified tickets under an admission
+fence before it counts, `SCAN` names the twin like any cold slot, one
+cold address carries one ticket, and the recovery rebuild reads the
+slots it cannot pair by construction (two RAM keys with one hash, or
+pairs beyond the cap) and settles them by full key before the cell
+serves; reconciliation is a *verify* (the read, legal under a checkpoint
+walk) and a *settle* (read-free, never under a walk).
 
 ### Determinism is a feature
 

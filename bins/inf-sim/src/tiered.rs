@@ -68,6 +68,7 @@ use std::rc::Rc;
 use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
+use inf_log::fs::sim::SimDisk;
 use inf_server::StallConfig;
 
 use crate::durable::{
@@ -255,6 +256,16 @@ pub struct TieredNodeReport {
     /// Phase 6b's cold resolves (both arms — how many of its overwrites
     /// met a cold candidate; the shape's coverage, disclosed).
     pub phase6b_cold_resolves: u64,
+    /// Phase 6c (ADR-0093 A7): crafted colliding pairs written through
+    /// the plane, the tickets they opened, the collision verdicts, the
+    /// `Ticketed` refusals, the `DBSIZE` drains and the SCAN twins the
+    /// phase observed — coverage, disclosed per seed.
+    pub collide_pairs: u64,
+    pub collide_tickets: u64,
+    pub collide_verdicts: u64,
+    pub collide_ticketed_fallbacks: u64,
+    pub collide_dbsize_drains: u64,
+    pub collide_scan_twins: u64,
 }
 
 impl TieredNodeReport {
@@ -405,6 +416,125 @@ fn ns_watermarks(text: &str) -> Option<(u64, u64)> {
 }
 
 /// Extracts one `key:value` integer from an `INFO` section text.
+/// `DBSIZE` summed over every cell (the tiered table is cell-scoped),
+/// each through a connection pinned to its cell.
+fn dbsize_sum(
+    node: &mut Node,
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &SimDisk,
+    scenario: &TieredScenario,
+) -> Result<u64, String> {
+    let mut total = 0u64;
+    for cell in 0..usize::from(scenario.cells) {
+        let mut probe = MiniClient::connect(node, cell);
+        let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
+        match probe.call(node, rng, clock, disk, scenario.step_ns_max, use_ns) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => return Err(format!("USE on cell {cell} answered {other:?}")),
+        }
+        let dbsize: &[&[u8]] = &[b"DBSIZE"];
+        match probe.call(node, rng, clock, disk, scenario.step_ns_max, dbsize) {
+            Ok(Some(reply)) if reply.starts_with(b":") => {
+                total += String::from_utf8_lossy(&reply[1..]).trim().parse::<u64>().unwrap_or(0);
+            }
+            other => return Err(format!("DBSIZE on cell {cell} answered {other:?}")),
+        }
+    }
+    Ok(total)
+}
+
+/// `INFO tiering` fields summed over every cell (the section is
+/// cell-scoped), one value per key in `keys`' order.
+fn info_sum(
+    node: &mut Node,
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &SimDisk,
+    scenario: &TieredScenario,
+    keys: &[&str],
+) -> Result<Vec<u64>, String> {
+    let mut totals = vec![0u64; keys.len()];
+    for cell in 0..usize::from(scenario.cells) {
+        let mut probe = MiniClient::connect(node, cell);
+        let text = info_tiering(&mut probe, node, rng, clock, disk, scenario.step_ns_max)
+            .map_err(|err| format!("INFO on cell {cell}: {err}"))?;
+        for (i, key) in keys.iter().enumerate() {
+            totals[i] += info_field(&text, key);
+        }
+    }
+    Ok(totals)
+}
+
+/// Every key `SCAN` names on every cell (a full enumeration — the
+/// at-least-once contract; duplicates are legal and kept).
+fn scan_all_keys(
+    node: &mut Node,
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &SimDisk,
+    scenario: &TieredScenario,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut keys = Vec::new();
+    for cell in 0..usize::from(scenario.cells) {
+        let mut probe = MiniClient::connect(node, cell);
+        let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
+        match probe.call(node, rng, clock, disk, scenario.step_ns_max, use_ns) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => return Err(format!("USE on cell {cell} answered {other:?}")),
+        }
+        let mut cursor = 0u64;
+        for _ in 0..4096 {
+            let cursor_text = cursor.to_string();
+            let scan: &[&[u8]] = &[b"SCAN", cursor_text.as_bytes(), b"COUNT", b"512"];
+            let reply = match probe.call(node, rng, clock, disk, scenario.step_ns_max, scan) {
+                Ok(Some(reply)) => reply,
+                other => return Err(format!("SCAN on cell {cell} answered {other:?}")),
+            };
+            let (next, named) = parse_scan_reply(&reply)
+                .ok_or_else(|| format!("SCAN on cell {cell}: unparsable {}", preview(&reply)))?;
+            keys.extend(named);
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+    }
+    Ok(keys)
+}
+
+/// `*2 $cursor *N $key…` → `(cursor, keys)`; `None` on any other shape.
+fn parse_scan_reply(reply: &[u8]) -> Option<(u64, Vec<Vec<u8>>)> {
+    fn line(rest: &mut &[u8]) -> Option<Vec<u8>> {
+        let end = rest.windows(2).position(|w| w == b"\r\n")?;
+        let out = rest[..end].to_vec();
+        *rest = &rest[end + 2..];
+        Some(out)
+    }
+    fn bulk_item(rest: &mut &[u8]) -> Option<Vec<u8>> {
+        let head = line(rest)?;
+        let len: usize = std::str::from_utf8(head.strip_prefix(b"$")?).ok()?.parse().ok()?;
+        if rest.len() < len + 2 {
+            return None;
+        }
+        let out = rest[..len].to_vec();
+        *rest = &rest[len + 2..];
+        Some(out)
+    }
+    let mut rest = reply;
+    if line(&mut rest)? != b"*2" {
+        return None;
+    }
+    let cursor: u64 = std::str::from_utf8(&bulk_item(&mut rest)?).ok()?.parse().ok()?;
+    let count_line = line(&mut rest)?;
+    let count: usize = std::str::from_utf8(count_line.strip_prefix(b"*")?).ok()?.parse().ok()?;
+    let mut keys = Vec::with_capacity(count);
+    for _ in 0..count {
+        keys.push(bulk_item(&mut rest)?);
+    }
+    Some((cursor, keys))
+}
+
 fn info_field(text: &str, key: &str) -> u64 {
     text.lines()
         .find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix(':')))
@@ -500,15 +630,56 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         }
         // The fan's witness: the executing cell's table carries the arm
         // (peers follow on the MAINTAIN version sweep).
-        match info_tiering(&mut setup, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
-            Ok(text) if info_field(&text, "tiering_shadow_enabled") == 0 => {
-                fail(&mut report, "shadow CONFIG SET did not reach the tiered table".to_string());
+        match info_sum(&mut node, &mut rng, &clock, &disk, scenario, &["tiering_shadow_enabled"]) {
+            Ok(v) if v[0] != u64::from(scenario.cells) => {
+                fail(
+                    &mut report,
+                    format!("shadow CONFIG SET reached {} of {} cells", v[0], scenario.cells),
+                );
                 return finish(report, &observer, &clock);
             }
             Ok(_) => {}
             Err(err) => fail(&mut report, format!("post-knob scrape: {err}")),
         }
     }
+
+    // ADR-0093 A7 (phase 6c's material): the crafted colliding pairs'
+    // first keys are written now, pre-cut — acked `always` writes that
+    // survive the cut, demote with the phase-2 corpus and are re-demoted
+    // by phase 6's fill exactly like the audited keys — so phase 6c's
+    // second-key writes meet a **cold** exact candidate on both arms.
+    const COLLIDE_PAIRS: u64 = 4;
+    let pairs: Vec<([u8; 48], [u8; 48])> = (0..COLLIDE_PAIRS)
+        .map(|i| inf_store::forced_collision_pair(seed ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+        .collect();
+    let collide_values: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..COLLIDE_PAIRS)
+        .map(|i| {
+            (
+                value_bytes(b'c', 6, i, 2048),
+                value_bytes(b'd', 6, i, 1536),
+                value_bytes(b'e', 6, i, 2304),
+            )
+        })
+        .collect();
+    let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
+    match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, use_ns) {
+        Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+        other => {
+            fail(&mut report, format!("setup USE answered {other:?}"));
+            return finish(report, &observer, &clock);
+        }
+    }
+    for (i, pair) in pairs.iter().enumerate() {
+        let set: &[&[u8]] = &[b"SET", &pair.0, &collide_values[i].0];
+        match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("pre-cut SET pair {i}.0 answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    report.commands_done += COLLIDE_PAIRS;
 
     // ---- phase 2: seeded traffic until the cut -------------------------
     let mut writers = Vec::new();
@@ -659,9 +830,18 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
                 return finish(report, &observer, &clock);
             }
         }
-        match info_tiering(&mut audit, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
-            Ok(text) if info_field(&text, "tiering_shadow_enabled") == 0 => {
-                fail(&mut report, "post-boot shadow CONFIG SET did not reach the table".into());
+        // The fan's witness on **every** cell (`INFO tiering` is
+        // cell-scoped; the review of 2026-08-27 found the one-cell
+        // witness blind to a cell the fan had not reached).
+        match info_sum(&mut node, &mut rng, &clock, &disk, scenario, &["tiering_shadow_enabled"]) {
+            Ok(v) if v[0] != u64::from(scenario.cells) => {
+                fail(
+                    &mut report,
+                    format!(
+                        "post-boot shadow CONFIG SET reached {} of {} cells",
+                        v[0], scenario.cells
+                    ),
+                );
                 return finish(report, &observer, &clock);
             }
             Ok(_) => {}
@@ -887,6 +1067,142 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
                 info_field(&text, "tiering_cold_resolves").saturating_sub(cold_before);
         }
         Err(err) => fail(&mut report, format!("phase-6b scrape: {err}")),
+    }
+
+    // ---- phase 6c: forced 64-bit collisions through the plane (A7) ------
+    // Two real keys with one hash per pair (`forced_collision_pair`; the
+    // shared hashtag routes both to one cell): the first was written
+    // pre-cut and is cold again (phase 6's re-demotion, phase 6b's settle
+    // wait), the second now meets it as its only exact cold candidate —
+    // on the shadow arm a ticket whose verdict must be `Collision`, on
+    // the off arm the synchronous read that tells the keys apart. Every
+    // answer with the ticket open is exact: `GET` of each key, `DBSIZE`
+    // (the fenced drain), `SCAN` naming both; then an overwrite of the
+    // first key (the `Ticketed` refusal while the ticket is open), a
+    // `DEL` of the second, and the count again.
+    let base = match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+        Ok(n) => n,
+        Err(err) => {
+            fail(&mut report, format!("phase-6c DBSIZE base: {err}"));
+            return finish(report, &observer, &clock);
+        }
+    };
+    // `INFO tiering` is cell-scoped: the pairs live on the hashtag's
+    // cell, so the coverage deltas are summed over every cell.
+    const COLLIDE_KEYS: [&str; 5] = [
+        "tiering_shadow_created",
+        "tiering_shadow_resolved_collision",
+        "tiering_shadow_fallback_ticketed",
+        "tiering_shadow_dbsize_drains",
+        "tiering_shadow_scan_twins_emitted",
+    ];
+    let before = match info_sum(&mut node, &mut rng, &clock, &disk, scenario, &COLLIDE_KEYS) {
+        Ok(v) => v,
+        Err(err) => {
+            fail(&mut report, format!("phase-6c coverage scrape: {err}"));
+            return finish(report, &observer, &clock);
+        }
+    };
+    for (i, pair) in pairs.iter().enumerate() {
+        let (v1, v2, v1b) = &collide_values[i];
+        let mut expect_reply = |cmd: &[&[u8]], want: &[u8], what: &str| -> bool {
+            match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, cmd) {
+                Ok(Some(reply)) if reply == want => true,
+                other => {
+                    report.violations.push(format!(
+                        "COLLISION VIOLATION seed {seed:#x} pair {i}: {what} answered {other:?}, \
+                         wanted {}",
+                        preview(want)
+                    ));
+                    false
+                }
+            }
+        };
+        let ok = expect_reply(&[b"SET", &pair.1, v2], b"+OK\r\n", "SET pair.1")
+            && expect_reply(&[b"GET", &pair.0], &bulk(v1), "GET pair.0 (ticket open)")
+            && expect_reply(&[b"GET", &pair.1], &bulk(v2), "GET pair.1 (ticket open)");
+        if !ok {
+            return finish(report, &observer, &clock);
+        }
+        // DBSIZE with the ticket possibly open: exact, never one short
+        // (every pair's first key is in `base`; the second is the one
+        // new key, deleted again below).
+        match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+            Ok(n) if n == base + 1 => {}
+            Ok(n) => report.violations.push(format!(
+                "COLLISION VIOLATION seed {seed:#x} pair {i}: DBSIZE {n} after the colliding \
+                 SET, wanted {} (ADR-0093 A3)",
+                base + 1
+            )),
+            Err(err) => {
+                fail(&mut report, format!("phase-6c DBSIZE: {err}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        // SCAN names both keys (a collision key is never hidden).
+        match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario) {
+            Ok(keys) => {
+                for (side, key) in [(0, &pair.0[..]), (1, &pair.1[..])] {
+                    if !keys.iter().any(|k| k == key) {
+                        report.violations.push(format!(
+                            "COLLISION VIOLATION seed {seed:#x} pair {i}: SCAN did not name \
+                             pair.{side} (ADR-0093 A3)"
+                        ));
+                    }
+                }
+            }
+            Err(err) => {
+                fail(&mut report, format!("phase-6c SCAN: {err}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        let mut expect_reply = |cmd: &[&[u8]], want: &[u8], what: &str| -> bool {
+            match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, cmd) {
+                Ok(Some(reply)) if reply == want => true,
+                other => {
+                    report.violations.push(format!(
+                        "COLLISION VIOLATION seed {seed:#x} pair {i}: {what} answered {other:?}, \
+                         wanted {}",
+                        preview(want)
+                    ));
+                    false
+                }
+            }
+        };
+        let ok = expect_reply(&[b"SET", &pair.0, v1b], b"+OK\r\n", "SET pair.0 again")
+            && expect_reply(&[b"GET", &pair.0], &bulk(v1b), "GET pair.0 after overwrite")
+            && expect_reply(&[b"GET", &pair.1], &bulk(v2), "GET pair.1 after the other's SET")
+            && expect_reply(&[b"DEL", &pair.1], b":1\r\n", "DEL pair.1")
+            && expect_reply(&[b"GET", &pair.1], b"$-1\r\n", "GET pair.1 after DEL")
+            && expect_reply(&[b"GET", &pair.0], &bulk(v1b), "GET pair.0 after the other's DEL");
+        if !ok {
+            return finish(report, &observer, &clock);
+        }
+        match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+            Ok(n) if n == base => {}
+            Ok(n) => report.violations.push(format!(
+                "COLLISION VIOLATION seed {seed:#x} pair {i}: DBSIZE {n} after DEL, wanted {base}"
+            )),
+            Err(err) => {
+                fail(&mut report, format!("phase-6c DBSIZE: {err}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        observed.insert(pair.0.to_vec(), bulk(v1b));
+        observed.insert(pair.1.to_vec(), b"$-1\r\n".to_vec());
+        report.commands_done += 11;
+    }
+    report.collide_pairs = COLLIDE_PAIRS;
+    match info_sum(&mut node, &mut rng, &clock, &disk, scenario, &COLLIDE_KEYS) {
+        Ok(after) => {
+            let delta = |i: usize| after[i].saturating_sub(before[i]);
+            report.collide_tickets = delta(0);
+            report.collide_verdicts = delta(1);
+            report.collide_ticketed_fallbacks = delta(2);
+            report.collide_dbsize_drains = delta(3);
+            report.collide_scan_twins = delta(4);
+        }
+        Err(err) => fail(&mut report, format!("phase-6c scrape: {err}")),
     }
 
     // ---- phase 7: cold re-read sweep (exact bytes after re-demotion) -----

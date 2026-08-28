@@ -591,6 +591,56 @@ impl<F: SegmentFs> TierFlush<F> {
             .map(|w| (self.active_id, w.base(), w.data_len(), w.durable_len(), w.path()))
     }
 
+    /// Reads `len` bytes at `addr` straight from the tier bytes through
+    /// this catalog — sealed files, or the active file's durable prefix
+    /// — with a **blocking** read on a fresh buffered handle, CRC-verified
+    /// frame by frame (M4.5-S37, ADR-0093 A4: the recovery boot's settle
+    /// reads, before the cell serves; the DST harnesses' oracle reads —
+    /// the caller sizes the record from its header window first). Never
+    /// a serving-path primitive: the plane reads cold records through
+    /// `ColdReads`. `Ok(None)` when no catalogued range covers the whole
+    /// span (a retired file, or a hole).
+    ///
+    /// # Errors
+    /// The filesystem's; a frame that fails its CRC (`InvalidData`); a
+    /// file shorter than its catalogued range (`UnexpectedEof`).
+    pub fn read_span_blocking(&self, addr: u64, len: usize) -> io::Result<Option<Vec<u8>>> {
+        use crate::tier::{TIER_FRAME_BYTES, tier_extract, tier_frame_offset, tier_frame_span};
+        let covers =
+            |base: u64, data_len: u64| addr >= base && addr + len as u64 <= base + data_len;
+        let located = self
+            .sealed
+            .iter()
+            .find(|m| covers(m.base.to_raw(), m.data_len))
+            .map(|m| (m.base.to_raw(), m.path.clone()))
+            .or_else(|| {
+                let (_, base, _, durable_len, path) = self.active()?;
+                covers(base.to_raw(), durable_len).then(|| (base.to_raw(), path.to_path_buf()))
+            });
+        let Some((base, path)) = located else { return Ok(None) };
+        let file = self.fs.open_read(&path)?;
+        let (first, count, skip) = tier_frame_span(addr - base, len);
+        let from = tier_frame_offset(first);
+        let span = count as usize * TIER_FRAME_BYTES;
+        let mut window = vec![0u8; span];
+        let mut done = 0usize;
+        while done < span {
+            let n = file.read_at(from + done as u64, &mut window[done..])?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("tier file {} ends inside the span at {addr}", path.display()),
+                ));
+            }
+            done += n;
+        }
+        let mut out = Vec::with_capacity(len);
+        tier_extract(&window, skip, len, &mut out).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("tier frame at {addr}: {e:?}"))
+        })?;
+        Ok(Some(out))
+    }
+
     /// The next append address, when a file is active — the drive loop's
     /// resume cursor (bytes staged ahead of `flushed` must never be
     /// re-appended). `None` when no file is active (fresh pipeline, or

@@ -181,12 +181,7 @@ async fn run_command<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         CommandId::Type => type_cmd(shared, ns, argv.arg(1), proto).await,
         CommandId::Ttl | CommandId::Pttl => ttl(shared, ns, argv.arg(1), proto).await,
         CommandId::Getrange | CommandId::Substr => getrange(shared, ns, argv, proto).await,
-        CommandId::Dbsize => {
-            let mut reply = shared.take_reply_buf();
-            let len = shared.store.borrow().tiered_store(ns).map_or(0, TieredTable::len);
-            RespWriter::new(&mut reply, proto).int(len as i64);
-            TieredReply::Done(reply)
-        }
+        CommandId::Dbsize => dbsize(shared, ns, proto).await,
         CommandId::Scan => scan(shared, ns, argv, proto).await,
         CommandId::Set => set_cmd(shared, ns, argv, proto, class).await,
         CommandId::Setnx => setnx(shared, ns, argv, proto, class).await,
@@ -658,6 +653,13 @@ fn try_shadow_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         inf_store::ShadowProbe::NoCandidate => None,
         inf_store::ShadowProbe::Many => {
             table.note_shadow_multi();
+            return ShadowAttempt::Ineligible;
+        }
+        // The one exact candidate already carries a ticket (ADR-0093 A2:
+        // a second key colliding with a ticketed slot): the synchronous
+        // path's read tells the keys apart; one cold address, one ticket.
+        inf_store::ShadowProbe::Ticketed(_) => {
+            table.note_shadow_ticketed();
             return ShadowAttempt::Ineligible;
         }
         // An absent key or a RAM hit: the ordinary paths, byte-for-byte.
@@ -1237,6 +1239,96 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     for key in &keys {
         w.bulk(key);
     }
+    TieredReply::Done(reply)
+}
+
+/// `DBSIZE` on a tiered namespace (ADR-0093 A3): exact under open
+/// shadow tickets. `len()` is `index − open tickets`, which is a fact
+/// only once every open ticket is verified same-key — so the command
+/// first **drains** the unverified tickets: it raises the admission
+/// fence (no new ticket while a drain runs, so the set only shrinks),
+/// reads each unverified twin Foreground and verifies it (same key ⇒
+/// verified, the `− 1` is right; collision ⇒ the ticket ends and the
+/// slot counts as the other key it is), then answers. A twin that
+/// cannot be read is a typed error — never an inexact integer.
+/// Bounded by the ticket cap; no borrow is held across an await.
+async fn dbsize<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    proto: Protocol,
+) -> TieredReply {
+    let snapshot = |shared: &Rc<Shared<O, F>>| -> Option<Vec<inf_store::ShadowTicket>> {
+        let ks = shared.store.borrow();
+        let table = ks.tiered_store(ns)?;
+        Some(if table.shadow_unverified() == 0 {
+            Vec::new()
+        } else {
+            table.shadow_unverified_tickets()
+        })
+    };
+    let Some(mut pending) = snapshot(shared) else {
+        return done_error(shared, proto, "ERR the selected namespace was dropped");
+    };
+    let mut fenced = false;
+    // Two passes at most: the fence stops new tickets, and a ticket that
+    // moved under a concurrent overwrite is still verified by its cold
+    // address — a second snapshot only catches a read the first pass
+    // could not complete.
+    for _pass in 0..2 {
+        if pending.is_empty() {
+            break;
+        }
+        if !fenced && let Some(table) = shared.store.borrow_mut().tiered_store_mut(ns) {
+            table.shadow_fence(true);
+            fenced = true;
+        }
+        for ticket in pending.drain(..) {
+            let image =
+                read_cold_record(shared, ns, ticket.cold, inf_runtime::ReadClass::Foreground).await;
+            let mut ks = shared.store.borrow_mut();
+            let Some(table) = ks.tiered_store_mut(ns) else {
+                return done_error(shared, proto, "ERR the selected namespace was dropped");
+            };
+            match image {
+                Ok(image) => {
+                    table.note_shadow_dbsize_read();
+                    let _ = table.verify_shadow(ticket.hash, ticket.cold, &image);
+                }
+                Err(cause) => {
+                    table.shadow_read_failed(ticket.cold);
+                    table.shadow_fence(false);
+                    let addr = ticket.cold.to_raw();
+                    let mut reply = shared.take_reply_buf();
+                    RespWriter::new(&mut reply, proto).error(&format!(
+                        "ERR DBSIZE: shadow twin at {addr} unreadable ({cause}) — ADR-0093 A3"
+                    ));
+                    return TieredReply::Done(reply);
+                }
+            }
+        }
+        pending = snapshot(shared).unwrap_or_default();
+    }
+    let mut reply = shared.take_reply_buf();
+    let len = {
+        let mut ks = shared.store.borrow_mut();
+        match ks.tiered_store_mut(ns) {
+            Some(table) => {
+                if fenced {
+                    table.shadow_fence(false);
+                }
+                if table.shadow_unverified() > 0 {
+                    // Unreachable under the fence unless a read raced a
+                    // retarget twice; say so rather than guess.
+                    RespWriter::new(&mut reply, proto)
+                        .error("ERR DBSIZE: shadow tickets still unverified after the drain");
+                    return TieredReply::Done(reply);
+                }
+                table.len()
+            }
+            None => 0,
+        }
+    };
+    RespWriter::new(&mut reply, proto).int(len as i64);
     TieredReply::Done(reply)
 }
 
@@ -1830,26 +1922,39 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         };
         let mut verified_twin: Option<(LogicalAddr, usize)> = None;
         if let Some(ticket) = ticket {
-            let image =
-                match read_cold_record(shared, ns, ticket.cold, inf_runtime::ReadClass::Foreground)
-                    .await
+            // A ticket already verified same-key (ADR-0093 A1) needs no
+            // read: the twin's exact length is on the ticket.
+            if let Some(len) = ticket.verified_len {
+                let mut ks = shared.store.borrow_mut();
+                let Some(table) = ks.tiered_store_mut(ns) else { continue };
+                table.note_shadow_forced_delete();
+                verified_twin = Some((ticket.cold, len as usize));
+            } else {
+                let image = match read_cold_record(
+                    shared,
+                    ns,
+                    ticket.cold,
+                    inf_runtime::ReadClass::Foreground,
+                )
+                .await
                 {
                     Ok(image) => image,
                     Err(message) => return Err(error_bytes(shared, proto, message)),
                 };
-            let verdict = {
-                let mut ks = shared.store.borrow_mut();
-                let Some(table) = ks.tiered_store_mut(ns) else { continue };
-                table.note_shadow_forced_delete();
-                table.verify_shadow(ticket.hash, ticket.cold, ticket.winner, &image)
-            };
-            match verdict {
-                inf_store::ShadowVerdict::SameKey => {
-                    verified_twin = Some((ticket.cold, image.len()));
+                let verdict = {
+                    let mut ks = shared.store.borrow_mut();
+                    let Some(table) = ks.tiered_store_mut(ns) else { continue };
+                    table.note_shadow_forced_delete();
+                    table.verify_shadow(ticket.hash, ticket.cold, &image)
+                };
+                match verdict {
+                    inf_store::ShadowVerdict::SameKey => {
+                        verified_twin = Some((ticket.cold, image.len()));
+                    }
+                    inf_store::ShadowVerdict::Collision => {}
+                    // Stale (`verify` never defers): re-resolve.
+                    _ => continue,
                 }
-                inf_store::ShadowVerdict::Collision => {}
-                // Stale (`verify` never defers): re-resolve.
-                _ => continue,
             }
         }
         // Atomic block: fit check → apply → markers + Delete record.

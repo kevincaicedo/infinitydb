@@ -23,8 +23,9 @@ use inf_log::{
 };
 use inf_store::{
     AddrClass, AddressSpaceConfig, CompactionConfig, CompactionWork, DemotionConfig, Index,
-    LogicalAddr, SHADOW_READS_IN_FLIGHT, ShadowProbe, ShadowRefusal, ShadowVerdict, TieredLookup,
-    TieredMode, TieredTable,
+    LogicalAddr, SHADOW_READS_IN_FLIGHT, SHADOW_TICKETS_CAP, SettleOutcome, SettleReason,
+    ShadowProbe, ShadowRefusal, ShadowVerdict, TieredLookup, TieredMode, TieredTable,
+    forced_collision_pair, forced_collision_triple,
 };
 
 const RING: u64 = 1 << 20;
@@ -118,7 +119,7 @@ impl Harness {
         let image = self.tier.get(&read.ticket.cold.to_raw()).expect("cold implies captured");
         let image = image.clone();
         let t = read.ticket;
-        Some(self.table.resolve_shadow(t.hash, t.cold, t.winner, &image))
+        Some(self.table.resolve_shadow(t.hash, t.cold, &image))
     }
 
     fn reconcile_all(&mut self) {
@@ -242,7 +243,8 @@ fn a_foreign_image_is_a_collision_and_removes_nothing() {
     let hash = TieredTable::hash_key(b"k");
     let foreign = h.tier[&other.to_raw()].clone();
     let dead_before = h.table.space().report().dead_bytes;
-    assert_eq!(h.table.resolve_shadow(hash, a, b, &foreign), ShadowVerdict::Collision);
+    assert_eq!(h.table.resolve_shadow(hash, a, &foreign), ShadowVerdict::Collision);
+    let _ = b;
     assert_eq!(h.table.shadow_pending(), 0);
     assert!(h.table.contains_pair(hash, a), "both records stay");
     assert!(h.table.contains_pair(hash, b));
@@ -305,11 +307,14 @@ fn the_ticket_follows_the_winner_across_overwrites() {
     h.check_accounting();
 }
 
-/// ADR-0093 D4 (the stale verdict): a read whose ticket no longer
-/// matches — the winner moved past it — changes nothing; the ticket, if
-/// still open under its new winner, is simply re-offered.
+/// ADR-0093 D4 as amended (A1/A3): a completion whose ticket moved
+/// under an overwrite is verified against the ticket's **current**
+/// winner — the relation is the twin versus the key's current record,
+/// and the image is the twin's immutable bytes — so it resolves; a
+/// completion for a ticket that no longer exists is `Stale` and changes
+/// nothing.
 #[test]
-fn a_stale_completion_changes_nothing() {
+fn a_completion_after_the_winner_moved_resolves_against_the_current_winner() {
     let mut h = Harness::new();
     let a = cold_key(&mut h, b"k", b"v1");
     let (_, b) = h.shadow_set(b"k", b"v2");
@@ -318,17 +323,18 @@ fn a_stale_completion_changes_nothing() {
     // The key is overwritten while the read is in flight.
     let c = h.update_ram(b"k", b"a longer value that must copy to the tail");
     let image = h.tier[&a.to_raw()].clone();
-    let dead_before = h.table.space().report().dead_bytes;
     let hash = TieredTable::hash_key(b"k");
-    assert_eq!(h.table.resolve_shadow(hash, a, b, &image), ShadowVerdict::Stale);
+    assert_eq!(h.table.resolve_shadow(hash, a, &image), ShadowVerdict::SameKey);
+    assert_eq!(h.table.shadow_pending(), 0, "resolved against the moved winner");
+    assert_eq!(h.table.shadow_counters().stale, 0);
+    let origins = h.table.take_displacement_origins(hash, c);
+    assert_eq!(origins.iter().map(|(o, _)| *o).collect::<Vec<_>>(), vec![a.to_raw()]);
+    // The same completion again: the ticket is gone — stale, nothing.
+    let dead_before = h.table.space().report().dead_bytes;
+    assert_eq!(h.table.resolve_shadow(hash, a, &image), ShadowVerdict::Stale);
     assert_eq!(h.table.space().report().dead_bytes, dead_before);
-    assert_eq!(h.table.shadow_pending(), 1, "the ticket lives on under the new winner");
     assert_eq!(h.table.shadow_counters().stale, 1);
-    // Re-offered with the current winner; then it resolves.
-    let read = h.table.shadow_work(1).into_iter().next().expect("re-offered");
-    assert_eq!(read.ticket.winner, c);
-    assert_eq!(h.table.resolve_shadow(hash, a, c, &image), ShadowVerdict::SameKey);
-    assert_eq!(h.table.shadow_pending(), 0);
+    h.check_accounting();
 }
 
 /// ADR-0093 D3 (I7): deleting a winner with an open ticket is a
@@ -352,7 +358,7 @@ fn delete_after_a_forced_resolution_covers_the_twin() {
     let (_, b) = h.shadow_set(b"k", b"v2");
     let hash = TieredTable::hash_key(b"k");
     let image = h.tier[&a.to_raw()].clone();
-    assert_eq!(h.table.resolve_shadow(hash, a, b, &image), ShadowVerdict::SameKey);
+    assert_eq!(h.table.resolve_shadow(hash, a, &image), ShadowVerdict::SameKey);
     let len = h.table.record(b).encoded_len;
     let origins = h.table.take_displacement_origins(hash, b);
     assert_eq!(origins.iter().map(|(addr, _)| *addr).collect::<Vec<_>>(), vec![a.to_raw()]);
@@ -548,15 +554,14 @@ fn the_knob_off_keeps_reconciling_open_tickets() {
     assert_eq!(h.reconcile_one(), None, "the read was marked in flight above");
     let read = h.table.shadow_tickets().next().expect("open");
     let image = h.tier[&read.cold.to_raw()].clone();
-    assert_eq!(
-        h.table.resolve_shadow(read.hash, read.cold, read.winner, &image),
-        ShadowVerdict::SameKey
-    );
+    assert_eq!(h.table.resolve_shadow(read.hash, read.cold, &image), ShadowVerdict::SameKey);
 }
 
-/// ADR-0093 D3: enumeration never names a ticket's cold slot.
+/// ADR-0093 A3: enumeration names a ticket's cold slot like any cold
+/// slot — the key twice (legal) or the collision key (required); the
+/// twin is counted.
 #[test]
-fn scan_skips_a_tickets_cold_slot() {
+fn scan_names_a_tickets_cold_slot() {
     let mut h = Harness::new();
     let a = cold_key(&mut h, b"k", b"v1");
     let (_, b) = h.shadow_set(b"k", b"v2");
@@ -568,9 +573,11 @@ fn scan_skips_a_tickets_cold_slot() {
             break;
         }
     }
-    assert_eq!(seen, vec![b], "the winner only");
-    assert!(!seen.contains(&a));
-    assert_eq!(h.table.shadow_counters().scan_skipped, 1);
+    seen.sort_unstable();
+    let mut want = vec![a, b];
+    want.sort_unstable();
+    assert_eq!(seen, want, "both slots, the twin included");
+    assert_eq!(h.table.shadow_counters().scan_twins_emitted, 1);
 }
 
 /// ADR-0093 D6: promotion never relocates a ticket's cold slot.
@@ -649,7 +656,7 @@ fn recovery_appliers_reform_pairs_in_both_orders() {
             }
         };
         assert_eq!(t.shadow_pending(), 0, "no ticket before the rebuild");
-        t.rebuild_shadow_tickets();
+        assert!(t.rebuild_shadow_tickets().is_empty(), "one RAM sibling: nothing to settle");
         assert_eq!(t.shadow_pending(), 1, "order {order}");
         let ticket = t.shadow_of_winner(b).expect("pair");
         assert_eq!((ticket.cold, ticket.winner), (pre_life, b));
@@ -664,7 +671,7 @@ fn recovery_appliers_reform_pairs_in_both_orders() {
     let b = t.apply_image(b"k", b"v2", hash).expect("fits");
     t.apply_ref(hash, pre_life);
     assert!(t.apply_displace(hash, pre_life));
-    t.rebuild_shadow_tickets();
+    assert!(t.rebuild_shadow_tickets().is_empty());
     assert_eq!(t.shadow_pending(), 0, "the twin's slot is gone");
     assert_eq!(t.space().record_pin(), None);
     let _ = b;
@@ -676,10 +683,384 @@ fn recovery_appliers_reform_pairs_in_both_orders() {
     let _b = t.apply_image(b"k", b"v2", hash).expect("fits");
     t.apply_ref(hash, pre_life);
     assert!(t.apply_delete(b"k", hash));
-    t.rebuild_shadow_tickets();
+    assert!(t.rebuild_shadow_tickets().is_empty());
     assert_eq!(t.shadow_pending(), 0);
     assert!(t.contains_pair(hash, pre_life), "the twin stays slotted, unpaired");
     assert_eq!(t.len(), 1, "one slot, counted as one key (no open ticket)");
+}
+
+// ---- forced 64-bit collisions (ADR-0093 A7) ------------------------------
+
+/// A crafted pair: two distinct keys with one `hash_key` (the oracle).
+fn collision_pair(tag: u64) -> (Vec<u8>, Vec<u8>) {
+    let (k1, k2) = forced_collision_pair(tag);
+    assert_ne!(k1, k2);
+    assert_eq!(TieredTable::hash_key(&k1), TieredTable::hash_key(&k2));
+    (k1.to_vec(), k2.to_vec())
+}
+
+/// The plane's synchronous insert of an absent key whose cold candidate
+/// is another key: read, compare, exclude, retry, insert.
+fn sync_insert_absent(h: &mut Harness, key: &[u8], value: &[u8]) -> LogicalAddr {
+    assert_eq!(h.value_of(key), None, "the key is absent (its candidates are other keys)");
+    h.insert(key, value)
+}
+
+/// ADR-0093 A2: a second key colliding with a ticketed slot is
+/// `Ticketed` — synchronous, never a second ticket on one cold address
+/// — and the first ticket resolves as the same key it always was.
+#[test]
+fn a_colliding_write_over_a_ticketed_slot_is_synchronous() {
+    let (k1, k2) = collision_pair(1);
+    let mut h = Harness::new();
+    let a = cold_key(&mut h, &k1, b"one");
+    let (cold, b1) = h.shadow_set(&k1, b"one-v2");
+    assert_eq!(cold, a);
+    let hash = TieredTable::hash_key(&k2);
+    assert_eq!(h.table.shadow_probe(&k2, hash), ShadowProbe::Ticketed(a));
+    h.table.note_shadow_ticketed();
+    assert_eq!(h.table.shadow_counters().fallback_ticketed, 1);
+    let b2 = sync_insert_absent(&mut h, &k2, b"two");
+    assert_eq!(h.value_of(&k1).as_deref(), Some(&b"one-v2"[..]));
+    assert_eq!(h.value_of(&k2).as_deref(), Some(&b"two"[..]));
+    assert_eq!(h.table.shadow_pending(), 1, "still the one ticket");
+    assert_eq!(h.reconcile_one(), Some(ShadowVerdict::SameKey));
+    assert!(!h.table.contains_pair(hash, a));
+    assert!(h.table.contains_pair(hash, b1) && h.table.contains_pair(hash, b2));
+    assert_eq!(h.table.len(), 2);
+    h.check_accounting();
+}
+
+/// ADR-0093 A2: the duplicate is unrepresentable — a release assert.
+#[test]
+#[should_panic(expected = "a cold address carries one ticket")]
+fn registering_a_second_ticket_on_one_cold_address_panics() {
+    let (k1, k2) = collision_pair(2);
+    let mut h = Harness::new();
+    let a = cold_key(&mut h, &k1, b"one");
+    h.shadow_set(&k1, b"one-v2");
+    let b2 = sync_insert_absent(&mut h, &k2, b"two");
+    h.table.register_shadow(TieredTable::hash_key(&k2), a, b2);
+}
+
+/// ADR-0093 A1/A3: a real collision ticket — the second key's write
+/// over the first key's cold record — serves both keys exactly while
+/// open, is ambiguous in `len()` until read, and the `DBSIZE` drain
+/// (verify without settle) makes the count exact: the verdict is
+/// `Collision`, both slots stay, nothing dies.
+#[test]
+fn a_collision_ticket_keeps_both_keys_and_the_drain_makes_the_count_exact() {
+    let (k1, k2) = collision_pair(3);
+    let mut h = Harness::new();
+    let a = cold_key(&mut h, &k1, b"one");
+    let hash = TieredTable::hash_key(&k2);
+    assert_eq!(h.table.shadow_probe(&k2, hash), ShadowProbe::One(a), "k1's slot is exact");
+    let (cold, b2) = h.shadow_set(&k2, b"two");
+    assert_eq!(cold, a);
+    assert_eq!(h.value_of(&k1).as_deref(), Some(&b"one"[..]), "k1 serves from its record");
+    assert_eq!(h.value_of(&k2).as_deref(), Some(&b"two"[..]), "k2 is the winner");
+    assert_eq!(h.table.shadow_unverified(), 1, "ambiguous until read");
+    assert_eq!(h.table.len(), 1, "the arithmetic assumes same-key — not yet a fact");
+    // The DBSIZE drain: verify every unverified ticket, then count.
+    let dead_before = h.table.space().report().dead_bytes;
+    let pending = h.table.shadow_unverified_tickets();
+    assert_eq!(pending.len(), 1);
+    for t in pending {
+        let image = h.tier[&t.cold.to_raw()].clone();
+        assert_eq!(h.table.verify_shadow(t.hash, t.cold, &image), ShadowVerdict::Collision);
+    }
+    assert_eq!(h.table.shadow_unverified(), 0);
+    assert_eq!(h.table.len(), 2, "exact: two keys");
+    assert!(h.table.contains_pair(hash, a) && h.table.contains_pair(hash, b2));
+    assert_eq!(h.table.space().report().dead_bytes, dead_before, "nothing died");
+    assert_eq!(h.table.shadow_counters().resolved_collision, 1);
+    assert_eq!(h.value_of(&k1).as_deref(), Some(&b"one"[..]));
+    assert_eq!(h.value_of(&k2).as_deref(), Some(&b"two"[..]));
+}
+
+/// ADR-0093 A3: the fence refuses a new ticket while a drain runs (the
+/// unverified set only shrinks), and lifts after it.
+#[test]
+fn the_dbsize_fence_refuses_new_tickets_while_raised() {
+    let mut h = Harness::new();
+    let a = cold_key(&mut h, b"k", b"v1");
+    let hash = TieredTable::hash_key(b"k");
+    h.table.shadow_fence(true);
+    assert_eq!(h.table.shadow_admit(hash, a, 64), Err(ShadowRefusal::Fence));
+    assert_eq!(h.table.shadow_counters().fallback_fence, 1);
+    assert_eq!(h.table.shadow_counters().dbsize_drains, 1);
+    h.table.shadow_fence(false);
+    assert_eq!(h.table.shadow_admit(hash, a, 64), Ok(()));
+}
+
+/// ADR-0093 A3: enumeration names a collision key while its slot is a
+/// ticket's cold address.
+#[test]
+fn scan_names_a_collision_key() {
+    let (k1, k2) = collision_pair(4);
+    let mut h = Harness::new();
+    let a = cold_key(&mut h, &k1, b"one");
+    let (_, b2) = h.shadow_set(&k2, b"two");
+    let mut seen = Vec::new();
+    let mut cursor = 0;
+    loop {
+        cursor = h.table.scan_slots(cursor, 64, |_, addr| seen.push(addr));
+        if cursor == 0 {
+            break;
+        }
+    }
+    assert!(seen.contains(&a), "k1's slot is named");
+    assert!(seen.contains(&b2));
+    let named: Vec<Vec<u8>> = seen
+        .iter()
+        .map(|addr| match h.table.space().resolve(*addr) {
+            AddrClass::Cold => TieredTable::decode_record(&h.tier[&addr.to_raw()]).key.to_vec(),
+            _ => h.table.record(*addr).key.to_vec(),
+        })
+        .collect();
+    assert!(named.contains(&k1) && named.contains(&k2), "both keys by name");
+}
+
+/// ADR-0093 D3/A1: `DEL` of a winner whose twin is a collision key
+/// verifies first — the verdict ends the ticket and the other key
+/// stays; a verified same-key ticket lets `DEL` skip the read.
+#[test]
+fn delete_of_a_winner_whose_twin_is_a_collision_key_leaves_the_key() {
+    let (k1, k2) = collision_pair(5);
+    let mut h = Harness::new();
+    let a = cold_key(&mut h, &k1, b"one");
+    let (_, b2) = h.shadow_set(&k2, b"two");
+    let ticket = h.table.shadow_of_winner(b2).expect("open");
+    assert_eq!(ticket.verified_len, None);
+    let image = h.tier[&a.to_raw()].clone();
+    assert_eq!(h.table.verify_shadow(ticket.hash, ticket.cold, &image), ShadowVerdict::Collision);
+    assert!(h.table.shadow_of_winner(b2).is_none(), "the ticket ended");
+    let len = h.table.record(b2).encoded_len;
+    h.table.delete(ticket.hash, b2, len);
+    assert_eq!(h.value_of(&k2), None);
+    assert_eq!(h.value_of(&k1).as_deref(), Some(&b"one"[..]), "k1 untouched");
+    assert_eq!(h.table.len(), 1);
+    h.check_accounting();
+    // The same-key shape: verified, then DEL needs no read.
+    let (_, b1) = h.shadow_set(&k1, b"one-v2");
+    let t = h.table.shadow_of_winner(b1).expect("open");
+    assert_eq!(h.table.verify_shadow(t.hash, t.cold, &image), ShadowVerdict::SameKey);
+    let t = h.table.shadow_of_winner(b1).expect("still open, verified");
+    assert_eq!(t.verified_len, Some(image.len() as u32));
+    assert_eq!(h.table.shadow_unverified(), 0);
+    assert_eq!(h.table.len(), 1, "exact with the verified ticket open");
+}
+
+/// A recovered-life table (pre-life addresses below `origin`) with the
+/// manifested file the refs count into.
+fn recovered_table() -> TieredTable {
+    let origin = LogicalAddr::from_raw(1 << 20).expect("fits");
+    let mut t = TieredTable::new(
+        AddressSpaceConfig {
+            reserve_bytes: RING as usize,
+            page_bytes: PAGE as usize,
+            life_origin: origin,
+        },
+        DemotionConfig::for_budget(RING, PAGE),
+        64,
+    )
+    .expect("reservation");
+    t.seed_recovered_files(
+        &[inf_log::TierFileMeta {
+            id: 0,
+            base: LogicalAddr::ZERO,
+            data_len: 1 << 19,
+            reason: inf_log::tier::SealReason::Recovered,
+            path: Path::new("shard-0/cold/tier-000000.itier").to_path_buf(),
+        }],
+        7,
+    );
+    t
+}
+
+/// A record image for `key` (the bytes a tier file would hold), built
+/// in a scratch table — the address is irrelevant to the image.
+fn record_image(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut scratch = Harness::new();
+    let addr = scratch.insert(key, value);
+    let len = scratch.table.record(addr).encoded_len;
+    scratch.table.record_bytes(addr, len).to_vec()
+}
+
+/// ADR-0093 A4 (the review's mis-pair, reconstructed): two RAM keys
+/// with one hash beside a cold twin — the rebuild forms no ticket and
+/// returns the slot as `Ambiguous`; the settle reads it and pairs it
+/// with its **true** owner by full key, whichever of the two it is; a
+/// third key's record is `Distinct` and stays.
+#[test]
+fn rebuild_settles_an_ambiguous_twin_against_its_true_owner() {
+    let (k1, k2) = collision_pair(6);
+    let hash = TieredTable::hash_key(&k1);
+    let pre_life = LogicalAddr::from_raw(4096).expect("fits");
+    for (twin_key, twin_value) in [(&k1, &b"one-old"[..]), (&k2, &b"two-old"[..])] {
+        let mut t = recovered_table();
+        t.apply_ref(hash, pre_life);
+        let b1 = t.apply_image(&k1, b"one", hash).expect("fits");
+        let b2 = t.apply_image(&k2, b"two", hash).expect("fits");
+        let settle = t.rebuild_shadow_tickets();
+        assert_eq!(t.shadow_pending(), 0, "no guess");
+        assert_eq!(settle.len(), 1);
+        assert_eq!(
+            (settle[0].hash, settle[0].cold, settle[0].reason),
+            (hash, pre_life, SettleReason::Ambiguous)
+        );
+        let image = record_image(twin_key, twin_value);
+        assert_eq!(t.settle_rebuilt_slot(hash, pre_life, &image), SettleOutcome::SameKey);
+        assert!(!t.contains_pair(hash, pre_life), "the twin settled");
+        assert_eq!(t.shadow_pending(), 0);
+        assert_eq!(t.len(), 2);
+        let owner = if twin_key == &k1 { b1 } else { b2 };
+        let other = if twin_key == &k1 { b2 } else { b1 };
+        assert_eq!(
+            t.take_displacement_origins(hash, owner).iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![pre_life.to_raw()],
+            "chained into the true owner"
+        );
+        assert!(t.take_displacement_origins(hash, other).is_empty());
+        let c = t.shadow_counters();
+        assert_eq!(
+            (c.rebuild_reads, c.rebuild_settled_same_key, c.rebuild_settled_distinct),
+            (1, 1, 0)
+        );
+    }
+    // A third key's record under the same hash: distinct, untouched.
+    let mut t = recovered_table();
+    t.apply_ref(hash, pre_life);
+    t.apply_image(&k1, b"one", hash).expect("fits");
+    t.apply_image(&k2, b"two", hash).expect("fits");
+    assert_eq!(t.rebuild_shadow_tickets().len(), 1);
+    let [_, _, k3] = forced_collision_triple(6);
+    assert_eq!(TieredTable::hash_key(&k3), hash, "a third key with the same hash");
+    let image = record_image(&k3, b"three");
+    assert_eq!(t.settle_rebuilt_slot(hash, pre_life, &image), SettleOutcome::Distinct);
+    assert!(t.contains_pair(hash, pre_life));
+    assert_eq!(t.shadow_pending(), 0);
+    assert_eq!(t.len(), 3, "three slots, three keys, no ticket");
+    assert_eq!(t.shadow_counters().rebuild_settled_distinct, 1);
+}
+
+/// ADR-0093 A4/D7: the rebuild forms at most `SHADOW_TICKETS_CAP`
+/// tickets; the excess pairs are returned `OverCap` and settle at boot
+/// — the maps never exceed the cap, the settle list is the excess.
+#[test]
+fn rebuild_sends_pairs_beyond_the_cap_to_the_settle_list() {
+    let mut t = recovered_table();
+    let mut images: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut addr = 64u64;
+    for i in 0..=SHADOW_TICKETS_CAP {
+        let key = format!("cap:{i}").into_bytes();
+        let hash = TieredTable::hash_key(&key);
+        let pre = LogicalAddr::from_raw(addr).expect("fits");
+        t.apply_ref(hash, pre);
+        images.insert(addr, record_image(&key, b"old"));
+        t.apply_image(&key, b"new", hash).expect("fits");
+        addr += 64;
+    }
+    let settle = t.rebuild_shadow_tickets();
+    assert_eq!(t.shadow_pending(), SHADOW_TICKETS_CAP);
+    assert_eq!(settle.len(), 1);
+    assert_eq!(settle[0].reason, SettleReason::OverCap);
+    assert_eq!(t.shadow_counters().rebuild_over_cap, 1);
+    let slot = settle[0];
+    let outcome = t.settle_rebuilt_slot(slot.hash, slot.cold, &images[&slot.cold.to_raw()]);
+    assert_eq!(outcome, SettleOutcome::SameKey);
+    assert!(!t.contains_pair(slot.hash, slot.cold), "the excess pair settled at boot");
+    assert_eq!(t.len(), SHADOW_TICKETS_CAP + 1);
+}
+
+/// ADR-0093 A1 (verify/settle split): under a pinned walk the read
+/// verifies the ticket and the settle is deferred; after the walk the
+/// next round settles it **without a read**, and `len()` was exact
+/// throughout.
+#[test]
+fn a_verified_ticket_settles_without_a_read_after_the_walk() {
+    let mut h = Harness::new();
+    let a = cold_key(&mut h, b"k", b"v1");
+    let (_, b) = h.shadow_set(b"k", b"v2");
+    h.table.begin_ckpt_walk(1);
+    assert_eq!(h.table.shadow_work(4).len(), 1, "the read is legal under a walk (A1)");
+    let hash = TieredTable::hash_key(b"k");
+    let image = h.tier[&a.to_raw()].clone();
+    assert_eq!(h.table.resolve_shadow(hash, a, &image), ShadowVerdict::Deferred);
+    let t = h.table.shadow_of_winner(b).expect("open");
+    assert_eq!(t.verified_len, Some(image.len() as u32));
+    assert_eq!(h.table.shadow_unverified(), 0);
+    assert_eq!(h.table.len(), 1, "exact: verified same-key");
+    assert!(h.table.contains_pair(hash, a), "not settled under the walk");
+    assert_eq!(h.table.shadow_counters().deferred_walk, 1);
+    h.table.end_ckpt_walk();
+    assert!(h.table.shadow_work(4).is_empty(), "settled, nothing to read");
+    assert_eq!(h.table.shadow_pending(), 0);
+    assert!(!h.table.contains_pair(hash, a));
+    let c = h.table.shadow_counters();
+    assert_eq!((c.settled_without_read, c.resolved_same_key, c.verified), (1, 1, 1));
+    h.check_accounting();
+}
+
+/// ADR-0093 A6: the pinned-suffix peak folds on every tail advance
+/// while a ticket is open — an unrelated write after registration moves
+/// the peak, which the registration-time sample missed.
+#[test]
+fn the_pinned_peak_folds_on_unrelated_writes() {
+    let mut h = Harness::new();
+    cold_key(&mut h, b"k", b"v1");
+    let (_, b) = h.shadow_set(b"k", b"v2");
+    let at_registration = h.table.shadow_counters().pinned_bytes_peak;
+    assert_eq!(at_registration, h.table.space().tail().to_raw() - b.to_raw());
+    for i in 0..4u32 {
+        h.insert(format!("unrelated:{i}").as_bytes(), &[0x5A; 900]);
+    }
+    let now = h.table.space().tail().to_raw() - b.to_raw();
+    assert!(now > at_registration);
+    assert_eq!(h.table.shadow_counters().pinned_bytes_peak, now, "the peak is the real peak");
+    assert_eq!(h.table.shadow_pinned_bytes(), now);
+}
+
+/// ADR-0093 A5: a settle whose winner has no origin room is deferred
+/// (verified, pinned) — never a panic — and settles once the winner's
+/// next displacement drains its list.
+#[test]
+fn a_full_origin_list_defers_the_settle_until_the_winner_moves() {
+    let key = b"k".to_vec();
+    let hash = TieredTable::hash_key(&key);
+    let mut t = recovered_table();
+    let twins: Vec<LogicalAddr> =
+        (1..=4u64).map(|i| LogicalAddr::from_raw(i * 4096).expect("fits")).collect();
+    for twin in &twins {
+        t.apply_ref(hash, *twin);
+    }
+    let winner = t.apply_image(&key, b"new", hash).expect("fits");
+    assert!(t.rebuild_shadow_tickets().is_empty(), "one RAM sibling: four tickets");
+    assert_eq!(t.shadow_pending(), 4);
+    let image = record_image(&key, b"old");
+    let mut verdicts = Vec::new();
+    for twin in &twins {
+        verdicts.push(t.resolve_shadow(hash, *twin, &image));
+    }
+    assert_eq!(
+        verdicts,
+        [
+            ShadowVerdict::SameKey,
+            ShadowVerdict::SameKey,
+            ShadowVerdict::SameKey,
+            ShadowVerdict::Deferred
+        ]
+    );
+    assert_eq!(t.shadow_counters().deferred_origin, 1);
+    assert_eq!(t.shadow_pending(), 1);
+    assert_eq!(t.shadow_unverified(), 0);
+    assert_eq!(t.len(), 1, "exact throughout");
+    // The winner's displacement takes its origins; the settle proceeds.
+    assert_eq!(t.take_displacement_origins(hash, winner).len(), 3);
+    assert_eq!(t.shadow_settle_verified(), 1);
+    assert_eq!(t.shadow_pending(), 0);
+    assert!(!t.contains_pair(hash, twins[3]));
+    assert_eq!(t.take_displacement_origins(hash, winner).len(), 1);
 }
 
 // ---- compaction over the real pipeline (MemFs) --------------------------
@@ -830,7 +1211,7 @@ fn compaction_defers_a_tickets_cold_slot_until_resolution() {
     let head = rig.read_cold(a.to_raw(), TieredTable::RECORD_HEADER_LEN).expect("head");
     let len = TieredTable::record_len_from_header(&head);
     let image = rig.read_cold(a.to_raw(), len).expect("exact");
-    assert_eq!(rig.table.resolve_shadow(hash, a, b, &image), ShadowVerdict::SameKey);
+    assert_eq!(rig.table.resolve_shadow(hash, a, &image), ShadowVerdict::SameKey);
     assert!(!rig.table.contains_pair(hash, a));
     let report = rig.table.space().report();
     assert_eq!(rig.table.live_bytes() + report.dead_bytes, report.allocated_bytes);

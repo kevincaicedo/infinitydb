@@ -74,6 +74,62 @@ pub fn hash64(data: &[u8], seed: u64) -> u64 {
     mix(P1 ^ (len as u64), mix(a ^ P1, b ^ seed))
 }
 
+/// Three **distinct** 48-byte keys with equal [`hash64`] under `seed`
+/// and a shared 16-byte `prefix` — the collision oracle (M4.5-S37,
+/// ADR-0093 A7). A 64-bit collision is unreachable by chance at any
+/// corpus the tests or the simulators can build, so the paths that must
+/// be exact under one (the tiered shadow tickets, `DBSIZE`, `SCAN`, the
+/// recovery rebuild) are exercised with keys derived from the function's
+/// own structure: for a 48-byte key the state after each 16-byte block
+/// is `mix(w_even ^ P1, w_odd ^ state)`, a 128-bit product folded, and
+/// three factorizations of one product (`2t · 2u == t · 4u == 4t · u`)
+/// collide in the second block before the shared third. The prefix is
+/// the first block (a `{hashtag}` routes the keys to one cell); `tag`
+/// selects the triple (different tags give unrelated triples); the
+/// result is self-checked. For tests and simulators only — a fact about
+/// `hash64`'s shape, not a capability the engine uses.
+///
+/// # Panics
+/// Debug-panics if the derivation ever stops colliding (the hash
+/// changed under the oracle — the [`hash64`] stability contract).
+#[must_use]
+pub fn hash64_collision_triple(prefix: &[u8; 16], tag: u64, seed: u64) -> [[u8; 48]; 3] {
+    let seed0 = seed ^ mix(seed ^ P0, P1);
+    let state = mix(read_u64(prefix) ^ P1, read_u64(&prefix[8..]) ^ seed0);
+    // `t`, `u` odd and below 2^60: `2t · 2u`, `t · 4u` and `4t · u` are
+    // one u128 — `mix` folds them identically — and the three factor
+    // pairs are pairwise distinct.
+    let t = (tag & ((1u64 << 60) - 1)) | 1;
+    let u = ((tag.rotate_left(29) ^ 0x9E37_79B9_7F4A_7C15) & ((1u64 << 60) - 1)) | 1;
+    let factors = [(t << 1, u << 1), (t, u << 2), (t << 2, u)];
+    let w4 = tag.wrapping_mul(P2);
+    let w5 = w4 ^ P3;
+    let build = |(a, b): (u64, u64)| -> [u8; 48] {
+        let mut out = [0u8; 48];
+        out[..16].copy_from_slice(prefix);
+        out[16..24].copy_from_slice(&(a ^ P1).to_le_bytes());
+        out[24..32].copy_from_slice(&(b ^ state).to_le_bytes());
+        out[32..40].copy_from_slice(&w4.to_le_bytes());
+        out[40..].copy_from_slice(&w5.to_le_bytes());
+        out
+    };
+    let keys = [build(factors[0]), build(factors[1]), build(factors[2])];
+    debug_assert!(keys[0] != keys[1] && keys[1] != keys[2] && keys[0] != keys[2], "three keys");
+    debug_assert!(
+        hash64(&keys[0], seed) == hash64(&keys[1], seed)
+            && hash64(&keys[1], seed) == hash64(&keys[2], seed),
+        "the collision oracle broke"
+    );
+    keys
+}
+
+/// The first two keys of [`hash64_collision_triple`].
+#[must_use]
+pub fn hash64_collision_pair(prefix: &[u8; 16], tag: u64, seed: u64) -> ([u8; 48], [u8; 48]) {
+    let [first, second, _] = hash64_collision_triple(prefix, tag, seed);
+    (first, second)
+}
+
 // ---- trusted-integer table hashing -------------------------------------------
 
 /// Folded-multiply [`core::hash::Hasher`] for **trusted integer keys**
@@ -189,6 +245,28 @@ mod tests {
             let h1 = hash64(&a, 7);
             *a.last_mut().expect("non-empty") ^= 1;
             assert_ne!(h1, hash64(&a, 7), "tail byte ignored at len {len}");
+        }
+    }
+
+    /// ADR-0093 A7: the collision oracle yields two distinct keys with
+    /// one hash for every tag, and pairs from different tags do not
+    /// collide with each other (a sound oracle, not a degenerate one).
+    #[test]
+    fn collision_pairs_collide_and_differ() {
+        let seed = 0x1AF1_D8A5_0DB5_EED1;
+        let prefix = b"{shadow-collide}";
+        let mut seen = std::collections::HashSet::new();
+        for tag in [0u64, 1, 2, 7, 0xDEAD_BEEF, u64::MAX, 0x8000_0000_0000_0000] {
+            let (a, b) = hash64_collision_pair(prefix, tag, seed);
+            assert_ne!(a, b, "tag {tag:#x}");
+            assert_eq!(&a[..16], prefix, "the prefix is the first block");
+            let [x, y, z] = hash64_collision_triple(prefix, tag, seed);
+            assert!(x != y && y != z && x != z);
+            assert_eq!(hash64(&x, seed), hash64(&z, seed), "tag {tag:#x}: a triple");
+            assert_eq!((x, y), (a, b), "the pair is the triple's head");
+            assert_eq!(hash64(&a, seed), hash64(&b, seed), "tag {tag:#x}");
+            assert_ne!(hash64(&a, seed ^ 1), hash64(&a, seed), "seed-sensitive");
+            assert!(seen.insert(hash64(&a, seed)), "tags give distinct hashes");
         }
     }
 

@@ -24,6 +24,9 @@
 //! write_ops_per_s_4k = 2898
 //! write_ops_per_s_4k_qd4 = 9918
 //! read_bytes_per_s_256k = 0
+//! # schema 4 (ADR-0088, second amendment): one direct reader's rate beside
+//! # the four-reader row; the boot's replay term is min(qd1, qd4 ÷ cells).
+//! read_bytes_per_s_256k_qd1 = 0
 //! read_ops_per_s_4k = 0
 //! # schema 3 (M4.5-S42, ADR-0091 D2): the identity of the device the
 //! # model describes — a boot compares it to the data directory's device.
@@ -73,6 +76,12 @@ pub struct IoProperties {
     /// the direct class was not measured (`None` = it was).
     pub identity: DeviceIdentity,
     pub fua_unsupported: Option<String>,
+    /// Schema 4 (ADR-0088, second amendment): the direct 256 KiB read
+    /// rate at one reader — what a single replaying log reaches, the
+    /// replay term's bound at one or two cells (`min(qd1, qd4 ÷ cells)`).
+    /// 0 = not probed or a schema ≤ 3 file ⇒ the boot keeps the
+    /// conservative `qd4 ÷ max(cells, 4)` rule.
+    pub read_bytes_per_s_256k_qd1: u64,
 }
 
 /// Where the boot's `IoProperties` came from (ADR-0091 D5) — the fact
@@ -154,6 +163,7 @@ impl Default for IoProperties {
             write_ops_per_s_4k_qd4: 0,
             identity: DeviceIdentity::default(),
             fua_unsupported: None,
+            read_bytes_per_s_256k_qd1: 0,
         }
     }
 }
@@ -244,48 +254,64 @@ impl IoProperties {
                 }
                 "fua_p50_us_4k" => props.fua_p50_us_4k = parse_u64("fua_p50_us_4k", value)?,
                 "flush_p50_us_4k" => props.flush_p50_us_4k = parse_u64("flush_p50_us_4k", value)?,
-                // Schema 2 (ADR-0088 D6) — each typed, none required.
-                "probe_schema" => props.probe_schema = parse_u64("probe_schema", value)?,
-                "write_bytes_per_s_256k" => {
-                    props.device.write_bytes_per_s = parse_u64("write_bytes_per_s_256k", value)?;
-                }
-                "write_ops_per_s_4k" => {
-                    props.device.write_ops_per_s = parse_u64("write_ops_per_s_4k", value)?;
-                }
-                "write_ops_per_s_4k_qd4" => {
-                    props.write_ops_per_s_4k_qd4 = parse_u64("write_ops_per_s_4k_qd4", value)?;
-                }
-                "read_bytes_per_s_256k" => {
-                    props.device.read_bytes_per_s = parse_u64("read_bytes_per_s_256k", value)?;
-                }
-                "read_ops_per_s_4k" => {
-                    props.device.read_ops_per_s = parse_u64("read_ops_per_s_4k", value)?;
-                }
-                // Schema 3 (ADR-0091 D2/D3) — the identity block, each
-                // typed, none required; the strings are the kernel's own
-                // names (quoted, unescaped here).
-                "fs_type" => props.identity.fs_type = parse_string(value),
-                "fs_uuid" => props.identity.fs_uuid = parse_string(value),
-                "device_path" => props.identity.device_path = parse_string(value),
-                "device_major_minor" => props.identity.device_major_minor = parse_string(value),
-                "block_logical_bytes" => {
-                    props.identity.block_logical_bytes = parse_u32("block_logical_bytes", value)?;
-                }
-                "block_physical_bytes" => {
-                    props.identity.block_physical_bytes = parse_u32("block_physical_bytes", value)?;
-                }
-                "kernel_release" => props.identity.kernel_release = parse_string(value),
-                "fua_unsupported" => props.fua_unsupported = Some(parse_string(value)),
-                // Provenance keys (`probed_at_unix_s`, `probe_version`,
-                // `probe_seconds_per_row`, `fua_p50_us_512`, …) are
-                // informational; unknown keys are a forward-compatibility
-                // allowance, not an error.
-                _ => {}
+                // Schema 2+ keys: the model, the identity, the qd1 row.
+                _ => parse_model_key(&mut props, key, value)?,
             }
         }
         props.io_mode = class.ok_or(IoPropertiesError::MissingClass)?;
         Ok(props)
     }
+}
+
+/// The schema 2/3/4 keys — each typed, none required. Provenance keys
+/// (`probed_at_unix_s`, `probe_version`, `probe_seconds_per_row`,
+/// `fua_p50_us_512`, …) are informational; unknown keys are a
+/// forward-compatibility allowance, not an error.
+fn parse_model_key(
+    props: &mut IoProperties,
+    key: &str,
+    value: &str,
+) -> Result<(), IoPropertiesError> {
+    match key {
+        // Schema 2 (ADR-0088 D6): the device model.
+        "probe_schema" => props.probe_schema = parse_u64("probe_schema", value)?,
+        "write_bytes_per_s_256k" => {
+            props.device.write_bytes_per_s = parse_u64("write_bytes_per_s_256k", value)?;
+        }
+        "write_ops_per_s_4k" => {
+            props.device.write_ops_per_s = parse_u64("write_ops_per_s_4k", value)?;
+        }
+        "write_ops_per_s_4k_qd4" => {
+            props.write_ops_per_s_4k_qd4 = parse_u64("write_ops_per_s_4k_qd4", value)?;
+        }
+        "read_bytes_per_s_256k" => {
+            props.device.read_bytes_per_s = parse_u64("read_bytes_per_s_256k", value)?;
+        }
+        "read_ops_per_s_4k" => {
+            props.device.read_ops_per_s = parse_u64("read_ops_per_s_4k", value)?;
+        }
+        // Schema 4 (ADR-0088, second amendment): the one-reader read row;
+        // absent on a schema-3 file ⇒ 0 ⇒ the boot's `qd4 ÷ max(cells, 4)`.
+        "read_bytes_per_s_256k_qd1" => {
+            props.read_bytes_per_s_256k_qd1 = parse_u64("read_bytes_per_s_256k_qd1", value)?;
+        }
+        // Schema 3 (ADR-0091 D2/D3): the identity block; the strings are
+        // the kernel's own names (quoted, unescaped here).
+        "fs_type" => props.identity.fs_type = parse_string(value),
+        "fs_uuid" => props.identity.fs_uuid = parse_string(value),
+        "device_path" => props.identity.device_path = parse_string(value),
+        "device_major_minor" => props.identity.device_major_minor = parse_string(value),
+        "block_logical_bytes" => {
+            props.identity.block_logical_bytes = parse_u32("block_logical_bytes", value)?;
+        }
+        "block_physical_bytes" => {
+            props.identity.block_physical_bytes = parse_u32("block_physical_bytes", value)?;
+        }
+        "kernel_release" => props.identity.kernel_release = parse_string(value),
+        "fua_unsupported" => props.fua_unsupported = Some(parse_string(value)),
+        _ => {}
+    }
+    Ok(())
 }
 
 fn parse_class(value: &str) -> Result<SegmentIoMode, IoPropertiesError> {
@@ -389,6 +415,10 @@ mod tests {
         assert_eq!(props.identity.block_physical_bytes, 4096);
         assert_eq!(props.identity.kernel_release, "7.0.0-30-generic");
         assert!(props.fua_unsupported.is_none());
+        // A schema-3 file carries no one-reader row: 0, the boot's
+        // conservative `qd4 ÷ max(cells, 4)` rule (ADR-0088, second amendment).
+        assert_eq!(props.device.read_bytes_per_s, 0);
+        assert_eq!(props.read_bytes_per_s_256k_qd1, 0);
         let live = DeviceIdentity { fs_uuid: props.identity.fs_uuid.clone(), ..Default::default() };
         assert_eq!(props.identity.mismatch(&live).0, IdentityVerdict::Verified);
         let moved = DeviceIdentity { fs_uuid: "0000".into(), ..Default::default() };
@@ -402,6 +432,33 @@ mod tests {
         assert!(matches!(
             IoProperties::parse("barrier_class = \"fua\"\nblock_logical_bytes = 5000000000\n"),
             Err(IoPropertiesError::Value { key: "block_logical_bytes", .. })
+        ));
+    }
+
+    /// ADR-0088, second amendment: schema 4 carries the one-reader read
+    /// row beside the four-reader row; a schema-3 file with the
+    /// four-reader row leaves it 0; a malformed value is a typed refusal.
+    #[test]
+    fn schema_4_carries_the_one_reader_read_row() {
+        let text = "barrier_class = \"fua\"\n\
+                    probe_schema = 4\n\
+                    read_bytes_per_s_256k = 1_083_000_000\n\
+                    read_bytes_per_s_256k_qd1 = 612_000_000\n\
+                    read_ops_per_s_4k = 0\n";
+        let props = IoProperties::parse(text).expect("valid");
+        assert_eq!(props.probe_schema, 4);
+        assert_eq!(props.device.read_bytes_per_s, 1_083_000_000);
+        assert_eq!(props.read_bytes_per_s_256k_qd1, 612_000_000);
+        let schema_3 = "barrier_class = \"fua\"\n\
+                        probe_schema = 3\n\
+                        read_bytes_per_s_256k = 1_083_000_000\n";
+        let props = IoProperties::parse(schema_3).expect("valid");
+        assert_eq!(props.probe_schema, 3);
+        assert_eq!(props.device.read_bytes_per_s, 1_083_000_000);
+        assert_eq!(props.read_bytes_per_s_256k_qd1, 0);
+        assert!(matches!(
+            IoProperties::parse("barrier_class = \"fua\"\nread_bytes_per_s_256k_qd1 = fast\n"),
+            Err(IoPropertiesError::Value { key: "read_bytes_per_s_256k_qd1", .. })
         ));
     }
 

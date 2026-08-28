@@ -4071,8 +4071,18 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         // Named-namespace commands (M2-S08): single-owner shape — local
         // execution with durable admission/emission/gating, or a whole-argv
         // `ApplyNs` to the owning cell. Conn-state (SELECT/HELLO/USE) falls
-        // through to the mirror arm below.
-        Some(meta) if well_formed && conn_ns.is_some() && !is_conn_state(owned) => {
+        // through to the mirror arm below. `CONFIG SET`/`RESETSTAT` are
+        // node-wide hot-per-cell keys whatever namespace the connection
+        // selected — they belong to the scatter arm below (review of
+        // 2026-08-27, M4.5-S37: a namespace-bound connection applied them
+        // to its own cell only, found by the `m4-tiered` DST's per-cell
+        // witness on `tiered-shadow-overwrite`).
+        Some(meta)
+            if well_formed
+                && conn_ns.is_some()
+                && !is_conn_state(owned)
+                && !(meta.id == CommandId::Config && is_scatter(meta.id, argv.get(1).copied())) =>
+        {
             let ns = conn_ns.expect("guarded");
             return dispatch_ns(
                 shared, key, origin, meta, argv, proto, id, db, ns, pending, inflight,
@@ -5472,7 +5482,7 @@ async fn shadow_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     let ticket = read.ticket;
     match image {
         Ok(image) => {
-            let _ = table.resolve_shadow(ticket.hash, ticket.cold, ticket.winner, &image);
+            let _ = table.resolve_shadow(ticket.hash, ticket.cold, &image);
         }
         Err(_) => table.shadow_read_failed(ticket.cold),
     }

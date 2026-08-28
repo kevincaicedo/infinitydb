@@ -7,21 +7,35 @@
 //! same exact death the synchronous path performs today, moved off the
 //! command's critical path. Nothing is ever removed on hash evidence.
 //!
+//! **A ticket is ambiguous until its full-key read** (ADR-0093 A1): the
+//! cold slot may be the key's old record or a different key with the
+//! same 64 bits, and nobody knows which until the record is read. A
+//! ticket is therefore *unverified* or *verified* (`verified_len`), and
+//! reconciliation has two halves — **verify** (the read; legal under a
+//! pinned checkpoint walk) and **settle** (no read: the exact removal,
+//! death and origin chain; never under a walk). Every answer the engine
+//! derives from a ticket is exact or waits: `DBSIZE` verifies before it
+//! counts (the plane's fenced drain, A3), `SCAN` names the twin like any
+//! cold slot (A3), the recovery rebuild reads the slots it cannot pair
+//! by construction (A4).
+//!
 //! The ticket set is a **projection of the index** (L2): a ticket exists
 //! exactly for a same-64-bit-hash pair of one RAM slot and one cold
-//! slot, so it is rebuilt wherever recovery forms such a pair (the
-//! replay appliers) and lost tickets lose nothing. Every bound is a
-//! named constant with a counter (D7), and every exhaustion turns the
-//! eligible write back into the synchronous verify — slower, never
-//! less correct.
+//! slot, so it is rebuilt from the finished index at recovery-complete
+//! ([`TieredTable::rebuild_shadow_tickets`]) and lost tickets lose
+//! nothing. Every bound is a named constant with a counter (D7 as
+//! amended by A6), and every exhaustion turns the eligible write back
+//! into the synchronous verify — slower, never less correct.
 //!
 //! Invariants this module enforces mechanically (ADR-0093 §Invariants):
 //! a winner is RAM-resident for the ticket's life (the record pin on
-//! the release ceiling — `AddressSpace::set_record_pin`); a ticket's
-//! cold address is never relocated (compaction and promotion consult
-//! [`TieredTable::is_shadow_cold`]); a winner is never deleted while a
-//! ticket names it (`TieredTable::delete` asserts); `len()` is the
-//! index minus the open tickets.
+//! the release ceiling — `AddressSpace::set_record_pin`); a cold address
+//! carries **one** ticket (`register_shadow` asserts in release, A2); a
+//! ticket's cold address is never relocated (compaction and promotion
+//! consult [`TieredTable::is_shadow_cold`]); a winner is never deleted
+//! while a ticket names it (`TieredTable::delete` asserts); `len()` is
+//! the index minus the open tickets, exact once every open ticket is
+//! verified.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -32,26 +46,52 @@ use crate::address_space::AddrClass;
 use crate::tiered::TieredLookup;
 
 /// Open tickets per table (ADR-0093 D7): above it new eligible writes
-/// verify synchronously. ≈ 100 KiB of map entries at the cap.
+/// verify synchronously, and a recovery rebuild sends the excess pairs
+/// to the boot's settle list (A4). ≈ 100 KiB of map entries at the cap.
 pub const SHADOW_TICKETS_CAP: usize = 4096;
 /// Reconciliation reads in flight per table (D7).
 pub const SHADOW_READS_IN_FLIGHT: usize = 4;
-/// The pinned-suffix cap is `MEM-BUDGET / SHADOW_PIN_CAP_DIVISOR` (D7):
-/// above it new eligible writes verify synchronously; above half of it
-/// the reconciler reads Foreground.
+/// The pinned-suffix cap is `MEM-BUDGET / SHADOW_PIN_CAP_DIVISOR` (D7 as
+/// amended by A6 — the throttle: above half of it the reconciler reads
+/// Foreground, above it no new ticket is admitted; the structural bound
+/// is the committed window, where writes park).
 pub const SHADOW_PIN_CAP_DIVISOR: u64 = 8;
 /// Approximate bytes per open ticket across the two maps (the L5 term
-/// `shadow_bytes` reports `pending × this`): a `BTreeMap<(u64, u64), u64>`
-/// entry plus a `HashMap<u64, (u64, u64)>` entry with their overheads.
-const SHADOW_TICKET_BYTES: u64 = 96;
+/// `shadow_bytes` reports `pending × this`): a `BTreeMap<(u64, u64), ()>`
+/// entry plus a `HashMap<u64, ColdEntry>` entry with their overheads.
+const SHADOW_TICKET_BYTES: u64 = 104;
 
-/// One open shadow: the key's hash, the unverified cold slot, and the
-/// RAM-resident winner.
+/// The hashtag every forced-collision key starts with: both keys of a
+/// pair route to one cell (the collision must meet inside one table).
+pub const COLLISION_KEY_PREFIX: &[u8; 16] = b"{shadow-collide}";
+
+/// Two distinct 48-byte keys with one [`TieredTable::hash_key`] and the
+/// [`COLLISION_KEY_PREFIX`] hashtag — the collision oracle (ADR-0093 A7)
+/// for the store suite and the simulators; `tag` selects the pair.
+/// Never an engine capability.
+#[must_use]
+pub fn forced_collision_pair(tag: u64) -> ([u8; 48], [u8; 48]) {
+    inf_foundation::hash64_collision_pair(COLLISION_KEY_PREFIX, tag, crate::store::HASH_SEED)
+}
+
+/// Three distinct keys with one hash (the pair plus a third — the
+/// "distinct key's record" the rebuild's settle must leave alone).
+#[must_use]
+pub fn forced_collision_triple(tag: u64) -> [[u8; 48]; 3] {
+    inf_foundation::hash64_collision_triple(COLLISION_KEY_PREFIX, tag, crate::store::HASH_SEED)
+}
+
+/// One open shadow: the key's hash, the unverified-or-verified cold
+/// slot, and the RAM-resident winner.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ShadowTicket {
     pub hash: u64,
     pub cold: LogicalAddr,
     pub winner: LogicalAddr,
+    /// `Some(len)` once a full-key read proved the cold record is the
+    /// winner's key (its exact encoded length — the settle needs no
+    /// read); `None` while the twin's identity is unknown (A1).
+    pub verified_len: Option<u32>,
 }
 
 /// One reconciliation read the plane issues (D4): the ticket, and the
@@ -64,7 +104,7 @@ pub struct ShadowRead {
     pub foreground: bool,
 }
 
-/// What the write path found for the key (D2 step 2).
+/// What the write path found for the key (D2 step 2, as amended by A2).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ShadowProbe {
     /// A RAM-resident, key-verified record: an ordinary overwrite.
@@ -75,9 +115,14 @@ pub enum ShadowProbe {
     /// 64-bit hash below the head: a fingerprint-only match, i.e.
     /// another key — an insert is correct without a read.
     NoCandidate,
-    /// Exactly one cold slot carries the key's 64-bit hash: the shadow
-    /// candidate.
+    /// Exactly one cold slot carries the key's 64-bit hash and no ticket
+    /// names it: the shadow candidate.
     One(LogicalAddr),
+    /// Exactly one cold slot carries the hash and it is already a
+    /// ticket's cold address — a second key colliding with a ticketed
+    /// slot (A2): the synchronous path's business, whose read tells the
+    /// keys apart.
+    Ticketed(LogicalAddr),
     /// Two or more cold slots carry the hash (a 64-bit collision on
     /// disk): the synchronous path's business.
     Many,
@@ -88,6 +133,9 @@ pub enum ShadowProbe {
 pub enum ShadowRefusal {
     /// The knob is off for this table.
     Off,
+    /// A `DBSIZE` drain is fencing admission (A3): the unverified set
+    /// may only shrink until the count is answered.
+    Fence,
     /// The ticket cap.
     Tickets,
     /// The pinned-suffix cap.
@@ -99,42 +147,87 @@ pub enum ShadowRefusal {
 /// The reconciler's verdict on one read (D4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ShadowVerdict {
-    /// The cold record carried the winner's key: removed exactly, its
-    /// death attributed, its address chained as the winner's origin.
+    /// The cold record carries the winner's key. From `verify_shadow`:
+    /// the ticket is now verified (the settle needs no read). From
+    /// `resolve_shadow`: settled — removed exactly, its death
+    /// attributed, its address chained as the winner's origin.
     SameKey,
-    /// A different key with the same 64-bit hash: both stay.
+    /// A different key with the same 64-bit hash: both stay, the ticket
+    /// ends.
     Collision,
-    /// The ticket no longer describes the index (the key was deleted or
-    /// its winner moved past the read): nothing changed.
+    /// The ticket no longer exists (the key was deleted, or a verified
+    /// path removed a slot it named): nothing changed.
     Stale,
-    /// A checkpoint walk is pinned: the death is not attributed under a
-    /// walk (D5 as amended — the walk may already have emitted the
-    /// twin's ref and would serialize its death in the live-set section
-    /// after it; recovery would then re-form the pair and attribute the
-    /// death twice). The ticket stays; the next round after the walk
-    /// resolves it.
+    /// Verified same key, but the settle is deferred: a checkpoint walk
+    /// is pinned (D5 as amended — a death attributed mid-walk could be
+    /// serialized after the twin's ref and attributed twice at recovery)
+    /// or the winner's origin list has no room (A5). The ticket stays
+    /// verified; the next round without the obstacle settles it without
+    /// a read.
     Deferred,
 }
 
+/// Why a rebuilt cold slot must be read before the cell serves (A4).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SettleReason {
+    /// Two or more RAM-resident records carry the slot's hash: which
+    /// one (if any) the twin belongs to is a full-key question.
+    Ambiguous,
+    /// Exactly one RAM sibling, but the ticket cap is reached: the pair
+    /// is real and must not go unprotected, so it is settled now.
+    OverCap,
+}
+
+/// A rebuilt cold slot the boot reads and settles (A4).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SettleSlot {
+    pub hash: u64,
+    pub cold: LogicalAddr,
+    pub reason: SettleReason,
+}
+
+/// The outcome of settling one rebuilt slot by its full key (A4).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SettleOutcome {
+    /// A RAM record carries the twin's key: settled against it (or left
+    /// verified-open when its origin list has no room — the pin holds).
+    SameKey,
+    /// No RAM record carries the twin's key: the slot is a distinct
+    /// key's, untouched, no ticket.
+    Distinct,
+}
+
 /// Shadow observability (D8) — `INFO tiering` renders these; the A/B
-/// and the DST oracles read them. Gauges (`pending`, `pinned_bytes`,
-/// `pin_cap_bytes`, `bytes`) are filled by [`TieredTable::shadow_counters`].
+/// and the DST oracles read them. Gauges (`pending`, `verified_pending`,
+/// `pinned_bytes`, `pin_cap_bytes`, `bytes`, `enabled`) are filled by
+/// [`TieredTable::shadow_counters`].
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct ShadowCounters {
     pub created: u64,
+    /// Same-key settles (the exact removal), read-driven or read-free.
     pub resolved_same_key: u64,
     pub resolved_collision: u64,
+    /// Reads whose full-key comparison verified a same-key twin.
+    pub verified: u64,
+    /// Settles that needed no read (a verified ticket past its deferral).
+    pub settled_without_read: u64,
     pub stale: u64,
     pub read_errors: u64,
     pub reads_issued: u64,
     pub reads_foreground: u64,
     pub pending: u64,
+    /// Gauge: open tickets already verified same-key (exact in `len()`).
+    pub verified_pending: u64,
     pub pending_peak: u64,
     pub pinned_bytes: u64,
+    /// Folded on every tail advance while a ticket is open (A6).
     pub pinned_bytes_peak: u64,
     pub pin_cap_bytes: u64,
     pub fallback_off: u64,
+    pub fallback_fence: u64,
     pub fallback_multi: u64,
+    /// The one exact candidate already carries a ticket (A2).
+    pub fallback_ticketed: u64,
     pub fallback_tickets: u64,
     pub fallback_pin: u64,
     pub fallback_origin: u64,
@@ -143,7 +236,9 @@ pub struct ShadowCounters {
     pub exact_miss_inserts: u64,
     pub compaction_deferred: u64,
     pub promote_skip: u64,
-    pub scan_skipped: u64,
+    /// `scan_slots` slots that were a ticket's cold address, emitted
+    /// like any cold slot (A3).
+    pub scan_twins_emitted: u64,
     pub forced_by_delete: u64,
     /// Tickets retargeted to a later winner (the key was overwritten
     /// while its ticket was open).
@@ -151,8 +246,19 @@ pub struct ShadowCounters {
     /// Tickets ended because a slot they named was removed by another
     /// verified path (a collision key deleted or moved).
     pub dropped_by_removal: u64,
-    /// Reads whose verdict was deferred by a pinned checkpoint walk.
+    /// Settles deferred by a pinned checkpoint walk.
     pub deferred_walk: u64,
+    /// Settles deferred by a full origin list (A5).
+    pub deferred_origin: u64,
+    /// `DBSIZE` drains raised (A3) and the twins they read.
+    pub dbsize_drains: u64,
+    pub dbsize_reads: u64,
+    /// The recovery rebuild's boot reads (A4): slots read, settled as
+    /// the same key, found distinct, and pairs beyond the cap.
+    pub rebuild_reads: u64,
+    pub rebuild_settled_same_key: u64,
+    pub rebuild_settled_distinct: u64,
+    pub rebuild_over_cap: u64,
     pub bytes: u64,
     /// Gauge: 1 per table with the arm on (the CONFIG fan's witness).
     pub enabled: u64,
@@ -169,49 +275,74 @@ impl ShadowCounters {
             created,
             resolved_same_key,
             resolved_collision,
+            verified,
+            settled_without_read,
             stale,
             read_errors,
             reads_issued,
             reads_foreground,
             pending,
+            verified_pending,
             pending_peak,
             pinned_bytes,
             pinned_bytes_peak,
             pin_cap_bytes,
             fallback_off,
+            fallback_fence,
             fallback_multi,
+            fallback_ticketed,
             fallback_tickets,
             fallback_pin,
             fallback_origin,
             exact_miss_inserts,
             compaction_deferred,
             promote_skip,
-            scan_skipped,
+            scan_twins_emitted,
             forced_by_delete,
             retargeted,
             dropped_by_removal,
             deferred_walk,
+            deferred_origin,
+            dbsize_drains,
+            dbsize_reads,
+            rebuild_reads,
+            rebuild_settled_same_key,
+            rebuild_settled_distinct,
+            rebuild_over_cap,
             bytes,
             enabled
         );
     }
 }
 
+/// The cold-address side of one ticket.
+#[derive(Copy, Clone, Debug)]
+struct ColdEntry {
+    hash: u64,
+    winner: u64,
+    verified_len: Option<u32>,
+}
+
 /// The open tickets of one table (L1: cell-local, one owner).
 pub(super) struct ShadowSet {
-    /// `(winner, cold) → hash`, ascending by winner: the front is the
-    /// oldest unresolved winner — the record pin — and the read order.
-    by_winner: BTreeMap<(u64, u64), u64>,
-    /// `cold → (hash, winner)`: the compaction/promotion/removal probe.
-    by_cold: HashMap<u64, (u64, u64)>,
+    /// `(winner, cold)`, ascending by winner: the front is the oldest
+    /// unresolved winner — the record pin — and the read order.
+    by_winner: BTreeMap<(u64, u64), ()>,
+    /// `cold → (hash, winner, verified)`: the compaction/promotion/
+    /// removal probe and the ticket's state.
+    by_cold: HashMap<u64, ColdEntry>,
+    /// Open tickets whose twin has not been read (A1).
+    unverified: usize,
     /// Cold addresses whose read is in flight (bounded by
     /// [`SHADOW_READS_IN_FLIGHT`]).
     in_flight: Vec<u64>,
+    /// `DBSIZE` drains in progress (A3): admission refuses while > 0.
+    fence: u32,
     enabled: bool,
     counters: ShadowCounters,
     /// `scan_slots` runs on `&self` — interior-mutable like the
     /// resolver's `cold_resolves`.
-    scan_skipped: LocalCounter,
+    scan_twins: LocalCounter,
 }
 
 impl ShadowSet {
@@ -219,10 +350,12 @@ impl ShadowSet {
         ShadowSet {
             by_winner: BTreeMap::new(),
             by_cold: HashMap::new(),
+            unverified: 0,
             in_flight: Vec::with_capacity(SHADOW_READS_IN_FLIGHT),
+            fence: 0,
             enabled: false,
             counters: ShadowCounters::default(),
-            scan_skipped: LocalCounter::new(),
+            scan_twins: LocalCounter::new(),
         }
     }
 
@@ -231,7 +364,16 @@ impl ShadowSet {
     }
 
     fn winner_tickets(&self, winner: u64) -> impl Iterator<Item = u64> + '_ {
-        self.by_winner.range((winner, 0)..=(winner, u64::MAX)).map(|((_, cold), _)| *cold)
+        self.by_winner.range((winner, 0)..=(winner, u64::MAX)).map(|((_, cold), ())| *cold)
+    }
+
+    fn ticket(&self, cold: u64) -> Option<ShadowTicket> {
+        self.by_cold.get(&cold).map(|entry| ShadowTicket {
+            hash: entry.hash,
+            cold: LogicalAddr::from_raw(cold).expect("slot addresses are 48-bit"),
+            winner: LogicalAddr::from_raw(entry.winner).expect("slot addresses are 48-bit"),
+            verified_len: entry.verified_len,
+        })
     }
 }
 
@@ -264,6 +406,14 @@ impl TieredTable {
         self.shadow.by_winner.len()
     }
 
+    /// Open tickets whose twin has not been read — the ones `len()` is
+    /// not yet exact about (A1/A3).
+    #[inline]
+    #[must_use]
+    pub fn shadow_unverified(&self) -> usize {
+        self.shadow.unverified
+    }
+
     /// The pinned suffix: `tail − oldest unresolved winner` (0 when no
     /// ticket is open) — the RAM the release watermark may not pass.
     #[must_use]
@@ -276,17 +426,20 @@ impl TieredTable {
     pub fn shadow_counters(&self) -> ShadowCounters {
         let mut counters = self.shadow.counters;
         counters.pending = self.shadow_pending() as u64;
+        counters.verified_pending = (self.shadow_pending() - self.shadow.unverified) as u64;
         counters.pinned_bytes = self.shadow_pinned_bytes();
+        counters.pinned_bytes_peak = counters.pinned_bytes_peak.max(counters.pinned_bytes);
         counters.pin_cap_bytes = self.shadow_pin_cap_bytes();
         counters.bytes = counters.pending * SHADOW_TICKET_BYTES;
-        counters.scan_skipped = self.shadow.scan_skipped.get();
+        counters.scan_twins_emitted = self.shadow.scan_twins.get();
         counters.enabled = u64::from(self.shadow.enabled);
         counters
     }
 
-    /// The write path's probe (D2 step 2). A `Cold` answer from `lookup`
-    /// is a fingerprint match; only the sidecar's 64-bit hash decides
-    /// whether a cold slot can be *this* key.
+    /// The write path's probe (D2 step 2, A2). A `Cold` answer from
+    /// `lookup` is a fingerprint match; only the sidecar's 64-bit hash
+    /// decides whether a cold slot can be *this* key, and a slot already
+    /// under a ticket is never a second ticket's candidate.
     #[must_use]
     pub fn shadow_probe(&self, key: &[u8], hash: u64) -> ShadowProbe {
         debug_assert_eq!(hash, Self::hash_key(key));
@@ -305,12 +458,13 @@ impl TieredTable {
         });
         match (count, exact) {
             (0, _) => ShadowProbe::NoCandidate,
+            (1, Some(addr)) if self.is_shadow_cold(addr) => ShadowProbe::Ticketed(addr),
             (1, Some(addr)) => ShadowProbe::One(addr),
             _ => ShadowProbe::Many,
         }
     }
 
-    /// Admission (D2 steps 1, 3, 4, 5) for a shadow write of
+    /// Admission (D2 steps 1, 3, 4, 5; A3's fence) for a shadow write of
     /// `encoded_len` bytes over the cold candidate `cold`. Pure apart
     /// from the refusal counters; the caller then inserts and registers
     /// inside the same borrow.
@@ -327,6 +481,10 @@ impl TieredTable {
         if !self.shadow.enabled {
             self.shadow.counters.fallback_off += 1;
             return Err(ShadowRefusal::Off);
+        }
+        if self.shadow.fence > 0 {
+            self.shadow.counters.fallback_fence += 1;
+            return Err(ShadowRefusal::Fence);
         }
         if self.shadow.by_winner.len() >= SHADOW_TICKETS_CAP {
             self.shadow.counters.fallback_tickets += 1;
@@ -349,6 +507,12 @@ impl TieredTable {
         self.shadow.counters.fallback_multi += 1;
     }
 
+    /// Counts a `Ticketed` probe the caller sent down the synchronous
+    /// path (A2).
+    pub fn note_shadow_ticketed(&mut self) {
+        self.shadow.counters.fallback_ticketed += 1;
+    }
+
     /// Counts an insert that skipped the read on exact-hash evidence
     /// ([`ShadowProbe::NoCandidate`] after a fingerprint-only `Cold`).
     pub fn note_shadow_exact_miss_insert(&mut self) {
@@ -360,46 +524,83 @@ impl TieredTable {
         self.shadow.counters.forced_by_delete += 1;
     }
 
-    /// Registers the ticket `(hash, cold, winner)` (D2's last step, and
-    /// the recovery appliers' pair formation — D5). The winner is
-    /// RAM-resident and the cold address cold; both slots exist exactly.
+    /// Counts one twin read by a `DBSIZE` drain (A3).
+    pub fn note_shadow_dbsize_read(&mut self) {
+        self.shadow.counters.dbsize_reads += 1;
+    }
+
+    /// Raises or lowers the `DBSIZE` fence (A3): while any drain is in
+    /// progress no new ticket is admitted, so the unverified set only
+    /// shrinks and the drain terminates.
     ///
     /// # Panics
-    /// Panics when either precondition fails — a ticket over a record
-    /// the pin cannot keep or a slot that does not exist is a violated
-    /// invariant, never an operating condition.
+    /// Debug-panics on a lower without a raise.
+    pub fn shadow_fence(&mut self, raise: bool) {
+        if raise {
+            self.shadow.fence += 1;
+            self.shadow.counters.dbsize_drains += 1;
+        } else {
+            debug_assert!(self.shadow.fence > 0, "fence lowered without a raise");
+            self.shadow.fence = self.shadow.fence.saturating_sub(1);
+        }
+    }
+
+    /// Every open unverified ticket, oldest winner first (the `DBSIZE`
+    /// drain's snapshot, A3 — bounded by the ticket cap).
+    #[must_use]
+    pub fn shadow_unverified_tickets(&self) -> Vec<ShadowTicket> {
+        self.shadow_tickets().filter(|t| t.verified_len.is_none()).collect()
+    }
+
+    /// Registers the ticket `(hash, cold, winner)` (D2's last step, and
+    /// the recovery rebuild's pair formation — D5). The winner is
+    /// RAM-resident and the cold address cold; both slots exist exactly;
+    /// the cold address carries no ticket (A2).
+    ///
+    /// # Panics
+    /// Panics when a precondition fails — a ticket over a record the
+    /// pin cannot keep, a slot that does not exist, or a second ticket
+    /// on one cold address is a violated invariant, never an operating
+    /// condition (the write path answers `Ticketed` first).
     pub fn register_shadow(&mut self, hash: u64, cold: LogicalAddr, winner: LogicalAddr) {
+        self.register_shadow_with(hash, cold, winner, None);
+    }
+
+    fn register_shadow_with(
+        &mut self,
+        hash: u64,
+        cold: LogicalAddr,
+        winner: LogicalAddr,
+        verified_len: Option<u32>,
+    ) {
         assert!(self.space.resolve(cold) == AddrClass::Cold, "shadow candidate is not cold");
         assert!(self.space.resolve(winner) != AddrClass::Cold, "shadow winner is not RAM-resident");
         assert!(self.index.contains_pair(hash, cold), "shadow candidate is not slotted");
         assert!(self.index.contains_pair(hash, winner), "shadow winner is not slotted");
         let (c, w) = (cold.to_raw(), winner.to_raw());
-        if self.shadow.by_cold.insert(c, (hash, w)).is_some() {
-            debug_assert!(false, "a cold address carries one ticket");
+        assert!(!self.shadow.by_cold.contains_key(&c), "a cold address carries one ticket");
+        self.shadow.by_cold.insert(c, ColdEntry { hash, winner: w, verified_len });
+        self.shadow.by_winner.insert((w, c), ());
+        if verified_len.is_none() {
+            self.shadow.unverified += 1;
         }
-        self.shadow.by_winner.insert((w, c), hash);
         self.shadow.counters.created += 1;
         let pending = self.shadow.by_winner.len() as u64;
         self.shadow.counters.pending_peak = self.shadow.counters.pending_peak.max(pending);
         self.sync_shadow_pin();
-        let pinned = self.shadow_pinned_bytes();
-        self.shadow.counters.pinned_bytes_peak = self.shadow.counters.pinned_bytes_peak.max(pinned);
+        self.shadow_note_alloc();
     }
 
     /// The first ticket naming `winner`, if any (the `DEL` path's probe,
     /// D3).
     #[must_use]
     pub fn shadow_of_winner(&self, winner: LogicalAddr) -> Option<ShadowTicket> {
-        let w = winner.to_raw();
-        self.shadow.winner_tickets(w).next().map(|cold| ShadowTicket {
-            hash: self.shadow.by_cold[&cold].0,
-            cold: LogicalAddr::from_raw(cold).expect("slot addresses are 48-bit"),
-            winner,
-        })
+        let cold = self.shadow.winner_tickets(winner.to_raw()).next()?;
+        self.shadow.ticket(cold)
     }
 
     /// Whether `addr` is a ticket's cold address (compaction, promotion
-    /// and enumeration consult this — D6).
+    /// and the write path consult this — D6, A2).
     #[inline]
     #[must_use]
     pub fn is_shadow_cold(&self, addr: LogicalAddr) -> bool {
@@ -408,44 +609,47 @@ impl TieredTable {
 
     /// Every open ticket, oldest winner first (tests and the DST oracle).
     pub fn shadow_tickets(&self) -> impl Iterator<Item = ShadowTicket> + '_ {
-        self.shadow.by_winner.iter().map(|((winner, cold), hash)| ShadowTicket {
-            hash: *hash,
-            cold: LogicalAddr::from_raw(*cold).expect("48-bit"),
-            winner: LogicalAddr::from_raw(*winner).expect("48-bit"),
-        })
+        self.shadow
+            .by_winner
+            .keys()
+            .map(|(_, cold)| self.shadow.ticket(*cold).expect("by_winner and by_cold agree"))
     }
 
     /// Hands the plane up to `max` reconciliation reads (D4): oldest
-    /// winner first, never one already in flight, never more than
-    /// [`SHADOW_READS_IN_FLIGHT`] in flight. The reads are marked in
-    /// flight here; [`resolve_shadow`](Self::resolve_shadow) or
+    /// winner first, unverified tickets only, never one already in
+    /// flight, never more than [`SHADOW_READS_IN_FLIGHT`] in flight.
+    /// Verified tickets are **settled** here first without a read (A1)
+    /// when no walk is pinned. The reads are marked in flight here;
+    /// [`resolve_shadow`](Self::resolve_shadow) or
     /// [`shadow_read_failed`](Self::shadow_read_failed) clears them.
     pub fn shadow_work(&mut self, max: usize) -> Vec<ShadowRead> {
-        let free = SHADOW_READS_IN_FLIGHT.saturating_sub(self.shadow.in_flight.len()).min(max);
-        if free == 0 || self.shadow.by_winner.is_empty() {
+        if self.shadow.by_winner.is_empty() {
             return Vec::new();
         }
-        // No resolution under a pinned walk (D5 as amended; ADR-0059
-        // D9-1's rule for the same reason): a death attributed mid-walk
-        // can land in the live-set section after the walk emitted the
-        // twin's ref, and recovery would attribute it again.
-        if self.space.walk_watermark().is_some() {
+        // No settle under a pinned walk (D5 as amended; ADR-0059 D9-1's
+        // rule for the same reason): a death attributed mid-walk can
+        // land in the live-set section after the walk emitted the
+        // twin's ref, and recovery would attribute it again. The reads
+        // themselves are legal under a walk (A1): a verified ticket
+        // settles the moment the walk ends.
+        if self.space.walk_watermark().is_none() {
+            self.shadow_settle_verified();
+        }
+        let free = SHADOW_READS_IN_FLIGHT.saturating_sub(self.shadow.in_flight.len()).min(max);
+        if free == 0 || self.shadow.unverified == 0 {
             return Vec::new();
         }
         let foreground = self.shadow_pinned_bytes() >= self.shadow_pin_cap_bytes() / 2;
         let mut out = Vec::with_capacity(free);
-        for ((winner, cold), hash) in &self.shadow.by_winner {
+        for (_, cold) in self.shadow.by_winner.keys() {
             if self.shadow.in_flight.contains(cold) {
                 continue;
             }
-            out.push(ShadowRead {
-                ticket: ShadowTicket {
-                    hash: *hash,
-                    cold: LogicalAddr::from_raw(*cold).expect("48-bit"),
-                    winner: LogicalAddr::from_raw(*winner).expect("48-bit"),
-                },
-                foreground,
-            });
+            let ticket = self.shadow.ticket(*cold).expect("by_winner and by_cold agree");
+            if ticket.verified_len.is_some() {
+                continue;
+            }
+            out.push(ShadowRead { ticket, foreground });
             if out.len() == free {
                 break;
             }
@@ -460,6 +664,31 @@ impl TieredTable {
         out
     }
 
+    /// Settles every verified ticket whose obstacle is gone (no walk
+    /// pinned — the caller checked; origin room re-checked per ticket).
+    /// Returns how many settled.
+    pub fn shadow_settle_verified(&mut self) -> usize {
+        if self.shadow.unverified == self.shadow.by_winner.len() {
+            return 0;
+        }
+        debug_assert!(self.space.walk_watermark().is_none(), "settle under a pinned walk");
+        let verified: Vec<u64> = self
+            .shadow
+            .by_cold
+            .iter()
+            .filter(|(_, e)| e.verified_len.is_some())
+            .map(|(c, _)| *c)
+            .collect();
+        let mut settled = 0usize;
+        for cold in verified {
+            if self.settle_ticket(cold) {
+                self.shadow.counters.settled_without_read += 1;
+                settled += 1;
+            }
+        }
+        settled
+    }
+
     /// A reconciliation read failed (I/O, CRC, a retired-file miss):
     /// the ticket stays, the next round retries (D4.3).
     pub fn shadow_read_failed(&mut self, cold: LogicalAddr) {
@@ -467,30 +696,31 @@ impl TieredTable {
         self.shadow.counters.read_errors += 1;
     }
 
-    /// The verdict without the resolution (D3's `DEL` path): re-validates
-    /// the ticket against the index after the suspension and compares
-    /// the **full key**. `Collision` ends the ticket (both records are
-    /// keys); `SameKey` changes nothing — the caller removes the twin
-    /// through its own marker path (`delete`), which attributes the death
-    /// consistently with a pinned walk; `Stale` changes nothing.
+    /// The verdict without the settle (D3's `DEL` path, A3's `DBSIZE`
+    /// drain): re-validates the ticket against the index after the
+    /// suspension and compares the **full key** of the cold record with
+    /// the ticket's *current* winner — the relation is "the twin versus
+    /// the key's current RAM record", so a winner that moved under an
+    /// overwrite is still the right comparand. `SameKey` marks the ticket
+    /// verified (idempotent — an already-verified ticket answers without
+    /// comparing); `Collision` ends the ticket (both records are keys);
+    /// `Stale` (the ticket is gone) changes nothing.
     ///
     /// # Panics
     /// Panics when `image` is not exactly one record (the caller's
     /// framing is this crate's own vocabulary fed back).
-    pub fn verify_shadow(
-        &mut self,
-        hash: u64,
-        cold: LogicalAddr,
-        winner: LogicalAddr,
-        image: &[u8],
-    ) -> ShadowVerdict {
-        let (c, w) = (cold.to_raw(), winner.to_raw());
+    pub fn verify_shadow(&mut self, hash: u64, cold: LogicalAddr, image: &[u8]) -> ShadowVerdict {
+        let c = cold.to_raw();
         self.shadow.in_flight.retain(|x| *x != c);
-        let current = self.shadow.by_cold.get(&c).copied();
-        if current != Some((hash, w)) {
+        let Some(entry) = self.shadow.by_cold.get(&c).copied() else {
+            self.shadow.counters.stale += 1;
+            return ShadowVerdict::Stale;
+        };
+        if entry.hash != hash {
             self.shadow.counters.stale += 1;
             return ShadowVerdict::Stale;
         }
+        let winner = LogicalAddr::from_raw(entry.winner).expect("48-bit");
         if !self.index.contains_pair(hash, cold) || !self.index.contains_pair(hash, winner) {
             // The pair no longer exists (a removal path that missed the
             // hook would be a bug — the debug assert names it; the
@@ -501,6 +731,9 @@ impl TieredTable {
             return ShadowVerdict::Stale;
         }
         assert!(self.space.resolve(winner) != AddrClass::Cold, "a pinned winner went cold");
+        if entry.verified_len.is_some() {
+            return ShadowVerdict::SameKey;
+        }
         assert_eq!(
             crate::record::encoded_len_from_header(image),
             image.len(),
@@ -515,27 +748,26 @@ impl TieredTable {
             self.shadow.counters.resolved_collision += 1;
             return ShadowVerdict::Collision;
         }
+        let len = u32::try_from(image.len()).expect("record lengths fit u32");
+        self.shadow.by_cold.get_mut(&c).expect("present").verified_len = Some(len);
+        self.shadow.unverified -= 1;
+        self.shadow.counters.verified += 1;
         ShadowVerdict::SameKey
     }
 
     /// Applies one read's verdict (D4): [`verify_shadow`]
-    /// (Self::verify_shadow), then — same key, no walk pinned — removes
-    /// exactly the cold pair, attributes the exact death and chains the
-    /// address (with its own origins) into the winner's relocation-origin
-    /// list — the ADR-0059 D9 repair the next displacement stages.
-    /// Under a pinned walk the verdict is `Deferred` and the ticket
-    /// stays (D5 as amended). `image` is the verbatim cold record.
+    /// (Self::verify_shadow), then — same key, no walk pinned, origin
+    /// room — settles: removes exactly the cold pair, attributes the
+    /// exact death and chains the address (with its own origins) into
+    /// the winner's relocation-origin list — the ADR-0059 D9 repair the
+    /// next displacement stages. Under a pinned walk or a full origin
+    /// list the verdict is `Deferred` and the ticket stays verified (A1,
+    /// A5). `image` is the verbatim cold record.
     ///
     /// # Panics
     /// As [`verify_shadow`](Self::verify_shadow).
-    pub fn resolve_shadow(
-        &mut self,
-        hash: u64,
-        cold: LogicalAddr,
-        winner: LogicalAddr,
-        image: &[u8],
-    ) -> ShadowVerdict {
-        let verdict = self.verify_shadow(hash, cold, winner, image);
+    pub fn resolve_shadow(&mut self, hash: u64, cold: LogicalAddr, image: &[u8]) -> ShadowVerdict {
+        let verdict = self.verify_shadow(hash, cold, image);
         if verdict != ShadowVerdict::SameKey {
             return verdict;
         }
@@ -543,25 +775,46 @@ impl TieredTable {
             self.shadow.counters.deferred_walk += 1;
             return ShadowVerdict::Deferred;
         }
-        let (c, w) = (cold.to_raw(), winner.to_raw());
-        // The synchronous path's removal, performed on the same
-        // evidence (ADR-0093 §I3): exact pair, exact length.
+        if self.settle_ticket(cold.to_raw()) {
+            ShadowVerdict::SameKey
+        } else {
+            ShadowVerdict::Deferred
+        }
+    }
+
+    /// The settle of one verified ticket (A1): the synchronous path's
+    /// removal on the same evidence (§I3 — exact pair, exact length),
+    /// the death, the origin chain. `false` when the winner's origin
+    /// list has no room (A5: deferred, counted; the ticket stays).
+    ///
+    /// # Panics
+    /// Debug-panics on an unverified ticket or under a pinned walk (the
+    /// callers check both).
+    fn settle_ticket(&mut self, c: u64) -> bool {
+        let entry = self.shadow.by_cold[&c];
+        let len = entry.verified_len.expect("settle of an unverified ticket");
+        debug_assert!(self.space.walk_watermark().is_none(), "settle under a pinned walk");
+        let (hash, w) = (entry.hash, entry.winner);
+        let cold = LogicalAddr::from_raw(c).expect("48-bit");
+        let incoming = self.reloc_origins.get(&(hash, c)).map_or(0, Vec::len) + 1;
+        let existing = self.reloc_origins.get(&(hash, w)).map_or(0, Vec::len);
+        if existing + incoming > super::RELOC_ORIGIN_CAP {
+            self.shadow.counters.deferred_origin += 1;
+            return false;
+        }
         self.index.remove(hash, cold);
-        self.note_death(cold, image.len() as u64);
+        self.note_death(cold, u64::from(len));
         let mut origins = self.reloc_origins.remove(&(hash, c)).unwrap_or_default();
         origins.push((c, self.live.ckpt_begun()));
-        let chain = self.reloc_origins.entry((hash, w)).or_default();
-        chain.extend(origins);
-        assert!(chain.len() <= super::RELOC_ORIGIN_CAP, "shadow resolution exceeds the origin cap");
+        self.reloc_origins.entry((hash, w)).or_default().extend(origins);
         self.drop_ticket(c);
         self.shadow.counters.resolved_same_key += 1;
-        ShadowVerdict::SameKey
+        true
     }
 
     /// A slot at `addr` was removed by a verified path (delete,
     /// displacement replay, a collision key's overwrite): every ticket
-    /// naming it as cold or winner ends (D5). The pair-formation hooks
-    /// re-register a pair the paired mutation re-forms.
+    /// naming it as cold or winner ends (D5).
     pub(super) fn shadow_note_removed(&mut self, addr: LogicalAddr) {
         if self.shadow.by_winner.is_empty() {
             return;
@@ -596,9 +849,10 @@ impl TieredTable {
 
     /// The slot `(hash, old)` was repointed to `new` (an overwrite or a
     /// relocation): tickets naming `old` as their winner follow it (D3
-    /// — "the key's current RAM record"); a ticket naming `old` as its
-    /// cold address ends (its slot moved into RAM under a verified key —
-    /// the collision key was overwritten).
+    /// — "the key's current RAM record"; a verified ticket stays
+    /// verified — the twin's identity did not change); a ticket naming
+    /// `old` as its cold address ends (its slot moved into RAM under a
+    /// verified key — the collision key was overwritten).
     pub(super) fn shadow_note_moved(&mut self, hash: u64, old: LogicalAddr, new: LogicalAddr) {
         if self.shadow.by_winner.is_empty() {
             return;
@@ -610,60 +864,120 @@ impl TieredTable {
         }
         let colds: Vec<u64> = self.shadow.winner_tickets(o).collect();
         for cold in colds {
-            let ticket_hash = self.shadow.by_winner.remove(&(o, cold)).expect("listed");
-            debug_assert_eq!(ticket_hash, hash, "a winner moves under its own key");
-            self.shadow.by_winner.insert((n, cold), ticket_hash);
-            self.shadow.by_cold.insert(cold, (ticket_hash, n));
+            self.shadow.by_winner.remove(&(o, cold)).expect("listed");
+            self.shadow.by_winner.insert((n, cold), ());
+            let entry = self.shadow.by_cold.get_mut(&cold).expect("listed");
+            debug_assert_eq!(entry.hash, hash, "a winner moves under its own key");
+            entry.winner = n;
             self.shadow.counters.retargeted += 1;
         }
         self.sync_shadow_pin();
     }
 
-    /// Rebuilds the entire ticket set from the index (ADR-0093 D5) — the
-    /// recovery-complete authority: a ticket **is** a same-64-bit-hash
-    /// pair of one RAM slot and one cold slot, so after the checkpoint
-    /// and the WAL tail have replayed into the final index, the tickets
-    /// are exactly those pairs. Rebuilding from the finished index —
-    /// rather than tracking incrementally through replay's overwrites,
-    /// where a winner's address moves under the ticket — is the design's
-    /// "projection of the index" made literal, and it cannot leave an
-    /// orphaned slot. Clears in-flight and every counter-invisible bit of
-    /// per-ticket state; the counters (created, verdicts) are per-life
-    /// observability and are not reset (a boot starts them at 0 anyway).
-    /// Control-plane cost, O(index): the checkpoint walk's cadence.
+    /// Rebuilds the ticket set from the finished index (ADR-0093 D5 as
+    /// amended by A4) — the recovery-complete authority: a ticket **is**
+    /// a same-64-bit-hash pair of one RAM slot and one cold slot, so
+    /// after the checkpoint and the WAL tail have replayed, the tickets
+    /// are exactly those pairs. One home-group walk; for each **cold**
+    /// slot the probe chain (`each_exact`) names its RAM siblings — no
+    /// map of the index, no vector of cold slots (O(pairs) memory, the
+    /// ticket cap bounding the maps). Exactly one RAM sibling under the
+    /// cap ⇒ a ticket (unverified: the twin may still be a collision
+    /// key, and the verdict is the reconciler's ordinary read). Two or
+    /// more RAM siblings (two live keys with one hash — which one, if
+    /// any, the twin belongs to is a full-key question the review found
+    /// answered by a guess), or the cap reached ⇒ the slot is returned
+    /// for the caller to **read and settle before the cell serves**
+    /// ([`settle_rebuilt_slot`](Self::settle_rebuilt_slot)). Clears
+    /// in-flight and the fence; the counters are per-life observability
+    /// and are not reset (a boot starts them at 0 anyway).
     ///
-    /// One RAM slot with several exact-hash cold siblings forms one
-    /// ticket per cold slot, all against that winner; the pin follows the
-    /// oldest winner as always.
-    pub fn rebuild_shadow_tickets(&mut self) {
+    /// The counters record the boot's reads (`rebuild_reads`, filled by
+    /// the settle) and the pairs beyond the cap (`rebuild_over_cap`).
+    #[must_use]
+    pub fn rebuild_shadow_tickets(&mut self) -> Vec<SettleSlot> {
         self.shadow.by_winner.clear();
         self.shadow.by_cold.clear();
+        self.shadow.unverified = 0;
         self.shadow.in_flight.clear();
-        // Home-group scan: every live slot, emitted once (the checkpoint
-        // walker's primitive — no record read for the classification, the
-        // sidecar hash and the resolver decide).
-        let groups = self.index.group_count();
-        let mut ram: std::collections::HashMap<u64, LogicalAddr> = std::collections::HashMap::new();
-        let mut colds: Vec<(u64, LogicalAddr)> = Vec::new();
-        for g in 0..groups {
+        self.shadow.fence = 0;
+        self.space.set_record_pin(None);
+        let mut settle: Vec<SettleSlot> = Vec::new();
+        // Per home group: the cold slots and their RAM-sibling verdict
+        // (count, lowest address) — a group is 16 slots, so this scratch
+        // is bounded by the group, not the index.
+        let mut group_pairs: Vec<(u64, LogicalAddr, usize, Option<LogicalAddr>)> = Vec::new();
+        for g in 0..self.index.group_count() {
+            group_pairs.clear();
             self.index.scan_home_group_ext(g, |addr, hash| {
-                if self.space.resolve(addr) == AddrClass::Cold {
-                    colds.push((hash, addr));
-                } else {
-                    // One RAM slot per key (the index invariant); a
-                    // duplicate hash here would be a different key with
-                    // the same 64 bits — vanishingly rare, and either RAM
-                    // winner is a live record of *a* key, so the pair is
-                    // still "cold twin vs a RAM record of this hash".
-                    ram.insert(hash, addr);
+                if self.space.resolve(addr) != AddrClass::Cold {
+                    return;
                 }
+                let mut siblings = 0usize;
+                let mut lowest: Option<LogicalAddr> = None;
+                self.index.each_exact(hash, |sib| {
+                    if self.space.resolve(sib) != AddrClass::Cold {
+                        siblings += 1;
+                        lowest = Some(lowest.map_or(sib, |l| l.min(sib)));
+                    }
+                });
+                group_pairs.push((hash, addr, siblings, lowest));
             });
-        }
-        for (hash, cold) in colds {
-            if let Some(&winner) = ram.get(&hash) {
-                self.register_shadow(hash, cold, winner);
+            for &(hash, cold, siblings, lowest) in &group_pairs {
+                match (siblings, lowest) {
+                    (0, _) => {}
+                    (1, Some(winner)) if self.shadow.by_winner.len() < SHADOW_TICKETS_CAP => {
+                        self.register_shadow(hash, cold, winner);
+                    }
+                    (1, Some(_)) => {
+                        self.shadow.counters.rebuild_over_cap += 1;
+                        settle.push(SettleSlot { hash, cold, reason: SettleReason::OverCap });
+                    }
+                    _ => settle.push(SettleSlot { hash, cold, reason: SettleReason::Ambiguous }),
+                }
             }
         }
+        settle
+    }
+
+    /// Settles one slot the rebuild returned (A4), by the twin's **full
+    /// key**: the finished index is asked for a RAM record with that key
+    /// — found ⇒ the twin is its old record, settled now exactly (or
+    /// registered verified and left pinned when the winner's origin list
+    /// has no room, A5); not found ⇒ the slot is a distinct key's and
+    /// nothing changes. `image` is the verbatim cold record.
+    ///
+    /// # Panics
+    /// Panics when the slot is not a cold exact pair or `image` is not
+    /// exactly one record — the caller read the slot the rebuild named.
+    pub fn settle_rebuilt_slot(
+        &mut self,
+        hash: u64,
+        cold: LogicalAddr,
+        image: &[u8],
+    ) -> SettleOutcome {
+        assert!(self.index.contains_pair(hash, cold), "settle of a slot that is not there");
+        assert!(self.space.resolve(cold) == AddrClass::Cold, "settle of a RAM slot");
+        assert_eq!(
+            crate::record::encoded_len_from_header(image),
+            image.len(),
+            "settle image is not exactly one record"
+        );
+        assert!(!self.is_shadow_cold(cold), "settle of a ticketed slot");
+        self.shadow.counters.rebuild_reads += 1;
+        let key = TieredTable::decode_record(image).key;
+        debug_assert_eq!(hash, Self::hash_key(key), "a slot carries its record's hash");
+        let TieredLookup::Ram(winner) = self.lookup(key, hash, &[]) else {
+            self.shadow.counters.rebuild_settled_distinct += 1;
+            return SettleOutcome::Distinct;
+        };
+        let len = u32::try_from(image.len()).expect("record lengths fit u32");
+        self.register_shadow_with(hash, cold, winner, Some(len));
+        self.shadow.counters.rebuild_settled_same_key += 1;
+        if self.space.walk_watermark().is_none() {
+            let _deferred_for_origin_room = !self.settle_ticket(cold.to_raw());
+        }
+        SettleOutcome::SameKey
     }
 
     /// Counts one compaction record deferred for being a ticket's cold
@@ -677,14 +991,29 @@ impl TieredTable {
         self.shadow.counters.promote_skip += 1;
     }
 
-    /// Counts one `scan_slots` slot skipped (D3; `&self` — interior).
-    pub(super) fn note_shadow_scan_skipped(&self) {
-        self.shadow.scan_skipped.incr();
+    /// Counts one `scan_slots` twin emitted (A3; `&self` — interior).
+    pub(super) fn note_shadow_scan_twin(&self) {
+        self.shadow.scan_twins.incr();
+    }
+
+    /// Folds the pinned suffix's peak on a tail advance (A6): one
+    /// `is_empty` branch on the allocation path, nothing when no ticket
+    /// is open.
+    #[inline]
+    pub(super) fn shadow_note_alloc(&mut self) {
+        if self.shadow.by_winner.is_empty() {
+            return;
+        }
+        let pinned = self.shadow_pinned_bytes();
+        self.shadow.counters.pinned_bytes_peak = self.shadow.counters.pinned_bytes_peak.max(pinned);
     }
 
     fn drop_ticket(&mut self, cold: u64) {
-        if let Some((_, winner)) = self.shadow.by_cold.remove(&cold) {
-            self.shadow.by_winner.remove(&(winner, cold));
+        if let Some(entry) = self.shadow.by_cold.remove(&cold) {
+            self.shadow.by_winner.remove(&(entry.winner, cold));
+            if entry.verified_len.is_none() {
+                self.shadow.unverified -= 1;
+            }
         }
         self.shadow.in_flight.retain(|c| *c != cold);
         self.sync_shadow_pin();
