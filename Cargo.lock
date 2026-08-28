@@ -161,6 +161,7 @@ dependencies = [
  "inf-log",
  "inf-runtime",
  "inf-server",
+ "inf-sim",
  "inf-store",
 ]
 

@@ -126,6 +126,20 @@ impl Default for ConfigStore {
                     Kind::Enum(&["no", "yes"]),
                     "no",
                 ),
+                // M4.5-S37 (ADR-0093 A8, review of 2026-08-28): pauses
+                // the shadow reconciler (no MAINTAIN reads, no settles)
+                // so open tickets stay open — the DST's lever for the
+                // open-ticket rows (`DBSIZE`'s drain, `SCAN`'s twin, the
+                // `Ticketed` refusal, `DEL`'s forced resolution) and an
+                // operator's pause; the pin cap and the ticket cap bound
+                // what a paused reconciler can hold. `DBSIZE` and `DEL`
+                // keep their own reads.
+                e(
+                    "tiered-shadow-reconcile",
+                    ReloadClass::HotPerCell,
+                    Kind::Enum(&["yes", "no"]),
+                    "yes",
+                ),
                 // M4-S19 (ADR-0062 D4): the node bound on aggregate
                 // reserved tiered-Region VA — an explicit bounded
                 // default, never an inferred host maximum. Divided per

@@ -85,3 +85,16 @@ point = "durable_fsync_eio"
 tier = "node"
 test = "fsyncgate"
 expect = "fail-stop"
+# M4.5-S37 (ADR-0093 D4.3/A3/A8): a shadow twin's cold read fails while
+# a ticket is open. Carried by `tests/shadow_open_tickets.rs` (the
+# whole-node `m4-tiered` scenario in-process, phase 6d: the point is
+# armed around one `DBSIZE` drain).
+#   dbsize-typed-error  — DBSIZE answers `-ERR DBSIZE: shadow twin at …
+#                         unreadable`, relayed through the namespace
+#                         scatter, never an inexact count; the ticket
+#                         stays open and the next drain reads it exactly
+[[row]]
+point = "shadow_twin_read_fail"
+tier = "node"
+test = "shadow_open_tickets"
+expect = "dbsize-typed-error"

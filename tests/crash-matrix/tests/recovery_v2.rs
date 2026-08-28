@@ -34,6 +34,7 @@ use inf_log::{
     Lsn, Manifest, NsId, SealReason, SegmentId, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
     TierIoMode, read_manifest, tier_extract, tier_frame_offset, tier_frame_span, write_manifest,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, CompactionWork, DemotionConfig, LogicalAddr, TieredTable, recover_tiered_ns,
 };
@@ -70,7 +71,8 @@ fn space_config(origin: u64) -> AddressSpaceConfig {
 
 fn rig(fs: &MemFs) -> (TieredTable, TierFlush<MemFs>) {
     fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
-    let table = TieredTable::new(space_config(0), demote(), 256).expect("ring");
+    let table =
+        TieredTable::new(space_config(0), demote(), 256, KeyHasher::default()).expect("ring");
     let flush = TierFlush::new(fs.clone(), flush_config(), 0);
     (table, flush)
 }
@@ -81,7 +83,7 @@ fn fill_and_flush(table: &mut TieredTable, flush: &mut TierFlush<MemFs>, batch: 
     for i in 0..keys {
         let key = format!("r:{batch}:{i:04}");
         let value = vec![0x30 + (i % 40) as u8; 120 + (i as usize % 60)];
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         table.insert(key.as_bytes(), &value, hash).expect("fits");
     }
     loop {
@@ -175,6 +177,7 @@ fn manifest_v2_rename_fail_keeps_old_unit() {
         space_config(0),
         demote(),
         256,
+        KeyHasher::default(),
     )
     .expect("recovery");
     assert_eq!(
@@ -254,6 +257,7 @@ fn manifest_v2_dir_fsync_crash_resolves_new_unit() {
         space_config(0),
         demote(),
         256,
+        KeyHasher::default(),
     )
     .expect("recovery");
     assert_eq!(recovered.table.space().life_origin().to_raw(), new_flushed);
@@ -287,7 +291,7 @@ fn tier_torn_frame_reseal_from_manifest_v2() {
     fault::arm("tier_torn_frame", FaultSpec::Nth(1));
     for i in 0..200u32 {
         let key = format!("torn:{i:04}");
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         table.insert(key.as_bytes(), &[0x77; 200], hash).expect("fits");
     }
     loop {
@@ -313,6 +317,7 @@ fn tier_torn_frame_reseal_from_manifest_v2() {
         space_config(0),
         demote(),
         256,
+        KeyHasher::default(),
     )
     .expect("recovery");
     assert!(
@@ -344,6 +349,7 @@ fn tier_torn_frame_reseal_from_manifest_v2() {
         space_config(0),
         demote(),
         256,
+        KeyHasher::default(),
     )
     .expect("recovery is idempotent");
     assert_eq!(again.stats.files_resealed, 0, "second boot takes the sealed fast path");
@@ -361,7 +367,7 @@ fn tier_fsync_frozen_watermark_bounds_manifest() {
     let frozen = table.space().flushed().to_raw();
     for i in 0..32u32 {
         let key = format!("f:{i:04}");
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         table.insert(key.as_bytes(), &[0x55; 200], hash).expect("fits");
     }
     table.seal_slice();
@@ -398,7 +404,7 @@ fn kill_cold_prefix(
             break;
         }
         let key = format!("r:0:{i:04}");
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         let inf_store::TieredLookup::Cold(addr) = table.lookup(key.as_bytes(), hash, &[]) else {
             continue;
         };
@@ -497,6 +503,7 @@ fn s15_covering_swap_abort_serves_from_prior_unit() {
         space_config(0),
         demote(),
         256,
+        KeyHasher::default(),
     )
     .expect("recovery");
     for range in &tier.files {
@@ -561,6 +568,7 @@ fn s15_covering_swap_dir_fsync_resolves_and_boot_gc_reclaims() {
         space_config(0),
         demote(),
         256,
+        KeyHasher::default(),
     )
     .expect("recovery");
     assert!(recovered.stats.files_removed >= 1, "boot GC reclaimed the un-named file");

@@ -8,6 +8,7 @@
 //! | point | site | documented failure path |
 //! |---|---|---|
 //! | `durable_fsync_eio` | `DurableCell::on_synced` | the fsync completion arrives as a device-reported EIO instead of `Synced` — the watermark freezes (no ack for the affected batch can ever fire) and the process fail-stops with [`EXIT_DURABLE_FAILSTOP`](crate::EXIT_DURABLE_FAILSTOP) (the fsyncgate rule; ADR-0020 D3) |
+//! | `shadow_twin_read_fail` | `plane::tiered::read_cold_record` | a shadow twin's cold read fails (M4.5-S37, ADR-0093 D4.3/A3): the reconciler leaves the ticket for the next round, `DBSIZE`'s drain answers the typed `-ERR DBSIZE: shadow twin … unreadable` (relayed through a scattered leg), `DEL`'s forced resolution answers its error — never an inexact count, never a removal |
 //!
 //! The sync-tier seal fsync has its own point (`inf_log::fault::FSYNC_ERR`);
 //! this one exists because the reactor tier defers the seal fsync through
@@ -15,6 +16,7 @@
 //! this point is the deterministic stand-in for that CQE.
 
 pub const DURABLE_FSYNC_EIO: &str = "durable_fsync_eio";
+pub const SHADOW_TWIN_READ_FAIL: &str = "shadow_twin_read_fail";
 
 /// Inventory for the CI coverage check.
-pub const ALL: &[&str] = &[DURABLE_FSYNC_EIO];
+pub const ALL: &[&str] = &[DURABLE_FSYNC_EIO, SHADOW_TWIN_READ_FAIL];

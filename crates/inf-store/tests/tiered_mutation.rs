@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 
+use inf_store::KeyHasher;
 use inf_store::{
     AddrClass, AddressSpaceConfig, DemotionConfig, LogicalAddr, OpError, TieredLookup, TieredTable,
 };
@@ -70,6 +71,7 @@ impl Harness {
                 },
                 DemotionConfig::for_budget(RING, PAGE),
                 64,
+                KeyHasher::default(),
             )
             .expect("reservation"),
             oracle: HashMap::new(),
@@ -81,7 +83,7 @@ impl Harness {
 
     /// Drives `lookup` through the fetch-verify-retry contract.
     fn find(&self, key: &[u8]) -> Option<Found> {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let mut exclude: Vec<LogicalAddr> = Vec::new();
         loop {
             assert!(exclude.len() <= MAX_COLD_RETRIES, "fingerprint collision storm");
@@ -118,7 +120,7 @@ impl Harness {
     /// The storm's SET: routes through `update` for present keys and
     /// asserts the S05 placement contract before checking content.
     fn set(&mut self, key: &[u8], value: &[u8], applied: &mut Vec<LoggedOp>) {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let mut existing = self.find(key);
         // Pre-op accounting snapshot: dead bytes may legally grow by the
         // displaced record *and* a ring-seal hole in the same op — the
@@ -205,7 +207,7 @@ impl Harness {
     fn del(&mut self, key: &[u8], applied: &mut Vec<LoggedOp>) {
         match self.find(key) {
             Some(found) => {
-                let hash = TieredTable::hash_key(key);
+                let hash = KeyHasher::default().hash(key);
                 self.table.delete(
                     hash,
                     LogicalAddr::from_raw(found.addr).expect("fits"),

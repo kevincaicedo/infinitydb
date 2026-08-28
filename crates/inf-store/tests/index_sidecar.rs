@@ -41,6 +41,7 @@ use inf_log::fs::mem::MemFs;
 use inf_log::{
     CkptConfig, DocLineage, IckIdxSidecarStep, IdxSidecarMeta, Lsn, RecordView, SegmentId,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     BackfillBudget, CellStore, FsyncClass, INDEX_KEY_ENCODING_VERSION, IndexId, IndexKeyBuf,
     IndexKeyType, IndexScalar, IndexSpec, IndexState, Keyspace, NsId, NsMode, NsSpec,
@@ -213,7 +214,7 @@ fn oracle_entries(
         let Ok(Some(read)) = store.json_get(key, now) else { continue };
         let matches =
             eval(&program, read.root, &EvalLimits::default()).expect("test docs are small");
-        let hash = CellStore::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let mut buf = IndexKeyBuf::new();
         for steps in matches.iter() {
             let Some(value) = resolve(read.root, steps) else { continue };

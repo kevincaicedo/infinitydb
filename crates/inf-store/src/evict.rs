@@ -304,7 +304,7 @@ pub(crate) fn evict_one(store: &mut CellStore, samples: u32, now: Nanos) -> Evic
                     return;
                 }
                 let view = crate::store::record_at(arena, addr);
-                let hash = CellStore::hash_key(view.key());
+                let hash = store.hash_key(view.key());
                 if view.is_expired(now) {
                     expired.push((hash, addr, view.encoded_len()));
                     return;

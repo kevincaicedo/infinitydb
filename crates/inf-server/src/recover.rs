@@ -788,6 +788,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 },
                 demote,
                 1024,
+                ks.hasher(),
             )?;
             ks.install_recovered_tiered(ns, recovered.table);
             let mut files = Vec::with_capacity(recovered.flush.sealed().len());
@@ -822,31 +823,33 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         for tier in &self.recovered_tiers {
             if let Some(table) = ks.tiered_store_mut(tier.ns) {
                 table.extent_sweep_seed(&tier.extents_listed);
-                // M4.5-S37 (ADR-0093 D5/A4): the shadow ticket set is a
+                // M4.5-S37 (ADR-0093 D5/A4′): the shadow ticket set is a
                 // projection of the finished index — rebuild it once the
                 // checkpoint and WAL tail have replayed, before serving.
-                // The slots the rebuild cannot pair by construction (two
-                // RAM keys with one hash beside a cold twin) or beyond
-                // the ticket cap are read and settled by their full key
-                // here — exactly those, never the general index.
-                let settle = table.rebuild_shadow_tickets();
-                for slot in settle {
-                    let addr = slot.cold.to_raw();
-                    let read = |len: usize| -> io::Result<Vec<u8>> {
-                        tier.flush.read_span_blocking(addr, len)?.ok_or_else(|| {
-                            io_msg(format!(
-                                "ns {}: shadow settle slot at {addr} ({:?}) lies in no \
-                                 catalogued tier range (ADR-0093 A4)",
-                                tier.ns.0, slot.reason
-                            ))
-                        })
-                    };
-                    let head = read(inf_store::TieredTable::RECORD_HEADER_LEN)?;
-                    let len = inf_store::TieredTable::record_len_from_header(&head);
-                    let image = read(len)?;
-                    self.stats.shadow_settle_reads += 1;
-                    table.settle_rebuilt_slot(slot.hash, slot.cold, &image);
-                }
+                // The rebuild is a cursor: the slots it cannot pair by
+                // construction (two RAM keys with one hash beside a cold
+                // twin) or beyond the ticket cap are handed back one at a
+                // time, read and settled by their full key here — exactly
+                // those, never the general index, never a list of them.
+                // An unreadable or unsettleable slot is a recovery
+                // fail-stop (corrupt input, ADR-0057's posture).
+                let ns = tier.ns;
+                let stats = &mut self.stats;
+                table
+                    .rebuild_shadow_tickets(|slot| -> io::Result<Vec<u8>> {
+                        let addr = slot.cold.to_raw();
+                        let read = |len: usize| -> io::Result<Vec<u8>> {
+                            tier.flush.read_span_blocking(addr, len)?.ok_or_else(|| {
+                                io_msg("lies in no catalogued tier range".to_owned())
+                            })
+                        };
+                        let head = read(inf_store::TieredTable::RECORD_HEADER_LEN)?;
+                        let len = inf_store::TieredTable::record_len_from_header(&head);
+                        let image = read(len)?;
+                        stats.shadow_settle_reads += 1;
+                        Ok(image)
+                    })
+                    .map_err(|err| io_msg(format!("ns {}: {err} (ADR-0093 A4′)", ns.0)))?;
             }
         }
         Ok(())

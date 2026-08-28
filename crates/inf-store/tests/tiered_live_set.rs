@@ -21,6 +21,7 @@ use std::path::Path;
 
 use inf_log::fs::mem::MemFs;
 use inf_log::{NsId, TierFlush, TierFlushConfig, TierIoMode};
+use inf_store::KeyHasher;
 use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, TieredLookup, TieredTable};
 use proptest::prelude::*;
 
@@ -54,6 +55,7 @@ impl Storm {
             },
             demote,
             2048,
+            KeyHasher::default(),
         )
         .expect("ring");
         let flush = TierFlush::new(
@@ -87,7 +89,7 @@ impl Storm {
     /// candidate the key's own slot at this corpus size).
     fn set(&mut self, id: u64, value: &[u8]) {
         let key = format!("k:{id:05}").into_bytes();
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         let placed = match self.model.get(&id) {
             Some(&(old, old_len, old_version)) => {
                 let old = LogicalAddr::from_raw(old).expect("48-bit");
@@ -125,7 +127,7 @@ impl Storm {
     fn del(&mut self, id: u64) {
         let Some((addr, len, _)) = self.model.remove(&id) else { return };
         let key = format!("k:{id:05}").into_bytes();
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         self.table.delete(hash, LogicalAddr::from_raw(addr).expect("48-bit"), len);
     }
 

@@ -8,6 +8,7 @@
 
 use inf_foundation::time::Nanos;
 use inf_log::{FsyncClass, NsId, RecordView};
+use inf_store::KeyHasher;
 use inf_store::{
     Keyspace, NsMode, NsSpec, ReplayError, ReplayOutcome, StoreConfig, TierSpec, TieredLookup,
     TieredTable, WallAnchor,
@@ -34,7 +35,7 @@ fn tiered_keyspace() -> Keyspace {
 
 fn ram_addr(ks: &mut Keyspace, key: &[u8]) -> inf_store::LogicalAddr {
     let table = ks.tiered_store_mut(NS).expect("materialized");
-    match table.lookup(key, TieredTable::hash_key(key), &[]) {
+    match table.lookup(key, KeyHasher::default().hash(key), &[]) {
         TieredLookup::Ram(addr) => addr,
         other => panic!("expected a RAM entry for {key:?}, got {other:?}"),
     }
@@ -91,7 +92,7 @@ fn displace_delete_pairing_removes_the_key() {
     assert!(matches!(ks.apply_record(&del, NOW, ANCHOR), Ok(ReplayOutcome::Applied)));
     assert_eq!(ks.displace_register_len(), 0);
     let table = ks.tiered_store_mut(NS).expect("materialized");
-    let hash = TieredTable::hash_key(b"k");
+    let hash = KeyHasher::default().hash(b"k");
     assert!(matches!(table.lookup(b"k", hash, &[]), TieredLookup::Miss));
 }
 
@@ -174,7 +175,7 @@ fn in_place_set_replays_without_its_displacement_marker() {
     let table = ks.tiered_store_mut(NS).expect("materialized");
     assert_eq!(table.record(addr_after).value, b"bbbb", "the final value wins");
     // No second slot: displacing the sole address empties the key.
-    let hash = TieredTable::hash_key(b"k");
+    let hash = KeyHasher::default().hash(b"k");
     assert!(table.apply_displace(hash, addr_after), "exactly one slot existed");
     assert!(
         matches!(table.lookup(b"k", hash, &[]), TieredLookup::Miss),
@@ -200,6 +201,7 @@ fn origin_marker_repairs_the_cold_ref_and_its_absence_leaks() {
         AddressSpaceConfig { reserve_bytes: 1 << 16, page_bytes: 1 << 12, life_origin: origin },
         DemotionConfig::for_budget(1 << 16, 1 << 12),
         64,
+        KeyHasher::default(),
     )
     .expect("reservation");
     table.seed_recovered_files(
@@ -214,7 +216,7 @@ fn origin_marker_repairs_the_cold_ref_and_its_absence_leaks() {
     );
 
     // Repaired half: ref → origin marker → image ⇒ one RAM slot.
-    let hash_a = TieredTable::hash_key(b"relocated");
+    let hash_a = KeyHasher::default().hash(b"relocated");
     let cold_a = LogicalAddr::from_raw(0x100).expect("fits");
     table.apply_ref(hash_a, cold_a);
     assert!(table.apply_displace(hash_a, cold_a), "the origin marker kills the cold ref");
@@ -226,7 +228,7 @@ fn origin_marker_repairs_the_cold_ref_and_its_absence_leaks() {
 
     // Leak half (negative space): image over a cold ref with NO marker
     // leaves the stale cold slot alive next to the new RAM slot.
-    let hash_b = TieredTable::hash_key(b"leaky");
+    let hash_b = KeyHasher::default().hash(b"leaky");
     let cold_b = LogicalAddr::from_raw(0x900).expect("fits");
     table.apply_ref(hash_b, cold_b);
     table.apply_image(b"leaky", b"v2", hash_b).expect("fits");

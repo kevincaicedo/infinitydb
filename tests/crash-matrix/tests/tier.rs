@@ -24,9 +24,8 @@ use inf_log::{
     NsId, SealReason, TIER_FOOTER_BYTES, TIER_FRAME_BYTES, TIER_FRAME_DATA, TierDrive, TierFlush,
     TierFlushConfig, TierIdentity, TierIoMode, TierWriter, inspect_tier_bytes,
 };
-use inf_store::{
-    AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, StoreConfig, TieredTable,
-};
+use inf_store::KeyHasher;
+use inf_store::{AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, StoreConfig};
 
 const NS: NsId = NsId(21);
 const PAGE: u64 = 4 << 10;
@@ -86,7 +85,7 @@ fn fill_batch(ks: &mut Keyspace, keys: u32, batch: u32) {
     for i in 0..keys {
         let key = format!("crash:{batch}:{i:04}");
         let value = vec![0x61 + (i % 20) as u8; 100 + (i as usize % 60)];
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         table.insert(key.as_bytes(), &value, hash).expect("fits");
     }
     let tail = table.space().tail();
@@ -267,7 +266,7 @@ fn tier_write_nospace_diskfull_typed_then_automatic_recovery() {
         "foreground latches DISKFULL instead of an opaque stall"
     );
     let refusal = table
-        .insert(b"crash:more", &[0x33; 128], TieredTable::hash_key(b"crash:more"))
+        .insert(b"crash:more", &[0x33; 128], KeyHasher::default().hash(b"crash:more"))
         .expect_err("foreground refuses while latched");
     assert!(matches!(refusal, inf_store::OpError::DiskFull(inf_store::DiskFullCause::Device)));
     assert!(fault::fired("tier_write_nospace") >= 1, "the row is not vacuous");
@@ -280,7 +279,7 @@ fn tier_write_nospace_diskfull_typed_then_automatic_recovery() {
     let _ = table.flush_slice(&mut flush).expect("the retry succeeds");
     assert!(table.disk_full().is_none(), "the latch cleared — admission resumed");
     table
-        .insert(b"crash:more", &[0x33; 128], TieredTable::hash_key(b"crash:more"))
+        .insert(b"crash:more", &[0x33; 128], KeyHasher::default().hash(b"crash:more"))
         .expect("writes resume with no operator step");
     // The relanded backlog is durable: the shutdown drain seals, and the
     // watermark advances over every sealed byte.
@@ -512,6 +511,7 @@ fn reactor_sealed_file_beyond_the_manifest_is_clamped_inert() {
         },
         DemotionConfig::for_budget(4 << 20, PAGE),
         128,
+        KeyHasher::default(),
     )
     .expect("recovery keeps the sealed file");
     let metas = recovered.flush.sealed();

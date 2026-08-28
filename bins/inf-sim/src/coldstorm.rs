@@ -38,8 +38,8 @@ use inf_log::{
 };
 use inf_runtime::{BackendDriver, CellExecutor, ColdReads, RawFd, TierFileId, TokenClass, Wait};
 use inf_store::{
-    AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsId, StoreConfig, TieredLookup,
-    TieredTable,
+    AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId, StoreConfig,
+    TieredLookup, TieredTable,
 };
 
 use crate::net::{CellNet, Plant, SimDriver};
@@ -289,7 +289,7 @@ fn plan_chunk(world: &Rc<RefCell<World>>, addr: u64, done: usize, remaining: usi
 /// resume, bounded chunked staging for oversized records, and bounded
 /// restarts when relocation moves the record mid-read.
 async fn cold_get(world: Rc<RefCell<World>>, key: Vec<u8>, cancel_roll: u64) -> GetAnswer {
-    let hash = TieredTable::hash_key(&key);
+    let hash = world.borrow().ks.hasher().hash(&key);
     let from_seq = world.borrow().model.get(&key).map_or(0, |h| h.seq);
     let mut answer = GetAnswer {
         key: key.clone(),
@@ -531,7 +531,7 @@ fn mutate_round(world: &mut World, rng: &mut SplitMix64, ops: &mut u64, budget: 
         *ops += 1;
         let key = format!("k:{:04}", rng.next_u64() % KEYS).into_bytes();
         let roll = rng.next_u64() % 100;
-        let hash = TieredTable::hash_key(&key);
+        let hash = world.ks.hasher().hash(&key);
         let current = world.values.get(&key).cloned();
         match (roll, current) {
             // Delete: index + accounting only, even when cold.
@@ -688,7 +688,7 @@ fn flush_all_sealed(world: &mut World) {
             w.append(LogicalAddr::from_raw(addr).expect("fits"), &bytes).expect("append");
             // Only records still pointed at by the index are live here;
             // dead copies flush as raw bytes (the contiguous-range rule).
-            let hash = TieredTable::hash_key(&key);
+            let hash = world.ks.hasher().hash(&key);
             if lookup_addr(world, &key, hash).map(LogicalAddr::to_raw) == Some(addr) {
                 live.push(key);
             }
@@ -738,7 +738,7 @@ fn relocation_wave(world: &mut World) {
     };
     let keys = world.files[index].live.clone();
     for key in keys {
-        let hash = TieredTable::hash_key(&key);
+        let hash = world.ks.hasher().hash(&key);
         let Some(value) = world.values.get(&key).cloned() else { continue };
         // Content-preserving relocation, modeled as an update (the real
         // S15 copy-forward preserves versions; this harness's oracle
@@ -798,7 +798,10 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
         slice_bytes: 16 << 10,
     };
     let ring = demote.ring_reserve_bytes().expect("valid budget");
-    let mut ks = Keyspace::new(StoreConfig::default());
+    let mut ks = Keyspace::new(StoreConfig {
+        hasher: KeyHasher::from_seed(scenario.seed),
+        ..Default::default()
+    });
     assert!(
         ks.materialize_tiered(
             NS,

@@ -112,6 +112,16 @@ infinityd [--port 6379] [--cells N] [--buffers 4096] [--buf-size 4096]
 | `--route-local-only` | Treat every key as local to the accepting cell (benchmark/diagnostic mode). |
 | `--version` | Print version + git SHA + target and exit. |
 
+### Data-directory files a first boot writes
+
+With `--data-dir`, the first boot of a directory writes two files before
+any cell creates a log, and every later boot reads them:
+
+| File | What it is |
+|---|---|
+| `io-properties.toml` | The device model and barrier class the probe measured (ADR-0091); identity-bound to the filesystem + device. |
+| `key-hash.toml` | The **key-hash secret** (ADR-0094): the index hashes every key with SipHash-1-3 under a 128-bit secret drawn from the OS at this first boot. Every checkpoint ref and index sidecar under the directory is placed by it — never edit it, never copy it between directories, and back it up with the directory. A directory that holds data without it (one written by a pre-ADR-0094 binary) is refused at boot with a typed message: reload from a dump into a new directory. A node without `--data-dir` draws a fresh secret per boot. |
+
 ## Configuration
 
 Configuration uses the Redis `CONFIG` command surface. The most relevant keys

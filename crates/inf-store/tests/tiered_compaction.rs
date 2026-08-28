@@ -22,6 +22,7 @@ use inf_log::{
     TierFlush, TierFlushConfig, TierIoMode, decode_record, read_ick_hybrid, read_manifest,
     tier_extract, tier_frame_offset, tier_frame_span, write_manifest,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, CompactionConfig, CompactionWork, DemotionConfig, LogicalAddr,
     TieredLookup, TieredTable, apply_live_set_section, apply_ref_section, recover_tiered_ns,
@@ -87,7 +88,8 @@ impl Rig {
     fn new() -> Rig {
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
         let fs = MemFs::new();
-        let table = TieredTable::new(space_config(demote, 0), demote, 2048).expect("ring");
+        let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
+            .expect("ring");
         let flush = TierFlush::new(fs.clone(), flush_config(), 0);
         Rig {
             table,
@@ -135,7 +137,7 @@ impl Rig {
 
     /// SET with the D4 marker discipline, D9 origin markers included.
     fn set(&mut self, key: &[u8], value: &[u8]) {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let displaced: Option<(LogicalAddr, usize, u32)> = match self.table.lookup(key, hash, &[]) {
             TieredLookup::Ram(addr) => {
                 let parts = self.table.record(addr);
@@ -187,7 +189,7 @@ impl Rig {
     }
 
     fn del(&mut self, key: &[u8]) {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let target = match self.table.lookup(key, hash, &[]) {
             TieredLookup::Ram(addr) => Some((addr, self.table.record(addr).encoded_len)),
             TieredLookup::Cold(addr) => {
@@ -270,7 +272,7 @@ impl Rig {
         let keys: Vec<(Vec<u8>, Expect)> =
             self.model.iter().map(|(k, e)| (k.clone(), e.clone())).collect();
         for (key, expect) in keys {
-            let hash = TieredTable::hash_key(&key);
+            let hash = KeyHasher::default().hash(&key);
             let mut exclude: Vec<LogicalAddr> = Vec::new();
             let (value, version) = loop {
                 match self.table.lookup(&key, hash, &exclude) {
@@ -317,7 +319,7 @@ impl Rig {
                     .model
                     .iter()
                     .filter_map(|(k, e)| {
-                        let hash = TieredTable::hash_key(k);
+                        let hash = KeyHasher::default().hash(k);
                         let addr = match self.table.lookup(k, hash, &[]) {
                             TieredLookup::Ram(addr) | TieredLookup::Cold(addr) => addr.to_raw(),
                             TieredLookup::Miss => return None,
@@ -337,7 +339,7 @@ fn keys_in_file(rig: &Rig, base: u64, len: u64) -> Vec<Vec<u8>> {
     rig.model
         .keys()
         .filter(|key| {
-            let hash = TieredTable::hash_key(key);
+            let hash = KeyHasher::default().hash(key);
             matches!(
                 rig.table.lookup(key, hash, &[]),
                 TieredLookup::Cold(addr) if addr.to_raw() >= base && addr.to_raw() < base + len
@@ -475,7 +477,8 @@ fn stalled_relocation_resumes_after_window_progress() {
     // A small budget so relocations hit the admission bound quickly.
     let demote = DemotionConfig::for_budget(192 << 10, PAGE);
     let fs = MemFs::new();
-    let table = TieredTable::new(space_config(demote, 0), demote, 2048).expect("ring");
+    let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
+        .expect("ring");
     let flush = TierFlush::new(fs.clone(), flush_config(), 0);
     let mut rig = Rig {
         table,
@@ -508,7 +511,7 @@ fn stalled_relocation_resumes_after_window_progress() {
     let mut i = 0u64;
     loop {
         let key = format!("fill:{i:04}").into_bytes();
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         if rig.table.insert(&key, &[0x44; 96], hash).is_err() {
             break;
         }
@@ -569,7 +572,7 @@ fn oversized_record_scans_via_need() {
     // Kill enough small records around it to arm the trigger in the
     // big record's file, keeping the big record live.
     let files: Vec<_> = rig.table.live_set().files().to_vec();
-    let big_hash = TieredTable::hash_key(b"big:record");
+    let big_hash = KeyHasher::default().hash(b"big:record");
     let TieredLookup::Cold(big_addr) = rig.table.lookup(b"big:record", big_hash, &[]) else {
         panic!("the big record demoted cold");
     };
@@ -595,7 +598,7 @@ fn oversized_record_scans_via_need() {
     // verify content (the `need` path is exercised by any chunk smaller
     // than the record; compact_burst honors `need` by construction).
     let expect = rig.model.get(b"big:record".as_slice()).expect("live").clone();
-    let hash = TieredTable::hash_key(b"big:record");
+    let hash = KeyHasher::default().hash(b"big:record");
     match rig.table.lookup(b"big:record", hash, &[]) {
         TieredLookup::Ram(addr) => {
             assert_eq!(rig.table.record(addr).value, expect.value.as_slice());
@@ -762,6 +765,7 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
         space_config(demote, 0),
         demote,
         2048,
+        KeyHasher::default(),
     )
     .expect("recovery");
     let table = std::cell::RefCell::new(recovered.table);
@@ -774,7 +778,7 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
             if let RecordView::StringPostImage { key, value, .. } = record {
                 table
                     .borrow_mut()
-                    .apply_image(key, value, TieredTable::hash_key(key))
+                    .apply_image(key, value, KeyHasher::default().hash(key))
                     .expect("fits");
             }
             Ok::<(), std::convert::Infallible>(())
@@ -806,14 +810,14 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
                 assert!(pending.len() <= 4, "register within the D9 bound");
             }
             RecordView::StringPostImage { key, value, .. } => {
-                let hash = TieredTable::hash_key(key);
+                let hash = KeyHasher::default().hash(key);
                 for old in pending.drain(..) {
                     table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
                 }
                 table.apply_image(key, value, hash).expect("fits");
             }
             RecordView::Delete { key, .. } => {
-                let hash = TieredTable::hash_key(key);
+                let hash = KeyHasher::default().hash(key);
                 for old in pending.drain(..) {
                     table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
                 }
@@ -914,7 +918,8 @@ fn endurance_slice_disk_oscillates_and_statvfs_reclaims() {
     // reclaim pipeline actually cycles.
     let demote = DemotionConfig::for_budget(256 << 10, PAGE);
     let config = TierFlushConfig { shard_dir: shard.clone(), ..flush_config() };
-    let mut table = TieredTable::new(space_config(demote, 0), demote, 4096).expect("ring");
+    let mut table = TieredTable::new(space_config(demote, 0), demote, 4096, KeyHasher::default())
+        .expect("ring");
     table.set_compaction_config(CompactionConfig { dead_ratio_pct: 50, slice_bytes: 1 << 20 });
     let mut flush = TierFlush::new(StdSegmentFs, config, 0);
 
@@ -947,7 +952,7 @@ fn endurance_slice_disk_oscillates_and_statvfs_reclaims() {
         for i in 0..keys {
             let key = format!("e:{i:05}");
             let value = vec![(seeded(&mut seed) % 251) as u8; 96];
-            let hash = TieredTable::hash_key(key.as_bytes());
+            let hash = KeyHasher::default().hash(key.as_bytes());
             loop {
                 let done = match table.lookup(key.as_bytes(), hash, &[]) {
                     TieredLookup::Ram(addr) => {

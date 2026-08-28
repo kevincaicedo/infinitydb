@@ -54,9 +54,9 @@ use inf_log::{
     tier_frame_span, write_manifest,
 };
 use inf_store::{
-    AddressSpaceConfig, BlobConfig, CompactionWork, DemotionConfig, ExtentRef, LogicalAddr,
-    TieredLookup, TieredTable, apply_blob_ref_section, apply_live_set_section, apply_ref_section,
-    forced_collision_pair, recover_tiered_ns,
+    AddressSpaceConfig, BlobConfig, CompactionWork, DemotionConfig, ExtentRef, KeyHasher,
+    LogicalAddr, TieredLookup, TieredTable, apply_blob_ref_section, apply_live_set_section,
+    apply_ref_section, forced_collision_pair, recover_tiered_ns,
 };
 
 const NS: NsId = NsId(88);
@@ -172,8 +172,8 @@ struct Life {
     flush_lag: bool,
 }
 
-fn tiered_table(origin: u64) -> TieredTable {
-    let mut table = TieredTable::new(space_config(origin), demote(), 1024).expect("ring");
+fn tiered_table(origin: u64, hasher: KeyHasher) -> TieredTable {
+    let mut table = TieredTable::new(space_config(origin), demote(), 1024, hasher).expect("ring");
     table.set_blob_config(BlobConfig { threshold_bytes: BLOB_THRESHOLD, max_bytes: 1 << 20 });
     // The shadow arm (M4.5-S37, ADR-0093 D8) runs on in this harness —
     // the store-level DST's authority over the mechanism.
@@ -556,7 +556,7 @@ impl Run {
     /// displacement marker (ADR-0057 D4 — unconditional for displacing
     /// mutations).
     fn apply_op(&mut self, life: &mut Life, key: &[u8], op: Op) {
-        let hash = TieredTable::hash_key(key);
+        let hash = life.table.hash_key(key);
         if key.starts_with(inf_store::COLLISION_KEY_PREFIX) {
             self.report.shadow_collide_ops += 1;
         }
@@ -784,7 +784,7 @@ impl Run {
     /// are per-life (§3.1).
     fn audit(&mut self, life: &Life, when: &str) {
         for (key, expect) in &self.model {
-            let hash = TieredTable::hash_key(key);
+            let hash = life.table.hash_key(key);
             let mut exclude: Vec<LogicalAddr> = Vec::new();
             let got = loop {
                 match life.table.lookup(key, hash, &exclude) {
@@ -1011,6 +1011,9 @@ fn seeded_op(rng: &mut SplitMix64) -> Op {
 #[must_use]
 pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
     let mut rng = SplitMix64::new(scenario.seed ^ 0x4EC0_7E4Fu64);
+    // The table's key hasher (ADR-0094 D2): seed-derived, one value for
+    // every life of the run (the checkpoint's refs are its outputs).
+    let hasher = KeyHasher::from_seed(scenario.seed ^ 0x4B45_5948);
     let disk = SimDisk::new();
     let shard = PathBuf::from("node/shard-0");
     disk.create_dir_all(&shard).expect("shard dir");
@@ -1023,7 +1026,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         report: RecoveryReport::default(),
     };
     let mut life = Life {
-        table: tiered_table(0),
+        table: tiered_table(0, hasher),
         flush: TierFlush::new(disk.clone(), flush_config(&shard), 0),
         ring: StagingRing::new(StagingConfig::default()),
         flush_lag: false,
@@ -1286,6 +1289,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             space_config(0),
             demote(),
             1024,
+            hasher,
         ) {
             Ok(recovered) => recovered,
             Err(e) => {
@@ -1302,17 +1306,14 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             |record| {
                 match record {
                     RecordView::StringPostImage { key, value, .. } => {
-                        table
-                            .borrow_mut()
-                            .apply_image(key, value, TieredTable::hash_key(key))
-                            .expect("fits");
+                        table.borrow_mut().apply_image(key, value, hasher.hash(key)).expect("fits");
                     }
                     RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
                         table
                             .borrow_mut()
                             .apply_extent_image(
                                 key,
-                                TieredTable::hash_key(key),
+                                hasher.hash(key),
                                 ExtentRef { extent_id, offset, len },
                             )
                             .expect("fits");
@@ -1355,14 +1356,14 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                     assert!(pending.len() <= 4, "displace register exceeds the D9 bound");
                 }
                 RecordView::StringPostImage { key, value, .. } => {
-                    let hash = TieredTable::hash_key(key);
+                    let hash = table.hash_key(key);
                     for old in pending.drain(..) {
                         table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
                     }
                     table.apply_image(key, value, hash).expect("fits");
                 }
                 RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
-                    let hash = TieredTable::hash_key(key);
+                    let hash = table.hash_key(key);
                     for old in pending.drain(..) {
                         table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
                     }
@@ -1371,7 +1372,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                         .expect("fits");
                 }
                 RecordView::Delete { key, .. } => {
-                    let hash = TieredTable::hash_key(key);
+                    let hash = table.hash_key(key);
                     for old in pending.drain(..) {
                         table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
                     }
@@ -1391,18 +1392,15 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // by construction (two RAM keys with one hash beside a cold
         // twin) or beyond the cap, read and settled by their full key
         // before the life serves.
-        let settle = table.rebuild_shadow_tickets();
-        for slot in settle {
-            let Some(image) = read_cold_record(&disk, &recovered.flush, slot.cold.to_raw()) else {
-                run.report.violations.push(format!(
-                    "life {life_index}: settle slot at {} ({:?}) unreadable",
-                    slot.cold.to_raw(),
-                    slot.reason
-                ));
-                return run.report;
-            };
-            table.settle_rebuilt_slot(slot.hash, slot.cold, &image);
-            run.report.shadow_settled_at_boot += 1;
+        let settled_at_boot = &mut run.report.shadow_settled_at_boot;
+        if let Err(err) = table.rebuild_shadow_tickets(|slot| -> Result<Vec<u8>, String> {
+            let image = read_cold_record(&disk, &recovered.flush, slot.cold.to_raw())
+                .ok_or_else(|| "unreadable while its slot is live".to_owned())?;
+            *settled_at_boot += 1;
+            Ok(image)
+        }) {
+            run.report.violations.push(format!("life {life_index}: {err}"));
+            return run.report;
         }
         // The M4-S14 oracle (ADR-0058 D4): by replay-complete, every
         // recovered file's slot count equals the index's ground truth,

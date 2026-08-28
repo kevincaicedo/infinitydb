@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, EvictionPressure, Keyspace, LogicalAddr, NsId, StoreConfig,
     TieredLookup, TieredTable,
@@ -121,7 +122,7 @@ impl Harness {
     /// Ground-truth read through the fetch-verify contract (cold reads
     /// resolve against the captured tier bytes — index-only, §3.3).
     fn find(&mut self, key: &[u8]) -> Option<(Vec<u8>, bool)> {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let mut exclude: Vec<LogicalAddr> = Vec::new();
         loop {
             assert!(exclude.len() <= 4, "fingerprint collision storm");
@@ -163,7 +164,7 @@ fn fill_to_4x_budget_holds_rss_within_one_slice() {
         while round_bytes < PAGE && written < total_target {
             let key = format!("fill:{keys:08}");
             let value = value_of(keys, seed);
-            let hash = TieredTable::hash_key(key.as_bytes());
+            let hash = KeyHasher::default().hash(key.as_bytes());
             let addr = h
                 .table()
                 .insert(key.as_bytes(), &value, hash)
@@ -255,7 +256,7 @@ fn unpaced_burst_stalls_on_the_budget_and_resumes_after_flush_progress() {
     loop {
         let key = format!("burst:{i:08}");
         let value = value_of(i, 0xB0057);
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         match h.table().insert(key.as_bytes(), &value, hash) {
             Ok(addr) => {
                 let len = h.table().record(addr).encoded_len;
@@ -285,7 +286,7 @@ fn unpaced_burst_stalls_on_the_budget_and_resumes_after_flush_progress() {
         rounds += 1;
         assert!(rounds < 4096, "flush progress must reach the stall target");
     }
-    let hash = TieredTable::hash_key(stalled_key.as_bytes());
+    let hash = KeyHasher::default().hash(stalled_key.as_bytes());
     h.table()
         .insert(stalled_key.as_bytes(), &stalled_value, hash)
         .expect("the stall target is exact — the woken retry fits");

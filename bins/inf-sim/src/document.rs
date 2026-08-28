@@ -29,6 +29,8 @@ use inf_log::{
 use inf_server::{SimDisk, load_catalog_from};
 use inf_store::{CheckpointImage, Keyspace, NsId, StoreConfig, WallAnchor};
 
+use crate::harness::node_hasher;
+
 use crate::durable::{DurableScenario, Node, Pending, Writer, bulk, encode};
 
 // ---- the fuzz-derived document corpus (M3-S24) ------------------------------
@@ -493,7 +495,8 @@ pub(crate) fn equivalence_check(
     };
     let mut canary = scenario.replay_canary;
     for cell in 0..scenario.cells {
-        let mut shadow = Keyspace::new(StoreConfig::default());
+        let mut shadow =
+            Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() });
         if let Err(err) = shadow.seed_catalog(&catalog) {
             violations.push(format!(
                 "REPLAY EQUIVALENCE VIOLATION seed {:#x} [{label}]: seed_catalog: {err:?}",

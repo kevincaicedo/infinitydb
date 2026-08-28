@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use inf_doc::JsonParser;
 use inf_foundation::time::Nanos;
+use inf_store::KeyHasher;
 use inf_store::{CellStore, ExpireCond, JsonSetOptions, StoreConfig};
 
 #[allow(dead_code, unused_imports)] // shared generator also contains its CLI and witness tests
@@ -73,7 +74,7 @@ fn run(store: &mut CellStore, keys: &[[u8; 12]], arm: Arm) -> f64 {
     for chunk in keys.chunks(BATCH) {
         if arm != Arm::Off {
             for (index, key) in chunk.iter().enumerate() {
-                hashes[index] = CellStore::hash_key(key);
+                hashes[index] = KeyHasher::default().hash(key);
                 store.prefetch(hashes[index]);
             }
             for hash in &hashes[..chunk.len()] {

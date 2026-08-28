@@ -21,6 +21,9 @@ default = ["doc"]
 doc = ["dep:inf-doc"]
 # Repeated-key interning experiment (M3-S04, ADR-0038) - default-off.
 doc-intern-keys = ["doc", "inf-doc/doc-intern-keys"]
+# ADR-0094 D3: the collision oracle as a hasher mode (tests and the
+# simulators only — never a shipping build; see inf-foundation).
+collision-oracle = ["inf-foundation/collision-oracle"]
 
 [dev-dependencies]
 proptest.workspace = true
@@ -29,7 +32,7 @@ criterion.workspace = true
 libc.workspace = true
 # M4-S21: the `*_nospace` injection legs in `tiered_diskfull.rs` — the
 # same dev-dependency feature unification the inf-log tests ride.
-inf-foundation = { workspace = true, features = ["fault-points"] }
+inf-foundation = { workspace = true, features = ["fault-points", "collision-oracle"] }
 
 [[bench]]
 name = "store"

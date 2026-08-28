@@ -20,6 +20,7 @@ mod glob;
 mod io_properties;
 #[cfg(feature = "doc")]
 mod json;
+mod key_hash;
 mod log_bytes;
 mod plane;
 mod pubsub;
@@ -67,6 +68,10 @@ pub use inf_log::{
 };
 pub use io_properties::{
     IO_PROPERTIES_FILE, IoProperties, IoPropertiesError, IoPropertiesSource, IoProvenance,
+};
+pub use key_hash::{
+    KEY_HASH_FILE, KeyHashError, KeyHashSource, create_key_hash, directory_has_data, load_key_hash,
+    parse_key_hash, render_key_hash, resolve_key_hash,
 };
 pub use plane::{ExecOrigin, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane};
 pub use readahead::{ReadAheadFile, ReadAheadFs};

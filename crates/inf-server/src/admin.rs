@@ -761,6 +761,7 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     // oracles read these.
     let shadow = ks.tiering_shadow();
     push(text, &format!("tiering_shadow_enabled:{}", shadow.enabled));
+    push(text, &format!("tiering_shadow_reconcile_paused:{}", shadow.reconcile_paused));
     push(text, &format!("tiering_shadow_created:{}", shadow.created));
     push(text, &format!("tiering_shadow_resolved_same_key:{}", shadow.resolved_same_key));
     push(text, &format!("tiering_shadow_resolved_collision:{}", shadow.resolved_collision));
@@ -1165,6 +1166,8 @@ pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
     // M4.5-S37 (ADR-0093 D8): the shadow arm rides the same sweep;
     // absent or anything but `yes` is off (the shipping default).
     let shadow = cfg.get("tiered-shadow-overwrite").is_some_and(|v| v == "yes");
+    // ADR-0093 A8: the reconciler runs unless paused (`no`); absent is on.
+    let reconcile = cfg.get("tiered-shadow-reconcile").is_none_or(|v| v != "no");
     drop(cfg);
     let cells = u64::from(node.cells.get().max(1));
     // Per-namespace MAXMEMORY shares divide by the same symmetric cell
@@ -1175,6 +1178,7 @@ pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
     ks.set_tiered_va_limit(va_limit / cells);
     ks.set_tier_promote(promote);
     ks.set_tier_shadow(shadow);
+    ks.set_tier_shadow_reconcile(reconcile);
 }
 
 // ---- INF.NS (M1-S08) -----------------------------------------------------------
@@ -2067,6 +2071,7 @@ mod tests {
             "tiering_promote_filter_bytes",
             // M4.5-S37 (ADR-0093 D8): no table, no tickets.
             "tiering_shadow_enabled",
+            "tiering_shadow_reconcile_paused",
             "tiering_shadow_created",
             "tiering_shadow_pending",
             "tiering_shadow_pinned_bytes",
@@ -2088,7 +2093,7 @@ mod tests {
     /// cell aggregate is the exact sum of those lines.
     #[test]
     fn info_tiering_renders_per_namespace_watermarks_and_write_counters() {
-        use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId, TieredTable};
+        use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
         let mut cx = ConnCx::default();
         let mut store = Keyspace::new(StoreConfig::default());
@@ -2109,7 +2114,7 @@ mod tests {
                 .is_ok()
         );
         let table = store.tiered_store_mut(ns).expect("materialized");
-        table.insert(b"key", b"value", TieredTable::hash_key(b"key")).expect("fits");
+        table.insert(b"key", b"value", KeyHasher::default().hash(b"key")).expect("fits");
 
         let text =
             String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tiering"])).expect("ascii");
@@ -2214,7 +2219,7 @@ mod tests {
     #[test]
     fn info_tiering_reports_write_amplification_per_namespace() {
         use inf_log::{MutationEffect, StagingConfig, StagingRing};
-        use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId, TieredTable};
+        use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
         let mut cx = ConnCx::default();
         let mut store = Keyspace::new(StoreConfig::default());
@@ -2248,7 +2253,7 @@ mod tests {
                 MutationEffect::StringSet { ns: NsId(7), key: key.as_bytes(), value: &value };
             table.stage_wal(&mut ring, &effect).expect("frame has room");
             table
-                .insert(key.as_bytes(), &value, TieredTable::hash_key(key.as_bytes()))
+                .insert(key.as_bytes(), &value, KeyHasher::default().hash(key.as_bytes()))
                 .expect("fits");
         }
         let measured = table.write_accounting();
@@ -2434,7 +2439,7 @@ mod tests {
         use inf_log::TierIoMode;
         use inf_log::blob::{ExtentId, ExtentWriter};
         use inf_log::fs::mem::MemFs;
-        use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId, TieredTable};
+        use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
         let mut cx = ConnCx::default();
         let mut store = Keyspace::new(StoreConfig::default());
@@ -2471,7 +2476,7 @@ mod tests {
         let table = store.tiered_store_mut(ns).expect("materialized");
         table.note_blob_bytes(sealed.device_bytes());
         table
-            .insert_extent(b"blob-key", TieredTable::hash_key(b"blob-key"), &sealed)
+            .insert_extent(b"blob-key", KeyHasher::default().hash(b"blob-key"), &sealed)
             .expect("fits");
         let expect_milli = table
             .write_accounting()

@@ -40,8 +40,8 @@ use inf_log::{
 use inf_server::{DurableConfig, open_cell_log};
 use inf_store::{
     BackfillBudget, FsyncClass, INDEX_KEY_ENCODING_VERSION, IndexId, IndexKeyBuf, IndexKeyType,
-    IndexScalar, IndexSpec, IndexState, Keyspace, NsCatalog, NsMode, NsSpec, StoreConfig,
-    WallAnchor, index_key_encode,
+    IndexScalar, IndexSpec, IndexState, KeyHasher, Keyspace, NsCatalog, NsMode, NsSpec,
+    StoreConfig, WallAnchor, index_key_encode,
 };
 
 const NS: NsId = NsId(16);
@@ -204,7 +204,7 @@ fn build_shard(data_dir: &Path, docs: u64, sidecars: bool) -> u64 {
                     _ => IndexScalar::I64(ts),
                 };
                 index_key_encode(key_type, scalar, &mut buf).expect("encodable");
-                let hash = inf_store::CellStore::hash_key(&key_of(i));
+                let hash = KeyHasher::default().hash(&key_of(i));
                 entries.insert((buf.as_bytes().to_vec(), hash));
             }
             let meta = IdxSidecarMeta {

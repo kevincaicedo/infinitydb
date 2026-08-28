@@ -23,6 +23,7 @@ use std::collections::BTreeSet;
 use inf_doc::JsonParser;
 use inf_doc::path::{EvalLimits, compile, eval, resolve};
 use inf_foundation::time::Nanos;
+use inf_store::KeyHasher;
 use inf_store::{
     CellStore, EvictBudget, EvictionPolicy, ExpiryBudget, IndexId, IndexKeyBuf, IndexKeyType,
     IndexScalar, IndexSpec, IndexState, Keyspace, NsId, OrderedCursor, PressureConfig, SetOptions,
@@ -147,7 +148,7 @@ fn doc_entries(
     let Ok(Some(read)) = store.json_get(key, now) else { return };
     let program = compile(path.as_bytes()).expect("valid path");
     let matches = eval(&program, read.root, &EvalLimits::default()).expect("test docs are small");
-    let hash = CellStore::hash_key(key);
+    let hash = KeyHasher::default().hash(key);
     let mut buf = IndexKeyBuf::new();
     for steps in matches.iter() {
         let Some(value) = resolve(read.root, steps) else { continue };

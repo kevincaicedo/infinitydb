@@ -30,6 +30,7 @@ use inf_log::{
     SyncIckWriter, TierFlush, TierFlushConfig, TierIoMode, decode_record, read_ick_hybrid,
     write_manifest,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, BlobConfig, CompactionWork, DemotionConfig, LogicalAddr, TieredLookup,
     TieredTable, apply_blob_ref_section, apply_live_set_section, apply_ref_section,
@@ -102,6 +103,7 @@ impl Rig {
             },
             demote,
             2048,
+            KeyHasher::default(),
         )
         .expect("ring");
         table.set_blob_config(BlobConfig { threshold_bytes: THRESHOLD, max_bytes: 1 << 20 });
@@ -167,7 +169,7 @@ impl Rig {
     /// or above it (ADR-0061 D3 — the token is the ordering proof).
     fn set(&mut self, id: u64, generation: u64, blob: bool) {
         let key = Self::key(id);
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         let value = value_for(id, generation, blob);
         let old = self.model.get(&id).cloned();
         if let Some(old) = &old {
@@ -289,7 +291,7 @@ impl Rig {
     fn del(&mut self, id: u64) {
         let Some(entry) = self.model.remove(&id) else { return };
         let key = Self::key(id);
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         let addr = LogicalAddr::from_raw(entry.addr).expect("48-bit");
         self.stage_displacement(hash, addr);
         self.stage(&MutationEffect::Delete { ns: NS, key: &key });
@@ -332,7 +334,7 @@ impl Rig {
         let entries: Vec<u64> = self.model.keys().copied().collect();
         for id in entries {
             let key = Self::key(id);
-            let hash = TieredTable::hash_key(&key);
+            let hash = KeyHasher::default().hash(&key);
             let entry = self.model.get_mut(&id).expect("just listed");
             if let Some(ext) = entry.extent_id {
                 let (addr, _, _) = references
@@ -653,6 +655,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
         },
         demote,
         2048,
+        KeyHasher::default(),
     )
     .expect("recovery");
     assert!(
@@ -670,7 +673,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
                 RecordView::StringPostImage { key, value, .. } => {
                     table
                         .borrow_mut()
-                        .apply_image(key, value, TieredTable::hash_key(key))
+                        .apply_image(key, value, KeyHasher::default().hash(key))
                         .expect("fits");
                 }
                 RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
@@ -678,7 +681,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
                         .borrow_mut()
                         .apply_extent_image(
                             key,
-                            TieredTable::hash_key(key),
+                            KeyHasher::default().hash(key),
                             inf_store::ExtentRef { extent_id, offset, len },
                         )
                         .expect("fits");
@@ -802,14 +805,14 @@ fn replay_tail(table: &mut TieredTable, tail: &[u8]) {
                 assert!(pending.len() <= 4, "displace register exceeds the D9 bound");
             }
             RecordView::StringPostImage { key, value, .. } => {
-                let hash = TieredTable::hash_key(key);
+                let hash = KeyHasher::default().hash(key);
                 for old in pending.drain(..) {
                     table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
                 }
                 table.apply_image(key, value, hash).expect("fits");
             }
             RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
-                let hash = TieredTable::hash_key(key);
+                let hash = KeyHasher::default().hash(key);
                 for old in pending.drain(..) {
                     table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
                 }
@@ -818,7 +821,7 @@ fn replay_tail(table: &mut TieredTable, tail: &[u8]) {
                     .expect("fits");
             }
             RecordView::Delete { key, .. } => {
-                let hash = TieredTable::hash_key(key);
+                let hash = KeyHasher::default().hash(key);
                 for old in pending.drain(..) {
                     table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
                 }

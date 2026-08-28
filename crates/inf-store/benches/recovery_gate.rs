@@ -27,6 +27,7 @@ use inf_log::ckpt::{CkptConfig, IckReaderConfig, ick_file_name, read_ick_hybrid}
 use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
 use inf_log::{Lsn, NsId, RecordView, SegmentId, SyncIckWriter};
+use inf_store::KeyHasher;
 use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, TieredTable};
 
 const NS: NsId = NsId(31);
@@ -70,6 +71,7 @@ fn bench_images(n: u64, value_len: usize) {
             },
             demote,
             usize::try_from(n).expect("fits"),
+            KeyHasher::default(),
         )
         .expect("ring");
         let t = Instant::now();
@@ -79,7 +81,7 @@ fn bench_images(n: u64, value_len: usize) {
             IckReaderConfig::default(),
             |record| {
                 if let RecordView::StringPostImage { key, value, .. } = record {
-                    table.apply_image(key, value, TieredTable::hash_key(key)).expect("fits");
+                    table.apply_image(key, value, KeyHasher::default().hash(key)).expect("fits");
                 }
                 Ok::<(), std::convert::Infallible>(())
             },
@@ -146,6 +148,7 @@ fn bench_refs(n: u64) {
             },
             demote,
             usize::try_from(n).expect("fits"),
+            KeyHasher::default(),
         )
         .expect("ring");
         // One manifested file covering every ref (M4-S14): `apply_ref`

@@ -33,6 +33,7 @@ use inf_log::{
     MutationEffect, NsId, StagingConfig, StagingRing, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
     TierIoMode, tier_extract, tier_frame_offset, tier_frame_span,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, CompactionConfig, CompactionWork, DemotionConfig, DiskFullCause,
     LogicalAddr, OpError, TieredTable,
@@ -96,6 +97,7 @@ impl Rig {
             },
             demote,
             2048,
+            KeyHasher::default(),
         )
         .expect("ring");
         table.set_compaction_config(CompactionConfig { dead_ratio_pct: 50, slice_bytes: 1 << 20 });
@@ -146,7 +148,7 @@ impl Rig {
     /// the caller decides whether it expected one.
     fn set(&mut self, id: u64, generation: u64) -> Result<(), OpError> {
         let key = Self::key(id);
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         let value = Self::value_for(id, generation);
         let old = self.model.get(&id).cloned();
         if let Some(o) = &old {
@@ -181,7 +183,7 @@ impl Rig {
     fn del(&mut self, id: u64) {
         let Some(entry) = self.model.remove(&id) else { return };
         let key = Self::key(id);
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         let addr = LogicalAddr::from_raw(entry.addr).expect("48-bit");
         let _ = self.table.take_displacement_origins(hash, addr);
         self.stage(&MutationEffect::Delete { ns: NS, key: &key });
@@ -259,7 +261,7 @@ impl Rig {
     fn refresh_model_addresses(&mut self) {
         for (id, entry) in &mut self.model {
             let key = Self::key(*id);
-            let hash = TieredTable::hash_key(&key);
+            let hash = KeyHasher::default().hash(&key);
             match self.table.lookup(&key, hash, &[]) {
                 inf_store::TieredLookup::Ram(addr) | inf_store::TieredLookup::Cold(addr) => {
                     entry.addr = addr.to_raw();
@@ -316,7 +318,7 @@ impl Rig {
         let model: Vec<(u64, Entry)> = self.model.iter().map(|(k, v)| (*k, v.clone())).collect();
         for (id, entry) in model {
             let key = Self::key(id);
-            let hash = TieredTable::hash_key(&key);
+            let hash = KeyHasher::default().hash(&key);
             let expect = Self::value_for(id, entry.generation);
             match self.table.lookup(&key, hash, &[]) {
                 inf_store::TieredLookup::Ram(addr) => {
@@ -426,7 +428,7 @@ fn budget_cap_refuses_typed_and_nonconsuming_ops_proceed() {
     let live = rig.table.live_bytes();
     let user = rig.table.write_accounting().user_bytes;
     let key = Rig::key(next_id + 1);
-    let hash = TieredTable::hash_key(&key);
+    let hash = KeyHasher::default().hash(&key);
     let value = Rig::value_for(next_id + 1, 1);
     assert!(matches!(
         rig.table.insert(&key, &value, hash),
@@ -439,13 +441,13 @@ fn budget_cap_refuses_typed_and_nonconsuming_ops_proceed() {
     // Reads serve at the cap — the oldest key is cold by now, the
     // newest is RAM; both resolve.
     let first = Rig::key(0);
-    let h_first = TieredTable::hash_key(&first);
+    let h_first = KeyHasher::default().hash(&first);
     assert!(
         matches!(rig.table.lookup(&first, h_first, &[]), inf_store::TieredLookup::Cold(_)),
         "the oldest key reads cold — and still resolves at the cap"
     );
     let last = Rig::key(next_id - 1);
-    let h_last = TieredTable::hash_key(&last);
+    let h_last = KeyHasher::default().hash(&last);
     assert!(
         !matches!(rig.table.lookup(&last, h_last, &[]), inf_store::TieredLookup::Miss),
         "the newest key resolves at the cap"
@@ -643,7 +645,7 @@ fn device_enospc_latches_foreground_and_clears_on_successful_flush() {
     assert!(matches!(refusal, OpError::DiskFull(DiskFullCause::Device)), "{refusal:?}");
     // Reads and deletes proceed under the latch.
     let first = Rig::key(0);
-    let h = TieredTable::hash_key(&first);
+    let h = KeyHasher::default().hash(&first);
     assert!(!matches!(rig.table.lookup(&first, h, &[]), inf_store::TieredLookup::Miss));
     rig.del(0);
 
@@ -740,7 +742,7 @@ fn blob_write_enospc_is_per_op_typed_and_self_heals() {
         len: sealed.data_len(),
     });
     rig.table
-        .insert_extent(b"blob", TieredTable::hash_key(b"blob"), &sealed)
+        .insert_extent(b"blob", KeyHasher::default().hash(b"blob"), &sealed)
         .expect("the reference lands");
 }
 
@@ -772,7 +774,7 @@ fn blob_placement_respects_the_disk_budget() {
     let sealed = w.finish().expect("finish");
     let err = rig
         .table
-        .insert_extent(b"big", TieredTable::hash_key(b"big"), &sealed)
+        .insert_extent(b"big", KeyHasher::default().hash(b"big"), &sealed)
         .expect_err("the reference refuses past the admit limit");
     assert!(matches!(err, OpError::DiskFull(DiskFullCause::Budget { .. })), "{err:?}");
     assert_eq!(rig.table.extent_stats().live, 0, "no reference registered on refusal");

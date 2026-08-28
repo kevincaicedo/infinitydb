@@ -25,6 +25,7 @@ use inf_log::flush::{TierFlush, TierFlushConfig};
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{NsId, TierIoMode};
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, StoreConfig, TieredLookup,
     TieredTable,
@@ -115,7 +116,7 @@ fn run_storm<F: SegmentFs>(fs: F, shard_dir: PathBuf, mode: TierIoMode, label: &
     for i in 0..KEYS {
         let key = format!("k:{i:06}");
         let value = vec![0x41u8; 64 + (seeded(&mut seed) % 192) as usize];
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         let table = storm.table();
         let addr = table.insert(key.as_bytes(), &value, hash).expect("fits");
         lens.push(table.record(addr).encoded_len);
@@ -132,7 +133,7 @@ fn run_storm<F: SegmentFs>(fs: F, shard_dir: PathBuf, mode: TierIoMode, label: &
             ops += 1;
             let idx = (seeded(&mut seed) % KEYS) as usize;
             let key = format!("k:{idx:06}");
-            let hash = TieredTable::hash_key(key.as_bytes());
+            let hash = KeyHasher::default().hash(key.as_bytes());
             let is_set = seeded(&mut seed) % 10 < 3;
             let started = Instant::now();
             if is_set {

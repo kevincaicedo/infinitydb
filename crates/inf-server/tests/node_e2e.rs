@@ -1136,6 +1136,76 @@ fn read_line(stream: &mut TcpStream) -> Vec<u8> {
     }
 }
 
+/// Review of 2026-08-28 (M4.5-S37 finding 2): `DBSIZE` on a
+/// namespace-bound connection is the **node-wide** count — the compat
+/// matrix's `DBSIZE | full` — on a memory namespace, a flat durable one
+/// and a tiered one, with keys spread over both cells of a two-cell
+/// node; before, it answered the connection's cell alone. Asked from a
+/// second connection too (whichever cell it lands on, the same count).
+#[test]
+fn namespace_bound_dbsize_counts_every_cell() {
+    let dir = temp_data_dir("ns-dbsize");
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    let namespaces: [&[&[u8]]; 3] = [
+        &[b"INF.NS", b"CREATE", b"cache", b"MODE", b"memory"],
+        &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"everysec"],
+        &[
+            b"INF.NS",
+            b"CREATE",
+            b"hot",
+            b"MODE",
+            b"durable",
+            b"MEM-BUDGET",
+            b"8mb",
+            b"DISK-BUDGET",
+            b"64mb",
+            b"MUTABLE-FRACTION",
+            b"100",
+        ],
+    ];
+    for create in namespaces {
+        c.write_all(&cmd(create)).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    // Keys owned by each cell, ten per cell, so a per-cell answer would
+    // read 10 and the node-wide one 20.
+    let keys: Vec<Vec<u8>> = (0..10u32)
+        .flat_map(|i| {
+            let mut a = key_for_cell(2, 0);
+            a.extend_from_slice(format!(":{i}").as_bytes());
+            let mut b = key_for_cell(2, 1);
+            b.extend_from_slice(format!(":{i}").as_bytes());
+            [a, b]
+        })
+        .collect();
+    for ns in [&b"cache"[..], b"ledger", b"hot"] {
+        c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+        read_exactly(&mut c, b":0\r\n");
+        for key in &keys {
+            c.write_all(&cmd(&[b"SET", key, b"v"])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+        read_exactly(&mut c, b":20\r\n");
+        // Single-key deletes (a multi-key DEL spanning cells is the
+        // recorded M2 limitation of named namespaces): one per cell + one.
+        for key in &keys[..3] {
+            c.write_all(&cmd(&[b"DEL", key])).expect("write");
+            read_exactly(&mut c, b":1\r\n");
+        }
+        c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+        read_exactly(&mut c, b":17\r\n");
+        // A second connection, bound to the same namespace — the same
+        // node-wide answer whichever cell accepted it.
+        let mut other = connect_use(&node, ns);
+        other.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+        read_exactly(&mut other, b":17\r\n");
+    }
+}
+
 /// `INF.NS CREATE … MODE durable` goes live: create → USE → write → read,
 /// `always` acks return (after fsync — the reply itself is the proof the
 /// gate opened), then a full restart recovers both the namespace

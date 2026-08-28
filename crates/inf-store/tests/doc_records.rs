@@ -17,6 +17,7 @@ use inf_store::{
 };
 
 use inf_foundation::time::Nanos;
+use inf_store::KeyHasher;
 
 fn now() -> Nanos {
     Nanos::from_millis(1)
@@ -124,7 +125,7 @@ fn document_root_prefetch_is_hint_only_for_every_record_form() {
     let report = s.report();
     let stats = s.stats();
     for key in [b"inline".as_slice(), b"tape", b"tree", b"string", b"missing"] {
-        let hash = CellStore::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         s.prefetch(hash);
         s.probe_prefetch(hash);
         s.prefetch_doc_root(hash);

@@ -41,7 +41,7 @@ use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_foundation::{CellId, hash64};
 use inf_runtime::{CellLoop, LoopConfig};
 use inf_server::{ConnCx, ExecOrigin, NodeInfo, PlaneObserver, ServerPlane, execute_slices};
-use inf_store::{ExpiryBudget, Keyspace, StoreConfig};
+use inf_store::{ExpiryBudget, KeyHasher, Keyspace, StoreConfig};
 use inf_wire::Protocol;
 
 use crate::net::{CellNet, Plant, SimDriver, listener_fd};
@@ -141,6 +141,14 @@ struct Oracle {
     trace: Vec<u8>,
     events: u64,
     violations: Vec<String>,
+}
+
+/// The node's key hasher for a scenario (ADR-0094 D2, injected — L7):
+/// every cell of the simulated node, and every model keyspace that
+/// replays the node's checkpoints, derives the same secret from the
+/// scenario seed, so placement is reproducible and never a constant.
+pub(crate) fn node_hasher(seed: u64) -> KeyHasher {
+    KeyHasher::from_seed(seed ^ 0x4B45_5948_4153_4845)
 }
 
 impl Oracle {
@@ -477,7 +485,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
-            Keyspace::new(StoreConfig::default()),
+            Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() }),
             fabric,
             node,
             oracle.clone(),

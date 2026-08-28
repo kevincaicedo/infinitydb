@@ -19,6 +19,7 @@ use inf_log::fs::mem::MemFs;
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{NsId, TierDrive, TierFlush, TierFlushConfig, TierIoMode, inspect_tier_bytes};
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, StoreConfig, TieredLookup,
     TieredTable,
@@ -162,7 +163,7 @@ fn reactor_drive_matches_the_seam_drive_byte_for_byte() {
             let key = format!("flush:{idx:05}").into_bytes();
             let value =
                 vec![(seeded(&mut seed) % 251) as u8; 40 + (seeded(&mut seed) % 200) as usize];
-            let hash = TieredTable::hash_key(&key);
+            let hash = KeyHasher::default().hash(&key);
             let mut placed_version = 0u32;
             let mut placed_len = 0usize;
             for ks in [&mut seam_ks, &mut reactor_ks] {
@@ -219,7 +220,7 @@ fn reactor_drive_matches_the_seam_drive_byte_for_byte() {
     // Both tables agree on every key's resolution class and content.
     let mut cold = 0u64;
     for (key, (want_value, _, _)) in &model {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let seam_table = seam_ks.tiered_store_mut(NS).expect("t");
         let seam_hit = seam_table.lookup(key, hash, &[]);
         let reactor_table = reactor_ks.tiered_store_mut(NS).expect("t");

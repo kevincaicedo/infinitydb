@@ -55,8 +55,7 @@ use inf_runtime::{
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
 use inf_store::{
-    CellStore, EvictBudget, ExpiryBudget, Keyspace, LogFullImage, NsId, NsMode, SlotRouter,
-    WallAnchor,
+    EvictBudget, ExpiryBudget, Keyspace, LogFullImage, NsId, NsMode, SlotRouter, WallAnchor,
 };
 use inf_wire::{
     ArgvRef, CmdFlags, CommandId, ConnParser, Parsed, ParserLimits, Protocol, RespWriter, arity_ok,
@@ -345,6 +344,10 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     cell: CellId,
     cells: u16,
     router: SlotRouter,
+    /// The node's key hasher (ADR-0094) — the keyspace's own value,
+    /// copied so the stage-time prefetch hashes exactly as the store
+    /// probes (no ambient constant, no second source of truth).
+    hasher: inf_foundation::KeyHasher,
     /// Forces every key local — the cross-cell penalty A/B leg (§6 gate).
     route_local_only: bool,
     /// `DEBUG SLEEP` cell stall: connection parse/respond pause until this
@@ -1372,6 +1375,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 cell,
                 cells,
                 router: SlotRouter::new_contiguous(cells),
+                hasher: store.hasher(),
                 route_local_only,
                 stall_until: Cell::new(Nanos(0)),
                 store: RefCell::new(store),
@@ -2541,7 +2545,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 // of buffer with its record lines prefetched.
                                 let (hash, has_key) = match argv.len() >= 2 {
                                     true => {
-                                        let hash = CellStore::hash_key(argv.arg(1));
+                                        let hash = self.shared.hasher.hash(argv.arg(1));
                                         if let Some(store) =
                                             self.shared.store.borrow().db(usize::from(conn_cx.db))
                                         {
@@ -3185,6 +3189,30 @@ fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 });
                 return;
             }
+            // A scattered `DBSIZE` leg on a memory namespace (the tiered
+            // and pressured shapes were diverted above): a typed count.
+            if argv.len() == 1
+                && argv[0].eq_ignore_ascii_case(b"DBSIZE")
+                && let Some(n) = {
+                    let store = shared.store.borrow();
+                    store
+                        .ns_get_by_id(NsId(ns))
+                        .map(|_| store.ns_store(NsId(ns)).map_or(0, |s| s.len() as i64))
+                }
+            {
+                let now = shared.now.get();
+                let mut reply = Vec::new();
+                RespWriter::new(&mut reply, Protocol::Resp2).int(n);
+                shared.observer.borrow_mut().on_execute(
+                    shared.cell,
+                    ExecOrigin::Fabric(from),
+                    &[b"DBSIZE"],
+                    &reply,
+                    now,
+                );
+                staged.push((from, token, StagedReply::Int(n)));
+                return;
+            }
             let start = scratch.len();
             match shared.execute_ns_owned(from, argv, proto, NsId(ns), scratch) {
                 NsApplyOutcome::Reply => {
@@ -3297,7 +3325,7 @@ struct StagedApply {
     cmd: u8,
     /// Offset of the flat argv block in the stage scratch.
     off: u32,
-    /// `CellStore::hash_key(argv[1])` when the op carries a key argument.
+    /// `hasher.hash(argv[1])` when the op carries a key argument.
     hash: u64,
     db: u16,
     has_key: bool,
@@ -3347,7 +3375,7 @@ fn read_argv_block<'b>(bytes: &'b [u8], off: u32, out: &mut [&'b [u8]; MAX_APPLY
 struct StagedParse {
     /// Offset of the flat argv block in the stage scratch.
     off: u32,
-    /// `CellStore::hash_key(argv[1])` when the command carries a key.
+    /// `hasher.hash(argv[1])` when the command carries a key.
     hash: u64,
     has_key: bool,
 }
@@ -3474,7 +3502,7 @@ fn stage_or_handle<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             let db = u16::from(cmd >> 4);
             let (hash, has_key) = match argv.get(1) {
                 Some(key) => {
-                    let hash = CellStore::hash_key(key);
+                    let hash = shared.hasher.hash(key);
                     // Phase 1 at stage time: the index probe lines get the
                     // rest of the drain window to arrive.
                     if let Some(store) = shared.store.borrow().db(usize::from(db)) {
@@ -3576,8 +3604,16 @@ enum PendingReply {
     /// the gate if it lands before its turn.
     Remote { waiter: GateWait<u64, OwnedOutcome>, proto: Protocol },
     /// Split DEL/UNLINK/EXISTS/TOUCH (and scattered DBSIZE): locally-counted
-    /// contributions in `acc`, remote per-key contributions in flight.
-    Counted { waiters: Vec<GateWait<u64, OwnedOutcome>>, acc: i64, proto: Protocol },
+    /// contributions in `acc`, remote per-key contributions in flight. A
+    /// leg that answered a typed error instead of a count, or a leg that
+    /// could not be sent (`refusal`), makes the reply that error — never
+    /// a partial sum (review of 2026-08-28, M4.5-S37 finding 2).
+    Counted {
+        waiters: Vec<GateWait<u64, OwnedOutcome>>,
+        acc: i64,
+        proto: Protocol,
+        refusal: Option<Vec<u8>>,
+    },
     /// Split MGET / JSON.MGET: per-key replies reassemble into one array
     /// in argv order. `unwrap_single` marks JSON.MGET's shape: each
     /// sub-reply is a single-key `*1` array whose element joins the outer
@@ -3841,17 +3877,33 @@ async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 inflight -= 1;
                 render_outcome(&shared, outcome, proto)
             }
-            PendingReply::Counted { waiters, mut acc, proto } => {
+            PendingReply::Counted { waiters, mut acc, proto, refusal } => {
+                let mut error = refusal;
                 for waiter in waiters {
                     match waiter.await {
                         OwnedOutcome::Int(n) => acc += n,
+                        // A typed error from a leg (a tiered `DBSIZE` drain
+                        // that could not read a twin, ADR-0093 A3): the
+                        // first one is the reply; every leg is still
+                        // awaited so nothing is orphaned in flight.
+                        OwnedOutcome::Bytes(bytes) if bytes.first() == Some(&b'-') => {
+                            if error.is_none() {
+                                error = Some(bytes);
+                            } else {
+                                shared.recycle_reply_buf(bytes);
+                            }
+                        }
                         other => debug_assert!(false, "counted apply returned {other:?}"),
                     }
                     inflight -= 1;
                 }
-                let mut reply = shared.take_reply_buf();
-                RespWriter::new(&mut reply, proto).int(acc);
-                reply
+                if let Some(error) = error {
+                    return_error(&shared, error, proto)
+                } else {
+                    let mut reply = shared.take_reply_buf();
+                    RespWriter::new(&mut reply, proto).int(acc);
+                    reply
+                }
             }
             PendingReply::Gather { parts, proto, unwrap_single } => {
                 let mut reply = shared.take_reply_buf();
@@ -4106,7 +4158,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                             *inflight += 1;
                         }
                     }
-                    pending.push_back(PendingReply::Counted { waiters, acc, proto });
+                    pending.push_back(PendingReply::Counted { waiters, acc, proto, refusal: None });
                 }
                 CommandId::Flushdb | CommandId::Flushall | CommandId::Config | CommandId::InfNs => {
                     // Per-cell-state mutators (flush, CONFIG SET/RESETSTAT,
@@ -4169,7 +4221,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                     }
                 }
             }
-            pending.push_back(PendingReply::Counted { waiters, acc, proto });
+            pending.push_back(PendingReply::Counted { waiters, acc, proto, refusal: None });
         }
         Some(meta) if well_formed && meta.id == CommandId::Mget && has_remote_key(meta) => {
             // Gather: every position resolves independently, replies
@@ -4437,6 +4489,53 @@ fn render_outcome<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 // ---- fabric-program helpers (M1-S02) -------------------------------------------
 
 /// All cells except this one (scatter targets).
+/// This cell's exact `DBSIZE` contribution for a named namespace: the
+/// tiered drain (`tiered::dbsize_count`, ADR-0093 A3) or the memory
+/// table's count — the local leg of the scattered shape and every
+/// `ApplyNs` leg alike. Reported to the observer per cell, as the
+/// default database's `apply_dbsize` is. `Err` is the typed error reply.
+async fn ns_dbsize_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    origin: ExecOrigin,
+    ns: NsId,
+    proto: Protocol,
+) -> Result<i64, Vec<u8>> {
+    let tiered = shared.store.borrow().is_tiered(ns);
+    let n = if tiered {
+        tiered::dbsize_count(shared, ns, proto).await? as i64
+    } else {
+        let ks = shared.store.borrow();
+        if ks.ns_get_by_id(ns).is_none() {
+            return Err(error_reply(
+                shared,
+                proto,
+                "ERR the selected namespace was dropped (INF.NS USE again)",
+            ));
+        }
+        // A registered namespace whose per-cell store has not
+        // materialized yet (no write reached this cell) holds no keys.
+        ks.ns_store(ns).map_or(0, |store| store.len() as i64)
+    };
+    let now = shared.now.get();
+    let mut reply = Vec::new();
+    RespWriter::new(&mut reply, Protocol::Resp2).int(n);
+    shared.observer.borrow_mut().on_execute(shared.cell, origin, &[b"DBSIZE"], &reply, now);
+    Ok(n)
+}
+
+/// A leg's error reply, re-rendered for the connection's protocol (the
+/// bytes are RESP2/RESP3-identical for a simple error — passed through).
+fn return_error<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    error: Vec<u8>,
+    _proto: Protocol,
+) -> Vec<u8> {
+    let mut reply = shared.take_reply_buf();
+    reply.extend_from_slice(&error);
+    shared.recycle_reply_buf(error);
+    reply
+}
+
 fn peer_cells<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
 ) -> Vec<CellId> {
@@ -4867,7 +4966,7 @@ async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
                         *inflight += 1;
                     }
                 }
-                pending.push_back(PendingReply::Counted { waiters, acc, proto });
+                pending.push_back(PendingReply::Counted { waiters, acc, proto, refusal: None });
                 if !self_frames.is_empty() {
                     pending.push_back(PendingReply::Done(self_frames));
                 }
@@ -5344,6 +5443,27 @@ async fn ns_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
         };
         let Some(item) = next else { return };
         let argv: Vec<&[u8]> = item.args.iter().map(Vec::as_slice).collect();
+        // A scattered `DBSIZE` leg (the origin's `Counted` shape): this
+        // cell's exact count as a typed integer — the tiered drain runs
+        // here, on the pump, exactly as a local `DBSIZE` would — or the
+        // drain's error as bytes for the origin to relay.
+        if argv.len() == 1 && argv[0].eq_ignore_ascii_case(b"DBSIZE") {
+            let origin_cell = ExecOrigin::Fabric(CellId(origin));
+            match ns_dbsize_local(&shared, origin_cell, item.ns, item.proto).await {
+                Ok(n) => {
+                    shared.fabric.borrow_mut().reply(CellId(origin), item.token, &Outcome::Int(n));
+                }
+                Err(reply) => {
+                    shared.fabric.borrow_mut().reply(
+                        CellId(origin),
+                        item.token,
+                        &Outcome::Bytes(&reply),
+                    );
+                    shared.recycle_reply_buf(reply);
+                }
+            }
+            continue;
+        }
         // Flat durable applies ride the same FIFO under staging pressure
         // (M4.5-S27, ADR-0083 D1); the tier is re-resolved here because
         // the owner stays authoritative and DDL can retier a namespace
@@ -5663,6 +5783,39 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
             }
             return true;
         }
+    }
+    // `DBSIZE` on a namespace-bound connection is the node-wide count
+    // (review of 2026-08-28, M4.5-S37 finding 2 — it answered this cell's
+    // table alone while the compat matrix declared it `full`): the local
+    // leg — the tiered drain (ADR-0093 A3) or the memory table's count —
+    // plus every peer's typed contribution through `ApplyNs`, the
+    // `Counted` shape the default database's scatter uses. A leg that
+    // errors or cannot be sent makes the reply that error, never a
+    // partial sum.
+    if meta.id == CommandId::Dbsize && shared.cells > 1 && !shared.route_local_only {
+        let acc = match ns_dbsize_local(shared, origin, ns, proto).await {
+            Ok(n) => n,
+            Err(reply) => {
+                pending.push_back(PendingReply::Done(reply));
+                return true;
+            }
+        };
+        let mut waiters = Vec::new();
+        let mut refusal = None;
+        for cell in peer_cells(shared) {
+            match send_apply_ns(shared, cell, proto, ns, &[b"DBSIZE"]).await {
+                Ok(waiter) => {
+                    waiters.push(waiter);
+                    *inflight += 1;
+                }
+                Err(reply) => {
+                    refusal = Some(reply);
+                    break;
+                }
+            }
+        }
+        pending.push_back(PendingReply::Counted { waiters, acc, proto, refusal });
+        return true;
     }
     // Tiered namespaces execute through the async tiered arm (M4-S26):
     // suspension-capable resolution with its own admission + staging.

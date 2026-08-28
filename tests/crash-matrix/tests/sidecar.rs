@@ -124,7 +124,7 @@ fn entries_of(idoc: &[u8], key: &[u8], path: &str, key_type: IndexKeyType) -> Ve
     let tape = TapeDoc::from_validated_bytes(idoc);
     let root = DocValue::from(tape.root());
     let matches = eval(&program, root, &EvalLimits::default()).expect("small doc");
-    let hash = inf_store::CellStore::hash_key(key);
+    let hash = inf_store::KeyHasher::default().hash(key);
     let mut buf = IndexKeyBuf::new();
     let mut out = Vec::new();
     for steps in matches.iter() {

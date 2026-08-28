@@ -31,7 +31,7 @@ use inf_alloc::ArenaAddr;
 use inf_foundation::LogicalAddr;
 use inf_simd::{eq_mask16, high_bit_mask16, prefetch_read};
 
-const GROUP: usize = 16;
+pub(crate) const GROUP: usize = 16;
 const CTRL_EMPTY: u8 = 0x80;
 const CTRL_TOMB: u8 = 0xFE;
 /// Numerator of the maximum load factor (live + tombstones ≤ 85% of slots).
@@ -200,6 +200,24 @@ pub struct Index<M: SlotMode = MemoryMode> {
     capacity: usize,
     live: usize,
     tombstones: usize,
+}
+
+/// The position of a resumable home-group walk
+/// ([`Index::home_group_cursor`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HomeGroupCursor {
+    mask: usize,
+    home: usize,
+    group: usize,
+    stride: usize,
+}
+
+impl HomeGroupCursor {
+    /// The home group this cursor walks.
+    #[must_use]
+    pub fn home(&self) -> usize {
+        self.home
+    }
 }
 
 impl<M: SlotMode> Index<M> {
@@ -481,6 +499,55 @@ impl<M: SlotMode> Index<M> {
             }
             group = (group + stride) & mask;
         }
+    }
+
+    /// A resumable home-group walk positioned at `group`'s home (M4.5-S37,
+    /// ADR-0093 A4′): [`scan_home_group_step`](Self::scan_home_group_step)
+    /// visits the chain one 16-slot probe group at a time, so a caller
+    /// that mutates between steps holds a scratch bounded by the group,
+    /// never by the chain.
+    #[must_use]
+    pub fn home_group_cursor(&self, group: usize) -> HomeGroupCursor {
+        let mask = self.group_mask();
+        let home = group & mask;
+        HomeGroupCursor { mask, home, group: home, stride: 0 }
+    }
+
+    /// One step of a home-group walk: emits `(addr, full hash)` for the
+    /// live entries of the cursor's current probe group whose home is
+    /// the cursor's, then advances it; `false` once the chain has ended
+    /// (this was its last group). Same guarantee as
+    /// [`scan_home_group_ext`](Self::scan_home_group_ext) taken group by
+    /// group. Valid across removals between steps: `remove` writes EMPTY
+    /// only into groups that already hold one, so no chain shortens
+    /// under a cursor — and never across growth (debug-asserted: the
+    /// cursor carries the mask it was cut for).
+    pub fn scan_home_group_step(
+        &self,
+        cursor: &mut HomeGroupCursor,
+        mut emit: impl FnMut(M::Addr, u64),
+    ) -> bool {
+        let mask = self.group_mask();
+        debug_assert_eq!(cursor.mask, mask, "a home-group cursor outlived a grow");
+        let ctrl = self.ctrl_group(cursor.group);
+        for (i, &c) in ctrl.iter().enumerate() {
+            if c & 0x80 == 0 {
+                let pos = cursor.group * GROUP + i;
+                let hash = M::ext_hash(&self.ext, pos);
+                if (hash as usize) & mask == cursor.home {
+                    emit(M::addr_from_raw(self.slots[pos].addr_raw()), hash);
+                }
+            }
+        }
+        if eq_mask16(ctrl, CTRL_EMPTY) != 0 {
+            return false;
+        }
+        cursor.stride += 1;
+        if cursor.stride > mask {
+            return false;
+        }
+        cursor.group = (cursor.group + cursor.stride) & mask;
+        true
     }
 
     fn position_of(&self, hash: u64, addr: M::Addr) -> Option<usize> {

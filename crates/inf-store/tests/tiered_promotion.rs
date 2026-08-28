@@ -20,6 +20,7 @@ use inf_log::{
     TierFlush, TierFlushConfig, TierIoMode, decode_record, read_ick_hybrid, read_manifest,
     tier_extract, tier_frame_offset, tier_frame_span, write_manifest,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, LogicalAddr, TieredLookup, TieredTable,
     apply_live_set_section, apply_ref_section, recover_tiered_ns,
@@ -80,7 +81,8 @@ impl Rig {
     fn new() -> Rig {
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
         let fs = MemFs::new();
-        let table = TieredTable::new(space_config(demote, 0), demote, 2048).expect("ring");
+        let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
+            .expect("ring");
         let flush = TierFlush::new(fs.clone(), flush_config(), 0);
         Rig {
             table,
@@ -128,7 +130,7 @@ impl Rig {
     /// SET with the D4 marker discipline, D9 origin markers included —
     /// the displacing mutation that stages a promoted record's origins.
     fn set(&mut self, key: &[u8], value: &[u8]) {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let displaced: Option<(LogicalAddr, usize, u32)> = match self.table.lookup(key, hash, &[]) {
             TieredLookup::Ram(addr) => {
                 let parts = self.table.record(addr);
@@ -178,7 +180,7 @@ impl Rig {
     /// cold-fetch, key-verify, then offer the verbatim image. RAM hits
     /// never reach the promotion hook — exactly the plane's shape.
     fn get_promote(&mut self, key: &[u8]) -> Vec<u8> {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let mut exclude: Vec<LogicalAddr> = Vec::new();
         loop {
             match self.table.lookup(key, hash, &exclude) {
@@ -204,7 +206,7 @@ impl Rig {
     /// second-touch rule. Asserts the promotion actually landed.
     fn promote_key(&mut self, key: &[u8]) {
         self.maintain();
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         assert!(
             matches!(self.table.lookup(key, hash, &[]), TieredLookup::Cold(_)),
             "promote_key needs a cold candidate for {:?}",
@@ -240,7 +242,7 @@ impl Rig {
         let keys: Vec<(Vec<u8>, Expect)> =
             self.model.iter().map(|(k, e)| (k.clone(), e.clone())).collect();
         for (key, expect) in keys {
-            let hash = TieredTable::hash_key(&key);
+            let hash = KeyHasher::default().hash(&key);
             let mut exclude: Vec<LogicalAddr> = Vec::new();
             let value = loop {
                 match self.table.lookup(&key, hash, &exclude) {
@@ -269,7 +271,7 @@ fn keys_in_file(rig: &Rig, base: u64, len: u64) -> Vec<Vec<u8>> {
     rig.model
         .keys()
         .filter(|key| {
-            let hash = TieredTable::hash_key(key);
+            let hash = KeyHasher::default().hash(key);
             matches!(
                 rig.table.lookup(key, hash, &[]),
                 TieredLookup::Cold(addr) if addr.to_raw() >= base && addr.to_raw() < base + len
@@ -307,7 +309,7 @@ fn second_cold_read_promotes_verbatim() {
         .first()
         .expect("file 0 holds cold keys")
         .clone();
-    let hash = TieredTable::hash_key(&key);
+    let hash = KeyHasher::default().hash(&key);
     let expect_len = rig.model.get(&key).expect("live").encoded_len as u64;
 
     let acct_before = rig.table.write_accounting();
@@ -349,7 +351,7 @@ fn one_touch_sweep_never_promotes() {
         .model
         .keys()
         .filter(|k| {
-            let hash = TieredTable::hash_key(k);
+            let hash = KeyHasher::default().hash(k);
             matches!(rig.table.lookup(k, hash, &[]), TieredLookup::Cold(_))
         })
         .cloned()
@@ -374,7 +376,7 @@ fn promotion_converges_a_reread_working_set() {
         .model
         .keys()
         .filter(|k| {
-            let hash = TieredTable::hash_key(k);
+            let hash = KeyHasher::default().hash(k);
             matches!(rig.table.lookup(k, hash, &[]), TieredLookup::Cold(_))
         })
         .take(64)
@@ -389,7 +391,7 @@ fn promotion_converges_a_reread_working_set() {
         let resident = hot
             .iter()
             .filter(|k| {
-                let hash = TieredTable::hash_key(k);
+                let hash = KeyHasher::default().hash(k);
                 matches!(rig.table.lookup(k, hash, &[]), TieredLookup::Ram(_))
             })
             .count();
@@ -411,7 +413,7 @@ fn promotion_skips_under_walk_pin_and_retries() {
     fill_cold(&mut rig, 4500);
     let first = rig.table.live_set().files()[0].clone();
     let key = keys_in_file(&rig, first.base, first.data_len)[0].clone();
-    let hash = TieredTable::hash_key(&key);
+    let hash = KeyHasher::default().hash(&key);
 
     rig.table.begin_ckpt_walk(1);
     let _ = rig.get_promote(&key); // first touch
@@ -437,7 +439,7 @@ fn promotion_skips_on_window_refusal_and_retries() {
     fill_cold(&mut rig, 4500);
     let first = rig.table.live_set().files()[0].clone();
     let key = keys_in_file(&rig, first.base, first.data_len)[0].clone();
-    let hash = TieredTable::hash_key(&key);
+    let hash = KeyHasher::default().hash(&key);
 
     let _ = rig.get_promote(&key); // first touch
     // Drive the tail window to the admission wall (alloc refusal) with
@@ -445,7 +447,7 @@ fn promotion_skips_on_window_refusal_and_retries() {
     let mut i = 0u32;
     loop {
         let fill = format!("fill:{i:05}");
-        let fill_hash = TieredTable::hash_key(fill.as_bytes());
+        let fill_hash = KeyHasher::default().hash(fill.as_bytes());
         if rig.table.insert(fill.as_bytes(), &[0x42; 120], fill_hash).is_err() {
             break;
         }
@@ -472,7 +474,7 @@ fn promotion_defers_at_the_origin_cap_until_a_covering_swap() {
     fill_cold(&mut rig, 4500);
     let first = rig.table.live_set().files()[0].clone();
     let key = keys_in_file(&rig, first.base, first.data_len)[0].clone();
-    let hash = TieredTable::hash_key(&key);
+    let hash = KeyHasher::default().hash(&key);
 
     // Three promote→age-to-cold cycles: the origin chain reaches the
     // RELOC_ORIGIN_CAP (3). Aging needs a mutable-target's worth of
@@ -512,7 +514,7 @@ fn disabled_promotion_is_inert() {
     rig.table.set_promote_enabled(false);
     let first = rig.table.live_set().files()[0].clone();
     let key = keys_in_file(&rig, first.base, first.data_len)[0].clone();
-    let hash = TieredTable::hash_key(&key);
+    let hash = KeyHasher::default().hash(&key);
 
     for _ in 0..3 {
         let _ = rig.get_promote(&key);
@@ -672,6 +674,7 @@ fn replay_and_check(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
         space_config(demote, 0),
         demote,
         2048,
+        KeyHasher::default(),
     )
     .expect("recovery");
     let table = std::cell::RefCell::new(recovered.table);
@@ -684,7 +687,7 @@ fn replay_and_check(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
             if let RecordView::StringPostImage { key, value, .. } = record {
                 table
                     .borrow_mut()
-                    .apply_image(key, value, TieredTable::hash_key(key))
+                    .apply_image(key, value, KeyHasher::default().hash(key))
                     .expect("fits");
             }
             Ok::<(), std::convert::Infallible>(())
@@ -716,7 +719,7 @@ fn replay_and_check(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
                 assert!(pending.len() <= 4, "register within the D9 bound");
             }
             RecordView::StringPostImage { key, value, .. } => {
-                let hash = TieredTable::hash_key(key);
+                let hash = KeyHasher::default().hash(key);
                 for old in pending.drain(..) {
                     table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
                 }

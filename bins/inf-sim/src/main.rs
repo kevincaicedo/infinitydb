@@ -476,10 +476,32 @@ fn main() {
             let mut collide_ticketed = 0u64;
             let mut collide_drains = 0u64;
             let mut collide_scan_twins = 0u64;
+            let mut open_seeds = 0u64;
+            let mut open_tickets = 0u64;
+            let mut open_drains = 0u64;
+            let mut open_reads = 0u64;
+            let mut open_scan_twins = 0u64;
+            let mut open_retargeted = 0u64;
+            let mut open_forced_deletes = 0u64;
+            let mut open_ticketed = 0u64;
+            let mut open_collisions = 0u64;
+            let mut open_read_faults = 0u64;
+            let mut open_settled_without_read = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
                 ran += 1;
+                open_seeds += u64::from(report.open_rows);
+                open_tickets += report.open_tickets;
+                open_drains += report.open_dbsize_drains;
+                open_reads += report.open_dbsize_reads;
+                open_scan_twins += report.open_scan_twins;
+                open_retargeted += report.open_retargeted;
+                open_forced_deletes += report.open_forced_deletes;
+                open_ticketed += report.open_ticketed_fallbacks;
+                open_collisions += report.open_collision_verdicts;
+                open_read_faults += report.open_read_fault_errors;
+                open_settled_without_read += report.open_settled_without_read;
                 collide_tickets += report.collide_tickets;
                 collide_verdicts += report.collide_verdicts;
                 collide_ticketed += report.collide_ticketed_fallbacks;
@@ -527,7 +549,13 @@ fn main() {
                  {shadow_stale} stale, {shadow_fallbacks} fallbacks; forced collisions: \
                  {collide_tickets} tickets, {collide_verdicts} collision verdicts, \
                  {collide_ticketed} ticketed fallbacks, {collide_drains} DBSIZE drains, \
-                 {collide_scan_twins} SCAN twins"
+                 {collide_scan_twins} SCAN twins; open-ticket rows on {open_seeds} seeds: \
+                 {open_tickets} tickets held open, {open_drains} DBSIZE drains reading \
+                 {open_reads} twins, {open_scan_twins} SCAN twins, {open_retargeted} \
+                 retargets, {open_forced_deletes} read-free forced deletes, {open_ticketed} \
+                 ticketed fallbacks, {open_collisions} collision verdicts, {open_read_faults} \
+                 injected read errors relayed, {open_settled_without_read} settled without a \
+                 read after resume"
             );
             println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
             if let Some(dir) = out_dir {
@@ -544,7 +572,13 @@ fn main() {
                      shadow_collision={shadow_collision} shadow_stale={shadow_stale} \
                      shadow_fallbacks={shadow_fallbacks} collide_tickets={collide_tickets} \
                      collide_verdicts={collide_verdicts} collide_ticketed={collide_ticketed} \
-                     collide_drains={collide_drains} collide_scan_twins={collide_scan_twins}\n"
+                     collide_drains={collide_drains} collide_scan_twins={collide_scan_twins} \
+                     open_seeds={open_seeds} open_tickets={open_tickets} \
+                     open_drains={open_drains} open_reads={open_reads} \
+                     open_scan_twins={open_scan_twins} open_retargeted={open_retargeted} \
+                     open_forced_deletes={open_forced_deletes} open_ticketed={open_ticketed} \
+                     open_collisions={open_collisions} open_read_faults={open_read_faults} \
+                     open_settled_without_read={open_settled_without_read}\n"
                 );
                 std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
                     .expect("manifest");

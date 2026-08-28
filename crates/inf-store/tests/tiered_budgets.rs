@@ -30,6 +30,7 @@ use inf_log::{
     FsyncClass, MutationEffect, NsId, StagingConfig, StagingRing, TierFlush, TierFlushConfig,
     TierIoMode,
 };
+use inf_store::KeyHasher;
 use inf_store::{Keyspace, NsError, NsMode, NsSpec, StoreConfig, TierSpec, TieredTable};
 
 /// A tiered durable spec around `TierSpec::for_budget`, named fields
@@ -203,7 +204,7 @@ fn memory_fill_respects_each_namespace_budget() {
     for i in 0..2 * ((budget as usize) / value.len()) {
         for (slot, ns) in [NsId(16), NsId(17)].into_iter().enumerate() {
             let key = format!("k:{i:06}");
-            let hash = TieredTable::hash_key(key.as_bytes());
+            let hash = KeyHasher::default().hash(key.as_bytes());
             loop {
                 let table = ks.tiered_store_mut(ns).expect("materialized");
                 if table.insert(key.as_bytes(), &value, hash).is_ok() {
@@ -290,7 +291,7 @@ fn disk_pressure_engages_before_the_cap() {
                 },
             )
             .expect("stage");
-        table.insert_extent(b"blob", TieredTable::hash_key(b"blob"), &sealed).expect("fits");
+        table.insert_extent(b"blob", KeyHasher::default().hash(b"blob"), &sealed).expect("fits");
         assert_eq!(
             table.disk_used(flush.disk_bytes()),
             flush.disk_bytes() + sealed.device_bytes(),
@@ -305,7 +306,7 @@ fn disk_pressure_engages_before_the_cap() {
     let mut fired_at = None;
     'fill: for i in 0..8_192u32 {
         let key = format!("d:{i:06}");
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         loop {
             let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
             if table.insert(key.as_bytes(), &value, hash).is_ok() {
@@ -391,7 +392,7 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
     let value = vec![0x33u8; (4 << 10) - 1];
     for i in 0..1_024u32 {
         let key = format!("t:{i:06}");
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         loop {
             let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
             if table.insert(key.as_bytes(), &value, hash).is_ok() {
@@ -419,7 +420,7 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
     w.append_chunk(&blob).expect("chunk");
     let sealed = w.finish().expect("finish");
     table.note_blob_bytes(sealed.device_bytes());
-    table.insert_extent(b"big", TieredTable::hash_key(b"big"), &sealed).expect("fits");
+    table.insert_extent(b"big", KeyHasher::default().hash(b"big"), &sealed).expect("fits");
     loop {
         let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
         let s = table.seal_slice();

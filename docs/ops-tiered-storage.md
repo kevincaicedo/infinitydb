@@ -334,17 +334,32 @@ cap, or disk-admission pressure.
   the same exact death). The winner is pinned in RAM until then — the
   pinned suffix (`tiering_shadow_pinned_bytes`, capped at
   `MEM-BUDGET / 8`, `tiering_shadow_pin_cap_bytes`) and the open tickets
-  (`tiering_shadow_pending`, ≤ 4 096 per cell-namespace) are the two
-  bounds; at either bound the write verifies synchronously
-  (`tiering_shadow_fallback_*`). `DBSIZE` counts keys, not tickets;
-  `SCAN` never names a ticket's twin; `DEL`/`GETDEL` verify the twin
-  first. Read `tiering_shadow_created` against `_resolved_same_key` /
+  (`tiering_shadow_pending`, ≤ 4 096 per cell-namespace — a bound the
+  engine asserts) are the two bounds; at either bound the write
+  verifies synchronously (`tiering_shadow_fallback_*`). A ticket is
+  ambiguous until its twin is read (ADR-0093 A1): `DBSIZE` **verifies
+  before it counts** (a fenced Foreground drain of the unverified
+  tickets — exact, or the typed `-ERR DBSIZE: shadow twin … unreadable`,
+  never an inexact integer; `tiering_shadow_dbsize_{drains,reads}`),
+  and on a namespace-bound connection it is the **node-wide** count
+  (the scatter, like the default database's); `SCAN` names a ticket's
+  twin like any cold slot (the key twice — legal — or the collision key
+  it must name; `_scan_twins_emitted`); `DEL`/`GETDEL` verify the twin
+  first (read-free once a drain verified it). Read
+  `tiering_shadow_created` against `_resolved_same_key` /
   `_resolved_collision` (a real 64-bit collision keeps both records),
   `_stale` (the key moved past its read — re-offered), `_read_errors`
   (the ticket stays; the pinned suffix cannot release until it reads —
   visible, never fail-stop). Turning the knob off orphans nothing: open
-  tickets keep reconciling. The default flips only on the reference-box
-  campaign the ADR predeclares.
+  tickets keep reconciling. **`CONFIG SET tiered-shadow-reconcile
+  no|yes`** (default `yes`, hot, node-wide) pauses the reconciler —
+  tickets stay open, bounded by the two caps; `DBSIZE` and `DEL` keep
+  their own reads; `tiering_shadow_reconcile_paused` is the witness —
+  an operator's pause and the DST's lever. The recovery rebuild of the
+  ticket set is a cursor with one probe group of scratch; the slots it
+  cannot pair by construction are read and settled before the cell
+  serves (`tiering_shadow_rebuild_*`). The default flips only on the
+  reference-box campaign the ADR predeclares.
 - **Cost model:** promoted bytes re-flush (they appear in `flush_bytes`,
   attributed by `tiering_promoted_bytes` the way `compaction_bytes`
   attributes copy-forward) and the displaced cold copy becomes dead

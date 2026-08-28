@@ -18,7 +18,7 @@
 //! pressure is forbidden by the engineering rules.
 
 use inf_alloc::{Arena, ArenaAddr, ArenaConfig};
-use inf_foundation::hash64;
+use inf_foundation::KeyHasher;
 use inf_foundation::time::Nanos;
 
 use crate::doc::{self, DocStore};
@@ -32,13 +32,13 @@ use crate::wheel::{ArmOutcome, TtlWheel};
 
 pub use crate::wheel::ExpiryBudget;
 
-/// Stable hash seed: deterministic across runs and cells (L7; DST oracles
-/// rely on reproducible placement).
-pub(crate) const HASH_SEED: u64 = 0x1AF1_D8A5_0DB5_EED1;
-
 /// Configuration for [`CellStore::new`].
 #[derive(Copy, Clone, Debug)]
 pub struct StoreConfig {
+    /// The key hash's secret (ADR-0094): injected — a data directory's
+    /// `key-hash.toml`, a simulator's seed, a test's fixed default — and
+    /// the same value on every store of one node. Never a constant.
+    pub hasher: KeyHasher,
     /// Record arena settings (chunk size, resident budget).
     pub arena: ArenaConfig,
     /// Index pre-sizing (entries before the first rehash).
@@ -88,6 +88,7 @@ pub struct StoreConfig {
 impl Default for StoreConfig {
     fn default() -> StoreConfig {
         StoreConfig {
+            hasher: KeyHasher::default(),
             arena: ArenaConfig::default(),
             initial_keys: 0,
             evict_seed: 0,
@@ -447,10 +448,21 @@ impl CellStore {
         }
     }
 
-    /// Stable key hash — also what the batch pipeline computes up front.
+    /// The key hash under this store's secret (ADR-0094) — also what the
+    /// batch pipeline computes up front, from the same [`KeyHasher`] the
+    /// plane carries. An instance method: a hash is meaningful only to
+    /// the store whose hasher computed it.
     #[inline]
-    pub fn hash_key(key: &[u8]) -> u64 {
-        hash64(key, HASH_SEED)
+    #[must_use]
+    pub fn hash_key(&self, key: &[u8]) -> u64 {
+        self.cfg.hasher.hash(key)
+    }
+
+    /// This store's key hasher (the plane copies it at construction).
+    #[inline]
+    #[must_use]
+    pub fn hasher(&self) -> KeyHasher {
+        self.cfg.hasher
     }
 
     /// Prefetch the index probe path for a pre-hashed key (PARSE→hash→
@@ -547,14 +559,14 @@ impl CellStore {
 
     /// `GET`.
     pub fn get(&mut self, key: &[u8], now: Nanos) -> Option<&[u8]> {
-        self.get_with_hash(key, Self::hash_key(key), now)
+        self.get_with_hash(key, self.hash_key(key), now)
     }
 
     /// `GET` with a precomputed hash — the batch pipeline path: EXECUTE
     /// hashes and [`prefetch`](Self::prefetch)es a whole parse batch first,
     /// then executes with the hashes it already has (L3/L4).
     pub fn get_with_hash(&mut self, key: &[u8], hash: u64, now: Nanos) -> Option<&[u8]> {
-        debug_assert_eq!(hash, Self::hash_key(key));
+        debug_assert_eq!(hash, self.hash_key(key));
         let Some((addr, len)) = self.resolve_hashed(key, hash, now) else {
             self.stats.keyspace_misses += 1;
             return None;
@@ -585,7 +597,7 @@ impl CellStore {
     /// (probe-length histogram artifact, M0-S14 AC).
     pub fn probe_groups(&self, key: &[u8]) -> usize {
         let arena = &self.arena;
-        self.index.probe_groups(Self::hash_key(key), |addr| record_at(arena, addr).key() == key)
+        self.index.probe_groups(self.hash_key(key), |addr| record_at(arena, addr).key() == key)
     }
 
     /// Batched `GET` — the full §7.3 pipeline. Per 32-key chunk:
@@ -610,7 +622,7 @@ impl CellStore {
         for (chunk_at, chunk) in keys.chunks(CHUNK).enumerate() {
             let base = chunk_at * CHUNK;
             for (i, key) in chunk.iter().enumerate() {
-                hashes[i] = Self::hash_key(key);
+                hashes[i] = self.hash_key(key);
                 self.index.prefetch(hashes[i]);
             }
             for (i, _) in chunk.iter().enumerate() {
@@ -841,7 +853,7 @@ impl CellStore {
         if let Some(ms) = expire_at_ms
             && old_deadline != Some(ms)
         {
-            self.arm_wheel(Self::hash_key(key), ms);
+            self.arm_wheel(self.hash_key(key), ms);
         }
         Ok(SetOutcome::Applied { old: old_value })
     }
@@ -851,7 +863,7 @@ impl CellStore {
         match self.resolve(key, now) {
             Some((addr, len)) => {
                 let had_ttl = RecordView::new(self.arena.bytes(addr, len)).expire_at_ms().is_some();
-                self.free_record(Self::hash_key(key), addr, len);
+                self.free_record(self.hash_key(key), addr, len);
                 self.note_ttl(had_ttl, false);
                 true
             }
@@ -870,7 +882,7 @@ impl CellStore {
         }
         let value = view.value().to_vec();
         let had_ttl = view.expire_at_ms().is_some();
-        self.free_record(Self::hash_key(key), addr, len);
+        self.free_record(self.hash_key(key), addr, len);
         self.note_ttl(had_ttl, false);
         Some(value)
     }
@@ -884,7 +896,7 @@ impl CellStore {
     /// An expired-but-unreaped key reads as absent — correct for emission:
     /// its deadline already passed, so the post-image is "gone".
     pub fn post_image(&self, key: &[u8], now: Nanos) -> Option<PostImage<'_>> {
-        let hash = Self::hash_key(key);
+        let hash = self.hash_key(key);
         let arena = &self.arena;
         let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
         let view = record_at(arena, addr);
@@ -906,7 +918,7 @@ impl CellStore {
     /// Exact canonical value bytes a full durable image would carry,
     /// resolved once and without access tracking. Used only for admission.
     pub fn log_image_bytes(&self, key: &[u8], now: Nanos) -> Option<usize> {
-        let hash = Self::hash_key(key);
+        let hash = self.hash_key(key);
         let arena = &self.arena;
         let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
         let view = record_at(arena, addr);
@@ -934,7 +946,7 @@ impl CellStore {
     /// Resolve and materialize the post-command full image once. Document
     /// cadence resets as part of consuming this image for the log.
     pub fn log_full_image(&mut self, key: &[u8], now: Nanos) -> Option<LogFullImage<'_>> {
-        let hash = Self::hash_key(key);
+        let hash = self.hash_key(key);
         let arena = &self.arena;
         let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
         let (_encoded_len, kind, expired) = {
@@ -1199,11 +1211,11 @@ impl CellStore {
         // Source removal: the dst write never moves the src record, and the
         // payload now belongs to dst — no release.
         let src_had_ttl = deadline.is_some();
-        self.index.remove(Self::hash_key(src), src_addr);
+        self.index.remove(self.hash_key(src), src_addr);
         self.arena.free(src_addr, src_len);
         self.note_ttl(src_had_ttl, false);
         if let Some(ms) = deadline {
-            self.arm_wheel(Self::hash_key(dst), ms);
+            self.arm_wheel(self.hash_key(dst), ms);
         }
         Ok(true)
     }
@@ -1279,7 +1291,7 @@ impl CellStore {
         self.write_record(dst, dst_existing, spec)?;
         self.note_ttl(dst_had_ttl, deadline.is_some());
         if let Some(ms) = deadline {
-            self.arm_wheel(Self::hash_key(dst), ms);
+            self.arm_wheel(self.hash_key(dst), ms);
         }
         Ok(CopyResult::Copied)
     }
@@ -1321,7 +1333,7 @@ impl CellStore {
         )?;
         self.note_ttl(dst_had_ttl, deadline.is_some());
         if let Some(ms) = deadline {
-            self.arm_wheel(Self::hash_key(dst), ms);
+            self.arm_wheel(self.hash_key(dst), ms);
         }
         Ok(CopyResult::Copied)
     }
@@ -1379,7 +1391,7 @@ impl CellStore {
         self.write_record(dst, dst_existing, spec)?;
         self.note_ttl(dst_had_ttl, rec.expire_at_ms.is_some());
         if let Some(ms) = rec.expire_at_ms {
-            self.arm_wheel(Self::hash_key(dst), ms);
+            self.arm_wheel(self.hash_key(dst), ms);
         }
         Ok(CopyResult::Copied)
     }
@@ -1416,7 +1428,7 @@ impl CellStore {
         if let Some(ms) = new_ms
             && ms <= now.0 / 1_000_000
         {
-            self.free_record(Self::hash_key(key), addr, len);
+            self.free_record(self.hash_key(key), addr, len);
             self.note_ttl(current.is_some(), false);
             return true;
         }
@@ -1444,7 +1456,7 @@ impl CellStore {
         if let Some(ms) = new_ms
             && current != new_ms
         {
-            self.arm_wheel(Self::hash_key(key), ms);
+            self.arm_wheel(self.hash_key(key), ms);
         }
         true
     }
@@ -1473,17 +1485,18 @@ impl CellStore {
         loop {
             batch.clear();
             {
+                let hasher = self.cfg.hasher;
                 let arena = &self.arena;
                 self.index.scan_home_group(
                     cursor as usize,
-                    |addr| Self::hash_key(record_at(arena, addr).key()),
+                    |addr| hasher.hash(record_at(arena, addr).key()),
                     |addr| batch.push(addr),
                 );
             }
             for &addr in &batch {
                 let view = record_at(&self.arena, addr);
                 if view.is_expired(now) {
-                    let (hash, len) = (Self::hash_key(view.key()), view.encoded_len());
+                    let (hash, len) = (self.hash_key(view.key()), view.encoded_len());
                     self.free_record(hash, addr, len);
                     self.note_reap_lazy();
                 } else {
@@ -1543,17 +1556,18 @@ impl CellStore {
         loop {
             batch.clear();
             {
+                let hasher = self.cfg.hasher;
                 let arena = &self.arena;
                 self.index.scan_home_group(
                     cursor as usize,
-                    |addr| Self::hash_key(record_at(arena, addr).key()),
+                    |addr| hasher.hash(record_at(arena, addr).key()),
                     |addr| batch.push(addr),
                 );
             }
             for &addr in &batch {
                 let view = record_at(&self.arena, addr);
                 if view.is_expired(now) {
-                    let (hash, len) = (Self::hash_key(view.key()), view.encoded_len());
+                    let (hash, len) = (self.hash_key(view.key()), view.encoded_len());
                     self.free_record(hash, addr, len);
                     self.note_reap_lazy();
                     continue;
@@ -1651,10 +1665,11 @@ impl CellStore {
         let mut cursor = cursor & mask;
         let mut emitted = 0usize;
         loop {
+            let hasher = self.cfg.hasher;
             let arena = &self.arena;
             self.index.scan_home_group(
                 cursor as usize,
-                |addr| Self::hash_key(record_at(arena, addr).key()),
+                |addr| hasher.hash(record_at(arena, addr).key()),
                 |addr| {
                     let view = record_at(arena, addr);
                     if view.is_expired(now) {
@@ -1709,7 +1724,7 @@ impl CellStore {
             if !view.is_expired(now) {
                 return Some(view.key().to_vec());
             }
-            let (hash, len) = (Self::hash_key(view.key()), view.encoded_len());
+            let (hash, len) = (self.hash_key(view.key()), view.encoded_len());
             self.free_record(hash, addr, len);
             self.note_reap_lazy();
         }
@@ -1741,6 +1756,7 @@ impl CellStore {
         let now_ms = now.0 / 1_000_000;
         #[cfg(feature = "doc")]
         let max_matches = self.cfg.doc_max_path_matches;
+        let hasher = self.cfg.hasher;
         let CellStore { arena, index, wheel, stats, docs, idx, .. } = self;
         #[cfg(not(feature = "doc"))]
         let _ = &idx;
@@ -1752,7 +1768,7 @@ impl CellStore {
             // armed the entry).
             let found = index.find(hash, |addr| {
                 let view = record_at(arena, addr);
-                view.is_expired(now) && hash64(view.key(), HASH_SEED) == hash
+                view.is_expired(now) && hasher.hash(view.key()) == hash
             });
             match found {
                 Some(addr) => {
@@ -1835,7 +1851,7 @@ impl CellStore {
     /// recorded deviation: Redis reports its own log-counter scale).
     pub fn object_freq(&mut self, key: &[u8], now: Nanos) -> Option<u8> {
         self.resolve(key, now)?;
-        let hash = Self::hash_key(key);
+        let hash = self.hash_key(key);
         Some(self.evict.cms.as_ref().map_or(0, |cms| cms.estimate(hash)))
     }
 
@@ -1910,7 +1926,7 @@ impl CellStore {
     /// Index lookup + expire-on-read: returns the live record's address and
     /// encoded length, reaping it if its deadline passed.
     pub(crate) fn resolve(&mut self, key: &[u8], now: Nanos) -> Option<(ArenaAddr, usize)> {
-        self.resolve_hashed(key, Self::hash_key(key), now)
+        self.resolve_hashed(key, self.hash_key(key), now)
     }
 
     fn resolve_hashed(&mut self, key: &[u8], hash: u64, now: Nanos) -> Option<(ArenaAddr, usize)> {
@@ -1988,7 +2004,7 @@ impl CellStore {
         spec: RecordSpec<'_>,
     ) -> Result<(), OpError> {
         let new_len = spec.encoded_len();
-        let hash = Self::hash_key(key);
+        let hash = self.hash_key(key);
         // Writes count as accesses (Redis updates LRU/LFU on write), at
         // write strength: one CLOCK generation / one CMS baseline bump —
         // repeated reads are what saturate recency, so churn cannot
@@ -2009,8 +2025,9 @@ impl CellStore {
             }
             None => {
                 if self.index.needs_grow() {
+                    let hasher = self.cfg.hasher;
                     let arena = &self.arena;
-                    self.index.grow(|addr, _| Self::hash_key(record_at(arena, addr).key()));
+                    self.index.grow(|addr, _| hasher.hash(record_at(arena, addr).key()));
                     self.stats.index_grows += 1;
                 }
                 let new_addr = self.arena.alloc(new_len).ok_or(OpError::OutOfMemory)?;

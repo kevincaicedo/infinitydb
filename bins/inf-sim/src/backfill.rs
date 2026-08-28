@@ -28,8 +28,8 @@ use inf_doc::{DocValue, PathProgram, TapeDoc};
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_store::{
-    CellStore, CheckpointImage, IndexId, IndexKeyBuf, IndexKeyType, IndexScalar, IndexSpec,
-    IndexState, Keyspace, NsId, OrderedCursor, index_key_encode,
+    CheckpointImage, IndexId, IndexKeyBuf, IndexKeyType, IndexScalar, IndexSpec, IndexState,
+    Keyspace, NsId, OrderedCursor, index_key_encode,
 };
 
 use crate::durable::{
@@ -160,7 +160,7 @@ pub(crate) fn cell_truth(
             let tape = TapeDoc::from_validated_bytes(idoc);
             let root = DocValue::from(tape.root());
             let Ok(matches) = eval(program, root, &EvalLimits::default()) else { return };
-            let hash = CellStore::hash_key(key);
+            let hash = ks.hasher().hash(key);
             for steps in matches.iter() {
                 let Some(value) = resolve(root, steps) else { continue };
                 let scalar = match value {

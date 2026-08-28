@@ -18,6 +18,7 @@ use inf_log::{
     NsId, SealReason, TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode, inspect_tier_bytes,
     tier_extract, tier_frame_offset, tier_frame_span,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddrClass, AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, StoreConfig,
     TieredLookup, TieredTable,
@@ -151,7 +152,7 @@ fn flush_storm_round_trips_every_record() {
             let key = format!("flush:{idx:05}").into_bytes();
             let value =
                 vec![(seeded(&mut seed) % 251) as u8; 40 + (seeded(&mut seed) % 200) as usize];
-            let hash = TieredTable::hash_key(&key);
+            let hash = KeyHasher::default().hash(&key);
             let table = rig.table();
             let placed = match table.lookup(&key, hash, &[]) {
                 TieredLookup::Ram(old) | TieredLookup::Cold(old) => {
@@ -215,7 +216,7 @@ fn flush_storm_round_trips_every_record() {
     let entries: Vec<(Vec<u8>, Vec<u8>, usize)> =
         model.iter().map(|(k, (v, _, l))| (k.clone(), v.clone(), *l)).collect();
     for (key, want_value, len) in entries {
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         let table = rig.ks.tiered_store_mut(NS).expect("materialized");
         let looked = table.lookup(&key, hash, &[]);
         match looked {

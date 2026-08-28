@@ -33,6 +33,7 @@ use inf_runtime::{
     BackendDriver, ColdReadConfig, ColdReads, ColdWait, RawFd, ReadClass, TierFileId, TokenClass,
     UringDriver, Wait,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsId, StoreConfig, TieredLookup,
     TieredTable,
@@ -230,7 +231,7 @@ fn coalesce_leg(
 fn ram_lane(table: &mut TieredTable, hits: usize, rng: &mut SplitMix64, out: &mut Vec<u64>) {
     for _ in 0..hits {
         let key = format!("ram:{:06}", rng.next() % u64::from(RAM_KEYS)).into_bytes();
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         let at = Instant::now();
         match table.lookup(&key, hash, &[]) {
             TieredLookup::Ram(addr) => {
@@ -350,7 +351,7 @@ pub fn run() {
         let table = ks.tiered_store_mut(NS).expect("materialized");
         for i in 0..RAM_KEYS {
             let key = format!("ram:{i:06}").into_bytes();
-            table.insert(&key, &[0xAB; 64], TieredTable::hash_key(&key)).expect("fits");
+            table.insert(&key, &[0xAB; 64], KeyHasher::default().hash(&key)).expect("fits");
         }
         for rep in 0..reps {
             // Unloaded leg.
