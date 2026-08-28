@@ -175,7 +175,7 @@ impl TieredTable {
         );
         debug_assert_eq!(
             hash,
-            TieredTable::hash_key(TieredTable::decode_record(image).key),
+            self.hash_key(TieredTable::decode_record(image).key),
             "promotion hash does not match the fetched image's key"
         );
         if !self.promote_filter.touch(hash) {

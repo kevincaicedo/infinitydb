@@ -14,8 +14,8 @@ use std::rc::Rc;
 
 use inf_alloc::BufferPool;
 use inf_fabric::{CellFabric, Mesh, MeshConfig};
-use inf_foundation::CellId;
 use inf_foundation::time::{Clock, StdClock};
+use inf_foundation::{CellId, KeyHasher};
 use inf_runtime::net::{bound_port, listen_reuseport, pin_current_thread};
 use inf_runtime::{BackendDriver, CellLoop, LoopConfig};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane, StdSegmentFs};
@@ -663,6 +663,42 @@ fn main() {
         }
     }
 
+    // The key-hash secret (ADR-0094 D2), before anything else touches the
+    // directory: a data directory's persisted secret — created from OS
+    // entropy at its first boot, read on every later one, refused when
+    // the directory holds data that predates the ADR — or a fresh secret
+    // per memory-only boot. Every store of this node hashes with it.
+    let hasher = match &args.data_dir {
+        Some(dir) => match inf_server::resolve_key_hash(dir, os_entropy) {
+            Ok((hasher, source)) => {
+                eprintln!(
+                    "infinityd: key-hash secret: {} ({})",
+                    inf_server::KEY_HASH_FILE,
+                    match source {
+                        inf_server::KeyHashSource::File => "read — siphash13, ADR-0094",
+                        inf_server::KeyHashSource::Created =>
+                            "created at this first boot — siphash13, ADR-0094",
+                    }
+                );
+                hasher
+            }
+            Err(e) => {
+                eprintln!("infinityd: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => match os_entropy() {
+            Ok(bytes) => KeyHasher::from_keys(
+                u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")),
+                u64::from_le_bytes(bytes[8..].try_into().expect("8 bytes")),
+            ),
+            Err(e) => {
+                eprintln!("infinityd: no entropy for the key-hash secret: {e} (fail-stop)");
+                std::process::exit(1);
+            }
+        },
+    };
+
     // Durable boot order (M2-S08, ADR-0015 D3 — the node_e2e reference):
     // catalog before cells (the id→definition map must exist before any
     // cell replays records naming ids), control thread as the catalog's
@@ -828,7 +864,7 @@ fn main() {
                     // an io_uring_setup failure nobody printed. A cell that
                     // cannot run takes the node down loudly, here and now.
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        cell_main(i as u16, &args, boot, fabric, park_flags, wake_fd)
+                        cell_main(i as u16, &args, boot, hasher, fabric, park_flags, wake_fd)
                     }));
                     match outcome {
                         Ok(Ok(())) => Ok::<(), std::io::Error>(()),
@@ -878,6 +914,7 @@ fn cell_main(
     cell: u16,
     args: &Args,
     boot: Boot,
+    hasher: KeyHasher,
     fabric: CellFabric,
     park_flags: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>>,
     wake_fd: Option<std::os::fd::OwnedFd>,
@@ -938,7 +975,7 @@ fn cell_main(
     // blocking exception, now sliced). Progress/summary lines come from
     // the control thread's recovery board.
     mark(14); // setup:keyspace
-    let mut ks = Keyspace::new(StoreConfig::default());
+    let mut ks = Keyspace::new(StoreConfig { hasher, ..StoreConfig::default() });
     let mut durable = None;
     if let Some((dir, catalog, control, io, seal_barriers_per_s, frames_in_flight, provenance)) =
         &boot
@@ -1121,6 +1158,15 @@ mod never {
     }
 }
 
+/// Sixteen bytes of OS randomness for a key-hash secret (ADR-0094 D2):
+/// boot code, blocking, never a fixed fallback.
+fn os_entropy() -> std::io::Result<[u8; 16]> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn backend_name() -> &'static str {
     #[cfg(target_os = "linux")]
     return "io_uring";
@@ -1130,23 +1176,33 @@ fn backend_name() -> &'static str {
     "none"
 }
 
-/// The checkpoint cap's replay term (ADR-0088 D4 as amended, second
-/// amendment), conservative at every cell count. With both probed read
-/// rows: `min(qd1, qd4 ÷ cells)` — a one- or two-cell node is bounded by
-/// what one `O_DIRECT` reader gets (the four-reader aggregate overstates
-/// it there), a four-or-more-cell node by its share of the aggregate
-/// (campaign M3 measured it at a quarter of the D4 constant per cell).
+/// The checkpoint cap's replay term (ADR-0088 D4 as amended — third
+/// amendment, review of 2026-08-28): a conservative interpolation from
+/// the two probed geometries, with its assumptions named. The probe
+/// measured one reader (`qd1`) and four (`qd4`); nothing in between and
+/// nothing beyond. With both rows:
+///
+/// - one cell: `qd1` — measured directly, no assumption;
+/// - two to four cells: `min(qd1, qd4 ÷ 4)` — the **four-reader share**,
+///   conservative under A1 (a reader's share does not grow with more
+///   contending readers: `agg(n)/n ≥ agg(4)/4` for `n ≤ 4`); the earlier
+///   `qd4 ÷ cells` assumed `agg(2) = agg(4)`, which is optimistic;
+/// - more than four cells: `min(qd1, qd4 ÷ cells)` — conservative under
+///   A2 (the aggregate does not fall as readers grow past four:
+///   `agg(n) ≥ agg(4)`), the one assumption a probe at the node's own
+///   geometry would remove.
+///
 /// With the four-reader row only (a schema-3 file): `qd4 ÷ max(cells,
-/// 4)` — never more than one reader's quarter share. With the one-reader
-/// row only: `qd1 ÷ cells`. With neither: the D4 constant. `cells = 0`
-/// counts as one.
+/// 4)`. With the one-reader row only: `qd1 ÷ cells` (A2 again). With
+/// neither: the D4 constant. `cells = 0` counts as one.
 fn replay_bytes_per_s_per_cell(read_qd4: u64, read_qd1: u64, cells: u16) -> u64 {
     let cells = u64::from(cells.max(1));
     match (read_qd4, read_qd1) {
         (0, 0) => inf_server::DEFAULT_REPLAY_BYTES_PER_S,
         (qd4, 0) => qd4 / cells.max(4),
         (0, qd1) => qd1 / cells,
-        (qd4, qd1) => qd1.min(qd4 / cells),
+        (_, qd1) if cells == 1 => qd1,
+        (qd4, qd1) => qd1.min(qd4 / cells.max(4)),
     }
 }
 
@@ -1160,8 +1216,15 @@ fn replay_term_origin(read_qd4: u64, read_qd1: u64, cells: u16) -> String {
             format!("qd4 read row only {} MiB/s (schema-3 file) ÷ max({cells}, 4) cells", qd4 >> 20)
         }
         (0, qd1) => format!("qd1 read row only {} MiB/s ÷ {cells} cells", qd1 >> 20),
+        (_, qd1) if cells == 1 => format!("probed read row qd1 {} MiB/s (one cell)", qd1 >> 20),
+        (qd4, qd1) if cells <= 4 => format!(
+            "min(probed read rows qd1 {} MiB/s, qd4 {} MiB/s ÷ 4 — the four-reader share at \
+             {cells} cells, assumption A1)",
+            qd1 >> 20,
+            qd4 >> 20
+        ),
         (qd4, qd1) => format!(
-            "min(probed read rows qd1 {} MiB/s, qd4 {} MiB/s ÷ {cells} cells)",
+            "min(probed read rows qd1 {} MiB/s, qd4 {} MiB/s ÷ {cells} cells, assumption A2)",
             qd1 >> 20,
             qd4 >> 20
         ),
@@ -1278,9 +1341,15 @@ mod tests {
         // Both rows: one reader's rate bounds the small node, the
         // aggregate's share the large one (they cross between 1 and 2).
         assert_eq!(replay_bytes_per_s_per_cell(QD4, QD1, 1), QD1);
-        assert_eq!(replay_bytes_per_s_per_cell(QD4, QD1, 2), 541_500_000);
+        // Two and three cells take the four-reader share, not qd4 ÷ cells
+        // (the review of 2026-08-28: a two-reader aggregate can be lower
+        // than the four-reader one — `qd4 ÷ 2` was unsupported).
+        assert_eq!(replay_bytes_per_s_per_cell(QD4, QD1, 2), 270_750_000);
+        assert_eq!(replay_bytes_per_s_per_cell(QD4, QD1, 3), 270_750_000);
         assert_eq!(replay_bytes_per_s_per_cell(QD4, QD1, 4), 270_750_000);
         assert_eq!(replay_bytes_per_s_per_cell(QD4, QD1, 8), 135_375_000);
+        // A one-reader row below the four-reader share binds everywhere.
+        assert_eq!(replay_bytes_per_s_per_cell(QD4, 200_000_000, 2), 200_000_000);
         // The four-reader row only (a schema-3 file): never more than a
         // quarter share, even at one cell.
         assert_eq!(replay_bytes_per_s_per_cell(QD4, 0, 1), 270_750_000);
@@ -1297,6 +1366,8 @@ mod tests {
         assert!(replay_term_origin(QD4, 0, 1).contains("schema-3 file"));
         assert!(replay_term_origin(QD4, 0, 1).contains("max(1, 4)"));
         assert!(replay_term_origin(0, QD1, 8).contains("qd1 read row only"));
-        assert!(replay_term_origin(QD4, QD1, 2).contains("min(probed read rows qd1"));
+        assert!(replay_term_origin(QD4, QD1, 2).contains("four-reader share at 2 cells"));
+        assert!(replay_term_origin(QD4, QD1, 8).contains("÷ 8 cells, assumption A2"));
+        assert!(replay_term_origin(QD4, QD1, 1).contains("(one cell)"));
     }
 }

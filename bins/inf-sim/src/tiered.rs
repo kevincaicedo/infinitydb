@@ -65,6 +65,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use inf_foundation::fault::FaultSpec;
 use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
@@ -266,6 +267,27 @@ pub struct TieredNodeReport {
     pub collide_ticketed_fallbacks: u64,
     pub collide_dbsize_drains: u64,
     pub collide_scan_twins: u64,
+    /// Phase 6d (ADR-0093 A8, review of 2026-08-28): the open-ticket
+    /// rows under a paused reconciler — tickets opened and held open
+    /// through `GET`/`DBSIZE`/`SCAN`/a second `SET`/`DEL`, the `DBSIZE`
+    /// drains (two in flight together), the twins the drains read and
+    /// verified, the SCAN twins, the retargets, the read-free forced
+    /// deletes, the `Ticketed` refusals, the collision verdicts, the
+    /// injected twin-read errors `DBSIZE` relayed, and the tickets the
+    /// resumed reconciler settled without a read. Every row asserts its
+    /// own coverage — a vacuous row is a violation.
+    pub open_rows: bool,
+    pub open_tickets: u64,
+    pub open_dbsize_drains: u64,
+    pub open_dbsize_reads: u64,
+    pub open_verified_pending: u64,
+    pub open_scan_twins: u64,
+    pub open_retargeted: u64,
+    pub open_forced_deletes: u64,
+    pub open_ticketed_fallbacks: u64,
+    pub open_collision_verdicts: u64,
+    pub open_read_fault_errors: u64,
+    pub open_settled_without_read: u64,
 }
 
 impl TieredNodeReport {
@@ -418,6 +440,12 @@ fn ns_watermarks(text: &str) -> Option<(u64, u64)> {
 /// Extracts one `key:value` integer from an `INFO` section text.
 /// `DBSIZE` summed over every cell (the tiered table is cell-scoped),
 /// each through a connection pinned to its cell.
+/// `DBSIZE` on the namespace, asked of **every** cell through a
+/// namespace-bound probe: since the review of 2026-08-28 (M4.5-S37
+/// finding 2) the answer is the node-wide count on every cell — the
+/// scatter-sum through `ApplyNs` — so the cells must agree, and the one
+/// value is returned. (Before, each cell answered its own table and the
+/// harness summed them; a disagreement now is a violation.)
 fn dbsize_sum(
     node: &mut Node,
     rng: &mut SplitMix64,
@@ -425,7 +453,7 @@ fn dbsize_sum(
     disk: &SimDisk,
     scenario: &TieredScenario,
 ) -> Result<u64, String> {
-    let mut total = 0u64;
+    let mut agreed: Option<u64> = None;
     for cell in 0..usize::from(scenario.cells) {
         let mut probe = MiniClient::connect(node, cell);
         let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
@@ -434,14 +462,24 @@ fn dbsize_sum(
             other => return Err(format!("USE on cell {cell} answered {other:?}")),
         }
         let dbsize: &[&[u8]] = &[b"DBSIZE"];
-        match probe.call(node, rng, clock, disk, scenario.step_ns_max, dbsize) {
+        let n = match probe.call(node, rng, clock, disk, scenario.step_ns_max, dbsize) {
             Ok(Some(reply)) if reply.starts_with(b":") => {
-                total += String::from_utf8_lossy(&reply[1..]).trim().parse::<u64>().unwrap_or(0);
+                String::from_utf8_lossy(&reply[1..]).trim().parse::<u64>().unwrap_or(0)
             }
             other => return Err(format!("DBSIZE on cell {cell} answered {other:?}")),
+        };
+        match agreed {
+            None => agreed = Some(n),
+            Some(first) if first == n => {}
+            Some(first) => {
+                return Err(format!(
+                    "DBSIZE VIOLATION: cell {cell} answered {n}, cell 0 answered {first} — a \
+                     namespace-bound DBSIZE is node-wide on every cell"
+                ));
+            }
         }
     }
-    Ok(total)
+    Ok(agreed.unwrap_or(0))
 }
 
 /// `INFO tiering` fields summed over every cell (the section is
@@ -680,6 +718,47 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         }
     }
     report.commands_done += COLLIDE_PAIRS;
+    // ADR-0093 A8 (phase 6d's material): the open-ticket rows' keys —
+    // four plain keys (same-key tickets held open), four crafted triples
+    // (a collision ticket plus a `Ticketed` third key each) and one key
+    // for the injected-read-error row — written pre-cut like the pairs,
+    // so they are cold again when phase 6d runs.
+    const OPEN_SAME_KEYS: u64 = 4;
+    const OPEN_TRIPLES: u64 = 4;
+    let open_same_keys: Vec<Vec<u8>> =
+        (0..OPEN_SAME_KEYS).map(|i| format!("open:sk:{i}").into_bytes()).collect();
+    let open_fault_key: Vec<u8> = b"open:fault".to_vec();
+    let open_triples: Vec<[[u8; 48]; 3]> = (0..OPEN_TRIPLES)
+        .map(|i| {
+            inf_store::forced_collision_triple(
+                seed ^ 0xA5A5_0000 ^ (i + 8).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            )
+        })
+        .collect();
+    let open_value = |tag: u8, i: u64| value_bytes(tag, 7, i, 1792);
+    for (i, key) in open_same_keys.iter().chain(std::iter::once(&open_fault_key)).enumerate() {
+        let value = open_value(b'o', i as u64);
+        let set: &[&[u8]] = &[b"SET", key, &value];
+        match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("pre-cut SET open key {i} answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    for (i, triple) in open_triples.iter().enumerate() {
+        let value = open_value(b'p', i as u64);
+        let set: &[&[u8]] = &[b"SET", &triple[0], &value];
+        match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("pre-cut SET open triple {i}.0 answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    report.commands_done += OPEN_SAME_KEYS + 1 + OPEN_TRIPLES;
 
     // ---- phase 2: seeded traffic until the cut -------------------------
     let mut writers = Vec::new();
@@ -1205,6 +1284,350 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         Err(err) => fail(&mut report, format!("phase-6c scrape: {err}")),
     }
 
+    // ---- phase 6d: open-ticket rows under a paused reconciler (A8) -----
+    // Phase 6c's tickets resolve between the harness's commands (the
+    // MAINTAIN reconciler runs every iteration), so its node-level rows
+    // never saw a ticket open — the review of 2026-08-28. Here the
+    // reconciler is paused (`tiered-shadow-reconcile no`, fanned to every
+    // cell and witnessed on each) and the tickets stay exactly as the
+    // writes left them while `GET`, two `DBSIZE`s in flight together
+    // (the fenced Foreground drain; the node-wide scatter), `SCAN` (the
+    // twin named), a second `SET` (the ticket follows the winner), `DEL`
+    // (read-free once the drain verified), a colliding third key
+    // (`Ticketed` → synchronous), a `DBSIZE` whose twin read is made to
+    // fail (the typed error, relayed through the scatter) and `DEL` of a
+    // collision winner run against them. Every row asserts its own
+    // coverage — a vacuous row is a violation, not a disclosure.
+    if scenario.shadow {
+        report.open_rows = true;
+        macro_rules! bail {
+            ($($arg:tt)*) => {{
+                fail(&mut report, format!($($arg)*));
+                return finish(report, &observer, &clock);
+            }};
+        }
+        macro_rules! expect {
+            ($cmd:expr, $want:expr, $what:expr) => {{
+                let want: &[u8] = $want;
+                match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, $cmd) {
+                    Ok(Some(reply)) if reply == want => {}
+                    other => bail!(
+                        "OPEN-TICKET VIOLATION seed {seed:#x}: {} answered {other:?}, wanted {}",
+                        $what,
+                        preview(want)
+                    ),
+                }
+                report.commands_done += 1;
+            }};
+        }
+        const OPEN_KEYS: [&str; 12] = [
+            "tiering_shadow_created",
+            "tiering_shadow_dbsize_drains",
+            "tiering_shadow_dbsize_reads",
+            "tiering_shadow_verified_pending",
+            "tiering_shadow_scan_twins_emitted",
+            "tiering_shadow_retargeted",
+            "tiering_shadow_forced_by_delete",
+            "tiering_shadow_fallback_ticketed",
+            "tiering_shadow_resolved_collision",
+            "tiering_shadow_read_errors",
+            "tiering_shadow_reconcile_paused",
+            "tiering_shadow_pending",
+        ];
+        macro_rules! scrape {
+            () => {
+                match info_sum(&mut node, &mut rng, &clock, &disk, scenario, &OPEN_KEYS) {
+                    Ok(v) => v,
+                    Err(err) => bail!("phase-6d scrape: {err}"),
+                }
+            };
+        }
+        macro_rules! count {
+            ($want:expr, $what:expr) => {{
+                let want: u64 = $want;
+                match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+                    Ok(n) if n == want => {}
+                    Ok(n) => bail!(
+                        "OPEN-TICKET VIOLATION seed {seed:#x}: DBSIZE {n} {}, wanted {want}",
+                        $what
+                    ),
+                    Err(err) => bail!("phase-6d DBSIZE {}: {err}", $what),
+                }
+            }};
+        }
+        let pause: &[&[u8]] = &[b"CONFIG", b"SET", b"tiered-shadow-reconcile", b"no"];
+        expect!(pause, b"+OK\r\n", "CONFIG SET tiered-shadow-reconcile no");
+        let before = scrape!();
+        if before[10] != u64::from(scenario.cells) {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: the pause reached {} of {} cells",
+                before[10],
+                scenario.cells
+            );
+        }
+        let base = match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+            Ok(n) => n,
+            Err(err) => bail!("phase-6d DBSIZE base: {err}"),
+        };
+        // (1) Same-key writes over cold candidates: tickets open — and,
+        //     paused, they stay open. The winner serves at once.
+        let sk_v1: Vec<Vec<u8>> =
+            (0..OPEN_SAME_KEYS).map(|i| value_bytes(b'q', 7, i, 1920)).collect();
+        for (i, key) in open_same_keys.iter().enumerate() {
+            expect!(&[b"SET", key, &sk_v1[i]], b"+OK\r\n", "SET open same key");
+        }
+        let after_sets = scrape!();
+        let opened = after_sets[0] - before[0];
+        if opened != OPEN_SAME_KEYS {
+            bail!(
+                "OPEN-TICKET ROW VACUOUS seed {seed:#x}: {opened} of {OPEN_SAME_KEYS} same-key \
+                 SETs opened a ticket (the candidates were not cold)"
+            );
+        }
+        if after_sets[11] < OPEN_SAME_KEYS {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: {} tickets pending under the pause, \
+                 wanted ≥ {OPEN_SAME_KEYS} (the reconciler did not pause)",
+                after_sets[11]
+            );
+        }
+        report.open_tickets += opened;
+        for (i, key) in open_same_keys.iter().enumerate() {
+            expect!(&[b"GET", key], &bulk(&sk_v1[i]), "GET open same key (ticket open)");
+        }
+        // (2) Two DBSIZEs in flight together, from two namespace-bound
+        //     connections on different cells: both drain (the fence
+        //     counts two), both answer the exact node-wide count.
+        let mut second = MiniClient::connect(&mut node, usize::from(scenario.cells) - 1);
+        let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
+        match second.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, use_ns) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => bail!("phase-6d second USE answered {other:?}"),
+        }
+        audit.send(&mut node, &[b"DBSIZE"]);
+        second.send(&mut node, &[b"DBSIZE"]);
+        let (mut a, mut b) = (None, None);
+        for _ in 0..STALL_STEPS {
+            if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
+                bail!("phase-6d overlapping DBSIZE step: {err}");
+            }
+            report.scheduler_steps += 1;
+            if a.is_none() {
+                a = audit.recv(&mut node);
+            }
+            if b.is_none() {
+                b = second.recv(&mut node);
+            }
+            if a.is_some() && b.is_some() {
+                break;
+            }
+        }
+        let (Some(a), Some(b)) = (a, b) else {
+            report.stalled = true;
+            bail!("OPEN-TICKET STALL seed {seed:#x}: two DBSIZEs in flight never both answered");
+        };
+        report.commands_done += 2;
+        let want = format!(":{base}\r\n");
+        if a != want.as_bytes() || b != want.as_bytes() {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: overlapping DBSIZEs answered {} and {}, \
+                 wanted {want:?} on both (the same-key SETs change no count)",
+                preview(&a),
+                preview(&b)
+            );
+        }
+        let after_drain = scrape!();
+        let (drains, reads) = (after_drain[1] - before[1], after_drain[2] - before[2]);
+        if drains == 0 || reads < OPEN_SAME_KEYS {
+            bail!(
+                "OPEN-TICKET ROW VACUOUS seed {seed:#x}: DBSIZE raised {drains} drains reading \
+                 {reads} twins, wanted ≥ 1 and ≥ {OPEN_SAME_KEYS}"
+            );
+        }
+        if after_drain[3] < OPEN_SAME_KEYS {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: {} verified tickets pending after the \
+                 drain, wanted ≥ {OPEN_SAME_KEYS} (verified tickets must stay open, paused)",
+                after_drain[3]
+            );
+        }
+        report.open_dbsize_drains += drains;
+        report.open_dbsize_reads += reads;
+        report.open_verified_pending = after_drain[3];
+        // (3) SCAN names each same key twice — its twin is a cold slot
+        //     like any other (ADR-0093 A3).
+        match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario) {
+            Ok(keys) => {
+                for key in &open_same_keys {
+                    let named = keys.iter().filter(|k| *k == key).count();
+                    if named < 2 {
+                        bail!(
+                            "OPEN-TICKET VIOLATION seed {seed:#x}: SCAN named {:?} {named} \
+                             time(s) with its twin slotted, wanted ≥ 2 (ADR-0093 A3)",
+                            String::from_utf8_lossy(key)
+                        );
+                    }
+                }
+            }
+            Err(err) => bail!("phase-6d SCAN: {err}"),
+        }
+        let after_scan = scrape!();
+        let twins = after_scan[4] - before[4];
+        if twins < OPEN_SAME_KEYS {
+            bail!("OPEN-TICKET ROW VACUOUS seed {seed:#x}: SCAN emitted {twins} twins");
+        }
+        report.open_scan_twins += twins;
+        // (4) A second SET while the ticket is open: the ticket follows
+        //     the winner (retargeted), the value is the new one.
+        let sk_v2: Vec<Vec<u8>> =
+            (0..OPEN_SAME_KEYS).map(|i| value_bytes(b'w', 7, i, 2176)).collect();
+        for (i, key) in open_same_keys.iter().enumerate() {
+            expect!(&[b"SET", key, &sk_v2[i]], b"+OK\r\n", "second SET (ticket open)");
+            expect!(&[b"GET", key], &bulk(&sk_v2[i]), "GET after the second SET");
+        }
+        let after_set2 = scrape!();
+        let retargeted = after_set2[5] - before[5];
+        if retargeted < OPEN_SAME_KEYS {
+            bail!("OPEN-TICKET ROW VACUOUS seed {seed:#x}: {retargeted} tickets retargeted");
+        }
+        report.open_retargeted += retargeted;
+        // (5) DEL of two verified winners: the forced resolution needs no
+        //     read; the twin dies through the marker path; the count is
+        //     exact.
+        for key in &open_same_keys[..2] {
+            expect!(&[b"DEL", key], b":1\r\n", "DEL open same key (verified ticket)");
+            expect!(&[b"GET", key], b"$-1\r\n", "GET after DEL");
+        }
+        let after_del = scrape!();
+        let forced = after_del[6] - before[6];
+        if forced < 2 {
+            bail!("OPEN-TICKET ROW VACUOUS seed {seed:#x}: {forced} forced deletes");
+        }
+        report.open_forced_deletes += forced;
+        count!(base - 2, "after two DELs");
+        // (6) Crafted triples: the second key's write over the cold first
+        //     opens a collision-shaped ticket; both keys read exactly
+        //     with it open; the third key's write finds the ticketed slot
+        //     (`Ticketed` → synchronous); DBSIZE's drain answers
+        //     `Collision`; SCAN names all three; DEL of the second leaves
+        //     the first.
+        let t_v: Vec<(Vec<u8>, Vec<u8>)> = (0..OPEN_TRIPLES)
+            .map(|i| (value_bytes(b'r', 7, i, 1664), value_bytes(b't', 7, i, 1408)))
+            .collect();
+        for (i, triple) in open_triples.iter().enumerate() {
+            expect!(&[b"SET", &triple[1], &t_v[i].0], b"+OK\r\n", "SET triple.1");
+            expect!(
+                &[b"GET", &triple[0]],
+                &bulk(&open_value(b'p', i as u64)),
+                "GET triple.0 (the collision key, ticket open)"
+            );
+            expect!(&[b"GET", &triple[1]], &bulk(&t_v[i].0), "GET triple.1 (winner)");
+            expect!(&[b"SET", &triple[2], &t_v[i].1], b"+OK\r\n", "SET triple.2 (Ticketed)");
+            expect!(&[b"GET", &triple[2]], &bulk(&t_v[i].1), "GET triple.2");
+        }
+        let after_triples = scrape!();
+        let ticketed = after_triples[7] - before[7];
+        if ticketed < OPEN_TRIPLES {
+            bail!(
+                "OPEN-TICKET ROW VACUOUS seed {seed:#x}: {ticketed} Ticketed refusals, wanted \
+                 ≥ {OPEN_TRIPLES}"
+            );
+        }
+        report.open_ticketed_fallbacks += ticketed;
+        count!(base - 2 + 2 * OPEN_TRIPLES, "after the triples' writes (the drain)");
+        let after_cdrain = scrape!();
+        let collisions = after_cdrain[8] - before[8];
+        if collisions < OPEN_TRIPLES {
+            bail!(
+                "OPEN-TICKET ROW VACUOUS seed {seed:#x}: {collisions} collision verdicts, \
+                 wanted ≥ {OPEN_TRIPLES}"
+            );
+        }
+        report.open_collision_verdicts += collisions;
+        match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario) {
+            Ok(keys) => {
+                for (i, triple) in open_triples.iter().enumerate() {
+                    for (side, key) in triple.iter().enumerate() {
+                        if !keys.iter().any(|k| k == key) {
+                            bail!(
+                                "OPEN-TICKET VIOLATION seed {seed:#x}: SCAN did not name triple \
+                                 {i}.{side}"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => bail!("phase-6d triple SCAN: {err}"),
+        }
+        for (i, triple) in open_triples.iter().enumerate() {
+            expect!(&[b"DEL", &triple[1]], b":1\r\n", "DEL triple.1");
+            expect!(
+                &[b"GET", &triple[0]],
+                &bulk(&open_value(b'p', i as u64)),
+                "GET triple.0 after the other's DEL"
+            );
+        }
+        // (7) An unreadable twin: a fresh unverified ticket, the drain's
+        //     read made to fail — DBSIZE answers the typed error through
+        //     the scatter (never an inexact count) — then, healed, exact.
+        let fault_v = value_bytes(b'u', 7, 0, 1536);
+        expect!(&[b"SET", &open_fault_key, &fault_v], b"+OK\r\n", "SET open fault key");
+        let after_fault_set = scrape!();
+        if after_fault_set[0] - after_cdrain[0] != 1 {
+            bail!("OPEN-TICKET ROW VACUOUS seed {seed:#x}: the fault row's SET opened no ticket");
+        }
+        inf_foundation::fault::arm(inf_server::fault::SHADOW_TWIN_READ_FAIL, FaultSpec::Always);
+        let dbsize: &[&[u8]] = &[b"DBSIZE"];
+        let faulted = audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, dbsize);
+        inf_foundation::fault::disarm(inf_server::fault::SHADOW_TWIN_READ_FAIL);
+        report.commands_done += 1;
+        match faulted {
+            Ok(Some(reply)) if reply.starts_with(b"-ERR DBSIZE: shadow twin at ") => {}
+            other => bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: DBSIZE with an unreadable twin answered \
+                 {other:?}, wanted the typed `-ERR DBSIZE: shadow twin at …` (ADR-0093 A3)"
+            ),
+        }
+        let after_fault = scrape!();
+        let faults = after_fault[9] - before[9];
+        if faults == 0 {
+            bail!("OPEN-TICKET ROW VACUOUS seed {seed:#x}: the injected twin read never failed");
+        }
+        report.open_read_fault_errors += faults;
+        count!(base - 2 + OPEN_TRIPLES, "after the fault healed");
+        // (8) Resume the reconciler on every cell; phase 7b's quiescence
+        //     oracle then settles the verified tickets without a read.
+        let resume: &[&[u8]] = &[b"CONFIG", b"SET", b"tiered-shadow-reconcile", b"yes"];
+        expect!(resume, b"+OK\r\n", "CONFIG SET tiered-shadow-reconcile yes");
+        let resumed = scrape!();
+        if resumed[10] != 0 {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: {} cells still paused after resume",
+                resumed[10]
+            );
+        }
+        for (i, key) in open_same_keys.iter().enumerate() {
+            let state = if i < 2 { b"$-1\r\n".to_vec() } else { bulk(&sk_v2[i]) };
+            observed.insert(key.clone(), state);
+        }
+        for (i, triple) in open_triples.iter().enumerate() {
+            observed.insert(triple[0].to_vec(), bulk(&open_value(b'p', i as u64)));
+            observed.insert(triple[1].to_vec(), b"$-1\r\n".to_vec());
+            observed.insert(triple[2].to_vec(), bulk(&t_v[i].1));
+        }
+        observed.insert(open_fault_key.clone(), bulk(&fault_v));
+    } else {
+        // The off arm never touches phase 6d's pre-cut material: it is
+        // live as written, and the model must say so (the cardinality
+        // oracle counts it; the cold sweep re-reads it).
+        for (i, key) in open_same_keys.iter().chain(std::iter::once(&open_fault_key)).enumerate() {
+            observed.insert(key.clone(), bulk(&open_value(b'o', i as u64)));
+        }
+        for (i, triple) in open_triples.iter().enumerate() {
+            observed.insert(triple[0].to_vec(), bulk(&open_value(b'p', i as u64)));
+        }
+    }
+
     // ---- phase 7: cold re-read sweep (exact bytes after re-demotion) -----
     for (key, want) in &observed {
         let reply = match audit.call(
@@ -1298,29 +1721,39 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             }
         }
     }
-    // DBSIZE answers per cell (the tiered table is cell-scoped): sum
-    // every cell's answer through a connection pinned to it.
-    let mut total_keys = 0u64;
-    for cell in 0..usize::from(scenario.cells) {
-        let mut probe = MiniClient::connect(&mut node, cell);
-        let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
-        match probe.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, use_ns) {
-            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
-            other => {
-                fail(&mut report, format!("quiescence USE on cell {cell} answered {other:?}"));
-                return finish(report, &observer, &clock);
-            }
+    // DBSIZE on a namespace-bound connection is the node-wide count on
+    // every cell (the scatter-sum; the helper asserts the cells agree).
+    let total_keys = match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+        Ok(n) => n,
+        Err(err) => {
+            fail(&mut report, format!("quiescence DBSIZE: {err}"));
+            return finish(report, &observer, &clock);
         }
-        let dbsize: &[&[u8]] = &[b"DBSIZE"];
-        match probe.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, dbsize) {
-            Ok(Some(reply)) if reply.starts_with(b":") => {
-                total_keys +=
-                    String::from_utf8_lossy(&reply[1..]).trim().parse::<u64>().unwrap_or(0);
+    };
+    if report.open_rows {
+        // The resumed reconciler settled phase 6d's verified tickets
+        // without a read (ADR-0093 A1) — summed over every cell.
+        match info_sum(
+            &mut node,
+            &mut rng,
+            &clock,
+            &disk,
+            scenario,
+            &["tiering_shadow_settled_without_read"],
+        ) {
+            Ok(v) => {
+                report.open_settled_without_read = v[0];
+                if v[0] == 0 {
+                    fail(
+                        &mut report,
+                        format!(
+                            "OPEN-TICKET ROW VACUOUS seed {seed:#x}: no ticket settled without a \
+                             read after the reconciler resumed"
+                        ),
+                    );
+                }
             }
-            other => {
-                fail(&mut report, format!("quiescence DBSIZE on cell {cell} answered {other:?}"));
-                return finish(report, &observer, &clock);
-            }
+            Err(err) => fail(&mut report, format!("settled-without-read scrape: {err}")),
         }
     }
     if total_keys != live_keys {

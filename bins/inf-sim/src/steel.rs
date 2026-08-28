@@ -37,8 +37,8 @@ use inf_runtime::{
     PollImmediate, RawFd, StableBytesMut, TokenClass, Wait,
 };
 use inf_store::{
-    AddrClass, AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsId, StoreConfig,
-    TieredLookup, TieredTable,
+    AddrClass, AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId,
+    StoreConfig, TieredLookup, TieredTable,
 };
 
 use crate::net::{CellNet, Plant, SimDriver};
@@ -171,7 +171,7 @@ fn plan(ctx: &Rc<RefCell<Ctx>>, key: &[u8], hash: u64, exclude: &[LogicalAddr]) 
 /// The scenario GET — fetch-verify-retry over real suspension, resuming
 /// with a re-resolve (the M0 custody rule).
 async fn steel_get(ctx: Rc<RefCell<Ctx>>, key: Vec<u8>) -> Answer {
-    let hash = TieredTable::hash_key(&key);
+    let hash = ctx.borrow().ks.hasher().hash(&key);
     let mut exclude: Vec<LogicalAddr> = Vec::new();
     loop {
         let (buf, addr, frame_count, skip, waiter) = match plan(&ctx, &key, hash, &exclude) {
@@ -278,9 +278,10 @@ fn run_life(
     ledger: &[(Vec<u8>, Vec<u8>)],
     updates_from: Option<UpdateLeg<'_>>,
     report: &mut SteelReport,
+    hasher: KeyHasher,
 ) -> (LogicalAddr, u32) {
     // Replay the ledger into a fresh life (the harness plays the WAL).
-    let mut ks = Keyspace::new(StoreConfig::default());
+    let mut ks = Keyspace::new(StoreConfig { hasher, ..Default::default() });
     assert!(
         ks.materialize_tiered(
             NS,
@@ -294,7 +295,7 @@ fn run_life(
     {
         let table = ks.tiered_store_mut(NS).expect("materialized");
         for (key, value) in ledger {
-            let hash = TieredTable::hash_key(key);
+            let hash = table.hash_key(key);
             let placed = match table.lookup(key, hash, &[]) {
                 TieredLookup::Ram(old) => {
                     let (old_len, old_version) = {
@@ -396,7 +397,7 @@ fn run_life(
             let value = vec![(rng.next_u64() % 251) as u8; value_len];
             let ctx = &mut *ctx.borrow_mut();
             let table = ctx.table();
-            let hash = TieredTable::hash_key(&key);
+            let hash = table.hash_key(&key);
             let TieredLookup::Cold(old) = table.lookup(&key, hash, &[]) else {
                 // Already promoted by an earlier update this round: RAM.
                 let TieredLookup::Ram(old) = table.lookup(&key, hash, &[]) else {
@@ -471,6 +472,7 @@ pub fn run_steel_scenario(scenario: &SteelScenario) -> SteelReport {
         &ledger.clone(),
         Some((&mut rng, scenario.updates, &mut ledger)),
         &mut report,
+        KeyHasher::from_seed(scenario.seed),
     );
 
     // The S06 crash leg: tear un-fsynced state, then a new life replays
@@ -478,6 +480,15 @@ pub fn run_steel_scenario(scenario: &SteelScenario) -> SteelReport {
     disk.power_cut(scenario.seed ^ 0x0FF5_EED0);
     let origin = LogicalAddr::from_raw(tail.to_raw().next_multiple_of(PAGE as u64))
         .expect("origin fits 48 bits");
-    run_life(&disk, &shard_dir, next_file_id, origin, &ledger, None, &mut report);
+    run_life(
+        &disk,
+        &shard_dir,
+        next_file_id,
+        origin,
+        &ledger,
+        None,
+        &mut report,
+        KeyHasher::from_seed(scenario.seed),
+    );
     report
 }

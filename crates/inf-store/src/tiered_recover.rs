@@ -28,7 +28,7 @@
 
 use std::io;
 
-use inf_foundation::LogicalAddr;
+use inf_foundation::{KeyHasher, LogicalAddr};
 use inf_log::blob::parse_extent_file_name;
 use inf_log::ckpt::{IckBlobRefSection, IckLiveSetSection, IckRefSection};
 use inf_log::flush::{TierFileMeta, TierFlush, TierFlushConfig};
@@ -86,6 +86,7 @@ pub struct RecoveredTier<F: SegmentFs> {
 /// I/O failures; `InvalidData` when a named file is missing, its header
 /// identity mismatches, or a sealed footer covers less than the
 /// manifested range; `OutOfMemory` when the ring reservation fails.
+#[allow(clippy::too_many_arguments)] // the recovery entry's seven inputs + the key hasher (ADR-0094)
 pub fn recover_tiered_ns<F: SegmentFs>(
     fs: F,
     tier: &TierNsManifest,
@@ -94,6 +95,7 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     space: AddressSpaceConfig,
     demote: DemotionConfig,
     initial_keys: usize,
+    hasher: KeyHasher,
 ) -> io::Result<RecoveredTier<F>> {
     assert_eq!(flush_config.ns.0, tier.ns, "manifest section vs pipeline namespace");
     let cold_dir = flush_config.shard_dir.join("cold");
@@ -180,6 +182,7 @@ pub fn recover_tiered_ns<F: SegmentFs>(
         },
         demote,
         initial_keys,
+        hasher,
     )
     .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "tier ring reservation failed"))?;
     // Live-set seeding (M4-S14, ADR-0058 D4): counts start at zero and

@@ -842,7 +842,7 @@ mod imp {
             };
             let mut outcome = Ok(());
             for key in keys {
-                let hash = CellStore::hash_key(key);
+                let hash = self.hash_key(key);
                 self.idx.note_write_key(hash);
                 let CellStore { arena, index, docs, idx, .. } = self;
                 let root = peek_doc_root(arena, index, docs, key, hash);
@@ -883,7 +883,7 @@ mod imp {
             debug_assert_eq!(keys.len(), self.idx.write_set_len());
             let mut flooded = false;
             for key in keys {
-                let hash = CellStore::hash_key(key);
+                let hash = self.hash_key(key);
                 let CellStore { arena, index, docs, idx, .. } = self;
                 let root = peek_doc_root(arena, index, docs, key, hash);
                 debug_assert!(

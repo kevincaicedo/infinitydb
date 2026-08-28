@@ -36,6 +36,7 @@ use inf_runtime::{
     BackendDriver, CellExecutor, ColdReads, ColdWait, PollImmediate, RawFd, ReadClass, TierFileId,
     TokenClass, UringDriver, Wait,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsId, StoreConfig, TieredLookup,
     TieredTable,
@@ -70,7 +71,7 @@ type Answer = Option<(Vec<u8>, u32, bool)>;
 /// The hardened GET: fetch-verify-retry through `ColdReads`, re-resolve
 /// after every resume, chunked staging for oversized records.
 async fn hardened_get(ctx: Rc<RefCell<Ctx>>, key: Vec<u8>) -> Answer {
-    let hash = TieredTable::hash_key(&key);
+    let hash = KeyHasher::default().hash(&key);
     let mut exclude: Vec<LogicalAddr> = Vec::new();
     'attempt: loop {
         let (addr, wait, window_frames, skip) = {
@@ -282,14 +283,14 @@ fn build_demoted_corpus(
         let table = ks.tiered_store_mut(NS).expect("materialized");
         for (i, key) in corpus.small_keys.iter().enumerate() {
             let value = vec![b'a' + (i % 23) as u8; 48 + i * 5];
-            let addr = table.insert(key, &value, TieredTable::hash_key(key)).expect("fits");
+            let addr = table.insert(key, &value, KeyHasher::default().hash(key)).expect("fits");
             log.push((addr, table.record(addr).encoded_len));
             corpus.values.insert(key.clone(), value);
         }
         // > POOL_BUF (16 KiB) by a wide margin: ~7 staged chunks.
         let big_value = vec![0xB8u8; 100 * 1024];
         let addr = table
-            .insert(&corpus.big_key, &big_value, TieredTable::hash_key(&corpus.big_key))
+            .insert(&corpus.big_key, &big_value, KeyHasher::default().hash(&corpus.big_key))
             .expect("fits");
         log.push((addr, table.record(addr).encoded_len));
         corpus.values.insert(corpus.big_key.clone(), big_value);
@@ -371,7 +372,7 @@ fn cold_reads_share_the_cell_with_hot_commands() {
     {
         let ctx = &mut *ctx.borrow_mut();
         let hot_key = b"hot:while-cold";
-        let hash = TieredTable::hash_key(hot_key);
+        let hash = KeyHasher::default().hash(hot_key);
         let addr = ctx.table().insert(hot_key, b"written-during-cold-read", hash).expect("fits");
         assert_eq!(ctx.table().record(addr).value, b"written-during-cold-read");
         let (ram_answer, ram_suspended) = {

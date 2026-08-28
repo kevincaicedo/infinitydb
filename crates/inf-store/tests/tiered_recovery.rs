@@ -20,6 +20,7 @@ use inf_log::{
     TierFlush, TierFlushConfig, TierIoMode, decode_record, read_ick_hybrid, read_manifest,
     tier_extract, tier_frame_offset, tier_frame_span, write_manifest,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, FileLiveSet, LogicalAddr, TieredLookup, TieredTable,
     apply_live_set_section, apply_ref_section, recover_tiered_ns,
@@ -84,7 +85,8 @@ impl Rig {
 
     fn with_demote(demote: DemotionConfig) -> Rig {
         let fs = MemFs::new();
-        let table = TieredTable::new(space_config(demote, 0), demote, 2048).expect("ring");
+        let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
+            .expect("ring");
         let flush = TierFlush::new(fs.clone(), flush_config(), 0);
         Rig { table, fs, flush, model: BTreeMap::new(), tail: Vec::new(), begun: false }
     }
@@ -130,7 +132,7 @@ impl Rig {
     /// begun. Every displacement carries its `ColdDisplace` marker
     /// (ADR-0057 D4 — unconditional).
     fn set(&mut self, key: &[u8], value: &[u8]) {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let displaced: Option<(LogicalAddr, usize, u32)> = match self.table.lookup(key, hash, &[]) {
             TieredLookup::Ram(addr) => {
                 let parts = self.table.record(addr);
@@ -180,7 +182,7 @@ impl Rig {
     /// DEL through the live-path rules (index-only for cold — §3.3),
     /// with the D4 marker once begun.
     fn del(&mut self, key: &[u8]) {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let target = match self.table.lookup(key, hash, &[]) {
             TieredLookup::Ram(addr) => Some((addr, self.table.record(addr).encoded_len)),
             TieredLookup::Cold(addr) => {
@@ -206,7 +208,7 @@ impl Rig {
         let keys: Vec<(Vec<u8>, Expect)> =
             self.model.iter().map(|(k, e)| (k.clone(), e.clone())).collect();
         for (key, expect) in keys {
-            let hash = TieredTable::hash_key(&key);
+            let hash = KeyHasher::default().hash(&key);
             let mut exclude: Vec<LogicalAddr> = Vec::new();
             let value = loop {
                 match self.table.lookup(&key, hash, &exclude) {
@@ -248,14 +250,14 @@ fn replay_tail(table: &mut TieredTable, tail: &[u8]) {
                 pending_displace = Some(old_addr);
             }
             RecordView::StringPostImage { key, value, .. } => {
-                let hash = TieredTable::hash_key(key);
+                let hash = KeyHasher::default().hash(key);
                 if let Some(old) = pending_displace.take() {
                     table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
                 }
                 table.apply_image(key, value, hash).expect("fits");
             }
             RecordView::Delete { key, .. } => {
-                let hash = TieredTable::hash_key(key);
+                let hash = KeyHasher::default().hash(key);
                 if let Some(old) = pending_displace.take() {
                     table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
                 }
@@ -426,6 +428,7 @@ fn unified_recovery_round_trips_all_classes() {
         space_config(demote, 0),
         demote,
         2048,
+        KeyHasher::default(),
     )
     .expect("tier recovery");
     assert_eq!(
@@ -445,7 +448,7 @@ fn unified_recovery_round_trips_all_classes() {
             if let RecordView::StringPostImage { key, value, .. } = record {
                 table
                     .borrow_mut()
-                    .apply_image(key, value, TieredTable::hash_key(key))
+                    .apply_image(key, value, KeyHasher::default().hash(key))
                     .expect("fits");
             }
             Ok::<(), std::convert::Infallible>(())
@@ -492,7 +495,7 @@ fn unified_recovery_round_trips_all_classes() {
         .model
         .keys()
         .filter(|key| {
-            let hash = TieredTable::hash_key(key);
+            let hash = KeyHasher::default().hash(key);
             matches!(recovered_rig.table.lookup(key, hash, &[]), TieredLookup::Cold(_))
         })
         .take(40)
@@ -637,7 +640,9 @@ fn walk_pin_clamps_release() {
 #[test]
 fn ref_apply_idempotent_and_displace_exact() {
     let demote = DemotionConfig::for_budget(BUDGET, PAGE);
-    let mut table = TieredTable::new(space_config(demote, 1 << 20), demote, 64).expect("ring");
+    let mut table =
+        TieredTable::new(space_config(demote, 1 << 20), demote, 64, KeyHasher::default())
+            .expect("ring");
     // The manifested catalog the refs land in, seeded recovery-shaped.
     table.seed_recovered_files(
         &[inf_log::TierFileMeta {
@@ -677,7 +682,9 @@ fn ref_apply_idempotent_and_displace_exact() {
 #[test]
 fn displacement_never_removes_a_foreign_key_at_a_colliding_address() {
     let demote = DemotionConfig::for_budget(BUDGET, PAGE);
-    let mut table = TieredTable::new(space_config(demote, 1 << 20), demote, 64).expect("ring");
+    let mut table =
+        TieredTable::new(space_config(demote, 1 << 20), demote, 64, KeyHasher::default())
+            .expect("ring");
     table.seed_recovered_files(
         &[inf_log::TierFileMeta {
             id: 0,
@@ -689,7 +696,7 @@ fn displacement_never_removes_a_foreign_key_at_a_colliding_address() {
         1,
     );
     // One recovered ref slot for key J at a fixed pre-life address.
-    let hash_j = TieredTable::hash_key(b"victim-key");
+    let hash_j = KeyHasher::default().hash(b"victim-key");
     let addr = LogicalAddr::from_raw(4096).expect("48-bit");
     table.apply_ref(hash_j, addr);
     assert_eq!(table.len(), 1);
@@ -698,7 +705,7 @@ fn displacement_never_removes_a_foreign_key_at_a_colliding_address() {
     // may remove J.
     for i in 0..10_000u64 {
         let key = format!("foreign:{i}");
-        let hash_k = TieredTable::hash_key(key.as_bytes());
+        let hash_k = KeyHasher::default().hash(key.as_bytes());
         if hash_k == hash_j {
             continue; // a genuine 2⁻⁶⁴ coincidence would be legal removal
         }

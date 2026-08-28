@@ -29,8 +29,8 @@
 //! (`limit − limit/16`, hysteresis) under its own budget so a storm of
 //! writes cannot monopolize the loop (the bounded-everything rule).
 
-use inf_foundation::hash64;
 use inf_foundation::time::Nanos;
+use inf_foundation::{KeyHasher, hash64};
 use inf_log::{FsyncClass, NsId, RecordView as LogRecordView};
 
 use inf_foundation::LogicalAddr;
@@ -176,6 +176,9 @@ pub struct Keyspace {
     /// `tiered-shadow-overwrite` CONFIG key's cell-local value — the
     /// A/B arm, default off.
     tier_shadow: bool,
+    /// `tiered-shadow-reconcile` (ADR-0093 A8): `false` pauses every
+    /// table's reconciler; tickets stay open, bounded by their caps.
+    tier_shadow_reconcile: bool,
     /// Replay displacement register (ADR-0057 D4, widened to a bounded
     /// list by ADR-0059 D9): `ColdDisplace` markers park here until the
     /// paired mutation record — the very next record, same namespace —
@@ -217,6 +220,7 @@ impl Keyspace {
             tiered_va_limit_bytes: TIERED_VA_LIMIT_DEFAULT,
             tier_promote: true,
             tier_shadow: false,
+            tier_shadow_reconcile: true,
             pending_displace: Vec::new(),
             indexes: IndexRegistry::default(),
             backfill: Vec::new(),
@@ -348,10 +352,11 @@ impl Keyspace {
                 limit_bytes,
             });
         }
-        let mut table = TieredTable::new(config, demote, initial_keys)
+        let mut table = TieredTable::new(config, demote, initial_keys, self.cfg.hasher)
             .ok_or(TieredCreateError::Unrepresentable)?;
         table.set_promote_enabled(self.tier_promote);
         table.set_shadow_enabled(self.tier_shadow);
+        table.set_shadow_reconcile(self.tier_shadow_reconcile);
         self.tiered_stores.push((ns, Box::new(table)));
         Ok(())
     }
@@ -411,6 +416,7 @@ impl Keyspace {
         entry.1.set_disk_budget(tier.disk_budget_bytes);
         entry.1.set_promote_enabled(self.tier_promote);
         entry.1.set_shadow_enabled(self.tier_shadow);
+        entry.1.set_shadow_reconcile(self.tier_shadow_reconcile);
     }
 
     /// This cell's share of the node reserved-VA limit (ADR-0062 D4).
@@ -444,6 +450,16 @@ impl Keyspace {
         self.tier_shadow = on;
         for (_, table) in &mut self.tiered_stores {
             table.set_shadow_enabled(on);
+        }
+    }
+
+    /// Pushes the reconciler pause (M4.5-S37, ADR-0093 A8 — the
+    /// `tiered-shadow-reconcile` CONFIG sweep; `false` = paused) to every
+    /// standing tiered table; future tables inherit it.
+    pub fn set_tier_shadow_reconcile(&mut self, on: bool) {
+        self.tier_shadow_reconcile = on;
+        for (_, table) in &mut self.tiered_stores {
+            table.set_shadow_reconcile(on);
         }
     }
 
@@ -1875,14 +1891,14 @@ impl Keyspace {
                 Ok(Some(ReplayOutcome::Applied))
             }
             LogRecordView::StringPostImage { ns, key, value } if self.is_tiered(ns) => {
-                let hash = TieredTable::hash_key(key);
+                let hash = self.cfg.hasher.hash(key);
                 self.drain_displace(ns, hash)?;
                 let table = self.tiered_store_mut(ns).expect("is_tiered checked");
                 table.apply_image(key, value, hash).map_err(ReplayError::Store)?;
                 Ok(Some(ReplayOutcome::Applied))
             }
             LogRecordView::Delete { ns, key } if self.is_tiered(ns) => {
-                let hash = TieredTable::hash_key(key);
+                let hash = self.cfg.hasher.hash(key);
                 self.drain_displace(ns, hash)?;
                 let table = self.tiered_store_mut(ns).expect("is_tiered checked");
                 table.apply_delete(key, hash);
@@ -1891,7 +1907,7 @@ impl Keyspace {
             LogRecordView::StringExtentRef { ns, key, extent_id, offset, len }
                 if self.is_tiered(ns) =>
             {
-                let hash = TieredTable::hash_key(key);
+                let hash = self.cfg.hasher.hash(key);
                 self.drain_displace(ns, hash)?;
                 let table = self.tiered_store_mut(ns).expect("is_tiered checked");
                 table
@@ -1945,6 +1961,15 @@ impl Keyspace {
     #[must_use]
     pub fn is_tiered(&self, ns: NsId) -> bool {
         self.tiered_stores.iter().any(|(id, _)| *id == ns)
+    }
+
+    /// The node's key hasher (ADR-0094): every store of this keyspace
+    /// hashes with it, and the plane copies it for its stage-time
+    /// prefetch so the hash it computes is the one the store probes.
+    #[inline]
+    #[must_use]
+    pub fn hasher(&self) -> KeyHasher {
+        self.cfg.hasher
     }
 
     /// Shared view of a tiered table (the command layer's lookup path —

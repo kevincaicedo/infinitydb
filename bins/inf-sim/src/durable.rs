@@ -40,6 +40,8 @@ use inf_server::{
 };
 use inf_store::{Keyspace, NsId, StoreConfig, WallAnchor};
 
+use crate::harness::node_hasher;
+
 use crate::net::{CellNet, Plant, SimDriver, listener_fd};
 use crate::resp::reply_len;
 
@@ -1029,7 +1031,8 @@ pub(crate) fn boot(
         let pool = BufferPool::new(128, 1024);
         let node_info = Rc::new(NodeInfo::default());
         node_info.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
-        let mut ks = Keyspace::new(StoreConfig::default());
+        let mut ks =
+            Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() });
         if let Some(catalog) = &catalog {
             ks.seed_catalog(catalog).map_err(|e| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
@@ -1168,6 +1171,22 @@ impl MiniClient {
             }
         }
         Ok(None) // stall — the caller records the verdict
+    }
+
+    /// Sends `argv` without awaiting its reply — for commands that must
+    /// be in flight together with another connection's (the M4.5-S37
+    /// overlapping-drain row); the caller steps the node and
+    /// [`recv`](Self::recv)s.
+    pub(crate) fn send(&mut self, node: &mut Node, argv: &[&[u8]]) {
+        node.nets[self.cell].borrow_mut().client_send(self.fd, &encode(argv));
+    }
+
+    /// One framed reply if it has arrived (no stepping).
+    pub(crate) fn recv(&mut self, node: &mut Node) -> Option<Vec<u8>> {
+        let bytes = node.nets[self.cell].borrow_mut().client_recv(self.fd);
+        self.rx.extend_from_slice(&bytes);
+        let n = reply_len(&self.rx)?;
+        Some(self.rx.drain(..n).collect())
     }
 }
 
@@ -2002,7 +2021,8 @@ pub(crate) fn survival_audit(
             return;
         }
     };
-    let mut ks = Keyspace::new(StoreConfig::default());
+    let mut ks =
+        Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() });
     if let Err(err) = ks.seed_catalog(&catalog) {
         tally.violations.push(format!("survival audit: seed_catalog failed: {err:?}"));
         return;

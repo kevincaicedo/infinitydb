@@ -35,7 +35,7 @@ workspace = true
 
 [dev-dependencies]
 # M2-S16: recovery/fault tests arm named points (dev-only unification).
-inf-foundation = { workspace = true, features = ["fault-points"] }
+inf-foundation = { workspace = true, features = ["fault-points", "collision-oracle"] }
 # M2.5-S12 (ADR-0031): recovery tests hand-build legacy v1 frames (CRC32C)
 # — no shipping code path emits them anymore.
 inf-simd.workspace = true

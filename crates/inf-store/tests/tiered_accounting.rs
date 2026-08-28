@@ -18,6 +18,7 @@ use inf_log::{
     MutationEffect, NsId, StagingConfig, StagingRing, TIER_FOOTER_BYTES, TIER_FRAME_BYTES,
     TIER_HEADER_BYTES, TierFlush, TierFlushConfig, TierIoMode,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, StoreConfig, TieredLookup,
     TieredTable,
@@ -162,7 +163,7 @@ fn user_bytes_count_key_plus_value_at_the_record_boundary() {
     for i in 0..256u32 {
         let key = format!("k:{i:05}");
         let value = vec![0x41u8; 32 + (seeded(&mut seed) % 96) as usize];
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         let table = rig.table();
         let addr = table.insert(key.as_bytes(), &value, hash).expect("fits");
         expected += (key.len() + value.len()) as u64;
@@ -176,7 +177,7 @@ fn user_bytes_count_key_plus_value_at_the_record_boundary() {
     // writes of a full record image.
     for i in 0..256usize {
         let key = format!("k:{i:05}");
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         let grow = i % 2 == 0;
         let value = vec![0x42u8; if grow { lens[i] } else { 32 }];
         let table = rig.table();
@@ -200,7 +201,7 @@ fn user_bytes_count_key_plus_value_at_the_record_boundary() {
     let before = rig.table().write_accounting().user_bytes;
     for i in 0..64usize {
         let key = format!("k:{i:05}");
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         let table = rig.table();
         let TieredLookup::Ram(addr) = table.lookup(key.as_bytes(), hash, &[]) else {
             panic!("the key is RAM-resident");
@@ -287,7 +288,7 @@ fn flush_bytes_are_device_bytes_including_framing_and_rewrites() {
         for i in 0..64u32 {
             let key = format!("k:{round:03}:{i:03}");
             let value = vec![0x61u8; 64 + (seeded(&mut seed) % 192) as usize];
-            let hash = TieredTable::hash_key(key.as_bytes());
+            let hash = KeyHasher::default().hash(key.as_bytes());
             rig.table().insert(key.as_bytes(), &value, hash).expect("fits");
         }
         rig.drain();
@@ -334,7 +335,7 @@ fn flush_bytes_are_device_bytes_including_framing_and_rewrites() {
 #[test]
 fn compaction_bytes_are_relocation_volume_not_a_numerator_leg() {
     let mut rig = Rig::narrow();
-    let hash = TieredTable::hash_key(b"k");
+    let hash = KeyHasher::default().hash(b"k");
     rig.table().insert(b"k", b"value", hash).expect("fits");
     let mut ring = StagingRing::new(StagingConfig::default());
     let effect = MutationEffect::StringSet { ns: NS, key: b"k", value: b"value" };
@@ -369,7 +370,9 @@ fn amplification_run(rig: &mut Rig) -> inf_store::WriteAccounting {
         let effect = MutationEffect::StringSet { ns: NS, key: key.as_bytes(), value: &value };
         let table = rig.table();
         table.stage_wal(&mut ring, &effect).expect("room");
-        table.insert(key.as_bytes(), &value, TieredTable::hash_key(key.as_bytes())).expect("fits");
+        table
+            .insert(key.as_bytes(), &value, KeyHasher::default().hash(key.as_bytes()))
+            .expect("fits");
         if i % 64 == 63 {
             rig.drain();
             // The LOG step drains the staging ring in production; here

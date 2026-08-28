@@ -605,7 +605,7 @@ impl CellStore {
         if let Some(ms) = expire_at_ms
             && old_deadline != Some(ms)
         {
-            self.arm_wheel(Self::hash_key(key), ms);
+            self.arm_wheel(self.hash_key(key), ms);
         }
         Ok(JsonSetOutcome::Applied)
     }
@@ -1100,7 +1100,7 @@ impl CellStore {
     /// Resolve for post-command log staging without LRU/LFU touch or lazy
     /// expiry mutation. An expired physical residue is logically absent.
     fn json_log_record(&self, key: &[u8], now: Nanos) -> Option<(ArenaAddr, usize)> {
-        let hash = Self::hash_key(key);
+        let hash = self.hash_key(key);
         let arena = &self.arena;
         let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
         let view = record_at(arena, addr);

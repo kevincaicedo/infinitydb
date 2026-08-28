@@ -48,7 +48,7 @@ pub use extents::{
     BLOB_MAX_BYTES_DEFAULT, BLOB_RECLAIM_PER_SLICE_DEFAULT, BLOB_THRESHOLD_DEFAULT, BlobConfig,
     ExtentRefs, ExtentStats,
 };
-pub use index::{Index, MemoryMode, SlotMode, TieredMode};
+pub use index::{HomeGroupCursor, Index, MemoryMode, SlotMode, TieredMode};
 pub use index_backfill::{
     BackfillBudget, BackfillInfo, BackfillPhase, BackfillProgress, BackfillTickStats,
 };
@@ -70,6 +70,7 @@ pub use index_sidecar::SidecarLoader;
 pub use index_sidecar::{SidecarBootInfo, SidecarBootRow};
 pub use inf_alloc::ArenaConfig;
 // One import point for the shared store↔log vocabulary (ADR-0015 D2/D5).
+pub use inf_foundation::KeyHasher;
 pub use inf_foundation::LogicalAddr;
 pub use inf_log::{FsyncClass, NsId};
 pub use keyspace::{
@@ -93,8 +94,9 @@ pub use tiered::compact::{CompactionApplied, CompactionConfig, CompactionWork};
 pub use tiered::promote::PromotionCounters;
 pub use tiered::shadow::{
     COLLISION_KEY_PREFIX, SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT, SHADOW_TICKETS_CAP,
-    SettleOutcome, SettleReason, SettleSlot, ShadowCounters, ShadowProbe, ShadowRead,
-    ShadowRefusal, ShadowTicket, ShadowVerdict, forced_collision_pair, forced_collision_triple,
+    SettleError, SettleOutcome, SettleReason, SettleSlot, ShadowCounters, ShadowProbe, ShadowRead,
+    ShadowRebuild, ShadowRebuildError, ShadowRefusal, ShadowTicket, ShadowVerdict,
+    forced_collision_pair, forced_collision_triple,
 };
 pub use tiered::{RecordParts, TieredLookup, TieredTable};
 pub use tiered_recover::{

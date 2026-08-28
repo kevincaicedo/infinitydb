@@ -16,7 +16,11 @@ name = "inf-sim"
 path = "src/main.rs"
 
 [dependencies]
-inf-foundation.workspace = true
+# ADR-0094 D3: the simulators build real colliding keys through the
+# hasher's oracle mode (never a shipping build). `fault-points`: the
+# m4-tiered open-ticket rows arm `shadow_twin_read_fail` around a
+# `DBSIZE` drain (ADR-0093 A8) — a DST binary, never a shipping one.
+inf-foundation = { workspace = true, features = ["collision-oracle", "fault-points"] }
 inf-alloc.workspace = true
 inf-fabric.workspace = true
 inf-runtime.workspace = true

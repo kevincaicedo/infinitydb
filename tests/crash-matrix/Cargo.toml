@@ -21,6 +21,10 @@ inf-foundation = { workspace = true, features = ["fault-points"] }
 # M3-S18 document fixtures encode the production idoc/path/delta forms;
 # the dependency is test-only and does not alter the shipping crate DAG.
 inf-doc.workspace = true
+# M4.5-S37 (ADR-0093 A8): the open-ticket rows run the whole-node
+# `m4-tiered` scenario in-process (the `shadow_twin_read_fail` point is
+# thread-local — a real node cannot be armed from a test); test-only.
+inf-sim = { path = "../../bins/inf-sim" }
 
 # The fsyncgate row boots a real single-cell uring node in a child
 # process (ADR-0020 D3) — assembly parts, test-harness edges.

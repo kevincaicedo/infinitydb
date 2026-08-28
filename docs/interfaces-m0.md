@@ -30,7 +30,9 @@ pub mod rng {
     pub trait Entropy { fn next_u64(&mut self) -> u64; }
     pub struct SplitMix64;                 // seeded, deterministic
 }
-pub fn hash64(data: &[u8], seed: u64) -> u64;      // wyhash-style, stable
+pub fn hash64(data: &[u8], seed: u64) -> u64;      // wyhash-style digest, stable — NOT the key hash (ADR-0094)
+pub struct KeyHasher;                              // SipHash-1-3 under a per-data-directory secret: `hash(&self, key)` — the index hash (ADR-0094)
+pub fn siphash13(k0: u64, k1: u64, data: &[u8]) -> u64;
 pub fn crc16(data: &[u8]) -> u16;                  // XMODEM, Redis Cluster vectors
 pub fn hashtag(key: &[u8]) -> &[u8];               // Redis Cluster {tag} rule
 pub mod varint { encode_u64 / decode_u64 }

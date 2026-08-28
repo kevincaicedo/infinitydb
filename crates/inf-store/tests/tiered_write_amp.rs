@@ -34,6 +34,7 @@ use inf_log::{
     TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode, create_cell_dirs, tier_extract,
     tier_frame_offset, tier_frame_span,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, CompactionConfig, CompactionWork, DemotionConfig, LogicalAddr,
     TieredLookup, TieredTable, WriteAccounting, WriteAmplification,
@@ -107,6 +108,7 @@ impl Rig {
             },
             demote,
             KEYS as usize * 2,
+            KeyHasher::default(),
         )
         .expect("ring");
         table.set_compaction_config(CompactionConfig { dead_ratio_pct, slice_bytes: 1 << 20 });
@@ -170,7 +172,7 @@ impl Rig {
     /// compaction later reclaims).
     fn set(&mut self, key: &[u8], value: &[u8]) {
         self.stage(&MutationEffect::StringSet { ns: NS, key, value });
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let found = match self.table.lookup(key, hash, &[]) {
             TieredLookup::Ram(addr) | TieredLookup::Cold(addr) => Some(addr),
             TieredLookup::Miss => None,

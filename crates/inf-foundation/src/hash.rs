@@ -1,10 +1,25 @@
-//! Stable 64-bit hashing for short keys (wyhash-style folded multiply).
+//! Hashing: the **key hash** ([`KeyHasher`] — SipHash-1-3 under a
+//! per-store 128-bit secret, ADR-0094) and the **digest** fold
+//! ([`hash64`] — a wyhash-style folded multiply, stable, unkeyed).
 //!
-//! Stability is part of the contract: hashes feed the per-cell index and the
-//! deterministic simulator (L7), so the function may never change without an
-//! ADR and an index-migration story. Quality bar: passes the avalanche and
-//! distribution sanity tests below; throughput target is measured at the
-//! index level (M0-S14), not assumed (L4).
+//! The two are not interchangeable. Every index a client can populate
+//! (the memory-mode and tiered indexes, the tiered 64-bit sidecar, the
+//! checkpoint's `(hash, addr)` refs, the ADR-0076 primary-key refs)
+//! places entries by [`KeyHasher`]: a PRF under a secret the client
+//! never learns, so no key set an attacker chooses degrades a probe
+//! chain or forges 64-bit "exact" evidence. The secret is a value
+//! carried by the store (injected — L7), persisted once per data
+//! directory (ADR-0094 D2), never a constant in this crate.
+//!
+//! [`hash64`] stays for inputs the engine itself produces — the `.ick`
+//! checkpoint digest chain (ADR-0016), the keyspace determinism digest,
+//! the simulated filesystem's path digest. Its fold has a known
+//! seed-independent weakness (a block whose even word equals `P1`
+//! zeroes the running state — the wyhash "zero multiplier"), which is
+//! harmless for a digest of trusted bytes and disqualifying for a
+//! table keyed by client bytes; ADR-0094's context section has the
+//! measurement. Stability is part of its contract: the digests it
+//! signs are persisted, so it may never change without an ADR.
 
 const P0: u64 = 0xa076_1d64_78bd_642f;
 const P1: u64 = 0xe703_7ed1_a0b4_28db;
@@ -27,7 +42,10 @@ fn read_u32(b: &[u8]) -> u64 {
     u64::from(u32::from_le_bytes(b[..4].try_into().expect("caller guarantees 4 bytes")))
 }
 
-/// Hash `data` with `seed`. Stable across platforms and releases.
+/// Digest `data` with `seed` — stable across platforms and releases.
+/// **Not a key hash** (ADR-0094): its fold can be zeroed by a chosen
+/// block regardless of `seed`; use [`KeyHasher`] for anything a client
+/// can place in a table.
 #[inline]
 pub fn hash64(data: &[u8], seed: u64) -> u64 {
     let len = data.len();
@@ -74,60 +92,129 @@ pub fn hash64(data: &[u8], seed: u64) -> u64 {
     mix(P1 ^ (len as u64), mix(a ^ P1, b ^ seed))
 }
 
-/// Three **distinct** 48-byte keys with equal [`hash64`] under `seed`
-/// and a shared 16-byte `prefix` — the collision oracle (M4.5-S37,
-/// ADR-0093 A7). A 64-bit collision is unreachable by chance at any
-/// corpus the tests or the simulators can build, so the paths that must
-/// be exact under one (the tiered shadow tickets, `DBSIZE`, `SCAN`, the
-/// recovery rebuild) are exercised with keys derived from the function's
-/// own structure: for a 48-byte key the state after each 16-byte block
-/// is `mix(w_even ^ P1, w_odd ^ state)`, a 128-bit product folded, and
-/// three factorizations of one product (`2t · 2u == t · 4u == 4t · u`)
-/// collide in the second block before the shared third. The prefix is
-/// the first block (a `{hashtag}` routes the keys to one cell); `tag`
-/// selects the triple (different tags give unrelated triples); the
-/// result is self-checked. For tests and simulators only — a fact about
-/// `hash64`'s shape, not a capability the engine uses.
-///
-/// # Panics
-/// Debug-panics if the derivation ever stops colliding (the hash
-/// changed under the oracle — the [`hash64`] stability contract).
-#[must_use]
-pub fn hash64_collision_triple(prefix: &[u8; 16], tag: u64, seed: u64) -> [[u8; 48]; 3] {
-    let seed0 = seed ^ mix(seed ^ P0, P1);
-    let state = mix(read_u64(prefix) ^ P1, read_u64(&prefix[8..]) ^ seed0);
-    // `t`, `u` odd and below 2^60: `2t · 2u`, `t · 4u` and `4t · u` are
-    // one u128 — `mix` folds them identically — and the three factor
-    // pairs are pairwise distinct.
-    let t = (tag & ((1u64 << 60) - 1)) | 1;
-    let u = ((tag.rotate_left(29) ^ 0x9E37_79B9_7F4A_7C15) & ((1u64 << 60) - 1)) | 1;
-    let factors = [(t << 1, u << 1), (t, u << 2), (t << 2, u)];
-    let w4 = tag.wrapping_mul(P2);
-    let w5 = w4 ^ P3;
-    let build = |(a, b): (u64, u64)| -> [u8; 48] {
-        let mut out = [0u8; 48];
-        out[..16].copy_from_slice(prefix);
-        out[16..24].copy_from_slice(&(a ^ P1).to_le_bytes());
-        out[24..32].copy_from_slice(&(b ^ state).to_le_bytes());
-        out[32..40].copy_from_slice(&w4.to_le_bytes());
-        out[40..].copy_from_slice(&w5.to_le_bytes());
-        out
-    };
-    let keys = [build(factors[0]), build(factors[1]), build(factors[2])];
-    debug_assert!(keys[0] != keys[1] && keys[1] != keys[2] && keys[0] != keys[2], "three keys");
-    debug_assert!(
-        hash64(&keys[0], seed) == hash64(&keys[1], seed)
-            && hash64(&keys[1], seed) == hash64(&keys[2], seed),
-        "the collision oracle broke"
-    );
-    keys
+// ---- the key hash: SipHash-1-3 under a secret (ADR-0094 D1) ------------
+
+#[inline(always)]
+fn sip_round(v: &mut [u64; 4]) {
+    v[0] = v[0].wrapping_add(v[1]);
+    v[1] = v[1].rotate_left(13);
+    v[1] ^= v[0];
+    v[0] = v[0].rotate_left(32);
+    v[2] = v[2].wrapping_add(v[3]);
+    v[3] = v[3].rotate_left(16);
+    v[3] ^= v[2];
+    v[0] = v[0].wrapping_add(v[3]);
+    v[3] = v[3].rotate_left(21);
+    v[3] ^= v[0];
+    v[2] = v[2].wrapping_add(v[1]);
+    v[1] = v[1].rotate_left(17);
+    v[1] ^= v[2];
+    v[2] = v[2].rotate_left(32);
 }
 
-/// The first two keys of [`hash64_collision_triple`].
+/// SipHash-c-d over `data` under the 128-bit key `(k0, k1)` — the
+/// reference algorithm (Aumasson–Bernstein), little-endian message
+/// words, the length byte in the final word's top byte. `C`
+/// compression rounds per word, `D` finalization rounds.
+#[inline]
+fn siphash<const C: usize, const D: usize>(k0: u64, k1: u64, data: &[u8]) -> u64 {
+    let mut v = [
+        k0 ^ 0x736f_6d65_7073_6575,
+        k1 ^ 0x646f_7261_6e64_6f6d,
+        k0 ^ 0x6c79_6765_6e65_7261,
+        k1 ^ 0x7465_6462_7974_6573,
+    ];
+    let mut words = data.chunks_exact(8);
+    for word in &mut words {
+        let m = u64::from_le_bytes(word.try_into().expect("8-byte chunk"));
+        v[3] ^= m;
+        for _ in 0..C {
+            sip_round(&mut v);
+        }
+        v[0] ^= m;
+    }
+    let mut last = (data.len() as u64) << 56;
+    for (i, &byte) in words.remainder().iter().enumerate() {
+        last |= u64::from(byte) << (8 * i);
+    }
+    v[3] ^= last;
+    for _ in 0..C {
+        sip_round(&mut v);
+    }
+    v[0] ^= last;
+    v[2] ^= 0xff;
+    for _ in 0..D {
+        sip_round(&mut v);
+    }
+    v[0] ^ v[1] ^ v[2] ^ v[3]
+}
+
+/// SipHash-1-3 of `data` under `(k0, k1)` — the key hash's function
+/// (ADR-0094 D1; Redis ≥ 4.0 and Rust's `DefaultHasher` use the same
+/// parameters). Prefer [`KeyHasher::hash`], which carries the secret.
+#[inline]
 #[must_use]
-pub fn hash64_collision_pair(prefix: &[u8; 16], tag: u64, seed: u64) -> ([u8; 48], [u8; 48]) {
-    let [first, second, _] = hash64_collision_triple(prefix, tag, seed);
-    (first, second)
+pub fn siphash13(k0: u64, k1: u64, data: &[u8]) -> u64 {
+    siphash::<1, 3>(k0, k1, data)
+}
+
+/// The hashtag every forced-collision key starts with (ADR-0094 D3):
+/// under the `collision-oracle` feature a 48-byte key with this prefix
+/// hashes its first 32 bytes only, so keys differing in the last 16
+/// bytes are distinct real keys with one hash — and the shared hashtag
+/// routes them to one cell. Inert without the feature.
+pub const COLLISION_KEY_PREFIX: &[u8; 16] = b"{shadow-collide}";
+
+/// The key hash: SipHash-1-3 under a 128-bit secret (ADR-0094). A
+/// `Copy` value every store carries — the secret is injected (a data
+/// directory's `key-hash.toml`, a simulator's seed, a test's fixed
+/// value), never a constant, and a hash is only meaningful to the
+/// store whose hasher computed it (`hash_key` is an instance method on
+/// every store for that reason).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct KeyHasher {
+    k0: u64,
+    k1: u64,
+}
+
+impl KeyHasher {
+    /// A hasher over the 128-bit secret `(k0, k1)`.
+    #[must_use]
+    pub const fn from_keys(k0: u64, k1: u64) -> KeyHasher {
+        KeyHasher { k0, k1 }
+    }
+
+    /// A hasher derived from one 64-bit seed (the simulators: the
+    /// scenario seed decides placement, deterministically — L7).
+    #[must_use]
+    pub fn from_seed(seed: u64) -> KeyHasher {
+        KeyHasher { k0: mix(seed ^ P0, P1), k1: mix(seed.rotate_left(32) ^ P2, P3) }
+    }
+
+    /// The secret (the data directory's file writes it; `INFO` never).
+    #[must_use]
+    pub const fn keys(&self) -> (u64, u64) {
+        (self.k0, self.k1)
+    }
+
+    /// The hash of `key` under this secret.
+    #[inline]
+    #[must_use]
+    pub fn hash(&self, key: &[u8]) -> u64 {
+        #[cfg(feature = "collision-oracle")]
+        if key.len() == 48 && key[..16] == *COLLISION_KEY_PREFIX {
+            return siphash13(self.k0, self.k1, &key[..32]);
+        }
+        siphash13(self.k0, self.k1, key)
+    }
+}
+
+impl Default for KeyHasher {
+    /// A fixed secret — unit tests and models only. A node resolves its
+    /// own (ADR-0094 D2); a simulator derives one from its seed.
+    fn default() -> KeyHasher {
+        KeyHasher::from_keys(0x1AF1_D8A5_0DB5_EED1, 0xE703_7ED1_A0B4_28DB)
+    }
 }
 
 // ---- trusted-integer table hashing -------------------------------------------
@@ -248,26 +335,83 @@ mod tests {
         }
     }
 
-    /// ADR-0093 A7: the collision oracle yields two distinct keys with
-    /// one hash for every tag, and pairs from different tags do not
-    /// collide with each other (a sound oracle, not a degenerate one).
+    /// ADR-0094 K4: the reference SipHash-2-4 vector (Aumasson–Bernstein,
+    /// key `00…0f`, the empty message and the 15-byte `00…0e`) pins the
+    /// round-generic core.
     #[test]
-    fn collision_pairs_collide_and_differ() {
-        let seed = 0x1AF1_D8A5_0DB5_EED1;
-        let prefix = b"{shadow-collide}";
-        let mut seen = std::collections::HashSet::new();
-        for tag in [0u64, 1, 2, 7, 0xDEAD_BEEF, u64::MAX, 0x8000_0000_0000_0000] {
-            let (a, b) = hash64_collision_pair(prefix, tag, seed);
-            assert_ne!(a, b, "tag {tag:#x}");
-            assert_eq!(&a[..16], prefix, "the prefix is the first block");
-            let [x, y, z] = hash64_collision_triple(prefix, tag, seed);
-            assert!(x != y && y != z && x != z);
-            assert_eq!(hash64(&x, seed), hash64(&z, seed), "tag {tag:#x}: a triple");
-            assert_eq!((x, y), (a, b), "the pair is the triple's head");
-            assert_eq!(hash64(&a, seed), hash64(&b, seed), "tag {tag:#x}");
-            assert_ne!(hash64(&a, seed ^ 1), hash64(&a, seed), "seed-sensitive");
-            assert!(seen.insert(hash64(&a, seed)), "tags give distinct hashes");
+    fn siphash24_reference_vectors() {
+        let (k0, k1) = (0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908);
+        assert_eq!(siphash::<2, 4>(k0, k1, b""), 0x726f_db47_dd0e_0e31);
+        let msg: Vec<u8> = (0u8..15).collect();
+        assert_eq!(siphash::<2, 4>(k0, k1, &msg), 0xa129_ca61_49be_45e5);
+    }
+
+    /// ADR-0094 K4: SipHash-1-3 agrees with the standard library's
+    /// `DefaultHasher` (SipHash-1-3 under the zero key) at every length
+    /// class up to 200 bytes — the streaming word/tail rules included.
+    #[test]
+    fn siphash13_matches_the_standard_library() {
+        use std::hash::Hasher;
+        let mut data = Vec::new();
+        for len in 0..=200usize {
+            data.clear();
+            data.extend((0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(7)));
+            let mut std_hasher = std::hash::DefaultHasher::new();
+            std_hasher.write(&data);
+            assert_eq!(siphash13(0, 0, &data), std_hasher.finish(), "len {len}");
         }
+    }
+
+    /// ADR-0094 D1: the key hash is secret-sensitive, key-sensitive, and
+    /// the zero-multiplier family that collapses `hash64` for every seed
+    /// spreads under it.
+    #[test]
+    fn key_hasher_is_keyed_and_spreads_the_hash64_zero_family() {
+        let a = KeyHasher::from_seed(1);
+        let b = KeyHasher::from_seed(2);
+        assert_ne!(a, b);
+        assert_ne!(a.hash(b"key:1"), b.hash(b"key:1"), "secret-sensitive");
+        assert_ne!(a.hash(b"key:1"), a.hash(b"key:2"), "key-sensitive");
+        assert_eq!(a.hash(b"key:1"), KeyHasher::from_seed(1).hash(b"key:1"), "deterministic");
+        // The 16-byte family: a = P1 in `hash64`'s ≤16 path (bytes 0..4
+        // and 8..12), the other eight bytes free.
+        let mut key = [0u8; 16];
+        key[0..4].copy_from_slice(&((P1 >> 32) as u32).to_le_bytes());
+        key[8..12].copy_from_slice(&((P1 & 0xffff_ffff) as u32).to_le_bytes());
+        let mut digest_seen = std::collections::HashSet::new();
+        let mut keyed_seen = std::collections::HashSet::new();
+        for i in 0..256u32 {
+            key[4..8].copy_from_slice(&i.to_le_bytes());
+            key[12..16].copy_from_slice(&i.wrapping_mul(7).to_le_bytes());
+            digest_seen.insert(hash64(&key, 0x1AF1_D8A5_0DB5_EED1));
+            keyed_seen.insert(a.hash(&key));
+        }
+        assert_eq!(digest_seen.len(), 1, "the digest's zero-multiplier family (ADR-0094)");
+        assert_eq!(keyed_seen.len(), 256, "the key hash spreads it");
+    }
+
+    /// ADR-0094 D3: the oracle mode collides exactly the forced shape
+    /// (48 bytes, the hashtag prefix, one 32-byte head) and nothing else.
+    #[cfg(feature = "collision-oracle")]
+    #[test]
+    fn collision_oracle_mode_collides_only_the_forced_shape() {
+        let h = KeyHasher::from_seed(9);
+        let mut a = [0u8; 48];
+        a[..16].copy_from_slice(COLLISION_KEY_PREFIX);
+        a[16..32].copy_from_slice(&[0x11; 16]);
+        let mut b = a;
+        b[32..].copy_from_slice(&[0x22; 16]);
+        assert_ne!(a, b);
+        assert_eq!(h.hash(&a), h.hash(&b), "same 32-byte head");
+        let mut c = a;
+        c[20] ^= 1;
+        assert_ne!(h.hash(&a), h.hash(&c), "a different head");
+        assert_ne!(h.hash(&a[..47]), h.hash(&b[..47]), "47 bytes is not the shape");
+        let mut d = a;
+        d[0] = b'x';
+        let mut e = b;
+        e[0] = b'x';
+        assert_ne!(h.hash(&d), h.hash(&e), "another prefix is not the shape");
     }
 
     #[test]

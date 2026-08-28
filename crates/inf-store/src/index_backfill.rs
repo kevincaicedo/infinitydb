@@ -175,16 +175,17 @@ impl CellStore {
             batch.clear();
             {
                 let arena = &self.arena;
+                let hasher = self.cfg.hasher;
                 self.index.scan_home_group(
                     cursor as usize,
-                    |addr| CellStore::hash_key(record_at(arena, addr).key()),
+                    |addr| hasher.hash(record_at(arena, addr).key()),
                     |addr| batch.push(addr),
                 );
             }
             for &addr in &batch {
                 let view = record_at(&self.arena, addr);
                 if view.is_expired(now) {
-                    let (hash, len) = (CellStore::hash_key(view.key()), view.encoded_len());
+                    let (hash, len) = (self.hash_key(view.key()), view.encoded_len());
                     self.free_record(hash, addr, len);
                     self.note_reap_lazy();
                     out.reaped += 1;
@@ -193,7 +194,7 @@ impl CellStore {
                 if view.type_tag() != TypeTag::JsonDoc {
                     continue; // strings never enter an index (sparse).
                 }
-                let (hash, len) = (CellStore::hash_key(view.key()), view.encoded_len());
+                let (hash, len) = (self.hash_key(view.key()), view.encoded_len());
                 let max_matches = self.cfg.doc_max_path_matches;
                 let CellStore { arena, docs, idx, .. } = self;
                 let Some(root) = crate::doc::doc_root_at(arena, docs, addr, len) else {

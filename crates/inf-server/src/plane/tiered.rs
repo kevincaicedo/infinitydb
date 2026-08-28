@@ -719,6 +719,11 @@ pub(super) async fn read_cold_record<O: PlaneObserver + 'static, F: SegmentFs + 
     addr: LogicalAddr,
     class: inf_runtime::ReadClass,
 ) -> Result<Vec<u8>, &'static str> {
+    // The deterministic stand-in for a device error on a twin read
+    // (M2-S16 fault point; the DST arms it around a `DBSIZE` drain).
+    if inf_foundation::fault::fire(crate::fault::SHADOW_TWIN_READ_FAIL) {
+        return Err("injected twin read failure (fault point shadow_twin_read_fail)");
+    }
     let mut image: Vec<u8> = Vec::new();
     // 0 = unknown until the header decodes.
     let mut total: usize = 0;
@@ -945,7 +950,7 @@ async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     proto: Protocol,
     compute: impl Fn(Option<&[u8]>, Option<u32>) -> Result<Vec<u8>, Vec<u8>>,
 ) -> Result<(u64, Option<Vec<u8>>), Vec<u8>> {
-    let hash = TieredTable::hash_key(key);
+    let hash = shared.hasher.hash(key);
     let deadline = stall_deadline(shared, ns);
     loop {
         let (old, old_value): (Displaced, Option<Vec<u8>>) =
@@ -1015,7 +1020,7 @@ async fn read_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     key: &[u8],
     proto: Protocol,
 ) -> TieredReply {
-    let hash = TieredTable::hash_key(key);
+    let hash = shared.hasher.hash(key);
     let mut reply = shared.take_reply_buf();
     let mut w = RespWriter::new(&mut reply, proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
@@ -1040,7 +1045,7 @@ async fn mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let mut reply = shared.take_reply_buf();
     RespWriter::new(&mut reply, proto).array_header(argv.len() - 1);
     for key in &argv[1..] {
-        let hash = TieredTable::hash_key(key);
+        let hash = shared.hasher.hash(key);
         let mut w = RespWriter::new(&mut reply, proto);
         match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
             Resolved::Ram(addr) => {
@@ -1063,7 +1068,7 @@ async fn exists<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 ) -> TieredReply {
     let mut count = 0i64;
     for key in &argv[1..] {
-        let hash = TieredTable::hash_key(key);
+        let hash = shared.hasher.hash(key);
         match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
             Resolved::Ram(_) | Resolved::Cold { .. } | Resolved::Extent { .. } => count += 1,
             _ => {}
@@ -1080,7 +1085,7 @@ async fn strlen<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     key: &[u8],
     proto: Protocol,
 ) -> TieredReply {
-    let hash = TieredTable::hash_key(key);
+    let hash = shared.hasher.hash(key);
     let mut reply = shared.take_reply_buf();
     let mut w = RespWriter::new(&mut reply, proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
@@ -1104,7 +1109,7 @@ async fn type_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     key: &[u8],
     proto: Protocol,
 ) -> TieredReply {
-    let hash = TieredTable::hash_key(key);
+    let hash = shared.hasher.hash(key);
     let mut reply = shared.take_reply_buf();
     let mut w = RespWriter::new(&mut reply, proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
@@ -1121,7 +1126,7 @@ async fn ttl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     key: &[u8],
     proto: Protocol,
 ) -> TieredReply {
-    let hash = TieredTable::hash_key(key);
+    let hash = shared.hasher.hash(key);
     let mut reply = shared.take_reply_buf();
     let mut w = RespWriter::new(&mut reply, proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
@@ -1143,7 +1148,7 @@ async fn getrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         return done_error(shared, proto, "ERR value is not an integer or out of range");
     };
     let key = argv.arg(1);
-    let hash = TieredTable::hash_key(key);
+    let hash = shared.hasher.hash(key);
     let mut reply = shared.take_reply_buf();
     let mut w = RespWriter::new(&mut reply, proto);
     let slice_of = |value: &[u8], w: &mut RespWriter<'_>| {
@@ -1257,6 +1262,26 @@ async fn dbsize<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     proto: Protocol,
 ) -> TieredReply {
+    match dbsize_count(shared, ns, proto).await {
+        Ok(len) => {
+            let mut reply = shared.take_reply_buf();
+            RespWriter::new(&mut reply, proto).int(len as i64);
+            TieredReply::Done(reply)
+        }
+        Err(reply) => TieredReply::Done(reply),
+    }
+}
+
+/// This cell's exact count for the tiered namespace — the [`dbsize`]
+/// drain without the rendering, so a scattered `DBSIZE` (a
+/// namespace-bound connection on a multi-cell node — the plane's
+/// `Counted` shape) can sum typed contributions. `Err` is the typed
+/// error reply, never a partial integer.
+pub(super) async fn dbsize_count<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    proto: Protocol,
+) -> Result<u64, Vec<u8>> {
     let snapshot = |shared: &Rc<Shared<O, F>>| -> Option<Vec<inf_store::ShadowTicket>> {
         let ks = shared.store.borrow();
         let table = ks.tiered_store(ns)?;
@@ -1267,7 +1292,7 @@ async fn dbsize<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         })
     };
     let Some(mut pending) = snapshot(shared) else {
-        return done_error(shared, proto, "ERR the selected namespace was dropped");
+        return Err(error_bytes(shared, proto, "ERR the selected namespace was dropped"));
     };
     let mut fenced = false;
     // Two passes at most: the fence stops new tickets, and a ticket that
@@ -1287,7 +1312,7 @@ async fn dbsize<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 read_cold_record(shared, ns, ticket.cold, inf_runtime::ReadClass::Foreground).await;
             let mut ks = shared.store.borrow_mut();
             let Some(table) = ks.tiered_store_mut(ns) else {
-                return done_error(shared, proto, "ERR the selected namespace was dropped");
+                return Err(error_bytes(shared, proto, "ERR the selected namespace was dropped"));
             };
             match image {
                 Ok(image) => {
@@ -1302,34 +1327,31 @@ async fn dbsize<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                     RespWriter::new(&mut reply, proto).error(&format!(
                         "ERR DBSIZE: shadow twin at {addr} unreadable ({cause}) — ADR-0093 A3"
                     ));
-                    return TieredReply::Done(reply);
+                    return Err(reply);
                 }
             }
         }
         pending = snapshot(shared).unwrap_or_default();
     }
-    let mut reply = shared.take_reply_buf();
-    let len = {
-        let mut ks = shared.store.borrow_mut();
-        match ks.tiered_store_mut(ns) {
-            Some(table) => {
-                if fenced {
-                    table.shadow_fence(false);
-                }
-                if table.shadow_unverified() > 0 {
-                    // Unreachable under the fence unless a read raced a
-                    // retarget twice; say so rather than guess.
-                    RespWriter::new(&mut reply, proto)
-                        .error("ERR DBSIZE: shadow tickets still unverified after the drain");
-                    return TieredReply::Done(reply);
-                }
-                table.len()
+    let mut ks = shared.store.borrow_mut();
+    match ks.tiered_store_mut(ns) {
+        Some(table) => {
+            if fenced {
+                table.shadow_fence(false);
             }
-            None => 0,
+            if table.shadow_unverified() > 0 {
+                // Unreachable under the fence unless a read raced a
+                // retarget twice; say so rather than guess.
+                return Err(error_bytes(
+                    shared,
+                    proto,
+                    "ERR DBSIZE: shadow tickets still unverified after the drain",
+                ));
+            }
+            Ok(table.len() as u64)
         }
-    };
-    RespWriter::new(&mut reply, proto).int(len as i64);
-    TieredReply::Done(reply)
+        None => Ok(0),
+    }
 }
 
 /// Fetches the record at a cold slot solely to learn its key (SCAN).
@@ -1496,7 +1518,7 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     value: &[u8],
     plain: bool,
 ) -> Result<(u64, Option<Vec<u8>>, bool), Vec<u8>> {
-    let hash = TieredTable::hash_key(key);
+    let hash = shared.hasher.hash(key);
     let deadline = stall_deadline(shared, ns);
     loop {
         // M4.5-S37 step 1 (`bench-diagnostics` only): the ceiling arm —
@@ -1889,7 +1911,7 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     proto: Protocol,
     want_value: bool,
 ) -> Result<Option<(u64, Option<Vec<u8>>)>, Vec<u8>> {
-    let hash = TieredTable::hash_key(key);
+    let hash = shared.hasher.hash(key);
     loop {
         let (old, old_value): (Displaced, Option<Vec<u8>>) =
             match resolve(shared, ns, key, hash, PromoteOnCold::Never).await {

@@ -25,7 +25,7 @@ pub mod shadow;
 
 use std::collections::{HashMap, VecDeque};
 
-use inf_foundation::{LogicalAddr, hash64};
+use inf_foundation::{KeyHasher, LogicalAddr};
 
 use inf_log::flush::{TierFileMeta, TierFlush, TierFlushError};
 use inf_log::fs::SegmentFs;
@@ -36,7 +36,7 @@ use crate::demote::DemotionConfig;
 use crate::index::{Index, TieredMode};
 use crate::live_set::LiveSet;
 use crate::record::{ExtentRef, RecordKind, RecordSpec, RecordView};
-use crate::store::{DiskFullCause, HASH_SEED, OpError};
+use crate::store::{DiskFullCause, OpError};
 use crate::write_accounting::WriteAccounting;
 
 /// Answer of a tiered lookup. `Cold` is a *candidate*: the 22-bit
@@ -97,6 +97,8 @@ const NO_MARK_PAGE: u64 = u64::MAX;
 
 /// One durable-tiered namespace's record table on one cell (L1).
 pub struct TieredTable {
+    /// The key hash's secret (ADR-0094) — the node's one value, injected.
+    hasher: KeyHasher,
     index: Index<TieredMode>,
     space: AddressSpace,
     live_bytes: u64,
@@ -244,6 +246,7 @@ impl TieredTable {
         config: AddressSpaceConfig,
         demote: DemotionConfig,
         initial_keys: usize,
+        hasher: KeyHasher,
     ) -> Option<TieredTable> {
         let mut space = AddressSpace::new(config)?;
         // The budget admission bound (ADR-0053 D1): alloc refuses — and
@@ -255,6 +258,7 @@ impl TieredTable {
         }
         space.set_window_limit(window);
         Some(TieredTable {
+            hasher,
             index: Index::with_capacity(initial_keys.max(64)),
             space,
             live_bytes: 0,
@@ -281,11 +285,28 @@ impl TieredTable {
         })
     }
 
-    /// Stable key hash — same seed as the memory-mode store, so batch
-    /// pipelines hash once regardless of table mode.
+    /// The key hash under this table's secret (ADR-0094) — the same
+    /// value as the node's memory-mode stores, so batch pipelines hash
+    /// once regardless of table mode. An instance method: a hash is
+    /// meaningful only to the table whose hasher computed it.
     #[inline]
-    pub fn hash_key(key: &[u8]) -> u64 {
-        hash64(key, HASH_SEED)
+    #[must_use]
+    pub fn hash_key(&self, key: &[u8]) -> u64 {
+        self.hasher.hash(key)
+    }
+
+    /// This table's key hasher.
+    #[inline]
+    #[must_use]
+    pub fn hasher(&self) -> KeyHasher {
+        self.hasher
+    }
+
+    /// Probe groups in the index (the SCAN cursor space; the rebuild's
+    /// walk) — tests that craft home-group collisions size by it.
+    #[must_use]
+    pub fn index_group_count(&self) -> usize {
+        self.index.group_count()
     }
 
     /// Probe-line prefetch (the batch pipeline's phase 1 — L3).
@@ -314,7 +335,7 @@ impl TieredTable {
     /// (`exclude` carries fetched-and-mismatched addresses on retry — the
     /// false-positive path, ≈2⁻²² per candidate).
     pub fn lookup(&self, key: &[u8], hash: u64, exclude: &[LogicalAddr]) -> TieredLookup {
-        debug_assert_eq!(hash, Self::hash_key(key));
+        debug_assert_eq!(hash, self.hash_key(key));
         let mut cold_candidate = None;
         let ram_hit = self.index.find(hash, |addr| match self.space.resolve(addr) {
             AddrClass::Mutable | AddrClass::ReadOnly => self.record(addr).key == key,
@@ -422,7 +443,7 @@ impl TieredTable {
         old_len: usize,
         old_version: u32,
     ) -> Result<LogicalAddr, OpError> {
-        debug_assert_eq!(hash, Self::hash_key(key));
+        debug_assert_eq!(hash, self.hash_key(key));
         let spec = RecordSpec {
             key,
             value,
@@ -1955,12 +1976,13 @@ mod tests {
             },
             DemotionConfig::for_budget(1 << 16, 1 << 12),
             64,
+            KeyHasher::default(),
         )
         .expect("reservation")
     }
 
     fn find(table: &TieredTable, key: &[u8]) -> (LogicalAddr, usize, u32) {
-        let hash = TieredTable::hash_key(key);
+        let hash = table.hash_key(key);
         match table.lookup(key, hash, &[]) {
             TieredLookup::Ram(addr) => {
                 let parts = table.record(addr);
@@ -1975,7 +1997,7 @@ mod tests {
     #[test]
     fn update_in_place_when_mutable_and_exact_fit() {
         let mut t = table();
-        let hash = TieredTable::hash_key(b"k");
+        let hash = t.hash_key(b"k");
         let addr = t.insert(b"k", b"aaaa", hash).expect("fits");
         let (_, len, version) = find(&t, b"k");
         let dead_before = t.space().report().dead_bytes;
@@ -1992,7 +2014,7 @@ mod tests {
     #[test]
     fn update_relocates_on_size_change() {
         let mut t = table();
-        let hash = TieredTable::hash_key(b"k");
+        let hash = t.hash_key(b"k");
         let addr = t.insert(b"k", b"aaaa", hash).expect("fits");
         let (_, len, version) = find(&t, b"k");
         let dead_before = t.space().report().dead_bytes;
@@ -2010,7 +2032,7 @@ mod tests {
     #[test]
     fn update_of_sealed_record_copies_to_tail() {
         let mut t = table();
-        let hash = TieredTable::hash_key(b"k");
+        let hash = t.hash_key(b"k");
         let addr = t.insert(b"k", b"aaaa", hash).expect("fits");
         let (_, len, version) = find(&t, b"k");
         let tail = t.space().tail();
@@ -2037,14 +2059,14 @@ mod tests {
             },
             DemotionConfig::for_budget(1 << 14, 1 << 12),
             64,
+            KeyHasher::default(),
         )
         .expect("reservation");
         // ~40 records ≈ 2.5 pages of mutable bytes (record ≈ 260 B).
         let mut starts = Vec::new();
         for i in 0..40u32 {
             let key = format!("k:{i:04}");
-            let addr =
-                t.insert(key.as_bytes(), &[0xAB; 240], TieredTable::hash_key(key.as_bytes()));
+            let addr = t.insert(key.as_bytes(), &[0xAB; 240], t.hash_key(key.as_bytes()));
             starts.push(addr.expect("fits").to_raw());
         }
         let target = t.demotion().mutable_target_bytes();
@@ -2083,11 +2105,12 @@ mod tests {
             // Target 0 mutable bytes: everything is seal debt.
             DemotionConfig { mem_budget_bytes: 1 << 14, mutable_permille: 0, slice_bytes: 256 },
             64,
+            KeyHasher::default(),
         )
         .expect("reservation");
-        let hash = TieredTable::hash_key(b"wide");
+        let hash = t.hash_key(b"wide");
         let wide = t.insert(b"wide", &[0x77; 8 << 10], hash).expect("fits");
-        let hash2 = TieredTable::hash_key(b"next");
+        let hash2 = t.hash_key(b"next");
         let next = t.insert(b"next", &[0x11; 64], hash2).expect("fits");
         // First slice: the wide record exceeds 256 B but seals whole.
         assert!(t.seal_slice() > 256, "minimum one record of progress");
@@ -2105,16 +2128,16 @@ mod tests {
     fn stall_target_names_the_unblocking_flushed_watermark() {
         let mut t = table();
         let value = vec![0x5A; (1 << 14) - 32];
-        let hash = TieredTable::hash_key(b"a");
+        let hash = t.hash_key(b"a");
         t.insert(b"a", &value, hash).expect("fits");
-        let hash_b = TieredTable::hash_key(b"b");
+        let hash_b = t.hash_key(b"b");
         t.insert(b"b", &value, hash_b).expect("fits");
-        let hash_c = TieredTable::hash_key(b"c");
+        let hash_c = t.hash_key(b"c");
         t.insert(b"c", &value, hash_c).expect("fits");
-        let hash_d = TieredTable::hash_key(b"d");
+        let hash_d = t.hash_key(b"d");
         t.insert(b"d", &value, hash_d).expect("fits");
         // The ring (64 KiB) is full: the next write must stall.
-        assert!(t.insert(b"e", &value, TieredTable::hash_key(b"e")).is_err());
+        assert!(t.insert(b"e", &value, t.hash_key(b"e")).is_err());
         let target = t.write_stall_target(b"e", &value).expect("watermark progress can help");
         assert_eq!(t.space().counters().tail_alloc_stalls, 1, "the stall is tripwired");
         // MAINTAIN's job, played by the test: seal → flush → release to
@@ -2124,7 +2147,7 @@ mod tests {
         t.space_mut().advance_flushed(tail);
         assert!(tail >= target, "the sealed range covers the stall target");
         while t.release_slice() > 0 {}
-        t.insert(b"e", &value, TieredTable::hash_key(b"e")).expect("fits after release");
+        t.insert(b"e", &value, t.hash_key(b"e")).expect("fits after release");
     }
 
     /// M4-S07: release steps are slice-bounded and stop at `flushed`.
@@ -2133,8 +2156,7 @@ mod tests {
         let mut t = table();
         for i in 0..8u32 {
             let key = format!("r:{i}");
-            t.insert(key.as_bytes(), &[0x33; 4000], TieredTable::hash_key(key.as_bytes()))
-                .expect("fits");
+            t.insert(key.as_bytes(), &[0x33; 4000], t.hash_key(key.as_bytes())).expect("fits");
         }
         let tail = t.space().tail();
         t.space_mut().advance_ro_boundary(tail);
@@ -2163,7 +2185,7 @@ mod tests {
     #[test]
     fn doc_shape_in_place_patch_above_boundary() {
         let mut t = table();
-        let hash = TieredTable::hash_key(b"doc");
+        let hash = t.hash_key(b"doc");
         let addr = t.insert(b"doc", b"01234567", hash).expect("fits");
         let (_, len, version) = find(&t, b"doc");
         let record = t.space_mut().bytes_mut(addr, len);

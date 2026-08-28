@@ -203,7 +203,7 @@ impl TieredTable {
             let image = &bytes[off..off + len];
             let parts = TieredTable::decode_record(image);
             debug_assert_eq!(parts.encoded_len, len, "image framing agrees with its header");
-            let hash = TieredTable::hash_key(parts.key);
+            let hash = self.hash_key(parts.key);
             let old = LogicalAddr::from_raw(cur.next + off as u64).expect("in-range address");
             // Exact-pair liveness (ADR-0058 D6 discipline): within one
             // life this cannot alias — addresses are monotonic and

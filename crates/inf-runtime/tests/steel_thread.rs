@@ -28,6 +28,7 @@ use inf_runtime::{
     BackendDriver, CellExecutor, CompletionResult, CompletionToken, GateWait, IoGate, IoOp,
     PollImmediate, RawFd, StableBytesMut, TokenClass, UringDriver, Wait,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddrClass, AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsId, StoreConfig,
     TieredLookup, TieredTable,
@@ -237,7 +238,7 @@ fn resume_oversized(
 /// The steel-thread GET (the L6 shape): RAM answers synchronously; cold
 /// candidates fetch-verify-retry through real suspension.
 async fn steel_get(ctx: Rc<RefCell<Ctx>>, key: Vec<u8>) -> Answer {
-    let hash = TieredTable::hash_key(&key);
+    let hash = KeyHasher::default().hash(&key);
     let mut exclude: Vec<LogicalAddr> = Vec::new();
     loop {
         let (plan, waiter) = match plan_first_window(&ctx, &key, hash, &exclude) {
@@ -368,7 +369,7 @@ fn build_demoted_corpus(
         let table = ks.tiered_store_mut(NS).expect("materialized");
         for (i, key) in corpus.small_keys.iter().enumerate() {
             let value = vec![b'a' + (i % 23) as u8; 40 + i * 7];
-            let addr = table.insert(key, &value, TieredTable::hash_key(key)).expect("fits");
+            let addr = table.insert(key, &value, KeyHasher::default().hash(key)).expect("fits");
             log.push((addr, table.record(addr).encoded_len));
             corpus.values.insert(key.clone(), value);
         }
@@ -376,7 +377,7 @@ fn build_demoted_corpus(
         // the exact second read.
         let big_value = vec![0xB6u8; 100 * 1024];
         let addr = table
-            .insert(&corpus.big_key, &big_value, TieredTable::hash_key(&corpus.big_key))
+            .insert(&corpus.big_key, &big_value, KeyHasher::default().hash(&corpus.big_key))
             .expect("fits");
         log.push((addr, table.record(addr).encoded_len));
         corpus.values.insert(corpus.big_key.clone(), big_value);
@@ -449,7 +450,7 @@ fn steel_thread_write_flush_demote_cold_read() {
     {
         let ctx = &mut *ctx.borrow_mut();
         let table = ctx.table();
-        let hash = TieredTable::hash_key(&hot_key);
+        let hash = KeyHasher::default().hash(&hot_key);
         let TieredLookup::Cold(old) = table.lookup(&hot_key, hash, &[]) else {
             panic!("expected the demoted record to be cold")
         };

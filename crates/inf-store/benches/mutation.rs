@@ -26,6 +26,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use inf_alloc::{Arena, ArenaAddr, ArenaConfig};
+use inf_store::KeyHasher;
 use inf_store::{AddressSpace, AddressSpaceConfig, DemotionConfig, LogicalAddr, TieredTable};
 
 const KEY_LEN: usize = 16;
@@ -205,7 +206,7 @@ fn bench_relocate(n: usize, label: &str) {
     let mut entries: Vec<(u64, ArenaAddr, usize)> = Vec::with_capacity(n);
     for i in 0..n {
         let key = key_of(i);
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         let addr = arena.alloc(small_len).expect("arena budget");
         write_record_image(arena.bytes_mut(addr, small_len), &key, &small, 1);
         index.insert(hash, addr);
@@ -240,12 +241,13 @@ fn bench_relocate(n: usize, label: &str) {
         },
         DemotionConfig::for_budget(ring as u64, 1 << 20),
         n * 2,
+        KeyHasher::default(),
     )
     .expect("reservation");
     let mut tiered: Vec<(u64, LogicalAddr, usize, u32)> = Vec::with_capacity(n);
     for i in 0..n {
         let key = key_of(i);
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         let addr = table.insert(&key, &small, hash).expect("fits");
         tiered.push((hash, addr, small_len, 0));
     }
@@ -295,11 +297,12 @@ fn main() {
         },
         DemotionConfig::for_budget(1 << 16, 1 << 12),
         64,
+        KeyHasher::default(),
     )
     .expect("reservation");
     let key = key_of(7);
     let value = [b'v'; VAL_LEN];
-    let addr = probe.insert(&key, &value, TieredTable::hash_key(&key)).expect("fits");
+    let addr = probe.insert(&key, &value, KeyHasher::default().hash(&key)).expect("fits");
     let mut image = vec![0u8; RECORD_LEN];
     write_record_image(&mut image, &key, &value, 0);
     assert_eq!(probe.record_bytes(addr, RECORD_LEN), &image[..], "layout twin drifted");

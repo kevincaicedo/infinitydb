@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, LogicalAddr, OpError, TieredLookup, TieredTable,
 };
@@ -61,6 +62,7 @@ impl Harness {
                 },
                 DemotionConfig::for_budget(RING, PAGE),
                 64,
+                KeyHasher::default(),
             )
             .expect("reservation"),
             oracle: HashMap::new(),
@@ -73,7 +75,7 @@ impl Harness {
     /// Drives `lookup` through the fetch-verify-retry contract until it
     /// grounds out (verified hit or miss).
     fn find(&self, key: &[u8]) -> Option<Found> {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         self.table.prefetch(hash);
         self.table.prefetch_candidate(hash); // skips cold candidates
         let mut exclude: Vec<LogicalAddr> = Vec::new();
@@ -112,7 +114,7 @@ impl Harness {
     }
 
     fn set(&mut self, key: &[u8], value: &[u8]) {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         let existing = self.find(key);
         let result = match &existing {
             Some(found) => self.table.overwrite(
@@ -161,7 +163,7 @@ impl Harness {
     }
 
     fn del(&mut self, key: &[u8]) -> bool {
-        let hash = TieredTable::hash_key(key);
+        let hash = KeyHasher::default().hash(key);
         match self.find(key) {
             Some(found) => {
                 self.table.delete(

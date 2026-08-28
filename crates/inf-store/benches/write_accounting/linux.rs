@@ -40,9 +40,10 @@ use inf_log::{
     TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode, create_cell_dirs, tier_extract,
     tier_frame_offset, tier_frame_span,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, CompactionWork, DemotionConfig, Keyspace, LogicalAddr, StoreConfig,
-    TieredLookup, TieredTable, WriteAccounting,
+    TieredLookup, WriteAccounting,
 };
 
 const NS: NsId = NsId(31);
@@ -226,7 +227,7 @@ fn workload(dir: &Path, user_mib: u64, leg: Leg) -> Run {
         let effect = MutationEffect::StringSet { ns: NS, key: key.as_bytes(), value: &value };
         let table = ks.tiered_store_mut(NS).expect("materialized");
         table.stage_wal(&mut ring, &effect).expect("frame has room");
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         let placed = if i < keys {
             table
                 .insert(key.as_bytes(), &value, hash)

@@ -33,6 +33,7 @@ use inf_store::{
 };
 
 use crash_matrix::load_matrix;
+use inf_store::KeyHasher;
 
 const NS: NsId = NsId(29);
 const PAGE: u64 = 4 << 10;
@@ -59,7 +60,7 @@ fn table(origin: u64) -> TieredTable {
         page_bytes: PAGE as usize,
         life_origin: LogicalAddr::from_raw(origin).expect("48-bit"),
     };
-    let mut t = TieredTable::new(space, demote(), 256).expect("ring");
+    let mut t = TieredTable::new(space, demote(), 256, KeyHasher::default()).expect("ring");
     t.set_blob_config(inf_store::BlobConfig { threshold_bytes: 64, max_bytes: 1 << 20 });
     t
 }
@@ -235,7 +236,7 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
     let live_id = t.allocate_extent_id();
     let sealed = write_extent(&fs, live_id, &live_value);
     let key = b"blob:live".to_vec();
-    let hash = TieredTable::hash_key(&key);
+    let hash = KeyHasher::default().hash(&key);
     let effect = MutationEffect::StringSetExtent {
         ns: NS,
         key: &key,
@@ -332,6 +333,7 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
         },
         demote(),
         256,
+        KeyHasher::default(),
     )
     .expect("recovery");
     assert!(recovered.extents_listed.contains(&orphan_id), "the listing saw the orphan");
@@ -345,14 +347,14 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
             match record {
                 RecordView::StringPostImage { key, value, .. } => {
                     cell.borrow_mut()
-                        .apply_image(key, value, TieredTable::hash_key(key))
+                        .apply_image(key, value, KeyHasher::default().hash(key))
                         .expect("fits");
                 }
                 RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
                     cell.borrow_mut()
                         .apply_extent_image(
                             key,
-                            TieredTable::hash_key(key),
+                            KeyHasher::default().hash(key),
                             ExtentRef { extent_id, offset, len },
                         )
                         .expect("fits");
@@ -385,7 +387,7 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
             RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
                 t.apply_extent_image(
                     key,
-                    TieredTable::hash_key(key),
+                    KeyHasher::default().hash(key),
                     ExtentRef { extent_id, offset, len },
                 )
                 .expect("fits");
@@ -438,7 +440,7 @@ fn blob_unlink_failure_defers_nonfatally_and_the_retry_reclaims() {
     let id = t.allocate_extent_id();
     let sealed = write_extent(&fs, id, &bytes);
     let key = b"blob:doomed".to_vec();
-    let hash = TieredTable::hash_key(&key);
+    let hash = KeyHasher::default().hash(&key);
     t.stage_wal(
         &mut ring,
         &MutationEffect::StringSetExtent {

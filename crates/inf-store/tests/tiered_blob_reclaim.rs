@@ -38,6 +38,7 @@ use inf_log::fs::mem::MemFs;
 use inf_log::{
     MutationEffect, NsId, StagingConfig, StagingRing, TierFlush, TierFlushConfig, TierIoMode,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, BLOB_RECLAIM_PER_SLICE_DEFAULT, BlobConfig, CompactionConfig,
     CompactionWork, DemotionConfig, LogicalAddr, TieredTable,
@@ -101,6 +102,7 @@ impl<F: SegmentFs + Clone> Rig<F> {
             },
             demote,
             2048,
+            KeyHasher::default(),
         )
         .expect("ring");
         table.set_blob_config(BlobConfig { threshold_bytes: THRESHOLD, max_bytes: 1 << 20 });
@@ -151,7 +153,7 @@ impl<F: SegmentFs + Clone> Rig<F> {
     /// → reference (the D3 ordering, structural).
     fn set_blob(&mut self, id: u64, generation: u64) {
         let key = Self::key(id);
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         let value = self.value_for(id, generation);
         let old = self.model.get(&id).cloned();
         if let Some(old) = &old {
@@ -215,7 +217,7 @@ impl<F: SegmentFs + Clone> Rig<F> {
     fn del(&mut self, id: u64) {
         let Some(entry) = self.model.remove(&id) else { return };
         let key = Self::key(id);
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         let addr = LogicalAddr::from_raw(entry.addr).expect("48-bit");
         let _ = self.table.take_displacement_origins(hash, addr);
         self.stage(&MutationEffect::Delete { ns: NS, key: &key });

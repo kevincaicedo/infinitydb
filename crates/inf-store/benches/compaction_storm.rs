@@ -25,6 +25,7 @@ use inf_log::fs::{SegmentFile, SegmentFs, StdSegmentFs};
 use inf_log::{
     NsId, TIER_FRAME_BYTES, TierIoMode, tier_extract, tier_frame_offset, tier_frame_span,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, CompactionWork, DemotionConfig, Keyspace, LogicalAddr, StoreConfig,
     TieredLookup, TieredTable,
@@ -185,7 +186,7 @@ fn run_storm<F: SegmentFs + Clone>(fs: F, shard_dir: PathBuf, mode: TierIoMode, 
     for i in 0..KEYS {
         let key = format!("k:{i:06}");
         let value = vec![0x41u8; 64 + (seeded(&mut seed) % 192) as usize];
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         let table = storm.table();
         let addr = table.insert(key.as_bytes(), &value, hash).expect("fits");
         lens.push(table.record(addr).encoded_len);
@@ -210,7 +211,7 @@ fn run_storm<F: SegmentFs + Clone>(fs: F, shard_dir: PathBuf, mode: TierIoMode, 
                 (seeded(&mut seed) % KEYS) as usize
             };
             let key = format!("k:{idx:06}");
-            let hash = TieredTable::hash_key(key.as_bytes());
+            let hash = KeyHasher::default().hash(key.as_bytes());
             let started = Instant::now();
             if is_set {
                 let value = vec![0x42u8; 64 + (seeded(&mut seed) % 192) as usize];
