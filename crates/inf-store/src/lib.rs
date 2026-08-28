@@ -92,8 +92,9 @@ pub use store::{
 pub use tiered::compact::{CompactionApplied, CompactionConfig, CompactionWork};
 pub use tiered::promote::PromotionCounters;
 pub use tiered::shadow::{
-    SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT, SHADOW_TICKETS_CAP, ShadowCounters,
-    ShadowProbe, ShadowRead, ShadowRefusal, ShadowTicket, ShadowVerdict,
+    COLLISION_KEY_PREFIX, SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT, SHADOW_TICKETS_CAP,
+    SettleOutcome, SettleReason, SettleSlot, ShadowCounters, ShadowProbe, ShadowRead,
+    ShadowRefusal, ShadowTicket, ShadowVerdict, forced_collision_pair, forced_collision_triple,
 };
 pub use tiered::{RecordParts, TieredLookup, TieredTable};
 pub use tiered_recover::{

@@ -764,6 +764,9 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tiering_shadow_created:{}", shadow.created));
     push(text, &format!("tiering_shadow_resolved_same_key:{}", shadow.resolved_same_key));
     push(text, &format!("tiering_shadow_resolved_collision:{}", shadow.resolved_collision));
+    push(text, &format!("tiering_shadow_verified:{}", shadow.verified));
+    push(text, &format!("tiering_shadow_settled_without_read:{}", shadow.settled_without_read));
+    push(text, &format!("tiering_shadow_verified_pending:{}", shadow.verified_pending));
     push(text, &format!("tiering_shadow_stale:{}", shadow.stale));
     push(text, &format!("tiering_shadow_read_errors:{}", shadow.read_errors));
     push(text, &format!("tiering_shadow_reads_issued:{}", shadow.reads_issued));
@@ -774,7 +777,9 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tiering_shadow_pinned_bytes_peak:{}", shadow.pinned_bytes_peak));
     push(text, &format!("tiering_shadow_pin_cap_bytes:{}", shadow.pin_cap_bytes));
     push(text, &format!("tiering_shadow_fallback_off:{}", shadow.fallback_off));
+    push(text, &format!("tiering_shadow_fallback_fence:{}", shadow.fallback_fence));
     push(text, &format!("tiering_shadow_fallback_multi:{}", shadow.fallback_multi));
+    push(text, &format!("tiering_shadow_fallback_ticketed:{}", shadow.fallback_ticketed));
     push(text, &format!("tiering_shadow_fallback_tickets:{}", shadow.fallback_tickets));
     push(text, &format!("tiering_shadow_fallback_pin:{}", shadow.fallback_pin));
     push(text, &format!("tiering_shadow_fallback_origin:{}", shadow.fallback_origin));
@@ -782,10 +787,24 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tiering_shadow_exact_miss_inserts:{}", shadow.exact_miss_inserts));
     push(text, &format!("tiering_shadow_compaction_deferred:{}", shadow.compaction_deferred));
     push(text, &format!("tiering_shadow_promote_skip:{}", shadow.promote_skip));
-    push(text, &format!("tiering_shadow_scan_skipped:{}", shadow.scan_skipped));
+    push(text, &format!("tiering_shadow_scan_twins_emitted:{}", shadow.scan_twins_emitted));
     push(text, &format!("tiering_shadow_forced_by_delete:{}", shadow.forced_by_delete));
     push(text, &format!("tiering_shadow_retargeted:{}", shadow.retargeted));
     push(text, &format!("tiering_shadow_dropped_by_removal:{}", shadow.dropped_by_removal));
+    push(text, &format!("tiering_shadow_deferred_walk:{}", shadow.deferred_walk));
+    push(text, &format!("tiering_shadow_deferred_origin:{}", shadow.deferred_origin));
+    push(text, &format!("tiering_shadow_dbsize_drains:{}", shadow.dbsize_drains));
+    push(text, &format!("tiering_shadow_dbsize_reads:{}", shadow.dbsize_reads));
+    push(text, &format!("tiering_shadow_rebuild_reads:{}", shadow.rebuild_reads));
+    push(
+        text,
+        &format!("tiering_shadow_rebuild_settled_same_key:{}", shadow.rebuild_settled_same_key),
+    );
+    push(
+        text,
+        &format!("tiering_shadow_rebuild_settled_distinct:{}", shadow.rebuild_settled_distinct),
+    );
+    push(text, &format!("tiering_shadow_rebuild_over_cap:{}", shadow.rebuild_over_cap));
     push(text, &format!("tiering_shadow_bytes:{}", shadow.bytes));
     push(
         text,
@@ -2052,6 +2071,12 @@ mod tests {
             "tiering_shadow_pending",
             "tiering_shadow_pinned_bytes",
             "tiering_shadow_fallback_pin",
+            "tiering_shadow_fallback_fence",
+            "tiering_shadow_fallback_ticketed",
+            "tiering_shadow_verified_pending",
+            "tiering_shadow_dbsize_drains",
+            "tiering_shadow_rebuild_reads",
+            "tiering_shadow_scan_twins_emitted",
             "tiering_shadow_bytes",
         ] {
             assert!(text.contains(&format!("{name}:0")), "missing {name}: {text}");

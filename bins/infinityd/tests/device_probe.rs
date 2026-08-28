@@ -1,6 +1,6 @@
 //! M4.5-S42 (ADR-0091 D4): the device-model lifecycle at the binary
 //! level — `infinityd --device-probe auto` on a fresh data directory
-//! probes, writes a schema-3 `io-properties.toml`, boots, and says so in
+//! probes, writes a schema-4 `io-properties.toml`, boots, and says so in
 //! `INFO persistence`; the second boot reads the file; `off` on an
 //! absent file boots the dev tier; a file carrying a foreign identity
 //! refuses under `off` and re-probes (leaving `.stale`) under `auto`.
@@ -9,7 +9,7 @@
 //! workspace `target/` (a real filesystem — `/tmp` may be a quota-bound
 //! tmpfs on the dev box, and a tmpfs probe would only ever measure the
 //! refused-direct-class branch). Each `auto` boot pays the probe
-//! (≈ 9 rows × 1 s + a 256 MiB pre-write), so the test runs three of
+//! (≈ 10 rows × 1 s + a 256 MiB pre-write), so the test runs three of
 //! them and no more.
 #![cfg(target_os = "linux")]
 
@@ -152,10 +152,11 @@ fn a_fresh_data_directory_is_probed_once_and_the_model_is_identity_bound() {
         let server = spawn(&dir, &[]).expect("auto boots");
         let info = info_when(server.port, "io_properties_source", "probed-at-boot");
         assert_eq!(field(&info, "io_properties_source"), "probed-at-boot");
-        assert_eq!(field(&info, "io_properties_schema"), "3");
+        assert_eq!(field(&info, "io_properties_schema"), "4");
         assert_eq!(field(&info, "io_properties_identity"), "verified");
         let text = std::fs::read_to_string(dir.join("io-properties.toml")).expect("written");
-        assert!(text.contains("probe_schema = 3\n"), "{text}");
+        assert!(text.contains("probe_schema = 4\n"), "{text}");
+        assert!(text.contains("read_bytes_per_s_256k_qd1 = "), "{text}");
         assert!(text.contains("fs_type = \""), "{text}");
         assert!(text.contains("fua_p50_us_512 = "), "{text}");
         // The configured class is the probe's own verdict. INFO's
@@ -257,17 +258,23 @@ fn a_fresh_data_directory_is_probed_once_and_the_model_is_identity_bound() {
         assert_eq!(field(&info, "io_class_configured"), verdict);
         assert!(dir.join("io-properties.toml.stale").exists(), "the stale model is kept");
         assert!(!fresh.contains("dead-beef"), "the foreign identity is gone: {fresh}");
-        // The read row (ADR-0088 D4 as amended) is measured on a device
-        // that serves the direct class, and the boot's cap follows it.
+        // The two read rows (ADR-0088 D4 as amended, second amendment)
+        // are measured on a device that serves the direct class, and the
+        // boot's cap follows them: at one cell, `min(qd1, qd4 ÷ 1)`.
         if !fresh.contains("fua_unsupported") {
-            let read: u64 = fresh
-                .lines()
-                .find_map(|l| l.strip_prefix("read_bytes_per_s_256k = "))
-                .and_then(|v| v.parse().ok())
-                .expect("read row");
-            assert!(read > 0, "the probe measures the read row: {fresh}");
+            let row = |key: &str| -> u64 {
+                fresh
+                    .lines()
+                    .find_map(|l| l.strip_prefix(key))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| panic!("{key} row: {fresh}"))
+            };
+            let qd4 = row("read_bytes_per_s_256k = ");
+            let qd1 = row("read_bytes_per_s_256k_qd1 = ");
+            assert!(qd4 > 0, "the probe measures the four-reader row: {fresh}");
+            assert!(qd1 > 0, "the probe measures the one-reader row: {fresh}");
             let per_cell: u64 = field(&info, "ckpt_replay_bytes_per_s").parse().expect("u64");
-            assert_eq!(per_cell, read, "one cell: the replay term is the probed row");
+            assert_eq!(per_cell, qd1.min(qd4), "one cell: the replay term is min(qd1, qd4)");
         }
     }
 

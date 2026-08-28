@@ -314,6 +314,10 @@ fn main() {
             let mut shadow_at_cut = 0u64;
             let mut shadow_reformed = 0u64;
             let mut shadow_same_key = 0u64;
+            let mut shadow_collision = 0u64;
+            let mut shadow_collide_ops = 0u64;
+            let mut shadow_settled_at_boot = 0u64;
+            let mut shadow_drain_checks = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
@@ -322,6 +326,10 @@ fn main() {
                 shadow_at_cut += report.shadow_open_at_cut;
                 shadow_reformed += report.shadow_reformed;
                 shadow_same_key += report.shadow_same_key;
+                shadow_collision += report.shadow_collision;
+                shadow_collide_ops += report.shadow_collide_ops;
+                shadow_settled_at_boot += report.shadow_settled_at_boot;
+                shadow_drain_checks += report.shadow_drain_checks;
                 refs += report.refs_emitted;
                 images += report.images_emitted;
                 cuts_before += report.cut_before_publish;
@@ -354,7 +362,10 @@ fn main() {
                  {boot_gc} left-to-boot-gc, {blobs} blobs, {blob_orphans} orphans-planted, \
                  {blob_reclaims} blob-reclaims; shadow {shadow_opened} opened, \
                  {shadow_at_cut} open at a cut, {shadow_reformed} re-formed by recovery, \
-                 {shadow_same_key} same-key verdicts"
+                 {shadow_same_key} same-key / {shadow_collision} collision verdicts; \
+                 {shadow_collide_ops} ops on crafted colliding pairs, \
+                 {shadow_settled_at_boot} slots settled at boot, {shadow_drain_checks} \
+                 DBSIZE-drain checks"
             );
             if let Some(dir) = out_dir {
                 std::fs::create_dir_all(&dir).expect("--out dir");
@@ -367,7 +378,10 @@ fn main() {
                      files_unlinked={files_unlinked} unlinks_boot_gc={boot_gc} \
                      blobs={blobs} blob_orphans={blob_orphans} blob_reclaims={blob_reclaims} \
                      shadow_opened={shadow_opened} shadow_at_cut={shadow_at_cut} \
-                     shadow_reformed={shadow_reformed} shadow_same_key={shadow_same_key}\n"
+                     shadow_reformed={shadow_reformed} shadow_same_key={shadow_same_key} \
+                     shadow_collision={shadow_collision} shadow_collide_ops={shadow_collide_ops} \
+                     shadow_settled_at_boot={shadow_settled_at_boot} \
+                     shadow_drain_checks={shadow_drain_checks}\n"
                 );
                 std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
                     .expect("manifest");
@@ -385,7 +399,8 @@ fn main() {
              records, {} cut-before-publish, {} flush-lag, {} keys audited, {} live-set \
              entries, {} relocations, {} retired, {} unlinked, {} left-to-boot-gc, \
              {} blobs, {} orphans-planted, {} blob-reclaims, shadow {} opened / {} open at a \
-             cut / {} re-formed / {} same-key, trace {:#x}",
+             cut / {} re-formed / {} same-key / {} collision, {} collide-ops, {} settled-at-boot, \
+             {} drain-checks, trace {:#x}",
             report.lives,
             report.refs_emitted,
             report.images_emitted,
@@ -405,6 +420,10 @@ fn main() {
             report.shadow_open_at_cut,
             report.shadow_reformed,
             report.shadow_same_key,
+            report.shadow_collision,
+            report.shadow_collide_ops,
+            report.shadow_settled_at_boot,
+            report.shadow_drain_checks,
             report.trace_hash
         );
         if verify {
@@ -452,10 +471,20 @@ fn main() {
             let mut shadow_fallbacks = 0u64;
             let mut shadow_stale = 0u64;
             let mut shadow_at_cut = 0u64;
+            let mut collide_tickets = 0u64;
+            let mut collide_verdicts = 0u64;
+            let mut collide_ticketed = 0u64;
+            let mut collide_drains = 0u64;
+            let mut collide_scan_twins = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
                 ran += 1;
+                collide_tickets += report.collide_tickets;
+                collide_verdicts += report.collide_verdicts;
+                collide_ticketed += report.collide_ticketed_fallbacks;
+                collide_drains += report.collide_dbsize_drains;
+                collide_scan_twins += report.collide_scan_twins;
                 shadow_seeds += u64::from(report.shadow_arm);
                 shadow_created += report.shadow_created;
                 shadow_same_key += report.shadow_resolved_same_key;
@@ -495,7 +524,10 @@ fn main() {
                  drop-race {drop_values} values / {drop_other} typed-other; shadow arm on \
                  {shadow_seeds} seeds: {shadow_created} tickets ({shadow_at_cut} open at the \
                  cut), {shadow_same_key} same-key / {shadow_collision} collision verdicts, \
-                 {shadow_stale} stale, {shadow_fallbacks} fallbacks"
+                 {shadow_stale} stale, {shadow_fallbacks} fallbacks; forced collisions: \
+                 {collide_tickets} tickets, {collide_verdicts} collision verdicts, \
+                 {collide_ticketed} ticketed fallbacks, {collide_drains} DBSIZE drains, \
+                 {collide_scan_twins} SCAN twins"
             );
             println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
             if let Some(dir) = out_dir {
@@ -510,7 +542,9 @@ fn main() {
                      shadow_seeds={shadow_seeds} shadow_created={shadow_created} \
                      shadow_at_cut={shadow_at_cut} shadow_same_key={shadow_same_key} \
                      shadow_collision={shadow_collision} shadow_stale={shadow_stale} \
-                     shadow_fallbacks={shadow_fallbacks}\n"
+                     shadow_fallbacks={shadow_fallbacks} collide_tickets={collide_tickets} \
+                     collide_verdicts={collide_verdicts} collide_ticketed={collide_ticketed} \
+                     collide_drains={collide_drains} collide_scan_twins={collide_scan_twins}\n"
                 );
                 std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
                     .expect("manifest");
@@ -528,8 +562,9 @@ fn main() {
              required ops, {} allowed-lost, {} B flushed pre-cut, {} B flushed final, {} cold \
              resolves, {} blob sets, {} DISKFULL refusals (reopened: {}), drop-race {} values / \
              {} typed-other, refused-boot {}, shadow arm {} ({} tickets, {} open at the cut, \
-             {} same-key / {} collision, {} stale, {} fallbacks; phase 6b cold resolves {}), \
-             trace {} bytes, hash {:#018x}",
+             {} same-key / {} collision, {} stale, {} fallbacks; phase 6b cold resolves {}; \
+             phase 6c {} pairs: {} tickets, {} collision verdicts, {} ticketed fallbacks, {} \
+             DBSIZE drains, {} SCAN twins), trace {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -552,6 +587,12 @@ fn main() {
             report.shadow_stale,
             report.shadow_fallbacks,
             report.phase6b_cold_resolves,
+            report.collide_pairs,
+            report.collide_tickets,
+            report.collide_verdicts,
+            report.collide_ticketed_fallbacks,
+            report.collide_dbsize_drains,
+            report.collide_scan_twins,
             report.trace.len(),
             report.trace_hash
         );

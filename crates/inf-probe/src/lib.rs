@@ -52,6 +52,13 @@
 //! the logical block size (`fua_p50_us_512`) for S39c's sub-block
 //! question.
 //!
+//! **Schema 4** (ADR-0088, second amendment) adds
+//! `read_bytes_per_s_256k_qd1`: the same direct 256 KiB sequential read
+//! at **one** reader over the whole scratch — what a single replaying log
+//! reaches, which the four-reader aggregate overstates at one or two
+//! cells. The boot's replay term is `min(qd1, qd4 ÷ cells)`; a schema-3
+//! file (no qd1 row) keeps `qd4 ÷ max(cells, 4)` and is not re-probed.
+//!
 //! Dev tool: `Instant::now()` and `std::thread` are fine here (not cell
 //! code — the crate is a leaf the two binaries share, ADR-0091); the
 //! output is a boot input, never a claim (L10 — the A/B is the claim).
@@ -78,15 +85,21 @@ pub use inf_foundation::{DeviceIdentity, IdentityVerdict};
 
 /// File name under the data directory.
 pub const IO_PROPERTIES_FILE: &str = "io-properties.toml";
-/// The schema this probe writes (ADR-0091 D2). Readers accept ≤ this.
-pub const PROBE_SCHEMA: u64 = 3;
+/// The schema this probe writes: 3 = the identity block (ADR-0091 D2),
+/// 4 = the one-reader read row (ADR-0088, second amendment). Readers
+/// accept ≤ this; a schema-3 file is not re-probed for the missing row
+/// (the boot keeps a conservative rule for it).
+pub const PROBE_SCHEMA: u64 = 4;
 /// The recommendation rule's revision — bumped when the rule changes so
 /// an old verdict is recognisable as one.
 pub const PROBE_VERSION: u64 = 3;
 /// `inf probe-device`'s default seconds per row.
 pub const DEFAULT_SECONDS_PER_ROW: u64 = 2;
 /// The in-boot probe's default seconds per row (ADR-0091 D1): eight
-/// latency rows + one four-writer row + the pre-write ≈ 10 s.
+/// latency rows, the four-writer row, the two read rows (the second is
+/// ADR-0088's second amendment), the logical-block row and the
+/// pre-write — within the ADR-0091 D6 bound (the first boot ≤ 15 s
+/// longer than the second).
 pub const BOOT_SECONDS_PER_ROW: u64 = 1;
 /// Bounds of `--seconds` / `--probe-seconds`.
 pub const SECONDS_PER_ROW_RANGE: std::ops::RangeInclusive<u64> = 1..=60;
@@ -158,6 +171,11 @@ pub struct Verdict {
     /// probed (the direct class is unavailable) ⇒ the boot keeps the
     /// D4 constant.
     pub read_bytes_per_s_256k: u64,
+    /// Schema 4 (ADR-0088, second amendment): the same read at **one**
+    /// direct reader over the whole scratch — what a single replaying
+    /// log reaches; the boot's replay term is `min(qd1, qd4 ÷ cells)`.
+    /// 0 = not probed (the direct class is unavailable).
+    pub read_bytes_per_s_256k_qd1: u64,
     /// Schema 3 (ADR-0091 D3): why the direct class was not measured
     /// (`None` = it was), and the logical-block-size write-through row
     /// (`None` = not run: the logical block is ≥ 4 KiB or the class is
@@ -205,11 +223,15 @@ impl ProbeReport {
                 "read  bytes={:<8} readers={QD_WRITERS} bytes/s={:>10} (aggregate, direct)",
                 SIZES[2], self.verdict.read_bytes_per_s_256k
             ));
+            out.push(format!(
+                "read  bytes={:<8} readers=1 bytes/s={:>10} (direct)",
+                SIZES[2], self.verdict.read_bytes_per_s_256k_qd1
+            ));
         }
         out
     }
 
-    /// The file's text (schema 3).
+    /// The file's text (schema 4).
     #[must_use]
     pub fn render(&self) -> String {
         render(&self.rows, &self.verdict, &self.identity, self.seconds_per_row)
@@ -296,6 +318,14 @@ fn probe_rows(dir: &Path, scratch: &Path, opts: ProbeOptions) -> io::Result<Prob
     } else {
         measure_read_concurrent(scratch, SIZES[2], per_row, QD_WRITERS)?
     };
+    // The one-reader row (ADR-0088, second amendment): what a single
+    // replaying log reaches — the replay term's bound at one or two
+    // cells, where the aggregate above would overstate it.
+    let read_256k_qd1 = if fua_unsupported.is_some() {
+        0
+    } else {
+        measure_read_concurrent(scratch, SIZES[2], per_row, 1)?
+    };
     // The logical-block row (ADR-0091 D3): informational, for S39c.
     let fua_512 = match (fua_unsupported.is_none(), identity.block_logical_bytes) {
         (true, logical) if logical > 0 && (logical as usize) < SIZES[0] => {
@@ -309,6 +339,7 @@ fn probe_rows(dir: &Path, scratch: &Path, opts: ProbeOptions) -> io::Result<Prob
     };
     let mut verdict = recommend(&rows, qd4);
     verdict.read_bytes_per_s_256k = read_256k;
+    verdict.read_bytes_per_s_256k_qd1 = read_256k_qd1;
     verdict.fua_unsupported = fua_unsupported;
     verdict.fua_512 = fua_512;
     Ok(ProbeReport {
@@ -454,8 +485,10 @@ fn measure_concurrent(
 }
 
 /// The direct sequential read rate at `readers` concurrent readers, each
-/// on its own quarter of the scratch file (ADR-0088 D4 as amended):
-/// aggregate bytes/s. `O_DIRECT` reads bypass the page cache the buffered
+/// on its own `1/readers` share of the scratch file — quarters at four
+/// (ADR-0088 D4 as amended), the whole scratch at one (the second
+/// amendment's qd1 row): aggregate bytes/s. `O_DIRECT` reads bypass the
+/// page cache the buffered
 /// rows populated, so the row is page-cache-cold by construction; the
 /// device's own write cache is not controlled (disclosed in the module
 /// docs). Not cell code: `std::thread` is fine here.
@@ -541,6 +574,7 @@ pub fn recommend(rows: &[Row], write_ops_per_s_4k_qd4: u64) -> Verdict {
             write_ops_per_s_4k,
             write_ops_per_s_4k_qd4,
             read_bytes_per_s_256k: 0,
+            read_bytes_per_s_256k_qd1: 0,
             fua_unsupported: None,
             fua_512: None,
         };
@@ -566,6 +600,7 @@ pub fn recommend(rows: &[Row], write_ops_per_s_4k_qd4: u64) -> Verdict {
         write_ops_per_s_4k,
         write_ops_per_s_4k_qd4,
         read_bytes_per_s_256k: 0,
+        read_bytes_per_s_256k_qd1: 0,
         fua_unsupported: None,
         fua_512: None,
     }
@@ -621,19 +656,7 @@ fn render(rows: &[Row], verdict: &Verdict, identity: &DeviceIdentity, seconds: u
     out.push_str(&format!("fua_p50_us_4k = {}\n", verdict.fua_p50_us_4k));
     out.push_str(&format!("flush_p50_us_4k = {}\n", verdict.flush_p50_us_4k));
     out.push_str(&format!("probed_at_unix_s = {probed_at}\n"));
-    // Schema 2 (M4.5-S36, ADR-0088 D6): the device model. The 256 KiB
-    // read row (ADR-0088 D4 as amended) is the four-reader direct rate;
-    // `read_ops_per_s_4k` is declared at 0 (no consumer yet).
-    out.push_str("# schema 2 (ADR-0088 D6): the device model the per-cell budget spends;\n");
-    out.push_str("#   0 = not probed => that direction is unbudgeted (io_budget_model:absent).\n");
-    out.push_str("#   read_bytes_per_s_256k: four direct readers, aggregate — the checkpoint\n");
-    out.push_str("#   cap's replay term is this value / cells (ADR-0088 D4 as amended).\n");
-    out.push_str(&format!("probe_schema = {PROBE_SCHEMA}\n"));
-    out.push_str(&format!("write_bytes_per_s_256k = {}\n", verdict.write_bytes_per_s_256k));
-    out.push_str(&format!("write_ops_per_s_4k = {}\n", verdict.write_ops_per_s_4k));
-    out.push_str(&format!("write_ops_per_s_4k_qd4 = {}\n", verdict.write_ops_per_s_4k_qd4));
-    out.push_str(&format!("read_bytes_per_s_256k = {}\n", verdict.read_bytes_per_s_256k));
-    out.push_str("read_ops_per_s_4k = 0\n");
+    render_model(&mut out, verdict);
     // Schema 3 (M4.5-S42, ADR-0091 D2/D3): what the model describes.
     out.push_str("# schema 3 (ADR-0091 D2): the identity of the device this model describes.\n");
     out.push_str("#   A boot compares it to the data directory's device; a mismatch is a\n");
@@ -658,6 +681,27 @@ fn render(rows: &[Row], verdict: &Verdict, identity: &DeviceIdentity, seconds: u
     out.push_str(&format!("fua_p50_us_512 = {p50}\n"));
     out.push_str(&format!("fua_p99_us_512 = {p99}\n"));
     out
+}
+
+/// The schema-2 block (M4.5-S36, ADR-0088 D6): the device model, with
+/// the two 256 KiB read rows beside each other — the four-reader rate
+/// (ADR-0088 D4 as amended) and, schema 4, the one-reader rate (the
+/// second amendment); `read_ops_per_s_4k` is declared at 0 (no consumer
+/// yet).
+fn render_model(out: &mut String, verdict: &Verdict) {
+    out.push_str("# schema 2 (ADR-0088 D6): the device model the per-cell budget spends;\n");
+    out.push_str("#   0 = not probed => that direction is unbudgeted (io_budget_model:absent).\n");
+    out.push_str("#   read_bytes_per_s_256k: four direct readers, aggregate (ADR-0088 D4 as\n");
+    out.push_str("#   amended); read_bytes_per_s_256k_qd1: one direct reader (schema 4,\n");
+    out.push_str("#   ADR-0088 second amendment). The checkpoint cap's replay term is\n");
+    out.push_str("#   min(qd1, qd4 / cells); a schema-3 file keeps qd4 / max(cells, 4).\n");
+    out.push_str(&format!("probe_schema = {PROBE_SCHEMA}\n"));
+    out.push_str(&format!("write_bytes_per_s_256k = {}\n", verdict.write_bytes_per_s_256k));
+    out.push_str(&format!("write_ops_per_s_4k = {}\n", verdict.write_ops_per_s_4k));
+    out.push_str(&format!("write_ops_per_s_4k_qd4 = {}\n", verdict.write_ops_per_s_4k_qd4));
+    out.push_str(&format!("read_bytes_per_s_256k = {}\n", verdict.read_bytes_per_s_256k));
+    out.push_str(&format!("read_bytes_per_s_256k_qd1 = {}\n", verdict.read_bytes_per_s_256k_qd1));
+    out.push_str("read_ops_per_s_4k = 0\n");
 }
 
 // ---- identity (ADR-0091 D2): safe text reads, never FFI -------------------
@@ -856,17 +900,25 @@ mod tests {
         assert_eq!(v.write_ops_per_s_4k, 2_898);
         assert_eq!(v.write_bytes_per_s_256k, 1_949 * (256 << 10));
         assert_eq!(v.read_bytes_per_s_256k, 0, "the rule leaves the read row to the probe");
+        assert_eq!(v.read_bytes_per_s_256k_qd1, 0, "the rule leaves the qd1 row to the probe");
         v.read_bytes_per_s_256k = 1_083_000_000;
+        v.read_bytes_per_s_256k_qd1 = 612_000_000;
         let text = render(&rows, &v, &DeviceIdentity::default(), 2);
-        assert!(text.contains("probe_schema = 3\n"));
+        assert!(text.contains("probe_schema = 4\n"));
         assert!(text.contains(&format!("write_bytes_per_s_256k = {}\n", 1_949 * (256 << 10))));
         assert!(text.contains("write_ops_per_s_4k_qd4 = 9918\n"));
         assert!(text.contains("read_bytes_per_s_256k = 1083000000\n"));
+        // Schema 4 (ADR-0088, second amendment): the one-reader row sits
+        // directly after the four-reader row.
+        assert!(text.contains(
+            "read_bytes_per_s_256k = 1083000000\nread_bytes_per_s_256k_qd1 = 612000000\n"
+        ));
         assert!(text.contains("read_ops_per_s_4k = 0\n"));
     }
 
     /// The file stays the flat `key = value` subset the inf-server parser
-    /// reads, in a fixed key order (schema 3 appends to schema 2).
+    /// reads, in a fixed key order (schema 3 appends to schema 2; schema
+    /// 4's qd1 row sits beside its schema-2 four-reader row).
     #[test]
     fn rendered_file_parses_as_the_flat_subset() {
         let rows = vec![r(Policy::Flush, 4 << 10, 900, 1200), r(Policy::Fua, 4 << 10, 300, 600)];
@@ -898,6 +950,7 @@ mod tests {
                 "write_ops_per_s_4k",
                 "write_ops_per_s_4k_qd4",
                 "read_bytes_per_s_256k",
+                "read_bytes_per_s_256k_qd1",
                 "read_ops_per_s_4k",
                 "fs_type",
                 "fs_uuid",
@@ -931,6 +984,8 @@ mod tests {
         assert!(text.contains("barrier_class = \"flush\"\n"));
         assert!(text.contains("fua_unsupported = \"open: Invalid argument (os error 22)\"\n"));
         assert!(text.contains("write_ops_per_s_4k = 0\n"));
+        assert!(text.contains("read_bytes_per_s_256k = 0\n"));
+        assert!(text.contains("read_bytes_per_s_256k_qd1 = 0\n"));
         assert!(text.contains("fua_p50_us_512 = 0\n"));
         assert!(is_direct_refusal(&io::Error::from_raw_os_error(22)));
         assert!(!is_direct_refusal(&io::Error::from_raw_os_error(28))); // ENOSPC
