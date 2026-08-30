@@ -18,29 +18,33 @@
 //!   later milestones (M5 retention exemptions) may publish holes;
 //!   recovery accepts segments appended after publication and fail-stops
 //!   if a *listed* segment is missing.
-//! - **Epoch 2 (M4-S12, ADR-0057 D5):** cells owning tiered namespaces
-//!   append per-namespace tier sections — `{ns, flushed watermark, file
-//!   set}` — so {ckpt, WAL segments, tier files, watermarks} publish as
-//!   one atomic unit and a checkpoint's address references can never
-//!   outrun the file set that resolves them (the §3.1 corollary). Cells
-//!   without tiered namespaces keep writing epoch-1 payloads
-//!   byte-identically: the degenerate case is absence (ADR-0051 posture).
-//!   The manifest names **logical durable ranges**, not physical files —
-//!   a sealed file's physical extent may exceed its manifested range in
-//!   the disclosed capacity-seal edge; recovery truncates only unsealed
-//!   files (seal is terminal, ADR-0056 D5).
+//! - **Tier sections (M4-S12, ADR-0057 D5):** cells owning tiered
+//!   namespaces append per-namespace tier sections — `{ns, flushed
+//!   watermark, file set}` — so {ckpt, WAL segments, tier files,
+//!   watermarks} publish as one atomic unit and a checkpoint's address
+//!   references can never outrun the file set that resolves them (the
+//!   §3.1 corollary). The manifest names **logical durable ranges**, not
+//!   physical files — a sealed file's physical extent may exceed its
+//!   manifested range in the disclosed capacity-seal edge; recovery
+//!   truncates only unsealed files (seal is terminal, ADR-0056 D5).
+//! - **Epoch 3 (ADR-0094 D6):** the manifest names the **key-hash
+//!   identity** of the secret that placed its checkpoint's refs, so a
+//!   boot holding another secret refuses before applying any of them.
+//!   Epoch 3 is the only epoch the writer emits (a tierless cell writes
+//!   `tier_ns_count = 0`); epochs 1 and 2 cannot name their secret and
+//!   decode to the typed `PredatesKeyHashBinding` — no migration (ADR-0094
+//!   D2), never a guess.
 //!
 //! ```text
 //! payload := magic:   [u8;8] = "INFMAN1\0"
-//!            epoch:   u32 LE  — format epoch (1 = no tier sections, 2 = tiered)
+//!            epoch:   u32 LE  — format epoch (3; 1 and 2 are refused, typed)
 //!            ckpt_id: u64 LE  — the named checkpoint (`ckpt-{id}.ick`)
 //!            begin:   u64 LE  — packed begin-LSN (Lsn::to_u64)
+//!            key_hash_id: u64 LE — the placing secret's identity (ADR-0094 D6)
 //!            count:   u32 LE
 //!            count × u32 LE   — segment ids, strictly ascending,
 //!                               segments[0] == begin.segment (the floor)
-//! epoch 2 appends:
-//!            tier_ns_count: u32 LE            — ≥ 1 (canonical: an empty
-//!                                               set re-encodes as epoch 1)
+//!            tier_ns_count: u32 LE            — 0 for a tierless cell
 //!            tier_ns_count × tier_ns
 //! tier_ns := ns: u32 LE · flushed: u64 LE (48-bit checked) ·
 //!            file_count: u32 LE ·
@@ -59,6 +63,8 @@ use core::fmt;
 use std::io;
 use std::path::Path;
 
+use inf_foundation::KeyHashId;
+
 use crate::fs::SegmentFs;
 use crate::lsn::{Lsn, SegmentId};
 use crate::meta::{read_envelope, write_envelope};
@@ -72,10 +78,16 @@ pub const MANIFEST_STAGING_FILE: &str = "MANIFEST.new";
 /// Payload magic; the trailing `1` tags the payload family alongside
 /// `epoch` (epoch, not magic, is the version — ADR-0057 D5).
 pub const MANIFEST_MAGIC: [u8; 8] = *b"INFMAN1\0";
-/// Format epoch for cells without tiered namespaces (schema v1).
+/// The M2 format epoch (no tier sections, no key-hash identity) —
+/// **refused** at decode (ADR-0094 D6: it cannot name its secret).
 pub const MANIFEST_EPOCH: u32 = 1;
-/// Format epoch once tier sections are present (M4-S12, ADR-0057 D5).
+/// The M4-S12 epoch (tier sections, no key-hash identity) — refused
+/// likewise.
 pub const MANIFEST_EPOCH_V2: u32 = 2;
+/// The current epoch (ADR-0094 D6): the key-hash identity after the
+/// begin-LSN, the tier-section count always present. The only epoch the
+/// writer emits.
+pub const MANIFEST_EPOCH_V3: u32 = 3;
 
 /// Defensive bound on the decoded segment-set size: 2²⁰ segments × 256 MiB
 /// is a 256 TiB cell log — corruption, not configuration.
@@ -87,7 +99,11 @@ const MAX_TIER_FILES: usize = 1 << 20;
 /// Logical addresses are 48-bit (§3.2 freeze).
 const ADDR_LIMIT: u64 = 1 << 48;
 
-const FIXED_LEN: usize = 8 + 4 + 8 + 8 + 4;
+/// magic · epoch · ckpt_id · begin · key_hash_id · segment count.
+const FIXED_LEN: usize = 8 + 4 + 8 + 8 + 8 + 4;
+/// Enough to read the epoch (the legacy-epoch refusal must name it
+/// before anything else is asked of the payload).
+const EPOCH_END: usize = 8 + 4;
 const TIER_NS_FIXED_LEN: usize = 4 + 8 + 4;
 const TIER_FILE_LEN: usize = 4 + 8 + 8;
 
@@ -140,18 +156,26 @@ pub struct Manifest {
     /// `segments[0] == begin_lsn.segment`.
     pub segments: Vec<SegmentId>,
     /// Tier sections (M4-S12, ADR-0057 D5), strictly ascending by ns.
-    /// Empty for cells without tiered namespaces — such a manifest
-    /// encodes as epoch 1, byte-identical to M2 (degenerate = absence).
+    /// Empty for cells without tiered namespaces.
     pub tiers: Vec<TierNsManifest>,
+    /// The identity of the key-hash secret that placed the named
+    /// checkpoint's refs (ADR-0094 D6). Recovery compares it with the
+    /// secret it holds before the checkpoint loads; a mismatch is a
+    /// typed fail-stop, never a boot with invisible keys.
+    pub key_hash_id: KeyHashId,
 }
 
 impl Manifest {
-    /// A tierless recovery unit — the M2 shape (encodes as epoch 1).
-    /// Cells that own tiered namespaces populate `tiers` and encode as
-    /// epoch 2 (ADR-0057 D5).
+    /// A tierless recovery unit. Cells that own tiered namespaces
+    /// populate `tiers` (ADR-0057 D5); both shapes encode as epoch 3.
     #[must_use]
-    pub fn v1(ckpt_id: u64, begin_lsn: Lsn, segments: Vec<SegmentId>) -> Manifest {
-        Manifest { ckpt_id, begin_lsn, segments, tiers: Vec::new() }
+    pub fn tierless(
+        ckpt_id: u64,
+        begin_lsn: Lsn,
+        segments: Vec<SegmentId>,
+        key_hash_id: KeyHashId,
+    ) -> Manifest {
+        Manifest { ckpt_id, begin_lsn, segments, tiers: Vec::new(), key_hash_id }
     }
 
     /// The truncation floor: the first live segment. Everything below is
@@ -167,8 +191,7 @@ impl Manifest {
         self.tiers.iter().find(|t| t.ns == ns)
     }
 
-    /// Canonical payload bytes: epoch 1 when `tiers` is empty (bit-exact
-    /// M2 output), epoch 2 otherwise.
+    /// Canonical payload bytes (epoch 3; one value ↔ one encoding).
     ///
     /// # Panics
     /// Panics when a tier section violates its own invariants — the
@@ -180,18 +203,15 @@ impl Manifest {
             self.tiers.iter().map(|t| TIER_NS_FIXED_LEN + t.files.len() * TIER_FILE_LEN).sum();
         let mut out = Vec::with_capacity(FIXED_LEN + self.segments.len() * 4 + 4 + tier_len);
         out.extend_from_slice(&MANIFEST_MAGIC);
-        let epoch = if self.tiers.is_empty() { MANIFEST_EPOCH } else { MANIFEST_EPOCH_V2 };
-        out.extend_from_slice(&epoch.to_le_bytes());
+        out.extend_from_slice(&MANIFEST_EPOCH_V3.to_le_bytes());
         out.extend_from_slice(&self.ckpt_id.to_le_bytes());
         out.extend_from_slice(&self.begin_lsn.to_u64().to_le_bytes());
+        out.extend_from_slice(&self.key_hash_id.to_u64().to_le_bytes());
         out.extend_from_slice(
             &u32::try_from(self.segments.len()).expect("segment count").to_le_bytes(),
         );
         for seg in &self.segments {
             out.extend_from_slice(&seg.0.to_le_bytes());
-        }
-        if self.tiers.is_empty() {
-            return out;
         }
         out.extend_from_slice(
             &u32::try_from(self.tiers.len()).expect("tier ns count").to_le_bytes(),
@@ -223,17 +243,18 @@ impl Manifest {
         out
     }
 
-    /// Decode and validate one payload (epoch 1 or 2). Canonical:
-    /// trailing bytes, a non-ascending set, an empty set, a floor
-    /// mismatch, or any tier-section violation (epoch 2 with no
-    /// sections, unordered namespaces/files, overlapping or
-    /// past-`flushed` ranges, zero-length ranges, non-48-bit addresses)
-    /// are all named errors — recovery never guesses (§8.4).
+    /// Decode and validate one epoch-3 payload. Canonical: trailing
+    /// bytes, a non-ascending set, an empty set, a floor mismatch, or
+    /// any tier-section violation (unordered namespaces/files,
+    /// overlapping or past-`flushed` ranges, zero-length ranges,
+    /// non-48-bit addresses) are all named errors — recovery never
+    /// guesses (§8.4). An epoch-1/2 payload is the typed
+    /// [`ManifestDecodeError::PredatesKeyHashBinding`] (ADR-0094 D6).
     ///
     /// # Errors
     /// [`ManifestDecodeError`] naming the exact violation.
     pub fn decode(payload: &[u8]) -> Result<Manifest, ManifestDecodeError> {
-        if payload.len() < FIXED_LEN {
+        if payload.len() < EPOCH_END {
             return Err(ManifestDecodeError::Truncated { at: payload.len() });
         }
         if payload[..8] != MANIFEST_MAGIC {
@@ -242,13 +263,21 @@ impl Manifest {
             return Err(ManifestDecodeError::BadMagic { got });
         }
         let epoch = u32::from_le_bytes(payload[8..12].try_into().expect("4 bytes"));
-        if epoch != MANIFEST_EPOCH && epoch != MANIFEST_EPOCH_V2 {
+        if epoch == MANIFEST_EPOCH || epoch == MANIFEST_EPOCH_V2 {
+            return Err(ManifestDecodeError::PredatesKeyHashBinding { epoch });
+        }
+        if epoch != MANIFEST_EPOCH_V3 {
             return Err(ManifestDecodeError::UnsupportedEpoch { epoch });
+        }
+        if payload.len() < FIXED_LEN {
+            return Err(ManifestDecodeError::Truncated { at: payload.len() });
         }
         let ckpt_id = u64::from_le_bytes(payload[12..20].try_into().expect("8 bytes"));
         let begin_lsn =
             Lsn::from_u64(u64::from_le_bytes(payload[20..28].try_into().expect("8 bytes")));
-        let count = u32::from_le_bytes(payload[28..32].try_into().expect("4 bytes")) as usize;
+        let key_hash_id =
+            KeyHashId::from_u64(u64::from_le_bytes(payload[28..36].try_into().expect("8 bytes")));
+        let count = u32::from_le_bytes(payload[36..40].try_into().expect("4 bytes")) as usize;
         if count == 0 {
             return Err(ManifestDecodeError::NoSegments);
         }
@@ -274,17 +303,8 @@ impl Manifest {
                 begin_segment: begin_lsn.segment,
             });
         }
-        let tiers = if epoch == MANIFEST_EPOCH {
-            if payload.len() > segments_end {
-                return Err(ManifestDecodeError::TrailingBytes {
-                    extra: payload.len() - segments_end,
-                });
-            }
-            Vec::new()
-        } else {
-            Self::decode_tiers(payload, segments_end)?
-        };
-        Ok(Manifest { ckpt_id, begin_lsn, segments, tiers })
+        let tiers = Self::decode_tiers(payload, segments_end)?;
+        Ok(Manifest { ckpt_id, begin_lsn, segments, tiers, key_hash_id })
     }
 
     fn decode_tiers(
@@ -300,10 +320,6 @@ impl Manifest {
             Ok(slice)
         };
         let ns_count = u32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4 bytes")) as usize;
-        if ns_count == 0 {
-            // Canonical: an empty tier set re-encodes as epoch 1.
-            return Err(ManifestDecodeError::NoTierSections);
-        }
         if ns_count > MAX_TIER_NS {
             return Err(ManifestDecodeError::TooManyTierSections { count: ns_count });
         }
@@ -370,6 +386,11 @@ pub enum ManifestDecodeError {
     UnsupportedEpoch {
         epoch: u32,
     },
+    /// An epoch-1/2 manifest: it cannot name the secret that placed its
+    /// checkpoint's refs (ADR-0094 D6), and there is no migration (D2).
+    PredatesKeyHashBinding {
+        epoch: u32,
+    },
     Truncated {
         at: usize,
     },
@@ -387,9 +408,6 @@ pub enum ManifestDecodeError {
         first: SegmentId,
         begin_segment: SegmentId,
     },
-    /// Epoch 2 with zero tier sections — re-encodes as epoch 1, so the
-    /// form is non-canonical by construction (ADR-0057 D5).
-    NoTierSections,
     TooManyTierSections {
         count: usize,
     },
@@ -429,6 +447,12 @@ impl fmt::Display for ManifestDecodeError {
             ManifestDecodeError::UnsupportedEpoch { epoch } => {
                 write!(f, "MANIFEST unsupported format epoch {epoch}")
             }
+            ManifestDecodeError::PredatesKeyHashBinding { epoch } => write!(
+                f,
+                "MANIFEST epoch {epoch} predates the key-hash binding (ADR-0094 D6): it cannot \
+                 name the secret that placed its checkpoint's refs, and there is no migration — \
+                 reload from a dump into a new data directory (fail-stop)"
+            ),
             ManifestDecodeError::Truncated { at } => {
                 write!(f, "MANIFEST payload truncated at {at} bytes")
             }
@@ -446,9 +470,6 @@ impl fmt::Display for ManifestDecodeError {
                 f,
                 "MANIFEST floor mismatch: first segment {first}, begin-LSN segment {begin_segment}"
             ),
-            ManifestDecodeError::NoTierSections => {
-                write!(f, "MANIFEST epoch 2 with no tier sections (non-canonical)")
-            }
             ManifestDecodeError::TooManyTierSections { count } => {
                 write!(f, "MANIFEST tier section count {count} exceeds the sanity bound")
             }
@@ -525,6 +546,7 @@ mod tests {
             begin_lsn: Lsn::new(SegmentId(3), 0x40),
             segments: vec![SegmentId(3), SegmentId(4), SegmentId(5)],
             tiers: Vec::new(),
+            key_hash_id: KeyHashId::from_u64(0x0123_4567_89AB_CDEF),
         }
     }
 
@@ -546,52 +568,71 @@ mod tests {
         }
     }
 
+    /// Epoch 3 (ADR-0094 D6): the key-hash identity sits after the
+    /// begin-LSN, a tierless cell writes a zero tier count, and both
+    /// shapes round-trip byte-exact.
     #[test]
     fn roundtrip_is_byte_exact() {
         let m = sample();
         let payload = m.encode();
-        assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), MANIFEST_EPOCH);
-        assert_eq!(Manifest::decode(&payload).expect("valid"), m);
-        assert_eq!(Manifest::decode(&payload).expect("valid").encode(), payload);
+        assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), MANIFEST_EPOCH_V3);
+        assert_eq!(&payload[28..36], &0x0123_4567_89AB_CDEFu64.to_le_bytes(), "key_hash_id");
+        assert_eq!(&payload[payload.len() - 4..], &0u32.to_le_bytes(), "tierless = 0 sections");
+        let decoded = Manifest::decode(&payload).expect("valid");
+        assert_eq!(decoded, m);
+        assert_eq!(decoded.key_hash_id, KeyHashId::from_u64(0x0123_4567_89AB_CDEF));
+        assert_eq!(decoded.encode(), payload);
     }
 
-    /// A tier-carrying manifest encodes as epoch 2 and round-trips byte-
-    /// exact; a tierless one stays epoch-1 byte-identical to the M2
-    /// writer (the degenerate case is absence — ADR-0057 D5).
+    /// A tier-carrying manifest round-trips byte-exact and shares the
+    /// fixed prefix with the tierless shape.
     #[test]
-    fn v2_roundtrip_and_v1_byte_identity() {
+    fn tiered_roundtrip_and_truncation() {
         let m2 = sample_v2();
         let payload = m2.encode();
-        assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), MANIFEST_EPOCH_V2);
+        assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), MANIFEST_EPOCH_V3);
         assert_eq!(Manifest::decode(&payload).expect("valid"), m2);
         assert_eq!(Manifest::decode(&payload).expect("valid").encode(), payload);
         assert_eq!(Manifest::decode(&payload).unwrap().tier_ns(16).unwrap().files.len(), 2);
         assert!(Manifest::decode(&payload).unwrap().tier_ns(99).is_none());
-        // The epoch-1 prefix of the v2 payload is exactly the v1 encoding.
-        let v1 = sample().encode();
-        assert_eq!(&payload[12..v1.len()], &v1[12..], "shared fields are byte-identical");
+        // The fixed prefix + segment set is exactly the tierless encoding's.
+        let tierless = sample().encode();
+        let shared = tierless.len() - 4;
+        assert_eq!(&payload[..shared], &tierless[..shared], "shared fields are byte-identical");
         // Truncation anywhere in the tier region is named, never a panic.
-        for cut in v1.len()..payload.len() {
+        for cut in shared..payload.len() {
             let err = Manifest::decode(&payload[..cut]).expect_err("truncation must fail");
-            assert!(
-                matches!(
-                    err,
-                    ManifestDecodeError::Truncated { .. } | ManifestDecodeError::NoTierSections
-                ),
-                "cut {cut}: got {err:?}"
-            );
+            assert!(matches!(err, ManifestDecodeError::Truncated { .. }), "cut {cut}: got {err:?}");
         }
+    }
+
+    /// ADR-0094 D6: an epoch-1 or epoch-2 payload is the typed refusal,
+    /// named before anything else is asked of the bytes; an unknown
+    /// epoch stays `UnsupportedEpoch`.
+    #[test]
+    fn legacy_epochs_are_refused_by_name() {
+        for epoch in [MANIFEST_EPOCH, MANIFEST_EPOCH_V2] {
+            let mut raw = sample().encode();
+            raw[8..12].copy_from_slice(&epoch.to_le_bytes());
+            assert_eq!(
+                Manifest::decode(&raw),
+                Err(ManifestDecodeError::PredatesKeyHashBinding { epoch })
+            );
+            // The refusal needs only the epoch, not a whole payload.
+            assert_eq!(
+                Manifest::decode(&raw[..EPOCH_END]),
+                Err(ManifestDecodeError::PredatesKeyHashBinding { epoch })
+            );
+            let text = ManifestDecodeError::PredatesKeyHashBinding { epoch }.to_string();
+            assert!(text.contains("ADR-0094") && text.contains("fail-stop"), "{text}");
+        }
+        let mut raw = sample().encode();
+        raw[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(Manifest::decode(&raw), Err(ManifestDecodeError::UnsupportedEpoch { epoch: 0 }));
     }
 
     #[test]
     fn every_tier_violation_is_named() {
-        // Epoch 2 with zero sections is non-canonical.
-        let mut empty = sample_v2().encode();
-        let seg_end = empty.len() - 4 - 2 * TIER_NS_FIXED_LEN - 2 * TIER_FILE_LEN;
-        empty.truncate(seg_end);
-        empty.extend_from_slice(&0u32.to_le_bytes());
-        assert_eq!(Manifest::decode(&empty), Err(ManifestDecodeError::NoTierSections));
-
         // Namespaces must strictly ascend.
         let mut payload = sample_v2().encode();
         let dup_at = payload.len() - TIER_NS_FIXED_LEN;
@@ -670,6 +711,11 @@ mod tests {
             Manifest::decode(&bad),
             Err(ManifestDecodeError::UnsupportedEpoch { epoch: 9 })
         ));
+        bad[8] = 1;
+        assert!(matches!(
+            Manifest::decode(&bad),
+            Err(ManifestDecodeError::PredatesKeyHashBinding { epoch: 1 })
+        ));
 
         for cut in 0..good.len() {
             let err = Manifest::decode(&good[..cut]).expect_err("truncation must fail");
@@ -688,7 +734,7 @@ mod tests {
         let mut payload = none.encode();
         assert!(matches!(Manifest::decode(&payload), Err(ManifestDecodeError::NoSegments)));
         // A count field larger than the body: truncated, not a wild alloc.
-        payload[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        payload[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(
             Manifest::decode(&payload),
             Err(ManifestDecodeError::TooManySegments { .. })

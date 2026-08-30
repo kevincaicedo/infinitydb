@@ -663,22 +663,47 @@ fn main() {
         }
     }
 
-    // The key-hash secret (ADR-0094 D2), before anything else touches the
-    // directory: a data directory's persisted secret — created from OS
-    // entropy at its first boot, read on every later one, refused when
-    // the directory holds data that predates the ADR — or a fresh secret
-    // per memory-only boot. Every store of this node hashes with it.
+    // The data directory's owner lock (ADR-0094 D7), before anything
+    // else touches the directory — the secret, its binding scan, the
+    // device profile, the catalog, every shard. Held for the process's
+    // life (the binding below; the kernel releases it on any exit).
+    let _data_dir_lock =
+        args.data_dir.as_deref().map(|dir| match inf_server::DataDirLock::acquire(dir) {
+            Ok(lock) => lock,
+            Err(e) => {
+                eprintln!("infinityd: {e}");
+                std::process::exit(1);
+            }
+        });
+
+    // The key-hash secret (ADR-0094 D2): a data directory's persisted
+    // secret — created from OS entropy at its first boot, read on every
+    // later one, refused when the directory holds data that predates the
+    // ADR — or a fresh secret per memory-only boot. Every store of this
+    // node hashes with it. Then the binding scan (D6): every shard's
+    // MANIFEST must name this secret, checked before any cell starts.
     let hasher = match &args.data_dir {
         Some(dir) => match inf_server::resolve_key_hash(dir, os_entropy) {
             Ok((hasher, source)) => {
+                let binding = match inf_server::verify_key_hash_binding(dir, hasher) {
+                    Ok(binding) => binding,
+                    Err(e) => {
+                        eprintln!("infinityd: {e}");
+                        std::process::exit(1);
+                    }
+                };
                 eprintln!(
-                    "infinityd: key-hash secret: {} ({})",
+                    "infinityd: key-hash secret: {} ({}; id {}; {} manifest(s) bound, {} shard(s) \
+                     unpublished)",
                     inf_server::KEY_HASH_FILE,
                     match source {
                         inf_server::KeyHashSource::File => "read — siphash13, ADR-0094",
                         inf_server::KeyHashSource::Created =>
                             "created at this first boot — siphash13, ADR-0094",
-                    }
+                    },
+                    hasher.identity(),
+                    binding.manifests_bound,
+                    binding.shards_unpublished
                 );
                 hasher
             }

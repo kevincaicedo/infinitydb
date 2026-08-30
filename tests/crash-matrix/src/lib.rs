@@ -27,6 +27,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use inf_foundation::KeyHasher;
 use inf_foundation::fault::{self, FaultSpec};
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::Nanos;
@@ -505,7 +506,13 @@ fn publish(
     write_manifest(
         fs,
         Path::new("data/shard-0"),
-        &Manifest { ckpt_id: u64::from(id), begin_lsn: begin, segments, tiers: Vec::new() },
+        &Manifest {
+            ckpt_id: u64::from(id),
+            begin_lsn: begin,
+            segments,
+            tiers: Vec::new(),
+            key_hash_id: KeyHasher::default().identity(),
+        },
     )
     .map_err(|e| e.to_string())
 }

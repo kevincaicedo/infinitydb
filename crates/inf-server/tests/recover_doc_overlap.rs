@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use inf_doc::apply::{ApplyOp, Number};
 use inf_doc::path::compile;
 use inf_doc::{JsonParser, encode_apply_op};
+use inf_foundation::KeyHasher;
 use inf_foundation::time::Nanos;
 use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::mem::MemFs;
@@ -168,7 +169,13 @@ fn fuzzy_checkpoint_overlap_counts_stale_and_missing_deltas() {
     write_manifest(
         &fs,
         Path::new("data/shard-0"),
-        &Manifest { ckpt_id: 1, begin_lsn, segments: vec![SegmentId(0)], tiers: Vec::new() },
+        &Manifest {
+            ckpt_id: 1,
+            begin_lsn,
+            segments: vec![SegmentId(0)],
+            tiers: Vec::new(),
+            key_hash_id: KeyHasher::default().identity(),
+        },
     )
     .expect("manifest");
     drop(rotor);

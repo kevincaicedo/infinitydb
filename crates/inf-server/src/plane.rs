@@ -1626,6 +1626,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             shard_dir,
             ckpt_dir,
             cell_id,
+            self.shared.hasher.identity(),
             recovered.map(|m| crate::ckpt::PendingManifest {
                 ckpt_id: m.ckpt_id,
                 begin_lsn: m.begin_lsn,
@@ -3877,32 +3878,25 @@ async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 inflight -= 1;
                 render_outcome(&shared, outcome, proto)
             }
-            PendingReply::Counted { waiters, mut acc, proto, refusal } => {
-                let mut error = refusal;
+            PendingReply::Counted { waiters, acc, proto, refusal } => {
+                // Every leg is awaited so nothing is orphaned in flight;
+                // the fold decides the reply (a count, or the first
+                // error — a leg that is not a count is an error, never
+                // a partial sum: ADR-0093 A3′).
+                let mut fold = CountedFold::new(acc, refusal);
                 for waiter in waiters {
-                    match waiter.await {
-                        OwnedOutcome::Int(n) => acc += n,
-                        // A typed error from a leg (a tiered `DBSIZE` drain
-                        // that could not read a twin, ADR-0093 A3): the
-                        // first one is the reply; every leg is still
-                        // awaited so nothing is orphaned in flight.
-                        OwnedOutcome::Bytes(bytes) if bytes.first() == Some(&b'-') => {
-                            if error.is_none() {
-                                error = Some(bytes);
-                            } else {
-                                shared.recycle_reply_buf(bytes);
-                            }
-                        }
-                        other => debug_assert!(false, "counted apply returned {other:?}"),
+                    if let Some(unused) = fold.leg(waiter.await, proto) {
+                        shared.recycle_reply_buf(unused);
                     }
                     inflight -= 1;
                 }
-                if let Some(error) = error {
-                    return_error(&shared, error, proto)
-                } else {
-                    let mut reply = shared.take_reply_buf();
-                    RespWriter::new(&mut reply, proto).int(acc);
-                    reply
+                match fold.finish() {
+                    Err(error) => return_error(&shared, error, proto),
+                    Ok(total) => {
+                        let mut reply = shared.take_reply_buf();
+                        RespWriter::new(&mut reply, proto).int(total);
+                        reply
+                    }
                 }
             }
             PendingReply::Gather { parts, proto, unwrap_single } => {
@@ -4487,6 +4481,72 @@ fn render_outcome<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 }
 
 // ---- fabric-program helpers (M1-S02) -------------------------------------------
+
+/// The fold behind a counted scatter (`DBSIZE` across cells, the
+/// `DEL`/`EXISTS`/`TOUCH` families): integers sum; the first error is
+/// the reply; **any leg that is neither** — a typed fabric error, or a
+/// shape no counted apply produces — is an internal error, so a release
+/// build can never answer a partial sum (the review of `44527f4`:
+/// the shape was a `debug_assert!` before). Pure, so the rows below pin
+/// it without a fabric.
+struct CountedFold {
+    acc: i64,
+    error: Option<Vec<u8>>,
+}
+
+impl CountedFold {
+    fn new(acc: i64, refusal: Option<Vec<u8>>) -> CountedFold {
+        CountedFold { acc, error: refusal }
+    }
+
+    /// Fold one leg. Returns a buffer the fold did not keep (an error
+    /// after the first), for the caller to recycle.
+    fn leg(&mut self, outcome: OwnedOutcome, proto: Protocol) -> Option<Vec<u8>> {
+        let error = match outcome {
+            OwnedOutcome::Int(n) => {
+                self.acc = self.acc.saturating_add(n);
+                return None;
+            }
+            // A typed error reply from a leg (a tiered `DBSIZE` drain
+            // that could not read a twin, ADR-0093 A3).
+            OwnedOutcome::Bytes(bytes) if bytes.first() == Some(&b'-') => bytes,
+            OwnedOutcome::Err(code) => {
+                let mut bytes = Vec::new();
+                RespWriter::new(&mut bytes, proto)
+                    .error(&format!("ERR cross-cell execution failed ({code:?})"));
+                bytes
+            }
+            other => {
+                let mut bytes = Vec::new();
+                RespWriter::new(&mut bytes, proto).error(&format!(
+                    "ERR internal: a counted leg returned {} instead of a count (fail-closed)",
+                    match other {
+                        OwnedOutcome::Ok => "OK",
+                        OwnedOutcome::Nil => "nil",
+                        OwnedOutcome::Bool(_) => "a boolean",
+                        OwnedOutcome::Bytes(_) => "a non-error reply",
+                        OwnedOutcome::Int(_) | OwnedOutcome::Err(_) => unreachable!(),
+                    }
+                ));
+                bytes
+            }
+        };
+        if self.error.is_none() {
+            self.error = Some(error);
+            None
+        } else {
+            Some(error)
+        }
+    }
+
+    /// The reply: the sum, or the first error seen.
+    fn finish(self) -> Result<i64, Vec<u8>> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(self.acc),
+        }
+    }
+}
 
 /// All cells except this one (scatter targets).
 /// This cell's exact `DBSIZE` contribution for a named namespace: the
@@ -6273,6 +6333,74 @@ async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
     }
     Ok(waiter)
+}
+
+#[cfg(test)]
+mod counted_fold_tests {
+    use inf_fabric::ErrCode;
+
+    use super::{CountedFold, OwnedOutcome, Protocol};
+
+    fn fold(legs: Vec<OwnedOutcome>) -> Result<i64, Vec<u8>> {
+        let mut fold = CountedFold::new(0, None);
+        for leg in legs {
+            let _ = fold.leg(leg, Protocol::Resp2);
+        }
+        fold.finish()
+    }
+
+    /// Counts sum; a leg's error reply is the answer.
+    #[test]
+    fn counts_sum_and_a_leg_error_is_the_reply() {
+        assert_eq!(fold(vec![OwnedOutcome::Int(2), OwnedOutcome::Int(3)]), Ok(5));
+        assert_eq!(
+            fold(vec![
+                OwnedOutcome::Int(2),
+                OwnedOutcome::Bytes(b"-ERR twin\r\n".to_vec()),
+                OwnedOutcome::Int(3),
+            ]),
+            Err(b"-ERR twin\r\n".to_vec())
+        );
+    }
+
+    /// The review of `44527f4`: an unexpected leg outcome was a
+    /// `debug_assert!`, so a release build summed the rest. Now every
+    /// non-count leg is a typed error and no integer is ever returned.
+    #[test]
+    fn an_injected_typed_error_or_foreign_shape_never_yields_a_count() {
+        for foreign in [
+            OwnedOutcome::Err(ErrCode::OutOfMemory),
+            OwnedOutcome::Err(ErrCode::Unknown(7)),
+            OwnedOutcome::Ok,
+            OwnedOutcome::Nil,
+            OwnedOutcome::Bool(true),
+            OwnedOutcome::Bytes(b"+OK\r\n".to_vec()),
+        ] {
+            let label = format!("{foreign:?}");
+            let reply =
+                fold(vec![OwnedOutcome::Int(2), foreign, OwnedOutcome::Int(5)]).expect_err(&label);
+            assert_eq!(reply.first(), Some(&b'-'), "{label}: {reply:?}");
+            let text = String::from_utf8_lossy(&reply);
+            assert!(text.starts_with("-ERR "), "{label}: {text}");
+        }
+    }
+
+    /// The first error wins; later ones are handed back for recycling,
+    /// and a refusal already in hand outranks every leg.
+    #[test]
+    fn the_first_error_wins_and_later_buffers_are_handed_back() {
+        let mut fold = CountedFold::new(0, None);
+        assert!(fold.leg(OwnedOutcome::Bytes(b"-ERR one\r\n".to_vec()), Protocol::Resp2).is_none());
+        assert_eq!(
+            fold.leg(OwnedOutcome::Bytes(b"-ERR two\r\n".to_vec()), Protocol::Resp2),
+            Some(b"-ERR two\r\n".to_vec())
+        );
+        assert!(fold.leg(OwnedOutcome::Err(ErrCode::WrongType), Protocol::Resp2).is_some());
+        assert_eq!(fold.finish(), Err(b"-ERR one\r\n".to_vec()));
+        let mut refused = CountedFold::new(4, Some(b"-ERR refused\r\n".to_vec()));
+        assert!(refused.leg(OwnedOutcome::Int(1), Protocol::Resp2).is_none());
+        assert_eq!(refused.finish(), Err(b"-ERR refused\r\n".to_vec()));
+    }
 }
 
 #[cfg(test)]

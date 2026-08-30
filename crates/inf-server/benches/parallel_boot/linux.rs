@@ -32,6 +32,7 @@ use std::time::Instant;
 use inf_alloc::BufferPool;
 use inf_fabric::{Mesh, MeshConfig};
 use inf_foundation::CellId;
+use inf_foundation::KeyHasher;
 use inf_foundation::time::{Clock, StdClock};
 use inf_log::ckpt::{SyncIckWriter, ick_file_name};
 use inf_log::fs::StdSegmentFs;
@@ -173,7 +174,13 @@ fn build_cell_image(root: &Path, cfg: &DurableConfig, cell: u16, records: u64) -
     write_manifest(
         &fs,
         &shard,
-        &Manifest { ckpt_id: 1, begin_lsn: begin, segments, tiers: Vec::new() },
+        &Manifest {
+            ckpt_id: 1,
+            begin_lsn: begin,
+            segments,
+            tiers: Vec::new(),
+            key_hash_id: KeyHasher::default().identity(),
+        },
     )
     .expect("manifest");
     for &id in scan.segments().iter().filter(|id| **id < floor) {

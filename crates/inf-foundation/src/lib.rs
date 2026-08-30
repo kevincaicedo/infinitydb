@@ -21,7 +21,9 @@ pub mod varint;
 pub use addr::LogicalAddr;
 pub use crc::{crc16, hashtag};
 pub use device::{DeviceIdentity, IdentityVerdict};
-pub use hash::{BuildIntHasher, COLLISION_KEY_PREFIX, IntHasher, KeyHasher, hash64, siphash13};
+pub use hash::{
+    BuildIntHasher, COLLISION_KEY_PREFIX, IntHasher, KeyHashId, KeyHasher, hash64, siphash13,
+};
 pub use hist::LogHistogram;
 pub use ids::{CellId, KeySlot, SLOT_COUNT};
 pub use local::{CachePadded, LocalCounter};

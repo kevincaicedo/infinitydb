@@ -24,6 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use inf_foundation::KeyHasher;
 use inf_foundation::time::Nanos;
 use inf_log::ckpt::{SyncIckWriter, ick_file_name};
 use inf_log::fs::StdSegmentFs;
@@ -211,7 +212,13 @@ fn build_image(root: &Path, cfg: &DurableConfig, records: u64, ckpt_at: Option<u
         write_manifest(
             &fs,
             &shard,
-            &Manifest { ckpt_id: 1, begin_lsn: begin, segments, tiers: Vec::new() },
+            &Manifest {
+                ckpt_id: 1,
+                begin_lsn: begin,
+                segments,
+                tiers: Vec::new(),
+                key_hash_id: KeyHasher::default().identity(),
+            },
         )
         .expect("manifest");
         // The truncation slice already ran: covered prefix segments gone.

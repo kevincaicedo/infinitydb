@@ -13,6 +13,7 @@ mod ckpt;
 mod clients;
 mod config;
 mod control;
+mod data_dir_lock;
 mod durable;
 mod exec;
 pub mod fault;
@@ -42,6 +43,7 @@ pub use control::{
     CellRecoverySlot, ControlHandle, ControlInbox, INDEX_SLOTS, IndexBoard, RecoveryBoard,
     load_catalog, load_catalog_from, spawn as spawn_control,
 };
+pub use data_dir_lock::{DataDirLock, DataDirLockError, LOCK_FILE};
 pub use durable::{
     DeviceConfig, DurableConfig, DurableStats, FillConfig, GroupDecision, GroupHoldConfig,
     RecoverConfig,
@@ -70,8 +72,9 @@ pub use io_properties::{
     IO_PROPERTIES_FILE, IoProperties, IoPropertiesError, IoPropertiesSource, IoProvenance,
 };
 pub use key_hash::{
-    KEY_HASH_FILE, KeyHashError, KeyHashSource, create_key_hash, directory_has_data, load_key_hash,
-    parse_key_hash, render_key_hash, resolve_key_hash,
+    KEY_HASH_FILE, KeyHashBinding, KeyHashError, KeyHashSource, create_key_hash,
+    directory_has_data, load_key_hash, parse_key_hash, render_key_hash, resolve_key_hash,
+    verify_key_hash_binding,
 };
 pub use plane::{ExecOrigin, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane};
 pub use readahead::{ReadAheadFile, ReadAheadFs};

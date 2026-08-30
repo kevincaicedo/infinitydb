@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use inf_foundation::KeyHasher;
 use inf_foundation::fault::{self, FaultSpec};
 use inf_log::FrameLayout;
 use inf_log::fs::mem::MemFs;
@@ -235,6 +236,7 @@ fn manifest_rename_fail_leaves_the_old_unit_authoritative() {
         begin_lsn: Lsn::new(SegmentId(0), 64),
         segments: vec![SegmentId(0)],
         tiers: Vec::new(),
+        key_hash_id: KeyHasher::default().identity(),
     };
     write_manifest(&fs, &shard, &old).expect("first manifest");
 
@@ -244,6 +246,7 @@ fn manifest_rename_fail_leaves_the_old_unit_authoritative() {
         begin_lsn: Lsn::new(SegmentId(1), 64),
         segments: vec![SegmentId(1)],
         tiers: Vec::new(),
+        key_hash_id: KeyHasher::default().identity(),
     };
     let err = write_manifest(&fs, &shard, &newer).expect_err("rename refused");
     assert!(err.to_string().contains("injected fault: manifest_rename_fail"), "{err}");

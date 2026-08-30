@@ -392,7 +392,13 @@ fn unified_recovery_round_trips_all_classes() {
     write_manifest(
         &rig.fs,
         Path::new(SHARD),
-        &Manifest { ckpt_id, begin_lsn, segments: vec![SegmentId(1)], tiers: vec![tier_section] },
+        &Manifest {
+            ckpt_id,
+            begin_lsn,
+            segments: vec![SegmentId(1)],
+            tiers: vec![tier_section],
+            key_hash_id: KeyHasher::default().identity(),
+        },
     )
     .expect("manifest swap");
 
