@@ -1216,6 +1216,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                     begin_lsn,
                     segments: vec![begin_lsn.segment],
                     tiers: vec![section],
+                    key_hash_id: hasher.identity(),
                 },
             )
             .expect("manifest swap");

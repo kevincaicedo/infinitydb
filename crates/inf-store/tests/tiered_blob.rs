@@ -598,6 +598,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
         begin_lsn,
         segments: vec![SegmentId(1)],
         tiers: vec![rig.table.tier_manifest(NS.0, &rig.flush)],
+        key_hash_id: KeyHasher::default().identity(),
     };
     write_manifest(&rig.fs, Path::new(SHARD), &manifest).expect("manifest swap");
     // Recovery replays from begin-LSN: everything before the walk is

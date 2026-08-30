@@ -647,6 +647,26 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         };
         debug_assert_eq!(dirs.log, self.log_dir);
         let manifest = read_manifest(self.fs(), &self.shard_dir)?;
+        // ADR-0094 D6: the manifest names the secret that placed its
+        // checkpoint's refs; a boot holding another one refuses here,
+        // before the checkpoint loads. `infinityd` pre-scans every shard
+        // before any cell starts; this is the guard every boot passes —
+        // the simulators' and the embedded one's included.
+        if let Some(m) = &manifest {
+            let secret = ks.hasher().identity();
+            if m.key_hash_id != secret {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "cell {}: MANIFEST names key-hash id {} but the node's secret is {}: the \
+                         secret was replaced after that checkpoint was placed (ADR-0094 D6) — \
+                         every cold ref would be silently unreachable; restore the directory's \
+                         original key-hash.toml (fail-stop)",
+                        self.cell, m.key_hash_id, secret
+                    ),
+                ));
+            }
+        }
 
         // The manifest names the recovery unit; without one, the whole
         // retained log is the unit.

@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use inf_foundation::KeyHasher;
 use inf_foundation::time::Nanos;
 use inf_log::FrameLayout;
 use inf_log::ckpt::SyncIckWriter;
@@ -576,6 +577,7 @@ fn torn_tail_below_the_manifest_begin_lsn_refuses_to_start() {
             begin_lsn: begin,
             segments: vec![begin.segment],
             tiers: Vec::new(),
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect("manifest");
@@ -614,6 +616,7 @@ fn torn_tail_above_begin_recovers_checkpoint_plus_tail() {
             begin_lsn: begin,
             segments: vec![begin.segment],
             tiers: Vec::new(),
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect("manifest");

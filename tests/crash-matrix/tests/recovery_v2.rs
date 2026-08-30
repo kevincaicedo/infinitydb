@@ -106,6 +106,7 @@ fn publish(fs: &MemFs, table: &TieredTable, flush: &TierFlush<MemFs>, ckpt_id: u
             begin_lsn: Lsn::new(SegmentId(1), 64),
             segments: vec![SegmentId(1)],
             tiers: vec![table.tier_manifest(NS.0, flush)],
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect("manifest swap");
@@ -156,6 +157,7 @@ fn manifest_v2_rename_fail_keeps_old_unit() {
             begin_lsn: Lsn::new(SegmentId(2), 64),
             segments: vec![SegmentId(2)],
             tiers,
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect_err("the swap dies at its commit point");
@@ -237,6 +239,7 @@ fn manifest_v2_dir_fsync_crash_resolves_new_unit() {
             begin_lsn: Lsn::new(SegmentId(2), 64),
             segments: vec![SegmentId(2)],
             tiers,
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect_err("the barrier after the rename dies");
@@ -480,6 +483,7 @@ fn s15_covering_swap_abort_serves_from_prior_unit() {
             begin_lsn: Lsn::new(SegmentId(1), 64),
             segments: vec![SegmentId(1)],
             tiers: vec![table.tier_manifest(NS.0, &flush)],
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect_err("the covering swap dies at its commit point");
@@ -546,6 +550,7 @@ fn s15_covering_swap_dir_fsync_resolves_and_boot_gc_reclaims() {
             begin_lsn: Lsn::new(SegmentId(1), 64),
             segments: vec![SegmentId(1)],
             tiers: vec![table.tier_manifest(NS.0, &flush)],
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect_err("the barrier fails after the rename");

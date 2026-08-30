@@ -326,7 +326,7 @@ leaves its core" in the signature, and the ecosystem supplies audited
 foundations for the edges (wasmtime for reducers, mlua for scripting)
 without touching the zero-dependency core. Stable toolchain, pinned
 version; `unsafe` confined to audited leaf crates under Miri and Loom,
-plus one module-scoped emit region (`inf_doc::emit`, ADR-0049). The index hash is SipHash-1-3 under a per-data-directory secret (ADR-0094; `hash64` is a digest, not a key hash), so no client-chosen key set can lengthen a probe chain or forge 64-bit "exact" evidence.
+plus one module-scoped emit region (`inf_doc::emit`, ADR-0049). The index hash is SipHash-1-3 under a per-data-directory secret (ADR-0094; `hash64` is a digest, not a key hash), so no client-chosen key set can lengthen a probe chain or forge 64-bit "exact" evidence. The secret's identity is named by every `MANIFEST` (epoch 3) and compared before any checkpoint loads — a replaced secret is a typed boot refusal, never a boot with invisible keys; a data directory has one owning process (`LOCK`, taken before anything else is touched) and the secret file is created `0600` and refused otherwise (ADR-0094 D6–D9).
 
 ## References
 

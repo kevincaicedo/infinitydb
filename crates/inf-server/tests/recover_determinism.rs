@@ -19,6 +19,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use inf_foundation::KeyHasher;
 use inf_foundation::time::Nanos;
 use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::mem::MemFs;
@@ -208,6 +209,7 @@ fn build_crashed_image(fs: &MemFs, seed: u64, ops: usize, ckpts: u32, tear: bool
                     begin_lsn: begin,
                     segments,
                     tiers: Vec::new(),
+                    key_hash_id: KeyHasher::default().identity(),
                 },
             )
             .expect("manifest swap");

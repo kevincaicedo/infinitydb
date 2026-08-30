@@ -15,6 +15,7 @@
 use std::io;
 use std::path::Path;
 
+use inf_foundation::KeyHasher;
 use inf_log::ckpt::{IckReaderConfig, SyncIckWriter, ick_file_name, read_ick};
 use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
@@ -58,6 +59,7 @@ fn shard_with_old_unit(fs: &MemFs, shard: &Path) {
             begin_lsn: begin(1, 16),
             segments: vec![SegmentId(1), SegmentId(2)],
             tiers: Vec::new(),
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect("old manifest");
@@ -89,6 +91,7 @@ fn publish_new_unit(fs: &MemFs, shard: &Path) -> io::Result<()> {
             begin_lsn: begin(2, 32),
             segments: vec![SegmentId(2)],
             tiers: Vec::new(),
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
 }
@@ -209,6 +212,7 @@ fn old_unit_survives_until_the_new_manifest_is_durable() {
             begin_lsn: begin(2, 32),
             segments: vec![SegmentId(2)],
             tiers: Vec::new(),
+            key_hash_id: KeyHasher::default().identity(),
         },
     );
     assert!(err.is_err(), "swap crashed at step 0");

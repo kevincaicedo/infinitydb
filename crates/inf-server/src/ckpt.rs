@@ -17,6 +17,7 @@ use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
 use inf_alloc::AlignedBox;
+use inf_foundation::KeyHashId;
 use inf_log::ckpt::{ICK_BLOCK_ALIGN, ick_file_name, ick_staging_file_name, parse_ick_file_name};
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{CkptConfig, IckStream, Lsn, Manifest, SectionLease, SegmentId, StagedAt};
@@ -625,6 +626,9 @@ pub(crate) struct ManifestCell<F: SegmentFs> {
     ckpt_dir: PathBuf,
     cell: u16,
     fs: F,
+    /// The node's key-hash identity (ADR-0094 D6): every manifest this
+    /// cell publishes names the secret that placed its checkpoint's refs.
+    key_hash_id: KeyHashId,
     /// Truncation floor from the durable manifest (`None` until the first
     /// manifest is published or recovered).
     floor: Option<SegmentId>,
@@ -650,6 +654,7 @@ impl<F: SegmentFs> ManifestCell<F> {
         shard_dir: PathBuf,
         ckpt_dir: PathBuf,
         cell: u16,
+        key_hash_id: KeyHashId,
         recovered: Option<PendingManifest>,
     ) -> ManifestCell<F> {
         // `recovered` is the manifest recovery loaded (not a pending swap):
@@ -660,6 +665,7 @@ impl<F: SegmentFs> ManifestCell<F> {
             ckpt_dir,
             cell,
             fs,
+            key_hash_id,
             floor: recovered.map(|m| m.begin_lsn.segment),
             named_ckpt: recovered.map(|m| m.ckpt_id),
             pending_epoch: 0,
@@ -847,6 +853,7 @@ impl<F: SegmentFs> ManifestCell<F> {
                     begin_lsn: pending.begin_lsn,
                     segments: (floor.0..=active.0).map(SegmentId).collect(),
                     tiers,
+                    key_hash_id: self.key_hash_id,
                 };
                 let staged_write = self.fs.create_meta(&staged).and_then(|mut file| {
                     let envelope = inf_log::manifest_envelope(&manifest);

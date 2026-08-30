@@ -224,7 +224,13 @@ fn build_shard(data_dir: &Path, docs: u64, sidecars: bool) -> u64 {
     write_manifest(
         &StdSegmentFs,
         &shard,
-        &Manifest { ckpt_id: 1, begin_lsn, segments: vec![begin_lsn.segment], tiers: vec![] },
+        &Manifest {
+            ckpt_id: 1,
+            begin_lsn,
+            segments: vec![begin_lsn.segment],
+            tiers: vec![],
+            key_hash_id: KeyHasher::default().identity(),
+        },
     )
     .expect("manifest");
     file_bytes

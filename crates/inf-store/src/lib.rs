@@ -70,8 +70,8 @@ pub use index_sidecar::SidecarLoader;
 pub use index_sidecar::{SidecarBootInfo, SidecarBootRow};
 pub use inf_alloc::ArenaConfig;
 // One import point for the shared store↔log vocabulary (ADR-0015 D2/D5).
-pub use inf_foundation::KeyHasher;
 pub use inf_foundation::LogicalAddr;
+pub use inf_foundation::{KeyHashId, KeyHasher};
 pub use inf_log::{FsyncClass, NsId};
 pub use keyspace::{
     DEFAULT_DBS, EvictBudget, Keyspace, PressureConfig, ReplayError, ReplayOutcome, StateDigest,

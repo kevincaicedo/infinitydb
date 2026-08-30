@@ -177,6 +177,37 @@ pub struct KeyHasher {
     k1: u64,
 }
 
+/// The identity of a secret (ADR-0094 D6): a PRF output under it, so it
+/// names the secret without revealing it, and two secrets share an id
+/// with probability 2⁻⁶⁴. Persisted where the hashes are — the MANIFEST
+/// (epoch 3) — so a boot can tell whether the secret it holds is the one
+/// that placed a checkpoint's refs, and refuse before applying any.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct KeyHashId(u64);
+
+/// The fixed message whose SipHash under the secret is the identity.
+const KEY_HASH_ID_DOMAIN: &[u8] = b"infinitydb/key-hash-id/v1";
+
+impl KeyHashId {
+    /// The 64-bit wire value (the MANIFEST carries it LE).
+    #[must_use]
+    pub const fn to_u64(self) -> u64 {
+        self.0
+    }
+
+    /// From the wire value.
+    #[must_use]
+    pub const fn from_u64(raw: u64) -> KeyHashId {
+        KeyHashId(raw)
+    }
+}
+
+impl core::fmt::Display for KeyHashId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:#018x}", self.0)
+    }
+}
+
 impl KeyHasher {
     /// A hasher over the 128-bit secret `(k0, k1)`.
     #[must_use]
@@ -195,6 +226,12 @@ impl KeyHasher {
     #[must_use]
     pub const fn keys(&self) -> (u64, u64) {
         (self.k0, self.k1)
+    }
+
+    /// The secret's identity (ADR-0094 D6) — what a MANIFEST names.
+    #[must_use]
+    pub fn identity(&self) -> KeyHashId {
+        KeyHashId(siphash13(self.k0, self.k1, KEY_HASH_ID_DOMAIN))
     }
 
     /// The hash of `key` under this secret.
@@ -314,6 +351,21 @@ impl core::hash::BuildHasher for BuildIntHasher {
 
 #[cfg(test)]
 mod tests {
+    /// ADR-0094 D6: the identity is a function of the secret alone —
+    /// stable across hashers holding the same keys, distinct across
+    /// secrets, and never the hash of any key (the domain is fixed and
+    /// hashed directly, not through `hash`).
+    #[test]
+    fn identity_names_the_secret_without_being_a_key_hash() {
+        use super::{KeyHashId, KeyHasher};
+        let a = KeyHasher::from_keys(1, 2);
+        assert_eq!(a.identity(), KeyHasher::from_keys(1, 2).identity());
+        assert_ne!(a.identity(), KeyHasher::from_keys(2, 1).identity());
+        assert_ne!(a.identity(), KeyHasher::from_seed(7).identity());
+        assert_eq!(KeyHashId::from_u64(a.identity().to_u64()), a.identity());
+        assert_eq!(a.identity().to_string().len(), 18, "{}", a.identity());
+    }
+
     use super::*;
 
     #[test]

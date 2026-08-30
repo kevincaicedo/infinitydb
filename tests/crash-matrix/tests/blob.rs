@@ -307,6 +307,7 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
         begin_lsn,
         segments: vec![SegmentId(1)],
         tiers: vec![t.tier_manifest(NS.0, &flush)],
+        key_hash_id: KeyHasher::default().identity(),
     };
     write_manifest(&fs, Path::new(SHARD), &manifest).expect("swap");
 

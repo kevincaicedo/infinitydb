@@ -21,6 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
+use inf_foundation::KeyHasher;
 use inf_foundation::time::Nanos;
 use inf_log::ckpt::{ICK_BLOCK_ALIGN, SyncIckWriter, ick_file_name, ick_staging_file_name};
 use inf_log::fs::mem::MemFs;
@@ -139,7 +140,13 @@ fn build_shard(fs: &MemFs, tail_ops: u64) -> Vec<u8> {
     write_manifest(
         fs,
         Path::new(SHARD),
-        &Manifest { ckpt_id: 1, begin_lsn, segments: vec![begin_lsn.segment], tiers: vec![] },
+        &Manifest {
+            ckpt_id: 1,
+            begin_lsn,
+            segments: vec![begin_lsn.segment],
+            tiers: vec![],
+            key_hash_id: KeyHasher::default().identity(),
+        },
     )
     .expect("manifest");
     fs.contents(&ckpt_dir.join(ick_file_name(1))).expect("published bytes")

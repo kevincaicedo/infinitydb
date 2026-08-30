@@ -8,6 +8,7 @@ use crash_matrix::load_matrix;
 use inf_doc::apply::{ApplyOp, Number};
 use inf_doc::path::compile;
 use inf_doc::{JsonParser, encode_apply_op};
+use inf_foundation::KeyHasher;
 use inf_foundation::time::Nanos;
 use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::mem::MemFs;
@@ -202,7 +203,13 @@ fn publish_checkpoint<F: SegmentFs + Clone>(
     write_manifest(
         fs,
         Path::new(SHARD_DIR),
-        &Manifest { ckpt_id: 1, begin_lsn: begin, segments, tiers: Vec::new() },
+        &Manifest {
+            ckpt_id: 1,
+            begin_lsn: begin,
+            segments,
+            tiers: Vec::new(),
+            key_hash_id: KeyHasher::default().identity(),
+        },
     )
     .expect("manifest publish");
 }

@@ -636,6 +636,7 @@ fn promoted_after_c0(emit_origins: bool) -> (Rig, Vec<Vec<u8>>) {
             begin_lsn,
             segments: vec![begin_lsn.segment],
             tiers: vec![rig.table.tier_manifest(NS.0, &rig.flush)],
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect("swap");

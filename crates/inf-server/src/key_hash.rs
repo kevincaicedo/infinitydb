@@ -11,6 +11,16 @@
 //! is pre-1.0). Boot code: blocking file I/O is fine here; no cell runs
 //! yet.
 //!
+//! The first amendment (ADR-0094 D6–D9) adds what D2 lacked: the secret's
+//! **identity** (`KeyHasher::identity`) is named by every `MANIFEST`
+//! (epoch 3), and [`verify_key_hash_binding`] refuses a directory whose
+//! checkpoints were placed under another secret — before any cell
+//! starts; the file is created **private** (`0600`, checked on the handle
+//! every load — a lax mode is a refusal naming the `chmod`); publication
+//! is **create-exclusive** (`create_new` temp, `link(2)` no-replace);
+//! and the caller holds the directory's owner lock
+//! (`crate::data_dir_lock`) around all of it.
+//!
 //! Format (one `key = value` per line, `#` comments):
 //!
 //! ```text
@@ -21,10 +31,13 @@
 //! ```
 
 use std::fmt;
-use std::io::{self, Write};
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
-use inf_foundation::KeyHasher;
+use inf_foundation::{KeyHashId, KeyHasher};
+use inf_log::fs::StdSegmentFs;
+use inf_log::read_manifest;
 
 /// The file's name under the data directory.
 pub const KEY_HASH_FILE: &str = "key-hash.toml";
@@ -58,6 +71,29 @@ pub enum KeyHashError {
     Predates,
     /// The OS gave no entropy for a first boot.
     Entropy(io::Error),
+    /// The file is readable by its group or others (ADR-0094 D9): a
+    /// world-readable secret reopens the hash-flooding threat.
+    Permissions {
+        mode: u32,
+    },
+    /// Publication found a secret already in place (ADR-0094 D8): the
+    /// directory's owner lock was not held — fail-stop, never "use
+    /// whichever won".
+    Contended,
+    /// A shard's `MANIFEST` names a secret other than the one this
+    /// directory holds (ADR-0094 D6): the secret was replaced after that
+    /// checkpoint was placed.
+    Mismatch {
+        shard: String,
+        manifest: KeyHashId,
+        secret: KeyHashId,
+    },
+    /// A shard's `MANIFEST` could not be read for the binding scan (a
+    /// legacy epoch that cannot name its secret, or corruption).
+    Manifest {
+        shard: String,
+        detail: String,
+    },
 }
 
 impl fmt::Display for KeyHashError {
@@ -82,6 +118,24 @@ impl fmt::Display for KeyHashError {
             KeyHashError::Entropy(err) => {
                 write!(f, "no entropy for the first boot's key-hash secret: {err}")
             }
+            KeyHashError::Permissions { mode } => write!(
+                f,
+                "{KEY_HASH_FILE} is mode {mode:04o}: the secret must be readable by its owner \
+                 only (ADR-0094 D9) — `chmod 600` it (fail-stop)"
+            ),
+            KeyHashError::Contended => write!(
+                f,
+                "{KEY_HASH_FILE} appeared while this first boot was publishing its own: the data \
+                 directory has a second writer (ADR-0094 D7/D8) — fail-stop"
+            ),
+            KeyHashError::Mismatch { shard, manifest, secret } => write!(
+                f,
+                "{shard}/MANIFEST names key-hash id {manifest} but {KEY_HASH_FILE} holds \
+                 {secret}: the secret was replaced after that checkpoint was placed (ADR-0094 \
+                 D6) — every cold ref would be silently unreachable; restore the directory's \
+                 original {KEY_HASH_FILE} (fail-stop)"
+            ),
+            KeyHashError::Manifest { shard, detail } => write!(f, "{shard}/MANIFEST: {detail}"),
         }
     }
 }
@@ -103,17 +157,40 @@ pub enum KeyHashSource {
     Created,
 }
 
-/// Read `<data_dir>/key-hash.toml`; `Ok(None)` when absent.
+/// Read `<data_dir>/key-hash.toml`; `Ok(None)` when absent. The mode is
+/// checked on the handle the text is then read from (ADR-0094 D9): no
+/// stat-then-read window.
 ///
 /// # Errors
-/// A present-but-malformed file (never a silent default).
+/// A present-but-malformed file, or one readable beyond its owner
+/// (never a silent default).
 pub fn load_key_hash(data_dir: &Path) -> Result<Option<KeyHasher>, KeyHashError> {
-    let text = match std::fs::read_to_string(data_dir.join(KEY_HASH_FILE)) {
-        Ok(text) => text,
+    let mut file = match File::open(data_dir.join(KEY_HASH_FILE)) {
+        Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(KeyHashError::Io(err)),
     };
+    require_private(&file)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
     parse_key_hash(&text).map(Some)
+}
+
+/// ADR-0094 D9: no group/other permission bit on the secret. Unix only —
+/// the product's targets (Linux, the macOS dev tier); elsewhere the mode
+/// model does not exist and the check is vacuous.
+fn require_private(file: &File) -> Result<(), KeyHashError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file.metadata()?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(KeyHashError::Permissions { mode });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
 }
 
 /// Parse the file's text.
@@ -217,24 +294,116 @@ pub fn directory_has_data(data_dir: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-/// Write `<data_dir>/key-hash.toml` durably: a temp file, `fsync`, a
-/// rename over the name, and the directory `fsync` — the same discipline
-/// as `io-properties.toml`. The directory is created if absent.
+/// Write `<data_dir>/key-hash.toml` durably and exclusively (ADR-0094
+/// D8/D9): a `create_new` temp file at mode `0600` (a stale temp from a
+/// crashed earlier first boot is removed first — under the owner lock
+/// nobody else can be writing it), `fsync`, then `link(2)` onto the
+/// final name — atomic and **no-replace** by the kernel's contract —
+/// the temp unlinked, and the directory `fsync`. The directory is
+/// created if absent.
 ///
 /// # Errors
-/// Any I/O failure (the boot refuses; a half-written secret must never
-/// be read back as one).
-pub fn create_key_hash(data_dir: &Path, hasher: KeyHasher) -> io::Result<()> {
+/// [`KeyHashError::Contended`] when a secret is already in place (the
+/// owner lock was not held); [`KeyHashError::Permissions`] when the
+/// created file is not private; any I/O failure (the boot refuses; a
+/// half-written secret must never be read back as one).
+pub fn create_key_hash(data_dir: &Path, hasher: KeyHasher) -> Result<(), KeyHashError> {
     std::fs::create_dir_all(data_dir)?;
     let tmp = data_dir.join(format!("{KEY_HASH_FILE}.tmp"));
+    let target = data_dir.join(KEY_HASH_FILE);
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(KeyHashError::Io(err)),
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
     {
-        let mut file = std::fs::File::create(&tmp)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    {
+        let mut file = options.open(&tmp)?;
+        require_private(&file)?;
         file.write_all(render_key_hash(hasher).as_bytes())?;
         file.sync_all()?;
     }
-    std::fs::rename(&tmp, data_dir.join(KEY_HASH_FILE))?;
-    std::fs::File::open(data_dir)?.sync_all()?;
+    // Publication: `link` never replaces — a present secret is EEXIST.
+    match std::fs::hard_link(&tmp, &target) {
+        Ok(()) => {}
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(if err.kind() == io::ErrorKind::AlreadyExists {
+                KeyHashError::Contended
+            } else {
+                KeyHashError::Io(err)
+            });
+        }
+    }
+    std::fs::remove_file(&tmp)?;
+    File::open(data_dir)?.sync_all()?;
     Ok(())
+}
+
+/// What the binding pre-scan found (the boot line says so).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyHashBinding {
+    /// Shards whose `MANIFEST` names this directory's secret.
+    pub manifests_bound: u32,
+    /// Shards that have never published a checkpoint (nothing to bind).
+    pub shards_unpublished: u32,
+}
+
+/// ADR-0094 D6, node level: every `shard-*/MANIFEST` must name the
+/// identity of `hasher` — run after the secret resolves and **before**
+/// the catalog, the device profile, or any cell thread, so a mismatched
+/// directory is left byte-identical (no cell can publish a manifest
+/// under the wrong secret while another refuses). Shards are visited in
+/// name order; the first mismatch is the refusal.
+///
+/// # Errors
+/// [`KeyHashError::Mismatch`] naming the shard and both identities;
+/// [`KeyHashError::Manifest`] when a manifest cannot be read (a legacy
+/// epoch that cannot name its secret, or corruption); I/O failures.
+pub fn verify_key_hash_binding(
+    data_dir: &Path,
+    hasher: KeyHasher,
+) -> Result<KeyHashBinding, KeyHashError> {
+    let secret = hasher.identity();
+    let mut report = KeyHashBinding::default();
+    let mut shards: Vec<PathBuf> = Vec::new();
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(report),
+        Err(err) => return Err(KeyHashError::Io(err)),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with("shard-") && entry.file_type()?.is_dir()
+        {
+            shards.push(entry.path());
+        }
+    }
+    shards.sort();
+    for shard in shards {
+        let name = shard.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match read_manifest(&StdSegmentFs, &shard) {
+            Ok(Some(manifest)) if manifest.key_hash_id == secret => report.manifests_bound += 1,
+            Ok(Some(manifest)) => {
+                return Err(KeyHashError::Mismatch {
+                    shard: name,
+                    manifest: manifest.key_hash_id,
+                    secret,
+                });
+            }
+            Ok(None) => report.shards_unpublished += 1,
+            Err(err) => {
+                return Err(KeyHashError::Manifest { shard: name, detail: err.to_string() });
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// Load → or, on a directory that has never booted, draw from `entropy`
@@ -337,6 +506,124 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         std::fs::write(dir.join(KEY_HASH_FILE), "schema = 1\n").expect("write");
         assert!(resolve_key_hash(&dir, entropy).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0094 D9: the first boot's file is `0600`; a file readable
+    /// beyond its owner is refused naming the mode and the `chmod`, and
+    /// boots again once private.
+    #[cfg(unix)]
+    #[test]
+    fn the_secret_is_private_and_a_lax_mode_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fresh_dir("private");
+        let (hasher, _) = resolve_key_hash(&dir, entropy).expect("first boot");
+        let file = dir.join(KEY_HASH_FILE);
+        let mode = std::fs::metadata(&file).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:04o}");
+        for lax in [0o644u32, 0o640, 0o604, 0o660] {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(lax)).expect("chmod");
+            let err = resolve_key_hash(&dir, || panic!("no entropy")).expect_err("refused");
+            assert!(matches!(err, KeyHashError::Permissions { mode } if mode == lax), "{err}");
+            assert!(err.to_string().contains("chmod 600"), "{err}");
+        }
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).expect("chmod");
+        let (again, source) =
+            resolve_key_hash(&dir, || panic!("no entropy")).expect("0400 is private");
+        assert_eq!((again, source), (hasher, KeyHashSource::File));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0094 D8: publication never replaces a secret already in
+    /// place — the typed `Contended`, the original bytes untouched, no
+    /// temp residue; and a stale temp from a crashed first boot is
+    /// cleared, not read.
+    #[test]
+    fn publication_is_exclusive_and_clears_a_stale_temp() {
+        let dir = fresh_dir("exclusive");
+        let tmp = dir.join(format!("{KEY_HASH_FILE}.tmp"));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(&tmp, b"garbage from a crashed first boot").expect("stale temp");
+        create_key_hash(&dir, KeyHasher::from_keys(1, 2)).expect("first publication");
+        assert!(!tmp.exists(), "the stale temp is gone");
+        let first = std::fs::read_to_string(dir.join(KEY_HASH_FILE)).expect("published");
+        assert_eq!(parse_key_hash(&first).expect("parses").keys(), (1, 2));
+        let err = create_key_hash(&dir, KeyHasher::from_keys(3, 4)).expect_err("no replace");
+        assert!(matches!(err, KeyHashError::Contended), "{err}");
+        assert!(err.to_string().contains("second writer"), "{err}");
+        assert_eq!(std::fs::read_to_string(dir.join(KEY_HASH_FILE)).expect("still"), first);
+        assert!(!tmp.exists(), "the loser's temp is unlinked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0094 D6, the node-level pre-scan: a shard whose MANIFEST names
+    /// another secret is the typed `Mismatch` (shard and both ids named);
+    /// a shard without a manifest is merely unpublished; a legacy-epoch
+    /// manifest is refused through the decoder's own reason.
+    #[test]
+    fn the_binding_scan_refuses_a_replaced_secret_and_a_legacy_manifest() {
+        use inf_log::fs::StdSegmentFs;
+        use inf_log::{Lsn, Manifest, SegmentId, write_manifest};
+        let dir = fresh_dir("binding");
+        let placed = KeyHasher::from_keys(11, 12);
+        let other = KeyHasher::from_keys(21, 22);
+        for shard in ["shard-0", "shard-1"] {
+            std::fs::create_dir_all(dir.join(shard)).expect("shard");
+        }
+        write_manifest(
+            &StdSegmentFs,
+            &dir.join("shard-0"),
+            &Manifest::tierless(
+                1,
+                Lsn::new(SegmentId(0), 64),
+                vec![SegmentId(0)],
+                placed.identity(),
+            ),
+        )
+        .expect("manifest");
+        assert_eq!(
+            verify_key_hash_binding(&dir, placed).expect("bound"),
+            KeyHashBinding { manifests_bound: 1, shards_unpublished: 1 }
+        );
+        let err = verify_key_hash_binding(&dir, other).expect_err("replaced secret");
+        match &err {
+            KeyHashError::Mismatch { shard, manifest, secret } => {
+                assert_eq!(shard, "shard-0");
+                assert_eq!((*manifest, *secret), (placed.identity(), other.identity()));
+            }
+            other => panic!("{other}"),
+        }
+        assert!(err.to_string().contains("ADR-0094") && err.to_string().contains("fail-stop"));
+        // A legacy (epoch-1) manifest cannot name its secret: refused by
+        // the decoder's reason, relayed with the shard named.
+        let mut legacy = Manifest::tierless(
+            1,
+            Lsn::new(SegmentId(0), 64),
+            vec![SegmentId(0)],
+            placed.identity(),
+        )
+        .encode();
+        legacy[8..12].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::create_dir_all(dir.join("shard-2")).expect("shard");
+        inf_log::meta::write_envelope(
+            &StdSegmentFs,
+            &dir.join("shard-2"),
+            "MANIFEST.new",
+            "MANIFEST",
+            &legacy,
+        )
+        .expect("legacy manifest");
+        let err = verify_key_hash_binding(&dir, placed).expect_err("legacy refused");
+        assert!(
+            matches!(&err, KeyHashError::Manifest { shard, .. } if shard == "shard-2"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("predates the key-hash binding"), "{err}");
+        // An absent directory has nothing to bind.
+        assert_eq!(
+            verify_key_hash_binding(&fresh_dir("absent"), placed).expect("nothing"),
+            KeyHashBinding::default()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
