@@ -30,6 +30,9 @@ jobs:
       matrix:
         include:
           - { dir: crates/inf-wire, target: resp_parse }
+          # Reply half of the wire (review 2026-08-30 C6 / ADR-0097):
+          # a client's argument bytes reach every `-ERR` that quotes them.
+          - { dir: crates/inf-wire, target: resp_reply_frame }
           - { dir: crates/inf-fabric, target: fabric_codec }
           - { dir: crates/inf-server, target: glob_match }
           - { dir: crates/inf-server, target: scan_cursor }

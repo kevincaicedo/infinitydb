@@ -27,21 +27,44 @@ impl<'b> RespWriter<'b> {
         self.proto
     }
 
-    /// `+OK\r\n`. `text` must not contain CR/LF (debug-asserted; replies are
-    /// engine-controlled constants).
+    /// `+OK\r\n`. The text is written as one protocol line — see
+    /// [`RespWriter::error`] for the sanitization both line-framed writers
+    /// share.
+    #[inline]
     pub fn simple(&mut self, text: &str) {
-        debug_assert!(!text.bytes().any(|b| b == b'\r' || b == b'\n'));
-        self.out.push(b'+');
-        self.out.extend_from_slice(text.as_bytes());
-        self.out.extend_from_slice(b"\r\n");
+        self.push_line(b'+', text.as_bytes());
     }
 
     /// `-ERR ...\r\n`.
+    ///
+    /// Simple strings and errors are the only replies whose frame boundary
+    /// **is** a CRLF in the payload; every other reply this writer emits is
+    /// length-prefixed. So `text` is sanitized on the way out rather than
+    /// asserted clean: a leading/trailing run of CR/LF is trimmed and any
+    /// remaining CR or LF becomes a space — byte-for-byte what
+    /// redis-server 8.0.5 does in `addReplyErrorFormatInternal`
+    /// (`sdstrim(s, "\r\n")` then `sdsmapchars(s, "\r\n", "  ", 2)`).
+    ///
+    /// ADR-0097 (review 2026-08-30, finding C6). The previous contract —
+    /// *"`text` must not contain CR/LF (debug-asserted; replies are
+    /// engine-controlled constants)"* — was false for twelve live call
+    /// sites that interpolate client bytes, and `debug_assert!` is compiled
+    /// out of the shipping profile: a client could open a second RESP frame
+    /// inside its own error reply and so forge the reply to the *next*
+    /// pipelined command. Enforcing the invariant here closes the class for
+    /// every caller, present and future.
+    #[inline]
     pub fn error(&mut self, text: &str) {
-        debug_assert!(!text.bytes().any(|b| b == b'\r' || b == b'\n'));
-        self.out.push(b'-');
-        self.out.extend_from_slice(text.as_bytes());
-        self.out.extend_from_slice(b"\r\n");
+        self.error_bytes(text.as_bytes());
+    }
+
+    /// [`RespWriter::error`] for error text that interpolates raw client
+    /// bytes: argv contents need not be UTF-8, and a lossy conversion would
+    /// both change the byte budget a caller bounds against and diverge from
+    /// the oracle's bytes.
+    #[inline]
+    pub fn error_bytes(&mut self, text: &[u8]) {
+        self.push_line(b'-', text);
     }
 
     /// `:N\r\n`.
@@ -193,12 +216,82 @@ impl<'b> RespWriter<'b> {
         }
     }
 
+    /// Writes one line-framed reply: `tag`, the body, `\r\n`. The body is
+    /// sanitized so it cannot open a second frame (see [`RespWriter::error`]).
+    ///
+    /// Clean text — every engine constant, and so the whole hot reply path
+    /// (`+OK`, `+PONG`) — takes the straight-line branch: one scan, then the
+    /// same three appends the writer did before sanitization existed. Text
+    /// that really carries CR/LF goes to a cold, out-of-line path.
+    #[inline]
+    fn push_line(&mut self, tag: u8, text: &[u8]) {
+        if contains_line_break(text) {
+            self.push_line_sanitized(tag, text);
+            return;
+        }
+        self.out.push(tag);
+        self.out.extend_from_slice(text);
+        self.out.extend_from_slice(b"\r\n");
+    }
+
+    /// The CR/LF-carrying half of [`RespWriter::push_line`]: trim a
+    /// leading/trailing run, map what is left to spaces. Out of line — no
+    /// engine-controlled reply reaches it, only client bytes do.
+    #[cold]
+    #[inline(never)]
+    fn push_line_sanitized(&mut self, tag: u8, text: &[u8]) {
+        let start = text.iter().position(|b| *b != b'\r' && *b != b'\n').unwrap_or(text.len());
+        let end = text.iter().rposition(|b| *b != b'\r' && *b != b'\n').map_or(start, |i| i + 1);
+        self.out.push(tag);
+        let at = self.out.len();
+        self.out.extend_from_slice(&text[start..end]);
+        for byte in &mut self.out[at..] {
+            if *byte == b'\r' || *byte == b'\n' {
+                *byte = b' ';
+            }
+        }
+        // Postcondition: the terminator below is the only CRLF in this
+        // reply — the property the whole connection's framing rests on.
+        debug_assert!(!self.out[at..].iter().any(|b| *b == b'\r' || *b == b'\n'));
+        self.out.extend_from_slice(b"\r\n");
+    }
+
     /// Integer → ASCII via a stack buffer (no allocation, no `format!`).
     fn raw_int(&mut self, value: i64) {
         let mut buf = [0u8; 20];
         let text = itoa(value, &mut buf);
         self.out.extend_from_slice(text);
     }
+}
+
+/// Whether `text` holds a CR or an LF — the only bytes that can end a
+/// line-framed reply early.
+///
+/// SWAR, eight bytes per step: the fast path of every `+`/`-` reply runs
+/// this, and a short-circuiting `iter().any()` costs a cycle per byte
+/// (measured: +12.6 ns on a 44-byte error line, +580 % on the write bench).
+#[inline(always)]
+fn contains_line_break(text: &[u8]) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    /// Non-zero iff `word` contains a zero byte (Mycroft's bit trick).
+    #[inline(always)]
+    fn has_zero_byte(word: u64) -> u64 {
+        word.wrapping_sub(ONES) & !word & HIGH
+    }
+    if text.len() < 8 {
+        return text.iter().any(|b| *b == b'\r' || *b == b'\n');
+    }
+    let mut chunks = text.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
+        let cr = has_zero_byte(word ^ (ONES * u64::from(b'\r')));
+        let lf = has_zero_byte(word ^ (ONES * u64::from(b'\n')));
+        if cr | lf != 0 {
+            return true;
+        }
+    }
+    chunks.remainder().iter().any(|b| *b == b'\r' || *b == b'\n')
 }
 
 /// Minimal signed-integer formatter into a caller stack buffer.
@@ -314,6 +407,117 @@ mod tests {
             w.simple("OK");
         });
         assert_eq!(out, b":1\r\n$3\r\nabc\r\n+OK\r\n");
+    }
+
+    /// C6 (review 2026-08-30): a line-framed reply must never gain a frame
+    /// boundary from its payload. The pinned bytes are what
+    /// **redis-server 8.0.5** answers for the same message text — its
+    /// `addReplyErrorFormatInternal` runs `sdstrim(s, "\r\n")` then
+    /// `sdsmapchars(s, "\r\n", "  ", 2)`, and both halves are observable
+    /// (`EXPIRE k 100 <opt>` puts client bytes at the very end of the
+    /// message, `unknown command` puts them in the middle).
+    #[test]
+    fn error_line_is_sanitized_like_the_redis_oracle() {
+        // Interior CR/LF -> one space each (oracle: `EXPIRE k 100 B\r\nAD`).
+        assert_eq!(
+            render(Protocol::Resp2, |w| w.error("ERR Unsupported option B\r\nAD")),
+            b"-ERR Unsupported option B  AD\r\n"
+        );
+        // Trailing run trimmed, not mapped (oracle: `... BAD\r\n` -> `BAD`).
+        assert_eq!(
+            render(Protocol::Resp2, |w| w.error("ERR Unsupported option BAD\r\n")),
+            b"-ERR Unsupported option BAD\r\n"
+        );
+        assert_eq!(
+            render(Protocol::Resp2, |w| w.error("ERR Unsupported option BAD\n")),
+            b"-ERR Unsupported option BAD\r\n"
+        );
+        // An all-CR/LF tail leaves the message empty behind it.
+        assert_eq!(
+            render(Protocol::Resp2, |w| w.error("ERR Unsupported option \r\n")),
+            b"-ERR Unsupported option \r\n"
+        );
+        // Lone CR and lone LF map too — RESP framing accepts a bare LF.
+        assert_eq!(render(Protocol::Resp2, |w| w.error("ERR a\nb")), b"-ERR a b\r\n");
+        assert_eq!(render(Protocol::Resp2, |w| w.error("ERR a\rb")), b"-ERR a b\r\n");
+        // Simple strings are line-framed too, and get the same treatment.
+        assert_eq!(render(Protocol::Resp2, |w| w.simple("O\r\nK")), b"+O  K\r\n");
+        // Clean text is byte-identical to before the sanitizer existed.
+        assert_eq!(render(Protocol::Resp2, |w| w.error("ERR boom")), b"-ERR boom\r\n");
+        assert_eq!(render(Protocol::Resp2, |w| w.simple("OK")), b"+OK\r\n");
+    }
+
+    /// The attacker's half of C6: the reply forgery is a *framing* claim, so
+    /// assert framing, not the text. Every byte, at every position of a
+    /// short body, through both line-framed writers: exactly one CRLF, at
+    /// the end.
+    #[test]
+    fn no_byte_in_a_line_reply_can_open_a_second_frame() {
+        for byte in 0u8..=255 {
+            for position in 0..3usize {
+                let mut body = *b"abc";
+                body[position] = byte;
+                // Only valid UTF-8 can reach the `&str` writers; the raw
+                // form takes the rest (`error_bytes`, the argv path).
+                let cases: [Vec<u8>; 2] = [body.to_vec(), {
+                    let mut v = b"ERR ".to_vec();
+                    v.extend_from_slice(&body);
+                    v.extend_from_slice(b" tail");
+                    v
+                }];
+                for case in cases {
+                    let out = render(Protocol::Resp2, |w| w.error_bytes(&case));
+                    assert!(out.ends_with(b"\r\n"), "byte {byte:#04x} pos {position}: {out:?}");
+                    let body = &out[1..out.len() - 2];
+                    assert!(
+                        !body.contains(&b'\r') && !body.contains(&b'\n'),
+                        "byte {byte:#04x} pos {position} left a frame boundary: {out:?}"
+                    );
+                    if let Ok(text) = std::str::from_utf8(&case) {
+                        assert_eq!(render(Protocol::Resp2, |w| w.error(text)), out);
+                        let simple = render(Protocol::Resp2, |w| w.simple(text));
+                        assert_eq!(&simple[1..], &out[1..], "simple/error must agree");
+                    }
+                }
+            }
+        }
+    }
+
+    /// SWAR kernel against a scalar oracle, every length across the
+    /// eight-byte step and every position — the word path is invisible to
+    /// the byte-sweep test above, which only builds short bodies.
+    #[test]
+    fn contains_line_break_matches_the_scalar_oracle() {
+        fn scalar(text: &[u8]) -> bool {
+            text.iter().any(|b| *b == b'\r' || *b == b'\n')
+        }
+        for len in 0..=24usize {
+            let clean = vec![b'x'; len];
+            assert!(!contains_line_break(&clean), "len {len}");
+            for position in 0..len {
+                for byte in [b'\r', b'\n', b'\t', 0x00, 0x0c, 0x8d, 0xff] {
+                    let mut body = clean.clone();
+                    body[position] = byte;
+                    assert_eq!(
+                        contains_line_break(&body),
+                        scalar(&body),
+                        "len {len} position {position} byte {byte:#04x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Length-prefixed replies are *not* sanitized — CR/LF in a bulk body is
+    /// legal wire content and truncating it would corrupt values. This is
+    /// the negative half of the C6 contract (assert the space you forbid).
+    #[test]
+    fn length_prefixed_replies_still_carry_crlf_verbatim() {
+        assert_eq!(render(Protocol::Resp2, |w| w.bulk(b"a\r\nb")), b"$4\r\na\r\nb\r\n");
+        assert_eq!(
+            render(Protocol::Resp3, |w| w.verbatim(b"txt", b"a\r\nb")),
+            b"=8\r\ntxt:a\r\nb\r\n"
+        );
     }
 
     #[test]
