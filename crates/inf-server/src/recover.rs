@@ -209,6 +209,13 @@ pub struct RecoverStats {
     /// renamed back before serving — a wrong orphan verdict healed.
     /// Nonzero is the upstream-accounting falsifier signal; logged.
     pub blob_revived: u64,
+    /// ADR-0100 D6: tombstoned namespaces whose residue this boot swept
+    /// (a `MANIFEST` tier section, an `ns-N/cold` directory, or both),
+    /// the files unlinked doing it, and the checkpoint's tiered sections
+    /// (ref / live-set / blob-ref) skipped for them.
+    pub dropped_ns_swept: u64,
+    pub dropped_files_swept: u64,
+    pub dropped_sections_skipped: u64,
     /// Sealed segments with non-validating remnant bytes behind their data
     /// end — the inert residue of an earlier torn-tail resume (the reader
     /// never crosses a segment's data end, so they can never replay).
@@ -784,11 +791,20 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     /// manifested flushed watermark, install the recovered table, and
     /// retain creation-mode fds for the plane's cold-read table.
     fn recover_tiers(&mut self, ks: &mut Keyspace, manifest: &Manifest) -> io::Result<()> {
+        // ADR-0100 D6: the catalog decides which namespaces exist; a
+        // tombstoned id's residue is swept, an unknown id's is corruption.
+        let mut swept: Vec<inf_log::NsId> = Vec::new();
         for tier in &manifest.tiers {
             let ns = inf_log::NsId(tier.ns);
             let Some(spec) = ks.ns_get_by_id(ns).and_then(|spec| spec.tier) else {
+                if ks.ns_tombstoned(ns) {
+                    self.sweep_dropped_ns(ns)?;
+                    swept.push(ns);
+                    continue;
+                }
                 return Err(io_msg(format!(
-                    "MANIFEST carries a tier section for ns {} the catalog does not know",
+                    "MANIFEST carries a tier section for ns {} the catalog does not know and no \
+                     drop tombstone explains (corruption or a foreign META — ADR-0100 D6)",
                     tier.ns
                 )));
             };
@@ -831,6 +847,43 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 extents_quarantined: recovered.extents_quarantined,
             });
         }
+        // The after-checkpoint, before-teardown residue: a tombstoned
+        // namespace's directory with no section naming it.
+        let tombstones: Vec<inf_log::NsId> = ks.ns_tombstones().to_vec();
+        for ns in tombstones {
+            if !swept.contains(&ns) {
+                self.sweep_dropped_ns(ns)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Unlinks a tombstoned namespace's `ns-N/cold` files — tier files and
+    /// blob extents share that directory — before the cell serves
+    /// (ADR-0100 D6: the teardown an acked `DROP` owed). Idempotent: an
+    /// absent directory is nothing to do; a cut mid-sweep repeats it on
+    /// the next boot because the tombstone outlives the residue.
+    fn sweep_dropped_ns(&mut self, ns: inf_log::NsId) -> io::Result<()> {
+        let cold = self.shard_dir.join(format!("ns-{}", ns.0)).join("cold");
+        let names = match self.fs().list_dir(&cold) {
+            Ok(names) => names,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let mut files = 0u64;
+        for name in names {
+            self.fs().remove_file(&cold.join(&name))?;
+            files += 1;
+        }
+        if files > 0 {
+            self.fs().sync_dir(&cold)?;
+        }
+        self.stats.dropped_ns_swept += 1;
+        self.stats.dropped_files_swept += files;
+        eprintln!(
+            "cell {}: swept dropped namespace {} residue ({files} files) — ADR-0100 D6",
+            self.cell, ns.0
+        );
         Ok(())
     }
 
@@ -961,6 +1014,18 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         let ks = std::cell::RefCell::new(ks);
         let mut spent = 0u64;
         loop {
+            // ADR-0100 D6: a tiered section naming a tombstoned namespace
+            // is the residue of an acked DROP — skipped and counted (the
+            // m4-tiered DST found this class on the fix's first seed);
+            // an untombstoned unknown id stays the fail-stop below.
+            let dropped_sections = core::cell::Cell::new(0u64);
+            let tombstoned = |ns: u32| {
+                let skip = ks.borrow().ns_tombstoned(inf_log::NsId(ns));
+                if skip {
+                    dropped_sections.set(dropped_sections.get() + 1);
+                }
+                skip
+            };
             let step = reader
                 .next_step_hybrid(
                     |record| {
@@ -970,6 +1035,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                             .map_err(io_invalid)
                     },
                     |refs| {
+                        if tombstoned(refs.ns) {
+                            return Ok(());
+                        }
                         let flushed = flushed_of(refs.ns).ok_or_else(|| {
                             io_msg(format!("ref section for unmanifested tier ns {}", refs.ns))
                         })?;
@@ -981,6 +1049,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                         inf_store::apply_ref_section(table, &refs, flushed)
                     },
                     |live| {
+                        if tombstoned(live.ns) {
+                            return Ok(());
+                        }
                         let mut ks = ks.borrow_mut();
                         let table =
                             ks.tiered_store_mut(inf_log::NsId(live.ns)).ok_or_else(|| {
@@ -990,6 +1061,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                         Ok(())
                     },
                     |blob| {
+                        if tombstoned(blob.ns) {
+                            return Ok(());
+                        }
                         let mut ks = ks.borrow_mut();
                         let table =
                             ks.tiered_store_mut(inf_log::NsId(blob.ns)).ok_or_else(|| {
@@ -1041,6 +1115,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     },
                 )
                 .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
+            self.stats.dropped_sections_skipped += dropped_sections.get();
             match step {
                 IckStep::Section { bytes } => {
                     spent += bytes;

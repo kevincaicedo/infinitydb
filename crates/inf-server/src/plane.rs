@@ -252,6 +252,18 @@ struct ConnKey {
     generation: u32,
 }
 
+impl ConnKey {
+    /// The key as one word — the publisher tag the fabric echoes
+    /// (ADR-0101 D1). Meaningful on the issuing cell only.
+    fn packed(self) -> u64 {
+        (u64::from(self.slot) << 32) | u64::from(self.generation)
+    }
+
+    fn unpack(word: u64) -> ConnKey {
+        ConnKey { slot: (word >> 32) as u32, generation: word as u32 }
+    }
+}
+
 struct Conn {
     fd: RawFd,
     parser: ConnParser,
@@ -273,6 +285,17 @@ struct Conn {
     cob_soft_since_ms: u64,
     /// The output-cap kill was already requested (idempotent counter guard).
     cob_kill_sent: bool,
+    /// Remote-publish sequence (ADR-0101 D1): a subscribed connection's
+    /// forwarded `PUBLISH` carries `(key, seq)` so the owner's fan leg
+    /// back to this cell can pair the publisher's own frames with its
+    /// own reply. Never advances for unsubscribed publishers.
+    publish_seq: u64,
+    /// The publisher's own frames a tagged fan leg delivered, keyed by
+    /// sequence; the pump emits each right after that publish's count
+    /// reply (ADR-0101 D3/D4). Bounded by the in-flight window and
+    /// empty for every connection that is not a self-subscribed
+    /// publisher.
+    self_push: Vec<(u64, Vec<u8>)>,
 }
 
 impl Conn {
@@ -283,6 +306,14 @@ impl Conn {
             + self.queue.iter().map(OwnedCmd::mem).sum::<usize>()
             + self.cx.sub_channels.iter().map(|c| c.len() + 24).sum::<usize>()
             + self.cx.sub_patterns.iter().map(|p| p.len() + 24).sum::<usize>()
+            + self.self_push.iter().map(|(_, f)| f.capacity() + 32).sum::<usize>()
+    }
+
+    /// Takes the stashed self-frames of remote publish `seq`, if the
+    /// tagged fan leg delivered any (ADR-0101 D4).
+    fn take_self_push(&mut self, seq: u64) -> Option<Vec<u8>> {
+        let at = self.self_push.iter().position(|(s, _)| *s == seq)?;
+        Some(self.self_push.swap_remove(at).1)
     }
 }
 
@@ -402,6 +433,12 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// (a tiered namespace is a configuration of `MODE durable` —
     /// ADR-0062 D1); inner state stays empty until one materializes.
     tier: RefCell<Option<crate::tier_cell::TierCell<F>>>,
+    /// Dropped namespaces awaiting their catalog persist (ADR-0100 D5):
+    /// `(ns, epoch)` recorded by the DROP program (origin) or the
+    /// `INF.NSFAN DROP` apply (peers) before MAINTAIN parks the tier
+    /// files; consumed by `TierCell::sync_namespaces`. Bounded by DDL
+    /// rate — one entry per drop, consumed at the next MAINTAIN.
+    ns_drop_releases: RefCell<Vec<(NsId, u64)>>,
     /// Fabric-origin tiered applies (M4-S26): per-origin FIFO queues. A
     /// tiered apply can suspend on a cold read, so it cannot run inside
     /// the synchronous FABRIC-IN drain — each origin's applies run on
@@ -482,6 +519,9 @@ struct OwnerPub {
     token: FabricToken,
     channel: Vec<u8>,
     payload: Vec<u8>,
+    /// The publisher tag `(conn, seq)` as the origin sent it (ADR-0101
+    /// D1/D2): opaque here, echoed on the origin cell's fan leg only.
+    tag: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 /// One armed maintenance bracket (M4.5-S04, ADR-0076 D3): the write-set
@@ -1132,8 +1172,17 @@ fn apply_nsfan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 ) -> Result<(), inf_store::NsError> {
     use inf_store::NsError;
     let malformed = NsError::InvalidName; // internal vocabulary; never client-visible
-    if argv.len() == 3 && argv[1].eq_ignore_ascii_case(b"DROP") {
-        return shared.store.borrow_mut().ns_drop(argv[2]);
+    if argv.len() == 4 && argv[1].eq_ignore_ascii_case(b"DROP") {
+        // ADR-0100 D4: the leg carries the persist epoch of the catalog
+        // swap that drops the namespace; this cell's tier teardown holds
+        // until that epoch is durable (D5).
+        let epoch: u64 =
+            core::str::from_utf8(argv[3]).ok().and_then(|s| s.parse().ok()).ok_or(malformed)?;
+        let spec = shared.store.borrow_mut().ns_drop(argv[2])?;
+        if spec.tier.is_some() {
+            shared.ns_drop_releases.borrow_mut().push((spec.id, epoch));
+        }
+        return Ok(());
     }
     if argv.len() == 4 && argv[1].eq_ignore_ascii_case(b"SET") {
         let tier = tier_from_fan(argv[3])?.ok_or(malformed)?;
@@ -1400,6 +1449,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 cob_pubsub: Cell::new((0, 0, 0)),
                 durable: RefCell::new(None),
                 tier: RefCell::new(None),
+                ns_drop_releases: RefCell::new(Vec::new()),
                 ns_applies: RefCell::new((0..cells).map(|_| VecDeque::new()).collect::<Vec<_>>()),
                 ns_pump_active: RefCell::new(vec![false; usize::from(cells)]),
                 pump_gated: RefCell::new(VecDeque::new()),
@@ -1672,7 +1722,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let cold = {
             let mut tier_slot = self.shared.tier.borrow_mut();
             let Some(tier) = tier_slot.as_mut() else { return };
-            tier.sync_namespaces(&self.shared.store.borrow());
+            tier.sync_namespaces(
+                &self.shared.store.borrow(),
+                &mut self.shared.ns_drop_releases.borrow_mut(),
+            );
             if tier.namespaces.is_empty() && tier.cold.is_none() {
                 return;
             }
@@ -1725,7 +1778,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                     shadow_reads.extend(reads.into_iter().map(|read| (t.ns, read)));
                 }
             }
-            units += tier.maintain_teardown();
+            // ADR-0100 D5: a dropped namespace's files unlink only once
+            // the catalog swap carrying the drop is durable.
+            let control = self.shared.control.borrow().clone();
+            units += tier.maintain_teardown(|epoch| {
+                control.as_ref().is_none_or(|control| control.persisted(epoch))
+            });
             if units > 0 {
                 cx.charge(GroupClass::Maintenance, units);
             }
@@ -2097,6 +2155,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     rearm_recv: false,
                     cob_soft_since_ms: 0,
                     cob_kill_sent: false,
+                    publish_seq: 0,
+                    self_push: Vec::new(),
                 });
                 let id = (u64::from(key.slot) << 32) | u64::from(key.generation);
                 self.shared.with_conn(key, |conn| conn.cx.id = id);
@@ -3015,6 +3075,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 self.shared.ckpt_waiters.wake_all(0);
             }
             self.shared.node.rdb_last_save_ms.set(board.max_unix_ms());
+            self.shared.node.ns_drop_tombstones.set(control.drop_tombstones() as u64);
         }
         // ---- stats flush
         let node = &self.shared.node;
@@ -3628,6 +3689,10 @@ enum PendingReply {
     /// One remote `Apply` in flight; the owner's raw RESP reply parks in
     /// the gate if it lands before its turn.
     Remote { waiter: GateWait<u64, OwnedOutcome>, proto: Protocol },
+    /// A tagged remote `PUBLISH` (ADR-0101 D4): the count reply, then the
+    /// publisher's own frames stashed under `seq` by the tagged fan leg
+    /// — Redis's reply-then-push order across a remote owner.
+    Publish { waiter: GateWait<u64, OwnedOutcome>, proto: Protocol, seq: u64 },
     /// Split DEL/UNLINK/EXISTS/TOUCH (and scattered DBSIZE): locally-counted
     /// contributions in `acc`, remote per-key contributions in flight. A
     /// leg that answered a typed error instead of a count, or a leg that
@@ -3909,6 +3974,21 @@ async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 let outcome = waiter.await;
                 inflight -= 1;
                 render_outcome(&shared, outcome, proto)
+            }
+            PendingReply::Publish { waiter, proto, seq } => {
+                let outcome = waiter.await;
+                inflight -= 1;
+                let mut reply = render_outcome(&shared, outcome, proto);
+                // The owner replied only after this cell acked its fan
+                // leg, so a self-frame stash for `seq` is either already
+                // here or never existed (the publisher was not subscribed
+                // at delivery) — ADR-0101 D4.
+                if let Some(frames) =
+                    shared.with_conn(key, |conn| conn.take_self_push(seq)).flatten()
+                {
+                    reply.extend_from_slice(&frames);
+                }
+                reply
             }
             PendingReply::Counted { waiters, acc, proto, refusal } => {
                 // Every leg is awaited so nothing is orphaned in flight;
@@ -5254,11 +5334,41 @@ async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
                     pending.push_back(PendingReply::Done(self_frames));
                 }
             } else {
-                let publ = &[&b"INF.PUB"[..], channel, payload];
-                match send_apply(shared, owner, Protocol::Resp2, 0, publ).await {
+                // ADR-0101 D1: a subscribed publisher tags the forward
+                // with `(conn, seq)` so the owner's fan leg back to this
+                // cell defers the publisher's own frames to the reply
+                // (Redis: reply, then push). Subscription commands are
+                // conn-state barriers, so the set cannot change while the
+                // publish is in flight; unsubscribed publishers pay
+                // nothing and keep the three-arg form.
+                let seq = shared
+                    .with_conn(key, |conn| {
+                        let subscribed =
+                            !conn.cx.sub_channels.is_empty() || !conn.cx.sub_patterns.is_empty();
+                        subscribed.then(|| {
+                            conn.publish_seq += 1;
+                            conn.publish_seq
+                        })
+                    })
+                    .flatten();
+                let mut conn_buf = [0u8; 20];
+                let mut seq_buf = [0u8; 20];
+                let mut publ: [&[u8]; 5] = [&b"INF.PUB"[..], channel, payload, b"", b""];
+                let argc = match seq {
+                    Some(seq) => {
+                        publ[3] = u64_decimal(&mut conn_buf, key.packed());
+                        publ[4] = u64_decimal(&mut seq_buf, seq);
+                        5
+                    }
+                    None => 3,
+                };
+                match send_apply(shared, owner, Protocol::Resp2, 0, &publ[..argc]).await {
                     Ok(waiter) => {
                         *inflight += 1;
-                        pending.push_back(PendingReply::Remote { waiter, proto });
+                        pending.push_back(match seq {
+                            Some(seq) => PendingReply::Publish { waiter, proto, seq },
+                            None => PendingReply::Remote { waiter, proto },
+                        });
                     }
                     Err(refusal) => pending.push_back(PendingReply::Done(refusal)),
                 }
@@ -5368,7 +5478,13 @@ async fn owner_pub_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
         let targets = shared.pubsub.borrow().fan_targets(&item.channel, shared.cell.0);
         let mut waiters = Vec::new();
         for cell in targets {
-            let fan = &[&b"INF.PUBFAN"[..], &item.channel, &item.payload];
+            // ADR-0101 D2: the origin cell's leg echoes the publisher
+            // tag; every other leg keeps the three-arg form.
+            let tagged = item.tag.as_ref().filter(|_| cell == item.origin.0);
+            let fan: &[&[u8]] = match tagged {
+                Some((conn, seq)) => &[&b"INF.PUBFAN"[..], &item.channel, &item.payload, conn, seq],
+                None => &[&b"INF.PUBFAN"[..], &item.channel, &item.payload],
+            };
             if let Ok(waiter) = send_apply(&shared, CellId(cell), Protocol::Resp2, 0, fan).await {
                 note_fan(&shared.node);
                 waiters.push(waiter);
@@ -5497,15 +5613,23 @@ fn handle_pubsub_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
     pubs: &mut Vec<OwnerPub>,
 ) -> bool {
     let name = argv[0];
-    if name.eq_ignore_ascii_case(b"INF.PUBFAN") && argv.len() == 3 {
+    if name.eq_ignore_ascii_case(b"INF.PUBFAN") && matches!(argv.len(), 3 | 5) {
         // Subscriber-cell delivery leg: append frames locally, reply the
-        // typed per-cell receiver count. (A publisher subscribed to its own
-        // channel through a remote owner may see its message frame before
-        // its publish reply — recorded ordering deviation.)
-        let (delivered, _) = deliver_local(shared, argv[1], argv[2], None);
+        // typed per-cell receiver count. A tagged leg (ADR-0101 D3 — the
+        // publisher's own cell) writes the tagged connection's frames
+        // into its stash instead of its output, still counted; the
+        // pump emits them right after that publish's reply.
+        let tag = (argv.len() == 5).then(|| parse_publisher_tag(argv[3], argv[4])).flatten();
+        let (delivered, self_frames) =
+            deliver_local(shared, argv[1], argv[2], tag.map(|(conn, _)| conn));
+        if let Some((conn, seq)) = tag
+            && !self_frames.is_empty()
+        {
+            shared.with_conn(conn, |c| c.self_push.push((seq, self_frames)));
+        }
         staged.push((from, token, StagedReply::Int(delivered)));
         true
-    } else if name.eq_ignore_ascii_case(b"INF.PUB") && argv.len() == 3 {
+    } else if name.eq_ignore_ascii_case(b"INF.PUB") && matches!(argv.len(), 3 | 5) {
         // Owner leg of a remote PUBLISH: park for the owner pump (the
         // fabric is mutably borrowed by this drain; fan-out needs sends).
         pubs.push(OwnerPub {
@@ -5513,6 +5637,7 @@ fn handle_pubsub_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
             token,
             channel: argv[1].to_vec(),
             payload: argv[2].to_vec(),
+            tag: (argv.len() == 5).then(|| (argv[3].to_vec(), argv[4].to_vec())),
         });
         true
     } else if name.eq_ignore_ascii_case(b"INF.SUBD") && argv.len() == 4 {
@@ -5635,6 +5760,30 @@ fn enforce_output_cap(node: &NodeInfo, conn: &mut Conn, now_ms: u64, caps: (u64,
 
 fn note_fan(node: &NodeInfo) {
     node.pubsub_fan_msgs.set(node.pubsub_fan_msgs.get() + 1);
+}
+
+/// Decimal text of `v` in a caller-owned stack buffer (the publisher tag
+/// never allocates — ADR-0101 D1).
+fn u64_decimal(buf: &mut [u8; 20], mut v: u64) -> &[u8] {
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    &buf[at..]
+}
+
+/// The `(conn, seq)` publisher tag a fan leg carries (ADR-0101 D2/D3).
+/// Malformed text — impossible from a peer, harmless from anything
+/// else — reads as untagged.
+fn parse_publisher_tag(conn: &[u8], seq: &[u8]) -> Option<(ConnKey, u64)> {
+    let conn: u64 = core::str::from_utf8(conn).ok()?.parse().ok()?;
+    let seq: u64 = core::str::from_utf8(seq).ok()?.parse().ok()?;
+    Some((ConnKey::unpack(conn), seq))
 }
 
 /// `*N\r\n` array header → `(N, body offset)`. `None` for errors/nulls.
@@ -6312,7 +6461,10 @@ async fn program_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
 /// The namespace-DDL program (M2-S08, ADR-0015 D2/D3): parse → allocate id
 /// (CREATE) → apply locally → fan `INF.NSFAN` to every peer (AllOk) →
 /// persist the catalog through the control thread → `+OK` only after the
-/// swap is durable.
+/// swap is durable. `DROP` reorders to *apply → request persist → fan
+/// (carrying the persist epoch) → wait → request checkpoint + stamp →
+/// `+OK`* (ADR-0100 D3/D4), so every cell can hold its tier-file teardown
+/// on the swap that makes the drop durable.
 async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
@@ -6397,12 +6549,7 @@ async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
         if argv.len() != 3 {
             return error_reply(shared, proto, "ERR wrong number of arguments for 'INF.NS|DROP'");
         }
-        if let Err(e) = shared.store.borrow_mut().ns_drop(argv[2]) {
-            let mut reply = shared.take_reply_buf();
-            crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
-            return reply;
-        }
-        vec![b"INF.NSFAN".to_vec(), b"DROP".to_vec(), argv[2].to_vec()]
+        return program_ns_drop(shared, &control, proto, argv[2]).await;
     };
     // Fan to peers (AllOk — partial failure surfaces as the first error
     // leg, the recorded M1 scatter semantics).
@@ -6429,6 +6576,92 @@ async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     ));
     while !control.persisted(epoch) {
         shared.ddl_waiters.wait(0).await;
+    }
+    simple_reply(shared, proto, "OK")
+}
+
+/// `INF.NS DROP` (ADR-0100 D3/D4/D5): apply locally → request the catalog
+/// persist that carries the drop (a durable namespace's tombstone joins
+/// the payload) → fan `INF.NSFAN DROP name epoch` so every peer holds its
+/// tier-file teardown on that epoch → wait for the swap → request the
+/// node-wide checkpoint that retires the tombstone and stamp it → `+OK`.
+/// At the tombstone cap the drop first waits for a node-wide checkpoint
+/// (the `INF.CKPT WAIT` machinery) so the persist retires everything
+/// stamped — bounded backpressure, never an unbounded set.
+async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    control: &Arc<ControlHandle>,
+    proto: Protocol,
+    name: &[u8],
+) -> Vec<u8> {
+    let durable = shared.store.borrow().ns_get(name).is_some_and(|s| s.mode == NsMode::Durable);
+    if durable && control.drop_tombstones() >= crate::control::DROPPED_NS_MAX {
+        let epoch = control.request_ckpt_all();
+        while control.ckpt_board().min_published() < epoch {
+            shared.ckpt_waiters.wait(0).await;
+        }
+    }
+    let spec = match shared.store.borrow_mut().ns_drop(name) {
+        Ok(spec) => spec,
+        Err(e) => {
+            let mut reply = shared.take_reply_buf();
+            crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
+            return reply;
+        }
+    };
+    // Crash-matrix point: the on-disk state of a cut before the swap
+    // (nothing durable changed; the origin alone lacks the namespace).
+    // No persist will ever carry this drop, so the tier files hold
+    // until the restart restores the namespace from the intact META.
+    if inf_foundation::fault::fire(crate::fault::NS_DROP_BEFORE_META) {
+        if spec.tier.is_some() {
+            shared.ns_drop_releases.borrow_mut().push((spec.id, u64::MAX));
+        }
+        return error_reply(shared, proto, "ERR fault: ns_drop_before_meta");
+    }
+    let drop = (spec.mode == NsMode::Durable).then_some(spec.id.0);
+    let epoch = control.request_persist_drop(
+        shared.store.borrow().export_catalog(
+            control.next_ns_id(),
+            control.next_index_id(),
+            control.next_index_generation(),
+        ),
+        drop,
+    );
+    if spec.tier.is_some() {
+        shared.ns_drop_releases.borrow_mut().push((spec.id, epoch));
+    }
+    // The fan carries the epoch (ADR-0100 D4): peers park their teardown
+    // on it — no second fan, no derived epoch.
+    let epoch_text = epoch.to_string();
+    let fan: [&[u8]; 4] = [b"INF.NSFAN", b"DROP", name, epoch_text.as_bytes()];
+    while !control.persisted(epoch) {
+        shared.ddl_waiters.wait(0).await;
+    }
+    // Crash-matrix point: the on-disk state of a cut after the swap
+    // (META lacks the namespace and carries its tombstone; every
+    // MANIFEST still names it).
+    if inf_foundation::fault::fire(crate::fault::NS_DROP_AFTER_META) {
+        return error_reply(shared, proto, "ERR fault: ns_drop_after_meta");
+    }
+    let mut failure: Option<Vec<u8>> = None;
+    for cell in peer_cells(shared) {
+        if let Ok(waiter) = send_apply(shared, cell, proto, 0, &fan).await
+            && let OwnedOutcome::Bytes(bytes) = waiter.await
+            && bytes.first() == Some(&b'-')
+            && failure.is_none()
+        {
+            failure = Some(bytes);
+        }
+    }
+    if let Some(error) = failure {
+        return error;
+    }
+    if let Some(id) = drop {
+        // Every cell applied the drop: a checkpoint requested now
+        // publishes MANIFESTs without it (ADR-0100 D3).
+        let ckpt_epoch = control.request_ckpt_all();
+        control.stamp_drop(id, ckpt_epoch);
     }
     simple_reply(shared, proto, "OK")
 }

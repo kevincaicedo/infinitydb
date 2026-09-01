@@ -11,10 +11,18 @@
 //! allocated once, never reused — ADR-0015 D2): a shared `AtomicU32`
 //! seeded from the catalog's `next_id` at boot. One `fetch_add` per DDL is
 //! control-plane traffic; L1's no-shared-atomics rule binds the data plane.
+//!
+//! Since ADR-0100 D2 the writer also owns the **drop-tombstone set**: a
+//! durable namespace's `DROP` adds its id to every payload the writer
+//! emits until every cell has published a `MANIFEST` past the drop (the
+//! origin requests that checkpoint and stamps the tombstone with its
+//! epoch; the writer retires stamped tombstones at the next persist once
+//! `CkptBoard::min_published` covers them). Recovery reads the set to
+//! tell dropped residue from corruption.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -514,11 +522,89 @@ struct PersistReq {
     catalog: NsCatalog,
     /// The epoch value published once this snapshot is durable.
     epoch: u64,
+    /// The durable namespace this persist drops (ADR-0100 D2): its
+    /// tombstone joins the writer's set before the payload encodes.
+    drop: Option<u32>,
+}
+
+/// The catalog writer's live tombstone set (ADR-0100 D2/D3): one entry
+/// per durable namespace dropped since every cell last published a
+/// `MANIFEST` past the drop. Single owner — the thread (or the sim's
+/// inline inbox); cells only read the boot snapshot the catalog carries.
+#[derive(Debug, Default)]
+struct DropTombstones {
+    /// `(namespace id, checkpoint epoch that retires it)` — unstamped
+    /// entries never retire. Kept sorted by id (the wire order).
+    entries: Vec<(u32, Option<u64>)>,
+}
+
+/// Bound on live tombstones (ADR-0100 D3): at the cap a `DROP` waits for
+/// its own node-wide checkpoint before persisting, so `META` never
+/// carries more than 1 KiB of tombstones.
+pub const DROPPED_NS_MAX: usize = 256;
+
+impl DropTombstones {
+    fn seed(ids: &[u32]) -> DropTombstones {
+        DropTombstones { entries: ids.iter().map(|&id| (id, None)).collect() }
+    }
+
+    fn add(&mut self, id: u32) {
+        match self.entries.binary_search_by_key(&id, |e| e.0) {
+            Ok(_) => {}
+            Err(at) => self.entries.insert(at, (id, None)),
+        }
+    }
+
+    fn stamp(&mut self, id: u32, ckpt_epoch: u64) {
+        if let Ok(at) = self.entries.binary_search_by_key(&id, |e| e.0) {
+            // A re-stamp only ever comes from boot (every survivor gets
+            // one fresh epoch); a later stamp never lowers the bar.
+            let slot = &mut self.entries[at].1;
+            *slot = Some(slot.map_or(ckpt_epoch, |e| e.max(ckpt_epoch)));
+        }
+    }
+
+    /// Stamps every unstamped survivor (the boot re-stamp, ADR-0100 D3).
+    fn stamp_unstamped(&mut self, ckpt_epoch: u64) {
+        for entry in &mut self.entries {
+            if entry.1.is_none() {
+                entry.1 = Some(ckpt_epoch);
+            }
+        }
+    }
+
+    /// Retires every tombstone whose checkpoint every cell has published.
+    fn retire(&mut self, min_published: u64) {
+        self.entries.retain(|(_, epoch)| !epoch.is_some_and(|e| e <= min_published));
+    }
+
+    /// Merges the set into `catalog` (ADR-0100 D2): the payload carries
+    /// the ids, and an entry whose id is tombstoned is dropped — ids
+    /// never reuse, so such an entry is replica lag from a concurrent
+    /// DDL, never a live namespace.
+    fn reconcile(&self, catalog: &mut NsCatalog) {
+        catalog.dropped = self.entries.iter().map(|e| e.0).collect();
+        if !self.entries.is_empty() {
+            catalog
+                .entries
+                .retain(|e| self.entries.binary_search_by_key(&e.id.0, |t| t.0).is_err());
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 /// Control-thread work (single receiver, bounded — L3).
 enum ControlMsg {
     Persist(PersistReq),
+    /// The origin fanned a `DROP` and requested the node-wide checkpoint
+    /// that retires its tombstone (ADR-0100 D3).
+    StampDrop {
+        id: u32,
+        ckpt_epoch: u64,
+    },
     /// Blocking unlink delegated by a cell (M2-S11/S12, ADR-0017):
     /// freeing a truncated segment's or stale checkpoint's pages is
     /// O(file size) in the kernel — a measured multi-ms stall when done
@@ -552,9 +638,24 @@ pub struct ControlHandle {
     memory_board: Arc<MemoryBoard>,
     /// Per-cell index readiness (M4.5-S03, ADR-0075 D5).
     index_board: Arc<IndexBoard>,
+    /// Live drop tombstones (ADR-0100 D7 gauge + the D3 cap input);
+    /// written by the catalog writer after every change.
+    drop_tombstones: AtomicUsize,
 }
 
 impl ControlHandle {
+    /// Live drop tombstones in the catalog writer (ADR-0100 D3/D7).
+    pub fn drop_tombstones(&self) -> usize {
+        self.drop_tombstones.load(Ordering::Relaxed)
+    }
+
+    /// The origin's post-fan notice (ADR-0100 D3): `id`'s tombstone
+    /// retires once every cell publishes `ckpt_epoch`.
+    pub fn stamp_drop(&self, id: u32, ckpt_epoch: u64) {
+        self.tx
+            .send(ControlMsg::StampDrop { id, ckpt_epoch })
+            .expect("control thread alive (fail-stop)");
+    }
     /// Allocates one namespace id (never reused — ADR-0015 D2).
     pub fn alloc_ns_id(&self) -> u32 {
         self.next_ns_id.fetch_add(1, Ordering::Relaxed)
@@ -596,9 +697,16 @@ impl ControlHandle {
     /// blocks the *sender* briefly (DDL-rate traffic, never the data path
     /// of other connections — the pump yields between commands).
     pub fn request_persist(&self, catalog: NsCatalog) -> u64 {
+        self.request_persist_drop(catalog, None)
+    }
+
+    /// [`request_persist`](Self::request_persist) for a `DROP`: the
+    /// dropped durable namespace's tombstone joins the payload
+    /// (ADR-0100 D2). `None` is a plain persist.
+    pub fn request_persist_drop(&self, catalog: NsCatalog, drop: Option<u32>) -> u64 {
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         self.tx
-            .send(ControlMsg::Persist(PersistReq { catalog, epoch }))
+            .send(ControlMsg::Persist(PersistReq { catalog, epoch, drop }))
             .expect("control thread alive (fail-stop)");
         epoch
     }
@@ -685,6 +793,30 @@ pub fn load_catalog_from<F: inf_log::fs::SegmentFs>(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
+/// One catalog persist as the writer performs it (ADR-0015 D3 + ADR-0100
+/// D2/D3): counters cover their allocators, the drop joins the tombstone
+/// set, stamped tombstones every cell has checkpointed past retire, the
+/// set merges into the payload. Shared by the thread and the sim inbox
+/// so DST runs the same writer. Returns the encoded payload.
+fn prepare_persist(
+    handle: &ControlHandle,
+    tombstones: &mut DropTombstones,
+    req: PersistReq,
+) -> (Vec<u8>, u64) {
+    let mut catalog = req.catalog;
+    catalog.next_id = catalog.next_id.max(handle.next_ns_id());
+    catalog.index.next_id = catalog.index.next_id.max(handle.next_index_id());
+    catalog.index.next_generation =
+        catalog.index.next_generation.max(handle.next_index_generation());
+    if let Some(id) = req.drop {
+        tombstones.add(id);
+    }
+    tombstones.retire(handle.ckpt_board().min_published());
+    tombstones.reconcile(&mut catalog);
+    handle.drop_tombstones.store(tombstones.len(), Ordering::Relaxed);
+    (catalog.encode(), req.epoch)
+}
+
 /// The receiving end of a detached control plane (M2-S19, ADR-0021 D2):
 /// the sim cannot spawn the control thread (single-thread determinism),
 /// so [`ControlHandle::detached`] hands the message queue back and the
@@ -695,6 +827,8 @@ pub fn load_catalog_from<F: inf_log::fs::SegmentFs>(
 pub struct ControlInbox {
     rx: mpsc::Receiver<ControlMsg>,
     handle: Arc<ControlHandle>,
+    /// The writer's tombstone set (ADR-0100 D2) — inline, deterministic.
+    tombstones: DropTombstones,
 }
 
 impl std::fmt::Debug for ControlInbox {
@@ -710,17 +844,20 @@ impl ControlInbox {
     ///
     /// # Errors
     /// The catalog META swap failed — a DDL was acked against it (§8.4).
-    pub fn drain<F: inf_log::fs::SegmentFs>(&self, fs: &F, data_dir: &Path) -> std::io::Result<()> {
+    pub fn drain<F: inf_log::fs::SegmentFs>(
+        &mut self,
+        fs: &F,
+        data_dir: &Path,
+    ) -> std::io::Result<()> {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 ControlMsg::Persist(req) => {
-                    let mut catalog = req.catalog;
-                    catalog.next_id = catalog.next_id.max(self.handle.next_ns_id());
-                    catalog.index.next_id = catalog.index.next_id.max(self.handle.next_index_id());
-                    catalog.index.next_generation =
-                        catalog.index.next_generation.max(self.handle.next_index_generation());
-                    write_meta(fs, data_dir, &catalog.encode())?;
-                    self.handle.persisted_epoch.store(req.epoch, Ordering::Release);
+                    let (payload, epoch) = prepare_persist(&self.handle, &mut self.tombstones, req);
+                    write_meta(fs, data_dir, &payload)?;
+                    self.handle.persisted_epoch.store(epoch, Ordering::Release);
+                }
+                ControlMsg::StampDrop { id, ckpt_epoch } => {
+                    self.tombstones.stamp(id, ckpt_epoch);
                 }
                 ControlMsg::Unlink(path) => {
                     let _ = fs.remove_file(&path);
@@ -749,16 +886,20 @@ impl ControlHandle {
         cells: u16,
         start_unix_ms: u64,
     ) -> (Arc<ControlHandle>, ControlInbox) {
-        let (handle, rx) = ControlHandle::new_parts(seed, cells, start_unix_ms);
-        let inbox = ControlInbox { rx, handle: Arc::clone(&handle) };
+        let (handle, rx, tombstones) = ControlHandle::new_parts(seed, cells, start_unix_ms);
+        let inbox = ControlInbox { rx, handle: Arc::clone(&handle), tombstones };
         (handle, inbox)
     }
 
+    /// The handle, the writer's inbox, and the writer's tombstone set
+    /// seeded from the boot catalog — every survivor re-stamped with one
+    /// fresh node-wide checkpoint request (ADR-0100 D3: cells edge-detect
+    /// it after recovery, and the next persist retires what they cover).
     fn new_parts(
         seed: Option<&NsCatalog>,
         cells: u16,
         start_unix_ms: u64,
-    ) -> (Arc<ControlHandle>, mpsc::Receiver<ControlMsg>) {
+    ) -> (Arc<ControlHandle>, mpsc::Receiver<ControlMsg>, DropTombstones) {
         let next_id = seed.map_or(FIRST_NAMED_NS_ID, |c| c.next_id.max(FIRST_NAMED_NS_ID));
         let next_index_id = seed.map_or(FIRST_INDEX_ID, |c| c.index.next_id.max(FIRST_INDEX_ID));
         let next_index_generation = seed.map_or(FIRST_INDEX_GENERATION, |c| {
@@ -779,8 +920,15 @@ impl ControlHandle {
             recovery: Arc::new(RecoveryBoard::new(cells, start_unix_ms)),
             memory_board: Arc::new(MemoryBoard::new(cells)),
             index_board: Arc::new(IndexBoard::new(cells)),
+            drop_tombstones: AtomicUsize::new(0),
         });
-        (handle, rx)
+        let mut tombstones = DropTombstones::seed(seed.map_or(&[][..], |c| &c.dropped));
+        if tombstones.len() > 0 {
+            let epoch = handle.request_ckpt_all();
+            tombstones.stamp_unstamped(epoch);
+            handle.drop_tombstones.store(tombstones.len(), Ordering::Relaxed);
+        }
+        (handle, rx, tombstones)
     }
 }
 
@@ -796,7 +944,7 @@ pub fn spawn(
     cells: u16,
     start_unix_ms: u64,
 ) -> Arc<ControlHandle> {
-    let (handle, rx) = ControlHandle::new_parts(seed, cells, start_unix_ms);
+    let (handle, rx, tombstones) = ControlHandle::new_parts(seed, cells, start_unix_ms);
     let allocator = Arc::clone(&handle);
     let persisted = Arc::clone(&handle.persisted_epoch);
     let board = Arc::clone(&handle.recovery);
@@ -809,7 +957,7 @@ pub fn spawn(
             // silently dead — the ADR-0026 D2 class. Same boundary as
             // the cell threads (M2.5-S01/S16): panic ⇒ loud process exit.
             let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                control_main(&data_dir, &allocator, &persisted, &board, &rx, cells);
+                control_main(&data_dir, &allocator, &persisted, &board, &rx, cells, tombstones);
             }));
             if body.is_err() {
                 // The default hook already printed the panic.
@@ -830,20 +978,17 @@ fn control_main(
     board: &Arc<RecoveryBoard>,
     rx: &mpsc::Receiver<ControlMsg>,
     cells: u16,
+    mut tombstones: DropTombstones,
 ) {
     {
-        let handle_msg = |msg: ControlMsg| match msg {
+        let mut handle_msg = |msg: ControlMsg| match msg {
             ControlMsg::Persist(req) => {
                 // The persisted counters must always cover their
                 // allocators so ids and generations never regress
                 // across restart, even for DDL that raced this
-                // snapshot (ADR-0015 D2; index counters ADR-0075 D1).
-                let mut catalog = req.catalog;
-                catalog.next_id = catalog.next_id.max(allocator.next_ns_id());
-                catalog.index.next_id = catalog.index.next_id.max(allocator.next_index_id());
-                catalog.index.next_generation =
-                    catalog.index.next_generation.max(allocator.next_index_generation());
-                let payload = catalog.encode();
+                // snapshot (ADR-0015 D2; index counters ADR-0075 D1);
+                // the tombstone set merges in (ADR-0100 D2).
+                let (payload, epoch) = prepare_persist(allocator, &mut tombstones, req);
                 if let Err(err) = write_meta(&StdSegmentFs, data_dir, &payload) {
                     // §8.4 fail-stop: a DDL was acked against this
                     // swap. `process::exit`, never `panic!` — this
@@ -856,8 +1001,9 @@ fn control_main(
                     eprintln!("FATAL: catalog META swap failed (fail-stop, §8.4): {err}");
                     std::process::exit(crate::EXIT_DURABLE_FAILSTOP);
                 }
-                persisted.store(req.epoch, Ordering::Release);
+                persisted.store(epoch, Ordering::Release);
             }
+            ControlMsg::StampDrop { id, ckpt_epoch } => tombstones.stamp(id, ckpt_epoch),
             ControlMsg::Unlink(path) => {
                 // Never fatal: the file is outside every recovery
                 // unit; a survivor is re-collected at boot.
@@ -965,5 +1111,62 @@ fn control_main(
         }
         // Channel closed = node shutdown; nothing to flush (every
         // acked DDL already persisted before its reply).
+    }
+}
+
+#[cfg(test)]
+mod drop_tombstone_tests {
+    use inf_store::{IndexCatalog, NsCatalog, NsMode, NsSpec};
+
+    use super::DropTombstones;
+
+    fn entry(id: u32) -> NsSpec {
+        NsSpec {
+            id: inf_log::NsId(id),
+            name: format!("ns{id}").into_bytes(),
+            mode: NsMode::Durable,
+            fsync: Some(inf_log::FsyncClass::Everysec),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        }
+    }
+
+    /// ADR-0100 D2/D3: add → stamp → retire once every cell published the
+    /// stamped epoch; unstamped tombstones never retire; the payload
+    /// carries the sorted set and loses any entry the set names.
+    #[test]
+    fn tombstones_add_stamp_retire_and_reconcile() {
+        let mut t = DropTombstones::default();
+        t.add(18);
+        t.add(16);
+        t.add(18);
+        assert_eq!(t.entries, vec![(16, None), (18, None)]);
+        t.retire(u64::MAX);
+        assert_eq!(t.len(), 2, "unstamped tombstones never retire");
+        t.stamp(16, 3);
+        t.retire(2);
+        assert_eq!(t.len(), 2, "not every cell published epoch 3 yet");
+        t.retire(3);
+        assert_eq!(t.entries, vec![(18, None)]);
+        // Boot re-stamp: only the unstamped survivor takes the epoch; a
+        // later stamp never lowers an existing bar.
+        t.add(20);
+        t.stamp(20, 9);
+        t.stamp_unstamped(5);
+        assert_eq!(t.entries, vec![(18, Some(5)), (20, Some(9))]);
+        t.stamp(20, 7);
+        assert_eq!(t.entries[1], (20, Some(9)));
+        let mut catalog = NsCatalog {
+            next_id: 21,
+            entries: vec![entry(17), entry(18)],
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
+        t.reconcile(&mut catalog);
+        assert_eq!(catalog.dropped, vec![18, 20]);
+        assert_eq!(catalog.entries.len(), 1, "a tombstoned entry is replica lag, never live");
+        assert_eq!(catalog.entries[0].id.0, 17);
+        assert_eq!(NsCatalog::decode(&catalog.encode()).expect("v4 payload"), catalog);
     }
 }

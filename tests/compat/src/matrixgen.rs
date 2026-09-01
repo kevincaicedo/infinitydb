@@ -206,12 +206,7 @@ pub static DECLARED: &[Declared] = &[
     ),
     d("PSUBSCRIBE", Status::Full, "M1", ""),
     d("PUNSUBSCRIBE", Status::Full, "M1", "same bare-form ordering note as UNSUBSCRIBE"),
-    d(
-        "PUBLISH",
-        Status::Full,
-        "M1",
-        "a publisher subscribed to its own channel via a remote owner cell may receive its frame before the publish reply (local owners match Redis order)",
-    ),
+    d("PUBLISH", Status::Full, "M1", ""),
     d(
         "PUBSUB",
         Status::Partial,

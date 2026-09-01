@@ -464,6 +464,10 @@ fn main() {
             let mut diskfull_refusals = 0u64;
             let mut drop_values = 0u64;
             let mut drop_other = 0u64;
+            let mut drop_reboots = 0u64;
+            let mut drop_reboot_residue = 0u64;
+            let mut drop_cut_whole = 0u64;
+            let mut drop_cut_swept = 0u64;
             let mut shadow_seeds = 0u64;
             let mut shadow_created = 0u64;
             let mut shadow_same_key = 0u64;
@@ -523,6 +527,13 @@ fn main() {
                 diskfull_refusals += report.diskfull_refusals;
                 drop_values += report.drop_replies_value;
                 drop_other += report.drop_replies_other;
+                drop_reboots += u64::from(report.drop_reboot_ok);
+                drop_reboot_residue += u64::from(report.drop_reboot_manifest_residue);
+                match report.drop_cut_outcome {
+                    inf_sim::tiered::DropCutOutcome::Whole => drop_cut_whole += 1,
+                    inf_sim::tiered::DropCutOutcome::Swept => drop_cut_swept += 1,
+                    inf_sim::tiered::DropCutOutcome::NotReached => {}
+                }
                 if report.refused_boot && report.ok() {
                     refused += 1;
                     lines.push(format!("{seed:#x} refused (taxonomy fail-stop)"));
@@ -543,7 +554,9 @@ fn main() {
                  violations, {refused} legal taxonomy refusals, {commands} commands, {audited} \
                  keys audited, {flushed_pre_cut} B flushed pre-cut, {cold_resolves} cold \
                  resolves, {blob_sets} blob sets, {diskfull_refusals} DISKFULL refusals, \
-                 drop-race {drop_values} values / {drop_other} typed-other; shadow arm on \
+                 drop-race {drop_values} values / {drop_other} typed-other; post-drop reboots \
+                 {drop_reboots} ({drop_reboot_residue} with MANIFEST residue), cut inside DROP: \
+                 {drop_cut_whole} whole / {drop_cut_swept} swept (ADR-0100); shadow arm on \
                  {shadow_seeds} seeds: {shadow_created} tickets ({shadow_at_cut} open at the \
                  cut), {shadow_same_key} same-key / {shadow_collision} collision verdicts, \
                  {shadow_stale} stale, {shadow_fallbacks} fallbacks; forced collisions: \
@@ -567,6 +580,8 @@ fn main() {
                      flushed_pre_cut={flushed_pre_cut} cold_resolves={cold_resolves} \
                      blob_sets={blob_sets} diskfull_refusals={diskfull_refusals} \
                      drop_values={drop_values} drop_other={drop_other} \
+                     drop_reboots={drop_reboots} drop_reboot_residue={drop_reboot_residue} \
+                     drop_cut_whole={drop_cut_whole} drop_cut_swept={drop_cut_swept} \
                      shadow_seeds={shadow_seeds} shadow_created={shadow_created} \
                      shadow_at_cut={shadow_at_cut} shadow_same_key={shadow_same_key} \
                      shadow_collision={shadow_collision} shadow_stale={shadow_stale} \
@@ -595,7 +610,8 @@ fn main() {
             "inf-sim: m4-tiered seed {seed:#x}: {} commands, {} steps, {} keys audited, {} \
              required ops, {} allowed-lost, {} B flushed pre-cut, {} B flushed final, {} cold \
              resolves, {} blob sets, {} DISKFULL refusals (reopened: {}), drop-race {} values / \
-             {} typed-other, refused-boot {}, shadow arm {} ({} tickets, {} open at the cut, \
+             {} typed-other, post-drop reboot {} (MANIFEST residue {}), cut inside DROP after {} \
+             steps: {:?}, refused-boot {}, shadow arm {} ({} tickets, {} open at the cut, \
              {} same-key / {} collision, {} stale, {} fallbacks; phase 6b cold resolves {}; \
              phase 6c {} pairs: {} tickets, {} collision verdicts, {} ticketed fallbacks, {} \
              DBSIZE drains, {} SCAN twins), trace {} bytes, hash {:#018x}",
@@ -612,6 +628,10 @@ fn main() {
             report.diskfull_reopened,
             report.drop_replies_value,
             report.drop_replies_other,
+            report.drop_reboot_ok,
+            report.drop_reboot_manifest_residue,
+            report.drop_cut_steps,
+            report.drop_cut_outcome,
             report.refused_boot,
             report.shadow_arm,
             report.shadow_created,

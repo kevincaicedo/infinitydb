@@ -578,7 +578,15 @@ unchanged: the pub/sub fan-out vocabulary (`INF.PUB`/`INF.PUBFAN`/
 `INF.SUBD`/`INF.PUBSUB`) rides `Op::Apply` as unregistered argv programs
 intercepted by the plane ahead of `execute` — invisible to clients,
 reserved names for the fabric. See ADR-0010 (M1-E5 pub/sub plane; internal
-decision record).
+decision record). **ADR-0101 (2026-09-01, review finding N4):** `INF.PUB`
+and the owner's `INF.PUBFAN` leg *to the origin cell* carry two optional
+trailing arguments — the publisher tag `conn seq` (the origin's packed
+connection key and its remote-publish sequence, decimal, opaque to the
+owner) — present iff the publishing connection holds a subscription. The
+tagged leg stashes the publisher's own frames on that connection; the pump
+emits them right after the count reply, so the remote-owner arm now
+matches Redis's reply-then-push order. Every other leg keeps the three-arg
+form; the codec is untouched.
 
 **Linux-validation note (updated 2026-06-11):** the io_uring backend is now
 exercised on real Linux (kernel 7.0): conformance suite green in probed

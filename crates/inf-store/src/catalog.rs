@@ -1,6 +1,7 @@
-//! Namespace-catalog encoding **v2/v3** (M2-S08/ADR-0015 D3 shape;
+//! Namespace-catalog encoding **v2/v3/v4** (M2-S08/ADR-0015 D3 shape;
 //! M4-S19/ADR-0062 D6 adds the tier block; M4.5-S03/ADR-0075 D2 adds the
-//! v3 index section): the bytes that ride `inf-log`'s `META` envelope.
+//! v3 index section; ADR-0100 D1 adds the v4 drop-tombstone section):
+//! the bytes that ride `inf-log`'s `META` envelope.
 //! The envelope (write/fsync/rename swap, CRC, version tag) is
 //! `inf-log`'s protocol and treats this payload as opaque; `inf-store`
 //! owns only the encoding and still never opens a file.
@@ -8,11 +9,16 @@
 //! ## Wire format v2/v3 (all integers little-endian)
 //!
 //! ```text
-//! catalog := version: u8 (= 2 | 3)
+//! catalog := version: u8 (= 2 | 3 | 4)
 //!            next_id: u32          # node id counter; named ids start at 16
 //!            count:   u32          # entry count
 //!            entry*count
-//!            [index_section]       # v3 only (ADR-0075 D2)
+//!            [index_section]       # v3+ (ADR-0075 D2); always present in v4
+//!            [dropped_section]     # v4 only (ADR-0100 D1)
+//! dropped_section := dropped_count: u32      # ≤ DROPPED_IDS_MAX
+//!                    dropped_id: u32 * dropped_count
+//!                    # strictly ascending; each ≥ 16, < next_id, and
+//!                    # absent from the entries (ids never reuse)
 //! index_section := next_index_id: u32        # ≥ 1; never regresses
 //!                  next_generation: u64      # ≥ 1; never regresses
 //!                  index_count: u32          # ≤ INDEXES_PER_NODE_MAX
@@ -44,14 +50,21 @@
 //!               tail_stall_timeout_ms: u32
 //! ```
 //!
-//! **v1 and v2 decode forever** (ADR-0062 D6 / ADR-0075 D2): v1 is v2
-//! without the tier byte; v2 is v3 without the index section — both
-//! decode index-absent. The writer emits **v3 iff the index feature has
-//! been used** (any index entry, or a moved index counter — a
-//! created-then-dropped index must not reset its id space) and v2
-//! byte-identically otherwise: never-indexed nodes stay
+//! **v1, v2 and v3 decode forever** (ADR-0062 D6 / ADR-0075 D2 /
+//! ADR-0100 D1): v1 is v2 without the tier byte; v2 is v3 without the
+//! index section; v3 is v4 without the drop-tombstone section — each
+//! decodes with the later sections absent. The writer emits **v4 iff a
+//! drop tombstone is live**, else **v3 iff the index feature has been
+//! used** (any index entry, or a moved index counter — a
+//! created-then-dropped index must not reset its id space), and v2
+//! byte-identically otherwise: never-indexed, tombstone-free nodes stay
 //! downgrade-unaffected, the degenerate-case-is-absence rule at the
-//! format layer (ADR-0073 D2 precedent). Versions above 3 fail-stop.
+//! format layer (ADR-0073 D2 precedent). Versions above 4 fail-stop.
+//!
+//! The tombstone set is **owned by the catalog writer** (the control
+//! thread, ADR-0100 D2): cell exports leave `dropped` empty and the
+//! writer merges its live set into every payload it writes — `NsCatalog`
+//! carries the field so one encoder serves both.
 //!
 //! Decode is **fail-stop** for callers (§8.4 honesty): unknown version,
 //! truncation, trailing bytes, invalid mode/fsync/policy/tier bytes,
@@ -79,6 +92,12 @@ use crate::index_registry::{
 };
 use crate::ns::{FIRST_NAMED_NS_ID, NsMode, NsSpec, TierSpec, is_default_name, valid_ns_name};
 
+/// v4 = v3 + the drop-tombstone section (ADR-0100 D1); the index
+/// section is always present in v4.
+const CATALOG_VERSION_V4: u8 = 4;
+/// Format bound on the tombstone section (the writer's own bound,
+/// `DROPPED_NS_MAX`, is smaller — a payload above this is corrupt).
+pub const DROPPED_IDS_MAX: usize = 4096;
 /// v3 = v2 + the index section (M4.5-S03, ADR-0075 D2).
 const CATALOG_VERSION_V3: u8 = 3;
 const CATALOG_VERSION: u8 = 2;
@@ -133,6 +152,11 @@ pub struct NsCatalog {
     pub entries: Vec<NsSpec>,
     /// Index declarations + counters (M4.5-S03, ADR-0075 D2).
     pub index: IndexCatalog,
+    /// Drop tombstones (ADR-0100 D1/D2): ids of durable namespaces whose
+    /// `DROP` is durable but whose per-cell `MANIFEST`/checkpoint residue
+    /// may still name them. Owned by the catalog writer — cell exports
+    /// leave it empty. Strictly ascending; never a live entry.
+    pub dropped: Vec<u32>,
 }
 
 /// Why a catalog payload failed to decode. Every variant means the `META`
@@ -188,6 +212,11 @@ pub enum CatalogError {
     /// catalog refuses typed rather than silently dropping them (L8;
     /// the ADR-0073 D7 boundary posture).
     IndexesRequireDocBuild,
+    /// A drop tombstone violates the v4 rules (ADR-0100 D1): reserved
+    /// id, not strictly ascending, at or above `next_id`, naming a live
+    /// entry, or a section above [`DROPPED_IDS_MAX`] (carried as
+    /// `u32::MAX`).
+    InvalidDroppedId(u32),
 }
 
 impl fmt::Display for CatalogError {
@@ -226,6 +255,12 @@ impl fmt::Display for CatalogError {
             CatalogError::IndexesRequireDocBuild => {
                 write!(f, "catalog declares indexes but this build has no document engine")
             }
+            CatalogError::InvalidDroppedId(id) => {
+                write!(
+                    f,
+                    "invalid drop tombstone {id} (reserved, unordered, live, or above next_id)"
+                )
+            }
         }
     }
 }
@@ -233,10 +268,14 @@ impl fmt::Display for CatalogError {
 impl std::error::Error for CatalogError {}
 
 impl NsCatalog {
-    /// Encodes the catalog (see module docs): v3 when the index feature
-    /// has been used, v2 byte-identically otherwise (ADR-0075 D2.2).
-    /// Durable entries always encode a resolved fsync class (`None` →
-    /// `everysec`).
+    /// Encodes the catalog (see module docs): v4 when a drop tombstone is
+    /// live, v3 when the index feature has been used, v2 byte-identically
+    /// otherwise (ADR-0075 D2.2, ADR-0100 D1). Durable entries always
+    /// encode a resolved fsync class (`None` → `everysec`).
+    ///
+    /// # Panics
+    /// A tombstone set that violates its own rules (unsorted, reserved,
+    /// live) — the writer builds it, so that is a violated invariant.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let payload: usize = self
@@ -244,9 +283,16 @@ impl NsCatalog {
             .iter()
             .map(|e| 17 + if e.tier.is_some() { TIER_BLOCK_BYTES } else { 0 } + e.name.len())
             .sum();
-        let mut out = Vec::with_capacity(9 + payload);
+        let mut out = Vec::with_capacity(9 + payload + 4 * self.dropped.len());
         let pristine = self.index.is_pristine();
-        out.push(if pristine { CATALOG_VERSION } else { CATALOG_VERSION_V3 });
+        let version = if !self.dropped.is_empty() {
+            CATALOG_VERSION_V4
+        } else if pristine {
+            CATALOG_VERSION
+        } else {
+            CATALOG_VERSION_V3
+        };
+        out.push(version);
         out.extend_from_slice(&self.next_id.to_le_bytes());
         out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for e in &self.entries {
@@ -267,24 +313,35 @@ impl NsCatalog {
             out.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
             out.extend_from_slice(&e.name);
         }
-        if !pristine {
+        if version >= CATALOG_VERSION_V3 {
             encode_index_section(&self.index, &mut out);
+        }
+        if version >= CATALOG_VERSION_V4 {
+            debug_assert!(
+                validate_dropped(&self.dropped, self.next_id, &self.entries).is_ok(),
+                "the writer builds a rule-abiding tombstone set"
+            );
+            out.extend_from_slice(&(self.dropped.len() as u32).to_le_bytes());
+            for id in &self.dropped {
+                out.extend_from_slice(&id.to_le_bytes());
+            }
         }
         out
     }
 
-    /// Decodes a v1, v2, or v3 payload, enforcing every format and
+    /// Decodes a v1, v2, v3, or v4 payload, enforcing every format and
     /// registry rule (see module docs). v1 — the v0.3.0-alpha on-disk
     /// format — is v2 without the tier byte; v2 is v3 without the index
-    /// section; both decode index-absent (a shipped catalog never
-    /// becomes unreadable).
+    /// section; v3 is v4 without the tombstone section; each decodes
+    /// with the later sections absent (a shipped catalog never becomes
+    /// unreadable).
     ///
     /// # Errors
     /// A [`CatalogError`] naming the violated rule; callers fail-stop.
     pub fn decode(buf: &[u8]) -> Result<NsCatalog, CatalogError> {
         let mut r = Cursor { buf, at: 0 };
         let version = r.u8()?;
-        if !(CATALOG_VERSION_V1..=CATALOG_VERSION_V3).contains(&version) {
+        if !(CATALOG_VERSION_V1..=CATALOG_VERSION_V4).contains(&version) {
             return Err(CatalogError::UnknownVersion(version));
         }
         let next_id = r.u32_le()?;
@@ -302,11 +359,55 @@ impl NsCatalog {
         } else {
             IndexCatalog::default()
         };
+        let dropped = if version >= CATALOG_VERSION_V4 {
+            decode_dropped_section(&mut r, next_id, &entries)?
+        } else {
+            Vec::new()
+        };
         if r.at != buf.len() {
             return Err(CatalogError::TrailingBytes);
         }
-        Ok(NsCatalog { next_id, entries, index })
+        Ok(NsCatalog { next_id, entries, index, dropped })
     }
+}
+
+/// The v4 tombstone rules (ADR-0100 D1): strictly ascending, each a named
+/// id below `next_id`, none a live entry.
+fn validate_dropped(dropped: &[u32], next_id: u32, entries: &[NsSpec]) -> Result<(), CatalogError> {
+    if dropped.len() > DROPPED_IDS_MAX {
+        return Err(CatalogError::InvalidDroppedId(u32::MAX));
+    }
+    let mut prev: Option<u32> = None;
+    for &id in dropped {
+        if id < FIRST_NAMED_NS_ID
+            || id >= next_id
+            || prev.is_some_and(|p| id <= p)
+            || entries.iter().any(|e| e.id.0 == id)
+        {
+            return Err(CatalogError::InvalidDroppedId(id));
+        }
+        prev = Some(id);
+    }
+    Ok(())
+}
+
+/// Decodes the v4 tombstone section against the already-decoded entries.
+/// Fail-stop strict: nothing is skipped or repaired.
+fn decode_dropped_section(
+    r: &mut Cursor<'_>,
+    next_id: u32,
+    entries: &[NsSpec],
+) -> Result<Vec<u32>, CatalogError> {
+    let count = r.u32_le()? as usize;
+    if count > DROPPED_IDS_MAX {
+        return Err(CatalogError::InvalidDroppedId(u32::MAX));
+    }
+    let mut dropped = Vec::with_capacity(count);
+    for _ in 0..count {
+        dropped.push(r.u32_le()?);
+    }
+    validate_dropped(&dropped, next_id, entries)?;
+    Ok(dropped)
 }
 
 fn decode_entry(r: &mut Cursor<'_>, version: u8) -> Result<NsSpec, CatalogError> {
@@ -691,7 +792,12 @@ mod tests {
 
     #[test]
     fn empty_catalog_round_trips() {
-        let cat = NsCatalog { next_id: 16, entries: Vec::new(), index: IndexCatalog::default() };
+        let cat = NsCatalog {
+            next_id: 16,
+            entries: Vec::new(),
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
         assert_eq!(NsCatalog::decode(&cat.encode()), Ok(cat));
     }
 
@@ -728,7 +834,12 @@ mod tests {
         // Topic: format-valid (mode byte 2); the registry rejects it at
         // seed time until M5.
         entries.push(entry(id, b"topic-0", NsMode::Topic));
-        let cat = NsCatalog { next_id: id + 1, entries, index: IndexCatalog::default() };
+        let cat = NsCatalog {
+            next_id: id + 1,
+            entries,
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
         assert_eq!(NsCatalog::decode(&cat.encode()), Ok(cat));
     }
 
@@ -738,6 +849,7 @@ mod tests {
             next_id: 17,
             entries: vec![entry(16, b"ledger", NsMode::Durable)],
             index: IndexCatalog::default(),
+            dropped: Vec::new(),
         };
         let decoded = NsCatalog::decode(&cat.encode()).expect("decode");
         assert_eq!(decoded.entries[0].fsync, Some(FsyncClass::Everysec));
@@ -751,6 +863,7 @@ mod tests {
             next_id: 17,
             entries: vec![e, entry(17, b"cache", NsMode::Memory)],
             index: IndexCatalog::default(),
+            dropped: Vec::new(),
         };
         let buf = cat.encode();
         for cut in 0..buf.len() {
@@ -760,12 +873,20 @@ mod tests {
 
     #[test]
     fn bad_version_errors() {
-        let cat = NsCatalog { next_id: 16, entries: Vec::new(), index: IndexCatalog::default() };
+        let cat = NsCatalog {
+            next_id: 16,
+            entries: Vec::new(),
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
         let mut buf = cat.encode();
-        buf[0] = 4;
-        assert_eq!(NsCatalog::decode(&buf), Err(CatalogError::UnknownVersion(4)));
-        // v3 with no index section is short, not unknown (M4.5-S03).
+        buf[0] = 5;
+        assert_eq!(NsCatalog::decode(&buf), Err(CatalogError::UnknownVersion(5)));
+        // v3 with no index section is short, not unknown (M4.5-S03);
+        // v4 with neither section likewise (ADR-0100 D1).
         buf[0] = 3;
+        assert_eq!(NsCatalog::decode(&buf), Err(CatalogError::Truncated));
+        buf[0] = 4;
         assert_eq!(NsCatalog::decode(&buf), Err(CatalogError::Truncated));
     }
 
@@ -793,6 +914,7 @@ mod tests {
             next_id: 17,
             entries: vec![e, entry(17, b"plain", NsMode::Memory)],
             index: IndexCatalog::default(),
+            dropped: Vec::new(),
         };
         let decoded = NsCatalog::decode(&cat.encode()).expect("decode");
         assert_eq!(decoded, cat);
@@ -810,6 +932,7 @@ mod tests {
             next_id: 18,
             entries: vec![e, entry(17, b"cache", NsMode::Memory)],
             index: IndexCatalog::default(),
+            dropped: Vec::new(),
         };
         let decoded = NsCatalog::decode(&encode_v1(&cat)).expect("v1 decodes");
         assert_eq!(decoded, cat, "v1 is v2 with every entry tier-absent");
@@ -824,7 +947,12 @@ mod tests {
         let mut e = entry(16, b"tiered", NsMode::Durable);
         e.fsync = Some(FsyncClass::Everysec);
         e.tier = Some(TierSpec::for_budget(64 << 20));
-        let cat = NsCatalog { next_id: 17, entries: vec![e], index: IndexCatalog::default() };
+        let cat = NsCatalog {
+            next_id: 17,
+            entries: vec![e],
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
         let buf = cat.encode();
         for cut in 0..buf.len() {
             assert!(NsCatalog::decode(&buf[..cut]).is_err(), "cut at {cut} must not decode");
@@ -856,7 +984,12 @@ mod tests {
         let mut e = entry(16, b"tiered", NsMode::Durable);
         e.fsync = Some(FsyncClass::Everysec);
         e.tier = Some(TierSpec::for_budget(64 << 20));
-        let cat = NsCatalog { next_id: 17, entries: vec![e], index: IndexCatalog::default() };
+        let cat = NsCatalog {
+            next_id: 17,
+            entries: vec![e],
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
         let mut buf = cat.encode();
         // Flip the mode byte to memory; zero the fsync byte to keep the
         // fsync cross-rule satisfied — the tier rule must fire.
@@ -874,6 +1007,7 @@ mod tests {
             next_id: 18,
             entries: vec![entry(16, b"one", NsMode::Memory), entry(16, b"two", NsMode::Memory)],
             index: IndexCatalog::default(),
+            dropped: Vec::new(),
         };
         assert_eq!(NsCatalog::decode(&cat.encode()), Err(CatalogError::DuplicateId(16)));
     }
@@ -884,6 +1018,7 @@ mod tests {
             next_id: 16,
             entries: vec![entry(3, b"sneaky", NsMode::Memory)],
             index: IndexCatalog::default(),
+            dropped: Vec::new(),
         };
         assert_eq!(NsCatalog::decode(&cat.encode()), Err(CatalogError::ReservedId(3)));
     }
@@ -899,7 +1034,12 @@ mod tests {
             tier: Some(TierSpec::for_budget(64 << 20)),
             ..entry(16, b"hot", NsMode::Durable)
         };
-        let cat = NsCatalog { next_id: 17, entries: vec![bad], index: IndexCatalog::default() };
+        let cat = NsCatalog {
+            next_id: 17,
+            entries: vec![bad],
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
         assert_eq!(NsCatalog::decode(&cat.encode()), Err(CatalogError::TierOwnsBudget(16)));
     }
 
@@ -909,6 +1049,7 @@ mod tests {
             next_id: 17,
             entries: vec![entry(16, b"cache", NsMode::Memory)],
             index: IndexCatalog::default(),
+            dropped: Vec::new(),
         };
         let buf = cat.encode();
         // Entry layout after the 9-byte header: id(4) mode(1) fsync(1)
@@ -943,6 +1084,7 @@ mod tests {
             next_id: 17,
             entries: vec![entry(16, b"ok", NsMode::Memory)],
             index: IndexCatalog::default(),
+            dropped: Vec::new(),
         };
         let mut buf = cat.encode();
         let space_at = buf.len() - 2;
@@ -953,13 +1095,19 @@ mod tests {
             next_id: 17,
             entries: vec![entry(16, b"db0", NsMode::Memory)],
             index: IndexCatalog::default(),
+            dropped: Vec::new(),
         };
         assert_eq!(NsCatalog::decode(&dflt.encode()), Err(CatalogError::InvalidName));
     }
 
     #[test]
     fn trailing_bytes_are_rejected() {
-        let cat = NsCatalog { next_id: 16, entries: Vec::new(), index: IndexCatalog::default() };
+        let cat = NsCatalog {
+            next_id: 16,
+            entries: Vec::new(),
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
         let mut buf = cat.encode();
         buf.push(0);
         assert_eq!(NsCatalog::decode(&buf), Err(CatalogError::TrailingBytes));
@@ -1021,6 +1169,7 @@ mod tests {
                 next_id: 17,
                 entries: vec![entry(16, b"docs", NsMode::Memory)],
                 index: IndexCatalog { next_id: 10, next_generation: 100, entries },
+                dropped: Vec::new(),
             };
             let buf = cat.encode();
             assert_eq!(buf[0], 3, "index-bearing catalogs are v3");
@@ -1038,6 +1187,7 @@ mod tests {
                 next_id: 17,
                 entries: vec![e.clone(), entry(17, b"cache", NsMode::Memory)],
                 index: IndexCatalog::default(),
+                dropped: Vec::new(),
             };
             let buf = cat.encode();
             assert_eq!(buf[0], 2);
@@ -1066,6 +1216,7 @@ mod tests {
                 next_id: 16,
                 entries: Vec::new(),
                 index: IndexCatalog { next_id: 5, next_generation: 9, entries: Vec::new() },
+                dropped: Vec::new(),
             };
             let buf = cat.encode();
             assert_eq!(buf[0], 3);
@@ -1085,6 +1236,7 @@ mod tests {
                     next_generation: 4,
                     entries: vec![idx(1, 16, b"by-price", IndexState::Ready, IndexKeyType::F64)],
                 },
+                dropped: Vec::new(),
             };
             let buf = cat.encode();
             for cut in 0..buf.len() {
@@ -1099,6 +1251,7 @@ mod tests {
                 next_id: 17,
                 entries: vec![entry(16, b"cache", NsMode::Memory)],
                 index: IndexCatalog::default(),
+                dropped: Vec::new(),
             };
             let decoded = NsCatalog::decode(&cat.encode()).expect("v2 decodes");
             assert!(decoded.index.is_pristine());
@@ -1120,6 +1273,7 @@ mod tests {
                     t
                 }],
                 index,
+                dropped: Vec::new(),
             };
             let with = |entries: Vec<IndexSpec>| IndexCatalog {
                 next_id: 100,
@@ -1179,6 +1333,7 @@ mod tests {
                     next_generation: 4,
                     entries: vec![idx(1, 16, b"by-price", IndexState::Ready, IndexKeyType::F64)],
                 },
+                dropped: Vec::new(),
             };
             let buf = cat.encode();
             // Section layout after the 9-byte header + one memory entry
@@ -1215,6 +1370,7 @@ mod tests {
                 next_id: 17,
                 entries: vec![entry(16, b"docs", NsMode::Memory)],
                 index,
+                dropped: Vec::new(),
             };
             let zero_id = IndexSpec { id: IndexId(0), ..ok.clone() };
             assert_eq!(
@@ -1254,13 +1410,91 @@ mod tests {
     fn maxmemory_sentinel_is_inherit() {
         let mut e = entry(16, b"cap", NsMode::Memory);
         e.maxmemory = Some(4096);
-        let cat = NsCatalog { next_id: 17, entries: vec![e], index: IndexCatalog::default() };
+        let cat = NsCatalog {
+            next_id: 17,
+            entries: vec![e],
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
         let decoded = NsCatalog::decode(&cat.encode()).expect("decode");
         assert_eq!(decoded.entries[0].maxmemory, Some(4096));
         let mut e = entry(16, b"cap", NsMode::Memory);
         e.maxmemory = None;
-        let cat = NsCatalog { next_id: 17, entries: vec![e], index: IndexCatalog::default() };
+        let cat = NsCatalog {
+            next_id: 17,
+            entries: vec![e],
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
         let decoded = NsCatalog::decode(&cat.encode()).expect("decode");
         assert_eq!(decoded.entries[0].maxmemory, None);
+    }
+    // ---- ADR-0100 D1: the v4 drop-tombstone section ----
+
+    #[test]
+    fn dropped_tombstones_round_trip_as_v4_with_a_pristine_index() {
+        let cat = NsCatalog {
+            next_id: 20,
+            entries: vec![entry(17, b"live", NsMode::Memory)],
+            index: IndexCatalog::default(),
+            dropped: vec![16, 18, 19],
+        };
+        let buf = cat.encode();
+        assert_eq!(buf[0], CATALOG_VERSION_V4, "a live tombstone pivots the writer to v4");
+        assert_eq!(NsCatalog::decode(&buf), Ok(cat));
+    }
+
+    #[test]
+    fn an_empty_tombstone_set_keeps_the_v2_or_v3_bytes() {
+        let mut cat = NsCatalog {
+            next_id: 17,
+            entries: vec![entry(16, b"live", NsMode::Memory)],
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
+        assert_eq!(cat.encode()[0], CATALOG_VERSION, "pristine, tombstone-free: v2");
+        cat.index.next_id = FIRST_INDEX_ID + 1;
+        assert_eq!(cat.encode()[0], CATALOG_VERSION_V3, "used index, tombstone-free: v3");
+        assert_eq!(NsCatalog::decode(&cat.encode()), Ok(cat));
+    }
+
+    #[test]
+    fn every_tombstone_rule_is_typed() {
+        let base = |dropped: Vec<u32>| NsCatalog {
+            next_id: 19,
+            entries: vec![entry(17, b"live", NsMode::Memory)],
+            index: IndexCatalog::default(),
+            dropped,
+        };
+        // Encode the section by hand so the writer's debug assert does
+        // not short-circuit the decoder's verdict.
+        let raw = |dropped: &[u32]| {
+            let mut buf = base(Vec::new()).encode();
+            assert_eq!(buf[0], CATALOG_VERSION);
+            buf[0] = CATALOG_VERSION_V4;
+            encode_index_section(&IndexCatalog::default(), &mut buf);
+            buf.extend_from_slice(&(dropped.len() as u32).to_le_bytes());
+            for id in dropped {
+                buf.extend_from_slice(&id.to_le_bytes());
+            }
+            buf
+        };
+        assert_eq!(NsCatalog::decode(&raw(&[16, 18])), Ok(base(vec![16, 18])));
+        assert_eq!(NsCatalog::decode(&raw(&[15])), Err(CatalogError::InvalidDroppedId(15)));
+        assert_eq!(NsCatalog::decode(&raw(&[18, 16])), Err(CatalogError::InvalidDroppedId(16)));
+        assert_eq!(NsCatalog::decode(&raw(&[16, 16])), Err(CatalogError::InvalidDroppedId(16)));
+        assert_eq!(NsCatalog::decode(&raw(&[19])), Err(CatalogError::InvalidDroppedId(19)));
+        assert_eq!(
+            NsCatalog::decode(&raw(&[17])),
+            Err(CatalogError::InvalidDroppedId(17)),
+            "a tombstone never names a live entry"
+        );
+        let mut truncated = raw(&[16, 18]);
+        truncated.truncate(truncated.len() - 2);
+        assert_eq!(NsCatalog::decode(&truncated), Err(CatalogError::Truncated));
+        let mut over = raw(&[]);
+        let at = over.len() - 4;
+        over[at..].copy_from_slice(&((DROPPED_IDS_MAX as u32) + 1).to_le_bytes());
+        assert_eq!(NsCatalog::decode(&over), Err(CatalogError::InvalidDroppedId(u32::MAX)));
     }
 }

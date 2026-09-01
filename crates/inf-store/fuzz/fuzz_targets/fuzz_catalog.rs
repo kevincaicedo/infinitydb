@@ -8,8 +8,9 @@
 //!   normalizer (v1 upgrades, pristine index sections drop to v2) and
 //!   re-decoding the normalized bytes reproduces the same catalog:
 //!   `decode(encode(decode(b))) == decode(b)`.
-//! - **Version pivot:** the normalized payload is v3 exactly when the
-//!   index feature has been used (ADR-0075 D2.2), v2 otherwise.
+//! - **Version pivot:** the normalized payload is v4 exactly when a drop
+//!   tombstone is live (ADR-0100 D1), else v3 exactly when the index
+//!   feature has been used (ADR-0075 D2.2), v2 otherwise.
 
 #![no_main]
 
@@ -22,8 +23,14 @@ fuzz_target!(|data: &[u8]| {
         return; // typed rejection — panics are the bug
     };
     let normalized = decoded.encode();
-    let expected_version = if decoded.index.is_pristine() { 2 } else { 3 };
-    assert_eq!(normalized[0], expected_version, "the D2.2 version pivot");
+    let expected_version = if !decoded.dropped.is_empty() {
+        4
+    } else if decoded.index.is_pristine() {
+        2
+    } else {
+        3
+    };
+    assert_eq!(normalized[0], expected_version, "the D2.2 / ADR-0100 D1 version pivot");
     let reencoded = NsCatalog::decode(&normalized).expect("normalized bytes decode");
     assert_eq!(reencoded, decoded, "encode is a normalizer, not a mutator");
     assert_eq!(reencoded.encode(), normalized, "normalization is a fixpoint");

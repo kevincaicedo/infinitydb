@@ -232,6 +232,9 @@ pub(crate) fn info(
         // max across cells, unix seconds — the LASTSAVE currency).
         push(&mut text, &format!("rdb_bgsave_in_progress:{}", node.ckpt_in_progress.get()));
         push(&mut text, &format!("rdb_last_save_time:{}", node.rdb_last_save_ms.get() / 1000));
+        // ADR-0100 D7: durable namespaces dropped since every cell last
+        // published a MANIFEST past the drop (node scope).
+        push(&mut text, &format!("ns_drop_tombstones:{}", node.ns_drop_tombstones.get()));
         push(&mut text, "aof_enabled:0");
         push(&mut text, "aof_rewrite_in_progress:0");
         // Durable-namespace gauges (M2-S08, this cell's slice — the S21
@@ -1307,7 +1310,7 @@ pub(crate) fn inf_ns(
             return arity_error("INF.NS|DROP", w);
         }
         match ks.ns_drop(argv.arg(2)) {
-            Ok(()) => w.simple("OK"),
+            Ok(_) => w.simple("OK"),
             Err(e) => ns_error(e, w),
         }
     } else if sub.eq_ignore_ascii_case(b"LIST") {
