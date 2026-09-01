@@ -64,12 +64,43 @@ impl SerializeOpts<'_> {
     }
 }
 
+/// Serialized text would exceed the caller's byte budget (ADR-0099,
+/// review 2026-08-30 C9): a reply is not bounded by the document cap —
+/// path repetition, `$..*` match amplification, formatting separators
+/// and `\u00xx` escapes all multiply it — so reply construction carries
+/// an explicit budget instead of building an unbounded buffer.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct ReplyTooLarge;
+
 /// Serialize `value` as JSON text, appending to `out`.
 pub fn serialize_into(value: DocValue<'_>, opts: &SerializeOpts<'_>, out: &mut Vec<u8>) {
-    if opts.is_compact() {
-        compact(value, out);
+    let Ok(()) = (if opts.is_compact() {
+        compact::<false>(value, out, 0)
     } else {
-        formatted(value, opts, out, 0);
+        formatted::<false>(value, opts, out, 0, 0)
+    }) else {
+        unreachable!("unbounded serialization never refuses");
+    };
+}
+
+/// [`serialize_into`] under a byte budget: refuses once `out` would pass
+/// `limit` (counted over the whole buffer, so a caller measures from its
+/// own baseline by passing `out.len() + budget`). On `Err` the buffer
+/// holds a truncated prefix — callers roll the frame back
+/// (`RespWriter::try_bulk_patched`) and answer an error. The overshoot
+/// past `limit` is at most one scalar token (≤ ~32 B): every slice
+/// append pre-checks, only single-byte structure and number tokens land
+/// between checks.
+pub fn serialize_into_bounded(
+    value: DocValue<'_>,
+    opts: &SerializeOpts<'_>,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), ReplyTooLarge> {
+    if opts.is_compact() {
+        compact::<true>(value, out, limit)
+    } else {
+        formatted::<true>(value, opts, out, 0, limit)
     }
 }
 
@@ -90,6 +121,28 @@ pub enum Reply<'a> {
 
 /// Serialize a reply tree, appending to `out` (see [`Reply`]).
 pub fn serialize_reply_into(reply: &Reply<'_>, opts: &SerializeOpts<'_>, out: &mut Vec<u8>) {
+    let Ok(()) = reply_walk::<false>(reply, opts, out, 0) else {
+        unreachable!("unbounded serialization never refuses");
+    };
+}
+
+/// [`serialize_reply_into`] under a byte budget — the contract of
+/// [`serialize_into_bounded`], for the reply-wrapper tree.
+pub fn serialize_reply_into_bounded(
+    reply: &Reply<'_>,
+    opts: &SerializeOpts<'_>,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), ReplyTooLarge> {
+    reply_walk::<true>(reply, opts, out, limit)
+}
+
+fn reply_walk<const BOUNDED: bool>(
+    reply: &Reply<'_>,
+    opts: &SerializeOpts<'_>,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), ReplyTooLarge> {
     enum Wrap<'a, 'r> {
         Arr { items: &'r [Reply<'a>], at: usize },
         Obj { items: &'r [(&'a [u8], Reply<'a>)], at: usize },
@@ -98,13 +151,14 @@ pub fn serialize_reply_into(reply: &Reply<'_>, opts: &SerializeOpts<'_>, out: &m
     let mut stack: Vec<Wrap<'_, '_>> = Vec::new();
     let mut next: Option<&Reply<'_>> = Some(reply);
     loop {
+        check::<BOUNDED>(out, limit)?;
         if let Some(r) = next.take() {
             match r {
                 Reply::Value(v) => {
                     if compact_mode {
-                        compact(*v, out);
+                        compact::<BOUNDED>(*v, out, limit)?;
                     } else {
-                        formatted(*v, opts, out, stack.len());
+                        formatted::<BOUNDED>(*v, opts, out, stack.len(), limit)?;
                     }
                 }
                 Reply::Array(items) => {
@@ -120,7 +174,7 @@ pub fn serialize_reply_into(reply: &Reply<'_>, opts: &SerializeOpts<'_>, out: &m
         }
         let depth = stack.len();
         let Some(frame) = stack.last_mut() else {
-            return;
+            return Ok(());
         };
         match frame {
             Wrap::Arr { items, at } => {
@@ -131,12 +185,12 @@ pub fn serialize_reply_into(reply: &Reply<'_>, opts: &SerializeOpts<'_>, out: &m
                     }
                     *at += 1;
                     if !compact_mode {
-                        break_indent(opts, depth, out);
+                        break_indent::<BOUNDED>(opts, depth, out, limit)?;
                     }
                     next = Some(item);
                 } else {
                     if !compact_mode && !items.is_empty() {
-                        break_indent(opts, depth - 1, out);
+                        break_indent::<BOUNDED>(opts, depth - 1, out, limit)?;
                     }
                     out.push(b']');
                     stack.pop();
@@ -150,17 +204,17 @@ pub fn serialize_reply_into(reply: &Reply<'_>, opts: &SerializeOpts<'_>, out: &m
                     }
                     *at += 1;
                     if !compact_mode {
-                        break_indent(opts, depth, out);
+                        break_indent::<BOUNDED>(opts, depth, out, limit)?;
                     }
-                    write_string(out, key);
+                    write_string::<BOUNDED>(out, key, limit)?;
                     out.push(b':');
                     if !compact_mode {
-                        out.extend_from_slice(opts.space);
+                        budget_extend::<BOUNDED>(out, opts.space, limit)?;
                     }
                     next = Some(item);
                 } else {
                     if !compact_mode && !items.is_empty() {
-                        break_indent(opts, depth - 1, out);
+                        break_indent::<BOUNDED>(opts, depth - 1, out, limit)?;
                     }
                     out.push(b'}');
                     stack.pop();
@@ -170,20 +224,58 @@ pub fn serialize_reply_into(reply: &Reply<'_>, opts: &SerializeOpts<'_>, out: &m
     }
 }
 
-/// `newline + indent×depth` — the element-break rule shared by the
-/// document walker and the reply wrapper (module docs).
-fn break_indent(opts: &SerializeOpts<'_>, depth: usize, out: &mut Vec<u8>) {
-    out.extend_from_slice(opts.newline);
-    for _ in 0..depth {
-        out.extend_from_slice(opts.indent);
+/// Budget check over the whole buffer — compiled out entirely on the
+/// unbounded paths (`BOUNDED = false` monomorphizes to a no-op, so the
+/// canonical/index/replay serializers are byte-for-byte the pre-ADR-0099
+/// code).
+#[inline(always)]
+fn check<const BOUNDED: bool>(out: &[u8], limit: usize) -> Result<(), ReplyTooLarge> {
+    if BOUNDED && out.len() > limit {
+        return Err(ReplyTooLarge);
     }
+    Ok(())
+}
+
+/// Slice append with a pre-check: refuses before growing when the bytes
+/// would pass the budget — a run that busts the limit proves the whole
+/// reply does, so refusing early is exact, never a false refusal.
+#[inline(always)]
+fn budget_extend<const BOUNDED: bool>(
+    out: &mut Vec<u8>,
+    bytes: &[u8],
+    limit: usize,
+) -> Result<(), ReplyTooLarge> {
+    if BOUNDED && out.len() + bytes.len() > limit {
+        return Err(ReplyTooLarge);
+    }
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// `newline + indent×depth` — the element-break rule shared by the
+/// document walker and the reply wrapper (module docs). `INDENT` repeats
+/// per depth level, so the bounded arm checks per repetition — a 1 MiB
+/// separator at depth 128 is 128 MiB from one call.
+fn break_indent<const BOUNDED: bool>(
+    opts: &SerializeOpts<'_>,
+    depth: usize,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), ReplyTooLarge> {
+    budget_extend::<BOUNDED>(out, opts.newline, limit)?;
+    for _ in 0..depth {
+        budget_extend::<BOUNDED>(out, opts.indent, limit)?;
+    }
+    Ok(())
 }
 
 /// Canonical mode: compact, fixed number formatting — the byte-exact
 /// comparator for the E8 replay-equivalence oracle and the default
 /// (option-less) reply shape.
 pub fn serialize_canonical_into(value: DocValue<'_>, out: &mut Vec<u8>) {
-    compact(value, out);
+    let Ok(()) = compact::<false>(value, out, 0) else {
+        unreachable!("unbounded serialization never refuses");
+    };
 }
 
 /// One open container on the walk stack. `first` distinguishes the entry
@@ -194,10 +286,15 @@ enum Frame<'a> {
     Arr { it: ArrEntries<'a>, first: bool },
 }
 
-fn compact(value: DocValue<'_>, out: &mut Vec<u8>) {
+fn compact<const BOUNDED: bool>(
+    value: DocValue<'_>,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), ReplyTooLarge> {
     let mut stack: Vec<Frame<'_>> = Vec::new();
     let mut next = Some(value);
     loop {
+        check::<BOUNDED>(out, limit)?;
         if let Some(v) = next.take() {
             match v {
                 DocValue::Obj(o) => {
@@ -208,12 +305,12 @@ fn compact(value: DocValue<'_>, out: &mut Vec<u8>) {
                     out.push(b'[');
                     stack.push(Frame::Arr { it: a.iter(), first: true });
                 }
-                scalar => write_scalar(scalar, out),
+                scalar => write_scalar::<BOUNDED>(scalar, out, limit)?,
             }
             continue;
         }
         let Some(frame) = stack.last_mut() else {
-            return;
+            return Ok(());
         };
         match frame {
             Frame::Obj { it, first } => match it.next() {
@@ -221,7 +318,7 @@ fn compact(value: DocValue<'_>, out: &mut Vec<u8>) {
                     if !core::mem::take(first) {
                         out.push(b',');
                     }
-                    write_string(out, key.as_bytes());
+                    write_string::<BOUNDED>(out, key.as_bytes(), limit)?;
                     out.push(b':');
                     next = Some(v);
                 }
@@ -249,10 +346,17 @@ fn compact(value: DocValue<'_>, out: &mut Vec<u8>) {
 /// `base` offsets the indentation when the value nests inside a
 /// [`Reply`] wrapper; `depth == base + stack.len()` with the element's
 /// own frame already on the stack.
-fn formatted(value: DocValue<'_>, opts: &SerializeOpts<'_>, out: &mut Vec<u8>, base: usize) {
+fn formatted<const BOUNDED: bool>(
+    value: DocValue<'_>,
+    opts: &SerializeOpts<'_>,
+    out: &mut Vec<u8>,
+    base: usize,
+    limit: usize,
+) -> Result<(), ReplyTooLarge> {
     let mut stack: Vec<Frame<'_>> = Vec::new();
     let mut next = Some(value);
     loop {
+        check::<BOUNDED>(out, limit)?;
         if let Some(v) = next.take() {
             match v {
                 DocValue::Obj(o) => {
@@ -263,13 +367,13 @@ fn formatted(value: DocValue<'_>, opts: &SerializeOpts<'_>, out: &mut Vec<u8>, b
                     out.push(b'[');
                     stack.push(Frame::Arr { it: a.iter(), first: true });
                 }
-                scalar => write_scalar(scalar, out),
+                scalar => write_scalar::<BOUNDED>(scalar, out, limit)?,
             }
             continue;
         }
         let depth = base + stack.len();
         let Some(frame) = stack.last_mut() else {
-            return;
+            return Ok(());
         };
         match frame {
             Frame::Obj { it, first } => match it.next() {
@@ -277,15 +381,15 @@ fn formatted(value: DocValue<'_>, opts: &SerializeOpts<'_>, out: &mut Vec<u8>, b
                     if !core::mem::take(first) {
                         out.push(b',');
                     }
-                    break_indent(opts, depth, out);
-                    write_string(out, key.as_bytes());
+                    break_indent::<BOUNDED>(opts, depth, out, limit)?;
+                    write_string::<BOUNDED>(out, key.as_bytes(), limit)?;
                     out.push(b':');
-                    out.extend_from_slice(opts.space);
+                    budget_extend::<BOUNDED>(out, opts.space, limit)?;
                     next = Some(v);
                 }
                 None => {
                     if !*first {
-                        break_indent(opts, depth - 1, out);
+                        break_indent::<BOUNDED>(opts, depth - 1, out, limit)?;
                     }
                     out.push(b'}');
                     stack.pop();
@@ -296,12 +400,12 @@ fn formatted(value: DocValue<'_>, opts: &SerializeOpts<'_>, out: &mut Vec<u8>, b
                     if !core::mem::take(first) {
                         out.push(b',');
                     }
-                    break_indent(opts, depth, out);
+                    break_indent::<BOUNDED>(opts, depth, out, limit)?;
                     next = Some(v);
                 }
                 None => {
                     if !*first {
-                        break_indent(opts, depth - 1, out);
+                        break_indent::<BOUNDED>(opts, depth - 1, out, limit)?;
                     }
                     out.push(b']');
                     stack.pop();
@@ -311,16 +415,21 @@ fn formatted(value: DocValue<'_>, opts: &SerializeOpts<'_>, out: &mut Vec<u8>, b
     }
 }
 
-fn write_scalar(v: DocValue<'_>, out: &mut Vec<u8>) {
+fn write_scalar<const BOUNDED: bool>(
+    v: DocValue<'_>,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), ReplyTooLarge> {
     match v {
         DocValue::Null => out.extend_from_slice(b"null"),
         DocValue::Bool(true) => out.extend_from_slice(b"true"),
         DocValue::Bool(false) => out.extend_from_slice(b"false"),
         DocValue::I64(i) => write_i64(out, i),
         DocValue::F64(f) => write_f64(out, f),
-        DocValue::Str(s) => write_string(out, s.as_bytes()),
+        DocValue::Str(s) => write_string::<BOUNDED>(out, s.as_bytes(), limit)?,
         DocValue::Obj(_) | DocValue::Arr(_) => unreachable!("containers handled by the walker"),
     }
+    Ok(())
 }
 
 /// Canonical JSON text for one mutation result into caller stack storage.
@@ -374,8 +483,15 @@ fn write_f64(out: &mut Vec<u8>, v: f64) {
 }
 
 /// serde_json-parity JSON string escaping (module docs) over the raw
-/// bytes; clean runs copy as slices.
-fn write_string(out: &mut Vec<u8>, bytes: &[u8]) {
+/// bytes; clean runs copy as slices. The bounded arm pre-checks every
+/// run and escape — a string is the one scalar with no intrinsic size
+/// bound (`\u00xx` amplifies control bytes 6×), so it must not overshoot
+/// the budget by more than one escape.
+fn write_string<const BOUNDED: bool>(
+    out: &mut Vec<u8>,
+    bytes: &[u8],
+    limit: usize,
+) -> Result<(), ReplyTooLarge> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     out.push(b'"');
     let mut start = 0;
@@ -386,27 +502,29 @@ fn write_string(out: &mut Vec<u8>, bytes: &[u8]) {
             i += 1;
             continue;
         }
-        out.extend_from_slice(&bytes[start..i]);
-        match b {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            0x09 => out.extend_from_slice(b"\\t"),
-            0x0A => out.extend_from_slice(b"\\n"),
-            0x0C => out.extend_from_slice(b"\\f"),
-            0x0D => out.extend_from_slice(b"\\r"),
-            control => out.extend_from_slice(&[
+        budget_extend::<BOUNDED>(out, &bytes[start..i], limit)?;
+        let escape: &[u8] = match b {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            0x08 => b"\\b",
+            0x09 => b"\\t",
+            0x0A => b"\\n",
+            0x0C => b"\\f",
+            0x0D => b"\\r",
+            control => &[
                 b'\\',
                 b'u',
                 b'0',
                 b'0',
                 HEX[(control >> 4) as usize],
                 HEX[(control & 0x0F) as usize],
-            ]),
-        }
+            ],
+        };
+        budget_extend::<BOUNDED>(out, escape, limit)?;
         i += 1;
         start = i;
     }
-    out.extend_from_slice(&bytes[start..]);
+    budget_extend::<BOUNDED>(out, &bytes[start..], limit)?;
     out.push(b'"');
+    Ok(())
 }

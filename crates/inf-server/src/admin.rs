@@ -1212,8 +1212,15 @@ pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
     // count (M4-S27, ADR-0068 D2) — pushed before the pressure config so
     // the flag recompute inside `set_pressure` sees current shares.
     ks.set_budget_shares(cells);
-    ks.set_pressure(PressureConfig { limit_bytes: maxmemory / cells, policy, samples });
-    ks.set_tiered_va_limit(va_limit / cells);
+    // A configured nonzero bound must stay nonzero per cell (review
+    // 2026-09-01, found by the INFINITYD_BIN compat lane): `0` is the
+    // "no limit" sentinel, so flooring `maxmemory < cells` to 0 silently
+    // turned memory protection OFF on every multi-cell node — the
+    // per-namespace fan (`ns_budget_share`) already guarded with
+    // `.max(1)`; this is the same rule applied to the global class.
+    let cell_share = |bound: u64| if bound == 0 { 0 } else { (bound / cells).max(1) };
+    ks.set_pressure(PressureConfig { limit_bytes: cell_share(maxmemory), policy, samples });
+    ks.set_tiered_va_limit(cell_share(va_limit));
     ks.set_tier_promote(promote);
     ks.set_tier_shadow(shadow);
     ks.set_tier_shadow_reconcile(reconcile);
@@ -1930,6 +1937,26 @@ mod tests {
         let mut out = Vec::new();
         execute(&argv, store, cx, Nanos(1), &mut out);
         out
+    }
+
+    /// Review 2026-09-01 (INFINITYD_BIN compat lane): the per-cell fan of
+    /// a configured nonzero bound must never floor to the `0` "no limit"
+    /// sentinel — `maxmemory 1` on a 4-cell node turned memory
+    /// protection OFF on every cell while the single-cell path (and the
+    /// redis oracle) refused writes with -OOM. Red pre-fix.
+    #[test]
+    fn nonzero_maxmemory_never_fans_to_the_unlimited_sentinel() {
+        let node = NodeInfo::default();
+        node.cells.set(4);
+        let mut ks = Keyspace::new(StoreConfig::default());
+        for (configured, per_cell) in [(1u64, 1u64), (2, 1), (5, 1), (100, 25), (0, 0)] {
+            node.config
+                .borrow_mut()
+                .set(b"maxmemory", configured.to_string().as_bytes())
+                .expect("valid maxmemory");
+            push_pressure(&mut ks, &node);
+            assert_eq!(ks.pressure().limit_bytes, per_cell, "maxmemory {configured} on 4 cells");
+        }
     }
 
     #[test]

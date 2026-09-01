@@ -3765,8 +3765,13 @@ fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     if let Some(meta) = meta
         && well_formed
         && restricted
-        && !pubsub::is_plane_pubsub(meta.id)
+        && !pubsub::allowed_in_subscriber_mode(meta.id)
     {
+        // The gate must use the Redis allowlist, not "commands the plane
+        // routes to the pub/sub engine": `PUBSUB`/`PUBLISH` are plane
+        // pub/sub yet restricted in RESP2 subscriber mode — the old
+        // predicate let them through here while `execute`'s fast path
+        // refused them (found 2026-09-01 by the INFINITYD_BIN lane).
         pending.push_back(PendingReply::Done(restricted_reply(shared, meta, argv, proto)));
         return FastDispatch::Handled;
     }
@@ -4110,11 +4115,15 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     // M1-S10: RESP2 subscriber-mode restriction for pump-dispatched
     // commands — the fast path checks inside `execute`, but commands
     // landing here would otherwise run under a synthesized ConnCx without
-    // the subscription state (remote Apply, scatter legs).
+    // the subscription state (remote Apply, scatter legs). The predicate
+    // is the Redis allowlist, not `is_plane_pubsub`: `PUBSUB`/`PUBLISH`
+    // are plane pub/sub yet restricted in RESP2 subscriber mode (found
+    // 2026-09-01 by the INFINITYD_BIN lane, matrix case `PUBSUB
+    // CHANNELS`).
     if let Some(meta) = meta
         && well_formed
         && restricted
-        && !pubsub::is_plane_pubsub(meta.id)
+        && !pubsub::allowed_in_subscriber_mode(meta.id)
     {
         pending.push_back(PendingReply::Done(restricted_reply(shared, meta, argv, proto)));
         return true;

@@ -69,4 +69,27 @@ fuzz_target!(|data: &[u8]| {
     let mut twice = Vec::new();
     RespWriter::new(&mut twice, proto).error_bytes(body);
     assert_eq!(once, twice, "sanitization is not idempotent");
+
+    // ADR-0099 (review 2026-08-30, C9): a patched bulk must equal the
+    // plain bulk byte for byte whatever the payload, and a failing
+    // builder must leave no trace of the frame. (The ≥ 100 MB header
+    // widening is unit-tested — per-exec payloads that size would stall
+    // the fuzzer without exploring anything new.)
+    let payload = &data[1..];
+    let mut plain = Vec::new();
+    RespWriter::new(&mut plain, proto).bulk(payload);
+    let mut patched = Vec::new();
+    RespWriter::new(&mut patched, proto).bulk_patched(|out| out.extend_from_slice(payload));
+    assert_eq!(plain, patched, "patched bulk diverged from plain bulk");
+    let mut rolled = Vec::new();
+    let mut w = RespWriter::new(&mut rolled, proto);
+    assert!(
+        w.try_bulk_patched(|out| {
+            out.extend_from_slice(payload);
+            Err::<(), ()>(())
+        })
+        .is_err()
+    );
+    w.error("ERR reply too large");
+    assert_eq!(rolled, b"-ERR reply too large\r\n", "rollback left frame residue");
 });

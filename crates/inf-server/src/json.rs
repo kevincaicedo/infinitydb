@@ -20,7 +20,7 @@
 
 use inf_doc::apply::{ApplyError, ApplyOp, ApplyOutcome, MatchResult, Number, apply};
 use inf_doc::path::{EvalLimits, Matches, PathProgram, Segment, eval, resolve};
-use inf_doc::ser::{Reply, SerializeOpts, serialize_into, serialize_reply_into};
+use inf_doc::ser::{Reply, SerializeOpts, serialize_into_bounded, serialize_reply_into_bounded};
 use inf_doc::{DeltaOpcode, DocValue, JsonErrorKind, ObjCursor, TapeDoc, encode_apply_op};
 use inf_foundation::time::Nanos;
 use inf_store::{CellStore, JsonScalarPatch, JsonSetOptions, JsonSetOutcome, SetCond, SetExpire};
@@ -274,6 +274,29 @@ fn path_missing(path: &[u8], w: &mut RespWriter<'_>) {
 }
 
 const MISSING_KEY: &str = "ERR could not perform this operation on a key that doesn't exist";
+
+/// Pinned phrasing for a serialized reply over the namespace's
+/// `doc-max-reply-bytes` budget (ADR-0099 D3, beside ADR-0039 D5's
+/// `ERR document too large`).
+const REPLY_TOO_LARGE: &str = "ERR reply too large";
+
+/// One patched bulk under the reply budget (ADR-0099 D4 — the rule for
+/// the whole document-serializing class, not per command): a breach
+/// rolls the frame back and answers the pinned error in its place.
+fn bulk_reply_bounded(
+    w: &mut RespWriter<'_>,
+    reply: &Reply<'_>,
+    opts: &SerializeOpts<'_>,
+    budget: usize,
+) {
+    let result = w.try_bulk_patched(|out| {
+        let limit = out.len().saturating_add(budget);
+        serialize_reply_into_bounded(reply, opts, out, limit)
+    });
+    if result.is_err() {
+        w.error(REPLY_TOO_LARGE);
+    }
+}
 
 /// Freeze a document's plain canonical bytes for a path mutation, or
 /// write the command's missing-key/WRONGTYPE reply. The freeze copy is
@@ -573,6 +596,7 @@ fn get(
         programs.push(program);
     }
     let limits = eval_limits(store);
+    let reply_budget = store.doc_max_reply_bytes();
     let read = match store.json_get(argv.arg(1), now) {
         Ok(Some(read)) => read,
         Ok(None) => return w.null(),
@@ -601,7 +625,7 @@ fn get(
             .collect();
         Reply::Object(members)
     };
-    w.bulk_patched(|out| serialize_reply_into(&reply, &args.opts, out));
+    bulk_reply_bounded(w, &reply, &args.opts, reply_budget);
 }
 
 /// One path's reply subtree: `$` mode wraps every match in an array;
@@ -627,6 +651,7 @@ fn mget(
     let path = argv.arg(argv.len() - 1);
     let Some(program) = compile(store, cx, path, w) else { return };
     let limits = eval_limits(store);
+    let reply_budget = store.doc_max_reply_bytes();
     w.array_header(argv.len() - 2);
     for i in 1..argv.len() - 1 {
         // Per-key element: missing and non-document keys answer nil
@@ -641,10 +666,11 @@ fn mget(
             Ok(None) | Err(_) => None,
         };
         match element {
+            // The array header is already committed, so an over-budget
+            // element answers the pinned error *as its element* (the
+            // EXEC error-in-array precedent) — other keys unaffected.
             Some(reply) => {
-                w.bulk_patched(|out| {
-                    serialize_reply_into(&reply, &SerializeOpts::default(), out);
-                });
+                bulk_reply_bounded(w, &reply, &SerializeOpts::default(), reply_budget);
             }
             None => w.null(),
         }
@@ -828,7 +854,7 @@ fn num_op(
             })
             .collect();
         let reply = Reply::Array(members);
-        w.bulk_patched(|out| serialize_reply_into(&reply, &SerializeOpts::default(), out));
+        bulk_reply_bounded(w, &reply, &SerializeOpts::default(), store.doc_max_reply_bytes());
     }
 }
 
@@ -1163,8 +1189,22 @@ fn arr_pop(
     if !commit_delta(store, key, &program, &op, &outcome, cx, now, w) {
         return;
     }
-    let popped_text = |at: u32, out: &mut Vec<u8>| {
-        serialize_into(DocValue::from(doc.value_at(at as usize)), &SerializeOpts::default(), out);
+    // A popped element serializes under the reply budget like every
+    // document-serializing reply (ADR-0099 D4) — escape amplification
+    // alone can sextuple a string element's stored bytes.
+    let reply_budget = store.doc_max_reply_bytes();
+    let popped_bulk = |at: u32, w: &mut RespWriter<'_>| {
+        let mut text = Vec::new();
+        let ok = serialize_into_bounded(
+            DocValue::from(doc.value_at(at as usize)),
+            &SerializeOpts::default(),
+            &mut text,
+            reply_budget,
+        );
+        match ok {
+            Ok(()) => w.bulk(&text),
+            Err(_) => w.error(REPLY_TOO_LARGE),
+        }
     };
     if program.is_legacy() {
         // Last array match wins: its popped value, or null when it was
@@ -1175,11 +1215,7 @@ fn arr_pop(
             .rev()
             .find(|r| matches!(r, MatchResult::Popped(_) | MatchResult::PoppedEmpty));
         return match last_array {
-            Some(MatchResult::Popped(at)) => {
-                let mut text = Vec::new();
-                popped_text(*at, &mut text);
-                w.bulk(&text);
-            }
+            Some(MatchResult::Popped(at)) => popped_bulk(*at, w),
             Some(_) => w.null(),
             None if outcome.results.is_empty() => path_missing(path, w),
             None => {
@@ -1191,11 +1227,7 @@ fn arr_pop(
     w.array_header(outcome.results.len());
     for r in &outcome.results {
         match r {
-            MatchResult::Popped(at) => {
-                let mut text = Vec::new();
-                popped_text(*at, &mut text);
-                w.bulk(&text);
-            }
+            MatchResult::Popped(at) => popped_bulk(*at, w),
             _ => w.null(),
         }
     }
