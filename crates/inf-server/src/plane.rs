@@ -795,10 +795,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         last
     }
 
-    /// Post-execution effect emission (ADR-0015 D5): per written key, the
-    /// post-image (+ `ExpireAt` when a deadline is set) or a `Delete` —
-    /// the one hook covering every string/key/expiry command. Returns the
-    /// last staged seq (the `always` gate key).
+    /// Post-execution effect emission (ADR-0015 D5, amended by ADR-0098):
+    /// per written key, the post-image (+ `ExpireAt` when a deadline is
+    /// set) or a `Delete` — the one hook covering every string/key/expiry
+    /// command, error reply or not for the commands that can partially
+    /// apply. Returns the last staged seq (the `always` gate key).
     fn stage_durable_effects(
         &self,
         ns: NsId,
@@ -998,8 +999,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         self.execute_owned_into(ExecOrigin::Fabric(from), argv, proto, 0, 0, Some(ns), out);
         let mut outcome = NsApplyOutcome::Reply;
         if is_write
-            && out.get(before) != Some(&b'-')
             && let (Some(meta), Some(class)) = (meta, class)
+            && (out.get(before) != Some(&b'-') || stages_despite_error(meta.id))
             && let Some(seq) = self.stage_durable_effects(ns, meta, argv, class)
             && class == FsyncClass::Always
         {
@@ -3621,8 +3622,11 @@ enum PendingReply {
     /// array (ADR-0041 D9).
     Gather { parts: Vec<GatherPart>, proto: Protocol, unwrap_single: bool },
     /// Fanned MSET / scattered FLUSH: all legs must come back `+OK` (the
-    /// first error leg wins the reply otherwise).
-    AllOk { waiters: Vec<GateWait<u64, OwnedOutcome>>, proto: Protocol },
+    /// first error leg wins the reply otherwise). A leg that could not be
+    /// sent (`refusal`) makes the reply that refusal — never a silent
+    /// `+OK` over a dropped cell (review of 2026-08-30, H1 / F-L13-01);
+    /// already-sent waiters still drain so nothing orphans in flight.
+    AllOk { waiters: Vec<GateWait<u64, OwnedOutcome>>, proto: Protocol, refusal: Option<Vec<u8>> },
     /// `always` durable write (M2-S08): the reply bytes are staged but the
     /// slot resolves only once the fsync watermark covers the record's
     /// durable seq (§8.2 — ack after fsync; FIFO per connection holds).
@@ -3934,8 +3938,10 @@ async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 waiter.await;
                 reply
             }
-            PendingReply::AllOk { waiters, proto } => {
-                let mut failure: Option<Vec<u8>> = None;
+            PendingReply::AllOk { waiters, proto, refusal } => {
+                // A refusal (a leg never sent) outranks leg errors: the
+                // fan is known-incomplete, and `+OK` would be a lie.
+                let mut failure: Option<Vec<u8>> = refusal;
                 for waiter in waiters {
                     let outcome = waiter.await;
                     inflight -= 1;
@@ -3983,6 +3989,35 @@ fn is_scatter(id: CommandId, sub: Option<&[u8]>) -> bool {
         CommandId::InfNs => is_ns_ddl_sub(sub),
         _ => false,
     }
+}
+
+/// Peer legs for one scatter-mutator fan. A variadic `CONFIG SET` chunks
+/// its pairs so every leg stays under the fabric codec's `MAX_APPLY_ARGS`
+/// (review of 2026-08-30, H1 / F-L13-01: at ≥ 8 pairs every peer leg was
+/// refused at the encoder and silently dropped — `+OK` with the peers
+/// never told); every other mutator fans its argv whole (bounded arity).
+/// Chunks land on each peer in ring-FIFO order and re-validate against
+/// the same config table, so a locally-validated command cannot fail a
+/// chunk; cross-chunk atomicity per peer matches the fan's existing
+/// cross-cell eventual semantics (ADR-0098).
+fn scatter_fan_legs<'a>(id: CommandId, argv: &[&'a [u8]]) -> Vec<Vec<&'a [u8]>> {
+    const PAIRS_PER_LEG: usize = (MAX_APPLY_ARGS - 2) / 2;
+    if id == CommandId::Config
+        && argv.len() > MAX_APPLY_ARGS
+        && argv.get(1).is_some_and(|s| s.eq_ignore_ascii_case(b"SET"))
+    {
+        return argv[2..]
+            .chunks(2 * PAIRS_PER_LEG)
+            .map(|pairs| {
+                let mut leg = Vec::with_capacity(2 + pairs.len());
+                leg.push(argv[0]);
+                leg.push(argv[1]);
+                leg.extend_from_slice(pairs);
+                leg
+            })
+            .collect();
+    }
+    vec![argv.to_vec()]
 }
 
 /// `INF.NS` subcommands that ride the pump's DDL program: CREATE/DROP
@@ -4152,32 +4187,60 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 CommandId::Dbsize => {
                     let acc = shared.apply_dbsize(origin, db);
                     let mut waiters = Vec::new();
+                    let mut refusal = None;
                     for cell in peer_cells(shared) {
-                        if let Ok(waiter) = send_apply(shared, cell, proto, db, &[b"DBSIZE"]).await
-                        {
-                            waiters.push(waiter);
-                            *inflight += 1;
+                        // A leg that cannot be sent becomes the reply —
+                        // never a partial sum (review of 2026-08-30, H1:
+                        // `if let Ok` silently dropped the cell).
+                        match send_apply(shared, cell, proto, db, &[b"DBSIZE"]).await {
+                            Ok(waiter) => {
+                                waiters.push(waiter);
+                                *inflight += 1;
+                            }
+                            Err(reply) => {
+                                refusal = Some(reply);
+                                break;
+                            }
                         }
                     }
-                    pending.push_back(PendingReply::Counted { waiters, acc, proto, refusal: None });
+                    pending.push_back(PendingReply::Counted { waiters, acc, proto, refusal });
                 }
                 CommandId::Flushdb | CommandId::Flushall | CommandId::Config | CommandId::InfNs => {
                     // Per-cell-state mutators (flush, CONFIG SET/RESETSTAT,
                     // INF.NS CREATE/DROP): the local leg validates and
                     // applies; an error reply short-circuits the fan-out.
+                    // Every command on this arm must therefore be
+                    // all-or-nothing locally (review of 2026-08-30, H1 /
+                    // F-L17-12: `CONFIG SET` was not — ADR-0098 split it).
                     let local = run_local(shared, origin, proto, id, db, argv);
                     if local.first() == Some(&b'-') {
                         pending.push_back(PendingReply::Done(local));
                     } else {
                         shared.recycle_reply_buf(local);
+                        // A wide `CONFIG SET` fans in pair-preserving
+                        // chunks under the codec's argument cap; a leg
+                        // that still cannot be sent surfaces as the reply
+                        // instead of being swallowed (H1 / F-L13-01: 8+
+                        // pairs answered `+OK` while every peer leg was
+                        // silently refused).
+                        let legs = scatter_fan_legs(meta.id, argv);
                         let mut waiters = Vec::new();
-                        for cell in peer_cells(shared) {
-                            if let Ok(waiter) = send_apply(shared, cell, proto, db, argv).await {
-                                waiters.push(waiter);
-                                *inflight += 1;
+                        let mut refusal = None;
+                        'fan: for cell in peer_cells(shared) {
+                            for leg in &legs {
+                                match send_apply(shared, cell, proto, db, leg).await {
+                                    Ok(waiter) => {
+                                        waiters.push(waiter);
+                                        *inflight += 1;
+                                    }
+                                    Err(reply) => {
+                                        refusal = Some(reply);
+                                        break 'fan;
+                                    }
+                                }
                             }
                         }
-                        pending.push_back(PendingReply::AllOk { waiters, proto });
+                        pending.push_back(PendingReply::AllOk { waiters, proto, refusal });
                     }
                 }
                 CommandId::Keys => {
@@ -4330,7 +4393,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                         }
                         i += 2;
                     }
-                    pending.push_back(PendingReply::AllOk { waiters, proto });
+                    pending.push_back(PendingReply::AllOk { waiters, proto, refusal: None });
                 }
             }
         }
@@ -4677,6 +4740,21 @@ async fn run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         },
         Err(refusal) => refusal,
     }
+}
+
+/// Write commands that can apply a prefix of their keys and still reply
+/// an error (review of 2026-08-30, H2 / F-L17-11, ADR-0098): their
+/// effects stage even on an error reply. `stage_durable_effects` reads
+/// post-images from the store, so it records exactly what was applied;
+/// keys the loop never reached stage their unchanged pre-state
+/// (redundant, never wrong). With bounds pre-validated in `exec`, the
+/// only remaining trigger is arena OOM mid-way (and the
+/// `mset_midway_oom` fault point standing in for it). Every other
+/// write-class command is all-or-nothing by construction; a new
+/// multi-key write must either validate whole up front or join this
+/// set — the durable gate's soundness depends on it.
+fn stages_despite_error(id: CommandId) -> bool {
+    matches!(id, CommandId::Mset | CommandId::Msetnx)
 }
 
 /// Which keyspace a scatter program addresses: the connection's numbered
@@ -6093,7 +6171,7 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     let mut reply = shared.take_reply_buf();
     shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), &mut reply);
     let gated = if is_write
-        && reply.first() != Some(&b'-')
+        && (reply.first() != Some(&b'-') || stages_despite_error(meta.id))
         && let Some(class) = class
         && let Some(seq) = shared.stage_durable_effects(ns, meta, argv, class)
         && class == FsyncClass::Always

@@ -115,3 +115,20 @@ point = "cold_enqueue_full"
 tier = "node"
 test = "node_e2e"
 expect = "read-typed-error"
+# Review of 2026-08-30 (H2 / F-L17-11, ADR-0098): a multi-key write
+# applies a prefix and then fails mid-way (the deterministic stand-in
+# for arena OOM — bounds are pre-validated since ADR-0098, so the
+# fault point is the only remaining partial-application trigger).
+# Carried by `inf-server/tests/node_e2e.rs`
+# (`durable_mset_midway_failure_stages_what_it_wrote` — the local pump
+# gate — and `durable_mset_midway_failure_stages_on_the_fabric_path` —
+# the `ApplyNs` owner gate; armed on the cell threads at boot).
+#   staged-prefix — the pairs the loop applied are durably staged
+#                   despite the error reply; recovery replays exactly
+#                   the live store, never a silent rollback of a
+#                   read-visible key; unapplied pairs stay absent.
+[[row]]
+point = "mset_midway_oom"
+tier = "node"
+test = "node_e2e"
+expect = "staged-prefix"

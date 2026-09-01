@@ -1414,6 +1414,227 @@ fn durable_namespace_survives_restart() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Review of 2026-08-30 (H1 / F-L17-12 defect B, ADR-0098): an erroring
+/// `CONFIG SET` must leave **every** cell unchanged. Pre-fix the local
+/// leg applied pairs while validating them, then the error reply
+/// suppressed the peer fan-out — cell 0 held `maxmemory 100mb` while
+/// cells 1–3 held the default, permanently and silently.
+#[test]
+fn config_set_error_leaves_every_cell_unchanged() {
+    let node = Node::start(4);
+    let mut c = conn_on_cell(&node, 0);
+    c.write_all(&cmd(&[b"CONFIG", b"SET", b"maxmemory", b"100mb", b"databases", b"32"]))
+        .expect("write");
+    let reply = read_line(&mut c);
+    assert!(reply.starts_with(b"-ERR CONFIG SET failed"), "{:?}", String::from_utf8_lossy(&reply));
+    // The cell-scope scrape (the S37 convention): CONFIG GET reads the
+    // executing cell's replica, so every cell must report the default.
+    for cell in 0..4 {
+        let mut peer = conn_on_cell(&node, cell);
+        peer.write_all(&cmd(&[b"CONFIG", b"GET", b"maxmemory"])).expect("write");
+        read_exactly(&mut peer, b"*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n");
+    }
+    node.stop();
+}
+
+/// Review of 2026-08-30 (H1 / F-L13-01, ADR-0098): a `CONFIG SET` whose
+/// argv exceeds the fabric codec's `MAX_APPLY_ARGS` (8 pairs = 18
+/// args, over the 16-slice cap) must still reach every peer. Pre-fix
+/// every peer leg's
+/// `send_apply` refusal was silently swallowed: the reply was `+OK`,
+/// the local cell applied, and the peers never saw the command.
+#[test]
+fn config_set_eight_pairs_reaches_every_cell() {
+    let node = Node::start(2);
+    let mut c = conn_on_cell(&node, 0);
+    c.write_all(&cmd(&[
+        b"CONFIG",
+        b"SET",
+        b"maxmemory",
+        b"64mb",
+        b"maxmemory-policy",
+        b"allkeys-lru",
+        b"maxmemory-samples",
+        b"7",
+        b"proto-max-bulk-len",
+        b"268435456",
+        b"tcp-keepalive",
+        b"200",
+        b"timeout",
+        b"30",
+        b"tiered-promote-on-read",
+        b"no",
+        b"save",
+        b"900 1",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for cell in 0..2 {
+        let mut peer = conn_on_cell(&node, cell);
+        peer.write_all(&cmd(&[b"CONFIG", b"GET", b"maxmemory"])).expect("write");
+        read_exactly(&mut peer, b"*2\r\n$9\r\nmaxmemory\r\n$8\r\n67108864\r\n");
+        peer.write_all(&cmd(&[b"CONFIG", b"GET", b"maxmemory-policy"])).expect("write");
+        read_exactly(&mut peer, b"*2\r\n$16\r\nmaxmemory-policy\r\n$11\r\nallkeys-lru\r\n");
+        peer.write_all(&cmd(&[b"CONFIG", b"GET", b"timeout"])).expect("write");
+        read_exactly(&mut peer, b"*2\r\n$7\r\ntimeout\r\n$2\r\n30\r\n");
+    }
+    node.stop();
+}
+
+/// Connects until landing on `cell`, then selects `ns` (retrying fresh
+/// connections until the DDL fan reached that cell).
+fn conn_on_cell_use(node: &Node, cell: u16, ns: &[u8]) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut c = conn_on_cell(node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+        if read_line(&mut c) == b"+OK\r\n" {
+            return c;
+        }
+        assert!(Instant::now() < deadline, "USE never fanned to cell {cell}");
+    }
+}
+
+/// Review of 2026-08-30 (H2 / F-L13-06, F-L17-11, ADR-0098): a
+/// partially-failing `MSET` on a durable namespace. Pre-fix the first
+/// pair applied (readable for hours), the error reply skipped durable
+/// staging, and recovery silently rolled the key back while a later
+/// acked write survived — the review's proven L2 breach. The fix makes
+/// the command atomic (bounds validated before any pair applies), so
+/// the live store and recovery agree on the pre-command state.
+#[test]
+fn durable_mset_bounds_failure_is_atomic_across_recovery() {
+    let dir = temp_data_dir("mset-atomic");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"pay", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"pay"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"a", b"old"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let long_key = vec![b'k'; 256];
+    c.write_all(&cmd(&[b"MSET", b"a", b"new", &long_key, b"v"])).expect("write");
+    read_exactly(&mut c, b"-ERR key or value exceeds InfinityDB M0 record bounds\r\n");
+    // Atomic: the error reply implies zero mutation (pre-fix: "new").
+    c.write_all(&cmd(&[b"GET", b"a"])).expect("write");
+    read_exactly(&mut c, b"$3\r\nold\r\n");
+    // The log stays live and healthy — a later write acks durably.
+    c.write_all(&cmd(&[b"SET", b"z", b"9"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+    node.stop();
+
+    // Recovery agrees with everything the client observed.
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"pay"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"a"])).expect("write");
+    read_exactly(&mut c, b"$3\r\nold\r\n");
+    c.write_all(&cmd(&[b"GET", b"z"])).expect("write");
+    read_exactly(&mut c, b"$1\r\n9\r\n");
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, b":2\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The `mset_midway_oom` crash-matrix row, local-pump site (review of
+/// 2026-08-30, H2 / F-L17-11, ADR-0098): when a multi-key write genuinely
+/// applies a prefix and then fails (arena OOM — bounds are pre-validated
+/// now, so the fault point is the deterministic stand-in), the applied
+/// prefix must be durably staged despite the error reply. Pre-fix the
+/// emission gate read the reply's first byte, so the prefix was applied
+/// in RAM, never logged, and silently rolled back by recovery.
+#[test]
+fn durable_mset_midway_failure_stages_what_it_wrote() {
+    let dir = temp_data_dir("mset-midway");
+    let node = Node::start_durable_with_faults(
+        1,
+        &dir,
+        vec![(inf_server::fault::MSET_MIDWAY_OOM, inf_foundation::fault::FaultSpec::Nth(1))],
+    );
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"pay", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"pay"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"a", b"old"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // Pair 1 applies; the armed point fails pair 2.
+    c.write_all(&cmd(&[b"MSET", b"a", b"new", b"b", b"vb"])).expect("write");
+    read_exactly(&mut c, b"-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    c.write_all(&cmd(&[b"GET", b"a"])).expect("write");
+    read_exactly(&mut c, b"$3\r\nnew\r\n"); // the prefix is live and read-visible
+    c.write_all(&cmd(&[b"GET", b"b"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    drop(c);
+    node.stop();
+
+    // Recovery must replay exactly the live store — never roll back a
+    // read-visible key (pre-fix: `a` came back as "old").
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"pay"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"a"])).expect("write");
+    read_exactly(&mut c, b"$3\r\nnew\r\n");
+    c.write_all(&cmd(&[b"GET", b"b"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same staged-prefix contract on the fabric path (`ApplyNs`, the
+/// owner-side emission gate at `Shared::execute_ns_owned`): a hashtag
+/// routes both pairs to one remote owner, the owner applies pair 1,
+/// the armed point fails pair 2, and the origin's client sees the error
+/// while the owner's staged prefix survives restart.
+#[test]
+fn durable_mset_midway_failure_stages_on_the_fabric_path() {
+    let dir = temp_data_dir("mset-midway-fabric");
+    let node = Node::start_durable_with_faults(
+        2,
+        &dir,
+        vec![(inf_server::fault::MSET_MIDWAY_OOM, inf_foundation::fault::FaultSpec::Nth(1))],
+    );
+    let mut boot = node.connect();
+    boot.write_all(&cmd(&[b"INF.NS", b"CREATE", b"pay", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut boot, b"+OK\r\n");
+    drop(boot);
+    // Both keys share the `{t}` hashtag slot; connect on the other cell
+    // so the MSET rides `ApplyNs` to the owner.
+    let router = SlotRouter::new_contiguous(2);
+    let owner = router.cell_of(SlotRouter::slot_of(b"{t}a")).0;
+    let mut c = conn_on_cell_use(&node, 1 - owner, b"pay");
+    c.write_all(&cmd(&[b"SET", b"{t}a", b"old"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"MSET", b"{t}a", b"new", b"{t}b", b"vb"])).expect("write");
+    read_exactly(&mut c, b"-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    c.write_all(&cmd(&[b"GET", b"{t}a"])).expect("write");
+    read_exactly(&mut c, b"$3\r\nnew\r\n");
+    c.write_all(&cmd(&[b"GET", b"{t}b"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    drop(c);
+    node.stop();
+
+    let node = Node::start_durable(2, &dir);
+    let mut c = connect_use(&node, b"pay");
+    c.write_all(&cmd(&[b"GET", b"{t}a"])).expect("write");
+    read_exactly(&mut c, b"$3\r\nnew\r\n");
+    c.write_all(&cmd(&[b"GET", b"{t}b"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// `--conn-default-ns` is an operator requirement, not a best-effort hint:
 /// an unresolved name must never route a command to db0. Namespace DDL and
 /// explicit selection remain available, and an `always` ack written after

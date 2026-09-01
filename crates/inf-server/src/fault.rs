@@ -10,6 +10,7 @@
 //! | `durable_fsync_eio` | `DurableCell::on_synced` | the fsync completion arrives as a device-reported EIO instead of `Synced` — the watermark freezes (no ack for the affected batch can ever fire) and the process fail-stops with [`EXIT_DURABLE_FAILSTOP`](crate::EXIT_DURABLE_FAILSTOP) (the fsyncgate rule; ADR-0020 D3) |
 //! | `shadow_twin_read_fail` | `plane::tiered::read_cold_record` | a shadow twin's cold read fails (M4.5-S37, ADR-0093 D4.3/A3): the reconciler leaves the ticket for the next round, `DBSIZE`'s drain answers the typed `-ERR DBSIZE: shadow twin … unreadable` (relayed through a scattered leg), `DEL`'s forced resolution answers its error — never an inexact count, never a removal |
 //! | `cold_enqueue_full` | `plane::tiered::probe` + `plane::tiered::fetch_key` | the `ColdReads` enqueue refuses `QueueFull` (the BUSY leg the review of 2026-08-30, C2′/F-L06-02/F-L06-04, found untestable deterministically): every read command answers the typed `BUSY cold-read queue saturated` — `GET`, `MGET`, `EXISTS`/`TOUCH`, and a `SCAN` page alike — never a nil, a `:0`, or a silently shorter page |
+//! | `mset_midway_oom` | `exec::mset` + `exec::msetnx` (the apply loops, pairs ≥ 2) | a multi-key write fails mid-way after applying a prefix (the deterministic stand-in for arena OOM — review of 2026-08-30, H2/F-L17-11, ADR-0098): the reply is the error, and the durable emission gate stages the applied prefix anyway — recovery replays exactly the live store, never a silent rollback of read-visible keys |
 //!
 //! The sync-tier seal fsync has its own point (`inf_log::fault::FSYNC_ERR`);
 //! this one exists because the reactor tier defers the seal fsync through
@@ -19,6 +20,8 @@
 pub const DURABLE_FSYNC_EIO: &str = "durable_fsync_eio";
 pub const SHADOW_TWIN_READ_FAIL: &str = "shadow_twin_read_fail";
 pub const COLD_ENQUEUE_FULL: &str = "cold_enqueue_full";
+pub const MSET_MIDWAY_OOM: &str = "mset_midway_oom";
 
 /// Inventory for the CI coverage check.
-pub const ALL: &[&str] = &[DURABLE_FSYNC_EIO, SHADOW_TWIN_READ_FAIL, COLD_ENQUEUE_FULL];
+pub const ALL: &[&str] =
+    &[DURABLE_FSYNC_EIO, SHADOW_TWIN_READ_FAIL, COLD_ENQUEUE_FULL, MSET_MIDWAY_OOM];

@@ -437,6 +437,17 @@ pub static MATRIX: &[Case] = &[
     skip(&["CONFIG", "GET", "maxmemory*"], "InfinityDB returns the typed M1 key subset"),
     skip(&["CONFIG", "SET", "maxmemory-policy", "bogus"], "error detail text differs; both reject"),
     skip(&["CONFIG", "SET", "nonexistent-param", "1"], "error text shape differs slightly"),
+    // Review of 2026-08-30 (H1 / ADR-0098): multi-pair CONFIG SET is
+    // all-or-nothing — a failing pair rolls back the valid one (both
+    // GETs must answer the pre-command value), and duplicates are
+    // refused byte-exactly (oracle-measured 8.0.5).
+    c(&["CONFIG", "SET", "maxmemory", "12345678", "databases", "32"]),
+    c(&["CONFIG", "GET", "maxmemory"]),
+    c(&["CONFIG", "SET", "maxmemory", "1mb", "MAXMEMORY", "2mb"]),
+    c(&["CONFIG", "GET", "maxmemory"]),
+    c(&["CONFIG", "SET", "maxmemory", "7mb", "timeout", "0"]),
+    c(&["CONFIG", "GET", "maxmemory"]),
+    c(&["CONFIG", "SET", "maxmemory", "0"]),
     c(&["CONFIG", "REWRITE"]),
     // --- CLIENT ---
     skip(&["CLIENT", "ID"], "connection ids are engine-internal counters"),

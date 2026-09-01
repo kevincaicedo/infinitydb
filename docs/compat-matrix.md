@@ -10,7 +10,7 @@ Oracles: **Redis 8.0.5** for the core surface; RedisJSON uses
 Every covered behavior is byte-diffed under its declared protocol; any new or
 stale deviation fails CI (L8 — honesty is total).
 
-**Corpus:** 555 byte-compared executions · 59 documented deviations · 0 tolerated failures.
+**Corpus:** 562 byte-compared executions · 59 documented deviations · 0 tolerated failures.
 **Surface:** 90 commands — 54 full · 32 partial · 0 stub · 2 extension · 2 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
@@ -76,7 +76,7 @@ program primitives, not a client surface.
 | `EXPIRETIME` | full | M1 | readonly fast | 2 | 5 |  |
 | `PEXPIRETIME` | full | M1 | readonly fast | 2 | 4 |  |
 | `SELECT` | full | M1 | fast | 2 | 7 |  |
-| `CONFIG` | partial | M1 | admin | -2 | 27 | typed M1 key subset with frozen hot-reload classes |
+| `CONFIG` | partial | M1 | admin | -2 | 34 | typed M1 key subset with frozen hot-reload classes |
 | `CLIENT` | partial | M1 | admin | -2 | 5 | KILL supports the ID filter form; LIST addr/fd are placeholders until peername capture |
 | `LOLWUT` | partial | M1 | readonly | -1 | 0 | the whole reply is version art (nothing byte-comparable by design) |
 | `SUBSCRIBE` | full | M1 | fast | -2 | 5 |  |

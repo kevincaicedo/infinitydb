@@ -54,6 +54,24 @@ pub enum ConfigSetError {
     Invalid { key: String, value: String },
 }
 
+/// A validated, normalized pair ready for [`ConfigStore::apply`] — the
+/// typestate that makes applying an unvalidated pair unrepresentable
+/// (ADR-0098). Holds the entry's table index, so it must be applied to
+/// the store that validated it within the same borrow scope.
+#[derive(Debug)]
+pub struct ValidatedSet {
+    index: usize,
+    normalized: String,
+}
+
+impl ValidatedSet {
+    /// The canonical (lowercase, `'static`) key name — the duplicate-pair
+    /// detector's identity (Redis refuses duplicates; measured 8.0.5).
+    pub fn key(&self, store: &ConfigStore) -> &'static str {
+        store.entries[self.index].key
+    }
+}
+
 /// All eight Redis eviction policies (M1-E3 consumes the selection).
 pub const MAXMEMORY_POLICIES: &[&str] = &[
     "noeviction",
@@ -173,10 +191,15 @@ impl ConfigStore {
         self.entries.iter().find(|e| e.key == key).map(|e| e.value.as_str())
     }
 
-    /// Validates and stores. The caller maps errors to Redis reply strings.
-    pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<ReloadClass, ConfigSetError> {
+    /// Validates one pair without mutating anything — the validate half of
+    /// the all-or-nothing split (review of 2026-08-30, H1 / F-L17-12,
+    /// ADR-0098): a multi-pair `CONFIG SET` runs every pair through here
+    /// before [`ConfigStore::apply`] touches the first, so an error reply
+    /// implies zero mutation (Redis 7 semantics, oracle-verified).
+    pub fn validate(&self, key: &[u8], value: &[u8]) -> Result<ValidatedSet, ConfigSetError> {
         let key_str = String::from_utf8_lossy(key).to_lowercase();
-        let Some(entry) = self.entries.iter_mut().find(|e| e.key == key_str) else {
+        let Some((index, entry)) = self.entries.iter().enumerate().find(|(_, e)| e.key == key_str)
+        else {
             return Err(ConfigSetError::Unknown(key_str));
         };
         if entry.class == ReloadClass::BootOnly {
@@ -201,9 +224,23 @@ impl ConfigStore {
             Kind::OutputBufferLimit => merge_output_buffer_limit(&entry.value, &text)
                 .ok_or(ConfigSetError::Invalid { key: key_str, value: text })?,
         };
-        entry.value = normalized;
+        Ok(ValidatedSet { index, normalized })
+    }
+
+    /// Applies a validated pair. Infallible by construction — validation
+    /// already resolved the entry and normalized the value.
+    pub fn apply(&mut self, set: ValidatedSet) -> ReloadClass {
+        let entry = &mut self.entries[set.index];
+        entry.value = set.normalized;
         self.version += 1;
-        Ok(entry.class)
+        entry.class
+    }
+
+    /// Validates and stores one pair. The caller maps errors to Redis
+    /// reply strings. Multi-pair callers must use the split directly.
+    pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<ReloadClass, ConfigSetError> {
+        let validated = self.validate(key, value)?;
+        Ok(self.apply(validated))
     }
 
     /// Monotone mutation counter (see the field note).
@@ -309,6 +346,23 @@ mod tests {
         ));
         assert!(matches!(cfg.set(b"databases", b"32"), Err(ConfigSetError::Immutable(_))));
         assert!(matches!(cfg.set(b"nope", b"1"), Err(ConfigSetError::Unknown(_))));
+    }
+
+    /// ADR-0098: `validate` mutates nothing (value, version), and
+    /// `apply(validate(..))` lands exactly where `set` does.
+    #[test]
+    fn validate_is_pure_and_apply_completes_it() {
+        let mut cfg = ConfigStore::default();
+        let v = cfg.validate(b"maxmemory", b"100mb").expect("valid");
+        assert_eq!(v.key(&cfg), "maxmemory");
+        assert_eq!(cfg.get("maxmemory"), Some("0"), "validate must not mutate");
+        assert_eq!(cfg.version(), 0, "validate must not bump the version");
+        assert!(cfg.validate(b"maxmemory", b"nope").is_err());
+        assert!(cfg.validate(b"databases", b"32").is_err());
+        assert_eq!(cfg.version(), 0);
+        assert_eq!(cfg.apply(v), ReloadClass::HotPerCell);
+        assert_eq!(cfg.get("maxmemory"), Some("104857600"));
+        assert_eq!(cfg.version(), 1);
     }
 
     #[test]
