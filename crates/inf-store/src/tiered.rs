@@ -386,6 +386,18 @@ impl TieredTable {
     /// can size the full fetch).
     pub const RECORD_HEADER_LEN: usize = crate::record::HEADER_LEN;
 
+    /// Decodes just the key from a record *prefix* (the SCAN cold-read
+    /// window): `Some` when the prefix covers the header, the TTL
+    /// extension when present, and the whole key — at most 268 bytes
+    /// from the record's start, so one cold window always holds it.
+    /// `None` means the prefix stops inside the key (review of
+    /// 2026-08-30, C2: naming a key must never require the value's
+    /// bytes).
+    #[must_use]
+    pub fn key_from_prefix(bytes: &[u8]) -> Option<&[u8]> {
+        crate::record::key_from_prefix(bytes)
+    }
+
     /// Sizes a full record from its fixed header alone (the cold-read
     /// two-round contract: a first aligned window covers at least the
     /// header; if the record overruns the window, the exact remainder is

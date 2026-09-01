@@ -781,6 +781,12 @@ impl CellStore {
         }
         let value = view.value();
         let n = value.len() as i64;
+        // Redis `getrangeCommand`: a wholly-negative inverted range is
+        // empty *before* any clamping (review of 2026-08-30, F-L00-06 —
+        // the clamp-then-compare form returned data for it).
+        if start < 0 && end < 0 && start > end {
+            return Ok(b"");
+        }
         let from = if start < 0 { (n + start).max(0) } else { start };
         let to = if end < 0 { (n + end).max(0) } else { end }.min(n - 1);
         if n == 0 || from > to || from >= n {
@@ -1033,6 +1039,9 @@ impl CellStore {
 
     /// `INCR`/`DECR`/`INCRBY`/`DECRBY` (delta may be negative).
     pub fn incr_by(&mut self, key: &[u8], delta: i64, now: Nanos) -> Result<i64, OpError> {
+        // Typed refusal before the record writer's panic bound (review of
+        // 2026-08-30, C3: a 256-byte key here was a node-wide fail-stop).
+        check_bounds(key, &[])?;
         let existing = self.resolve(key, now);
         let (current, version, expire_at_ms) = match existing {
             Some((addr, len)) => {
@@ -1065,6 +1074,8 @@ impl CellStore {
         delta: f64,
         now: Nanos,
     ) -> Result<Vec<u8>, OpError> {
+        // Same C3 bound as `incr_by`: refuse, never panic the cell.
+        check_bounds(key, &[])?;
         let existing = self.resolve(key, now);
         let (current, version, expire_at_ms) = match existing {
             Some((addr, len)) => {

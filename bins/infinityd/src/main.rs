@@ -724,6 +724,32 @@ fn main() {
         },
     };
 
+    // The cell topology binding (ADR-0095, review C8): the slot→cell
+    // partition is a fact of the directory, not of this boot's argv —
+    // stamped at first boot under the owner lock, derived from the
+    // shard set for pre-ADR directories, and a `--cells` that disagrees
+    // is a typed refusal before the catalog or any cell is touched
+    // (reopening at another count silently loses acked durable data).
+    if let Some(dir) = &args.data_dir {
+        match inf_server::resolve_topology(dir, args.cells) {
+            Ok(source) => eprintln!(
+                "infinityd: topology: {} cells ({}; {})",
+                args.cells,
+                match source {
+                    inf_server::TopologySource::File => "read — ADR-0095",
+                    inf_server::TopologySource::Created => "stamped at this first boot — ADR-0095",
+                    inf_server::TopologySource::Adopted =>
+                        "derived from the shard set and stamped — ADR-0095 D3",
+                },
+                inf_server::TOPOLOGY_FILE,
+            ),
+            Err(e) => {
+                eprintln!("infinityd: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Durable boot order (M2-S08, ADR-0015 D3 — the node_e2e reference):
     // catalog before cells (the id→definition map must exist before any
     // cell replays records naming ids), control thread as the catalog's

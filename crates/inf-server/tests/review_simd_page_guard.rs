@@ -128,14 +128,15 @@ fn rv_simd_kernels_do_not_over_read_past_a_guard_page() {
         // SAFETY: child exits immediately; the read past the guard is the point.
         let data = unsafe { guarded(16, |_| 0) };
         let past = data.as_ptr().wrapping_add(64);
-        // SAFETY (deliberately violated): this is the positive control that
+        // SAFETY: deliberately violated — this is the positive control that
         // proves the guard page faults; it runs only in the forked child.
         std::hint::black_box(unsafe { past.read_volatile() });
         abort();
     });
     assert_eq!(control, Some(libc::SIGSEGV), "guard page is not armed — results would be vacuous");
 
-    let kernels: &[(&str, fn(&[u8]))] = &[
+    type Kernel = (&'static str, fn(&[u8]));
+    let kernels: &[Kernel] = &[
         ("crc32c", k_crc32c),
         ("scan_crlf", k_scan_crlf),
         ("find_crlf", k_find_crlf),

@@ -1227,11 +1227,17 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         match ram_key {
             Some(key) => keys.push(key),
             None => {
-                // Cold slot: fetch the record to name the key — what a
-                // beyond-RAM enumeration inherently costs (SCAN allows
-                // duplicates/races; the decoded key is authoritative).
-                if let Some(key) = fetch_key(shared, ns, hash, addr).await {
-                    keys.push(key);
+                // Cold slot: fetch the record head to name the key — what
+                // a beyond-RAM enumeration inherently costs (SCAN allows
+                // duplicates/races; the decoded key is authoritative). A
+                // typed read failure fails the whole page — the client
+                // retries its cursor — never a silently shorter page with
+                // an advanced cursor (review of 2026-08-30, C2; the
+                // DBSIZE drain's rule).
+                match fetch_key(shared, ns, hash, addr).await {
+                    Ok(Some(key)) => keys.push(key),
+                    Ok(None) => {}
+                    Err(message) => return done_error(shared, proto, message),
                 }
             }
         }
@@ -1354,41 +1360,74 @@ pub(super) async fn dbsize_count<O: PlaneObserver + 'static, F: SegmentFs + Clon
     }
 }
 
-/// Fetches the record at a cold slot solely to learn its key (SCAN).
+/// Fetches the key at a cold slot (SCAN key resolution). One window
+/// suffices: the plan clamps to `min(4, frames-to-file-end)` frames — a
+/// single-frame window means the record ends inside it (a record never
+/// outruns its file's data), and any wider window holds at least
+/// `2·TIER_FRAME_DATA − skip ≥ 4093` data bytes, past the 268-byte bound
+/// of header + TTL + key (`TieredTable::key_from_prefix`). `Ok(None)` is
+/// a slot displaced *and* re-indexed mid-scan (the SCAN contract's
+/// mutation case); `Err` is a typed cold-read failure the caller must
+/// surface. The review of 2026-08-30 (C2, F-L07-05) found the previous
+/// whole-record demand here silently omitted every cold value past one
+/// window — and every read failure — while the cursor advanced.
 async fn fetch_key<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
-    _hash: u64,
+    hash: u64,
     addr: LogicalAddr,
-) -> Option<Vec<u8>> {
-    let plan = {
+) -> Result<Option<Vec<u8>>, &'static str> {
+    let planned = {
         let tier = shared.tier.borrow();
-        let t = tier.as_ref().and_then(|t| t.ns(ns))?;
-        let cold = tier.as_ref().and_then(|t| t.cold.clone())?;
-        let (fd, file, offset, frames, skip) =
-            t.plan_cold_read(addr, TieredTable::RECORD_HEADER_LEN)?;
-        let bytes = frames as usize * inf_log::TIER_FRAME_BYTES;
-        // Same-clock stamp as `on_completion` (the `cold_read_p99_us` pair).
-        let now_us = shared.now.get().as_micros();
-        let wait = cold
-            .enqueue(fd, file, offset, bytes, inf_runtime::ReadClass::Foreground, now_us)
-            .ok()?;
-        ColdPlan { wait, addr, frames, skip }
+        let Some(t) = tier.as_ref().and_then(|t| t.ns(ns)) else {
+            return Err("ERR the selected namespace was dropped (INF.NS USE again)");
+        };
+        let Some(cold) = tier.as_ref().and_then(|t| t.cold.clone()) else {
+            return Err(ERR_COLD_IO);
+        };
+        match t.plan_cold_read(addr, TieredTable::RECORD_HEADER_LEN) {
+            Some((fd, file, offset, frames, skip)) => {
+                let bytes = frames as usize * inf_log::TIER_FRAME_BYTES;
+                // Same-clock stamp as `on_completion` (the `cold_read_p99_us` pair).
+                let now_us = shared.now.get().as_micros();
+                let wait = cold
+                    .enqueue(fd, file, offset, bytes, inf_runtime::ReadClass::Foreground, now_us)
+                    .map_err(|_| ERR_COLD_BUSY)?;
+                Some(ColdPlan { wait, addr, frames, skip })
+            }
+            None => None,
+        }
+    };
+    let Some(plan) = planned else {
+        // Outside every catalogued file: either the slot was displaced
+        // and its file retired mid-scan (the index has moved on — a
+        // legal mutation skip) or the index still names the pair (an
+        // index/catalog inconsistency — say so, never drop the key).
+        let ks = shared.store.borrow();
+        let still = ks.tiered_store(ns).is_some_and(|t| t.contains_pair(hash, addr));
+        return if still { Err(ERR_COLD_IO) } else { Ok(None) };
     };
     let done = plan.wait.await;
-    done.outcome().ok()?;
-    done.bytes(|window| {
+    if done.outcome().is_err() {
+        return Err(ERR_COLD_IO);
+    }
+    let key = done.bytes(|window| {
         let mut head = Vec::new();
         inf_log::tier_extract(window, plan.skip, TieredTable::RECORD_HEADER_LEN, &mut head).ok()?;
         let total = TieredTable::record_len_from_header(&head);
-        let window_data = plan.frames as usize * inf_log::TIER_FRAME_DATA;
-        // SCAN key resolution reads one window; records spilling past it
-        // are skipped this slice (rare: keys live in the record head).
-        let take = total.min(window_data - plan.skip);
-        let mut record = Vec::new();
-        inf_log::tier_extract(window, plan.skip, take, &mut record).ok()?;
-        (take == total).then(|| TieredTable::decode_record(&record).key.to_vec())
-    })
+        let window_data = plan.frames as usize * inf_log::TIER_FRAME_DATA - plan.skip;
+        let take = total.min(window_data);
+        let mut prefix = Vec::new();
+        inf_log::tier_extract(window, plan.skip, take, &mut prefix).ok()?;
+        TieredTable::key_from_prefix(&prefix).map(<[u8]>::to_vec)
+    });
+    match key {
+        Some(key) => Ok(Some(key)),
+        None => {
+            debug_assert!(false, "one cold window always covers the record key");
+            Err(ERR_COLD_IO)
+        }
+    }
 }
 
 /// Fetches a blob-resident value from its extent (M4-S26 wiring the

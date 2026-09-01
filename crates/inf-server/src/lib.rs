@@ -28,6 +28,7 @@ mod pubsub;
 mod readahead;
 mod recover;
 mod tier_cell;
+mod topology;
 
 /// Process exit code for a durable-path fail-stop (§8.4, the fsyncgate
 /// rule): an fsync/log-write error freezes the watermark — no ack for the
@@ -81,4 +82,8 @@ pub use readahead::{ReadAheadFile, ReadAheadFs};
 pub use recover::{
     RecoverPhase, RecoverPhases, RecoverStats, RecoveredManifest, Recovery, RecoveryProgress,
     open_cell_log,
+};
+pub use topology::{
+    TOPOLOGY_FILE, TopologyError, TopologySource, create_topology, load_topology, parse_topology,
+    render_topology, resolve_topology,
 };
