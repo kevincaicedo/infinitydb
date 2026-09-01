@@ -237,6 +237,16 @@ pairs beyond the cap) and settles them by full key before the cell
 serves; reconciliation is a *verify* (the read, legal under a checkpoint
 walk) and a *settle* (read-free, never under a walk).
 
+The same never-on-single-evidence posture governs blob-extent disposal
+(ADR-0096): a refcount-proven death unlinks its extent file, but a boot
+orphan — a listed file the replayed reference map does not name — is
+probed and **quarantined** by rename for one full life instead of
+unlinked, revived if a later boot's replay references it after all, and
+destroyed only by a second still-unreferenced verdict. One rebuilt map
+is not enough evidence to delete user bytes; the checkpoint's 0x05 walk
+that feeds it resumes by address (never ordinal), so mid-walk deletes
+cannot silently shorten the emitted set (review 2026-08-30, C4/C7).
+
 ### Determinism is a feature
 
 Time, randomness, disk, network, and fabric effects are injected behind

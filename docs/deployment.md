@@ -123,6 +123,17 @@ any cell creates a log, and every later boot reads them:
 | `io-properties.toml` | The device model and barrier class the probe measured (ADR-0091); identity-bound to the filesystem + device. |
 | `key-hash.toml` | The **key-hash secret** (ADR-0094): the index hashes every key with SipHash-1-3 under a 128-bit secret drawn from the OS at this first boot. Every checkpoint ref and index sidecar under the directory is placed by it — never edit it, never copy it between directories, and back it up with the directory. A directory that holds data without it (one written by a pre-ADR-0094 binary) is refused at boot with a typed message: reload from a dump into a new directory. A node without `--data-dir` draws a fresh secret per boot. |
 
+A tiered namespace's cold directory (`shard-N/ns-N/cold/`) may also hold
+`blob-NNNNNN.iblob.quarantine` files (ADR-0096): a boot that finds a
+well-formed blob extent no durable artifact references **quarantines** it
+by rename instead of deleting it — the bytes stay recoverable for one
+full life, a later boot revives the file if the replayed state references
+it after all, and only a second still-unreferenced verdict deletes it.
+Leave these files alone; `INFO tiering` discloses them
+(`tiering_blob_quarantined` / `tiering_blob_quarantine_revived` — the
+revived counter going nonzero means a wrong orphan verdict healed and is
+worth reporting).
+
 ## Configuration
 
 Configuration uses the Redis `CONFIG` command surface. The most relevant keys
