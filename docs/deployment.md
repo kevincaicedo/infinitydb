@@ -114,11 +114,12 @@ infinityd [--port 6379] [--cells N] [--buffers 4096] [--buf-size 4096]
 
 ### Data-directory files a first boot writes
 
-With `--data-dir`, the first boot of a directory writes two files before
+With `--data-dir`, the first boot of a directory writes three files before
 any cell creates a log, and every later boot reads them:
 
 | File | What it is |
 |---|---|
+| `topology.toml` | The **cell topology** (ADR-0095): the `--cells` count the directory was written at. The keyspace's slot ranges are partitioned by it, so a boot whose `--cells` disagrees is refused with a typed error naming both counts — reopening at another count would silently lose access to acked durable data. Resizing a node is an explicit re-shard, never a flag edit. A directory written before ADR-0095 adopts on its first post-ADR boot by deriving the count from its `shard-*` set. |
 | `io-properties.toml` | The device model and barrier class the probe measured (ADR-0091); identity-bound to the filesystem + device. |
 | `key-hash.toml` | The **key-hash secret** (ADR-0094): the index hashes every key with SipHash-1-3 under a 128-bit secret drawn from the OS at this first boot. Every checkpoint ref and index sidecar under the directory is placed by it — never edit it, never copy it between directories, and back it up with the directory. A directory that holds data without it (one written by a pre-ADR-0094 binary) is refused at boot with a typed message: reload from a dump into a new directory. A node without `--data-dir` draws a fresh secret per boot. |
 

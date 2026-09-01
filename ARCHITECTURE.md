@@ -49,7 +49,11 @@ allocator. One additional control thread runs the slow plane: config,
 topology, stats aggregation, checkpoint scheduling.
 
 The keyspace is partitioned by the same 16,384-slot space as Redis Cluster,
-assigned to cells in contiguous ranges. Cells share **nothing** on the data
+assigned to cells in contiguous ranges. The cell count is therefore part of
+what a data directory *means*: it is recorded in `topology.toml` at the
+directory's first boot, and a boot whose `--cells` disagrees is a typed
+refusal — resizing is an explicit re-shard, never a flag edit (ADR-0095).
+Cells share **nothing** on the data
 plane: no locks, no shared atomics, no cross-core cache-line traffic. When
 a command on cell A needs a key owned by cell B, it crosses the **fabric**
 — a full mesh of lock-free SPSC ring pairs, polled cooperatively, batched,
