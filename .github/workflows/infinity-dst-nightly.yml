@@ -155,12 +155,18 @@ jobs:
 
       - name: corpus replay (full size)
         run: |
-          grep -v '^#' bins/inf-sim/seeds/corpus.txt | grep -v '^$' | \
+          # Review of 2026-08-30 (§5.5 "several gates cannot go red at
+          # all"): the old `grep | while | tee` pipeline's status was
+          # tee's, always 0 — a corpus divergence left the step green.
+          # The fail=1 pattern the sibling steps use.
+          fail=0
           while read -r scenario seed; do
             echo "== corpus: $scenario $seed =="
             ./target/release/inf-sim --scenario "$scenario" --seed "$seed" --verify-determinism \
               | tee -a /tmp/fleet.log
-          done
+            [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1
+          done < <(grep -v '^#' bins/inf-sim/seeds/corpus.txt | grep -v '^$')
+          exit $fail
 
       - name: "fresh-seed fleet (replayable: seeds derive from the run id)"
         run: |

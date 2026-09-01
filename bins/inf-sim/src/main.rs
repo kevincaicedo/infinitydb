@@ -725,12 +725,13 @@ fn main() {
     }
     let mut scenario = match scenario_name.as_str() {
         "m0-smoke" => Scenario::m0_smoke(seed),
+        "m0-adversarial" => Scenario::m0_adversarial(seed),
         "m1-cache" => Scenario::m1_cache(seed),
         other => {
             eprintln!(
-                "inf-sim: unknown scenario {other} (have: m0-smoke, m1-cache, m2-durable, \
-                 m3-document, m2-combined, boot-storm, m4-steel, m4-pressure, m4-cold, \
-                 m4-recovery, m4-diskfull, m4-tiered)"
+                "inf-sim: unknown scenario {other} (have: m0-smoke, m0-adversarial, m1-cache, \
+                 m2-durable, m3-document, m2-combined, boot-storm, m4-steel, m4-pressure, \
+                 m4-cold, m4-recovery, m4-diskfull, m4-tiered)"
             );
             std::process::exit(2);
         }

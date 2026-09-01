@@ -1524,9 +1524,20 @@ async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         };
         let done = wait.await;
         done.outcome().ok()?;
+        // Extract into a scratch and extend — `tier_extract` REPLACES its
+        // output's contents, so handing it the accumulator erased every
+        // previously assembled window and this loop never terminated for
+        // any extent needing more than one window (> 16,368 data bytes):
+        // an unbounded foreground read spin with the connection's pump
+        // held (review of 2026-09-01, N1 — found by the Group 0 widened
+        // DST value generator; the sim livelocked on every seed).
         let ok = done.bytes(|window| {
             let take = remaining.min(frames as usize * inf_log::TIER_FRAME_DATA - skip);
-            inf_log::tier_extract(window, skip, take, &mut out).is_ok()
+            let mut piece = Vec::new();
+            inf_log::tier_extract(window, skip, take, &mut piece)
+                .is_ok()
+                .then(|| out.extend_from_slice(&piece))
+                .is_some()
         });
         drop(done);
         if !ok {

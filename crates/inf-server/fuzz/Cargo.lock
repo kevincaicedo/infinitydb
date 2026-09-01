@@ -77,6 +77,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "inf-doc"
+version = "0.0.0"
+dependencies = [
+ "inf-alloc",
+ "inf-foundation",
+ "inf-simd",
+ "zmij",
+]
+
+[[package]]
 name = "inf-fabric"
 version = "0.0.0"
 dependencies = [
@@ -87,6 +97,15 @@ dependencies = [
 [[package]]
 name = "inf-foundation"
 version = "0.0.0"
+
+[[package]]
+name = "inf-log"
+version = "0.0.0"
+dependencies = [
+ "inf-foundation",
+ "inf-simd",
+ "libc",
+]
 
 [[package]]
 name = "inf-runtime"
@@ -102,8 +121,10 @@ name = "inf-server"
 version = "0.0.0"
 dependencies = [
  "inf-alloc",
+ "inf-doc",
  "inf-fabric",
  "inf-foundation",
+ "inf-log",
  "inf-runtime",
  "inf-store",
  "inf-wire",
@@ -116,6 +137,7 @@ dependencies = [
  "inf-foundation",
  "inf-server",
  "inf-store",
+ "inf-wire",
  "libfuzzer-sys",
 ]
 
@@ -128,7 +150,9 @@ name = "inf-store"
 version = "0.0.0"
 dependencies = [
  "inf-alloc",
+ "inf-doc",
  "inf-foundation",
+ "inf-log",
  "inf-simd",
 ]
 
@@ -385,3 +409,9 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"

@@ -1925,6 +1925,59 @@ fn durable_pressure_always_acks_gate_through_the_pump() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Review of 2026-09-01 (found by Group 0 item 3 — the widened DST
+/// value generator; N1 in the review report): `fetch_extent` passed its
+/// accumulator straight to `tier_extract`, which **replaces** its
+/// output's contents — so every continuation window erased the bytes
+/// already assembled and the loop could never terminate. Any `GET` of a
+/// blob value needing more than one cold window (> 16,368 data bytes)
+/// spun device reads forever: no reply, no error, the connection's pump
+/// held, unbounded foreground I/O. Client-reachable on any namespace
+/// with a sub-16 KiB `BLOB-THRESHOLD` (a public CREATE option), and at
+/// the 16 MiB default by any tiered value over 16 MiB. Pre-fix this
+/// test times out on the first big GET; post-fix all sizes round-trip.
+#[test]
+fn tiered_blob_get_spanning_multiple_cold_windows() {
+    let dir = temp_data_dir("blob-multiwindow");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"blobs",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"8mb",
+        b"DISK-BUDGET",
+        b"64mb",
+        b"BLOB-THRESHOLD",
+        b"4kb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"blobs"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // One-window (≤ 16,368), boundary-crossing, and four-window sizes:
+    // the continuation loop must terminate for every one of them.
+    for (name, len) in [(&b"one"[..], 16_000usize), (&b"cross"[..], 17_000), (&b"four"[..], 50_000)]
+    {
+        let value: Vec<u8> = (0..len).map(|i| b'a' + (i % 23) as u8).collect();
+        c.write_all(&cmd(&[b"SET", name, &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"STRLEN", name])).expect("write");
+        read_exactly(&mut c, format!(":{len}\r\n").as_bytes());
+        c.write_all(&cmd(&[b"GET", name])).expect("write");
+        let mut want = format!("${len}\r\n").into_bytes();
+        want.extend_from_slice(&value);
+        want.extend_from_slice(b"\r\n");
+        read_exactly(&mut c, &want);
+    }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// M4-S19 (ADR-0062): the tiered-namespace lifecycle over TCP — CREATE
 /// with budget keys rides the DDL program (9-arg NSFAN, AllOk fan,
 /// catalog persist-then-ack) and materializes per-cell tables under the
@@ -2431,6 +2484,69 @@ fn read_get(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     }
 }
 
+// ---- the paced-checkpoint fixture (Group 0, from the batch-2 traps) ----
+
+/// One `INFO` integer field from this connection's cell. Scope caveats
+/// apply: `Memory` is a node fold, `Tiering`/`Persistence` are
+/// cell-scope — multiply by cells before comparing to node totals.
+fn scrape_u64(c: &mut TcpStream, section: &[u8], field: &str) -> u64 {
+    info_text(c, section)
+        .lines()
+        .find_map(|l| l.strip_prefix(field))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Waits until demotion has genuinely pushed records cold. Batch-1 trap
+/// (review remediation, 2026-08-31): cold-ness must be **asserted**
+/// (flush-confirmed bytes past `min_confirmed` AND decommitted pages),
+/// never assumed from write volume — an e2e that "forces demotion" by
+/// filling and then reads immediately measures the RAM path.
+fn wait_demoted(c: &mut TcpStream, min_confirmed: u64) {
+    for _ in 0..1500 {
+        if scrape_u64(c, b"tiering", "tiering_flush_confirmed_bytes:") > min_confirmed
+            && scrape_u64(c, b"tiering", "tiering_region_decommit_pages:") > 0
+        {
+            return;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("demotion never pushed the records cold (confirmed > {min_confirmed} + decommit)");
+}
+
+/// The reusable paced-checkpoint driver (review remediation batch 2 →
+/// Group 0): requests a checkpoint on every cell, then drives `pump`
+/// between the walk's MAINTAIN slices — 10 ms pacing, because an unpaced
+/// pump exhausts its whole schedule inside pass 0 and never overlaps the
+/// later passes (the batch-2 harness trap this fixture exists to keep).
+/// Returns the number of pump calls that landed inside the walk. The
+/// node must be booted with `CkptTrigger::Paced` (with
+/// `section_bytes == slice_bytes` a section is written per fill slice);
+/// with any other trigger the walk completes inside one MAINTAIN call
+/// and no schedule can interleave.
+fn drive_paced_ckpt_with_pump(
+    node: &Node,
+    probe: &mut TcpStream,
+    mut pump: impl FnMut(&mut TcpStream),
+    timeout: Duration,
+) -> u32 {
+    let before = scrape_u64(probe, b"persistence", "ckpts_completed:");
+    node.control.as_ref().expect("durable node").request_ckpt_all();
+    let deadline = Instant::now() + timeout;
+    let mut pumped = 0u32;
+    loop {
+        pump(probe);
+        pumped += 1;
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if scrape_u64(probe, b"persistence", "ckpts_completed:") > before {
+            return pumped;
+        }
+        assert!(Instant::now() < deadline, "checkpoint never completed under the pump");
+    }
+}
+
 /// Review of 2026-08-30 (C4 / F-L03-01 + C7 / F-L04-08, F-L14-02): the
 /// checkpoint's 0x05 blob-reference walk must not lose a live entry when
 /// foreground `DEL`s remove reference-map entries *below its cursor*
@@ -2502,25 +2618,7 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
             c.write_all(&cmd(&[b"SET", key.as_bytes(), &[b'f'; 3000]])).expect("write");
             read_exactly(&mut c, b"+OK\r\n");
         }
-        let info_u64 = |c: &mut TcpStream, section: &[u8], field: &str| {
-            info_text(c, section)
-                .lines()
-                .find_map(|l| l.strip_prefix(field))
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(0)
-        };
-        let mut demoted = false;
-        for _ in 0..1500 {
-            if info_u64(&mut c, b"tiering", "tiering_flush_confirmed_bytes:") > 3 << 20
-                && info_u64(&mut c, b"tiering", "tiering_region_decommit_pages:") > 0
-            {
-                demoted = true;
-                break;
-            }
-            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(demoted, "demotion never pushed the blob-reference records cold");
+        wait_demoted(&mut c, 3 << 20);
         // Clear the filler (compaction is off, so the cold blob refs stay
         // put): pass 1 then emits nothing and the paced walk's wall time
         // splits between pass 0 and pass 3 — the DEL pump lands between
@@ -2530,32 +2628,28 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
             c.write_all(&cmd(&[b"DEL", key.as_bytes()])).expect("write");
             read_exactly(&mut c, b":1\r\n");
         }
-        // Begin the checkpoint, then DEL from the low end while the walk
-        // streams — the review's adversarial schedule.
-        node.control.as_ref().expect("durable node").request_ckpt_all();
+        // The paced walk with the review's adversarial schedule: DEL from
+        // the low end between the walk's MAINTAIN slices.
         let walk_started = Instant::now();
-        let deadline = Instant::now() + Duration::from_secs(30);
         let mut next_del = 0usize;
-        loop {
-            if next_del < 300 {
-                let key = format!("big:{next_del:04}");
-                c.write_all(&cmd(&[b"DEL", key.as_bytes()])).expect("write");
-                read_exactly(&mut c, b":1\r\n");
-                deleted.insert(key.into_bytes());
-                next_del += 1;
-            }
-            // Pace the pump across the whole paced walk (an unpaced pump
-            // exhausts its schedule inside pass 0 and never overlaps the
-            // 0x05 pass, which streams last).
-            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            let done = info_u64(&mut c, b"persistence", "ckpts_completed:");
-            if done >= 1 {
-                break;
-            }
-            assert!(Instant::now() < deadline, "checkpoint never completed under the DEL pump");
-        }
-        eprintln!("walk took {:?}, {next_del} DELs landed during it", walk_started.elapsed());
+        let pumped = drive_paced_ckpt_with_pump(
+            &node,
+            &mut c,
+            |c| {
+                if next_del < 300 {
+                    let key = format!("big:{next_del:04}");
+                    c.write_all(&cmd(&[b"DEL", key.as_bytes()])).expect("write");
+                    read_exactly(c, b":1\r\n");
+                    deleted.insert(key.into_bytes());
+                    next_del += 1;
+                }
+            },
+            Duration::from_secs(30),
+        );
+        eprintln!(
+            "walk took {:?}, {next_del} DELs landed during it ({pumped} pump rounds)",
+            walk_started.elapsed()
+        );
         assert!(next_del > 20, "the pump barely ran — the walk finished before the schedule");
         // Let everysec cover the DEL deaths, then stop without a further
         // checkpoint (a second walk would re-emit the intact RAM map and
@@ -2598,15 +2692,8 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
     read_exactly(&mut c, b"+OK\r\n");
     // Drain the boot reclaim backlog (the deleted extents' deaths) so a
     // pre-fix run cannot pass by racing the unlink.
-    let info_u64 = |c: &mut TcpStream, field: &str| {
-        info_text(c, b"tiering")
-            .lines()
-            .find_map(|l| l.strip_prefix(field))
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(0)
-    };
     let deadline = Instant::now() + Duration::from_secs(20);
-    while info_u64(&mut c, "tiering_blob_reclaimable:") > 0 {
+    while scrape_u64(&mut c, b"tiering", "tiering_blob_reclaimable:") > 0 {
         assert!(Instant::now() < deadline, "boot reclaim backlog never drained");
         #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -2615,7 +2702,7 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
     // falsifier run booted at live 541 < 560 survivors). `>=`, not `==`:
     // an acked everysec DEL that missed the last fsync legitimately
     // revives its key (and extent) at replay.
-    let live = info_u64(&mut c, "tiering_blob_extents_live:");
+    let live = scrape_u64(&mut c, b"tiering", "tiering_blob_extents_live:");
     assert!(
         live >= (blobs - deleted.len()) as u64,
         "extents live after reopen ({live}) below the {} surviving blob keys",

@@ -3,8 +3,9 @@
 //! at full scenario size via the CLI.
 
 use inf_sim::{
-    BootStormScenario, CombinedScenario, DurableScenario, Scenario, TieredScenario,
-    run_boot_storm_scenario, run_combined_scenario, run_durable_scenario, run_scenario,
+    BackfillScenario, BootStormScenario, CombinedScenario, DurableScenario, Scenario,
+    SidecarScenario, TieredScenario, run_backfill_scenario, run_boot_storm_scenario,
+    run_combined_scenario, run_durable_scenario, run_scenario, run_sidecar_scenario,
     run_tiered_scenario,
 };
 
@@ -82,8 +83,31 @@ fn corpus_seeds_replay_green() {
             ran += 1;
             continue;
         }
+        // F-L17-14 (review of 2026-08-30): the M4.5 index crash scenarios
+        // join the corpus — their own runners + verdict shapes.
+        if name == "m45-backfill" {
+            let report = run_backfill_scenario(&BackfillScenario::m45_backfill(seed));
+            assert!(
+                report.ok(),
+                "corpus seed {line} regressed: violations={:?}",
+                report.violations
+            );
+            ran += 1;
+            continue;
+        }
+        if name == "m45-sidecar" {
+            let report = run_sidecar_scenario(&SidecarScenario::m45_sidecar(seed));
+            assert!(
+                report.ok(),
+                "corpus seed {line} regressed: violations={:?}",
+                report.violations
+            );
+            ran += 1;
+            continue;
+        }
         let mut scenario = match name {
             "m0-smoke" => Scenario::m0_smoke(seed),
+            "m0-adversarial" => Scenario::m0_adversarial(seed),
             "m1-cache" => Scenario::m1_cache(seed),
             other => panic!("corpus names unknown scenario {other}"),
         };
