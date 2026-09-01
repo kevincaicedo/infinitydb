@@ -198,11 +198,14 @@ jobs:
           done
           grep -q 'module:name=ReJSON' <<<"$oracle_info"
           grep -q 'ver=20809' <<<"$oracle_info"
+      - name: build infinityd (the real-node compat candidate — F-L19-09)
+        run: cargo build -p infinityd
       - name: compat-diff matrix + generated-matrix staleness gate
         run: cargo test -p compat -- --nocapture
         env:
           INF_COMPAT_ORACLE_ADDR: 127.0.0.1:6390
           INF_COMPAT_JSON_ORACLE_ADDR: 127.0.0.1:6391
+          INFINITYD_BIN: ${{ github.workspace }}/target/debug/infinityd
 
   client-smoke:
     # M1-S03/S14: major Redis client libraries work against infinityd out of

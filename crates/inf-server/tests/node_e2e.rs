@@ -847,6 +847,24 @@ fn deasync_dispatch_matches_pump_semantics() {
     let line = read_line(&mut sub);
     assert!(line.starts_with(b"-ERR"), "restricted error for remote-ish key: {line:?}");
 
+    // Review 2026-09-01 (INFINITYD_BIN compat lane): PUBSUB and PUBLISH
+    // are plane pub/sub yet NOT in the Redis subscriber-mode allowlist —
+    // the plane gate must refuse them like `execute`'s fast path does
+    // (pre-fix, the node answered `PUBSUB CHANNELS` with the channel
+    // list; oracle-pinned refusal byte shape).
+    sub.write_all(&cmd(&[b"PUBSUB", b"CHANNELS"])).expect("write");
+    read_exactly(
+        &mut sub,
+        b"-ERR Can't execute 'pubsub|channels': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / \
+          PING / QUIT / RESET are allowed in this context\r\n",
+    );
+    sub.write_all(&cmd(&[b"PUBLISH", b"ch", b"m"])).expect("write");
+    let line = read_line(&mut sub);
+    assert!(line.starts_with(b"-ERR Can't execute 'publish'"), "restricted PUBLISH: {line:?}");
+    // The allowlist itself still passes: a further SUBSCRIBE works.
+    sub.write_all(&cmd(&[b"SUBSCRIBE", b"ch2"])).expect("write");
+    read_exactly(&mut sub, b"*3\r\n$9\r\nsubscribe\r\n$3\r\nch2\r\n:2\r\n");
+
     node.stop();
 }
 

@@ -424,6 +424,98 @@ fn configured_limits_carry_their_pinned_phrasing() {
     assert_reply(&mut db, &["JSON.GET", "m", "$[*]"], "-ERR path matched too many values\r\n");
 }
 
+/// Asserts `reply` is exactly one well-formed RESP bulk string and
+/// returns its payload length — the frame-validity claim of C9: whatever
+/// the payload size, the length header must be right and the frame whole.
+fn assert_single_bulk(reply: &[u8]) -> usize {
+    assert_eq!(reply.first(), Some(&b'$'), "not a bulk reply: {:?}", &reply[..reply.len().min(64)]);
+    let header_end = reply.windows(2).position(|w| w == b"\r\n").expect("bulk header CRLF");
+    let len: usize = std::str::from_utf8(&reply[1..header_end])
+        .expect("ASCII length digits")
+        .parse()
+        .expect("decimal length");
+    assert_eq!(
+        reply.len(),
+        header_end + 2 + len + 2,
+        "frame length disagrees with its header (header says {len})"
+    );
+    assert!(reply.ends_with(b"\r\n"), "unterminated bulk frame");
+    len
+}
+
+/// C9 falsifier 1 (review 2026-08-30, F-L12-03): the exact L12 shape — a
+/// sub-kilobyte document and a client-supplied `NEWLINE` separator push
+/// the serialized reply past the writer's 8-digit header reserve.
+/// Pre-fix this panicked (`debug_assert` here, wrapped `copy_within` →
+/// cell panic → node `exit(101)` in release). The reply is legitimate
+/// (under the doc-max-reply-bytes budget), so the fixed writer must
+/// answer a single well-formed bulk frame.
+#[test]
+fn get_reply_crossing_the_header_reserve_is_a_well_formed_bulk() {
+    let mut db = Db::new();
+    let doc = format!("[{}]", (0..200).map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+    assert_reply(&mut db, &["JSON.SET", "d", "$", &doc], "+OK\r\n");
+    let newline = "x".repeat(524_288);
+    let reply = db.run_str(&["JSON.GET", "d", "NEWLINE", &newline, "$"]);
+    let len = assert_single_bulk(&reply);
+    // ≈ 202 separators × 512 KiB: 9 length digits, past the old reserve.
+    assert!(len >= 100_000_000, "shape regressed below the reserve boundary: {len}");
+}
+
+/// C9 falsifier 2 (F-L15-01): multi-path repeat amplification — nine `$`
+/// paths over a ~16 MB document is a ~145 MB serialized reply, over the
+/// default doc-max-reply-bytes budget. Pre-fix this panicked mid-build;
+/// the fix must refuse with the pinned error instead of building it.
+#[test]
+fn get_reply_over_the_budget_answers_a_typed_error() {
+    let mut db = Db::new();
+    let doc = format!(r#"{{"s":"{}"}}"#, "x".repeat(16_000_000));
+    assert_reply(&mut db, &["JSON.SET", "d", "$", &doc], "+OK\r\n");
+    let reply = db.run_str(&["JSON.GET", "d", "$", "$", "$", "$", "$", "$", "$", "$", "$"]);
+    assert_eq!(String::from_utf8_lossy(&reply), "-ERR reply too large\r\n");
+}
+
+/// ADR-0099 D3/D4 at a lowered budget: all three amplification reaches
+/// from F-L15-01 refuse with the pinned phrasing, an in-budget reply is
+/// untouched, and the per-element commands answer the error as the
+/// element (array header already committed — the EXEC precedent).
+#[test]
+fn reply_budget_refuses_every_amplification_reach() {
+    let mut db =
+        Db::with_config(StoreConfig { doc_max_reply_bytes: 64 << 10, ..StoreConfig::default() });
+    // ~40 KiB document: under the budget once, over it twice.
+    let doc = format!(r#"{{"s":"{}"}}"#, "x".repeat(40_000));
+    assert_reply(&mut db, &["JSON.SET", "k", "$", &doc], "+OK\r\n");
+    // In-budget single path serializes normally.
+    let reply = db.run_str(&["JSON.GET", "k", "$"]);
+    assert_single_bulk(&reply);
+    // Reach 1 — multi-path repeat.
+    assert_reply(&mut db, &["JSON.GET", "k", "$", "$"], "-ERR reply too large\r\n");
+    // Reach 2 — `$..*` match amplification: every level of a 10-deep
+    // nest re-serializes its whole subtree, ≈ 10 × the document, from a
+    // document that serves a single path in-budget.
+    let deep = format!("{}\"{}\"{}", "[".repeat(10), "d".repeat(40_000), "]".repeat(10));
+    assert_reply(&mut db, &["JSON.SET", "deep", "$", &deep], "+OK\r\n");
+    let reply = db.run_str(&["JSON.GET", "deep", "$"]);
+    assert_single_bulk(&reply);
+    assert_reply(&mut db, &["JSON.GET", "deep", "$..*"], "-ERR reply too large\r\n");
+    // Reach 3 — client-supplied separator bytes.
+    let newline = "n".repeat(30_000);
+    db.run_str(&["JSON.SET", "a", "$", "[1,2,3]"]);
+    assert_reply(&mut db, &["JSON.GET", "a", "NEWLINE", &newline, "$"], "-ERR reply too large\r\n");
+    // MGET: the healthy key's element survives beside the refused one.
+    let reply = db.run_str(&["JSON.MGET", "a", "deep", "$..*"]);
+    let text = String::from_utf8_lossy(&reply);
+    assert!(text.starts_with("*2\r\n$"), "healthy element first: {text:?}");
+    assert!(text.ends_with("-ERR reply too large\r\n"), "refused element: {text:?}");
+    // ARRPOP: a popped element over the budget refuses; the mutation
+    // itself has committed (RedisJSON pop-then-reply order).
+    let big_elem = format!(r#"["{}"]"#, "y".repeat(70_000));
+    db.run_str(&["JSON.SET", "p", "$", &big_elem]);
+    assert_reply(&mut db, &["JSON.ARRPOP", "p", "$"], "*1\r\n-ERR reply too large\r\n");
+    assert_reply(&mut db, &["JSON.ARRLEN", "p", "$"], "*1\r\n:0\r\n");
+}
+
 #[test]
 fn filter_rejection_names_the_plan() {
     let mut db = Db::new();

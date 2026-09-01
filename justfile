@@ -39,7 +39,8 @@ loom:
 
 # Compat-diff vs real redis-server (requires redis-server on PATH).
 compat:
-    cargo test -p compat -- --nocapture
+    cargo build -p infinityd
+    INFINITYD_BIN={{justfile_directory()}}/target/debug/infinityd cargo test -p compat -- --nocapture
 
 # Deterministic simulator smoke scenarios, each twice, comparing traces.
 # m4-steel is the M4-S04 steel-thread twin (tiered lifecycle + cold reads

@@ -367,6 +367,14 @@ pub struct RespWriter<'b>;                  // over &mut Vec<u8> (a wire buffer)
   // bytes, which let a client open a second RESP frame inside its own reply
   // (review 2026-08-30, C6). `error_bytes` takes raw argv bytes, which need
   // not be UTF-8. Length-prefixed replies are never sanitized.
+  // `bulk_patched` (the M3 build-in-place bulk, ADR-0041 D10) has a TOTAL
+  // header patch since 2026-09-01 (ADR-0099, review C9): the 8-digit
+  // reserve is a fast path, not a bound — a payload needing more digits
+  // takes a cold in-place widening. `try_bulk_patched` is the fallible
+  // variant: a failing builder rolls the buffer back to the frame start
+  // (no partial frame can escape), for reply-byte budgets that refuse
+  // mid-serialization (`inf-doc`'s `serialize_*_bounded`,
+  // `doc-max-reply-bytes`).
 
 // Command metadata (frozen schema): name, arity, flags, key spec.
 // EXPIREAT is not in the M0 surface (matches the S15 list); registry is the

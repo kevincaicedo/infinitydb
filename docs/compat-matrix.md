@@ -9,6 +9,11 @@ Oracles: **Redis 8.0.5** for the core surface; RedisJSON uses
 **redis/redis-stack-server:7.4.0-v8@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a** with ReJSON/20809.
 Every covered behavior is byte-diffed under its declared protocol; any new or
 stale deviation fails CI (L8 — honesty is total).
+Candidates: the in-process executor **and**, since 2026-09-01 (review
+F-L19-09), a spawned **4-cell durable `infinityd`** behind TCP — the core
+corpus runs against both, plus a namespace-bound fan-out/tier lane
+(`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned
+byte-exact there, never silently excused.
 
 **Corpus:** 562 byte-compared executions · 59 documented deviations · 0 tolerated failures.
 **Surface:** 90 commands — 54 full · 32 partial · 0 stub · 2 extension · 2 internal.

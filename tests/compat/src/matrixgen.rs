@@ -563,6 +563,11 @@ pub fn render() -> String {
     ));
     push("Every covered behavior is byte-diffed under its declared protocol; any new or");
     push("stale deviation fails CI (L8 — honesty is total).");
+    push("Candidates: the in-process executor **and**, since 2026-09-01 (review");
+    push("F-L19-09), a spawned **4-cell durable `infinityd`** behind TCP — the core");
+    push("corpus runs against both, plus a namespace-bound fan-out/tier lane");
+    push("(`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned");
+    push("byte-exact there, never silently excused.");
     push("");
     push(&format!(
         "**Corpus:** {compared} byte-compared executions · {deviations} documented deviations · 0 tolerated failures.",

@@ -83,6 +83,14 @@ pub struct StoreConfig {
     /// key ADR-0040 D6 named): a declared product limit — the
     /// pathological `$..*` mutation otherwise plans unboundedly.
     pub doc_max_path_matches: u32,
+    /// Maximum serialized reply bytes per document-serializing command
+    /// (ADR-0099, review 2026-08-30 C9): a reply is not bounded by
+    /// `doc_max_bytes` — path repetition, `$..*` amplification and
+    /// client-supplied `INDENT`/`NEWLINE`/`SPACE` multiply it. The
+    /// default provably admits every single-document reply (worst
+    /// escape amplification is 6 × (16 MiB − 1) + 2 ≈ 100.7 MB) and cuts
+    /// off only amplified shapes; breach answers `ERR reply too large`.
+    pub doc_max_reply_bytes: usize,
 }
 
 impl Default for StoreConfig {
@@ -100,6 +108,7 @@ impl Default for StoreConfig {
             doc_max_bytes: DOC_MAX_BYTES_DEFAULT,
             doc_max_path_bytes: DOC_MAX_PATH_BYTES_DEFAULT,
             doc_max_path_matches: DOC_MAX_PATH_MATCHES_DEFAULT,
+            doc_max_reply_bytes: DOC_MAX_REPLY_BYTES_DEFAULT,
         }
     }
 }
@@ -111,6 +120,13 @@ const DOC_MAX_DEPTH_DEFAULT: usize = 128;
 const DOC_MAX_BYTES_DEFAULT: usize = 0xFF_FFFF;
 const DOC_MAX_PATH_BYTES_DEFAULT: usize = 4096;
 const DOC_MAX_PATH_MATCHES_DEFAULT: u32 = 65_536;
+const DOC_MAX_REPLY_BYTES_DEFAULT: usize = 128 << 20;
+
+// ADR-0099's admissibility proof pinned as arithmetic: the worst
+// single-document reply (every byte a control character, 6-byte
+// `\u00xx` escapes, plus quotes) fits the default reply budget, so
+// only amplified shapes can ever be refused at the default.
+const _: () = assert!(6 * DOC_MAX_BYTES_DEFAULT + 2 < DOC_MAX_REPLY_BYTES_DEFAULT);
 
 #[cfg(feature = "doc")]
 const _: () = {

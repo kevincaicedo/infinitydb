@@ -1082,6 +1082,14 @@ impl CellStore {
         self.cfg.doc_max_bytes
     }
 
+    /// Namespace-resolved serialized-reply budget (ADR-0099): the byte
+    /// cap every document-serializing reply is built under; breach
+    /// answers the pinned `ERR reply too large`.
+    #[inline]
+    pub fn doc_max_reply_bytes(&self) -> usize {
+        self.cfg.doc_max_reply_bytes
+    }
+
     /// The document memory domain (S19 wires this into reports/`INFO`).
     #[inline]
     pub fn doc_domain(&self) -> DocDomain {

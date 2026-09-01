@@ -84,33 +84,62 @@ impl<'b> RespWriter<'b> {
     }
 
     /// Bulk string of unknown length (ADR-0039 D1's wire half, built at
-    /// M3-S11 per ADR-0041 D10): reserve the maximal length-header width,
+    /// M3-S11 per ADR-0041 D10): reserve the common length-header width,
     /// let `build` append the payload once, back-patch the digits, and
     /// close the gap with one overlapping `copy_within` of the payload.
-    /// The move is O(payload) — bounded by the 16 MiB−1 document cap and
-    /// ~tens of ns at the 1 KiB gate shape; rejected alternatives
-    /// (scratch-buffer double write; deferred-length iovec chains) are
-    /// recorded in the ADR.
+    /// The move is O(payload) — ~tens of ns at the 1 KiB gate shape;
+    /// rejected alternatives (scratch-buffer double write; deferred-length
+    /// iovec chains) are recorded in the ADR.
+    ///
+    /// The header patch is **total** (ADR-0099, review 2026-08-30 C9): a
+    /// serialized reply is not bounded by the 16 MiB−1 document cap
+    /// (multi-path `JSON.GET`, formatting separators, `\u00xx` escape
+    /// amplification), so a payload needing more than the reserved
+    /// 8 digits takes a cold path that widens the header in place. The
+    /// previous `debug_assert!` on the payload size documented the bound
+    /// while release builds wrapped `MAX_DIGITS - text.len()` and
+    /// panicked inside `copy_within` — a client-drivable quantity is not
+    /// an internal invariant.
     pub fn bulk_patched(&mut self, build: impl FnOnce(&mut Vec<u8>)) {
-        // 8 digits cover the record-format value bound (16 MiB − 1).
-        const MAX_DIGITS: usize = 8;
+        let Ok(()) = self.try_bulk_patched(|out| {
+            build(out);
+            Ok::<(), core::convert::Infallible>(())
+        });
+    }
+
+    /// [`RespWriter::bulk_patched`] with a fallible builder (ADR-0099 D2):
+    /// when `build` errors — a reply-byte budget refusing mid-serialization
+    /// — the buffer is truncated back to the frame start, so no partial
+    /// frame can escape and the caller answers an error reply instead.
+    pub fn try_bulk_patched<E>(
+        &mut self,
+        build: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let frame_at = self.out.len();
         self.out.push(b'$');
         let digits_at = self.out.len();
         self.out.extend_from_slice(b"00000000\r\n");
-        let payload_at = digits_at + MAX_DIGITS + 2;
-        build(self.out);
+        let payload_at = digits_at + PATCHED_DIGITS + 2;
+        if let Err(e) = build(self.out) {
+            self.out.truncate(frame_at);
+            return Err(e);
+        }
         let len = self.out.len() - payload_at;
-        debug_assert!(len < 100_000_000, "payload exceeds the reserved header width");
         let mut buf = [0u8; 20];
         let text = itoa(len as i64, &mut buf);
-        let gap = MAX_DIGITS - text.len();
-        self.out[digits_at..digits_at + text.len()].copy_from_slice(text);
-        self.out[digits_at + text.len()..digits_at + text.len() + 2].copy_from_slice(b"\r\n");
-        if gap > 0 {
-            self.out.copy_within(payload_at.., payload_at - gap);
-            self.out.truncate(self.out.len() - gap);
+        if text.len() <= PATCHED_DIGITS {
+            let gap = PATCHED_DIGITS - text.len();
+            self.out[digits_at..digits_at + text.len()].copy_from_slice(text);
+            self.out[digits_at + text.len()..digits_at + text.len() + 2].copy_from_slice(b"\r\n");
+            if gap > 0 {
+                self.out.copy_within(payload_at.., payload_at - gap);
+                self.out.truncate(self.out.len() - gap);
+            }
+        } else {
+            widen_patched_header(self.out, digits_at, payload_at, text);
         }
         self.out.extend_from_slice(b"\r\n");
+        Ok(())
     }
 
     /// Null: `$-1\r\n` (RESP2) / `_\r\n` (RESP3).
@@ -262,6 +291,26 @@ impl<'b> RespWriter<'b> {
         let text = itoa(value, &mut buf);
         self.out.extend_from_slice(text);
     }
+}
+
+/// Reserved length-header width of a patched bulk: 8 digits cover every
+/// payload under 100 MB — all of them but the near-boundary amplified
+/// replies that take [`widen_patched_header`].
+const PATCHED_DIGITS: usize = 8;
+
+/// The ≥ 100 MB half of the total header patch (ADR-0099 D1): extend by
+/// the extra digit count, shift the payload right once, write the digits
+/// and CRLF over the old reserve. O(payload), on a frame that is ≥ 100 MB
+/// by construction — out of line so the fast path stays the D10 bytes.
+#[cold]
+#[inline(never)]
+fn widen_patched_header(out: &mut Vec<u8>, digits_at: usize, payload_at: usize, text: &[u8]) {
+    let extra = text.len() - PATCHED_DIGITS;
+    let old_len = out.len();
+    out.resize(old_len + extra, 0);
+    out.copy_within(payload_at..old_len, payload_at + extra);
+    out[digits_at..digits_at + text.len()].copy_from_slice(text);
+    out[digits_at + text.len()..digits_at + text.len() + 2].copy_from_slice(b"\r\n");
 }
 
 /// Whether `text` holds a CR or an LF — the only bytes that can end a
@@ -481,6 +530,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// C9 (review 2026-08-30, F-L12-03/F-L15-01): the length header must
+    /// be correct for ANY payload the builder produces. The old code
+    /// reserved 8 digits sized to the 16 MiB−1 *document* cap, but a
+    /// serialized reply is not bounded by the document cap (multi-path
+    /// `JSON.GET`, `INDENT`/`NEWLINE` repetition, `\u00xx` escape
+    /// amplification: 6 × 16 MiB−1 ≈ 100.66 MB already crosses it), and
+    /// `MAX_DIGITS - text.len()` underflowed at len ≥ 100,000,000 —
+    /// `debug_assert` in this profile, wrapped `copy_within` panic and a
+    /// whole-node `exit(101)` in release.
+    #[test]
+    fn bulk_patched_widens_the_header_past_the_reserve() {
+        // One past the 8-digit reserve: 100,000,000 bytes → 9 digits.
+        let payload_len = 100_000_000usize;
+        let out = render(Protocol::Resp2, |w| {
+            w.bulk_patched(|out| {
+                let at = out.len();
+                out.resize(at + payload_len, b'x');
+            });
+        });
+        let header = b"$100000000\r\n";
+        assert_eq!(&out[..header.len()], header);
+        assert_eq!(out.len(), header.len() + payload_len + 2);
+        assert!(out.ends_with(b"\r\n"));
+        assert!(out[header.len()..header.len() + payload_len].iter().all(|b| *b == b'x'));
+        // Mid-stream: an earlier reply is untouched and the next reply
+        // lands after the widened frame.
+        let out = render(Protocol::Resp2, |w| {
+            w.int(7);
+            w.bulk_patched(|out| {
+                let at = out.len();
+                out.resize(at + payload_len, b'y');
+            });
+            w.simple("OK");
+        });
+        assert_eq!(&out[..4], b":7\r\n");
+        assert_eq!(&out[4..4 + header.len()], header);
+        assert_eq!(&out[out.len() - 5..], b"+OK\r\n");
+    }
+
+    /// ADR-0099 D2: a failing builder must leave the buffer exactly as it
+    /// was before the frame opened — earlier replies intact, no partial
+    /// `$`-header — so the caller's error reply lands where the bulk
+    /// would have.
+    #[test]
+    fn try_bulk_patched_rolls_back_the_whole_frame_on_error() {
+        let out = render(Protocol::Resp2, |w| {
+            w.int(1);
+            let result = w.try_bulk_patched(|out| {
+                out.extend_from_slice(b"partial payload the budget refused");
+                Err::<(), &str>("too large")
+            });
+            assert_eq!(result, Err("too large"));
+            w.error("ERR reply too large");
+        });
+        assert_eq!(out, b":1\r\n-ERR reply too large\r\n");
+        // The Ok arm is byte-identical to the infallible method.
+        let out = render(Protocol::Resp2, |w| {
+            w.try_bulk_patched(|out| {
+                out.extend_from_slice(b"abc");
+                Ok::<(), &str>(())
+            })
+            .expect("infallible builder");
+        });
+        assert_eq!(out, b"$3\r\nabc\r\n");
     }
 
     /// SWAR kernel against a scalar oracle, every length across the

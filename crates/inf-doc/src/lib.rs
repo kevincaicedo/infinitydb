@@ -68,7 +68,8 @@ pub use header::{FLAG_INTERNED, HEADER_LEN, MAGIC, VERSION};
 pub use json::{JsonErrorKind, JsonParseError, JsonParser, ParseLimits, parse_number_token};
 pub use path::{Matches, PathError, PathErrorKind, PathProgram, PathStep, PathSteps, ProgramCache};
 pub use ser::{
-    Reply, SerializeOpts, serialize_canonical_into, serialize_into, serialize_number_text,
-    serialize_reply_into,
+    Reply, ReplyTooLarge, SerializeOpts, serialize_canonical_into, serialize_into,
+    serialize_into_bounded, serialize_number_text, serialize_reply_into,
+    serialize_reply_into_bounded,
 };
 pub use tape::{DocStr, TapeDoc};

@@ -85,7 +85,7 @@
 
   <div class="callout">
     <span class="callout-tag"><strong>Generated page &mdash; do not edit.</strong></span>
-    Rendered from <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/compat-matrix.md"><code>docs/compat-matrix.md</code></a> (itself generated from the <code>inf-wire</code> command registry and the oracle-diff corpus by <code>tests/compat/src/matrixgen.rs</code>, with a CI staleness gate) by <code>scripts/gen-compat-page.py</code> on 2026-08-16. Upstream regenerate: <code>INF_REGEN_MATRIX=1 cargo test -p compat --test matrix_artifact</code> (CI fails when this file is stale — the release pipeline inherits that refusal).
+    Rendered from <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/compat-matrix.md"><code>docs/compat-matrix.md</code></a> (itself generated from the <code>inf-wire</code> command registry and the oracle-diff corpus by <code>tests/compat/src/matrixgen.rs</code>, with a CI staleness gate) by <code>scripts/gen-compat-page.py</code> on 2026-09-01. Upstream regenerate: <code>INF_REGEN_MATRIX=1 cargo test -p compat --test matrix_artifact</code> (CI fails when this file is stale — the release pipeline inherits that refusal).
   </div>
 
   <div class="stat-row">
@@ -95,7 +95,7 @@
     <div class="stat"><div class="v">2</div><div class="l">extension</div></div>
     <div class="stat"><div class="v">2</div><div class="l">internal</div></div>
   </div>
-  <p class="mono-note">CORPUS: 546 byte-compared executions · 58 documented deviations · 0 tolerated failures &middot; SURFACE: 90 commands — 54 full · 32 partial · 0 stub · 2 extension · 2 internal</p>
+  <p class="mono-note">CORPUS: 562 byte-compared executions · 59 documented deviations · 0 tolerated failures &middot; SURFACE: 90 commands — 54 full · 32 partial · 0 stub · 2 extension · 2 internal</p>
 
   <h2 style="margin-top:40px">Status vocabulary</h2>
   <ul>
@@ -173,7 +173,7 @@
         <tr data-status="full"><td><code>EXPIRETIME</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>2</td><td>5</td><td></td></tr>
         <tr data-status="full"><td><code>PEXPIRETIME</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>2</td><td>4</td><td></td></tr>
         <tr data-status="full"><td><code>SELECT</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>2</td><td>7</td><td></td></tr>
-        <tr data-status="partial"><td><code>CONFIG</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>27</td><td>typed M1 key subset with frozen hot-reload classes</td></tr>
+        <tr data-status="partial"><td><code>CONFIG</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>34</td><td>typed M1 key subset with frozen hot-reload classes</td></tr>
         <tr data-status="partial"><td><code>CLIENT</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>5</td><td>KILL supports the ID filter form; LIST addr/fd are placeholders until peername capture</td></tr>
         <tr data-status="partial"><td><code>LOLWUT</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">readonly</td><td>-1</td><td>0</td><td>the whole reply is version art (nothing byte-comparable by design)</td></tr>
         <tr data-status="full"><td><code>SUBSCRIBE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>-2</td><td>5</td><td></td></tr>
