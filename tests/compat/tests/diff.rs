@@ -155,6 +155,18 @@ fn matrix_replies_match_redis() {
 
         match case.check {
             Check::ByteExact => {
+                // One command, one reply — asserted structurally, not just
+                // by the byte compare below: a candidate reply that splits
+                // into two frames desynchronises the connection even when
+                // its first frame matches (review 2026-08-30, C6).
+                if count_frames(&candidate_reply) != Some(1) {
+                    failures.push(format!(
+                        "case {i} {:?}: candidate answered {:?} frames, not 1:\n  {:?}",
+                        case.argv,
+                        count_frames(&candidate_reply),
+                        String::from_utf8_lossy(&candidate_reply),
+                    ));
+                }
                 if oracle_reply != candidate_reply {
                     failures.push(format!(
                         "case {i} {:?}:\n  oracle    {:?}\n  candidate {:?}",

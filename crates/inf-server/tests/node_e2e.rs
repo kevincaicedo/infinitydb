@@ -4269,3 +4269,239 @@ fn frame_pipeline_fills_under_concurrent_always_writers_and_survives_restart() {
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- C6 · RESP reply framing under hostile argument bytes ------------------
+//
+// Review 2026-08-30, finding **C6** (= `F-L00-25` / `F-L12-04`): raw client
+// bytes were spliced into line-framed error replies, so one command's
+// argument could open a *second* RESP frame and forge the reply to the next
+// pipelined command. The sanitizer lives in `RespWriter` (ADR-0097); these
+// tests are the node-level contract — the plane writes error replies from
+// paths `execute` never sees (`CONFIG`, `CLIENT`, `INF.NS`, the subcommand
+// dispatchers), so the class is only closed if it is closed *here*.
+
+/// Length of one complete RESP2/RESP3 reply at `buf[at..]`, or `None` when
+/// the bytes are incomplete. `Err` when they cannot be RESP at all — which
+/// is itself the C6 signature (an injected payload leaves a ragged tail).
+fn reply_len(buf: &[u8], at: usize) -> Result<Option<usize>, String> {
+    let Some(&tag) = buf.get(at) else { return Ok(None) };
+    let Some(rel) = buf[at..].windows(2).position(|w| w == b"\r\n") else { return Ok(None) };
+    let line_end = at + rel;
+    let head = &buf[at + 1..line_end];
+    let count = || -> Result<i64, String> {
+        std::str::from_utf8(head)
+            .map_err(|_| format!("non-utf8 length at {at}"))?
+            .parse::<i64>()
+            .map_err(|_| format!("bad length {:?} at {at}", String::from_utf8_lossy(head)))
+    };
+    match tag {
+        b'+' | b'-' | b':' | b',' | b'#' | b'(' | b'_' => Ok(Some(line_end + 2 - at)),
+        b'$' | b'=' => {
+            let n = count()?;
+            if n < 0 {
+                return Ok(Some(line_end + 2 - at));
+            }
+            let end = line_end + 2 + n as usize + 2;
+            Ok(if end <= buf.len() { Some(end - at) } else { None })
+        }
+        b'*' | b'~' | b'>' | b'%' => {
+            let n = count()?;
+            if n < 0 {
+                return Ok(Some(line_end + 2 - at));
+            }
+            let elements = if tag == b'%' { n * 2 } else { n };
+            let mut cur = line_end + 2;
+            for _ in 0..elements {
+                match reply_len(buf, cur)? {
+                    Some(len) => cur += len,
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(cur - at))
+        }
+        other => Err(format!("unknown RESP tag {:?} at {at}", other as char)),
+    }
+}
+
+/// Splits `buf` into complete replies. `Err` names the first byte that is
+/// not the start of a valid reply — a split reply always ends there.
+fn split_replies(buf: &[u8]) -> Result<Vec<&[u8]>, String> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < buf.len() {
+        match reply_len(buf, at)? {
+            Some(len) => {
+                out.push(&buf[at..at + len]);
+                at += len;
+            }
+            None => return Err(format!("incomplete reply at byte {at}")),
+        }
+    }
+    Ok(out)
+}
+
+/// Everything the server sends until it goes quiet for `quiet`.
+fn read_until_quiet(stream: &mut TcpStream, quiet: Duration) -> Vec<u8> {
+    stream.set_read_timeout(Some(quiet)).expect("timeout");
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => break, // WouldBlock/TimedOut: the reply is complete
+        }
+    }
+    stream.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    buf
+}
+
+/// The review's scenario, end to end on a real node: an application passes
+/// user data to a command InfinityDB has not implemented yet (the common
+/// case during the Redis-adoption story the product is built for) and
+/// pipelines a read it cares about behind it. The user's bytes must not be
+/// able to answer that read.
+#[test]
+fn a_command_argument_cannot_forge_the_reply_to_the_next_command() {
+    let node = Node::start(2);
+    let mut client = node.connect();
+
+    client.write_all(&cmd(&[b"SET", b"session:victim", b"REAL-SESSION-TOKEN"])).expect("write");
+    read_exactly(&mut client, b"+OK\r\n");
+
+    // The payload is a complete RESP bulk reply wrapped in CRLFs: if it
+    // reaches the wire verbatim, the client reads it as the *next* reply.
+    let payload = b"hello\r\n$18\r\nFORGED-SESSION-TOK\r\n";
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"LPUSH", b"mylist", payload])); // M5 command: unknown today
+    pipeline.extend(cmd(&[b"GET", b"session:victim"]));
+    client.write_all(&pipeline).expect("write");
+
+    let raw = read_until_quiet(&mut client, Duration::from_millis(400));
+    let replies = split_replies(&raw)
+        .unwrap_or_else(|e| panic!("two commands produced un-framed bytes ({e}): {raw:?}"));
+    assert_eq!(
+        replies.len(),
+        2,
+        "two commands must produce exactly two replies, got {}: {:?}",
+        replies.len(),
+        String::from_utf8_lossy(&raw)
+    );
+    assert!(replies[0].starts_with(b"-ERR unknown command "), "{:?}", replies[0]);
+    assert_eq!(
+        replies[1],
+        b"$18\r\nREAL-SESSION-TOKEN\r\n",
+        "the client was handed a forged reply: {:?}",
+        String::from_utf8_lossy(replies[1])
+    );
+    // Nothing may be left over: a leftover is a permanently desynced socket.
+    client.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut client, b"+PONG\r\n");
+
+    node.stop();
+}
+
+/// Class check, not site check: every command in the registry, plus every
+/// subcommand dispatcher that formats client bytes into its error, answers
+/// **exactly one** RESP reply when its arguments carry CR/LF. One fresh
+/// connection per case, so a split cannot hide inside the next case.
+#[test]
+fn no_command_can_split_its_reply_with_hostile_argument_bytes() {
+    let node = Node::start(2);
+    // A complete `+INJECTED\r\n` reply framed by CRLFs: if any byte of it
+    // reaches the wire unsanitized, `split_replies` sees two replies.
+    const SPLIT: &[u8] = b"\r\n+INJECTED\r\n";
+
+    let mut cases: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+    let hostile = |suffix: &[u8]| -> Vec<u8> {
+        let mut v = suffix.to_vec();
+        v.extend_from_slice(SPLIT);
+        v
+    };
+    // The unknown-command path: the payload as the command *name*, and as
+    // an argument of an unknown command.
+    cases.push(("unknown-name".into(), vec![hostile(b"BAD"), b"x".to_vec()]));
+    cases.push(("unknown-arg".into(), vec![b"NOSUCHCMD".to_vec(), hostile(b"a")]));
+    cases.push(("lone-lf-name".into(), vec![b"BAD\nLF".to_vec(), b"x".to_vec()]));
+    cases.push(("lone-cr-name".into(), vec![b"BAD\rCR".to_vec(), b"x".to_vec()]));
+    cases.push(("trailing-crlf-name".into(), vec![b"BAD\r\n".to_vec()]));
+    // The subcommand dispatchers, which reply through the plane rather than
+    // `execute` — every one of these split the reply before the fix.
+    for (name, sub) in [
+        (&b"DEBUG"[..], &b"NOPE"[..]),
+        (b"CONFIG", b"NOPE"),
+        (b"OBJECT", b"NOPE"),
+        (b"CLIENT", b"NOPE"),
+        (b"PUBSUB", b"NOPE"),
+        (b"INF.NS", b"NOPE"),
+        (b"INF.CKPT", b"NOPE"),
+    ] {
+        cases.push((
+            format!("{}-subcommand", String::from_utf8_lossy(name)),
+            vec![name.to_vec(), hostile(sub)],
+        ));
+    }
+    cases.push((
+        "config-set-param".into(),
+        vec![b"CONFIG".to_vec(), b"SET".to_vec(), hostile(b"nope"), b"1".to_vec()],
+    ));
+    cases.push((
+        "json-path".into(),
+        vec![b"JSON.GET".to_vec(), b"nokey".to_vec(), hostile(b"$.a[")],
+    ));
+    cases.push(("ns-use-name".into(), vec![b"INF.NS".to_vec(), b"USE".to_vec(), hostile(b"nope")]));
+    // And the whole registry with a hostile trailing argument: the point is
+    // that no *future* error text can reopen the hole either.
+    for meta in &inf_wire::COMMANDS {
+        cases.push((
+            format!("registry-{}", meta.name),
+            vec![meta.name.as_bytes().to_vec(), hostile(b"z")],
+        ));
+    }
+
+    let mut failures = Vec::new();
+    for (label, argv) in &cases {
+        let parts: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
+        let mut client = node.connect();
+        client.write_all(&cmd(&parts)).expect("write");
+        let raw = read_until_quiet(&mut client, Duration::from_millis(120));
+        match split_replies(&raw) {
+            Err(e) => failures.push(format!(
+                "{label}: reply is not whole frames ({e}): {:?}",
+                String::from_utf8_lossy(&raw)
+            )),
+            Ok(replies) => {
+                if replies.len() != 1 {
+                    failures.push(format!(
+                        "{label}: {} replies for one command: {:?}",
+                        replies.len(),
+                        String::from_utf8_lossy(&raw)
+                    ));
+                } else if replies[0] == b"+INJECTED\r\n" {
+                    failures.push(format!("{label}: the reply IS the injected frame"));
+                }
+            }
+        }
+        // The connection must still be usable — sanitization, not closure.
+        // (A `SUBSCRIBE` case leaves RESP2 subscriber mode, where `PING`
+        // answers a two-element array, so assert framing, not bytes.)
+        client.write_all(&cmd(&[b"PING"])).expect("write");
+        let raw = read_until_quiet(&mut client, Duration::from_millis(120));
+        match split_replies(&raw) {
+            Ok(replies) if replies.len() == 1 => {}
+            _ => failures.push(format!(
+                "{label}: connection unusable after: {:?}",
+                String::from_utf8_lossy(&raw)
+            )),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} hostile-argument cases split their reply:\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
+
+    node.stop();
+}

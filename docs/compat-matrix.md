@@ -10,7 +10,7 @@ Oracles: **Redis 8.0.5** for the core surface; RedisJSON uses
 Every covered behavior is byte-diffed under its declared protocol; any new or
 stale deviation fails CI (L8 — honesty is total).
 
-**Corpus:** 546 byte-compared executions · 58 documented deviations · 0 tolerated failures.
+**Corpus:** 555 byte-compared executions · 59 documented deviations · 0 tolerated failures.
 **Surface:** 90 commands — 54 full · 32 partial · 0 stub · 2 extension · 2 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations

@@ -1570,17 +1570,42 @@ fn inf_take_peek(
 
 // ---- shared helpers ---------------------------------------------------------------
 
+/// Longest command name echoed back (Redis: `%.128s` on the name).
+const UNKNOWN_NAME_MAX: usize = 128;
+/// Byte budget for the whole argument tail (Redis: arguments are appended
+/// while the tail is under 128 bytes, each truncated to what is left).
+const UNKNOWN_ARGS_BUDGET: usize = 128;
+
 // Format pinned byte-exact against Redis 8.0.5 by the compat harness:
-// `'arg1' 'arg2' ` — space-separated, trailing space, no parentheses.
+// `'arg1' 'arg2' ` — space-separated, trailing space, no parentheses. The
+// *bounds* are the oracle's too (`server.c`): without them 20 arguments of
+// `max_frame_bytes` each build a ~20 MB reply per bogus command. Argument
+// bytes go out raw (`error_bytes`) — they need not be UTF-8, and a lossy
+// conversion would change the byte budget as well as the bytes. CR/LF
+// inside them cannot break framing: `RespWriter` sanitizes the line
+// (ADR-0097 — review finding C6, where these bytes forged a second reply).
 fn unknown_command(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
-    let mut text = format!(
-        "ERR unknown command '{}', with args beginning with: ",
-        String::from_utf8_lossy(argv.arg(0))
-    );
-    for i in 1..argv.len().min(21) {
-        text.push_str(&format!("'{}' ", String::from_utf8_lossy(argv.arg(i))));
+    // One allocation, always: the message is bounded by its own two caps.
+    let mut text = Vec::with_capacity(UNKNOWN_NAME_MAX + UNKNOWN_ARGS_BUDGET + 64);
+    text.extend_from_slice(b"ERR unknown command '");
+    let name = argv.arg(0);
+    text.extend_from_slice(&name[..name.len().min(UNKNOWN_NAME_MAX)]);
+    text.extend_from_slice(b"', with args beginning with: ");
+    let mut spent = 0usize;
+    for i in 1..argv.len() {
+        if spent >= UNKNOWN_ARGS_BUDGET {
+            break;
+        }
+        let arg = argv.arg(i);
+        let take = arg.len().min(UNKNOWN_ARGS_BUDGET - spent);
+        text.push(b'\'');
+        text.extend_from_slice(&arg[..take]);
+        text.extend_from_slice(b"' ");
+        // The quotes and the separator count against the budget, as in the
+        // oracle's `sdscatprintf(args, "'%.*s' ", ...)`.
+        spent += take + 3;
     }
-    w.error(&text);
+    w.error_bytes(&text);
 }
 
 pub(crate) fn arity_error(name: &str, w: &mut RespWriter<'_>) {
@@ -1764,6 +1789,94 @@ mod tests {
 
     fn run(cx: &mut ConnCx, store: &mut Keyspace, parts: &[&[u8]]) -> Vec<u8> {
         run_at(cx, store, Nanos(1), parts)
+    }
+
+    /// C6 (review 2026-08-30, `F-L12-04` / `F-L00-25`): the unknown-command
+    /// reply interpolates raw client bytes, so it is where a client's own
+    /// argument can forge a *second* reply frame. Two contracts are pinned
+    /// here, both read off **redis-server 8.0.5**:
+    ///
+    /// 1. **Framing** — the reply is exactly one RESP frame whatever the
+    ///    argument bytes are (the sanitizer lives in `RespWriter`, so this
+    ///    is the command layer's end of that contract).
+    /// 2. **Bounds** — `server.c` truncates the name to 128 bytes and
+    ///    appends arguments *while the tail is under 128 bytes*, each
+    ///    truncated to the remaining budget. The old 20-argument cap had no
+    ///    byte bound at all: 20 × 1 MiB of argument built a ~20 MB `String`
+    ///    per bogus command.
+    #[test]
+    fn unknown_command_reply_is_bounded_and_framed_like_the_oracle() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        // One frame: a terminating CRLF and no other CR or LF anywhere.
+        let framed = |reply: &[u8]| -> bool {
+            reply.ends_with(b"\r\n")
+                && !reply[..reply.len() - 2].iter().any(|b| *b == b'\r' || *b == b'\n')
+        };
+
+        // Name truncated at 128 bytes (oracle: 300 N's -> 128 N's).
+        let long_name = vec![b'N'; 300];
+        let reply = run(&mut cx, &mut store, &[&long_name, b"x"]);
+        let want = format!(
+            "-ERR unknown command '{}', with args beginning with: 'x' \r\n",
+            "N".repeat(128)
+        );
+        assert_eq!(reply, want.as_bytes(), "{}", String::from_utf8_lossy(&reply));
+
+        // One long argument truncated to the 128-byte budget.
+        let long_arg = vec![b'A'; 300];
+        let reply = run(&mut cx, &mut store, &[b"NOSUCHCMD", &long_arg]);
+        let want = format!(
+            "-ERR unknown command 'NOSUCHCMD', with args beginning with: '{}' \r\n",
+            "A".repeat(128)
+        );
+        assert_eq!(reply, want.as_bytes(), "{}", String::from_utf8_lossy(&reply));
+
+        // The budget is spent across arguments: 'A*100' costs 103 bytes, so
+        // the next argument gets 25 and the third is never reached.
+        let a = vec![b'A'; 100];
+        let b = vec![b'B'; 100];
+        let c = vec![b'C'; 100];
+        let reply = run(&mut cx, &mut store, &[b"NOSUCHCMD", &a, &b, &c]);
+        let want = format!(
+            "-ERR unknown command 'NOSUCHCMD', with args beginning with: '{}' '{}' \r\n",
+            "A".repeat(100),
+            "B".repeat(25)
+        );
+        assert_eq!(reply, want.as_bytes(), "{}", String::from_utf8_lossy(&reply));
+
+        // Many short arguments stop at the same byte budget (oracle: a22).
+        let args: Vec<Vec<u8>> = (0..30).map(|i| format!("a{i}").into_bytes()).collect();
+        let mut parts: Vec<&[u8]> = vec![b"NOSUCHCMD"];
+        parts.extend(args.iter().map(|a| a.as_slice()));
+        let reply = run(&mut cx, &mut store, &parts);
+        let mut tail = String::new();
+        for i in 0..=22 {
+            tail.push_str(&format!("'a{i}' "));
+        }
+        let want =
+            format!("-ERR unknown command 'NOSUCHCMD', with args beginning with: {tail}\r\n");
+        assert_eq!(reply, want.as_bytes(), "{}", String::from_utf8_lossy(&reply));
+
+        // Framing: CR/LF in the name and in an argument stay inside one frame.
+        let reply = run(&mut cx, &mut store, &[b"BAD\r\n+INJECTED", b"x"]);
+        assert_eq!(
+            reply,
+            b"-ERR unknown command 'BAD  +INJECTED', with args beginning with: 'x' \r\n"
+        );
+        assert!(framed(&reply));
+        let reply = run(&mut cx, &mut store, &[b"NOSUCHCMD", b"a\r\n$3\r\nfoo"]);
+        assert_eq!(
+            reply,
+            b"-ERR unknown command 'NOSUCHCMD', with args beginning with: 'a  $3  foo' \r\n"
+        );
+        assert!(framed(&reply));
+
+        // A name that is nothing but CR/LF collapses to spaces, and the
+        // empty argument tail keeps the oracle's trailing space.
+        let reply = run(&mut cx, &mut store, &[b"BAD\r\n"]);
+        assert_eq!(reply, b"-ERR unknown command 'BAD  ', with args beginning with: \r\n");
+        assert!(framed(&reply));
     }
 
     #[test]

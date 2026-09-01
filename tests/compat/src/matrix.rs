@@ -48,6 +48,10 @@ const fn skip(argv: &'static [&'static str], why: &'static str) -> Case {
     Case { argv, check: Check::SkipDiff(why) }
 }
 
+/// 130 bytes — two past the oracle's 128-byte argument/name budget, so a
+/// case using it sees the truncation and not just the copy (C6).
+const LONG_ARG: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
 /// The v0 script. Order matters: later cases read state earlier ones wrote.
 pub static MATRIX: &[Case] = &[
     // --- PING / ECHO ---
@@ -193,6 +197,54 @@ pub static MATRIX: &[Case] = &[
     c(&["TTL"]),
     c(&["NOSUCHCOMMAND"]),
     c(&["NOSUCHCOMMAND", "arg1", "arg2"]),
+    // --- C6 (review 2026-08-30): client bytes inside a line-framed reply ---
+    // The unknown-command reply quotes the name and the arguments raw, so it
+    // is where a client's own bytes can open a second RESP frame. Redis maps
+    // CR/LF to spaces (`sdsmapchars`) and trims a trailing run (`sdstrim`);
+    // before the fix the corpus had only clean names and could not see it.
+    c(&["BAD\r\n+INJECTED", "x"]),
+    c(&["NOSUCHCOMMAND", "a\r\n$3\r\nfoo"]),
+    c(&["BAD\r\n"]),
+    c(&["BAD\nLF", "x"]),
+    c(&["BAD\rCR", "x"]),
+    // …and the oracle's bounds on the reply it builds from them: the name is
+    // truncated at 128 bytes and the argument tail stops once it passes 128,
+    // each argument cut to what is left (`LONG_ARG` is 130 bytes).
+    c(&["NOSUCHCOMMAND", LONG_ARG]),
+    c(&["NOSUCHCOMMAND", LONG_ARG, LONG_ARG]),
+    c(&[
+        "NOSUCHCOMMAND",
+        "a0",
+        "a1",
+        "a2",
+        "a3",
+        "a4",
+        "a5",
+        "a6",
+        "a7",
+        "a8",
+        "a9",
+        "a10",
+        "a11",
+        "a12",
+        "a13",
+        "a14",
+        "a15",
+        "a16",
+        "a17",
+        "a18",
+        "a19",
+        "a20",
+        "a21",
+        "a22",
+        "a23",
+        "a24",
+    ]),
+    c(&[LONG_ARG, "x"]),
+    skip(
+        &["NOSUCHCOMMAND", "a\0b"],
+        "Redis truncates the message at an embedded NUL (C `%s`); InfinityDB quotes the raw bytes — same framing, longer text",
+    ),
     // --- introspection (documented deviations) ---
     skip(&["HELLO"], "identity fields differ by design (L8: server/version)"),
     skip(&["HELLO", "3"], "identity fields differ; proto switch verified locally"),
