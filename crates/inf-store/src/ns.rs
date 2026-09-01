@@ -346,13 +346,12 @@ impl NsRegistry {
         Ok(())
     }
 
-    pub fn drop_ns(&mut self, name: &[u8]) -> Result<(), NsError> {
+    pub fn drop_ns(&mut self, name: &[u8]) -> Result<NsSpec, NsError> {
         if is_default_name(name) {
             return Err(NsError::DefaultImmutable);
         }
         let at = self.named.iter().position(|s| s.name == name).ok_or(NsError::Unknown)?;
-        self.named.remove(at);
-        Ok(())
+        Ok(self.named.remove(at))
     }
 
     /// Replaces a memory namespace's pressure knobs (M4-S27 hot-reload,

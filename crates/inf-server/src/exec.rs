@@ -270,6 +270,9 @@ pub struct NodeInfo {
     /// max — `rdb_last_save_time`/`LASTSAVE`).
     pub ckpt_in_progress: Cell<u64>,
     pub rdb_last_save_ms: Cell<u64>,
+    /// ADR-0100 D7: live drop tombstones in the catalog writer (node
+    /// scope, refreshed at MAINTAIN from the control handle).
+    pub ns_drop_tombstones: Cell<u64>,
     /// M2-S21: windowed rates (previous everysec-tick window) + fsync
     /// latency percentiles (µs) + checkpoint age (s).
     pub fsyncs_per_sec: Cell<u64>,

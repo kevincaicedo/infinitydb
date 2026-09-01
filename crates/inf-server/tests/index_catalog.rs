@@ -149,7 +149,7 @@ fn declarations_survive_restart_through_the_meta_swap() {
     let dir =
         std::env::temp_dir().join(format!("inf-m45-s03-meta-{}-{}", std::process::id(), line!()));
     std::fs::create_dir_all(&dir).expect("mkdir");
-    let (mut cells, control, inbox) = fleet();
+    let (mut cells, control, mut inbox) = fleet();
     let ready_id = IndexId(control.alloc_index_id());
     let ready_generation = control.alloc_index_generation();
     let dropping_id = IndexId(control.alloc_index_id());

@@ -10,6 +10,8 @@
 //! | `durable_fsync_eio` | `DurableCell::on_synced` | the fsync completion arrives as a device-reported EIO instead of `Synced` — the watermark freezes (no ack for the affected batch can ever fire) and the process fail-stops with [`EXIT_DURABLE_FAILSTOP`](crate::EXIT_DURABLE_FAILSTOP) (the fsyncgate rule; ADR-0020 D3) |
 //! | `shadow_twin_read_fail` | `plane::tiered::read_cold_record` | a shadow twin's cold read fails (M4.5-S37, ADR-0093 D4.3/A3): the reconciler leaves the ticket for the next round, `DBSIZE`'s drain answers the typed `-ERR DBSIZE: shadow twin … unreadable` (relayed through a scattered leg), `DEL`'s forced resolution answers its error — never an inexact count, never a removal |
 //! | `cold_enqueue_full` | `plane::tiered::probe` + `plane::tiered::fetch_key` | the `ColdReads` enqueue refuses `QueueFull` (the BUSY leg the review of 2026-08-30, C2′/F-L06-02/F-L06-04, found untestable deterministically): every read command answers the typed `BUSY cold-read queue saturated` — `GET`, `MGET`, `EXISTS`/`TOUCH`, and a `SCAN` page alike — never a nil, a `:0`, or a silently shorter page |
+//! | `ns_drop_before_meta` | `plane::program_ns_ddl` (the DROP branch, after the local apply, before the catalog persist request) | the DDL stops with the origin's registry already lacking the namespace and nothing durable changed — the on-disk state of a power cut before the catalog swap (ADR-0100 D5): a restart restores the namespace whole, its tier files intact on every cell (the teardown hold never released) |
+//! | `ns_drop_after_meta` | `plane::program_ns_ddl` (the DROP branch, after the catalog swap is durable, before the fan) | the DDL stops with `META` lacking the namespace and carrying its tombstone while every `MANIFEST` still names it — the on-disk state of a power cut after the swap (ADR-0100 D6): a restart boots, sweeps the residue, and the namespace is gone |
 //! | `mset_midway_oom` | `exec::mset` + `exec::msetnx` (the apply loops, pairs ≥ 2) | a multi-key write fails mid-way after applying a prefix (the deterministic stand-in for arena OOM — review of 2026-08-30, H2/F-L17-11, ADR-0098): the reply is the error, and the durable emission gate stages the applied prefix anyway — recovery replays exactly the live store, never a silent rollback of read-visible keys |
 //!
 //! The sync-tier seal fsync has its own point (`inf_log::fault::FSYNC_ERR`);
@@ -21,7 +23,15 @@ pub const DURABLE_FSYNC_EIO: &str = "durable_fsync_eio";
 pub const SHADOW_TWIN_READ_FAIL: &str = "shadow_twin_read_fail";
 pub const COLD_ENQUEUE_FULL: &str = "cold_enqueue_full";
 pub const MSET_MIDWAY_OOM: &str = "mset_midway_oom";
+pub const NS_DROP_BEFORE_META: &str = "ns_drop_before_meta";
+pub const NS_DROP_AFTER_META: &str = "ns_drop_after_meta";
 
 /// Inventory for the CI coverage check.
-pub const ALL: &[&str] =
-    &[DURABLE_FSYNC_EIO, SHADOW_TWIN_READ_FAIL, COLD_ENQUEUE_FULL, MSET_MIDWAY_OOM];
+pub const ALL: &[&str] = &[
+    DURABLE_FSYNC_EIO,
+    SHADOW_TWIN_READ_FAIL,
+    COLD_ENQUEUE_FULL,
+    MSET_MIDWAY_OOM,
+    NS_DROP_BEFORE_META,
+    NS_DROP_AFTER_META,
+];

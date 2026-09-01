@@ -110,6 +110,10 @@ pub(crate) struct TierNs<F: SegmentFs> {
     /// explicit per-namespace bound; the staged intents live in
     /// [`TierFlush`]).
     round: Option<FlushRound>,
+    /// Set when the namespace is dropped with a round in flight (the
+    /// ADR-0084 D3 custody park): the catalog epoch its files release
+    /// at once the round is terminal (ADR-0100 D5).
+    release_epoch: u64,
 }
 
 /// Plane bookkeeping of one in-flight flush round (M4.5-S31): terminal
@@ -277,9 +281,12 @@ pub(crate) struct TierCell<F: SegmentFs> {
 }
 
 /// A dropped namespace's file half, unlinked in bounded slices
-/// (ADR-0062 D7 — DROP's plane-side obligation).
+/// (ADR-0062 D7 — DROP's plane-side obligation) once the catalog swap
+/// that carries the drop is durable (ADR-0100 D5: `release_epoch` is
+/// that persist's epoch; a crash before it must find every file).
 struct TeardownNs {
     files: Vec<TierFileMeta>,
+    release_epoch: u64,
 }
 
 /// One compaction cold-read chain for the plane to issue
@@ -369,8 +376,11 @@ impl<F: SegmentFs + Clone> TierCell<F> {
     /// Reconciles plane state with the keyspace's tiered set (runs each
     /// MAINTAIN; DDL is rare, the fast path is two length loads).
     /// Creation builds the flush pipeline + custody engine; a dropped
-    /// namespace moves its file half to the bounded teardown queue.
-    pub fn sync_namespaces(&mut self, ks: &Keyspace) {
+    /// namespace moves its file half to the bounded teardown queue,
+    /// held until the catalog persist named in `releases` is durable
+    /// (ADR-0100 D5 — the DROP program records `(ns, epoch)` there
+    /// before this runs; the entry is consumed here).
+    pub fn sync_namespaces(&mut self, ks: &Keyspace, releases: &mut Vec<(NsId, u64)>) {
         let live: Vec<(NsId, TierSpec)> =
             ks.ns_iter().filter_map(|spec| spec.tier.map(|t| (spec.id, t))).collect();
         if live.len() == self.namespaces.len()
@@ -385,15 +395,26 @@ impl<F: SegmentFs + Clone> TierCell<F> {
                 i += 1;
                 continue;
             }
-            let gone = self.namespaces.remove(i);
+            let mut gone = self.namespaces.remove(i);
+            let release_epoch = match releases.iter().position(|(ns, _)| *ns == gone.ns) {
+                Some(at) => releases.swap_remove(at).1,
+                None => {
+                    // Every drop path records its epoch before MAINTAIN
+                    // can run; a missing entry is a violated invariant,
+                    // answered by today's immediate teardown in release.
+                    debug_assert!(false, "dropped tiered ns {} without a release epoch", gone.ns.0);
+                    0
+                }
+            };
             // A dropped namespace with a flush round in flight parks
             // whole: the driver may still touch its windows, so nothing
             // frees until every op is terminal (ADR-0084 D3 custody).
             if gone.round.is_some() {
+                gone.release_epoch = release_epoch;
                 self.round_drain.push(gone);
                 continue;
             }
-            self.teardown.push(TeardownNs { files: teardown_files(&gone) });
+            self.teardown.push(TeardownNs { files: teardown_files(&gone), release_epoch });
         }
         for (id, spec) in live {
             if self.namespaces.iter().any(|t| t.ns == id) {
@@ -446,6 +467,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             lane,
             round_seq: 0,
             round: None,
+            release_epoch: 0,
         })
     }
 
@@ -643,8 +665,10 @@ impl<F: SegmentFs + Clone> TierCell<F> {
     /// defers disk space — the boot orphan sweep re-drives it.
     /// Also advances parked rounds of dropped namespaces (ADR-0084 D3):
     /// once every op is terminal, the windows recycle and the files
-    /// join the teardown queue.
-    pub fn maintain_teardown(&mut self) -> u32 {
+    /// join the teardown queue. A queue whose catalog persist is not yet
+    /// durable (`persisted(release_epoch)` false — ADR-0100 D5) waits:
+    /// a cut before the swap must find every file.
+    pub fn maintain_teardown(&mut self, persisted: impl Fn(u64) -> bool) -> u32 {
         let mut i = 0;
         while i < self.round_drain.len() {
             let done = self.round_drain[i].round.as_ref().is_none_or(|r| r.pending == 0);
@@ -658,12 +682,18 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             // catalog facts die with it. Windows return to the pool the
             // drop then frees.
             let _ = gone.flush.finish_round();
-            self.teardown.push(TeardownNs { files: teardown_files(&gone) });
+            self.teardown.push(TeardownNs {
+                files: teardown_files(&gone),
+                release_epoch: gone.release_epoch,
+            });
         }
         let mut units = 0;
         let fs = self.fs.clone();
         let cold = self.cold.as_ref();
         for tn in &mut self.teardown {
+            if !persisted(tn.release_epoch) {
+                continue;
+            }
             let mut i = 0;
             while i < tn.files.len() && units < UNLINKS_PER_SLICE as u32 {
                 let id = tn.files[i].id;

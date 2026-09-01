@@ -38,6 +38,7 @@ fn durable_keyspace() -> Keyspace {
             tier: None,
         }],
         index: Default::default(),
+        dropped: Vec::new(),
     };
     ks.seed_catalog(&catalog).expect("seed");
     ks

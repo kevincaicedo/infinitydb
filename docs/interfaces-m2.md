@@ -22,7 +22,7 @@ Formats defined by ADR-0011 unless noted.
 | Sequential read path (`SegmentReader`) | `inf-log` | implemented (M2-S04; `BackendDriver` reads at S05; S14 tail policy implemented — ADR-0018) |
 | Durability watermark contract | `inf-log`/`inf-runtime` | implemented (M2-S05/S06/S08, ADR-0013/0015; live on `ServerPlane` — acks seq-keyed, semantics unchanged; sim disk at S18) |
 | Driver file ops (`LogWrite`/`Fdatasync`) | `inf-runtime` | implemented (M2-S05, ADR-0013 D1 — extends the frozen M0 `BackendDriver` contract) |
-| Node catalog `META` swap (`inf-log::meta`) | `inf-log` | implemented (M2-S08, ADR-0015 D3 — the S11 MANIFEST protocol class; payload = `inf-store::catalog` v1) |
+| Node catalog `META` swap (`inf-log::meta`) | `inf-log` | implemented (M2-S08, ADR-0015 D3 — the S11 MANIFEST protocol class; payload = `inf-store::catalog` v1 → v2 (ADR-0062 D6) → v3 (ADR-0075 D2) → **v4 (ADR-0100 D1, 2026-09-01)**: a drop-tombstone section, written iff non-empty, owned by the catalog writer) |
 | Namespace selection + `Op::ApplyNs` | `inf-server`/`inf-fabric` | implemented (M2-S08, ADR-0015 D1 — the ADR-0009 §4 codec revision, additive opcode 6; `ns ≥ 16` enforced at decode) |
 | `.ick` checkpoint format v1 | `inf-log` | implemented (M2-S10, ADR-0016 — record-v1 payload; digest = hash64 chain, recorded deviation from "xxh3") |
 | Checkpoint scheduler group + ckpt token classes | `inf-runtime` | implemented (M2-S10/S11, ADR-0016 D4/D5 + ADR-0017 D3 — `GroupClass::Checkpoint`; `TokenClass::{CkptWrite,CkptSync,ManifestSync}` routing-only extensions of the frozen M0 token contract) |
@@ -1152,6 +1152,41 @@ per episode). A drained cell always seals — never slower than K = 1.
      re-registration** (`ExtentRefs::register`) — the ADR-0057 D4
      at-least-once physics applied to the reclaim queue (found by the
      DST sweep; ADR-0061 D5).
+- **ADR-0100 amendment (2026-09-01, full-codebase review C13 /
+  F-L14-04) — namespace catalog v4 + the `DROP` choreography.**
+  1. **Catalog v4** (`inf-store::catalog`): after the (now always
+     present) index section, `dropped_count: u32 · dropped_id: u32 *
+     count` — strictly ascending ids, each `≥ 16`, `< next_id`, never a
+     live entry, `≤ DROPPED_IDS_MAX` (4096); every violation is the
+     typed `InvalidDroppedId`. Written **iff non-empty** (else v3/v2
+     byte-identically); v1–v3 decode with an empty set. The set is
+     **owned by the catalog writer** (`inf-server::control`, ADR-0100
+     D2): cell exports leave it empty, the writer merges its live set
+     into every payload and drops any entry a tombstone names (replica
+     lag from a concurrent DDL — ids never reuse). A tombstone is added
+     by a durable namespace's `DROP`, stamped with the node-wide
+     checkpoint epoch the origin requests after the fan, and retired at
+     the next persist once `CkptBoard::min_published` covers it; boot
+     re-stamps survivors with one fresh request. Bound `DROPPED_NS_MAX
+     = 256` — at the cap the `DROP` waits for its checkpoint first.
+  2. **`INF.NSFAN DROP name epoch`** (4 positional args): the fan carries
+     the persist epoch of the swap that drops the namespace; peers park
+     their tier-file teardown until `ControlHandle::persisted(epoch)`
+     (ADR-0100 D5). `DROP` itself runs *apply → request persist → fan →
+     wait → request checkpoint + `StampDrop` → `+OK`* (ADR-0100 D4);
+     `CREATE`/`SET` keep the ADR-0015 D3 order. `Keyspace::ns_drop`
+     returns the dropped `NsSpec`; `ns_tombstoned`/`ns_tombstones`
+     expose the boot snapshot to recovery.
+  3. **Recovery rule** (`inf-server::recover`, ADR-0100 D6): a `MANIFEST`
+     tier section naming an id the catalog does not know is skipped and
+     its `shard-k/ns-N/cold` files unlinked **iff the id is tombstoned**
+     (`RecoverStats::{dropped_ns_swept, dropped_files_swept}`); every
+     tombstoned id's directory is swept even without a section; the
+     checkpoint's tiered sections (ref / live-set / blob-ref) naming a
+     tombstoned id are skipped (`dropped_sections_skipped`);
+     an untombstoned unknown id stays the fail-stop in both places. `INFO persistence`
+     gains `ns_drop_tombstones`. Fault points `ns_drop_before_meta` /
+     `ns_drop_after_meta` carry the two crash-matrix rows.
 - **M4-S19 amendment (ADR-0062) — namespace catalog v2 + the `INF.NS`
   tiering surface.**
   1. **Catalog v2** (`inf-store::catalog`): `CATALOG_VERSION = 2` — the

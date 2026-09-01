@@ -132,3 +132,30 @@ point = "mset_midway_oom"
 tier = "node"
 test = "node_e2e"
 expect = "staged-prefix"
+# Review of 2026-08-30 (C13 / F-L14-04, ADR-0100): `INF.NS DROP` of a
+# tiered namespace — the two windows a power cut can land in. Both
+# points stop the DDL program with the on-disk state of that cut and the
+# carrying tests restart the node on it. Carried by
+# `inf-server/tests/node_e2e.rs`
+# (`dropped_tiered_namespace_survives_a_cut_before_its_swap` /
+# `…_after_its_swap`; armed on the cell threads at boot).
+#   namespace-restored-whole — the cut preceded the catalog swap:
+#                         nothing durable changed, the teardown hold
+#                         (ADR-0100 D5) kept every tier file, and the
+#                         restart serves the namespace with its data
+#   residue-swept       — the cut followed the swap: META lacks the
+#                         namespace and carries its tombstone, every
+#                         MANIFEST still names it, and the restart
+#                         boots (never the pre-ADR fail-stop), sweeps
+#                         `ns-N/cold`, and the namespace is gone
+[[row]]
+point = "ns_drop_before_meta"
+tier = "node"
+test = "node_e2e"
+expect = "namespace-restored-whole"
+
+[[row]]
+point = "ns_drop_after_meta"
+tier = "node"
+test = "node_e2e"
+expect = "residue-swept"

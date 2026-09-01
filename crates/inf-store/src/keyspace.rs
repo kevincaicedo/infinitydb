@@ -201,6 +201,11 @@ pub struct Keyspace {
     /// This boot's sidecar load fold (M4.5-S06, ADR-0078 D6) — written
     /// once by the loader's commit, rendered by `INFO stats`.
     sidecar_info: crate::index_sidecar::SidecarBootInfo,
+    /// Drop tombstones as the boot catalog carried them (ADR-0100 D6):
+    /// recovery's read-only witness that a `MANIFEST` tier section or
+    /// `ns-N/` directory naming an unknown id is the residue of an acked
+    /// `DROP`. The live set is the catalog writer's; this is a snapshot.
+    dropped_ns: Vec<NsId>,
 }
 
 impl Keyspace {
@@ -213,6 +218,7 @@ impl Keyspace {
             named: NsRegistry::default(),
             named_stores: Vec::new(),
             tiered_stores: Vec::new(),
+            dropped_ns: Vec::new(),
             pressure: PressureConfig::default(),
             budget_shares: 1,
             over_limit: false,
@@ -1104,18 +1110,33 @@ impl Keyspace {
     /// admitted sum — structurally, not by bookkeeping. The plane owns
     /// the file half of the teardown (tier + blob unlinks after pin
     /// drain — `inf-store` never does I/O, §3.3).
-    pub fn ns_drop(&mut self, name: &[u8]) -> Result<(), NsError> {
-        let id = self.named.get(name).map(|s| s.id);
-        self.named.drop_ns(name)?;
-        if let Some(id) = id {
-            self.named_stores.retain(|e| e.id != id);
-            self.tiered_stores.retain(|(nid, _)| *nid != id);
-            // A namespace drop takes its index declarations and trees
-            // with it (M4.5-S03) — their ids stay retired.
-            self.indexes.remove_ns(id);
-            self.refresh_pressure();
-        }
-        Ok(())
+    /// Drops a named namespace, returning the spec it had (the DDL
+    /// program reads the mode and id off it — ADR-0100 D3/D4).
+    ///
+    /// # Errors
+    /// `Unknown` / `DefaultImmutable` from the registry.
+    pub fn ns_drop(&mut self, name: &[u8]) -> Result<NsSpec, NsError> {
+        let spec = self.named.drop_ns(name)?;
+        let id = spec.id;
+        self.named_stores.retain(|e| e.id != id);
+        self.tiered_stores.retain(|(nid, _)| *nid != id);
+        // A namespace drop takes its index declarations and trees
+        // with it (M4.5-S03) — their ids stay retired.
+        self.indexes.remove_ns(id);
+        self.refresh_pressure();
+        Ok(spec)
+    }
+
+    /// True when the boot catalog tombstoned `ns` (ADR-0100 D6): residue
+    /// naming it is the leftover of an acked `DROP`, not corruption.
+    pub fn ns_tombstoned(&self, ns: NsId) -> bool {
+        self.dropped_ns.contains(&ns)
+    }
+
+    /// The boot catalog's tombstones (recovery sweeps each one's
+    /// directory whether or not a `MANIFEST` section still names it).
+    pub fn ns_tombstones(&self) -> &[NsId] {
+        &self.dropped_ns
     }
 
     /// Hot-reloads a tiered namespace's spec (M4-S19, ADR-0062 D3): the
@@ -1247,6 +1268,7 @@ impl Keyspace {
         self.named_stores.clear();
         self.tiered_stores.clear();
         self.indexes = IndexRegistry::default();
+        self.dropped_ns = cat.dropped.iter().map(|&id| NsId(id)).collect();
         // Boot restarts every build (ADR-0077 D2): jobs re-derive from
         // the seeded registry at the first MAINTAIN tick.
         self.backfill.clear();
@@ -1285,7 +1307,9 @@ impl Keyspace {
 
     /// Snapshot the registry as a catalog (the DDL persist path; the
     /// caller owns all three counters — they live on the node-level
-    /// allocator and never regress).
+    /// allocator and never regress). `dropped` is left empty: the
+    /// tombstone set is the catalog writer's (ADR-0100 D2) and is merged
+    /// into the payload there.
     pub fn export_catalog(
         &self,
         next_id: u32,
@@ -1300,6 +1324,7 @@ impl Keyspace {
                 next_generation: next_index_generation,
                 entries: self.indexes.export(),
             },
+            dropped: Vec::new(),
         }
     }
 

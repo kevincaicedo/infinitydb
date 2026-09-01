@@ -40,32 +40,15 @@ fn scratch_base() -> &'static Path {
 /// compare fails (so the mid-script `FLUSHALL` — before any durable
 /// namespace exists — still byte-compares), and each pins exact bytes or
 /// an exact shape: drift inside a deviation fails the lane.
-const NODE_OVERRIDES: &[CaseOverride] = &[
-    CaseOverride {
-        // ADR-0015's recorded M2 cut: once the script has created a
-        // durable namespace, node-wide FLUSHALL refuses typed.
-        argv: &["FLUSHALL"],
-        expect: Expect::CandidateExact(
-            b"-ERR FLUSHALL on a node with durable namespaces is not yet supported (M2)\r\n",
-        ),
-        why: "FLUSHALL with durable namespaces refuses (ADR-0015 M2 cut)",
-    },
-    CaseOverride {
-        // Finding N4 (2026-09-01, this lane): when another cell owns the
-        // channel, the INF.PUBFAN push reaches the self-subscribed
-        // publisher before the fabric round-trip returns the count
-        // reply — frame content byte-exact, order divergent. Open
-        // product finding, not a declared deviation.
-        argv: &["PUBLISH", "alpha", "selfmsg"],
-        expect: Expect::FramePermutation,
-        why: "N4 open finding: cross-cell self-delivery push precedes the PUBLISH reply",
-    },
-    CaseOverride {
-        argv: &["PUBLISH", "alpha", "both"],
-        expect: Expect::FramePermutation,
-        why: "N4 open finding: cross-cell self-delivery push precedes the PUBLISH reply",
-    },
-];
+const NODE_OVERRIDES: &[CaseOverride] = &[CaseOverride {
+    // ADR-0015's recorded M2 cut: once the script has created a
+    // durable namespace, node-wide FLUSHALL refuses typed.
+    argv: &["FLUSHALL"],
+    expect: Expect::CandidateExact(
+        b"-ERR FLUSHALL on a node with durable namespaces is not yet supported (M2)\r\n",
+    ),
+    why: "FLUSHALL with durable namespaces refuses (ADR-0015 M2 cut)",
+}];
 
 #[test]
 fn node_matrix_replies_match_redis() {
@@ -101,12 +84,12 @@ fn node_matrix_replies_match_redis() {
     );
     // The pinned list is exact: a fixed divergence must retire its
     // override (a stale excuse is a lie), a new one must be filed. The
-    // FLUSHALL deviation always fires; the two N4 cases fire only when
-    // the channel's owner is remote from the connection's cell (¾ of
-    // boots — the local-owner arm already implements the Redis order),
-    // and they share one channel and connection, so they fire together.
-    assert!(
-        matches!(report.deviations.len(), 1 | 3),
+    // FLUSHALL deviation always fires; N4 (the cross-cell self-delivery
+    // permutation) retired with ADR-0101 — its two overrides are gone,
+    // so the self-subscribed PUBLISH cases byte-compare on every boot.
+    assert_eq!(
+        report.deviations.len(),
+        1,
         "pinned node deviations drifted:\n{}",
         report.deviations.join("\n")
     );

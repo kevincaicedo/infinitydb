@@ -480,6 +480,13 @@ impl Node {
         {
             let deadline = Instant::now() + Duration::from_secs(30);
             while !control.recovery_board().all_ready() {
+                // A cell thread that exited during recovery panicked on
+                // its boot error (fail-stop, §8.4): report that now, with
+                // the refusal on stderr, instead of a 30 s timeout.
+                assert!(
+                    !node.handles.iter().any(std::thread::JoinHandle::is_finished),
+                    "a cell thread exited during recovery (fail-stop — see stderr)"
+                );
                 assert!(Instant::now() < deadline, "recovery did not finish in 30s");
                 #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
                 std::thread::sleep(Duration::from_millis(1));
@@ -4830,4 +4837,450 @@ fn no_command_can_split_its_reply_with_hostile_argument_bytes() {
     );
 
     node.stop();
+}
+
+// ---------------------------------------------------------------------
+// ADR-0101 — cross-cell pub/sub self-delivery order (review finding N4).
+// ---------------------------------------------------------------------
+
+/// A channel owned by `cell` under an N-cell contiguous router.
+fn channel_for_cell(cells: u16, cell: u16) -> Vec<u8> {
+    let router = SlotRouter::new_contiguous(cells);
+    for i in 0..100_000u32 {
+        let ch = format!("ch:{i}");
+        if router.cell_of(SlotRouter::slot_of(ch.as_bytes())) == CellId(cell) {
+            return ch.into_bytes();
+        }
+    }
+    panic!("no channel found for cell {cell}");
+}
+
+/// `HELLO 3`, draining the reply map (ends with the empty modules array).
+fn hello3(conn: &mut TcpStream) {
+    conn.write_all(&cmd(&[b"HELLO", b"3"])).expect("write");
+    let mut drained = Vec::new();
+    let mut byte = [0u8; 1];
+    while !drained.ends_with(b"*0\r\n") {
+        conn.read_exact(&mut byte).expect("hello body");
+        drained.push(byte[0]);
+    }
+}
+
+fn bulk_frame(s: &[u8]) -> Vec<u8> {
+    let mut out = format!("${}\r\n", s.len()).into_bytes();
+    out.extend_from_slice(s);
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// RESP3 `>3 message ch payload`.
+fn push_message(ch: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut out = b">3\r\n$7\r\nmessage\r\n".to_vec();
+    out.extend(bulk_frame(ch));
+    out.extend(bulk_frame(payload));
+    out
+}
+
+/// RESP3 `>4 pmessage pattern ch payload`.
+fn push_pmessage(pattern: &[u8], ch: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut out = b">4\r\n$8\r\npmessage\r\n".to_vec();
+    out.extend(bulk_frame(pattern));
+    out.extend(bulk_frame(ch));
+    out.extend(bulk_frame(payload));
+    out
+}
+
+/// `SUBSCRIBE ch` on a RESP3 connection, expecting subscription count `n`.
+fn subscribe3(conn: &mut TcpStream, ch: &[u8], n: u32) {
+    conn.write_all(&cmd(&[b"SUBSCRIBE", ch])).expect("write");
+    let mut want = b">3\r\n$9\r\nsubscribe\r\n".to_vec();
+    want.extend(bulk_frame(ch));
+    want.extend_from_slice(format!(":{n}\r\n").as_bytes());
+    read_exactly(conn, &want);
+}
+
+/// ADR-0101 D1–D4 (review finding N4): a RESP3 connection subscribed to a
+/// channel a *remote* cell owns publishes to it. Redis order is the count
+/// reply, then the publisher's own push. Pre-fix the owner's `INF.PUBFAN`
+/// leg wrote the push into this connection before the fabric round-trip
+/// returned `:1` — the frame permutation the node compat lane pinned.
+#[test]
+fn cross_cell_self_publish_reply_precedes_push() {
+    let node = Node::start(2);
+    let mut c = conn_on_cell(&node, 0);
+    hello3(&mut c);
+    let ch = channel_for_cell(2, 1);
+    subscribe3(&mut c, &ch, 1);
+    c.write_all(&cmd(&[b"PUBLISH", &ch, b"selfmsg"])).expect("write");
+    let mut want = b":1\r\n".to_vec();
+    want.extend(push_message(&ch, b"selfmsg"));
+    read_exactly(&mut c, &want);
+    // Channel and pattern frames both ride the reply: message, then
+    // pmessage, after the count — Redis order (ADR-0010 §5).
+    c.write_all(&cmd(&[b"PSUBSCRIBE", b"ch:*"])).expect("write");
+    read_exactly(&mut c, b">3\r\n$10\r\npsubscribe\r\n$4\r\nch:*\r\n:2\r\n");
+    c.write_all(&cmd(&[b"PUBLISH", &ch, b"both"])).expect("write");
+    let mut want = b":2\r\n".to_vec();
+    want.extend(push_message(&ch, b"both"));
+    want.extend(push_pmessage(b"ch:*", &ch, b"both"));
+    read_exactly(&mut c, &want);
+    // An unsubscribed publisher on the same connection state is untagged
+    // and unchanged: plain count reply.
+    c.write_all(&cmd(&[b"UNSUBSCRIBE", &ch])).expect("write");
+    let mut want = b">3\r\n$11\r\nunsubscribe\r\n".to_vec();
+    want.extend(bulk_frame(&ch));
+    want.extend_from_slice(b":1\r\n");
+    read_exactly(&mut c, &want);
+    c.write_all(&cmd(&[b"PUNSUBSCRIBE", b"ch:*"])).expect("write");
+    read_exactly(&mut c, b">3\r\n$12\r\npunsubscribe\r\n$4\r\nch:*\r\n:0\r\n");
+    c.write_all(&cmd(&[b"PUBLISH", &ch, b"nobody"])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+    drop(c);
+    node.stop();
+}
+
+/// ADR-0101 D4: pipelined publishes to channels with two *different*
+/// remote owners. Their fan legs and replies reach this cell in any
+/// order; pairing by sequence keeps each reply followed by exactly its
+/// own frames — `:1 push(a) :1 push(b)`, never a foreign push after the
+/// wrong reply (the per-connection deferral alternative's failure).
+#[test]
+fn pipelined_self_publishes_pair_each_reply_with_its_own_frames() {
+    let node = Node::start(4);
+    let mut c = conn_on_cell(&node, 0);
+    hello3(&mut c);
+    let a = channel_for_cell(4, 1);
+    let b = channel_for_cell(4, 2);
+    subscribe3(&mut c, &a, 1);
+    subscribe3(&mut c, &b, 2);
+    for round in 0..20u32 {
+        let ma = format!("a{round}").into_bytes();
+        let mb = format!("b{round}").into_bytes();
+        let mut wire = cmd(&[b"PUBLISH", &a, &ma]);
+        wire.extend(cmd(&[b"PUBLISH", &b, &mb]));
+        c.write_all(&wire).expect("write");
+        let mut want = b":1\r\n".to_vec();
+        want.extend(push_message(&a, &ma));
+        want.extend_from_slice(b":1\r\n");
+        want.extend(push_message(&b, &mb));
+        read_exactly(&mut c, &want);
+    }
+    drop(c);
+    node.stop();
+}
+
+/// ADR-0101 D3: the tag defers only the tagged connection's frames. A
+/// second subscriber on the owner cell publishing the *same payload* on
+/// the same channel while the first's publish is in flight loses
+/// nothing: both frames reach both connections, every count is 2, and
+/// the self-subscribed publisher's own push still follows its reply.
+#[test]
+fn foreign_publish_during_self_publish_is_not_swallowed() {
+    let node = Node::start(2);
+    let ch = channel_for_cell(2, 1);
+    let mut remote = conn_on_cell(&node, 0);
+    hello3(&mut remote);
+    subscribe3(&mut remote, &ch, 1);
+    let mut owner = conn_on_cell(&node, 1);
+    hello3(&mut owner);
+    subscribe3(&mut owner, &ch, 1);
+    for _ in 0..20 {
+        // Neither reply is read before both publishes are on the wire.
+        owner.write_all(&cmd(&[b"PUBLISH", &ch, b"same"])).expect("write");
+        remote.write_all(&cmd(&[b"PUBLISH", &ch, b"same"])).expect("write");
+        let push = push_message(&ch, b"same");
+        for conn in [&mut remote, &mut owner] {
+            // Three frames: `:2` and two identical pushes, in one of the
+            // two legal orders — the publisher's own push is contiguous
+            // with its reply, so the frame after `:2` is always a push.
+            let mut got = Vec::new();
+            let mut byte = [0u8; 1];
+            let total = 4 + 2 * push.len();
+            while got.len() < total {
+                conn.read_exact(&mut byte).expect("frames");
+                got.push(byte[0]);
+            }
+            let mut a = b":2\r\n".to_vec();
+            a.extend(&push);
+            a.extend(&push);
+            let mut b = push.clone();
+            b.extend_from_slice(b":2\r\n");
+            b.extend(&push);
+            assert!(got == a || got == b, "frames: {:?}", String::from_utf8_lossy(&got));
+        }
+    }
+    drop(remote);
+    drop(owner);
+    node.stop();
+}
+
+// ---------------------------------------------------------------------
+// ADR-0100 — namespace drop residue (review C13 / F-L14-04).
+// ---------------------------------------------------------------------
+
+/// The value of key `k{i}` in the ADR-0100 tests: every even key is an
+/// 8 KiB blob (above the 4 KiB `BLOB-THRESHOLD`, so it lands in
+/// `ns-16/cold` as an extent file at SET time — real residue on disk);
+/// odd keys stay inline.
+fn cold_value(i: u32) -> Vec<u8> {
+    if i.is_multiple_of(2) {
+        let mut v = format!("blob{i}:").into_bytes();
+        v.resize(8 << 10, b'x');
+        v
+    } else {
+        format!("v{i}").into_bytes()
+    }
+}
+
+/// Creates the tiered namespace `cold` (id 16 on a fresh directory),
+/// writes `keys` values into it (half of them blob extents), fills the
+/// ring until **every cell has demoted and flush-confirmed** cold bytes
+/// (so the checkpoint carries a live-set section — the residue class the
+/// `m4-tiered` DST found on the fix's first seed, invisible to a
+/// checkpoint of RAM-only data), publishes a checkpoint on every cell so
+/// each `MANIFEST` carries its tier section, and asserts every cell holds
+/// cold files — the residue the tests are about must exist, or they
+/// prove nothing.
+fn seed_tiered_namespace_with_checkpoint(node: &Node, dir: &std::path::Path, keys: u32) {
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"cold",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"8mb",
+        b"DISK-BUDGET",
+        b"64mb",
+        b"MUTABLE-FRACTION",
+        b"100",
+        b"BLOB-THRESHOLD",
+        b"4kb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"cold"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for i in 0..keys {
+        c.write_all(&cmd(&[b"SET", format!("k{i}").as_bytes(), &cold_value(i)])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    // Ring fill: 3 KiB inline values (below the blob threshold) in
+    // pipelined batches until both cells report flush-confirmed bytes.
+    let mut scrapers: Vec<TcpStream> = (0..2).map(|cell| conn_on_cell(node, cell)).collect();
+    let filler = vec![b'f'; 3 << 10];
+    let mut batch = 0u32;
+    loop {
+        let flushed_everywhere = scrapers
+            .iter_mut()
+            .all(|s| scrape_u64(s, b"tiering", "tiering_flush_confirmed_bytes:") > 0);
+        if flushed_everywhere {
+            break;
+        }
+        assert!(batch < 128, "no cell demoted after {batch} batches of 200 × 3 KiB");
+        let mut wire = Vec::new();
+        for i in 0..200u32 {
+            wire.extend(cmd(&[b"SET", format!("fill{batch}:{i}").as_bytes(), &filler]));
+        }
+        c.write_all(&wire).expect("write");
+        for _ in 0..200 {
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        batch += 1;
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    c.write_all(&cmd(&[b"SELECT", b"0"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for cell in 0..2u16 {
+        let shard = dir.join(format!("shard-{cell}"));
+        let manifest = inf_log::read_manifest(&inf_log::fs::StdSegmentFs, &shard)
+            .expect("manifest reads")
+            .expect("checkpoint published");
+        assert!(
+            manifest.tiers.iter().any(|t| t.ns == 16),
+            "cell {cell}: MANIFEST names the tiered namespace before the drop"
+        );
+        assert!(
+            tier_residue_files(dir, cell) > 0,
+            "cell {cell}: cold files exist before the drop (the residue under test)"
+        );
+    }
+}
+
+/// Files under `shard-k/ns-16/cold` (0 when the directory is gone).
+fn tier_residue_files(dir: &std::path::Path, cell: u16) -> usize {
+    let cold = dir.join(format!("shard-{cell}")).join("ns-16").join("cold");
+    match std::fs::read_dir(&cold) {
+        Ok(entries) => entries.count(),
+        Err(_) => 0,
+    }
+}
+
+/// Polls `INFO persistence` until `field` reads `want` (the gauge
+/// refreshes at MAINTAIN cadence), returning the last text.
+fn wait_persistence_field(conn: &mut TcpStream, field: &str, want: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = info_text(conn, b"persistence");
+        if text.contains(&format!("{field}:{want}\r\n")) || Instant::now() >= deadline {
+            return text;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// ADR-0100 (review C13 / F-L14-04): dropping a tiered namespace after a
+/// checkpoint named it must leave a bootable directory even when no
+/// checkpoint follows the drop. Pre-fix every reopen refused with
+/// "MANIFEST carries a tier section for ns 16 the catalog does not know".
+/// Post-fix: the catalog's tombstone explains the residue, recovery
+/// sweeps it, a post-boot checkpoint plus one DDL persist retires the
+/// tombstone, and a third boot reads a tombstone-free catalog.
+#[test]
+fn dropped_tiered_namespace_reboots_without_a_checkpoint() {
+    let dir = temp_data_dir("drop-reboot");
+    let node = Node::start_durable(2, &dir);
+    seed_tiered_namespace_with_checkpoint(&node, &dir, 64);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"DROP", b"cold"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+    node.stop();
+
+    // No checkpoint since the drop: every MANIFEST still names ns 16.
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    let tiering = info_text(&mut c, b"tiering");
+    assert!(tiering.contains("tiering_tables:0"), "{tiering}");
+    for cell in 0..2 {
+        assert_eq!(tier_residue_files(&dir, cell), 0, "cell {cell}: residue swept at boot");
+    }
+    let text = wait_persistence_field(&mut c, "ns_drop_tombstones", "1");
+    assert!(text.contains("ns_drop_tombstones:1\r\n"), "survives the boot: {text}");
+    // Retirement: every cell publishes a post-boot checkpoint (the boot
+    // re-stamped the tombstone with one), then any DDL persist retires it.
+    c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"scratch", b"MODE", b"memory"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let text = wait_persistence_field(&mut c, "ns_drop_tombstones", "0");
+    assert!(text.contains("ns_drop_tombstones:0\r\n"), "retired: {text}");
+    drop(c);
+    node.stop();
+
+    // Third boot: no tier section, no tombstone, no residue.
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut c, b"+PONG\r\n");
+    let text = wait_persistence_field(&mut c, "ns_drop_tombstones", "0");
+    assert!(text.contains("ns_drop_tombstones:0\r\n"), "{text}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Reads every key `k0..keys` from namespace `cold` on `conn`.
+fn assert_cold_keys_served(conn: &mut TcpStream, keys: u32) {
+    conn.write_all(&cmd(&[b"INF.NS", b"USE", b"cold"])).expect("write");
+    read_exactly(conn, b"+OK\r\n");
+    for i in 0..keys {
+        conn.write_all(&cmd(&[b"GET", format!("k{i}").as_bytes()])).expect("write");
+        let value = cold_value(i);
+        let mut want = format!("${}\r\n", value.len()).into_bytes();
+        want.extend_from_slice(&value);
+        want.extend_from_slice(b"\r\n");
+        read_exactly(conn, &want);
+    }
+    conn.write_all(&cmd(&[b"SELECT", b"0"])).expect("write");
+    read_exactly(conn, b"+OK\r\n");
+}
+
+/// Crash-matrix row `ns_drop_before_meta` (ADR-0100 D5): the DDL stops
+/// after the local apply and before the catalog persist request — the
+/// on-disk state of a cut before the swap. Nothing durable changed and
+/// the teardown hold kept every tier file (the origin cell's registry
+/// alone lacks the namespace, so the origin's own files are the ones
+/// that would have been unlinked pre-ADR). A restart serves the
+/// namespace with every key.
+#[test]
+fn dropped_tiered_namespace_survives_a_cut_before_its_swap() {
+    let dir = temp_data_dir("drop-cut-before");
+    let node = Node::start_durable_with_faults(
+        2,
+        &dir,
+        vec![(inf_server::fault::NS_DROP_BEFORE_META, inf_foundation::fault::FaultSpec::Nth(1))],
+    );
+    seed_tiered_namespace_with_checkpoint(&node, &dir, 32);
+    let residue_before: Vec<usize> = (0..2).map(|cell| tier_residue_files(&dir, cell)).collect();
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"DROP", b"cold"])).expect("write");
+    read_exactly(&mut c, b"-ERR fault: ns_drop_before_meta\r\n");
+    // Give MAINTAIN time to run its teardown slices: the hold must keep
+    // every file since no catalog swap carried the drop.
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(200));
+    for cell in 0..2 {
+        assert_eq!(
+            tier_residue_files(&dir, cell),
+            residue_before[usize::from(cell)],
+            "cell {cell}: the teardown hold kept every file (ADR-0100 D5)"
+        );
+    }
+    drop(c);
+    node.stop();
+
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    let tiering = info_text(&mut c, b"tiering");
+    assert!(tiering.contains("tiering_tables:1"), "namespace restored whole: {tiering}");
+    assert_cold_keys_served(&mut c, 32);
+    let text = wait_persistence_field(&mut c, "ns_drop_tombstones", "0");
+    assert!(text.contains("ns_drop_tombstones:0\r\n"), "no tombstone was ever written: {text}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Crash-matrix row `ns_drop_after_meta` (ADR-0100 D6): the DDL stops
+/// once the catalog swap is durable and before the fan — the on-disk
+/// state of a cut after the swap. `META` lacks the namespace and carries
+/// its tombstone while every `MANIFEST` still names it. The restart
+/// boots (the pre-ADR fail-stop refused exactly this state), sweeps the
+/// residue on every cell, and the namespace is gone.
+#[test]
+fn dropped_tiered_namespace_survives_a_cut_after_its_swap() {
+    let dir = temp_data_dir("drop-cut-after");
+    let node = Node::start_durable_with_faults(
+        2,
+        &dir,
+        vec![(inf_server::fault::NS_DROP_AFTER_META, inf_foundation::fault::FaultSpec::Nth(1))],
+    );
+    seed_tiered_namespace_with_checkpoint(&node, &dir, 32);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"DROP", b"cold"])).expect("write");
+    read_exactly(&mut c, b"-ERR fault: ns_drop_after_meta\r\n");
+    drop(c);
+    node.stop();
+
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    let tiering = info_text(&mut c, b"tiering");
+    assert!(tiering.contains("tiering_tables:0"), "the drop was durable: {tiering}");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"cold"])).expect("write");
+    let refusal = read_line(&mut c);
+    assert!(refusal.starts_with(b"-ERR"), "{refusal:?}");
+    for cell in 0..2 {
+        assert_eq!(tier_residue_files(&dir, cell), 0, "cell {cell}: residue swept (ADR-0100 D6)");
+    }
+    let text = wait_persistence_field(&mut c, "ns_drop_tombstones", "1");
+    assert!(text.contains("ns_drop_tombstones:1\r\n"), "{text}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
 }

@@ -82,6 +82,15 @@ use crate::resp::reply_len;
 
 /// The tiered namespace every phase drives.
 const NS_NAME: &[u8] = b"t";
+/// The first named namespace's id (`FIRST_NAMED_NS_ID`), the phase-10
+/// residue the boot sweep must clear.
+const DROPPED_NS_ID: u32 = 16;
+/// Phase 10b's second tiered namespace (id 17: ids never reuse) and its
+/// seeded cut window.
+const CUT_NS_NAME: &[u8] = b"t2";
+const CUT_NS_ID: u32 = 17;
+const CUT_NS_KEYS: u32 = 8;
+const CUT_STEPS_MAX: u64 = 48;
 
 /// `MEM-BUDGET` + `MAINTAIN-SLICE` at the smallest admissible pair: the
 /// alloc-admission window (budget + slice) must clear four region pages
@@ -211,6 +220,18 @@ impl TieredScenario {
 /// What one seeded run produced. Coverage counters are disclosures
 /// (ADR-0045 D4) — sweeps aggregate them so a fleet that stopped
 /// demoting or stopped refusing is visible in the manifest.
+/// Phase 10b's verdict (ADR-0100 D5): the only two states a cut inside a
+/// `DROP` may leave behind.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum DropCutOutcome {
+    #[default]
+    NotReached,
+    /// The cut preceded the catalog swap: the namespace serves every key.
+    Whole,
+    /// The swap was durable: the namespace is gone, its residue swept.
+    Swept,
+}
+
 #[derive(Debug, Default)]
 pub struct TieredNodeReport {
     pub trace: Vec<u8>,
@@ -244,6 +265,16 @@ pub struct TieredNodeReport {
     pub drop_replies_value: u64,
     /// Drop-race replies that answered typed errors/nils (drop won).
     pub drop_replies_other: u64,
+    /// Phase 10 (ADR-0100 D6): the post-drop reboot succeeded; whether a
+    /// MANIFEST still named the dropped namespace (the row is inert on a
+    /// seed where a checkpoint raced the drop — disclosed).
+    pub drop_reboot_ok: bool,
+    pub drop_reboot_manifest_residue: bool,
+    /// Phase 10b (ADR-0100 D5): steps between the second DROP's send and
+    /// the power cut, and which of the two legal outcomes the reboot
+    /// landed on.
+    pub drop_cut_steps: u64,
+    pub drop_cut_outcome: DropCutOutcome,
     /// M4.5-S37 (ADR-0093): the arm this seed ran, and the coverage the
     /// quiescence oracle stood on — tickets created (both lives), the
     /// verdicts, every fallback, and the ticket count at the cut.
@@ -2021,7 +2052,196 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         other => fail(&mut report, format!("USE of the dropped ns answered {other:?}")),
     }
 
+    // ---- phase 10: reboot after the DROP (ADR-0100, review C13) ----------
+    // Nothing checkpointed since phase 9's drop, so a cell's MANIFEST may
+    // still carry the namespace's tier section. The pre-ADR node refused
+    // exactly this boot ("MANIFEST carries a tier section for ns 16 the
+    // catalog does not know"); the catalog's tombstone now explains the
+    // residue and recovery sweeps `ns-16/cold`. Disclosed, never assumed:
+    // a seed whose MANIFESTs no longer name the namespace (a checkpoint
+    // raced the drop) is counted inert for this row.
+    drop(node);
+    for cell in 0..scenario.cells {
+        let shard = PathBuf::from("node").join(format!("shard-{cell}"));
+        if let Ok(Some(manifest)) = inf_log::read_manifest(&disk, &shard)
+            && manifest.tiers.iter().any(|t| t.ns == DROPPED_NS_ID)
+        {
+            report.drop_reboot_manifest_residue = true;
+        }
+    }
+    let mut node = match reboot_until_ready(
+        &harness,
+        &disk,
+        &clock,
+        &observer,
+        &mut rng,
+        &mut report,
+        scenario.step_ns_max,
+    ) {
+        Ok(node) => node,
+        Err(what) => {
+            fail(&mut report, format!("post-drop reboot: {what}"));
+            return finish(report, &observer, &clock);
+        }
+    };
+    report.drop_reboot_ok = true;
+    let mut after = MiniClient::connect(&mut node, 0);
+    match after.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, use_dropped) {
+        Ok(Some(reply)) if reply.starts_with(b"-ERR") => {}
+        other => fail(&mut report, format!("dropped ns came back after the reboot: {other:?}")),
+    }
+    let residue = tier_residue_files(&disk, DROPPED_NS_ID);
+    if residue > 0 {
+        fail(
+            &mut report,
+            format!("{residue} tier files survived the drop's boot sweep (ADR-0100 D6)"),
+        );
+    }
+
+    // ---- phase 10b: a power cut inside a second DROP (ADR-0100 D5) -------
+    // A fresh tiered namespace with a checkpointed tier section; its DROP
+    // goes on the wire and the power is cut a seeded number of steps
+    // later — before or after the catalog swap, the sweep decides. The
+    // reboot must land on exactly one of the two D5 outcomes: the
+    // namespace whole (every key served — the teardown hold kept its
+    // files), or gone with its residue swept. Anything else is a finding.
+    let create2: Vec<&[u8]> =
+        create.iter().map(|arg| if *arg == NS_NAME { CUT_NS_NAME } else { *arg }).collect();
+    let mut ddl = MiniClient::connect(&mut node, 0);
+    for (argv, what) in
+        [(create2.as_slice(), "CREATE"), (&[&b"INF.NS"[..], b"USE", CUT_NS_NAME][..], "USE")]
+    {
+        match ddl.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, argv) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("phase 10b {what} answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    for i in 0..CUT_NS_KEYS {
+        let key = format!("cut:{i}");
+        let value = format!("v{i}");
+        let set: &[&[u8]] = &[b"SET", key.as_bytes(), value.as_bytes()];
+        match ddl.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("phase 10b SET answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    let ckpt: &[&[u8]] = &[b"INF.CKPT", b"WAIT"];
+    match ddl.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, ckpt) {
+        Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+        other => {
+            fail(&mut report, format!("phase 10b INF.CKPT WAIT answered {other:?}"));
+            return finish(report, &observer, &clock);
+        }
+    }
+    let cut_steps = rng.next_below(CUT_STEPS_MAX);
+    report.drop_cut_steps = cut_steps;
+    let dropper_cell = (rng.next_u64() as usize) % scenario.cells as usize;
+    let dropper_fd = node.nets[dropper_cell].borrow_mut().connect();
+    node.nets[dropper_cell]
+        .borrow_mut()
+        .client_send(dropper_fd, &encode(&[b"INF.NS", b"DROP", CUT_NS_NAME]));
+    for _ in 0..cut_steps {
+        report.scheduler_steps += 1;
+        if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
+            fail(&mut report, format!("phase 10b step: {err}"));
+            return finish(report, &observer, &clock);
+        }
+    }
+    drop(node);
+    disk.power_cut(scenario.seed ^ 0x0D20_9C07);
+    let mut node = match reboot_until_ready(
+        &harness,
+        &disk,
+        &clock,
+        &observer,
+        &mut rng,
+        &mut report,
+        scenario.step_ns_max,
+    ) {
+        Ok(node) => node,
+        Err(what) => {
+            fail(&mut report, format!("reboot after the cut inside DROP: {what}"));
+            return finish(report, &observer, &clock);
+        }
+    };
+    let mut audit2 = MiniClient::connect(&mut node, 0);
+    let use_cut: &[&[u8]] = &[b"INF.NS", b"USE", CUT_NS_NAME];
+    match audit2.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, use_cut) {
+        Ok(Some(ok)) if ok == b"+OK\r\n" => {
+            // Whole: the cut preceded the swap — every key serves.
+            report.drop_cut_outcome = DropCutOutcome::Whole;
+            for i in 0..CUT_NS_KEYS {
+                let key = format!("cut:{i}");
+                let want = format!("${}\r\nv{i}\r\n", format!("v{i}").len());
+                let get: &[&[u8]] = &[b"GET", key.as_bytes()];
+                match audit2.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, get) {
+                    Ok(Some(reply)) if reply == want.as_bytes() => {}
+                    other => fail(
+                        &mut report,
+                        format!(
+                            "cut before the swap restored the namespace but {key} answered \
+                             {other:?} (ADR-0100 D5: the teardown hold must keep every file)"
+                        ),
+                    ),
+                }
+            }
+        }
+        Ok(Some(reply)) if reply.starts_with(b"-ERR") => {
+            // Swept: the swap was durable — the namespace is gone and
+            // nothing of it remains on disk.
+            report.drop_cut_outcome = DropCutOutcome::Swept;
+            let residue = tier_residue_files(&disk, CUT_NS_ID);
+            if residue > 0 {
+                fail(
+                    &mut report,
+                    format!("{residue} tier files survived the sweep after a cut past the swap"),
+                );
+            }
+        }
+        other => fail(&mut report, format!("USE after the cut inside DROP answered {other:?}")),
+    }
+
     finish(report, &observer, &clock)
+}
+
+/// Boots the node on the surviving image and steps it until every cell is
+/// ready (the phase-4 reboot loop without the mid-recovery second cut).
+fn reboot_until_ready(
+    harness: &DurableScenario,
+    disk: &SimDisk,
+    clock: &Rc<VirtualClock>,
+    observer: &TraceObserver,
+    rng: &mut SplitMix64,
+    report: &mut TieredNodeReport,
+    step_ns_max: u64,
+) -> Result<Node, String> {
+    let mut node = boot(harness, PathBuf::from("node"), disk, clock, observer)
+        .map_err(|err| format!("boot refused: {err}"))?;
+    let mut steps = 0u64;
+    while !node.ready() {
+        steps += 1;
+        report.scheduler_steps += 1;
+        if let Err(err) = node.step(rng, clock, disk, step_ns_max) {
+            return Err(format!("recovery failed: {err}"));
+        }
+        if steps > STALL_STEPS {
+            report.stalled = true;
+            return Err("recovery stalled".to_string());
+        }
+    }
+    Ok(node)
+}
+
+/// Files under `shard-*/ns-{ns}/cold/` in the disk image.
+fn tier_residue_files(disk: &SimDisk, ns: u32) -> usize {
+    let needle = format!("ns-{ns}/cold/");
+    disk.image().iter().filter(|(path, _)| path.to_string_lossy().contains(&needle)).count()
 }
 
 fn finish(
