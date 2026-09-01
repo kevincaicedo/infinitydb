@@ -40,6 +40,11 @@ enum CkptTrigger {
     /// The pre-S36 fixed trigger (α = 0): every `interval_bytes` staged
     /// bytes, independent of checkpoint size and device speed.
     Fixed { interval_bytes: u64 },
+    /// Manual trigger with a tightened fill slice and stream pace, so a
+    /// walk spans many MAINTAIN calls and a test can interleave foreground
+    /// mutations with specific walk passes (the 2026-08-30 review's C4
+    /// reproduction shape).
+    Paced { slice_bytes: u32, stream_bytes_per_sec: u32 },
 }
 
 impl CkptTrigger {
@@ -53,6 +58,16 @@ impl CkptTrigger {
             CkptTrigger::Fixed { interval_bytes } => {
                 inf_log::CkptConfig { interval_bytes, alpha: 0, ..base }
             }
+            CkptTrigger::Paced { slice_bytes, stream_bytes_per_sec } => inf_log::CkptConfig {
+                interval_bytes: 0,
+                slice_bytes,
+                // One section per fill slice: every slice pays a real
+                // section write before the next fill call runs, so
+                // foreground commands interleave with every walk slice.
+                section_bytes: slice_bytes,
+                stream_bytes_per_sec,
+                ..base
+            },
         }
     }
 }
@@ -2169,6 +2184,541 @@ fn blob_values_round_trip_and_survive_restart() {
     read_exactly(&mut c, b"$-1\r\n");
     drop(c);
     node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Reads one GET reply: `Ok(body)` for a bulk, `Err(line)` for an error
+/// reply, `Ok(empty)` is unreachable here (no test key is empty).
+fn read_get(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let header = read_line(stream);
+    match header.first() {
+        Some(&b'-') => Err(String::from_utf8_lossy(&header).into_owned()),
+        Some(&b'$') => {
+            let len: i64 = std::str::from_utf8(&header[1..header.len() - 2])
+                .expect("ascii")
+                .parse()
+                .expect("bulk length");
+            if len < 0 {
+                return Ok(Vec::new()); // nil
+            }
+            let mut body = vec![0u8; len as usize + 2];
+            stream.read_exact(&mut body).expect("bulk body");
+            body.truncate(len as usize);
+            Ok(body)
+        }
+        other => panic!("unexpected GET reply head {other:?}: {header:?}"),
+    }
+}
+
+/// Review of 2026-08-30 (C4 / F-L03-01 + C7 / F-L04-08, F-L14-02): the
+/// checkpoint's 0x05 blob-reference walk must not lose a live entry when
+/// foreground `DEL`s remove reference-map entries *below its cursor*
+/// between MAINTAIN slices. Before the fix the pass-3 resume was a
+/// positional `.skip(ordinal)` into the mutating `BTreeMap`: each
+/// below-cursor removal shifted every later rank down one, the resume
+/// stepped over one live entry, the checkpoint published without its
+/// 0x05 row, and the next boot's orphan sweep unlinked the extent — a
+/// `GET` of an acked, never-deleted key then failed forever.
+///
+/// The walk is paced (1 KiB fill slices) so pass 3 spans many MAINTAIN
+/// calls, and the `DEL` pump runs on the same cell for the whole stream:
+/// deletes land between pass-3 slices at the lowest-ranked addresses —
+/// the exact adversarial schedule. After the fix (address-keyed resume)
+/// the schedule is harmless by construction, so this test is
+/// deterministic-green; before it, each in-window DEL dropped one
+/// surviving key's extent (observed red: GET → ERR blob extent read
+/// failed after reopen).
+#[test]
+fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
+    let dir = temp_data_dir("blob-ckpt-del-race");
+    let blobs = 600usize;
+    let fillers = 2400usize;
+    let blob_value = |i: usize| format!("V{i:04}!").into_bytes().repeat(700); // 4,200 B ≥ 4 KiB threshold
+    let mut deleted = std::collections::BTreeSet::new();
+    {
+        let node = Node::start_with(
+            1,
+            Some(dir.clone()),
+            CkptTrigger::Paced { slice_bytes: 1 << 10, stream_bytes_per_sec: 64 << 10 },
+        );
+        let mut c = node.connect();
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"b",
+            b"MODE",
+            b"durable",
+            b"FSYNC",
+            b"everysec",
+            b"MEM-BUDGET",
+            b"3mb",
+            b"BLOB-THRESHOLD",
+            b"4kb",
+            // Copy-forward off (a 100% dead-ratio trigger never fires):
+            // compaction would otherwise relocate the cold blob
+            // references to the RAM tail once the filler is deleted, and
+            // pass 3 would have nothing to walk.
+            b"COMPACTION-DEAD-RATIO",
+            b"100",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        // Blob keys first: their 24-byte reference records take the lowest
+        // addresses, so the DEL pump below always removes entries ranked
+        // below any pass-3 cursor position.
+        for i in 0..blobs {
+            let key = format!("big:{i:04}");
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), &blob_value(i)])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        // Inline filler past the budget: forces demotion, so every blob
+        // reference record is cold (below the walk watermark) and pass 3
+        // owns all 600 entries.
+        for i in 0..fillers {
+            let key = format!("fill:{i:04}");
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), &[b'f'; 3000]])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        let info_u64 = |c: &mut TcpStream, section: &[u8], field: &str| {
+            info_text(c, section)
+                .lines()
+                .find_map(|l| l.strip_prefix(field))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let mut demoted = false;
+        for _ in 0..1500 {
+            if info_u64(&mut c, b"tiering", "tiering_flush_confirmed_bytes:") > 3 << 20
+                && info_u64(&mut c, b"tiering", "tiering_region_decommit_pages:") > 0
+            {
+                demoted = true;
+                break;
+            }
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(demoted, "demotion never pushed the blob-reference records cold");
+        // Clear the filler (compaction is off, so the cold blob refs stay
+        // put): pass 1 then emits nothing and the paced walk's wall time
+        // splits between pass 0 and pass 3 — the DEL pump lands between
+        // pass-3 slices.
+        for i in 0..fillers {
+            let key = format!("fill:{i:04}");
+            c.write_all(&cmd(&[b"DEL", key.as_bytes()])).expect("write");
+            read_exactly(&mut c, b":1\r\n");
+        }
+        // Begin the checkpoint, then DEL from the low end while the walk
+        // streams — the review's adversarial schedule.
+        node.control.as_ref().expect("durable node").request_ckpt_all();
+        let walk_started = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut next_del = 0usize;
+        loop {
+            if next_del < 300 {
+                let key = format!("big:{next_del:04}");
+                c.write_all(&cmd(&[b"DEL", key.as_bytes()])).expect("write");
+                read_exactly(&mut c, b":1\r\n");
+                deleted.insert(key.into_bytes());
+                next_del += 1;
+            }
+            // Pace the pump across the whole paced walk (an unpaced pump
+            // exhausts its schedule inside pass 0 and never overlaps the
+            // 0x05 pass, which streams last).
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let done = info_u64(&mut c, b"persistence", "ckpts_completed:");
+            if done >= 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "checkpoint never completed under the DEL pump");
+        }
+        eprintln!("walk took {:?}, {next_del} DELs landed during it", walk_started.elapsed());
+        assert!(next_del > 20, "the pump barely ran — the walk finished before the schedule");
+        // Let everysec cover the DEL deaths, then stop without a further
+        // checkpoint (a second walk would re-emit the intact RAM map and
+        // mask the omission).
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        drop(c);
+        node.stop();
+    }
+    {
+        // At-least-once floor on the published 0x05 section. The count
+        // alone cannot prove correctness (the recorded falsifier run
+        // emitted a *count-right, contents-wrong* section: 560 entries,
+        // 19 live keys skipped, 19 dead/duplicate rows in their place) —
+        // the GET sweep below is the contents oracle.
+        let ick = dir.join("shard-0").join("ckpt").join("ckpt-000001.ick");
+        let mut blob_entries = 0usize;
+        let _ = inf_log::ckpt::read_ick_hybrid(
+            &inf_log::fs::StdSegmentFs,
+            &ick,
+            inf_log::ckpt::IckReaderConfig::default(),
+            |_| Ok::<(), ()>(()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |section| {
+                blob_entries += section.len();
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .expect("published checkpoint validates");
+        assert!(blob_entries > 0, "pass 3 emitted nothing — the setup lost its cold refs");
+        eprintln!("published 0x05 entries: {blob_entries}");
+    }
+    // Reopen: replay = short 0x05 section + the tail. Pre-fix, the boot
+    // sweep unlinks the never-emitted extent and its key errors forever.
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // Drain the boot reclaim backlog (the deleted extents' deaths) so a
+    // pre-fix run cannot pass by racing the unlink.
+    let info_u64 = |c: &mut TcpStream, field: &str| {
+        info_text(c, b"tiering")
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while info_u64(&mut c, "tiering_blob_reclaimable:") > 0 {
+        assert!(Instant::now() < deadline, "boot reclaim backlog never drained");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Every surviving key's extent is referenced again (the recorded
+    // falsifier run booted at live 541 < 560 survivors). `>=`, not `==`:
+    // an acked everysec DEL that missed the last fsync legitimately
+    // revives its key (and extent) at replay.
+    let live = info_u64(&mut c, "tiering_blob_extents_live:");
+    assert!(
+        live >= (blobs - deleted.len()) as u64,
+        "extents live after reopen ({live}) below the {} surviving blob keys",
+        blobs - deleted.len()
+    );
+    let mut lost: Vec<String> = Vec::new();
+    for i in 0..blobs {
+        let key = format!("big:{i:04}");
+        if deleted.contains(key.as_bytes()) {
+            continue; // acked DELs may or may not have replayed (everysec)
+        }
+        c.write_all(&cmd(&[b"GET", key.as_bytes()])).expect("write");
+        match read_get(&mut c) {
+            Ok(body) if body == blob_value(i) => {}
+            Ok(body) => lost.push(format!("{key}: served {} bytes", body.len())),
+            Err(err) => lost.push(format!("{key}: {err}")),
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "{} of {} surviving blob keys lost after the checkpoint/DEL race (first: {:?})",
+        lost.len(),
+        blobs - deleted.len(),
+        &lost[..lost.len().min(5)]
+    );
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Review of 2026-08-30 (C2′ / F-L06-04 + F-L06-02's BUSY leg): a
+/// failed cold read is a **typed error on every read command** — never
+/// "the key is not there". Before the fix, `MGET` rendered
+/// `Resolved::Fail` as a nil element and `EXISTS`/`TOUCH` skipped the
+/// count, so the node answered *differently for the same key in the
+/// same instant* depending on which command asked (`GET` → `-BUSY`,
+/// `EXISTS` → `:0`, `MGET` → nil) — and `EXISTS` is exactly what a
+/// cache-fill path uses to decide whether to overwrite. The
+/// `cold_enqueue_full` fault point is the deterministic stand-in for a
+/// saturated `ColdReads` queue (the review's `overflow_cap` scenario);
+/// genuinely absent keys keep their miss shapes — a miss never reaches
+/// the queue.
+#[test]
+fn tiered_cold_read_failure_is_typed_for_every_read_command() {
+    let dir = temp_data_dir("tiered-cold-busy");
+    let node = Node::start_durable_with_faults(
+        1,
+        &dir,
+        vec![(inf_server::fault::COLD_ENQUEUE_FULL, inf_foundation::fault::FaultSpec::Always)],
+    );
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"t",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+        b"MEM-BUDGET",
+        b"3mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let keys = 150usize;
+    for i in 0..keys {
+        let key = format!("big:{i:04}").into_bytes();
+        let value = format!("B{i:04}:").into_bytes().repeat(6_667); // ~40 KB
+        c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    let info_u64 = |c: &mut TcpStream, field: &str| {
+        info_text(c, b"tiering")
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let mut demoted = false;
+    for _ in 0..1000 {
+        if info_u64(&mut c, "tiering_flush_confirmed_bytes:") > 3 << 20
+            && info_u64(&mut c, "tiering_region_decommit_pages:") > 0
+        {
+            demoted = true;
+            break;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(demoted, "demotion never made a cold working set");
+    // Per-key agreement: whatever GET answers, EXISTS/TOUCH/MGET must
+    // agree — a key is served, absent, or *unreadable, typed*; the
+    // defect's signature was GET erroring while the others said absent.
+    let read_int_or_err = |c: &mut TcpStream| -> Result<i64, String> {
+        let line = read_line(c);
+        match line.first() {
+            Some(&b'-') => Err(String::from_utf8_lossy(&line).into_owned()),
+            Some(&b':') => Ok(std::str::from_utf8(&line[1..line.len() - 2])
+                .expect("ascii")
+                .parse()
+                .expect("int")),
+            other => panic!("unexpected reply head {other:?}: {line:?}"),
+        }
+    };
+    let mut cold_failures = 0usize;
+    let mut disagreements: Vec<String> = Vec::new();
+    for i in 0..keys {
+        let key = format!("big:{i:04}");
+        c.write_all(&cmd(&[b"GET", key.as_bytes()])).expect("write");
+        let get = read_get(&mut c);
+        c.write_all(&cmd(&[b"EXISTS", key.as_bytes()])).expect("write");
+        let exists = read_int_or_err(&mut c);
+        c.write_all(&cmd(&[b"TOUCH", key.as_bytes()])).expect("write");
+        let touch = read_int_or_err(&mut c);
+        c.write_all(&cmd(&[b"MGET", key.as_bytes()])).expect("write");
+        let mget_head = read_line(&mut c);
+        let mget_err = mget_head.first() == Some(&b'-');
+        if !mget_err {
+            assert_eq!(mget_head, b"*1\r\n", "one-key MGET array");
+            let _ = read_get(&mut c); // consume the element
+        }
+        match get {
+            Ok(_) => {
+                if exists != Ok(1) || touch != Ok(1) || mget_err {
+                    disagreements.push(format!(
+                        "{key}: GET served but EXISTS {exists:?} / TOUCH {touch:?} / MGET err {mget_err}"
+                    ));
+                }
+            }
+            Err(_) => {
+                cold_failures += 1;
+                if exists.is_ok() || touch.is_ok() || !mget_err {
+                    disagreements.push(format!(
+                        "{key}: GET failed typed but EXISTS {exists:?} / TOUCH {touch:?} / \
+                         MGET err {mget_err} — unreadability rendered as absence"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(cold_failures > 0, "no cold read failed — the BUSY leg was never exercised");
+    assert!(
+        disagreements.is_empty(),
+        "{} of {keys} keys answered inconsistently across read commands (first: {:?})",
+        disagreements.len(),
+        &disagreements[..disagreements.len().min(3)]
+    );
+    // Absent keys keep their miss shapes: a miss never reaches the queue.
+    c.write_all(&cmd(&[b"EXISTS", b"nosuch"])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+    c.write_all(&cmd(&[b"TOUCH", b"nosuch"])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+    c.write_all(&cmd(&[b"MGET", b"nosuch"])).expect("write");
+    read_exactly(&mut c, b"*1\r\n$-1\r\n");
+    // The SCAN page fails typed too (the F-L06-02 BUSY leg): with every
+    // cold read refused, an iteration must surface an error — never a
+    // "complete" enumeration missing the cold keys.
+    let mut cursor: Vec<u8> = b"0".to_vec();
+    let mut scan_errored = false;
+    for _ in 0..10_000 {
+        c.write_all(&cmd(&[b"SCAN", &cursor, b"COUNT", b"64"])).expect("write");
+        let head = read_line(&mut c);
+        if head.first() == Some(&b'-') {
+            scan_errored = true;
+            break;
+        }
+        assert_eq!(head, b"*2\r\n", "scan reply shape");
+        let next = read_get(&mut c).expect("cursor bulk");
+        let inner = read_line(&mut c);
+        assert_eq!(inner.first(), Some(&b'*'), "keys array");
+        let n: usize =
+            std::str::from_utf8(&inner[1..inner.len() - 2]).expect("ascii").parse().expect("len");
+        for _ in 0..n {
+            let _ = read_get(&mut c);
+        }
+        if next == b"0" {
+            break;
+        }
+        cursor = next;
+    }
+    assert!(
+        scan_errored,
+        "SCAN completed an iteration with every cold read refused — silent omission"
+    );
+    // The failures are scrapeable, not just per-reply (L10): the
+    // always-on counter moved for every typed refusal above.
+    assert!(
+        info_u64(&mut c, "tiering_cold_read_errors:") as usize >= cold_failures,
+        "tiering_cold_read_errors below the observed typed failures"
+    );
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Review of 2026-08-30 (C7 / F-L04-08; ADR-0096) over the wire: a
+/// header-valid boot orphan — an extent file no durable artifact
+/// references, the crashed-blob-write shape — is **quarantined** by the
+/// first boot's MAINTAIN slice (renamed, counted, bytes intact) and
+/// unlinked only by the next boot's second verdict. Before ADR-0096 the
+/// first slice after boot destroyed the file outright, which turned any
+/// upstream accounting omission into permanent loss. A referenced blob
+/// key keeps serving through both lives.
+#[test]
+fn blob_boot_orphan_quarantines_for_one_life_then_reclaims() {
+    let dir = temp_data_dir("blob-orphan-quarantine");
+    let value = vec![0xAB_u8; 8 << 10];
+    let orphan_id = inf_log::ExtentId(700_001);
+    let info_u64 = |c: &mut TcpStream, field: &str| {
+        info_text(c, b"tiering")
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    // Life 1: one referenced blob key.
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"q",
+            b"MODE",
+            b"durable",
+            b"FSYNC",
+            b"always",
+            b"MEM-BUDGET",
+            b"3mb",
+            b"BLOB-THRESHOLD",
+            b"4kb",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"q"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"SET", b"big:1", &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        // A published checkpoint: the sweep seeds from the manifest
+        // recovery path, so the next boot lists the cold directory.
+        c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        drop(c);
+        node.stop();
+    }
+    // Between lives: plant a well-formed orphan extent in the namespace's
+    // cold dir — the "extent durable, referencing frame lost" crash shape.
+    let shard = dir.join("shard-0");
+    let ns_dir = std::fs::read_dir(&shard)
+        .expect("shard dir")
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().starts_with("ns-"))
+        .expect("tiered ns dir")
+        .path();
+    let ns_id: u32 = ns_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("ns-"))
+        .and_then(|n| n.parse().ok())
+        .expect("ns id from dir name");
+    {
+        let fs = inf_log::fs::StdSegmentFs;
+        let mut w = inf_log::ExtentWriter::create(
+            &fs,
+            &ns_dir,
+            orphan_id,
+            0,
+            inf_log::NsId(ns_id),
+            128,
+            inf_log::TierIoMode::Buffered,
+        )
+        .expect("orphan create");
+        w.append_chunk(&[0xEE; 128]).expect("orphan bytes");
+        let _ = w.finish().expect("orphan seal");
+    }
+    // Life 2: the boot sweep quarantines the orphan — renamed, counted,
+    // bytes intact — and the referenced key serves untouched.
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"q"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while info_u64(&mut c, "tiering_blob_quarantined:") == 0 {
+            assert!(Instant::now() < deadline, "the boot orphan was never quarantined");
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(info_u64(&mut c, "tiering_blob_quarantine_revived:"), 0);
+        c.write_all(&cmd(&[b"GET", b"big:1"])).expect("write");
+        assert_eq!(read_get(&mut c).expect("serves"), value);
+        drop(c);
+        node.stop();
+    }
+    let fs = inf_log::fs::StdSegmentFs;
+    assert_eq!(
+        inf_log::list_quarantined_extent_ids(&fs, &ns_dir).expect("listing"),
+        vec![orphan_id],
+        "the twin holds the bytes through the life"
+    );
+    assert!(
+        !inf_log::list_extent_ids(&fs, &ns_dir).expect("listing").contains(&orphan_id),
+        "the orphan left the reachable listing"
+    );
+    // Life 3: the second verdict — still unreferenced — unlinks the twin.
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"q"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !inf_log::list_quarantined_extent_ids(&fs, &ns_dir).expect("listing").is_empty() {
+            assert!(Instant::now() < deadline, "the second verdict never reclaimed the twin");
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(info_u64(&mut c, "tiering_blob_quarantined:"), 0, "nothing new quarantined");
+        c.write_all(&cmd(&[b"GET", b"big:1"])).expect("write");
+        assert_eq!(read_get(&mut c).expect("serves"), value);
+        drop(c);
+        node.stop();
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 

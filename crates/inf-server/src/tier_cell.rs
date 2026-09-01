@@ -547,12 +547,59 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             }
         }
         let reclaim = table.extent_reclaim_work(t.durable_epoch, EXTENT_RECLAIM_PER_SLICE);
-        for extent_id in reclaim {
+        for candidate in reclaim {
             units += 1;
-            match inf_log::blob::unlink_extent_file(&self.fs, &t.dir, ExtentId(extent_id)) {
-                Ok(()) => table.extent_reclaim_done(extent_id),
+            let extent_id = candidate.extent_id;
+            let id = ExtentId(extent_id);
+            /// How one candidate's disposal ended (drives the store ack).
+            enum Disposal {
+                Unlinked,
+                Quarantined,
+            }
+            let outcome = match candidate.origin {
+                // Refcount-proven death: the count is the proof
+                // (ADR-0061 D5) — unlink as always.
+                inf_store::ReclaimOrigin::Death => {
+                    inf_log::blob::unlink_extent_file(&self.fs, &t.dir, id)
+                        .map(|()| Disposal::Unlinked)
+                }
+                // Boot orphan (ADR-0096 D2): probe the header first. A
+                // file that is not a well-formed extent of this id is
+                // garbage nothing can reference — unlink. A verifying
+                // header quarantines by rename: the bytes survive the
+                // life, and a later boot delivers the second verdict.
+                inf_store::ReclaimOrigin::BootOrphan => {
+                    let path = t.dir.join("cold").join(inf_log::extent_file_name(id));
+                    match inf_log::probe_extent_file(&self.fs, &path) {
+                        Ok(header) if header.extent_id == id => {
+                            inf_log::blob::quarantine_extent_file(&self.fs, &t.dir, id)
+                                .map(|()| Disposal::Quarantined)
+                        }
+                        Ok(_) => inf_log::blob::unlink_extent_file(&self.fs, &t.dir, id)
+                            .map(|()| Disposal::Unlinked),
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                            inf_log::blob::unlink_extent_file(&self.fs, &t.dir, id)
+                                .map(|()| Disposal::Unlinked)
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            Ok(Disposal::Unlinked) // already gone — the goal state
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                // Second verdict (ADR-0096 D4): still unreferenced after
+                // a full boot cycle — unlink the quarantine twin.
+                inf_store::ReclaimOrigin::Quarantined => {
+                    inf_log::blob::unlink_quarantined_file(&self.fs, &t.dir, id)
+                        .map(|()| Disposal::Unlinked)
+                }
+            };
+            match outcome {
+                Ok(Disposal::Unlinked) => table.extent_reclaim_done(extent_id),
+                Ok(Disposal::Quarantined) => table.extent_reclaim_quarantined(extent_id),
                 // Non-fatal by contract (ADR-0061 D5): counted,
-                // re-offered, boot-sweep re-driven.
+                // re-offered with its origin intact, boot-sweep
+                // re-driven.
                 Err(_) => table.extent_reclaim_deferred(extent_id),
             }
         }

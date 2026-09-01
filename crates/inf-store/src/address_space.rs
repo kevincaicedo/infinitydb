@@ -113,6 +113,13 @@ pub struct TieringCounters {
     pub region_decommit_pages: u64,
     /// Resolver answers of [`AddrClass::Cold`] — cold-read candidates.
     pub cold_resolves: u64,
+    /// Cold reads that failed typed at the command surface (queue
+    /// saturation, device error, frame CRC, extent open/read, replan
+    /// exhaustion — review of 2026-08-30, C2′): every one answered a
+    /// client `-ERR`/`BUSY`, never an absence, and this counter makes
+    /// the rate scrapeable (L10). Zero in memory mode and in any
+    /// healthy run.
+    pub cold_read_errors: u64,
     /// Writes that suspended on flushed-watermark progress (M4-S07,
     /// ADR-0053 D4) — the always-on backpressure tripwire.
     pub tail_alloc_stalls: u64,
@@ -691,6 +698,12 @@ impl AddressSpace {
     /// Always-on counters snapshot (S03 scrapes and asserts these).
     pub fn counters(&self) -> TieringCounters {
         TieringCounters { cold_resolves: self.cold_resolves.get(), ..self.counters }
+    }
+
+    /// Counts one typed cold-read failure served to a client (C2′ —
+    /// the plane's resolve funnel and SCAN's key fetch report here).
+    pub fn note_cold_read_error(&mut self) {
+        self.counters.cold_read_errors += 1;
     }
 
     /// Byte-exact attribution snapshot (L5).

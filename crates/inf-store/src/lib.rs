@@ -46,7 +46,7 @@ pub use doc::{JsonLogDecision, JsonRead, JsonScalarPatch, JsonSetOptions, JsonSe
 pub use evict::{EvictStats, EvictionPolicy};
 pub use extents::{
     BLOB_MAX_BYTES_DEFAULT, BLOB_RECLAIM_PER_SLICE_DEFAULT, BLOB_THRESHOLD_DEFAULT, BlobConfig,
-    ExtentRefs, ExtentStats,
+    ExtentRefs, ExtentStats, ReclaimCandidate, ReclaimOrigin,
 };
 pub use index::{HomeGroupCursor, Index, MemoryMode, SlotMode, TieredMode};
 pub use index_backfill::{

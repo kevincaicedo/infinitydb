@@ -205,6 +205,10 @@ pub struct RecoverStats {
     /// settled by their full key — the ambiguous (two RAM keys with one
     /// hash) and over-cap pairs, never the general index.
     pub shadow_settle_reads: u64,
+    /// ADR-0096 D3: quarantined extents the replayed map references,
+    /// renamed back before serving — a wrong orphan verdict healed.
+    /// Nonzero is the upstream-accounting falsifier signal; logged.
+    pub blob_revived: u64,
     /// Sealed segments with non-validating remnant bytes behind their data
     /// end — the inert residue of an earlier torn-tail resume (the reader
     /// never crosses a segment's data end, so they can never replay).
@@ -425,6 +429,9 @@ pub(crate) struct RecoveredTierNs<F: SegmentFs> {
     /// one mode) — the cold-read table inherits them.
     pub files: Vec<(u32, F::File)>,
     pub extents_listed: Vec<u64>,
+    /// `.quarantine`-named ids (ADR-0096 D3) — swept for the second
+    /// verdict; referenced ids revive before the node serves.
+    pub extents_quarantined: Vec<u64>,
 }
 
 impl<F: SegmentFs + Clone> Recovery<F> {
@@ -821,6 +828,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 flush: recovered.flush,
                 files,
                 extents_listed: recovered.extents_listed,
+                extents_quarantined: recovered.extents_quarantined,
             });
         }
         Ok(())
@@ -842,7 +850,23 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         }
         for tier in &self.recovered_tiers {
             if let Some(table) = ks.tiered_store_mut(tier.ns) {
-                table.extent_sweep_seed(&tier.extents_listed);
+                let revive =
+                    table.extent_sweep_seed(&tier.extents_listed, &tier.extents_quarantined);
+                // ADR-0096 D3: a quarantined extent the replayed map
+                // references was a wrong orphan verdict — rename it back
+                // before the node serves, so reads never see the twin.
+                // A rename I/O failure is a recovery fail-stop (§8.4);
+                // "nothing to revive" is fine (already revived or gone —
+                // reads answer the latter typed).
+                for extent_id in revive {
+                    let shard = self.shard_dir.join(format!("ns-{}", tier.ns.0));
+                    inf_log::blob::revive_extent_file(
+                        self.fs(),
+                        &shard,
+                        inf_log::ExtentId(extent_id),
+                    )?;
+                    self.stats.blob_revived += 1;
+                }
                 // M4.5-S37 (ADR-0093 D5/A4′): the shadow ticket set is a
                 // projection of the finished index — rebuild it once the
                 // checkpoint and WAL tail have replayed, before serving.

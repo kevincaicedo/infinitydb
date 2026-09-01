@@ -72,6 +72,22 @@ pub fn parse_extent_file_name(name: &str) -> Option<ExtentId> {
     digits.parse::<u64>().ok().map(ExtentId)
 }
 
+/// `blob-NNNNNN.iblob.quarantine` — the boot-orphan quarantine twin
+/// (ADR-0096 D2): same bytes, a name no read or listing resolves, so a
+/// wrong orphan verdict is recoverable by rename instead of being an
+/// `unlink(2)`.
+#[must_use]
+pub fn quarantined_file_name(id: ExtentId) -> String {
+    format!("{}.quarantine", extent_file_name(id))
+}
+
+/// Parses a quarantined extent file name back to its id (`None` for
+/// foreign names — the [`parse_extent_file_name`] rule).
+#[must_use]
+pub fn parse_quarantined_file_name(name: &str) -> Option<ExtentId> {
+    parse_extent_file_name(name.strip_suffix(".quarantine")?)
+}
+
 /// Parsed v1 extent header — the ground truth the orphan sweep and every
 /// read verifies against (ADR-0061 D1).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -738,6 +754,91 @@ pub fn unlink_extent_file<F: SegmentFs>(fs: &F, shard_dir: &Path, id: ExtentId) 
     }
 }
 
+/// Lists quarantined extent ids in `shard_dir/cold/` — names only, the
+/// [`list_extent_ids`] rule (ADR-0096 D3: the boot collection pass
+/// partitions the directory; both halves advance the id cursor).
+///
+/// # Errors
+/// I/O failures from the directory listing itself.
+pub fn list_quarantined_extent_ids<F: SegmentFs>(
+    fs: &F,
+    shard_dir: &Path,
+) -> io::Result<Vec<ExtentId>> {
+    let cold_dir = shard_dir.join("cold");
+    let names = match fs.list_dir(&cold_dir) {
+        Ok(names) => names,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut ids: Vec<ExtentId> =
+        names.iter().filter_map(|n| parse_quarantined_file_name(n)).collect();
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+/// Quarantines one boot-orphan extent file (ADR-0096 D2): an atomic
+/// rename to the `.quarantine` twin — the bytes survive the life, reads
+/// of the id fail typed, and the next boot delivers the second verdict.
+/// No directory fsync: a rename lost to a crash re-lists the file as an
+/// orphan and re-quarantines (idempotent). An already-absent source is
+/// **success** — either the file is already quarantined (re-listed next
+/// boot) or already gone.
+///
+/// # Errors
+/// The typed I/O failure — callers defer the candidate and retry.
+pub fn quarantine_extent_file<F: SegmentFs>(
+    fs: &F,
+    shard_dir: &Path,
+    id: ExtentId,
+) -> io::Result<()> {
+    let cold = shard_dir.join("cold");
+    match fs.rename(&cold.join(extent_file_name(id)), &cold.join(quarantined_file_name(id))) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+/// Revives one quarantined extent (ADR-0096 D3): renames the
+/// `.quarantine` twin back so reads resolve again. `Ok(false)` when
+/// there was nothing to revive (already revived, or the file is gone —
+/// reads answer that typed); the caller counts `Ok(true)`.
+///
+/// # Errors
+/// The typed I/O failure from the rename itself.
+pub fn revive_extent_file<F: SegmentFs>(
+    fs: &F,
+    shard_dir: &Path,
+    id: ExtentId,
+) -> io::Result<bool> {
+    let cold = shard_dir.join("cold");
+    match fs.rename(&cold.join(quarantined_file_name(id)), &cold.join(extent_file_name(id))) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Unlinks one quarantined extent file — the second-verdict disposal
+/// (ADR-0096 D4). Same contract as [`unlink_extent_file`]: non-fatal,
+/// already-absent is success.
+///
+/// # Errors
+/// The typed I/O failure — callers count it and retry next round.
+pub fn unlink_quarantined_file<F: SegmentFs>(
+    fs: &F,
+    shard_dir: &Path,
+    id: ExtentId,
+) -> io::Result<()> {
+    if inf_foundation::fault::fire(crate::fault::BLOB_UNLINK_FAIL) {
+        return Err(crate::fault::injected(crate::fault::BLOB_UNLINK_FAIL));
+    }
+    let path = shard_dir.join("cold").join(quarantined_file_name(id));
+    match fs.remove_file(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -857,6 +958,52 @@ mod tests {
         assert_eq!(parse_extent_file_name("tier-000003.itier"), None);
         assert_eq!(parse_extent_file_name("blob-3.iblob"), None);
         assert_eq!(parse_extent_file_name("blob-00000a.iblob"), None);
+        // ADR-0096: the quarantine twin's name parses back and never
+        // aliases the live name (each parser refuses the other's form).
+        assert_eq!(quarantined_file_name(ExtentId(3)), "blob-000003.iblob.quarantine");
+        assert_eq!(parse_quarantined_file_name("blob-000003.iblob.quarantine"), Some(ExtentId(3)));
+        assert_eq!(parse_quarantined_file_name("blob-000003.iblob"), None);
+        assert_eq!(parse_extent_file_name("blob-000003.iblob.quarantine"), None);
+    }
+
+    /// ADR-0096 D2–D4 file lifecycle: quarantine renames (bytes intact,
+    /// out of both the listing and `open_extent`'s reach), revive
+    /// restores service, the second-verdict unlink returns the disk —
+    /// every step idempotent under an already-absent source.
+    #[test]
+    fn quarantine_revive_and_second_verdict_lifecycle() {
+        let fs = MemFs::default();
+        let bytes = value(2000, 9);
+        write_extent(&fs, 4, &bytes);
+        quarantine_extent_file(&fs, Path::new(SHARD), ExtentId(4)).expect("quarantine");
+        assert_eq!(list_extent_ids(&fs, Path::new(SHARD)).expect("ids"), Vec::new());
+        assert_eq!(
+            list_quarantined_extent_ids(&fs, Path::new(SHARD)).expect("ids"),
+            vec![ExtentId(4)]
+        );
+        assert!(
+            open_extent(&fs, Path::new(SHARD), ExtentId(4), TierIoMode::Buffered).is_err(),
+            "a quarantined extent does not resolve"
+        );
+        quarantine_extent_file(&fs, Path::new(SHARD), ExtentId(4))
+            .expect("re-quarantine is idempotent success");
+        // Revive: the bytes serve again, byte-exact.
+        assert!(revive_extent_file(&fs, Path::new(SHARD), ExtentId(4)).expect("revive"));
+        let mut reader =
+            open_extent(&fs, Path::new(SHARD), ExtentId(4), TierIoMode::Buffered).expect("open");
+        let mut out = Vec::new();
+        reader.read(0, bytes.len(), &mut out).expect("io").expect("crc");
+        assert_eq!(out, bytes, "revival is loss-free");
+        assert!(
+            !revive_extent_file(&fs, Path::new(SHARD), ExtentId(4)).expect("nothing to revive"),
+            "a second revive is a no-op, not an error"
+        );
+        // Second verdict: quarantine again, then unlink the twin.
+        quarantine_extent_file(&fs, Path::new(SHARD), ExtentId(4)).expect("quarantine");
+        unlink_quarantined_file(&fs, Path::new(SHARD), ExtentId(4)).expect("unlink twin");
+        assert_eq!(list_quarantined_extent_ids(&fs, Path::new(SHARD)).expect("ids"), Vec::new());
+        unlink_quarantined_file(&fs, Path::new(SHARD), ExtentId(4))
+            .expect("already-absent is success");
     }
 
     #[test]

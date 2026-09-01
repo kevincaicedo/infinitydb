@@ -283,6 +283,11 @@ fn probe<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     // zero here turns `cold_read_p99_us` into absolute uptime — the
     // v0.4.0-alpha soak's 85899345919 µs fingerprint (instrument fix).
     let now_us = shared.now.get().as_micros();
+    // Deterministic stand-in for a saturated cold queue (the BUSY leg's
+    // fault point — review of 2026-08-30, C2′).
+    if inf_foundation::fault::fire(crate::fault::COLD_ENQUEUE_FULL) {
+        return Probe::Fail(ERR_COLD_BUSY);
+    }
     match cold.enqueue(fd, file, offset, bytes, inf_runtime::ReadClass::Foreground, now_us) {
         Ok(wait) => Probe::Cold(ColdPlan { wait, addr, frames, skip }),
         Err(_) => Probe::Fail(ERR_COLD_BUSY),
@@ -330,7 +335,28 @@ async fn serve_cold_image<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'st
 
 /// Resolves one key: RAM hit, verified cold fetch, or miss — the S08
 /// hardened loop (re-resolve after every resume; exclude on mismatch).
+/// Counting wrapper over [`resolve_inner`]: every terminal `Fail` —
+/// which every consumer now surfaces typed (review of 2026-08-30, C2′)
+/// — increments the always-on `cold_read_errors` counter, so the
+/// failure rate is scrapeable (`INFO tiering`), not just visible
+/// per-reply (L10).
 async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    key: &[u8],
+    hash: u64,
+    promote: PromoteOnCold,
+) -> Resolved {
+    let resolved = resolve_inner(shared, ns, key, hash, promote).await;
+    if matches!(resolved, Resolved::Fail(_))
+        && let Some(table) = shared.store.borrow_mut().tiered_store_mut(ns)
+    {
+        table.note_cold_read_error();
+    }
+    resolved
+}
+
+async fn resolve_inner<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
     key: &[u8],
@@ -1054,7 +1080,16 @@ async fn mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 w.bulk(table.record(addr).value);
             }
             Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => w.bulk(&value),
-            _ => w.null(),
+            Resolved::Miss => w.null(),
+            // A failed read is never "not there" (review of 2026-08-30,
+            // C2′/F-L06-04): RESP2 has no per-element error, so the
+            // whole command answers typed — the partial array is
+            // abandoned, exactly what GET answers for the same key.
+            Resolved::Fail(message) => {
+                reply.clear();
+                RespWriter::new(&mut reply, proto).error(message);
+                return TieredReply::Done(reply);
+            }
         }
     }
     TieredReply::Done(reply)
@@ -1071,7 +1106,12 @@ async fn exists<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         let hash = shared.hasher.hash(key);
         match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
             Resolved::Ram(_) | Resolved::Cold { .. } | Resolved::Extent { .. } => count += 1,
-            _ => {}
+            Resolved::Miss => {}
+            // Unreadable ≠ absent (C2′/F-L06-04): EXISTS is exactly what
+            // a cache-fill path uses to decide whether to overwrite, so
+            // a partial count under a failed read would license
+            // overwriting live data. Typed, whole-command, like GET.
+            Resolved::Fail(message) => return done_error(shared, proto, message),
         }
     }
     let mut reply = shared.take_reply_buf();
@@ -1237,7 +1277,12 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 match fetch_key(shared, ns, hash, addr).await {
                     Ok(Some(key)) => keys.push(key),
                     Ok(None) => {}
-                    Err(message) => return done_error(shared, proto, message),
+                    Err(message) => {
+                        if let Some(table) = shared.store.borrow_mut().tiered_store_mut(ns) {
+                            table.note_cold_read_error();
+                        }
+                        return done_error(shared, proto, message);
+                    }
                 }
             }
         }
@@ -1390,6 +1435,11 @@ async fn fetch_key<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 let bytes = frames as usize * inf_log::TIER_FRAME_BYTES;
                 // Same-clock stamp as `on_completion` (the `cold_read_p99_us` pair).
                 let now_us = shared.now.get().as_micros();
+                // The BUSY leg's fault point (review of 2026-08-30, C2′):
+                // a saturated queue fails the SCAN page typed.
+                if inf_foundation::fault::fire(crate::fault::COLD_ENQUEUE_FULL) {
+                    return Err(ERR_COLD_BUSY);
+                }
                 let wait = cold
                     .enqueue(fd, file, offset, bytes, inf_runtime::ReadClass::Foreground, now_us)
                     .map_err(|_| ERR_COLD_BUSY)?;

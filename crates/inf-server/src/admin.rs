@@ -714,6 +714,10 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tiering_region_commit_pages:{}", tiering.region_commit_pages));
     push(text, &format!("tiering_region_decommit_pages:{}", tiering.region_decommit_pages));
     push(text, &format!("tiering_cold_resolves:{}", tiering.cold_resolves));
+    // C2′ (review of 2026-08-30): typed cold-read failures served to
+    // clients — zero in memory mode and in any healthy run; the paired
+    // saturation cause is `cold_queue_full` above.
+    push(text, &format!("tiering_cold_read_errors:{}", tiering.cold_read_errors));
     // M4.5-S37 step 1: the ceiling arm's count — present only in a
     // `bench-diagnostics` build, so a shipping INFO cannot be mistaken
     // for one.
@@ -861,6 +865,12 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tiering_blob_reclaimable:{}", extents.reclaimable));
     push(text, &format!("tiering_blob_reclaim_deferred:{}", extents.reclaim_deferred));
     push(text, &format!("tiering_blob_reclaim_slices:{}", extents.reclaim_slices));
+    // ADR-0096: boot orphans renamed to their quarantine twin instead of
+    // unlinked, and quarantined extents revived because the replayed map
+    // references them — the latter nonzero is the upstream-accounting
+    // falsifier signal (a wrong orphan verdict healed).
+    push(text, &format!("tiering_blob_quarantined:{}", extents.quarantined));
+    push(text, &format!("tiering_blob_quarantine_revived:{}", extents.quarantine_revived));
     push(text, &format!("tiering_blob_rmw_ops:{}", extents.rmw_ops));
     // M4-S19 (ADR-0062 D5): extent device bytes on disk right now — the
     // blob half of every namespace's disk usage (the tier-file half is
@@ -2042,6 +2052,9 @@ mod tests {
             // the same structural reason as the counters.
             "tiering_write_amp_milli_max",
             "tiering_write_amp_undefined_ns",
+            // C2′ (review of 2026-08-30): no table, no cold reads to
+            // fail — and zero in any healthy tiered run too.
+            "tiering_cold_read_errors",
             // M4-S17 (ADR-0061 D8): no table, no extents — the blob leg
             // reads zero for the same structural reason.
             "tiering_blob_user_bytes",
@@ -2057,6 +2070,9 @@ mod tests {
             "tiering_blob_write_amp_undefined_ns",
             "tiering_blob_reclaimable",
             "tiering_blob_reclaim_deferred",
+            // ADR-0096: no table, no boot sweep — structurally zero.
+            "tiering_blob_quarantined",
+            "tiering_blob_quarantine_revived",
             // M4.5-S30 (ADR-0085 D6): no table, no promotion path — the
             // read-promotion observables and the filter's L5 term read
             // zero for the same structural reason.

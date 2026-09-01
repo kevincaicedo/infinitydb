@@ -39,8 +39,10 @@ pub mod tier;
 pub use blob::{
     BLOB_CHUNK_BYTES, BLOB_HEADER_BYTES, ExtentHeaderV1, ExtentId, ExtentReader, ExtentSummary,
     ExtentWriteFailure, ExtentWriter, SealedExtent, extent_file_name, extent_frame_offset,
-    inspect_extent_bytes, list_extent_ids, open_extent, parse_extent_file_name,
-    parse_extent_header, probe_extent_file, unlink_extent_file,
+    inspect_extent_bytes, list_extent_ids, list_quarantined_extent_ids, open_extent,
+    parse_extent_file_name, parse_extent_header, parse_quarantined_file_name, probe_extent_file,
+    quarantine_extent_file, quarantined_file_name, revive_extent_file, unlink_extent_file,
+    unlink_quarantined_file,
 };
 pub use ckpt::{
     BlobRefEntry, CkptConfig, IckBlobRefSection, IckIdxSidecarSection, IckIdxSidecarStep,
