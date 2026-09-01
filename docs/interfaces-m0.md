@@ -355,9 +355,18 @@ pub struct ArgvRef<'a>;   // argv[i] -> &'a [u8]; offset-based over the frame;
 // Serializer: RESP2/RESP3 selected per connection (HELLO).
 pub enum Protocol { Resp2, Resp3 }
 pub struct RespWriter<'b>;                  // over &mut Vec<u8> (a wire buffer)
-  // simple / error / int / bulk / null / null_array / array_header /
-  // map_header / bool / double / verbatim / big_number — RESP2/3 variants
-  // selected by `Protocol`; stack-buffer itoa, no allocation.
+  // simple / error / error_bytes / int / bulk / null / null_array /
+  // array_header / map_header / bool / double / verbatim / big_number —
+  // RESP2/3 variants selected by `Protocol`; stack-buffer itoa, no allocation.
+  // Line-framed replies (`simple`, `error`, `error_bytes`) SANITIZE their
+  // text: a leading/trailing CR/LF run is trimmed and any remaining CR/LF
+  // becomes a space, byte-for-byte as redis-server 8.0.5 does
+  // (`sdstrim` + `sdsmapchars`). Amended 2026-09-01 by ADR-0097 — the
+  // former contract ("text must not contain CR/LF; debug-asserted") was a
+  // caller precondition that twelve live call sites violated with client
+  // bytes, which let a client open a second RESP frame inside its own reply
+  // (review 2026-08-30, C6). `error_bytes` takes raw argv bytes, which need
+  // not be UTF-8. Length-prefixed replies are never sanitized.
 
 // Command metadata (frozen schema): name, arity, flags, key spec.
 // EXPIREAT is not in the M0 surface (matches the S15 list); registry is the

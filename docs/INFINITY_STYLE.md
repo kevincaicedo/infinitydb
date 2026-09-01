@@ -136,6 +136,18 @@ force multiplier for DST and fuzzing.
   other code. `unwrap()`/`expect()` on an operational `Result` is a review
   reject; `expect()` with an invariant justification is an assertion and is
   judged as one.
+- **A precondition on data that crossed a trust boundary is not a
+  precondition — it is a check you owe.** If a value can reach a function
+  from a client, a peer, or a file, do not document "callers must not pass
+  X" and `debug_assert!` it: `debug_assert!` is absent from
+  `[profile.release]`, so the shipping build has no check at all, and a
+  debug build turns the same input into a cell panic. Enforce it where it
+  can be enforced — normalize, bound, or return a typed error — and turn
+  the assertion into a **postcondition on what you emit**. ADR-0097 is the
+  worked example: `RespWriter::error` documented "text must not contain
+  CR/LF (debug-asserted; replies are engine-controlled constants)" while
+  twelve live call sites interpolated client bytes, which let a client open
+  a second RESP frame inside its own reply.
 - fsync failure is fail-stop. Never silently degrade durability (§8.4).
 
 ### Unsafe Rust
