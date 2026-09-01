@@ -244,6 +244,23 @@ pub(crate) fn bump_version_in_place(bytes: &mut [u8]) {
     bytes[5..8].copy_from_slice(&next[..3]);
 }
 
+/// Decodes just the key from a record *prefix* — `Some` when the prefix
+/// covers the fixed header, the TTL extension when present, and the whole
+/// key; `None` when it is too short. The key always ends within
+/// `HEADER_LEN + TTL_EXT_LEN + MAX_KEY_LEN` = 268 bytes of the record's
+/// start, so a cold-read first window always holds it (review of
+/// 2026-08-30, C2: `SCAN`'s cold key resolution must not require the
+/// value's bytes to name a key).
+#[inline]
+pub(crate) fn key_from_prefix(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < HEADER_LEN {
+        return None;
+    }
+    let klen = bytes[1] as usize;
+    let at = HEADER_LEN + if bytes[0] & FLAG_TTL != 0 { TTL_EXT_LEN } else { 0 };
+    bytes.get(at..at + klen)
+}
+
 /// Computes a record's full encoded length from its fixed header alone —
 /// how the store sizes the second arena read (header first, then the whole
 /// record).
@@ -432,6 +449,32 @@ mod tests {
             kind: RecordKind::String { raw: false },
         };
         assert_eq!(spec.encoded_len(), 88);
+    }
+
+    /// Review of 2026-08-30 (C2): the key decodes from a record prefix —
+    /// with and without the TTL extension, at the 255-byte key bound, and
+    /// from a prefix holding none of the value — while a prefix that stops
+    /// inside the key answers `None`, never a truncated key.
+    #[test]
+    fn key_decodes_from_a_value_free_prefix() {
+        for expire_at_ms in [None, Some(5u64)] {
+            let key = vec![b'K'; MAX_KEY_LEN];
+            let spec = RecordSpec {
+                key: &key,
+                value: &[0xAB; 40_000],
+                version: 1,
+                expire_at_ms,
+                kind: RecordKind::String { raw: false },
+            };
+            let buf = roundtrip(spec);
+            let key_end =
+                HEADER_LEN + if expire_at_ms.is_some() { TTL_EXT_LEN } else { 0 } + key.len();
+            assert!(key_end <= 268, "prefix bound documented on key_from_prefix");
+            assert_eq!(key_from_prefix(&buf[..key_end]), Some(&key[..]));
+            assert_eq!(key_from_prefix(&buf), Some(&key[..]));
+            assert_eq!(key_from_prefix(&buf[..key_end - 1]), None);
+            assert_eq!(key_from_prefix(&buf[..HEADER_LEN - 1]), None);
+        }
     }
 
     #[test]

@@ -23,7 +23,7 @@ fn store_with(value: &[u8]) -> CellStore {
 /// Redis `getrangeCommand` (t_string.c), transcribed. The first clause is the
 /// one InfinityDB is missing: a range whose two indices are BOTH negative and
 /// inverted returns empty *before* any clamping happens.
-fn redis_get_range<'a>(value: &'a [u8], start: i64, end: i64) -> &'a [u8] {
+fn redis_get_range(value: &[u8], start: i64, end: i64) -> &[u8] {
     let n = value.len() as i64;
     if start < 0 && end < 0 && start > end {
         return b"";

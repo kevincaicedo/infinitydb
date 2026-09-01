@@ -4122,12 +4122,19 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         // selected — they belong to the scatter arm below (review of
         // 2026-08-27, M4.5-S37: a namespace-bound connection applied them
         // to its own cell only, found by the `m4-tiered` DST's per-cell
-        // witness on `tiered-shadow-overwrite`).
+        // witness on `tiered-shadow-overwrite`). `FLUSHALL` is node-wide
+        // whatever the connection selected, for the same reason (review
+        // of 2026-08-30, C1: it replied `+OK` having flushed one cell of
+        // `cells`); `FLUSHDB` stays here — under a named namespace it
+        // means "flush the namespace", which `execute` refuses typed
+        // (ADR-0015). `SCAN`/`KEYS`/`RANDOMKEY` stay here too:
+        // `dispatch_ns` scatters them namespace-aware.
         Some(meta)
             if well_formed
                 && conn_ns.is_some()
                 && !is_conn_state(owned)
-                && !(meta.id == CommandId::Config && is_scatter(meta.id, argv.get(1).copied())) =>
+                && !(matches!(meta.id, CommandId::Config | CommandId::Flushall)
+                    && is_scatter(meta.id, argv.get(1).copied())) =>
         {
             let ns = conn_ns.expect("guarded");
             return dispatch_ns(
@@ -4174,15 +4181,19 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                     }
                 }
                 CommandId::Keys => {
-                    let reply = program_keys(shared, origin, proto, id, db, argv).await;
+                    let reply =
+                        program_keys(shared, origin, proto, id, db, ScatterScope::Db, argv).await;
                     pending.push_back(PendingReply::Done(reply));
                 }
                 CommandId::Scan => {
-                    let reply = program_scan(shared, origin, proto, id, db, argv).await;
+                    let reply =
+                        program_scan(shared, origin, proto, id, db, ScatterScope::Db, argv).await;
                     pending.push_back(PendingReply::Done(reply));
                 }
                 CommandId::Randomkey => {
-                    let reply = program_randomkey(shared, origin, proto, id, db, argv).await;
+                    let reply =
+                        program_randomkey(shared, origin, proto, id, db, ScatterScope::Db, argv)
+                            .await;
                     pending.push_back(PendingReply::Done(reply));
                 }
                 _ => unreachable!("is_scatter covers exactly the arms above"),
@@ -4668,6 +4679,102 @@ async fn run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     }
 }
 
+/// Which keyspace a scatter program addresses: the connection's numbered
+/// database (legs ride `Apply` with the packed db byte) or a named
+/// namespace (legs ride `ApplyNs` — the ADR-0015 D1 op, the shape the
+/// S37 `DBSIZE` fix established). Review of 2026-08-30 (C1, F-L13-07):
+/// namespace-bound connections must reach the **same** node-wide
+/// programs the default database uses — before this, `SCAN`/`KEYS`/
+/// `RANDOMKEY` served the connection's own cell and reported a complete
+/// answer.
+#[derive(Copy, Clone)]
+enum ScatterScope {
+    Db,
+    Ns(NsId),
+}
+
+/// This cell's leg of a namespace-scoped scatter program: the tiered
+/// arm for a tiered namespace (its `SCAN` walks the tiered index and
+/// its unsupported commands answer their typed errors), the ordinary
+/// namespace execution otherwise. Read-only programs only — a gated
+/// (durable-write) verdict here is a dispatch bug, answered as a typed
+/// error rather than an unfenced ack.
+async fn ns_run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    origin: ExecOrigin,
+    proto: Protocol,
+    id: u64,
+    db: u16,
+    ns: NsId,
+    argv: &[&[u8]],
+) -> Vec<u8> {
+    let (tiered, class) = {
+        let ks = shared.store.borrow();
+        (ks.is_tiered(ns), ks.ns_fsync_class(ns))
+    };
+    if tiered {
+        let meta = lookup(argv[0]).expect("scatter programs dispatch registered commands");
+        match tiered::dispatch_tiered(shared, origin, ns, meta, argv, proto, class).await {
+            tiered::TieredReply::Done(reply) => reply,
+            tiered::TieredReply::Gated { reply, .. } => {
+                debug_assert!(false, "read-only scatter leg staged a durable effect");
+                shared.recycle_reply_buf(reply);
+                error_reply(shared, proto, "ERR cross-cell execution failed")
+            }
+        }
+    } else {
+        let mut reply = shared.take_reply_buf();
+        shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), &mut reply);
+        reply
+    }
+}
+
+/// Ship one scatter leg to `to` under `scope` and return the reply
+/// waiter (`Apply` for the numbered database, `ApplyNs` for a named
+/// namespace). `Err` carries the refusal reply.
+async fn scatter_send<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    to: CellId,
+    proto: Protocol,
+    db: u16,
+    scope: ScatterScope,
+    argv: &[&[u8]],
+) -> Result<GateWait<u64, OwnedOutcome>, Vec<u8>> {
+    match scope {
+        ScatterScope::Db => send_apply(shared, to, proto, db, argv).await,
+        ScatterScope::Ns(ns) => send_apply_ns(shared, to, proto, ns, argv).await,
+    }
+}
+
+/// One scope-aware program step on `cell` (the [`run_on`] shape).
+#[allow(clippy::too_many_arguments)] // internal dispatch funnel
+async fn scatter_run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    origin: ExecOrigin,
+    cell: CellId,
+    proto: Protocol,
+    id: u64,
+    db: u16,
+    scope: ScatterScope,
+    argv: &[&[u8]],
+) -> Vec<u8> {
+    match scope {
+        ScatterScope::Db => run_on(shared, origin, cell, proto, id, db, argv).await,
+        ScatterScope::Ns(ns) => {
+            if cell.0 == shared.cell.0 {
+                return ns_run_local(shared, origin, proto, id, db, ns, argv).await;
+            }
+            match send_apply_ns(shared, cell, proto, ns, argv).await {
+                Ok(waiter) => match waiter.await {
+                    OwnedOutcome::Bytes(bytes) => bytes,
+                    outcome => render_outcome(shared, outcome, proto),
+                },
+                Err(refusal) => refusal,
+            }
+        }
+    }
+}
+
 /// One typed counted step (EXISTS/DEL shape) on `cell`.
 async fn count_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
@@ -4828,15 +4935,19 @@ async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     proto: Protocol,
     id: u64,
     db: u16,
+    scope: ScatterScope,
     argv: &[&[u8]],
 ) -> Vec<u8> {
-    let local = run_local(shared, origin, proto, id, db, argv);
+    let local = match scope {
+        ScatterScope::Db => run_local(shared, origin, proto, id, db, argv),
+        ScatterScope::Ns(ns) => ns_run_local(shared, origin, proto, id, db, ns, argv).await,
+    };
     let Some((mut total, local_off)) = parse_array_header(&local) else {
         return local; // error passthrough
     };
     let mut waiters = Vec::new();
     for cell in peer_cells(shared) {
-        match send_apply(shared, cell, proto, db, argv).await {
+        match scatter_send(shared, cell, proto, db, scope, argv).await {
             Ok(waiter) => waiters.push(waiter),
             Err(refusal) => return refusal,
         }
@@ -4874,6 +4985,7 @@ async fn program_scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     proto: Protocol,
     id: u64,
     db: u16,
+    scope: ScatterScope,
     argv: &[&[u8]],
 ) -> Vec<u8> {
     let Some(cursor) = crate::exec::parse_cursor(argv[1]) else {
@@ -4887,7 +4999,7 @@ async fn program_scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     let local_cursor = crate::exec::fmt_u64(&mut cursor_buf, cursor & SCAN_LOCAL_MASK);
     let mut sub: Vec<&[u8]> = argv.to_vec();
     sub[1] = local_cursor;
-    let raw = run_on(shared, origin, CellId(target), proto, id, db, &sub).await;
+    let raw = scatter_run_on(shared, origin, CellId(target), proto, id, db, scope, &sub).await;
     let Some((inner, rest_at)) = parse_scan_head(&raw) else {
         return raw; // error passthrough
     };
@@ -4918,12 +5030,13 @@ async fn program_randomkey<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     proto: Protocol,
     id: u64,
     db: u16,
+    scope: ScatterScope,
     argv: &[&[u8]],
 ) -> Vec<u8> {
     let start = (crate::exec::next_rand(&shared.node) % u64::from(shared.cells)) as u16;
     for i in 0..shared.cells {
         let cell = CellId((start + i) % shared.cells);
-        let raw = run_on(shared, origin, cell, proto, id, db, argv).await;
+        let raw = scatter_run_on(shared, origin, cell, proto, id, db, scope, argv).await;
         if raw != b"$-1\r\n" && raw != b"_\r\n" {
             return raw;
         }
@@ -5875,6 +5988,26 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
             }
         }
         pending.push_back(PendingReply::Counted { waiters, acc, proto, refusal });
+        return true;
+    }
+    // Node-wide iteration + the random probe (review of 2026-08-30, C1 /
+    // F-L13-07): a namespace-bound connection reaches the same scatter
+    // programs the default database uses, with `ApplyNs` legs — before
+    // this arm they fell through to local execution and served one cell
+    // of `cells` while reporting a complete answer (`SCAN` cursor 0,
+    // `KEYS` with no marker). Single-cell nodes keep the local path
+    // below — there the cell is the node.
+    if matches!(meta.id, CommandId::Keys | CommandId::Scan | CommandId::Randomkey)
+        && shared.cells > 1
+        && !shared.route_local_only
+    {
+        let scope = ScatterScope::Ns(ns);
+        let reply = match meta.id {
+            CommandId::Keys => program_keys(shared, origin, proto, id, db, scope, argv).await,
+            CommandId::Scan => program_scan(shared, origin, proto, id, db, scope, argv).await,
+            _ => program_randomkey(shared, origin, proto, id, db, scope, argv).await,
+        };
+        pending.push_back(PendingReply::Done(reply));
         return true;
     }
     // Tiered namespaces execute through the async tiered arm (M4-S26):

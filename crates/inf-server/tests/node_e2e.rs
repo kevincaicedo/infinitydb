@@ -1206,6 +1206,144 @@ fn namespace_bound_dbsize_counts_every_cell() {
     }
 }
 
+/// Reads one flat RESP array of bulk strings (the `KEYS` reply shape).
+fn read_key_array(stream: &mut TcpStream) -> std::collections::BTreeSet<Vec<u8>> {
+    let header = read_line(stream);
+    assert_eq!(header.first(), Some(&b'*'), "KEYS reply shape: {header:?}");
+    let count: usize =
+        String::from_utf8_lossy(&header[1..header.len() - 2]).parse().expect("array length");
+    (0..count).map(|_| read_bulk(stream)).collect()
+}
+
+/// Review of 2026-08-30 (full-codebase review C1 / F-L13-07): on a
+/// namespace-bound connection of a multi-cell node, `SCAN`, `KEYS` and
+/// `RANDOMKEY` cover **every** cell, and `FLUSHALL` deletes node-wide —
+/// the same programs the default database rides, with `ApplyNs` legs.
+/// Before the fix each served the connection's own cell and reported a
+/// complete answer (`FLUSHALL` replied `+OK` having deleted 1/cells).
+/// `FLUSHDB` keeps its honest typed refusal (ADR-0015): under a named
+/// namespace it means "flush the namespace", which is not yet a thing.
+#[test]
+fn namespace_bound_scan_keys_flushall_cover_every_cell() {
+    // A durable node whose only namespace is a memory one: DDL needs the
+    // control plane, while FLUSHALL refuses only when a *durable*
+    // namespace exists (exec.rs's ADR-0015 guard).
+    let dir = temp_data_dir("ns-scan-flushall");
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"cache", b"MODE", b"memory"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let mut c = connect_use(&node, b"cache");
+    let cell0: std::collections::BTreeSet<Vec<u8>> = keys_for_cell(2, 0, 10).into_iter().collect();
+    let cell1: std::collections::BTreeSet<Vec<u8>> = keys_for_cell(2, 1, 10).into_iter().collect();
+    let expected: std::collections::BTreeSet<Vec<u8>> = cell0.union(&cell1).cloned().collect();
+    for key in &expected {
+        c.write_all(&cmd(&[b"SET", key, b"v"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    // Keys in the *default* database too — FLUSHALL's blast radius.
+    let mut plain = node.connect();
+    for key in &expected {
+        plain.write_all(&cmd(&[b"SET", key, b"db0"])).expect("write");
+        read_exactly(&mut plain, b"+OK\r\n");
+    }
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, b":20\r\n");
+    // SCAN and KEYS name the whole namespace — set equality, both ways
+    // (the defect's signature was a complete-looking 1/cells answer).
+    assert_eq!(scan_to_completion(&mut c, b"7"), expected, "SCAN covers every cell");
+    c.write_all(&cmd(&[b"KEYS", b"*"])).expect("write");
+    assert_eq!(read_key_array(&mut c), expected, "KEYS covers every cell");
+    // RANDOMKEY draws from every cell's pool (200 draws: the chance of
+    // missing one cell with both non-empty is 2⁻²⁰⁰-ish).
+    let mut saw = (false, false);
+    for _ in 0..200 {
+        c.write_all(&cmd(&[b"RANDOMKEY"])).expect("write");
+        let key = read_bulk(&mut c);
+        saw.0 |= cell0.contains(&key);
+        saw.1 |= cell1.contains(&key);
+        assert!(expected.contains(&key), "RANDOMKEY named a foreign key: {key:?}");
+    }
+    assert!(saw.0 && saw.1, "RANDOMKEY drew from one cell's pool only: {saw:?}");
+    // FLUSHDB: the honest refusal, nothing deleted.
+    c.write_all(&cmd(&[b"FLUSHDB"])).expect("write");
+    let refusal = read_line(&mut c);
+    assert!(refusal.starts_with(b"-ERR"), "FLUSHDB refuses typed: {refusal:?}");
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, b":20\r\n");
+    // FLUSHALL: +OK means gone — from every cell, namespace and db0 both.
+    c.write_all(&cmd(&[b"FLUSHALL"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+    c.write_all(&cmd(&[b"KEYS", b"*"])).expect("write");
+    read_exactly(&mut c, b"*0\r\n");
+    plain.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut plain, b":0\r\n");
+    drop(plain);
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The C1 sweep's durable half: `SCAN`/`KEYS` on a namespace-bound
+/// connection cover both cells of a flat durable namespace, and tiered
+/// `SCAN` hops cells through the packed cursor (its per-cell walk was
+/// the same 1/cells defect through `plane/tiered.rs`). Tiered `KEYS`/
+/// `RANDOMKEY` keep their honest typed refusals.
+#[test]
+fn namespace_bound_scan_covers_durable_and_tiered_namespaces() {
+    let dir = temp_data_dir("ns-scan-sweep");
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    let namespaces: [&[&[u8]]; 2] = [
+        &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"everysec"],
+        &[
+            b"INF.NS",
+            b"CREATE",
+            b"hot",
+            b"MODE",
+            b"durable",
+            b"MEM-BUDGET",
+            b"8mb",
+            b"DISK-BUDGET",
+            b"64mb",
+            b"MUTABLE-FRACTION",
+            b"100",
+        ],
+    ];
+    for create in namespaces {
+        c.write_all(&cmd(create)).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    drop(c);
+    let expected: std::collections::BTreeSet<Vec<u8>> =
+        keys_for_cell(2, 0, 10).into_iter().chain(keys_for_cell(2, 1, 10)).collect();
+    for ns in [&b"ledger"[..], b"hot"] {
+        let mut c = connect_use(&node, ns);
+        for key in &expected {
+            c.write_all(&cmd(&[b"SET", key, b"v"])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+        read_exactly(&mut c, b":20\r\n");
+        let label = String::from_utf8_lossy(ns).into_owned();
+        assert_eq!(scan_to_completion(&mut c, b"7"), expected, "{label}: SCAN covers every cell");
+        c.write_all(&cmd(&[b"KEYS", b"*"])).expect("write");
+        if ns == b"hot" {
+            let reply = read_line(&mut c);
+            assert!(reply.starts_with(b"-ERR"), "{label}: tiered KEYS refuses typed: {reply:?}");
+            c.write_all(&cmd(&[b"RANDOMKEY"])).expect("write");
+            let reply = read_line(&mut c);
+            assert!(reply.starts_with(b"-ERR"), "{label}: tiered RANDOMKEY refusal: {reply:?}");
+        } else {
+            assert_eq!(read_key_array(&mut c), expected, "{label}: KEYS covers every cell");
+        }
+    }
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// `INF.NS CREATE … MODE durable` goes live: create → USE → write → read,
 /// `always` acks return (after fsync — the reply itself is the proof the
 /// gate opened), then a full restart recovers both the namespace
@@ -1826,6 +1964,134 @@ fn tiered_data_plane_serves_and_survives_restart() {
         expect.extend_from_slice(b"\r\n");
         read_exactly(&mut c, &expect);
     }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Reads one `SCAN` reply (`[next-cursor, [key…]]`) off the stream.
+fn read_scan_page(stream: &mut TcpStream) -> (u64, Vec<Vec<u8>>) {
+    let header = read_line(stream);
+    assert_eq!(header, b"*2\r\n", "SCAN reply shape: {header:?}");
+    let cursor_text = read_bulk(stream);
+    let cursor: u64 =
+        String::from_utf8_lossy(&cursor_text).parse().expect("SCAN cursor is a decimal u64");
+    let count_line = read_line(stream);
+    assert_eq!(count_line.first(), Some(&b'*'), "SCAN keys array: {count_line:?}");
+    let count: usize = String::from_utf8_lossy(&count_line[1..count_line.len() - 2])
+        .parse()
+        .expect("array length");
+    let keys = (0..count).map(|_| read_bulk(stream)).collect();
+    (cursor, keys)
+}
+
+/// Drives `SCAN` to cursor 0 and returns every key named, as a set.
+fn scan_to_completion(stream: &mut TcpStream, count: &[u8]) -> std::collections::BTreeSet<Vec<u8>> {
+    let mut collected = std::collections::BTreeSet::new();
+    let mut cursor: Vec<u8> = b"0".to_vec();
+    for _ in 0..10_000 {
+        stream.write_all(&cmd(&[b"SCAN", &cursor, b"COUNT", count])).expect("write");
+        let (next, keys) = read_scan_page(stream);
+        collected.extend(keys);
+        if next == 0 {
+            return collected;
+        }
+        cursor = next.to_string().into_bytes();
+    }
+    panic!("SCAN never returned cursor 0");
+}
+
+/// Review of 2026-08-30 (full-codebase review C2 / F-L07-05): `SCAN` on a
+/// tiered namespace names **every** live key — including cold records
+/// whose value overruns the 4-frame (~16 KiB) cold-read window. Before
+/// the fix, `fetch_key` demanded the whole record from one window and
+/// silently dropped the key while the cursor advanced: values from
+/// ~16,368 bytes up to the blob threshold vanished from a "complete"
+/// iteration (DBSIZE 920 / SCAN 373 in the review's reproduction) while
+/// `GET` still served them. The small-value band pins the control: keys
+/// inside the window were never affected.
+#[test]
+fn tiered_scan_names_every_cold_key_across_the_window() {
+    let dir = temp_data_dir("tiered-scan-window");
+    let big = 150usize; // 40 KB values — far past the 16,368-byte window
+    let small = 150usize; // 50 B values — the always-worked control band
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"t",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+        b"MEM-BUDGET",
+        b"3mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let mut expected = std::collections::BTreeSet::new();
+    for i in 0..big {
+        let key = format!("big:{i:04}").into_bytes();
+        let value = format!("B{i:04}:").into_bytes().repeat(6_667); // ~40 KB
+        c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        expected.insert(key);
+    }
+    for i in 0..small {
+        let key = format!("small:{i:04}").into_bytes();
+        c.write_all(&cmd(&[b"SET", &key, &[b's'; 50]])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        expected.insert(key);
+    }
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", big + small).as_bytes());
+    // ~6 MB against a 3 MB budget: poll MAINTAIN-driven demotion until
+    // most of the fill is flushed AND released pages exist (records are
+    // genuinely cold — a RAM-served SCAN would not exercise the window).
+    let info_u64 = |c: &mut TcpStream, field: &str| {
+        let tiering = info_text(c, b"tiering");
+        tiering
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let mut demoted = false;
+    let mut last = (0u64, 0u64);
+    for _ in 0..1000 {
+        last = (
+            info_u64(&mut c, "tiering_flush_confirmed_bytes:"),
+            info_u64(&mut c, "tiering_region_decommit_pages:"),
+        );
+        if last.0 > 3 << 20 && last.1 > 0 {
+            demoted = true;
+            break;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(demoted, "demotion never released (flushed {}, decommitted pages {})", last.0, last.1);
+    // The defect's signature: the count is right and the contents are
+    // wrong — so assert exact set equality, not cardinality alone.
+    let cold_reads_before = info_u64(&mut c, "cold_reads_enqueued:");
+    let collected = scan_to_completion(&mut c, b"64");
+    let cold_reads = info_u64(&mut c, "cold_reads_enqueued:") - cold_reads_before;
+    assert!(cold_reads > 0, "SCAN resolved no cold slot — the window path was not exercised");
+    let missing: Vec<_> =
+        expected.difference(&collected).map(|k| String::from_utf8_lossy(k).into_owned()).collect();
+    let phantom: Vec<_> =
+        collected.difference(&expected).map(|k| String::from_utf8_lossy(k).into_owned()).collect();
+    assert!(
+        missing.is_empty() && phantom.is_empty(),
+        "SCAN vs DBSIZE: {} of {} named; missing {:?}…; phantom {:?}",
+        collected.len(),
+        expected.len(),
+        &missing[..missing.len().min(5)],
+        &phantom[..phantom.len().min(5)],
+    );
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
