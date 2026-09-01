@@ -138,6 +138,17 @@ jobs:
         run: cargo test -p inf-sim
       - name: m0-smoke determinism (CLI)
         run: cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
+      # Group 0 (review of 2026-08-30, §5.5 items 1+3): the multi-cell +
+      # adversarial-length lane — 4 cells, MAX_KEY_LEN-edge keys, values
+      # past the cold-window class, over-bound MSET pairs. No other CI
+      # lane exercises either parameter.
+      - name: m0-adversarial at 4 cells (Group 0)
+        run: cargo run --release --bin inf-sim -- --scenario m0-adversarial --seed 0xC0FFEE --cells 4 --verify-determinism
+      # F-L17-14: the M4.5 index crash scenarios ran in no automated lane.
+      - name: m45 index crash scenarios (F-L17-14)
+        run: |
+          cargo run --release --bin inf-sim -- --scenario m45-backfill --seed 0xC0FFEE --verify-determinism
+          cargo run --release --bin inf-sim -- --scenario m45-sidecar --seed 0xC0FFEE --verify-determinism
 
   fuzz-smoke:
     # REDUCED: one decoder, 60 s, to catch gross breakage fast. cargo-fuzz

@@ -15,6 +15,7 @@ libfuzzer-sys = "0.4"
 inf-server = { path = ".." }
 inf-store = { path = "../../inf-store" }
 inf-foundation = { path = "../../inf-foundation" }
+inf-wire = { path = "../../inf-wire" }
 
 [[bin]]
 name = "glob_match"
@@ -26,6 +27,13 @@ bench = false
 [[bin]]
 name = "scan_cursor"
 path = "fuzz_targets/scan_cursor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "command_surface"
+path = "fuzz_targets/command_surface.rs"
 test = false
 doc = false
 bench = false

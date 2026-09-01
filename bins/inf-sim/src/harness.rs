@@ -30,7 +30,7 @@
 //! AC); the comparator just memcmps two runs.
 
 use core::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::fd::RawFd;
 use std::rc::Rc;
 
@@ -70,6 +70,12 @@ pub struct Scenario {
     /// `1µs..=1µs+step_ns_max`). The m1 scenario uses bigger steps so its
     /// PEXPIRE deadlines genuinely fire mid-run (wheel slices under load).
     pub step_ns_max: u64,
+    /// Adversarial-length share of the mix, percent (review of
+    /// 2026-08-30, §5.5 Group 0 item 3: the frozen mixes are 9-byte keys
+    /// and 6-byte values, so the `MAX_KEY_LEN` edge, big values, and the
+    /// partial-application multi-key shapes were unreachable by any
+    /// seed). 0 keeps every existing scenario's RNG stream exactly.
+    pub adversarial_percent: u64,
 }
 
 impl Scenario {
@@ -88,6 +94,32 @@ impl Scenario {
             channels: 0,
             publish_percent: 0,
             step_ns_max: 15_000,
+            adversarial_percent: 0,
+        }
+    }
+
+    /// Group 0 item 3 (review of 2026-08-30, §5.5): the m0 shape with a
+    /// 35% adversarial-length slice — `MAX_KEY_LEN`-edge keys (254, 255,
+    /// 256, 300 bytes), values to 64 KiB (past the 16,368 B cold-window
+    /// class), and the partial-application multi-key shapes (`MSET`/
+    /// `MSETNX` with an over-bound pair, ADR-0098's atomicity contract).
+    /// Every reply byte-diffs against the model, and the key-set content
+    /// oracle binds at quiescence — the two lanes no prior seed could
+    /// reach. Runs at `--cells 4` in sim-smoke (Group 0 item 1).
+    pub fn m0_adversarial(seed: u64) -> Scenario {
+        Scenario {
+            seed,
+            cells: 3,
+            connections: 50,
+            commands: 40_000,
+            key_space: 500,
+            pipelined_every: 5,
+            plant: Plant::None,
+            subscribers: 0,
+            channels: 0,
+            publish_percent: 0,
+            step_ns_max: 15_000,
+            adversarial_percent: 35,
         }
     }
 
@@ -107,6 +139,7 @@ impl Scenario {
             channels: 8,
             publish_percent: 10,
             step_ns_max: 250_000,
+            adversarial_percent: 0,
         }
     }
 }
@@ -252,6 +285,9 @@ impl SimClient {
     /// Next command. Returns the wire bytes plus, for a PUBLISH, the channel
     /// index (the harness updates the delivery ledger at send time).
     fn next_command(&mut self, scenario: &Scenario) -> (Vec<u8>, Option<u64>) {
+        if scenario.adversarial_percent > 0 {
+            return (self.next_command_adversarial(scenario), None);
+        }
         if scenario.publish_percent == 0 {
             return (self.next_command_m0(scenario.key_space), None);
         }
@@ -294,6 +330,58 @@ impl SimClient {
             _ => vec![b"TTL".to_vec(), key.into_bytes()],
         };
         (encode(&argv), None)
+    }
+
+    /// The adversarial-length mix (Group 0 item 3, review 2026-08-30
+    /// §5.5): a `adversarial_percent` slice of `MAX_KEY_LEN`-edge keys,
+    /// big values, and the multi-key partial-application shapes; the
+    /// remainder is the m0 shape. Correctness rides the standing
+    /// oracles — every reply byte-diffs against the model at the apply
+    /// seam, and the key-set content oracle binds at quiescence.
+    fn next_command_adversarial(&mut self, scenario: &Scenario) -> Vec<u8> {
+        let roll = self.rng.next_u64() % 100;
+        if roll >= scenario.adversarial_percent {
+            return self.next_command_m0(scenario.key_space);
+        }
+        // Deterministic long key: an id inside the key space, padded to a
+        // boundary length (254/255 legal, 256/300 over `MAX_KEY_LEN`).
+        let id = self.rng.next_u64() % scenario.key_space;
+        let klen = [254usize, 255, 256, 300][(self.rng.next_u64() % 4) as usize];
+        let mut key = format!("K:{id}:").into_bytes();
+        key.resize(klen, b'k');
+        let short = format!("key:{id}").into_bytes();
+        let vlen = [0usize, 64, 4096, 16 << 10, 64 << 10][(self.rng.next_u64() % 5) as usize];
+        let value: Vec<u8> = format!("A:{id}:{}:", self.sent)
+            .into_bytes()
+            .iter()
+            .copied()
+            .cycle()
+            .take(vlen)
+            .collect();
+        let argv: Vec<Vec<u8>> = match self.rng.next_u64() % 12 {
+            0 => vec![b"GET".to_vec(), key],
+            1 => vec![b"SET".to_vec(), key, value],
+            // C3's exact trigger: INCR on an over-bound key must refuse
+            // typed on both engines, never panic the cell.
+            2 => vec![b"INCR".to_vec(), key],
+            3 => vec![b"DEL".to_vec(), key],
+            4 => vec![b"EXISTS".to_vec(), key, short],
+            5 => vec![b"APPEND".to_vec(), short, value],
+            // H2's class on the memory path (ADR-0098): an over-bound
+            // pair anywhere makes the whole command a typed no-op — the
+            // model and the node must agree, and the content oracle
+            // catches a half-applied prefix.
+            6 => vec![b"MSET".to_vec(), short, value, key, b"v".to_vec()],
+            7 => vec![b"MSETNX".to_vec(), short, value, key, b"v".to_vec()],
+            8 => vec![b"GETRANGE".to_vec(), short, b"0".to_vec(), b"9223372036854775807".to_vec()],
+            9 => {
+                let offset = format!("{}", self.rng.next_u64() % (64 << 10));
+                vec![b"SETRANGE".to_vec(), short, offset.into_bytes(), b"patch".to_vec()]
+            }
+            10 => vec![b"SET".to_vec(), short, value],
+            _ => vec![b"STRLEN".to_vec(), key],
+        };
+        encode(&argv)
     }
 
     /// The frozen M0 mix — byte-for-byte the RNG stream the m0-smoke trace
@@ -798,6 +886,48 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             if node_live != model_live {
                 violations.push(format!(
                     "live-record reconciliation failed: node {node_live} vs model {model_live}"
+                ));
+            }
+            // Content oracle (review of 2026-08-30, §5.5 Group 0): the
+            // scalar comparison above is blind to *count right, contents
+            // wrong* — the proven Criticals' exact signature — so the key
+            // sets themselves must agree at quiescence. Cells partition
+            // the keyspace by slot, so the per-cell union is the node set.
+            let mut node_keys: BTreeSet<(usize, Vec<u8>)> = BTreeSet::new();
+            for (_, plane) in &cells {
+                plane.fold_live_keys(final_now, |db, key| {
+                    node_keys.insert((db, key.to_vec()));
+                });
+            }
+            let mut model_keys: BTreeSet<(usize, Vec<u8>)> = BTreeSet::new();
+            let dbs: Vec<usize> = oracle.model.dbs().map(|(i, _)| i).collect();
+            for db in dbs {
+                let store = oracle.model.db_mut(db);
+                let mut cursor = 0;
+                loop {
+                    cursor = store.scan(cursor, usize::MAX, final_now, |key| {
+                        model_keys.insert((db, key.to_vec()));
+                    });
+                    if cursor == 0 {
+                        break;
+                    }
+                }
+            }
+            if node_keys != model_keys {
+                let sample = |a: &BTreeSet<(usize, Vec<u8>)>, b: &BTreeSet<(usize, Vec<u8>)>| {
+                    a.difference(b)
+                        .take(5)
+                        .map(|(db, k)| format!("db{db}:{}", String::from_utf8_lossy(k)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                violations.push(format!(
+                    "key-set reconciliation failed: node {} keys vs model {} keys \
+                     (node-only: [{}] model-only: [{}])",
+                    node_keys.len(),
+                    model_keys.len(),
+                    sample(&node_keys, &model_keys),
+                    sample(&model_keys, &node_keys),
                 ));
             }
         }

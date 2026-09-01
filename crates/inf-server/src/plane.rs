@@ -1937,6 +1937,29 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.shared.store.borrow()
     }
 
+    /// DST content oracle (review of 2026-08-30, §5.5 Group 0): every
+    /// live key in this cell's materialized numbered databases, emitted
+    /// as `(db, key)` through the same resize-stable walk `SCAN` uses,
+    /// run to completion. A count oracle is blind to *count right,
+    /// contents wrong* — the proven Criticals' signature — so the sim
+    /// compares key sets at quiescence. Named namespaces have their own
+    /// scenario oracles (`inf-sim::tiered`, `recovery`). Quiescence-only
+    /// tooling — never the data plane.
+    pub fn fold_live_keys(&self, now: Nanos, mut emit: impl FnMut(usize, &[u8])) {
+        let mut ks = self.shared.store.borrow_mut();
+        let dbs: Vec<usize> = ks.dbs().map(|(i, _)| i).collect();
+        for db in dbs {
+            let store = ks.db_mut(db);
+            let mut cursor = 0;
+            loop {
+                cursor = store.scan(cursor, usize::MAX, now, |key| emit(db, key));
+                if cursor == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Pub/sub registry gauges `(owned channels, patterns, state bytes)` —
     /// the sim teardown oracle asserts all three return to zero once every
     /// subscriber unwound (M1-S15).

@@ -61,7 +61,7 @@
 //! folds into `trace_hash`; `--verify-determinism` runs the scenario
 //! twice and requires trace identity (L7).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -306,9 +306,12 @@ fn value_bytes(tag: u8, id: usize, sent: u64, len: usize) -> Vec<u8> {
 
 /// Builds the next tiered command + its exact expected reply: inline
 /// SETs (1–3 KiB — ring residents that demote), blob SETs (6–10 KiB —
-/// out-of-line extents, ADR-0061), exact GETs, and counted DELs.
-/// Overwrites across the arms exercise blob-over-inline,
-/// inline-over-blob, and cold-candidate displacement (ADR-0057 D4).
+/// out-of-line extents, ADR-0061; plus a 15–20 KiB slice straddling the
+/// 16,368 B one-frame cold window — review of 2026-08-30 §5.5 Group 0:
+/// the old 10,239 B cap left C2's multi-window cold reads unreachable
+/// by any seed), exact GETs, and counted DELs. Overwrites across the
+/// arms exercise blob-over-inline, inline-over-blob, and cold-candidate
+/// displacement (ADR-0057 D4).
 fn next_tiered_command(
     writer: &mut Writer,
     scenario: &TieredScenario,
@@ -319,9 +322,12 @@ fn next_tiered_command(
     if roll < 65 {
         let (tag, len) = if roll < 55 {
             (b'i', 3072 + writer.rng.next_below(1024) as usize)
-        } else {
+        } else if roll < 61 {
             *blob_sets += 1;
             (b'b', (6 << 10) + writer.rng.next_below(4096) as usize)
+        } else {
+            *blob_sets += 1;
+            (b'B', 15 * 1024 + writer.rng.next_below(5 << 10) as usize)
         };
         let value = value_bytes(tag, writer.id, writer.sent, len);
         let wire = encode(&[b"SET", &key, &value]);
@@ -504,8 +510,17 @@ fn info_sum(
     Ok(totals)
 }
 
-/// Every key `SCAN` names on every cell (a full enumeration — the
-/// at-least-once contract; duplicates are legal and kept).
+/// Every key one `SCAN` walk names (the at-least-once contract;
+/// duplicates are legal and kept), asked of **every** cell — and each
+/// cell's walk must be complete **by itself**. Review of 2026-08-30
+/// (§5.5): this helper used to perform the per-cell fan-out itself and
+/// union the results, which encoded C1 (a namespace-bound `SCAN`
+/// serving one cell of `cells`) as correct behaviour by construction.
+/// Since the C1 fix the server scatters the walk (`ScatterScope::Ns`),
+/// so the oracle now demands the C1 contract instead of doing the
+/// server's work for it: a cell whose enumeration's key **set**
+/// disagrees with cell 0's is a violation (the `dbsize_sum` shape).
+/// Returns cell 0's enumeration.
 fn scan_all_keys(
     node: &mut Node,
     rng: &mut SplitMix64,
@@ -513,7 +528,11 @@ fn scan_all_keys(
     disk: &SimDisk,
     scenario: &TieredScenario,
 ) -> Result<Vec<Vec<u8>>, String> {
-    let mut keys = Vec::new();
+    struct FirstWalk {
+        keys: Vec<Vec<u8>>,
+        set: BTreeSet<Vec<u8>>,
+    }
+    let mut first: Option<FirstWalk> = None;
     for cell in 0..usize::from(scenario.cells) {
         let mut probe = MiniClient::connect(node, cell);
         let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
@@ -521,6 +540,7 @@ fn scan_all_keys(
             Ok(Some(ok)) if ok == b"+OK\r\n" => {}
             other => return Err(format!("USE on cell {cell} answered {other:?}")),
         }
+        let mut keys = Vec::new();
         let mut cursor = 0u64;
         for _ in 0..4096 {
             let cursor_text = cursor.to_string();
@@ -537,8 +557,22 @@ fn scan_all_keys(
                 break;
             }
         }
+        let set: BTreeSet<Vec<u8>> = keys.iter().cloned().collect();
+        match &first {
+            None => first = Some(FirstWalk { keys, set }),
+            Some(walk) if walk.set == set => {}
+            Some(walk) => {
+                return Err(format!(
+                    "SCAN VIOLATION: cell {cell} enumerated {} distinct keys, cell 0 \
+                     enumerated {} — a namespace-bound SCAN walk is node-complete on \
+                     every cell (review 2026-08-30 C1)",
+                    set.len(),
+                    walk.set.len()
+                ));
+            }
+        }
     }
-    Ok(keys)
+    Ok(first.map(|walk| walk.keys).unwrap_or_default())
 }
 
 /// `*2 $cursor *N $key…` → `(cursor, keys)`; `None` on any other shape.

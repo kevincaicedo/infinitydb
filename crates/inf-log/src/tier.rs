@@ -197,6 +197,11 @@ pub struct TierCorruption {
 /// `window` is raw disk frames as read (a multiple of
 /// [`TIER_FRAME_BYTES`]).
 ///
+/// **`out` is replaced, not appended** (cleared first): a multi-window
+/// assembler must extract each window into a scratch and extend its own
+/// accumulator. Handing the accumulator here erases every previously
+/// assembled window — the review-of-2026-09-01 N1 infinite read loop.
+///
 /// # Errors
 /// [`TierCorruption`] naming the first frame whose CRC fails.
 ///

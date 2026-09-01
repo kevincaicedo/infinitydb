@@ -36,6 +36,9 @@ jobs:
           - { dir: crates/inf-fabric, target: fabric_codec }
           - { dir: crates/inf-server, target: glob_match }
           - { dir: crates/inf-server, target: scan_cursor }
+          # Group 0 item 3 (review of 2026-08-30, §5.5 / the C3 lesson):
+          # the whole command registry under adversarial argv shapes.
+          - { dir: crates/inf-server, target: command_surface }
           # Seeds the pinned first_lsn-offset-ceiling regression (this target
           # found it on the 08-17 night; ADR-0072, readiness F35).
           - { dir: crates/inf-log, target: frame_decode, seeds: fuzz/corpora/frame_decode }

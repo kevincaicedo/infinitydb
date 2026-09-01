@@ -29,3 +29,12 @@ boot-storm 0x5EED0003
 # seed whose phase-2 traffic completes with pre-cut flushed tier bytes
 # (recovery composes MANIFEST v2 → tier files → checkpoint → WAL tail).
 m4-tiered 0x5EED0003
+# Group 0 (review of 2026-08-30, §5.5 item 3): adversarial key/value
+# lengths — MAX_KEY_LEN-edge keys, values past the 16,368 B cold-window
+# class, MSET/MSETNX with over-bound pairs (ADR-0098 atomicity).
+m0-adversarial 0xC0FFEE
+m0-adversarial 0xBAD5EED
+# F-L17-14 (review of 2026-08-30): the M4.5 index crash scenarios ran in
+# no automated lane between story close and this row.
+m45-backfill 0xC0FFEE
+m45-sidecar 0xC0FFEE
