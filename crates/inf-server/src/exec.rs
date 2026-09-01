@@ -22,8 +22,8 @@ use std::rc::Rc;
 
 use inf_foundation::time::Nanos;
 use inf_store::{
-    CellStore, CopyResult, ExpireCond, Keyspace, OpError, SetCond, SetExpire, SetOptions,
-    SetOutcome, Ttl, TtlUpdate,
+    CellStore, CopyResult, ExpireCond, Keyspace, MAX_KEY_LEN, MAX_VAL_LEN, OpError, SetCond,
+    SetExpire, SetOptions, SetOutcome, Ttl, TtlUpdate,
 };
 use inf_wire::{ArgvRef, CmdFlags, CommandId, Protocol, RespWriter, arity_ok, lookup};
 
@@ -1180,15 +1180,41 @@ fn getex(
 
 // ---- MSET / MSETNX -----------------------------------------------------------
 
+/// Bounds pre-pass for the multi-pair writes (review of 2026-08-30, H2 /
+/// F-L13-06, F-L17-11, ADR-0098): every pair validates before any pair
+/// applies — Redis's MSET is atomic, and the durable emission gate needs
+/// an error reply to imply zero mutation. The store's own `check_bounds`
+/// stays as the per-write invariant; this is the command-shape gate.
+fn pairs_within_bounds(argv: &(impl Argv + ?Sized)) -> bool {
+    let mut i = 1;
+    while i < argv.len() {
+        if argv.arg(i).len() > MAX_KEY_LEN || argv.arg(i + 1).len() > MAX_VAL_LEN {
+            return false;
+        }
+        i += 2;
+    }
+    true
+}
+
 fn mset(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mut RespWriter<'_>) {
     if argv.len().is_multiple_of(2) {
         return arity_error("MSET", w);
     }
+    if !pairs_within_bounds(argv) {
+        return op_error(OpError::TooLarge, w);
+    }
     let mut i = 1;
     while i < argv.len() {
-        // Single-cell MSET is atomic by single-threadedness; an OOM mid-way
-        // surfaces as the error (partial application — Redis can't hit this
-        // shape; recorded with the OOM backpressure semantics).
+        // Deterministic stand-in for arena OOM after a prefix applied —
+        // with bounds pre-validated, the only remaining mid-way failure
+        // (review of 2026-08-30, H2 — the staged-prefix crash-matrix row).
+        if i > 1 && inf_foundation::fault::fire(crate::fault::MSET_MIDWAY_OOM) {
+            return op_error(OpError::OutOfMemory, w);
+        }
+        // Single-cell MSET is atomic by single-threadedness; an OOM
+        // mid-way surfaces as the error, and the durable emission gate
+        // stages the applied prefix despite it (ADR-0098 — recovery
+        // replays the live store, never a silent rollback).
         if let Err(e) = store.set(argv.arg(i), argv.arg(i + 1), SetOptions::default(), now) {
             return op_error(e, w);
         }
@@ -1201,6 +1227,11 @@ fn msetnx(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mu
     if argv.len().is_multiple_of(2) {
         return arity_error("MSETNX", w);
     }
+    // Bounds are command validity (like arity), so they precede the NX
+    // existence gate (ADR-0098).
+    if !pairs_within_bounds(argv) {
+        return op_error(OpError::TooLarge, w);
+    }
     let mut i = 1;
     while i < argv.len() {
         if store.exists(argv.arg(i), now) {
@@ -1210,6 +1241,10 @@ fn msetnx(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mu
     }
     let mut i = 1;
     while i < argv.len() {
+        // Same mid-way stand-in as `mset` (one point, both apply loops).
+        if i > 1 && inf_foundation::fault::fire(crate::fault::MSET_MIDWAY_OOM) {
+            return op_error(OpError::OutOfMemory, w);
+        }
         if let Err(e) = store.set(argv.arg(i), argv.arg(i + 1), SetOptions::default(), now) {
             return op_error(e, w);
         }
@@ -1789,6 +1824,56 @@ mod tests {
 
     fn run(cx: &mut ConnCx, store: &mut Keyspace, parts: &[&[u8]]) -> Vec<u8> {
         run_at(cx, store, Nanos(1), parts)
+    }
+
+    /// Review of 2026-08-30 (H2 / F-L13-06, F-L17-11, ADR-0098): `MSET` is
+    /// atomic — an over-bound pair anywhere refuses the whole command with
+    /// zero mutation, so an error reply implies nothing changed (the
+    /// premise the durable emission gate stands on). Pre-fix, the first
+    /// pair applied before the second pair's bounds check fired.
+    #[test]
+    fn mset_bounds_failure_applies_nothing() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"a", b"old"]), b"+OK\r\n");
+        let long_key = vec![b'k'; 256];
+        let reply = run(&mut cx, &mut store, &[b"MSET", b"a", b"new", &long_key, b"v"]);
+        assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
+        assert_eq!(
+            run(&mut cx, &mut store, &[b"GET", b"a"]),
+            b"$3\r\nold\r\n",
+            "an erroring MSET must apply none of its pairs"
+        );
+        // Over-bound value in the last pair, fresh first key: same
+        // contract (slice argv — a 16 MiB bulk exceeds the test parser's
+        // frame cap, and the queued/remote paths execute slices anyway).
+        let big_val = vec![b'v'; MAX_VAL_LEN + 1];
+        let argv: Vec<&[u8]> = vec![b"MSET", b"fresh", b"x", b"b", &big_val];
+        let mut reply = Vec::new();
+        execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut reply);
+        assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
+        assert_eq!(run(&mut cx, &mut store, &[b"GET", b"fresh"]), b"$-1\r\n");
+    }
+
+    /// The MSETNX half of the same contract. Bounds are command validity
+    /// (like arity), so they precede the NX existence gate.
+    #[test]
+    fn msetnx_bounds_failure_applies_nothing() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let long_key = vec![b'k'; 256];
+        let reply = run(&mut cx, &mut store, &[b"MSETNX", b"fresh", b"v", &long_key, b"w"]);
+        assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
+        assert_eq!(
+            run(&mut cx, &mut store, &[b"GET", b"fresh"]),
+            b"$-1\r\n",
+            "an erroring MSETNX must apply none of its pairs"
+        );
+        // An existing key alongside an over-bound pair: validity first.
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"held", b"1"]), b"+OK\r\n");
+        let reply = run(&mut cx, &mut store, &[b"MSETNX", b"held", b"2", &long_key, b"w"]);
+        assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
+        assert_eq!(run(&mut cx, &mut store, &[b"GET", b"held"]), b"$1\r\n1\r\n");
     }
 
     /// C6 (review 2026-08-30, `F-L12-04` / `F-L00-25`): the unknown-command

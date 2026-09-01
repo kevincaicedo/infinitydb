@@ -15,7 +15,7 @@ use inf_store::{
 use inf_wire::{CmdFlags, Protocol, RespWriter};
 
 use crate::clients::{format_client_line, valid_client_name};
-use crate::config::ConfigSetError;
+use crate::config::{ConfigSetError, ValidatedSet};
 use crate::exec::{Argv, ConnCx, NodeInfo, arity_error, parse_i64, wall_ms};
 
 // ---- HELLO -------------------------------------------------------------------
@@ -1109,23 +1109,47 @@ pub(crate) fn config(
                 "ERR Unknown subcommand or wrong number of arguments for 'SET'. Try CONFIG HELP.",
             );
         }
-        // Validate every pair before applying any (Redis 7 all-or-nothing).
+        // Validate every pair before applying any (Redis 7 all-or-nothing,
+        // oracle-verified on 8.0.5). Review of 2026-08-30 (H1 / F-L17-12,
+        // ADR-0098): the pre-fix loop applied while validating, so an
+        // error reply left earlier pairs live on this cell only — the
+        // plane's "error short-circuits the fan-out" rule depends on an
+        // error implying zero local mutation.
+        let mut cfg = node.config.borrow_mut();
+        let mut validated: Vec<ValidatedSet> = Vec::with_capacity((argv.len() - 2) / 2);
         let mut i = 2;
         while i < argv.len() {
-            let outcome = node.config.borrow_mut().set(argv.arg(i), argv.arg(i + 1));
-            match outcome {
-                Ok(_) => {}
+            match cfg.validate(argv.arg(i), argv.arg(i + 1)) {
+                Ok(pair) => {
+                    // Redis refuses duplicate parameters, case-insensitive,
+                    // echoing the second occurrence's raw client spelling
+                    // (oracle-measured 8.0.5 — the corpus diff caught the
+                    // canonical-name guess).
+                    let key = pair.key(&cfg);
+                    if validated.iter().any(|p| p.key(&cfg) == key) {
+                        drop(cfg);
+                        let mut text =
+                            b"ERR CONFIG SET failed (possibly related to argument '".to_vec();
+                        text.extend_from_slice(argv.arg(i));
+                        text.extend_from_slice(b"') - duplicate parameter");
+                        return w.error_bytes(&text);
+                    }
+                    validated.push(pair);
+                }
                 Err(ConfigSetError::Unknown(key)) => {
+                    drop(cfg);
                     return w.error(&format!(
                         "ERR Unknown option or number of arguments for CONFIG SET - '{key}'"
                     ));
                 }
                 Err(ConfigSetError::Immutable(key)) => {
+                    drop(cfg);
                     return w.error(&format!(
                         "ERR CONFIG SET failed (possibly related to argument '{key}') - can't set immutable config"
                     ));
                 }
                 Err(ConfigSetError::Invalid { key, value }) => {
+                    drop(cfg);
                     return w.error(&format!(
                         "ERR CONFIG SET failed (possibly related to argument '{key}') - invalid value '{value}'"
                     ));
@@ -1133,6 +1157,10 @@ pub(crate) fn config(
             }
             i += 2;
         }
+        for pair in validated {
+            cfg.apply(pair);
+        }
+        drop(cfg);
         // hot-per-cell (M1-S03 freeze): the executing cell applies its
         // pressure config immediately; peers apply on the scatter leg, and
         // the MAINTAIN version sweep covers boot-time mutation.
@@ -1922,6 +1950,71 @@ mod tests {
         );
         let reply = run(&mut cx, &mut store, &[b"CONFIG", b"SET", b"databases", b"32"]);
         assert!(reply.starts_with(b"-ERR CONFIG SET failed"), "{reply:?}");
+    }
+
+    /// Review of 2026-08-30 (H1 / F-L17-12, ADR-0098): `CONFIG SET` is
+    /// all-or-nothing (Redis 7 multi-pair semantics, oracle-verified
+    /// 2026-09-01 on redis-server 8.0.5) — an erroring pair leaves every
+    /// other pair unapplied. Pre-fix the loop applied while validating,
+    /// so `maxmemory` here stuck at 104857600 while the reply was `-ERR`.
+    #[test]
+    fn config_set_error_applies_nothing() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        // Valid pair, then an immutable pair.
+        let reply = run(
+            &mut cx,
+            &mut store,
+            &[b"CONFIG", b"SET", b"maxmemory", b"100mb", b"databases", b"32"],
+        );
+        assert!(reply.starts_with(b"-ERR CONFIG SET failed"), "{reply:?}");
+        assert_eq!(
+            cx.node.config.borrow().get("maxmemory"),
+            Some("0"),
+            "a valid earlier pair must not apply when a later pair fails"
+        );
+        // Valid pair, then an invalid value.
+        let reply = run(
+            &mut cx,
+            &mut store,
+            &[b"CONFIG", b"SET", b"timeout", b"7", b"maxmemory-policy", b"bogus"],
+        );
+        assert!(reply.starts_with(b"-ERR CONFIG SET failed"), "{reply:?}");
+        assert_eq!(cx.node.config.borrow().get("timeout"), Some("0"));
+        // Valid pair, then an unknown key (the Unknown error shape wins).
+        let reply = run(&mut cx, &mut store, &[b"CONFIG", b"SET", b"timeout", b"7", b"nope", b"1"]);
+        assert!(reply.starts_with(b"-ERR Unknown option"), "{reply:?}");
+        assert_eq!(cx.node.config.borrow().get("timeout"), Some("0"));
+        // Duplicate parameter (case-insensitive) is refused with nothing
+        // applied, echoing the second occurrence's raw spelling — both
+        // measured on redis-server 8.0.5 (the compat corpus byte-diffs
+        // the uppercase-echo shape too).
+        let reply = run(
+            &mut cx,
+            &mut store,
+            &[b"CONFIG", b"SET", b"MAXMEMORY", b"1mb", b"maxmemory", b"2mb"],
+        );
+        assert_eq!(
+            reply,
+            b"-ERR CONFIG SET failed (possibly related to argument 'maxmemory') - duplicate parameter\r\n"
+        );
+        assert_eq!(cx.node.config.borrow().get("maxmemory"), Some("0"));
+        let reply = run(
+            &mut cx,
+            &mut store,
+            &[b"CONFIG", b"SET", b"maxmemory", b"1mb", b"MAXMEMORY", b"2mb"],
+        );
+        assert_eq!(
+            reply,
+            b"-ERR CONFIG SET failed (possibly related to argument 'MAXMEMORY') - duplicate parameter\r\n"
+        );
+        assert_eq!(cx.node.config.borrow().get("maxmemory"), Some("0"));
+        // A fully valid multi-pair command still applies whole.
+        let reply =
+            run(&mut cx, &mut store, &[b"CONFIG", b"SET", b"maxmemory", b"4mb", b"timeout", b"9"]);
+        assert_eq!(reply, b"+OK\r\n");
+        assert_eq!(cx.node.config.borrow().get("maxmemory"), Some("4194304"));
+        assert_eq!(cx.node.config.borrow().get("timeout"), Some("9"));
     }
 
     #[test]
