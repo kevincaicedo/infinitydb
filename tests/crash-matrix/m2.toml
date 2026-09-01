@@ -98,3 +98,20 @@ point = "shadow_twin_read_fail"
 tier = "node"
 test = "shadow_open_tickets"
 expect = "dbsize-typed-error"
+# Review of 2026-08-30 (C2′ / F-L06-02, F-L06-04): the ColdReads enqueue
+# refuses QueueFull — the deterministic stand-in for a saturated cold
+# queue. Carried by `inf-server/tests/node_e2e.rs`
+# (`tiered_cold_read_failure_is_typed_for_every_read_command`, armed on
+# the cell thread at boot).
+#   read-typed-error  — GET/MGET/EXISTS/TOUCH answer the typed BUSY,
+#                       never nil / :0 (unreadability is not absence);
+#                       a SCAN page fails whole (the client retries its
+#                       cursor), never a silently shorter page; absent
+#                       keys keep their miss shapes (a miss never
+#                       reaches the queue); `tiering_cold_read_errors`
+#                       counts every refusal served.
+[[row]]
+point = "cold_enqueue_full"
+tier = "node"
+test = "node_e2e"
+expect = "read-typed-error"

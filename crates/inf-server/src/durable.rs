@@ -2049,11 +2049,16 @@ fn tier_walk_step<F: SegmentFs>(
             TierStep::Progress
         }
         2 => {
+            // Resume by file id, not ordinal (the C4 rule applied
+            // defensively): `files()` ascends by id and today only
+            // shrinks at `commit_retirement` — which the swap sequences
+            // strictly after the walk — but that ordering is a coupling,
+            // not an invariant, and an id-keyed resume costs nothing.
             let files: Vec<_> = table
                 .live_set()
                 .files()
                 .iter()
-                .skip(*cursor as usize)
+                .filter(|f| u64::from(f.id) >= *cursor)
                 .take(TIER_WALK_CHUNK)
                 .map(|f| (f.id, f.data_len, f.dead_bytes, f.byte_exact))
                 .collect();
@@ -2062,36 +2067,40 @@ fn tier_walk_step<F: SegmentFs>(
                 *tier_pass = 3;
                 return TierStep::Progress;
             }
-            let mut staged = 0u64;
             for (file_id, data_len, dead_bytes, byte_exact) in &files {
                 stream.stage_live_set(ns.0, *file_id, *data_len, *dead_bytes, *byte_exact);
                 *emitted = emitted.saturating_add(24);
-                staged += 1;
+                *cursor = u64::from(*file_id) + 1;
                 if stream.section_full() || *emitted >= slice_cap {
                     break;
                 }
             }
-            *cursor += staged;
             TierStep::Progress
         }
         3 => {
+            // The 0x05 resume is an *address* (review of 2026-08-30, C4 /
+            // F-L03-01, F-L14-02): the reference map mutates between
+            // slices (foreground DEL/overwrite, compaction), and the
+            // ordinal `.skip` this replaces stepped over one live entry
+            // per below-cursor removal — the checkpoint then published
+            // silently short and the next boot's sweep unlinked a live
+            // extent. `range(cursor..W)` is stable under removals on
+            // either side of the cursor.
             let entries: Vec<(u64, u64, u64)> =
-                table.extent_ckpt_entries().skip(*cursor as usize).take(TIER_WALK_CHUNK).collect();
+                table.extent_ckpt_entries_from(*cursor).take(TIER_WALK_CHUNK).collect();
             if entries.is_empty() {
                 *cursor = 0;
                 *tier_pass = 4;
                 return TierStep::Progress;
             }
-            let mut staged = 0u64;
             for (addr, extent_id, len) in &entries {
                 stream.stage_blob_ref(ns.0, *addr, *extent_id, *len);
                 *emitted = emitted.saturating_add(24);
-                staged += 1;
+                *cursor = *addr + 1;
                 if stream.section_full() || *emitted >= slice_cap {
                     break;
                 }
             }
-            *cursor += staged;
             TierStep::Progress
         }
         _ => {

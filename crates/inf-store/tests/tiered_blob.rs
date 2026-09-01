@@ -22,7 +22,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use inf_log::blob::{ExtentId, ExtentWriter, list_extent_ids, open_extent, unlink_extent_file};
+use inf_log::blob::{
+    ExtentId, ExtentWriter, extent_file_name, list_extent_ids, open_extent, unlink_extent_file,
+};
 use inf_log::fs::mem::MemFs;
 use inf_log::tier::{TIER_FRAME_BYTES, tier_extract, tier_frame_offset, tier_frame_span};
 use inf_log::{
@@ -382,7 +384,13 @@ impl Rig {
             if work.is_empty() {
                 break;
             }
-            for id in work {
+            for candidate in work {
+                let id = candidate.extent_id;
+                assert_eq!(
+                    candidate.origin,
+                    inf_store::ReclaimOrigin::Death,
+                    "runtime churn only produces refcount-proven deaths"
+                );
                 assert!(
                     !self.model.values().any(|e| e.extent_id == Some(id)),
                     "early free: extent {id} is model-live"
@@ -709,26 +717,75 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
     .expect("hybrid load");
     let mut table = table.into_inner();
     replay_tail(&mut table, &tail);
-    // The sweep: orphans reclaim through ordinary slices; nothing live
-    // is ever handed out.
-    table.extent_sweep_seed(&recovered.extents_listed);
-    let mut swept: Vec<u64> = Vec::new();
+    // The sweep (ADR-0096): orphans dispose through ordinary slices —
+    // the header-valid orphan quarantines (rename, bytes survive the
+    // life), and only the next boot's second verdict unlinks; nothing
+    // live is ever handed out.
+    let revive = table.extent_sweep_seed(&recovered.extents_listed, &[]);
+    assert!(revive.is_empty(), "nothing was quarantined before this boot");
+    let mut quarantined: Vec<u64> = Vec::new();
     loop {
         let work = table.extent_reclaim_work(0, 8);
         if work.is_empty() {
             break;
         }
-        for id in work {
+        for candidate in work {
+            let id = candidate.extent_id;
             assert!(
                 !model.values().any(|e| e.extent_id == Some(id)),
                 "sweep handed out live extent {id}"
             );
-            unlink_extent_file(&fs, Path::new(SHARD), ExtentId(id)).expect("unlink");
-            table.extent_reclaim_done(id);
-            swept.push(id);
+            match candidate.origin {
+                inf_store::ReclaimOrigin::Death => {
+                    unlink_extent_file(&fs, Path::new(SHARD), ExtentId(id)).expect("unlink");
+                    table.extent_reclaim_done(id);
+                }
+                inf_store::ReclaimOrigin::BootOrphan => {
+                    // The plane's dispatch: probe, then quarantine.
+                    let path = Path::new(SHARD).join("cold").join(extent_file_name(ExtentId(id)));
+                    let header = inf_log::probe_extent_file(&fs, &path).expect("orphan verifies");
+                    assert_eq!(header.extent_id, ExtentId(id));
+                    inf_log::quarantine_extent_file(&fs, Path::new(SHARD), ExtentId(id))
+                        .expect("quarantine");
+                    table.extent_reclaim_quarantined(id);
+                    quarantined.push(id);
+                }
+                inf_store::ReclaimOrigin::Quarantined => {
+                    panic!("no quarantined names existed at this boot")
+                }
+            }
         }
     }
-    assert!(swept.contains(&orphan_id.0), "the orphan was reclaimed");
+    assert!(
+        quarantined.contains(&orphan_id.0),
+        "the deliberate orphan quarantined (with the churn's own dead-extent debris)"
+    );
+    let quarantined_on_disk: Vec<u64> = inf_log::list_quarantined_extent_ids(&fs, Path::new(SHARD))
+        .expect("listing")
+        .iter()
+        .map(|i| i.0)
+        .collect();
+    assert!(quarantined_on_disk.contains(&orphan_id.0), "the twin holds the bytes");
+    // The next boot's second verdict: still unreferenced ⇒ every twin
+    // unlinks through its own typed candidate.
+    let revive = table.extent_sweep_seed(&[], &quarantined_on_disk);
+    assert!(revive.is_empty(), "an unreferenced quarantined id never revives");
+    loop {
+        let work = table.extent_reclaim_work(0, 8);
+        if work.is_empty() {
+            break;
+        }
+        for candidate in work {
+            assert_eq!(candidate.origin, inf_store::ReclaimOrigin::Quarantined);
+            inf_log::unlink_quarantined_file(&fs, Path::new(SHARD), ExtentId(candidate.extent_id))
+                .expect("unlink twin");
+            table.extent_reclaim_done(candidate.extent_id);
+        }
+    }
+    assert!(
+        inf_log::list_quarantined_extent_ids(&fs, Path::new(SHARD)).expect("listing").is_empty(),
+        "the second verdict returned the disk"
+    );
 
     // Refcount reconciliation + content: every model-live blob key's
     // extent exists, counts exactly 1, and serves its exact bytes
@@ -786,7 +843,13 @@ fn reclaim_gates_on_the_deaths_durability() {
     // Durability reaches the death: the extent reclaims and the disk
     // returns.
     let work = rig.table.extent_reclaim_work(stamped, 8);
-    assert_eq!(work, vec![ext]);
+    assert_eq!(
+        work,
+        vec![inf_store::ReclaimCandidate {
+            extent_id: ext,
+            origin: inf_store::ReclaimOrigin::Death
+        }]
+    );
     unlink_extent_file(&rig.fs, Path::new(SHARD), ExtentId(ext)).expect("unlink");
     rig.table.extent_reclaim_done(ext);
     let on_disk = list_extent_ids(&rig.fs, Path::new(SHARD)).expect("listing");

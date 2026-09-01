@@ -290,18 +290,22 @@ impl Run {
         self.reclaim_blobs(life, "maintain");
     }
 
-    /// The extent-reclaim slice (M4-S17, ADR-0061 D5): candidates whose
-    /// killing record's staging epoch is covered unlink here — with the
-    /// early-free oracle armed (a model-live extent handed out is a
-    /// violation, immediately).
+    /// The extent-reclaim slice (M4-S17, ADR-0061 D5; disposal per
+    /// ADR-0096): candidates whose killing record's staging epoch is
+    /// covered dispose here — deaths unlink, boot orphans quarantine
+    /// (probe + rename, the plane's exact dispatch), second verdicts
+    /// unlink the twin — with the early-free oracle armed (a model-live
+    /// extent handed out is a violation, immediately).
     fn reclaim_blobs(&mut self, life: &mut Life, when: &str) {
+        use inf_log::blob::{probe_extent_file, quarantine_extent_file, unlink_quarantined_file};
         let durable = life.table.wal_epoch();
         loop {
             let work = life.table.extent_reclaim_work(durable, 4);
             if work.is_empty() {
                 break;
             }
-            for id in work {
+            for candidate in work {
+                let id = candidate.extent_id;
                 if self.model.values().any(|e| e.extent == Some(id)) {
                     self.report
                         .violations
@@ -309,9 +313,39 @@ impl Run {
                     life.table.extent_reclaim_done(id);
                     continue;
                 }
-                unlink_extent_file(&self.disk, &self.shard, ExtentId(id)).expect("sim unlink");
-                life.table.extent_reclaim_done(id);
-                self.report.blob_extents_reclaimed += 1;
+                match candidate.origin {
+                    inf_store::ReclaimOrigin::Death => {
+                        unlink_extent_file(&self.disk, &self.shard, ExtentId(id))
+                            .expect("sim unlink");
+                        life.table.extent_reclaim_done(id);
+                        self.report.blob_extents_reclaimed += 1;
+                    }
+                    inf_store::ReclaimOrigin::BootOrphan => {
+                        let path = self
+                            .shard
+                            .join("cold")
+                            .join(inf_log::blob::extent_file_name(ExtentId(id)));
+                        match probe_extent_file(&self.disk, &path) {
+                            Ok(header) if header.extent_id == ExtentId(id) => {
+                                quarantine_extent_file(&self.disk, &self.shard, ExtentId(id))
+                                    .expect("sim quarantine");
+                                life.table.extent_reclaim_quarantined(id);
+                            }
+                            _ => {
+                                unlink_extent_file(&self.disk, &self.shard, ExtentId(id))
+                                    .expect("sim unlink");
+                                life.table.extent_reclaim_done(id);
+                                self.report.blob_extents_reclaimed += 1;
+                            }
+                        }
+                    }
+                    inf_store::ReclaimOrigin::Quarantined => {
+                        unlink_quarantined_file(&self.disk, &self.shard, ExtentId(id))
+                            .expect("sim unlink twin");
+                        life.table.extent_reclaim_done(id);
+                        self.report.blob_extents_reclaimed += 1;
+                    }
+                }
             }
         }
     }
@@ -906,7 +940,21 @@ fn check_blob_refs(run: &mut Run, life: &mut Life, listed: &[u64], life_index: u
             ));
         }
     }
-    life.table.extent_sweep_seed(listed);
+    let quarantined_before: Vec<u64> =
+        inf_log::blob::list_quarantined_extent_ids(&run.disk, &run.shard)
+            .expect("quarantine listing")
+            .iter()
+            .map(|i| i.0)
+            .collect();
+    let revive = life.table.extent_sweep_seed(listed, &quarantined_before);
+    // ADR-0096 D3: the sim stages no upstream accounting omission, so a
+    // revival means the sweep's verdict machinery itself desynced.
+    if !revive.is_empty() {
+        run.report.violations.push(format!(
+            "life {life_index}: quarantined extents {revive:?} revived — the sweep \
+             quarantined a referenced extent"
+        ));
+    }
     run.reclaim_blobs(life, &format!("life {life_index} boot sweep"));
     // Post-sweep, the directory is exactly the live set (zero leaks,
     // zero early frees — checked against the disk, not the accounting).
@@ -916,6 +964,21 @@ fn check_blob_refs(run: &mut Run, life: &mut Life, listed: &[u64], life_index: u
         run.report.violations.push(format!(
             "life {life_index}: post-sweep directory {on_disk:?} != live set {model_live:?}"
         ));
+    }
+    // ADR-0096 D4 bound: every quarantine from a previous life resolved
+    // this boot (second-verdict unlink — nothing lingers a second life).
+    let quarantined_after: Vec<u64> =
+        inf_log::blob::list_quarantined_extent_ids(&run.disk, &run.shard)
+            .expect("quarantine listing")
+            .iter()
+            .map(|i| i.0)
+            .collect();
+    for id in &quarantined_before {
+        if quarantined_after.contains(id) {
+            run.report.violations.push(format!(
+                "life {life_index}: quarantined extent {id} survived its second verdict"
+            ));
+        }
     }
     run.report.trace_hash = hash64(&(model_live.len() as u64).to_le_bytes(), run.report.trace_hash);
 }

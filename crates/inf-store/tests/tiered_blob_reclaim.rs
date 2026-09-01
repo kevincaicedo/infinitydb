@@ -305,7 +305,13 @@ impl<F: SegmentFs + Clone> Rig<F> {
         self.stage(&MutationEffect::CkptBegin { ckpt_id: u64::MAX });
         let work = self.table.extent_reclaim_work(self.table.wal_epoch(), max);
         let count = work.len();
-        for id in work {
+        for candidate in work {
+            let id = candidate.extent_id;
+            assert_eq!(
+                candidate.origin,
+                inf_store::ReclaimOrigin::Death,
+                "runtime churn only produces refcount-proven deaths"
+            );
             assert!(
                 !self.model.values().any(|e| e.extent_id == id),
                 "early free: extent {id} is model-live"
@@ -377,6 +383,122 @@ impl<F: SegmentFs + Clone> Rig<F> {
         }
         panic!("quiescence not reached in 64 rounds — a backlog is stuck");
     }
+}
+
+/// Review of 2026-08-30 (C7 / F-L04-08, F-L14-02; ADR-0096): the boot
+/// orphan sweep must not turn a single upstream accounting omission
+/// into `unlink(2)` in the life it booted in. The scenario is
+/// F-L04-08's repro staged directly at this layer, independent of the
+/// (also fixed) C4 walk bug: two extents on disk, both header-valid,
+/// both referenced by live cold records — but the "recovered" reference
+/// map lost one entry. Pre-ADR-0096 the sweep queued the unmapped
+/// extent at stamp 0 and the first reclaim slice destroyed the bytes a
+/// live record still references (the recorded falsifier run). The
+/// property that must hold instead: the file survives its first life —
+/// as the extent or its `.quarantine` twin — and only a *second* boot
+/// that still finds it unreferenced may destroy it.
+#[test]
+fn boot_orphan_sweep_quarantines_before_destruction() {
+    let fs = MemFs::new();
+    let shard = Path::new(SHARD);
+    let mut rig = Rig::new(fs.clone(), shard, 256, 1 << 20, 1 << 20);
+    rig.set_blob(1, 0);
+    rig.set_blob(2, 0);
+    let (e1, e2) = (rig.model[&1].extent_id, rig.model[&2].extent_id);
+    let (addr1, len1) = (rig.model[&1].addr, rig.model[&1].value_len);
+    // "Reboot" into a fresh table whose 0x05 restore lost e2's entry —
+    // only e1 re-registers; both files are on disk and verify.
+    let demote = DemotionConfig {
+        mem_budget_bytes: 1 << 20,
+        mutable_permille: MUTABLE_PERMILLE,
+        slice_bytes: PAGE,
+    };
+    let mut boot = TieredTable::new(
+        AddressSpaceConfig {
+            reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
+            page_bytes: PAGE as usize,
+            life_origin: LogicalAddr::from_raw(1 << 30).expect("48-bit"),
+        },
+        demote,
+        2048,
+        KeyHasher::default(),
+    )
+    .expect("ring");
+    boot.restore_extent_entry(addr1, e1, len1);
+    let listed: Vec<u64> =
+        list_extent_ids(&fs, shard).expect("listing").iter().map(|i| i.0).collect();
+    assert!(listed.contains(&e2), "e2's file is on disk before the sweep");
+    let revive = boot.extent_sweep_seed(&listed, &[]);
+    assert!(revive.is_empty(), "nothing was quarantined before this boot");
+    // The plane's reclaim slice, mirrored as `reclaim_round` mirrors it
+    // (ADR-0096 dispatch: a header-valid boot orphan quarantines).
+    let work = boot.extent_reclaim_work(u64::MAX, 8);
+    for candidate in work {
+        let id = ExtentId(candidate.extent_id);
+        match candidate.origin {
+            inf_store::ReclaimOrigin::Death => {
+                unlink_extent_file(&fs, shard, id).expect("unlink");
+                boot.extent_reclaim_done(id.0);
+            }
+            inf_store::ReclaimOrigin::BootOrphan => {
+                let path = shard.join("cold").join(extent_file_name(id));
+                match inf_log::probe_extent_file(&fs, &path) {
+                    Ok(header) if header.extent_id == id => {
+                        inf_log::quarantine_extent_file(&fs, shard, id).expect("quarantine");
+                        boot.extent_reclaim_quarantined(id.0);
+                    }
+                    _ => {
+                        unlink_extent_file(&fs, shard, id).expect("unlink");
+                        boot.extent_reclaim_done(id.0);
+                    }
+                }
+            }
+            inf_store::ReclaimOrigin::Quarantined => {
+                inf_log::unlink_quarantined_file(&fs, shard, id).expect("unlink twin");
+                boot.extent_reclaim_done(id.0);
+            }
+        }
+    }
+    let survivors = fs.list_dir(&shard.join("cold")).expect("cold dir");
+    assert!(
+        survivors.iter().any(|n| n.starts_with(&extent_file_name(ExtentId(e2)))),
+        "the sweep destroyed extent {e2} on its first slice — permanent loss for a live \
+         cold record (cold dir: {survivors:?})"
+    );
+    assert_eq!(boot.extent_refcount(e1), 1, "the referenced extent is untouched");
+    assert_eq!(boot.extent_stats().quarantined, 1, "the boot orphan quarantined, not unlinked");
+    // The next boot lists the twin; its replayed map DOES reference e2
+    // (the artifacts healed — e.g. a later checkpoint imaged the record)
+    // — revival returns the file to service with zero loss (ADR-0096 D3).
+    let mut boot2 = TieredTable::new(
+        AddressSpaceConfig {
+            reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
+            page_bytes: PAGE as usize,
+            life_origin: LogicalAddr::from_raw(1 << 30).expect("48-bit"),
+        },
+        demote,
+        2048,
+        KeyHasher::default(),
+    )
+    .expect("ring");
+    boot2.restore_extent_entry(addr1, e1, len1);
+    boot2.restore_extent_entry(rig.model[&2].addr, e2, rig.model[&2].value_len);
+    let listed2: Vec<u64> =
+        list_extent_ids(&fs, shard).expect("listing").iter().map(|i| i.0).collect();
+    let quarantined2: Vec<u64> = inf_log::list_quarantined_extent_ids(&fs, shard)
+        .expect("listing")
+        .iter()
+        .map(|i| i.0)
+        .collect();
+    assert_eq!(quarantined2, vec![e2], "the twin survived the first life");
+    let revive = boot2.extent_sweep_seed(&listed2, &quarantined2);
+    assert_eq!(revive, vec![e2], "the referenced quarantined extent revives");
+    inf_log::revive_extent_file(&fs, shard, ExtentId(e2)).expect("revive");
+    assert!(
+        list_extent_ids(&fs, shard).expect("listing").contains(&ExtentId(e2)),
+        "the revived extent serves again — zero loss"
+    );
+    assert!(boot2.extent_reclaim_work(u64::MAX, 8).is_empty(), "nothing left to dispose");
 }
 
 /// The leak test (plan AC 1): blob create/overwrite/delete cycles with

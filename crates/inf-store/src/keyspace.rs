@@ -608,6 +608,7 @@ impl Keyspace {
             total.region_commit_pages += counters.region_commit_pages;
             total.region_decommit_pages += counters.region_decommit_pages;
             total.cold_resolves += counters.cold_resolves;
+            total.cold_read_errors += counters.cold_read_errors;
             total.tail_alloc_stalls += counters.tail_alloc_stalls;
             total.demote_slices += counters.demote_slices;
             total.demote_sealed_bytes += counters.demote_sealed_bytes;
@@ -632,6 +633,8 @@ impl Keyspace {
             total.reclaimable += stats.reclaimable;
             total.reclaim_slices += stats.reclaim_slices;
             total.reclaim_deferred += stats.reclaim_deferred;
+            total.quarantined += stats.quarantined;
+            total.quarantine_revived += stats.quarantine_revived;
             total.rmw_ops += stats.rmw_ops;
             total.disk_bytes += stats.disk_bytes;
         }

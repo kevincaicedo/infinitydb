@@ -661,6 +661,14 @@ impl TieredTable {
         self.extents.note_rmw();
     }
 
+    /// Counts one typed cold-read failure served to a client (review of
+    /// 2026-08-30, C2′): the plane's resolve funnel and SCAN's key
+    /// fetch report here — the `note_blob_bytes` seam shape.
+    #[inline]
+    pub fn note_cold_read_error(&mut self) {
+        self.space.note_cold_read_error();
+    }
+
     /// Blob-extent observables (`INFO tiering`; the §3.3 zero-assert
     /// lists — memory-mode namespaces have no table, hence all-zero).
     #[must_use]
@@ -698,13 +706,21 @@ impl TieredTable {
         self.wal_epoch
     }
 
-    /// Unlink candidates whose killing record is durable (`stamp ≤
+    /// Disposal candidates whose killing record is durable (`stamp ≤
     /// durable_epoch`), at most `max` (one MAINTAIN slice's budget —
-    /// ADR-0061 D5). The plane composes the in-flight read pin check and
-    /// answers each candidate with [`extent_reclaim_done`]
-    /// (Self::extent_reclaim_done) or [`extent_reclaim_deferred`]
-    /// (Self::extent_reclaim_deferred).
-    pub fn extent_reclaim_work(&mut self, durable_epoch: u64, max: usize) -> Vec<u64> {
+    /// ADR-0061 D5), each typed with its [`ReclaimOrigin`]
+    /// (crate::extents::ReclaimOrigin) (ADR-0096 D1). The plane composes
+    /// the in-flight read pin check, dispatches the disposal on the
+    /// origin (death → unlink; boot orphan → probe + quarantine rename;
+    /// second verdict → unlink the twin), and answers each candidate
+    /// with [`extent_reclaim_done`](Self::extent_reclaim_done),
+    /// [`extent_reclaim_quarantined`](Self::extent_reclaim_quarantined),
+    /// or [`extent_reclaim_deferred`](Self::extent_reclaim_deferred).
+    pub fn extent_reclaim_work(
+        &mut self,
+        durable_epoch: u64,
+        max: usize,
+    ) -> Vec<crate::extents::ReclaimCandidate> {
         self.extents.reclaim_work(durable_epoch, max)
     }
 
@@ -713,19 +729,30 @@ impl TieredTable {
         self.extents.reclaim_done(extent_id);
     }
 
-    /// Returns one candidate after a non-fatal unlink failure
+    /// Confirms one boot-orphan quarantine (ADR-0096 D2 — renamed, not
+    /// unlinked; the bytes wait for a later boot's second verdict).
+    pub fn extent_reclaim_quarantined(&mut self, extent_id: u64) {
+        self.extents.reclaim_quarantined(extent_id);
+    }
+
+    /// Returns one candidate after a non-fatal disposal failure
     /// (`blob_unlink_fail` — counted, re-offered, boot-sweep-re-driven).
     pub fn extent_reclaim_deferred(&mut self, extent_id: u64) {
         self.extents.reclaim_deferred(extent_id);
     }
 
     /// Seeds the boot orphan sweep with the extent directory listing
-    /// (names only — ADR-0061 D6). Call after replay completes; parked
-    /// replay deaths stamp durable here (they were replayed *from* the
-    /// log) and every listed-but-unreferenced extent becomes a reclaim
-    /// candidate drained by ordinary MAINTAIN slices, never at boot.
-    pub fn extent_sweep_seed(&mut self, listed: &[u64]) {
-        self.extents.sweep_seed(listed);
+    /// (names only — ADR-0061 D6; disposal per ADR-0096). Call after
+    /// replay completes; parked replay deaths stamp durable here (they
+    /// were replayed *from* the log) and every listed-but-unreferenced
+    /// extent becomes a typed reclaim candidate drained by ordinary
+    /// MAINTAIN slices, never at boot. `quarantined` is the
+    /// `.quarantine` listing; the returned ids are quarantined extents
+    /// the replayed map references — the caller renames them back
+    /// before serving (ADR-0096 D3).
+    #[must_use = "revived quarantined extents must be renamed back before serving"]
+    pub fn extent_sweep_seed(&mut self, listed: &[u64], quarantined: &[u64]) -> Vec<u64> {
+        self.extents.sweep_seed(listed, quarantined)
     }
 
     /// Applies one checkpoint tag-9 image / tail `StringExtentRef`
@@ -788,6 +815,22 @@ impl TieredTable {
     pub fn extent_ckpt_entries(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
         let w = self.space.walk_watermark().expect("walk not begun").to_raw();
         self.extents.entries_below(w)
+    }
+
+    /// [`extent_ckpt_entries`](Self::extent_ckpt_entries) resumed at the
+    /// address cursor `resume` — the pass-3 slice form (review of
+    /// 2026-08-30, C4): stable under mid-walk removals below the cursor,
+    /// which the ordinal `.skip` resume it replaces was not.
+    ///
+    /// # Panics
+    /// Panics when no walk is pinned ([`begin_ckpt_walk`]
+    /// (Self::begin_ckpt_walk) first).
+    pub fn extent_ckpt_entries_from(
+        &self,
+        resume: u64,
+    ) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
+        let w = self.space.walk_watermark().expect("walk not begun").to_raw();
+        self.extents.entries_from(resume, w)
     }
 
     /// Takes the relocation origins of the record at `addr` (M4-S15,

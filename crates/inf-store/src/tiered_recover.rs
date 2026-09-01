@@ -72,6 +72,11 @@ pub struct RecoveredTier<F: SegmentFs> {
     /// refcounts, never by the manifest — the tier-file "unmanifested ⇒
     /// garbage" rule deliberately does not extend to extents.
     pub extents_listed: Vec<u64>,
+    /// `.quarantine`-named extent ids (ADR-0096 D3) — boot orphans a
+    /// previous life renamed instead of unlinking. Handed to the same
+    /// sweep seed; ids the replayed map references come back for
+    /// revival, the rest await their second-verdict unlink.
+    pub extents_quarantined: Vec<u64>,
     /// Boot facts.
     pub stats: TierRecoverStats,
 }
@@ -161,9 +166,14 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     // refcount-governed — their ids are collected here (names only) and
     // the post-replay sweep decides.
     let mut extents_listed: Vec<u64> = Vec::new();
+    let mut extents_quarantined: Vec<u64> = Vec::new();
     for name in fs.list_dir(&cold_dir)? {
         if let Some(extent_id) = parse_extent_file_name(&name) {
             extents_listed.push(extent_id.0);
+            continue;
+        }
+        if let Some(extent_id) = inf_log::parse_quarantined_file_name(&name) {
+            extents_quarantined.push(extent_id.0);
             continue;
         }
         let Some(id) = parse_tier_file_name(&name) else { continue };
@@ -173,6 +183,7 @@ pub fn recover_tiered_ns<F: SegmentFs>(
         }
     }
     extents_listed.sort_unstable();
+    extents_quarantined.sort_unstable();
     let next_id = tier.files.iter().map(|f| f.id + 1).max().unwrap_or(0);
     let mut table = TieredTable::new(
         AddressSpaceConfig {
@@ -191,7 +202,7 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     // section arrives ([`apply_live_set_section`]).
     table.seed_recovered_files(&catalog, boot_ckpt_id);
     let flush = TierFlush::with_catalog(fs, flush_config, next_id, catalog);
-    Ok(RecoveredTier { table, flush, extents_listed, stats })
+    Ok(RecoveredTier { table, flush, extents_listed, extents_quarantined, stats })
 }
 
 /// Applies one validated `.ick` address-reference section (ADR-0057 D6
