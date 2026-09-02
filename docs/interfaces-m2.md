@@ -526,8 +526,11 @@ discipline:
   hints the next two windows; `IckReader::next_step` hints per section.
   Hint-only by contract: implementations must not change any byte the
   reader sees (L7 — MemFs/sim keep the no-op). The real implementation is
-  `inf-server::ReadAheadFs` (boot-scoped prefetch thread; prefetch enabled
-  by the assembly iff a single cell recovers — the measured regime split).
+  `inf-server`'s crate-private `ReadAheadFs` — a boot-scoped prefetch
+  thread held only by `Recovery::boot_reads` (ADR-0109: the plane, the
+  rotor and the tier handles keep the bare tier by type); enabled by
+  `RecoverConfig::boot_prefetch`, which the assembly sets iff a single
+  cell recovers — the measured regime split.
   Also under this ADR: `read_ick_counts` gained a direct end-of-file
   footer probe (CRC-validated, hops as fallback) — a parse-path change
   covered by the extended `ick_decode` fuzz oracle.

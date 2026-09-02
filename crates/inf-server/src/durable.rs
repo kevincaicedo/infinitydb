@@ -303,13 +303,25 @@ pub struct RecoverConfig {
     /// Test-only pacing: cap recovery at roughly this rate against the
     /// injected loop clock (`None` = flat out).
     pub throttle_bytes_per_sec: Option<u64>,
+    /// Boot-read prefetch (M2.5-S08; ADR-0109): recovery's segment,
+    /// checkpoint and audit readers ride a per-file prefetch thread that
+    /// pulls the next advised window into the page cache, so cold
+    /// replay's device read overlaps apply. **Boot-scoped by type**: the
+    /// wrapper lives inside [`Recovery`](crate::Recovery) and never
+    /// reaches the serving plane (L17-02 of the 2026-08-30 review — the
+    /// wrapper used to be the plane's filesystem for the node's life).
+    /// Off by default: the DST and every in-memory tier never spawn a
+    /// thread; `infinityd` turns it on for a single recovering cell (the
+    /// S08 A/B's regime split — N parallel recovering cells already
+    /// saturate the device).
+    pub boot_prefetch: bool,
 }
 
 impl Default for RecoverConfig {
     fn default() -> RecoverConfig {
         // 8 MiB ≈ single-digit-ms steps at the ≥ 1 GB/s replay gate: the
         // loop keeps answering -LOADING while paying < 0.1% step overhead.
-        RecoverConfig { step_bytes: 8 << 20, throttle_bytes_per_sec: None }
+        RecoverConfig { step_bytes: 8 << 20, throttle_bytes_per_sec: None, boot_prefetch: false }
     }
 }
 

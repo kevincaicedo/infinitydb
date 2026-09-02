@@ -402,11 +402,26 @@ fn parse_args() -> Result<Args, String> {
     if args.buffers == 0 {
         return Err("--buffers must be >= 1".into());
     }
-    if args.buffers > u32::MAX as usize {
-        return Err(format!("--buffers must be <= {}", u32::MAX));
+    // Batch 12 of the 2026-08-30 review (Theme 4): the io_uring driver
+    // addresses provided recv buffers by a u16 buffer id and hands recv
+    // lengths to the kernel as i32 — `--buffers 65536` and `--buf-size`
+    // above i32::MAX booted, printed "listening", and died in the cell
+    // thread's first recv arm (`uring.rs` asserts, proven at the binary).
+    // The bound lives here, where every operator value is validated.
+    if args.buffers > usize::from(u16::MAX) {
+        return Err(format!(
+            "--buffers must be <= {} (the io_uring provided-buffer group addresses buffers by u16 id)",
+            u16::MAX
+        ));
     }
     if args.buf_size == 0 {
         return Err("--buf-size must be >= 1".into());
+    }
+    if args.buf_size > i32::MAX as usize {
+        return Err(format!(
+            "--buf-size must be <= {} (recv lengths are i32 at the io_uring boundary)",
+            i32::MAX
+        ));
     }
     Ok(args)
 }
@@ -1080,7 +1095,17 @@ fn cell_main(
                 ),
                 ..Default::default()
             },
-            recover: inf_server::RecoverConfig::default(),
+            // Boot-read prefetch (M2.5-S08; ADR-0109): recovery reads hint
+            // the next window so cold replay's device read overlaps apply.
+            // Only when this cell recovers alone — N parallel recovering
+            // cells already saturate the device, and N extra prefetch
+            // streams cost sequential locality (the S08 A/B's measured
+            // regime split). Boot-scoped by type: the wrapper lives inside
+            // `Recovery`; the plane's filesystem stays `StdSegmentFs`.
+            recover: inf_server::RecoverConfig {
+                boot_prefetch: args.cells == 1,
+                ..inf_server::RecoverConfig::default()
+            },
             flush_bound: 1,
             fua_p50_us_probed: io.fua_p50_us_4k,
             // ADR-0088 D2/D2b: static per-cell shares, computed once here
@@ -1118,18 +1143,10 @@ fn cell_main(
     );
     if let Some((cfg, control)) = durable {
         plane.set_control(control);
-        // ReadAheadFs (M2.5-S08): recovery reads hint the next window so
-        // cold replay's device read overlaps apply; the write path is pure
-        // delegation. Prefetch only when this cell recovers alone — N
-        // parallel recovering cells already saturate the device, and N
-        // extra prefetch streams cost sequential locality (the S08 A/B's
-        // measured regime split).
-        plane.begin_recovery(
-            inf_server::ReadAheadFs::new(StdSegmentFs, args.cells == 1),
-            &cfg,
-            cell,
-            StdClock::new().now(),
-        );
+        // The bare filesystem is the plane's for the node's life; the
+        // boot-read prefetch rides `cfg.recover.boot_prefetch` inside
+        // `Recovery` and never escapes it (ADR-0109).
+        plane.begin_recovery(StdSegmentFs, &cfg, cell, StdClock::new().now());
     }
     // Doorbell wakeups (Linux): peers end this cell's park via eventfd, so
     // the park timeout is a fallback, not the hop-latency ceiling. The park

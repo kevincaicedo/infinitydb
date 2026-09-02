@@ -99,8 +99,9 @@ pub trait SegmentFile {
     /// never an effect: it changes no bytes the caller reads, so L7
     /// determinism and every digest are untouched — the default (and every
     /// in-memory/sim tier) is a no-op. The real implementation is
-    /// `inf-server`'s `ReadAheadFs` boot wrapper (a per-file prefetch
-    /// thread; this crate forbids unsafe and never blocks on the hint).
+    /// `inf-server`'s crate-private `ReadAheadFs` — held only by its boot
+    /// `Recovery` machine (ADR-0109), a per-file prefetch thread; this
+    /// crate forbids unsafe and never blocks on the hint.
     fn advise_read_ahead(&self, offset: u64, len: u64) {
         let _ = (offset, len);
     }

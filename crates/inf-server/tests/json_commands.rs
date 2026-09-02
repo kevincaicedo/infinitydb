@@ -909,3 +909,36 @@ fn reply_corpus_is_pinned_under_resp3_with_protocol_nulls() {
         assert_eq!(String::from_utf8_lossy(&got), expected, "RESP3 mismatch for {argv:?}");
     }
 }
+
+// ---- batch 12 of the 2026-08-30 review: RESP3 doubles are total -------------
+
+/// Before the fix `RespWriter::double` formatted through a 40-byte stack
+/// buffer with `expect("f64 display fits 40 bytes")`; a document number of
+/// magnitude ≥ 1e40 (or below 1e-40) reached it through every numeric
+/// reply on a RESP3 connection and killed the cell. Rust's `Display`
+/// prints `1e300` as 301 digits; the reply now carries them.
+#[test]
+fn resp3_numeric_replies_survive_extreme_doubles() {
+    let mut db = Db::new();
+    db.cx.proto = Protocol::Resp3;
+    db.run_str(&[
+        "JSON.SET",
+        "d",
+        "$",
+        r#"{"big":1e300,"tiny":5e-324,"neg":-2.2250738585072014e-308}"#,
+    ]);
+    let big = format!("{}", 1e300);
+    assert_eq!(big.len(), 301);
+    assert_reply(&mut db, &["JSON.NUMINCRBY", "d", "$.big", "0"], &format!("*1\r\n,{big}\r\n"));
+    let tiny = format!("{}", 5e-324);
+    assert_reply(&mut db, &["JSON.NUMMULTBY", "d", "$.tiny", "1"], &format!("*1\r\n,{tiny}\r\n"));
+    let neg = format!("{}", -2.2250738585072014e-308);
+    assert_eq!(neg.len(), 327, "the longest f64 Display");
+    assert_reply(&mut db, &["JSON.NUMINCRBY", "d", "$.neg", "0"], &format!("*1\r\n,{neg}\r\n"));
+    // Legacy (non-`$`) path replies ride the same writer.
+    assert_reply(&mut db, &["JSON.NUMINCRBY", "d", ".big", "0"], &format!("*1\r\n,{big}\r\n"));
+    // RESP2 stays the JSON number text (`serialize_number_text`, bounded,
+    // exponent form with Redis's sign).
+    db.cx.proto = Protocol::Resp2;
+    assert_reply(&mut db, &["JSON.NUMINCRBY", "d", "$.big", "0"], "$8\r\n[1e+300]\r\n");
+}

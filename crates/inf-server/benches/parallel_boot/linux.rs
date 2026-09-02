@@ -192,8 +192,8 @@ fn build_cell_image(root: &Path, cfg: &DurableConfig, cell: u16, records: u64) -
 /// One cell's boot thread body, generic over the recovery fs tier
 /// (M2.5-S08 A/B: `ReadAheadFs` vs bare `StdSegmentFs`).
 #[allow(clippy::too_many_arguments)]
-fn drive_cell<F: inf_log::fs::SegmentFs + Clone + 'static>(
-    fs: F,
+fn drive_cell(
+    boot_prefetch: bool,
     i: usize,
     cells: u16,
     listener: std::net::TcpListener,
@@ -233,7 +233,11 @@ fn drive_cell<F: inf_log::fs::SegmentFs + Clone + 'static>(
         false,
     );
     plane.set_control(control);
-    plane.begin_recovery(fs, &durable_config(root), i as u16, StdClock::new().now());
+    // M2.5-S08 A/B arm on the config (ADR-0109): the prefetch wrapper is
+    // Recovery-private; the plane's filesystem is the bare tier.
+    let mut cfg = durable_config(root);
+    cfg.recover.boot_prefetch = boot_prefetch;
+    plane.begin_recovery(StdSegmentFs, &cfg, i as u16, StdClock::new().now());
     let config = LoopConfig {
         park_default: Some(std::time::Duration::from_micros(500)),
         ..Default::default()
@@ -277,20 +281,8 @@ fn boot_once(root: &Path, cells: u16) -> f64 {
             // (the multi-cell regime infinityd's cells==1 policy declines
             // — the A/B that measured why); default matches the shipped
             // multi-cell posture (no prefetch).
-            if env_u64("INF_BOOT_READAHEAD", 0) != 0 {
-                drive_cell(
-                    inf_server::ReadAheadFs::new(StdSegmentFs, true),
-                    i,
-                    cells,
-                    listener,
-                    fabric,
-                    control,
-                    &root,
-                    &stop,
-                );
-            } else {
-                drive_cell(StdSegmentFs, i, cells, listener, fabric, control, &root, &stop);
-            }
+            let boot_prefetch = env_u64("INF_BOOT_READAHEAD", 0) != 0;
+            drive_cell(boot_prefetch, i, cells, listener, fabric, control, &root, &stop);
         }));
     }
     while !board.all_ready() {

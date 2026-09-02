@@ -488,8 +488,33 @@ I	1	crates/fake/src/lib.rs	assert	n is positive	own argument check
 EOF
 expect red "release-asserts: a second site behind one identity is a count mismatch" env INF_CHECK_ROOT="$root" $RELEASE
 
+# ADR-0107 D2, first amendment (batch 12): a C row's proof pointer must
+# RESOLVE — a definition in the named file's production code, by
+# rust-symbol-defined.awk over the stripped file. The fixture defines a
+# free fn, a `Type::method` inside a multi-line generic `impl Trait for`,
+# a const, and a test-only fn that must not count.
 root=$(fixture ra-caller <<'EOF'
 pub fn write(len: usize) { assert!(len <= 255, "caller validated the length"); }
+pub fn check_bounds(len: usize) -> bool { len <= 255 }
+pub const MAX_LEN: usize = 255;
+pub struct Store<T> { inner: T }
+pub trait Bounds { fn bound(&self) -> usize; fn other(&self); }
+impl<T: Clone + Send> Bounds
+    for Store<T>
+where
+    T: Sync,
+{
+    fn bound(&self) -> usize { 255 }
+    fn other(&self) {}
+}
+pub mod guard {
+    pub fn admit(len: usize) -> bool { len <= 255 }
+}
+
+#[cfg(test)]
+mod tests {
+    pub fn check_bounds_test_only() {}
+}
 EOF
 )
 inventory "$root" <<'EOF'
@@ -497,11 +522,42 @@ C	1	crates/fake/src/lib.rs	assert	caller validated the length	trust me
 EOF
 expect red "release-asserts: a C row without a proof pointer is red" env INF_CHECK_ROOT="$root" $RELEASE
 inventory "$root" <<'EOF'
-C	1	crates/fake/src/lib.rs	assert	caller validated the length	store.rs:check_bounds at every write entry
+C	1	crates/fake/src/lib.rs	assert	caller validated the length	`crates/fake/src/lib.rs:check_bounds` at every write entry
 EOF
-expect green "release-asserts: a C row citing file.rs:function is accepted" env INF_CHECK_ROOT="$root" $RELEASE
+expect green "release-asserts: a C row citing a resolving free fn is accepted" env INF_CHECK_ROOT="$root" $RELEASE
+expect_output "release-asserts: resolved pointers are counted" "1 proof pointers resolved" env INF_CHECK_ROOT="$root" $RELEASE
 inventory "$root" <<'EOF'
-Q	1	crates/fake/src/lib.rs	assert	caller validated the length	store.rs:check_bounds
+C	1	crates/fake/src/lib.rs	assert	caller validated the length	`crates/fake/src/lib.rs:Store::bound` (a multi-line generic impl) and `crates/fake/src/lib.rs:MAX_LEN`, `crates/fake/src/lib.rs:Bounds::other`, `crates/fake/src/lib.rs:guard::admit`
+EOF
+expect green "release-asserts: Type::method inside impl Trait for Type, a const, Trait::method and mod::fn resolve" env INF_CHECK_ROOT="$root" $RELEASE
+expect_output "release-asserts: every distinct pointer is resolved" "4 proof pointers resolved" env INF_CHECK_ROOT="$root" $RELEASE
+inventory "$root" <<'EOF'
+C	1	crates/fake/src/lib.rs	assert	caller validated the length	`crates/fake/src/lib.rs:check_bound` at every write entry
+EOF
+expect red "release-asserts: a renamed enforcing function is red (the L20 row)" env INF_CHECK_ROOT="$root" $RELEASE
+expect_output "release-asserts: the unresolved pointer is named" "proof pointer 'crates/fake/src/lib.rs:check_bound' does not resolve" env INF_CHECK_ROOT="$root" $RELEASE
+inventory "$root" <<'EOF'
+C	1	crates/fake/src/lib.rs	assert	caller validated the length	`crates/fake/src/lib.rs:Other::bound`
+EOF
+expect red "release-asserts: a method on the wrong type is red" env INF_CHECK_ROOT="$root" $RELEASE
+inventory "$root" <<'EOF'
+C	1	crates/fake/src/lib.rs	assert	caller validated the length	`crates/fake/src/lib.rs:check_bounds_test_only`
+EOF
+expect red "release-asserts: a symbol that exists only under #[cfg(test)] is no proof" env INF_CHECK_ROOT="$root" $RELEASE
+inventory "$root" <<'EOF'
+C	1	crates/fake/src/lib.rs	assert	caller validated the length	`lib.rs:check_bounds` at every write entry
+EOF
+expect red "release-asserts: a bare file name is red" env INF_CHECK_ROOT="$root" $RELEASE
+inventory "$root" <<'EOF'
+C	1	crates/fake/src/lib.rs	assert	caller validated the length	`crates/fake/src/lib.rs:12` at every write entry
+EOF
+expect red "release-asserts: a line number is not a proof pointer" env INF_CHECK_ROOT="$root" $RELEASE
+inventory "$root" <<'EOF'
+C	1	crates/fake/src/lib.rs	assert	caller validated the length	`crates/fake/src/gone.rs:check_bounds`
+EOF
+expect red "release-asserts: a pointer into a missing file is red" env INF_CHECK_ROOT="$root" $RELEASE
+inventory "$root" <<'EOF'
+Q	1	crates/fake/src/lib.rs	assert	caller validated the length	`crates/fake/src/lib.rs:check_bounds`
 EOF
 expect red "release-asserts: an unknown class is red" env INF_CHECK_ROOT="$root" $RELEASE
 

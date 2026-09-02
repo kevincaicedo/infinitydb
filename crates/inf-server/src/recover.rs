@@ -297,6 +297,13 @@ pub fn open_cell_log<F: SegmentFs + Clone>(
     Ok(recovery.finish())
 }
 
+use crate::readahead::{ReadAheadFile, ReadAheadFs};
+
+/// A boot reader's file: the bare tier's file behind the boot-read
+/// prefetch wrapper (ADR-0109). Only [`Recovery`]'s readers hold these;
+/// the rotor, tier handles and barrier dirs stay `F::File`.
+type BootFile<F> = ReadAheadFile<<F as SegmentFs>::File>;
+
 /// Continuity verdict for one validating frame's stamp (ADR-0031 D3).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum StampVerdict {
@@ -352,12 +359,18 @@ enum Phase<File: SegmentFile> {
 /// their semantics are exactly [`open_cell_log`]'s documented pipeline —
 /// that function *is* this machine run to completion.
 pub struct Recovery<F: SegmentFs> {
+    /// The bare tier: dirs, the size probe, tier handles, the rotor —
+    /// everything that outlives boot is opened here.
     fs: Option<F>,
+    /// The boot readers' tier (ADR-0109): MANIFEST, checkpoint stream,
+    /// segment replay and the slack audit open through the prefetch
+    /// wrapper; it is constructed here and dies with this machine.
+    boot_reads: ReadAheadFs<F>,
     cell: u16,
     cfg: DurableConfig,
     anchor: WallAnchor,
     now: Nanos,
-    phase: Phase<F::File>,
+    phase: Phase<BootFile<F>>,
     stats: RecoverStats,
     shard_dir: PathBuf,
     log_dir: PathBuf,
@@ -452,8 +465,10 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     #[must_use]
     pub fn new(fs: F, cell: u16, cfg: &DurableConfig, anchor: WallAnchor, now: Nanos) -> Self {
         let shard_dir = cfg.data_dir.join(format!("shard-{cell}"));
+        let boot_reads = ReadAheadFs::new(fs.clone(), cfg.recover.boot_prefetch);
         Recovery {
             fs: Some(fs),
+            boot_reads,
             cell,
             cfg: cfg.clone(),
             anchor,
@@ -665,7 +680,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             create_cell_dirs(self.fs(), &self.shard_dir)?
         };
         debug_assert_eq!(dirs.log, self.log_dir);
-        let manifest = read_manifest(self.fs(), &self.shard_dir)?;
+        let manifest = read_manifest(&self.boot_reads, &self.shard_dir)?;
         // ADR-0094 D6: the manifest names the secret that placed its
         // checkpoint's refs; a boot holding another one refuses here,
         // before the checkpoint loads. `infinityd` pre-scans every shard
@@ -691,7 +706,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // retained log is the unit.
         self.floor = manifest.as_ref().map_or(SegmentId(0), Manifest::floor);
         let outcome =
-            scan_log_dir_from(self.fs(), &self.log_dir, self.floor).map_err(io_invalid)?;
+            scan_log_dir_from(&self.boot_reads, &self.log_dir, self.floor).map_err(io_invalid)?;
         let scan = outcome.scan;
         self.stale = outcome.stale;
         self.segments = scan.segments().to_vec();
@@ -733,13 +748,15 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             let ick_path = self.ckpt_dir.join(ick_file_name(manifest.ckpt_id));
             // Presize from the footer counts before streaming (M2-S13):
             // the bulk apply must not pay a doubling-rehash storm.
-            let counts = read_ick_counts(self.fs(), &ick_path, IckReaderConfig::default())
-                .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
+            let counts =
+                read_ick_counts(&self.boot_reads, &ick_path, IckReaderConfig::default())
+                    .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
             for &(ns, entries) in &counts {
                 ks.reserve_ns(inf_log::NsId(ns), entries);
             }
-            let reader = IckReader::open(self.fs(), &ick_path, IckReaderConfig::default())
-                .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
+            let reader =
+                IckReader::open(&self.boot_reads, &ick_path, IckReaderConfig::default())
+                    .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
             let info = reader.info();
             if info.ckpt_id != manifest.ckpt_id
                 || info.begin_lsn != manifest.begin_lsn
@@ -1001,7 +1018,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     fn step_ick(
         &mut self,
         ks: &mut Keyspace,
-        mut reader: Box<IckReader<F::File>>,
+        mut reader: Box<IckReader<BootFile<F>>>,
         budget_bytes: u64,
     ) -> io::Result<RecoveryProgress> {
         let manifest = self.manifest.as_ref().expect("ick phase");
@@ -1159,7 +1176,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         &mut self,
         ks: &mut Keyspace,
         idx: usize,
-        reader: Option<Box<SegmentReader<F::File>>>,
+        reader: Option<Box<SegmentReader<BootFile<F>>>>,
         budget_bytes: u64,
     ) -> io::Result<RecoveryProgress> {
         // ADR-0031 D5: replay already ended at an epoch-regressed frame —
@@ -1176,7 +1193,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             Some(reader) => reader,
             None => Box::new(
                 SegmentReader::open(
-                    self.fs(),
+                    &self.boot_reads,
                     &self.log_dir,
                     self.segments[idx],
                     ReaderConfig::default(),
@@ -1442,8 +1459,13 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     fn step_audit(&mut self, idx: usize) -> io::Result<RecoveryProgress> {
         let segment = self.segments[idx];
         let (end, failed) = (self.ends[idx].0, self.ends[idx].1.is_some());
-        let evidence =
-            scan_region_evidence(self.fs(), &self.log_dir, segment, end, ReaderConfig::default())?;
+        let evidence = scan_region_evidence(
+            &self.boot_reads,
+            &self.log_dir,
+            segment,
+            end,
+            ReaderConfig::default(),
+        )?;
         self.note_audit(&evidence);
         let residue = match evidence.summary() {
             RegionScan::ValidFrame { .. } | RegionScan::Garbage { .. } => true,
@@ -1508,8 +1530,13 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     fn step_probe(&mut self, idx: usize) -> io::Result<RecoveryProgress> {
         debug_assert!(self.hole.is_some_and(|hole| hole < idx), "probe only behind a hole");
         let segment = self.segments[idx];
-        let evidence =
-            scan_region_evidence(self.fs(), &self.log_dir, segment, 0, ReaderConfig::default())?;
+        let evidence = scan_region_evidence(
+            &self.boot_reads,
+            &self.log_dir,
+            segment,
+            0,
+            ReaderConfig::default(),
+        )?;
         self.note_audit(&evidence);
         self.stats.segments += 1;
         self.ends.push((0, None));
@@ -1672,7 +1699,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             }
             if self.stats.torn_segments_removed > 0 {
                 self.scan = Some(
-                    scan_log_dir_from(self.fs(), &self.log_dir, self.floor)
+                    scan_log_dir_from(&self.boot_reads, &self.log_dir, self.floor)
                         .map_err(io_invalid)?
                         .scan,
                 );

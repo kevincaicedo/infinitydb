@@ -494,7 +494,7 @@ pub(crate) fn info(
         push(&mut text, &format!("total_connections_received:{}", node.total_connections.get()));
         push(&mut text, &format!("total_commands_processed:{commands}"));
         push(&mut text, "instantaneous_ops_per_sec:0");
-        push(&mut text, "rejected_connections:0");
+        push(&mut text, &format!("rejected_connections:{}", node.rejected_connections.get()));
         push(&mut text, &format!("expired_keys:{}", stats.expired_lazy + stats.expired_active));
         push(&mut text, &format!("expired_active:{}", stats.expired_active));
         push(&mut text, &format!("expired_lazy:{}", stats.expired_lazy));

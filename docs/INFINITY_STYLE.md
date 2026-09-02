@@ -138,9 +138,15 @@ force multiplier for DST and fuzzing.
   judged as one. Every release `assert!`/`expect()`/`panic!`/`unreachable!`
   in cell code is a row of `docs/release-assert-inventory.tsv` (ADR-0107
   D2): `I` an invariant on the callee's own state, `C` a claim about a
-  caller **with the enforcing check named**, `F` a fail-stop the policy
-  sanctions — an operating condition is never a row, it is a typed error.
-  `check-release-asserts.sh` is red on a new, changed or vanished site.
+  caller **with the enforcing check named as a symbol the gate resolves**
+  (`path/from/root.rs:Type::method` — a renamed enforcing function is
+  red; ADR-0107 first amendment), `F` a fail-stop the policy sanctions —
+  an operating condition is never a row, it is a typed error: a flag, a
+  client-sized number, a lifetime counter (sends, DDLs, connections) is
+  bounded or wrapped where it enters, never asserted where it lands.
+  `check-release-asserts.sh` is red on a new, changed or vanished site
+  and on a pointer that does not resolve; every cell crate is audited
+  (`U` is the class a new crate is born into until its audit story).
 - **A precondition on data that crossed a trust boundary is not a
   precondition — it is a check you owe.** If a value can reach a function
   from a client, a peer, or a file, do not document "callers must not pass

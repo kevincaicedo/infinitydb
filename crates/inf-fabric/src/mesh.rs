@@ -284,7 +284,13 @@ impl CellFabric {
     #[inline]
     pub fn next_token(&mut self) -> FabricToken {
         let token = FabricToken::new(self.cell, self.next_seq);
-        self.next_seq += 1;
+        // Wrap at the token's 48-bit sequence width (`FabricToken::MAX_SEQ`):
+        // uniqueness is required among in-flight ops only (≤ the ring
+        // capacities), so a wrapped sequence never collides with a live
+        // one. Before batch 12 this counter ran unbounded into
+        // `FabricToken::new`'s assert — a cell-lifetime send count as a
+        // release panic.
+        self.next_seq = (self.next_seq + 1) & FabricToken::MAX_SEQ;
         token
     }
 
@@ -524,5 +530,28 @@ impl core::fmt::Debug for CellFabric {
             self.staged_frames(),
             self.stats
         )
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod token_tests {
+    use super::*;
+
+    /// Batch 12 of the 2026-08-30 review: the per-cell sequence wraps at
+    /// 48 bits instead of running into `FabricToken::new`'s assert after
+    /// 2^48 sends (under a year at 10 M/s).
+    #[test]
+    fn next_token_wraps_at_the_48_bit_width() {
+        let mut cells = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 8 });
+        let a = &mut cells[0];
+        a.next_seq = FabricToken::MAX_SEQ - 1;
+        let t1 = a.next_token();
+        let t2 = a.next_token();
+        let t3 = a.next_token();
+        assert_eq!(t1.seq(), FabricToken::MAX_SEQ - 1);
+        assert_eq!(t2.seq(), FabricToken::MAX_SEQ);
+        assert_eq!(t3.seq(), 0, "wrapped, not panicked");
+        assert_eq!(t3.origin_cell(), CellId(0));
+        assert_ne!(t2, t3);
     }
 }
