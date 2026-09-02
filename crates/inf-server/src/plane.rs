@@ -1635,6 +1635,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                                     recycled_residue_slacks: stats.recycled_residue_slacks,
                                 },
                                 stats.phases,
+                                stats.records_skipped_unknown_ns,
                             );
                         }
                     }
@@ -6482,6 +6483,10 @@ async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
         );
     };
     let create = argv[1].eq_ignore_ascii_case(b"CREATE");
+    // ADR-0103: a CREATE persisted before the fan; its pending entry
+    // retires once the fan is done (either way), and it needs no
+    // trailing persist.
+    let mut created: Option<u32> = None;
     let fan: Vec<Vec<u8>> = if create {
         let draft = match crate::admin::parse_ns_create(argv) {
             Ok(draft) => draft,
@@ -6496,11 +6501,75 @@ async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
         }
         let ns_id = control.alloc_ns_id();
         let spec = draft.with_id(ns_id);
-        if let Err(e) = shared.store.borrow_mut().ns_create(spec.clone()) {
+        // ADR-0103 D1 (review of 2026-08-30, C14): persist before
+        // serving. Validate without applying (D3), swap `META` with the
+        // spec in it, read the writer's verdict, and only then make the
+        // namespace exist anywhere — a namespace any cell can name is
+        // one the catalog already names. The pre-ADR order (apply → fan
+        // → persist) served the namespace on every cell for the whole
+        // swap window and lost `always`-acked writes to a cut inside it.
+        if let Err(e) = shared.store.borrow().ns_create_check(&spec) {
             let mut reply = shared.take_reply_buf();
             crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
             return reply;
         }
+        if control.pending_creates() >= crate::control::PENDING_CREATE_MAX {
+            return error_reply(
+                shared,
+                proto,
+                "BUSY too many namespace creations in flight — retry (ADR-0103 D2)",
+            );
+        }
+        let (epoch, verdict) = control.request_persist_create(
+            shared.store.borrow().export_catalog(
+                control.next_ns_id(),
+                control.next_index_id(),
+                control.next_index_generation(),
+            ),
+            spec.clone(),
+        );
+        while !control.persisted(epoch) {
+            shared.ddl_waiters.wait(0).await;
+        }
+        match verdict.get() {
+            Some(crate::control::CreateOutcome::Accepted) => {}
+            Some(crate::control::CreateOutcome::NameExists) => {
+                let mut reply = shared.take_reply_buf();
+                crate::admin::ns_error(
+                    inf_store::NsError::Exists,
+                    &mut RespWriter::new(&mut reply, proto),
+                );
+                return reply;
+            }
+            Some(crate::control::CreateOutcome::AtCapacity) => {
+                return error_reply(
+                    shared,
+                    proto,
+                    "BUSY too many namespace creations in flight — retry (ADR-0103 D2)",
+                );
+            }
+            None => {
+                debug_assert!(false, "the writer sets the verdict before the epoch");
+                control.create_applied(ns_id);
+                return error_reply(shared, proto, "ERR internal: catalog verdict missing");
+            }
+        }
+        // Crash-matrix point (ADR-0103 D5): the on-disk state of a cut
+        // after the swap — META names a namespace no cell serves.
+        if inf_foundation::fault::fire(crate::fault::NS_CREATE_AFTER_META) {
+            control.create_applied(ns_id);
+            return error_reply(shared, proto, "ERR fault: ns_create_after_meta");
+        }
+        if let Err(e) = shared.store.borrow_mut().ns_create(spec.clone()) {
+            // The OS refused the ring reservation (the one check D3
+            // cannot run ahead): the pending entry retires and a later
+            // persist drops the definition (recorded residual).
+            control.create_applied(ns_id);
+            let mut reply = shared.take_reply_buf();
+            crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
+            return reply;
+        }
+        created = Some(ns_id);
         let fsync = spec.fsync.map_or("-", |f| match f {
             FsyncClass::Everysec => "everysec",
             FsyncClass::Always => "always",
@@ -6564,6 +6633,14 @@ async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             failure = Some(bytes);
         }
     }
+    if let Some(id) = created {
+        // Every leg answered: each cell's export carries the namespace
+        // from here on (ADR-0103 D2). A failed leg still retires the
+        // entry — the client gets the error, the next persist drops the
+        // definition (recorded partial-fan residual).
+        control.create_applied(id);
+        return failure.unwrap_or_else(|| simple_reply(shared, proto, "OK"));
+    }
     if let Some(error) = failure {
         return error;
     }
@@ -6626,7 +6703,8 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
             control.next_index_id(),
             control.next_index_generation(),
         ),
-        drop,
+        spec.id.0,
+        drop.is_some(),
     );
     if spec.tier.is_some() {
         shared.ns_drop_releases.borrow_mut().push((spec.id, epoch));

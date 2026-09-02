@@ -461,6 +461,7 @@ fn main() {
             let mut flushed_pre_cut = 0u64;
             let mut cold_resolves = 0u64;
             let mut blob_sets = 0u64;
+            let mut race_replans = 0u64;
             let mut diskfull_refusals = 0u64;
             let mut drop_values = 0u64;
             let mut drop_other = 0u64;
@@ -524,6 +525,7 @@ fn main() {
                 flushed_pre_cut += report.flushed_pre_cut_bytes;
                 cold_resolves += report.cold_resolves;
                 blob_sets += report.blob_sets;
+                race_replans += report.race_replans;
                 diskfull_refusals += report.diskfull_refusals;
                 drop_values += report.drop_replies_value;
                 drop_other += report.drop_replies_other;
@@ -553,7 +555,8 @@ fn main() {
                 "inf-sim: m4-tiered sweep shard {shard_i}/{shard_k}: {ran} seeds, {violations} \
                  violations, {refused} legal taxonomy refusals, {commands} commands, {audited} \
                  keys audited, {flushed_pre_cut} B flushed pre-cut, {cold_resolves} cold \
-                 resolves, {blob_sets} blob sets, {diskfull_refusals} DISKFULL refusals, \
+                 resolves, {blob_sets} blob sets, {race_replans} blob-key race replans, \
+                 {diskfull_refusals} DISKFULL refusals, \
                  drop-race {drop_values} values / {drop_other} typed-other; post-drop reboots \
                  {drop_reboots} ({drop_reboot_residue} with MANIFEST residue), cut inside DROP: \
                  {drop_cut_whole} whole / {drop_cut_swept} swept (ADR-0100); shadow arm on \
@@ -614,7 +617,8 @@ fn main() {
              steps: {:?}, refused-boot {}, shadow arm {} ({} tickets, {} open at the cut, \
              {} same-key / {} collision, {} stale, {} fallbacks; phase 6b cold resolves {}; \
              phase 6c {} pairs: {} tickets, {} collision verdicts, {} ticketed fallbacks, {} \
-             DBSIZE drains, {} SCAN twins), trace {} bytes, hash {:#018x}",
+             DBSIZE drains, {} SCAN twins), blob-key race {} replans, trace {} bytes, hash \
+             {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -647,6 +651,7 @@ fn main() {
             report.collide_ticketed_fallbacks,
             report.collide_dbsize_drains,
             report.collide_scan_twins,
+            report.race_replans,
             report.trace.len(),
             report.trace_hash
         );
@@ -675,6 +680,95 @@ fn main() {
         return;
     }
 
+    // ADR-0103 (review of 2026-08-30, C14): the namespace-creation window
+    // — a held catalog swap, probes attempting `USE`/`SET` inside it, a
+    // cut, and the audit that an acked write never vanishes and no tail
+    // record is skipped for a namespace nothing explains. Sweep mode
+    // mirrors m4-cold's shape.
+    if scenario_name == "m2-ns-create-window" {
+        let run_one = |seed: u64| inf_sim::run_ns_create_window_scenario(seed);
+        if let Some(sweep) = sweep {
+            let (shard_i, shard_k) = shard;
+            assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+            let mut violations = 0u64;
+            let mut ran = 0u64;
+            let (mut attempts, mut refused, mut acked, mut skips, mut held) =
+                (0u64, 0u64, 0u64, 0u64, 0u64);
+            let mut lines = Vec::new();
+            for i in (shard_i..sweep).step_by(shard_k as usize) {
+                let seed = seed.wrapping_add(i);
+                let report = run_one(seed);
+                ran += 1;
+                attempts += report.use_attempts;
+                refused += report.use_refused;
+                acked += report.acked_in_window;
+                skips += report.skipped_unknown_ns;
+                held += report.held_steps;
+                if report.ok() {
+                    lines.push(format!("{seed:#x} ok"));
+                } else {
+                    violations += 1;
+                    let first = report.violations.first().map_or("stall", |v| v.as_str());
+                    lines.push(format!("{seed:#x} VIOLATION {first}"));
+                    eprintln!("inf-sim: seed {seed:#x}: {first}");
+                }
+            }
+            println!(
+                "inf-sim: m2-ns-create-window sweep shard {shard_i}/{shard_k}: {ran} seeds, \
+                 {violations} violations, {attempts} USE attempts in the window ({refused} \
+                 refused, {acked} writes acked), {skips} untombstoned unknown-ns skips, {held} \
+                 held steps"
+            );
+            if let Some(dir) = out_dir.as_deref() {
+                std::fs::create_dir_all(dir).expect("out dir");
+                std::fs::write(
+                    format!("{dir}/results-shard-{shard_i}.txt"),
+                    lines.join("\n") + "\n",
+                )
+                .expect("results");
+            }
+            std::process::exit(if violations > 0 { 1 } else { 0 });
+        }
+        let report = run_one(seed);
+        println!(
+            "inf-sim: scenario m2-ns-create-window seed {seed:#x}: {} commands, {} steps, swap \
+             held {} steps, {} USE attempts ({} refused, {} writes acked in the window), {} \
+             untombstoned unknown-ns skips, {} released keys found, trace {} bytes, hash {:#018x}",
+            report.commands_done,
+            report.scheduler_steps,
+            report.held_steps,
+            report.use_attempts,
+            report.use_refused,
+            report.acked_in_window,
+            report.skipped_unknown_ns,
+            report.released_keys_found,
+            report.trace.len(),
+            report.trace_hash
+        );
+        println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+        if verify {
+            let second = run_one(seed);
+            if second.trace != report.trace {
+                eprintln!(
+                    "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs \
+                     {:#x})",
+                    report.trace.len(),
+                    second.trace.len(),
+                    report.trace_hash,
+                    second.trace_hash
+                );
+                std::process::exit(1);
+            }
+            println!("inf-sim: determinism verified — second run trace byte-identical");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
     if scenario_name == "m4-cold" {
         let mut scenario = inf_sim::ColdStormScenario::m4_cold(seed);
         if let Some(ops) = ops_override {

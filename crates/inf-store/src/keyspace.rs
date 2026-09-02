@@ -206,6 +206,11 @@ pub struct Keyspace {
     /// `ns-N/` directory naming an unknown id is the residue of an acked
     /// `DROP`. The live set is the catalog writer's; this is a snapshot.
     dropped_ns: Vec<NsId>,
+    /// Tiered entries whose `BLOB-THRESHOLD` the last `seed_catalog`
+    /// clamped to their ring's inline bound (ADR-0102 D4 — a catalog
+    /// written before the rule); reported on the boot line, never
+    /// silent.
+    seed_normalized_thresholds: u32,
 }
 
 impl Keyspace {
@@ -219,6 +224,7 @@ impl Keyspace {
             named_stores: Vec::new(),
             tiered_stores: Vec::new(),
             dropped_ns: Vec::new(),
+            seed_normalized_thresholds: 0,
             pressure: PressureConfig::default(),
             budget_shares: 1,
             over_limit: false,
@@ -325,6 +331,28 @@ impl Keyspace {
         self.tiered_stores.len()
     }
 
+    /// The aggregate reserved-VA admission bound (ADR-0062 D4) for one
+    /// more `requested_bytes` ring: checked arithmetic, refused before
+    /// any Region exists — the reservation is the VA truth this bound
+    /// counts, so the check and the mmap can never disagree. Pure, so
+    /// the DDL program can run it before the catalog persist (ADR-0103
+    /// D3).
+    ///
+    /// # Errors
+    /// `VaLimitExceeded` with the three quantities named.
+    pub fn tiered_admit_check(&self, requested_bytes: u64) -> Result<(), TieredCreateError> {
+        let admitted_bytes = self.tiering_usage().reserved_bytes;
+        let limit_bytes = self.tiered_va_limit_bytes;
+        if admitted_bytes.checked_add(requested_bytes).is_none_or(|total| total > limit_bytes) {
+            return Err(TieredCreateError::VaLimitExceeded {
+                requested_bytes,
+                admitted_bytes,
+                limit_bytes,
+            });
+        }
+        Ok(())
+    }
+
     /// Materializes the tiered record table for namespace `ns` (M4-S04 —
     /// the first `tiered_stores` entry; M4-S07 adds the demotion
     /// configuration; M4-S19 adds the aggregate reserved-VA admission
@@ -345,19 +373,7 @@ impl Keyspace {
         if self.tiered_stores.iter().any(|(nid, _)| *nid == ns) {
             return Err(TieredCreateError::Exists);
         }
-        let requested_bytes = config.reserve_bytes as u64;
-        let admitted_bytes = self.tiering_usage().reserved_bytes;
-        let limit_bytes = self.tiered_va_limit_bytes;
-        // Checked arithmetic, refused before the Region exists: the
-        // reservation is the VA truth this bound counts, so the check
-        // and the mmap can never disagree.
-        if admitted_bytes.checked_add(requested_bytes).is_none_or(|total| total > limit_bytes) {
-            return Err(TieredCreateError::VaLimitExceeded {
-                requested_bytes,
-                admitted_bytes,
-                limit_bytes,
-            });
-        }
+        self.tiered_admit_check(config.reserve_bytes as u64)?;
         let mut table = TieredTable::new(config, demote, initial_keys, self.cfg.hasher)
             .ok_or(TieredCreateError::Unrepresentable)?;
         table.set_promote_enabled(self.tier_promote);
@@ -621,6 +637,7 @@ impl Keyspace {
             total.flush_slices += counters.flush_slices;
             total.flush_confirmed_bytes += counters.flush_confirmed_bytes;
             total.compact_slices += counters.compact_slices;
+            total.write_replans += counters.write_replans;
         }
         total
     }
@@ -1049,6 +1066,51 @@ impl Keyspace {
 
     // ---- named namespaces (M1-S08 registry; M2-S08 stores + catalog) ----
 
+    /// Tiered entries whose threshold the last [`seed_catalog`]
+    /// (Self::seed_catalog) normalized (ADR-0102 D4).
+    #[must_use]
+    pub fn seed_normalized_thresholds(&self) -> u32 {
+        self.seed_normalized_thresholds
+    }
+
+    /// Everything [`ns_create`](Self::ns_create) would refuse, without
+    /// applying anything (ADR-0103 D3): the registry rules, the tier
+    /// gauntlet, and the reserved-VA admission arithmetic. The one
+    /// apply-time failure it cannot foresee is the OS refusing the ring
+    /// reservation itself.
+    ///
+    /// # Errors
+    /// The refusal `ns_create` would answer.
+    pub fn ns_create_check(&self, spec: &NsSpec) -> Result<(), NsError> {
+        self.named.check(spec)?;
+        if let Some(tier) = &spec.tier {
+            let reserve = tier.ring_bytes().ok_or(NsError::InvalidTierConfig(
+                "MEM-BUDGET + MAINTAIN-SLICE has no representable ring reservation",
+            ))?;
+            if self.tiered_store(spec.id).is_some() {
+                return Err(NsError::Exists);
+            }
+            if let Err(e) = self.tiered_admit_check(reserve) {
+                return Err(match e {
+                    TieredCreateError::Exists => NsError::Exists,
+                    TieredCreateError::Unrepresentable => NsError::InvalidTierConfig(
+                        "MEM-BUDGET + MAINTAIN-SLICE has no representable ring reservation",
+                    ),
+                    TieredCreateError::VaLimitExceeded {
+                        requested_bytes,
+                        admitted_bytes,
+                        limit_bytes,
+                    } => NsError::TierVaLimitExceeded {
+                        requested_bytes,
+                        admitted_bytes,
+                        limit_bytes,
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Registers `spec` and, for a tiered spec (M4-S19), materializes the
     /// cell's `TieredTable` under the D4 admission bound. Registration
     /// and materialization succeed or fail together — an admission
@@ -1269,13 +1331,31 @@ impl Keyspace {
         self.tiered_stores.clear();
         self.indexes = IndexRegistry::default();
         self.dropped_ns = cat.dropped.iter().map(|&id| NsId(id)).collect();
+        self.seed_normalized_thresholds = 0;
         // Boot restarts every build (ADR-0077 D2): jobs re-derive from
         // the seeded registry at the first MAINTAIN tick.
         self.backfill.clear();
         for spec in &cat.entries {
+            // ADR-0102 D4: a catalog written before the ring's inline
+            // bound was a gauntlet rule may carry a small budget with
+            // the old 16 MiB default threshold. Clamp it to the bound
+            // (the value the store would enforce anyway), count it, and
+            // let the next persist re-export the normalized spec — a
+            // refused boot would strand the directory over a default
+            // the operator never chose.
+            let mut spec = spec.clone();
+            if let Some(tier) = spec.tier.as_mut()
+                && let Some(ring) = tier.ring_bytes()
+            {
+                let cap = crate::ns::TierSpec::blob_threshold_max(ring);
+                if tier.blob_threshold_bytes > cap {
+                    tier.blob_threshold_bytes = cap;
+                    self.seed_normalized_thresholds += 1;
+                }
+            }
             // `ns_create` materializes tiered entries under the D4 bound
             // — seeding and DDL share one path, so they cannot drift.
-            self.ns_create(spec.clone())?;
+            self.ns_create(spec)?;
         }
         for spec in &cat.index.entries {
             if spec.state == IndexState::Dropping {
@@ -1735,7 +1815,7 @@ impl Keyspace {
         match *rec {
             LogRecordView::StringPostImage { ns, key, value } => {
                 let Some(store) = self.replay_store(ns) else {
-                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                    return Ok(ReplayOutcome::SkippedUnknownNs(ns));
                 };
                 // Replay maintenance (ADR-0072 D4): a string image over a
                 // document key is an overwrite death — the same bracket,
@@ -1752,7 +1832,7 @@ impl Keyspace {
             }
             LogRecordView::Delete { ns, key } => {
                 let Some(store) = self.replay_store(ns) else {
-                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                    return Ok(ReplayOutcome::SkippedUnknownNs(ns));
                 };
                 #[cfg(feature = "doc")]
                 let maint = store.idx_replay_begin(key);
@@ -1765,7 +1845,7 @@ impl Keyspace {
             }
             LogRecordView::ExpireAt { ns, at_unix_ms, key } => {
                 let Some(store) = self.replay_store(ns) else {
-                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                    return Ok(ReplayOutcome::SkippedUnknownNs(ns));
                 };
                 let at = anchor.internal_from_unix(at_unix_ms).unwrap_or(Nanos(u64::MAX));
                 store.replay_expire_at(key, at, now);
@@ -1790,7 +1870,7 @@ impl Keyspace {
             LogRecordView::CkptBegin { .. } => Ok(ReplayOutcome::SkippedMarker),
             LogRecordView::DocFull { ns, key, lineage, version, idoc } => {
                 let Some(store) = self.replay_store(ns) else {
-                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                    return Ok(ReplayOutcome::SkippedUnknownNs(ns));
                 };
                 #[cfg(feature = "doc")]
                 {
@@ -1820,7 +1900,7 @@ impl Keyspace {
                 operand,
             } => {
                 let Some(store) = self.replay_store(ns) else {
-                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                    return Ok(ReplayOutcome::SkippedUnknownNs(ns));
                 };
                 #[cfg(feature = "doc")]
                 {
@@ -1908,7 +1988,7 @@ impl Keyspace {
                 if !self.is_tiered(ns) {
                     // Dropped namespace or a foreign log: the paired
                     // mutation skips the same way — no register entry.
-                    return Ok(Some(ReplayOutcome::SkippedUnknownNs));
+                    return Ok(Some(ReplayOutcome::SkippedUnknownNs(ns)));
                 }
                 if self.pending_displace.len() >= DISPLACE_REGISTER_CAP {
                     return Err(ReplayError::Displacement(
@@ -2200,9 +2280,13 @@ fn fold_store(acc: &mut StateDigest, store: &CellStore, tag: u64, now: Nanos) {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ReplayOutcome {
     Applied,
-    /// The record names an id the catalog doesn't know (dropped namespace,
-    /// or a reserved default id) — skipped and counted by the caller.
-    SkippedUnknownNs,
+    /// The record names an id the catalog doesn't know — a dropped
+    /// namespace (its tombstone explains it — ADR-0100 D6) or, after
+    /// ADR-0103, a foreign log: a namespace is never servable before its
+    /// definition is durable, so the created-but-unpersisted case is
+    /// unreachable. Skipped and counted by the caller, which tells the
+    /// two apart by the id.
+    SkippedUnknownNs(NsId),
     /// A record type M2 never emits (`NsOp`) — reserved, skipped.
     SkippedReserved,
     /// A checkpoint-begin marker (M2-S10): expected in every log with
@@ -2710,12 +2794,12 @@ mod tests {
         let foreign = LogRecordView::StringPostImage { ns: NsId(99), key: b"x", value: b"y" };
         assert_eq!(
             ks.apply_record(&foreign, now, anchor).expect("apply"),
-            ReplayOutcome::SkippedUnknownNs
+            ReplayOutcome::SkippedUnknownNs(NsId(99))
         );
         let reserved = LogRecordView::StringPostImage { ns: NsId(3), key: b"x", value: b"y" };
         assert_eq!(
             ks.apply_record(&reserved, now, anchor).expect("apply"),
-            ReplayOutcome::SkippedUnknownNs
+            ReplayOutcome::SkippedUnknownNs(NsId(3))
         );
         let nsop = LogRecordView::NsOp { ns: NsId(16), payload: b"reserved" };
         assert_eq!(

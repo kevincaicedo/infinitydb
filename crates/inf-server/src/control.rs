@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use inf_log::fs::StdSegmentFs;
 use inf_log::meta::{read_meta, write_meta};
-use inf_store::{FIRST_INDEX_GENERATION, FIRST_INDEX_ID, FIRST_NAMED_NS_ID, NsCatalog};
+use inf_store::{FIRST_INDEX_GENERATION, FIRST_INDEX_ID, FIRST_NAMED_NS_ID, NsCatalog, NsSpec};
 
 /// Recycled-life residue recovery proved at boot (M4.5-S39b, ADR-0090
 /// D2/D4 as amended): how many segments ended their data at a foreign-
@@ -64,6 +64,9 @@ pub struct CellRecoverySlot {
     /// `recover_recycled_residue_slacks`) carry them.
     segment_residue_stops: AtomicU64,
     recycled_residue_slacks: AtomicU64,
+    /// ADR-0103 D4: tail records skipped for an id no drop tombstone
+    /// explains — the C14 verifier (zero on every honest boot).
+    skipped_unknown_ns: AtomicU64,
     /// M4.5-S39d: the boot's per-phase loop-clock time (ns, pipeline
     /// order: start, checkpoint, replay, audit, finish) and the bytes the
     /// checkpoint, replay and audit phases read — the boot line's
@@ -94,9 +97,11 @@ impl CellRecoverySlot {
         torn_truncated_at: Option<inf_log::Lsn>,
         residue: RecoveredResidue,
         phases: crate::recover::RecoverPhases,
+        skipped_unknown_ns: u64,
     ) {
         debug_assert_eq!(self.state.load(Ordering::Relaxed), 0, "mark_ready called twice");
         self.records.store(records, Ordering::Relaxed);
+        self.skipped_unknown_ns.store(skipped_unknown_ns, Ordering::Relaxed);
         self.torn_at.store(torn_truncated_at.map_or(0, |lsn| lsn.to_u64() + 1), Ordering::Relaxed);
         self.segment_residue_stops.store(residue.segment_residue_stops, Ordering::Relaxed);
         self.recycled_residue_slacks.store(residue.recycled_residue_slacks, Ordering::Relaxed);
@@ -120,6 +125,12 @@ impl CellRecoverySlot {
             std::array::from_fn(|i| self.phase_ns[i].load(Ordering::Relaxed)),
             std::array::from_fn(|i| self.phase_bytes[i].load(Ordering::Relaxed)),
         )
+    }
+
+    /// Tail records this boot skipped for a namespace id no tombstone
+    /// explains (ADR-0103 D4), valid once ready.
+    pub fn records_skipped_unknown_ns(&self) -> u64 {
+        self.skipped_unknown_ns.load(Ordering::Relaxed)
     }
 
     /// The recycled-residue facts of this cell's boot (ADR-0090 D4).
@@ -525,6 +536,113 @@ struct PersistReq {
     /// The durable namespace this persist drops (ADR-0100 D2): its
     /// tombstone joins the writer's set before the payload encodes.
     drop: Option<u32>,
+    /// Any namespace this persist drops (ADR-0103 D2): retired from the
+    /// pending-create set whatever its mode.
+    dropped: Option<u32>,
+    /// The `CREATE` this persist carries (ADR-0103 D1/D2): merged into
+    /// the payload and the pending set, its verdict written before the
+    /// epoch publishes.
+    create: Option<(NsSpec, CreateVerdict)>,
+}
+
+/// The catalog writer's answer to one `CREATE` (ADR-0103 D2), read by
+/// the origin after `persisted(epoch)`: one atomic the origin owns, set
+/// by the writer before it publishes the epoch (Release/Acquire pairs
+/// through `persisted_epoch`).
+#[derive(Clone, Debug)]
+pub struct CreateVerdict(Arc<AtomicU8>);
+
+/// What the writer decided about a `CREATE`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CreateOutcome {
+    /// The name was free across existing and pending entries: the
+    /// definition is durable, the origin may apply and fan.
+    Accepted,
+    /// An existing or earlier-pending entry holds the name.
+    NameExists,
+    /// The pending set is at [`PENDING_CREATE_MAX`].
+    AtCapacity,
+}
+
+impl CreateVerdict {
+    fn new() -> CreateVerdict {
+        CreateVerdict(Arc::new(AtomicU8::new(0)))
+    }
+
+    fn set(&self, outcome: CreateOutcome) {
+        let code = match outcome {
+            CreateOutcome::Accepted => 1,
+            CreateOutcome::NameExists => 2,
+            CreateOutcome::AtCapacity => 3,
+        };
+        self.0.store(code, Ordering::Release);
+    }
+
+    /// The writer's decision; `None` until the persist that carried the
+    /// request ran (callers read after `persisted(epoch)`).
+    #[must_use]
+    pub fn get(&self) -> Option<CreateOutcome> {
+        match self.0.load(Ordering::Acquire) {
+            1 => Some(CreateOutcome::Accepted),
+            2 => Some(CreateOutcome::NameExists),
+            3 => Some(CreateOutcome::AtCapacity),
+            _ => None,
+        }
+    }
+}
+
+/// Bound on creates in flight between their catalog swap and their
+/// fan's completion (ADR-0103 D2). At the cap the origin answers a
+/// typed `BUSY` before requesting; the writer refuses too, so a race of
+/// origins past the gauge cannot overshoot.
+pub const PENDING_CREATE_MAX: usize = 256;
+
+/// The catalog writer's pending-create set (ADR-0103 D2): every
+/// namespace whose definition is durable but whose fan may not have
+/// reached every cell. Merged into each payload so a concurrent
+/// origin's stale export cannot drop an accepted definition; retired
+/// once the origin's fan completed (every export carries it from then
+/// on) or a `DROP` names the id. Single owner — the thread or the sim's
+/// inline inbox. Empty at boot: `META` already holds every accepted
+/// create.
+#[derive(Debug, Default)]
+struct PendingCreates {
+    /// Sorted by id.
+    entries: Vec<NsSpec>,
+}
+
+impl PendingCreates {
+    fn retire(&mut self, id: u32) {
+        self.entries.retain(|e| e.id.0 != id);
+    }
+
+    /// Adds every pending spec the payload lacks (by id).
+    fn merge(&self, catalog: &mut NsCatalog) {
+        for spec in &self.entries {
+            if !catalog.entries.iter().any(|e| e.id == spec.id) {
+                catalog.entries.push(spec.clone());
+            }
+        }
+    }
+
+    /// Decides one create against the merged payload and, when
+    /// accepted, adds it to both.
+    fn admit(&mut self, catalog: &mut NsCatalog, spec: NsSpec) -> CreateOutcome {
+        if catalog.entries.iter().any(|e| e.name == spec.name) {
+            return CreateOutcome::NameExists;
+        }
+        if self.entries.len() >= PENDING_CREATE_MAX {
+            return CreateOutcome::AtCapacity;
+        }
+        let at = self.entries.partition_point(|e| e.id < spec.id);
+        self.entries.insert(at, spec.clone());
+        catalog.entries.push(spec);
+        CreateOutcome::Accepted
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 /// The catalog writer's live tombstone set (ADR-0100 D2/D3): one entry
@@ -605,6 +723,12 @@ enum ControlMsg {
         id: u32,
         ckpt_epoch: u64,
     },
+    /// The origin's `CREATE` fan completed (or failed) — every cell's
+    /// export carries the namespace from now on, so its pending entry
+    /// retires (ADR-0103 D2).
+    CreateApplied {
+        id: u32,
+    },
     /// Blocking unlink delegated by a cell (M2-S11/S12, ADR-0017):
     /// freeing a truncated segment's or stale checkpoint's pages is
     /// O(file size) in the kernel — a measured multi-ms stall when done
@@ -641,12 +765,26 @@ pub struct ControlHandle {
     /// Live drop tombstones (ADR-0100 D7 gauge + the D3 cap input);
     /// written by the catalog writer after every change.
     drop_tombstones: AtomicUsize,
+    /// Creates in flight in the writer's pending set (ADR-0103 D2 —
+    /// the cap input); written by the writer after every change.
+    pending_creates: AtomicUsize,
 }
 
 impl ControlHandle {
     /// Live drop tombstones in the catalog writer (ADR-0100 D3/D7).
     pub fn drop_tombstones(&self) -> usize {
         self.drop_tombstones.load(Ordering::Relaxed)
+    }
+
+    /// Creates in flight in the writer's pending set (ADR-0103 D2).
+    pub fn pending_creates(&self) -> usize {
+        self.pending_creates.load(Ordering::Relaxed)
+    }
+
+    /// The origin's post-fan notice for a `CREATE` (ADR-0103 D2): the
+    /// pending entry retires — every cell's export carries it now.
+    pub fn create_applied(&self, id: u32) {
+        self.tx.send(ControlMsg::CreateApplied { id }).expect("control thread alive (fail-stop)");
     }
 
     /// The origin's post-fan notice (ADR-0100 D3): `id`'s tombstone
@@ -697,16 +835,37 @@ impl ControlHandle {
     /// blocks the *sender* briefly (DDL-rate traffic, never the data path
     /// of other connections — the pump yields between commands).
     pub fn request_persist(&self, catalog: NsCatalog) -> u64 {
-        self.request_persist_drop(catalog, None)
+        self.send_persist(catalog, None, None, None)
     }
 
-    /// [`request_persist`](Self::request_persist) for a `DROP`: the
-    /// dropped durable namespace's tombstone joins the payload
-    /// (ADR-0100 D2). `None` is a plain persist.
-    pub fn request_persist_drop(&self, catalog: NsCatalog, drop: Option<u32>) -> u64 {
+    /// [`request_persist`](Self::request_persist) for a `DROP` of
+    /// namespace `id`: a durable namespace's tombstone joins the payload
+    /// (ADR-0100 D2, `tombstone`); any mode retires from the
+    /// pending-create set (ADR-0103 D2).
+    pub fn request_persist_drop(&self, catalog: NsCatalog, id: u32, tombstone: bool) -> u64 {
+        self.send_persist(catalog, tombstone.then_some(id), Some(id), None)
+    }
+
+    /// [`request_persist`](Self::request_persist) for a `CREATE`
+    /// (ADR-0103 D1/D2): `spec` joins the payload and the writer's
+    /// pending set; the returned verdict is readable once
+    /// [`persisted`](Self::persisted) holds for the epoch.
+    pub fn request_persist_create(&self, catalog: NsCatalog, spec: NsSpec) -> (u64, CreateVerdict) {
+        let verdict = CreateVerdict::new();
+        let epoch = self.send_persist(catalog, None, None, Some((spec, verdict.clone())));
+        (epoch, verdict)
+    }
+
+    fn send_persist(
+        &self,
+        catalog: NsCatalog,
+        drop: Option<u32>,
+        dropped: Option<u32>,
+        create: Option<(NsSpec, CreateVerdict)>,
+    ) -> u64 {
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         self.tx
-            .send(ControlMsg::Persist(PersistReq { catalog, epoch, drop }))
+            .send(ControlMsg::Persist(PersistReq { catalog, epoch, drop, dropped, create }))
             .expect("control thread alive (fail-stop)");
         epoch
     }
@@ -801,6 +960,7 @@ pub fn load_catalog_from<F: inf_log::fs::SegmentFs>(
 fn prepare_persist(
     handle: &ControlHandle,
     tombstones: &mut DropTombstones,
+    pending: &mut PendingCreates,
     req: PersistReq,
 ) -> (Vec<u8>, u64) {
     let mut catalog = req.catalog;
@@ -808,12 +968,24 @@ fn prepare_persist(
     catalog.index.next_id = catalog.index.next_id.max(handle.next_index_id());
     catalog.index.next_generation =
         catalog.index.next_generation.max(handle.next_index_generation());
+    if let Some(id) = req.dropped {
+        pending.retire(id);
+    }
     if let Some(id) = req.drop {
         tombstones.add(id);
     }
     tombstones.retire(handle.ckpt_board().min_published());
+    // ADR-0103 D2: pending creates join before the tombstones prune, so
+    // a since-dropped pending entry is dropped like any other; the
+    // verdict is decided against the merged view and written before
+    // the epoch publishes (the origin reads it after `persisted`).
+    pending.merge(&mut catalog);
+    if let Some((spec, verdict)) = req.create {
+        verdict.set(pending.admit(&mut catalog, spec));
+    }
     tombstones.reconcile(&mut catalog);
     handle.drop_tombstones.store(tombstones.len(), Ordering::Relaxed);
+    handle.pending_creates.store(pending.len(), Ordering::Relaxed);
     (catalog.encode(), req.epoch)
 }
 
@@ -829,6 +1001,8 @@ pub struct ControlInbox {
     handle: Arc<ControlHandle>,
     /// The writer's tombstone set (ADR-0100 D2) — inline, deterministic.
     tombstones: DropTombstones,
+    /// The writer's pending-create set (ADR-0103 D2) — inline too.
+    pending: PendingCreates,
 }
 
 impl std::fmt::Debug for ControlInbox {
@@ -852,12 +1026,17 @@ impl ControlInbox {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 ControlMsg::Persist(req) => {
-                    let (payload, epoch) = prepare_persist(&self.handle, &mut self.tombstones, req);
+                    let (payload, epoch) =
+                        prepare_persist(&self.handle, &mut self.tombstones, &mut self.pending, req);
                     write_meta(fs, data_dir, &payload)?;
                     self.handle.persisted_epoch.store(epoch, Ordering::Release);
                 }
                 ControlMsg::StampDrop { id, ckpt_epoch } => {
                     self.tombstones.stamp(id, ckpt_epoch);
+                }
+                ControlMsg::CreateApplied { id } => {
+                    self.pending.retire(id);
+                    self.handle.pending_creates.store(self.pending.len(), Ordering::Relaxed);
                 }
                 ControlMsg::Unlink(path) => {
                     let _ = fs.remove_file(&path);
@@ -887,7 +1066,12 @@ impl ControlHandle {
         start_unix_ms: u64,
     ) -> (Arc<ControlHandle>, ControlInbox) {
         let (handle, rx, tombstones) = ControlHandle::new_parts(seed, cells, start_unix_ms);
-        let inbox = ControlInbox { rx, handle: Arc::clone(&handle), tombstones };
+        let inbox = ControlInbox {
+            rx,
+            handle: Arc::clone(&handle),
+            tombstones,
+            pending: PendingCreates::default(),
+        };
         (handle, inbox)
     }
 
@@ -921,6 +1105,7 @@ impl ControlHandle {
             memory_board: Arc::new(MemoryBoard::new(cells)),
             index_board: Arc::new(IndexBoard::new(cells)),
             drop_tombstones: AtomicUsize::new(0),
+            pending_creates: AtomicUsize::new(0),
         });
         let mut tombstones = DropTombstones::seed(seed.map_or(&[][..], |c| &c.dropped));
         if tombstones.len() > 0 {
@@ -980,6 +1165,7 @@ fn control_main(
     cells: u16,
     mut tombstones: DropTombstones,
 ) {
+    let mut pending = PendingCreates::default();
     {
         let mut handle_msg = |msg: ControlMsg| match msg {
             ControlMsg::Persist(req) => {
@@ -987,8 +1173,10 @@ fn control_main(
                 // allocators so ids and generations never regress
                 // across restart, even for DDL that raced this
                 // snapshot (ADR-0015 D2; index counters ADR-0075 D1);
-                // the tombstone set merges in (ADR-0100 D2).
-                let (payload, epoch) = prepare_persist(allocator, &mut tombstones, req);
+                // the tombstone set merges in (ADR-0100 D2), the
+                // pending creates too (ADR-0103 D2).
+                let (payload, epoch) =
+                    prepare_persist(allocator, &mut tombstones, &mut pending, req);
                 if let Err(err) = write_meta(&StdSegmentFs, data_dir, &payload) {
                     // §8.4 fail-stop: a DDL was acked against this
                     // swap. `process::exit`, never `panic!` — this
@@ -1004,6 +1192,10 @@ fn control_main(
                 persisted.store(epoch, Ordering::Release);
             }
             ControlMsg::StampDrop { id, ckpt_epoch } => tombstones.stamp(id, ckpt_epoch),
+            ControlMsg::CreateApplied { id } => {
+                pending.retire(id);
+                allocator.pending_creates.store(pending.len(), Ordering::Relaxed);
+            }
             ControlMsg::Unlink(path) => {
                 // Never fatal: the file is outside every recovery
                 // unit; a survivor is re-collected at boot.
@@ -1049,9 +1241,16 @@ fn control_main(
                     };
                     let (ns, bytes) = slot.phases();
                     let ms = |i: usize| ns[i] as f64 / 1e6;
+                    let unknown = match slot.records_skipped_unknown_ns() {
+                        0 => String::new(),
+                        n => format!(
+                            ", {n} records of untombstoned unknown namespaces skipped \
+                             (foreign log or corruption — ADR-0103 D4)"
+                        ),
+                    };
                     eprintln!(
                         "control: cell {cell} recovered ({segs} segments, {total} bytes, {} \
-                         records{torn}{recycled}; phases ms: start {:.1}, ckpt {:.1} \
+                         records{torn}{recycled}{unknown}; phases ms: start {:.1}, ckpt {:.1} \
                          [{} B], replay {:.1} [{} B], audit {:.1} [{} B], finish {:.1}, \
                          total {:.1})",
                         slot.records(),
@@ -1168,5 +1367,79 @@ mod drop_tombstone_tests {
         assert_eq!(catalog.entries.len(), 1, "a tombstoned entry is replica lag, never live");
         assert_eq!(catalog.entries[0].id.0, 17);
         assert_eq!(NsCatalog::decode(&catalog.encode()).expect("v4 payload"), catalog);
+    }
+
+    /// ADR-0103 D2: a pending create joins every payload that lacks it,
+    /// a same-name create is refused against the merged view, the cap
+    /// refuses, retirement frees the name, and the verdict slot reads
+    /// exactly what the writer set.
+    #[test]
+    fn pending_creates_merge_admit_retire_and_verdict() {
+        use super::{CreateOutcome, CreateVerdict, PENDING_CREATE_MAX, PendingCreates};
+        let mut pending = PendingCreates::default();
+        let mut catalog = NsCatalog {
+            next_id: 17,
+            entries: vec![entry(16)],
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
+        // Accepted: joins the payload and the set.
+        assert_eq!(pending.admit(&mut catalog, entry(17)), CreateOutcome::Accepted);
+        assert_eq!(catalog.entries.len(), 2);
+        assert_eq!(pending.len(), 1);
+        // A concurrent origin's stale export (no 17) gets it merged in.
+        let mut stale = NsCatalog {
+            next_id: 18,
+            entries: vec![entry(16)],
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
+        pending.merge(&mut stale);
+        assert_eq!(stale.entries.iter().map(|e| e.id.0).collect::<Vec<_>>(), vec![16, 17]);
+        // The same name from another origin (fresh id) is refused
+        // against the merged view — existing and pending alike.
+        let mut dup = entry(18);
+        dup.name = b"ns17".to_vec();
+        assert_eq!(pending.admit(&mut stale, dup), CreateOutcome::NameExists);
+        let mut dup16 = entry(19);
+        dup16.name = b"ns16".to_vec();
+        assert_eq!(pending.admit(&mut stale, dup16), CreateOutcome::NameExists);
+        assert_eq!(pending.len(), 1, "a refused create never joins the set");
+        // Retirement frees the name.
+        pending.retire(17);
+        assert_eq!(pending.len(), 0);
+        let mut again = NsCatalog {
+            next_id: 20,
+            entries: vec![entry(16)],
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
+        let mut reuse = entry(20);
+        reuse.name = b"ns17".to_vec();
+        assert_eq!(pending.admit(&mut again, reuse), CreateOutcome::Accepted);
+        pending.retire(20);
+        // The cap.
+        for id in 100..(100 + PENDING_CREATE_MAX as u32) {
+            let mut c = NsCatalog {
+                next_id: id + 1,
+                entries: Vec::new(),
+                index: IndexCatalog::default(),
+                dropped: Vec::new(),
+            };
+            assert_eq!(pending.admit(&mut c, entry(id)), CreateOutcome::Accepted);
+        }
+        let mut full = NsCatalog {
+            next_id: 1_000,
+            entries: Vec::new(),
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
+        assert_eq!(pending.admit(&mut full, entry(999)), CreateOutcome::AtCapacity);
+        assert!(full.entries.is_empty(), "a refused create never joins the payload");
+        // The verdict slot.
+        let verdict = CreateVerdict::new();
+        assert_eq!(verdict.get(), None, "unset until the writer ran");
+        verdict.set(CreateOutcome::NameExists);
+        assert_eq!(verdict.get(), Some(CreateOutcome::NameExists));
     }
 }

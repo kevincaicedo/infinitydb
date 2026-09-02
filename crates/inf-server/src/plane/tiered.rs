@@ -103,12 +103,59 @@ enum WriteBlock {
     /// Tail allocation stalled on flush/release progress — park on the
     /// stall gate (deadline-bounded, ADR-0053 D4).
     Stall,
+    /// The resolved slot moved while the write was suspended on its
+    /// extent read (review of 2026-08-30, F-L06-03) — re-resolve; the
+    /// caller bounds the retries.
+    Replan,
     /// Terminal typed reply.
     Reply(Vec<u8>),
 }
 
 /// The displaced record a write kills: `(addr, encoded_len, version)`.
 type Displaced = Option<(LogicalAddr, usize, u32)>;
+
+/// Whether a resolved `Displaced` is still current when the write runs
+/// (F-L06-03). Every `resolve` arm but one returns under the borrow
+/// that verified the slot; the blob arm suspends on `fetch_extent`
+/// after its verification (one await per cold window, up to 65 k of
+/// them), so a concurrent write, delete, compaction relocation or
+/// promotion may have moved the slot underneath it — and the store
+/// answers a stale address with a panic, correctly (`Index::replace`).
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum WriteGuard {
+    /// No suspension separates the resolve from the write.
+    Current,
+    /// The resolve suspended after its verification: re-verify the
+    /// slot under the write's own borrow — the guard `delete_one`
+    /// already had.
+    Reverify,
+}
+
+/// Bound on consecutive replans of one write (a legal interleaving
+/// that keeps recurring is a livelock in the making — L6/§17 "put a
+/// limit on everything"); past it the client gets a typed retry.
+const WRITE_REPLAN_MAX: u8 = 32;
+const ERR_REPLAN_EXHAUSTED: &str =
+    "BUSY the key kept changing under this write's extent read — retry";
+
+/// What a refused write's stall probe is sized from (ADR-0102 D3,
+/// F-L06-05): the inline record's value, or the 24-byte extent
+/// reference — never a blob's bytes.
+enum StallProbe<'a> {
+    Inline(&'a [u8]),
+    Extent,
+}
+
+impl WriteGuard {
+    fn of(resolved: &Resolved) -> WriteGuard {
+        match resolved {
+            Resolved::Extent { .. } => WriteGuard::Reverify,
+            Resolved::Miss | Resolved::Ram(_) | Resolved::Cold { .. } | Resolved::Fail(_) => {
+                WriteGuard::Current
+            }
+        }
+    }
+}
 
 /// One tiered command, executed to a complete reply. `class` is the
 /// namespace's fsync class (tiered ⊆ durable — ADR-0062 D1).
@@ -545,6 +592,7 @@ fn try_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     hash: u64,
     value: &[u8],
     old: Displaced,
+    guard: WriteGuard,
     proto: Protocol,
 ) -> Result<u64, WriteBlock> {
     let mut ks = shared.store.borrow_mut();
@@ -562,6 +610,25 @@ fn try_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             "ERR the selected namespace was dropped (INF.NS USE again)",
         )));
     };
+    // F-L06-03 (review of 2026-08-30): the resolve that produced `old`
+    // suspended after its verification — re-verify under this borrow
+    // (no await separates this lookup from the apply below) and make
+    // the caller re-resolve on a mismatch. The RAM/cold arms pay
+    // nothing: they returned under the borrow that verified them.
+    if guard == WriteGuard::Reverify {
+        let current = table.lookup(key, hash, &[]);
+        let still = match old {
+            None => !matches!(current, TieredLookup::Ram(_)),
+            Some((addr, _, _)) => matches!(
+                current,
+                TieredLookup::Ram(now) | TieredLookup::Cold(now) if now == addr
+            ),
+        };
+        if !still {
+            table.note_write_replan();
+            return Err(WriteBlock::Replan);
+        }
+    }
     // Blob routing (ADR-0061 D1): the threshold is a plane decision; the
     // store refuses misrouted values typed.
     let blob = value.len() >= table.blob_config().threshold_bytes as usize;
@@ -598,7 +665,9 @@ fn try_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     };
     let new_addr = match applied {
         Ok(addr) => addr,
-        Err(err) => return Err(write_block_of(shared, table, key, value, err, proto)),
+        Err(err) => {
+            return Err(write_block_of(shared, table, key, StallProbe::Inline(value), err, proto));
+        }
     };
     // M4.5-S31 rider (ADR-0084 D5): an in-place rewrite (same address)
     // displaces no slot — replay's key-verified upsert re-covers it, so
@@ -722,7 +791,14 @@ fn try_shadow_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let new_addr = match table.insert(key, value, hash) {
         Ok(addr) => addr,
         Err(err) => {
-            return ShadowAttempt::Blocked(write_block_of(shared, table, key, value, err, proto));
+            return ShadowAttempt::Blocked(write_block_of(
+                shared,
+                table,
+                key,
+                StallProbe::Inline(value),
+                err,
+                proto,
+            ));
         }
     };
     match cold {
@@ -877,9 +953,11 @@ fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     };
     if let Err(err) = applied {
         // Abandon: the extent is durable-referenced by nothing; the
-        // sweep reclaims it. The handle just closes.
+        // sweep reclaims it. The handle just closes. The stall probe is
+        // sized from the 24-byte reference the store refused, never
+        // from the value (F-L06-05, ADR-0102 D3).
         drop(handle);
-        return Err(write_block_of(shared, table, key, value, err, proto));
+        return Err(write_block_of(shared, table, key, StallProbe::Extent, err, proto));
     }
     // D3 ordering: the barrier's ledger position precedes this
     // iteration's linked frame fsync (seal_log registers later in the
@@ -907,7 +985,7 @@ fn write_block_of<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     table: &mut TieredTable,
     key: &[u8],
-    value: &[u8],
+    probe: StallProbe<'_>,
     err: inf_store::OpError,
     proto: Protocol,
 ) -> WriteBlock {
@@ -915,7 +993,11 @@ fn write_block_of<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         inf_store::OpError::OutOfMemory => {
             // Ring window exhausted: distinguish "flush will free this"
             // (park on the stall gate) from genuine exhaustion.
-            if table.write_stall_target(key, value).is_some() {
+            let target = match probe {
+                StallProbe::Inline(value) => table.write_stall_target(key, value),
+                StallProbe::Extent => table.extent_stall_target(key),
+            };
+            if target.is_some() {
                 WriteBlock::Stall
             } else {
                 WriteBlock::Reply(error_bytes(shared, proto, ERR_OOM))
@@ -978,25 +1060,33 @@ async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
 ) -> Result<(u64, Option<Vec<u8>>), Vec<u8>> {
     let hash = shared.hasher.hash(key);
     let deadline = stall_deadline(shared, ns);
+    let mut replans: u8 = 0;
     loop {
-        let (old, old_value): (Displaced, Option<Vec<u8>>) =
-            match resolve(shared, ns, key, hash, PromoteOnCold::Never).await {
-                Resolved::Miss => (None, None),
-                Resolved::Ram(addr) => {
-                    let ks = shared.store.borrow();
-                    let table = ks.tiered_store(ns).expect("resolved on this table");
-                    let parts = table.record(addr);
-                    (Some((addr, parts.encoded_len, parts.version)), Some(parts.value.to_vec()))
-                }
-                Resolved::Cold { addr, value, version, encoded_len }
-                | Resolved::Extent { addr, value, version, encoded_len } => {
-                    (Some((addr, encoded_len, version)), Some(value))
-                }
-                Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
-            };
+        let resolved = resolve(shared, ns, key, hash, PromoteOnCold::Never).await;
+        let guard = WriteGuard::of(&resolved);
+        let (old, old_value): (Displaced, Option<Vec<u8>>) = match resolved {
+            Resolved::Miss => (None, None),
+            Resolved::Ram(addr) => {
+                let ks = shared.store.borrow();
+                let table = ks.tiered_store(ns).expect("resolved on this table");
+                let parts = table.record(addr);
+                (Some((addr, parts.encoded_len, parts.version)), Some(parts.value.to_vec()))
+            }
+            Resolved::Cold { addr, value, version, encoded_len }
+            | Resolved::Extent { addr, value, version, encoded_len } => {
+                (Some((addr, encoded_len, version)), Some(value))
+            }
+            Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
+        };
         let value = compute(old_value.as_deref(), old.map(|(_, _, v)| v))?;
-        match try_write(shared, ns, class, key, hash, &value, old, proto) {
+        match try_write(shared, ns, class, key, hash, &value, old, guard, proto) {
             Ok(seq) => return Ok((seq, old_value)),
+            Err(WriteBlock::Replan) => {
+                replans += 1;
+                if replans > WRITE_REPLAN_MAX {
+                    return Err(error_bytes(shared, proto, ERR_REPLAN_EXHAUSTED));
+                }
+            }
             Err(WriteBlock::StagingFull) => {
                 let wait = {
                     let durable = shared.durable.borrow();
@@ -1620,6 +1710,7 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
 ) -> Result<(u64, Option<Vec<u8>>, bool), Vec<u8>> {
     let hash = shared.hasher.hash(key);
     let deadline = stall_deadline(shared, ns);
+    let mut replans: u8 = 0;
     loop {
         // M4.5-S37 step 1 (`bench-diagnostics` only): the ceiling arm —
         // a plain SET (no NX/XX: the reply does not depend on the old
@@ -1670,28 +1761,34 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
                     continue;
                 }
                 ShadowAttempt::Blocked(WriteBlock::Reply(reply)) => return Err(reply),
-                ShadowAttempt::Ineligible => {}
+                ShadowAttempt::Blocked(WriteBlock::Replan) | ShadowAttempt::Ineligible => {}
             }
         }
-        let (old, old_value): (Displaced, Option<Vec<u8>>) = if blind {
+        let (old, old_value, guard): (Displaced, Option<Vec<u8>>, WriteGuard) = if blind {
             #[cfg(feature = "bench-diagnostics")]
             shared
                 .node
                 .blind_overwrites_ceiling
                 .set(shared.node.blind_overwrites_ceiling.get() + 1);
-            (None, None)
+            (None, None, WriteGuard::Current)
         } else {
-            match resolve(shared, ns, key, hash, PromoteOnCold::Never).await {
-                Resolved::Miss => (None, None),
+            let resolved = resolve(shared, ns, key, hash, PromoteOnCold::Never).await;
+            let guard = WriteGuard::of(&resolved);
+            match resolved {
+                Resolved::Miss => (None, None, guard),
                 Resolved::Ram(addr) => {
                     let ks = shared.store.borrow();
                     let table = ks.tiered_store(ns).expect("resolved on this table");
                     let parts = table.record(addr);
-                    (Some((addr, parts.encoded_len, parts.version)), Some(parts.value.to_vec()))
+                    (
+                        Some((addr, parts.encoded_len, parts.version)),
+                        Some(parts.value.to_vec()),
+                        guard,
+                    )
                 }
                 Resolved::Cold { addr, value, version, encoded_len }
                 | Resolved::Extent { addr, value, version, encoded_len } => {
-                    (Some((addr, encoded_len, version)), Some(value))
+                    (Some((addr, encoded_len, version)), Some(value), guard)
                 }
                 Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
             }
@@ -1699,8 +1796,14 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
         if (nx && old.is_some()) || (xx && old.is_none()) {
             return Ok((0, old_value, false));
         }
-        match try_write(shared, ns, class, key, hash, value, old, proto) {
+        match try_write(shared, ns, class, key, hash, value, old, guard, proto) {
             Ok(seq) => return Ok((seq, old_value, true)),
+            Err(WriteBlock::Replan) => {
+                replans += 1;
+                if replans > WRITE_REPLAN_MAX {
+                    return Err(error_bytes(shared, proto, ERR_REPLAN_EXHAUSTED));
+                }
+            }
             Err(WriteBlock::StagingFull) => {
                 let wait = {
                     let durable = shared.durable.borrow();

@@ -68,6 +68,7 @@ sim-smoke:
     cargo run --release --bin inf-sim -- --scenario m4-recovery --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m4-diskfull --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m4-tiered --seed 0xC0FFEE --verify-determinism
+    cargo run --release --bin inf-sim -- --scenario m2-ns-create-window --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m2-device-budget --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m2-mode-transition --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m2-reorder-window --seed 0xC0FFEE --verify-determinism

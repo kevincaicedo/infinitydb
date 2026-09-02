@@ -100,9 +100,17 @@ pub struct TierSpec {
     pub tail_stall_timeout_ms: u32,
 }
 
+/// The smallest ring window a tiered namespace may reserve (ADR-0102
+/// D1, the ADR-0052 D1 floor as implemented): `MEM-BUDGET +
+/// MAINTAIN-SLICE` must cover four commit pages, so the ring's seal-hole
+/// arithmetic and the admission window both have room to work.
+pub const RING_WINDOW_MIN_BYTES: u64 = 4 * inf_alloc::REGION_PAGE_BYTES as u64;
+
 impl TierSpec {
     /// The defaults for a given memory budget — every other key at its
-    /// owning ADR's default.
+    /// owning ADR's default; the blob threshold derives from the ring
+    /// (ADR-0102 D2), so a budget-only spec never admits an inline
+    /// record its ring cannot hold.
     #[must_use]
     pub fn for_budget(mem_budget_bytes: u64) -> TierSpec {
         TierSpec {
@@ -117,6 +125,53 @@ impl TierSpec {
             tier_io_mode: TierIoMode::Direct,
             tail_stall_timeout_ms: 1_000,
         }
+        .with_default_blob_threshold()
+    }
+
+    /// The largest `BLOB-THRESHOLD` a ring of `ring_bytes` can honour
+    /// (ADR-0102 D2): every inline record — header, a 255-byte key, and
+    /// a value below the threshold — must fit half the ring (ADR-0052
+    /// D1's `R ≥ 2 × RECORD_INLINE_MAX`). Saturates to the u24 inline
+    /// ceiling; zero for a ring below the floor (no threshold is legal
+    /// there — D1 refuses first).
+    #[must_use]
+    pub fn blob_threshold_max(ring_bytes: u64) -> u32 {
+        let overhead = (crate::record::HEADER_LEN + crate::record::MAX_KEY_LEN) as u64;
+        let half = ring_bytes / 2;
+        let cap = half.saturating_sub(overhead).saturating_add(1);
+        u32::try_from(cap.min(u64::from(BLOB_THRESHOLD_DEFAULT))).expect("bounded above")
+    }
+
+    /// The ring-derived default threshold (ADR-0102 D2): a quarter of
+    /// the ring, ceilinged at the u24 inline bound — at every legal ring
+    /// (D1) this satisfies [`blob_threshold_max`](Self::blob_threshold_max)
+    /// with room for the record overhead. `None` when the spec has no
+    /// representable ring (the gauntlet refuses those).
+    #[must_use]
+    pub fn default_blob_threshold(&self) -> Option<u32> {
+        let ring = self.demotion_config().ring_reserve_bytes()? as u64;
+        let quarter = ring / 4;
+        let derived = quarter.min(u64::from(BLOB_THRESHOLD_DEFAULT));
+        Some(u32::try_from(derived).expect("bounded above"))
+    }
+
+    /// `self` with the blob threshold replaced by the ring-derived
+    /// default — what a spec gets when `BLOB-THRESHOLD` was not given
+    /// (the parser and [`for_budget`](Self::for_budget)). A spec with no
+    /// representable ring is returned unchanged (the gauntlet owns it).
+    #[must_use]
+    pub fn with_default_blob_threshold(mut self) -> TierSpec {
+        if let Some(threshold) = self.default_blob_threshold() {
+            self.blob_threshold_bytes = threshold;
+        }
+        self
+    }
+
+    /// The ring this spec reserves when materialized (`next_pow2(budget
+    /// + slice)`), or `None` when unrepresentable.
+    #[must_use]
+    pub fn ring_bytes(&self) -> Option<u64> {
+        self.demotion_config().ring_reserve_bytes().map(|r| r as u64)
     }
 
     /// The ADR-0062 D2 range gauntlet. One place, shared by the command
@@ -130,8 +185,14 @@ impl TierSpec {
         if self.mem_budget_bytes == 0 {
             return Err("MEM-BUDGET must be > 0");
         }
-        if self.demotion_config().ring_reserve_bytes().is_none() {
+        let Some(ring) = self.ring_bytes() else {
             return Err("MEM-BUDGET + MAINTAIN-SLICE has no representable ring reservation");
+        };
+        // ADR-0102 D1 (H0): the four-page floor — before this rule the
+        // constructor's release assert answered a client `MEM-BUDGET`.
+        if self.mem_budget_bytes.saturating_add(self.maintain_slice_bytes) < RING_WINDOW_MIN_BYTES {
+            return Err("MEM-BUDGET + MAINTAIN-SLICE must reserve at least 4mb (four commit \
+                        pages — ADR-0102 D1)");
         }
         if self.disk_budget_bytes != 0 && self.disk_budget_bytes < (1 << 20) {
             return Err("DISK-BUDGET is 0 (unbounded) or >= 1mb");
@@ -154,6 +215,17 @@ impl TierSpec {
         }
         if !(4 << 10..=1 << 24).contains(&self.blob_threshold_bytes) {
             return Err("BLOB-THRESHOLD is 4kb..=16mb");
+        }
+        // ADR-0102 D2 (F-L06-01): the largest inline record must fit
+        // half the ring this spec reserves — the ADR-0052 D1 invariant
+        // as a typed rule. `ring` is the smallest ring the spec can
+        // ever materialize (a reboot re-derives it), so a `SET` that
+        // lowers MEM-BUDGET under an explicit threshold is refused here
+        // rather than accepted for one life and refused at the next boot.
+        if self.blob_threshold_bytes > TierSpec::blob_threshold_max(ring) {
+            return Err("BLOB-THRESHOLD exceeds the ring's inline record bound (half of \
+                        next_pow2(MEM-BUDGET + MAINTAIN-SLICE), less the record overhead — \
+                        ADR-0102 D2): raise MEM-BUDGET or lower BLOB-THRESHOLD");
         }
         if self.tail_stall_timeout_ms == 0 || self.tail_stall_timeout_ms > 60_000 {
             return Err("TAIL-STALL-TIMEOUT is 1..=60000 milliseconds");
@@ -289,19 +361,13 @@ pub struct NsRegistry {
 }
 
 impl NsRegistry {
-    /// Registers `spec`. A durable spec with `fsync: None` is stored with
-    /// the documented default (`Everysec`).
+    /// Every rule [`create`](Self::create) enforces, applied to `spec`
+    /// without registering it (ADR-0103 D3: the DDL program validates
+    /// before the catalog persist, applies after).
     ///
     /// # Errors
-    /// - `InvalidName` / `DefaultImmutable` for bad or reserved names;
-    /// - `ModeNotSupported(Topic)` until M5;
-    /// - `FsyncRequiresDurable` when `fsync` is set on a non-durable mode;
-    /// - `EvictionNotAllowedDurable` when `policy` is set on a durable
-    ///   namespace (ADR-0015 D5);
-    /// - `Exists` for a duplicate name — or a duplicate id, which is a
-    ///   caller bug (ids are allocated once, never reused) and additionally
-    ///   trips a debug assertion.
-    pub fn create(&mut self, spec: NsSpec) -> Result<(), NsError> {
+    /// Exactly `create`'s.
+    pub fn check(&self, spec: &NsSpec) -> Result<(), NsError> {
         if !valid_ns_name(&spec.name) {
             return Err(NsError::InvalidName);
         }
@@ -338,6 +404,23 @@ impl NsRegistry {
             return Err(NsError::Exists);
         }
         debug_assert!(spec.id.0 >= FIRST_NAMED_NS_ID, "ids 0..16 are the implicit defaults");
+        Ok(())
+    }
+
+    /// Registers `spec`. A durable spec with `fsync: None` is stored with
+    /// the documented default (`Everysec`).
+    ///
+    /// # Errors
+    /// - `InvalidName` / `DefaultImmutable` for bad or reserved names;
+    /// - `ModeNotSupported(Topic)` until M5;
+    /// - `FsyncRequiresDurable` when `fsync` is set on a non-durable mode;
+    /// - `EvictionNotAllowedDurable` when `policy` is set on a durable
+    ///   namespace (ADR-0015 D5);
+    /// - `Exists` for a duplicate name — or a duplicate id, which is a
+    ///   caller bug (ids are allocated once, never reused) and additionally
+    ///   trips a debug assertion.
+    pub fn create(&mut self, spec: NsSpec) -> Result<(), NsError> {
+        self.check(&spec)?;
         let mut spec = spec;
         if spec.mode == NsMode::Durable && spec.fsync.is_none() {
             spec.fsync = Some(FsyncClass::Everysec);
@@ -600,9 +683,41 @@ mod tests {
             (TierSpec { compaction_slice_bytes: 1 << 30, ..base }, "oversized slice"),
             (TierSpec { blob_threshold_bytes: 1 << 25, ..base }, "threshold above u24"),
             (TierSpec { tail_stall_timeout_ms: 0, ..base }, "zero timeout"),
+            // ADR-0102 D1 (H0): windows under four commit pages.
+            (TierSpec { mem_budget_bytes: 1 << 20, ..base }, "1mb budget (the H0 node kill)"),
+            (TierSpec { mem_budget_bytes: 2 << 20, ..base }, "2mb budget (window 3 MiB)"),
+            (
+                TierSpec { mem_budget_bytes: 3 << 20, maintain_slice_bytes: 512 << 10, ..base },
+                "3mb budget with a 512kb slice (window 3.5 MiB)",
+            ),
+            // ADR-0102 D2 (F-L06-01): a threshold the ring cannot hold.
+            (
+                TierSpec { mem_budget_bytes: 3 << 20, blob_threshold_bytes: 1 << 24, ..base },
+                "16 MiB threshold in a 4 MiB ring",
+            ),
+            (
+                TierSpec {
+                    mem_budget_bytes: 3 << 20,
+                    blob_threshold_bytes: TierSpec::blob_threshold_max(4 << 20) + 1,
+                    ..base
+                },
+                "one byte over the ring's inline bound",
+            ),
         ] {
             assert!(bad.validate().is_err(), "{what} must refuse");
         }
+        // The floor itself and the bound itself are legal.
+        assert!(TierSpec::for_budget(3 << 20).validate().is_ok(), "3mb: exactly four pages");
+        assert!(
+            TierSpec {
+                mem_budget_bytes: 3 << 20,
+                blob_threshold_bytes: TierSpec::blob_threshold_max(4 << 20),
+                ..base
+            }
+            .validate()
+            .is_ok(),
+            "exactly the inline bound is legal"
+        );
         let mut reg = NsRegistry::default();
         let bad = NsSpec {
             tier: Some(TierSpec { compaction_dead_ratio_pct: 10, ..base }),
@@ -613,5 +728,33 @@ mod tests {
             "registration runs the same gauntlet"
         );
         assert_eq!(reg.iter().count(), 0);
+    }
+
+    /// ADR-0102 D2: the default threshold follows the ring — a quarter
+    /// of it, ceilinged at the u24 bound — and always passes the
+    /// gauntlet; the bound function is exact at the record overhead.
+    #[test]
+    fn blob_threshold_default_derives_from_the_ring() {
+        for (budget, ring, want) in [
+            (3u64 << 20, 4u64 << 20, 1u32 << 20),
+            (4 << 20, 8 << 20, 2 << 20),
+            (8 << 20, 16 << 20, 4 << 20),
+            (31 << 20, 32 << 20, 8 << 20),
+            (63 << 20, 64 << 20, 16 << 20),
+            (64 << 20, 128 << 20, 16 << 20),
+            (1 << 30, 1 << 31, 16 << 20),
+        ] {
+            let spec = TierSpec::for_budget(budget);
+            assert_eq!(spec.ring_bytes(), Some(ring), "budget {budget}");
+            assert_eq!(spec.blob_threshold_bytes, want, "budget {budget}");
+            assert!(spec.validate().is_ok(), "budget {budget}");
+            assert!(want <= TierSpec::blob_threshold_max(ring));
+        }
+        let overhead = (crate::record::HEADER_LEN + crate::record::MAX_KEY_LEN) as u64;
+        assert_eq!(u64::from(TierSpec::blob_threshold_max(4 << 20)), (2 << 20) - overhead + 1);
+        assert_eq!(TierSpec::blob_threshold_max(1 << 40), 1 << 24, "saturates at u24");
+        // A zero-budget draft (the parser's accumulator) derives nothing
+        // and keeps the ADR-0061 default until MEM-BUDGET arrives.
+        assert_eq!(TierSpec::for_budget(0).blob_threshold_bytes, BLOB_THRESHOLD_DEFAULT);
     }
 }

@@ -273,7 +273,10 @@ impl TieredTable {
             compact: None,
             reloc_origins: HashMap::new(),
             extents: crate::extents::ExtentRefs::new(),
-            blob: crate::extents::BlobConfig::default(),
+            blob: Self::clamp_blob_config(
+                config.reserve_bytes as u64,
+                crate::extents::BlobConfig::default(),
+            ),
             wal_epoch: 0,
             disk_budget_bytes: 0,
             disk_admit: DiskAdmission::default(),
@@ -534,14 +537,36 @@ impl TieredTable {
         self.blob
     }
 
-    /// Replaces the blob bounds (tests and, later, S19's `INF.NS` keys).
+    /// Replaces the blob bounds (S19's `INF.NS` keys; tests). The
+    /// threshold is clamped to this ring's inline bound (ADR-0102 D3):
+    /// whatever the registered spec says, the plane's routing decision
+    /// can never admit an inline record above `ring / 2`.
     ///
     /// # Panics
     /// Panics on nonsense bounds ([`BlobConfig::validate`]
     /// (crate::extents::BlobConfig::validate)).
     pub fn set_blob_config(&mut self, blob: crate::extents::BlobConfig) {
         blob.validate();
-        self.blob = blob;
+        self.blob = Self::clamp_blob_config(self.space.ring_bytes(), blob);
+    }
+
+    /// The largest record the ring admits inline: half the ring
+    /// (ADR-0052 D1's `R ≥ 2 × RECORD_INLINE_MAX`, ADR-0102 D3).
+    /// [`insert`](Self::insert)/[`update`](Self::update) refuse a longer
+    /// record typed; `AddressSpace::alloc`'s assert is the paired
+    /// internal invariant behind it.
+    #[inline]
+    #[must_use]
+    pub fn inline_record_max(&self) -> usize {
+        (self.space.ring_bytes() / 2) as usize
+    }
+
+    fn clamp_blob_config(
+        ring_bytes: u64,
+        blob: crate::extents::BlobConfig,
+    ) -> crate::extents::BlobConfig {
+        let cap = crate::ns::TierSpec::blob_threshold_max(ring_bytes).max(1);
+        crate::extents::BlobConfig { threshold_bytes: blob.threshold_bytes.min(cap), ..blob }
     }
 
     /// Allocates the next extent id (allocate-once — a failed extent
@@ -625,6 +650,9 @@ impl TieredTable {
             kind: RecordKind::StringExtent,
         };
         let len = spec.encoded_len();
+        if len > self.inline_record_max() {
+            return Err(OpError::TooLarge); // ADR-0102 D3 — unreachable with a legal key
+        }
         // M4-S21 disk admission (ADR-0063 D1/D2): the reference record
         // plus the extent's device bytes — the blob is already on disk
         // (`SealedExtent`), so this is the budget catching up with it;
@@ -1781,9 +1809,45 @@ impl TieredTable {
             expire_at_ms: None,
             kind: RecordKind::String { raw: false },
         };
-        let target = self.space.stall_target(spec.encoded_len())?;
+        self.stall_target_for(spec.encoded_len())
+    }
+
+    /// [`write_stall_target`](Self::write_stall_target) for a refused
+    /// **blob** write (ADR-0102 D3, review of 2026-08-30 F-L06-05): the
+    /// record that was refused is the 24-byte extent reference, never
+    /// the value — sizing the probe from a 1 GiB value asserted above
+    /// `ring / 2` and parked on the wrong watermark below it.
+    pub fn extent_stall_target(&mut self, key: &[u8]) -> Option<LogicalAddr> {
+        let reference = [0u8; crate::record::EXTENT_REF_LEN];
+        let spec = RecordSpec {
+            key,
+            value: &reference,
+            version: 0,
+            expire_at_ms: None,
+            kind: RecordKind::StringExtent,
+        };
+        self.stall_target_for(spec.encoded_len())
+    }
+
+    /// A total stall probe: a record the ring can never hold answers
+    /// `None` ("no watermark progress can help") instead of reaching the
+    /// space's release assert; a fitting one counts the stall.
+    fn stall_target_for(&mut self, len: usize) -> Option<LogicalAddr> {
+        if len > self.inline_record_max() {
+            return None;
+        }
+        let target = self.space.stall_target(len)?;
         self.space.note_tail_alloc_stall();
         Some(target)
+    }
+
+    /// Counts one write replan (review of 2026-08-30, F-L06-03): the
+    /// plane resolved a key, suspended on an extent read, and found the
+    /// key's slot moved by the time it was ready to write — the write
+    /// re-resolves instead of mutating through a stale address. Always
+    /// on; rendered in `INFO tiering`.
+    pub fn note_write_replan(&mut self) {
+        self.space.note_write_replan();
     }
 
     /// The underlying address space (watermark advancement, counters,
@@ -1925,6 +1989,15 @@ impl TieredTable {
             kind: RecordKind::String { raw: false },
         };
         let len = spec.encoded_len();
+        // ADR-0102 D3 (review of 2026-08-30, F-L06-01): a record above
+        // half the ring can never be placed — refuse typed before the
+        // space's release assert can see it. The threshold clamp above
+        // makes this unreachable through the plane's routing; a direct
+        // caller (recovery replay of a foreign image, a test) gets the
+        // same typed answer.
+        if len > self.inline_record_max() {
+            return Err(OpError::TooLarge);
+        }
         // M4-S21 disk admission (ADR-0063 D1/D2): before the alloc, so
         // refusal mutates nothing; the debit follows the alloc, so a
         // memory refusal never leaks headroom. Recovery re-appends pass

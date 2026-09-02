@@ -128,7 +128,10 @@ fn displace_register_overflow_is_a_decode_error() {
 fn marker_for_unknown_namespace_skips() {
     let mut ks = tiered_keyspace();
     let marker = RecordView::ColdDisplace { ns: NsId(99), old_addr: 4096 };
-    assert!(matches!(ks.apply_record(&marker, NOW, ANCHOR), Ok(ReplayOutcome::SkippedUnknownNs)));
+    assert!(matches!(
+        ks.apply_record(&marker, NOW, ANCHOR),
+        Ok(ReplayOutcome::SkippedUnknownNs(_))
+    ));
     assert_eq!(ks.displace_register_len(), 0);
 }
 

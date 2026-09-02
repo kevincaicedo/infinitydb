@@ -79,9 +79,61 @@ struct Node {
     /// Control handle of a durable node (manual checkpoint trigger — the
     /// surface `INF.CKPT` rides at S20).
     control: Option<Arc<inf_server::ControlHandle>>,
+    /// A harness-driven catalog writer instead of the control thread
+    /// (review of 2026-08-30, C14): the detached `ControlInbox` is drained
+    /// by a harness thread only while `hold` is clear — the e2e form of
+    /// "the META swap has not completed yet", which no fault point can
+    /// express (the registry is thread-local to the cells).
+    catalog_pump: Option<CatalogPump>,
+}
+
+struct CatalogPump {
+    hold: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
 }
 
 impl Node {
+    /// A durable node whose catalog swaps are held while `hold` is set
+    /// (C14): DDL parks on `persisted(epoch)` exactly as it would behind
+    /// a slow device, and the test decides when — or whether — the swap
+    /// lands. Clearing `hold` drains every queued swap.
+    fn start_durable_with_held_catalog(
+        cells: u16,
+        data_dir: &std::path::Path,
+        hold: Arc<AtomicBool>,
+    ) -> Node {
+        Node::start_cfg_default(
+            cells,
+            Some(data_dir.to_path_buf()),
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            None,
+            Default::default(),
+            Some(hold),
+        )
+    }
+
+    /// Ends the node the way a power cut inside a held swap would: cell
+    /// threads stop, the catalog pump exits **without draining**, so a
+    /// swap that never landed never lands. Everything the cells fsynced
+    /// stays on disk (process-kill physics).
+    fn kill_without_catalog_drain(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for handle in self.handles.drain(..) {
+            handle.join().expect("cell thread");
+        }
+        let pump = self.catalog_pump.take().expect("a held-catalog node");
+        pump.stop.store(true, Ordering::Relaxed);
+        pump.handle.join().expect("catalog pump thread");
+    }
+
     fn start(cells: u16) -> Node {
         Node::start_with(cells, None, CkptTrigger::Manual)
     }
@@ -112,6 +164,7 @@ impl Node {
             inf_log::SegmentIoMode::Buffered,
             Some(default_ns.to_vec()),
             Default::default(),
+            None,
         )
     }
 
@@ -140,6 +193,7 @@ impl Node {
                 seal_barriers_per_s: 0,
                 provenance: Default::default(),
             },
+            None,
         )
     }
 
@@ -346,6 +400,7 @@ impl Node {
             io_mode,
             None,
             Default::default(),
+            None,
         )
     }
 
@@ -363,8 +418,10 @@ impl Node {
         io_mode: inf_log::SegmentIoMode,
         default_ns: Option<Vec<u8>>,
         device: inf_server::DeviceConfig,
+        held_catalog: Option<Arc<AtomicBool>>,
     ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
+        let mut catalog_pump = None;
         // Bind cell 0 first on an ephemeral port, then the rest join it.
         let first = listen_reuseport(0).expect("listen");
         let port = bound_port(&first).expect("port");
@@ -381,8 +438,41 @@ impl Node {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let control =
-                inf_server::spawn_control(dir.clone(), catalog.as_ref(), cells, boot_unix_ms);
+            let control = match &held_catalog {
+                None => {
+                    inf_server::spawn_control(dir.clone(), catalog.as_ref(), cells, boot_unix_ms)
+                }
+                Some(hold) => {
+                    // The sim's detached writer, driven by a harness
+                    // thread that honours `hold` — same `prepare_persist`,
+                    // same on-disk swap, no control thread.
+                    let (control, mut inbox) = inf_server::ControlHandle::detached_with_catalog(
+                        catalog.as_ref(),
+                        cells,
+                        boot_unix_ms,
+                    );
+                    let hold = Arc::clone(hold);
+                    let pump_stop = Arc::new(AtomicBool::new(false));
+                    let pump_dir = dir.clone();
+                    let handle = {
+                        let hold = Arc::clone(&hold);
+                        let pump_stop = Arc::clone(&pump_stop);
+                        std::thread::spawn(move || {
+                            while !pump_stop.load(Ordering::Relaxed) {
+                                if !hold.load(Ordering::Relaxed) {
+                                    inbox
+                                        .drain(&inf_server::StdSegmentFs, &pump_dir)
+                                        .expect("held-catalog META swap");
+                                }
+                                #[allow(clippy::disallowed_methods)] // harness thread
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        })
+                    };
+                    catalog_pump = Some(CatalogPump { hold, stop: pump_stop, handle });
+                    control
+                }
+            };
             (dir, catalog, control)
         });
         let mut handles = Vec::new();
@@ -471,7 +561,7 @@ impl Node {
             }));
         }
         let control = boot.map(|(_, _, control)| control);
-        let node = Node { port, stop, handles, control };
+        let node = Node { port, stop, handles, control, catalog_pump };
         // Most tests speak data commands immediately after start: wait out
         // the -LOADING window unless the test throttled recovery to
         // observe it (the throttle IS the -LOADING test's subject).
@@ -526,6 +616,11 @@ impl Node {
         // whole queue drained (single FIFO receiver), after which the old
         // thread can never touch the data dir again.
         if let Some(control) = &self.control {
+            // A held catalog pump drains everything on stop (a test that
+            // wants the swap lost calls `kill_without_catalog_drain`).
+            if let Some(pump) = &self.catalog_pump {
+                pump.hold.store(false, Ordering::Relaxed);
+            }
             let sentinel = std::env::temp_dir().join(format!(
                 "inf-e2e-drain-{}-{}",
                 std::process::id(),
@@ -542,6 +637,10 @@ impl Node {
                 #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
                 std::thread::sleep(Duration::from_millis(1));
             }
+        }
+        if let Some(pump) = self.catalog_pump.take() {
+            pump.stop.store(true, Ordering::Relaxed);
+            pump.handle.join().expect("catalog pump thread");
         }
     }
 }
@@ -5280,6 +5379,376 @@ fn dropped_tiered_namespace_survives_a_cut_after_its_swap() {
     }
     let text = wait_persistence_field(&mut c, "ns_drop_tombstones", "1");
     assert!(text.contains("ns_drop_tombstones:1\r\n"), "{text}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- review of 2026-08-30: H0 / F-L06-01 / F-L06-03 / C14 falsifiers ----
+
+/// H0 (review of 2026-08-30 §2, proven by execution): `INF.NS CREATE …
+/// MEM-BUDGET 1mb` — and every budget whose window is under four commit
+/// pages — reached `AddressSpace::new`'s release `assert!("ring smaller
+/// than four pages")` before the range gauntlet ran; the connection
+/// closed and the cell was dead. `2mb` alone was refused typed, because
+/// its ring happened to clear the assert and fail the later window
+/// check. Every sub-floor budget must answer a typed error, the node
+/// must keep serving, and the smallest legal budget must materialize.
+#[test]
+fn ns_create_sub_floor_budget_refuses_typed_and_node_survives() {
+    let dir = temp_data_dir("h0-sub-floor-budget");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    for budget in [&b"64kb"[..], b"256kb", b"512kb", b"1mb", b"2mb"] {
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"tiny",
+            b"MODE",
+            b"durable",
+            b"MEM-BUDGET",
+            budget,
+        ]))
+        .expect("write");
+        // Pre-fix at 64kb: the read fails — the cell panicked and closed
+        // the socket (the review's "connection closed / node DEAD" row).
+        let reply = read_line(&mut c);
+        assert!(
+            reply.starts_with(b"-ERR MEM-BUDGET + MAINTAIN-SLICE"),
+            "budget {}: {:?}",
+            String::from_utf8_lossy(budget),
+            String::from_utf8_lossy(&reply)
+        );
+        c.write_all(&cmd(&[b"PING"])).expect("write");
+        read_exactly(&mut c, b"+PONG\r\n");
+    }
+    // 3mb + the 1 MiB default slice = exactly four commit pages.
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"tiny", b"MODE", b"durable", b"MEM-BUDGET", b"3mb"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"tiny"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"k", b"v"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// F-L06-01 (lane L06, High/Certain): ADR-0052 D1's `R ≥ 2 ×
+/// RECORD_INLINE_MAX` invariant was never enforced — `MEM-BUDGET 3mb`
+/// reserves a 4 MiB ring (`ring / 2` = 2 MiB) while the default
+/// `BLOB-THRESHOLD` stayed at 16 MiB, so a legal inline value between
+/// the two tripped `alloc`'s release assert. Reachability correction to
+/// the lane's scenario: one frame is capped at 1 MiB by the wire parser
+/// (`ParserLimits::max_frame_bytes`), so the route is growth —
+/// `APPEND` (or `SETRANGE`, L13-04) walks a value past `ring / 2` in
+/// three 900 KiB steps. Now the default threshold derives from the ring
+/// (ADR-0102 D2), so the grown value rides an extent and round-trips;
+/// an explicit over-bound threshold is refused typed at CREATE.
+#[test]
+fn inline_value_above_half_ring_is_routed_out_of_line() {
+    let dir = temp_data_dir("l06-01-half-ring");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"hot",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"3mb",
+        b"DISK-BUDGET",
+        b"64mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"hot"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let chunk: Vec<u8> = (0..900usize << 10).map(|i| b'a' + (i % 23) as u8).collect();
+    c.write_all(&cmd(&[b"SET", b"big", &chunk])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // 1.8 MiB: still under ring / 2 pre-fix (inline), over the derived
+    // 1 MiB threshold post-fix (extent).
+    c.write_all(&cmd(&[b"APPEND", b"big", &chunk])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", 2 * chunk.len()).as_bytes());
+    // 2.7 MiB: above ring / 2, below the old 16 MiB default threshold.
+    // Pre-fix: the read fails — `allocation exceeds half the ring`.
+    c.write_all(&cmd(&[b"APPEND", b"big", &chunk])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", 3 * chunk.len()).as_bytes());
+    c.write_all(&cmd(&[b"STRLEN", b"big"])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", 3 * chunk.len()).as_bytes());
+    c.write_all(&cmd(&[b"GET", b"big"])).expect("write");
+    let got = read_get(&mut c).expect("GET");
+    assert_eq!(got.len(), 3 * chunk.len());
+    assert!(got == chunk.repeat(3), "the 2.7 MiB value round-trips through its extent");
+    let tiering = info_text(&mut c, b"tiering");
+    assert!(
+        scrape_u64(&mut c, b"tiering", "tiering_blob_extents_created:") >= 1,
+        "routed out of line: {tiering}"
+    );
+    // The explicit face: a threshold the ring cannot honour is refused
+    // at the gauntlet, never accepted and clamped in silence.
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"hot2",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"3mb",
+        b"BLOB-THRESHOLD",
+        b"4mb",
+    ]))
+    .expect("write");
+    let reply = read_line(&mut c);
+    assert!(
+        reply.starts_with(b"-ERR BLOB-THRESHOLD"),
+        "an over-bound explicit threshold refuses typed: {:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    // Liveness from an unbound connection (PING is outside the tiered
+    // string family on a bound one).
+    let mut probe = node.connect();
+    probe.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut probe, b"+PONG\r\n");
+    drop((c, probe));
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0103 D5 / crash-matrix row `ns_create_after_meta`: the CREATE DDL
+/// stops once its catalog swap is durable and before the local apply —
+/// `META` names a namespace no cell serves and no client was ever
+/// answered `+OK`. A restart seeds it from `META` and serves it on
+/// every cell (an un-acked DDL that took effect: ack-after-durable).
+#[test]
+fn created_namespace_survives_a_cut_after_its_swap() {
+    let dir = temp_data_dir("create-cut-after");
+    let node = Node::start_durable_with_faults(
+        2,
+        &dir,
+        vec![(inf_server::fault::NS_CREATE_AFTER_META, inf_foundation::fault::FaultSpec::Nth(1))],
+    );
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"early", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"-ERR fault: ns_create_after_meta\r\n");
+    // No cell serves it in this life: the apply never ran anywhere.
+    for cell in 0..2u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"early"])).expect("write");
+        let reply = read_line(&mut c);
+        assert!(
+            reply.starts_with(b"-ERR namespace 'early' not found"),
+            "cell {cell}: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+    drop(c);
+    // The cut: the durable swap is the on-disk state the restart reads.
+    node.stop();
+
+    let node = Node::start_durable(2, &dir);
+    for cell in 0..2u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"early"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let key = key_for_cell(2, cell);
+        c.write_all(&cmd(&[b"SET", &key, b"seeded-from-meta"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    // The name is taken for good in this life: the DDL took effect.
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"early", b"MODE", b"durable"])).expect("write");
+    read_exactly(&mut c, b"-ERR namespace already exists\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// F-L06-03 (lane L06, High; L00-21 could not reproduce it by random
+/// racing): the extent read arm of `resolve` returns an address
+/// validated **before** `fetch_extent`'s multi-round `await` chain, and
+/// `try_write` consumed it unguarded — a concurrent write to the same
+/// key moved the slot, and `Index::replace` panicked the cell
+/// (`replace target present`). Two connections on one cell, a ~3 MB
+/// blob (184 cold windows per fetch, so the second writer's resolve
+/// lands inside the first's read): both writes must complete, the final
+/// value must be one of the two, and the write funnel must have
+/// **observed** the race (`tiering_write_replans`), so a green run is
+/// never vacuous.
+#[test]
+fn concurrent_writes_to_a_blob_key_never_desync_the_index() {
+    let dir = temp_data_dir("l06-03-blob-race");
+    let node = Node::start_durable(1, &dir);
+    let mut a = node.connect();
+    let mut b = node.connect();
+    a.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"hot",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"16mb",
+        b"DISK-BUDGET",
+        b"512mb",
+        b"BLOB-THRESHOLD",
+        b"4kb",
+    ]))
+    .expect("write");
+    read_exactly(&mut a, b"+OK\r\n");
+    for c in [&mut a, &mut b] {
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"hot"])).expect("write");
+        read_exactly(c, b"+OK\r\n");
+    }
+    // One frame is capped at 1 MiB (`ParserLimits`): grow the blob by
+    // `APPEND` — every step re-fetches and re-writes the extent.
+    let piece: Vec<u8> = (0..1_000_000usize).map(|i| b'a' + (i % 23) as u8).collect();
+    for round in 0..6u32 {
+        let key = format!("race:{round}").into_bytes();
+        a.write_all(&cmd(&[b"SET", &key, &piece])).expect("write");
+        read_exactly(&mut a, b"+OK\r\n");
+        for n in 2..=3u32 {
+            a.write_all(&cmd(&[b"APPEND", &key, &piece])).expect("write");
+            read_exactly(&mut a, format!(":{}\r\n", n as usize * piece.len()).as_bytes());
+        }
+        // Both resolve the key through the extent arm; the first to
+        // finish moves the slot, the other holds a dead address. The
+        // sender order alternates so each connection is the loser too.
+        let va = format!("a:{round}").into_bytes();
+        let vb = format!("b:{round}").into_bytes();
+        let (first, second) = if round % 2 == 0 { (&mut a, &mut b) } else { (&mut b, &mut a) };
+        let (vf, vs) = if round % 2 == 0 { (&va, &vb) } else { (&vb, &va) };
+        first.write_all(&cmd(&[b"SET", &key, vf])).expect("write");
+        second.write_all(&cmd(&[b"SET", &key, vs])).expect("write");
+        // Pre-fix: one of these reads fails — the cell panicked.
+        read_exactly(first, b"+OK\r\n");
+        read_exactly(second, b"+OK\r\n");
+        a.write_all(&cmd(&[b"GET", &key])).expect("write");
+        let got = read_get(&mut a).expect("GET");
+        assert!(got == va || got == vb, "round {round}: {:?}", String::from_utf8_lossy(&got));
+    }
+    let mut probe = node.connect();
+    probe.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut probe, b"+PONG\r\n");
+    let replans = scrape_u64(&mut probe, b"tiering", "tiering_write_replans:");
+    assert!(replans >= 1, "the race was never exercised — the test proves nothing");
+    drop((a, b, probe));
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// C14 (= F-L14-05, Critical; L00-35 missed it with a 50-round-trip
+/// window): a namespace was servable on every cell **before its
+/// definition was durable** — the DDL program applied locally, fanned,
+/// and only then requested the `META` swap, while nothing gated command
+/// dispatch on the swap. A second connection could `USE` the namespace
+/// inside that window and have an `always` write acked; a cut before
+/// the swap booted a catalog that never learned the id, and replay
+/// skipped the record as `SkippedUnknownNs`. The swap is held here
+/// (harness-driven catalog writer), so the window is as wide as the
+/// test wants: no cell may serve the namespace until `META` names it.
+#[test]
+fn namespace_is_unusable_until_its_definition_is_durable() {
+    let dir = temp_data_dir("c14-create-window");
+    let hold = Arc::new(AtomicBool::new(true));
+    let node = Node::start_durable_with_held_catalog(2, &dir, Arc::clone(&hold));
+    let mut creator = node.connect();
+    creator
+        .write_all(&cmd(&[
+            b"INF.NS", b"CREATE", b"fresh", b"MODE", b"durable", b"FSYNC", b"always",
+        ]))
+        .expect("write");
+    // The DDL parks on the held swap. Give the fan (pre-fix) or the
+    // persist request (post-fix) time to land before probing.
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(300));
+    let mut acked: Vec<Vec<u8>> = Vec::new();
+    for cell in 0..2u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"fresh"])).expect("write");
+        let reply = read_line(&mut c);
+        if reply == b"+OK\r\n" {
+            // Pre-fix: servable — and an `always` write acks here.
+            let mut key = key_for_cell(2, cell);
+            key.extend_from_slice(b":c14");
+            c.write_all(&cmd(&[b"SET", &key, b"acked-before-durable"])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+            acked.push(key);
+        } else {
+            assert!(
+                reply.starts_with(b"-ERR namespace 'fresh' not found"),
+                "cell {cell}: {:?}",
+                String::from_utf8_lossy(&reply)
+            );
+        }
+    }
+    // The cut inside the window: the swap never lands.
+    drop(creator);
+    node.kill_without_catalog_drain();
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"fresh"])).expect("write");
+    let reply = read_line(&mut c);
+    if !acked.is_empty() {
+        // The review's exact signature: acked writes, namespace gone.
+        assert_eq!(
+            reply,
+            b"+OK\r\n",
+            "acked `always` writes into 'fresh' exist but the namespace is gone after the cut \
+             (keys {:?}): {:?}",
+            acked.iter().map(|k| String::from_utf8_lossy(k).into_owned()).collect::<Vec<_>>(),
+            String::from_utf8_lossy(&reply)
+        );
+        for key in &acked {
+            c.write_all(&cmd(&[b"GET", key])).expect("write");
+            assert_eq!(read_get(&mut c).expect("GET"), b"acked-before-durable");
+        }
+    }
+    assert!(
+        acked.is_empty(),
+        "{} acked write(s) were served before the namespace's definition was durable (C14)",
+        acked.len()
+    );
+    // Nothing was promised: the un-acked CREATE may or may not exist.
+    assert!(
+        reply == b"+OK\r\n" || reply.starts_with(b"-ERR namespace 'fresh' not found"),
+        "{:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    drop(c);
+    node.stop();
+
+    // The released half: the swap lands, the CREATE acks, the namespace
+    // serves on every cell, and an acked write survives a restart.
+    let hold = Arc::new(AtomicBool::new(false));
+    let node = Node::start_durable_with_held_catalog(2, &dir, hold);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"fresh2", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for cell in 0..2u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"fresh2"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let key = key_for_cell(2, cell);
+        c.write_all(&cmd(&[b"SET", &key, b"durable-definition"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    drop(c);
+    node.stop();
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"fresh2"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for cell in 0..2u16 {
+        let key = key_for_cell(2, cell);
+        c.write_all(&cmd(&[b"GET", &key])).expect("write");
+        assert_eq!(read_get(&mut c).expect("GET"), b"durable-definition");
+    }
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();

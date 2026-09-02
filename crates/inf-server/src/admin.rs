@@ -721,6 +721,10 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     // clients — zero in memory mode and in any healthy run; the paired
     // saturation cause is `cold_queue_full` above.
     push(text, &format!("tiering_cold_read_errors:{}", tiering.cold_read_errors));
+    // F-L06-03 (review of 2026-08-30): writes that re-resolved because
+    // the key moved while they were suspended on an extent read — a
+    // legal interleaving, counted so the race is observable.
+    push(text, &format!("tiering_write_replans:{}", tiering.write_replans));
     // M4.5-S37 step 1: the ceiling arm's count — present only in a
     // `bench-diagnostics` build, so a shipping INFO cannot be mistaken
     // for one.
@@ -1649,6 +1653,7 @@ pub(crate) fn parse_ns_create(argv: &(impl Argv + ?Sized)) -> Result<NsSpecDraft
         tier: None,
     };
     let mut saw_mem_budget = false;
+    let mut saw_blob_threshold = false;
     let mut i = 3;
     while i < argv.len() {
         let opt = argv.arg(i);
@@ -1682,7 +1687,8 @@ pub(crate) fn parse_ns_create(argv: &(impl Argv + ?Sized)) -> Result<NsSpecDraft
                     .ok_or("ERR invalid MAXMEMORY value")?,
             );
         } else if let Some(applied) = parse_tier_key(&mut draft.tier, opt, value)? {
-            saw_mem_budget |= applied;
+            saw_mem_budget |= applied == TierKey::MemBudget;
+            saw_blob_threshold |= applied == TierKey::BlobThreshold;
         } else {
             return Err("ERR syntax error".to_string());
         }
@@ -1693,18 +1699,34 @@ pub(crate) fn parse_ns_create(argv: &(impl Argv + ?Sized)) -> Result<NsSpecDraft
                     ADR-0062 D1)"
             .to_string());
     }
+    // ADR-0102 D2: an absent BLOB-THRESHOLD derives from the ring the
+    // budget reserves (the accumulator started at budget 0, so the
+    // derivation must run once every key is in); an explicit one is
+    // honoured or refused by the gauntlet, never clamped.
+    if !saw_blob_threshold && let Some(tier) = draft.tier.as_mut() {
+        *tier = tier.with_default_blob_threshold();
+    }
     Ok(draft)
+}
+
+/// Which tier key [`parse_tier_key`] applied — the two the parser's
+/// post-loop rules key on.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum TierKey {
+    MemBudget,
+    BlobThreshold,
+    Other,
 }
 
 /// One tier key applied onto an accumulating [`TierSpec`] (ADR-0062 D2
 /// vocabulary; ranges validate at registration through
 /// `TierSpec::validate` — one gauntlet, not two). Returns `Ok(None)` for
-/// a non-tier key, `Ok(Some(is_mem_budget))` when applied.
+/// a non-tier key, `Ok(Some(which))` when applied.
 fn parse_tier_key(
     tier: &mut Option<TierSpec>,
     opt: &[u8],
     value: &[u8],
-) -> Result<Option<bool>, String> {
+) -> Result<Option<TierKey>, String> {
     let memory = |value: &[u8], key: &str| {
         core::str::from_utf8(value)
             .ok()
@@ -1734,7 +1756,7 @@ fn parse_tier_key(
     match key.as_slice() {
         b"MEM-BUDGET" => {
             spec.mem_budget_bytes = memory(value, "MEM-BUDGET")?;
-            return Ok(Some(true));
+            return Ok(Some(TierKey::MemBudget));
         }
         b"DISK-BUDGET" => spec.disk_budget_bytes = memory(value, "DISK-BUDGET")?,
         b"MUTABLE-FRACTION" => {
@@ -1754,6 +1776,7 @@ fn parse_tier_key(
         b"BLOB-THRESHOLD" => {
             spec.blob_threshold_bytes = u32::try_from(memory(value, "BLOB-THRESHOLD")?)
                 .map_err(|_| "ERR invalid BLOB-THRESHOLD value")?;
+            return Ok(Some(TierKey::BlobThreshold));
         }
         b"TIER-IO-MODE" => {
             spec.tier_io_mode = match value.to_ascii_lowercase().as_slice() {
@@ -1768,7 +1791,7 @@ fn parse_tier_key(
         }
         _ => unreachable!("membership matched above"),
     }
-    Ok(Some(false))
+    Ok(Some(TierKey::Other))
 }
 
 /// Planeless-tier id allocation: past the registered maximum, floor 16.
@@ -2178,6 +2201,8 @@ mod tests {
             // C2′ (review of 2026-08-30): no table, no cold reads to
             // fail — and zero in any healthy tiered run too.
             "tiering_cold_read_errors",
+            // F-L06-03: no table, no write to replan.
+            "tiering_write_replans",
             // M4-S17 (ADR-0061 D8): no table, no extents — the blob leg
             // reads zero for the same structural reason.
             "tiering_blob_user_bytes",
@@ -2417,6 +2442,81 @@ mod tests {
         assert!(
             text.contains("tiering_write_amp_undefined_ns:1"),
             "the unbounded namespace is counted, not averaged: {text}"
+        );
+    }
+
+    /// ADR-0102 D1/D2 (review of 2026-08-30, H0 / F-L06-01): the parser
+    /// derives an absent `BLOB-THRESHOLD` from the ring the budget
+    /// reserves (in any key order), honours an explicit one, and the
+    /// gauntlet refuses both a sub-floor budget and an over-bound
+    /// explicit threshold — typed, at the surface, never a cell panic.
+    #[test]
+    fn inf_ns_create_derives_the_blob_threshold_and_refuses_the_ring_floor() {
+        let tier = |argv: &[&[u8]]| parse_ns_create(argv).expect("parses").tier.expect("tiered");
+        // Budget-only: a quarter of the 8 MiB ring.
+        let spec = tier(&[b"INF.NS", b"CREATE", b"t", b"MODE", b"durable", b"MEM-BUDGET", b"4mb"]);
+        assert_eq!(spec.blob_threshold_bytes, 2 << 20);
+        assert!(spec.validate().is_ok());
+        // Key order does not matter: the derivation runs after the loop.
+        let spec = tier(&[
+            b"INF.NS",
+            b"CREATE",
+            b"t",
+            b"MODE",
+            b"durable",
+            b"MAINTAIN-SLICE",
+            b"64kb",
+            b"MEM-BUDGET",
+            b"4mb",
+        ]);
+        assert_eq!(spec.ring_bytes(), Some(8 << 20), "4 MiB + 64 KiB rounds up to 8 MiB");
+        assert_eq!(spec.blob_threshold_bytes, 2 << 20);
+        // A large budget keeps the ADR-0061 default.
+        let spec = tier(&[b"INF.NS", b"CREATE", b"t", b"MODE", b"durable", b"MEM-BUDGET", b"64mb"]);
+        assert_eq!(spec.blob_threshold_bytes, 1 << 24);
+        // Explicit values are kept verbatim — legal or not; the gauntlet
+        // decides at registration.
+        let spec = tier(&[
+            b"INF.NS",
+            b"CREATE",
+            b"t",
+            b"MODE",
+            b"durable",
+            b"BLOB-THRESHOLD",
+            b"64kb",
+            b"MEM-BUDGET",
+            b"4mb",
+        ]);
+        assert_eq!(spec.blob_threshold_bytes, 64 << 10);
+        assert!(spec.validate().is_ok());
+        let spec = tier(&[
+            b"INF.NS",
+            b"CREATE",
+            b"t",
+            b"MODE",
+            b"durable",
+            b"MEM-BUDGET",
+            b"4mb",
+            b"BLOB-THRESHOLD",
+            b"16mb",
+        ]);
+        assert_eq!(spec.blob_threshold_bytes, 1 << 24);
+        let err = spec.validate().expect_err("16 MiB threshold in an 8 MiB ring");
+        assert!(err.starts_with("BLOB-THRESHOLD exceeds"), "{err}");
+        // The H0 budgets: the floor rule, typed.
+        for budget in [&b"64kb"[..], b"256kb", b"512kb", b"1mb", b"2mb"] {
+            let spec =
+                tier(&[b"INF.NS", b"CREATE", b"t", b"MODE", b"durable", b"MEM-BUDGET", budget]);
+            let err = spec.validate().expect_err("sub-floor budget");
+            assert!(
+                err.starts_with("MEM-BUDGET + MAINTAIN-SLICE must reserve at least 4mb"),
+                "{err}"
+            );
+        }
+        assert!(
+            tier(&[b"INF.NS", b"CREATE", b"t", b"MODE", b"durable", b"MEM-BUDGET", b"3mb"])
+                .validate()
+                .is_ok()
         );
     }
 

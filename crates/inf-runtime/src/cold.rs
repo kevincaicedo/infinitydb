@@ -557,11 +557,20 @@ impl ColdReads {
                     }
                     let start = intent.offset;
                     let end = start + u64::from(intent.len);
-                    let joins = intent.file == seed_file && start <= hi && end >= lo;
+                    // One device read has one fd: an intent on the same
+                    // file id through a different descriptor never joins
+                    // (blob extents open one reader per fetch under one
+                    // synthetic id — review remediation of 2026-09-01,
+                    // N5: the former `debug_assert_eq!(intent.fd,
+                    // seed_fd)` was a cell panic under two concurrent
+                    // reads of one extent).
+                    let joins = intent.file == seed_file
+                        && intent.fd == seed_fd
+                        && start <= hi
+                        && end >= lo;
                     let new_lo = lo.min(start);
                     let new_hi = hi.max(end);
                     if joins && (new_hi - new_lo) as usize <= buf_size {
-                        debug_assert_eq!(intent.fd, seed_fd, "one file, one fd");
                         lo = new_lo;
                         hi = new_hi;
                         merge_scratch.push(intent);
@@ -1125,6 +1134,21 @@ mod tests {
         done.bytes(|bytes| assert!(bytes.iter().all(|&byte| byte == 0xDD)));
         drop(done);
         assert_eq!(cold.reconcile(), Ok(()));
+    }
+
+    /// Reads never merge across descriptors either (N5, review
+    /// remediation of 2026-09-01): two fetches of one blob extent open
+    /// two readers under one synthetic file id — each device read
+    /// carries exactly the fd its intent named.
+    #[test]
+    fn merging_never_crosses_descriptors() {
+        let cold = path(4);
+        let file = TierFileId::new(0x8000_0007);
+        let a = ask(&cold, 3, file, 0, FRAME as usize);
+        let b = ask(&cold, 4, file, FRAME, FRAME as usize);
+        let ops = drain_ops(&cold);
+        assert_eq!(ops.len(), 2, "adjacent offsets, one file id, two fds: two device reads");
+        drop((a, b));
     }
 
     /// Reads never merge across files, whatever their offsets say.

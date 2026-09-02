@@ -1152,6 +1152,65 @@ per episode). A drained cell always seals — never slower than K = 1.
      re-registration** (`ExtentRefs::register`) — the ADR-0057 D4
      at-least-once physics applied to the reclaim queue (found by the
      DST sweep; ADR-0061 D5).
+- **ADR-0103 amendment (2026-09-01, full-codebase review C14 /
+  F-L14-05) — the `CREATE` choreography: persist-then-serve.**
+  1. **Order** (`inf-server::plane::program_ns_ddl`): *parse → durable-
+     plane check → allocate the id → `Keyspace::ns_create_check`
+     (registry rules + tier gauntlet + reserved-VA arithmetic, applies
+     nothing) → `ControlHandle::request_persist_create(export ∪ spec)`
+     → wait `persisted(epoch)` → read the `CreateVerdict` → apply
+     locally → fan `INF.NSFAN CREATE` (unchanged 9 args) →
+     `create_applied(id)` → `+OK`*. No cell names a namespace before
+     `META` does. `SET` keeps *apply → fan → persist → ack*; `DROP`
+     follows ADR-0100 D4.
+  2. **The writer's pending-create set** (`inf-server::control`,
+     ADR-0103 D2): every `PersistReq` may carry `create: (NsSpec,
+     CreateVerdict)`; the writer merges every pending spec the payload
+     lacks (by id) *before* the tombstone reconciliation, decides the
+     create against the merged view (`Accepted | NameExists |
+     AtCapacity`, written to the request's `Arc<AtomicU8>` before
+     `persisted_epoch` publishes), and retires an entry on
+     `CreateApplied { id }` or on any `DROP` of the id
+     (`request_persist_drop(catalog, id, tombstone)`). Bound
+     `PENDING_CREATE_MAX = 256` (gauge `ControlHandle::pending_
+     creates`; the origin answers `BUSY` at the cap). Empty at boot —
+     `META` already holds every accepted create. The sim's inline
+     inbox runs the same state.
+  3. **Recovery verifier** (`inf-store::keyspace`, `inf-server::
+     recover`, ADR-0103 D4): `ReplayOutcome::SkippedUnknownNs(NsId)`
+     carries the id; `RecoverStats::records_skipped_unknown_ns`
+     counts the skips whose id no drop tombstone explains (the
+     `RecoveryBoard` slot exposes it; the boot line prints it when
+     nonzero). Zero on every honest boot — the DST asserts it.
+  4. **Fault point** `ns_create_after_meta` (crash-matrix row
+     `namespace-seeded-from-meta`): the restart seeds the namespace
+     from `META` and serves it.
+- **ADR-0102 amendment (2026-09-01, full-codebase review H0 /
+  F-L06-01 / F-L06-05) — tier ring invariants at the gauntlet.**
+  1. **`TierSpec::validate`** gains the four-page floor (`MEM-BUDGET +
+     MAINTAIN-SLICE ≥ 4mb`, `RING_WINDOW_MIN_BYTES`) and the half-ring
+     inline bound (`blob_threshold_bytes ≤ TierSpec::blob_threshold_
+     max(R)` = `R/2 − HEADER_LEN − MAX_KEY_LEN + 1`, `R` derived from
+     the spec). `for_budget` and the `INF.NS CREATE` parser derive an
+     absent `BLOB-THRESHOLD` as `min(16mb, R/4)` (`TierSpec::with_
+     default_blob_threshold`); an explicit value is honoured or
+     refused, never clamped.
+  2. **`TieredTable`** enforces the bound structurally: the effective
+     `BlobConfig` threshold is clamped to `blob_threshold_max(R)` at
+     construction and `set_blob_config`; `append`/`append_extent`
+     refuse a record above `inline_record_max() = R/2` with
+     `OpError::TooLarge`; `write_stall_target` is total (`None` above
+     the bound) and `extent_stall_target(key)` sizes the blob path's
+     probe from the 24-byte reference (`plane::tiered::StallProbe`).
+     `AddressSpace::{new, alloc, stall_target}` keep their asserts as
+     internal invariants.
+  3. **Legacy catalogs**: `Keyspace::seed_catalog` clamps a pre-rule
+     entry's threshold to the bound (`seed_normalized_thresholds`,
+     reported by the boot).
+  4. **`INFO tiering`** gains `tiering_write_replans` (F-L06-03: writes
+     that re-resolved because the slot moved under an extent read).
+  5. **`inf-runtime::cold`** (N5): an intent joins a merged read only on
+     the same descriptor (`file` *and* `fd`).
 - **ADR-0100 amendment (2026-09-01, full-codebase review C13 /
   F-L14-04) — namespace catalog v4 + the `DROP` choreography.**
   1. **Catalog v4** (`inf-store::catalog`): after the (now always

@@ -159,3 +159,16 @@ point = "ns_drop_after_meta"
 tier = "node"
 test = "node_e2e"
 expect = "residue-swept"
+
+# ADR-0103 D5 (`created_namespace_survives_a_cut_after_its_swap`): the
+# CREATE DDL stops once the catalog swap is durable and before the local
+# apply/fan — META names a namespace no cell serves and nothing was
+# acked.
+#   namespace-seeded-from-meta — the restart seeds the namespace from
+#                         META and serves it on every cell; an un-acked
+#                         DDL that took effect (ack-after-durable)
+[[row]]
+point = "ns_create_after_meta"
+tier = "node"
+test = "node_e2e"
+expect = "namespace-seeded-from-meta"
