@@ -12,7 +12,8 @@ mod parser;
 mod writer;
 
 pub use command::{
-    COMMANDS, CmdFlags, CommandId, CommandMeta, KeyIter, KeySpec, arity_ok, extract_keys, lookup,
+    COMMANDS, CmdFlags, CommandId, CommandMeta, KeyIter, KeySpec, arity_ok, extract_keys, key_spec,
+    lookup,
 };
 pub use parser::{ArgvRef, ConnParser, FrameIter, INLINE_ARGS, Parsed, ParserLimits, WireError};
 pub use writer::{Protocol, RespWriter};

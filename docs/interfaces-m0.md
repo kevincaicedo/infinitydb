@@ -392,6 +392,10 @@ pub struct CommandMeta {
 pub fn lookup(name: &[u8]) -> Option<&'static CommandMeta>;  // case-insensitive perfect hash:
     // fold+pack one u64, multiply-shift, one probe, one word compare (~5 ns dev-tier)
 pub fn extract_keys<'v, 'a>(meta: &CommandMeta, argv: &'v ArgvRef<'a>) -> KeyIter<'v, 'a>;
+pub fn key_spec(meta: &CommandMeta, subcommand: Option<&[u8]>) -> KeySpec;
+    // ADR-0104: the routing truth — `meta.keys`, or the subcommand-scoped row
+    // (`DEBUG OBJECT <key>` → SECOND; other DEBUG subcommands → NONE). Every
+    // key-position consumer reads this, never `meta.keys` directly.
 pub fn arity_ok(meta: &CommandMeta, argc: usize) -> bool;
 ```
 
@@ -508,11 +512,21 @@ impl ServerPlane<O> {
 
 /// Apply-point hook: local execution + the owner side of remote Apply.
 /// inf-sim's linearizability oracle consumes this; production observer is
-/// a no-op that monomorphizes away.
+/// a no-op that monomorphizes away. `scope` names the store the command
+/// addressed (ADR-0105: `Db(db)` | `Ns(id)` | `Unavailable`, as the
+/// connection stood when the command executed) so the replay model applies
+/// the same argv to the same store.
 pub trait PlaneObserver {
-    fn on_execute(&mut self, cell: CellId, origin: ExecOrigin,
+    fn on_execute(&mut self, cell: CellId, origin: ExecOrigin, scope: ExecScope,
                   argv: &[&[u8]], reply: &[u8], now: Nanos);
 }
+/// Quiescence content fold (ADR-0105): every live `(scope, key, value,
+/// expiry deadline)` over the numbered dbs and the memory / flat-durable
+/// named namespaces, through the store's checkpoint walk; tiered
+/// namespaces are skipped and counted. `ServerPlane::fold_live_entries`
+/// is the node side; the sim runs the same function on its model.
+pub fn fold_live_entries(ks: &mut Keyspace, now: Nanos,
+                         emit: impl FnMut(ExecScope, &[u8], &[u8], Option<u64>)) -> usize;
 
 /// INFO-visible node stats (S19): frozen tripwire snapshot + raw lifetime
 /// counters (scrapers diff two snapshots for under-load ratios) + memory

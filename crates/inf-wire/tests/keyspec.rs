@@ -200,3 +200,38 @@ proptest! {
         }
     }
 }
+
+/// Keys of one explicit argv through the registry's spec (the routing
+/// truth the plane reads).
+fn keys_via_argv(parts: &[&str]) -> Vec<Vec<u8>> {
+    let mut frame = format!("*{}\r\n", parts.len()).into_bytes();
+    for part in parts {
+        frame.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+    }
+    let mut parser = ConnParser::new(ParserLimits::default());
+    let mut iter = parser.feed(&frame);
+    let Some(Parsed::Command(argv)) = iter.next() else { panic!("{parts:?} did not parse") };
+    let meta = lookup(argv.arg(0)).expect("command resolves");
+    extract_keys(meta, &argv).map(<[u8]>::to_vec).collect()
+}
+
+/// Review of 2026-08-30 (L12-01, ADR-0104): `DEBUG OBJECT <key>` is the
+/// one registry row whose key position depends on the subcommand. The
+/// static spec says "no keys" (Redis's table, written for a node that
+/// never routes); the routing spec says argv[2] when argv[1] is `OBJECT`
+/// in any case, and nothing otherwise — `DEBUG SLEEP 0.5` must never
+/// route on `"0.5"`, and a bare `DEBUG OBJECT` (arity error downstream)
+/// yields no key rather than an out-of-range index.
+#[test]
+fn debug_object_is_the_subcommand_scoped_key() {
+    let none: Vec<Vec<u8>> = Vec::new();
+    assert_eq!(keys_via_argv(&["DEBUG", "OBJECT", "k"]), vec![b"k".to_vec()]);
+    assert_eq!(keys_via_argv(&["debug", "object", "k"]), vec![b"k".to_vec()]);
+    assert_eq!(keys_via_argv(&["DEBUG", "OBJECT"]), none);
+    assert_eq!(keys_via_argv(&["DEBUG", "SLEEP", "0.5"]), none);
+    assert_eq!(keys_via_argv(&["DEBUG", "JMAP"]), none);
+    assert_eq!(keys_via_argv(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]), none);
+    // The sibling with the same argv shape has always routed; the two
+    // must agree on where the key is.
+    assert_eq!(keys_via_argv(&["OBJECT", "ENCODING", "k"]), vec![b"k".to_vec()]);
+}

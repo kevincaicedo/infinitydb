@@ -5753,3 +5753,84 @@ fn namespace_is_unusable_until_its_definition_is_durable() {
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- review of 2026-08-30, L12-01: DEBUG OBJECT routes to the owner ----
+
+/// Review of 2026-08-30 (L12-01, the last member of C1's class):
+/// `DEBUG OBJECT <key>` was the one key-addressed command declared
+/// `KeySpec::NONE`, so it probed whichever cell the connection landed on
+/// and answered `-ERR no such key` for every key another cell owns — while
+/// `GET` on the same connection served the value. Goal: on a four-cell
+/// node, one connection SETs a key owned by every cell and `DEBUG OBJECT`
+/// must agree with `GET` on all four (pre-fix: three of four answered
+/// "no such key", stable by key name). Method: the default db here; the
+/// namespace-bound `ApplyNs` route in the test below.
+#[test]
+fn debug_object_routes_to_the_owning_cell() {
+    let node = Node::start(4);
+    let mut c = node.connect();
+    assert_debug_object_agrees_with_get(&mut c, 4, "db0");
+    drop(c);
+    node.stop();
+}
+
+/// The namespace-bound half of L12-01: a connection bound with `INF.NS
+/// USE` dispatches through `dispatch_ns`, whose owner resolution reads the
+/// same key spec — a memory namespace and a flat durable one, both on a
+/// four-cell node.
+#[test]
+fn debug_object_routes_under_a_named_namespace() {
+    let dir = temp_data_dir("debug-object-ns");
+    let node = Node::start_durable(4, &dir);
+    let mut c = node.connect();
+    let creates: [&[&[u8]]; 2] = [
+        &[b"INF.NS", b"CREATE", b"dbgmem", b"MODE", b"memory"],
+        &[b"INF.NS", b"CREATE", b"dbgdur", b"MODE", b"durable", b"FSYNC", b"everysec"],
+    ];
+    for create in creates {
+        c.write_all(&cmd(create)).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    for ns in ["dbgmem", "dbgdur"] {
+        c.write_all(&cmd(&[b"INF.NS", b"USE", ns.as_bytes()])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        assert_debug_object_agrees_with_get(&mut c, 4, ns);
+    }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// One key per cell: `SET`, then `DEBUG OBJECT` and `GET` on the same
+/// connection must agree on existence; the reply shape is the documented
+/// engine-internal one (`Value at:0x0 … serializedlength:<strlen>`), and a
+/// never-set key answers the Redis-exact error.
+fn assert_debug_object_agrees_with_get(c: &mut TcpStream, cells: u16, scope: &str) {
+    let mut disagreeing: Vec<(u16, String)> = Vec::new();
+    for cell in 0..cells {
+        let key = key_for_cell(cells, cell);
+        let value = format!("{scope}:{cell}");
+        c.write_all(&cmd(&[b"SET", &key, value.as_bytes()])).expect("write");
+        read_exactly(c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"DEBUG", b"OBJECT", &key])).expect("write");
+        let debug = read_line(c);
+        c.write_all(&cmd(&[b"GET", &key])).expect("write");
+        assert_eq!(read_bulk(c), value.as_bytes(), "{scope}: GET on cell {cell}'s key");
+        if debug.starts_with(b"+Value at:0x0 refcount:1 encoding:") {
+            let tail = format!("serializedlength:{} lru:0 lru_seconds_idle:0\r\n", value.len());
+            assert!(
+                debug.ends_with(tail.as_bytes()),
+                "{scope}: DEBUG OBJECT reported another cell's length: {:?}",
+                String::from_utf8_lossy(&debug)
+            );
+        } else {
+            disagreeing.push((cell, String::from_utf8_lossy(&debug).into_owned()));
+        }
+    }
+    assert!(
+        disagreeing.is_empty(),
+        "{scope}: DEBUG OBJECT disagrees with GET for keys owned by cells {disagreeing:?}"
+    );
+    c.write_all(&cmd(&[b"DEBUG", b"OBJECT", b"never-set:l12-01"])).expect("write");
+    read_exactly(c, b"-ERR no such key\r\n");
+}

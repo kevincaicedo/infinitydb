@@ -177,7 +177,7 @@ pub static DECLARED: &[Declared] = &[
         "DEBUG",
         Status::Partial,
         "M1",
-        "subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE; SLEEP stalls one cell, never the node",
+        "subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE; OBJECT routes to the key's owner cell and COMMAND GETKEYS reports that key (ADR-0104); SLEEP stalls one cell, never the node",
     ),
     d("EXPIREAT", Status::Full, "M1", ""),
     d("PEXPIREAT", Status::Full, "M1", ""),

@@ -840,10 +840,11 @@ fn main() {
     let mut scenario = match scenario_name.as_str() {
         "m0-smoke" => Scenario::m0_smoke(seed),
         "m0-adversarial" => Scenario::m0_adversarial(seed),
+        "m0-surface" => Scenario::m0_surface(seed),
         "m1-cache" => Scenario::m1_cache(seed),
         other => {
             eprintln!(
-                "inf-sim: unknown scenario {other} (have: m0-smoke, m0-adversarial, m1-cache, \
+                "inf-sim: unknown scenario {other} (have: m0-smoke, m0-adversarial, m0-surface, m1-cache, \
                  m2-durable, m3-document, m2-combined, boot-storm, m4-steel, m4-pressure, \
                  m4-cold, m4-recovery, m4-diskfull, m4-tiered)"
             );
@@ -873,8 +874,15 @@ fn main() {
     );
     // Machine-readable line for the nightly fleet (sim-seconds budget sum).
     println!(
-        "inf-sim: sim_seconds={:.6} published={} delivered={}",
-        report.sim_seconds, report.published, report.delivered
+        "inf-sim: sim_seconds={:.6} published={} delivered={} audits={} flushes={} \
+         scan_walks={} replays_skipped={}",
+        report.sim_seconds,
+        report.published,
+        report.delivered,
+        report.audits,
+        report.flushes,
+        report.scan_walks,
+        report.replays_skipped
     );
     if let Some(path) = &trace_out
         && let Err(e) = std::fs::write(path, &report.trace)
