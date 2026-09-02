@@ -1,19 +1,22 @@
 # Release-assert inventory (ADR-0107 D2; review of 2026-08-30, Theme 4).
 # class<TAB>count<TAB>file<TAB>kind<TAB>message<TAB>justification
 # I = invariant on the callee's own state; C = claim about a caller, with the enforcing
-# check named (file.rs:function); F = fail-stop the policy sanctions; U = unaudited crate.
-# Audited (batch 11, 2026-09-02): inf-alloc, inf-log, inf-store — the review's Theme-4 set.
-# Every other cell crate stays U until its audit story (counted, disclosed by the gate).
+# check named as a resolving `path/from/root.rs:Symbol` (ADR-0107 D2, first amendment);
+# F = fail-stop the policy sanctions; U = unaudited crate (none remain).
+# Audited: batch 11 (2026-09-02) inf-alloc, inf-log, inf-store — the review's Theme-4 set;
+# batch 12 (2026-09-02) the other eight crates — inf-foundation, inf-wire, inf-fabric,
+# inf-simd, inf-runtime, inf-doc, inf-query, inf-server. Every cell crate is audited;
+# a new crate is U from its first commit until its audit story.
 F	1	crates/inf-alloc/src/aligned.rs	assert	aligned box allocation failed	allocation failure is process-abort, the same fail-stop the global allocator applies to every `Vec` growth (`std::alloc::handle_alloc_error`); inf-alloc/SAFETY.md row `aligned.rs::AlignedPool::new / AlignedBox::new`
 I	2	crates/inf-alloc/src/aligned.rs	assert	aligned buffer id out of range	`AlignedBufId` is issued only by this pool's `lease`; the bound is checked before the offset forms (SAFETY.md `aligned.rs::bytes`)
 F	1	crates/inf-alloc/src/aligned.rs	assert	aligned pool allocation failed	allocation failure is process-abort, the same fail-stop the global allocator applies to every `Vec` growth (`std::alloc::handle_alloc_error`); inf-alloc/SAFETY.md row `aligned.rs::AlignedPool::new / AlignedBox::new`
 C	1	crates/inf-alloc/src/aligned.rs	assert	buf_size must be a multiple of the alignment	the only production pool is `crates/inf-server/src/tier_cell.rs:TierCell::create_ns` — count = COLD-READ-QD (1..=4096 by crates/inf-store/src/ns.rs:TierSpec::validate), buf_size = the const COLD_POOL_BUF (4 × TIER_FRAME_BYTES); ≤ 256 MiB ≪ isize::MAX
-C	1	crates/inf-alloc/src/aligned.rs	assert	empty aligned box	every production box is a const length: `crates/inf-log/src/segment.rs:ZERO_FILL_SLICE_BYTES` (256 KiB, `durable.rs:DurableCell::new`) and `crates/inf-log/src/ckpt.rs:ICK_BLOCK_ALIGN` (= FRAME_ALIGN, `inf-server/src/ckpt.rs`)
+C	1	crates/inf-alloc/src/aligned.rs	assert	empty aligned box	every production box is a const length: `crates/inf-log/src/segment.rs:ZERO_FILL_SLICE_BYTES` (256 KiB, `crates/inf-server/src/durable.rs:DurableCell::new`) and `crates/inf-log/src/ckpt.rs:ICK_BLOCK_ALIGN` (= FRAME_ALIGN, `inf-server/src/ckpt.rs`)
 C	1	crates/inf-alloc/src/aligned.rs	assert	empty buffers	the only production pool is `crates/inf-server/src/tier_cell.rs:TierCell::create_ns` — count = COLD-READ-QD (1..=4096 by crates/inf-store/src/ns.rs:TierSpec::validate), buf_size = the const COLD_POOL_BUF (4 × TIER_FRAME_BYTES); ≤ 256 MiB ≪ isize::MAX
 C	1	crates/inf-alloc/src/aligned.rs	assert	empty pool	the only production pool is `crates/inf-server/src/tier_cell.rs:TierCell::create_ns` — count = COLD-READ-QD (1..=4096 by crates/inf-store/src/ns.rs:TierSpec::validate), buf_size = the const COLD_POOL_BUF (4 × TIER_FRAME_BYTES); ≤ 256 MiB ≪ isize::MAX
-C	1	crates/inf-alloc/src/aligned.rs	assert	len must be a multiple of the alignment	every production box is a const length: `crates/inf-log/src/segment.rs:ZERO_FILL_SLICE_BYTES` (256 KiB, `durable.rs:DurableCell::new`) and `crates/inf-log/src/ckpt.rs:ICK_BLOCK_ALIGN` (= FRAME_ALIGN, `inf-server/src/ckpt.rs`)
+C	1	crates/inf-alloc/src/aligned.rs	assert	len must be a multiple of the alignment	every production box is a const length: `crates/inf-log/src/segment.rs:ZERO_FILL_SLICE_BYTES` (256 KiB, `crates/inf-server/src/durable.rs:DurableCell::new`) and `crates/inf-log/src/ckpt.rs:ICK_BLOCK_ALIGN` (= FRAME_ALIGN, `inf-server/src/ckpt.rs`)
 I	1	crates/inf-alloc/src/aligned.rs	assert	release of a non-leased aligned buffer {}	lease-bitmap lifecycle of the pool's own state (double release / never leased) — the M0 buffer-pool contract
-C	1	crates/inf-alloc/src/aligned.rs	expect	box layout within isize::MAX	every production box is a const length: `crates/inf-log/src/segment.rs:ZERO_FILL_SLICE_BYTES` (256 KiB, `durable.rs:DurableCell::new`) and `crates/inf-log/src/ckpt.rs:ICK_BLOCK_ALIGN` (= FRAME_ALIGN, `inf-server/src/ckpt.rs`)
+C	1	crates/inf-alloc/src/aligned.rs	expect	box layout within isize::MAX	every production box is a const length: `crates/inf-log/src/segment.rs:ZERO_FILL_SLICE_BYTES` (256 KiB, `crates/inf-server/src/durable.rs:DurableCell::new`) and `crates/inf-log/src/ckpt.rs:ICK_BLOCK_ALIGN` (= FRAME_ALIGN, `inf-server/src/ckpt.rs`)
 C	1	crates/inf-alloc/src/aligned.rs	expect	pool layout within isize::MAX	the only production pool is `crates/inf-server/src/tier_cell.rs:TierCell::create_ns` — count = COLD-READ-QD (1..=4096 by crates/inf-store/src/ns.rs:TierSpec::validate), buf_size = the const COLD_POOL_BUF (4 × TIER_FRAME_BYTES); ≤ 256 MiB ≪ isize::MAX
 I	2	crates/inf-alloc/src/aligned.rs	expect	validated at construction	layout re-derived in Drop from the constructor's validated (count, buf_size)
 I	2	crates/inf-alloc/src/arena.rs	assert	arena range escapes chunk (stale addr or bad len)	offset+len bounds-checked against the owning chunk's mapped length before the slice forms — a stale addr panics instead of UB (SAFETY.md `arena.rs::bytes`)
@@ -37,127 +40,125 @@ F	1	crates/inf-alloc/src/region.rs	assert	host page size {sz} not a power of two
 I	1	crates/inf-alloc/src/region.rs	assert	madvise(decommit) failed: {}	DONTNEED / PROT_NONE on a live private anonymous range fail only for a broken range (EINVAL, ENOMEM-unmapped) — SAFETY.md row `region.rs::release_and_protect_none`
 F	1	crates/inf-alloc/src/region.rs	assert	mprotect(commit) failed: {}	the one reachable OS failure is commit-charge exhaustion under vm.overcommit_memory=2 (ENOMEM) — the same fail-stop the global allocator applies to any `Vec` growth; VMA count is bounded by the ring's window discipline (≤ 3 protections) so max_map_count is unreachable — SAFETY.md row; disclosed in the batch-11 ledger entry
 I	1	crates/inf-alloc/src/region.rs	assert	mprotect(decommit) failed: {}	DONTNEED / PROT_NONE on a live private anonymous range fail only for a broken range (EINVAL, ENOMEM-unmapped) — SAFETY.md row `region.rs::release_and_protect_none`
-C	1	crates/inf-alloc/src/region.rs	assert	page larger than reservation	`crates/inf-store/src/address_space.rs:AddressSpace::new` asserts the ring is a power of two ≥ 4 pages before building the RegionConfig; page_bytes is the 4 KiB const; the ring itself is derived by `crates/inf-store/src/demote.rs:DemotionConfig::ring_reserve_bytes`
 C	1	crates/inf-alloc/src/region.rs	assert	page_bytes must be a power of two	`crates/inf-store/src/address_space.rs:AddressSpace::new` asserts the ring is a power of two ≥ 4 pages before building the RegionConfig; page_bytes is the 4 KiB const; the ring itself is derived by `crates/inf-store/src/demote.rs:DemotionConfig::ring_reserve_bytes`
+C	1	crates/inf-alloc/src/region.rs	assert	page larger than reservation	`crates/inf-store/src/address_space.rs:AddressSpace::new` asserts the ring is a power of two ≥ 4 pages before building the RegionConfig; page_bytes is the 4 KiB const; the ring itself is derived by `crates/inf-store/src/demote.rs:DemotionConfig::ring_reserve_bytes`
 I	1	crates/inf-alloc/src/region.rs	assert	region access out of bounds	offset+len bounds-checked against the reservation before the slice forms (SAFETY.md `region.rs::bytes`)
 C	1	crates/inf-alloc/src/region.rs	assert	reserve_bytes must be a power of two	`crates/inf-store/src/address_space.rs:AddressSpace::new` asserts the ring is a power of two ≥ 4 pages before building the RegionConfig; page_bytes is the 4 KiB const; the ring itself is derived by `crates/inf-store/src/demote.rs:DemotionConfig::ring_reserve_bytes`
 F	1	crates/inf-alloc/src/region.rs	assert	sysconf(_SC_PAGESIZE) failed	host invariant probed at the first ring reservation (cell boot / namespace create): an unsupported page geometry is fail-fast — SAFETY.md row `region.rs::protect_read_write`
-U	1	crates/inf-doc/src/apply.rs	expect	i64 scratch fits f64 encoding	unaudited
-U	1	crates/inf-doc/src/apply.rs	expect	peeked	unaudited
-U	1	crates/inf-doc/src/apply.rs	expect	targets are real locations, so a frame remains	unaudited
-U	1	crates/inf-doc/src/apply.rs	unreachable	caller checked the numeric arms	unaudited
-U	1	crates/inf-doc/src/apply.rs	unreachable	validated object key positions hold strings	unaudited
-U	1	crates/inf-doc/src/apply.rs	unreachable	validated object keys are strings	unaudited
-U	1	crates/inf-doc/src/arena.rs	assert_eq	document accounting reconciles to zero	unaudited
-U	3	crates/inf-doc/src/arena.rs	expect	4-byte field	unaudited
-U	1	crates/inf-doc/src/arena.rs	expect	8-byte cell	unaudited
-U	1	crates/inf-doc/src/arena.rs	expect	8-byte slot	unaudited
-U	1	crates/inf-doc/src/arena.rs	expect	arena key cells hold boundary-validated UTF-8	unaudited
-U	1	crates/inf-doc/src/arena.rs	expect	arena str cells hold boundary-validated UTF-8 (ADR-0036 D6)	unaudited
-U	1	crates/inf-doc/src/arena.rs	expect	caller checked non-empty	unaudited
-U	1	crates/inf-doc/src/arena.rs	expect	checked non-empty	unaudited
-U	2	crates/inf-doc/src/arena.rs	expect	frame still open	unaudited
-U	1	crates/inf-doc/src/arena.rs	expect	idx < count	unaudited
-U	1	crates/inf-doc/src/arena.rs	expect	payload holds a 48-bit address	unaudited
-U	1	crates/inf-doc/src/arena.rs	expect	value completes a pending key	unaudited
-U	1	crates/inf-doc/src/arena.rs	expect	walk ends with exactly the root ref	unaudited
-U	1	crates/inf-doc/src/arena.rs	unreachable	invalid DocRef tag {t} — refs are constructed, never decoded	unaudited
-U	1	crates/inf-doc/src/arena.rs	unreachable	obj step came from an obj frame	unaudited
-U	2	crates/inf-doc/src/build.rs	assert	builder misuse: finish() with open containers	unaudited
-U	2	crates/inf-doc/src/build.rs	assert	builder misuse: finish() without a root value	unaudited
-U	1	crates/inf-doc/src/build.rs	assert	builder misuse: finish_fragment() with open containers	unaudited
-U	1	crates/inf-doc/src/build.rs	assert	builder misuse: finish_fragment() without a root value	unaudited
-U	1	crates/inf-doc/src/build.rs	assert	builder misuse: key emitted where a value is due	unaudited
-U	1	crates/inf-doc/src/build.rs	assert	builder misuse: key inside an array	unaudited
-U	1	crates/inf-doc/src/build.rs	assert	builder misuse: object closed between key and value	unaudited
-U	1	crates/inf-doc/src/build.rs	assert	builder misuse: second root value	unaudited
-U	1	crates/inf-doc/src/build.rs	assert	builder misuse: value emitted where a key is due	unaudited
-U	1	crates/inf-doc/src/build.rs	expect	builder misuse: end() with no open container	unaudited
-U	1	crates/inf-doc/src/build.rs	expect	builder misuse: key outside an object	unaudited
-U	1	crates/inf-doc/src/delta.rs	expect	8-byte prefix	unaudited
-U	1	crates/inf-doc/src/emit.rs	expect	8-byte chunk	unaudited
-U	1	crates/inf-doc/src/intern.rs	expect	key implies open object	unaudited
-U	2	crates/inf-doc/src/intern.rs	expect	table bounded by INTERN_TABLE_MAX	unaudited
-U	2	crates/inf-doc/src/intern.rs	expect	validated dict splits	unaudited
-U	2	crates/inf-doc/src/intern.rs	expect	validated keyref resolves	unaudited
-U	1	crates/inf-doc/src/intern.rs	unreachable	plain input carries no refs	unaudited
-U	3	crates/inf-doc/src/json.rs	expect	8-byte chunk	unaudited
-U	1	crates/inf-doc/src/json.rs	expect	8-byte tail	unaudited
-U	1	crates/inf-doc/src/json.rs	expect	KeyOrObjClose implies an open object	unaudited
-U	1	crates/inf-doc/src/json.rs	expect	ValueOrArrClose implies an open array	unaudited
-U	1	crates/inf-doc/src/json.rs	expect	element loop owns an open array	unaudited
-U	1	crates/inf-doc/src/json.rs	expect	entry loop owns an open object	unaudited
-U	2	crates/inf-doc/src/json.rs	expect	non-empty run	unaudited
-U	1	crates/inf-doc/src/json.rs	expect	number slices are ASCII	unaudited
-U	1	crates/inf-doc/src/json.rs	expect	surrogates handled above; BMP/astral scalar remains	unaudited
-U	1	crates/inf-doc/src/limits.rs	assert	<no message>  assert!(DOC_BYTES_MAX <= 0xFF_FFFF);	unaudited
-U	1	crates/inf-doc/src/merge.rs	unreachable	validated object key positions hold strings	unaudited
-U	2	crates/inf-doc/src/model.rs	expect	top frame exists	unaudited
-U	1	crates/inf-doc/src/model.rs	expect	value completes a pending key	unaudited
-U	1	crates/inf-doc/src/model.rs	expect	walk ends with exactly the root value	unaudited
-U	1	crates/inf-doc/src/model.rs	unreachable	matched Arr above	unaudited
-U	1	crates/inf-doc/src/model.rs	unreachable	matched Obj above	unaudited
-U	3	crates/inf-doc/src/path/ast.rs	expect	AST keys are validated UTF-8	unaudited
-U	1	crates/inf-doc/src/path/cache.rs	unreachable	resident entries are chained	unaudited
-U	1	crates/inf-doc/src/path/eval.rs	expect	resolved slice indices are in range	unaudited
-U	4	crates/inf-doc/src/path/eval.rs	expect	saved ordinal within container	unaudited
-U	1	crates/inf-doc/src/path/eval.rs	expect	saved path resolves against the same document	unaudited
-U	1	crates/inf-doc/src/path/eval.rs	expect	stack top exists	unaudited
-U	1	crates/inf-doc/src/path/eval.rs	unreachable	Root never becomes a frame	unaudited
-U	1	crates/inf-doc/src/path/eval.rs	unreachable	descend-iterating frame on a container	unaudited
-U	1	crates/inf-doc/src/path/eval.rs	unreachable	iterating frame on a container	unaudited
-U	1	crates/inf-doc/src/path/eval.rs	unreachable	slice progress on array	unaudited
-U	2	crates/inf-doc/src/path/eval.rs	unreachable	unbounded budget cannot yield	unaudited
-U	1	crates/inf-doc/src/path/parse.rs	expect	one member	unaudited
-U	1	crates/inf-doc/src/path/parse.rs	expect	surrogates handled; scalar remains	unaudited
-U	3	crates/inf-doc/src/path/program.rs	expect	validated varint	unaudited
-U	1	crates/inf-doc/src/path/program.rs	unreachable	Root only leads (validated)	unaudited
-U	1	crates/inf-doc/src/path/program.rs	unreachable	simple_steps prevalidated the whole program	unaudited
-U	1	crates/inf-doc/src/path/program.rs	unreachable	validated member kinds	unaudited
-U	1	crates/inf-doc/src/path/program.rs	unreachable	validated position rules	unaudited
-U	1	crates/inf-doc/src/path/program.rs	unreachable	validated tape has no unknown opcodes	unaudited
-U	1	crates/inf-doc/src/ser.rs	unreachable	containers handled by the walker	unaudited
-U	3	crates/inf-doc/src/ser.rs	unreachable	unbounded serialization never refuses	unaudited
-U	1	crates/inf-doc/src/tape.rs	expect	9-byte extent	unaudited
-U	1	crates/inf-doc/src/tape.rs	expect	DocStr holds boundary-validated UTF-8 (ADR-0036 D6)	unaudited
-U	2	crates/inf-doc/src/tape.rs	expect	key position implies an open object	unaudited
-U	1	crates/inf-doc/src/tape.rs	expect	split_dict validated the table	unaudited
-U	1	crates/inf-doc/src/tape.rs	expect	validated dict splits	unaudited
-U	1	crates/inf-doc/src/tape.rs	expect	validated extent	unaudited
-U	1	crates/inf-doc/src/tape.rs	expect	validated keyref resolves	unaudited
-U	2	crates/inf-doc/src/tape.rs	expect	validated varint decodes	unaudited
-U	1	crates/inf-doc/src/tape.rs	unreachable	caller matched a string tag	unaudited
-U	1	crates/inf-doc/src/tape.rs	unreachable	header::decode rejects the interned flag without the feature	unaudited
-U	1	crates/inf-doc/src/tape.rs	unreachable	interned tapes cannot exist without the feature	unaudited
-U	1	crates/inf-doc/src/tape.rs	unreachable	validated object key positions hold strings	unaudited
-U	2	crates/inf-doc/src/tape.rs	unreachable	validated tape has no unknown tags	unaudited
-U	1	crates/inf-fabric/src/codec.rs	assert	ApplyNs ns {ns} is a default namespace (rides Op::Apply)	unaudited
-U	1	crates/inf-fabric/src/codec.rs	expect	fabric frame payload exceeds u32::MAX	unaudited
-U	1	crates/inf-fabric/src/codec.rs	panic	Batch must not nest Batch (codec v0)	unaudited
-U	1	crates/inf-fabric/src/codec.rs	panic	Batch must not nest Reply (codec v0)	unaudited
-U	1	crates/inf-fabric/src/mesh.rs	assert	Op::Reply goes through CellFabric::reply (reserved headroom)	unaudited
-U	1	crates/inf-fabric/src/mesh.rs	assert	mesh needs at least one cell	unaudited
-U	1	crates/inf-fabric/src/mesh.rs	assert	ring_capacity {} < 2 × data_credits {} — replies must always have headroom	unaudited
-U	1	crates/inf-fabric/src/mesh.rs	panic	cell {cell} has no fabric route to {to}	unaudited
-U	1	crates/inf-fabric/src/mesh.rs	panic	cell {} has no fabric route to {to}	unaudited
-U	1	crates/inf-fabric/src/msg.rs	assert	FabricMsg must stay in the 64-byte slot class (master plan §6.1)	unaudited
-U	1	crates/inf-fabric/src/msg.rs	assert	fabric token sequence overflows 48 bits: {seq}	unaudited
-U	1	crates/inf-fabric/src/ring.rs	assert	ring capacity must be a non-zero power of two, got {capacity}	unaudited
-U	1	crates/inf-foundation/src/hash.rs	expect	8-byte chunk	unaudited
-U	1	crates/inf-foundation/src/hash.rs	expect	caller guarantees 4 bytes	unaudited
-U	1	crates/inf-foundation/src/hash.rs	expect	caller guarantees 8 bytes	unaudited
-C	1	crates/inf-log/src/blob.rs	assert	an extent holds at least one value byte	`crates/inf-server/src/plane/tiered.rs:WriteGuard::try_write` routes to the extent writer only when value.len() ≥ BLOB-THRESHOLD, and crates/inf-store/src/ns.rs:TierSpec::validate bounds the threshold to 4kb..=16mb
+I	1	crates/inf-doc/src/apply.rs	expect	i64 scratch fits f64 encoding	`emit::I64_MAX_LEN` (11) ≥ `emit::F64_LEN` (9), both this crate's consts; the sub-slice is `F64_LEN` wide
+I	1	crates/inf-doc/src/apply.rs	expect	peeked	`edit_iter.peek()` returned `Some` two lines up
+I	1	crates/inf-doc/src/apply.rs	expect	targets are real locations, so a frame remains	own iterative walk state machine (frame stack pushed before the loop; popped only on its own close step); the root frame is pushed before the loop and popped only when `off == top.end`
+I	1	crates/inf-doc/src/apply.rs	unreachable	caller checked the numeric arms	private; both callers in this module (`patch_scalar_in_place`, `plan_site`) match `ValueRef::I64 | ValueRef::F64` immediately before the call
+C	1	crates/inf-doc/src/apply.rs	unreachable	validated object key positions hold strings	tape bodies are engine-emitted (this crate's parser/builders/patchers) and admitted through `crates/inf-store/src/doc.rs:CellStore::json_write_value` (`crates/inf-doc/src/tape.rs:TapeDoc::from_bytes` is the validator); `TypeTag::JsonDoc` keeps string records out; on-disk bytes ride CRC'd frames
+C	1	crates/inf-doc/src/apply.rs	unreachable	validated object keys are strings	tape bodies are engine-emitted (this crate's parser/builders/patchers) and admitted through `crates/inf-store/src/doc.rs:CellStore::json_write_value` (`crates/inf-doc/src/tape.rs:TapeDoc::from_bytes` is the validator); `TypeTag::JsonDoc` keeps string records out; on-disk bytes ride CRC'd frames
+I	1	crates/inf-doc/src/arena.rs	assert_eq	document accounting reconciles to zero	the document's own `DocMemReport` books: every alloc/free in this module accounts at the call site
+I	3	crates/inf-doc/src/arena.rs	expect	4-byte field	fixed-width sub-slice of a length-checked buffer — infallible by construction (`arena.bytes(addr, NODE_HDR/STR_HDR)`)
+I	1	crates/inf-doc/src/arena.rs	expect	8-byte cell	fixed-width sub-slice of a length-checked buffer — infallible by construction (`arena.bytes(addr, NUM_CELL)`)
+I	1	crates/inf-doc/src/arena.rs	expect	8-byte slot	fixed-width sub-slice of a length-checked buffer — infallible by construction (`arena.bytes(addr, node_bytes)`)
+I	1	crates/inf-doc/src/arena.rs	expect	arena key cells hold boundary-validated UTF-8	str cells are written only by `alloc_str` from `&str` / `DocStr::as_bytes` (this module's four call sites) — UTF-8 by type
+I	1	crates/inf-doc/src/arena.rs	expect	arena str cells hold boundary-validated UTF-8 (ADR-0036 D6)	str cells are written only by `alloc_str` from `&str` / `DocStr::as_bytes` (this module's four call sites) — UTF-8 by type
+I	1	crates/inf-doc/src/arena.rs	expect	caller checked non-empty	`freeze_walk` calls `freeze_step` only inside `while !stack.is_empty()`
+I	1	crates/inf-doc/src/arena.rs	expect	checked non-empty	`stack.is_empty()` returned on the line above
+I	2	crates/inf-doc/src/arena.rs	expect	frame still open	own iterative walk state machine (frame stack pushed before the loop; popped only on its own close step) (`morph_walk`: a step taken from the top frame implies the frame is still on the stack)
+I	1	crates/inf-doc/src/arena.rs	expect	idx < count	own iterator bound: `idx == count` returns `None` first; `index(idx)` is `Some` below `count`
+I	1	crates/inf-doc/src/arena.rs	expect	payload holds a 48-bit address	`ADDR_MASK` keeps 48 bits and `ArenaAddr::from_raw` accepts every 48-bit value; refs are built only by this module's constructors
+I	1	crates/inf-doc/src/arena.rs	expect	value completes a pending key	own iterative walk state machine (frame stack pushed before the loop; popped only on its own close step) (`morph_walk`: an object frame stores its key before descending into the value)
+I	1	crates/inf-doc/src/arena.rs	expect	walk ends with exactly the root ref	own iterative walk state machine (frame stack pushed before the loop; popped only on its own close step) (`morph_walk`: the root's completed ref is the last value carried up when the stack empties)
+I	1	crates/inf-doc/src/arena.rs	unreachable	invalid DocRef tag {t} — refs are constructed, never decoded	`DocRef` is built only by this module's constructors (tags 0..=8); never decoded from bytes
+I	1	crates/inf-doc/src/arena.rs	unreachable	obj step came from an obj frame	own iterative walk state machine (frame stack pushed before the loop; popped only on its own close step) (`MorphStep::ObjEntry` is produced only from a `MorphFrame::Obj` top)
+I	1	crates/inf-doc/src/build.rs	assert	builder misuse: finish_fragment() with open containers	the builder's own parity/single-root/nesting typestate (`BFrame` stack, `expects_key`, `root_done`); every driver is this crate's own walker (`freeze_walk`, `model.rs` `emit`) — `TapeBuilder` is used nowhere outside inf-doc
+I	1	crates/inf-doc/src/build.rs	assert	builder misuse: finish_fragment() without a root value	the builder's own parity/single-root/nesting typestate (`BFrame` stack, `expects_key`, `root_done`); every driver is this crate's own walker (`freeze_walk`, `model.rs` `emit`) — `TapeBuilder` is used nowhere outside inf-doc
+I	2	crates/inf-doc/src/build.rs	assert	builder misuse: finish() with open containers	the builder's own parity/single-root/nesting typestate (`BFrame` stack, `expects_key`, `root_done`); every driver is this crate's own walker (`freeze_walk`, `model.rs` `emit`) — `TapeBuilder` is used nowhere outside inf-doc
+I	2	crates/inf-doc/src/build.rs	assert	builder misuse: finish() without a root value	the builder's own parity/single-root/nesting typestate (`BFrame` stack, `expects_key`, `root_done`); every driver is this crate's own walker (`freeze_walk`, `model.rs` `emit`) — `TapeBuilder` is used nowhere outside inf-doc
+I	1	crates/inf-doc/src/build.rs	assert	builder misuse: key emitted where a value is due	the builder's own parity/single-root/nesting typestate (`BFrame` stack, `expects_key`, `root_done`); every driver is this crate's own walker (`freeze_walk`, `model.rs` `emit`) — `TapeBuilder` is used nowhere outside inf-doc
+I	1	crates/inf-doc/src/build.rs	assert	builder misuse: key inside an array	the builder's own parity/single-root/nesting typestate (`BFrame` stack, `expects_key`, `root_done`); every driver is this crate's own walker (`freeze_walk`, `model.rs` `emit`) — `TapeBuilder` is used nowhere outside inf-doc
+I	1	crates/inf-doc/src/build.rs	assert	builder misuse: object closed between key and value	the builder's own parity/single-root/nesting typestate (`BFrame` stack, `expects_key`, `root_done`); every driver is this crate's own walker (`freeze_walk`, `model.rs` `emit`) — `TapeBuilder` is used nowhere outside inf-doc
+I	1	crates/inf-doc/src/build.rs	assert	builder misuse: second root value	the builder's own parity/single-root/nesting typestate (`BFrame` stack, `expects_key`, `root_done`); every driver is this crate's own walker (`freeze_walk`, `model.rs` `emit`) — `TapeBuilder` is used nowhere outside inf-doc
+I	1	crates/inf-doc/src/build.rs	assert	builder misuse: value emitted where a key is due	the builder's own parity/single-root/nesting typestate (`BFrame` stack, `expects_key`, `root_done`); every driver is this crate's own walker (`freeze_walk`, `model.rs` `emit`) — `TapeBuilder` is used nowhere outside inf-doc
+I	1	crates/inf-doc/src/build.rs	expect	builder misuse: end() with no open container	the builder's own parity/single-root/nesting typestate (`BFrame` stack, `expects_key`, `root_done`); every driver is this crate's own walker (`freeze_walk`, `model.rs` `emit`) — `TapeBuilder` is used nowhere outside inf-doc
+I	1	crates/inf-doc/src/build.rs	expect	builder misuse: key outside an object	the builder's own parity/single-root/nesting typestate (`BFrame` stack, `expects_key`, `root_done`); every driver is this crate's own walker (`freeze_walk`, `model.rs` `emit`) — `TapeBuilder` is used nowhere outside inf-doc
+I	1	crates/inf-doc/src/delta.rs	expect	8-byte prefix	`bytes.get(..8)` on the line above returned `Some`
+I	1	crates/inf-doc/src/emit.rs	expect	8-byte chunk	`chunks_exact(8)` / `i + 8 <= len` loop bound — the sub-slice is exactly 8 bytes
+I	1	crates/inf-doc/src/intern.rs	expect	key implies open object	own scope stack: `expects_key` is set only on an open object frame, checked on the line above
+I	2	crates/inf-doc/src/intern.rs	expect	table bounded by INTERN_TABLE_MAX	`winners.len() > INTERN_TABLE_MAX` (= u16::MAX) returns `None` above; the table is a subset of the winners
+C	2	crates/inf-doc/src/intern.rs	expect	validated dict splits	interned tapes are produced only by `intern` (this module) and stored through `crates/inf-store/src/doc.rs:CellStore::json_write_value`; every reader takes a stored `TypeTag::JsonDoc` value (`crates/inf-store/src/doc.rs:checkpoint_idoc`, the `CellStore` readers); on-disk bytes ride CRC'd frames
+C	2	crates/inf-doc/src/intern.rs	expect	validated keyref resolves	interned tapes are produced only by `intern` (this module) and stored through `crates/inf-store/src/doc.rs:CellStore::json_write_value`; every reader takes a stored `TypeTag::JsonDoc` value (`crates/inf-store/src/doc.rs:checkpoint_idoc`, the `CellStore` readers); on-disk bytes ride CRC'd frames
+C	1	crates/inf-doc/src/intern.rs	unreachable	plain input carries no refs	the only production caller, `crates/inf-store/src/doc.rs:CellStore::json_write_value`, passes the freshly parsed plain tape (`crates/inf-doc/src/json.rs:JsonParser::parse` output), never an interned one
+I	3	crates/inf-doc/src/json.rs	expect	8-byte chunk	`chunks_exact(8)` / `i + 8 <= len` loop bound — the sub-slice is exactly 8 bytes
+I	1	crates/inf-doc/src/json.rs	expect	8-byte tail	the `len < 8` inputs returned from the scalar loop above; `len - 8..` is 8 bytes
+I	1	crates/inf-doc/src/json.rs	expect	element loop owns an open array	own grammar frame stack: the element loop is entered after `begin_arr` pushed the frame
+I	1	crates/inf-doc/src/json.rs	expect	entry loop owns an open object	own grammar frame stack: the entry loop is entered after `begin_obj` pushed the frame
+I	1	crates/inf-doc/src/json.rs	expect	KeyOrObjClose implies an open object	own grammar frame stack: `Expect::KeyOrObjClose` is set only after `begin_obj` pushed the frame
+I	2	crates/inf-doc/src/json.rs	expect	non-empty run	`end - run > 1` on the line above: the run has ≥ 2 members
+I	1	crates/inf-doc/src/json.rs	expect	number slices are ASCII	`parse_number_value` advanced `i` over ASCII digits (`digit_run_end`), `.`, `e`/`E`, `+`/`-` only
+I	1	crates/inf-doc/src/json.rs	expect	surrogates handled above; BMP/astral scalar remains	both surrogate ranges returned `LoneSurrogate` or combined into a supplementary scalar above; `from_u32` fails only on surrogates/out-of-range
+I	1	crates/inf-doc/src/json.rs	expect	ValueOrArrClose implies an open array	own grammar frame stack: `Expect::ValueOrArrClose` is set only after `begin_arr` pushed the frame
+I	1	crates/inf-doc/src/limits.rs	assert	<no message>  assert!(DOC_BYTES_MAX <= 0xFF_FFFF);	compile-time const assertion (the u24 field-width cap); a violation fails the build
+C	1	crates/inf-doc/src/merge.rs	unreachable	validated object key positions hold strings	tape bodies are engine-emitted (this crate's parser/builders/patchers) and admitted through `crates/inf-store/src/doc.rs:CellStore::json_write_value` (`crates/inf-doc/src/tape.rs:TapeDoc::from_bytes` is the validator); `TypeTag::JsonDoc` keeps string records out; on-disk bytes ride CRC'd frames
+I	2	crates/inf-doc/src/model.rs	expect	top frame exists	own iterative walk state machine (frame stack pushed before the loop; popped only on its own close step) (`from_cursor`: popped inside the arm that matched `stack.last_mut()`)
+I	1	crates/inf-doc/src/model.rs	expect	value completes a pending key	own iterative walk state machine (frame stack pushed before the loop; popped only on its own close step) (`from_cursor`: an object frame stores its key before descending into the value)
+I	1	crates/inf-doc/src/model.rs	expect	walk ends with exactly the root value	own iterative walk state machine (frame stack pushed before the loop; popped only on its own close step) (`from_cursor`: the root's completed value is carried up when the stack empties)
+I	1	crates/inf-doc/src/model.rs	unreachable	matched Arr above	the popped frame is the `BuildFrame::Arr` matched by `stack.last_mut()` two lines up
+I	1	crates/inf-doc/src/model.rs	unreachable	matched Obj above	the popped frame is the `BuildFrame::Obj` matched by `stack.last_mut()` two lines up
+C	3	crates/inf-doc/src/path/ast.rs	expect	AST keys are validated UTF-8	`PathAst` keys come from `crates/inf-doc/src/path/mod.rs:parse_ast` (rejects non-UTF-8 text before parsing) or `PathProgram::decode` of a validated program (`crates/inf-doc/src/path/program.rs:validate` requires UTF-8 child keys); `print` has no production caller (tests/fuzz only)
+I	1	crates/inf-doc/src/path/cache.rs	unreachable	resident entries are chained	own slab/bucket chain invariant: a resident slot is linked from its bucket head (insert links, evict unlinks)
+I	1	crates/inf-doc/src/path/eval.rs	expect	resolved slice indices are in range	`Progress::Slice` bounds were resolved against this array's length when the frame was created; `next` stays inside `[0, len)` by the step test above
+I	4	crates/inf-doc/src/path/eval.rs	expect	saved ordinal within container	own resumable-walk state: `EvalState` is opaque and produced/consumed only by `run` in this module; the saved path and ordinals were taken from the same `root` (no production caller resumes today — `eval_budgeted` is test/fuzz-only)
+I	1	crates/inf-doc/src/path/eval.rs	expect	saved path resolves against the same document	own resumable-walk state: `EvalState` is opaque and produced/consumed only by `run` in this module; the saved path and ordinals were taken from the same `root` (no production caller resumes today — `eval_budgeted` is test/fuzz-only)
+I	1	crates/inf-doc/src/path/eval.rs	expect	stack top exists	`stack.last_mut()` returned `Some` in the `let … else` above
+I	1	crates/inf-doc/src/path/eval.rs	unreachable	descend-iterating frame on a container	`SavedProgress::DescendIter` is saved only from a `DescendObj`/`DescendArr` frame, whose node is a container
+I	1	crates/inf-doc/src/path/eval.rs	unreachable	iterating frame on a container	`SavedProgress::Iter` is saved only from an `Obj`/`Arr` frame, whose node is a container
+I	1	crates/inf-doc/src/path/eval.rs	unreachable	Root never becomes a frame	`Op::Root` is consumed at pc 0 by `run`; frames are opened for selector ops only
+I	1	crates/inf-doc/src/path/eval.rs	unreachable	slice progress on array	`Progress::Slice` is created only for an array node (`advance` on `Op::Slice`)
+I	2	crates/inf-doc/src/path/eval.rs	unreachable	unbounded budget cannot yield	`run` yields only when `budget_nodes` (here `u64::MAX`) is exhausted
+I	1	crates/inf-doc/src/path/parse.rs	expect	one member	`members.len() == 1` on the line above
+I	1	crates/inf-doc/src/path/parse.rs	expect	surrogates handled; scalar remains	both surrogate ranges returned `BadEscape` or combined into a supplementary scalar above
+I	3	crates/inf-doc/src/path/program.rs	expect	validated varint	`PathProgram` holds validated bytes by type: built only by `crates/inf-doc/src/path/mod.rs:compile_with_max_bytes` (this crate's compiler) or `PathProgram::from_bytes` (`validate` runs first); fields are private
+I	1	crates/inf-doc/src/path/program.rs	unreachable	Root only leads (validated)	`PathProgram` holds validated bytes by type: built only by `crates/inf-doc/src/path/mod.rs:compile_with_max_bytes` (this crate's compiler) or `PathProgram::from_bytes` (`validate` runs first); fields are private; `validate` admits `Root` at offset 2 only
+I	1	crates/inf-doc/src/path/program.rs	unreachable	simple_steps prevalidated the whole program	`simple_steps` returns `None` unless every op is `Child`/`Index` (prescan in this module)
+I	1	crates/inf-doc/src/path/program.rs	unreachable	validated member kinds	`PathProgram` holds validated bytes by type: built only by `crates/inf-doc/src/path/mod.rs:compile_with_max_bytes` (this crate's compiler) or `PathProgram::from_bytes` (`validate` runs first); fields are private; `validate_selector(union_member = true)` admits `Child`/`Index`/`Slice` members only
+I	1	crates/inf-doc/src/path/program.rs	unreachable	validated position rules	`PathProgram` holds validated bytes by type: built only by `crates/inf-doc/src/path/mod.rs:compile_with_max_bytes` (this crate's compiler) or `PathProgram::from_bytes` (`validate` runs first); fields are private; `decode` consumes `Root` and `Descend` itself before `op_to_segment`
+I	1	crates/inf-doc/src/path/program.rs	unreachable	validated tape has no unknown opcodes	`PathProgram` holds validated bytes by type: built only by `crates/inf-doc/src/path/mod.rs:compile_with_max_bytes` (this crate's compiler) or `PathProgram::from_bytes` (`validate` runs first); fields are private
+I	1	crates/inf-doc/src/ser.rs	unreachable	containers handled by the walker	`write_scalar` is called only from the walkers' scalar arms (`compact`/`formatted`/`reply_walk`)
+I	3	crates/inf-doc/src/ser.rs	unreachable	unbounded serialization never refuses	`ReplyTooLarge` is produced only on the `BOUNDED = true` monomorphization; these entries instantiate `<false>`
+I	1	crates/inf-doc/src/tape.rs	expect	9-byte extent	`end > limit` returned `Truncated` on the line above; the sub-slice is 8 bytes
+C	1	crates/inf-doc/src/tape.rs	expect	DocStr holds boundary-validated UTF-8 (ADR-0036 D6)	`DocStr` is built only by `read_value`/`read_key` on validated tapes (`validate_str` requires UTF-8); tapes are engine-emitted and admitted through `crates/inf-store/src/doc.rs:CellStore::json_write_value` (`crates/inf-doc/src/tape.rs:TapeDoc::from_bytes` validates)
+I	2	crates/inf-doc/src/tape.rs	expect	key position implies an open object	`validate_one`'s own scope stack: `key_position` is derived from the top frame's `expects_key`
+I	1	crates/inf-doc/src/tape.rs	expect	split_dict validated the table	`DictCheck::new` runs on the `dict` region `split_dict` returned (count and every entry bounds-checked there)
+C	1	crates/inf-doc/src/tape.rs	expect	validated dict splits	tape bodies are engine-emitted (this crate's parser/builders/patchers) and admitted through `crates/inf-store/src/doc.rs:CellStore::json_write_value` (`crates/inf-doc/src/tape.rs:TapeDoc::from_bytes` is the validator); `TypeTag::JsonDoc` keeps string records out; on-disk bytes ride CRC'd frames
+C	1	crates/inf-doc/src/tape.rs	expect	validated extent	tape bodies are engine-emitted (this crate's parser/builders/patchers) and admitted through `crates/inf-store/src/doc.rs:CellStore::json_write_value` (`crates/inf-doc/src/tape.rs:TapeDoc::from_bytes` is the validator); `TypeTag::JsonDoc` keeps string records out; on-disk bytes ride CRC'd frames
+C	1	crates/inf-doc/src/tape.rs	expect	validated keyref resolves	tape bodies are engine-emitted (this crate's parser/builders/patchers) and admitted through `crates/inf-store/src/doc.rs:CellStore::json_write_value` (`crates/inf-doc/src/tape.rs:TapeDoc::from_bytes` is the validator); `TypeTag::JsonDoc` keeps string records out; on-disk bytes ride CRC'd frames
+C	2	crates/inf-doc/src/tape.rs	expect	validated varint decodes	tape bodies are engine-emitted (this crate's parser/builders/patchers) and admitted through `crates/inf-store/src/doc.rs:CellStore::json_write_value` (`crates/inf-doc/src/tape.rs:TapeDoc::from_bytes` is the validator); `TypeTag::JsonDoc` keeps string records out; on-disk bytes ride CRC'd frames
+I	1	crates/inf-doc/src/tape.rs	unreachable	caller matched a string tag	`validate_str` is called only from the `is_string` arm of `validate_one`
+I	1	crates/inf-doc/src/tape.rs	unreachable	header::decode rejects the interned flag without the feature	`crates/inf-doc/src/header.rs` decode admits `FLAG_INTERNED` only under `doc-intern-keys` (`supported` mask); `from_bytes` decoded the header first
+I	1	crates/inf-doc/src/tape.rs	unreachable	interned tapes cannot exist without the feature	no writer sets `FLAG_INTERNED` without `doc-intern-keys` (`intern` is feature-gated) and `header.rs` decode refuses it; the debug-asserted `from_bytes` precondition covers the rest
+C	1	crates/inf-doc/src/tape.rs	unreachable	validated object key positions hold strings	tape bodies are engine-emitted (this crate's parser/builders/patchers) and admitted through `crates/inf-store/src/doc.rs:CellStore::json_write_value` (`crates/inf-doc/src/tape.rs:TapeDoc::from_bytes` is the validator); `TypeTag::JsonDoc` keeps string records out; on-disk bytes ride CRC'd frames
+C	2	crates/inf-doc/src/tape.rs	unreachable	validated tape has no unknown tags	tape bodies are engine-emitted (this crate's parser/builders/patchers) and admitted through `crates/inf-store/src/doc.rs:CellStore::json_write_value` (`crates/inf-doc/src/tape.rs:TapeDoc::from_bytes` is the validator); `TypeTag::JsonDoc` keeps string records out; on-disk bytes ride CRC'd frames
+C	1	crates/inf-fabric/src/codec.rs	assert	ApplyNs ns {ns} is a default namespace (rides Op::Apply)	`Op::ApplyNs` is built only by `crates/inf-server/src/plane.rs:send_apply_ns` for a namespace-bound command; named ids come from `crates/inf-server/src/control.rs:ControlHandle::alloc_ns_id`, seeded above the 16 default dbs by the catalog's `next_id`
+C	1	crates/inf-fabric/src/codec.rs	expect	fabric frame payload exceeds u32::MAX	one op carries one parsed command's argv: `crates/inf-wire/src/parser.rs:parse_multibulk` bounds a frame to `ParserLimits::max_frame_bytes` (1 MiB default) and `max_args`; the senders (`crates/inf-server/src/plane.rs:send_apply`) hand the encoder one op at a time
+C	1	crates/inf-fabric/src/codec.rs	panic	Batch must not nest Batch (codec v0)	no production code constructs `Op::Batch` — the plane sends point ops only (`crates/inf-server/src/plane.rs:send_apply`, `send_apply_ns`, `try_send_apply`); the batch shape exists for the codec's tests
+C	1	crates/inf-fabric/src/codec.rs	panic	Batch must not nest Reply (codec v0)	no production code constructs `Op::Batch` — the plane sends point ops only (`crates/inf-server/src/plane.rs:send_apply`, `send_apply_ns`, `try_send_apply`); the batch shape exists for the codec's tests
+C	1	crates/inf-fabric/src/mesh.rs	assert	mesh needs at least one cell	`bins/infinityd/src/main.rs:parse_args` (`--cells` 1..=SLOT_COUNT); the DST and bench harnesses pass literals
+C	1	crates/inf-fabric/src/mesh.rs	assert	Op::Reply goes through CellFabric::reply (reserved headroom)	every `send` caller passes an `Op::Apply`/`Op::ApplyNs` it just built (`crates/inf-server/src/plane.rs:send_apply`, `send_apply_ns`, `try_send_apply`); replies ride `CellFabric::reply` from the FABRIC-IN drain
+C	1	crates/inf-fabric/src/mesh.rs	assert	ring_capacity {} < 2 × data_credits {} — replies must always have headroom	`MeshConfig` is a constant, never a flag: `{4096, 1024}` at `bins/infinityd/src/main.rs:main`, `crates/inf-fabric/src/mesh.rs:MeshConfig::default` (`{1024, 512}`) in the harnesses
+C	1	crates/inf-fabric/src/mesh.rs	panic	cell {cell} has no fabric route to {to}	`to` is the key's owner and a local owner never reaches `send`: dispatch goes remote only when `crates/inf-store/src/router.rs:SlotRouter::is_local` is false (`crates/inf-server/src/plane.rs:try_send_apply` and the `dispatch_one` arms); the mesh is full, so every other cell has a route
+C	1	crates/inf-fabric/src/mesh.rs	panic	cell {} has no fabric route to {to}	`to` is the key's owner and a local owner never reaches `send`: dispatch goes remote only when `crates/inf-store/src/router.rs:SlotRouter::is_local` is false (`crates/inf-server/src/plane.rs:try_send_apply` and the `dispatch_one` arms); the mesh is full, so every other cell has a route
+I	1	crates/inf-fabric/src/msg.rs	assert	FabricMsg must stay in the 64-byte slot class (master plan §6.1)	compile-time `const _: () = assert!` on `size_of::<FabricMsg>()` — a build failure, never a runtime panic
+I	1	crates/inf-fabric/src/msg.rs	assert	fabric token sequence overflows 48 bits: {seq}	the one production minter masks the sequence at 48 bits (`CellFabric::next_token`, batch 12 — it ran unbounded before) and the codec reads exactly 48 bits back; the assert guards the constructor's own packing
+C	1	crates/inf-fabric/src/ring.rs	assert	ring capacity must be a non-zero power of two, got {capacity}	`Mesh::new` passes `config.ring_capacity`: the constant 4096 at `bins/infinityd/src/main.rs:main`, `crates/inf-fabric/src/mesh.rs:MeshConfig::default` (1024) in the harnesses; the ring bench passes a const
+I	1	crates/inf-foundation/src/hash.rs	expect	8-byte chunk	`chunks_exact(8)` yields 8-byte slices; the `try_into` is infallible
+I	1	crates/inf-foundation/src/hash.rs	expect	caller guarantees 4 bytes	private helper of this module's own hashing loops, which slice `b[..4]` first (a shorter slice panics on the index, not here); the conversion after a 4-byte slice is infallible
+I	1	crates/inf-foundation/src/hash.rs	expect	caller guarantees 8 bytes	private helper of this module's own hashing loops, which slice `b[..8]` first (a shorter slice panics on the index, not here); the conversion after an 8-byte slice is infallible
+C	1	crates/inf-log/src/blob.rs	assert	an extent holds at least one value byte	`crates/inf-server/src/plane/tiered.rs:try_write` routes to the extent writer only when value.len() ≥ BLOB-THRESHOLD, and crates/inf-store/src/ns.rs:TierSpec::validate bounds the threshold to 4kb..=16mb
 I	1	crates/inf-log/src/blob.rs	assert	chunks must not exceed the declared extent length	ExtentWriter's own written/data_len state machine
-C	1	crates/inf-log/src/blob.rs	assert	extent read inside the value range (offset {offset} + len {len} > {})	the only production reader is `bins/inf-sim/src/recovery.rs:Run::read_blob` (streams in BLOB_CHUNK_BYTES chunks inside the header's data_len); the serving path never calls `read` — `crates/inf-server/src/plane/tiered.rs:WriteGuard::fetch_extent` streams through `tier_extract`
-C	1	crates/inf-log/src/blob.rs	assert	extent reads are chunk-bounded (stream larger ranges)	the only production reader is `bins/inf-sim/src/recovery.rs:Run::read_blob` (streams in BLOB_CHUNK_BYTES chunks inside the header's data_len); the serving path never calls `read` — `crates/inf-server/src/plane/tiered.rs:WriteGuard::fetch_extent` streams through `tier_extract`
+C	1	crates/inf-log/src/blob.rs	assert	extent read inside the value range (offset {offset} + len {len} > {})	the only production reader is `bins/inf-sim/src/recovery.rs:read_blob` (streams in BLOB_CHUNK_BYTES chunks inside the header's data_len); the serving path never calls `read` — `crates/inf-server/src/plane/tiered.rs:fetch_extent` streams through `tier_extract`
+C	1	crates/inf-log/src/blob.rs	assert	extent reads are chunk-bounded (stream larger ranges)	the only production reader is `bins/inf-sim/src/recovery.rs:read_blob` (streams in BLOB_CHUNK_BYTES chunks inside the header's data_len); the serving path never calls `read` — `crates/inf-server/src/plane/tiered.rs:fetch_extent` streams through `tier_extract`
 I	2	crates/inf-log/src/blob.rs	assert_eq	an extent finishes at its declared length	ExtentWriter's own written/data_len state machine
 I	6	crates/inf-log/src/blob.rs	expect	4 bytes	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	2	crates/inf-log/src/blob.rs	expect	8 bytes	fixed-width sub-slice of a length-checked buffer — infallible by construction
-C	1	crates/inf-log/src/ckpt.rs	assert	Fixed8 sidecar keys are exactly 8 bytes	`crates/inf-server/src/durable.rs:sidecar_walk_step` — keys are the ordered map's own encodings (`crates/inf-store/src/index_key.rs:IndexKeyBuf::index_scalar_coerce` bounds them), ordinals are the walker's running count, pairs come out of the B+ tree in order
-I	1	crates/inf-log/src/ckpt.rs	assert	IckReader stepped past its footer	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
-C	1	crates/inf-log/src/ckpt.rs	assert	a ref must sit below its walk watermark	`crates/inf-server/src/durable.rs:tier_walk_step` — refs come from `TieredTable::ckpt_walk_slice` / `extent_ckpt_entries` below the pinned walk watermark, addresses are `LogicalAddr` (48-bit by type), blob refs ascend by the extent table's ordered walk, live-set rows come from `LiveSet` accounting (dead ≤ data)
 I	1	crates/inf-log/src/ckpt.rs	assert	addr refs are a v2 vocabulary	the stream's own `version` field: the v2 sections are staged only by the v2 walker on a v2 stream (`crates/inf-server/src/durable.rs:tier_walk_step`)
 C	1	crates/inf-log/src/ckpt.rs	assert	an extent reference names at least one byte	`crates/inf-server/src/durable.rs:tier_walk_step` — refs come from `TieredTable::ckpt_walk_slice` / `extent_ckpt_entries` below the pinned walk watermark, addresses are `LogicalAddr` (48-bit by type), blob refs ascend by the extent table's ordered walk, live-set rows come from `LiveSet` accounting (dead ≤ data)
+C	1	crates/inf-log/src/ckpt.rs	assert	a ref must sit below its walk watermark	`crates/inf-server/src/durable.rs:tier_walk_step` — refs come from `TieredTable::ckpt_walk_slice` / `extent_ckpt_entries` below the pinned walk watermark, addresses are `LogicalAddr` (48-bit by type), blob refs ascend by the extent table's ordered walk, live-set rows come from `LiveSet` accounting (dead ≤ data)
 I	1	crates/inf-log/src/ckpt.rs	assert	begin on a dirty stream	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
 C	1	crates/inf-log/src/ckpt.rs	assert	blob-ref entries ascend strictly by address	`crates/inf-server/src/durable.rs:tier_walk_step` — refs come from `TieredTable::ckpt_walk_slice` / `extent_ckpt_entries` below the pinned walk watermark, addresses are `LogicalAddr` (48-bit by type), blob refs ascend by the extent table's ordered walk, live-set rows come from `LiveSet` accounting (dead ≤ data)
 I	1	crates/inf-log/src/ckpt.rs	assert	blob-ref sections are a v2 vocabulary	the stream's own `version` field: the v2 sections are staged only by the v2 walker on a v2 stream (`crates/inf-server/src/durable.rs:tier_walk_step`)
@@ -167,13 +168,15 @@ I	1	crates/inf-log/src/ckpt.rs	assert	derived checkpoint interval below its floo
 I	1	crates/inf-log/src/ckpt.rs	assert	finish outside header..finish	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
 I	1	crates/inf-log/src/ckpt.rs	assert	finish with a partial section staged	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
 I	1	crates/inf-log/src/ckpt.rs	assert	finish with a section in flight	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
+C	1	crates/inf-log/src/ckpt.rs	assert	Fixed8 sidecar keys are exactly 8 bytes	`crates/inf-server/src/durable.rs:sidecar_walk_step` — keys are the ordered map's own encodings (`crates/inf-store/src/index_key.rs:index_scalar_coerce` bounds them), ordinals are the walker's running count, pairs come out of the B+ tree in order
 I	1	crates/inf-log/src/ckpt.rs	assert	ick header staged twice	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
+I	1	crates/inf-log/src/ckpt.rs	assert	IckReader stepped past its footer	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
 I	2	crates/inf-log/src/ckpt.rs	assert	index sidecars are a v2 vocabulary	the stream's own `version` field: the v2 sections are staged only by the v2 walker on a v2 stream (`crates/inf-server/src/durable.rs:tier_walk_step`)
 I	1	crates/inf-log/src/ckpt.rs	assert	live-set sections are a v2 vocabulary	the stream's own `version` field: the v2 sections are staged only by the v2 walker on a v2 stream (`crates/inf-server/src/durable.rs:tier_walk_step`)
 C	1	crates/inf-log/src/ckpt.rs	assert	logical addresses are 48-bit	`crates/inf-server/src/durable.rs:tier_walk_step` — refs come from `TieredTable::ckpt_walk_slice` / `extent_ckpt_entries` below the pinned walk watermark, addresses are `LogicalAddr` (48-bit by type), blob refs ascend by the extent table's ordered walk, live-set rows come from `LiveSet` accounting (dead ≤ data)
 I	1	crates/inf-log/src/ckpt.rs	assert	seal_section without can_seal	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
-C	1	crates/inf-log/src/ckpt.rs	assert	sidecar key exceeds the structural cap	`crates/inf-server/src/durable.rs:sidecar_walk_step` — keys are the ordered map's own encodings (`crates/inf-store/src/index_key.rs:IndexKeyBuf::index_scalar_coerce` bounds them), ordinals are the walker's running count, pairs come out of the B+ tree in order
-C	1	crates/inf-log/src/ckpt.rs	assert	sidecar pairs ascend strictly	`crates/inf-server/src/durable.rs:sidecar_walk_step` — keys are the ordered map's own encodings (`crates/inf-store/src/index_key.rs:IndexKeyBuf::index_scalar_coerce` bounds them), ordinals are the walker's running count, pairs come out of the B+ tree in order
+C	1	crates/inf-log/src/ckpt.rs	assert	sidecar key exceeds the structural cap	`crates/inf-server/src/durable.rs:sidecar_walk_step` — keys are the ordered map's own encodings (`crates/inf-store/src/index_key.rs:index_scalar_coerce` bounds them), ordinals are the walker's running count, pairs come out of the B+ tree in order
+C	1	crates/inf-log/src/ckpt.rs	assert	sidecar pairs ascend strictly	`crates/inf-server/src/durable.rs:sidecar_walk_step` — keys are the ordered map's own encodings (`crates/inf-store/src/index_key.rs:index_scalar_coerce` bounds them), ordinals are the walker's running count, pairs come out of the B+ tree in order
 I	6	crates/inf-log/src/ckpt.rs	assert	stage outside header..finish	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
 C	1	crates/inf-log/src/ckpt.rs	assert	watermarks are 48-bit	`crates/inf-server/src/durable.rs:tier_walk_step` — refs come from `TieredTable::ckpt_walk_slice` / `extent_ckpt_entries` below the pinned walk watermark, addresses are `LogicalAddr` (48-bit by type), blob refs ascend by the extent table's ordered walk, live-set rows come from `LiveSet` accounting (dead ≤ data)
 I	1	crates/inf-log/src/ckpt.rs	assert_eq	an index finalizes once	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
@@ -181,11 +184,11 @@ I	2	crates/inf-log/src/ckpt.rs	assert_eq	lease does not match in-flight block	Ic
 I	1	crates/inf-log/src/ckpt.rs	assert_eq	no entries after a FINAL marker	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
 I	1	crates/inf-log/src/ckpt.rs	assert_eq	seal before finalizing another index	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
 I	1	crates/inf-log/src/ckpt.rs	assert_eq	seal before switching class	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
-I	2	crates/inf-log/src/ckpt.rs	assert_eq	seal before switching class or namespace	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
 I	1	crates/inf-log/src/ckpt.rs	assert_eq	seal before switching class, index, or generation	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
 I	1	crates/inf-log/src/ckpt.rs	assert_eq	seal before switching class, namespace, or watermark	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
-C	1	crates/inf-log/src/ckpt.rs	assert_eq	sidecar ordinals are contiguous within a section	`crates/inf-server/src/durable.rs:sidecar_walk_step` — keys are the ordered map's own encodings (`crates/inf-store/src/index_key.rs:IndexKeyBuf::index_scalar_coerce` bounds them), ordinals are the walker's running count, pairs come out of the B+ tree in order
-C	1	crates/inf-log/src/ckpt.rs	assert_eq	the FINAL total equals the emitted ordinal count	`crates/inf-server/src/durable.rs:sidecar_walk_step` — keys are the ordered map's own encodings (`crates/inf-store/src/index_key.rs:IndexKeyBuf::index_scalar_coerce` bounds them), ordinals are the walker's running count, pairs come out of the B+ tree in order
+I	2	crates/inf-log/src/ckpt.rs	assert_eq	seal before switching class or namespace	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
+C	1	crates/inf-log/src/ckpt.rs	assert_eq	sidecar ordinals are contiguous within a section	`crates/inf-server/src/durable.rs:sidecar_walk_step` — keys are the ordered map's own encodings (`crates/inf-store/src/index_key.rs:index_scalar_coerce` bounds them), ordinals are the walker's running count, pairs come out of the B+ tree in order
+C	1	crates/inf-log/src/ckpt.rs	assert_eq	the FINAL total equals the emitted ordinal count	`crates/inf-server/src/durable.rs:sidecar_walk_step` — keys are the ordered map's own encodings (`crates/inf-store/src/index_key.rs:index_scalar_coerce` bounds them), ordinals are the walker's running count, pairs come out of the B+ tree in order
 I	1	crates/inf-log/src/ckpt.rs	expect	2 bytes	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-log/src/ckpt.rs	expect	4 bytes	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-log/src/ckpt.rs	expect	8 bytes	fixed-width sub-slice of a length-checked buffer — infallible by construction
@@ -196,12 +199,12 @@ I	1	crates/inf-log/src/ckpt.rs	expect	no section in flight	IckWriter / IckReader
 I	2	crates/inf-log/src/ckpt.rs	expect	ns set fits u32	namespace ids are u32 and unique — a set of them fits u32
 I	1	crates/inf-log/src/ckpt.rs	expect	release with no section in flight	IckWriter / IckReader section state machine (header → sections → footer; one in-flight lease)
 I	1	crates/inf-log/src/ckpt.rs	expect	section fits u32	sections seal at the walker's slice bound (`SyncIckWriter` seals per slice ≤ 64 MiB) — far below u32
-C	1	crates/inf-log/src/commit.rs	assert	FLUSH-class bound is 1 or 2, never a queue	`bins/infinityd/src/main.rs:main` passes 1 (DurableCellConfig.flush_bound) and `crates/inf-log/src/commit.rs:GroupCommit::new` passes 1; the 2 arm is test-only
 I	1	crates/inf-log/src/commit.rs	assert	boot barriers register before any completion	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	assert	deferred seal with a frame write in flight — rotation drains	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
+C	1	crates/inf-log/src/commit.rs	assert	FLUSH-class bound is 1 or 2, never a queue	`bins/infinityd/src/main.rs:main` passes 1 (DurableCellConfig.flush_bound) and `crates/inf-log/src/commit.rs:GroupCommit::new` passes 1; the 2 arm is test-only
 C	1	crates/inf-log/src/commit.rs	assert	frame queued into a full reorder window	`crates/inf-log/src/staging.rs:StagingRing::seal` refuses when backlogged (in-flight < K ≤ MAX_FRAMES_IN_FLIGHT) and `crates/inf-log/src/commit.rs:GroupCommit::frame_plan` answers Wait while the reorder window is full (ADR-0102 ring invariants)
-I	1	crates/inf-log/src/commit.rs	assert	frame written twice	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	assert	frames queue in append order	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
+I	1	crates/inf-log/src/commit.rs	assert	frame written twice	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	assert	fsync coverage must be monotone in submission order	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	assert	fsync ticket completed twice	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	assert	fsync ticket errored after completing	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
@@ -211,22 +214,22 @@ C	1	crates/inf-log/src/commit.rs	assert	more frames in flight than the ring can 
 I	1	crates/inf-log/src/commit.rs	assert	write-through with an unqueued always record	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	assert_eq	boot barriers register before any frame	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	assert_eq	write-through frame must extend the durable prefix	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
-I	1	crates/inf-log/src/commit.rs	expect	LogWritten for a frame already written	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
-I	1	crates/inf-log/src/commit.rs	expect	LogWritten for a frame that was not queued	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
-I	1	crates/inf-log/src/commit.rs	expect	LogWritten with nothing queued	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	expect	advanced past None	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	expect	completion fsync with nothing written	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	expect	fsync completion for an unknown ticket	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	expect	fsync error for an unknown ticket	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	expect	linked fsync before any frame was queued	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
+I	1	crates/inf-log/src/commit.rs	expect	LogWritten for a frame already written	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
+I	1	crates/inf-log/src/commit.rs	expect	LogWritten for a frame that was not queued	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
+I	1	crates/inf-log/src/commit.rs	expect	LogWritten with nothing queued	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	expect	standalone fsync with nothing written	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	expect	write-through before any frame was queued	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
-I	1	crates/inf-log/src/flush.rs	assert	SealCommit without a pending seal	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 C	1	crates/inf-log/src/flush.rs	assert	catalog ids ascend	`crates/inf-log/src/manifest.rs:Manifest::decode_tiers` refuses typed unless file ids and ranges strictly ascend without overlap; `crates/inf-store/src/tiered_recover.rs:recover_tiered_ns` seeds next_id = max id + 1
 C	1	crates/inf-log/src/flush.rs	assert	catalog ranges must not overlap	`crates/inf-log/src/manifest.rs:Manifest::decode_tiers` refuses typed unless file ids and ranges strictly ascend without overlap; `crates/inf-store/src/tiered_recover.rs:recover_tiered_ns` seeds next_id = max id + 1
 I	1	crates/inf-log/src/flush.rs	assert	drive change with a round in flight	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 I	1	crates/inf-log/src/flush.rs	assert	drive change with pending seals	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 C	1	crates/inf-log/src/flush.rs	assert	next_id collides with a seeded file	`crates/inf-log/src/manifest.rs:Manifest::decode_tiers` refuses typed unless file ids and ranges strictly ascend without overlap; `crates/inf-store/src/tiered_recover.rs:recover_tiered_ns` seeds next_id = max id + 1
+I	1	crates/inf-log/src/flush.rs	assert	SealCommit without a pending seal	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 I	1	crates/inf-log/src/flush.rs	assert	seam append while a reactor round is in flight	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 I	1	crates/inf-log/src/flush.rs	assert	seam gap seal while a reactor round is in flight	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 I	2	crates/inf-log/src/flush.rs	assert	seam seal while a reactor round is in flight	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
@@ -238,16 +241,16 @@ I	1	crates/inf-log/src/flush.rs	assert_eq	flush ranges are contiguous; gaps go t
 I	1	crates/inf-log/src/flush.rs	assert_eq	queued append on the seam drive	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 I	1	crates/inf-log/src/flush.rs	assert_eq	queued gap seal on the seam drive	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 I	1	crates/inf-log/src/flush.rs	assert_eq	queued sync on the seam drive	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
-I	1	crates/inf-log/src/flush.rs	expect	DurableTo without an active writer	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 I	2	crates/inf-log/src/flush.rs	expect	created above	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
+I	1	crates/inf-log/src/flush.rs	expect	DurableTo without an active writer	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 C	1	crates/inf-log/src/flush.rs	expect	reactor drive requires fd-backed dirs (ADR-0084)	`crates/inf-server/src/tier_cell.rs:TierCell::create_ns` and `TierCell::install_recovered` select TierDrive::Reactor only on the fd-backed real fs (the sim fs answers `raw_fd` too — ADR-0084)
 I	1	crates/inf-log/src/flush.rs	expect	round op view without a round	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 I	1	crates/inf-log/src/frame.rs	assert	append on a sealed frame (missing reset)	FrameBuilder seal state machine (append → finalize → sealed_frame; reset between frames)
 C	1	crates/inf-log/src/frame.rs	assert	covered watermark leads the frame's own records	`crates/inf-server/src/durable.rs:DurableCell::queue_frame` stamps `covered` = the commit watermark, which the FIFO keeps below every unqueued record's LSN
 I	1	crates/inf-log/src/frame.rs	assert	double finalize (missing reset)	FrameBuilder seal state machine (append → finalize → sealed_frame; reset between frames)
 I	1	crates/inf-log/src/frame.rs	assert	finalize of an empty frame	FrameBuilder seal state machine (append → finalize → sealed_frame; reset between frames)
-C	1	crates/inf-log/src/frame.rs	assert	frame epoch 0 is reserved (ADR-0031 D1)	`crates/inf-server/src/durable.rs:DurableCell::new` stamps the recovery-derived life (≥ 1, `recover.rs:1730`) through `staging.rs:StagingRing::set_frame_epoch`, which asserts it; seq starts at 1 and only increments
-C	1	crates/inf-log/src/frame.rs	assert	frame seq 0 is reserved (ADR-0031 D1)	`crates/inf-server/src/durable.rs:DurableCell::new` stamps the recovery-derived life (≥ 1, `recover.rs:1730`) through `staging.rs:StagingRing::set_frame_epoch`, which asserts it; seq starts at 1 and only increments
+C	1	crates/inf-log/src/frame.rs	assert	frame epoch 0 is reserved (ADR-0031 D1)	`crates/inf-server/src/durable.rs:DurableCell::new` stamps the recovery-derived life (≥ 1, `crates/inf-server/src/recover.rs:Recovery::step_finish`) through `crates/inf-log/src/staging.rs:StagingRing::set_frame_epoch`, which asserts it; seq starts at 1 and only increments
+C	1	crates/inf-log/src/frame.rs	assert	frame seq 0 is reserved (ADR-0031 D1)	`crates/inf-server/src/durable.rs:DurableCell::new` stamps the recovery-derived life (≥ 1, `crates/inf-server/src/recover.rs:Recovery::step_finish`) through `crates/inf-log/src/staging.rs:StagingRing::set_frame_epoch`, which asserts it; seq starts at 1 and only increments
 I	1	crates/inf-log/src/frame.rs	assert	sealed_frame before finalize	FrameBuilder seal state machine (append → finalize → sealed_frame; reset between frames)
 I	6	crates/inf-log/src/frame.rs	expect	4-byte slice	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-log/src/frame.rs	expect	4-byte trailer	fixed-width sub-slice of a length-checked buffer — infallible by construction
@@ -284,8 +287,8 @@ I	1	crates/inf-log/src/meta.rs	expect	envelope size fits usize	u64 → usize is 
 I	2	crates/inf-log/src/reader.rs	expect	4-byte slice	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-log/src/reader.rs	expect	clean exhaustion always records an end	reader state machine: `end` is recorded on every clean exhaustion path before `Ok(None)`
 I	1	crates/inf-log/src/record.rs	expect	4-byte field	fixed-width sub-slice of a length-checked buffer — infallible by construction
-I	3	crates/inf-log/src/record.rs	expect	8 bytes	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-log/src/record.rs	expect	8-byte field	fixed-width sub-slice of a length-checked buffer — infallible by construction
+I	3	crates/inf-log/src/record.rs	expect	8 bytes	fixed-width sub-slice of a length-checked buffer — infallible by construction
 C	1	crates/inf-log/src/segment.rs	assert	Direct segments need segment_bytes to be a multiple of {FRAME_ALIGN}	`bins/infinityd/src/main.rs:main` exits 1 when --segment-bytes is not a multiple of FRAME_ALIGN under the fua class (the only Direct configurator)
 C	1	crates/inf-log/src/segment.rs	assert	frame epoch 0 is reserved (ADR-0031 D1)	`crates/inf-server/src/recover.rs:Recovery::step_finish` derives the resume epoch as the recovered life + 1 (≥ 1) before `set_resume_epoch`
 I	1	crates/inf-log/src/segment.rs	assert	zero slice written with none in flight	NextState machine of the pre-zeroed next segment (ADR-0086 D2)
@@ -293,8 +296,8 @@ I	1	crates/inf-log/src/segment.rs	assert_eq	frame bytes differ from reservation	
 I	2	crates/inf-log/src/segment.rs	assert_eq	frame slot is stale (out-of-order commit)	FrameSlot reservation ⇄ commit pairing (M2.5-S13)
 I	1	crates/inf-log/src/segment.rs	assert_eq	zero-fill synced out of order	NextState machine of the pre-zeroed next segment (ADR-0086 D2)
 I	1	crates/inf-log/src/segment.rs	expect	forget_sealed targets a sealed segment	the sealed set is the writer's own state
-I	1	crates/inf-log/src/segment.rs	expect	zero slice written with no next segment	NextState machine of the pre-zeroed next segment (ADR-0086 D2)
 I	1	crates/inf-log/src/segment.rs	expect	zero-fill synced with no next segment	NextState machine of the pre-zeroed next segment (ADR-0086 D2)
+I	1	crates/inf-log/src/segment.rs	expect	zero slice written with no next segment	NextState machine of the pre-zeroed next segment (ADR-0086 D2)
 I	1	crates/inf-log/src/segment.rs	panic	zero slice written while not filling	NextState machine of the pre-zeroed next segment (ADR-0086 D2)
 C	1	crates/inf-log/src/staging.rs	assert	at least one frame in flight	`bins/infinityd/src/main.rs:parse_args` (--log-staging-mib 1..=64, --frames-in-flight 1..=MAX_FRAMES_IN_FLIGHT or auto)
 C	1	crates/inf-log/src/staging.rs	assert	frame epoch 0 is reserved (ADR-0031 D1)	`crates/inf-server/src/durable.rs:DurableCell::new` passes the recovery-derived life (≥ 1)
@@ -314,227 +317,224 @@ I	1	crates/inf-log/src/tail.rs	expect	window fits u32	the probe window is bounde
 I	1	crates/inf-log/src/tier.rs	assert	an aligned window fits the over-allocation	the buffer is over-allocated by one frame; align_offset < TIER_FRAME_BYTES by construction
 I	1	crates/inf-log/src/tier.rs	assert	durable watermark past the append cursor	DurableTo completions carry the round's own staged length; durable_len ≤ data_len is the writer's watermark order
 I	1	crates/inf-log/src/tier.rs	assert	durable watermark regressed	DurableTo completions carry the round's own staged length; durable_len ≤ data_len is the writer's watermark order
-C	1	crates/inf-log/src/tier.rs	assert	empty read	`crates/inf-server/src/tier_cell.rs:TierCell::window` passes `len.max(1)` and `crates/inf-server/src/plane/tiered.rs:WriteGuard::fetch_extent` loops while remaining > 0; a record ≤ 16 MiB spans ≤ 4097 frames
+C	1	crates/inf-log/src/tier.rs	assert	empty read	`crates/inf-server/src/tier_cell.rs:TierNs::window` passes `len.max(1)` and `crates/inf-server/src/plane/tiered.rs:fetch_extent` loops while remaining > 0; a record ≤ 16 MiB spans ≤ 4097 frames
 I	1	crates/inf-log/src/tier.rs	assert	flush window pool overrun	WINDOWS_OUTSTANDING_CAP is the pool's own bound; a round takes at most one window per op and the round is sized by the slice
-C	1	crates/inf-log/src/tier.rs	assert	window too small for the record	`crates/inf-server/src/tier_cell.rs:TierCell::window` sizes every cold window in whole frames from `tier_frame_span(skip, len)` — the extract's callers in `plane/tiered.rs` pass that window with the same skip/len
+C	1	crates/inf-log/src/tier.rs	assert	window too small for the record	`crates/inf-server/src/tier_cell.rs:TierNs::window` sizes every cold window in whole frames from `tier_frame_span(skip, len)` — the extract's callers in `plane/tiered.rs` pass that window with the same skip/len
 C	2	crates/inf-log/src/tier.rs	assert_eq	tier appends are contiguous (gaps live between files — crate::flush)	`crates/inf-log/src/flush.rs:TierFlush::append_range` / `TierFlush::append_range_queued` assert the cursor before delegating to the writer
-C	1	crates/inf-log/src/tier.rs	assert_eq	window covered the record	`crates/inf-server/src/tier_cell.rs:TierCell::window` sizes every cold window in whole frames from `tier_frame_span(skip, len)` — the extract's callers in `plane/tiered.rs` pass that window with the same skip/len
-C	1	crates/inf-log/src/tier.rs	assert_eq	window is whole frames	`crates/inf-server/src/tier_cell.rs:TierCell::window` sizes every cold window in whole frames from `tier_frame_span(skip, len)` — the extract's callers in `plane/tiered.rs` pass that window with the same skip/len
+C	1	crates/inf-log/src/tier.rs	assert_eq	window covered the record	`crates/inf-server/src/tier_cell.rs:TierNs::window` sizes every cold window in whole frames from `tier_frame_span(skip, len)` — the extract's callers in `plane/tiered.rs` pass that window with the same skip/len
+C	1	crates/inf-log/src/tier.rs	assert_eq	window is whole frames	`crates/inf-server/src/tier_cell.rs:TierNs::window` sizes every cold window in whole frames from `tier_frame_span(skip, len)` — the extract's callers in `plane/tiered.rs` pass that window with the same skip/len
 I	9	crates/inf-log/src/tier.rs	expect	4 bytes	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	3	crates/inf-log/src/tier.rs	expect	8 bytes	fixed-width sub-slice of a length-checked buffer — infallible by construction
-C	1	crates/inf-log/src/tier.rs	expect	cold read spans a sane frame count	`crates/inf-server/src/tier_cell.rs:TierCell::window` passes `len.max(1)` and `crates/inf-server/src/plane/tiered.rs:WriteGuard::fetch_extent` loops while remaining > 0; a record ≤ 16 MiB spans ≤ 4097 frames
+C	1	crates/inf-log/src/tier.rs	expect	cold read spans a sane frame count	`crates/inf-server/src/tier_cell.rs:TierNs::window` passes `len.max(1)` and `crates/inf-server/src/plane/tiered.rs:fetch_extent` loops while remaining > 0; a record ≤ 16 MiB spans ≤ 4097 frames
 C	2	crates/inf-log/src/tier.rs	expect	reactor drive requires fd-backed tier files (ADR-0084)	`crates/inf-server/src/tier_cell.rs:TierCell::create_ns` / `TierCell::install_recovered` select TierDrive::Reactor only on the fd-backed real fs (ADR-0084)
 I	2	crates/inf-log/src/tier.rs	expect	staged frames imply a batch window	batch_frames > 0 ⇒ the batch window was taken when the first frame staged
-U	1	crates/inf-query/src/access.rs	expect	tag just validated	unaudited
-U	1	crates/inf-query/src/access.rs	expect	validated UTF-8 key	unaudited
-U	1	crates/inf-query/src/access.rs	expect	validated at the access-program boundary	unaudited
-U	1	crates/inf-query/src/access.rs	expect	validated key type	unaudited
-U	1	crates/inf-query/src/access.rs	expect	validated varint	unaudited
-U	1	crates/inf-query/src/partiql/cache.rs	unreachable	resident entries are chained	unaudited
-U	1	crates/inf-query/src/partiql/compile.rs	expect	caller admits the value by construction	unaudited
-U	1	crates/inf-query/src/partiql/compile.rs	expect	fixed8 key	unaudited
-U	2	crates/inf-query/src/partiql/compile.rs	expect	just checked	unaudited
-U	1	crates/inf-query/src/partiql/compile.rs	expect	registry programs passed the ADR-0075 gauntlet	unaudited
-U	1	crates/inf-query/src/partiql/compile.rs	expect	statement names are UTF-8	unaudited
-U	4	crates/inf-query/src/partiql/compile.rs	unreachable	!= is never servable	unaudited
-U	1	crates/inf-query/src/partiql/compile.rs	unreachable	$key conjuncts never reach the residual	unaudited
-U	1	crates/inf-query/src/partiql/compile.rs	unreachable	lossy coercion is never equal	unaudited
-U	1	crates/inf-query/src/partiql/compile.rs	unreachable	matched above	unaudited
-U	1	crates/inf-query/src/partiql/compile.rs	unreachable	parse invariants cover {e:?}	unaudited
-U	1	crates/inf-query/src/partiql/lex.rs	expect	ASCII number bytes	unaudited
-U	1	crates/inf-query/src/partiql/lex.rs	expect	UTF-8 pre-validated	unaudited
-U	1	crates/inf-query/src/partiql/lex.rs	expect	lexed float shape parses	unaudited
-U	1	crates/inf-query/src/partiql/lex.rs	expect	statement pre-validated as UTF-8	unaudited
-U	1	crates/inf-query/src/partiql/lex.rs	unreachable	ident start checked	unaudited
-U	1	crates/inf-query/src/partiql/parse.rs	unreachable	caller matched	unaudited
-U	1	crates/inf-query/src/partiql/parse.rs	unreachable	folded above	unaudited
-U	1	crates/inf-query/src/partiql/parse.rs	unreachable	folded above; Paren was found	unaudited
-U	1	crates/inf-query/src/partiql/parse.rs	unreachable	just matched	unaudited
-U	2	crates/inf-query/src/predicate/program.rs	expect	8-byte slice	unaudited
-U	1	crates/inf-query/src/predicate/program.rs	expect	validated path program	unaudited
-U	1	crates/inf-query/src/predicate/program.rs	expect	validated tape has no unknown opcodes	unaudited
-U	1	crates/inf-query/src/predicate/program.rs	expect	validated utf8	unaudited
-U	1	crates/inf-query/src/predicate/program.rs	expect	validated varint	unaudited
-U	1	crates/inf-query/src/predicate/program.rs	unreachable	connectives handled by the walk	unaudited
-U	2	crates/inf-query/src/predicate/program.rs	unreachable	just matched	unaudited
-U	1	crates/inf-query/src/predicate/program.rs	unreachable	validated BEGINS_WITH operand is utf8	unaudited
-U	1	crates/inf-query/src/predicate/program.rs	unreachable	validated constant tags	unaudited
-U	1	crates/inf-query/src/predicate/vm.rs	unreachable	connectives handled by the main loop	unaudited
-U	1	crates/inf-query/src/predicate/vm.rs	unreachable	validated BEGINS_WITH operand is utf8	unaudited
-U	1	crates/inf-runtime/src/budget.rs	expect	remainder below 10^9	unaudited
-U	1	crates/inf-runtime/src/budget.rs	expect	remainder below weights	unaudited
-U	1	crates/inf-runtime/src/cold.rs	assert	cold-read window exceeds a pool buffer	unaudited
-U	1	crates/inf-runtime/src/cold.rs	assert	empty cold read	unaudited
-U	1	crates/inf-runtime/src/cold.rs	assert	foreground grants must be nonzero	unaudited
-U	1	crates/inf-runtime/src/cold.rs	assert	maintain grants must be nonzero	unaudited
-U	1	crates/inf-runtime/src/cold.rs	assert	overflow_cap must queue at least one intent	unaudited
-U	1	crates/inf-runtime/src/cold.rs	assert	qd_cap must admit at least one device read	unaudited
-U	1	crates/inf-runtime/src/cold.rs	expect	completion for an unknown cold read	unaudited
-U	1	crates/inf-runtime/src/cold.rs	expect	counted	unaudited
-U	1	crates/inf-runtime/src/cold.rs	expect	front observed	unaudited
-U	1	crates/inf-runtime/src/cold.rs	expect	picked class has a live head	unaudited
-U	1	crates/inf-runtime/src/cold.rs	expect	pinned file has a pin entry	unaudited
-U	2	crates/inf-runtime/src/cold.rs	expect	seed present	unaudited
-U	1	crates/inf-runtime/src/cold.rs	expect	shared window outlives its ColdDones	unaudited
-U	1	crates/inf-runtime/src/cold.rs	panic	non-tier completion routed to ColdReads: {other:?}	unaudited
-U	1	crates/inf-runtime/src/cold.rs	unreachable	admit builds reads	unaudited
-U	2	crates/inf-runtime/src/driver.rs	expect	stable byte range fits u32	unaudited
-U	1	crates/inf-runtime/src/executor.rs	expect	layout align is nonzero	unaudited
-U	1	crates/inf-runtime/src/executor.rs	expect	ready queue references freed slot	unaudited
-U	1	crates/inf-runtime/src/executor.rs	expect	releasing freed slot	unaudited
-U	1	crates/inf-runtime/src/executor.rs	expect	scratch layout	unaudited
-U	1	crates/inf-runtime/src/executor.rs	expect	task slab exceeds u32 slots	unaudited
-U	1	crates/inf-runtime/src/executor.rs	unreachable	inserting task in state {other:?}	unaudited
-U	1	crates/inf-runtime/src/executor.rs	unreachable	post-poll task state {other:?}	unaudited
-U	1	crates/inf-runtime/src/gate.rs	assert	duplicate gate waiter for key	unaudited
-U	1	crates/inf-runtime/src/gate.rs	panic	GateWait polled after completion	unaudited
-U	1	crates/inf-runtime/src/gate.rs	panic	ListWait polled after cancellation	unaudited
-U	1	crates/inf-runtime/src/gate.rs	panic	gate key completed twice	unaudited
-U	1	crates/inf-runtime/src/gate.rs	unreachable	matched Delivered above	unaudited
-U	1	crates/inf-runtime/src/gate.rs	unreachable	watermark waiters are never cancelled	unaudited
-U	1	crates/inf-runtime/src/kqueue.rs	expect	changelist fits i32	unaudited
-U	1	crates/inf-runtime/src/kqueue.rs	expect	collected above	unaudited
-U	1	crates/inf-runtime/src/kqueue.rs	expect	eventlist fits i32	unaudited
-U	2	crates/inf-runtime/src/kqueue.rs	expect	head exists	unaudited
-U	1	crates/inf-runtime/src/sched.rs	assert	zero quantum/weight	unaudited
-U	1	crates/inf-runtime/src/timer.rs	expect	timer slab exceeds u32	unaudited
-U	1	crates/inf-runtime/src/timer.rs	unreachable	top level catches all deltas	unaudited
-U	1	crates/inf-runtime/src/token.rs	assert	token slot {slot} exceeds 24 bits	unaudited
-U	1	crates/inf-runtime/src/token.rs	expect	CompletionToken with invalid class byte	unaudited
-U	1	crates/inf-runtime/src/uring.rs	assert	fixed-buffer indices are u16	unaudited
-U	1	crates/inf-runtime/src/uring.rs	assert	provided bids are u16	unaudited
-U	1	crates/inf-runtime/src/uring.rs	expect	buffer size fits i32	unaudited
-U	1	crates/inf-runtime/src/uring.rs	expect	buffer size fits u32	unaudited
-U	2	crates/inf-runtime/src/uring.rs	expect	checked above	unaudited
-U	1	crates/inf-runtime/src/uring.rs	expect	checked capacity above	unaudited
-U	1	crates/inf-runtime/src/uring.rs	expect	collected above	unaudited
-U	1	crates/inf-runtime/src/uring.rs	expect	kernel returned a bid this driver never provided	unaudited
-U	1	crates/inf-runtime/src/uring.rs	expect	pool fully free at registration	unaudited
-U	1	crates/inf-runtime/src/uring.rs	expect	provided bids are u16	unaudited
-U	2	crates/inf-runtime/src/uring.rs	expect	room checked above	unaudited
-U	1	crates/inf-server/src/admin.rs	expect	seeded from the current spec	unaudited
-U	1	crates/inf-server/src/admin.rs	unreachable	membership matched above	unaudited
-U	1	crates/inf-server/src/ckpt.rs	assert	one recovery-unit transition in flight	unaudited
-U	1	crates/inf-server/src/ckpt.rs	assert	publish before the completion fdatasync landed	unaudited
-U	1	crates/inf-server/src/ckpt.rs	assert	publish with a section write still in flight	unaudited
-U	3	crates/inf-server/src/ckpt.rs	expect	std tier has fds	unaudited
-U	1	crates/inf-server/src/ckpt.rs	panic	ManifestSync completion with no barrier in flight	unaudited
-U	1	crates/inf-server/src/ckpt.rs	panic	ManifestSync error with no barrier in flight	unaudited
-U	1	crates/inf-server/src/control.rs	assert	cell id validated by the assembly	unaudited
-U	1	crates/inf-server/src/control.rs	assert	slot ids are control-plane-assigned < INDEX_SLOTS	unaudited
-U	3	crates/inf-server/src/control.rs	expect	control thread alive (fail-stop)	unaudited
-U	1	crates/inf-server/src/control.rs	expect	spawn control thread	unaudited
-U	2	crates/inf-server/src/durable.rs	assert	staging into a failed durable cell	unaudited
-U	1	crates/inf-server/src/durable.rs	assert	ticket fits slot+gen	unaudited
-U	1	crates/inf-server/src/durable.rs	assert_eq	barrier plan matches the slot	unaudited
-U	1	crates/inf-server/src/durable.rs	assert_eq	rotation plan matches the reservation	unaudited
-U	1	crates/inf-server/src/durable.rs	expect	CkptWrite with no in-flight lease	unaudited
-U	1	crates/inf-server/src/durable.rs	expect	LogWritten for a frame not in flight	unaudited
-U	1	crates/inf-server/src/durable.rs	expect	admission pre-checked	unaudited
-U	2	crates/inf-server/src/durable.rs	expect	admission pre-checked by would_fit	unaudited
-U	1	crates/inf-server/src/durable.rs	expect	begun above	unaudited
-U	1	crates/inf-server/src/durable.rs	expect	header staged by open_stream	unaudited
-U	1	crates/inf-server/src/durable.rs	expect	index from position	unaudited
-U	4	crates/inf-server/src/durable.rs	expect	std segment tier has fds	unaudited
-U	1	crates/inf-server/src/durable.rs	panic	CkptSync completion with no checkpoint streaming	unaudited
-U	1	crates/inf-server/src/durable.rs	panic	CkptWrite completion with no checkpoint streaming	unaudited
-U	1	crates/inf-server/src/durable.rs	unreachable	a waiting frame is never sealed	unaudited
-U	1	crates/inf-server/src/durable.rs	unreachable	just opened	unaudited
-U	1	crates/inf-server/src/durable.rs	unreachable	matched above	unaudited
-U	1	crates/inf-server/src/exec.rs	unreachable	keyspace-level and pub/sub commands dispatch in execute()	unaudited
-U	1	crates/inf-server/src/json.rs	assert	a logged document delta changed at least one match	unaudited
-U	2	crates/inf-server/src/json.rs	expect	compile above accepted this text	unaudited
-U	1	crates/inf-server/src/json.rs	expect	durable capture is named-namespace-only	unaudited
-U	1	crates/inf-server/src/json.rs	expect	match set is capped at u32	unaudited
-U	1	crates/inf-server/src/json.rs	expect	matches resolve on their document	unaudited
-U	1	crates/inf-server/src/json.rs	expect	matches resolve on their own document	unaudited
-U	1	crates/inf-server/src/json.rs	expect	one document is bounded far below i64::MAX	unaudited
-U	1	crates/inf-server/src/json.rs	unreachable	execute_db routes exactly the JSON family here	unaudited
-U	1	crates/inf-server/src/json.rs	unreachable	numeric ops apply numbers	unaudited
-U	1	crates/inf-server/src/json.rs	unreachable	numeric probe returns a number	unaudited
-U	1	crates/inf-server/src/json.rs	unreachable	toggle applies booleans	unaudited
-U	1	crates/inf-server/src/json.rs	unreachable	toggle probe returns a boolean	unaudited
-U	1	crates/inf-server/src/json.rs	unreachable	unconditional set applies	unaudited
-U	2	crates/inf-server/src/key_hash.rs	expect	8 bytes	unaudited
-U	1	crates/inf-server/src/plane.rs	assert	conn slot exceeds token slot width	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	Backfilling → Ready is an ADR-0075 D3 edge	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	LogWritten without durable plane	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	Synced without durable plane	unaudited
-U	2	crates/inf-server/src/plane.rs	expect	TierRead completion implies a live cold-read engine	unaudited
-U	3	crates/inf-server/src/plane.rs	expect	argc fits u32	unaudited
-U	2	crates/inf-server/src/plane.rs	expect	block fits u32	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	block header	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	boot present	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	captured full key remains a live document until staging	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	checked above	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	ckpt completion without durable plane	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	cmd fits u32	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	cold engine implies tier state	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	conn checked above	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	conn slots fit u32	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	db index validated at SELECT	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	durable admission parked	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	durable admission ran	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	emission requires the durable plane	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	enable_durable built tier state	unaudited
-U	2	crates/inf-server/src/plane.rs	expect	ends table	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	front exists	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	gated reply implies durable plane	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	guarded	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	header	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	log completion without durable plane	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	manifest completion without durable plane	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	materialized, checked above	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	record sizes fit usize	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	recovered namespace carries a tier block	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	scatter programs dispatch registered commands	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	set_control before begin_recovery	unaudited
-U	2	crates/inf-server/src/plane.rs	expect	stage scratch fits u32	unaudited
-U	2	crates/inf-server/src/plane.rs	expect	staged above	unaudited
-U	3	crates/inf-server/src/plane.rs	expect	tier-flush completion implies tier state	unaudited
-U	2	crates/inf-server/src/plane.rs	expect	tiered implies the durable plane	unaudited
-U	1	crates/inf-server/src/plane.rs	expect	tiered namespaces require the durable plane	unaudited
-U	1	crates/inf-server/src/plane.rs	panic	captured delta key remains a live document until staging	unaudited
-U	2	crates/inf-server/src/plane.rs	unreachable	<no message>  unreachable!(),	unaudited
-U	1	crates/inf-server/src/plane.rs	unreachable	full-image probe never returns a delta	unaudited
-U	1	crates/inf-server/src/plane.rs	unreachable	is_plane_pubsub covers exactly the arms above	unaudited
-U	1	crates/inf-server/src/plane.rs	unreachable	is_scatter covers exactly the arms above	unaudited
-U	1	crates/inf-server/src/plane.rs	unreachable	json_log_full always chooses a full image	unaudited
-U	1	crates/inf-server/src/plane/tiered.rs	expect	caller resolved the table	unaudited
-U	1	crates/inf-server/src/plane/tiered.rs	expect	continuation address is 48-bit	unaudited
-U	1	crates/inf-server/src/plane/tiered.rs	expect	resolved above	unaudited
-U	8	crates/inf-server/src/plane/tiered.rs	expect	resolved on this table	unaudited
-U	1	crates/inf-server/src/plane/tiered.rs	expect	tiered namespace has plane state	unaudited
-U	3	crates/inf-server/src/plane/tiered.rs	expect	tiered namespaces always carry a durability class	unaudited
-U	1	crates/inf-server/src/recover.rs	expect	40	unaudited
-U	1	crates/inf-server/src/recover.rs	expect	clean exhaustion records an end	unaudited
-U	1	crates/inf-server/src/recover.rs	expect	evidence anchor set with a valid frame	unaudited
-U	2	crates/inf-server/src/recover.rs	expect	fs present	unaudited
-U	1	crates/inf-server/src/recover.rs	expect	fs present until finish	unaudited
-U	1	crates/inf-server/src/recover.rs	expect	ick phase	unaudited
-U	1	crates/inf-server/src/recover.rs	expect	loader present until the audit	unaudited
-U	1	crates/inf-server/src/recover.rs	expect	non-empty scan	unaudited
-U	1	crates/inf-server/src/recover.rs	expect	recovery complete before finish()	unaudited
-U	1	crates/inf-server/src/recover.rs	expect	scan set	unaudited
-U	1	crates/inf-server/src/recover.rs	expect	scan set in start	unaudited
-U	1	crates/inf-server/src/recover.rs	unreachable	Io and foreign-segment reads are handled above	unaudited
-U	1	crates/inf-server/src/tier_cell.rs	assert	flush round exceeds the token op-index bound (ADR-0084 D3)	unaudited
-U	1	crates/inf-server/src/tier_cell.rs	assert	tier flush lanes exhausted	unaudited
-U	1	crates/inf-server/src/tier_cell.rs	expect	checked above	unaudited
-U	1	crates/inf-server/src/tier_cell.rs	expect	checked front	unaudited
-U	1	crates/inf-server/src/tier_cell.rs	expect	just created	unaudited
-U	2	crates/inf-simd/src/crc32c.rs	expect	4-byte slice	unaudited
-U	2	crates/inf-simd/src/crc32c.rs	expect	chunks_exact(8) yields 8 bytes	unaudited
-U	1	crates/inf-simd/src/crlf.rs	panic	CRLF offset exceeds u32 range: {position}	unaudited
-U	1	crates/inf-simd/src/crlf.rs	unreachable	index already bounds checked	unaudited
-U	1	crates/inf-simd/src/crlf.rs	unreachable	small buffer offsets must fit in u16	unaudited
-U	1	crates/inf-simd/src/json.rs	assert	<no message>  assert!((1..=31).contains(&len));	unaudited
-U	1	crates/inf-simd/src/json.rs	assert	<no message>  assert!(window.len() >= 32);	unaudited
-U	2	crates/inf-simd/src/json.rs	assert	caller guarantees 32 bytes of window	unaudited
-U	2	crates/inf-simd/src/json.rs	assert	fixstr payload length	unaudited
-U	1	crates/inf-simd/src/json.rs	expect	8-byte chunk	unaudited
-U	1	crates/inf-simd/src/json.rs	expect	slack-checked word	unaudited
-I	1	crates/inf-store/src/address_space.rs	assert	RAM read below head	memory-safety guard on the space's own window: below head is a decommitted page (SAFETY.md `region.rs::bytes`)
+I	1	crates/inf-query/src/access.rs	expect	tag just validated	`validate_tag` admitted one of the four key-type tags on the line above; `decode_key_type` maps exactly those
+I	1	crates/inf-query/src/access.rs	expect	validated at the access-program boundary	`AccessProgram` holds validated bytes by type: built only by this module's `encode` or `AccessProgram::from_bytes` (`validate_step` validates every step, edge and residual); fields are private; the residual bytes passed `PredicateProgram::from_bytes` in `validate_step`
+I	1	crates/inf-query/src/access.rs	expect	validated key type	`AccessProgram` holds validated bytes by type: built only by this module's `encode` or `AccessProgram::from_bytes` (`validate_step` validates every step, edge and residual); fields are private
+I	1	crates/inf-query/src/access.rs	expect	validated UTF-8 key	`validate_step` (this module) requires the pk key be non-empty, ≤ MAX_KEY_LEN and UTF-8 for every program built by `from_bytes`; the compiler's key is a lexer `String` (UTF-8 by type)
+I	1	crates/inf-query/src/access.rs	expect	validated varint	`AccessProgram` holds validated bytes by type: built only by this module's `encode` or `AccessProgram::from_bytes` (`validate_step` validates every step, edge and residual); fields are private
+I	1	crates/inf-query/src/partiql/cache.rs	unreachable	resident entries are chained	own slab/bucket chain invariant: a resident slot is linked from its bucket head (insert links, evict unlinks)
+I	1	crates/inf-query/src/partiql/compile.rs	expect	caller admits the value by construction	private; `lit_interval`/`i64_cross_interval`/`f64_cross_interval` (this module) pass same-family pairs only (Bool, I64, F64); coercion refuses only NaN (`crates/inf-query/src/partiql/lex.rs:lex_number` keeps floats finite), too-long Utf8 (never encoded here) and a family mismatch
+I	1	crates/inf-query/src/partiql/compile.rs	expect	fixed8 key	an F64 index key encodes to exactly 8 big-endian bytes (`IndexKeyType::F64` fixed8 form)
+I	2	crates/inf-query/src/partiql/compile.rs	expect	just checked	`v.len() == 1` on the same line
+C	1	crates/inf-query/src/partiql/compile.rs	expect	registry programs passed the ADR-0075 gauntlet	`crates/inf-store/src/index_registry.rs:validate_index_program` runs at `IndexRegistry::create` (INF.INDEX CREATE) and `crates/inf-store/src/catalog.rs:decode_index_record` re-validates every spec on catalog load
+C	1	crates/inf-query/src/partiql/compile.rs	expect	statement names are UTF-8	statement identifiers are lexer `&str` (`crates/inf-query/src/partiql/mod.rs:compile_with_max_bytes` refuses non-UTF-8 text); registry names pass `crates/inf-store/src/ns.rs:valid_ns_name` (ASCII) at `IndexRegistry::create` and `crates/inf-store/src/catalog.rs:decode_index_record`
+I	4	crates/inf-query/src/partiql/compile.rs	unreachable	!= is never servable	`servable` (this module) admits a `Cmp` leaf as a key condition only when `op != CmpOp::Ne`; `lit_interval` debug-asserts the same
+I	1	crates/inf-query/src/partiql/compile.rs	unreachable	$key conjuncts never reach the residual	`resolve_ns_target` (this module) takes the single `KeyEq` conjunct out of the residual set before `build_residual` runs
+I	1	crates/inf-query/src/partiql/compile.rs	unreachable	lossy coercion is never equal	reached only when `index_scalar_coerce` reported the i64→f64 conversion lossy, so `c` and `c as f64` differ
+I	1	crates/inf-query/src/partiql/compile.rs	unreachable	matched above	`key_conjunct` was set only from a `LeafKind::KeyEq` leaf in the loop above
+C	1	crates/inf-query/src/partiql/compile.rs	unreachable	parse invariants cover {e:?}	`crates/inf-query/src/partiql/parse.rs:Parser::parse_in` bounds IN members; `and_of`/`or_of` (this module) flatten to `BOOL_ARITY_MAX`, collapse singletons, empty residuals return early; `crates/inf-query/src/partiql/lex.rs:lex_number` refuses non-finite floats; paths are assembled rooted at `$`
+I	1	crates/inf-query/src/partiql/lex.rs	expect	ASCII number bytes	this function advanced over ASCII digits, sign, `.` and `e`/`E` only
+I	1	crates/inf-query/src/partiql/lex.rs	expect	lexed float shape parses	the lexed shape `[-]digits[.digits][e[+-]digits]` is always a valid `f64` literal for `str::parse`
+C	1	crates/inf-query/src/partiql/lex.rs	expect	statement pre-validated as UTF-8	`crates/inf-query/src/partiql/mod.rs:compile_with_max_bytes` refuses non-UTF-8 statement text before lexing; `lex` is private to the partiql module and reached only through it; byte-splitting at ASCII quotes keeps pieces valid UTF-8
+C	1	crates/inf-query/src/partiql/lex.rs	expect	UTF-8 pre-validated	`crates/inf-query/src/partiql/mod.rs:compile_with_max_bytes` refuses non-UTF-8 statement text before lexing; `lex` is private to the partiql module and reached only through it; byte-splitting at ASCII quotes keeps pieces valid UTF-8
+I	1	crates/inf-query/src/partiql/lex.rs	unreachable	ident start checked	`starts_ident` was checked on the line above; `lex_ident` always returns `Tok::Ident`
+I	1	crates/inf-query/src/partiql/parse.rs	unreachable	caller matched	`parse_key_leaf` is called only from the `Tok::Pseudo` arm of `parse_leaf`
+I	1	crates/inf-query/src/partiql/parse.rs	unreachable	folded above	own precedence-fold stack: every `Frame::Not` is folded before the connective loop inspects the stack
+I	1	crates/inf-query/src/partiql/parse.rs	unreachable	folded above; Paren was found	own precedence-fold stack: a `)` is reached only with the matching `Frame::Paren` below the folded frames
+I	1	crates/inf-query/src/partiql/parse.rs	unreachable	just matched	`matches!(stack.last(), Some(Frame::And(_)))` on the line above
+I	2	crates/inf-query/src/predicate/program.rs	expect	8-byte slice	`checked_add(8)` + `<= bytes.len()` filter (validator) / trusted reader on validated bytes — the sub-slice is 8 bytes
+I	1	crates/inf-query/src/predicate/program.rs	expect	validated path program	`PredicateProgram` holds validated bytes by type: built only by `encode` (this module) or `PredicateProgram::from_bytes` (`validate` runs first); trusted readers run on those bytes only; `validate` ran `PathProgram::from_bytes` on every pool entry
+I	1	crates/inf-query/src/predicate/program.rs	expect	validated tape has no unknown opcodes	`PredicateProgram` holds validated bytes by type: built only by `encode` (this module) or `PredicateProgram::from_bytes` (`validate` runs first); trusted readers run on those bytes only
+I	1	crates/inf-query/src/predicate/program.rs	expect	validated utf8	`PredicateProgram` holds validated bytes by type: built only by `encode` (this module) or `PredicateProgram::from_bytes` (`validate` runs first); trusted readers run on those bytes only; `validate_constant` requires UTF-8 for `CONST_UTF8`
+I	1	crates/inf-query/src/predicate/program.rs	expect	validated varint	`PredicateProgram` holds validated bytes by type: built only by `encode` (this module) or `PredicateProgram::from_bytes` (`validate` runs first); trusted readers run on those bytes only
+I	1	crates/inf-query/src/predicate/program.rs	unreachable	connectives handled by the walk	`encode_leaf` is called only from the leaf arm of the encoder's walk (this module)
+I	2	crates/inf-query/src/predicate/program.rs	unreachable	just matched	the popped frame is the `Frame::And`/`Frame::Or` matched by `frames.last_mut()` two lines up
+I	1	crates/inf-query/src/predicate/program.rs	unreachable	validated BEGINS_WITH operand is utf8	`PredicateProgram` holds validated bytes by type: built only by `encode` (this module) or `PredicateProgram::from_bytes` (`validate` runs first); trusted readers run on those bytes only; `validate` requires a `CONST_UTF8` operand for `OP_BEGINS_WITH`
+I	1	crates/inf-query/src/predicate/program.rs	unreachable	validated constant tags	`PredicateProgram` holds validated bytes by type: built only by `encode` (this module) or `PredicateProgram::from_bytes` (`validate` runs first); trusted readers run on those bytes only; `validate_constant` admits the four constant tags only
+I	1	crates/inf-query/src/predicate/vm.rs	unreachable	connectives handled by the main loop	`eval_leaf` is called only from the leaf arm of the VM's op loop (this module)
+I	1	crates/inf-query/src/predicate/vm.rs	unreachable	validated BEGINS_WITH operand is utf8	`PredicateProgram` holds validated bytes by type: built only by `encode` (this module) or `PredicateProgram::from_bytes` (`validate` runs first); trusted readers run on those bytes only; `validate` requires a `CONST_UTF8` operand for `OP_BEGINS_WITH`
+I	1	crates/inf-runtime/src/budget.rs	expect	remainder below 10^9	`scaled % NS_PER_S` is below 10^9 by definition of the remainder — fits u64
+I	1	crates/inf-runtime/src/budget.rs	expect	remainder below weights	`scaled % weights` is below `weights` (a u64) by definition of the remainder
+C	1	crates/inf-runtime/src/cold.rs	assert	cold-read window exceeds a pool buffer	`enqueue`'s `len` is a window planned by `crates/inf-server/src/tier_cell.rs:TierNs::window`: at most `COLD_POOL_BUF / TIER_FRAME_BYTES` frames, and the pool is built with `COLD_POOL_BUF` buffers (`crates/inf-server/src/tier_cell.rs:TierCell::create_ns`)
+C	1	crates/inf-runtime/src/cold.rs	assert	empty cold read	`crates/inf-server/src/tier_cell.rs:TierNs::window` plans at least one frame (`len.max(1)` and a `window_frames > 0` debug assert); the DST's `coldstorm` passes literal non-zero windows
+C	1	crates/inf-runtime/src/cold.rs	assert	foreground grants must be nonzero	the plane builds its config with `..ColdReadConfig::default()` (`crates/inf-server/src/tier_cell.rs:TierCell::create_ns`) — the grants are the defaults of `crates/inf-runtime/src/cold.rs:ColdReadConfig::default`, never a flag
+C	1	crates/inf-runtime/src/cold.rs	assert	maintain grants must be nonzero	the plane builds its config with `..ColdReadConfig::default()` (`crates/inf-server/src/tier_cell.rs:TierCell::create_ns`) — the grants are the defaults of `crates/inf-runtime/src/cold.rs:ColdReadConfig::default`, never a flag
+C	1	crates/inf-runtime/src/cold.rs	assert	overflow_cap must queue at least one intent	`overflow_cap = 4 × qd` at `crates/inf-server/src/tier_cell.rs:TierCell::create_ns`, qd = `COLD-READ-QD` ∈ 1..=4096 (`crates/inf-store/src/ns.rs:TierSpec::validate`); the DST's `coldstorm` passes the default
+C	1	crates/inf-runtime/src/cold.rs	assert	qd_cap must admit at least one device read	`qd_cap = COLD-READ-QD` ∈ 1..=4096 (`crates/inf-store/src/ns.rs:TierSpec::validate`) at `crates/inf-server/src/tier_cell.rs:TierCell::create_ns`; the DST's `coldstorm` passes a literal
+I	1	crates/inf-runtime/src/cold.rs	expect	completion for an unknown cold read	the token was minted by this state (`mint_token`) and stays in `inflight` until its one completion; the driver delivers each CQE once
+I	1	crates/inf-runtime/src/cold.rs	expect	counted	`for _ in 0..queue.len()` pops exactly the intents counted
+I	1	crates/inf-runtime/src/cold.rs	expect	front observed	`while let Some(head) = queue.front()` precedes the `pop_front`
+I	1	crates/inf-runtime/src/cold.rs	expect	picked class has a live head	the drain picks a class whose queue is non-empty after `purge_stale_heads` (same struct, same slice)
+I	1	crates/inf-runtime/src/cold.rs	expect	pinned file has a pin entry	the pin table is this state's own: every unpin pairs an earlier `enqueue`/window pin on the same file
+I	2	crates/inf-runtime/src/cold.rs	expect	seed present	`merge_scratch` holds the seed pushed a few lines above; `min`/`max` over a non-empty iterator
+I	1	crates/inf-runtime/src/cold.rs	expect	shared window outlives its ColdDones	the window table entry lives until `remaining` (the ColdDone count) reaches zero — this `Drop` is one of them
+C	1	crates/inf-runtime/src/cold.rs	panic	non-tier completion routed to ColdReads: {other:?}	the plane routes completions by token class: only `TierRead` results and `Error`s on `TokenClass::TierRead` tokens reach `on_completion` (`crates/inf-server/src/plane.rs:ServerPlane::on_completion`); the class is packed by `crates/inf-runtime/src/token.rs:CompletionToken::new`
+I	1	crates/inf-runtime/src/cold.rs	unreachable	admit builds reads	`admit` returns the `IoOp::TierRead` it constructs two lines above the match
+C	2	crates/inf-runtime/src/driver.rs	expect	stable byte range fits u32	frames: a sealed staging frame is at most the staging ring's capacity (`crates/inf-server/src/log_bytes.rs:sealed_frame`, ≤ 16 MiB format cap); windows: an aligned-pool buffer of `COLD_POOL_BUF` (`crates/inf-server/src/tier_cell.rs:TierCell::create_ns`) or the DST's literal
+I	1	crates/inf-runtime/src/executor.rs	expect	layout align is nonzero	`Layout` guarantees a non-zero power-of-two alignment
+I	1	crates/inf-runtime/src/executor.rs	expect	ready queue references freed slot	slots enter the ready queue only while their entry is live (`insert`/`run_ready` typestate on this slab)
+I	1	crates/inf-runtime/src/executor.rs	expect	releasing freed slot	`release` runs once per `Poll::Ready` of a live entry
+I	1	crates/inf-runtime/src/executor.rs	expect	scratch layout	`Layout::from_size_align` of a power-of-two size ≥ 128 and an alignment ≥ 16 — both valid; future sizes are compile-time constants far below `isize::MAX`
+I	1	crates/inf-runtime/src/executor.rs	expect	task slab exceeds u32 slots	one entry per live future (≥ 64 B each): 2^32 live tasks is 256 GiB of headers — memory exhausts first, and every task is admitted through bounded connections and credits
+I	1	crates/inf-runtime/src/executor.rs	unreachable	inserting task in state {other:?}	task typestate: `insert` is reached from `spawn` (Running) or the first-poll race (RunningWoken) only
+I	1	crates/inf-runtime/src/executor.rs	unreachable	post-poll task state {other:?}	task typestate: a task under poll is Running or RunningWoken
+C	1	crates/inf-runtime/src/gate.rs	assert	duplicate gate waiter for key	keys are tokens minted once per waiter: `crates/inf-fabric/src/mesh.rs:CellFabric::next_token` (a fresh sequence per send, registered at `crates/inf-server/src/plane.rs:send_apply`) and the durable seq (`crates/inf-server/src/durable.rs:DurableCell::stage`, one waiter per gated reply)
+I	1	crates/inf-runtime/src/gate.rs	panic	gate key completed twice	`complete` is called once per drained reply/completion; the slot is removed by the waiter's poll, so a second delivery of the same key is a routing bug in this crate's own tables
+I	1	crates/inf-runtime/src/gate.rs	panic	GateWait polled after completion	the `Future` contract: a future is not polled after `Poll::Ready` (`done` is set on the ready path)
+I	1	crates/inf-runtime/src/gate.rs	panic	ListWait polled after cancellation	the `Future` contract on a cancelled waiter (this crate's own wait list)
+I	1	crates/inf-runtime/src/gate.rs	unreachable	matched Delivered above	the `remove` returns the `Delivered` the match arm just saw
+I	1	crates/inf-runtime/src/gate.rs	unreachable	watermark waiters are never cancelled	the watermark list never sets `Cancelled` (this crate's own list type)
+I	1	crates/inf-runtime/src/kqueue.rs	expect	changelist fits i32	the change list holds at most two entries per registered fd of this driver; the fd table is bounded by the process's descriptor limit
+I	1	crates/inf-runtime/src/kqueue.rs	expect	collected above	the fds were collected from `self.recvs` in the statement above
+I	1	crates/inf-runtime/src/kqueue.rs	expect	eventlist fits i32	the event buffer is sized at construction (a small constant)
+I	2	crates/inf-runtime/src/kqueue.rs	expect	head exists	`while let Some(head) = queue.front_mut()` precedes the `pop_front`
+I	1	crates/inf-runtime/src/sched.rs	assert	zero quantum/weight	the only production constructor is `GroupScheduler::m0_default` (constants); no flag reaches `new`
+I	1	crates/inf-runtime/src/timer.rs	expect	timer slab exceeds u32	one entry per armed connection/loop timer (≥ 32 B): 2^32 armed timers is 128 GiB — memory exhausts first; timers are armed per connection, and connections are admission-bounded
+I	1	crates/inf-runtime/src/timer.rs	unreachable	top level catches all deltas	the loop's last level takes every delta (`level == LEVELS - 1`)
+I	1	crates/inf-runtime/src/token.rs	assert	token slot {slot} exceeds 24 bits	every minter masks or bounds the slot: the fsync/write tickets mask (`& 0xFF_FFFF`), the connection slab refuses past `CONN_SLOT_CAP = MAX_SLOT` (batch 12), tier lanes are 16 bits + an 8-bit op index
+I	1	crates/inf-runtime/src/token.rs	expect	CompletionToken with invalid class byte	the class byte is written by `CompletionToken::new` from a `TokenClass`; tokens are never decoded from external bytes
+C	1	crates/inf-runtime/src/uring.rs	assert	fixed-buffer indices are u16	the tier pool's capacity is `COLD-READ-QD` ∈ 1..=4096 (`crates/inf-store/src/ns.rs:TierSpec::validate`, built at `crates/inf-server/src/tier_cell.rs:TierCell::create_ns`)
+C	1	crates/inf-runtime/src/uring.rs	assert	provided bids are u16	`--buffers` ≤ 65535 at `bins/infinityd/src/main.rs:parse_args` (batch 12 — `--buffers 65536` booted and died here at the first recv arm, proven at the binary); the harnesses pass literals ≤ 256
+C	1	crates/inf-runtime/src/uring.rs	expect	buffer size fits i32	`--buf-size` ≤ i32::MAX at `bins/infinityd/src/main.rs:parse_args` (batch 12 — `--buf-size 2147483648` booted and died here, proven at the binary); the harnesses pass 4096
+C	1	crates/inf-runtime/src/uring.rs	expect	buffer size fits u32	`--buf-size` ≤ i32::MAX at `bins/infinityd/src/main.rs:parse_args` (batch 12); the harnesses pass 4096
+I	2	crates/inf-runtime/src/uring.rs	expect	checked above	the entry was found by the `get`/`is_some` on the lines above and nothing intervened
+I	1	crates/inf-runtime/src/uring.rs	expect	checked capacity above	`pool.capacity() <= u16::MAX` was asserted at the top of the same branch, and ids are below capacity
+I	1	crates/inf-runtime/src/uring.rs	expect	collected above	the fds were collected from `self.recvs` in the statement above
+I	1	crates/inf-runtime/src/uring.rs	expect	kernel returned a bid this driver never provided	the provided-buffer map is this driver's own; a bid the kernel returns was staged by `replenish_and_resume`
+I	1	crates/inf-runtime/src/uring.rs	expect	pool fully free at registration	`register_pool` runs at driver construction, before any lease is handed out
+C	1	crates/inf-runtime/src/uring.rs	expect	provided bids are u16	`--buffers` ≤ 65535 at `bins/infinityd/src/main.rs:parse_args` (batch 12); the ids in the provide op came from `try_stage` on a pool of that capacity
+I	2	crates/inf-runtime/src/uring.rs	expect	room checked above	`sq.len() + needed <= sq.capacity()` was checked in the same submission loop
+I	1	crates/inf-server/src/admin.rs	expect	seeded from the current spec	`parse_ns_set_tier` is entered only from the `if let Some(current) = spec.tier` arm and seeds `tier = Some(current)`; `parse_tier_key` mutates the inner spec, never clears it
+I	1	crates/inf-server/src/admin.rs	unreachable	membership matched above	the arm is reached only for keys the membership test above accepted
+I	1	crates/inf-server/src/ckpt.rs	assert	one recovery-unit transition in flight	the manifest driver's own `SwapPhase` machine: `note_published_ick` is reached from the checkpoint publish path only while `idle()` (M2.5-S13 release assert on the driver's state)
+I	1	crates/inf-server/src/ckpt.rs	assert	publish before the completion fdatasync landed	`Streaming::sync_done` is this driver's own flag, set by the `CkptSync` completion before `publish` is scheduled (M2.5-S13 release assert — a MANIFEST naming an unsynced checkpoint is silent durable corruption)
+I	1	crates/inf-server/src/ckpt.rs	assert	publish with a section write still in flight	`Streaming::in_flight` is this driver's own lease; publish is scheduled after the last `CkptWrite` released it (M2.5-S13 release assert)
+C	3	crates/inf-server/src/ckpt.rs	expect	std tier has fds	the reactor-driven plane runs only on fd-backed tiers: `StdSegmentFs` at `bins/infinityd/src/main.rs:main` and the harnesses, the sim disk in `inf-sim` (`crates/inf-log/src/fs/sim.rs:SimFile::raw_fd`); `MemFs` reaches only the synchronous `open_cell_log` tier
+I	1	crates/inf-server/src/ckpt.rs	panic	ManifestSync completion with no barrier in flight	the driver's own phase machine: a `ManifestSync` token is minted only when a barrier is queued, and `on_synced` consumes it once
+I	1	crates/inf-server/src/ckpt.rs	panic	ManifestSync error with no barrier in flight	the driver's own phase machine: a `ManifestSync` token is minted only when a barrier is queued, and the error path consumes it once
+C	1	crates/inf-server/src/control.rs	assert	cell id validated by the assembly	the board is sized from the same `cells` the assembly spawns (`bins/infinityd/src/main.rs:main` spawns cell threads 0..cells; the DST harness likewise); a cell reports its own id
+C	1	crates/inf-server/src/control.rs	assert	slot ids are control-plane-assigned < INDEX_SLOTS	index slots are registry-assigned below `INDEXES_PER_NODE_MAX` (`crates/inf-store/src/index_registry.rs:IndexRegistry::create` refuses the 65th index), and `INDEX_SLOTS` is that constant
+F	3	crates/inf-server/src/control.rs	expect	control thread alive (fail-stop)	the control thread's death is the sanctioned fail-stop (ADR-0107 D2 names it; the thread itself exits the process with 101 on a panic) — a cell that cannot persist a catalog must not keep serving
+F	1	crates/inf-server/src/control.rs	expect	spawn control thread	boot-time thread creation failure (resource exhaustion before any cell serves) — the same fail-stop class as allocation failure at boot; `infinityd` has no degraded mode without its control thread
+I	2	crates/inf-server/src/durable.rs	assert	staging into a failed durable cell	`fail_stop` sets `failed` and exits the process (§8.4); the flag is observable only in tests, so a stage after failure is unreachable in production
+I	1	crates/inf-server/src/durable.rs	assert	ticket fits slot+gen	fsync tickets are a per-cell monotone count of barriers: 2^56 barriers at a device-bound rate (≤ 10^6/s) is over 2,000 years — the cell's own counter
+I	1	crates/inf-server/src/durable.rs	assert_eq	barrier plan matches the slot	the plan and the reservation are derived from the same rotor state in the same slice (the cell's own state)
+I	1	crates/inf-server/src/durable.rs	assert_eq	rotation plan matches the reservation	the plan and the reservation are derived from the same rotor state in the same slice (the cell's own state)
+C	1	crates/inf-server/src/durable.rs	expect	admission pre-checked	`would_fit(effect.encoded_len())` on the line above, for the `CkptBegin` marker the cell itself encodes (`crates/inf-log/src/staging.rs:StagingRing::would_fit`)
+C	2	crates/inf-server/src/durable.rs	expect	admission pre-checked by would_fit	every write is admitted through `crates/inf-server/src/plane.rs:Shared::durable_admission`, whose `would_fit(est)` uses the conservative `crates/inf-server/src/plane.rs:Shared::estimate_effect_bytes` (≥ the encoded length; the staged-prefix rows of ADR-0098 exercise the bound)
+I	1	crates/inf-server/src/durable.rs	expect	begun above	`begin_ckpt_walk` ran two lines above when no watermark existed
+I	1	crates/inf-server/src/durable.rs	expect	CkptWrite with no in-flight lease	the cell's own checkpoint stream: a `CkptWrite` token exists only while `in_flight` holds its lease
+I	1	crates/inf-server/src/durable.rs	expect	header staged by open_stream	`open_stream` stages the header block and returns `Ok` only with the lease in `in_flight`
+I	1	crates/inf-server/src/durable.rs	expect	index from position	`position` returned an index into the same `Vec`
+I	1	crates/inf-server/src/durable.rs	expect	LogWritten for a frame not in flight	frame ids are minted here and stay in `in_flight` until their one `LogWritten`; the driver delivers each completion once
+C	4	crates/inf-server/src/durable.rs	expect	std segment tier has fds	the reactor-driven plane runs only on fd-backed tiers: `StdSegmentFs` at `bins/infinityd/src/main.rs:main` and the harnesses, the sim disk in `inf-sim` (`crates/inf-log/src/fs/sim.rs:SimFile::raw_fd`); `MemFs` reaches only the synchronous `open_cell_log` tier
+I	1	crates/inf-server/src/durable.rs	panic	CkptSync completion with no checkpoint streaming	the cell's own checkpoint phase: a `CkptSync` token is minted only by the streaming phase
+I	1	crates/inf-server/src/durable.rs	panic	CkptWrite completion with no checkpoint streaming	the cell's own checkpoint phase: a `CkptWrite` token is minted only by the streaming phase
+I	1	crates/inf-server/src/durable.rs	unreachable	a waiting frame is never sealed	`FramePlan::Wait` returns before the seal in the same function
+I	1	crates/inf-server/src/durable.rs	unreachable	just opened	`open_stream` set `phase = Stream` on the line above
+I	1	crates/inf-server/src/durable.rs	unreachable	matched above	the `matches!` on the line above saw `CkptPhase::Stream`
+C	1	crates/inf-server/src/exec.rs	unreachable	keyspace-level and pub/sub commands dispatch in execute()	`crates/inf-server/src/exec.rs:execute` routes those `CommandId`s before `execute_db`; a table-iterating compat test covers every registry row
+I	1	crates/inf-server/src/json.rs	assert	a logged document delta changed at least one match	`delta` is called from `commit_delta` only when `changed`, which requires a non-skipped result
+I	2	crates/inf-server/src/json.rs	expect	compile above accepted this text	the same function compiled `path` a few lines above; `parse_ast` accepts what the compiler accepted
+C	1	crates/inf-server/src/json.rs	expect	durable capture is named-namespace-only	`doc_log_admission` is set only while executing in a named durable namespace (`crates/inf-server/src/plane.rs:Shared::stage_durable_effects` clears it; the setter in `crates/inf-server/src/json.rs:int_per_match`'s module runs under a `ConnNamespace::Named`)
+I	1	crates/inf-server/src/json.rs	expect	matches resolve on their document	`matches` was just evaluated on `read.root`; `resolve` walks the same tape
+I	1	crates/inf-server/src/json.rs	expect	matches resolve on their own document	`matches` was just evaluated on `root`; `resolve` walks the same tape
+C	1	crates/inf-server/src/json.rs	expect	match set is capped at u32	`crates/inf-doc/src/path/eval.rs:Matches::record` refuses beyond `EvalLimits::max_matches` (65,536 — `crates/inf-doc/src/path/eval.rs:EvalLimits::default`)
+C	1	crates/inf-server/src/json.rs	expect	one document is bounded far below i64::MAX	a document is one arena record: `crates/inf-store/src/store.rs:check_bounds` bounds record length to the store's record cap (≪ 2^63); `json_memory_usage` sums that record and its attributed pools
+C	1	crates/inf-server/src/json.rs	unreachable	execute_db routes exactly the JSON family here	`crates/inf-server/src/exec.rs:execute_db` dispatches the `Json*` ids to this function and nothing else
+I	1	crates/inf-server/src/json.rs	unreachable	numeric ops apply numbers	`mutate_with` under a numeric `ApplyOp` yields `MatchResult::Num`/`Skipped` only (the applier's own typestate)
+I	1	crates/inf-server/src/json.rs	unreachable	numeric probe returns a number	the scalar-patch probe for a numeric op returns `Number`/`Missing`/`Skipped`/`Unsupported`, never `Toggled` (the store's own patch typestate)
+I	1	crates/inf-server/src/json.rs	unreachable	toggle applies booleans	`mutate_with` under `ApplyOp::Toggle` yields `MatchResult::Toggled`/`Skipped` only
+I	1	crates/inf-server/src/json.rs	unreachable	toggle probe returns a boolean	the scalar-patch probe for a toggle returns `Toggled`/`Missing`/`Skipped`/`Unsupported`, never `Number`
+I	1	crates/inf-server/src/json.rs	unreachable	unconditional set applies	`SetCond::Always` never yields `Skipped` (the store's own `json_set` contract)
+I	2	crates/inf-server/src/key_hash.rs	expect	8 bytes	`bytes` is a `[u8; 16]`; `[..8]`/`[8..]` are 8-byte slices
+C	3	crates/inf-server/src/plane.rs	expect	argc fits u32	argv is a parsed frame: `crates/inf-wire/src/parser.rs:parse_multibulk` bounds `argc` to `ParserLimits::max_args` (1024) and the frame to `max_frame_bytes`
+I	1	crates/inf-server/src/plane.rs	expect	Backfilling → Ready is an ADR-0075 D3 edge	`idx_fleet_candidates` yields only Backfilling indexes (the registry's own state), and the flip is the ADR-0075 D3 edge from that state
+C	2	crates/inf-server/src/plane.rs	expect	block fits u32	a staged block is one parsed frame: `crates/inf-wire/src/parser.rs:parse_multibulk` bounds it to `ParserLimits::max_frame_bytes` (1 MiB default)
+I	1	crates/inf-server/src/plane.rs	expect	block header	the block was written by `stage_argv_block` with a 4-byte header
+I	1	crates/inf-server/src/plane.rs	expect	boot present	`RecoveryProgress::Complete` is reported by the `boot` machine stepped on the line above
+I	1	crates/inf-server/src/plane.rs	expect	captured full key remains a live document until staging	the capture and the staging run in the same synchronous command (no suspension between them); the document the command just wrote is live
+I	1	crates/inf-server/src/plane.rs	expect	checked above	`self.durable.borrow()` was `Some` for `space_exhausted` a few lines above; nothing suspends in between
+I	1	crates/inf-server/src/plane.rs	expect	ckpt completion without durable plane	`CkptWrite`/`CkptSync` tokens are minted by the durable cell, which exists for the plane's life once enabled
+C	1	crates/inf-server/src/plane.rs	expect	cmd fits u32	the flattened command is one parsed frame: `crates/inf-wire/src/parser.rs:parse_multibulk` bounds it to `ParserLimits::max_frame_bytes` (1 MiB default)
+I	1	crates/inf-server/src/plane.rs	expect	cold engine implies tier state	`cold` is a field of the tier state (`TierCell::cold`); a drained cold engine came from `self.shared.tier`
+I	1	crates/inf-server/src/plane.rs	expect	conn checked above	`conns.get_mut(key)` succeeded at the top of the same drain; nothing removes the connection during it
+I	1	crates/inf-server/src/plane.rs	expect	db index validated at SELECT	`db` iterates `ks.dbs()` — the 16 numbered dbs (`DEFAULT_DBS`), each index below 16
+I	1	crates/inf-server/src/plane.rs	expect	durable admission parked	`NsApplyOutcome::Park` is produced only by the durable cell's admission, which exists for the plane's life once enabled
+I	1	crates/inf-server/src/plane.rs	expect	durable admission ran	`DurableAdmission::Park` is produced only by the durable cell's admission, which exists for the plane's life once enabled
+I	1	crates/inf-server/src/plane.rs	expect	emission requires the durable plane	durable-namespace writes reach `stage_durable_effects` only on a plane whose `enable_durable` ran (the catalog registers durable namespaces on the durable plane)
+I	1	crates/inf-server/src/plane.rs	expect	enable_durable built tier state	`enable_durable` returned `Ok` on the line above, and it constructs the tier state
+I	2	crates/inf-server/src/plane.rs	expect	ends table	the block was written by `stage_argv_block` with `argc` 4-byte ends after the header
+I	1	crates/inf-server/src/plane.rs	expect	front exists	`front().is_some_and(..)` on the line above
+I	1	crates/inf-server/src/plane.rs	expect	gated reply implies durable plane	a gated reply carries a durable seq minted by the durable cell, which exists for the plane's life once enabled
+I	1	crates/inf-server/src/plane.rs	expect	guarded	`conn_ns.is_some()` is part of the arm's guard
+I	1	crates/inf-server/src/plane.rs	expect	header	the block was written by `OwnedCmd::from_argv_into` with a 4-byte header
+I	1	crates/inf-server/src/plane.rs	expect	log completion without durable plane	`LogWrite`/`Fsync`/`ZeroFillWrite` tokens are minted by the durable cell, which exists for the plane's life once enabled
+I	1	crates/inf-server/src/plane.rs	expect	LogWritten without durable plane	`LogWrite` tokens are minted by the durable cell, which exists for the plane's life once enabled
+I	1	crates/inf-server/src/plane.rs	expect	manifest completion without durable plane	`ManifestSync` tokens are minted by the durable cell's manifest driver, which exists for the plane's life once enabled
+I	1	crates/inf-server/src/plane.rs	expect	materialized, checked above	`ns_store(id).is_none()` continued the loop on the line above; `ns_store_mut` on a known namespace materializes
+I	1	crates/inf-server/src/plane.rs	expect	record sizes fit usize	`need` is a record length (u64) on a 64-bit target; records are bounded by the frame cap
+I	1	crates/inf-server/src/plane.rs	expect	recovered namespace carries a tier block	`Recovery::recover_tiers` already refused a manifested tier section the catalog does not know (ADR-0100 D6), so every recovered namespace is catalogued tiered
+I	1	crates/inf-server/src/plane.rs	expect	scatter programs dispatch registered commands	`argv[0]` reached this program through a registry `lookup` in the dispatcher
+C	1	crates/inf-server/src/plane.rs	expect	set_control before begin_recovery	assembly order: `bins/infinityd/src/main.rs:main` and every harness call `set_control` first (`crates/inf-server/src/plane.rs:ServerPlane::begin_recovery` documents the panic)
+I	2	crates/inf-server/src/plane.rs	expect	staged above	`stage_durable_effects` returned a seq on the line above, which requires the durable cell
+C	2	crates/inf-server/src/plane.rs	expect	stage scratch fits u32	the stage scratch holds one recv buffer's parsed frames: `--buf-size` ≤ i32::MAX (`bins/infinityd/src/main.rs:parse_args`, batch 12) and each frame ≤ `max_frame_bytes` (`crates/inf-wire/src/parser.rs:parse_multibulk`)
+I	1	crates/inf-server/src/plane.rs	expect	Synced without durable plane	`Fsync`/`CkptSync`/`ManifestSync` tokens are minted by the durable cell, which exists for the plane's life once enabled
+I	2	crates/inf-server/src/plane.rs	expect	tiered implies the durable plane	a tiered namespace is a configuration of `MODE durable` (ADR-0062 D1), registered on a plane whose `enable_durable` ran
+I	1	crates/inf-server/src/plane.rs	expect	tiered namespaces require the durable plane	a tiered namespace is a configuration of `MODE durable` (ADR-0062 D1), registered on a plane whose `enable_durable` ran
+I	3	crates/inf-server/src/plane.rs	expect	tier-flush completion implies tier state	`TierFlushWrite`/`TierFlushSync` tokens are minted by the tier state's flush rounds
+I	2	crates/inf-server/src/plane.rs	expect	TierRead completion implies a live cold-read engine	`TierRead` tokens are minted by the cold-read engine inside the tier state
+I	1	crates/inf-server/src/plane.rs	panic	captured delta key remains a live document until staging	the capture and the staging run in the same synchronous command (no suspension between them); the document the command just mutated is live
+I	2	crates/inf-server/src/plane.rs	unreachable	<no message>  unreachable!(),	the outer match handled `Bytes`/`Err` (first site) and `Int`/`Err` (second site) before the `other` arm re-matches the remainder
+I	1	crates/inf-server/src/plane.rs	unreachable	full-image probe never returns a delta	`json_log_full` is the full-image probe; `Delta` is produced only by the delta probe (the store's own typestate)
+I	1	crates/inf-server/src/plane.rs	unreachable	is_plane_pubsub covers exactly the arms above	the dispatcher enters this function only when `is_plane_pubsub(id)`, whose arms this match enumerates
+I	1	crates/inf-server/src/plane.rs	unreachable	is_scatter covers exactly the arms above	the dispatcher enters this branch only when `is_scatter(id, sub)`, whose arms this match enumerates
+I	1	crates/inf-server/src/plane.rs	unreachable	json_log_full always chooses a full image	`json_log_full` returns `JsonLogDecision::Full` by construction (the store's own probe)
+I	1	crates/inf-server/src/plane/tiered.rs	expect	caller resolved the table	`write_blob` is called from `try_write` after `ks.tiered_store_mut(ns)` resolved in the same synchronous stretch
+I	1	crates/inf-server/src/plane/tiered.rs	expect	continuation address is 48-bit	`at` is a raw address the same probe produced from `LogicalAddr::to_raw` on the first window
+I	1	crates/inf-server/src/plane/tiered.rs	expect	resolved above	`ks.tiered_store_mut(ns)` resolved at the top of the same synchronous function
+I	8	crates/inf-server/src/plane/tiered.rs	expect	resolved on this table	`resolve` returned `Ram(addr)` from this namespace's table and the borrow follows without a suspension point, so no `DROP` can interleave (drops apply between polls)
+I	1	crates/inf-server/src/plane/tiered.rs	expect	tiered namespace has plane state	the tier state materializes every catalogued tiered namespace at MAINTAIN (`sync_namespaces`) before writes are admitted to it
+C	3	crates/inf-server/src/plane/tiered.rs	expect	tiered namespaces always carry a durability class	a tiered namespace is a configuration of `MODE durable`, refused otherwise at creation (`crates/inf-store/src/keyspace.rs:Keyspace::ns_create_check` via the registry's spec check), and durable namespaces carry an fsync class
+I	1	crates/inf-server/src/recover.rs	expect	40	the frame header length is the constant `FRAME_HEADER_LEN` (40)
+I	1	crates/inf-server/src/recover.rs	expect	clean exhaustion records an end	`SegmentReader` records `read_end` whenever `next_frame` returns `Ok(None)` (this crate's boot reader contract)
+I	1	crates/inf-server/src/recover.rs	expect	evidence anchor set with a valid frame	the anchor is set in the same loop whenever a scan reports `valid_frames > 0`
+I	2	crates/inf-server/src/recover.rs	expect	fs present	the machine's own phase order: `fs` is taken once, when the rotor is built at completion
+I	1	crates/inf-server/src/recover.rs	expect	fs present until finish	the machine's own phase order: `fs` is taken once, when the rotor is built at completion
+I	1	crates/inf-server/src/recover.rs	expect	ick phase	`Phase::Ick` is entered only after the manifest is stored
+I	1	crates/inf-server/src/recover.rs	expect	loader present until the audit	the sidecar loader is taken once, on entering the audit, after the ick phase that uses it
+I	1	crates/inf-server/src/recover.rs	expect	non-empty scan	the fresh-cell branch (empty scan) completed earlier; the finish phase runs only over a non-empty scan
+I	1	crates/inf-server/src/recover.rs	expect	recovery complete before finish()	documented panic: `finish` after `Complete` (callers loop on `step`)
+I	1	crates/inf-server/src/recover.rs	expect	scan set	`scan` is stored in the start phase before any later phase runs
+I	1	crates/inf-server/src/recover.rs	expect	scan set in start	`scan` is stored in the start phase before any later phase runs
+I	1	crates/inf-server/src/recover.rs	unreachable	Io and foreign-segment reads are handled above	those two error kinds returned earlier in the same match
+C	1	crates/inf-server/src/tier_cell.rs	assert	flush round exceeds the token op-index bound (ADR-0084 D3)	the round is staged under `admission.admit(slice_bound, TIER_ROUND_MAX_OPS)` in the same function, and `crates/inf-store/src/tiered.rs:TieredTable::stage_flush_round` stages at most the admitted ops (256)
+I	1	crates/inf-server/src/tier_cell.rs	assert	tier flush lanes exhausted	lanes recycle once their namespace has no op in flight (batch 12), so the bound is on live-plus-draining tiered namespaces: 2^16 pipelines of MiBs each — memory exhausts first
+I	1	crates/inf-server/src/tier_cell.rs	expect	checked above	`t.round` was seen `Some` at the top of the same function
+I	1	crates/inf-server/src/tier_cell.rs	expect	checked front	`front().is_some_and(..)` on the line above
+I	1	crates/inf-server/src/tier_cell.rs	expect	just created	`create_ns` pushed the namespace on the line above
+I	2	crates/inf-simd/src/crc32c.rs	expect	4-byte slice	`chunk[0..4]`/`[4..8]` of an 8-byte `chunks_exact` chunk
+I	2	crates/inf-simd/src/crc32c.rs	expect	chunks_exact(8) yields 8 bytes	`chunks_exact(8)` yields 8-byte slices; the `try_into` is infallible
+C	1	crates/inf-simd/src/crlf.rs	panic	CRLF offset exceeds u32 range: {position}	positions are offsets into a recv buffer or the parser's accumulator: `--buf-size` ≤ i32::MAX (`bins/infinityd/src/main.rs:parse_args`, batch 12) and the accumulator ≤ `ParserLimits::max_frame_bytes` (`crates/inf-wire/src/parser.rs:parse_multibulk`)
+I	1	crates/inf-simd/src/crlf.rs	unreachable	index already bounds checked	`position_at` is private: `next_after`'s binary search keeps `mid < self.len()` and `get` checks `index < len` first
+I	1	crates/inf-simd/src/crlf.rs	unreachable	small buffer offsets must fit in u16	`with_buffer_len` chooses `Small` only for buffers ≤ `SMALL_BUFFER_MAX` (u16::MAX), and this module's scanners push offsets into that buffer
+C	1	crates/inf-simd/src/json.rs	assert	<no message>  assert!((1..=31).contains(&len));	the scalar tier is reached only from `crates/inf-simd/src/json.rs:json_copy_unescaped_short` after its own `1..=31` assert; that entry point has no production caller (`json_copy_unescaped_fixstr` is the one inf-doc calls)
+C	1	crates/inf-simd/src/json.rs	assert	<no message>  assert!(window.len() >= 32);	the scalar tier is reached only from `crates/inf-simd/src/json.rs:json_copy_unescaped_short` after its own 32-byte assert; that entry point has no production caller (`json_copy_unescaped_fixstr` is the one inf-doc calls)
+C	2	crates/inf-simd/src/json.rs	assert	caller guarantees 32 bytes of window	`crates/inf-doc/src/json.rs:try_fixstr_fast` returns `false` unless `s + 32 <= input.len()` and passes exactly `&input[s..s + 32]`; the `_short` twin has no production caller
+C	2	crates/inf-simd/src/json.rs	assert	fixstr payload length	`crates/inf-doc/src/json.rs:try_fixstr_fast` is entered with `len <= FIXSTR_MAX_LEN` (31) and returns early for `len == 0`; the `_short` twin has no production caller
+I	1	crates/inf-simd/src/json.rs	expect	8-byte chunk	`src[i..i + 8]` under the loop guard `i + 8 <= len`
+I	1	crates/inf-simd/src/json.rs	expect	slack-checked word	`window[p..p + 8]` with `p ∈ {0, 8, 16, 24}` (`len ≤ 31`, step 8) inside the asserted 32-byte window
 C	2	crates/inf-store/src/address_space.rs	assert	allocation exceeds half the ring	`crates/inf-store/src/tiered.rs:TieredTable::append` bounds a record to HEADER + MAX_KEY_LEN + MAX_VAL_LEN, and crates/inf-store/src/ns.rs:TierSpec::validate bounds BLOB-THRESHOLD to half the ring so every inline record fits (ADR-0052 D1)
 C	2	crates/inf-store/src/address_space.rs	assert	empty allocation	`crates/inf-store/src/tiered.rs:TieredTable::append` bounds a record to HEADER + MAX_KEY_LEN + MAX_VAL_LEN, and crates/inf-store/src/ns.rs:TierSpec::validate bounds BLOB-THRESHOLD to half the ring so every inline record fits (ADR-0052 D1)
 C	1	crates/inf-store/src/address_space.rs	assert	empty flush budget	`crates/inf-store/src/tiered.rs:TieredTable::flush_slice_inner` / `stage_flush_round_inner` pass budget = slice_bytes (> 0) and a cursor they assert ≥ flushed
@@ -548,6 +548,7 @@ I	1	crates/inf-store/src/address_space.rs	assert	in-place write below ro_boundar
 I	1	crates/inf-store/src/address_space.rs	assert	one checkpoint walk in flight per cell	walk pin is the space's own state (one walk per cell)
 I	1	crates/inf-store/src/address_space.rs	assert	page release above flushed	watermark order head ≤ flushed ≤ ro_boundary ≤ tail is the space's own invariant (ADR-0052 D2)
 I	1	crates/inf-store/src/address_space.rs	assert	page release past a pinned watermark or record	watermark order head ≤ flushed ≤ ro_boundary ≤ tail is the space's own invariant (ADR-0052 D2)
+I	1	crates/inf-store/src/address_space.rs	assert	RAM read below head	memory-safety guard on the space's own window: below head is a decommitted page (SAFETY.md `region.rs::bytes`)
 C	1	crates/inf-store/src/address_space.rs	assert	ring must be a power of two	crates/inf-store/src/ns.rs:TierSpec::validate (MEM-BUDGET > 0, MAINTAIN-SLICE ≥ 64 KiB) and `crates/inf-store/src/demote.rs:DemotionConfig::ring_reserve_bytes` derives the power-of-two ring ≥ 4 pages
 C	1	crates/inf-store/src/address_space.rs	assert	ring smaller than four pages	crates/inf-store/src/ns.rs:TierSpec::validate (MEM-BUDGET > 0, MAINTAIN-SLICE ≥ 64 KiB) and `crates/inf-store/src/demote.rs:DemotionConfig::ring_reserve_bytes` derives the power-of-two ring ≥ 4 pages
 I	1	crates/inf-store/src/address_space.rs	assert	ro_boundary past tail	watermark order head ≤ flushed ≤ ro_boundary ≤ tail is the space's own invariant (ADR-0052 D2)
@@ -580,25 +581,25 @@ I	1	crates/inf-store/src/extents.rs	expect	a mapped reference has an extent	exte
 I	1	crates/inf-store/src/extents.rs	expect	reclaim_deferred for a candidate reclaim_work handed out	extent reference table invariants (refs ⇄ extents; reclaim candidates handed out by `reclaim_work`)
 I	1	crates/inf-store/src/extents.rs	expect	reclaim_done for a candidate reclaim_work handed out	extent reference table invariants (refs ⇄ extents; reclaim candidates handed out by `reclaim_work`)
 I	1	crates/inf-store/src/extents.rs	expect	reclaim_quarantined for a candidate reclaim_work handed out	extent reference table invariants (refs ⇄ extents; reclaim candidates handed out by `reclaim_work`)
+I	1	crates/inf-store/src/index_backfill.rs	expect	Backfilling → Ready is an ADR-0075 D3 edge	index registry state-machine edges (ADR-0075 D3) — the registry's own state
+I	2	crates/inf-store/src/index_backfill.rs	expect	Declared → Backfilling is an ADR-0075 D3 edge	index registry state-machine edges (ADR-0075 D3) — the registry's own state
+I	1	crates/inf-store/src/index_key.rs	expect	nonempty checked above	key-type dispatch invariant (utf8 keys are never fixed8; nonempty checked in the preceding statement)
+C	1	crates/inf-store/src/index_key.rs	unreachable	coerce admitted null	`crates/inf-store/src/index_key.rs:index_scalar_coerce` rejects Null before any encode
+I	1	crates/inf-store/src/index_key.rs	unreachable	utf8 is not fixed8	key-type dispatch invariant (utf8 keys are never fixed8; nonempty checked in the preceding statement)
+C	1	crates/inf-store/src/index_maint.rs	expect	registry validated the program	`crates/inf-store/src/index_registry.rs:validate_index_program` — called by `IndexRegistry::create` and by `crates/inf-store/src/catalog.rs:decode_index_record`
+I	1	crates/inf-store/src/index_maint.rs	unreachable	loop condition	the loop guard excludes the (None, None) arm
+I	1	crates/inf-store/src/index_registry.rs	assert	<no message>  assert!(INDEX_KEY_ENCODING_VERSION == 1);	compile-time const assertion — never executes
 I	1	crates/inf-store/src/index.rs	assert	insert found no slot — load invariant broken	SwissTable load invariant (grow before full)
 I	1	crates/inf-store/src/index.rs	expect	group-aligned	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-store/src/index.rs	expect	remove target present	the (hash, addr) pair was read from this index's own lookup earlier in the same mutation
 I	1	crates/inf-store/src/index.rs	expect	replace target present	the (hash, addr) pair was read from this index's own lookup earlier in the same mutation
 I	2	crates/inf-store/src/index.rs	expect	slot addr is 48-bit by masking	the slot's addr field is masked to 48 bits on store
-I	1	crates/inf-store/src/index_backfill.rs	expect	Backfilling → Ready is an ADR-0075 D3 edge	index registry state-machine edges (ADR-0075 D3) — the registry's own state
-I	2	crates/inf-store/src/index_backfill.rs	expect	Declared → Backfilling is an ADR-0075 D3 edge	index registry state-machine edges (ADR-0075 D3) — the registry's own state
-I	1	crates/inf-store/src/index_key.rs	expect	nonempty checked above	key-type dispatch invariant (utf8 keys are never fixed8; nonempty checked in the preceding statement)
-C	1	crates/inf-store/src/index_key.rs	unreachable	coerce admitted null	`crates/inf-store/src/index_key.rs:IndexKeyBuf::index_scalar_coerce` rejects Null before any encode
-I	1	crates/inf-store/src/index_key.rs	unreachable	utf8 is not fixed8	key-type dispatch invariant (utf8 keys are never fixed8; nonempty checked in the preceding statement)
-C	1	crates/inf-store/src/index_maint.rs	expect	registry validated the program	`crates/inf-store/src/index_registry.rs:validate_index_program` — called by `IndexRegistry::create` and by `crates/inf-store/src/catalog.rs:NsCatalog::decode_index_record`
-I	1	crates/inf-store/src/index_maint.rs	unreachable	loop condition	the loop guard excludes the (None, None) arm
-I	1	crates/inf-store/src/index_registry.rs	assert	<no message>  assert!(INDEX_KEY_ENCODING_VERSION == 1);	compile-time const assertion — never executes
 I	1	crates/inf-store/src/index_sidecar.rs	assert	sections after the checkpoint footer	sidecar loader state machine / registry edges (ADR-0075 D3)
 I	1	crates/inf-store/src/index_sidecar.rs	expect	a seeded index is Backfilling; Backfilling → Ready is a D3 edge	sidecar loader state machine / registry edges (ADR-0075 D3)
 I	1	crates/inf-store/src/index_sidecar.rs	unreachable	finish_load discarded every open stream	sidecar loader state machine / registry edges (ADR-0075 D3)
 C	1	crates/inf-store/src/keyspace.rs	assert	db index validated at the command layer	`crates/inf-server/src/admin.rs:default_db_index` (SELECT / COPY DB / MOVE parse n < DEFAULT_DBS); the connection's selected db is stored only from it
 I	1	crates/inf-store/src/keyspace.rs	expect	caller checked tiered	same-function sequencing: the entry was materialized / checked in the preceding statement
-C	1	crates/inf-store/src/keyspace.rs	expect	catalog decode validated the record	`crates/inf-store/src/catalog.rs:NsCatalog::decode_index_record` runs `validate_index_program` on every decoded index record
+C	1	crates/inf-store/src/keyspace.rs	expect	catalog decode validated the record	`crates/inf-store/src/catalog.rs:decode_index_record` runs `validate_index_program` on every decoded index record
 I	3	crates/inf-store/src/keyspace.rs	expect	is_tiered checked	same-function sequencing: the entry was materialized / checked in the preceding statement
 I	1	crates/inf-store/src/keyspace.rs	expect	just created	same-function sequencing: the entry was materialized / checked in the preceding statement
 I	1	crates/inf-store/src/keyspace.rs	expect	just rebuilt	same-function sequencing: the entry was materialized / checked in the preceding statement
@@ -621,10 +622,10 @@ I	1	crates/inf-store/src/live_set.rs	assert_eq	scan complete but slots still nam
 I	1	crates/inf-store/src/live_set.rs	expect	filed above	live-set accounting invariants (ADR-0058 D4): coverage_end, file order, dead ≤ data are the set's own state
 I	1	crates/inf-store/src/live_set.rs	expect	finalize of unknown file	live-set accounting invariants (ADR-0058 D4): coverage_end, file order, dead ≤ data are the set's own state
 I	2	crates/inf-store/src/ns.rs	expect	bounded above	min with a u32 const before the conversion
-C	1	crates/inf-store/src/ordered.rs	assert	Fixed8 keys are exactly 8 bytes	`crates/inf-store/src/index_key.rs:IndexKeyBuf::index_scalar_coerce` refuses utf8 keys above ORDERED_KEY_MAX and `index_key_encode` emits exactly 8 bytes for fixed8 types
 I	1	crates/inf-store/src/ordered.rs	assert	fanout: even, 8..=256	compile-time const block — never executes
+C	1	crates/inf-store/src/ordered.rs	assert	Fixed8 keys are exactly 8 bytes	`crates/inf-store/src/index_key.rs:index_scalar_coerce` refuses utf8 keys above ORDERED_KEY_MAX and `index_key_encode` emits exactly 8 bytes for fixed8 types
 I	1	crates/inf-store/src/ordered.rs	assert	get2_mut requires distinct ids	B+ tree structural invariants (height bound, distinct ids, InsertPlan sequencing)
-C	1	crates/inf-store/src/ordered.rs	assert	key exceeds ORDERED_KEY_MAX	`crates/inf-store/src/index_key.rs:IndexKeyBuf::index_scalar_coerce` refuses utf8 keys above ORDERED_KEY_MAX and `index_key_encode` emits exactly 8 bytes for fixed8 types
+C	1	crates/inf-store/src/ordered.rs	assert	key exceeds ORDERED_KEY_MAX	`crates/inf-store/src/index_key.rs:index_scalar_coerce` refuses utf8 keys above ORDERED_KEY_MAX and `index_key_encode` emits exactly 8 bytes for fixed8 types
 I	2	crates/inf-store/src/ordered.rs	assert	tree height invariant violated	B+ tree structural invariants (height bound, distinct ids, InsertPlan sequencing)
 I	1	crates/inf-store/src/ordered.rs	expect	meta planned	B+ tree structural invariants (height bound, distinct ids, InsertPlan sequencing)
 I	1	crates/inf-store/src/ordered.rs	expect	plan covered the full run	B+ tree structural invariants (height bound, distinct ids, InsertPlan sequencing)
@@ -647,16 +648,6 @@ I	1	crates/inf-store/src/store.rs	panic	string-only digest walker encountered a 
 I	1	crates/inf-store/src/store.rs	panic	string-only post-image walker encountered a document	the string-only walkers have no production caller (bench / test API); production walks use `scan_checkpoint_images`
 I	4	crates/inf-store/src/store.rs	unreachable	JsonDoc records cannot exist without the doc feature	type tags are written only by the owner that decodes them: CellStore never writes StringExtent; JsonDoc only under the `doc` feature
 I	4	crates/inf-store/src/store.rs	unreachable	StringExtent records exist only in tiered namespaces	type tags are written only by the owner that decodes them: CellStore never writes StringExtent; JsonDoc only under the `doc` feature
-I	1	crates/inf-store/src/tiered.rs	assert	delete of a shadow winner before its ticket resolved	ADR-0093 D4: a winner is deleted only after its ticket resolved (the table's own ticket state)
-I	2	crates/inf-store/src/tiered.rs	assert	flush cursor behind the watermark	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
-I	2	crates/inf-store/src/tiered.rs	expect	append_range leaves a file active	TierFlush postcondition: `append_range` creates the file it appends to
-I	1	crates/inf-store/src/tiered.rs	expect	below flushed	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
-I	2	crates/inf-store/src/tiered.rs	expect	chunk fits usize	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
-I	1	crates/inf-store/src/tiered.rs	expect	marks are 48-bit	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
-I	1	crates/inf-store/src/tiered.rs	expect	seals per round fit u32	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
-I	1	crates/inf-store/src/tiered.rs	expect	seals per slice fit u32	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
-C	3	crates/inf-store/src/tiered.rs	expect	walk not begun	`crates/inf-server/src/durable.rs:tier_walk_step` runs only between `begin_walk` and `end_walk`
-I	7	crates/inf-store/src/tiered.rs	expect	watermarks stay 48-bit	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
 C	1	crates/inf-store/src/tiered/compact.rs	assert	dead ratio is a percentage	crates/inf-store/src/ns.rs:TierSpec::validate (COMPACTION-DEAD-RATIO 50..=100, COMPACTION-SLICE 64kb..=64mb)
 C	1	crates/inf-store/src/tiered/compact.rs	assert	empty compaction read budget	`crates/inf-server/src/tier_cell.rs:TierCell::maintain_ns` passes the spec's slice (≥ 64 KiB by crates/inf-store/src/ns.rs:TierSpec::validate)
 C	1	crates/inf-store/src/tiered/compact.rs	assert	empty compaction slice budget	crates/inf-store/src/ns.rs:TierSpec::validate (COMPACTION-DEAD-RATIO 50..=100, COMPACTION-SLICE 64kb..=64mb)
@@ -667,6 +658,19 @@ I	1	crates/inf-store/src/tiered/compact.rs	expect	compaction_apply without a sca
 I	1	crates/inf-store/src/tiered/compact.rs	expect	file range fits usize	compaction cursor state machine: the chunk is the read the table itself requested
 I	1	crates/inf-store/src/tiered/compact.rs	expect	in-range address	compaction cursor state machine: the chunk is the read the table itself requested
 I	1	crates/inf-store/src/tiered/compact.rs	expect	scan cursor is 48-bit	compaction cursor state machine: the chunk is the read the table itself requested
+C	1	crates/inf-store/src/tiered_recover.rs	assert_eq	manifest section vs pipeline namespace	`crates/inf-server/src/recover.rs:Recovery::recover_tiers` builds the flush config from the same manifest tier section it passes
+C	2	crates/inf-store/src/tiered_recover.rs	expect	manifest decode checked 48 bits	`crates/inf-log/src/manifest.rs:Manifest::decode_tiers` (TierAddrOutOfRange) and `crates/inf-log/src/ckpt.rs:IckReader::step_inner` refuse addresses ≥ 2^48 typed
+C	1	crates/inf-store/src/tiered_recover.rs	expect	reader checked 48 bits	`crates/inf-log/src/manifest.rs:Manifest::decode_tiers` (TierAddrOutOfRange) and `crates/inf-log/src/ckpt.rs:IckReader::step_inner` refuse addresses ≥ 2^48 typed
+I	1	crates/inf-store/src/tiered.rs	assert	delete of a shadow winner before its ticket resolved	ADR-0093 D4: a winner is deleted only after its ticket resolved (the table's own ticket state)
+I	2	crates/inf-store/src/tiered.rs	assert	flush cursor behind the watermark	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
+I	2	crates/inf-store/src/tiered.rs	expect	append_range leaves a file active	TierFlush postcondition: `append_range` creates the file it appends to
+I	1	crates/inf-store/src/tiered.rs	expect	below flushed	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
+I	2	crates/inf-store/src/tiered.rs	expect	chunk fits usize	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
+I	1	crates/inf-store/src/tiered.rs	expect	marks are 48-bit	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
+I	1	crates/inf-store/src/tiered.rs	expect	seals per round fit u32	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
+I	1	crates/inf-store/src/tiered.rs	expect	seals per slice fit u32	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
+C	3	crates/inf-store/src/tiered.rs	expect	walk not begun	`crates/inf-server/src/durable.rs:tier_walk_step` runs only between `begin_walk` and `end_walk`
+I	7	crates/inf-store/src/tiered.rs	expect	watermarks stay 48-bit	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
 C	1	crates/inf-store/src/tiered/shadow.rs	assert	a boot settle under a pinned walk	`crates/inf-store/src/tiered/shadow.rs:TieredTable::shadow_rebuild_next` hands out only cold, slotted, un-ticketed slots, and boot settle runs before any walk begins (`crates/inf-server/src/recover.rs`)
 C	1	crates/inf-store/src/tiered/shadow.rs	assert	a cold address carries one ticket	`crates/inf-store/src/tiered/shadow.rs:TieredTable::shadow_admit` resolves both classes and both index pairs before a producer registers (ADR-0093 D1)
 I	1	crates/inf-store/src/tiered/shadow.rs	assert	a pinned winner went cold	shadow ticket tables are one structure (by_cold ⇄ by_winner; the record pin holds every winner above head — ADR-0093)
@@ -687,13 +691,10 @@ I	1	crates/inf-store/src/tiered/shadow.rs	expect	present	shadow ticket tables ar
 I	2	crates/inf-store/src/tiered/shadow.rs	expect	record lengths fit u32	shadow ticket tables are one structure (by_cold ⇄ by_winner; the record pin holds every winner above head — ADR-0093)
 I	1	crates/inf-store/src/tiered/shadow.rs	expect	settle of an unverified ticket	shadow ticket tables are one structure (by_cold ⇄ by_winner; the record pin holds every winner above head — ADR-0093)
 I	3	crates/inf-store/src/tiered/shadow.rs	expect	slot addresses are 48-bit	shadow ticket tables are one structure (by_cold ⇄ by_winner; the record pin holds every winner above head — ADR-0093)
-C	1	crates/inf-store/src/tiered_recover.rs	assert_eq	manifest section vs pipeline namespace	`crates/inf-server/src/recover.rs:Recovery::recover_tiers` builds the flush config from the same manifest tier section it passes
-C	2	crates/inf-store/src/tiered_recover.rs	expect	manifest decode checked 48 bits	`crates/inf-log/src/manifest.rs:Manifest::decode_tiers` (TierAddrOutOfRange) and `crates/inf-log/src/ckpt.rs:IckReader::step_inner` refuse addresses ≥ 2^48 typed
-C	1	crates/inf-store/src/tiered_recover.rs	expect	reader checked 48 bits	`crates/inf-log/src/manifest.rs:Manifest::decode_tiers` (TierAddrOutOfRange) and `crates/inf-log/src/ckpt.rs:IckReader::step_inner` refuse addresses ≥ 2^48 typed
-U	1	crates/inf-wire/src/command.rs	assert	command name exceeds MAX_NAME_LEN	unaudited
-U	1	crates/inf-wire/src/command.rs	assert	perfect-hash collision — re-search the multipliers	unaudited
-U	2	crates/inf-wire/src/command.rs	expect	8 bytes	unaudited
-U	1	crates/inf-wire/src/parser.rs	unreachable	mode checked above	unaudited
-U	1	crates/inf-wire/src/writer.rs	expect	Display output is UTF-8	unaudited
-U	1	crates/inf-wire/src/writer.rs	expect	chunks_exact(8) yields 8 bytes	unaudited
-U	1	crates/inf-wire/src/writer.rs	expect	f64 display fits 40 bytes	unaudited
+I	1	crates/inf-wire/src/command.rs	assert	command name exceeds MAX_NAME_LEN	evaluated inside `const fn build_table` for `static TABLE`: a violation fails compilation, never runs
+I	1	crates/inf-wire/src/command.rs	assert	perfect-hash collision — re-search the multipliers	evaluated inside `const fn build_table` for `static TABLE`: a violation fails compilation, never runs
+I	2	crates/inf-wire/src/command.rs	expect	8 bytes	`padded` is a fixed `[u8; 16]`; `[..8]`/`[8..]` are 8-byte slices
+I	1	crates/inf-wire/src/parser.rs	unreachable	mode checked above	`Mode::Done` returned `None` at the top of the same loop iteration, and the mode does not change in between
+I	1	crates/inf-wire/src/writer.rs	expect	chunks_exact(8) yields 8 bytes	`chunks_exact(8)` yields 8-byte slices; the `try_into` is infallible
+I	1	crates/inf-wire/src/writer.rs	expect	Display output is UTF-8	`Display for f64` writes ASCII only
+I	1	crates/inf-wire/src/writer.rs	expect	f64 display fits F64_DISPLAY_MAX bytes	`F64_DISPLAY_MAX` (336) exceeds the longest `Display` an f64 produces (327 bytes; `f64_display_never_exceeds_fmtbuf` enumerates every binary exponent) — batch 12 replaced the 40-byte buffer whose `expect` a client's `1e300` reached (RESP3 `JSON.NUMINCRBY`, proven)

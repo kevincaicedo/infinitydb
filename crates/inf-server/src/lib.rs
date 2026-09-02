@@ -82,7 +82,7 @@ pub use plane::{
     ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane,
     fold_live_entries,
 };
-pub use readahead::{ReadAheadFile, ReadAheadFs};
+pub use readahead::boot_prefetch_threads_spawned;
 pub use recover::{
     RecoverPhase, RecoverPhases, RecoverStats, RecoveredManifest, Recovery, RecoveryProgress,
     open_cell_log,

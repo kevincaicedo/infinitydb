@@ -54,8 +54,20 @@ fn boot(tag: &str, flags: &[&str]) -> (Option<i32>, String) {
 fn out_of_range_boot_flags_are_usage_errors_not_panics() {
     let cases: &[(&str, &[&str], &str)] = &[
         ("buffers-zero", &["--buffers", "0"], "--buffers must be >= 1"),
-        ("buffers-over", &["--buffers", "4294967296"], "--buffers must be <= 4294967295"),
+        // Batch 12 of the review: before the bound moved to the parser,
+        // `--buffers 65536` booted, printed "listening", and the cell
+        // thread died on the driver's `provided bids are u16` assert at
+        // the first recv arm (kernel ≥ 6.0, multishot recv) — proven at
+        // the binary on 2026-09-02, as was `--buf-size 2147483648`
+        // (`buffer size fits i32`). Both are usage errors now.
+        ("buffers-over", &["--buffers", "65536"], "--buffers must be <= 65535"),
+        ("buffers-far-over", &["--buffers", "4294967296"], "--buffers must be <= 65535"),
         ("buf-size-zero", &["--buf-size", "0"], "--buf-size must be >= 1"),
+        (
+            "buf-size-over-i32",
+            &["--buffers", "1", "--buf-size", "2147483648"],
+            "--buf-size must be <= 2147483647",
+        ),
         ("cells-over", &["--cells", "16385"], "--cells must be <= 16384"),
     ];
     let mut failures = Vec::new();

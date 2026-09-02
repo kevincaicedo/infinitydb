@@ -22,6 +22,15 @@
 # inventory names it. A row the tree no longer has is red too (a stale
 # inventory is the P1 shape). A `C` row without a proof pointer is red.
 #
+# A proof pointer RESOLVES (ADR-0107 D2, first amendment — batch 12):
+# every `path/from/root.rs:Symbol` a `C` row cites must name a definition
+# in that file's production code (rust-symbol-defined.awk over the
+# stripped file: a free item, `Type::method` inside an `impl`/`trait`/
+# `mod` block of that name, a const/static). A bare file name, a line
+# number, a file that does not exist, or a symbol the file no longer
+# defines is red — a renamed enforcing function fails the gate instead
+# of waiting for a reader to notice (the review's L20 row).
+#
 # Test modules are stripped structurally (strip-test-modules.awk); the
 # scanned set is scripts/cell-crates.sh (shared with the deny-list and
 # the panic-policy grep); scope is asserted and disclosed on both verdicts.
@@ -32,7 +41,13 @@ cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 . "$SCRIPT_DIR/cell-crates.sh"
 STRIP="$SCRIPT_DIR/strip-test-modules.awk"
 CENSUS="$SCRIPT_DIR/release-assert-census.awk"
+RESOLVE="$SCRIPT_DIR/rust-symbol-defined.awk"
 INVENTORY=docs/release-assert-inventory.tsv
+# A proof pointer: a path (with at least one `/`) to a .rs file, a colon,
+# and a symbol path — `crates/x/src/a.rs:Type::method`. A line number
+# after the colon is a citation, never a proof.
+PTR_RE='[A-Za-z0-9_./-]+\.rs:[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*'
+LINE_RE='[A-Za-z0-9_./-]+\.rs:[0-9]+'
 
 DIRS=()
 while IFS= read -r dir; do DIRS+=("$dir"); done < <(cell_crate_dirs)
@@ -92,14 +107,23 @@ if [ "$rows" -eq 0 ]; then
 fi
 
 # Shape + class rules.
+: > "$work/pointers"
 while IFS=$'\t' read -r class count file kind message justification; do
     case "$class" in
         I|F|U) ;;
         C)
-            if [ -z "${justification:-}" ] || ! printf '%s' "$justification" | grep -Eq '[A-Za-z0-9_./-]+\.rs:[A-Za-z0-9_:]+'; then
-                echo "RELEASE-ASSERT violation: C row without a proof pointer (file.rs:function): $file $kind \"$message\""
+            if [ -z "${justification:-}" ] || ! printf '%s' "$justification" | grep -Eq "$PTR_RE"; then
+                echo "RELEASE-ASSERT violation: C row without a proof pointer (path/from/root.rs:Symbol): $file $kind \"$message\""
                 fail=1
             fi
+            if printf '%s' "${justification:-}" | grep -Eq "$LINE_RE"; then
+                cite=$(printf '%s' "$justification" | grep -Eo "$LINE_RE" | head -1)
+                echo "RELEASE-ASSERT violation: a line number is not a proof pointer — '$cite' in the C row $file $kind \"$message\" (name the function)"
+                fail=1
+            fi
+            printf '%s' "${justification:-}" | grep -Eo "$PTR_RE" | while IFS= read -r ptr; do
+                printf '%s\t%s\t%s\t%s\n' "$ptr" "$file" "$kind" "$message"
+            done >> "$work/pointers"
             ;;
         *)
             echo "RELEASE-ASSERT violation: unknown class '$class' for $file $kind \"$message\" (I, C, F or U)"
@@ -108,6 +132,34 @@ while IFS=$'\t' read -r class count file kind message justification; do
     esac
     case "$count" in ''|*[!0-9]*) echo "RELEASE-ASSERT violation: bad count '$count' for $file $kind \"$message\""; fail=1 ;; esac
 done < "$work/inventory"
+
+# Proof pointers resolve: one resolution per distinct pointer, against
+# the production code of the file it names (test modules stripped, so a
+# symbol that exists only under #[cfg(test)] is no proof).
+sort -t "$(printf '\t')" -k1,1 -u "$work/pointers" > "$work/pointers.u"
+pointers=0
+while IFS=$'\t' read -r ptr file kind message; do
+    path=${ptr%%:*}
+    sym=${ptr#*:}
+    pointers=$((pointers + 1))
+    case "$path" in
+        */*) ;;
+        *)
+            echo "RELEASE-ASSERT violation: proof pointer '$ptr' is a bare file name — write the path from the workspace root (row: $file $kind \"$message\")"
+            fail=1
+            continue
+            ;;
+    esac
+    if [ ! -f "$path" ]; then
+        echo "RELEASE-ASSERT violation: proof pointer '$ptr' names a file that does not exist (row: $file $kind \"$message\")"
+        fail=1
+        continue
+    fi
+    if ! awk -f "$STRIP" "$path" | awk -v sym="$sym" -f "$RESOLVE" > /dev/null; then
+        echo "RELEASE-ASSERT violation: proof pointer '$ptr' does not resolve — $path defines no '$sym' in production code (renamed, moved, or test-only?) (row: $file $kind \"$message\")"
+        fail=1
+    fi
+done < "$work/pointers.u"
 
 # Census vs inventory, by identity (file, kind, message) and count.
 awk -F'\t' '{ print $2 "\t" $3 "\t" $4 "\t" $1 }' "$work/census" | sort > "$work/census.keyed"
@@ -132,7 +184,7 @@ while IFS=$'\t' read -r file kind message count; do
 done < "$work/inventory.keyed"
 
 classes=$(awk -F'\t' '{ n[$1] += $2 } END { printf "I=%d C=%d F=%d U=%d", n["I"], n["C"], n["F"], n["U"] }' "$work/inventory")
-scope="${#DIRS[@]} crates, $files files, $lines lines scanned, $stripped test-only lines stripped, $sites release-panic sites in $(wc -l < "$work/census" | tr -d ' ') identities; inventory $rows rows ($classes)"
+scope="${#DIRS[@]} crates, $files files, $lines lines scanned, $stripped test-only lines stripped, $sites release-panic sites in $(wc -l < "$work/census" | tr -d ' ') identities; inventory $rows rows ($classes); $pointers proof pointers resolved"
 if [ "$fail" -ne 0 ]; then
     echo "release-assert inventory FAILED ($scope)"
     echo "Every release assert!/expect()/panic!/unreachable! in cell code is a classified inventory row"

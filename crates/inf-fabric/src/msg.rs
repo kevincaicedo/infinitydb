@@ -26,11 +26,20 @@ const SEQ_MASK: u64 = (1 << SEQ_BITS) - 1;
 pub struct FabricToken(pub u64);
 
 impl FabricToken {
+    /// The largest sequence a token carries (48 bits). The one
+    /// production minter, [`crate::CellFabric::next_token`], wraps to 0
+    /// past it: a token only has to be unique among the ops in flight
+    /// (bounded by the ring capacities), never over a node's lifetime —
+    /// at 10 M sends/s a cell reaches 2^48 in under a year, which is an
+    /// uptime, not a bug (batch 12 of the 2026-08-30 review, Theme 4).
+    pub const MAX_SEQ: u64 = SEQ_MASK;
+
     /// Packs an origin cell and per-cell sequence number.
     ///
     /// # Panics
     ///
-    /// Panics if `seq` does not fit in 48 bits.
+    /// Panics if `seq` does not fit in 48 bits — an internal invariant:
+    /// the minter masks, and the decoder reads exactly 48 bits.
     #[inline]
     pub fn new(origin: CellId, seq: u64) -> FabricToken {
         assert!(seq <= SEQ_MASK, "fabric token sequence overflows 48 bits: {seq}");

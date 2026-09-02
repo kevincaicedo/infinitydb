@@ -101,7 +101,8 @@ pub(crate) struct TierNs<F: SegmentFs> {
     /// Namespace directory (teardown unlink root).
     pub dir: PathBuf,
     /// Completion-token lane (M4.5-S31, ADR-0084 D3): stable for this
-    /// namespace's plane life, never reused within a boot.
+    /// namespace's plane life; recycled by [`TierCell`] once no op of it
+    /// is in flight, the round sequence carried forward (batch 12).
     lane: u32,
     /// Round-identity generation for the lane (wrapping; stale
     /// completions mismatch and are counted, never applied).
@@ -267,10 +268,18 @@ pub(crate) struct TierCell<F: SegmentFs> {
     /// next MAINTAIN's push (ordering lives in the ledger, not the
     /// submission queue).
     pending_syncs: Vec<(std::os::fd::RawFd, inf_log::FsyncTicket)>,
-    /// Next completion-token lane (M4.5-S31; lanes never recycle within
-    /// a boot — the generation half then makes stale routing
-    /// unrepresentable).
+    /// Next fresh completion-token lane (M4.5-S31). Lanes are 16 bits of
+    /// the token slot (`MAX_SLOT >> 8`), so they recycle (batch 12 of the
+    /// 2026-08-30 review): a lane returns to `free_lanes` only once its
+    /// namespace has no op in flight — dropped with no round, or drained
+    /// through `round_drain` — and the reuser continues the lane's round
+    /// sequence, so the generation half still makes stale routing
+    /// unrepresentable. Before this the counter was monotone and the
+    /// 65,537th tiered `CREATE` on a cell's lifetime was a release assert.
     next_lane: u32,
+    /// Recycled lanes with the round sequence the next holder starts
+    /// above.
+    free_lanes: Vec<(u32, u32)>,
     /// Dropped namespaces whose flush round is still in flight: the
     /// windows the driver may touch live in their pipelines, so the
     /// whole [`TierNs`] parks here until every op is terminal, then its
@@ -368,6 +377,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             teardown: Vec::new(),
             pending_syncs: Vec::new(),
             next_lane: 0,
+            free_lanes: Vec::new(),
             round_drain: Vec::new(),
             flush_stats: TierFlushStats::default(),
         }
@@ -414,6 +424,9 @@ impl<F: SegmentFs + Clone> TierCell<F> {
                 self.round_drain.push(gone);
                 continue;
             }
+            // No op in flight on this lane: it recycles now, its round
+            // sequence carried forward.
+            self.free_lanes.push((gone.lane, gone.round_seq));
             self.teardown.push(TeardownNs { files: teardown_files(&gone), release_epoch });
         }
         for (id, spec) in live {
@@ -449,8 +462,15 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         // The plane's filesystems are fd-backed (StdSegmentFs, SimDisk):
         // flush I/O rides the driver (M4.5-S31, ADR-0084 D1).
         flush.set_drive(TierDrive::Reactor);
-        let lane = self.next_lane;
-        self.next_lane += 1;
+        // A recycled lane first (its round sequence continues past the
+        // previous holder's), else a fresh one. The bound is on lanes
+        // held at once — live plus draining tiered namespaces — which
+        // memory exhausts long before 2^16 (a pipeline is MiBs).
+        let (lane, round_seq) = self.free_lanes.pop().unwrap_or_else(|| {
+            let lane = self.next_lane;
+            self.next_lane += 1;
+            (lane, 0)
+        });
         assert!(lane <= inf_runtime::MAX_SLOT >> 8, "tier flush lanes exhausted");
         self.namespaces.push(TierNs {
             ns,
@@ -465,7 +485,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             compact_inflight: false,
             dir,
             lane,
-            round_seq: 0,
+            round_seq,
             round: None,
             release_epoch: 0,
         })
@@ -483,7 +503,9 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         files: Vec<(u32, F::File)>,
     ) {
         if let Some(pos) = self.namespaces.iter().position(|t| t.ns == ns) {
-            self.namespaces.remove(pos);
+            let replaced = self.namespaces.remove(pos);
+            // Boot-time replacement: nothing is in flight before serving.
+            self.free_lanes.push((replaced.lane, replaced.round_seq));
         }
         self.create_ns(ns, spec);
         let t = self.namespaces.last_mut().expect("just created");
@@ -678,6 +700,10 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             }
             let mut gone = self.round_drain.remove(i);
             gone.round = None;
+            // Every op of the lane is terminal: it recycles, its round
+            // sequence carried forward (a completion for it can no longer
+            // arrive, and the sequence keeps a stale one unroutable).
+            self.free_lanes.push((gone.lane, gone.round_seq));
             // Effects are discarded — the table is gone; the pipeline's
             // catalog facts die with it. Windows return to the pool the
             // drop then frees.
@@ -929,5 +955,68 @@ fn emit_round_wave<F: SegmentFs>(
         }
         round.states[index] = OpState::Sent;
         round.pending += 1;
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+    use inf_log::fs::mem::MemFs;
+    use inf_store::{Keyspace, StoreConfig, TierSpec};
+
+    fn spec() -> TierSpec {
+        TierSpec::for_budget(64 << 20)
+    }
+
+    /// Batch 12 of the 2026-08-30 review: flush lanes recycle once their
+    /// namespace has no op in flight, and the reuser continues the round
+    /// sequence. Before the fix `next_lane` was monotone: with the counter
+    /// at the width this test starts from, the second `CREATE` was the
+    /// release assert `tier flush lanes exhausted` (a DDL count over the
+    /// cell's lifetime as a node kill).
+    #[test]
+    fn dropped_namespace_lane_recycles_with_its_round_sequence() {
+        let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"));
+        cell.next_lane = inf_runtime::MAX_SLOT >> 8;
+        cell.create_ns(NsId(16), &spec());
+        let first = &cell.namespaces[0];
+        assert_eq!(first.lane, inf_runtime::MAX_SLOT >> 8, "the last fresh lane");
+        cell.namespaces[0].round_seq = 7;
+        // A keyspace without the namespace: MAINTAIN's reconcile drops it
+        // (no round in flight → the lane recycles immediately).
+        let ks = Keyspace::new(StoreConfig::default());
+        let mut releases = vec![(NsId(16), 1)];
+        cell.sync_namespaces(&ks, &mut releases);
+        assert!(cell.namespaces.is_empty());
+        assert_eq!(cell.free_lanes, vec![(inf_runtime::MAX_SLOT >> 8, 7)]);
+        // The next tiered namespace takes the recycled lane — pre-fix this
+        // call took lane `MAX_SLOT >> 8 + 1` and panicked.
+        cell.create_ns(NsId(17), &spec());
+        let second = &cell.namespaces[0];
+        assert_eq!(second.lane, inf_runtime::MAX_SLOT >> 8);
+        assert_eq!(second.round_seq, 7, "the round sequence continues past the last holder's");
+        assert!(cell.free_lanes.is_empty());
+        assert_eq!(cell.next_lane, (inf_runtime::MAX_SLOT >> 8) + 1, "no fresh lane was minted");
+    }
+
+    /// A drained round returns its lane too (the `round_drain` path).
+    #[test]
+    fn drained_namespace_lane_recycles_at_maintain() {
+        let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"));
+        cell.create_ns(NsId(16), &spec());
+        cell.namespaces[0].round_seq = 3;
+        // Park a finished round on it so the drop routes through the drain.
+        cell.namespaces[0].round = Some(FlushRound::new(0, 3, 0));
+        let ks = Keyspace::new(StoreConfig::default());
+        let mut releases = vec![(NsId(16), 1)];
+        cell.sync_namespaces(&ks, &mut releases);
+        assert_eq!(cell.round_drain.len(), 1, "parked until every op is terminal");
+        assert!(cell.free_lanes.is_empty(), "not recycled while parked");
+        cell.maintain_teardown(|_| false);
+        assert!(cell.round_drain.is_empty());
+        assert_eq!(cell.free_lanes, vec![(0, 3)]);
+        cell.create_ns(NsId(17), &spec());
+        assert_eq!(cell.namespaces[0].lane, 0);
+        assert_eq!(cell.namespaces[0].round_seq, 3);
     }
 }

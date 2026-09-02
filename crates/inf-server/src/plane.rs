@@ -356,36 +356,62 @@ impl Conn {
     }
 }
 
-#[derive(Default)]
-struct ConnSlab {
-    slots: Vec<Option<Conn>>,
+/// The slot every connection key is below: the completion token carries
+/// the slot in 24 bits (`inf_runtime::MAX_SLOT`), and the top value is
+/// reserved for the accept the slab refused (see `on_completion`'s
+/// `Accepted` arm) so its `Close` completion routes to no connection.
+const CONN_SLOT_CAP: u32 = inf_runtime::MAX_SLOT;
+
+/// Generation-keyed connection slab. Generic over the entry so the
+/// admission bound is unit-testable without building a `Conn`.
+struct ConnSlab<T = Conn> {
+    slots: Vec<Option<T>>,
     gens: Vec<u32>,
     free: Vec<u32>,
     live: usize,
+    /// Slots this slab may allocate (`CONN_SLOT_CAP` in production; a
+    /// small number in the admission test).
+    cap: u32,
 }
 
-impl ConnSlab {
-    fn insert(&mut self, conn: Conn) -> ConnKey {
-        self.live += 1;
-        if let Some(slot) = self.free.pop() {
-            self.slots[slot as usize] = Some(conn);
-            return ConnKey { slot, generation: self.gens[slot as usize] };
+impl<T> Default for ConnSlab<T> {
+    fn default() -> ConnSlab<T> {
+        ConnSlab {
+            slots: Vec::new(),
+            gens: Vec::new(),
+            free: Vec::new(),
+            live: 0,
+            cap: CONN_SLOT_CAP,
         }
-        let slot = u32::try_from(self.slots.len()).expect("conn slots fit u32");
-        assert!(slot < (1 << 24), "conn slot exceeds token slot width");
+    }
+}
+
+impl<T> ConnSlab<T> {
+    /// Admits `conn` into a free or fresh slot; `None` when every slot
+    /// below the cap is live — the admission bound (batch 12 of the
+    /// 2026-08-30 review): before it, the 2^24-th concurrent connection
+    /// on a cell was a release assert, i.e. a client-driven node kill.
+    fn insert(&mut self, conn: T) -> Option<ConnKey> {
+        if let Some(slot) = self.free.pop() {
+            self.live += 1;
+            self.slots[slot as usize] = Some(conn);
+            return Some(ConnKey { slot, generation: self.gens[slot as usize] });
+        }
+        let slot = u32::try_from(self.slots.len()).ok().filter(|&slot| slot < self.cap)?;
+        self.live += 1;
         self.slots.push(Some(conn));
         self.gens.push(0);
-        ConnKey { slot, generation: 0 }
+        Some(ConnKey { slot, generation: 0 })
     }
 
-    fn get_mut(&mut self, key: ConnKey) -> Option<&mut Conn> {
+    fn get_mut(&mut self, key: ConnKey) -> Option<&mut T> {
         if self.gens.get(key.slot as usize) != Some(&key.generation) {
             return None;
         }
         self.slots.get_mut(key.slot as usize).and_then(Option::as_mut)
     }
 
-    fn remove(&mut self, key: ConnKey) -> Option<Conn> {
+    fn remove(&mut self, key: ConnKey) -> Option<T> {
         if self.gens.get(key.slot as usize) != Some(&key.generation) {
             return None;
         }
@@ -2204,7 +2230,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         match c.result {
             CompletionResult::Accepted { fd } => {
                 let ns = self.conn_default_ns();
-                let key = self.shared.conns.borrow_mut().insert(Conn {
+                let inserted = self.shared.conns.borrow_mut().insert(Conn {
                     fd,
                     parser: ConnParser::new(ParserLimits::default()),
                     cx: ConnCx {
@@ -2230,6 +2256,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     publish_seq: 0,
                     self_push: Vec::new(),
                 });
+                let Some(key) = inserted else {
+                    // Admission bound (batch 12): the slab is full below
+                    // the token slot width. Close the accepted socket and
+                    // count it — the `Closed` completion carries the
+                    // reserved top slot, which no connection ever holds,
+                    // so it routes to nothing.
+                    let node = &self.shared.node;
+                    node.rejected_connections.set(node.rejected_connections.get() + 1);
+                    let refused = ConnKey { slot: CONN_SLOT_CAP, generation: 0 };
+                    cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, refused) });
+                    return;
+                };
                 let id = (u64::from(key.slot) << 32) | u64::from(key.generation);
                 self.shared.with_conn(key, |conn| conn.cx.id = id);
                 let node = &self.shared.node;
@@ -7236,5 +7274,47 @@ mod conn_default_tests {
         );
         assert_eq!(resolve_conn_default(Some((id, NsMode::Memory))), ConnNamespace::Named(id));
         assert_eq!(resolve_conn_default(Some((id, NsMode::Durable))), ConnNamespace::Named(id));
+    }
+}
+
+#[cfg(test)]
+mod conn_slab_tests {
+    use super::{CONN_SLOT_CAP, ConnKey, ConnSlab};
+
+    /// Batch 12 of the 2026-08-30 review: the slab refuses the accept
+    /// past its cap instead of asserting (the 2^24-th connection was a
+    /// release `assert!` — a client-driven node kill). A tiny cap stands
+    /// in for `CONN_SLOT_CAP`; the arithmetic is the same.
+    #[test]
+    fn slab_refuses_past_the_cap_and_readmits_on_release() {
+        let mut slab: ConnSlab<u8> = ConnSlab { cap: 3, ..ConnSlab::default() };
+        let a = slab.insert(1).expect("slot 0");
+        let b = slab.insert(2).expect("slot 1");
+        let c = slab.insert(3).expect("slot 2");
+        assert_eq!((a.slot, b.slot, c.slot), (0, 1, 2));
+        assert_eq!(slab.live, 3);
+        assert!(slab.insert(4).is_none(), "the cap refuses, never panics");
+        assert_eq!(slab.live, 3, "a refused accept is not live");
+        assert_eq!(slab.remove(b), Some(2));
+        let reused = slab.insert(5).expect("released slot readmits");
+        assert_eq!(reused.slot, 1);
+        assert_eq!(reused.generation, 1, "the generation moved so the old key is dead");
+        assert!(slab.get_mut(b).is_none());
+        assert!(slab.insert(6).is_none());
+    }
+
+    #[test]
+    fn production_cap_is_below_the_token_slot_width() {
+        assert_eq!(CONN_SLOT_CAP, inf_runtime::MAX_SLOT);
+        let refused = ConnKey { slot: CONN_SLOT_CAP, generation: 0 };
+        // The reserved slot round-trips through a token (the Close op the
+        // refusal issues) and never names a slab entry.
+        let token = super::ServerPlane::<super::NoopObserver>::token(
+            inf_runtime::TokenClass::Close,
+            refused,
+        );
+        assert_eq!(token.slot(), CONN_SLOT_CAP);
+        let slab: ConnSlab<u8> = ConnSlab::default();
+        assert_eq!(slab.cap, CONN_SLOT_CAP);
     }
 }

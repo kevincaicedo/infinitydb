@@ -364,15 +364,29 @@ fn itoa(value: i64, buf: &mut [u8; 20]) -> &[u8] {
     &buf[at..]
 }
 
-/// Tiny `fmt::Write` sink for double formatting (stack, cold path).
+/// The longest `Display` an `f64` produces, in bytes. Rust's `{}` prints
+/// the shortest round-trip digits (≤ 17) positioned without an exponent,
+/// so the extremes are a 309-digit integer (`f64::MAX`) and `0.` followed
+/// by 307 zeros and 17 digits (a negative near `f64::MIN_POSITIVE`:
+/// `-1.1125369292536007e-308` is 327 bytes); `inf`/`NaN` are short. The
+/// bound is enumerated by `f64_display_never_exceeds_fmtbuf` over every
+/// binary exponent and its neighbours. Before batch 12 of the 2026-08-30
+/// review the buffer was 40 bytes and a RESP3 `JSON.NUMINCRBY` reply of
+/// `1e300` (301 digits) killed the cell — Theme 4's shape: a release
+/// `expect("f64 display fits 40 bytes")` justified by a claim about the
+/// caller that client-supplied numbers falsified.
+const F64_DISPLAY_MAX: usize = 336;
+
+/// `fmt::Write` sink for double formatting: a stack buffer sized to the
+/// worst case above, so `format` is total for every `f64`.
 struct FmtBuf {
-    buf: [u8; 40],
+    buf: [u8; F64_DISPLAY_MAX],
     len: usize,
 }
 
 impl Default for FmtBuf {
     fn default() -> FmtBuf {
-        FmtBuf { buf: [0; 40], len: 0 }
+        FmtBuf { buf: [0; F64_DISPLAY_MAX], len: 0 }
     }
 }
 
@@ -380,7 +394,10 @@ impl FmtBuf {
     fn format(&mut self, args: core::fmt::Arguments<'_>) -> &str {
         use core::fmt::Write;
         self.len = 0;
-        self.write_fmt(args).expect("f64 display fits 40 bytes");
+        // Total by construction: `F64_DISPLAY_MAX` covers every `f64`'s
+        // `Display` (the sweep test is the proof) — an `Err` here would
+        // be a change to `impl Display for f64`, not an input.
+        self.write_fmt(args).expect("f64 display fits F64_DISPLAY_MAX bytes");
         core::str::from_utf8(&self.buf[..self.len]).expect("Display output is UTF-8")
     }
 }
@@ -406,6 +423,80 @@ mod tests {
         let mut writer = RespWriter::new(&mut out, proto);
         f(&mut writer);
         out
+    }
+
+    /// The bound behind `F64_DISPLAY_MAX`: every binary exponent (both
+    /// signs, plus the neighbouring representable values) and the named
+    /// extremes. A future `impl Display for f64` that prints longer
+    /// trips this before it trips `FmtBuf::format`'s expect.
+    #[test]
+    fn f64_display_never_exceeds_fmtbuf() {
+        let mut longest = (0usize, 0.0f64);
+        let mut consider = |v: f64| {
+            let len = format!("{v}").len();
+            if len > longest.0 {
+                longest = (len, v);
+            }
+        };
+        for exp in -1074i32..=1023 {
+            // Exact powers of two by bit pattern (`powi` underflows the
+            // deep subnormals to zero).
+            let bits = if exp < -1022 { 1u64 << (exp + 1074) } else { ((exp + 1023) as u64) << 52 };
+            let v = f64::from_bits(bits);
+            for w in [v, f64::from_bits(bits + 1), f64::from_bits(bits - 1)] {
+                consider(w);
+                consider(-w);
+            }
+        }
+        for v in [
+            f64::MAX,
+            f64::MIN,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            5e-324,
+            -5e-324,
+            0.0,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            consider(v);
+        }
+        assert!(
+            longest.0 <= F64_DISPLAY_MAX,
+            "f64 Display reaches {} bytes for {:e}; F64_DISPLAY_MAX is {}",
+            longest.0,
+            longest.1,
+            F64_DISPLAY_MAX
+        );
+        // The bound is tight to within the margin: the sweep finds the
+        // 327-byte extreme the constant was derived from.
+        assert_eq!(longest.0, 327, "the extreme moved: {:e}", longest.1);
+    }
+
+    /// Batch 12 of the 2026-08-30 review: before the fix this panicked
+    /// (`f64 display fits 40 bytes`) — a `JSON.NUMINCRBY` on a RESP3
+    /// connection with `1e300` in the document killed the cell.
+    #[test]
+    fn double_is_total_at_the_extremes() {
+        let plain_1e300 = format!("{}", 1e300);
+        assert_eq!(plain_1e300.len(), 301);
+        assert_eq!(
+            render(Protocol::Resp3, |w| w.double(1e300)),
+            format!(",{plain_1e300}\r\n").as_bytes()
+        );
+        assert_eq!(
+            render(Protocol::Resp2, |w| w.double(1e300)),
+            format!("$301\r\n{plain_1e300}\r\n").as_bytes()
+        );
+        for v in [f64::MAX, f64::MIN, 5e-324, -f64::MIN_POSITIVE, f64::INFINITY, f64::NAN] {
+            let text = format!("{v}");
+            assert_eq!(render(Protocol::Resp3, |w| w.double(v)), format!(",{text}\r\n").as_bytes());
+        }
+        // The ordinary values keep their bytes.
+        assert_eq!(render(Protocol::Resp3, |w| w.double(1.75)), b",1.75\r\n");
+        assert_eq!(render(Protocol::Resp2, |w| w.double(-2.5)), b"$4\r\n-2.5\r\n");
     }
 
     #[test]

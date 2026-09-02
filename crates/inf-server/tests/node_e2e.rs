@@ -4065,7 +4065,11 @@ fn loading_gate_byte_matches_redis_and_lifts() {
     let node = Node::start_with_recover(
         1,
         Some(dir.clone()),
-        inf_server::RecoverConfig { step_bytes: 32 << 10, throttle_bytes_per_sec: Some(128 << 10) },
+        inf_server::RecoverConfig {
+            step_bytes: 32 << 10,
+            throttle_bytes_per_sec: Some(128 << 10),
+            ..Default::default()
+        },
     );
     let mut c = node.connect();
 
@@ -4189,7 +4193,11 @@ fn loading_lifts_only_when_every_cell_recovered() {
     let node = Node::start_with_recover(
         2,
         Some(dir.clone()),
-        inf_server::RecoverConfig { step_bytes: 32 << 10, throttle_bytes_per_sec: Some(128 << 10) },
+        inf_server::RecoverConfig {
+            step_bytes: 32 << 10,
+            throttle_bytes_per_sec: Some(128 << 10),
+            ..Default::default()
+        },
     );
 
     // Wait until cell 1 (empty log) is ready while cell 0 still loads.

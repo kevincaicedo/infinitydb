@@ -108,6 +108,13 @@ pub struct NodeInfo {
     /// explicitly recovers it. `None` (the default) changes nothing.
     pub conn_default_ns: RefCell<Option<Vec<u8>>>,
     pub total_connections: Cell<u64>,
+    /// Accepts closed at the connection slab's admission bound (batch 12
+    /// of the 2026-08-30 review): the completion token carries the slot
+    /// in 24 bits, so a cell serves at most `MAX_SLOT` live connections;
+    /// the next accept is closed and counted here (`INFO stats`
+    /// `rejected_connections`, Redis's `maxclients` counter) instead of
+    /// tripping a release assert in the slab.
+    pub rejected_connections: Cell<u64>,
     /// Pub/sub gauges + counters (M1-S10/S11), flushed by the plane's
     /// MAINTAIN: channels this cell owns with live subscribers, live
     /// patterns (node-wide — the index is replicated), estimated registry

@@ -14,11 +14,23 @@
 //! when the reader drops — recovery replay is the §3.3 sanctioned blocking
 //! exception this rides). It communicates by atomics + park/unpark only,
 //! touches no cell state, and populates the page cache without changing a
-//! single byte the reader sees — L7 determinism and every digest hold; the
-//! DST tier never constructs this wrapper.
+//! single byte the reader sees — L7 determinism and every digest hold.
 //!
-//! Choosing the fs IS the A/B switch: `ReadAheadFs::new(StdSegmentFs,
-//! true)` is the lever-on arm, bare `StdSegmentFs` the lever-off arm.
+//! **Boot-scoped by type** (ADR-0109; L17-02 of the 2026-08-30 review):
+//! this wrapper is crate-private and constructed in exactly one place —
+//! [`crate::recover::Recovery`]'s `boot_reads`, which only the boot
+//! readers (MANIFEST, checkpoint, segment replay, the slack audit) open
+//! through. The rotor, the tier handles and the serving plane keep the
+//! bare filesystem `F`, so no serving-path `open_read` can reach
+//! `Prefetcher::spawn` — the type system, not a comment, holds the
+//! scope. Before ADR-0109 `infinityd` handed the wrapper to the plane as
+//! its filesystem for the node's life. The DST and every in-memory tier
+//! construct it with `prefetch = false` (pure delegation — no thread is
+//! ever spawned there); only `infinityd` turns it on, for a single
+//! recovering cell (`RecoverConfig::boot_prefetch`).
+//!
+//! The flag IS the A/B switch: `boot_prefetch = true` is the lever-on
+//! arm, `false` the lever-off arm (bare reads).
 
 use std::io;
 use std::path::Path;
@@ -31,6 +43,19 @@ use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode, TierIoMode};
 /// Prefetch granularity: matches the reader's default window so one
 /// advise = one pread.
 const PREFETCH_CHUNK: usize = 1 << 20;
+
+/// Prefetch threads spawned since process start — boot-path bookkeeping
+/// (one relaxed increment per boot-read open, never on the data plane).
+/// The scoping proof reads it: `recover_readahead` asserts the count
+/// moves during a prefetching recovery and that no `inf-readahead`
+/// thread survives `Recovery::finish`.
+static SPAWNED: AtomicU64 = AtomicU64::new(0);
+
+/// Prefetch threads spawned so far (see [`SPAWNED`]).
+#[must_use]
+pub fn boot_prefetch_threads_spawned() -> u64 {
+    SPAWNED.load(Ordering::Relaxed)
+}
 
 /// The prefetch worker: owns a second read handle to the same file and
 /// preads `[done, target)` into the page cache, then discards the bytes.
@@ -48,7 +73,7 @@ impl Prefetcher {
         let stop = Arc::new(AtomicBool::new(false));
         let t = Arc::clone(&target);
         let s = Arc::clone(&stop);
-        // L17-02 (review 2026-08-30) records that boot scoping is unenforced past recovery.
+        // Boot-scoped by type (ADR-0109, L17-02 fixed): only `Recovery::boot_reads` holds this wrapper.
         // denylist-allow: boot-scoped prefetch thread (M2.5-S08, the §3.3 recovery exception).
         let worker = std::thread::Builder::new().name("inf-readahead".into()).spawn(move || {
             use std::os::unix::fs::FileExt;
@@ -76,6 +101,7 @@ impl Prefetcher {
                 }
             }
         })?;
+        SPAWNED.fetch_add(1, Ordering::Relaxed);
         Ok(Prefetcher { target, stop, worker: Some(worker) })
     }
 
@@ -109,14 +135,15 @@ impl Drop for Prefetcher {
 /// 7.3 s → 10.0 s). The assembly passes `cells == 1`; re-evaluate the
 /// multi-cell arm on the Gen4 box (S18).
 #[derive(Copy, Clone, Debug, Default)]
-pub struct ReadAheadFs<F> {
+pub(crate) struct ReadAheadFs<F> {
     inner: F,
     prefetch: bool,
 }
 
 impl<F> ReadAheadFs<F> {
     /// Wrap `inner`; `prefetch = false` is delegation-only (off-arm).
-    pub fn new(inner: F, prefetch: bool) -> ReadAheadFs<F> {
+    /// Crate-private: `Recovery::new` is the one constructor site.
+    pub(crate) fn new(inner: F, prefetch: bool) -> ReadAheadFs<F> {
         ReadAheadFs { inner, prefetch }
     }
 }
@@ -124,7 +151,7 @@ impl<F> ReadAheadFs<F> {
 /// A file of [`ReadAheadFs`]: read-path opens carry a prefetcher; every
 /// operation delegates to the wrapped tier.
 #[derive(Debug)]
-pub struct ReadAheadFile<File> {
+pub(crate) struct ReadAheadFile<File> {
     inner: File,
     prefetcher: Option<Prefetcher>,
 }

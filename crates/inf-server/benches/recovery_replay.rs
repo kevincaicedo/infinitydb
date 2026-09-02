@@ -262,13 +262,12 @@ fn recover_once(cfg: &DurableConfig) -> RepResult {
     let anchor = WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 };
     let now = Nanos::from_millis(1);
     // M2.5-S08 A/B: INF_BENCH_READAHEAD=0 is the lever-off arm (bare
-    // StdSegmentFs, serial read∘apply); default rides ReadAheadFs like
-    // infinityd does.
-    let (millis, stats) = if env_u64("INF_BENCH_READAHEAD", 1) != 0 {
-        timed_recover(inf_server::ReadAheadFs::new(StdSegmentFs, true), &mut ks, cfg, anchor, now)
-    } else {
-        timed_recover(StdSegmentFs, &mut ks, cfg, anchor, now)
-    };
+    // reads, serial read∘apply); default rides the boot-read prefetch
+    // like a single-cell infinityd does (`RecoverConfig::boot_prefetch`,
+    // ADR-0109 — the wrapper is Recovery-private now).
+    let mut cfg = cfg.clone();
+    cfg.recover.boot_prefetch = env_u64("INF_BENCH_READAHEAD", 1) != 0;
+    let (millis, stats) = timed_recover(StdSegmentFs, &mut ks, &cfg, anchor, now);
     let digest = ks.state_digest(now);
     RepResult {
         millis,
