@@ -8,6 +8,11 @@
 //! - Virtual-time DST shape (M1-S04 AC): deadlines across 48 simulated
 //!   hours, every expiry fires exactly at catch-up, none early, none missed.
 //!   `INF_DST_FULL=1` runs the full 10M-key campaign (CI default: 200k).
+//!   The campaign reports the virtual time it actually advanced
+//!   (`expiry-campaign: sim_seconds=…`), which is the nightly fleet's
+//!   sim-seconds credit for the run (review 2026-08-30, F-L19-02: the
+//!   workflow used to echo the constant itself; a budget gate whose pass
+//!   value is a literal in the file that asserts it is not a gate).
 
 use std::collections::HashMap;
 
@@ -21,6 +26,25 @@ fn ms(v: u64) -> Nanos {
 fn set_with_ttl(store: &mut CellStore, key: &[u8], deadline_ms: u64, now: Nanos) {
     let opts = SetOptions { expire: SetExpire::At(ms(deadline_ms)), ..Default::default() };
     store.set(key, b"v", opts, now).expect("set");
+}
+
+/// The campaign's virtual clock: the largest `now` handed to the store,
+/// asserted monotone. What it reports at the end is measured from the
+/// walk the test performed — never a constant the harness writes for it.
+struct VirtualClock {
+    now: Nanos,
+}
+
+impl VirtualClock {
+    fn advance(&mut self, to: Nanos) -> Nanos {
+        assert!(to >= self.now, "virtual time never runs backwards: {to:?} < {:?}", self.now);
+        self.now = to;
+        to
+    }
+
+    fn sim_seconds(&self) -> f64 {
+        self.now.0 as f64 / 1e9
+    }
 }
 
 /// Tick until the wheel catches up to `now`; returns total reaped.
@@ -179,7 +203,7 @@ fn dst_virtual_time_48h_campaign() {
     // Seedable for the nightly DST fleet (M1-S15): distinct INF_DST_SEED
     // values are genuinely distinct 48 h campaigns, so the fleet's
     // sim-seconds budget is real coverage, not the same run repeated.
-    let mut x: u64 = std::env::var("INF_DST_SEED")
+    let seed: u64 = std::env::var("INF_DST_SEED")
         .ok()
         .and_then(|v| {
             let v = v.trim();
@@ -188,12 +212,14 @@ fn dst_virtual_time_48h_campaign() {
         })
         .filter(|&s| s != 0)
         .unwrap_or(0x48_4F_55_52);
+    let mut x = seed;
     let mut rand = move || {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         x
     };
+    let mut clock = VirtualClock { now: t0 };
     // Deadlines uniform across 48 h; sorted census via bucket counts.
     const BUCKETS: usize = 1 << 12;
     let bucket_width = HOURS_48_MS / BUCKETS as u64 + 1;
@@ -214,8 +240,13 @@ fn dst_virtual_time_48h_campaign() {
     let mut bucket = 0usize;
     while bucket < BUCKETS {
         bucket = (bucket + 1 + (rand() % 24) as usize).min(BUCKETS);
-        let now_ms = bucket as u64 * bucket_width - 1;
-        drain(&mut store, ms(now_ms));
+        // The last stride overshoots 48 h (BUCKETS × width > HOURS_48_MS by
+        // ~2 s), which the measured clock exposed: the campaign stops at the
+        // 48 h edge, where every deadline is due, and the drain below is the
+        // +2 ms step past it — so the reported sim-seconds are the campaign's
+        // actual span, not an artefact of the bucket arithmetic.
+        let now_ms = (bucket as u64 * bucket_width - 1).min(HOURS_48_MS + 1);
+        drain(&mut store, clock.advance(ms(now_ms)));
         let expected_gone: u64 = due_by_bucket[..bucket].iter().sum();
         assert_eq!(
             store.len() as u64,
@@ -223,11 +254,19 @@ fn dst_virtual_time_48h_campaign() {
             "census diverged at bucket {bucket} (t={now_ms}ms)"
         );
     }
-    drain(&mut store, ms(HOURS_48_MS + 2));
+    drain(&mut store, clock.advance(ms(HOURS_48_MS + 2)));
     assert_eq!(store.len(), 0, "every TTL fired");
     let stats = store.stats();
     assert_eq!(stats.expired_active, keys);
     assert_eq!(stats.wheel_fallback, 0, "pool never overflowed");
+    // The fleet's evidence line, printed only once every oracle above held:
+    // the nightly asserts this exact line per seed (`--nocapture`), so a
+    // renamed or filtered-out test cannot earn the credit (F-L19-01/02).
+    println!(
+        "expiry-campaign: sim_seconds={:.6} keys={keys} seed={seed:#x} mode={}",
+        clock.sim_seconds(),
+        if full { "full" } else { "ci" }
+    );
 }
 
 #[test]

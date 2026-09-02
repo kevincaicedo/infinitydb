@@ -89,6 +89,7 @@ pub struct StdClock {
 
 impl StdClock {
     pub fn new() -> StdClock {
+        // denylist-allow: the injected clock's real-time origin - the one sanctioned call (L7).
         StdClock { origin: Instant::now() }
     }
 }

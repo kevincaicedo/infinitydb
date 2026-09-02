@@ -21,6 +21,15 @@
 #
 # NOTE: the repo root is the Cargo workspace; jobs run from the root. Not yet
 # exercised against a live runner.
+#
+# Review 2026-08-30, F-L19-01/F-L19-02/F-L20-10 (ADR-0106 D6): a `run:`
+# block with no `shell:` is `bash -e {0}` — no pipefail — so every
+# `cmd | tee` step reported tee's status (0). `defaults.run.shell: bash`
+# is GitHub's `bash --noprofile --norc -eo pipefail {0}`; on top of it,
+# every multi-seed step keeps the explicit `if ! …; then fail=1` shape so
+# one failing seed cannot abort the loop before the others ran. And every
+# `sim_seconds=` line in /tmp/fleet.log is now emitted by the instrument
+# that advanced the virtual clock — the workflow writes none itself.
 name: infinity-dst-nightly
 
 on:
@@ -31,6 +40,10 @@ on:
 permissions:
   contents: read
   issues: write
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   # M2-S17 (ADR-0020 D5): the kill-and-recover crash matrix with the
@@ -158,14 +171,21 @@ jobs:
           # Review of 2026-08-30 (§5.5 "several gates cannot go red at
           # all"): the old `grep | while | tee` pipeline's status was
           # tee's, always 0 — a corpus divergence left the step green.
-          # The fail=1 pattern the sibling steps use.
+          # `if !` keeps the loop running past a failing seed (pipefail
+          # + `-e` would abort at the first one); an empty corpus is red.
           fail=0
+          ran=0
           while read -r scenario seed; do
             echo "== corpus: $scenario $seed =="
-            ./target/release/inf-sim --scenario "$scenario" --seed "$seed" --verify-determinism \
-              | tee -a /tmp/fleet.log
-            [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1
+            ran=$((ran + 1))
+            if ! ./target/release/inf-sim --scenario "$scenario" --seed "$seed" --verify-determinism \
+                   | tee -a /tmp/fleet.log; then
+              echo "$scenario $seed" >> /tmp/failures.txt
+              fail=1
+            fi
           done < <(grep -v '^#' bins/inf-sim/seeds/corpus.txt | grep -v '^$')
+          [ "$ran" -gt 0 ] || { echo "corpus is empty — nothing replayed"; fail=1; }
+          echo "corpus replay: $ran seeds"
           exit $fail
 
       - name: "fresh-seed fleet (replayable: seeds derive from the run id)"
@@ -188,21 +208,43 @@ jobs:
           done
           exit $fail
 
-      - name: seeded 48h expiry campaigns (6 × 172,800 sim-seconds)
+      - name: seeded 48h expiry campaigns (6 × 48 h of virtual time, measured)
         run: |
+          # F-L19-01/02: the campaign's verdict is the step's; the credit
+          # is the test's own `expiry-campaign: sim_seconds=…` line —
+          # printed only after every oracle held, carrying this seed and
+          # `mode=full` — and the step asserts that exact line, so a
+          # renamed or filtered-out test (cargo exits 0 on "0 passed")
+          # earns nothing. `--exact` pins the name; `--nocapture` lets
+          # the line reach the log.
+          fail=0
           for i in $(seq 1 6); do
             seed=$(( ${{ github.run_id }} + i ))
             echo "== expiry campaign seed $seed ==" | tee -a /tmp/fleet.log
-            INF_DST_FULL=1 INF_DST_SEED=$seed \
-              cargo test --release -p inf-store --test expiry dst_virtual_time_48h_campaign \
-              | tee -a /tmp/fleet.log
-            echo "inf-sim: sim_seconds=172800 (expiry campaign $seed)" >> /tmp/fleet.log
+            if ! INF_DST_FULL=1 INF_DST_SEED=$seed \
+                 cargo test --release -p inf-store --test expiry dst_virtual_time_48h_campaign \
+                   -- --exact --nocapture 2>&1 | tee -a /tmp/fleet.log; then
+              echo "expiry-campaign $seed" >> /tmp/failures.txt
+              fail=1
+            fi
+            want="expiry-campaign: sim_seconds=[0-9][0-9.]* keys=10000000 seed=$(printf '0x%x' "$seed") mode=full"
+            if ! grep -q "$want" /tmp/fleet.log; then
+              echo "expiry campaign seed $seed left no measured sim_seconds line (did the test run?)"
+              echo "expiry-campaign $seed (no evidence line)" >> /tmp/failures.txt
+              fail=1
+            fi
           done
+          exit $fail
 
-      - name: sim-seconds budget gate (≥ 1M)
+      - name: sim-seconds budget gate (≥ 1M, every line instrument-emitted)
         run: |
+          # Every `sim_seconds=` line comes from inf-sim's virtual clock or
+          # the expiry campaign's; the workflow writes none. An empty sum
+          # is red, not zero.
+          lines=$(grep -c 'sim_seconds=[0-9]' /tmp/fleet.log || true)
           total=$(grep -o 'sim_seconds=[0-9.]*' /tmp/fleet.log | cut -d= -f2 | paste -sd+ | bc)
-          echo "total simulated seconds this night: $total"
+          echo "total simulated seconds this night: ${total:-none} over $lines instrument lines"
+          [ -n "$total" ] || { echo "no sim_seconds lines found"; exit 1; }
           awk -v t="$total" 'BEGIN { exit (t >= 1000000) ? 0 : 1 }'
 
       - name: upload trace bundles

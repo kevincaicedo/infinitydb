@@ -10,6 +10,9 @@ check:
     ./scripts/check-fsync-fail-stop.sh
     ./scripts/check-panic-policy.sh
     ./scripts/check-safety-inventory.sh
+    # ADR-0106: the gates above must go red on a planted violation, or
+    # their OK is a claim (review 2026-08-30 P1/P1c: two were inert).
+    ./scripts/check-scripts-selftest.sh
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
     cargo clippy -p inf-doc -p inf-store --all-targets --features doc-intern-keys -- -D warnings
@@ -78,18 +81,14 @@ sim-smoke:
     cargo run --release --bin inf-sim -- --scenario m2-ckpt-refused --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m2-recycle --seed 0xC0FFEE --verify-determinism
 
-# M2-S19 durability sweep (the §6 dst_sweep gate shape). Usage:
+# M2-S19 durability sweep (the §6 dst_sweep gate shape). Every *-sweep
+# recipe runs through scripts/run-sweep.sh (ADR-0106 D7): eight shards,
+# each waited on by pid, each manifest required to carry ` violations=0 `
+# — the old inline bodies ended in a bare `wait`, whose status is 0
+# whatever the shards did (review 2026-08-30 follow-up). Usage:
 #   just durable-sweep [seeds] [base]
 durable-sweep seeds="10000" base="0xD5EE0000":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build --release --bin inf-sim
-    out=$(mktemp -d)
-    for i in 0 1 2 3 4 5 6 7; do
-        ./target/release/inf-sim --scenario m2-durable --sweep {{seeds}} --seed {{base}} \
-            --shard "$i/8" --out "$out" & done
-    wait
-    cat "$out"/manifest-shard-*.txt
+    ./scripts/run-sweep.sh m2-durable {{seeds}} {{base}}
 
 # M4.5-S36 device-budget sweep (ADR-0088 D8): the m2 durable shape under
 # a tight budget model over a bandwidth-modeled disk — the accounting
@@ -97,15 +96,7 @@ durable-sweep seeds="10000" base="0xD5EE0000":
 # and the durability oracle, per seed. Usage:
 #   just budget-sweep [seeds] [base]
 budget-sweep seeds="1000" base="0xB0D6E700":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build --release --bin inf-sim
-    out=$(mktemp -d)
-    for i in 0 1 2 3 4 5 6 7; do
-        ./target/release/inf-sim --scenario m2-device-budget --sweep {{seeds}} --seed {{base}} \
-            --shard "$i/8" --out "$out" & done
-    wait
-    cat "$out"/manifest-shard-*.txt
+    ./scripts/run-sweep.sh m2-device-budget {{seeds}} {{base}}
 
 # Barrier-class transition sweep (ADR-0086 D4 / ADR-0031 D5 as amended,
 # 2026-08-21): two lives per seed — FLUSH → FUA on even seeds (a packed
@@ -114,15 +105,7 @@ budget-sweep seeds="1000" base="0xB0D6E700":
 # rule exercised by the no-checkpoint half. Usage:
 #   just transition-sweep [seeds] [base]
 transition-sweep seeds="4000" base="0x7A4E0000":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build --release --bin inf-sim
-    out=$(mktemp -d)
-    for i in 0 1 2 3 4 5 6 7; do
-        ./target/release/inf-sim --scenario m2-mode-transition --sweep {{seeds}} --seed {{base}} \
-            --shard "$i/8" --out "$out" & done
-    wait
-    cat "$out"/manifest-shard-*.txt
+    ./scripts/run-sweep.sh m2-mode-transition {{seeds}} {{base}}
 
 # Completion-ledger reorder-window sweep (ADR-0087 D2 as amended,
 # 2026-08-22): every 40th plain write wedged 150 ms on a K ≥ 2 pipeline
@@ -132,15 +115,7 @@ transition-sweep seeds="4000" base="0x7A4E0000":
 # Usage:
 #   just reorder-sweep [seeds] [base]
 reorder-sweep seeds="2000" base="0x2E0D0000":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build --release --bin inf-sim
-    out=$(mktemp -d)
-    for i in 0 1 2 3 4 5 6 7; do
-        ./target/release/inf-sim --scenario m2-reorder-window --sweep {{seeds}} --seed {{base}} \
-            --shard "$i/8" --out "$out" & done
-    wait
-    cat "$out"/manifest-shard-*.txt
+    ./scripts/run-sweep.sh m2-reorder-window {{seeds}} {{base}}
 
 # M4.5-S39b segment-recycling sweep (ADR-0090 D5): the m2 durable shape
 # under the FUA class with an `always` namespace on every seed, small
@@ -152,29 +127,13 @@ reorder-sweep seeds="2000" base="0x2E0D0000":
 # on a scratch target dir must turn this sweep red. Usage:
 #   just recycle-sweep [seeds] [base]
 recycle-sweep seeds="10000" base="0xD5EE0000":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build --release --bin inf-sim
-    out=$(mktemp -d)
-    for i in 0 1 2 3 4 5 6 7; do
-        ./target/release/inf-sim --scenario m2-recycle --sweep {{seeds}} --seed {{base}} \
-            --shard "$i/8" --out "$out" & done
-    wait
-    cat "$out"/manifest-shard-*.txt
+    ./scripts/run-sweep.sh m2-recycle {{seeds}} {{base}}
 
 # M3-S24 document power-cut + replay-equivalence sweep (the M3 §7 crash
 # and replay-equivalence gate shape; ADR-0045). Usage:
 #   just doc-sweep [seeds] [base]
 doc-sweep seeds="10000" base="0xD0C24000":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build --release --bin inf-sim
-    out=$(mktemp -d)
-    for i in 0 1 2 3 4 5 6 7; do
-        ./target/release/inf-sim --scenario m3-document --sweep {{seeds}} --seed {{base}} \
-            --shard "$i/8" --out "$out" & done
-    wait
-    cat "$out"/manifest-shard-*.txt
+    ./scripts/run-sweep.sh m3-document {{seeds}} {{base}}
 
 # Competitive benchmark: drive memtier against redis + infinitydb (Phase-1 MVP),
 # render a markdown report under .artifacts/compare/. Pass extra flags through,

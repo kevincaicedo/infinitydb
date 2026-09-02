@@ -48,6 +48,8 @@ impl Prefetcher {
         let stop = Arc::new(AtomicBool::new(false));
         let t = Arc::clone(&target);
         let s = Arc::clone(&stop);
+        // L17-02 (review 2026-08-30) records that boot scoping is unenforced past recovery.
+        // denylist-allow: boot-scoped prefetch thread (M2.5-S08, the §3.3 recovery exception).
         let worker = std::thread::Builder::new().name("inf-readahead".into()).spawn(move || {
             use std::os::unix::fs::FileExt;
             // The spawning cell thread is core-pinned and this thread
@@ -62,6 +64,7 @@ impl Prefetcher {
                 if ended || done >= want {
                     // Bounded idle: a missed unpark degrades to this poll,
                     // never a hang; park's token makes the race benign.
+                    // denylist-allow: the prefetch thread parks itself, not a cell.
                     std::thread::park_timeout(Duration::from_micros(500));
                     continue;
                 }

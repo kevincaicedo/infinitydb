@@ -60,6 +60,10 @@ jobs:
         run: ./scripts/check-panic-policy.sh
       - name: SAFETY.md inventory (M2.5-S16, §17.3)
         run: ./scripts/check-safety-inventory.sh
+      # ADR-0106: the gates must go red on a planted violation, or their OK
+      # is a claim (review 2026-08-30 P1/P1c: two had been inert for months).
+      - name: check scripts self-test (planted violations turn each gate red)
+        run: ./scripts/check-scripts-selftest.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build
