@@ -387,8 +387,26 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown flag {other}")),
         }
     }
+    // The operator values that reach a cell-crate constructor are bounded
+    // here, where a violation is a usage error — never at the constructor's
+    // release assert (ADR-0107 D2: `buffer_pool.rs` / `router.rs` C rows
+    // cite this function). `--cells` above SLOT_COUNT never reached the
+    // router assert at all: the fabric mesh (cells² rings) is built first
+    // and ate the box (2026-09-02).
     if args.cells == 0 {
         return Err("--cells must be >= 1".into());
+    }
+    if args.cells > inf_foundation::SLOT_COUNT {
+        return Err(format!("--cells must be <= {}", inf_foundation::SLOT_COUNT));
+    }
+    if args.buffers == 0 {
+        return Err("--buffers must be >= 1".into());
+    }
+    if args.buffers > u32::MAX as usize {
+        return Err(format!("--buffers must be <= {}", u32::MAX));
+    }
+    if args.buf_size == 0 {
+        return Err("--buf-size must be >= 1".into());
     }
     Ok(args)
 }

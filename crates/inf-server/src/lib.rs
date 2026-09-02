@@ -41,8 +41,8 @@ pub use ckpt::{CkptStats, ManifestStats};
 pub use clients::{ClientInfo, ClientRegistry};
 pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
 pub use control::{
-    CellRecoverySlot, ControlHandle, ControlInbox, CreateOutcome, CreateVerdict, INDEX_SLOTS,
-    IndexBoard, PENDING_CREATE_MAX, RecoveryBoard, load_catalog, load_catalog_from,
+    CellRecoverySlot, ControlHandle, ControlInbox, CreateOutcome, CreateVerdict, DdlTicket,
+    INDEX_SLOTS, IndexBoard, PENDING_CREATE_MAX, RecoveryBoard, load_catalog, load_catalog_from,
     spawn as spawn_control,
 };
 pub use data_dir_lock::{DataDirLock, DataDirLockError, LOCK_FILE};

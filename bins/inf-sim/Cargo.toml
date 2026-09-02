@@ -15,12 +15,21 @@ path = "src/lib.rs"
 name = "inf-sim"
 path = "src/main.rs"
 
+[features]
+# ADR-0107 (review of 2026-08-30, F-L16-01 / P4): the DST's fault registry
+# and the ADR-0094 D3 collision oracle are requested through THIS feature
+# and never on the normal edge below. Cargo unifies normal-edge features
+# across every package in one invocation, so the old
+# `inf-foundation = { features = [...] }` line made `cargo build
+# --workspace` link `infinityd` against a hasher with a constructible
+# collision and a live fault registry. Off by default; every recipe that
+# builds the simulator passes `-p inf-sim --features dst`, and `main`
+# refuses to run without it (a plain-built sim would silently inject no
+# faults). `scripts/check-shipping-features.sh` asserts the graph.
+dst = ["inf-foundation/collision-oracle", "inf-foundation/fault-points"]
+
 [dependencies]
-# ADR-0094 D3: the simulators build real colliding keys through the
-# hasher's oracle mode (never a shipping build). `fault-points`: the
-# m4-tiered open-ticket rows arm `shadow_twin_read_fail` around a
-# `DBSIZE` drain (ADR-0093 A8) — a DST binary, never a shipping one.
-inf-foundation = { workspace = true, features = ["collision-oracle", "fault-points"] }
+inf-foundation.workspace = true
 inf-alloc.workspace = true
 inf-fabric.workspace = true
 inf-runtime.workspace = true

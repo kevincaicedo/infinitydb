@@ -524,6 +524,50 @@ pub fn key_spec(meta: &CommandMeta, subcommand: Option<&[u8]>) -> KeySpec {
     }
 }
 
+/// What a command addresses in the connection's selected keyspace (the
+/// numbered database or the named namespace an `INF.NS USE` bound). The
+/// plane's namespace-bound dispatch reads this to decide which commands
+/// the namespace's engine arm must see and which execute the same
+/// whatever the connection selected (ADR-0108; review of 2026-08-30,
+/// batch-8 residual: a tiered-bound connection answered `PING`, `ECHO`,
+/// `CLIENT`, `INFO`, … with "not supported on tiered namespaces" because
+/// every command the string family did not name fell into the tiered
+/// arm's refusal — a limitation recorded where a class was missing).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum KeyspaceScope {
+    /// Nothing in the keyspace: connection or node state (`PING`, `HELLO`,
+    /// `INFO`, `CLIENT`, `CONFIG GET`, `INF.NS LIST`, pub/sub, …). Such a
+    /// command executes identically on every binding.
+    None,
+    /// The keys its [`key_spec`] names (`GET`, `MSET`, `DEBUG OBJECT`).
+    Keys,
+    /// The whole selected keyspace without naming a key (`DBSIZE`, `KEYS`,
+    /// `SCAN`, `RANDOMKEY`, `FLUSHDB`, `FLUSHALL`): the scatter programs.
+    Whole,
+}
+
+/// The [`KeyspaceScope`] of one parsed command. `subcommand` is argv[1]
+/// when present (the subcommand-scoped rows read it — ADR-0104). Total
+/// over the registry: a row is `Whole` by membership in the fixed scatter
+/// set, `Keys` when its scoped key spec names a position, `None`
+/// otherwise — so a new registry row lands in a class by construction,
+/// and the plane cannot leave it to a catch-all refusal.
+#[inline]
+pub fn keyspace_scope(meta: &CommandMeta, subcommand: Option<&[u8]>) -> KeyspaceScope {
+    if matches!(
+        meta.id,
+        CommandId::Dbsize
+            | CommandId::Keys
+            | CommandId::Scan
+            | CommandId::Randomkey
+            | CommandId::Flushdb
+            | CommandId::Flushall
+    ) {
+        return KeyspaceScope::Whole;
+    }
+    if key_spec(meta, subcommand).first == 0 { KeyspaceScope::None } else { KeyspaceScope::Keys }
+}
+
 /// Extracts the key slices of `argv` per [`key_spec`]. Robust against
 /// malformed arity (an argv shorter than the spec yields fewer keys — arity
 /// validation rejects the command separately).
@@ -603,6 +647,58 @@ mod tests {
         for meta in &COMMANDS {
             assert!(seen.insert(meta.id), "duplicate id {:?}", meta.id);
             assert_eq!(lookup(meta.name.as_bytes()).expect("resolves").id, meta.id);
+        }
+    }
+
+    /// ADR-0108: every registry row has exactly one keyspace scope, the
+    /// `Whole` set is the scatter set and nothing else, and `None` means
+    /// "no key position" — the property the plane's namespace-bound
+    /// dispatch relies on. Iterates the table so a new row cannot land
+    /// unclassified (review of 2026-08-30, Theme 3: assert the class,
+    /// not one command).
+    #[test]
+    fn every_command_has_one_keyspace_scope() {
+        let whole: &[CommandId] = &[
+            CommandId::Dbsize,
+            CommandId::Keys,
+            CommandId::Scan,
+            CommandId::Randomkey,
+            CommandId::Flushdb,
+            CommandId::Flushall,
+        ];
+        let mut none = 0;
+        let mut keys = 0;
+        for meta in &COMMANDS {
+            let scope = keyspace_scope(meta, None);
+            if whole.contains(&meta.id) {
+                assert_eq!(scope, KeyspaceScope::Whole, "{}", meta.name);
+                assert_eq!(meta.keys, KeySpec::NONE, "{} names no key position", meta.name);
+                continue;
+            }
+            match scope {
+                KeyspaceScope::Whole => panic!("{} is not a scatter program", meta.name),
+                KeyspaceScope::Keys => {
+                    assert_ne!(meta.keys.first, 0, "{}", meta.name);
+                    keys += 1;
+                }
+                KeyspaceScope::None => {
+                    assert_eq!(meta.keys, KeySpec::NONE, "{}", meta.name);
+                    none += 1;
+                }
+            }
+        }
+        assert_eq!(none + keys + whole.len(), COMMANDS.len());
+        // The subcommand-scoped row (ADR-0104): `DEBUG OBJECT` addresses a
+        // key, every other `DEBUG` form addresses nothing.
+        let debug = lookup(b"DEBUG").expect("registered");
+        assert_eq!(keyspace_scope(debug, Some(b"OBJECT")), KeyspaceScope::Keys);
+        assert_eq!(keyspace_scope(debug, Some(b"object")), KeyspaceScope::Keys);
+        assert_eq!(keyspace_scope(debug, Some(b"SLEEP")), KeyspaceScope::None);
+        assert_eq!(keyspace_scope(debug, None), KeyspaceScope::None);
+        // The connection-level rows the batch-8 residual named.
+        for name in [&b"PING"[..], b"ECHO", b"HELLO", b"QUIT", b"CLIENT", b"INFO", b"COMMAND"] {
+            let meta = lookup(name).expect("registered");
+            assert_eq!(keyspace_scope(meta, None), KeyspaceScope::None, "{}", meta.name);
         }
     }
 

@@ -28,6 +28,13 @@
 #[cfg(feature = "fault-points")]
 use crate::rng::{Entropy, SplitMix64};
 
+/// Whether this build carries the registry at all (ADR-0107). A DST
+/// binary asserts `true` at startup — a simulator built without the
+/// feature would arm points into a void and report clean runs; a
+/// shipping binary is `false`, and `scripts/check-shipping-features.sh`
+/// keeps the workspace graph from ever turning it on for one.
+pub const COMPILED_IN: bool = cfg!(feature = "fault-points");
+
 /// When an armed point fires (all variants deterministic — L7).
 /// Occurrence counts start at 1 with the arming call: "the nth time this
 /// point is passed *after arming*".

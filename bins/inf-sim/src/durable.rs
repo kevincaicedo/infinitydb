@@ -1011,6 +1011,11 @@ pub(crate) struct Node {
     /// for as many steps as the scenario wants, the deterministic form
     /// of a slow `META` fdatasync.
     pub(crate) hold_inbox: bool,
+    /// ADR-0108 (the `m2-ns-ddl-race` scenario): `(cell, steps)` — that
+    /// cell's loop is not stepped for `steps` scheduler steps, the
+    /// deterministic form of a stalled origin (a park, an I/O stall)
+    /// whose DDL fan legs are then overtaken by another cell's.
+    pub(crate) frozen: Option<(usize, u64)>,
 }
 
 pub(crate) fn boot(
@@ -1092,7 +1097,7 @@ pub(crate) fn boot(
         nets.push(net);
         cells.push((cell_loop, plane));
     }
-    Ok(Node { cells, nets, control, inbox, data_dir, hold_inbox: false })
+    Ok(Node { cells, nets, control, inbox, data_dir, hold_inbox: false, frozen: None })
 }
 
 impl Node {
@@ -1107,8 +1112,21 @@ impl Node {
     ) -> std::io::Result<()> {
         let n = self.cells.len();
         let rotate = (rng.next_u64() as usize) % n;
+        let skip = match self.frozen {
+            Some((cell, steps)) if steps > 0 => {
+                self.frozen = Some((cell, steps - 1));
+                Some(cell)
+            }
+            _ => {
+                self.frozen = None;
+                None
+            }
+        };
         for i in 0..n {
             let idx = (i + rotate) % n;
+            if Some(idx) == skip {
+                continue;
+            }
             let (cell_loop, plane) = &mut self.cells[idx];
             cell_loop.run_iteration(plane).expect("sim iteration");
             if let Some(err) = plane.take_boot_error() {

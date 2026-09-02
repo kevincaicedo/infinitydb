@@ -58,10 +58,19 @@ jobs:
         run: ./scripts/check-fsync-fail-stop.sh
       - name: panic-policy grep (M2.5-S13)
         run: ./scripts/check-panic-policy.sh
+      # ADR-0107 D2 (review 2026-08-30, Theme 4): release asserts justified
+      # by a claim about a caller are an inventory, gated.
+      - name: release-assert inventory (ADR-0107 D2)
+        run: ./scripts/check-release-asserts.sh
       - name: SAFETY.md inventory (M2.5-S16, §17.3)
         run: ./scripts/check-safety-inventory.sh
       # ADR-0106: the gates must go red on a planted violation, or their OK
       # is a claim (review 2026-08-30 P1/P1c: two had been inert for months).
+      # ADR-0107 (review 2026-08-30, F-L16-01): the DST features never ride
+      # a normal dependency edge — `cargo build --workspace` linked infinityd
+      # against a colliding hasher until this fence existed.
+      - name: shipping-feature fence (ADR-0107)
+        run: ./scripts/check-shipping-features.sh
       - name: check scripts self-test (planted violations turn each gate red)
         run: ./scripts/check-scripts-selftest.sh
       - name: clippy
@@ -139,27 +148,28 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: sim tests (determinism, oracle, planted lost-wakeup)
-        run: cargo test -p inf-sim
+        run: cargo test -p inf-sim --features dst
       - name: m0-smoke determinism (CLI)
-        run: cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
+        run: cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
       # Group 0 (review of 2026-08-30, §5.5 items 1+3): the multi-cell +
       # adversarial-length lane — 4 cells, MAX_KEY_LEN-edge keys, values
       # past the cold-window class, over-bound MSET pairs. No other CI
       # lane exercises either parameter.
       - name: m0-adversarial at 4 cells (Group 0)
-        run: cargo run --release --bin inf-sim -- --scenario m0-adversarial --seed 0xC0FFEE --cells 4 --verify-determinism
+        run: cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-adversarial --seed 0xC0FFEE --cells 4 --verify-determinism
       # F-L19-05 / F-L19-06 (review of 2026-08-30): the surface mix at 4
       # cells — SELECTed and namespace-bound clients, SCAN/KEYS/DBSIZE/
       # RANDOMKEY/FLUSH* under quiescent audit, values + deadlines
       # reconciled against the model.
       - name: m0-surface at 4 cells (F-L19-05/06)
-        run: cargo run --release --bin inf-sim -- --scenario m0-surface --seed 0xC0FFEE --cells 4 --verify-determinism
+        run: cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-surface --seed 0xC0FFEE --cells 4 --verify-determinism
       # F-L17-14: the M4.5 index crash scenarios ran in no automated lane.
       - name: m45 index crash scenarios (F-L17-14)
         run: |
-          cargo run --release --bin inf-sim -- --scenario m45-backfill --seed 0xC0FFEE --verify-determinism
-          cargo run --release --bin inf-sim -- --scenario m45-sidecar --seed 0xC0FFEE --verify-determinism
-          cargo run --release --bin inf-sim -- --scenario m2-ns-create-window --seed 0xC0FFEE --verify-determinism
+          cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-backfill --seed 0xC0FFEE --verify-determinism
+          cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-sidecar --seed 0xC0FFEE --verify-determinism
+          cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ns-create-window --seed 0xC0FFEE --verify-determinism
+          cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ns-ddl-race --seed 0xC0FFEE --verify-determinism
 
   fuzz-smoke:
     # REDUCED: one decoder, 60 s, to catch gross breakage fast. cargo-fuzz

@@ -22,7 +22,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 // denylist-allow: the cell->control DDL channel (ADR-0015 D3), drained on this thread only.
 use std::sync::mpsc;
 use std::time::Duration;
@@ -769,6 +769,32 @@ pub struct ControlHandle {
     /// Creates in flight in the writer's pending set (ADR-0103 D2 —
     /// the cap input); written by the writer after every change.
     pending_creates: AtomicUsize,
+    /// The node-wide DDL ticket (ADR-0108 D1): `0` = free, `cell + 1` =
+    /// the cell whose DDL program holds it. One namespace DDL program
+    /// runs at a time — its fan legs never cross another's. Taken by
+    /// CAS from the origin's pump, released by [`DdlTicket`]'s drop.
+    ddl_holder: AtomicU16,
+    /// Bumped on every ticket release; cells edge-detect it in MAINTAIN
+    /// (one relaxed load — the persisted-epoch pattern) and wake their
+    /// parked DDL pumps.
+    ddl_generation: AtomicU64,
+}
+
+/// The DDL ticket (ADR-0108 D1): held by exactly one namespace DDL
+/// program per node from before its first effect to after its reply.
+/// Dropping it — on every exit path, a dropped future included —
+/// releases the holder slot and bumps the generation the waiters
+/// edge-detect. A deliberate exception to the "no guards across a
+/// suspension" rule: it is the serialization point, not a borrow.
+pub struct DdlTicket {
+    handle: Arc<ControlHandle>,
+}
+
+impl Drop for DdlTicket {
+    fn drop(&mut self) {
+        self.handle.ddl_holder.store(0, Ordering::Release);
+        self.handle.ddl_generation.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 impl ControlHandle {
@@ -780,6 +806,26 @@ impl ControlHandle {
     /// Creates in flight in the writer's pending set (ADR-0103 D2).
     pub fn pending_creates(&self) -> usize {
         self.pending_creates.load(Ordering::Relaxed)
+    }
+
+    /// Takes the DDL ticket for `cell` (ADR-0108 D1), or `None` while
+    /// another program holds it — the caller parks on its DDL waitlist
+    /// and retries on the release edge.
+    #[must_use]
+    pub fn ddl_try_acquire(self: &Arc<Self>, cell: u16) -> Option<DdlTicket> {
+        self.ddl_holder.compare_exchange(0, cell + 1, Ordering::AcqRel, Ordering::Acquire).ok()?;
+        Some(DdlTicket { handle: Arc::clone(self) })
+    }
+
+    /// The cell holding the DDL ticket, if any (a gauge, never a decision).
+    #[must_use]
+    pub fn ddl_holder(&self) -> Option<u16> {
+        self.ddl_holder.load(Ordering::Acquire).checked_sub(1)
+    }
+
+    /// Ticket releases so far (the MAINTAIN edge-detection input).
+    pub fn ddl_generation(&self) -> u64 {
+        self.ddl_generation.load(Ordering::Acquire)
     }
 
     /// The origin's post-fan notice for a `CREATE` (ADR-0103 D2): the
@@ -1107,6 +1153,8 @@ impl ControlHandle {
             index_board: Arc::new(IndexBoard::new(cells)),
             drop_tombstones: AtomicUsize::new(0),
             pending_creates: AtomicUsize::new(0),
+            ddl_holder: AtomicU16::new(0),
+            ddl_generation: AtomicU64::new(0),
         });
         let mut tombstones = DropTombstones::seed(seed.map_or(&[][..], |c| &c.dropped));
         if tombstones.len() > 0 {

@@ -510,6 +510,9 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     ckpt_waiters: WaitList<u8>,
     /// Last persist epoch MAINTAIN observed (edge-detects wakes).
     ddl_epoch_seen: Cell<u64>,
+    /// Last DDL-ticket generation MAINTAIN observed (ADR-0108 D1: a
+    /// release wakes the pumps parked on the ticket).
+    ddl_gen_seen: Cell<u64>,
     /// Board published-sum at the last MAINTAIN (the ckpt-wake edge).
     ckpt_pub_seen: Cell<u64>,
     /// Node is loading (M2-S15): commands without the LOADING flag answer
@@ -1219,6 +1222,17 @@ fn handle_ns_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     }
     let start = scratch.len();
     let mut w = RespWriter::new(scratch, Protocol::Resp2);
+    // Crash-matrix point (ADR-0108 D3): a peer refusing its `CREATE`
+    // leg — the deterministic stand-in for the OS refusing the tier
+    // ring reservation on this cell after the catalog swap.
+    if argv.len() == 9
+        && argv[1].eq_ignore_ascii_case(b"CREATE")
+        && inf_foundation::fault::fire(crate::fault::NS_CREATE_FAN_REFUSED)
+    {
+        w.error("ERR fault: ns_create_fan_refused");
+        staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+        return true;
+    }
     match apply_nsfan(shared, argv) {
         Ok(()) => w.simple("OK"),
         Err(e) => crate::admin::ns_error(e, &mut w),
@@ -1518,6 +1532,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 ddl_waiters: WaitList::new(),
                 ckpt_waiters: WaitList::new(),
                 ddl_epoch_seen: Cell::new(0),
+                ddl_gen_seen: Cell::new(0),
                 ckpt_pub_seen: Cell::new(0),
                 loading: Cell::new(false),
                 apply_prefetch: Cell::new(false),
@@ -3122,6 +3137,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             let epoch = control.persisted_epoch();
             if epoch != self.shared.ddl_epoch_seen.get() {
                 self.shared.ddl_epoch_seen.set(epoch);
+                self.shared.ddl_waiters.wake_all(0);
+            }
+            // ---- DDL-ticket releases (ADR-0108 D1): the same waitlist,
+            // one more edge — a program parked on the ticket retries.
+            let generation = control.ddl_generation();
+            if generation != self.shared.ddl_gen_seen.get() {
+                self.shared.ddl_gen_seen.set(generation);
                 self.shared.ddl_waiters.wake_all(0);
             }
             // ---- checkpoint-publication wakes (M2-S20): any cell's
@@ -4949,6 +4971,36 @@ fn stages_despite_error(id: CommandId) -> bool {
     matches!(id, CommandId::Mset | CommandId::Msetnx)
 }
 
+/// Whether a command on a named namespace executes through the ordinary
+/// `execute` path rather than the namespace's tiered arm: the
+/// keyspace-level commands `execute` owns regardless of the selected
+/// namespace (`SELECT`, `FLUSH*`, cross-db `COPY`, `INFO`, `CONFIG`,
+/// `INF.NS`, pub/sub) and every command that addresses nothing in the
+/// keyspace (`KeyspaceScope::None` — ADR-0108). **One predicate for both
+/// dispatch paths**: the connection's own cell (`dispatch_ns`) and the
+/// owner side of an `ApplyNs` leg (`ns_apply_pump`) must agree, or the
+/// same command answers differently depending on which cell owns its
+/// key — the twin lane found `COPY k k` on a tiered namespace answering
+/// the M2 `COPY` refusal locally and the string-family refusal remotely.
+fn keyspace_level(meta: &'static inf_wire::CommandMeta, argv: &[&[u8]]) -> bool {
+    matches!(
+        meta.id,
+        CommandId::Select
+            | CommandId::Flushall
+            | CommandId::Flushdb
+            | CommandId::Copy
+            | CommandId::Info
+            | CommandId::Config
+            | CommandId::InfNs
+            | CommandId::Subscribe
+            | CommandId::Unsubscribe
+            | CommandId::Psubscribe
+            | CommandId::Punsubscribe
+            | CommandId::Publish
+            | CommandId::Pubsub
+    ) || inf_wire::keyspace_scope(meta, argv.get(1).copied()) == inf_wire::KeyspaceScope::None
+}
+
 /// Which keyspace a scatter program addresses: the connection's numbered
 /// database (legs ride `Apply` with the packed db byte) or a named
 /// namespace (legs ride `ApplyNs` — the ADR-0015 D1 op, the shape the
@@ -6042,8 +6094,12 @@ async fn ns_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
         // Flat durable applies ride the same FIFO under staging pressure
         // (M4.5-S27, ADR-0083 D1); the tier is re-resolved here because
         // the owner stays authoritative and DDL can retier a namespace
-        // while an apply is queued.
-        if !shared.store.borrow().is_tiered(item.ns) {
+        // while an apply is queued. A keyspace-level command on a tiered
+        // namespace takes the ordinary path here exactly as it does on
+        // the connection's cell (`keyspace_level` — ADR-0108).
+        let ordinary = !shared.store.borrow().is_tiered(item.ns)
+            || lookup(argv[0]).is_some_and(|meta| keyspace_level(meta, &argv));
+        if ordinary {
             apply_flat_one(&shared, origin, item.ns, &argv, item.proto, item.token).await;
             continue;
         }
@@ -6416,23 +6472,15 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     // suspension-capable resolution with its own admission + staging.
     // Keyspace-level commands (INFO, CONFIG, INF.NS, SELECT, pub/sub)
     // stay on the ordinary path — `execute` owns them regardless of the
-    // selected namespace.
-    let keyspace_level = matches!(
-        meta.id,
-        CommandId::Select
-            | CommandId::Flushall
-            | CommandId::Flushdb
-            | CommandId::Copy
-            | CommandId::Info
-            | CommandId::Config
-            | CommandId::InfNs
-            | CommandId::Subscribe
-            | CommandId::Unsubscribe
-            | CommandId::Psubscribe
-            | CommandId::Punsubscribe
-            | CommandId::Publish
-            | CommandId::Pubsub
-    );
+    // selected namespace — and so does every command that addresses
+    // nothing in the keyspace (`KeyspaceScope::None`: `PING`, `ECHO`,
+    // `HELLO`, `QUIT`, `CLIENT`, `COMMAND`, `LOLWUT`, `DEBUG SLEEP`, …).
+    // ADR-0108, review of 2026-08-30 (the batch-8 residual): the arm
+    // below used to see them and answer its string-family refusal — a
+    // hand-kept list is exactly the shape Theme 3 forbids, so the class
+    // is read from the registry (`inf_wire::keyspace_scope`) and its
+    // totality is asserted by a table-iterating test.
+    let keyspace_level = keyspace_level(meta, argv);
     if !keyspace_level && shared.store.borrow().is_tiered(ns) {
         match tiered::dispatch_tiered(shared, origin, ns, meta, argv, proto, class).await {
             tiered::TieredReply::Done(reply) => pending.push_back(PendingReply::Done(reply)),
@@ -6624,11 +6672,25 @@ async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             "ERR namespace DDL requires the node control plane (planeless tier is read-only here)",
         );
     };
+    // ADR-0108 D1: one namespace DDL program per node at a time. Two
+    // programs whose fans crossed left a namespace on some cells only
+    // (a `DROP` landing between two `CREATE` legs — the `m2-ns-ddl-race`
+    // DST's phantom); the ticket serializes them from before the first
+    // effect to after the reply, on every exit path (it is a guard).
+    // Parked programs wake on the release edge MAINTAIN detects.
+    let _ticket = loop {
+        if let Some(ticket) = control.ddl_try_acquire(shared.cell.0) {
+            break ticket;
+        }
+        shared.ddl_waiters.wait(0).await;
+    };
     let create = argv[1].eq_ignore_ascii_case(b"CREATE");
     // ADR-0103: a CREATE persisted before the fan; its pending entry
     // retires once the fan is done (either way), and it needs no
-    // trailing persist.
-    let mut created: Option<u32> = None;
+    // trailing persist. `created` carries what a rollback needs
+    // (ADR-0108 D3): the id, the name, and whether the namespace is
+    // durable (tombstone) / tiered (teardown hold).
+    let mut created: Option<(u32, Vec<u8>, bool, bool)> = None;
     let fan: Vec<Vec<u8>> = if create {
         let draft = match crate::admin::parse_ns_create(argv) {
             Ok(draft) => draft,
@@ -6711,7 +6773,8 @@ async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
             return reply;
         }
-        created = Some(ns_id);
+        created =
+            Some((ns_id, spec.name.clone(), spec.mode == NsMode::Durable, spec.tier.is_some()));
         let fsync = spec.fsync.map_or("-", |f| match f {
             FsyncClass::Everysec => "everysec",
             FsyncClass::Always => "always",
@@ -6763,25 +6826,26 @@ async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
         return program_ns_drop(shared, &control, proto, argv[2]).await;
     };
     // Fan to peers (AllOk — partial failure surfaces as the first error
-    // leg, the recorded M1 scatter semantics).
+    // leg, the recorded M1 scatter semantics). Every leg answers: a leg
+    // that cannot be sent is a failed leg, never a skipped one (the H1
+    // shape — `if let Ok` silently dropped the cell).
     let fan_argv: Vec<&[u8]> = fan.iter().map(Vec::as_slice).collect();
-    let mut failure: Option<Vec<u8>> = None;
-    for cell in peer_cells(shared) {
-        if let Ok(waiter) = send_apply(shared, cell, proto, 0, &fan_argv).await
-            && let OwnedOutcome::Bytes(bytes) = waiter.await
-            && bytes.first() == Some(&b'-')
-            && failure.is_none()
-        {
-            failure = Some(bytes);
+    let failure = fan_all_or_first_error(shared, proto, &fan_argv).await;
+    if let Some((id, name, durable, tiered)) = created {
+        if let Some(error) = failure {
+            // ADR-0108 D3: a `CREATE` whose fan failed on any peer rolls
+            // back — the origin drops its copy, fans `DROP`, persists the
+            // drop — so the namespace's existence is exactly what the
+            // reply says. Before this the peers that accepted their leg
+            // (and the origin) served it while the client held an error,
+            // and `META` kept naming it until the next persist.
+            rollback_create(shared, &control, proto, id, &name, durable, tiered).await;
+            return error;
         }
-    }
-    if let Some(id) = created {
-        // Every leg answered: each cell's export carries the namespace
-        // from here on (ADR-0103 D2). A failed leg still retires the
-        // entry — the client gets the error, the next persist drops the
-        // definition (recorded partial-fan residual).
+        // Every leg answered `+OK`: each cell's export carries the
+        // namespace from here on (ADR-0103 D2).
         control.create_applied(id);
-        return failure.unwrap_or_else(|| simple_reply(shared, proto, "OK"));
+        return simple_reply(shared, proto, "OK");
     }
     if let Some(error) = failure {
         return error;
@@ -6864,17 +6928,7 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     if inf_foundation::fault::fire(crate::fault::NS_DROP_AFTER_META) {
         return error_reply(shared, proto, "ERR fault: ns_drop_after_meta");
     }
-    let mut failure: Option<Vec<u8>> = None;
-    for cell in peer_cells(shared) {
-        if let Ok(waiter) = send_apply(shared, cell, proto, 0, &fan).await
-            && let OwnedOutcome::Bytes(bytes) = waiter.await
-            && bytes.first() == Some(&b'-')
-            && failure.is_none()
-        {
-            failure = Some(bytes);
-        }
-    }
-    if let Some(error) = failure {
+    if let Some(error) = fan_all_or_first_error(shared, proto, &fan).await {
         return error;
     }
     if let Some(id) = drop {
@@ -6884,6 +6938,75 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         control.stamp_drop(id, ckpt_epoch);
     }
     simple_reply(shared, proto, "OK")
+}
+
+/// Fans one DDL vector to every peer and returns the first error reply,
+/// or `None` when every leg answered a non-error. Every leg is awaited —
+/// a leg that could not be sent or answered no bytes is an error leg.
+async fn fan_all_or_first_error<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    proto: Protocol,
+    fan: &[&[u8]],
+) -> Option<Vec<u8>> {
+    let mut failure: Option<Vec<u8>> = None;
+    for cell in peer_cells(shared) {
+        let leg = match send_apply(shared, cell, proto, 0, fan).await {
+            Ok(waiter) => match waiter.await {
+                OwnedOutcome::Bytes(bytes) => bytes,
+                _ => error_reply(shared, proto, "ERR cross-cell DDL leg answered no reply bytes"),
+            },
+            Err(refusal) => refusal,
+        };
+        if leg.first() == Some(&b'-') && failure.is_none() {
+            failure = Some(leg);
+        }
+    }
+    failure
+}
+
+/// ADR-0108 D3: undoes a `CREATE` whose fan failed — the mirror of
+/// `program_ns_drop` for a namespace nothing has been promised about.
+/// The origin drops its copy, the catalog persists the drop (the
+/// pending entry retires with it; a durable namespace gets its
+/// tombstone), every peer gets `INF.NSFAN DROP name epoch` (a peer that
+/// never applied its leg answers "not found" — accepted), and a durable
+/// drop is stamped for retirement. Runs under the DDL ticket.
+async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    control: &Arc<ControlHandle>,
+    proto: Protocol,
+    id: u32,
+    name: &[u8],
+    durable: bool,
+    tiered: bool,
+) {
+    // The origin's own copy (`Unknown` here would mean the fan's local
+    // apply never happened — nothing to undo).
+    let _ = shared.store.borrow_mut().ns_drop(name);
+    let epoch = control.request_persist_drop(
+        shared.store.borrow().export_catalog(
+            control.next_ns_id(),
+            control.next_index_id(),
+            control.next_index_generation(),
+        ),
+        id,
+        durable,
+    );
+    if tiered {
+        shared.ns_drop_releases.borrow_mut().push((NsId(id), epoch));
+    }
+    while !control.persisted(epoch) {
+        shared.ddl_waiters.wait(0).await;
+    }
+    let epoch_text = epoch.to_string();
+    let fan: [&[u8]; 4] = [b"INF.NSFAN", b"DROP", name, epoch_text.as_bytes()];
+    // Peers that refused or never received their CREATE leg answer
+    // "namespace not found" — the rollback is idempotent per cell.
+    let _ = fan_all_or_first_error(shared, proto, &fan).await;
+    if durable {
+        let ckpt_epoch = control.request_ckpt_all();
+        control.stamp_drop(id, ckpt_epoch);
+    }
 }
 
 /// Ship `argv` to `to` as an `ApplyNs` (named-namespace op — ADR-0015 D1)

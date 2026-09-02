@@ -5834,3 +5834,321 @@ fn assert_debug_object_agrees_with_get(c: &mut TcpStream, cells: u16, scope: &st
     c.write_all(&cmd(&[b"DEBUG", b"OBJECT", b"never-set:l12-01"])).expect("write");
     read_exactly(c, b"-ERR no such key\r\n");
 }
+
+/// Reads one complete RESP frame (any type, nested arrays included).
+fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(len) = reply_len(&buf, 0).expect("valid RESP") {
+            buf.truncate(len);
+            return buf;
+        }
+        let n = stream.read(&mut chunk).expect("read frame");
+        assert!(n > 0, "connection closed mid-frame; got {:?}", String::from_utf8_lossy(&buf));
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// How one connection-level template's three replies are compared.
+#[derive(Copy, Clone)]
+enum ConnLevelCompare {
+    /// Byte-identical on every binding.
+    Exact,
+    /// The same reply type and no error (payload carries connection or
+    /// wall-clock identity: `HELLO`'s id, `INFO`, `LASTSAVE`).
+    Shape,
+}
+
+/// ADR-0108 (review of 2026-08-30, the batch-8 residual): a command that
+/// addresses nothing in the keyspace — `PING`, `ECHO`, `HELLO`, `CLIENT`,
+/// `INFO`, `COMMAND`, `CONFIG GET`, `INF.NS LIST`, `DEBUG SLEEP`, `LOLWUT`,
+/// pub/sub, the checkpoint surface — answers the same on an unbound
+/// connection, a memory-namespace-bound one and a **tiered**-bound one.
+/// Pre-fix the tiered arm's catch-all answered `-ERR this command is not
+/// supported on tiered namespaces in M4 (string family only)` to every
+/// one of them that reached it (batch 8 recorded `PING` as a limitation;
+/// the class was every `KeyspaceScope::None` row the dispatch did not
+/// list by hand). The test iterates the command table: every `None` row
+/// needs a template here, so a new connection-level command cannot land
+/// outside the class (Theme 3: assert the class, not one command).
+#[test]
+fn connection_level_commands_ignore_the_bound_namespace() {
+    use inf_wire::{COMMANDS, KeyspaceScope, keyspace_scope};
+    let dir = temp_data_dir("conn-level-ns");
+    let node = Node::start_durable(4, &dir);
+    let mut admin = node.connect();
+    for argv in [
+        &[&b"INF.NS"[..], b"CREATE", b"mem", b"MODE", b"memory"][..],
+        &[
+            &b"INF.NS"[..],
+            b"CREATE",
+            b"tier",
+            b"MODE",
+            b"durable",
+            b"MEM-BUDGET",
+            b"64mb",
+            b"DISK-BUDGET",
+            b"256mb",
+        ][..],
+    ] {
+        admin.write_all(&cmd(argv)).expect("write");
+        assert_eq!(read_line(&mut admin), b"+OK\r\n", "{argv:?}");
+    }
+    // One template per connection-level command. `QUIT` closes the
+    // connection after its `+OK`; the subscribe family flips the
+    // connection into subscriber mode — every template therefore runs on
+    // three fresh connections.
+    let templates: &[(&str, &[&[u8]], ConnLevelCompare)] = &[
+        ("PING", &[b"PING"], ConnLevelCompare::Exact),
+        ("PING", &[b"PING", b"bound"], ConnLevelCompare::Exact),
+        ("ECHO", &[b"ECHO", b"tiered-bound"], ConnLevelCompare::Exact),
+        ("HELLO", &[b"HELLO", b"2"], ConnLevelCompare::Shape),
+        ("QUIT", &[b"QUIT"], ConnLevelCompare::Exact),
+        ("INFO", &[b"INFO", b"server"], ConnLevelCompare::Shape),
+        ("COMMAND", &[b"COMMAND", b"COUNT"], ConnLevelCompare::Exact),
+        ("SELECT", &[b"SELECT", b"0"], ConnLevelCompare::Exact),
+        ("CONFIG", &[b"CONFIG", b"GET", b"maxmemory"], ConnLevelCompare::Exact),
+        ("CLIENT", &[b"CLIENT", b"GETNAME"], ConnLevelCompare::Exact),
+        ("CLIENT", &[b"CLIENT", b"SETNAME", b"bound"], ConnLevelCompare::Exact),
+        ("LOLWUT", &[b"LOLWUT"], ConnLevelCompare::Exact),
+        ("SUBSCRIBE", &[b"SUBSCRIBE", b"conn-level"], ConnLevelCompare::Exact),
+        ("UNSUBSCRIBE", &[b"UNSUBSCRIBE", b"conn-level"], ConnLevelCompare::Exact),
+        ("PSUBSCRIBE", &[b"PSUBSCRIBE", b"conn-*"], ConnLevelCompare::Exact),
+        ("PUNSUBSCRIBE", &[b"PUNSUBSCRIBE", b"conn-*"], ConnLevelCompare::Exact),
+        ("PUBLISH", &[b"PUBLISH", b"conn-level", b"m"], ConnLevelCompare::Exact),
+        ("PUBSUB", &[b"PUBSUB", b"NUMSUB", b"conn-level"], ConnLevelCompare::Exact),
+        ("INF.NS", &[b"INF.NS", b"LIST"], ConnLevelCompare::Exact),
+        ("INF.NS", &[b"INF.NS", b"INFO", b"tier"], ConnLevelCompare::Exact),
+        ("INF.CKPT", &[b"INF.CKPT", b"WAIT"], ConnLevelCompare::Exact),
+        ("BGSAVE", &[b"BGSAVE"], ConnLevelCompare::Exact),
+        ("LASTSAVE", &[b"LASTSAVE"], ConnLevelCompare::Shape),
+        ("DEBUG", &[b"DEBUG", b"SLEEP", b"0"], ConnLevelCompare::Exact),
+        ("DEBUG", &[b"DEBUG", b"SET-ACTIVE-EXPIRE", b"1"], ConnLevelCompare::Exact),
+    ];
+    // Coverage: every registry row whose scope is `None` has a template.
+    let missing: Vec<&str> = COMMANDS
+        .iter()
+        .filter(|m| keyspace_scope(m, None) == KeyspaceScope::None)
+        .filter(|m| !templates.iter().any(|(name, _, _)| *name == m.name))
+        .map(|m| m.name)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "connection-level commands without a template (add one — the class must stay total): \
+         {missing:?}"
+    );
+    for (name, _, _) in templates {
+        let meta = inf_wire::lookup(name.as_bytes()).expect("template names a registered command");
+        assert_eq!(
+            keyspace_scope(meta, None),
+            KeyspaceScope::None,
+            "{name} is not connection-level"
+        );
+    }
+    const TIERED_REFUSAL: &[u8] =
+        b"-ERR this command is not supported on tiered namespaces in M4 (string family only)\r\n";
+    let mut failures = Vec::new();
+    let show = |argv: &[&[u8]]| {
+        argv.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect::<Vec<_>>().join(" ")
+    };
+    for (_, argv, compare) in templates {
+        let argv_text = show(argv);
+        let mut unbound = node.connect();
+        let mut mem = connect_use(&node, b"mem");
+        let mut tier = connect_use(&node, b"tier");
+        let mut replies = Vec::new();
+        for (binding, conn) in
+            [("unbound", &mut unbound), ("memory-bound", &mut mem), ("tiered-bound", &mut tier)]
+        {
+            conn.write_all(&cmd(argv)).expect("write");
+            let reply = read_frame(conn);
+            if reply == TIERED_REFUSAL {
+                failures.push(format!(
+                    "`{argv_text}` on a {binding} connection: the tiered arm's catch-all refusal"
+                ));
+            }
+            replies.push((binding, reply));
+        }
+        let (_, first) = &replies[0];
+        for (binding, reply) in &replies[1..] {
+            let ok = match compare {
+                ConnLevelCompare::Exact => reply == first,
+                ConnLevelCompare::Shape => {
+                    reply.first() == first.first() && first.first() != Some(&b'-')
+                }
+            };
+            if !ok {
+                failures.push(format!(
+                    "`{argv_text}`: {binding} answered {:?}, unbound answered {:?}",
+                    String::from_utf8_lossy(&reply[..reply.len().min(120)]),
+                    String::from_utf8_lossy(&first[..first.len().min(120)])
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} connection-level command(s) depend on the bound namespace:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    println!(
+        "conn-level: {} templates over {} KeyspaceScope::None commands, 3 bindings each, 0 failures",
+        templates.len(),
+        COMMANDS.iter().filter(|m| keyspace_scope(m, None) == KeyspaceScope::None).count()
+    );
+    node.stop();
+}
+
+/// ADR-0108 D3 (review of 2026-08-30, the batch-8 partial-fan residual):
+/// a `CREATE` whose fan leg is refused on a peer must leave the namespace
+/// on **no** cell — before this the origin and the peers that accepted
+/// their leg served it while the client held an error, and `META` kept
+/// naming it until the next persist (the `m2-ns-ddl-race` DST's
+/// pre-fix signature: 64 of 64 seeds, cells `[1, 2, 3]` serving a
+/// refused `y`). The fault fires on the first `INF.NSFAN CREATE` leg
+/// every cell receives, so every peer refuses; the origin rolls back
+/// and answers the leg's error; a restart seeds nothing.
+#[test]
+fn create_with_a_refused_fan_leg_rolls_back_on_every_cell() {
+    let dir = temp_data_dir("create-refused-leg");
+    let node = Node::start_durable_with_faults(
+        4,
+        &dir,
+        vec![(inf_server::fault::NS_CREATE_FAN_REFUSED, inf_foundation::fault::FaultSpec::Nth(1))],
+    );
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"half", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"-ERR fault: ns_create_fan_refused\r\n");
+    for cell in 0..4u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"half"])).expect("write");
+        let reply = read_line(&mut c);
+        assert!(
+            reply.starts_with(b"-ERR namespace 'half' not found"),
+            "cell {cell} serves a rolled-back namespace: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+    // The name is free again in this life (the rollback retired the
+    // pending entry and the catalog dropped the definition): a second
+    // CREATE — the fault fired once per cell — succeeds everywhere.
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"half", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for cell in 0..4u16 {
+        let mut c = conn_on_cell_use(&node, cell, b"half");
+        let key = key_for_cell(4, cell);
+        c.write_all(&cmd(&[b"SET", &key, b"after-rollback"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    drop(c);
+    node.stop();
+
+    // The restart: META names exactly the second definition, and the
+    // acked writes into it are there (the rolled-back id's tombstone
+    // explains nothing because nothing was ever written under it).
+    let node = Node::start_durable(4, &dir);
+    for cell in 0..4u16 {
+        let mut c = conn_on_cell_use(&node, cell, b"half");
+        let key = key_for_cell(4, cell);
+        c.write_all(&cmd(&[b"GET", &key])).expect("write");
+        read_exactly(&mut c, b"$14\r\nafter-rollback\r\n");
+    }
+    node.stop();
+}
+
+/// ADR-0108 D1: concurrent namespace DDL from every cell — `CREATE` and
+/// `DROP` of one name racing from four connections on four cells — ends
+/// with every cell agreeing on the namespace's existence and on the
+/// catalog listing, and every reply one of the honest four (`+OK`,
+/// "already exists", "not found"). The DDL ticket serializes the
+/// programs; the `m2-ns-ddl-race` DST holds the deterministic crossing
+/// (a frozen origin mid-fan); this is the real-node smoke of the class.
+#[test]
+fn concurrent_namespace_ddl_leaves_every_cell_agreeing() {
+    let dir = temp_data_dir("ddl-storm");
+    let node = Node::start_durable(4, &dir);
+    let port = node.port;
+    let rounds = 40u32;
+    let handles: Vec<_> = (0..4u16)
+        .map(|cell| {
+            std::thread::spawn(move || {
+                let mut c = loop {
+                    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+                    s.set_read_timeout(Some(Duration::from_secs(30))).expect("timeout");
+                    s.write_all(&cmd(&[b"INFO", b"server"])).expect("write");
+                    let info = read_bulk(&mut s);
+                    let text = String::from_utf8_lossy(&info);
+                    if text.contains(&format!("cell:{cell}\r\n")) {
+                        break s;
+                    }
+                };
+                let mut bad = Vec::new();
+                for round in 0..rounds {
+                    let argv: Vec<&[u8]> = if (round + u32::from(cell)) % 2 == 0 {
+                        vec![
+                            b"INF.NS", b"CREATE", b"storm", b"MODE", b"durable", b"FSYNC",
+                            b"always",
+                        ]
+                    } else {
+                        vec![b"INF.NS", b"DROP", b"storm"]
+                    };
+                    c.write_all(&cmd(&argv)).expect("write");
+                    let reply = read_line(&mut c);
+                    // `DROP` spells the miss `namespace not found`; `USE`
+                    // spells it `namespace 'storm' not found` — both honest.
+                    let honest = reply == b"+OK\r\n"
+                        || reply.starts_with(b"-ERR namespace already exists")
+                        || reply.starts_with(b"-ERR namespace not found")
+                        || reply.starts_with(b"-ERR namespace 'storm' not found");
+                    if !honest {
+                        bad.push(format!(
+                            "cell {cell} round {round} {argv:?}: {:?}",
+                            String::from_utf8_lossy(&reply)
+                        ));
+                    }
+                }
+                bad
+            })
+        })
+        .collect();
+    let mut bad = Vec::new();
+    for h in handles {
+        bad.extend(h.join().expect("storm thread"));
+    }
+    assert!(bad.is_empty(), "dishonest DDL replies under contention:\n{}", bad.join("\n"));
+    // Quiescent agreement: every cell answers USE the same way and lists
+    // the same catalog.
+    let mut served = Vec::new();
+    let mut listings = Vec::new();
+    for cell in 0..4u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"storm"])).expect("write");
+        served.push(read_line(&mut c) == b"+OK\r\n");
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"LIST"])).expect("write");
+        listings.push(read_frame(&mut c));
+    }
+    assert!(
+        served.iter().all(|&s| s == served[0]),
+        "cells disagree on 'storm' after the storm: {served:?}"
+    );
+    assert!(
+        listings.iter().all(|l| l == &listings[0]),
+        "cells list different catalogs after the storm"
+    );
+    // And META agrees with the cells: a restart serves it on every cell
+    // or on none, matching the pre-restart verdict.
+    node.stop();
+    let node = Node::start_durable(4, &dir);
+    for cell in 0..4u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"storm"])).expect("write");
+        let now = read_line(&mut c) == b"+OK\r\n";
+        assert_eq!(now, served[0], "cell {cell}: META disagrees with the pre-restart verdict");
+    }
+    node.stop();
+}

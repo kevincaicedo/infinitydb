@@ -21,6 +21,14 @@
 //! measurement. Stability is part of its contract: the digests it
 //! signs are persisted, so it may never change without an ADR.
 
+/// Whether this build's [`KeyHasher`] carries the ADR-0094 D3 collision
+/// oracle (a 48-byte `{shadow-collide}` key hashes its first 32 bytes
+/// only). `true` in the store suite and the simulators, `false` in every
+/// shipping binary — ADR-0107: the feature reaches a build only through
+/// `[dev-dependencies]` or the simulator's explicit `dst` feature, and
+/// `scripts/check-shipping-features.sh` asserts the graph.
+pub const COLLISION_ORACLE: bool = cfg!(feature = "collision-oracle");
+
 const P0: u64 = 0xa076_1d64_78bd_642f;
 const P1: u64 = 0xe703_7ed1_a0b4_28db;
 const P2: u64 = 0x8ebc_6af0_9c88_c6e3;

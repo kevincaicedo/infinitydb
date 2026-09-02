@@ -22,6 +22,7 @@ pub mod durable;
 pub mod harness;
 pub mod net;
 pub mod nscreate;
+pub mod nsddl;
 pub mod pressure;
 pub mod recovery;
 pub mod resp;
@@ -37,8 +38,34 @@ pub use diskfull::{DiskfullReport, DiskfullScenario, run_diskfull_scenario};
 pub use durable::{DurableReport, DurableScenario, run_durable_scenario};
 pub use harness::{Scenario, SimReport, run_scenario};
 pub use nscreate::{NsCreateWindowReport, run_ns_create_window_scenario};
+pub use nsddl::{NsDdlRaceReport, run_ns_ddl_race_scenario};
 pub use pressure::{PressureReport, PressureScenario, run_pressure_scenario};
 pub use recovery::{RecoveryReport, RecoveryScenario, run_recovery_scenario};
 pub use sidecar::{SidecarReport, SidecarScenario, run_sidecar_scenario};
 pub use steel::{SteelReport, SteelScenario, run_steel_scenario};
 pub use tiered::{TieredNodeReport, TieredScenario, run_tiered_scenario};
+
+/// ADR-0107: the simulator's tests arm fault points and build forced
+/// collisions; without the `dst` feature both are compiled to no-ops and
+/// every scenario test would pass vacuously. This test turns a plain
+/// `cargo test -p inf-sim` red (`cargo test --workspace` unifies the
+/// features through the store/server dev-dependencies; `--features dst`
+/// is the explicit form CI uses).
+#[cfg(test)]
+mod dst_build {
+    // The constants are the point: a runtime-visible red under a plain
+    // `cargo test -p inf-sim` (a `const` block would fail the *build* of
+    // every workspace-wide command instead — ADR-0107 chose the test).
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn fault_points_and_collision_oracle_are_compiled_in() {
+        assert!(
+            inf_foundation::fault::COMPILED_IN,
+            "inf-sim tests need the fault registry: run with `--features dst` (ADR-0107)"
+        );
+        assert!(
+            inf_foundation::COLLISION_ORACLE,
+            "inf-sim tests need the collision oracle: run with `--features dst` (ADR-0107)"
+        );
+    }
+}

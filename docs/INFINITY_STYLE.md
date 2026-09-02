@@ -135,7 +135,12 @@ force multiplier for DST and fuzzing.
   so error paths get tests, fault points, and crash-matrix rows like any
   other code. `unwrap()`/`expect()` on an operational `Result` is a review
   reject; `expect()` with an invariant justification is an assertion and is
-  judged as one.
+  judged as one. Every release `assert!`/`expect()`/`panic!`/`unreachable!`
+  in cell code is a row of `docs/release-assert-inventory.tsv` (ADR-0107
+  D2): `I` an invariant on the callee's own state, `C` a claim about a
+  caller **with the enforcing check named**, `F` a fail-stop the policy
+  sanctions — an operating condition is never a row, it is a typed error.
+  `check-release-asserts.sh` is red on a new, changed or vanished site.
 - **A precondition on data that crossed a trust boundary is not a
   precondition — it is a check you owe.** If a value can reach a function
   from a client, a peer, or a file, do not document "callers must not pass
@@ -167,7 +172,10 @@ measured cost, the unsafe version is wrong.
 All compiler and clippy warnings are errors from day one (`-D warnings`).
 The mechanical checks — `check-dep-dag.sh` (crate boundaries),
 `check-cell-denylist.sh` (no locks/sleep/ambient time in cells),
-fault-point and fsync-fail-stop greps, the attribution-divergence gate —
+fault-point and fsync-fail-stop greps, the attribution-divergence gate,
+`check-shipping-features.sh` (no test/DST feature on a normal dependency
+edge — ADR-0107 D1), `check-release-asserts.sh` (the classified
+release-assert inventory — ADR-0107 D2) —
 are not bureaucracy; they are laws made cheap. Never weaken a check to
 merge; change the law first (ADR) or fix the code.
 

@@ -172,3 +172,12 @@ point = "ns_create_after_meta"
 tier = "node"
 test = "node_e2e"
 expect = "namespace-seeded-from-meta"
+# ADR-0108 D3 (review 2026-08-30, the batch-8 partial-fan residual): a
+# peer refuses its CREATE leg after the catalog swap — the origin rolls
+# the namespace back (local drop, DROP fan, drop persist), answers the
+# leg's error, and no cell serves it before or after a restart.
+[[row]]
+point = "ns_create_fan_refused"
+tier = "node"
+test = "node_e2e"
+expect = "create-rolled-back"

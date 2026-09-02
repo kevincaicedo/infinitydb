@@ -22,7 +22,28 @@ fn parse_seed(text: &str) -> Result<u64, String> {
     }
 }
 
+/// ADR-0107 (review of 2026-08-30, F-L16-01): a simulator built without
+/// its `dst` feature carries no fault registry and no collision oracle —
+/// every armed point would fire `false` and every forced-collision row
+/// would hash two distinct keys, so a "clean" run would prove nothing.
+/// Refuse to run instead of reporting a lie. Exit 2 is the harness's
+/// usage-error code (`run-sweep.sh` treats it as a missing simulator).
+fn require_dst_build() {
+    if inf_foundation::fault::COMPILED_IN && inf_foundation::COLLISION_ORACLE {
+        return;
+    }
+    eprintln!(
+        "inf-sim: this binary was built without the `dst` feature (fault points: {}, collision \
+         oracle: {}) — build it with `cargo build -p inf-sim --features dst` (ADR-0107); a plain \
+         workspace build carries neither so that `infinityd` never does",
+        inf_foundation::fault::COMPILED_IN,
+        inf_foundation::COLLISION_ORACLE
+    );
+    std::process::exit(2);
+}
+
 fn main() {
+    require_dst_build();
     let mut scenario_name = "m0-smoke".to_string();
     let mut seed = 0xC0FFEEu64;
     let mut verify = false;
@@ -670,6 +691,102 @@ fn main() {
                 std::process::exit(1);
             }
             println!("inf-sim: determinism verified — second run trace byte-identical");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // ADR-0108 (review of 2026-08-30, the batch-8 residual): concurrent
+    // namespace DDL — a CREATE and a DROP of one name from two cells with
+    // crossing fans, a CREATE whose peer leg is refused, then a cut and
+    // the audit that every cell agrees with META.
+    if scenario_name == "m2-ns-ddl-race" {
+        let run_one = |seed: u64| inf_sim::run_ns_ddl_race_scenario(seed);
+        if let Some(sweep) = sweep {
+            let (shard_i, shard_k) = shard;
+            assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+            let mut violations = 0u64;
+            let mut ran = 0u64;
+            let (mut found, mut phantoms, mut partial, mut skips) = (0u64, 0u64, 0u64, 0u64);
+            let mut crossings = 0u64;
+            let mut lines = Vec::new();
+            for i in (shard_i..sweep).step_by(shard_k as usize) {
+                let seed = seed.wrapping_add(i);
+                let report = run_one(seed);
+                ran += 1;
+                found += u64::from(report.drop_found);
+                crossings += report.crossings;
+                let served = u64::from(report.served_before_cut);
+                if served != 0 && served != 4 {
+                    phantoms += 1;
+                }
+                partial += u64::from(report.partial_served);
+                skips += report.skipped_unknown_ns;
+                if report.ok() {
+                    lines.push(format!("{seed:#x} ok"));
+                } else {
+                    violations += 1;
+                    let first = report.violations.first().map_or("stall", |v| v.as_str());
+                    lines.push(format!("{seed:#x} VIOLATION {first}"));
+                    eprintln!("inf-sim: seed {seed:#x}: {first}");
+                }
+            }
+            println!(
+                "inf-sim: m2-ns-ddl-race sweep shard {shard_i}/{shard_k}: {ran} seeds, \
+                 {violations} violations, {crossings} crossings (origin frozen mid-fan), {found} \
+                 DROPs found the namespace, {phantoms} phantom namespaces, {partial} cells serving \
+                 a refused CREATE, {skips} untombstoned unknown-ns skips"
+            );
+            if let Some(dir) = out_dir.as_deref() {
+                std::fs::create_dir_all(dir).expect("out dir");
+                std::fs::write(
+                    format!("{dir}/results-shard-{shard_i}.txt"),
+                    lines.join("\n") + "\n",
+                )
+                .expect("results");
+            }
+            std::process::exit(if violations > 0 { 1 } else { 0 });
+        }
+        let report = run_one(seed);
+        println!(
+            "inf-sim: scenario m2-ns-ddl-race seed {seed:#x}: {} commands, {} steps, DROP after \
+             {} steps ({}, origin frozen {} steps), 'x' served on {} cells before the cut / {} \
+             after, refused leg {} left {} cells serving 'y', {} untombstoned unknown-ns skips, {} \
+             released keys found, trace {} bytes, hash {:#018x}",
+            report.commands_done,
+            report.scheduler_steps,
+            report.drop_delay,
+            if report.drop_found { "found" } else { "not found" },
+            report.freeze_steps,
+            report.served_before_cut,
+            report.served_after_cut,
+            report.refused_leg,
+            report.partial_served,
+            report.skipped_unknown_ns,
+            report.released_keys_found,
+            report.trace.len(),
+            report.trace_hash
+        );
+        println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+        if verify {
+            let second = run_one(seed);
+            if second.trace != report.trace {
+                eprintln!(
+                    "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs \
+                     {:#x})",
+                    report.trace.len(),
+                    second.trace.len(),
+                    report.trace_hash,
+                    second.trace_hash
+                );
+                std::process::exit(1);
+            }
+            println!("inf-sim: determinism verified (second run identical)");
         }
         if !report.ok() {
             for v in &report.violations {

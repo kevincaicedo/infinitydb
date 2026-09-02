@@ -1185,6 +1185,42 @@ per episode). A drained cell always seals — never slower than K = 1.
   4. **Fault point** `ns_create_after_meta` (crash-matrix row
      `namespace-seeded-from-meta`): the restart seeds the namespace
      from `META` and serves it.
+- **ADR-0108 amendment (2026-09-02, full-codebase review batch 8
+  residuals) — one DDL program at a time; a failed `CREATE` rolls back.**
+  1. **The DDL ticket** (`inf-server::control::DdlTicket`): every
+     `INF.NS CREATE`/`SET`/`DROP` program takes the node-wide ticket
+     (`ControlHandle::ddl_try_acquire(cell)`, CAS on `ddl_holder`)
+     before its first effect and holds it — a guard, dropped on every
+     exit path — until its reply; a program that finds it held parks
+     on the DDL waitlist and retries on the release edge MAINTAIN
+     detects (`ddl_generation`, one relaxed load per iteration, the
+     persisted-epoch pattern). Fan legs of one program never cross
+     another's.
+  2. **Every fan leg answers** (`plane::fan_all_or_first_error`): a
+     `CREATE`/`SET`/`DROP` fan awaits every peer; a leg that cannot be
+     sent or answers no bytes is an error leg.
+  3. **`CREATE` rollback** (`plane::rollback_create`, under the same
+     ticket): on any error leg the origin drops its copy, requests the
+     catalog persist that drops the id (`request_persist_drop` — the
+     pending entry retires, a durable namespace gets its tombstone),
+     waits the swap, fans `INF.NSFAN DROP name epoch` (a peer without
+     the namespace answers "not found", accepted), stamps a durable
+     drop for retirement, and answers the leg's error. The order
+     becomes *… → apply → fan → (all `+OK` → `create_applied` → `+OK` |
+     any error → rollback → the error)*.
+  4. **Fault point** `ns_create_fan_refused` (`plane::handle_ns_apply`,
+     a peer's `CREATE` leg before its local apply; crash-matrix row
+     `create-rolled-back`): no cell serves the namespace before or
+     after a restart. DST `m2-ns-ddl-race` (two crossing rounds with a
+     frozen origin, the refused-leg round, cuts and audits).
+  5. **Connection-level commands on any binding** (`inf_wire::
+     keyspace_scope`, `plane::keyspace_level`): a command with no key
+     position that is not a scatter program (`PING`, `ECHO`, `HELLO`,
+     `QUIT`, `CLIENT`, `COMMAND`, `LOLWUT`, `DEBUG SLEEP`, …) executes
+     through the ordinary path on a tiered-bound connection — on the
+     connection's cell and on the `ApplyNs` owner side alike — and the
+     planeless `execute` refuses a tiered namespace only for a command
+     that addresses it.
 - **ADR-0102 amendment (2026-09-01, full-codebase review H0 /
   F-L06-01 / F-L06-05) — tier ring invariants at the gauntlet.**
   1. **`TierSpec::validate`** gains the four-page floor (`MEM-BUDGET +

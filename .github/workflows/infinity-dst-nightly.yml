@@ -73,7 +73,7 @@ jobs:
         with:
           toolchain: 1.95.0
       - name: build (release)
-        run: cargo build --release --bin inf-sim
+        run: cargo build --release -p inf-sim --features dst --bin inf-sim
 
       - name: durability sweep (M2-S19; M2.5-S14 raised to 12k on the stall device)
         run: |
@@ -267,7 +267,7 @@ jobs:
           $(cat /tmp/failures.txt 2>/dev/null || echo 'see job log — failure outside the fresh-seed fleet')
           \`\`\`
 
-          Repro: \`cargo run --release --bin inf-sim -- --scenario <scenario> --seed <seed>\`
+          Repro: \`cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario <scenario> --seed <seed>\`
           Trace bundles: this run's \`dst-failure-traces\` artifact.
           Contract: the fix lands WITH the seed appended to \`bins/inf-sim/seeds/corpus.txt\`."
           gh issue create \
