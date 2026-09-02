@@ -136,6 +136,11 @@ pub struct TieringCounters {
     /// ADR-0059). Always-on; joins the S03 zero-assert set — a
     /// memory-mode run must never count one.
     pub compact_slices: u64,
+    /// Writes that re-resolved because the key's slot moved while the
+    /// write was suspended on an extent read (review of 2026-08-30,
+    /// F-L06-03) — a legal interleaving, counted so the race is
+    /// observable (a green race test must have seen ≥ 1).
+    pub write_replans: u64,
 }
 
 /// Byte-exact attribution snapshot (L5).
@@ -704,6 +709,18 @@ impl AddressSpace {
     /// the plane's resolve funnel and SCAN's key fetch report here).
     pub fn note_cold_read_error(&mut self) {
         self.counters.cold_read_errors += 1;
+    }
+
+    /// Counts one write replan (F-L06-03 — the plane's write funnel
+    /// found a stale address after an extent read and re-resolved).
+    pub fn note_write_replan(&mut self) {
+        self.counters.write_replans += 1;
+    }
+
+    /// The ring reservation in bytes (`R`, a power of two).
+    #[inline]
+    pub fn ring_bytes(&self) -> u64 {
+        self.ring_mask + 1
     }
 
     /// Byte-exact attribution snapshot (L5).

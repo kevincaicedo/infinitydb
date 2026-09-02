@@ -1004,6 +1004,11 @@ pub(crate) struct Node {
     pub(crate) control: std::sync::Arc<inf_server::ControlHandle>,
     inbox: ControlInbox,
     data_dir: PathBuf,
+    /// ADR-0103 (the `m2-ns-create-window` scenario): while set, `step`
+    /// skips the control-inbox drain — the catalog swap is "in flight"
+    /// for as many steps as the scenario wants, the deterministic form
+    /// of a slow `META` fdatasync.
+    pub(crate) hold_inbox: bool,
 }
 
 pub(crate) fn boot(
@@ -1085,7 +1090,7 @@ pub(crate) fn boot(
         nets.push(net);
         cells.push((cell_loop, plane));
     }
-    Ok(Node { cells, nets, control, inbox, data_dir })
+    Ok(Node { cells, nets, control, inbox, data_dir, hold_inbox: false })
 }
 
 impl Node {
@@ -1108,7 +1113,9 @@ impl Node {
                 return Err(err);
             }
         }
-        self.inbox.drain(disk, &self.data_dir)?;
+        if !self.hold_inbox {
+            self.inbox.drain(disk, &self.data_dir)?;
+        }
         clock.advance(Nanos(1_000 + rng.next_u64() % step_ns_max));
         Ok(())
     }

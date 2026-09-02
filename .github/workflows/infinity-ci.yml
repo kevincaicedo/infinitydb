@@ -149,6 +149,7 @@ jobs:
         run: |
           cargo run --release --bin inf-sim -- --scenario m45-backfill --seed 0xC0FFEE --verify-determinism
           cargo run --release --bin inf-sim -- --scenario m45-sidecar --seed 0xC0FFEE --verify-determinism
+          cargo run --release --bin inf-sim -- --scenario m2-ns-create-window --seed 0xC0FFEE --verify-determinism
 
   fuzz-smoke:
     # REDUCED: one decoder, 60 s, to catch gross breakage fast. cargo-fuzz

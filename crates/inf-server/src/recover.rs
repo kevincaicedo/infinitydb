@@ -177,6 +177,11 @@ pub struct RecoverStats {
     pub frames: u64,
     pub records_applied: u64,
     pub records_skipped: u64,
+    /// The subset of `records_skipped` whose namespace id no drop
+    /// tombstone explains (ADR-0103 D4). After ADR-0103 a namespace is
+    /// never servable before its definition is durable, so a nonzero
+    /// count means a foreign log or corruption — the C14 verifier.
+    pub records_skipped_unknown_ns: u64,
     /// Tail deltas already represented by a fuzzy checkpoint/full image
     /// (ADR-0043 R1). Separate from foreign-record skips.
     pub doc_deltas_skipped_stale: u64,
@@ -1239,9 +1244,18 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                             .map_err(|error| replay_apply_failed(at, &error))?;
                         match outcome {
                             ReplayOutcome::Applied => self.stats.records_applied += 1,
-                            ReplayOutcome::SkippedUnknownNs | ReplayOutcome::SkippedReserved => {
+                            ReplayOutcome::SkippedUnknownNs(ns) => {
                                 self.stats.records_skipped += 1;
+                                // ADR-0103 D4: a tombstone explains a
+                                // dropped namespace's records; an id
+                                // nothing explains is a foreign log or
+                                // corruption — counted apart, asserted
+                                // zero by the DST, never silent.
+                                if !ks.ns_tombstoned(ns) {
+                                    self.stats.records_skipped_unknown_ns += 1;
+                                }
                             }
+                            ReplayOutcome::SkippedReserved => self.stats.records_skipped += 1,
                             ReplayOutcome::SkippedMarker => self.stats.markers += 1,
                             ReplayOutcome::SkippedDocDeltaStale => {
                                 self.stats.doc_deltas_skipped_stale += 1;

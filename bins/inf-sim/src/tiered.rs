@@ -256,6 +256,11 @@ pub struct TieredNodeReport {
     pub cold_resolves: u64,
     /// SETs at or above `BLOB-THRESHOLD` (the ADR-0061 extent leg).
     pub blob_sets: u64,
+    /// Phase 1b (review of 2026-08-30, F-L06-03): write replans the
+    /// shared blob-key race provoked — the interleaving's coverage,
+    /// disclosed per seed (a sweep whose races never replanned proved
+    /// nothing about the guard).
+    pub race_replans: u64,
     /// Typed `DISKFULL` refusals observed at the clamped budget.
     pub diskfull_refusals: u64,
     /// Admission reopened after the budget lifted (phase 8's second
@@ -824,6 +829,119 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         }
     }
     report.commands_done += OPEN_SAME_KEYS + 1 + OPEN_TRIPLES;
+
+    // ---- phase 1b: the shared blob-key write race (F-L06-03) ------------
+    // K clients on cell 0 write the same key with extent-sized values in
+    // lockstep: every write resolves through the extent arm and suspends
+    // on its cold read, so the slot moves under the others — the
+    // interleaving the orchestrator's stress run (L00-21) never reached.
+    // Oracle: every reply `+OK`, the final value one of the round's, the
+    // cell alive (the sim dies on a cell panic — the pre-fix
+    // `Index::replace` "replace target present"), and the guard's replan
+    // count disclosed.
+    const RACE_CLIENTS: usize = 4;
+    const RACE_ROUNDS: u64 = 6;
+    let mut racers: Vec<MiniClient> =
+        (0..RACE_CLIENTS).map(|_| MiniClient::connect(&mut node, 0)).collect();
+    for (i, racer) in racers.iter_mut().enumerate() {
+        match racer.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, use_ns) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("racer {i} USE answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    for round in 0..RACE_ROUNDS {
+        let key = format!("race:{}", round % 2).into_bytes();
+        // Seed the key as an extent so every racer's resolve takes the
+        // suspending arm.
+        let seed_len = (6 << 10) + rng.next_below(2048) as usize;
+        let seed_value = value_bytes(b'R', 9, round, seed_len);
+        let set: &[&[u8]] = &[b"SET", &key, &seed_value];
+        match racers[0].call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("race round {round} seed SET answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        let values: Vec<Vec<u8>> = (0..RACE_CLIENTS)
+            .map(|i| value_bytes(b'r', i, round, (6 << 10) + rng.next_below(2048) as usize))
+            .collect();
+        for (racer, value) in racers.iter_mut().zip(&values) {
+            racer.send(&mut node, &[b"SET", &key, value]);
+        }
+        let mut replied = [false; RACE_CLIENTS];
+        let mut steps = 0u64;
+        while replied.iter().any(|r| !r) {
+            steps += 1;
+            report.scheduler_steps += 1;
+            if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
+                fail(&mut report, format!("race round {round}: {err}"));
+                return finish(report, &observer, &clock);
+            }
+            for (i, racer) in racers.iter_mut().enumerate() {
+                if !replied[i]
+                    && let Some(reply) = racer.recv(&mut node)
+                {
+                    replied[i] = true;
+                    if reply != b"+OK\r\n" {
+                        fail(
+                            &mut report,
+                            format!(
+                                "race round {round} racer {i}: SET answered {}",
+                                preview(&reply)
+                            ),
+                        );
+                    }
+                }
+            }
+            if steps > STALL_STEPS {
+                report.stalled = true;
+                fail(&mut report, format!("race round {round} stalled"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        report.commands_done += RACE_CLIENTS as u64 + 1;
+        let get: &[&[u8]] = &[b"GET", &key];
+        match racers[0].call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, get) {
+            Ok(Some(reply)) => {
+                if !values.iter().any(|v| bulk(v) == reply) {
+                    fail(
+                        &mut report,
+                        format!(
+                            "race round {round}: final value {} is none of the round's writes",
+                            preview(&reply)
+                        ),
+                    );
+                }
+            }
+            other => {
+                fail(&mut report, format!("race round {round} GET answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        report.commands_done += 1;
+    }
+    match info_tiering(&mut setup, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
+        Ok(text) => report.race_replans = info_field(&text, "tiering_write_replans"),
+        Err(err) => fail(&mut report, format!("race scrape: {err}")),
+    }
+    // The race keys are outside every later model (the quiescence
+    // oracle counts DBSIZE against the writers' ledgers): delete them.
+    for round in 0..2u64 {
+        let key = format!("race:{round}").into_bytes();
+        let del: &[&[u8]] = &[b"DEL", &key];
+        match racers[0].call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, del) {
+            Ok(Some(ok)) if ok == b":1\r\n" => report.commands_done += 1,
+            other => {
+                fail(&mut report, format!("race key {round} DEL answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    drop(racers);
 
     // ---- phase 2: seeded traffic until the cut -------------------------
     let mut writers = Vec::new();
