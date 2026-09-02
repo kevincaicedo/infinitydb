@@ -78,7 +78,10 @@ pub use key_hash::{
     directory_has_data, load_key_hash, parse_key_hash, render_key_hash, resolve_key_hash,
     verify_key_hash_binding,
 };
-pub use plane::{ExecOrigin, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane};
+pub use plane::{
+    ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane,
+    fold_live_entries,
+};
 pub use readahead::{ReadAheadFile, ReadAheadFs};
 pub use recover::{
     RecoverPhase, RecoverPhases, RecoverStats, RecoveredManifest, Recovery, RecoveryProgress,

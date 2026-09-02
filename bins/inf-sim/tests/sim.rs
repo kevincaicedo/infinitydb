@@ -1,5 +1,6 @@
 //! M0-S20 ACs + the DST items E3/E5 deferred here.
 
+use inf_sim::harness::Canary;
 use inf_sim::net::Plant;
 use inf_sim::{Scenario, run_scenario};
 
@@ -133,4 +134,96 @@ fn m1_cache_same_seed_same_trace() {
     assert!(a.ok(), "violations: {:?}", a.oracle_violations);
     assert_eq!(a.trace, b.trace, "trace must be byte-identical");
     assert_eq!((a.published, a.delivered), (b.published, b.delivered));
+}
+
+/// Review of 2026-08-30 (F-L19-05 surface half, F-L19-06 value half): the
+/// surface scenario at four cells — `SELECT`ed and namespace-bound clients
+/// replaying against the model's matching stores, concurrent `SCAN` walks
+/// under the weak oracle, quiescent audits comparing served surface and
+/// stored content (values, deadlines) — is oracle green, and its coverage
+/// counters prove the audits and walks actually ran.
+#[test]
+fn m0_surface_oracle_green() {
+    let mut scenario = Scenario::m0_surface(0xC0FFEE);
+    scenario.cells = 4;
+    scenario.commands = if cfg!(debug_assertions) { 12_000 } else { 40_000 };
+    scenario.audit_every = 2_000;
+    let report = run_scenario(&scenario);
+    assert!(!report.stalled, "surface scenario stalled");
+    assert_eq!(report.oracle_violations, Vec::<String>::new());
+    assert_eq!(report.commands_done, scenario.commands);
+    assert!(report.audits >= 3, "audits ran: {}", report.audits);
+    assert!(report.scan_walks >= 1, "a concurrent SCAN walk completed");
+    assert!(report.replays_skipped >= 1, "scatter legs reached the seam");
+}
+
+/// The content oracle has teeth for every damage class it claims to see
+/// (F-L19-06's "planted-bug canary"): a key dropped from the model, a value
+/// corrupted with the key set intact, a deadline dropped with key and value
+/// intact — each caught at quiescence, naming the entry.
+#[test]
+fn content_oracle_catches_each_planted_canary() {
+    for canary in [Canary::DropKey, Canary::CorruptValue, Canary::DropDeadline] {
+        let scenario = Scenario {
+            cells: 2,
+            connections: 6,
+            commands: 600,
+            key_space: 48,
+            pipelined_every: 3,
+            canary,
+            ..Scenario::m0_smoke(0x5EED)
+        };
+        let report = run_scenario(&scenario);
+        assert!(!report.stalled, "{canary:?}: stalled");
+        let hit = report
+            .oracle_violations
+            .iter()
+            .any(|v| v.starts_with("content reconciliation failed (quiescence)"));
+        assert!(hit, "{canary:?} went unnoticed: {:?}", report.oracle_violations);
+        let class = match canary {
+            Canary::None => unreachable!(),
+            Canary::DropKey => "node-only: [Db(0):",
+            Canary::CorruptValue => "value mismatches: [Db(0):",
+            Canary::DropDeadline => "deadline mismatches: [Db(0):",
+        };
+        assert!(
+            report.oracle_violations.iter().any(|v| v.contains(class)),
+            "{canary:?} was reported in the wrong class: {:?}",
+            report.oracle_violations
+        );
+    }
+}
+
+/// In an audited scenario the canary is planted before the final audit, so
+/// the served-surface comparators (`DBSIZE`, the `SCAN` walk) must see a
+/// dropped key over the wire too — not only the content fold.
+#[test]
+fn audit_oracle_catches_a_planted_canary_on_the_served_surface() {
+    let scenario = Scenario {
+        cells: 3,
+        connections: 8,
+        commands: 1_200,
+        key_space: 40,
+        audit_every: 400,
+        canary: Canary::DropKey,
+        ..Scenario::m0_surface(0xA0D17)
+    };
+    let report = run_scenario(&scenario);
+    assert!(!report.stalled, "stalled");
+    assert!(report.audits >= 2, "audits ran: {}", report.audits);
+    let dbsize =
+        report.oracle_violations.iter().any(|v| v.contains("final audit") && v.contains("DBSIZE"));
+    let scan = report
+        .oracle_violations
+        .iter()
+        .any(|v| v.contains("final audit") && v.contains("SCAN COUNT"));
+    let content = report
+        .oracle_violations
+        .iter()
+        .any(|v| v.starts_with("content reconciliation failed (final audit)"));
+    assert!(
+        dbsize && scan && content,
+        "served-surface audit missed the dropped key (dbsize {dbsize}, scan {scan}, content {content}): {:?}",
+        report.oracle_violations
+    );
 }

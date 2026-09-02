@@ -50,6 +50,67 @@ fn parse_len(digits: &[u8]) -> i64 {
     text.parse().expect("RESP length parses")
 }
 
+/// One parsed RESP2 reply — the shapes the sim's surface clients and the
+/// audit oracle read (`SCAN` pages, `KEYS`, `DBSIZE`, `RANDOMKEY`, status
+/// and error replies). Review of 2026-08-30, F-L19-05.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reply {
+    Simple(Vec<u8>),
+    Error(Vec<u8>),
+    Int(i64),
+    Bulk(Vec<u8>),
+    Nil,
+    Array(Vec<Reply>),
+}
+
+/// Parses exactly one complete RESP2 reply.
+///
+/// # Panics
+/// Panics on a malformed, incomplete, or over-long frame — the server
+/// under test produced it, which is itself a finding the panic surfaces
+/// with the seed.
+pub fn parse_reply(raw: &[u8]) -> Reply {
+    let (reply, end) = parse_at(raw, 0);
+    assert_eq!(end, raw.len(), "trailing bytes after one reply: {raw:?}");
+    reply
+}
+
+fn parse_at(buf: &[u8], at: usize) -> (Reply, usize) {
+    let end = frame(buf, at).expect("complete frame");
+    match buf[at] {
+        b'+' => (Reply::Simple(buf[at + 1..end - 2].to_vec()), end),
+        b'-' => (Reply::Error(buf[at + 1..end - 2].to_vec()), end),
+        b':' => {
+            let text = core::str::from_utf8(&buf[at + 1..end - 2]).expect("int ASCII");
+            (Reply::Int(text.parse().expect("int parses")), end)
+        }
+        b'$' => {
+            let header = line_end(buf, at).expect("bulk header");
+            if parse_len(&buf[at + 1..header - 2]) < 0 {
+                (Reply::Nil, end)
+            } else {
+                (Reply::Bulk(buf[header..end - 2].to_vec()), end)
+            }
+        }
+        b'*' => {
+            let header = line_end(buf, at).expect("array header");
+            let n = parse_len(&buf[at + 1..header - 2]);
+            if n < 0 {
+                return (Reply::Nil, end);
+            }
+            let mut items = Vec::with_capacity(n as usize);
+            let mut pos = header;
+            for _ in 0..n {
+                let (item, next) = parse_at(buf, pos);
+                items.push(item);
+                pos = next;
+            }
+            (Reply::Array(items), end)
+        }
+        other => panic!("sim reply parser saw RESP tag {other:#04x}"),
+    }
+}
+
 /// One frame on a subscriber connection, classified (M1-S15 pub/sub
 /// delivery oracle). RESP2 only — sim clients never HELLO.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,6 +206,23 @@ fn parse_array(buf: &[u8]) -> Vec<Item> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_the_surface_reply_shapes() {
+        assert_eq!(parse_reply(b"+OK\r\n"), Reply::Simple(b"OK".to_vec()));
+        assert_eq!(parse_reply(b"-ERR x\r\n"), Reply::Error(b"ERR x".to_vec()));
+        assert_eq!(parse_reply(b":7\r\n"), Reply::Int(7));
+        assert_eq!(parse_reply(b"$-1\r\n"), Reply::Nil);
+        assert_eq!(parse_reply(b"$3\r\nfoo\r\n"), Reply::Bulk(b"foo".to_vec()));
+        assert_eq!(
+            parse_reply(b"*2\r\n$1\r\n0\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n"),
+            Reply::Array(vec![
+                Reply::Bulk(b"0".to_vec()),
+                Reply::Array(vec![Reply::Bulk(b"a".to_vec()), Reply::Bulk(b"b".to_vec())]),
+            ])
+        );
+        assert_eq!(parse_reply(b"*0\r\n"), Reply::Array(Vec::new()));
+    }
 
     #[test]
     fn frames_every_m0_reply_shape() {

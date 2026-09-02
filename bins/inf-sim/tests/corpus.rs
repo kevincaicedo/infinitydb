@@ -108,6 +108,7 @@ fn corpus_seeds_replay_green() {
         let mut scenario = match name {
             "m0-smoke" => Scenario::m0_smoke(seed),
             "m0-adversarial" => Scenario::m0_adversarial(seed),
+            "m0-surface" => Scenario::m0_surface(seed),
             "m1-cache" => Scenario::m1_cache(seed),
             other => panic!("corpus names unknown scenario {other}"),
         };

@@ -55,7 +55,8 @@ use inf_runtime::{
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
 use inf_store::{
-    EvictBudget, ExpiryBudget, Keyspace, LogFullImage, NsId, NsMode, SlotRouter, WallAnchor,
+    CellStore, EvictBudget, ExpiryBudget, Keyspace, LogFullImage, NsId, NsMode, SlotRouter,
+    WallAnchor,
 };
 use inf_wire::{
     ArgvRef, CmdFlags, CommandId, ConnParser, Parsed, ParserLimits, Protocol, RespWriter, arity_ok,
@@ -127,15 +128,44 @@ const SCAN_LOCAL_MASK: u64 = (1 << SCAN_CELL_SHIFT) - 1;
 /// Apply-point hook (sim oracle seam).
 pub trait PlaneObserver {
     /// One command applied on this cell: `argv` and the RESP reply bytes it
-    /// produced, at injected time `now`.
+    /// produced, against the store `scope` names, at injected time `now`.
     fn on_execute(
         &mut self,
         cell: CellId,
         origin: ExecOrigin,
+        scope: ExecScope,
         argv: &[&[u8]],
         reply: &[u8],
         now: Nanos,
     );
+}
+
+/// The store one applied command addressed (review of 2026-08-30,
+/// F-L19-05 / ADR-0105): a replay model must apply the same argv to the
+/// same store, so the apply seam names it. Mirrors `ConnCx::{db, ns}` as
+/// they stood *when the command executed* — before a conn-state command
+/// (`SELECT`, `INF.NS USE`) takes effect — and the `(db | ns)` an
+/// `Apply`/`ApplyNs` leg carried on the owner side.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum ExecScope {
+    /// Numbered database `db` of the default namespace.
+    Db(u16),
+    /// A named namespace.
+    Ns(NsId),
+    /// The connection's configured default namespace is unavailable
+    /// (`--conn-default-ns` fail-closed state, M4.5-S40): data commands
+    /// answered the typed refusal against no store.
+    Unavailable,
+}
+
+impl ExecScope {
+    fn of(cx: &ConnCx) -> ExecScope {
+        match cx.ns {
+            ConnNamespace::Named(ns) => ExecScope::Ns(ns),
+            ConnNamespace::Default => ExecScope::Db(cx.db),
+            ConnNamespace::RequiredUnavailable => ExecScope::Unavailable,
+        }
+    }
 }
 
 /// Where an applied command came from.
@@ -153,7 +183,16 @@ pub struct NoopObserver;
 
 impl PlaneObserver for NoopObserver {
     #[inline]
-    fn on_execute(&mut self, _: CellId, _: ExecOrigin, _: &[&[u8]], _: &[u8], _: Nanos) {}
+    fn on_execute(
+        &mut self,
+        _: CellId,
+        _: ExecOrigin,
+        _: ExecScope,
+        _: &[&[u8]],
+        _: &[u8],
+        _: Nanos,
+    ) {
+    }
 }
 
 /// Owned fabric outcome (decoded outcomes borrow ring slots; gate values
@@ -616,9 +655,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
             // Typed refusal before anything changed (ADR-0072 D7.1).
             RespWriter::new(out, proto).error(refusal.message());
             self.node.doc_log_admission.set(None);
-            self.observer.borrow_mut().on_execute(self.cell, origin, argv, &out[before..], now);
+            self.observer.borrow_mut().on_execute(
+                self.cell,
+                origin,
+                ExecScope::of(&cx),
+                argv,
+                &out[before..],
+                now,
+            );
             return;
         }
+        let scope = ExecScope::of(&cx);
         execute_slices(argv, &mut self.store.borrow_mut(), &mut cx, now, out);
         #[cfg(feature = "doc")]
         if let Some((target, keys, _)) = &bracket {
@@ -628,7 +675,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         }
         #[cfg(feature = "doc")]
         self.node.doc_log_admission.set(None);
-        self.observer.borrow_mut().on_execute(self.cell, origin, argv, &out[before..], now);
+        self.observer.borrow_mut().on_execute(self.cell, origin, scope, argv, &out[before..], now);
     }
 
     /// The mutation's path program for the S04 static path-overlap prune
@@ -718,7 +765,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         };
         let mut reply = Vec::new();
         RespWriter::new(&mut reply, Protocol::Resp2).int(i64::from(hit));
-        self.observer.borrow_mut().on_execute(self.cell, origin, &[name, key], &reply, now);
+        self.observer.borrow_mut().on_execute(
+            self.cell,
+            origin,
+            ExecScope::Db(db),
+            &[name, key],
+            &reply,
+            now,
+        );
         i64::from(hit)
     }
 
@@ -728,7 +782,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         let len = self.store.borrow_mut().db_mut(usize::from(db)).len() as i64;
         let mut reply = Vec::new();
         RespWriter::new(&mut reply, Protocol::Resp2).int(len);
-        self.observer.borrow_mut().on_execute(self.cell, origin, &[b"DBSIZE"], &reply, now);
+        self.observer.borrow_mut().on_execute(
+            self.cell,
+            origin,
+            ExecScope::Db(db),
+            &[b"DBSIZE"],
+            &reply,
+            now,
+        );
         len
     }
 
@@ -1996,27 +2057,22 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.shared.store.borrow()
     }
 
-    /// DST content oracle (review of 2026-08-30, §5.5 Group 0): every
-    /// live key in this cell's materialized numbered databases, emitted
-    /// as `(db, key)` through the same resize-stable walk `SCAN` uses,
-    /// run to completion. A count oracle is blind to *count right,
-    /// contents wrong* — the proven Criticals' signature — so the sim
-    /// compares key sets at quiescence. Named namespaces have their own
-    /// scenario oracles (`inf-sim::tiered`, `recovery`). Quiescence-only
-    /// tooling — never the data plane.
-    pub fn fold_live_keys(&self, now: Nanos, mut emit: impl FnMut(usize, &[u8])) {
-        let mut ks = self.shared.store.borrow_mut();
-        let dbs: Vec<usize> = ks.dbs().map(|(i, _)| i).collect();
-        for db in dbs {
-            let store = ks.db_mut(db);
-            let mut cursor = 0;
-            loop {
-                cursor = store.scan(cursor, usize::MAX, now, |key| emit(db, key));
-                if cursor == 0 {
-                    break;
-                }
-            }
-        }
+    /// Every live entry on this cell at `now` — `(scope, key, value,
+    /// expiry deadline in internal ms)` — across the numbered dbs and the
+    /// materialized memory / flat-durable named namespaces (review of
+    /// 2026-08-30, F-L19-06: the sim's content oracle compares values and
+    /// deadlines, not key sets or counts). Expired-but-unreaped records are
+    /// reaped, never emitted, so a model folded at the same `now` agrees
+    /// without an expiry-equalization pass. Tiered namespaces are skipped
+    /// — their post-images live partly on the device, and the tiered DST's
+    /// phase oracles own them — and the skip count is returned so a caller
+    /// cannot mistake a skipped namespace for an empty one.
+    pub fn fold_live_entries(
+        &self,
+        now: Nanos,
+        emit: impl FnMut(ExecScope, &[u8], &[u8], Option<u64>),
+    ) -> usize {
+        fold_live_entries(&mut self.shared.store.borrow_mut(), now, emit)
     }
 
     /// Pub/sub registry gauges `(owned channels, patterns, state bytes)` —
@@ -2655,6 +2711,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 let argv_slices: Vec<&[u8]> = argv.iter().collect();
                                 let before = out.len();
                                 let now = self.shared.now.get();
+                                let scope = ExecScope::of(conn_cx);
                                 execute(
                                     &argv,
                                     &mut self.shared.store.borrow_mut(),
@@ -2665,6 +2722,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 self.shared.observer.borrow_mut().on_execute(
                                     self.shared.cell,
                                     origin,
+                                    scope,
                                     &argv_slices,
                                     &out[before..],
                                     now,
@@ -3293,6 +3351,7 @@ fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 shared.observer.borrow_mut().on_execute(
                     shared.cell,
                     ExecOrigin::Fabric(from),
+                    ExecScope::Ns(NsId(ns)),
                     &[b"DBSIZE"],
                     &reply,
                     now,
@@ -3555,8 +3614,18 @@ fn flush_parse_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         let argc = read_argv_block(stage_bytes, e.off, &mut argv_buf);
         let argv = &argv_buf[..argc];
         let before = out.len();
+        // Staged commands are never conn-state, so the scope before and
+        // after execution is the same one.
+        let scope = ExecScope::of(conn_cx);
         execute(argv, &mut shared.store.borrow_mut(), conn_cx, now, out);
-        shared.observer.borrow_mut().on_execute(shared.cell, origin, argv, &out[before..], now);
+        shared.observer.borrow_mut().on_execute(
+            shared.cell,
+            origin,
+            scope,
+            argv,
+            &out[before..],
+            now,
+        );
         // QUIT and DEBUG are stage barriers; a staged command can neither
         // request a close nor a stall.
         debug_assert!(!conn_cx.close_requested.get(), "QUIT is a parse-stage barrier");
@@ -4620,8 +4689,11 @@ fn dispatch_mirror<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             return false;
         };
         let now = shared.now.get();
+        // The scope a conn-state command executed *under* — SELECT / USE
+        // change it for every later command, not for themselves.
+        let scope = ExecScope::of(&live);
         execute_slices(argv, &mut shared.store.borrow_mut(), &mut live, now, &mut reply);
-        shared.observer.borrow_mut().on_execute(shared.cell, origin, argv, &reply, now);
+        shared.observer.borrow_mut().on_execute(shared.cell, origin, scope, argv, &reply, now);
         shared.with_conn(key, |c| {
             c.cx.proto = live.proto;
             c.cx.db = live.db;
@@ -4766,7 +4838,14 @@ async fn ns_dbsize_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     let now = shared.now.get();
     let mut reply = Vec::new();
     RespWriter::new(&mut reply, Protocol::Resp2).int(n);
-    shared.observer.borrow_mut().on_execute(shared.cell, origin, &[b"DBSIZE"], &reply, now);
+    shared.observer.borrow_mut().on_execute(
+        shared.cell,
+        origin,
+        ExecScope::Ns(ns),
+        &[b"DBSIZE"],
+        &reply,
+        now,
+    );
     Ok(n)
 }
 
@@ -5825,6 +5904,68 @@ fn parse_take_reply(raw: &[u8]) -> Option<Option<(Vec<u8>, i64)>> {
     Some(Some((value, pttl)))
 }
 
+/// The store-level fold behind [`ServerPlane::fold_live_entries`], shared
+/// with the sim's replay model so node and model are walked by one
+/// implementation (a walker that differed per side would be the oracle
+/// encoding its own bug). Returns the number of tiered namespaces skipped.
+pub fn fold_live_entries(
+    ks: &mut Keyspace,
+    now: Nanos,
+    mut emit: impl FnMut(ExecScope, &[u8], &[u8], Option<u64>),
+) -> usize {
+    let dbs: Vec<usize> = ks.dbs().map(|(i, _)| i).collect();
+    for db in dbs {
+        let scope = ExecScope::Db(u16::try_from(db).expect("db index validated at SELECT"));
+        walk_live_entries(ks.db_mut(db), scope, now, &mut emit);
+    }
+    let named: Vec<(NsId, bool)> =
+        ks.ns_iter().map(|spec| (spec.id, spec.tier.is_some())).collect();
+    let mut tiered_skipped = 0;
+    for (id, tiered) in named {
+        if tiered {
+            tiered_skipped += 1;
+            continue;
+        }
+        // A registered namespace no write reached on this cell has no
+        // store and no entries; `ns_store_mut` would materialize one.
+        if ks.ns_store(id).is_none() {
+            continue;
+        }
+        let store = ks.ns_store_mut(id).expect("materialized, checked above");
+        walk_live_entries(store, ExecScope::Ns(id), now, &mut emit);
+    }
+    tiered_skipped
+}
+
+/// One store's live entries through the resize-stable checkpoint walk, run
+/// to completion; documents emit their canonical idoc bytes as the value.
+fn walk_live_entries(
+    store: &mut CellStore,
+    scope: ExecScope,
+    now: Nanos,
+    emit: &mut impl FnMut(ExecScope, &[u8], &[u8], Option<u64>),
+) {
+    let mut cursor = 0;
+    loop {
+        cursor =
+            store.scan_checkpoint_images(
+                cursor,
+                usize::MAX,
+                now,
+                |key, image, deadline| match image {
+                    inf_store::CheckpointImage::String(value) => emit(scope, key, value, deadline),
+                    #[cfg(feature = "doc")]
+                    inf_store::CheckpointImage::JsonDoc { idoc, .. } => {
+                        emit(scope, key, idoc, deadline)
+                    }
+                },
+            );
+        if cursor == 0 {
+            break;
+        }
+    }
+}
+
 /// Owned-slice twin of `extract_keys` (the wire helper wants an `ArgvRef`).
 fn extract_keys_slices<'a>(meta: &inf_wire::CommandMeta, argv: &[&'a [u8]]) -> Vec<&'a [u8]> {
     extract_keys_iter(meta, argv).collect()
@@ -5832,14 +5973,15 @@ fn extract_keys_slices<'a>(meta: &inf_wire::CommandMeta, argv: &[&'a [u8]]) -> V
 
 /// Non-allocating key iterator over owned slices — the dispatch hot path
 /// probes key routing once per command without a `Vec` per probe (M2.5
-/// Phase H allocator lever). Semantics identical to `extract_keys_slices`:
-/// `first == 0` or `step == 0` yields nothing; `last < 0` counts from the
-/// end; iteration stops at the argv boundary.
+/// Phase H allocator lever). Semantics identical to `inf_wire::extract_keys`
+/// (both read `inf_wire::key_spec`, the subcommand-aware routing truth —
+/// ADR-0104): `first == 0` or `step == 0` yields nothing; `last < 0`
+/// counts from the end; iteration stops at the argv boundary.
 fn extract_keys_iter<'v, 'a>(
     meta: &inf_wire::CommandMeta,
     argv: &'v [&'a [u8]],
 ) -> impl Iterator<Item = &'a [u8]> + 'v {
-    let spec = meta.keys;
+    let spec = inf_wire::key_spec(meta, argv.get(1).copied());
     let last = if spec.last >= 0 {
         spec.last as usize
     } else {

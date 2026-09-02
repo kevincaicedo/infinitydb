@@ -210,6 +210,9 @@ pub struct CommandMeta {
     /// name); negative = at least `|arity|`.
     pub arity: i8,
     pub flags: CmdFlags,
+    /// The static registry row (the shape `COMMAND INFO` renders). Routing
+    /// reads [`key_spec`], which overrides this row for the
+    /// subcommand-scoped commands (ADR-0104).
     pub keys: KeySpec,
 }
 
@@ -497,11 +500,35 @@ impl<'a> Iterator for KeyIter<'_, 'a> {
     }
 }
 
-/// Extracts the key slices of `argv` per `meta.keys`. Robust against
+/// The key spec the router reads for one parsed command: the registry row,
+/// or the subcommand-scoped row for the commands whose key position
+/// depends on argv[1] (ADR-0104). `subcommand` is argv[1] when present.
+///
+/// Exactly one command has a scoped row today. `DEBUG` copies Redis's
+/// keyless table row, but Redis never routes; here `DEBUG OBJECT <key>`
+/// addresses argv[2] like its sibling `OBJECT ENCODING <key>`, while
+/// `SLEEP <secs>` / `JMAP` / `SET-ACTIVE-EXPIRE <0|1>` address nothing —
+/// so `DEBUG SLEEP 0.5` must never route on the bytes `"0.5"`. Every
+/// consumer of key positions (`extract_keys`, the plane's owner pass,
+/// `COMMAND GETKEYS`) reads this function, never `meta.keys` directly:
+/// review of 2026-08-30, L12-01 was two notions of a command's keys
+/// disagreeing about one argv shape (the last member of C1's class).
+#[inline]
+pub fn key_spec(meta: &CommandMeta, subcommand: Option<&[u8]>) -> KeySpec {
+    match meta.id {
+        CommandId::Debug => match subcommand {
+            Some(sub) if sub.eq_ignore_ascii_case(b"OBJECT") => KeySpec::SECOND,
+            _ => KeySpec::NONE,
+        },
+        _ => meta.keys,
+    }
+}
+
+/// Extracts the key slices of `argv` per [`key_spec`]. Robust against
 /// malformed arity (an argv shorter than the spec yields fewer keys — arity
 /// validation rejects the command separately).
 pub fn extract_keys<'v, 'a>(meta: &CommandMeta, argv: &'v ArgvRef<'a>) -> KeyIter<'v, 'a> {
-    let spec = meta.keys;
+    let spec = key_spec(meta, (argv.len() > 1).then(|| argv.arg(1)));
     if spec.first == 0 || argv.is_empty() {
         return KeyIter { argv, next: 1, last: 0, step: 0 };
     }

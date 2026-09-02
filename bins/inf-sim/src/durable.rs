@@ -35,8 +35,8 @@ use inf_log::ckpt::{IckReaderConfig, ick_file_name, read_ick};
 use inf_log::{ReaderConfig, SegmentId, SegmentReader, read_manifest, scan_log_dir_from};
 use inf_runtime::{CellLoop, LoopConfig};
 use inf_server::{
-    ControlInbox, ExecOrigin, NodeInfo, PlaneObserver, SegmentIoMode, ServerPlane, SimDisk,
-    SimDiskConfig, StallConfig, load_catalog_from,
+    ControlInbox, ExecOrigin, ExecScope, NodeInfo, PlaneObserver, SegmentIoMode, ServerPlane,
+    SimDisk, SimDiskConfig, StallConfig, load_catalog_from,
 };
 use inf_store::{Keyspace, NsId, StoreConfig, WallAnchor};
 
@@ -704,6 +704,7 @@ impl PlaneObserver for TraceObserver {
         &mut self,
         cell: CellId,
         origin: ExecOrigin,
+        scope: ExecScope,
         argv: &[&[u8]],
         reply: &[u8],
         _now: Nanos,
@@ -722,6 +723,7 @@ impl PlaneObserver for TraceObserver {
                 trace.extend_from_slice(&[0, 0]);
             }
         }
+        crate::harness::trace_scope(&mut trace, scope);
         trace.push(argv.len() as u8);
         for arg in argv {
             trace.extend_from_slice(&(arg.len() as u32).to_le_bytes());

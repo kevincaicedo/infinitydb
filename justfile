@@ -59,6 +59,9 @@ sim-smoke:
     # Group 0 (review 2026-08-30 §5.5): adversarial key/value lengths at
     # 4 cells — the two parameters no other gate exercises.
     cargo run --release --bin inf-sim -- --scenario m0-adversarial --seed 0xC0FFEE --cells 4 --verify-determinism
+    # F-L19-05/06: namespace-bound + SELECTed clients, SCAN/KEYS/DBSIZE/
+    # RANDOMKEY/FLUSH* under audit, values + deadlines reconciled.
+    cargo run --release --bin inf-sim -- --scenario m0-surface --seed 0xC0FFEE --cells 4 --verify-determinism
     # F-L17-14: the M4.5 index crash scenarios ran in no automated lane.
     cargo run --release --bin inf-sim -- --scenario m45-backfill --seed 0xC0FFEE --verify-determinism
     cargo run --release --bin inf-sim -- --scenario m45-sidecar --seed 0xC0FFEE --verify-determinism

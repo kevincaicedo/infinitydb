@@ -194,6 +194,7 @@ pub(super) async fn dispatch_tiered<O: PlaneObserver + 'static, F: SegmentFs + C
     shared.observer.borrow_mut().on_execute(
         shared.cell,
         origin,
+        super::ExecScope::Ns(ns),
         argv,
         reply_bytes,
         shared.now.get(),

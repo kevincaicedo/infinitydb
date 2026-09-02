@@ -1062,7 +1062,11 @@ fn command_getkeys(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
     if !inf_wire::arity_ok(meta, argv.len() - 2) {
         return w.error("ERR Invalid number of arguments specified for command");
     }
-    let spec = meta.keys;
+    // The routing truth, subcommand-aware (ADR-0104): `GETKEYS DEBUG OBJECT
+    // k` answers `k` where Redis's keyless table says "no key arguments" —
+    // the recorded deviation; introspection that hid the key the router
+    // reads would misreport the engine.
+    let spec = inf_wire::key_spec(meta, (argv.len() > 3).then(|| argv.arg(3)));
     if spec.first == 0 {
         return w.error("ERR The command has no key arguments");
     }
@@ -2753,5 +2757,17 @@ mod tests {
         assert_eq!(getkeys, b"*2\r\n$2\r\nk1\r\n$2\r\nk2\r\n");
         let nokeys = run(&mut cx, &mut store, &[b"COMMAND", b"GETKEYS", b"PING"]);
         assert!(nokeys.starts_with(b"-ERR The command has no key arguments"), "{nokeys:?}");
+        // ADR-0104: the subcommand-scoped row is the routing truth GETKEYS
+        // reports (Redis's keyless DEBUG row is the recorded deviation);
+        // the keyless DEBUG subcommands stay keyless.
+        let debug_object =
+            run(&mut cx, &mut store, &[b"COMMAND", b"GETKEYS", b"DEBUG", b"OBJECT", b"k"]);
+        assert_eq!(debug_object, b"*1\r\n$1\r\nk\r\n");
+        let debug_sleep =
+            run(&mut cx, &mut store, &[b"COMMAND", b"GETKEYS", b"DEBUG", b"SLEEP", b"0.5"]);
+        assert!(
+            debug_sleep.starts_with(b"-ERR The command has no key arguments"),
+            "{debug_sleep:?}"
+        );
     }
 }

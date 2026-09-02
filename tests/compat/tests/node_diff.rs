@@ -255,6 +255,24 @@ fn run_ns_phase(
             n_keys.difference(&o_keys).collect::<Vec<_>>()
         );
         assert_eq!(o_scan, o_keys, "{phase}: oracle SCAN vs KEYS disagree — harness bug");
+        // L12-01 (ADR-0104): `DEBUG OBJECT` must agree with `GET` on every
+        // key wherever it lives — before, it probed the connection's cell
+        // and answered "no such key" for the keys of every other cell (the
+        // reply's address field is engine-internal, so the matrix case is
+        // `SkipDiff` and could not see it). The missing-key error is
+        // byte-exact against the oracle.
+        for key in n_keys.iter() {
+            let key = std::str::from_utf8(key).expect("ascii keys");
+            let reply = cmd(node, nb, &["DEBUG", "OBJECT", key]);
+            assert!(
+                reply.starts_with(b"+Value at:"),
+                "{phase}: DEBUG OBJECT {key} disagrees with GET/KEYS: {:?}",
+                String::from_utf8_lossy(&reply)
+            );
+        }
+        let o = cmd(oracle, ob, &["DEBUG", "OBJECT", "never-set:l12-01"]);
+        let n = cmd(node, nb, &["DEBUG", "OBJECT", "never-set:l12-01"]);
+        assert_pair(&o, &n, &format!("{phase}: DEBUG OBJECT missing"), failures);
         // RANDOMKEY — two-level random is the documented deviation; the
         // guarantee that survives it is membership.
         let random = cmd(node, nb, &["RANDOMKEY"]);

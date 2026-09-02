@@ -38,3 +38,8 @@ m0-adversarial 0xBAD5EED
 # no automated lane between story close and this row.
 m45-backfill 0xC0FFEE
 m45-sidecar 0xC0FFEE
+# F-L19-05 / F-L19-06 (review of 2026-08-30): the surface mix — SELECTed and
+# namespace-bound clients, concurrent SCAN walks, quiescent audits of the
+# served surface and the stored content (values, deadlines), seeded flushes.
+m0-surface 0xC0FFEE
+m0-surface 0x5CA1AB1E
