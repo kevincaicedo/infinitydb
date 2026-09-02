@@ -31,7 +31,9 @@ shards=${INF_SWEEP_SHARDS:-8}
 if [ -n "${INF_SIM_BIN:-}" ]; then
     sim=$INF_SIM_BIN
 else
-    cargo build --release --bin inf-sim
+    # ADR-0107: a DST binary is built with its `dst` feature (fault points +
+    # collision oracle) — never through the workspace graph.
+    cargo build --release -p inf-sim --features dst --bin inf-sim
     sim=./target/release/inf-sim
 fi
 [ -x "$sim" ] || { echo "run-sweep: simulator not executable: $sim" >&2; exit 2; }

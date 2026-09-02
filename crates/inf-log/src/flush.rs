@@ -357,9 +357,13 @@ impl<F: SegmentFs> TierFlush<F> {
                 cursor,
                 "flush ranges are contiguous; gaps go through seal_for_gap_queued"
             );
-            if w.data_len() > 0 && w.data_len() + bytes.len() as u64 > self.config.file_capacity {
-                self.seal_active_queued(SealReason::Capacity);
-            }
+        }
+        let capacity = self.config.file_capacity;
+        if let Some(writer) = self
+            .writer
+            .take_if(|w| w.data_len() > 0 && w.data_len() + bytes.len() as u64 > capacity)
+        {
+            self.seal_writer_queued(writer, SealReason::Capacity);
         }
         if self.writer.is_none() {
             self.create_file_queued(addr)?;
@@ -376,8 +380,8 @@ impl<F: SegmentFs> TierFlush<F> {
     /// completion (ADR-0052 D2, completion-gated).
     pub fn seal_for_gap_queued(&mut self, gap_end: u64) {
         assert_eq!(self.drive, TierDrive::Reactor, "queued gap seal on the seam drive");
-        if self.writer.is_some() {
-            self.seal_active_queued(SealReason::RingTopGap);
+        if let Some(writer) = self.writer.take() {
+            self.seal_writer_queued(writer, SealReason::RingTopGap);
         }
         let round = self.round.get_or_insert_with(TierRound::new);
         round.push_effect(RoundEffect::GapCross { to: gap_end });
@@ -456,8 +460,7 @@ impl<F: SegmentFs> TierFlush<F> {
         self.pending_seals.len()
     }
 
-    fn seal_active_queued(&mut self, reason: SealReason) {
-        let writer = self.writer.take().expect("caller checked an active file exists");
+    fn seal_writer_queued(&mut self, writer: TierWriter<F>, reason: SealReason) {
         let round = self.round.get_or_insert_with(TierRound::new);
         let sealed: QueuedSeal<F::File> = writer.seal_queued(reason, round, &mut self.pool);
         round.push_effect(RoundEffect::SealCommit);
@@ -673,9 +676,13 @@ impl<F: SegmentFs> TierFlush<F> {
                 cursor,
                 "flush ranges are contiguous; gaps go through seal_for_gap"
             );
-            if w.data_len() > 0 && w.data_len() + bytes.len() as u64 > self.config.file_capacity {
-                self.seal_active(SealReason::Capacity)?;
-            }
+        }
+        let capacity = self.config.file_capacity;
+        if let Some(writer) = self
+            .writer
+            .take_if(|w| w.data_len() > 0 && w.data_len() + bytes.len() as u64 > capacity)
+        {
+            self.seal_writer(writer, SealReason::Capacity)?;
         }
         if self.writer.is_none() {
             self.create_file(addr)?;
@@ -697,8 +704,8 @@ impl<F: SegmentFs> TierFlush<F> {
     /// after it) is not yet crossable.
     pub fn seal_for_gap(&mut self) -> Result<(), TierFlushError> {
         assert!(self.round.is_none(), "seam gap seal while a reactor round is in flight");
-        if self.writer.is_some() {
-            self.seal_active(SealReason::RingTopGap)?;
+        if let Some(writer) = self.writer.take() {
+            self.seal_writer(writer, SealReason::RingTopGap)?;
         }
         Ok(())
     }
@@ -724,8 +731,8 @@ impl<F: SegmentFs> TierFlush<F> {
     /// [`TierFlushError`] as for any seal.
     pub fn seal_shutdown(&mut self) -> Result<(), TierFlushError> {
         assert!(self.round.is_none(), "seam seal while a reactor round is in flight");
-        if self.writer.is_some() {
-            self.seal_active(SealReason::Shutdown)?;
+        if let Some(writer) = self.writer.take() {
+            self.seal_writer(writer, SealReason::Shutdown)?;
         }
         Ok(())
     }
@@ -740,8 +747,8 @@ impl<F: SegmentFs> TierFlush<F> {
     /// [`TierFlushError`] as for any seal.
     pub fn seal_stall(&mut self) -> Result<(), TierFlushError> {
         assert!(self.round.is_none(), "seam seal while a reactor round is in flight");
-        if self.writer.is_some() {
-            self.seal_active(SealReason::Stall)?;
+        if let Some(writer) = self.writer.take() {
+            self.seal_writer(writer, SealReason::Stall)?;
         }
         Ok(())
     }
@@ -781,8 +788,11 @@ impl<F: SegmentFs> TierFlush<F> {
         Ok(())
     }
 
-    fn seal_active(&mut self, reason: SealReason) -> Result<(), TierFlushError> {
-        let writer = self.writer.take().expect("caller checked an active file exists");
+    fn seal_writer(
+        &mut self,
+        writer: TierWriter<F>,
+        reason: SealReason,
+    ) -> Result<(), TierFlushError> {
         let base = writer.base();
         let path_hint = writer.path().to_path_buf();
         let (sealed, handle) =

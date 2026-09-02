@@ -9,7 +9,14 @@ check:
     ./scripts/check-fault-points.sh
     ./scripts/check-fsync-fail-stop.sh
     ./scripts/check-panic-policy.sh
+    # ADR-0107 D2 (review 2026-08-30, Theme 4): every release assert/expect/
+    # panic/unreachable in cell code is a classified inventory row.
+    ./scripts/check-release-asserts.sh
     ./scripts/check-safety-inventory.sh
+    # ADR-0107 (review 2026-08-30, F-L16-01): no normal dependency edge may
+    # request fault-points/collision-oracle — a workspace build would link
+    # infinityd against a colliding hasher.
+    ./scripts/check-shipping-features.sh
     # ADR-0106: the gates above must go red on a planted violation, or
     # their OK is a claim (review 2026-08-30 P1/P1c: two were inert).
     ./scripts/check-scripts-selftest.sh
@@ -58,28 +65,29 @@ compat:
 # net against the wired plane: cut → recover → §8.2 command audit →
 # re-pressure flush liveness → DISKFULL clamp → the S19 drop race).
 sim-smoke:
-    cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
     # Group 0 (review 2026-08-30 §5.5): adversarial key/value lengths at
     # 4 cells — the two parameters no other gate exercises.
-    cargo run --release --bin inf-sim -- --scenario m0-adversarial --seed 0xC0FFEE --cells 4 --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-adversarial --seed 0xC0FFEE --cells 4 --verify-determinism
     # F-L19-05/06: namespace-bound + SELECTed clients, SCAN/KEYS/DBSIZE/
     # RANDOMKEY/FLUSH* under audit, values + deadlines reconciled.
-    cargo run --release --bin inf-sim -- --scenario m0-surface --seed 0xC0FFEE --cells 4 --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-surface --seed 0xC0FFEE --cells 4 --verify-determinism
     # F-L17-14: the M4.5 index crash scenarios ran in no automated lane.
-    cargo run --release --bin inf-sim -- --scenario m45-backfill --seed 0xC0FFEE --verify-determinism
-    cargo run --release --bin inf-sim -- --scenario m45-sidecar --seed 0xC0FFEE --verify-determinism
-    cargo run --release --bin inf-sim -- --scenario m4-steel --seed 0xC0FFEE --verify-determinism
-    cargo run --release --bin inf-sim -- --scenario m4-pressure --seed 0xC0FFEE --verify-determinism
-    cargo run --release --bin inf-sim -- --scenario m4-cold --seed 0xC0FFEE --verify-determinism
-    cargo run --release --bin inf-sim -- --scenario m4-recovery --seed 0xC0FFEE --verify-determinism
-    cargo run --release --bin inf-sim -- --scenario m4-diskfull --seed 0xC0FFEE --verify-determinism
-    cargo run --release --bin inf-sim -- --scenario m4-tiered --seed 0xC0FFEE --verify-determinism
-    cargo run --release --bin inf-sim -- --scenario m2-ns-create-window --seed 0xC0FFEE --verify-determinism
-    cargo run --release --bin inf-sim -- --scenario m2-device-budget --seed 0xC0FFEE --verify-determinism
-    cargo run --release --bin inf-sim -- --scenario m2-mode-transition --seed 0xC0FFEE --verify-determinism
-    cargo run --release --bin inf-sim -- --scenario m2-reorder-window --seed 0xC0FFEE --verify-determinism
-    cargo run --release --bin inf-sim -- --scenario m2-ckpt-refused --seed 0xC0FFEE --verify-determinism
-    cargo run --release --bin inf-sim -- --scenario m2-recycle --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-backfill --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-sidecar --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-steel --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-pressure --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-cold --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-recovery --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-diskfull --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-tiered --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ns-create-window --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ns-ddl-race --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-device-budget --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-mode-transition --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-reorder-window --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ckpt-refused --seed 0xC0FFEE --verify-determinism
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-recycle --seed 0xC0FFEE --verify-determinism
 
 # M2-S19 durability sweep (the §6 dst_sweep gate shape). Every *-sweep
 # recipe runs through scripts/run-sweep.sh (ADR-0106 D7): eight shards,

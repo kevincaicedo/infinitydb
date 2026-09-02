@@ -631,8 +631,17 @@ pub fn execute(
                 // Tiered namespaces are plane-resident (M4-S26): their
                 // command path needs the reactor (cold-read suspension,
                 // WAL staging), so the planeless fallback refuses rather
-                // than silently serving the empty CellStore shell.
-                if ks.is_tiered(id) {
+                // than silently serving the empty CellStore shell — for
+                // a command that addresses the keyspace. A connection-
+                // level command (`HELLO`, `PING`, `CLIENT`, … —
+                // `KeyspaceScope::None`, ADR-0108) touches no store and
+                // executes here whatever the binding: review of
+                // 2026-08-30, the batch-8 residual — `HELLO` on a
+                // tiered-bound connection answered this refusal.
+                if ks.is_tiered(id)
+                    && inf_wire::keyspace_scope(meta, (argv.len() > 1).then(|| argv.arg(1)))
+                        != inf_wire::KeyspaceScope::None
+                {
                     let mut w = RespWriter::new(out, cx.proto);
                     return w.error("ERR tiered namespaces require the server plane (M4-S26)");
                 }

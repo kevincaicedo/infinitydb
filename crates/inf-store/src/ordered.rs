@@ -1281,38 +1281,6 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
         }
         leaf.refs[slot]
     }
-
-    /// Test-only deep invariant check: pairs strictly ascending across
-    /// the whole leaf chain, chain covers `len` exactly, min occupancy
-    /// once the tree is past trivial size.
-    #[cfg(test)]
-    fn check_invariants(&self) {
-        if self.root == NONE {
-            assert_eq!(self.len, 0);
-            return;
-        }
-        let mut leaf = self.leftmost_leaf();
-        let mut total = 0u64;
-        let mut prev: Option<(Vec<u8>, u64)> = None;
-        let mut buf = Vec::new();
-        while leaf != NONE {
-            let node = self.leaves.get(leaf);
-            assert!(node.count > 0, "empty leaf in chain");
-            for slot in 0..node.count as usize {
-                let entry_ref = self.emit_key(leaf, slot, &mut buf);
-                if let Some((prev_key, prev_ref)) = &prev {
-                    assert!(
-                        (prev_key.as_slice(), *prev_ref) < (buf.as_slice(), entry_ref),
-                        "pairs must be strictly ascending"
-                    );
-                }
-                prev = Some((buf.clone(), entry_ref));
-                total += 1;
-            }
-            leaf = node.next;
-        }
-        assert_eq!(total, self.len, "leaf chain must cover len exactly");
-    }
 }
 
 /// The allocations an [`OrderedMap::insert_split`] needs, gathered
@@ -1558,6 +1526,42 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::collections::BTreeSet;
+
+    // Moved into the test module (ADR-0106 D3 / ADR-0107 D2): an inline
+    // `#[cfg(test)]` item is scanned as production by the release-assert
+    // census; a test-only checker lives where the census strips it.
+    impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
+        /// Deep invariant check: pairs strictly ascending across
+        /// the whole leaf chain, chain covers `len` exactly, min occupancy
+        /// once the tree is past trivial size.
+        fn check_invariants(&self) {
+            if self.root == NONE {
+                assert_eq!(self.len, 0);
+                return;
+            }
+            let mut leaf = self.leftmost_leaf();
+            let mut total = 0u64;
+            let mut prev: Option<(Vec<u8>, u64)> = None;
+            let mut buf = Vec::new();
+            while leaf != NONE {
+                let node = self.leaves.get(leaf);
+                assert!(node.count > 0, "empty leaf in chain");
+                for slot in 0..node.count as usize {
+                    let entry_ref = self.emit_key(leaf, slot, &mut buf);
+                    if let Some((prev_key, prev_ref)) = &prev {
+                        assert!(
+                            (prev_key.as_slice(), *prev_ref) < (buf.as_slice(), entry_ref),
+                            "pairs must be strictly ascending"
+                        );
+                    }
+                    prev = Some((buf.clone(), entry_ref));
+                    total += 1;
+                }
+                leaf = node.next;
+            }
+            assert_eq!(total, self.len, "leaf chain must cover len exactly");
+        }
+    }
 
     type FixedMap = OrderedMap<Fixed8, 16>;
     type VarMap = OrderedMap<VarKey, 16>;

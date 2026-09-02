@@ -191,7 +191,7 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: campaign harnesses build (release)
-        run: cargo build --release -p inf-bench -p inf-compare -p inf-sim
+        run: cargo build --release -p inf-bench -p inf-compare -p inf-sim --features inf-sim/dst
       - name: criterion benches compile (no run)
         run: cargo bench --workspace --no-run
 

@@ -318,9 +318,205 @@ expect red "run-sweep: one shard exits non-zero (the bare-wait gap)" env INF_SIM
 expect red "run-sweep: one shard reports violations" env INF_SIM_BIN="$stub" INF_SWEEP_SHARDS=4 STUB_VIOLATING=3 $SWEEP stub 8 0x1
 expect red "run-sweep: one shard writes no manifest" env INF_SIM_BIN="$stub" INF_SWEEP_SHARDS=4 STUB_NO_MANIFEST=0 $SWEEP stub 8 0x1
 
+# ------------------------------------------------------ shipping features
+# ADR-0107 (F-L16-01): the manifest scan runs on fixture roots (the
+# resolver half needs a real workspace and is skipped under INF_CHECK_ROOT).
+SHIP=./scripts/check-shipping-features.sh
+
+# manifest <name> <toml…>: a fresh root with one crate manifest from stdin.
+manifest() {
+    local name=$1 root
+    [ -n "$name" ] && [ -n "$work" ] || { echo "manifest: empty name or work dir" >&2; exit 2; }
+    root="$work/$name"
+    [ -e "$root" ] && rm -rf "$root"
+    mkdir -p "$root/crates/fake"
+    cat >"$root/crates/fake/Cargo.toml"
+    echo "$root"
+}
+
+root=$(manifest ship-clean <<'EOF'
+[package]
+name = "fake"
+
+[dependencies]
+inf-foundation = { workspace = true }
+
+[dev-dependencies]
+inf-foundation = { workspace = true, features = ["fault-points", "collision-oracle"] }
+EOF
+)
+expect green "shipping: dev-dependency edge may request the features" env INF_CHECK_ROOT="$root" $SHIP
+expect_output "shipping: scope line discloses the scan" "1 manifests scanned" env INF_CHECK_ROOT="$root" $SHIP
+
+mkdir -p "$work/ship-empty/crates"
+expect red "shipping: no manifests at all is a failure, not OK" env INF_CHECK_ROOT="$work/ship-empty" $SHIP
+
+root=$(manifest ship-normal <<'EOF'
+[package]
+name = "fake"
+
+[dependencies]
+inf-foundation = { workspace = true, features = ["collision-oracle", "fault-points"] }
+EOF
+)
+expect red "shipping: the F-L16-01 shape — a normal edge requests the features" env INF_CHECK_ROOT="$root" $SHIP
+
+root=$(manifest ship-table <<'EOF'
+[package]
+name = "fake"
+
+[dependencies.inf-foundation]
+workspace = true
+features = ["fault-points"]
+EOF
+)
+expect red "shipping: a [dependencies.NAME] table requesting the feature" env INF_CHECK_ROOT="$root" $SHIP
+
+root=$(manifest ship-target <<'EOF'
+[package]
+name = "fake"
+
+[target.'cfg(unix)'.dependencies]
+inf-foundation = { workspace = true, features = ["fault-points"] }
+EOF
+)
+expect red "shipping: a target-cfg dependency edge is a normal edge" env INF_CHECK_ROOT="$root" $SHIP
+
+root=$(manifest ship-default <<'EOF'
+[package]
+name = "fake"
+
+[features]
+default = ["sim"]
+sim = ["dst"]
+dst = ["inf-foundation/fault-points"]
+
+[dependencies]
+inf-foundation = { workspace = true }
+EOF
+)
+expect red "shipping: default reaching a forwarder (transitively)" env INF_CHECK_ROOT="$root" $SHIP
+
+root=$(manifest ship-forwarder <<'EOF'
+[package]
+name = "fake"
+
+[features]
+dst = [
+    "inf-foundation/collision-oracle",
+    "inf-foundation/fault-points",
+]
+
+[dependencies]
+inf-foundation = { workspace = true }
+EOF
+)
+expect green "shipping: a non-default forwarder feature (inf-sim's dst shape)" env INF_CHECK_ROOT="$root" $SHIP
+expect_output "shipping: forwarders are counted" "1 forwarder feature(s)" env INF_CHECK_ROOT="$root" $SHIP
+
+# --------------------------------------------------- release-assert inventory
+# ADR-0107 D2: a fixture crate with one release assert and one expect, and
+# the inventory that names them; each planted drift is red.
+RELEASE=./scripts/check-release-asserts.sh
+
+# inventory <root> <rows…>: writes docs/release-assert-inventory.tsv under
+# the fixture root from stdin.
+inventory() {
+    local root=$1
+    [ -n "$root" ] && [ -d "$root" ] || { echo "inventory: bad root" >&2; exit 2; }
+    mkdir -p "$root/docs"
+    cat >"$root/docs/release-assert-inventory.tsv"
+}
+
+root=$(fixture ra-clean <<'EOF'
+pub fn ok(n: u64) -> u64 {
+    assert!(n > 0, "n is positive");
+    let v: Option<u64> = Some(n);
+    v.expect("just built")
+}
+
+#[cfg(test)]
+mod tests {
+    fn scratch() { assert!(false, "never counted"); }
+}
+EOF
+)
+inventory "$root" <<'EOF'
+# fixture
+I	1	crates/fake/src/lib.rs	assert	n is positive	own argument check
+I	1	crates/fake/src/lib.rs	expect	just built	built two lines up
+EOF
+expect green "release-asserts: matching inventory" env INF_CHECK_ROOT="$root" $RELEASE
+expect_output "release-asserts: scope line discloses sites and classes" "2 release-panic sites in 2 identities" env INF_CHECK_ROOT="$root" $RELEASE
+
+root=$(fixture ra-missing <<'EOF'
+pub fn ok(n: u64) -> u64 { assert!(n > 0, "n is positive"); n }
+EOF
+)
+expect red "release-asserts: no inventory file is a scope failure" env INF_CHECK_ROOT="$root" $RELEASE
+
+root=$(fixture ra-new <<'EOF'
+pub fn ok(n: u64) -> u64 {
+    assert!(n > 0, "n is positive");
+    assert!(n < 10, "n is small");
+    n
+}
+EOF
+)
+inventory "$root" <<'EOF'
+I	1	crates/fake/src/lib.rs	assert	n is positive	own argument check
+EOF
+expect red "release-asserts: a new site is unclassified" env INF_CHECK_ROOT="$root" $RELEASE
+
+root=$(fixture ra-stale <<'EOF'
+pub fn ok(n: u64) -> u64 { assert!(n > 0, "n is positive"); n }
+EOF
+)
+inventory "$root" <<'EOF'
+I	1	crates/fake/src/lib.rs	assert	n is positive	own argument check
+I	1	crates/fake/src/lib.rs	expect	gone	vanished
+EOF
+expect red "release-asserts: a stale row is red" env INF_CHECK_ROOT="$root" $RELEASE
+
+root=$(fixture ra-count <<'EOF'
+pub fn a(n: u64) -> u64 { assert!(n > 0, "n is positive"); n }
+pub fn b(n: u64) -> u64 { assert!(n > 0, "n is positive"); n }
+EOF
+)
+inventory "$root" <<'EOF'
+I	1	crates/fake/src/lib.rs	assert	n is positive	own argument check
+EOF
+expect red "release-asserts: a second site behind one identity is a count mismatch" env INF_CHECK_ROOT="$root" $RELEASE
+
+root=$(fixture ra-caller <<'EOF'
+pub fn write(len: usize) { assert!(len <= 255, "caller validated the length"); }
+EOF
+)
+inventory "$root" <<'EOF'
+C	1	crates/fake/src/lib.rs	assert	caller validated the length	trust me
+EOF
+expect red "release-asserts: a C row without a proof pointer is red" env INF_CHECK_ROOT="$root" $RELEASE
+inventory "$root" <<'EOF'
+C	1	crates/fake/src/lib.rs	assert	caller validated the length	store.rs:check_bounds at every write entry
+EOF
+expect green "release-asserts: a C row citing file.rs:function is accepted" env INF_CHECK_ROOT="$root" $RELEASE
+inventory "$root" <<'EOF'
+Q	1	crates/fake/src/lib.rs	assert	caller validated the length	store.rs:check_bounds
+EOF
+expect red "release-asserts: an unknown class is red" env INF_CHECK_ROOT="$root" $RELEASE
+
+root=$(fixture ra-debug <<'EOF'
+pub fn ok(n: u64) -> u64 { debug_assert!(n > 0, "debug only"); n }
+EOF
+)
+inventory "$root" <<'EOF'
+# nothing: debug asserts are not release sites
+EOF
+expect red "release-asserts: an inventory with no rows is a scope failure" env INF_CHECK_ROOT="$root" $RELEASE
+
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts each red on a planted violation)"
