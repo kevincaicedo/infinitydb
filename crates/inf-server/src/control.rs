@@ -23,6 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+// denylist-allow: the cell->control DDL channel (ADR-0015 D3), drained on this thread only.
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -1133,6 +1134,7 @@ pub fn spawn(
     let allocator = Arc::clone(&handle);
     let persisted = Arc::clone(&handle.persisted_epoch);
     let board = Arc::clone(&handle.recovery);
+    // denylist-allow: the control thread itself (ADR-0015 D3) - the slow plane, never a cell.
     std::thread::Builder::new()
         .name("inf-control".into())
         .spawn(move || {
@@ -1213,6 +1215,7 @@ fn control_main(
         // narration only, never oracle input (those ride the
         // injected clocks).
         let mut announced = vec![false; usize::from(cells)];
+        // denylist-allow: boot-narration wall clock on the control thread, never oracle input.
         let boot_started = std::time::Instant::now();
         let mut next_progress = boot_started + Duration::from_secs(1);
         while !board.all_ready() {
@@ -1266,6 +1269,7 @@ fn control_main(
                     );
                 }
             }
+            // denylist-allow: boot-narration wall clock on the control thread, never oracle input.
             let now = std::time::Instant::now();
             if now >= next_progress && !board.all_ready() {
                 next_progress = now + Duration::from_secs(1);

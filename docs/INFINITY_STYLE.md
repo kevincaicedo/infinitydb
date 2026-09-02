@@ -171,6 +171,21 @@ fault-point and fsync-fail-stop greps, the attribution-divergence gate —
 are not bureaucracy; they are laws made cheap. Never weaken a check to
 merge; change the law first (ADR) or fix the code.
 
+A check that silently checks nothing is worse than no check, because it
+is trusted (ADR-0106 — the 2026-08-30 review found the cell deny-list
+scanning a directory that did not exist and the panic-policy grep cut at
+22 % of a file, both green for months). So every `check-*.sh` **asserts
+its scope**: a missing directory, an empty file set, or a truncated scan
+is a failure, not a skip; the success line discloses what was scanned;
+exemptions are per-site markers that carry a reason (`denylist-allow:
+<why>`, `panic-policy-allow: <why>`) and are listed in the output; and
+`check-scripts-selftest.sh` runs a planted violation through each gate
+inside `just check` — a gate that cannot go red is not a gate. The same
+rule binds CI evidence: a workflow never writes a number an instrument
+should have measured (the nightly's `sim_seconds=` lines come from the
+virtual clocks that advanced), and a sweep recipe's exit status is the
+verdict of every shard.
+
 ## Performance
 
 > "The lack of back-of-the-envelope performance sketches is the root of all

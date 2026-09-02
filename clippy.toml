@@ -4,6 +4,9 @@
 disallowed-types = [
     { path = "std::sync::Mutex", reason = "no locks on the data plane (L1); control-thread code may use parking primitives via inf-server::control only" },
     { path = "std::sync::RwLock", reason = "no locks on the data plane (L1)" },
+    # Review 2026-08-30 F-L18-05: the grep in check-cell-denylist.sh cannot see
+    # through `use std::sync::{Condvar}`; this entry is type-resolved and can.
+    { path = "std::sync::Condvar", reason = "no blocking waits on the data plane (L1/L6); cells park via the backend idle strategy" },
 ]
 disallowed-methods = [
     { path = "std::thread::sleep", reason = "cells park via the backend driver idle strategy, never thread::sleep" },
