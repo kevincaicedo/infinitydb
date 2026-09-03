@@ -211,6 +211,37 @@ fn del_with_no_matches_changes_nothing() {
     assert_eq!(outcome.applied, 0);
 }
 
+/// Review C10: an index the evaluator used to wrap onto element 0 must
+/// be a no-op on the mutation lane — for DEL, SET, and the numeric op
+/// through the canonical `apply` path (the non-simple shapes that skip
+/// the in-place probe), and through a giant-step slice (C11).
+#[test]
+fn indices_beyond_the_u32_width_mutate_nothing() {
+    let frag = fragment(&Value::I64(999));
+    for path in ["$[4294967296]", "$[4294967297]", "$[8589934592]", "$[9223372036854775807]"] {
+        let outcome = run(r#"[10,20,30]"#, path, &ApplyOp::Del).expect("no-op succeeds");
+        assert!(outcome.bytes.is_none(), "DEL {path} must not edit");
+        assert_eq!(outcome.applied, 0);
+        let outcome = run(r#"[10,20,30]"#, path, &ApplyOp::SetReplace { fragment: &frag })
+            .expect("no-op succeeds");
+        assert!(outcome.bytes.is_none(), "SET {path} must not edit");
+        assert_eq!(outcome.applied, 0);
+    }
+    let union = "$[4294967296,4294967296]";
+    let outcome =
+        run(r#"[10,20,30]"#, union, &ApplyOp::NumIncrBy(Number::I64(1000))).expect("no-op");
+    assert!(outcome.bytes.is_none(), "NUMINCRBY {union} must not edit");
+    assert_eq!(outcome.applied, 0);
+    // The slice cursor at i64::MAX: exactly one element, then the walk ends.
+    let (json, outcome) = applied_json(
+        r#"[10,20,30]"#,
+        "$[1::9223372036854775807]",
+        &ApplyOp::NumIncrBy(Number::I64(1)),
+    );
+    assert_eq!(json, r#"[10,21,30]"#);
+    assert_eq!(outcome.applied, 1);
+}
+
 // ---- SET (replace + member create; parent rules per ADR-0041 D6) -----------
 
 #[test]

@@ -268,16 +268,39 @@ fn arb_name() -> impl Strategy<Value = Vec<u8>> {
     ]
 }
 
+/// The `i64` extremes and `u32` aliases (review C10/C11): the text form
+/// must print and reparse every one of them exactly.
+static EXTREME_INTS: [i64; 8] = [
+    u32::MAX as i64,
+    1 << 32,
+    (1 << 32) + 1,
+    i64::MAX,
+    -(1 << 32),
+    -(1 << 32) - 1,
+    i64::MIN + 1,
+    i64::MIN,
+];
+
+fn arb_int() -> BoxedStrategy<i64> {
+    prop_oneof![8 => -9i64..9, 1 => proptest::sample::select(&EXTREME_INTS[..])].boxed()
+}
+
 fn arb_slice() -> impl Strategy<Value = SliceSpec> {
-    let field = proptest::option::of(-9i64..9);
-    let step = proptest::option::of(prop_oneof![(-4i64..0), (1i64..4)]);
+    let field = proptest::option::of(arb_int());
+    let step = proptest::option::of(
+        prop_oneof![
+            8 => prop_oneof![(-4i64..0), (1i64..4)],
+            1 => proptest::sample::select(&EXTREME_INTS[..]),
+        ]
+        .boxed(),
+    );
     (field.clone(), field, step).prop_map(|(start, end, step)| SliceSpec { start, end, step })
 }
 
 fn arb_member() -> impl Strategy<Value = Member> {
     prop_oneof![
         arb_name().prop_map(Member::Name),
-        (-9i64..9).prop_map(Member::Index),
+        arb_int().prop_map(Member::Index),
         arb_slice().prop_map(Member::Slice),
     ]
 }
@@ -286,7 +309,7 @@ fn arb_selector() -> impl Strategy<Value = Segment> {
     prop_oneof![
         arb_name().prop_map(Segment::Child),
         Just(Segment::ChildAny),
-        (-9i64..9).prop_map(Segment::Index),
+        arb_int().prop_map(Segment::Index),
         arb_slice().prop_map(Segment::Slice),
         proptest::collection::vec(arb_member(), 2..5).prop_map(Segment::Union),
     ]

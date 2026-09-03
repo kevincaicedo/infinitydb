@@ -917,6 +917,93 @@ fn reply_corpus_is_pinned_under_resp3_with_protocol_nulls() {
 /// magnitude ≥ 1e40 (or below 1e-40) reached it through every numeric
 /// reply on a RESP3 connection and killed the cell. Rust's `Display`
 /// prints `1e300` as 301 digits; the reply now carries them.
+/// Review C10: a path index beyond the `u32` width used to wrap onto a
+/// real element — `JSON.GET` answered element 0 for `[4294967296]`, and
+/// `JSON.SET` / `JSON.DEL` overwrote or deleted it with a success reply,
+/// while `[99]` was correctly refused. Every command must now treat the
+/// index as the out-of-range one it is, on every evaluation lane.
+#[test]
+fn path_index_beyond_the_u32_width_selects_nothing_on_every_command() {
+    let mut db = Db::new();
+    db.run_str(&["JSON.SET", "d", "$", r#"{"a":[10,20,30,40,50],"b":[true]}"#]);
+    let intact = bulk("[[10,20,30,40,50]]");
+    // Read lane, both modes, simple and general programs.
+    for index in ["4294967296", "4294967297", "8589934592", "4294967295", "9223372036854775807"] {
+        let dollar = format!("$.a[{index}]");
+        assert_reply(&mut db, &["JSON.GET", "d", &dollar], &bulk("[]"));
+        let legacy = format!(".a[{index}]");
+        assert_reply(
+            &mut db,
+            &["JSON.GET", "d", &legacy],
+            &format!("-ERR Path '{legacy}' does not exist\r\n"),
+        );
+        let union = format!("$.a[{index},1]");
+        assert_reply(&mut db, &["JSON.GET", "d", &union], &bulk("[20]"));
+        let descend = format!("$..[{index}]");
+        assert_reply(&mut db, &["JSON.GET", "d", &descend], &bulk("[]"));
+    }
+    // Controls: the in-range neighbours and an ordinary out-of-range index.
+    assert_reply(&mut db, &["JSON.GET", "d", "$.a[4]"], &bulk("[50]"));
+    assert_reply(&mut db, &["JSON.GET", "d", "$.a[5]"], &bulk("[]"));
+    assert_reply(&mut db, &["JSON.GET", "d", "$.a[99]"], &bulk("[]"));
+    // Mutation lane: the review's exact rows.
+    assert_reply(
+        &mut db,
+        &["JSON.SET", "d", "$.a[4294967296]", "999"],
+        "-ERR Path '$.a[4294967296]' does not exist\r\n",
+    );
+    assert_reply(&mut db, &["JSON.GET", "d", "$.a"], &intact);
+    assert_reply(&mut db, &["JSON.DEL", "d", "$.a[4294967296]"], ":0\r\n");
+    assert_reply(&mut db, &["JSON.GET", "d", "$.a"], &intact);
+    // The numeric op on both of its lanes: the in-place probe (simple
+    // path, same-width result) and the canonical apply lane (a union is
+    // never simple), plus the width-changing operand on the simple path.
+    assert_reply(&mut db, &["JSON.NUMINCRBY", "d", "$.a[4294967296]", "1"], &bulk("[]"));
+    assert_reply(&mut db, &["JSON.NUMINCRBY", "d", "$.a[4294967296]", "1000"], &bulk("[]"));
+    assert_reply(
+        &mut db,
+        &["JSON.NUMINCRBY", "d", "$.a[4294967296,4294967296]", "1000"],
+        &bulk("[]"),
+    );
+    assert_reply(
+        &mut db,
+        &["JSON.NUMINCRBY", "d", ".a[4294967296]", "1"],
+        "-ERR Path '.a[4294967296]' does not exist\r\n",
+    );
+    assert_reply(&mut db, &["JSON.TOGGLE", "d", "$.b[4294967296]"], "*0\r\n");
+    assert_reply(&mut db, &["JSON.GET", "d"], &bulk(r#"{"a":[10,20,30,40,50],"b":[true]}"#));
+}
+
+/// Review C11: a slice step near `i64::MAX` overflowed the cursor and
+/// killed the cell on one `JSON.GET`. Every step magnitude is a bounded
+/// walk now, on the read lane and through the mutation planner.
+#[test]
+fn giant_slice_steps_answer_bounded_selections() {
+    let mut db = Db::new();
+    db.run_str(&["JSON.SET", "d", "$", r#"{"a":[10,20,30,40,50]}"#]);
+    let cases = [
+        ("$.a[0:5:1]", "[10,20,30,40,50]"),
+        ("$.a[1::4294967296]", "[20]"),
+        ("$.a[1::9223372036854775807]", "[20]"),
+        ("$.a[2:100:9223372036854775806]", "[30]"),
+        ("$.a[-1::9223372036854775807]", "[50]"),
+        ("$.a[::-9223372036854775808]", "[50]"),
+        ("$.a[3:0:-9223372036854775808]", "[40]"),
+        ("$.a[-9223372036854775808:9223372036854775807]", "[10,20,30,40,50]"),
+        ("$.a[9223372036854775807:-9223372036854775808:-1]", "[50,40,30,20,10]"),
+    ];
+    for (path, want) in cases {
+        assert_reply(&mut db, &["JSON.GET", "d", path], &bulk(want));
+    }
+    assert_reply(
+        &mut db,
+        &["JSON.NUMINCRBY", "d", "$.a[1::9223372036854775807]", "1"],
+        &bulk("[21]"),
+    );
+    assert_reply(&mut db, &["JSON.DEL", "d", "$.a[-1::9223372036854775807]"], ":1\r\n");
+    assert_reply(&mut db, &["JSON.GET", "d", "$.a"], &bulk("[[10,21,30,40]]"));
+}
+
 #[test]
 fn resp3_numeric_replies_survive_extreme_doubles() {
     let mut db = Db::new();
