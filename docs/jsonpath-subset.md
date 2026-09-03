@@ -99,7 +99,7 @@ is the reader's map.
 | `$` | `Root` | the root value |
 | `.name` / `['name']` | `Child(name)` | member `name` of an object; nothing on non-objects |
 | `.*` / `[*]` | `ChildAny` | every member value (objects, insertion order) / every element (arrays) |
-| `[3]` / `[-1]` | `Index(3)` / `Index(-1)` | array element, negatives from the end; nothing on non-arrays or out of range |
+| `[3]` / `[-1]` | `Index(3)` / `Index(-1)` | array element, negatives from the end; nothing on non-arrays or out of range. Indices are `i64`; a resolved index outside `[0, len)` selects nothing — including every value beyond the `u32` ordinal width, which never wraps onto a real element (review C10) |
 | `[a:b:s]` | `Slice(a,b,s)` | Python slice semantics over arrays: negatives resolved against `len`, then clamped; `s < 0` walks backward; omitted fields default per Python (`s` omitted = 1; `a`/`b` defaults depend on sign of `s`); nothing on non-arrays |
 | `[x, 1, a:b]` | `Union(n)` + members | concatenation of member selections, member order, duplicates kept (canonicalized to document order + deduplicated for mutation, ADR-0040 D5/R5) |
 | `..sel` | `Descend` + sel | `sel` applied to the node itself and every descendant, pre-order (document order) |
@@ -120,6 +120,12 @@ This is exactly Python's `list[a:b:s]` index set, the behavior RFC 9535
 specifies and the RedisJSON implementation family inherits; the S21
 oracle corpus pins the edges (`[::-1]`, `[-1:]`, `[:0:-1]`, over-range
 bounds, `len 0`).
+
+`s` is any non-zero `i64` and the walk is total: the cursor advances by
+saturating addition, so a step of any magnitude yields exactly the index
+set above (a step ≥ `len` from any in-range `a` yields one element) and
+never wraps — `[1::9223372036854775807]` on `[10,20,30]` is `[20]`
+(review C11).
 
 ## 5. Canonical printing (the `parse(print(ast)) == ast` contract)
 

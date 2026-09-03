@@ -641,7 +641,14 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                 return None;
             }
             let ord = *next;
-            *next += *step;
+            // Saturating: a step of any magnitude lands past `stop` in
+            // its own direction (`i64::MAX >= stop`, `i64::MIN <= stop`),
+            // so the guard above ends the slice on the next call and the
+            // cursor never wraps (review C11: `[1::i64::MAX]` wrapped to
+            // `i64::MIN` in release and the `expect` below killed the
+            // cell). With `start`/`stop` clamped by `resolve_slice`, that
+            // guard keeps `ord` inside `[0, len)` in both directions.
+            *next = next.saturating_add(*step);
             debug_assert!(ord >= 0, "resolved slice indices are in range");
             let DocValue::Arr(a) = frame.node else { unreachable!("slice progress on array") };
             let value = a.index(ord as usize).expect("resolved slice indices are in range");
@@ -716,14 +723,16 @@ fn child_item<'a>(
     Item { node: value, pc: frame.next_pc, cont: cont_of(bytes, frame.next_pc), step: Some(ord) }
 }
 
-/// Negative-index resolution: `len` is fetched lazily (a tape-array
-/// `len()` walks the body — only paid when the index is negative).
+/// Index resolution: negatives add `len` (the RedisJSON rule), and the
+/// result narrows to a `u32` ordinal only after `try_from` proves it is
+/// one — every other value, including the `i ≡ k (mod 2³²)` aliases a
+/// wrapping `as u32` used to land on real elements (review C10), is no
+/// match. `len` is fetched lazily (a tape-array `len()` walks the body
+/// — only paid when the index is negative); `index()` still filters
+/// `len..2³²`.
 fn resolve_index(i: i64, len: impl FnOnce() -> i64) -> Option<u32> {
-    if i >= 0 {
-        return Some(i as u32); // out-of-range surfaces as `index() == None`
-    }
-    let resolved = i + len();
-    if resolved < 0 { None } else { Some(resolved as u32) }
+    let resolved = if i < 0 { i + len() } else { i };
+    u32::try_from(resolved).ok()
 }
 
 /// Grammar §4: Python slice index resolution, pinned.

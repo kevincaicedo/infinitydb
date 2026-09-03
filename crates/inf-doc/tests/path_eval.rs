@@ -111,18 +111,25 @@ fn ref_select<'v>(
     }
 }
 
-/// Python slice indices — independently re-derived (grammar §4).
+/// Python slice indices — independently re-derived (grammar §4) in
+/// `i128`, so the oracle is overflow-free at every `i64` extreme the
+/// parser admits (review C11) without sharing the engine's saturating
+/// cursor.
 fn ref_slice_indices(spec: &SliceSpec, len: i64) -> Vec<i64> {
-    let step = spec.step.unwrap_or(1);
+    let len = i128::from(len);
+    let step = i128::from(spec.step.unwrap_or(1));
     assert_ne!(step, 0);
-    let resolve = |v: i64| if v < 0 { v + len } else { v };
+    let resolve = |v: i64| {
+        let v = i128::from(v);
+        if v < 0 { v + len } else { v }
+    };
     let mut out = Vec::new();
     if step > 0 {
         let start = spec.start.map(resolve).unwrap_or(0).clamp(0, len);
         let stop = spec.end.map(resolve).unwrap_or(len).clamp(0, len);
         let mut i = start;
         while i < stop {
-            out.push(i);
+            out.push(i64::try_from(i).expect("in-range index"));
             i += step;
         }
     } else {
@@ -130,7 +137,7 @@ fn ref_slice_indices(spec: &SliceSpec, len: i64) -> Vec<i64> {
         let stop = spec.end.map(resolve).unwrap_or(-1).clamp(-1, len - 1);
         let mut i = start;
         while i > stop {
-            out.push(i);
+            out.push(i64::try_from(i).expect("in-range index"));
             i += step;
         }
     }
@@ -325,6 +332,129 @@ fn budgeted_descend_yields_and_resumes() {
 }
 
 // ---------------------------------------------------------------------
+// Integer-width bounds (review C10 / C11): the parser admits any i64;
+// the evaluator must treat every out-of-array value as no match and
+// every step magnitude as a bounded walk — on both evaluation lanes.
+
+fn tape_root_of(value: &Value) -> Vec<u8> {
+    model::encode(value).expect("encodes")
+}
+
+/// `[10,20,30]` — three elements, so `2³²` aliases element 0 and
+/// `2³²+1` element 1 under a wrapping `as u32`.
+fn three() -> Value {
+    Value::Arr(vec![Value::I64(10), Value::I64(20), Value::I64(30)])
+}
+
+/// Every match `eval_visit` delivers for `text`, as raw ordinals of the
+/// scalar it landed on (this suite's documents are integer arrays).
+fn visited(text: &str, value: &Value) -> Vec<i64> {
+    let program = compile(text.as_bytes()).expect("compiles");
+    let bytes = tape_root_of(value);
+    let tape = TapeDoc::from_bytes(&bytes).expect("validates");
+    let mut seen = Vec::new();
+    let outcome = eval_visit(&program, DocValue::from(tape.root()), u64::MAX, |node| {
+        let DocValue::I64(v) = node else { panic!("integer array fixture") };
+        seen.push(v);
+        std::ops::ControlFlow::Continue(())
+    });
+    assert_eq!(outcome.end, path::VisitEnd::Complete, "{text}");
+    seen
+}
+
+#[test]
+fn index_beyond_the_u32_width_selects_nothing_on_every_lane() {
+    let doc = three();
+    for raw in EXTREME_INTS {
+        // Every extreme resolves outside [0, 3): the positive ones are
+        // ≥ 2³² − 1, the negative ones are below −len.
+        let simple = format!("$[{raw}]");
+        let union = format!("$[{raw},{raw}]");
+        let descend = format!("$..[{raw}]");
+        for text in [&simple, &union, &descend] {
+            assert!(eval_both_forms(text, &doc).is_empty(), "{text} must select nothing");
+            assert!(visited(text, &doc).is_empty(), "{text} must visit nothing");
+        }
+        // Reference agreement on the same shapes.
+        let ast = path::parse_ast(simple.as_bytes()).expect("parses");
+        assert!(ref_eval(&ast, &doc).is_empty(), "reference: {simple}");
+    }
+    // The in-range neighbours still resolve (the guard is exact).
+    assert_eq!(eval_both_forms("$[2]", &doc), vec![vec![2]]);
+    assert_eq!(eval_both_forms("$[-3]", &doc), vec![vec![0]]);
+    assert!(eval_both_forms("$[3]", &doc).is_empty());
+    assert!(eval_both_forms("$[-4]", &doc).is_empty());
+}
+
+#[test]
+fn giant_slice_steps_yield_the_python_index_set_and_terminate() {
+    let doc = three();
+    let cases: &[(&str, &[u32])] = &[
+        ("$[1::9223372036854775807]", &[1]),
+        ("$[::9223372036854775807]", &[0]),
+        ("$[2:100:9223372036854775806]", &[2]),
+        ("$[-1::9223372036854775807]", &[2]),
+        ("$[1::4294967296]", &[1]),
+        ("$[::-9223372036854775808]", &[2]),
+        ("$[2:0:-9223372036854775808]", &[2]),
+        ("$[1::-9223372036854775807]", &[1]),
+        ("$[::-4294967296]", &[2]),
+        // Extreme bounds clamp; the walk is then the ordinary one.
+        ("$[-9223372036854775808:9223372036854775807]", &[0, 1, 2]),
+        ("$[9223372036854775807:-9223372036854775808:-1]", &[2, 1, 0]),
+        ("$[4294967296:]", &[]),
+        ("$[:4294967296]", &[0, 1, 2]),
+    ];
+    for (text, want) in cases {
+        let want: Vec<Vec<u32>> = want.iter().map(|&o| vec![o]).collect();
+        assert_eq!(eval_both_forms(text, &doc), want, "{text}");
+        let ast = path::parse_ast(text.as_bytes()).expect("parses");
+        assert_eq!(ref_eval(&ast, &doc), want, "reference: {text}");
+        let visited_ords: Vec<i64> = visited(text, &doc);
+        let want_values: Vec<i64> = want.iter().map(|s| 10 * (i64::from(s[0]) + 1)).collect();
+        assert_eq!(visited_ords, want_values, "visit lane: {text}");
+    }
+    // Empty arrays: every extreme is a no-op walk.
+    let empty = Value::Arr(vec![]);
+    for text in ["$[::9223372036854775807]", "$[::-9223372036854775808]", "$[1::4294967296]"] {
+        assert!(eval_both_forms(text, &empty).is_empty(), "{text} on []");
+    }
+}
+
+/// The saved `Progress::Slice` cursor crosses a yield at the extreme:
+/// resuming after the first element must end the slice, never re-walk it.
+#[test]
+fn giant_slice_step_resumes_across_a_yield() {
+    let doc = three();
+    let bytes = tape_root_of(&doc);
+    let tape = TapeDoc::from_bytes(&bytes).expect("validates");
+    let root = DocValue::from(tape.root());
+    for text in
+        ["$[1::9223372036854775807]", "$[::-9223372036854775808]", "$[*][::9223372036854775807]"]
+    {
+        let program = compile(text.as_bytes()).expect("compiles");
+        let straight = eval(&program, root, &EvalLimits::default()).expect("ok");
+        for budget in 1..=3u64 {
+            let mut state = None;
+            let mut rounds = 0;
+            let resumed = loop {
+                match eval_budgeted(&program, root, &EvalLimits::default(), budget, state.take())
+                    .expect("ok")
+                {
+                    EvalStep::Done(m) => break m,
+                    EvalStep::Yield(s) => {
+                        state = Some(s);
+                        rounds += 1;
+                        assert!(rounds < 64, "{text} must terminate at budget {budget}");
+                    }
+                }
+            };
+            assert_eq!(resumed, straight, "{text} at budget {budget}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Differential property: 10⁵ (doc × path) pairs in the release AC run.
 
 fn arb_value() -> impl Strategy<Value = Value> {
@@ -348,24 +478,53 @@ fn arb_value() -> impl Strategy<Value = Value> {
     })
 }
 
+/// The integer widths review C10/C11 found unguarded: every value a
+/// wrapping `as u32` aliases onto a real ordinal, and the `i64` extremes
+/// the parser admits. Mixed in at low weight so the document-shaped
+/// draws keep their coverage.
+static EXTREME_INTS: [i64; 10] = [
+    u32::MAX as i64,
+    1 << 32,
+    (1 << 32) + 1,
+    1 << 33,
+    i64::MAX - 1,
+    i64::MAX,
+    -(1 << 32),
+    -(1 << 32) - 1,
+    i64::MIN + 1,
+    i64::MIN,
+];
+
+fn arb_index() -> BoxedStrategy<i64> {
+    prop_oneof![8 => -6i64..6, 1 => proptest::sample::select(&EXTREME_INTS[..])].boxed()
+}
+
+fn arb_step() -> BoxedStrategy<i64> {
+    prop_oneof![
+        8 => prop_oneof![(-3i64..0), (1i64..3)],
+        1 => proptest::sample::select(&EXTREME_INTS[..]),
+    ]
+    .boxed()
+}
+
 fn arb_path_ast() -> impl Strategy<Value = PathAst> {
     let name = prop_oneof![Just("a"), Just("b"), Just("k"), Just("z9"), Just("q")]
         .prop_map(|s| s.as_bytes().to_vec());
     let slice = (
-        proptest::option::of(-6i64..6),
-        proptest::option::of(-6i64..6),
-        proptest::option::of(prop_oneof![(-3i64..0), (1i64..3)]),
+        proptest::option::of(arb_index()),
+        proptest::option::of(arb_index()),
+        proptest::option::of(arb_step()),
     )
         .prop_map(|(start, end, step)| SliceSpec { start, end, step });
     let member = prop_oneof![
         name.clone().prop_map(Member::Name),
-        (-6i64..6).prop_map(Member::Index),
+        arb_index().prop_map(Member::Index),
         slice.clone().prop_map(Member::Slice),
     ];
     let selector = prop_oneof![
         4 => name.prop_map(Segment::Child),
         2 => Just(Segment::ChildAny),
-        2 => (-6i64..6).prop_map(Segment::Index),
+        2 => arb_index().prop_map(Segment::Index),
         1 => slice.prop_map(Segment::Slice),
         1 => proptest::collection::vec(member, 2..4).prop_map(Segment::Union),
     ];
