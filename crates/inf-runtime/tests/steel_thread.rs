@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: harness deadlines and timings, not cell code"
+)]
 //! M4-S04 steel thread: the smallest honest end-to-end vertical of the
 //! riskiest path — write → seal → flush (tier file, fdatasync) → demote
 //! (pages released) → **cold read through executor suspension** (real

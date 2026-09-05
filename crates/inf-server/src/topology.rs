@@ -330,6 +330,10 @@ pub fn resolve_topology(data_dir: &Path, cells: u16) -> Result<TopologySource, T
 mod tests {
     use super::*;
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test-only: a wall-clock stamp names the scratch dir"
+    )]
     fn fresh_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "inf-topology-{tag}-{}-{}",

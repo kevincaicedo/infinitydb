@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4.5-S06 sidecar load-path A/B (ADR-0078 D5; the ledger's L4 budget:
 //! **≤ 60 ns/entry** so 40M entries fit the < 15 s recovery envelope).
 //!

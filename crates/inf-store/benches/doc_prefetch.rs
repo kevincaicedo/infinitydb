@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M3-S20 placement + document-root prefetch evidence harness.
 //!
 //! Gate run (10M-document working set, ABBA x3):

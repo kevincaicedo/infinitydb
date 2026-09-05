@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4-S01 budget bench (§4.1): resolver cost on RAM-resident addresses vs
 //! the M3 arena-offset path — budget ≤ 2 ns added. The tiered read is
 //! `resolve` (two watermark compares) + ring `bytes` (mask + add + deref);

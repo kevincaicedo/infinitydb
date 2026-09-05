@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! The Linux body of the `parallel_boot` bench — see the target root
 //! (`../parallel_boot.rs`) for why it lives in its own module: it depends
 //! on `UringDriver`, which exists only under

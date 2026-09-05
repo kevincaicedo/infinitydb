@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! The Linux body of the `write_accounting` bench — see the target root
 //! (`../write_accounting.rs`) for why it lives in its own module: the
 //! whole measurement is `/proc/diskstats` against the database's own

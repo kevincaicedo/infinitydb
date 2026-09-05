@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: harness deadlines and stamps, not cell code"
+)]
 //! ADR-0094 at the binary level — the key-hash secret's lifecycle on a
 //! data directory:
 //!

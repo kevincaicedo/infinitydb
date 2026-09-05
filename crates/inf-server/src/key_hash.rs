@@ -433,6 +433,10 @@ pub fn resolve_key_hash(
 mod tests {
     use super::*;
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test-only: a wall-clock stamp names the scratch dir"
+    )]
     fn fresh_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "inf-key-hash-{tag}-{}-{}",

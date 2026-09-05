@@ -795,6 +795,10 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "process main thread: the wall-clock boot stamp, never oracle input"
+        )]
         let boot_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -1042,6 +1046,10 @@ fn cell_main(
     // cell clock's origin (internal ms 0); everything downstream converts
     // through the anchor (L7 — EXPIREAT/EXAT stay deterministic under DST,
     // which injects its own anchor).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "process main thread: the wall-clock anchor, never oracle input"
+    )]
     let unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

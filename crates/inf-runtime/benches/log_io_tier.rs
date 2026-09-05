@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M2-S07 log I/O tier A/B (dev tier): buffered+fdatasync vs O_DIRECT for
 //! the grouped `always` write path, measured at the driver+device layer —
 //! the same workload shape as `log_fsync.rs` so rows are comparable.

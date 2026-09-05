@@ -922,6 +922,14 @@ enum RoundWave {
 /// Converts one wave of the staged round to driver ops. Windows stay
 /// pipeline-owned until `finish_round` — the `StableBytes` custody
 /// argument lives in `log_bytes::tier_round_bytes`.
+/// Token slot of round op `index` on `lane` (ADR-0084 D3: `lane × 256 + op_index`).
+/// The index is narrowed, never masked: `TierRound::admit_op` bounds it at
+/// staging, and a wider index here would alias another op's completion.
+fn round_slot(lane: u32, index: usize) -> u32 {
+    let index = u8::try_from(index).expect("round op index is 8-bit (ADR-0084 D3)");
+    (lane << 8) | u32::from(index)
+}
+
 fn emit_round_wave<F: SegmentFs>(
     flush: &TierFlush<F>,
     round: &mut FlushRound,
@@ -939,7 +947,7 @@ fn emit_round_wave<F: SegmentFs>(
             continue;
         }
         let view = flush.round_op(index);
-        let slot = (lane << 8) | index as u32;
+        let slot = round_slot(lane, index);
         if view.is_barrier {
             let token = CompletionToken::new(TokenClass::TierFlushSync, slot, round.round_seq);
             ops.push(IoOp::Fdatasync { fd: view.fd, token });
@@ -966,6 +974,15 @@ mod lane_tests {
 
     fn spec() -> TierSpec {
         TierSpec::for_budget(64 << 20)
+    }
+
+    /// Batch 14 of the 2026-08-30 review: the op index has 8 token bits.
+    /// Pre-fix `round_slot(1, 256)` was `(1 << 8) | 0x100` — lane 1's op
+    /// 0 — a second op carrying the same completion token.
+    #[test]
+    #[should_panic(expected = "round op index is 8-bit")]
+    fn round_slot_refuses_an_aliasing_index() {
+        assert_ne!(round_slot(1, 0), round_slot(1, 256));
     }
 
     /// Batch 12 of the 2026-08-30 review: flush lanes recycle once their

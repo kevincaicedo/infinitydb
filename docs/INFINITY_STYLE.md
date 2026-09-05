@@ -177,7 +177,10 @@ measured cost, the unsafe version is wrong.
 
 All compiler and clippy warnings are errors from day one (`-D warnings`).
 The mechanical checks — `check-dep-dag.sh` (crate boundaries),
-`check-cell-denylist.sh` (no locks/sleep/ambient time in cells),
+`check-cell-denylist.sh` (no locks/sleep/ambient time in cells) with
+`check-clock-ban.sh` (the type-resolved half of the same rule: clippy's
+`disallowed-methods` for `Instant`/`SystemTime` `now`/`elapsed`, libc
+and the TSC, proven on a planted-bypass probe — ADR-0106 D7),
 fault-point and fsync-fail-stop greps, the attribution-divergence gate,
 `check-shipping-features.sh` (no test/DST feature on a normal dependency
 edge — ADR-0107 D1), `check-release-asserts.sh` (the classified
@@ -192,7 +195,10 @@ scanning a directory that did not exist and the panic-policy grep cut at
 its scope**: a missing directory, an empty file set, or a truncated scan
 is a failure, not a skip; the success line discloses what was scanned;
 exemptions are per-site markers that carry a reason (`denylist-allow:
-<why>`, `panic-policy-allow: <why>`) and are listed in the output; and
+<why>`, `panic-policy-allow: <why>`, and for the clippy-resolved bans
+`#[allow(clippy::disallowed_methods, reason = "<why>")]` on the
+statement or function — never on a crate or file inside cell code) and
+are listed in the output; and
 `check-scripts-selftest.sh` runs a planted violation through each gate
 inside `just check` — a gate that cannot go red is not a gate. The same
 rule binds CI evidence: a workflow never writes a number an instrument
@@ -290,7 +296,9 @@ verdict of every shard.
   was "validly" written.
 - Time, randomness, disk, network, and fabric effects are **injected**
   (L7). Ambient `Instant::now()` or `rand::random()` in cell code is a
-  denylist violation: it breaks the simulator's authority over the
+  denylist violation — and for clocks a clippy error under any spelling
+  (`disallowed-methods`, ADR-0106 D7; `UNIX_EPOCH.elapsed()` and
+  `_rdtsc` included): it breaks the simulator's authority over the
   universe, which is the single most valuable testing asset we own.
 
 ### Style by the numbers

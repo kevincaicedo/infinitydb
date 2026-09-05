@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: harness deadlines and timings, not cell code"
+)]
 //! M4.5-S39b falsifier (c) attribution: the cost of the slack audit over a
 //! segment full of recycled-life residue against the same segment full of
 //! zeros, on a real filesystem (`INF_RESIDUE_SCAN_DIR` names it; the test

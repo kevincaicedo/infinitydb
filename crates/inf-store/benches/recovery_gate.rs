@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4-S12 recovery-gate bench (§4.1: ≥ 1 GB/s/cell replay, 10 GB node
 //! < 15 s, tiering on — the M2-gate regression re-proof, ADR-0057 D6).
 //!

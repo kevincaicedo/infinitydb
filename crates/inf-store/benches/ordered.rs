@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4.5-S01 budget bench (§4.1): ordered-map point probe, range next(),
 //! the leaf-fanout 32-vs-64 A/B, the SIMD-vs-scalar leaf-search A/B, and
 //! bytes/entry attribution at N entries — the §7 memory gate measured

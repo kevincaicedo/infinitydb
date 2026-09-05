@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: harness deadlines and timings, not cell code"
+)]
 //! `BackendDriver` conformance over real loopback TCP. Generic over the
 //! driver so the same suite runs on kqueue (macOS dev tier) and io_uring
 //! (Linux CI, `--features uring`) — M0-S04/S05 AC.

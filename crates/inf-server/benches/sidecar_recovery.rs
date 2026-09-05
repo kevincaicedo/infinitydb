@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4.5-S06 recovery-gate re-proof (plan §7: a 10 GB node with 4
 //! declared indexes boots < 15 s **on the sidecar path**; the rebuild
 //! fallback is timed informationally beside it — ADR-0078).

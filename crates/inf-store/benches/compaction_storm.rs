@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4-S15 foreground-protection storm (§4.1: "foreground p99.9 < 2 ms
 //! with compaction running at full slice budget" — the S07 storm with
 //! the copy-forward leg live). Foreground GET/SET ops run while the

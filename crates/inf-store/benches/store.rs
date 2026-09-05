@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M0-S13/S14 gate bench: the L4 A/B for the hash→prefetch→execute batch
 //! pipeline at a cache-miss-bound working set, the probe-length histogram
 //! at load factor 0.85, and the per-key memory overhead artifact.

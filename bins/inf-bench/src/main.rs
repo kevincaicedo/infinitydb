@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "inf-bench is the load generator: the wall clock is its instrument; it drives infinityd over the wire and runs no cell"
+)]
 //! `inf-bench` — InfinityDB benchmark harness (M0).
 //!
 //! Subcommands:

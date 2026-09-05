@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: harness deadlines and stamps, not cell code"
+)]
 //! ADR-0095 at the binary level — the cell-topology binding on a data
 //! directory (full-codebase review of 2026-08-30, C8 / F-L14-03):
 //!

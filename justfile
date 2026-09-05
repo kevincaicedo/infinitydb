@@ -20,6 +20,11 @@ check:
     # ADR-0106: the gates above must go red on a planted violation, or
     # their OK is a claim (review 2026-08-30 P1/P1c: two were inert).
     ./scripts/check-scripts-selftest.sh
+    # ADR-0106 first amendment (review 2026-08-30 F-L18-05): the ambient-
+    # clock ban is clippy's type-resolved disallowed-methods; this gate
+    # proves the config is in force on planted bypass spellings and lists
+    # every sanctioned site in cell code.
+    ./scripts/check-clock-ban.sh
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
     cargo clippy -p inf-doc -p inf-store --all-targets --features doc-intern-keys -- -D warnings

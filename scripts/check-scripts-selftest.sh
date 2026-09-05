@@ -570,9 +570,89 @@ inventory "$root" <<'EOF'
 EOF
 expect red "release-asserts: an inventory with no rows is a scope failure" env INF_CHECK_ROOT="$root" $RELEASE
 
+# ---------------------------------------------------------------- clock ban
+# ADR-0106 first amendment (review 2026-08-30 F-L18-05): the type-resolved
+# clock ban's gate. Steps 1–3 run on fixtures (the real clippy.toml copied
+# in); the cargo-driven probe (step 4) is fixture-skipped and disclosed,
+# and runs unconditionally on the real tree inside `just check`.
+CLOCK=./scripts/check-clock-ban.sh
+clock_fixture() {
+    local root
+    root=$(fixture "$1")
+    cp clippy.toml "$root/clippy.toml"
+    echo "$root"
+}
+root=$(clock_fixture clock-clean <<'EOF'
+pub fn ok() -> u64 { 1 }
+EOF
+)
+expect green "clock-ban: clean crate under the real config" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+expect_output "clock-ban: scope line discloses config, scan and the skipped probe" "config 9/9 entries, 0 shadow configs, 1 cell crates / 1 files scanned, 0 allowed sites in cell code; probe: skipped (fixture mode)" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+[ -n "$root" ] && rm -f "$root/clippy.toml"
+expect red "clock-ban: no clippy.toml is red" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+cp clippy.toml "$root/clippy.toml"
+sed -i.bak '/std::time::SystemTime::elapsed/d' "$root/clippy.toml"
+expect red "clock-ban: a deleted config entry is red" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+cp clippy.toml "$root/clippy.toml"
+printf 'disallowed-methods = []\n' >"$root/crates/fake/clippy.toml"
+expect red "clock-ban: a shadow clippy.toml in a crate directory is red" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+[ -n "$root" ] && rm -f "$root/crates/fake/clippy.toml"
+
+for snippet in \
+    '#![allow(clippy::disallowed_methods)] pub fn t() {}' \
+    '#![allow(clippy::style)] pub fn t() {}' \
+    '#![allow(clippy::all)] pub fn t() {}' \
+    '#![allow(warnings)] pub fn t() {}' \
+    '#![expect(clippy::disallowed_methods)] pub fn t() {}' \
+    '#[allow(clippy::all)] pub fn t() {}' \
+    '#[allow(clippy::style)] pub fn t() {}' \
+    '#[allow(clippy::disallowed_methods)] pub fn t() {}' \
+    '#[expect(clippy::disallowed_methods)] pub fn t() {}'
+do
+    root=$(clock_fixture clock-planted <<<"$snippet")
+    expect red "clock-ban: planted '$snippet'" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+done
+# The multi-line shape rustfmt produces, without a reason.
+root=$(clock_fixture clock-multiline-bare <<'EOF'
+#[allow(
+    clippy::disallowed_methods
+)]
+pub fn t() {}
+EOF
+)
+expect red "clock-ban: a multi-line allow without a reason is red" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+# Sanctioned shapes: a per-site allow with a reason, one-line and rustfmt's.
+root=$(clock_fixture clock-sanctioned <<'EOF'
+#[allow(clippy::disallowed_methods, reason = "control thread: boot narration")]
+pub fn t() {}
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the injected clock's origin"
+)]
+pub fn u() {}
+EOF
+)
+expect green "clock-ban: per-site allows with reasons are green" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+expect_output "clock-ban: the one-line site is listed with its reason" "allowed crates/fake/src/lib.rs:1: control thread: boot narration" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+expect_output "clock-ban: the multi-line site is listed with its reason" "allowed crates/fake/src/lib.rs:3: the injected clock's origin" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+expect_output "clock-ban: the scope line counts both" "2 allowed sites in cell code" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+# An allow inside a test-only module is not cell code.
+root=$(clock_fixture clock-testmod <<'EOF'
+pub fn ok() {}
+
+#[cfg(test)]
+mod tests {
+    #[allow(clippy::disallowed_methods)]
+    fn scratch() -> u128 { 0 }
+}
+EOF
+)
+expect green "clock-ban: a bare allow inside a test-only module is stripped" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+expect_output "clock-ban: the stripped module counts no site" "0 allowed sites in cell code" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban each red on a planted violation)"

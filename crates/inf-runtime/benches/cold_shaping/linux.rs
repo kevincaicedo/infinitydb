@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4-S10 cold-read shaping (dev tier, ADR-0055): the coalescing A/B and
 //! the QD-cap saturation proof over the real machinery (`UringDriver` +
 //! registered `AlignedPool` + `ColdReads`).

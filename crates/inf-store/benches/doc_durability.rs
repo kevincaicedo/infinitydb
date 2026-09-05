@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M3-S17 evidence generator: exact delta/full byte ratio for the named
 //! 1 KiB path-mutation mix, plus CPU-side replay over a configurable
 //! document cell with deep version histories.

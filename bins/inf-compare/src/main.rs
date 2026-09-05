@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "inf-compare is the comparator load generator: the wall clock is its instrument; it drives engines over the wire and runs no cell"
+)]
 //! `inf-compare` — InfinityDB competitive benchmark harness.
 //!
 //! Drives the industry-standard load generators (memtier_benchmark,

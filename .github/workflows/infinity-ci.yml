@@ -73,6 +73,11 @@ jobs:
         run: ./scripts/check-shipping-features.sh
       - name: check scripts self-test (planted violations turn each gate red)
         run: ./scripts/check-scripts-selftest.sh
+      # ADR-0106 first amendment (review 2026-08-30 F-L18-05): the clock
+      # ban is type-resolved; the gate compiles a planted-bypass probe under
+      # the workspace clippy.toml and lists every sanctioned site.
+      - name: clock ban (type-resolved, planted-bypass probe)
+        run: ./scripts/check-clock-ban.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build
