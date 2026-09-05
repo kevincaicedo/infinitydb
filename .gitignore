@@ -18,27 +18,12 @@ tests/client-smoke/node_modules/
 .artifacts/m3/adr0047-stage-fusion-20260717/wire/preload-docs.resp
 .artifacts/m3/adr0047-stage-fusion-20260717/wire2/preload-docs.resp
 
-# Raw RESP loadgen streams are reproducible from seed and exceed GitHub's
-# 100 MB limit — keep them on disk, never in git (reports + summaries are
-# the committed evidence; a campaign script must add specific run dirs,
-# never a bare `git add -f .artifacts/`).
 .artifacts/**/*.resp
 
-# Same rule, same reason, for the soaks' document-leg logs: `redis-cli
-# --pipe` writes one summary line per iteration, so a 32 h run leaves
-# 1.4 M lines / 686 MB (one file 568 MB, past GitHub's limit) carrying
-# nothing the committed `loadgen-doc-summary.md` does not state exactly.
 .artifacts/**/loadgen-doc_*.log
 
-# Raw `perf` sample files are never committed — they are hundreds of MB to
-# gigabytes of machine-local sample data, they are not readable evidence,
-# and GitHub hard-rejects anything over 100 MB (one `jget-read.perf` came
-# to 1030 MB and blocked a push, 2026-08-16). The *extracted* artifacts —
-# `perf report` output, the banned-symbol grep, the verdict — are what a
-# reviewer cites, and those ARE committed. The S24 phase-7 runbook already
-# states the rule for campaign flamegraphs ("delete perf.data
-# immediately"); these patterns make it structural instead of a habit.
 .artifacts/**/*.perf
 .artifacts/**/perf.data
 .artifacts/**/perf.data.*
 .artifacts/**/*.perf.script
+.codegraph
