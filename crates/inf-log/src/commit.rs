@@ -983,6 +983,7 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// forever; the caller fail-stops the cell (§8.4 fsyncgate rule — this
     /// method exists so the freeze is observable in tests and the error
     /// path can name what was lost, never so the caller can continue).
+    // fsync-fail-stop-allow: freezes the watermark so the loss is observable and nameable; every caller fail-stops the cell next (§8.4) — this never resumes a commit
     pub fn on_fsync_error(&mut self, ticket: FsyncTicket) -> SyncReason {
         let entry = self
             .pending

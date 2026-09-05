@@ -78,6 +78,14 @@ jobs:
       # the workspace clippy.toml and lists every sanctioned site.
       - name: clock ban (type-resolved, planted-bypass probe)
         run: ./scripts/check-clock-ban.sh
+      # ADR-0106 second amendment (review 2026-08-30, F-L20-03): the M0-S06
+      # / ADR-0003 "no atomics in the waker path" AC. Its gate ran in no
+      # recipe and no workflow, and scanned 0 instruction lines per waker.
+      # Linux only: the Mach-O asm flavor is handled but unverified, and an
+      # unverified red on one leg would be noise, not evidence.
+      - name: waker-atomics (vtable-resolved, planted-bypass probe)
+        if: runner.os == 'Linux'
+        run: ./scripts/check-waker-atomics.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build

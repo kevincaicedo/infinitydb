@@ -98,6 +98,7 @@ impl core::fmt::Display for TierWriteFailure {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             TierWriteFailure::Write(e) => write!(f, "tier write failed: {e}"),
+            // fsync-fail-stop-allow: Display arm: renders, never handles
             TierWriteFailure::Fsync(e) => {
                 write!(f, "FATAL: tier fsync failed — cell must stop: {e}")
             }
@@ -915,10 +916,12 @@ impl<F: SegmentFs> TierWriter<F> {
         // non-recoverable by contract (§8.4: no caller may catch and
         // continue past it).
         if inf_foundation::fault::fire(crate::fault::TIER_FSYNC_ERR) {
+            // fsync-fail-stop-allow: tier_fsync_err injection (sync): constructs and returns typed
             return Err(TierWriteFailure::Fsync(crate::fault::injected(
                 crate::fault::TIER_FSYNC_ERR,
             )));
         }
+        // fsync-fail-stop-allow: the tier sync barrier: mapped to TierWriteFailure::Fsync and propagated with `?`
         self.file.sync_data().map_err(TierWriteFailure::Fsync)?;
         self.durable_len = self.data_len;
         Ok(())
@@ -962,10 +965,12 @@ impl<F: SegmentFs> TierWriter<F> {
         self.file.write_at(footer_at, footer).map_err(TierWriteFailure::Write)?;
         self.device_bytes += TIER_FOOTER_BYTES as u64;
         if inf_foundation::fault::fire(crate::fault::TIER_FSYNC_ERR) {
+            // fsync-fail-stop-allow: tier_fsync_err injection (seal): constructs and returns typed
             return Err(TierWriteFailure::Fsync(crate::fault::injected(
                 crate::fault::TIER_FSYNC_ERR,
             )));
         }
+        // fsync-fail-stop-allow: the tier seal barrier: mapped to TierWriteFailure::Fsync and propagated with `?`
         self.file.sync_data().map_err(TierWriteFailure::Fsync)?;
         let outcome = SealOutcome {
             data_len: self.data_len,

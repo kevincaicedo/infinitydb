@@ -25,6 +25,9 @@ check:
     # proves the config is in force on planted bypass spellings and lists
     # every sanctioned site in cell code.
     ./scripts/check-clock-ban.sh
+    # ADR-0106 second amendment (review 2026-08-30, F-L20-03): the M0-S06
+    # AC's own gate ran nowhere and scanned zero instructions per waker.
+    ./scripts/check-waker-atomics.sh
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
     cargo clippy -p inf-doc -p inf-store --all-targets --features doc-intern-keys -- -D warnings

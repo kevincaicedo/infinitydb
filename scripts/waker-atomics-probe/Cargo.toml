@@ -1,0 +1,18 @@
+# Planted-bypass probe for scripts/check-waker-atomics.sh (review
+# 2026-08-30 F-L20-03, ADR-0106 D8). Not a workspace member: the gate
+# copies it under a temp dir and emits its release asm with the same
+# pipeline it uses on inf-runtime, then asserts each declared verdict.
+[package]
+name = "waker-atomics-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[profile.release]
+codegen-units = 1
+debug = "line-tables-only"

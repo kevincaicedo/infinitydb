@@ -111,6 +111,7 @@ pub enum TierFlushError {
 impl core::fmt::Display for TierFlushError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            // fsync-fail-stop-allow: Display arm: renders, never handles
             TierFlushError::Fsync { path, source } => write!(
                 f,
                 "FATAL: tier fsync failed on {} — cell must stop: {source}",
@@ -130,6 +131,7 @@ impl TierFlushError {
     /// terminal fail-stop handler without naming the variant.
     #[must_use]
     pub fn is_fatal(&self) -> bool {
+        // fsync-fail-stop-allow: is_fatal classifier: answers true, takes no action
         matches!(self, TierFlushError::Fsync { .. })
     }
 
@@ -143,6 +145,7 @@ impl TierFlushError {
             TierFlushError::Io { source, .. } => {
                 source.kind() == io::ErrorKind::StorageFull || source.raw_os_error() == Some(28)
             }
+            // fsync-fail-stop-allow: is_retryable classifier: answers false — the rule that forbids the fsyncgate retry
             TierFlushError::Fsync { .. } => false,
         }
     }
@@ -813,6 +816,7 @@ impl<F: SegmentFs> TierFlush<F> {
 fn classify(failure: TierWriteFailure, path: PathBuf) -> TierFlushError {
     match failure {
         TierWriteFailure::Write(source) => TierFlushError::Io { path, source },
+        // fsync-fail-stop-allow: conversion between the two typed fsync errors; still propagating
         TierWriteFailure::Fsync(source) => TierFlushError::Fsync { path, source },
     }
 }

@@ -1300,6 +1300,7 @@ impl<F: SegmentFs> DurableCell<F> {
     /// Terminal error routed from REAP (write or fsync token).
     pub fn on_log_error(&mut self, token: CompletionToken, errno: i32) -> ! {
         if token.class() == TokenClass::Fsync {
+            // fsync-fail-stop-allow: records the freeze for the ledger; the very next statement is fail_stop() -> !, so the SyncReason has no reader and no path continues
             let _ = self.commit.on_fsync_error(token_ticket(token));
         }
         self.fail_stop("I/O", &format!("errno {errno} on {:?}", token.class()))
