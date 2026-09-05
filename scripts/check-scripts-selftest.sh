@@ -650,9 +650,253 @@ EOF
 expect green "clock-ban: a bare allow inside a test-only module is stripped" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 expect_output "clock-ban: the stripped module counts no site" "0 allowed sites in cell code" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 
+# ------------------------------------------------------- waker atomics (D8)
+# ADR-0106 second amendment (review 2026-08-30 F-L20-03). The gate's three
+# defects were all in the scan, so the fixtures ARE synthetic asm: a
+# `.Lfunc_beginN:` on the body's first line (the old awk reset there and
+# scanned two lines / zero instructions per waker), an x86 `lock` prefix in
+# its own tab-separated field (the old mnemonic set anchored at the line
+# start and could not match it), and the aarch64 pair. The cargo-driven
+# probe is fixture-skipped and disclosed; it always runs on the real tree.
+WAKER=./scripts/check-waker-atomics.sh
+waker_asm() { # <name>: writes a fixture .s from stdin, echoes its path
+    local out="$work/$1.s"
+    cat >"$out"
+    echo "$out"
+}
+# One clean vtable of four bodies, each opening with the DWARF label.
+waker_body() { # <sym> <instructions…>
+    local sym=$1; shift
+    printf '\t.type\t%s,@function\n%s:\n.Lfunc_begin_%s:\n\t.cfi_startproc\n' "$sym" "$sym" "$sym"
+    printf '\t%b\n' "$@"
+    printf '\t.cfi_endproc\n'
+}
+waker_vtable() {
+    printf '_ZN5probe12WAKER_VTABLE17hE:\n'
+    printf '\t.quad\t%s\n' waker_clone waker_wake waker_wake_by_ref waker_drop
+    printf '\t.size\t_ZN5probe12WAKER_VTABLE17hE, 32\n'
+}
+asm=$( { for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do
+             waker_body "$f" 'movq\t%rdi, %rax' 'retq'
+         done
+         waker_vtable; } | waker_asm waker-clean )
+expect green "waker: a clean vtable scans green" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+expect_output "waker: the scope line discloses instructions actually scanned" "4 wakers + 0 called bodies, 8 instruction lines scanned" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+
+# The F-L20-03 defect itself: an atomic in the SECOND basic block, past the
+# local label the old awk stopped at.
+asm=$( { waker_body waker_clone 'movq\t%rdi, %rax' 'je\t.LBB0_2' '.LBB0_2:' 'lock\t\tcmpxchgq\t%rcx, (%rax)' 'retq'
+         for f in waker_wake waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
+         waker_vtable; } | waker_asm waker-lock )
+expect red "waker: an x86 lock-prefixed CAS past a local label is red" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+for insn in 'lock\t\txaddq\t%rax, (%rcx)' 'xchgq\t%rax, (%rcx)' 'mfence' 'ldaxr\tw8, [x0]' 'stlxr\tw9, w8, [x0]' 'casal\tw8, w9, [x0]' 'ldaddal\tw8, w9, [x0]' 'swpal\tw8, w9, [x0]' 'dmb\tish'
+do
+    asm=$( { waker_body waker_wake 'movq\t%rdi, %rax' "$insn" 'retq'
+             for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
+             waker_vtable; } | waker_asm waker-insn )
+    expect red "waker: planted '$insn'" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+done
+# An atomic one hop out of a waker is still on the waker path.
+asm=$( { waker_body waker_drop 'callq\thelper_fn' 'retq'
+         for f in waker_clone waker_wake waker_wake_by_ref; do waker_body "$f" 'retq'; done
+         waker_body helper_fn 'lock\t\txaddq\t%rax, (%rcx)' 'retq'
+         waker_vtable; } | waker_asm waker-hop )
+expect red "waker: an atomic one call hop out of a waker is red" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+# The same atomic in a function the vtable never reaches must NOT be reported.
+asm=$( { for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
+         waker_body off_path 'lock\t\txaddq\t%rax, (%rcx)' 'retq'
+         waker_vtable; } | waker_asm waker-offpath )
+expect green "waker: an atomic off the waker path is not reported" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+# Scope errors: no vtable, a short vtable, a body with no instructions.
+asm=$( { for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done; } | waker_asm waker-novtable )
+expect red "waker: no RawWakerVTable is a scope error, not a pass" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+asm=$( { waker_body waker_clone 'retq'; waker_body waker_wake 'retq'
+         printf '_ZN5probe12WAKER_VTABLE17hE:\n\t.quad\twaker_clone\n\t.quad\twaker_wake\n\t.size\tx, 16\n'; } | waker_asm waker-short )
+expect red "waker: a vtable resolving fewer than four wakers is a scope error" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+asm=$( { printf '\t.type\twaker_clone,@function\nwaker_clone:\n.Lfunc_begin_x:\n\t.cfi_startproc\n\t.cfi_endproc\n'
+         for f in waker_wake waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
+         waker_vtable; } | waker_asm waker-empty )
+expect red "waker: a body that scans zero instructions is a scope error" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+
+# ------------------------------------------------------- fault points (D9)
+# ADR-0106 second amendment (review 2026-08-30 F-L20-04): "exercised" used
+# to mean any textual mention, so a `//!` doc line and an assert's message
+# string kept `shadow_twin_read_fail` green with zero arming sites.
+FAULTS=./scripts/check-fault-points.sh
+fault_fixture() { # <name> <decl-body> <fire-body> <test-body>
+    local root="$work/$1"
+    [ -n "$1" ] && [ -n "$work" ] || { echo "fault_fixture: empty name" >&2; exit 2; }
+    [ -e "$root" ] && rm -rf "$root"
+    mkdir -p "$root/crates/fake/src" "$root/crates/fake/tests"
+    printf '%s\n' "$2" >"$root/crates/fake/src/fault.rs"
+    printf '%s\n' "$3" >"$root/crates/fake/src/lib.rs"
+    printf '%s\n' "$4" >"$root/crates/fake/tests/t.rs"
+    echo "$root"
+}
+DECL='pub const P_ONE: &str = "p_one";
+pub const ALL: &[&str] = &[P_ONE];'
+FIRE='pub fn run() -> bool { inf_foundation::fault::fire(crate::fault::P_ONE) }'
+root=$(fault_fixture fp-clean "$DECL" "$FIRE" 'fn t() { fault::arm(fake::fault::P_ONE, FaultSpec::Nth(1)); }')
+expect green "fault-points: fired in production, armed in a test" env INF_CHECK_ROOT="$root" $FAULTS
+expect_output "fault-points: the scope line names the arming zone" "armed p_one <- crate-tests" env INF_CHECK_ROOT="$root" $FAULTS
+
+# The finding, exactly: the only references are a doc line and a message.
+root=$(fault_fixture fp-prose "$DECL" "$FIRE" '//! arms fake::fault::P_ONE
+fn t() { assert!(x, "fault::P_ONE fired: {}", n); }')
+expect red "fault-points: a doc line plus an assert message is not arming" env INF_CHECK_ROOT="$root" $FAULTS
+
+# A plan row is arming; a bare mention next to no spec is not.
+root=$(fault_fixture fp-plan "$DECL" "$FIRE" 'fn t() { start_node(vec![(fake::fault::P_ONE, FaultSpec::Always)]); }')
+expect green "fault-points: a (POINT, FaultSpec) plan row counts as arming" env INF_CHECK_ROOT="$root" $FAULTS
+root=$(fault_fixture fp-mention "$DECL" "$FIRE" 'fn t() { let name = fake::fault::P_ONE; println!("{name}"); }')
+expect red "fault-points: naming the const without arming it is red" env INF_CHECK_ROOT="$root" $FAULTS
+
+# A digit in the point name was silently dropped from the inventory.
+root=$(fault_fixture fp-digit 'pub const CKPT_V2_TORN: &str = "ckpt_v2_torn";
+pub const ALL: &[&str] = &[CKPT_V2_TORN];' 'pub fn run() {}' 'fn t() {}')
+expect red "fault-points: a point whose name carries a digit is now counted (and red)" env INF_CHECK_ROOT="$root" $FAULTS
+
+# ALL must agree with the declared consts, in both directions.
+root=$(fault_fixture fp-all-missing 'pub const P_ONE: &str = "p_one";
+pub const ALL: &[&str] = &[];' "$FIRE" 'fn t() { fault::arm(fake::fault::P_ONE, FaultSpec::Nth(1)); }')
+expect red "fault-points: a const missing from ALL is red" env INF_CHECK_ROOT="$root" $FAULTS
+root=$(fault_fixture fp-all-extra 'pub const P_ONE: &str = "p_one";
+pub const ALL: &[&str] = &[P_ONE, P_GHOST];' "$FIRE" 'fn t() { fault::arm(fake::fault::P_ONE, FaultSpec::Nth(1)); }')
+expect red "fault-points: an ALL entry that is not a declared const is red" env INF_CHECK_ROOT="$root" $FAULTS
+
+# An unparsable declaration is a scope error, never a silent skip.
+root=$(fault_fixture fp-unparsable 'pub const P_ONE: &str = "p_one";
+pub const P_BAD: &str = CONCAT;
+pub const ALL: &[&str] = &[P_ONE];' "$FIRE" 'fn t() { fault::arm(fake::fault::P_ONE, FaultSpec::Nth(1)); }')
+expect red "fault-points: a declaration the extractor cannot parse is a scope error" env INF_CHECK_ROOT="$root" $FAULTS
+
+# Firing is read from production code only.
+root=$(fault_fixture fp-testfire "$DECL" '#[cfg(test)]
+mod tests {
+    fn f() { inf_foundation::fault::fire(crate::fault::P_ONE); }
+}' 'fn t() { fault::arm(fake::fault::P_ONE, FaultSpec::Nth(1)); }')
+expect red "fault-points: a fire site that exists only in a test module is unwired" env INF_CHECK_ROOT="$root" $FAULTS
+
+# ---------------------------------------------------- fsync fail-stop (D10)
+# ADR-0106 second amendment (review 2026-08-30 F-L20-06): the allow-list was
+# per file, so a catch-and-continue inside a 1,722-line allow-listed file
+# passed; and the pattern set was five hand-listed names, blind to a raw
+# discarded sync.
+FSYNC=./scripts/check-fsync-fail-stop.sh
+fsync_fixture() { # <name>: crate src/lib.rs from stdin + the required types
+    local root
+    root=$(fixture "$1")
+    # Only three lines here match a derived pattern (`FsyncFailed`, the
+    # `Fsync(FsyncFailed)` variant, `on_fsync_error`); a bare
+    # `Fsync(io::Error)` variant of another enum does not, because the
+    # pattern is the qualified path. Each is marked so the fixture
+    # isolates the case under test.
+    cat >"$root/crates/fake/src/types.rs" <<'TYPES'
+// fsync-fail-stop-allow: the type itself
+pub struct FsyncFailed {
+    pub source: std::io::Error,
+}
+pub enum LogError {
+    // fsync-fail-stop-allow: the variant declaration
+    Fsync(FsyncFailed),
+}
+pub enum TierWriteFailure {
+    Fsync(std::io::Error),
+}
+pub enum TierFlushError {
+    Fsync { source: std::io::Error },
+}
+pub enum ExtentWriteFailure {
+    Fsync(std::io::Error),
+}
+impl Commit {
+    // fsync-fail-stop-allow: the freeze hook itself; the caller fail-stops
+    pub fn on_fsync_error(&mut self) {}
+}
+TYPES
+    echo "$root"
+}
+root=$(fsync_fixture fs-clean <<'EOF'
+pub fn ok() -> u64 { 1 }
+EOF
+)
+expect green "fsync: the declarations alone, each marked, are green" env INF_CHECK_ROOT="$root" $FSYNC
+expect_output "fsync: the scope line discloses the derived pattern set" "derived fsync-error patterns" env INF_CHECK_ROOT="$root" $FSYNC
+
+root=$(fsync_fixture fs-catch <<'EOF'
+pub fn swallow(r: Result<(), LogError>) {
+    if let Err(LogError::Fsync(_)) = r {}
+}
+EOF
+)
+expect red "fsync: a catch-and-continue anywhere is red (there is no file allow-list)" env INF_CHECK_ROOT="$root" $FSYNC
+
+root=$(fsync_fixture fs-discard <<'EOF'
+pub fn seal(file: &mut std::fs::File) {
+    let _ = file.sync_data();
+}
+EOF
+)
+expect red "fsync: a discarded raw sync_data is red with no named type involved" env INF_CHECK_ROOT="$root" $FSYNC
+root=$(fsync_fixture fs-discard-ok <<'EOF'
+pub fn seal(file: &mut std::fs::File) -> std::io::Result<()> {
+    file.sync_data()?;
+    Ok(())
+}
+EOF
+)
+expect green "fsync: a propagated sync_data is green" env INF_CHECK_ROOT="$root" $FSYNC
+
+root=$(fsync_fixture fs-newtype <<'EOF'
+pub enum CkptWriteFailure {
+    Write(std::io::Error),
+    Fsync(std::io::Error),
+}
+pub fn barrier(r: Result<(), CkptWriteFailure>) {
+    if let Err(CkptWriteFailure::Fsync(_)) = r {}
+}
+EOF
+)
+expect red "fsync: a brand-new fsync error type is derived and gated" env INF_CHECK_ROOT="$root" $FSYNC
+
+root=$(fsync_fixture fs-bare <<'EOF'
+// fsync-fail-stop-allow:
+pub fn swallow(r: Result<(), LogError>) {
+    if let Err(LogError::Fsync(_)) = r {}
+}
+EOF
+)
+expect red "fsync: a bare marker (no reason) does not audit a site" env INF_CHECK_ROOT="$root" $FSYNC
+
+root=$(fsync_fixture fs-stale <<'EOF'
+// fsync-fail-stop-allow: guards nothing
+pub fn ok() -> u64 { 1 }
+EOF
+)
+expect red "fsync: a marker guarding no site is stale scope" env INF_CHECK_ROOT="$root" $FSYNC
+
+root=$(fsync_fixture fs-prose <<'EOF'
+//! LogError::Fsync is non-recoverable by contract (§8.4).
+/// Returns TierFlushError::Fsync on a failed barrier.
+pub fn ok() -> u64 { 1 }
+EOF
+)
+expect green "fsync: prose naming the contract is not a site" env INF_CHECK_ROOT="$root" $FSYNC
+
+root=$(fsync_fixture fs-testmod <<'EOF'
+pub fn ok() -> u64 { 1 }
+
+#[cfg(test)]
+mod tests {
+    fn t(r: Result<(), LogError>) { if let Err(LogError::Fsync(_)) = r {} }
+}
+EOF
+)
+expect green "fsync: a test-only module is stripped" env INF_CHECK_ROOT="$root" $FSYNC
+
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop each red on a planted violation)"

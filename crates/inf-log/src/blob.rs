@@ -122,6 +122,7 @@ impl core::fmt::Display for ExtentWriteFailure {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ExtentWriteFailure::Write(e) => write!(f, "extent write failed: {e}"),
+            // fsync-fail-stop-allow: Display arm: renders, never handles
             ExtentWriteFailure::Fsync(e) => write!(f, "extent fsync failed (typed abort): {e}"),
         }
     }
@@ -140,6 +141,7 @@ impl ExtentWriteFailure {
             ExtentWriteFailure::Write(e) => {
                 e.kind() == io::ErrorKind::StorageFull || e.raw_os_error() == Some(28)
             }
+            // fsync-fail-stop-allow: is_retryable classifier: false — the ADR-0061 D3 typed abort is never retried
             ExtentWriteFailure::Fsync(_) => false,
         }
     }
@@ -383,10 +385,12 @@ impl<F: SegmentFs> ExtentWriter<F> {
         // ADR-0061 D3/D9 `blob_fsync_err`: the barrier fails — typed
         // abort; the extent is abandoned, nothing durable references it.
         if inf_foundation::fault::fire(crate::fault::BLOB_FSYNC_ERR) {
+            // fsync-fail-stop-allow: blob_fsync_err injection: constructs and returns typed
             return Err(ExtentWriteFailure::Fsync(crate::fault::injected(
                 crate::fault::BLOB_FSYNC_ERR,
             )));
         }
+        // fsync-fail-stop-allow: the extent barrier: mapped to ExtentWriteFailure::Fsync and propagated with `?`
         self.file.sync_data().map_err(ExtentWriteFailure::Fsync)?;
         Ok(SealedExtent {
             ns: self.ns,

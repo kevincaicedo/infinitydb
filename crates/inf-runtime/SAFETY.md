@@ -84,7 +84,22 @@ with the online set by the kernel, so no error path depends on topology.
 
 `RawWakerVTable` whose data pointer is `Rc<TaskHeader>` — refcounts are
 **non-atomic by design** (L1, ADR-0003; verified by
-`scripts/check-waker-atomics.sh` against release asm).
+`scripts/check-waker-atomics.sh` against release asm, in `just check` and
+Linux PR CI since ADR-0106 D8). The gate resolves the four wakers from the
+vtable static, scans each body from `.cfi_startproc` to `.cfi_endproc`, and
+follows direct calls transitively through every callee whose body is in the
+same asm (`Rc::drop_slow`, `VecDeque::grow` today); callees with no body in
+the asm — the allocator shim, `memcpy`/`memmove`, the cold panic/unwind
+edges — are listed on every run, not assumed clean.
+
+Before ADR-0106 D8 this sentence was not evidence: the gate ran in no
+recipe and no workflow, its `awk` reset at the `.Lfunc_beginN:` label that
+`line-tables-only` debuginfo puts on every body's first line (2 lines and
+**zero instructions** scanned per waker), and its mnemonic set was anchored
+at the line start, so an x86 `lock` prefix — its own tab-separated field —
+could not match. A `compare_exchange_weak` retry loop planted in
+`waker_wake_by_ref` compiled to `lock cmpxchgq` and the gate printed
+"zero atomic instructions".
 
 This deliberately does not satisfy `Waker`'s documented thread-safety
 contract. Soundness rests on the **thread-locality invariant**: a waker

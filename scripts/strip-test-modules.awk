@@ -20,6 +20,10 @@
 #
 # Modes (`-v mode=…`):
 #   (default)  print the file with test-only module bodies blanked
+#   testonly   the inverse: print ONLY the test-only module bodies, every
+#              other line blanked (line numbers preserved). Added at
+#              ADR-0106 D9 so check-fault-points.sh can count a unit test
+#              that arms a fault point without counting production code.
 #   report     print `stripped <lines>`, `inline <count>` (test-only
 #              attributes NOT followed by a module block — scanned as
 #              production) and one `modfile <name>` per `mod name;`
@@ -38,7 +42,7 @@ BEGIN { skipping = 0; pending = 0; stripped = 0; inline = 0 }
 skipping == 1 {
     stripped++
     if ($0 == closer) { skipping = 0 }
-    if (mode != "report") { print "" }
+    if (mode == "testonly") { print } else if (mode != "report") { print "" }
     next
 }
 
@@ -47,7 +51,7 @@ pending == 1 {
     if ($0 ~ /^[[:space:]]*#\[/) {
         # Stacked attributes (`#[cfg(test)]` then `#[allow(…)]`): keep
         # waiting for the item; the test-only verdict carries forward.
-        if (mode != "report") { print attr }
+        if (mode == "testonly") { print "" } else if (mode != "report") { print attr }
         attr = $0
         pending = 1
         next
@@ -65,11 +69,12 @@ pending == 1 {
         sub(/^.*mod[[:space:]]+/, "", name)
         sub(/[[:space:]]*;.*$/, "", name)
         if (mode == "report") { print "modfile " name }
-        if (mode != "report") { print attr; print $0 }
+        if (mode == "testonly") { print ""; print "" }
+        else if (mode != "report") { print attr; print $0 }
         next
     }
     inline++
-    if (mode != "report") { print attr }
+    if (mode == "testonly") { print "" } else if (mode != "report") { print attr }
 }
 
 is_test_only_attr($0) {
@@ -78,7 +83,7 @@ is_test_only_attr($0) {
     next
 }
 
-{ if (mode != "report") { print } }
+{ if (mode == "testonly") { print "" } else if (mode != "report") { print } }
 
 END {
     if (mode == "report") { print "stripped " stripped; print "inline " inline }

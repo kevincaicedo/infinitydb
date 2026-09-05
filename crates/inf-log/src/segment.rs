@@ -233,17 +233,20 @@ impl SegmentConfig {
 /// fail-stop. **No caller may catch this and continue**; CI greps for this
 /// type in non-fatal match arms (M2 §3.3, enforced from M2-S17).
 #[derive(Debug)]
+// fsync-fail-stop-allow: the type itself — an fsync failure's identity; constructed only in this file
 pub struct FsyncFailed {
     pub segment: SegmentId,
     pub source: io::Error,
 }
 
+// fsync-fail-stop-allow: Display for the typed error: renders, never recovers
 impl fmt::Display for FsyncFailed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "FATAL: fsync failed on {} — cell must stop: {}", self.segment, self.source)
     }
 }
 
+// fsync-fail-stop-allow: Error::source for the typed error: renders the chain, never recovers
 impl std::error::Error for FsyncFailed {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
@@ -270,6 +273,7 @@ pub enum LogError {
     NextNotReady {
         segment: SegmentId,
     },
+    // fsync-fail-stop-allow: the LogError variant declaration
     Fsync(FsyncFailed),
     Io {
         segment: SegmentId,
@@ -289,6 +293,7 @@ impl fmt::Display for LogError {
             LogError::NextNotReady { segment } => {
                 write!(f, "next segment {segment} has a zero-fill op in flight: frame waits")
             }
+            // fsync-fail-stop-allow: Display arm: renders the failure, never handles it
             LogError::Fsync(err) => err.fmt(f),
             LogError::Io { segment, source } => write!(f, "log I/O error on {segment}: {source}"),
         }
@@ -298,6 +303,7 @@ impl fmt::Display for LogError {
 impl std::error::Error for LogError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            // fsync-fail-stop-allow: Error::source arm: hands out the io::Error, never handles it
             LogError::Fsync(err) => Some(err),
             LogError::Io { source, .. } => Some(source),
             _ => None,
@@ -1390,6 +1396,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
         // M2-S16 `fsync_err`: the seal fsync fails — typed, non-recoverable
         // by contract (§8.4: no caller may catch and continue).
         if inf_foundation::fault::fire(crate::fault::FSYNC_ERR) {
+            // fsync-fail-stop-allow: fsync_err injection: constructs and returns typed — nothing catches it
             return Err(LogError::Fsync(FsyncFailed {
                 segment: self.active.id,
                 source: crate::fault::injected(crate::fault::FSYNC_ERR),
@@ -1400,6 +1407,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
         self.active
             .file
             .sync_data()
+            // fsync-fail-stop-allow: the seal fsync: mapped to LogError::Fsync and propagated with `?`
             .map_err(|source| LogError::Fsync(FsyncFailed { segment: self.active.id, source }))?;
         // M2-S16 `power_cut_after_seal`: the seal is durable; the process
         // dies before anything after it exists (the pointer swap, the next
@@ -1669,11 +1677,13 @@ fn create_prealloc<F: SegmentFs>(
 /// refers to the segment. Honours the M2-S16 `dir_fsync_fail` fault.
 fn sync_log_dir<F: SegmentFs>(fs: &F, log_dir: &Path, id: SegmentId) -> Result<(), LogError> {
     if inf_foundation::fault::fire(crate::fault::DIR_FSYNC_FAIL) {
+        // fsync-fail-stop-allow: dir_fsync_fail injection: constructs and returns typed
         return Err(LogError::Fsync(FsyncFailed {
             segment: id,
             source: crate::fault::injected(crate::fault::DIR_FSYNC_FAIL),
         }));
     }
+    // fsync-fail-stop-allow: the dir barrier: mapped to LogError::Fsync and returned
     fs.sync_dir(log_dir).map_err(|source| LogError::Fsync(FsyncFailed { segment: id, source }))
 }
 

@@ -1,80 +1,173 @@
 #!/usr/bin/env bash
-# fsync fail-stop grep (M2-S17, §3.3/§8.4 — the PostgreSQL fsyncgate
-# lesson): fsync failure surfaces as a typed, non-recoverable error
-# (`LogError::Fsync` / `FsyncFailed`, and the terminal `on_fsync_error`
-# ledger hook). No caller may catch and continue. Shell cannot parse Rust
-# match arms, so the enforceable rule is an audited allowlist: the
-# fsync-error types may be referenced only in the files below — the
-# definitions/constructions in `inf-log` and the terminal fail-stop
-# handlers. A new file referencing them fails the build until it is
-# reviewed as fail-stop and added here (with the review note saying why).
+# fsync fail-stop gate (M2-S17, §3.3/§8.4 — the PostgreSQL fsyncgate
+# lesson): an fsync failure surfaces as a typed, non-recoverable error and
+# **no caller may catch and continue**. Rewritten at ADR-0106 D10 (review
+# 2026-08-30, F-L20-06); the old gate had two structural gaps, both proven
+# on this tree:
+#
+#   1. its allow-list was per FILE, and the ten allow-listed files include
+#      `inf-log/src/commit.rs` (1,722 lines), `segment.rs` (1,700) and
+#      `inf-server/src/durable.rs` (2,358) — exactly where such a handler
+#      would be written. A planted
+#      `if let Err(LogError::Fsync(_)) = r { /* continue */ }` in
+#      `commit.rs` left it printing "OK (10 audited sites)";
+#   2. its pattern set was five hand-listed variant names, so a raw
+#      `let _ = file.sync_data();` planted in `segment.rs` — the fsyncgate
+#      poison with no named type at all — was equally invisible.
+#
+# Now:
+#   * the type set is DERIVED from the source (every enum in `crates/*/src`
+#     with an `Fsync` variant, plus every `*Fsync*` error struct), so a
+#     future `CkptWriteFailure::Fsync` is under the gate the moment it is
+#     declared; the derived set must still cover the audited minimum, or
+#     the derivation itself is a scope error;
+#   * the allow-list is per SITE: `fsync-fail-stop-allow: <reason>` on the
+#     line or the line directly above (the deny-list / panic-policy marker
+#     shape, ADR-0106 D4). Bare markers and stale markers fail; every
+#     reason is printed on every run;
+#   * a second rule flags a raw `sync_data`/`sync_all`/`fdatasync`/
+#     `libc::fsync` whose result is DISCARDED (`let _ =`, `.ok()`,
+#     `.unwrap_or…`, `.is_ok()/.is_err()`, `drop(`) — the act of syncing,
+#     not the spelling of a type;
+#   * comments and test-only modules are stripped (ADR-0106 D3): 11 of the
+#     41 raw hits in this tree are prose naming the contract, and prose is
+#     not a handler.
+#
+# Portable bash 3.2 / POSIX awk (macOS is in the CI matrix).
 set -euo pipefail
-cd "$(dirname "$0")/.."
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
+STRIP="$SCRIPT_DIR/strip-test-modules.awk"
+NOCOMMENT="$SCRIPT_DIR/rust-strip-comments.awk"
+[ -f "$STRIP" ] && [ -f "$NOCOMMENT" ] || { echo "FSYNC SCOPE ERROR: helper awk missing next to $0"; exit 2; }
 
-# Audited fail-stop sites (reviewed at M2-S17, ADR-0020 D4; tier rows
-# added at M4-S11, ADR-0056 D4):
-#   inf-log/segment.rs   — type definitions + the only constructions
-#                          (seal fsync, dir-fsync barriers)
-#   inf-log/commit.rs    — GroupCommit::on_fsync_error: freezes the
-#                          watermark; exists so the freeze is observable,
-#                          never so a caller can continue
-#   inf-log/lib.rs       — re-export
-#   inf-log/fs.rs        — trait doc naming the contract
-#   inf-log/fault.rs     — fault-point inventory doc
-#   inf-log/tier.rs      — TierWriteFailure::Fsync: the only tier-level
-#                          constructions (sync/seal barriers); propagated,
-#                          never handled (M4-S11 review)
-#   inf-log/flush.rs     — TierFlushError::Fsync: classification only —
-#                          the flushed watermark freezes by construction
-#                          (no advance happens past a failed barrier) and
-#                          the error propagates to the terminal handler
-#                          (M4-S11 review)
-#   inf-log/blob.rs      — ExtentWriteFailure::Fsync: the ADR-0061 D3
-#                          typed **abort** — the one ADR-defined narrower
-#                          behavior: at barrier time nothing durable
-#                          references the extent, the file is abandoned
-#                          (never retried — the fsyncgate poison is
-#                          structurally absent) and the write fails typed
-#                          (M4-S17 review)
-#   inf-server/durable.rs — on_log_error/fail_stop: eprintln + exit(3),
-#                          the terminal handler
-#   inf-server/tier_cell.rs — drive_flush_round: a reactor-drive flush
-#                          barrier's error completion re-surfaces as
-#                          TierFlushError::Fsync at the next MAINTAIN;
-#                          the watermark froze by construction (effects
-#                          apply only on success) and maintain_ns
-#                          propagates it to the plane's fatal arm →
-#                          DurableCell::fail_stop. Construction only,
-#                          never caught (M4.5-S31 review, ADR-0084 D4)
-ALLOW=(
-    crates/inf-log/src/segment.rs
-    crates/inf-log/src/commit.rs
-    crates/inf-log/src/lib.rs
-    crates/inf-log/src/fs.rs
-    crates/inf-log/src/fault.rs
-    crates/inf-log/src/tier.rs
-    crates/inf-log/src/flush.rs
-    crates/inf-log/src/blob.rs
-    crates/inf-server/src/durable.rs
-    crates/inf-server/src/tier_cell.rs
-)
+work=$(mktemp -d)
+[ -n "$work" ] && [ -d "$work" ] || { echo "FSYNC SCOPE ERROR: mktemp failed"; exit 2; }
+trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
 
 fail=0
-while IFS= read -r hit; do
-    file=${hit%%:*}
-    ok=0
-    for allowed in "${ALLOW[@]}"; do
-        [ "$file" = "$allowed" ] && ok=1 && break
-    done
-    if [ "$ok" -eq 0 ]; then
-        echo "UNAUDITED fsync-error handling: $hit"
-        fail=1
-    fi
-done < <(grep -rn --include='*.rs' -e 'LogError::Fsync' -e 'FsyncFailed' -e 'on_fsync_error' -e 'TierWriteFailure::Fsync' -e 'TierFlushError::Fsync' -e 'ExtentWriteFailure::Fsync' crates/*/src bins/*/src)
 
+# ---- 1. derive the fsync-error type set --------------------------------
+# The audited minimum: the set this gate's allow-list was reviewed against.
+# The derivation may only GROW it; a shrink means the parser broke.
+REQUIRED="LogError::Fsync FsyncFailed on_fsync_error TierWriteFailure::Fsync TierFlushError::Fsync ExtentWriteFailure::Fsync"
+: >"$work/derived"
+for dir in crates/*/src; do
+    [ -d "$dir" ] || continue
+    while IFS= read -r f; do
+        awk -f "$NOCOMMENT" "$f" | awk '
+            /^[[:space:]]*(pub[[:space:]]+)?enum[[:space:]]+[A-Za-z0-9_]+/ {
+                n = $0
+                sub(/^.*enum[[:space:]]+/, "", n)
+                sub(/[^A-Za-z0-9_].*$/, "", n)
+                match($0, /^[[:space:]]*/)
+                closer = substr($0, 1, RLENGTH) "}"
+                name = n
+                inenum = 1
+                next
+            }
+            inenum == 1 && $0 == closer { inenum = 0; next }
+            inenum == 1 && /^[[:space:]]*Fsync[[:space:]]*[({,]/ { print name "::Fsync" }
+            # Error-shaped only: FsyncTicket / FsyncClass are plumbing.
+            /^[[:space:]]*(pub[[:space:]]+)?struct[[:space:]]+[A-Za-z0-9_]*Fsync[A-Za-z0-9_]*/ {
+                n = $0
+                sub(/^.*struct[[:space:]]+/, "", n)
+                sub(/[^A-Za-z0-9_].*$/, "", n)
+                if (n ~ /(Failed|Error)/) { print n }
+            }
+            /pub fn on_fsync_error/ { print "on_fsync_error" }
+        ' >>"$work/derived"
+    done < <(find "$dir" -name '*.rs' | sort)
+done
+sort -u "$work/derived" -o "$work/derived"
+for p in $REQUIRED; do
+    grep -qx "$p" "$work/derived" || {
+        echo "FSYNC SCOPE ERROR: the derived type set lost \"$p\" — the derivation broke, or the type was renamed"
+        echo "  (derived: $(tr '\n' ' ' <"$work/derived"))"
+        fail=1
+    }
+done
+derived_count=$(wc -l <"$work/derived" | tr -d ' ')
+PATTERN=$(awk '{ printf "%s%s", (NR>1?"|":""), $0 }' "$work/derived" | sed 's/[.[\*^$]/\\&/g')
+
+# ---- 2. sites, per-site markers -----------------------------------------
+files=0
+lines=0
+sites=0
+allowed=0
+DISCARD='(let[[:space:]]+_[[:space:]]*=|\.ok\(\)|\.unwrap_or|\.is_ok\(\)|\.is_err\(\)|drop\()'
+SYNCCALL='(sync_data|sync_all|fdatasync|libc::fsync)[[:space:]]*\('
+syncs=0
+for dir in crates/*/src bins/*/src; do
+    [ -d "$dir" ] || continue
+    while IFS= read -r f; do
+        files=$((files + 1))
+        lines=$((lines + $(wc -l <"$f")))
+        # `use` / `pub use` statements are blanked: an import or a
+        # re-export names the typed error, it can never catch one.
+        awk -f "$STRIP" "$f" | awk -f "$NOCOMMENT" | awk '
+            inuse == 1 { if ($0 ~ /;/) { inuse = 0 }; print ""; next }
+            /^[[:space:]]*(pub([[:space:]]*\([a-z:]+\))?[[:space:]]+)?use[[:space:]]/ {
+                if ($0 !~ /;/) { inuse = 1 }
+                print ""
+                next
+            }
+            { print }' >"$work/code"
+        # Markers live in the comments, so they are read from the raw file.
+        while IFS=: read -r n text; do
+            sites=$((sites + 1))
+            reason=$(awk -v n="$n" 'NR==n-1 || NR==n {
+                if (match($0, /fsync-fail-stop-allow:[[:space:]]*[^ ].*/)) {
+                    r = substr($0, RSTART + 22, RLENGTH - 22)
+                    sub(/^[[:space:]]*/, "", r); sub(/[[:space:]]*\*\/[[:space:]]*$/, "", r)
+                    if (r != "") { print r; exit }
+                }
+            }' "$f")
+            bare=$(awk -v n="$n" 'NR==n-1 || NR==n { if ($0 ~ /fsync-fail-stop-allow:[[:space:]]*$/) { print "1"; exit } }' "$f")
+            if [ -n "$reason" ]; then
+                allowed=$((allowed + 1))
+                echo "  audited $f:$n — $reason"
+            elif [ -n "$bare" ]; then
+                echo "UNAUDITED fsync-error site: $f:$n has a bare marker (no reason)"
+                fail=1
+            else
+                echo "UNAUDITED fsync-error site: $f:$n:${text# }"
+                fail=1
+            fi
+        done < <(grep -nE "$PATTERN" "$work/code" || true)
+        # A raw sync whose result is thrown away — no named type involved.
+        while IFS=: read -r n text; do
+            syncs=$((syncs + 1))
+            case "$text" in
+                *"fn sync_data"*|*"fn sync_all"*) continue ;;
+            esac
+            # Same statement only: the continuation line counts only when
+            # line n did not terminate (`staged.sync_data()?;` followed by
+            # an unrelated `drop(staged);` is not a discard).
+            window=$(awk -v n="$n" 'NR==n { print; if ($0 ~ /;[[:space:]]*$/) exit } NR==n+1 { print }' "$work/code")
+            printf '%s' "$window" | grep -qE "$DISCARD" || continue
+            if awk -v n="$n" 'NR==n-1 || NR==n { if ($0 ~ /fsync-fail-stop-allow:[[:space:]]*[^ ]/) { f=1 } } END { exit !f }' "$f"; then
+                continue
+            fi
+            echo "UNAUDITED discarded sync result: $f:$n:${text# }"
+            fail=1
+        done < <(grep -nE "$SYNCCALL" "$work/code" || true)
+        # A marker that guards nothing is stale scope.
+        while IFS=: read -r n _; do
+            if ! awk -v n="$n" -v pat="$PATTERN" -v sc="$SYNCCALL" \
+                'NR==n || NR==n+1 { if ($0 ~ pat || $0 ~ sc) { f=1 } } END { exit !f }' "$work/code"; then
+                echo "STALE fsync-fail-stop marker: $f:$n guards no fsync-error site"
+                fail=1
+            fi
+        done < <(grep -n 'fsync-fail-stop-allow:' "$f" || true)
+    done < <(find "$dir" -name '*.rs' | sort)
+done
+
+scope="$derived_count derived fsync-error patterns, $files files / $lines lines scanned, $sites typed sites ($allowed audited), $syncs raw sync call sites"
 if [ "$fail" -ne 0 ]; then
-    echo "fsync fail-stop grep FAILED: fsync errors are fail-stop (§8.4);"
-    echo "prove the new site is terminal and extend the allowlist in this script."
+    echo "fsync fail-stop FAILED ($scope)"
+    echo "fsync failure is fail-stop (§8.4): prove the site is terminal and mark it"
+    echo "  // fsync-fail-stop-allow: <why this site cannot catch and continue>"
     exit 1
 fi
-echo "fsync fail-stop grep OK (${#ALLOW[@]} audited sites)"
+echo "fsync fail-stop OK ($scope)"

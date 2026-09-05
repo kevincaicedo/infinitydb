@@ -1,0 +1,46 @@
+# M4.5-S04/S05 index-maintenance fault rows (ADR-0072 D7.2 / ADR-0073).
+# These points live in `inf-store`'s inventory, which the coverage test
+# did not enumerate until batch 15 of the 2026-08-30 review: it chained
+# `inf_log::fault::ALL` and `inf_server::fault::ALL` only, so three
+# declared points had no row while the test's own name claimed every
+# declared point was covered (the F-L20-04 blind-spot class, in the
+# instrument rather than the script).
+#
+# All three are store-tier windows, not power cuts: the injected trip
+# happens inside one cell's maintenance, and the oracle is what the cell
+# serves afterwards. They carry as named tests, like the node tier.
+#
+# expect vocabulary (verified by the carrying tests):
+#   refusal-leaves-no-trace  — the reservation refuses before the command
+#                              executes: document absent, trees, counters
+#                              and accounting all unchanged, next
+#                              mutation maintains normally
+#   degrades-never-lies      — the mutation stands (the log is truth), the
+#                              projection breaks: every participating
+#                              index flips its serving veto, no partial
+#                              entries are served, rebuild clears it
+#   parks-and-rebuild-recovers — a tripped backfill parks + degrades that
+#                              build and never reports ready; the others
+#                              converge; rebuild resets and it converges
+
+# No memfs-tier rows here, so the runner executes none; the key is
+# required by the schema.
+seeds = 3
+
+[[row]]
+point = "idx_reserve_refuse"
+tier = "node"
+test = "inf-store/tests/index_maint_storm.rs"
+expect = "refusal-leaves-no-trace"
+
+[[row]]
+point = "idx_apply_trip"
+tier = "node"
+test = "inf-store/tests/index_maint_storm.rs"
+expect = "degrades-never-lies"
+
+[[row]]
+point = "idx_backfill_trip"
+tier = "node"
+test = "inf-store/tests/index_backfill_storm.rs"
+expect = "parks-and-rebuild-recovers"

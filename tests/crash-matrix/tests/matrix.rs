@@ -40,12 +40,21 @@ fn every_declared_point_has_a_matrix_row() {
     // regardless of which milestone owns it.
     let m4 = load_matrix(&Path::new(env!("CARGO_MANIFEST_DIR")).join("m4.toml"));
     def.rows.extend(m4.rows);
-    let declared: Vec<&str> =
-        inf_log::fault::ALL.iter().chain(inf_server::fault::ALL).copied().collect();
+    // M4.5 index-maintenance rows. The declared list chained two crates
+    // until batch 15 of the 2026-08-30 review, so `inf-store`'s three
+    // points had no row while this test's name claimed otherwise.
+    let m45 = load_matrix(&Path::new(env!("CARGO_MANIFEST_DIR")).join("m45.toml"));
+    def.rows.extend(m45.rows);
+    let declared: Vec<&str> = inf_log::fault::ALL
+        .iter()
+        .chain(inf_server::fault::ALL)
+        .chain(inf_store::fault::ALL)
+        .copied()
+        .collect();
     for point in declared {
         assert!(
             def.rows.iter().any(|row| row.point == point),
-            "fault point {point:?} has no crash-matrix row (tests/crash-matrix/m2.toml + m4.toml)"
+            "fault point {point:?} has no crash-matrix row (tests/crash-matrix/m2.toml + m4.toml + m45.toml)"
         );
     }
     for row in &def.rows {
