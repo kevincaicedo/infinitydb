@@ -24,7 +24,13 @@ inf-doc.workspace = true
 # M4.5-S37 (ADR-0093 A8): the open-ticket rows run the whole-node
 # `m4-tiered` scenario in-process (the `shadow_twin_read_fail` point is
 # thread-local — a real node cannot be armed from a test); test-only.
-inf-sim = { path = "../../bins/inf-sim" }
+# `dst` is required, not incidental: the row's `Ticketed` refusals need
+# ADR-0094 D3's forced 64-bit collisions. Without it the scenario ran with
+# `collision-oracle` off and the row reported "0 Ticketed refusals" —
+# green only under `cargo test --workspace`, where `inf-server`'s dev-edge
+# unified the feature in, and red under `cargo test -p crash-matrix`
+# (found in batch 15 of the 2026-08-30 review, §5.5 class).
+inf-sim = { path = "../../bins/inf-sim", features = ["dst"] }
 
 # The fsyncgate row boots a real single-cell uring node in a child
 # process (ADR-0020 D3) — assembly parts, test-harness edges.
