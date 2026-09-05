@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M2-S13 replay-throughput rehearsal (dev tier): time `open_cell_log` —
 //! the real boot path: manifest → `.ick` load → tail replay → S14 slack
 //! scans → rotor reopen — over a synthetic durable-cell image on the real

@@ -1,0 +1,14 @@
+# Planted-bypass probe for scripts/check-clock-ban.sh (review 2026-08-30
+# F-L18-05, ADR-0106 first amendment). Not a workspace member: the gate
+# copies it under target/ and runs clippy there, so the workspace
+# clippy.toml is found by the same directory walk-up the real crates use.
+[package]
+name = "clock-ban-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

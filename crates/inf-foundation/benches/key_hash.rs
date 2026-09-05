@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! ADR-0094 D4 — the key hash's per-key cost, both functions in one run:
 //! `hash64` (the M0 digest fold the index used to place keys with) and
 //! `KeyHasher::hash` (SipHash-1-3 under a secret, the key hash now), at

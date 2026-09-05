@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M2-S16 zero-cost A/B: the per-call cost of `fault::fire` in both
 //! build tiers.
 //!

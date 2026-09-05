@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: harness deadlines and timings, not cell code"
+)]
 //! Reactor-loop structure (M0-S07): bounded steps, HoL fairness via budgets,
 //! spin→park idle policy, timer-driven park timeouts, and the always-on
 //! iteration histogram. Uses a null in-memory driver — backend behavior has

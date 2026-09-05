@@ -311,10 +311,15 @@ impl Arena {
     pub fn bytes(&self, addr: ArenaAddr, len: usize) -> &[u8] {
         let chunk = &self.chunks[addr.chunk()];
         let offset = addr.offset();
-        assert!(offset + len <= chunk.len, "arena range escapes chunk (stale addr or bad len)");
+        // Total: a `len` near `usize::MAX` must not wrap under the bound.
+        assert!(
+            offset.checked_add(len).is_some_and(|end| end <= chunk.len),
+            "arena range escapes chunk (stale addr or bad len)"
+        );
         // SAFETY: chunk.base is a live mapping of chunk.len bytes (len == 0
-        // entries are rejected by the bounds check above); the arena owns it
-        // until unmap/drop, and &self borrows prevent concurrent mutation.
+        // entries are rejected by the bounds check above, which is total —
+        // no wrap); the arena owns it until unmap/drop, and &self borrows
+        // prevent concurrent mutation.
         unsafe { core::slice::from_raw_parts(chunk.base.add(offset), len) }
     }
 
@@ -323,7 +328,10 @@ impl Arena {
     pub fn bytes_mut(&mut self, addr: ArenaAddr, len: usize) -> &mut [u8] {
         let chunk = &self.chunks[addr.chunk()];
         let offset = addr.offset();
-        assert!(offset + len <= chunk.len, "arena range escapes chunk (stale addr or bad len)");
+        assert!(
+            offset.checked_add(len).is_some_and(|end| end <= chunk.len),
+            "arena range escapes chunk (stale addr or bad len)"
+        );
         // SAFETY: as `bytes`, plus &mut self guarantees exclusive access.
         unsafe { core::slice::from_raw_parts_mut(chunk.base.add(offset), len) }
     }
@@ -442,6 +450,29 @@ mod tests {
             assert!(idx == 0 || class_size(idx - 1) < len, "len {len} not minimal");
         }
         assert_eq!(class_of(threshold + 1, threshold), None);
+    }
+
+    /// Batch 14 of the 2026-08-30 review: the range check is total. A
+    /// `len` near `usize::MAX` once wrapped `offset + len` under the bound
+    /// (debug: an overflow panic with the wrong message; release: a slice
+    /// formed past the mapping — the SAFETY row's check was not the check).
+    #[test]
+    #[should_panic(expected = "arena range escapes chunk")]
+    fn bytes_refuses_a_wrapping_len() {
+        let mut arena = Arena::new(ArenaConfig::default());
+        let _first = arena.alloc(64).expect("alloc");
+        // A non-zero offset: `offset + usize::MAX` wraps to `offset - 1`.
+        let addr = arena.alloc(64).expect("alloc");
+        let _ = arena.bytes(addr, usize::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "arena range escapes chunk")]
+    fn bytes_mut_refuses_a_wrapping_len() {
+        let mut arena = Arena::new(ArenaConfig::default());
+        let _first = arena.alloc(64).expect("alloc");
+        let addr = arena.alloc(64).expect("alloc");
+        let _ = arena.bytes_mut(addr, usize::MAX);
     }
 
     #[test]

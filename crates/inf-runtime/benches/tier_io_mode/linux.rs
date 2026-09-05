@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4-S09 tier-file I/O mode A/B (dev tier): `TierIoMode::Direct` vs
 //! `Buffered` on the real cold-read machinery — `UringDriver` +
 //! registered `AlignedPool` + `ColdReads` (merge off: this row isolates

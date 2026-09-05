@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: harness deadlines and stamps, not cell code"
+)]
 //! M4.5-S42 (ADR-0091 D4): the device-model lifecycle at the binary
 //! level — `infinityd --device-probe auto` on a fresh data directory
 //! probes, writes a schema-4 `io-properties.toml`, boots, and says so in

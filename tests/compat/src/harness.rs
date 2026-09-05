@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "harness crate: process deadlines and run stamps, not cell code"
+)]
 //! Shared process plumbing and the matrix-compare loop for the compat
 //! lanes: the pinned redis-server oracle (spawned from PATH, or
 //! `INF_COMPAT_ORACLE_ADDR` for the dockerized CI pin) and the real

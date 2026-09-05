@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4.5-S04 budget bench (§4.1): maintenance ≤ 600 ns per (entry
 //! remove + insert) pair at 10M entries, plus the prune A/B (pruned
 //! vs unpruned rows — the §4.1 budget↔gate arithmetic made an

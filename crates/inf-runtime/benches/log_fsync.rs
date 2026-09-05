@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! Driver-tier group-commit rehearsal (M2-S06 AC dry-run, dev tier): one
 //! `LogWrite` frame + linked fdatasync per iteration against a real
 //! preallocated file, at several group sizes. Grouped-write throughput =

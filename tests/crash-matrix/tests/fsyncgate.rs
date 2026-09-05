@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "harness crate: process deadlines and run stamps, not cell code"
+)]
 //! M2-S17 fsyncgate row (ADR-0020 D3, §8.4): injected EIO on the fsync
 //! completion of a live uring node → the process **fail-stops** with
 //! [`inf_server::EXIT_DURABLE_FAILSTOP`], **zero acks** are emitted for

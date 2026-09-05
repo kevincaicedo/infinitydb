@@ -1263,6 +1263,10 @@ fn control_main(
         // narration only, never oracle input (those ride the
         // injected clocks).
         let mut announced = vec![false; usize::from(cells)];
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "control thread (ADR-0015 D3): boot narration, never oracle input"
+        )]
         // denylist-allow: boot-narration wall clock on the control thread, never oracle input.
         let boot_started = std::time::Instant::now();
         let mut next_progress = boot_started + Duration::from_secs(1);
@@ -1317,11 +1321,19 @@ fn control_main(
                     );
                 }
             }
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "control thread (ADR-0015 D3): boot narration, never oracle input"
+            )]
             // denylist-allow: boot-narration wall clock on the control thread, never oracle input.
             let now = std::time::Instant::now();
             if now >= next_progress && !board.all_ready() {
                 next_progress = now + Duration::from_secs(1);
                 let (done, total) = board.bytes();
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "control thread (ADR-0015 D3): boot narration, never oracle input"
+                )]
                 let elapsed = boot_started.elapsed().as_secs_f64();
                 let eta = if done > 0 {
                     (elapsed * (total.saturating_sub(done)) as f64 / done as f64).ceil()
@@ -1352,10 +1364,14 @@ fn control_main(
                 }
             }
         }
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "control thread (ADR-0015 D3): boot narration, never oracle input"
+        )]
+        let boot_ms = boot_started.elapsed().as_millis();
         eprintln!(
-            "control: recovery complete — {} cells serving ({} ms)",
-            board.cell_count(),
-            boot_started.elapsed().as_millis()
+            "control: recovery complete — {} cells serving ({boot_ms} ms)",
+            board.cell_count()
         );
         while let Ok(msg) = rx.recv() {
             handle_msg(msg);

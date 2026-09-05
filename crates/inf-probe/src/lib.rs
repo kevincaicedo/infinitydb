@@ -286,6 +286,10 @@ pub fn run_and_write(dir: &Path, opts: ProbeOptions) -> io::Result<(PathBuf, Pro
     Ok((path, report))
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the boot-time device probe measures the real device (ADR-0086 D7)"
+)]
 fn probe_rows(dir: &Path, scratch: &Path, opts: ProbeOptions) -> io::Result<ProbeReport> {
     let started = Instant::now();
     let per_row = Duration::from_secs(opts.seconds_per_row);
@@ -394,6 +398,10 @@ fn open(scratch: &Path, policy: Policy) -> io::Result<File> {
 
 /// One row: sequential `bytes`-sized writes for `per_row`, each followed
 /// by the policy's barrier; latency per barrier.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the boot-time device probe measures the real device (ADR-0086 D7)"
+)]
 fn measure(scratch: &Path, policy: Policy, bytes: usize, per_row: Duration) -> io::Result<Row> {
     let file = open(scratch, policy)?;
     // Aligned source (the ADR-0054 D2 shape): `O_DIRECT` needs it; the
@@ -442,6 +450,10 @@ fn measure(scratch: &Path, policy: Policy, bytes: usize, per_row: Duration) -> i
 /// its own quarter of the scratch file (ADR-0088 D6). Aggregate
 /// barriers/s — one thread per writer, the same loop as `measure` minus
 /// the latency histogram. Not cell code: `std::thread` is fine here.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the boot-time device probe measures the real device (ADR-0086 D7)"
+)]
 fn measure_concurrent(
     scratch: &Path,
     bytes: usize,
@@ -492,6 +504,10 @@ fn measure_concurrent(
 /// rows populated, so the row is page-cache-cold by construction; the
 /// device's own write cache is not controlled (disclosed in the module
 /// docs). Not cell code: `std::thread` is fine here.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the boot-time device probe measures the real device (ADR-0086 D7)"
+)]
 fn measure_read_concurrent(
     scratch: &Path,
     bytes: usize,
@@ -625,6 +641,10 @@ fn quoted(value: &str) -> String {
 }
 
 #[must_use]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the boot-time device probe measures the real device (ADR-0086 D7)"
+)]
 fn render(rows: &[Row], verdict: &Verdict, identity: &DeviceIdentity, seconds: u64) -> String {
     let probed_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

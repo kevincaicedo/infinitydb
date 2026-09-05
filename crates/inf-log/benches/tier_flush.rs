@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4-S11 flush-bandwidth bench (§4.1: "flush ≥ 0.8× device
 //! sequential-write bandwidth"; ADR-0056 D3). Two legs, ABBA, same
 //! device, same total bytes, same fdatasync cadence — the ceiling is

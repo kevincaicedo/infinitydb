@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "harness crate: process deadlines and run stamps, not cell code"
+)]
 //! The in-process diff candidate: encoded RESP command bytes → `ConnParser`
 //! → `inf_server::execute` → reply bytes. Exercises the same parser, command
 //! registry, and store the node will run — only the reactor/TCP plumbing is

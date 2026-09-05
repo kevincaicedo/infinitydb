@@ -401,11 +401,23 @@ impl TierRound {
         window: FrameStaging,
         frames: usize,
     ) {
+        self.admit_op();
         self.writes.push(StagedWrite { fd, offset, window, frames });
     }
 
     pub(crate) fn push_barrier(&mut self, fd: std::os::fd::RawFd) {
+        self.admit_op();
         self.barriers.push(fd);
+    }
+
+    /// The ADR-0084 D3 staging bound: op indices are 8 token bits. A
+    /// validated slice (≤ 64 MiB, ring ≥ slice) stages ≤ ~75 ops; past
+    /// [`ROUND_OPS_MAX`] a completion would alias another op's.
+    fn admit_op(&self) {
+        assert!(
+            self.op_count() < ROUND_OPS_MAX,
+            "tier round exceeds its 8-bit op index (ADR-0084 D3)"
+        );
     }
 
     pub(crate) fn push_effect(&mut self, effect: RoundEffect) {
@@ -433,9 +445,15 @@ pub(crate) struct WindowPool {
     outstanding: u32,
 }
 
+/// Ops a round may stage (ADR-0084 D3): the plane packs the op index
+/// into 8 token bits (`slot = lane × 256 + op_index`), so a 257th op
+/// would share another op's completion token.
+pub const ROUND_OPS_MAX: usize = 256;
+
 /// Backstop on circulating windows — a round staging more than this is
-/// a programmer error (the token op-index bound is 256; see ADR-0084 D3).
-const WINDOWS_OUTSTANDING_CAP: u32 = 256;
+/// a programmer error (the token op-index bound is [`ROUND_OPS_MAX`];
+/// see ADR-0084 D3).
+const WINDOWS_OUTSTANDING_CAP: u32 = ROUND_OPS_MAX as u32;
 
 impl WindowPool {
     pub(crate) fn new() -> WindowPool {
@@ -1418,6 +1436,19 @@ mod tests {
         let n = file.read_at(tier_frame_offset(first), &mut window).expect("read");
         assert_eq!(n, window.len(), "window inside the synced file");
         window
+    }
+
+    /// Batch 14 of the 2026-08-30 review: ADR-0084 D3 names a "≤ 256
+    /// ops/round, asserted at staging" bound that was never written; the
+    /// plane packs the op index into 8 token bits, so a 257th op would
+    /// have shared another op's completion token silently.
+    #[test]
+    #[should_panic(expected = "tier round exceeds its 8-bit op index")]
+    fn round_refuses_the_257th_op() {
+        let mut round = TierRound::new();
+        for _ in 0..=ROUND_OPS_MAX {
+            round.push_barrier(0);
+        }
     }
 
     /// Round trip: appended records read back byte-exact through the

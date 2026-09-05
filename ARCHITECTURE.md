@@ -263,7 +263,10 @@ nondeterministic execution to surprise anyone.
 
 The simulator's authority is guarded mechanically: cell code cannot name
 `tokio`, locks, `thread::sleep`, ambient clocks, or ambient randomness —
-a denylist script enforces it.
+a denylist grep enforces it, and locks, sleep and clocks are also
+type-resolved by clippy's `disallowed-types`/`disallowed-methods`
+(ADR-0106 D7: `check-clock-ban.sh` proves the clock ban on planted
+bypass spellings and lists every sanctioned site).
 
 ### Memory is the product
 

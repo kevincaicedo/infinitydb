@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4.5-S02 budget bench (§4.1): typed index-key encode ≤ 30 ns typical
 //! scalar. Steady-state sweeps over shuffled pre-generated corpora
 //! (the `ordered` bench harness precedent), medians over ROUNDS; the

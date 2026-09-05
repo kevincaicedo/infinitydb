@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: harness deadlines and timings, not cell code"
+)]
 //! End-to-end node assembly test (Linux + uring): two real cells on real
 //! threads behind one SO_REUSEPORT port, driven over TCP — local fast path,
 //! cross-cell Apply round-trips, multi-key aggregation, pipelined reply

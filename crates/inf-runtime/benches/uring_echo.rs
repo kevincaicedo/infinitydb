@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M0-S04 AC: loopback echo microbench on `UringDriver`.
 //!
 //! Gate: ≥ 1M echo frames/s (64 B frames) on ONE pinned server core with

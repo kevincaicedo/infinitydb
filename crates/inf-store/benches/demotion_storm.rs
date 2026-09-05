@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4-S07 foreground-protection storm (§4.1: "foreground p99.9 < 2 ms
 //! during sustained demotion storm" — the M1-S05 storm pattern applied
 //! to demotion). Foreground ops (GET/SET mix over a tiered table) run

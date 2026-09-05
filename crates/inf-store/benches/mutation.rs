@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4-S05 budget bench (§4.1): mutable-region mutation cost vs the M3
 //! arena path — "SET/`JSON.NUMINCRBY` within 1% of M3 baseline above the
 //! boundary". Three rows, each arena-vs-address-space with identical

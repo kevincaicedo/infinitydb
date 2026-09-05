@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4.5-S05 backfill gate bench (§4.1): ≥ 500k entries/s/cell **with**
 //! foreground p99.9 < 2 ms in the same run — both numbers, one run
 //! (the co-gate; plan S05 AC 1).

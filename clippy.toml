@@ -10,4 +10,21 @@ disallowed-types = [
 ]
 disallowed-methods = [
     { path = "std::thread::sleep", reason = "cells park via the backend driver idle strategy, never thread::sleep" },
+    # Review 2026-08-30 F-L18-05 (batch 14, ADR-0106 first amendment): the
+    # ambient-clock ban is type-resolved — `use std::time::Instant;` and a
+    # renamed/aliased/glob import defeat the grep in check-cell-denylist.sh
+    # and none of these. `elapsed` is banned too: `UNIX_EPOCH.elapsed()`
+    # reads the wall clock without spelling `now`. Sanctioned sites carry
+    # `#[allow(clippy::disallowed_methods, reason = "…")]` on the statement
+    # or fn; scripts/check-clock-ban.sh lists every allow in cell code and
+    # proves the ban on planted bypass shapes.
+    { path = "std::time::Instant::now", reason = "no ambient clocks in cell code (L7): time is injected through inf_foundation::time::Clock" },
+    { path = "std::time::Instant::elapsed", reason = "no ambient clocks in cell code (L7): elapsed() reads the real clock" },
+    { path = "std::time::SystemTime::now", reason = "no ambient clocks in cell code (L7): time is injected through inf_foundation::time::Clock" },
+    { path = "std::time::SystemTime::elapsed", reason = "no ambient clocks in cell code (L7): UNIX_EPOCH.elapsed() is SystemTime::now() in disguise" },
+    { path = "libc::clock_gettime", reason = "no ambient clocks in cell code (L7) — the libc spelling" },
+    { path = "libc::gettimeofday", reason = "no ambient clocks in cell code (L7) — the libc spelling" },
+    { path = "libc::time", reason = "no ambient clocks in cell code (L7) — the libc spelling" },
+    { path = "core::arch::x86_64::_rdtsc", reason = "no ambient clocks in cell code (L7) — the TSC spelling" },
+    { path = "core::arch::x86_64::_rdtscp", reason = "no ambient clocks in cell code (L7) — the TSC spelling" },
 ]
