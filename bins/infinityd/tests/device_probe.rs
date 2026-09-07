@@ -262,9 +262,9 @@ fn a_fresh_data_directory_is_probed_once_and_the_model_is_identity_bound() {
         assert_eq!(field(&info, "io_class_configured"), verdict);
         assert!(dir.join("io-properties.toml.stale").exists(), "the stale model is kept");
         assert!(!fresh.contains("dead-beef"), "the foreign identity is gone: {fresh}");
-        // The two read rows (ADR-0088 D4 as amended, second amendment)
-        // are measured on a device that serves the direct class, and the
-        // boot's cap follows them: at one cell, `min(qd1, qd4 ÷ 1)`.
+        // ADR-0088's third amendment uses the directly measured one-reader
+        // row at one cell. The former min(qd1, qd4) oracle fails whenever
+        // the measured four-reader aggregate happens to be below qd1.
         if !fresh.contains("fua_unsupported") {
             let row = |key: &str| -> u64 {
                 fresh
@@ -278,7 +278,7 @@ fn a_fresh_data_directory_is_probed_once_and_the_model_is_identity_bound() {
             assert!(qd4 > 0, "the probe measures the four-reader row: {fresh}");
             assert!(qd1 > 0, "the probe measures the one-reader row: {fresh}");
             let per_cell: u64 = field(&info, "ckpt_replay_bytes_per_s").parse().expect("u64");
-            assert_eq!(per_cell, qd1.min(qd4), "one cell: the replay term is min(qd1, qd4)");
+            assert_eq!(per_cell, qd1, "one cell: the replay term is the measured qd1 row");
         }
     }
 
