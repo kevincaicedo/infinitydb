@@ -16,6 +16,21 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     let mut store = Keyspace::new(StoreConfig::default());
     let mut cx = ConnCx::default();
+    // ADR-0110: explicitly reach the optional snapshot forms. Random argv
+    // almost never spells IF/ABS and otherwise leaves their bodies untouched.
+    let value = &data[..data.len().min(4096)];
+    let mut snapshot_reply = Vec::new();
+    for argv in [
+        &[b"SET".as_slice(), b"move", value][..],
+        &[b"INF.PEEK".as_slice(), b"move", b"ABS"],
+        &[b"INF.PEEK".as_slice(), b"move", b"ABS", b"NOSTATS"],
+        &[b"INF.PEEK".as_slice(), b"move", b"ABS", data],
+        &[b"INF.TAKE".as_slice(), b"move", b"IF", value, data],
+        &[b"INF.TAKE".as_slice(), b"move", b"IF", value, b"-1"],
+    ] {
+        snapshot_reply.clear();
+        execute_slices(argv, &mut store, &mut cx, Nanos(1), &mut snapshot_reply);
+    }
     let mut rest = data;
     let mut out = Vec::new();
     // Up to 8 commands per input. Each: [selector][argc][per-arg: u16-le

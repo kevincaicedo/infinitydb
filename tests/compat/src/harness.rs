@@ -120,11 +120,11 @@ pub fn oracle() -> Option<(Option<ProcessGuard>, TcpStream)> {
 /// The real-node candidate (F-L19-09): spawns `$INFINITYD_BIN` with
 /// `cells` cells and a fresh durable root under `scratch_base`, waits
 /// for readiness (`PING` → `+PONG`; `-LOADING` retries), and returns a
-/// connected stream. `None` when `INFINITYD_BIN` is unset — the caller
-/// prints the loud SKIP marker. A set-but-broken binary **panics**: an
+/// connected stream. `None` when optional and `INFINITYD_BIN` is unset.
+/// `INF_COMPAT_REQUIRE_BINARY=1` forbids skipping. A broken binary panics: an
 /// asked-for candidate must not silently skip (the F-L19-11 principle).
 pub fn infinityd(cells: u16, scratch_base: &Path) -> Option<(ProcessGuard, TcpStream)> {
-    let bin = std::env::var("INFINITYD_BIN").ok()?;
+    let bin = candidate_binary()?;
     let port = free_port();
     let dir = scratch_base.join(format!(
         "inf-compat-node-{}-{port}",
@@ -173,6 +173,22 @@ pub fn infinityd(cells: u16, scratch_base: &Path) -> Option<(ProcessGuard, TcpSt
         std::thread::sleep(Duration::from_millis(50));
     };
     Some((guard, stream))
+}
+
+fn candidate_binary() -> Option<String> {
+    let required = match std::env::var("INF_COMPAT_REQUIRE_BINARY") {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        _ => panic!("INF_COMPAT_REQUIRE_BINARY must be unset or 1"),
+    };
+    let bin = std::env::var("INFINITYD_BIN");
+    if required {
+        assert!(
+            bin.as_ref().is_ok_and(|path| !path.is_empty()),
+            "INF_COMPAT_REQUIRE_BINARY=1 requires INFINITYD_BIN"
+        );
+    }
+    bin.ok()
 }
 
 /// Reads exactly `n` complete RESP frames from `stream`, buffering

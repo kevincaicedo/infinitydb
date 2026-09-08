@@ -39,3 +39,10 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "move_snapshot"
+path = "fuzz_targets/move_snapshot.rs"
+test = false
+doc = false
+bench = false

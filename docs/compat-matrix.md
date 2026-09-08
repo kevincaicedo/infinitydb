@@ -63,9 +63,9 @@ program primitives, not a client surface.
 | `GETEX` | full | M1 | write fast | -2 | 8 |  |
 | `INCRBYFLOAT` | partial | M1 | write denyoom fast | 3 | 6 | computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision tails may differ |
 | `SUBSTR` | full | M1 | readonly | 4 | 1 |  |
-| `RENAME` | partial | M1 | write | 3 | 2 | cross-owner pairs run as a two-cell fabric program — atomic per cell, not across cells until M4; same-owner pairs exact |
-| `RENAMENX` | partial | M1 | write fast | 3 | 3 | same cross-owner window as RENAME |
-| `COPY` | partial | M1 | write denyoom | -3 | 12 | same cross-owner window as RENAME; TTL transfers as relative ms across cells |
+| `RENAME` | partial | M1 | write | 3 | 2 | cross-owner string moves use snapshot/put/conditional-delete (ADR-0110); destination refusal preserves source; changed-source cleanup returns -BUSY and may leave a copy; destination OOM remains possible because the SET leg is DENYOOM; full atomicity at M6 |
+| `RENAMENX` | partial | M1 | write fast | 3 | 3 | same cross-owner window and -BUSY cleanup error as RENAME; retry after -BUSY can return 0 against the leftover destination copy without removing the source |
+| `COPY` | partial | M1 | write denyoom | -3 | 12 | cross-owner string copy uses an absolute expiry deadline (ADR-0110); destination NX is checked at write; same cross-owner window as RENAME |
 | `TOUCH` | full | M1 | readonly fast | -2 | 1 |  |
 | `UNLINK` | full | M1 | write fast | -2 | 1 |  |
 | `DBSIZE` | full | M1 | readonly fast | 1 | 5 |  |
@@ -94,8 +94,8 @@ program primitives, not a client surface.
 | `INF.CKPT` | extension | M2 | admin | -1 | 0 | checkpoint operator surface (M2-S20): [CELL k] [WAIT]; WAIT returns after the new MANIFEST is durable — no fork, per-cell timing (ADR-0021) |
 | `BGSAVE` | partial | M2 | admin | -1 | 0 | maps onto INF.CKPT (fuzzy checkpoint, no fork, no RDB file); SCHEDULE accepted and moot; reply byte-identical; memory-only nodes answer a documented error |
 | `LASTSAVE` | partial | M2 | readonly fast | 1 | 0 | unix seconds of the newest durable MANIFEST publication; 0 before the first (Redis reports process-start time); loading flag docs-derived, not capture-verified |
-| `INF.TAKE` | internal | M1 | write fast | 2 | 0 | cross-cell RENAME/COPY program primitive |
-| `INF.PEEK` | internal | M1 | readonly fast | 2 | 0 | cross-cell COPY program primitive |
+| `INF.TAKE` | internal | M1 | write fast | -2 | 0 | legacy read/delete+TTL; IF value deadline conditionally deletes the matching string snapshot (ADR-0110) |
+| `INF.PEEK` | internal | M1 | readonly fast | -2 | 0 | legacy read+TTL; ABS reads a string snapshot with absolute Unix expiry; ABS NOSTATS omits client hit/miss accounting (ADR-0110) |
 | `JSON.SET` | partial | M3 | write denyoom | -4 | 32 | S21 corpus exact except parser-specific malformed-input text; root sets preserve TTL (as RedisJSON — S22 probe); durable writes use M3-S17 document records |
 | `JSON.GET` | partial | M3 | readonly | -2 | 36 | S21 corpus exact except documented large-exponent f64 text and module-specific WRONGTYPE wording; INDENT/NEWLINE/SPACE covered; path match sets capped by doc-max-path-matches |
 | `JSON.MGET` | partial | M3 | readonly | -3 | 2 | S21 corpus exact; per-key atomicity only — no cross-cell snapshot (each cell serves its key at its own serve time) |

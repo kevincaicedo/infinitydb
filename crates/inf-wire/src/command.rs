@@ -102,10 +102,11 @@ pub enum CommandId {
     /// publication across cells (0 before the first; deviation noted).
     Lastsave,
     /// Internal cross-cell program op: atomically read value+TTL and delete
-    /// at the owning cell (the RENAME/MOVE fabric-program primitive). Not a
-    /// Redis command; listed in `COMMAND` output as an `INF.*` extension.
+    /// at the owning cell. The IF form removes only matching snapshot bytes
+    /// and expiry (ADR-0110). Listed in COMMAND as an INF.* extension.
     InfTake,
-    /// Internal cross-cell program op: atomically read value+TTL (COPY).
+    /// Internal cross-cell read: value+TTL, or value+absolute expiry with
+    /// ABS (the RENAME/RENAMENX/COPY snapshot, ADR-0110).
     InfPeek,
     // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041) ----
     JsonSet,
@@ -328,8 +329,8 @@ pub static COMMANDS: [CommandMeta; 90] = [
     // recorded deviation.
     cmd(CommandId::Lastsave, "LASTSAVE", 1, LOADING_RO_FAST, KeySpec::NONE),
     // ---- internal fabric-program ops (INF.* extension namespace) ----
-    cmd(CommandId::InfTake, "INF.TAKE", 2, W_FAST, KeySpec::ONE),
-    cmd(CommandId::InfPeek, "INF.PEEK", 2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::InfTake, "INF.TAKE", -2, W_FAST, KeySpec::ONE),
+    cmd(CommandId::InfPeek, "INF.PEEK", -2, RO_FAST, KeySpec::ONE),
     // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041 D6–D9).
     // DENYOOM membership mirrors the RedisJSON module declarations:
     // memory-growing writes deny under OOM; DEL/FORGET/CLEAR free.

@@ -140,14 +140,19 @@ pub static DECLARED: &[Declared] = &[
         "RENAME",
         Status::Partial,
         "M1",
-        "cross-owner pairs run as a two-cell fabric program — atomic per cell, not across cells until M4; same-owner pairs exact",
+        "cross-owner string moves use snapshot/put/conditional-delete (ADR-0110); destination refusal preserves source; changed-source cleanup returns -BUSY and may leave a copy; destination OOM remains possible because the SET leg is DENYOOM; full atomicity at M6",
     ),
-    d("RENAMENX", Status::Partial, "M1", "same cross-owner window as RENAME"),
+    d(
+        "RENAMENX",
+        Status::Partial,
+        "M1",
+        "same cross-owner window and -BUSY cleanup error as RENAME; retry after -BUSY can return 0 against the leftover destination copy without removing the source",
+    ),
     d(
         "COPY",
         Status::Partial,
         "M1",
-        "same cross-owner window as RENAME; TTL transfers as relative ms across cells",
+        "cross-owner string copy uses an absolute expiry deadline (ADR-0110); destination NX is checked at write; same cross-owner window as RENAME",
     ),
     d("TOUCH", Status::Full, "M1", ""),
     d("UNLINK", Status::Full, "M1", ""),
@@ -251,8 +256,18 @@ pub static DECLARED: &[Declared] = &[
         "unix seconds of the newest durable MANIFEST publication; 0 before the first \
          (Redis reports process-start time); loading flag docs-derived, not capture-verified",
     ),
-    d("INF.TAKE", Status::Internal, "M1", "cross-cell RENAME/COPY program primitive"),
-    d("INF.PEEK", Status::Internal, "M1", "cross-cell COPY program primitive"),
+    d(
+        "INF.TAKE",
+        Status::Internal,
+        "M1",
+        "legacy read/delete+TTL; IF value deadline conditionally deletes the matching string snapshot (ADR-0110)",
+    ),
+    d(
+        "INF.PEEK",
+        Status::Internal,
+        "M1",
+        "legacy read+TTL; ABS reads a string snapshot with absolute Unix expiry; ABS NOSTATS omits client hit/miss accounting (ADR-0110)",
+    ),
     // ---- M3-S11/S12 · `JSON.*` (ADR-0041). S21 supplies the pinned
     // RedisJSON RESP2/RESP3 byte corpus and explicit deviation allowlist;
     // S22 (2026-07-16) audited every row: `full` requires byte-compared
