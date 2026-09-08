@@ -62,6 +62,21 @@ policies = ["always", "everysec"]
 workloads = ["rotation_heavy"]
 expect = "clean"
 
+# Review of 2026-08-30 (F-L02-01, ADR-0090 A14): the pooled file's open
+# fails at reuse. The runner's rotor is `Buffered` and never truncates,
+# so it cannot pool; the row is carried by the rotor tests
+# (`inf-log/tests/segment_recycle.rs`, `segment_prealloc_wait.rs`) and by
+# the `m2-recycle` DST scenario (armed on one seed class in eight).
+#   fresh-fallback — the generation preallocates fresh, counted as a
+#                    fallback; the pooled file keeps its below-floor name;
+#                    the rotor keeps preallocating (no `AlreadyExists`
+#                    loop, no fail-stop); a fed wait still ends once.
+[[row]]
+point = "recycle_open_fail"
+tier = "node"
+test = "segment_recycle"
+expect = "fresh-fallback"
+
 # dir-fsync barrier at the MANIFEST envelope swap (publication site).
 [[row]]
 point = "dir_fsync_fail"

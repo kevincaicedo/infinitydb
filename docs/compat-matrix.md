@@ -15,7 +15,7 @@ corpus runs against both, plus a namespace-bound fan-out/tier lane
 (`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned
 byte-exact there, never silently excused.
 
-**Corpus:** 562 byte-compared executions · 59 documented deviations · 0 tolerated failures.
+**Corpus:** 585 byte-compared executions · 59 documented deviations · 0 tolerated failures.
 **Surface:** 90 commands — 54 full · 32 partial · 0 stub · 2 extension · 2 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
@@ -32,15 +32,15 @@ program primitives, not a client surface.
 | `ECHO` | full | M0 | fast | 2 | 3 |  |
 | `HELLO` | full | M0 | fast | -1 | 1 | identity fields (server/version) are InfinityDB's own, as for any non-Redis server |
 | `QUIT` | partial | M1 | fast | 1 | 0 | replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus because closing tears down the shared oracle connection — covered by a unit test and the client-smoke suite |
-| `GET` | full | M0 | readonly fast | 2 | 27 |  |
-| `SET` | full | M0 | write denyoom | -3 | 73 |  |
+| `GET` | full | M0 | readonly fast | 2 | 28 |  |
+| `SET` | full | M0 | write denyoom | -3 | 84 |  |
 | `SETNX` | full | M0 | write denyoom fast | 3 | 2 |  |
 | `SETEX` | full | M0 | write denyoom | 4 | 4 |  |
 | `PSETEX` | full | M0 | write denyoom | 4 | 2 |  |
 | `GETSET` | full | M0 | write denyoom fast | 3 | 2 |  |
 | `GETDEL` | full | M0 | write fast | 2 | 2 |  |
 | `DEL` | full | M0 | write | -2 | 4 |  |
-| `EXISTS` | full | M0 | readonly fast | -2 | 10 |  |
+| `EXISTS` | full | M0 | readonly fast | -2 | 11 |  |
 | `TYPE` | full | M0 | readonly fast | 2 | 4 | only the string type exists until M3 |
 | `INCR` | full | M0 | write denyoom fast | 2 | 8 |  |
 | `DECR` | full | M0 | write denyoom fast | 2 | 2 |  |
@@ -50,7 +50,7 @@ program primitives, not a client surface.
 | `STRLEN` | full | M0 | readonly fast | 2 | 5 |  |
 | `EXPIRE` | full | M0 | write fast | -3 | 17 | TTLs ≥ ~34.8 years clamp to the u40 record bound |
 | `PEXPIRE` | full | M0 | write fast | -3 | 1 | same u40 clamp |
-| `TTL` | full | M0 | readonly fast | 2 | 18 |  |
+| `TTL` | full | M0 | readonly fast | 2 | 20 |  |
 | `PTTL` | full | M0 | readonly fast | 2 | 3 |  |
 | `PERSIST` | full | M0 | write fast | 2 | 3 |  |
 | `INFO` | partial | M0 | admin | -1 | 0 | sections + field vocabulary present; gauges are this cell's slice until the control plane aggregates (client-smoke CI is the open M1-S14 AC) |
@@ -60,7 +60,7 @@ program primitives, not a client surface.
 | `MSETNX` | partial | M1 | write denyoom | -3 | 3 | cross-cell keys are check-then-set until M4 transactions; single-cell exact |
 | `GETRANGE` | full | M1 | readonly | 4 | 8 |  |
 | `SETRANGE` | full | M1 | write denyoom | 4 | 4 | values bound at 16 MiB − 1 (record format v0) |
-| `GETEX` | full | M1 | write fast | -2 | 8 |  |
+| `GETEX` | full | M1 | write fast | -2 | 16 |  |
 | `INCRBYFLOAT` | partial | M1 | write denyoom fast | 3 | 6 | computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision tails may differ |
 | `SUBSTR` | full | M1 | readonly | 4 | 1 |  |
 | `RENAME` | partial | M1 | write | 3 | 2 | cross-owner string moves use snapshot/put/conditional-delete (ADR-0110); destination refusal preserves source; changed-source cleanup returns -BUSY and may leave a copy; destination OOM remains possible because the SET leg is DENYOOM; full atomicity at M6 |

@@ -393,6 +393,34 @@ pub static MATRIX: &[Case] = &[
     c(&["GET", "sxp"]),
     c(&["SET", "sx", "v", "EXAT", "notanint"]),
     c(&["SET", "sx", "v", "EX", "10", "EXAT", "2208988800"]),
+    // --- SET/GETEX absolute deadlines ≤ 0 (review 2026-08-30, M1 / F-L13-02):
+    // Redis's one gate refuses every non-positive expire value before the
+    // write; a positive past deadline still applies (born expired).
+    c(&["SET", "sxz", "v"]),
+    c(&["SET", "sxz", "v2", "EXAT", "0"]),
+    c(&["SET", "sxz", "v2", "EXAT", "-1"]),
+    c(&["SET", "sxz", "v2", "PXAT", "0"]),
+    c(&["SET", "sxz", "v2", "PXAT", "-1"]),
+    c(&["SET", "sxz", "v2", "EXAT", "0", "GET"]),
+    c(&["SET", "sxz", "v2", "XX", "EXAT", "0"]),
+    c(&["SET", "sxzn", "v2", "NX", "EXAT", "0"]),
+    c(&["SET", "sxz", "v2", "EXAT", "9223372036854775807"]),
+    c(&["GET", "sxz"]),
+    c(&["TTL", "sxz"]),
+    c(&["EXISTS", "sxzn"]),
+    c(&["GETEX", "sxz", "EXAT", "0"]),
+    c(&["GETEX", "sxz", "PXAT", "-1"]),
+    c(&["GETEX", "sxz", "EXAT", "9223372036854775807"]),
+    c(&["TTL", "sxz"]),
+    // GETEX looks the key up before it validates the value: nil first.
+    c(&["GETEX", "gxmissing", "EXAT", "0"]),
+    c(&["GETEX", "gxmissing", "EX", "0"]),
+    c(&["GETEX", "gxmissing", "EX", "notanint"]),
+    // Every option parses before any value is read (syntax errors first).
+    c(&["SET", "sxz", "v2", "EXAT", "0", "BOGUS"]),
+    c(&["SET", "sxz", "v2", "EX", "notanint", "BOGUS"]),
+    c(&["GETEX", "sxz", "EXAT", "0", "BOGUS"]),
+    c(&["GETEX", "gxmissing", "EX", "notanint", "BOGUS"]),
     // --- KEYS / SCAN / DBSIZE / RANDOMKEY ---
     c(&["KEYS", "gr"]),
     c(&["KEYS", "rnxfre*"]),

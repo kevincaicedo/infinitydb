@@ -435,9 +435,10 @@ pub struct RotorStats {
     /// the class was `Direct` — the zero-fill that follows is the miss's
     /// cost (`zero_fill_bytes`).
     pub recycle_misses: u64,
-    /// Pooled segments that could not be reused as ready: the rename
-    /// failed (fresh prealloc instead) or the file read not fully
-    /// allocated at reuse (ADR-0086 D4: read, never assumed — it fills).
+    /// Pooled segments that could not be reused as ready: the open or
+    /// rename failed (fresh prealloc instead; the file keeps its old
+    /// name for boot GC) or the file read not fully allocated at reuse
+    /// (ADR-0086 D4: read, never assumed — it fills).
     pub recycle_fallbacks: u64,
     /// Covered sealed segments offered to a full pool (unlinked as before).
     pub recycle_pool_full: u64,
@@ -445,7 +446,9 @@ pub struct RotorStats {
     /// whose prealloc was eligible to wait. Each ends exactly once, as
     /// `recycle_waits_satisfied` or `recycle_waits_expired`.
     pub recycle_waits_started: u64,
-    /// Waits the pool fed before the bound — the miss D9 removes.
+    /// Waits the pool fed before the bound — the miss D9 removes. A fed
+    /// wait whose take then fell back (`recycle_fallbacks`) ends here
+    /// too: the pool delivered; what became of the file is the other row.
     pub recycle_waits_satisfied: u64,
     /// Waits that reached the bound and fell back to a fresh prealloc —
     /// each one a `recycle_miss` and a segment of zero-fill.
@@ -563,6 +566,19 @@ pub struct SealedMeta {
 struct PooledSegment {
     id: SegmentId,
     path: PathBuf,
+}
+
+/// What the pool answered a prealloc for the next id (ADR-0090 D1, A14).
+enum PoolTake<File> {
+    /// Recycling off, or the pool empty — a miss (the caller may wait).
+    Empty,
+    /// The oldest pooled file, opened under its old name and renamed to
+    /// the next id.
+    Taken(File),
+    /// The pooled file could not be opened or renamed. It still carries
+    /// its below-floor name (an orphan for boot GC), so the next id is
+    /// free and the generation falls back to a fresh prealloc.
+    Failed,
 }
 
 /// What truncation does with a sealed segment it forgets
@@ -992,16 +1008,22 @@ impl<F: SegmentFs> SegmentRotor<F> {
     /// acknowledged before the rename is durable — the deferred tier
     /// registers the barrier in this slice, ahead of every ticket the
     /// segment's frames will take; the synchronous tier syncs the dir
-    /// inline, like `create_prealloc`). A rename that fails falls through
-    /// to a fresh prealloc and counts a fallback; the pooled file is then
-    /// an ordinary below-floor orphan for boot GC.
+    /// inline, like `create_prealloc`). A pooled file that fails to open
+    /// or rename falls through to a fresh prealloc and counts a fallback
+    /// (ADR-0090 A5/A14); it keeps its below-floor name, an ordinary
+    /// orphan for boot GC. A failed dir barrier is typed and propagated.
     fn prealloc_source(
         &mut self,
         id: SegmentId,
         deferred: bool,
     ) -> Option<(Result<F::File, LogError>, bool)> {
-        match self.take_recycled(id, deferred) {
-            Some(Ok(file)) => {
+        let take = match self.take_recycled(id, deferred) {
+            Ok(take) => take,
+            // The claimed name's barrier failed (§8.4): never a fallback.
+            Err(err) => return Some((Err(err), true)),
+        };
+        match take {
+            PoolTake::Taken(file) => {
                 if self.prealloc == Prealloc::WaitingForRecycle {
                     self.note_wait_end();
                     self.stats.recycle_waits_satisfied += 1;
@@ -1009,11 +1031,26 @@ impl<F: SegmentFs> SegmentRotor<F> {
                 }
                 Some((Ok(file), true))
             }
-            Some(Err(_)) => {
+            PoolTake::Failed => {
+                // The pool fed this generation a file it could not use:
+                // a wait ends here, satisfied (the take is the fallback
+                // row), and the fresh path owns the generation from the
+                // cursor the wait ran to — a NoSpace retry neither waits
+                // nor misses again, exactly as after an expiry.
                 self.stats.recycle_fallbacks += 1;
+                let fill_origin = match self.prealloc {
+                    Prealloc::WaitingForRecycle => {
+                        self.note_wait_end();
+                        self.stats.recycle_waits_satisfied += 1;
+                        self.active.written
+                    }
+                    Prealloc::Immediate => 0,
+                    Prealloc::FreshFallback { fill_origin } => fill_origin,
+                };
+                self.prealloc = Prealloc::FreshFallback { fill_origin };
                 Some((self.create_next(id, deferred), false))
             }
-            None => match self.prealloc {
+            PoolTake::Empty => match self.prealloc {
                 Prealloc::Immediate if self.wait_eligible() => {
                     self.prealloc = Prealloc::WaitingForRecycle;
                     self.stats.recycle_waits_started += 1;
@@ -1082,40 +1119,38 @@ impl<F: SegmentFs> SegmentRotor<F> {
         }
     }
 
-    /// ADR-0090 D1: take the oldest pooled segment as `id` by rename.
-    /// `None` when recycling is off or the pool is empty (a miss); `Some
-    /// (Err)` when the rename, the dir sync (synchronous tier) or the
-    /// open failed — the caller falls back to a fresh prealloc and the
-    /// pooled file, if it still exists, is a below-floor orphan boot GC
-    /// re-collects (one segment of disk until the next boot, counted).
+    /// ADR-0090 D1 / A14: take the oldest pooled segment as `id` — open
+    /// it under its old name first, then rename. The handle survives the
+    /// rename, and a failed open or rename leaves `id` unclaimed, so the
+    /// fallback's create-new finds its name free (the pre-A14 order
+    /// renamed first, and a failed open wedged every later prealloc on
+    /// `AlreadyExists`). Once the name is claimed, the only remaining
+    /// step is its dir barrier (synchronous tier), whose failure is the
+    /// typed fail-stop error — never a fallback.
     fn take_recycled(
         &mut self,
         id: SegmentId,
         deferred: bool,
-    ) -> Option<Result<F::File, LogError>> {
-        if self.cfg.recycle_slots == 0 || self.cfg.io_mode != SegmentIoMode::Direct {
-            return None;
-        }
-        if self.pool.is_empty() {
-            return None;
+    ) -> Result<PoolTake<F::File>, LogError> {
+        let recycling = self.cfg.recycle_slots > 0 && self.cfg.io_mode == SegmentIoMode::Direct;
+        if !recycling || self.pool.is_empty() {
+            return Ok(PoolTake::Empty);
         }
         let pooled = self.pool.remove(0);
+        let opened = if inf_foundation::fault::fire(crate::fault::RECYCLE_OPEN_FAIL) {
+            Err(crate::fault::injected(crate::fault::RECYCLE_OPEN_FAIL))
+        } else {
+            self.fs.open_segment_append(&pooled.path, SegmentIoMode::Direct)
+        };
+        let Ok(file) = opened else { return Ok(PoolTake::Failed) };
         let to = self.log_dir.join(segment_file_name(id));
-        let renamed = self
-            .fs
-            .rename(&pooled.path, &to)
-            .map_err(|source| LogError::Io { segment: id, source });
-        if let Err(err) = renamed {
-            return Some(Err(err));
+        if self.fs.rename(&pooled.path, &to).is_err() {
+            return Ok(PoolTake::Failed);
         }
-        if !deferred && let Err(err) = sync_log_dir(&self.fs, &self.log_dir, id) {
-            return Some(Err(err));
+        if !deferred {
+            sync_log_dir(&self.fs, &self.log_dir, id)?;
         }
-        Some(
-            self.fs
-                .open_segment_append(&to, SegmentIoMode::Direct)
-                .map_err(|source| LogError::Io { segment: id, source }),
-        )
+        Ok(PoolTake::Taken(file))
     }
 
     /// True once preallocation has failed for lack of space and no next
