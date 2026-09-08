@@ -313,7 +313,6 @@ I	2	crates/inf-log/src/staging.rs	expect	frame fits u32	a sealed frame is one st
 I	1	crates/inf-log/src/staging.rs	expect	lease does not match any in-flight frame	StagingRing lease / generation state machine (a stale `StagedAt` or lease is a violated invariant)
 I	1	crates/inf-log/src/tail.rs	expect	16-byte slice	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	2	crates/inf-log/src/tail.rs	expect	4-byte slice	fixed-width sub-slice of a length-checked buffer — infallible by construction
-I	1	crates/inf-log/src/tail.rs	expect	window fits u32	the probe window is bounded by max_frame_len (u32)
 I	1	crates/inf-log/src/tier.rs	assert	an aligned window fits the over-allocation	the buffer is over-allocated by one frame; align_offset < TIER_FRAME_BYTES by construction
 I	1	crates/inf-log/src/tier.rs	assert	durable watermark past the append cursor	DurableTo completions carry the round's own staged length; durable_len ≤ data_len is the writer's watermark order
 I	1	crates/inf-log/src/tier.rs	assert	durable watermark regressed	DurableTo completions carry the round's own staged length; durable_len ≤ data_len is the writer's watermark order

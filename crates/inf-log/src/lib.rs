@@ -65,7 +65,7 @@ pub use frame::{
     RecordIter, align_up_frame, decode_frame, frame_header_len,
 };
 pub use fs::{SegmentIoMode, TierIoMode};
-pub use lsn::{Lsn, SegmentId};
+pub use lsn::{Lsn, MAX_SEGMENT_LEN, SegmentId, check_segment_len};
 pub use manifest::{
     Manifest, ManifestDecodeError, TierFileRange, TierNsManifest, manifest_envelope, read_manifest,
     write_manifest,

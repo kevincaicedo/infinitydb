@@ -60,7 +60,7 @@ use std::path::Path;
 
 use crate::frame::{FrameStamp, decode_frame, frame_shape};
 use crate::fs::{SegmentFile, SegmentFs};
-use crate::lsn::{Lsn, SegmentId};
+use crate::lsn::{Lsn, SegmentId, check_segment_len};
 use crate::reader::ReaderConfig;
 use crate::segment::segment_file_name;
 
@@ -187,7 +187,7 @@ impl std::error::Error for LogCorruption {}
 /// speed (holes / unwritten extents never touch the device).
 ///
 /// # Errors
-/// Open/read failures on the segment file.
+/// Open/read failures or a segment end outside the u32 address range.
 pub fn scan_region<F: SegmentFs>(
     fs: &F,
     log_dir: &Path,
@@ -204,7 +204,7 @@ pub fn scan_region<F: SegmentFs>(
 /// bounded-memory contract as `scan_region`.
 ///
 /// # Errors
-/// Open/read failures on the segment file.
+/// Open/read failures or a segment end outside the u32 address range.
 pub fn scan_region_evidence<F: SegmentFs>(
     fs: &F,
     log_dir: &Path,
@@ -223,6 +223,7 @@ fn scanner<F: SegmentFs>(
     cfg: ReaderConfig,
 ) -> io::Result<RegionScanner<F::File>> {
     let file = fs.open_read(&log_dir.join(segment_file_name(segment)))?;
+    check_segment_len(segment, file.file_size()?)?;
     Ok(RegionScanner {
         file,
         segment,
@@ -316,7 +317,7 @@ impl<File: SegmentFile> RegionScanner<File> {
                 // case is hundreds of MiB of preallocated zeros, and a
                 // byte-wise scan was the measured floor of the every-boot
                 // audit (S13 rehearsal `slack-floor` row, ADR-0018).
-                self.consume(zero_run(window));
+                self.consume(zero_run(window))?;
                 continue;
             }
             evidence.first_nonzero.get_or_insert(self.offset);
@@ -326,7 +327,7 @@ impl<File: SegmentFile> RegionScanner<File> {
                     .iter()
                     .position(|&b| b == 0 || is_magic_first_byte(b))
                     .unwrap_or(window.len());
-                self.consume(run);
+                self.consume(run)?;
                 continue;
             }
             if let Some(probed) = self.try_frame()? {
@@ -357,10 +358,10 @@ impl<File: SegmentFile> RegionScanner<File> {
                         }
                     }
                 }
-                self.consume(probed.frame_len);
+                self.consume(probed.frame_len)?;
                 continue;
             }
-            self.consume(1);
+            self.consume(1)?;
         }
         Ok(evidence)
     }
@@ -401,7 +402,11 @@ impl<File: SegmentFile> RegionScanner<File> {
         }
         match decode_frame(self.window(), self.cfg.max_frame_len) {
             Ok((frame, _)) => {
-                let expected = Lsn::new(self.segment, self.offset + frame.header_len() as u32);
+                let expected_offset = self
+                    .offset
+                    .checked_add(frame.header_len() as u32)
+                    .ok_or_else(segment_offset_overflow)?;
+                let expected = Lsn::new(self.segment, expected_offset);
                 let stored = frame.first_lsn();
                 let placement = if stored == expected {
                     Placement::SelfLocated
@@ -435,9 +440,12 @@ impl<File: SegmentFile> RegionScanner<File> {
         &self.buf[self.start..self.valid]
     }
 
-    fn consume(&mut self, n: usize) {
+    fn consume(&mut self, n: usize) -> io::Result<()> {
+        let advance = u32::try_from(n).map_err(|_| segment_offset_overflow())?;
+        let offset = self.offset.checked_add(advance).ok_or_else(segment_offset_overflow)?;
         self.start += n;
-        self.offset += u32::try_from(n).expect("window fits u32");
+        self.offset = offset;
+        Ok(())
     }
 
     /// Ensure the window holds `needed` bytes from the current offset (or
@@ -466,4 +474,8 @@ impl<File: SegmentFile> RegionScanner<File> {
 /// Both frame magics start with `b'I'` — the garbage-skip probe byte.
 fn is_magic_first_byte(b: u8) -> bool {
     b == b'I'
+}
+
+fn segment_offset_overflow() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "tail scan exceeds u32 segment address limit")
 }
