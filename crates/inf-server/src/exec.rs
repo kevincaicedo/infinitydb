@@ -1054,6 +1054,7 @@ fn set(
     let mut opts = SetOptions::default();
     let mut have_cond = false;
     let mut have_expire = false;
+    let mut expire = None;
     let mut i = 3;
     while i < argv.len() {
         let opt = argv.arg(i);
@@ -1075,44 +1076,24 @@ fn set(
             }
             have_expire = true;
             opts.expire = SetExpire::Keep;
-        } else if opt.eq_ignore_ascii_case(b"EX")
-            || opt.eq_ignore_ascii_case(b"PX")
-            || opt.eq_ignore_ascii_case(b"EXAT")
-            || opt.eq_ignore_ascii_case(b"PXAT")
-        {
+        } else if let Some(unit) = expire_option(opt) {
             if have_expire || i + 1 >= argv.len() {
                 return w.error("ERR syntax error");
             }
             have_expire = true;
-            let Ok(value) = parse_i64(argv.arg(i + 1)) else {
-                return w.error("ERR value is not an integer or out of range");
-            };
-            let unit_ms: i64 =
-                if opt.eq_ignore_ascii_case(b"EX") || opt.eq_ignore_ascii_case(b"EXAT") {
-                    1000
-                } else {
-                    1
-                };
-            let absolute = opt.eq_ignore_ascii_case(b"EXAT") || opt.eq_ignore_ascii_case(b"PXAT");
-            let at = if absolute {
-                // Past EXAT/PXAT is legal: SET applies, the key is born
-                // expired (Redis semantics).
-                value
-                    .checked_mul(unit_ms)
-                    .and_then(|unix| internal_from_unix_ms(node, unix))
-                    .and_then(ms_to_nanos)
-            } else {
-                expire_deadline(now, value, unit_ms)
-            };
-            let Some(at) = at else {
-                return w.error("ERR invalid expire time in 'set' command");
-            };
-            opts.expire = SetExpire::At(at);
+            expire = Some((argv.arg(i + 1), unit));
             i += 1;
         } else {
             return w.error("ERR syntax error");
         }
         i += 1;
+    }
+    // Syntax first, the value after (Redis's order), before any write.
+    if let Some((raw, unit)) = expire {
+        match set_expire_deadline(node, now, raw, unit) {
+            Ok(at) => opts.expire = SetExpire::At(at),
+            Err(message) => return w.error(&message("set")),
+        }
     }
     match store.set(argv.arg(1), argv.arg(2), opts, now) {
         Ok(outcome) => {
@@ -1146,6 +1127,7 @@ fn getex(
 ) {
     let mut update = TtlUpdate::Keep;
     let mut have = false;
+    let mut expire = None;
     let mut i = 2;
     while i < argv.len() {
         let opt = argv.arg(i);
@@ -1155,42 +1137,32 @@ fn getex(
         if opt.eq_ignore_ascii_case(b"PERSIST") {
             have = true;
             update = TtlUpdate::Persist;
-        } else if opt.eq_ignore_ascii_case(b"EX")
-            || opt.eq_ignore_ascii_case(b"PX")
-            || opt.eq_ignore_ascii_case(b"EXAT")
-            || opt.eq_ignore_ascii_case(b"PXAT")
-        {
+        } else if let Some(unit) = expire_option(opt) {
             if i + 1 >= argv.len() {
                 return w.error("ERR syntax error");
             }
             have = true;
-            let Ok(value) = parse_i64(argv.arg(i + 1)) else {
-                return w.error("ERR value is not an integer or out of range");
-            };
-            let unit_ms: i64 =
-                if opt.eq_ignore_ascii_case(b"EX") || opt.eq_ignore_ascii_case(b"EXAT") {
-                    1000
-                } else {
-                    1
-                };
-            let absolute = opt.eq_ignore_ascii_case(b"EXAT") || opt.eq_ignore_ascii_case(b"PXAT");
-            let at = if absolute {
-                value
-                    .checked_mul(unit_ms)
-                    .and_then(|unix| internal_from_unix_ms(node, unix))
-                    .and_then(ms_to_nanos)
-            } else {
-                expire_deadline(now, value, unit_ms)
-            };
-            let Some(at) = at else {
-                return w.error("ERR invalid expire time in 'getex' command");
-            };
-            update = TtlUpdate::At(at);
+            expire = Some((argv.arg(i + 1), unit));
             i += 1;
         } else {
             return w.error("ERR syntax error");
         }
         i += 1;
+    }
+    if let Some((raw, unit)) = expire {
+        match set_expire_deadline(node, now, raw, unit) {
+            Ok(at) => update = TtlUpdate::At(at),
+            // Redis reads the value after its lookup: a missing key
+            // answers nil and a document WRONGTYPE whatever the value
+            // says (oracle-pinned). The probe is on the error path only.
+            Err(message) => {
+                return match store.type_of(argv.arg(1), now) {
+                    None => w.null(),
+                    Some(inf_store::TypeTag::JsonDoc) => op_error(OpError::WrongType, w),
+                    Some(_) => w.error(&message("getex")),
+                };
+            }
+        }
     }
     match store.get_ex(argv.arg(1), update, now) {
         Some(value) => w.bulk(&value),
@@ -1756,6 +1728,55 @@ pub(crate) fn op_error(e: OpError, w: &mut RespWriter<'_>) {
     }
 }
 
+/// A `SET`/`GETEX` expire option: its unit in ms and whether the value is
+/// a Unix instant (`EXAT`/`PXAT`) or a TTL (`EX`/`PX`).
+#[derive(Copy, Clone)]
+struct ExpireUnit {
+    ms: i64,
+    absolute: bool,
+}
+
+fn expire_option(opt: &[u8]) -> Option<ExpireUnit> {
+    if opt.eq_ignore_ascii_case(b"EX") {
+        Some(ExpireUnit { ms: 1000, absolute: false })
+    } else if opt.eq_ignore_ascii_case(b"PX") {
+        Some(ExpireUnit { ms: 1, absolute: false })
+    } else if opt.eq_ignore_ascii_case(b"EXAT") {
+        Some(ExpireUnit { ms: 1000, absolute: true })
+    } else if opt.eq_ignore_ascii_case(b"PXAT") {
+        Some(ExpireUnit { ms: 1, absolute: true })
+    } else {
+        None
+    }
+}
+
+/// The deadline of a `SET`/`GETEX` expire value — Redis's one gate
+/// (`getExpireMillisecondsOrReply`; review 2026-08-30, M1 / F-L13-02):
+/// an integer, **> 0 for every option**, relative or absolute, and no
+/// overflow. A positive past `EXAT`/`PXAT` passes and the key is born
+/// expired. `Err` carries the message builder (the command name differs).
+fn set_expire_deadline(
+    node: &NodeInfo,
+    now: Nanos,
+    raw: &[u8],
+    unit: ExpireUnit,
+) -> Result<Nanos, fn(&str) -> String> {
+    let Ok(value) = parse_i64(raw) else {
+        return Err(|_| "ERR value is not an integer or out of range".to_owned());
+    };
+    let at = if value <= 0 {
+        None
+    } else if unit.absolute {
+        value
+            .checked_mul(unit.ms)
+            .and_then(|unix| internal_from_unix_ms(node, unix))
+            .and_then(ms_to_nanos)
+    } else {
+        expire_deadline(now, value, unit.ms)
+    };
+    at.ok_or(|name| format!("ERR invalid expire time in '{name}' command"))
+}
+
 /// Positive-TTL deadline for SET EX/PX, SETEX, and GETEX EX/PX (must be > 0).
 fn expire_deadline(now: Nanos, ttl: i64, unit_ms: i64) -> Option<Nanos> {
     if ttl <= 0 {
@@ -2110,6 +2131,50 @@ mod tests {
         assert_eq!(run(&mut cx, &mut store, &[b"MSETNX", b"a", b"9", b"new", b"x"]), b":0\r\n");
         assert_eq!(run(&mut cx, &mut store, &[b"GET", b"new"]), b"$-1\r\n");
         assert_eq!(run(&mut cx, &mut store, &[b"MSETNX", b"n1", b"1", b"n2", b"2"]), b":1\r\n");
+    }
+
+    /// Review 2026-08-30 (M1 / F-L13-02): `SET`/`GETEX` with an absolute
+    /// deadline ≤ 0 are argument errors in Redis, refused before the
+    /// write — pre-fix the store applied them and the key was born
+    /// expired (destroyed under a `+OK`). GETEX validates after its
+    /// lookup: a missing key answers nil and a document WRONGTYPE,
+    /// whatever the value says.
+    #[test]
+    fn set_and_getex_refuse_non_positive_absolute_deadlines_before_the_write() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        cx.node.wall_anchor.set((1_000, 5_000_000));
+        let now = Nanos::from_millis(1_000);
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        let cases: [(&[u8], &[u8]); 4] =
+            [(b"EXAT", b"0"), (b"EXAT", b"-1"), (b"PXAT", b"0"), (b"PXAT", b"-1")];
+        for (opt, value) in cases {
+            let ctx =
+                format!("{} {}", String::from_utf8_lossy(opt), String::from_utf8_lossy(value));
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v2", opt, value]),
+                b"-ERR invalid expire time in 'set' command\r\n",
+                "SET {ctx}"
+            );
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"GETEX", b"k", opt, value]),
+                b"-ERR invalid expire time in 'getex' command\r\n",
+                "GETEX {ctx}"
+            );
+        }
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"k"]), b"$1\r\nv\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"TTL", b"k"]), b":-1\r\n");
+        // GETEX: the lookup precedes the value (Redis 8.0.5, oracle-pinned).
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GETEX", b"nk", b"EXAT", b"0"]), b"$-1\r\n");
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"GETEX", b"nk", b"EX", b"notanint"]),
+            b"$-1\r\n"
+        );
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"JSON.SET", b"d", b"$", b"{}"]), b"+OK\r\n");
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"GETEX", b"d", b"EXAT", b"0"]),
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
     }
 
     #[test]

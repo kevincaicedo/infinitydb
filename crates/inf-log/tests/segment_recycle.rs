@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode};
 use inf_log::{
@@ -277,6 +278,57 @@ fn a_failed_rename_falls_back_to_a_fresh_prealloc() {
     assert_eq!(lab.rotor.stats().segments_recycled, 0);
     assert_eq!(lab.rotor.pooled(), Vec::<SegmentId>::new(), "the pooled entry is gone");
     assert!(lab.names().contains(&"seg-000003.ilog".to_owned()), "created fresh");
+}
+
+/// Goal (review 2026-08-30, F-L02-01): a pooled file whose open fails
+/// falls back to a fresh prealloc and the rotor keeps preallocating — the
+/// pool must not claim the next segment's name before it holds the file,
+/// or the fallback's create-new finds its own name taken (`AlreadyExists`)
+/// on this slice and every later one. Method: pool seg 1, fail its open by
+/// fault point, maintain; then rotate onto the fresh segment and recycle
+/// the following generation from the pool again.
+#[test]
+fn a_failed_open_of_the_pooled_file_falls_back_and_never_wedges_the_rotor() {
+    fault::disarm_all();
+    let mut lab = Lab::new(1);
+    lab.maintain();
+    lab.rotate();
+    lab.maintain();
+    lab.rotate();
+    assert_eq!(lab.rotor.forget_sealed(SegmentId(1)), SealedDisposal::Recycled);
+    fault::arm(inf_log::fault::RECYCLE_OPEN_FAIL, FaultSpec::Nth(1));
+
+    let (report, barrier) = lab.rotor.maintain_deferred(0).expect("the fallback preallocates");
+    assert_eq!(fault::fired(inf_log::fault::RECYCLE_OPEN_FAIL), 1, "the point fired");
+    fault::disarm_all();
+    assert_eq!(report.preallocated, Some(SegmentId(3)));
+    assert!(barrier.is_some(), "the fresh entry rides the prealloc barrier");
+    assert!(lab.rotor.next_zero_filling(), "fresh ⇒ fills");
+    let stats = lab.rotor.stats();
+    assert_eq!((stats.segments_recycled, stats.recycle_fallbacks), (0, 1));
+    assert_eq!(lab.rotor.pooled(), Vec::<SegmentId>::new(), "the pooled entry is spent");
+    assert_eq!(
+        lab.names(),
+        vec!["seg-000000.ilog", "seg-000001.ilog", "seg-000002.ilog", "seg-000003.ilog"],
+        "the pooled file keeps its below-floor name (boot GC's orphan); seg 3 is fresh"
+    );
+    // Not wedged: the fill completes, the rotation lands, and the next
+    // generation recycles from the pool as if nothing happened.
+    let fd = barrier.expect("barrier").dir.raw_fd().expect("sim dir fd");
+    lab.disk.driver_fdatasync(fd).expect("dir barrier");
+    while let Some(slice) = lab.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) {
+        let zeros = vec![0u8; slice.len as usize];
+        lab.disk.driver_write_at(slice.fd, slice.offset, &zeros).expect("zero write");
+        lab.rotor.note_zero_slice_written();
+    }
+    let fd = lab.rotor.take_zero_fill_barrier().expect("fill barrier");
+    lab.disk.driver_fdatasync(fd).expect("barrier");
+    lab.rotor.note_zero_fill_synced();
+    assert_eq!(lab.rotate(), SegmentId(3));
+    assert_eq!(lab.rotor.forget_sealed(SegmentId(2)), SealedDisposal::Recycled);
+    let report = lab.maintain();
+    assert_eq!(report.preallocated, Some(SegmentId(4)));
+    assert_eq!(lab.rotor.stats().segments_recycled, 1, "seg 2's file became seg 4");
 }
 
 /// Goal: the residue a recycled file carries reads as foreign-segment

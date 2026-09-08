@@ -130,6 +130,7 @@ fn base(scenario: &SidecarScenario) -> DurableScenario {
         recycle_slots: 0,
         prealloc: inf_server::PreallocPolicy::DEFAULT,
         recycle_oracle: false,
+        recycle_open_fault: false,
     }
 }
 

@@ -17,6 +17,7 @@
 //! | `manifest_rename_fail` | `meta::write_envelope` step 5 | swap aborts; the committed envelope (old recovery unit) remains authoritative |
 //! | `dir_fsync_fail` | `meta::write_envelope` step 6, `segment::create_prealloc`, `scan::create_cell_dirs` | typed error at the barrier that makes a name durable |
 //! | `prealloc_no_space` | `segment::create_prealloc` | `LogError::NoSpace` — the S02 ENOSPC discipline: early surfacing, typed refusal, memory namespaces unaffected |
+//! | `recycle_open_fail` | `SegmentRotor::take_recycled` (the pooled file's open) | typed I/O error on the pooled file: the generation falls back to a fresh prealloc, counted (`recycle_fallbacks`), and the pooled file stays a below-floor orphan under its old name (ADR-0090 A5 / A14 — review 2026-08-30, F-L02-01) |
 //! | `tier_short_write` | `TierWriter::write_tail_frame` | frame write cut short, typed I/O error — the append fails whole (M4-S11, ADR-0056 D6) |
 //! | `tier_torn_frame` | `TierWriter::write_tail_frame` | prefix lands, call *succeeds* — final-write-before-crash physics; recovery truncates or CRC-refuses per ADR-0056 D5 |
 //! | `tier_fsync_err` | `TierWriter::sync` / `TierWriter::seal` | typed [`TierWriteFailure::Fsync`](crate::TierWriteFailure) — fatal-by-default, the flushed watermark freezes (§8.4 applies to tier files) |
@@ -41,6 +42,7 @@ pub const MANIFEST_RENAME_FAIL: &str = "manifest_rename_fail";
 pub const DIR_FSYNC_FAIL: &str = "dir_fsync_fail";
 pub const POWER_CUT_AFTER_SEAL: &str = "power_cut_after_seal";
 pub const PREALLOC_NO_SPACE: &str = "prealloc_no_space";
+pub const RECYCLE_OPEN_FAIL: &str = "recycle_open_fail";
 pub const TIER_SHORT_WRITE: &str = "tier_short_write";
 pub const TIER_TORN_FRAME: &str = "tier_torn_frame";
 pub const TIER_FSYNC_ERR: &str = "tier_fsync_err";
@@ -61,6 +63,7 @@ pub const ALL: &[&str] = &[
     DIR_FSYNC_FAIL,
     POWER_CUT_AFTER_SEAL,
     PREALLOC_NO_SPACE,
+    RECYCLE_OPEN_FAIL,
     TIER_SHORT_WRITE,
     TIER_TORN_FRAME,
     TIER_FSYNC_ERR,

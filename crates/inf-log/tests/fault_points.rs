@@ -106,6 +106,45 @@ fn prealloc_no_space_fires_the_enospc_discipline() {
     append_frame(&mut rotor, 600).expect("writes resume");
 }
 
+/// Review 2026-08-30 (F-L02-01/03): the recycled rename's dir barrier is
+/// `dir_fsync_fail`'s fourth site. Its typed error must propagate as the
+/// `FsyncFailed` contract says — the rotor used to swallow it and answer
+/// with the fallback's `AlreadyExists`, the very name the rename had
+/// just claimed.
+#[test]
+fn dir_fsync_fail_fires_at_the_recycle_rename_barrier() {
+    fault::disarm_all();
+    let fs = MemFs::new();
+    let dirs = create_cell_dirs(&fs, &PathBuf::from("data/shard-0")).expect("dirs");
+    let cfg = SegmentConfig {
+        segment_bytes: SEGMENT_BYTES,
+        io_mode: inf_log::fs::SegmentIoMode::Direct,
+        recycle_slots: 1,
+        prealloc: inf_log::PreallocPolicy::Immediate,
+        ..Default::default()
+    };
+    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg).expect("rotor");
+    // Two rotations — one aligned frame fills a 4 KiB `Direct` segment
+    // (MemFs segments are born allocated: every seal is a pool
+    // candidate); pool seg 1.
+    for target in [1, 2] {
+        rotor.maintain(0).expect("prealloc");
+        while rotor.active_segment() != SegmentId(target) {
+            let mut builder = FrameBuilder::new();
+            builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: b"v" });
+            let slot = rotor.begin_frame(builder.frame_len(), 0).expect("reserve");
+            let frame = builder.finalize(slot.first_record_lsn(), stamp(1), FrameLayout::Aligned);
+            rotor.commit_frame(slot, frame).expect("append");
+        }
+    }
+    assert_eq!(rotor.forget_sealed(SegmentId(1)), inf_log::SealedDisposal::Recycled);
+    fault::arm(inf_log::fault::DIR_FSYNC_FAIL, FaultSpec::Nth(1));
+    let err = rotor.maintain(0).expect_err("barrier fails");
+    fault::disarm_all();
+    assert!(matches!(err, LogError::Fsync(_)), "{err:?}");
+    assert!(err.to_string().contains("injected fault: dir_fsync_fail"), "{err}");
+}
+
 #[test]
 fn dir_fsync_fail_fires_at_every_barrier_class() {
     fault::disarm_all();

@@ -28,6 +28,7 @@ use std::rc::Rc;
 
 use inf_alloc::BufferPool;
 use inf_fabric::{Mesh, MeshConfig};
+use inf_foundation::fault::FaultSpec;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_foundation::{CellId, hash64};
@@ -181,6 +182,12 @@ pub struct DurableScenario {
     /// the pool did not serve). The m2 durability and log-quiescence
     /// oracles hold unchanged.
     pub recycle_oracle: bool,
+    /// Review 2026-08-30 (F-L02-01, ADR-0090 A14): arm `recycle_open_fail`
+    /// once — the first pooled file this life reuses fails to open. The
+    /// generation must fall back fresh (counted) and the run must go on;
+    /// the pre-fix rotor turned this into an `AlreadyExists` fail-stop.
+    /// `m2_recycle` sets it on one seed class in eight.
+    pub recycle_open_fault: bool,
 }
 
 /// The transition prelude (see [`DurableScenario::prelude`]).
@@ -295,6 +302,7 @@ impl DurableScenario {
             recycle_slots: if seed % 8 == 5 { 0 } else { inf_server::DEFAULT_RECYCLE_SLOTS },
             prealloc: inf_server::PreallocPolicy::DEFAULT,
             recycle_oracle: false,
+            recycle_open_fault: false,
         }
     }
 
@@ -347,6 +355,7 @@ impl DurableScenario {
             scenario.ops_per_writer = 400;
         }
         scenario.recycle_oracle = true;
+        scenario.recycle_open_fault = seed % 8 == 3;
         scenario
     }
 
@@ -536,6 +545,7 @@ impl DurableScenario {
             recycle_slots: 0,
             prealloc: inf_server::PreallocPolicy::DEFAULT,
             recycle_oracle: false,
+            recycle_open_fault: false,
         }
     }
 
@@ -582,6 +592,7 @@ impl DurableScenario {
             recycle_slots: 0,
             prealloc: inf_server::PreallocPolicy::DEFAULT,
             recycle_oracle: false,
+            recycle_open_fault: false,
         }
     }
 }
@@ -1362,6 +1373,12 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         }
     }
 
+    if scenario.recycle_open_fault {
+        // The sim node runs every cell on this thread (the registry is
+        // thread-local): the first pool reuse in any cell fires.
+        inf_foundation::fault::arm(inf_log::fault::RECYCLE_OPEN_FAIL, FaultSpec::Nth(1));
+    }
+
     // ---- writers -----------------------------------------------------
     let mut writers = Vec::new();
     let classes = [
@@ -1907,6 +1924,28 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
     .is_err()
     {
         return finish(report, &observer, &clock);
+    }
+    if scenario.recycle_open_fault {
+        let fired = inf_foundation::fault::fired(inf_log::fault::RECYCLE_OPEN_FAIL);
+        inf_foundation::fault::disarm(inf_log::fault::RECYCLE_OPEN_FAIL);
+        if fired == 0 {
+            fail(
+                &mut report,
+                format!(
+                    "RECYCLE-OPEN FAULT VACUOUS seed {:#x}: no pooled file was reused",
+                    scenario.seed
+                ),
+            );
+        } else if report.recycle_fallbacks == 0 {
+            fail(
+                &mut report,
+                format!(
+                    "RECYCLE-OPEN FALLBACK MISSING seed {:#x}: the point fired {fired}× and no \
+                     generation fell back fresh",
+                    scenario.seed
+                ),
+            );
+        }
     }
 
     finish(report, &observer, &clock)

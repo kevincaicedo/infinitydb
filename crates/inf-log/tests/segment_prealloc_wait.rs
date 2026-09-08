@@ -175,6 +175,38 @@ fn pool_arrival_before_the_bound_satisfies_the_wait_with_the_recycled_segment() 
     assert_eq!(lab.rotor.stats().rotations_unzeroed, 0);
 }
 
+/// Goal (review 2026-08-30, F-L02-03): a wait the pool feeds with a file
+/// that then fails to open still ends exactly once — `satisfied` (the
+/// pool delivered; the take is the `recycle_fallbacks` row) — and the
+/// generation goes fresh from there, paced from the cursor the wait ran
+/// to, with no second wait and no strand. Method: warm, wait, pool seg 1,
+/// fail its open by fault point, maintain.
+#[test]
+fn a_pool_arrival_whose_open_fails_ends_the_wait_and_falls_back_fresh() {
+    fault::disarm_all();
+    let mut lab = Lab::new(quarter());
+    lab.warm();
+    assert!(!lab.maintain(), "the pool is empty: the prealloc waits");
+    lab.write_to(QUARTER / 2);
+    assert_eq!(lab.waits(), (1, 0, 0));
+    assert_eq!(lab.rotor.forget_sealed(SegmentId(1)), SealedDisposal::Recycled);
+    fault::arm(inf_log::fault::RECYCLE_OPEN_FAIL, FaultSpec::Nth(1));
+    assert!(lab.maintain(), "the pool fed the wait; the take fell back fresh");
+    fault::disarm_all();
+    assert_eq!(lab.waits(), (1, 1, 0), "started == satisfied + expired");
+    assert_eq!(lab.rotor.next_ready(), Some(SegmentId(3)));
+    let stats = lab.rotor.stats();
+    assert_eq!((stats.segments_recycled, stats.recycle_fallbacks), (0, 1));
+    assert_eq!(stats.recycle_wait_active_bytes_max, u64::from(QUARTER / 2));
+    // The fallback's fill is paced from the wait's end, not from 0: the
+    // head start is measured from here, and the fill completes before
+    // the rotation (no strand, no unzeroed rotation).
+    assert_eq!(lab.rotate(), SegmentId(3));
+    assert_eq!(lab.rotor.stats().rotations_unzeroed, 0);
+    assert_eq!(lab.rotor.stats().inline_preallocs, 0);
+    assert_eq!(lab.waits(), (1, 1, 0), "a generation never waits twice");
+}
+
 /// Goal: a pool that stays empty expires the wait at the bound into
 /// exactly one fresh fallback, counted as one miss however many slices
 /// ran. Method: warm, maintain past the bound with many slices, count.

@@ -57,9 +57,14 @@ fn snapshot_length_overflow_is_rejected() {
     }
 }
 
-/// A zero Unix deadline can describe a live record under an injected anchor.
+/// A live record whose absolute deadline is ≤ 0 exists only under an
+/// injected anchor with `internal > unix` (no boot produces one). The
+/// destination put is a client-shaped `SET … PXAT`, bound by SET's Redis
+/// gate (M1, batch 16): the move refuses it and the source is preserved
+/// (ADR-0110 second amendment — the first amendment's acceptance stood on
+/// the M1 defect).
 #[test]
-fn zero_unix_deadline_moves_with_injected_anchor() {
+fn zero_unix_deadline_refuses_the_move_and_preserves_the_source() {
     for owner in [0, 1] {
         for command in [CommandId::Rename, CommandId::Renamenx, CommandId::Copy] {
             let rig = Rig::new(owner);
@@ -70,21 +75,25 @@ fn zero_unix_deadline_moves_with_injected_anchor() {
             assert_eq!(rig.source(&[b"PEXPIRETIME", &rig.source]), b":0\r\n");
             let reply = rig.run(command, |_, _| None);
             assert_eq!(
-                reply,
-                if command == CommandId::Rename { &b"+OK\r\n"[..] } else { b":1\r\n" },
-                "H3 follow-up: zero deadline refused"
+                reply, b"-ERR invalid expire time in 'set' command\r\n",
+                "batch 16: a non-positive absolute deadline never reaches the store"
             );
-            assert_eq!(rig.local(1 - owner, &[b"GET", &rig.target]), b"$7\r\npayroll\r\n");
-            assert_eq!(rig.local(1 - owner, &[b"PEXPIRETIME", &rig.target]), b":0\r\n");
+            assert_eq!(rig.source(&[b"GET", &rig.source]), b"$7\r\npayroll\r\n");
+            assert_eq!(rig.source(&[b"PEXPIRETIME", &rig.source]), b":0\r\n");
+            assert_eq!(rig.local(1 - owner, &[b"GET", &rig.target]), b"$-1\r\n");
         }
     }
 }
 
-/// With the default anchor, deadline zero is expired before snapshotting.
+/// With the default anchor, `PXAT 0` is refused at the SET (M1): the key
+/// never exists, and the move answers missing.
 #[test]
 fn default_anchor_zero_deadline_is_missing() {
     let rig = Rig::new(0);
-    assert_eq!(rig.source(&[b"SET", &rig.source, b"v", b"PXAT", b"0"]), b"+OK\r\n");
+    assert_eq!(
+        rig.source(&[b"SET", &rig.source, b"v", b"PXAT", b"0"]),
+        b"-ERR invalid expire time in 'set' command\r\n"
+    );
     assert_eq!(rig.run(CommandId::Rename, |_, _| None), b"-ERR no such key\r\n");
 }
 
