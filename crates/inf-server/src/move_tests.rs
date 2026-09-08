@@ -59,8 +59,9 @@ fn snapshot_length_overflow_is_rejected() {
 
 /// A live record whose absolute deadline is ≤ 0 exists only under an
 /// injected anchor with `internal > unix` (no boot produces one). The
-/// destination put is a client-shaped `SET … PXAT`, bound by SET's Redis
-/// gate (M1, batch 16): the move refuses it and the source is preserved
+/// destination put is bound by its own gate — `INF.PUT`'s deadline rule
+/// for the renames (ADR-0110 third amendment), SET's Redis gate for COPY
+/// (M1, batch 16): the move refuses it and the source is preserved
 /// (ADR-0110 second amendment — the first amendment's acceptance stood on
 /// the M1 defect).
 #[test]
@@ -74,9 +75,14 @@ fn zero_unix_deadline_refuses_the_move_and_preserves_the_source() {
             rig.seed();
             assert_eq!(rig.source(&[b"PEXPIRETIME", &rig.source]), b":0\r\n");
             let reply = rig.run(command, |_, _| None);
+            let expected: &[u8] = if command == CommandId::Copy {
+                b"-ERR invalid expire time in 'set' command\r\n"
+            } else {
+                b"-ERR invalid move snapshot deadline\r\n"
+            };
             assert_eq!(
-                reply, b"-ERR invalid expire time in 'set' command\r\n",
-                "batch 16: a non-positive absolute deadline never reaches the store"
+                reply, expected,
+                "batch 16/17: a non-positive absolute deadline never reaches the store"
             );
             assert_eq!(rig.source(&[b"GET", &rig.source]), b"$7\r\npayroll\r\n");
             assert_eq!(rig.source(&[b"PEXPIRETIME", &rig.source]), b":0\r\n");
@@ -120,7 +126,7 @@ fn renamenx_retry_after_busy_is_a_noop() {
     let rig = Rig::new(0);
     rig.seed();
     let reply = rig.run(CommandId::Renamenx, |args, rig| {
-        if args[0] == b"SET" {
+        if is_put(args) {
             assert_eq!(rig.source(&[b"SET", &rig.source, b"newer"]), b"+OK\r\n");
         }
         None
@@ -132,6 +138,12 @@ fn renamenx_retry_after_busy_is_a_noop() {
     assert_eq!(rig.run(CommandId::Renamenx, |_, _| None), b":0\r\n");
     assert_eq!(rig.source(&[b"GET", &rig.source]), b"$5\r\nnewer\r\n");
     assert_eq!(rig.local(1, &[b"GET", &rig.target]), b"$7\r\npayroll\r\n");
+}
+
+/// The destination leg: `INF.PUT` for the renames, `SET` for COPY
+/// (ADR-0110 third amendment).
+fn is_put(args: &[&[u8]]) -> bool {
+    matches!(args[0], b"SET" | b"INF.PUT")
 }
 
 struct Rig {
@@ -259,7 +271,7 @@ fn destination_refusal_preserves_source() {
             let rig = Rig::new(0);
             rig.seed();
             let before = rig.source(&[b"INF.PEEK", &rig.source]);
-            let reply = rig.run(command, |args, _| (args[0] == b"SET").then(|| error.to_vec()));
+            let reply = rig.run(command, |args, _| is_put(args).then(|| error.to_vec()));
             assert_eq!(reply, error);
             assert_eq!(
                 rig.source(&[b"INF.PEEK", &rig.source]),
@@ -276,7 +288,7 @@ fn renamenx_racing_destination_preserves_both_values() {
     let rig = Rig::new(0);
     rig.seed();
     let reply = rig.run(CommandId::Renamenx, |args, rig| {
-        if args[0] == b"SET" {
+        if is_put(args) {
             assert_eq!(rig.local(1, &[b"SET", &rig.target, b"racer"]), b"+OK\r\n");
         }
         None
@@ -292,7 +304,7 @@ fn source_replacement_is_not_deleted() {
     let rig = Rig::new(0);
     rig.seed();
     let reply = rig.run(CommandId::Rename, |args, rig| {
-        if args[0] == b"SET" {
+        if is_put(args) {
             assert_eq!(rig.source(&[b"SET", &rig.source, b"newer"]), b"+OK\r\n");
         }
         None
@@ -330,7 +342,7 @@ fn delayed_put_preserves_absolute_deadline() {
     let deadline = rig.source(&[b"PEXPIRETIME", &rig.source]);
     assert_eq!(
         rig.run(CommandId::Rename, |args, rig| {
-            if args[0] == b"SET" {
+            if is_put(args) {
                 for plane in &rig.planes {
                     plane.shared.now.set(Nanos(1_000_000_000));
                 }
@@ -353,7 +365,7 @@ fn source_deadline_deletion_and_expiry_invalidate_cleanup() {
         let rig = Rig::new(0);
         rig.seed();
         let reply = rig.run(CommandId::Rename, |args, rig| {
-            if args[0] == b"SET" {
+            if is_put(args) {
                 let mut change: Vec<&[u8]> = vec![mutation, &rig.source];
                 if mutation != b"DEL" {
                     change.push(if mutation == b"EXPIRE" { b"0" } else { b"90000" });
@@ -398,10 +410,108 @@ fn malformed_put_reply_never_authorizes_source_delete() {
     for response in [b"+OKAY\r\n".as_slice(), b":1\r\n", b"+OK\r\n+OK\r\n"] {
         let rig = Rig::new(0);
         rig.seed();
-        let reply =
-            rig.run(CommandId::Rename, |args, _| (args[0] == b"SET").then(|| response.to_vec()));
+        let reply = rig.run(CommandId::Rename, |args, _| (is_put(args)).then(|| response.to_vec()));
         assert_eq!(reply, b"-ERR cross-cell program reply malformed\r\n");
         assert_eq!(rig.source(&[b"GET", &rig.source]), b"$7\r\npayroll\r\n");
+    }
+}
+
+/// Redis admits `RENAME`/`RENAMENX` under `maxmemory` (neither is DENYOOM)
+/// and refuses `COPY`; the destination leg carries the command's own
+/// admission (ADR-0110 third amendment, batch 17). Pre-fix the leg was a
+/// client-shaped `SET`, so every cross-cell rename into a cell at its
+/// budget answered `-OOM` where the same-cell path and Redis succeed.
+/// Arena exhaustion still refuses — the test below this one.
+#[test]
+fn destination_maxmemory_admits_renames_and_refuses_copy() {
+    for owner in [0, 1] {
+        for existing in [false, true] {
+            for command in [CommandId::Rename, CommandId::Renamenx, CommandId::Copy] {
+                let rig = Rig::new(owner);
+                let dest = 1 - owner;
+                rig.seed();
+                if existing {
+                    assert_eq!(
+                        rig.local(dest, &[b"SET", &rig.target, b"previous", b"PX", b"900000"]),
+                        b"+OK\r\n"
+                    );
+                }
+                let source_deadline = rig.source(&[b"PEXPIRETIME", &rig.source]);
+                let target_before = rig.local(dest, &[b"GET", &rig.target]);
+                let target_deadline_before = rig.local(dest, &[b"PEXPIRETIME", &rig.target]);
+                assert_eq!(
+                    rig.local(
+                        dest,
+                        &[
+                            b"CONFIG",
+                            b"SET",
+                            b"maxmemory",
+                            b"1",
+                            b"maxmemory-policy",
+                            b"noeviction"
+                        ]
+                    ),
+                    b"+OK\r\n"
+                );
+                // The gate is armed: a client SET at the destination refuses.
+                assert!(rig.local(dest, &[b"SET", b"probe", b"v"]).starts_with(b"-OOM "));
+                let reply = rig.run(command, |_, _| None);
+                let label = format!("{command:?} owner={owner} existing={existing}");
+                let lands = match (command, existing) {
+                    (CommandId::Copy, _) => {
+                        assert!(
+                            reply.starts_with(b"-OOM "),
+                            "{label}: COPY keeps DENYOOM: {reply:?}"
+                        );
+                        false
+                    }
+                    (CommandId::Renamenx, true) => {
+                        assert_eq!(reply, b":0\r\n", "{label}");
+                        false
+                    }
+                    (CommandId::Rename, _) => {
+                        assert_eq!(
+                            reply, b"+OK\r\n",
+                            "{label}: Redis admits RENAME under maxmemory"
+                        );
+                        true
+                    }
+                    _ => {
+                        assert_eq!(
+                            reply, b":1\r\n",
+                            "{label}: Redis admits RENAMENX under maxmemory"
+                        );
+                        true
+                    }
+                };
+                if lands {
+                    assert_eq!(rig.source(&[b"GET", &rig.source]), b"$-1\r\n", "{label}");
+                    assert_eq!(
+                        rig.local(dest, &[b"GET", &rig.target]),
+                        b"$7\r\npayroll\r\n",
+                        "{label}"
+                    );
+                    assert_eq!(
+                        rig.local(dest, &[b"PEXPIRETIME", &rig.target]),
+                        source_deadline,
+                        "{label}: the absolute deadline travels with the value"
+                    );
+                } else {
+                    assert_eq!(rig.source(&[b"GET", &rig.source]), b"$7\r\npayroll\r\n", "{label}");
+                    assert_eq!(
+                        rig.source(&[b"PEXPIRETIME", &rig.source]),
+                        source_deadline,
+                        "{label}"
+                    );
+                    assert_eq!(rig.local(dest, &[b"GET", &rig.target]), target_before, "{label}");
+                    assert_eq!(
+                        rig.local(dest, &[b"PEXPIRETIME", &rig.target]),
+                        target_deadline_before,
+                        "{label}"
+                    );
+                }
+            }
+        }
     }
 }
 

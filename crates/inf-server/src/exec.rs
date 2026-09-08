@@ -727,15 +727,11 @@ fn execute_db(
             }
         }
         CommandId::Setex | CommandId::Psetex => {
-            let unit_ms = if meta.id == CommandId::Setex { 1000 } else { 1 };
-            let Ok(ttl) = parse_i64(argv.arg(2)) else {
-                return w.error("ERR value is not an integer or out of range");
-            };
-            let Some(at) = expire_deadline(now, ttl, unit_ms) else {
-                return w.error(&format!(
-                    "ERR invalid expire time in '{}' command",
-                    meta.name.to_ascii_lowercase()
-                ));
+            let ms = if meta.id == CommandId::Setex { 1000 } else { 1 };
+            let unit = ExpireUnit { ms, absolute: false };
+            let at = match set_expire_deadline(&cx.node, now, argv.arg(2), unit) {
+                Ok(at) => at,
+                Err(message) => return w.error(&message(&meta.name.to_ascii_lowercase())),
             };
             let opts = SetOptions { expire: SetExpire::At(at), ..Default::default() };
             match store.set(argv.arg(1), argv.arg(3), opts, now) {
@@ -943,6 +939,7 @@ fn execute_db(
                 inf_move_snapshot(argv, store, meta.id, &cx.node, now, &mut w);
             }
         }
+        CommandId::InfPut => inf_move_put(argv, store, &cx.node, now, &mut w),
         // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041) ----
         CommandId::JsonSet
         | CommandId::JsonGet
@@ -1016,13 +1013,26 @@ pub(crate) fn wall_ms(node: &NodeInfo, now: Nanos) -> u64 {
     now.as_millis().saturating_sub(internal_anchor).saturating_add(unix_anchor)
 }
 
-/// Internal (injected-clock) milliseconds for a Unix-epoch deadline. Past
-/// deadlines clamp to 0 (already expired); `None` = arithmetic overflow.
-fn internal_from_unix_ms(node: &NodeInfo, unix_ms: i64) -> Option<u64> {
+/// The store deadline for a Unix-epoch instant (ADR-0111): pre-anchor
+/// instants are already expired (internal 0), instants past the store's
+/// u40-ms bound saturate to it. Every instant Redis represents in i64 ms
+/// lands somewhere on the internal clock — this never refuses.
+fn absolute_deadline(node: &NodeInfo, unix_ms: i64) -> Nanos {
     let (internal_anchor, unix_anchor) = node.wall_anchor.get();
-    let delta = unix_ms.checked_sub(i64::try_from(unix_anchor).ok()?)?;
-    let internal = i64::try_from(internal_anchor).ok()?.checked_add(delta)?;
-    Some(internal.max(0) as u64)
+    let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let internal =
+        unix_ms.saturating_sub(clamp(unix_anchor)).saturating_add(clamp(internal_anchor));
+    inf_store::saturating_deadline(u64::try_from(internal).unwrap_or(0))
+}
+
+/// The store deadline `ttl_ms` after `now` (ADR-0111). Redis refuses only
+/// when the Unix-ms sum overflows `i64` (`expire.c`: `when > LLONG_MAX -
+/// basetime`); a negative TTL is already expired (internal 0, delete on
+/// apply) and a far-future one saturates to the store bound.
+fn relative_deadline(node: &NodeInfo, now: Nanos, ttl_ms: i64) -> Option<Nanos> {
+    let base = i64::try_from(wall_ms(node, now)).unwrap_or(i64::MAX);
+    ttl_ms.checked_add(base)?;
+    Some(inf_store::saturating_deadline(now.as_millis().saturating_add_signed(ttl_ms)))
 }
 
 /// Unix-epoch milliseconds for an internal deadline (EXPIRETIME family).
@@ -1539,13 +1549,16 @@ fn expire(
     } else {
         ExpireCond::Always
     };
-    // Deadline overflow is "invalid expire time".
+    // Redis's arithmetic (`expire.c`): seconds must fit i64 ms, a relative
+    // TTL must not overflow when the wall clock is added; nothing else
+    // refuses — negatives delete on apply, the far future saturates.
     let at = match deadline {
-        Deadline::Relative { unit_ms } => expire_deadline_signed(now, value, unit_ms),
-        Deadline::AbsoluteUnix { unit_ms } => value
-            .checked_mul(unit_ms)
-            .and_then(|unix| internal_from_unix_ms(node, unix))
-            .and_then(ms_to_nanos),
+        Deadline::Relative { unit_ms } => {
+            value.checked_mul(unit_ms).and_then(|ms| relative_deadline(node, now, ms))
+        }
+        Deadline::AbsoluteUnix { unit_ms } => {
+            value.checked_mul(unit_ms).map(|unix| absolute_deadline(node, unix))
+        }
     };
     let Some(at) = at else {
         return w
@@ -1656,6 +1669,38 @@ fn inf_move_snapshot(
     w.int(deadline);
 }
 
+/// `INF.PUT key value deadline [NX]` — the RENAME/RENAMENX destination leg
+/// (ADR-0110 third amendment). A bounded put whose admission is RENAME's
+/// (the registry row carries no DENYOOM; Redis admits both renames under
+/// `maxmemory`), whose deadline is the snapshot's absolute Unix ms (`-1` =
+/// none, saturating like every deadline — ADR-0111), and whose replies are
+/// `SET`'s (`+OK`, null on a refused NX) so the program's parser is one.
+/// The arena's own refusal (`OpError::OutOfMemory`) still answers OOM.
+fn inf_move_put(
+    argv: &(impl Argv + ?Sized),
+    store: &mut CellStore,
+    node: &NodeInfo,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) {
+    let cond = match argv.len() {
+        4 => SetCond::Always,
+        5 if argv.arg(4).eq_ignore_ascii_case(b"NX") => SetCond::IfAbsent,
+        _ => return w.error("ERR syntax error"),
+    };
+    let expire = match parse_i64(argv.arg(3)) {
+        Ok(-1) => SetExpire::Clear,
+        Ok(unix_ms) if unix_ms > 0 => SetExpire::At(absolute_deadline(node, unix_ms)),
+        _ => return w.error("ERR invalid move snapshot deadline"),
+    };
+    let opts = SetOptions { cond, expire, get_old: false };
+    match store.set(argv.arg(1), argv.arg(2), opts, now) {
+        Ok(SetOutcome::Applied { .. }) => w.simple("OK"),
+        Ok(SetOutcome::Skipped { .. }) => w.null(),
+        Err(e) => op_error(e, w),
+    }
+}
+
 // ---- shared helpers ---------------------------------------------------------------
 
 /// Longest command name echoed back (Redis: `%.128s` on the name).
@@ -1750,11 +1795,13 @@ fn expire_option(opt: &[u8]) -> Option<ExpireUnit> {
     }
 }
 
-/// The deadline of a `SET`/`GETEX` expire value — Redis's one gate
-/// (`getExpireMillisecondsOrReply`; review 2026-08-30, M1 / F-L13-02):
-/// an integer, **> 0 for every option**, relative or absolute, and no
-/// overflow. A positive past `EXAT`/`PXAT` passes and the key is born
-/// expired. `Err` carries the message builder (the command name differs).
+/// The deadline of a `SET`/`SETEX`/`PSETEX`/`GETEX` expire value — Redis's
+/// one gate (`getExpireMillisecondsOrReply`; review 2026-08-30, M1 /
+/// F-L13-02, width ADR-0111): an integer, **> 0 for every option**,
+/// seconds that fit i64 ms, and a relative sum that fits i64 Unix ms.
+/// Every instant that passes is stored (saturating at the store bound);
+/// a positive past `EXAT`/`PXAT` is born expired. `Err` carries the
+/// message builder (the command name differs).
 fn set_expire_deadline(
     node: &NodeInfo,
     now: Nanos,
@@ -1767,35 +1814,11 @@ fn set_expire_deadline(
     let at = if value <= 0 {
         None
     } else if unit.absolute {
-        value
-            .checked_mul(unit.ms)
-            .and_then(|unix| internal_from_unix_ms(node, unix))
-            .and_then(ms_to_nanos)
+        value.checked_mul(unit.ms).map(|unix| absolute_deadline(node, unix))
     } else {
-        expire_deadline(now, value, unit.ms)
+        value.checked_mul(unit.ms).and_then(|ms| relative_deadline(node, now, ms))
     };
     at.ok_or(|name| format!("ERR invalid expire time in '{name}' command"))
-}
-
-/// Positive-TTL deadline for SET EX/PX, SETEX, and GETEX EX/PX (must be > 0).
-fn expire_deadline(now: Nanos, ttl: i64, unit_ms: i64) -> Option<Nanos> {
-    if ttl <= 0 {
-        return None;
-    }
-    let ms = ttl.checked_mul(unit_ms)?;
-    let at = (now.0 / 1_000_000).checked_add_signed(ms)?;
-    Some(Nanos(at.checked_mul(1_000_000)?))
-}
-
-/// EXPIRE deadline — negative TTLs are legal (delete-on-apply).
-fn expire_deadline_signed(now: Nanos, ttl: i64, unit_ms: i64) -> Option<Nanos> {
-    let ms = ttl.checked_mul(unit_ms)?;
-    let at = (now.0 / 1_000_000).saturating_add_signed(ms);
-    Some(Nanos(at.checked_mul(1_000_000)?))
-}
-
-fn ms_to_nanos(ms: u64) -> Option<Nanos> {
-    Some(Nanos(ms.checked_mul(1_000_000)?))
 }
 
 /// Redis `string2ll`: optional sign, no leading zeros (and no `-0` —
@@ -2175,6 +2198,184 @@ mod tests {
             run_at(&mut cx, &mut store, now, &[b"GETEX", b"d", b"EXAT", b"0"]),
             b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
         );
+    }
+
+    /// Review 2026-08-30 follow-up (batch 17, ADR-0111): Redis decides an
+    /// expire argument in i64 Unix milliseconds — seconds must fit i64 ms,
+    /// a relative TTL adds the wall clock and must not exceed `i64::MAX`,
+    /// and every instant it represents is *accepted*. The engine refused
+    /// past year 2554 (`ms_to_nanos` overflowed `u64`) and refused the
+    /// lower side too (`PEXPIREAT i64::MIN`). Accepted instants saturate
+    /// into the store's u40-ms bound — the recorded clamp deviation.
+    #[test]
+    fn far_future_deadlines_follow_redis_arithmetic_and_saturate() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        // Anchor: internal 1000 ms == unix 1_757_000_000_000 ms (2025-09).
+        cx.node.wall_anchor.set((1_000, 1_757_000_000_000));
+        let now = Nanos::from_millis(1_000);
+        let ok: &[u8] = b"+OK\r\n";
+        let one: &[u8] = b":1\r\n";
+        let invalid = |name: &str| format!("-ERR invalid expire time in '{name}' command\r\n");
+        let set = |cx: &mut ConnCx, store: &mut Keyspace| {
+            assert_eq!(run_at(cx, store, now, &[b"SET", b"k", b"v"]), ok);
+        };
+        let exists =
+            |cx: &mut ConnCx, store: &mut Keyspace| run_at(cx, store, now, &[b"EXISTS", b"k"]);
+        // Redis 8.0.5, oracle-pinned (scratch probe 2026-09-08): every
+        // accept/refuse below matches the real server's reply.
+        let accepted: &[&[&[u8]]] = &[
+            &[b"SET", b"k", b"v", b"PXAT", b"9223372036854775807"],
+            &[b"SET", b"k", b"v", b"EXAT", b"9223372036854775"],
+            &[b"SET", b"k", b"v", b"EX", b"9223000000000000"],
+            &[b"SET", b"k", b"v", b"PX", b"9223000000000000000"],
+            &[b"SETEX", b"k", b"9223000000000000", b"v"],
+            &[b"PSETEX", b"k", b"9223000000000000000", b"v"],
+        ];
+        for argv in accepted {
+            assert_eq!(run_at(&mut cx, &mut store, now, argv), ok, "{argv:?}");
+            assert_eq!(exists(&mut cx, &mut store), one, "{argv:?} must leave a live key");
+        }
+        let refused: &[(&[&[u8]], &str)] = &[
+            (&[b"SET", b"k", b"v", b"EXAT", b"9223372036854776"], "set"),
+            (&[b"SET", b"k", b"v", b"PX", b"9223372036854775807"], "set"),
+            (&[b"SET", b"k", b"v", b"EX", b"9223372036854775"], "set"),
+            (&[b"SETEX", b"k", b"9223372036854775", b"v"], "setex"),
+            (&[b"PSETEX", b"k", b"9223372036854775807", b"v"], "psetex"),
+            (&[b"GETEX", b"k", b"EX", b"9223372036854775"], "getex"),
+            (&[b"GETEX", b"k", b"PX", b"9223372036854775807"], "getex"),
+            (&[b"EXPIREAT", b"k", b"9223372036854775807"], "expireat"),
+            (&[b"EXPIRE", b"k", b"9223372036854775"], "expire"),
+            (&[b"PEXPIRE", b"k", b"9223372036854775807"], "pexpire"),
+            (&[b"EXPIRE", b"k", b"-9223372036854775808"], "expire"),
+            (&[b"EXPIREAT", b"k", b"-9223372036854775808"], "expireat"),
+        ];
+        for (argv, name) in refused {
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, argv),
+                invalid(name).as_bytes(),
+                "{argv:?}"
+            );
+        }
+        // Accepted instants past the store bound saturate to it: the key
+        // lives, and the read-backs report the bound (the ADR-0008 clamp).
+        set(&mut cx, &mut store);
+        assert_eq!(
+            run_at(
+                &mut cx,
+                &mut store,
+                now,
+                &[b"SET", b"k", b"v", b"PXAT", b"9223372036854775807"]
+            ),
+            ok
+        );
+        const BOUND_MS: u64 = (1 << 40) - 1; // inf-store's u40 record bound
+        let pttl = format!(":{}\r\n", BOUND_MS - 1_000);
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"PTTL", b"k"]), pttl.as_bytes());
+        let pexpiretime = format!(":{}\r\n", BOUND_MS - 1_000 + 1_757_000_000_000);
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"PEXPIRETIME", b"k"]),
+            pexpiretime.as_bytes()
+        );
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"GETEX", b"k", b"PXAT", b"9223372036854775807"]),
+            b"$1\r\nv\r\n"
+        );
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"GETEX", b"k", b"EXAT", b"9223372036854775"]),
+            b"$1\r\nv\r\n"
+        );
+        for argv in [
+            &[b"PEXPIREAT".as_slice(), b"k", b"9223372036854775807"],
+            &[b"EXPIREAT", b"k", b"9223372036854775"],
+            &[b"EXPIRE", b"k", b"9223000000000000"],
+            &[b"PEXPIRE", b"k", b"9223000000000000000"],
+        ] {
+            assert_eq!(run_at(&mut cx, &mut store, now, argv), one, "{argv:?}");
+            assert_eq!(exists(&mut cx, &mut store), one, "{argv:?}");
+        }
+        // The lower side: milliseconds never refuse — a pre-epoch instant
+        // deletes on apply, exactly as any past deadline does.
+        for argv in [
+            &[b"PEXPIREAT".as_slice(), b"k", b"-9223372036854775808"],
+            &[b"EXPIREAT", b"k", b"-9223372036854775"],
+            &[b"EXPIRE", b"k", b"-9223372036854775"],
+            &[b"PEXPIRE", b"k", b"-9223372036854775808"],
+        ] {
+            set(&mut cx, &mut store);
+            assert_eq!(run_at(&mut cx, &mut store, now, argv), one, "{argv:?}");
+            assert_eq!(exists(&mut cx, &mut store), b":0\r\n", "{argv:?} deletes on apply");
+        }
+    }
+
+    /// ADR-0110 third amendment (batch 17): `INF.PUT key value deadline
+    /// [NX]` is the move's destination leg — a bounded put whose admission
+    /// is RENAME's (no DENYOOM), whose deadline is absolute Unix ms or `-1`,
+    /// and whose replies are SET's so the program's parser is unchanged.
+    #[test]
+    fn inf_put_is_a_bounded_put_admitted_like_rename() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        cx.node.wall_anchor.set((1_000, 5_000_000));
+        let now = Nanos::from_millis(1_000);
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"k", b"v", b"-1"]), b"+OK\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"k"]), b"$1\r\nv\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"TTL", b"k"]), b":-1\r\n");
+        // NX against a live key answers SET's null; the value stands.
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"k", b"v2", b"5100000", b"NX"]),
+            b"$-1\r\n"
+        );
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"k"]), b"$1\r\nv\r\n");
+        // An absolute deadline lands exactly (unix 5_100_000 → internal 101 s).
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"k", b"v2", b"5100000"]),
+            b"+OK\r\n"
+        );
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"PEXPIRETIME", b"k"]), b":5100000\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"k"]), b"$2\r\nv2\r\n");
+        // A document at the destination is overwritten, as RENAME does.
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"JSON.SET", b"d", b"$", b"{}"]), b"+OK\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"d", b"s", b"-1"]), b"+OK\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"TYPE", b"d"]), b"+string\r\n");
+        // Validation precedes any write: the deadline is `-1` or positive.
+        for bad in [&b"0"[..], b"-2", b"x", b"9223372036854775808"] {
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"k", b"v3", bad]),
+                b"-ERR invalid move snapshot deadline\r\n",
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"k", b"v3", b"-1", b"BOGUS"]),
+            b"-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"k", b"v3"]),
+            b"-ERR wrong number of arguments for 'inf.put' command\r\n"
+        );
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"k"]), b"$2\r\nv2\r\n");
+        // Bounds are the store's, refused typed before any write.
+        let long_key = vec![b'k'; 256];
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"INF.PUT", &long_key, b"v", b"-1"]),
+            b"-ERR key or value exceeds InfinityDB M0 record bounds\r\n"
+        );
+        // Admission is RENAME's: under `maxmemory` with `noeviction`, SET
+        // answers OOM and the put lands (Redis admits RENAME there).
+        run_at(
+            &mut cx,
+            &mut store,
+            now,
+            &[b"CONFIG", b"SET", b"maxmemory", b"1", b"maxmemory-policy", b"noeviction"],
+        );
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"SET", b"x", b"y"]),
+            b"-OOM command not allowed when used memory > 'maxmemory'.\r\n"
+        );
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"x", b"y", b"-1"]), b"+OK\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"x"]), b"$1\r\ny\r\n");
     }
 
     #[test]

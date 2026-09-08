@@ -49,8 +49,17 @@ const REF_MASK: u8 = 0b1100;
 /// clamp here (recorded deviation: "effectively never expires"; the store
 /// clamps at every deadline-conversion site so the writer assert is an
 /// internal invariant, not an input panic — M1-S03 fix of a latent M0 bound
-/// panic on ≥ 34.8-year TTLs).
-pub(crate) const MAX_EXPIRE_MS: u64 = (1 << 40) - 1;
+/// panic on ≥ 34.8-year TTLs). Public since ADR-0111: the command seam
+/// saturates into this bound instead of refusing what Redis accepts.
+pub const MAX_EXPIRE_MS: u64 = (1 << 40) - 1;
+
+/// The store deadline for an internal-clock instant in milliseconds:
+/// instants past [`MAX_EXPIRE_MS`] saturate to it (ADR-0111). Never
+/// overflows `Nanos` — the bound times 10⁶ is far below `u64::MAX`.
+#[inline]
+pub fn saturating_deadline(internal_ms: u64) -> Nanos {
+    Nanos::from_millis(internal_ms.min(MAX_EXPIRE_MS))
+}
 /// Versions live in 24 bits (see the module deviation note).
 pub(crate) const VERSION_MASK: u32 = (1 << 24) - 1;
 

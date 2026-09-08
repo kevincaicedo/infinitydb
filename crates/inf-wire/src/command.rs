@@ -108,6 +108,10 @@ pub enum CommandId {
     /// Internal cross-cell read: value+TTL, or value+absolute expiry with
     /// ABS (the RENAME/RENAMENX/COPY snapshot, ADR-0110).
     InfPeek,
+    /// Internal cross-cell put: `INF.PUT key value deadline [NX]` — the
+    /// RENAME/RENAMENX destination leg. Admitted as RENAME is (WRITE, no
+    /// DENYOOM); the arena's own refusal still applies (ADR-0110 A3).
+    InfPut,
     // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041) ----
     JsonSet,
     JsonGet,
@@ -230,7 +234,7 @@ const LOADING_ADMIN: CmdFlags = CmdFlags::ADMIN.union(CmdFlags::LOADING);
 const LOADING_RO_FAST: CmdFlags = CmdFlags::READONLY.union(CmdFlags::FAST).union(CmdFlags::LOADING);
 const W_FAST_OOM: CmdFlags = W_FAST.union(CmdFlags::DENYOOM);
 
-/// One registry row (the array below stays readable at 90 entries).
+/// One registry row (the array below stays readable at 91 entries).
 const fn cmd(
     id: CommandId,
     name: &'static str,
@@ -243,7 +247,7 @@ const fn cmd(
 
 /// The registry. M1+ append here (and only here) — the hash table below is
 /// derived mechanically at compile time.
-pub static COMMANDS: [CommandMeta; 90] = [
+pub static COMMANDS: [CommandMeta; 91] = [
     cmd(CommandId::Ping, "PING", -1, CmdFlags::FAST, KeySpec::NONE),
     cmd(CommandId::Echo, "ECHO", 2, LOADING_FAST, KeySpec::NONE),
     cmd(CommandId::Hello, "HELLO", -1, LOADING_FAST, KeySpec::NONE),
@@ -331,6 +335,7 @@ pub static COMMANDS: [CommandMeta; 90] = [
     // ---- internal fabric-program ops (INF.* extension namespace) ----
     cmd(CommandId::InfTake, "INF.TAKE", -2, W_FAST, KeySpec::ONE),
     cmd(CommandId::InfPeek, "INF.PEEK", -2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::InfPut, "INF.PUT", -4, CmdFlags::WRITE, KeySpec::ONE),
     // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041 D6–D9).
     // DENYOOM membership mirrors the RedisJSON module declarations:
     // memory-growing writes deny under OOM; DEL/FORGET/CLEAR free.

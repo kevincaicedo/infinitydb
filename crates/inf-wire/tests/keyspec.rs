@@ -90,6 +90,7 @@ fn oracle_key_indices(id: CommandId, argc: usize) -> Vec<usize> {
         | CommandId::Persist
         | CommandId::InfTake
         | CommandId::InfPeek
+        | CommandId::InfPut
         // M3-S11/S12: every JSON command addresses one document key…
         | CommandId::JsonSet
         | CommandId::JsonGet
