@@ -121,9 +121,13 @@ fn check(label: &str, actual: Vec<u8>, expected: &[u8], failures: &mut Vec<Strin
     }
 }
 
-/// A real OOM reply must leave both names and both deadlines unchanged.
+/// Destination pressure, Redis's way (ADR-0110 third amendment, batch 17):
+/// `RENAME`/`RENAMENX` land under `maxmemory` — neither is DENYOOM — and
+/// `COPY` refuses; every outcome keeps both values and both absolute
+/// deadlines exact. Pre-fix the destination leg was a client-shaped `SET`,
+/// so all 32 rename rows answered `-OOM` and moved nothing.
 #[test]
-fn cross_cell_move_refusal_matrix() {
+fn cross_cell_move_pressure_matrix() {
     let mut failures = Vec::new();
     let mut rows = 0;
     for cells in [2, 4] {
@@ -146,7 +150,7 @@ fn cross_cell_move_refusal_matrix() {
                             String::from_utf8_lossy(protocol),
                             String::from_utf8_lossy(command)
                         );
-                        refusal_row(
+                        pressure_row(
                             &mut node,
                             &source,
                             &target,
@@ -162,16 +166,18 @@ fn cross_cell_move_refusal_matrix() {
             }
         }
     }
-    println!("H3 binary refusal matrix: {rows} rows, {} failures", failures.len());
+    println!("H3 binary pressure matrix: {rows} rows, {} failures", failures.len());
     for failure in &failures {
         println!("{failure}");
     }
-    assert!(failures.is_empty(), "H3: refused move destroyed data");
+    assert!(failures.is_empty(), "H3: a move under destination pressure diverged from Redis");
 }
 
-/// One pressure row compares both values and both absolute deadlines.
+/// One pressure row: the reply Redis gives, then both values and both
+/// absolute deadlines — moved exactly for a landed rename, untouched for a
+/// refused `COPY` or a `RENAMENX` no-op.
 #[allow(clippy::too_many_arguments)] // Explicit matrix dimensions, test-only.
-fn refusal_row(
+fn pressure_row(
     node: &mut TcpStream,
     source: &[u8],
     target: &[u8],
@@ -194,35 +200,49 @@ fn refusal_row(
         b"+OK\r\n"
     );
     let reply = call(node, &[command, source, target]);
-    if existing && command == b"RENAMENX" {
-        assert_eq!(reply, b":0\r\n", "RENAMENX existing destination must remain a no-op under OOM");
-    } else {
-        assert!(reply.starts_with(b"-OOM "), "{label}: {reply:?}");
-    }
-    check(
-        &format!("{label} source"),
-        call(node, &[b"GET", source]),
-        &bulk(b"IMPORTANT-PAYLOAD"),
-        failures,
-    );
     let nil: &[u8] = if protocol == b"3" { b"_\r\n" } else { b"$-1\r\n" };
+    // Redis 8.0.5 under `maxmemory 1` / `noeviction` (oracle-pinned):
+    // RENAME `+OK`, RENAMENX `:1` / `:0` on an existing target, COPY `-OOM`.
+    let lands = match (command, existing) {
+        (b"COPY", _) => {
+            if !reply.starts_with(b"-OOM ") {
+                failures.push(format!("{label}: COPY must keep DENYOOM, got {reply:?}"));
+            }
+            false
+        }
+        (b"RENAMENX", true) => {
+            check(&format!("{label} reply"), reply, b":0\r\n", failures);
+            false
+        }
+        (b"RENAME", _) => {
+            check(&format!("{label} reply"), reply, b"+OK\r\n", failures);
+            true
+        }
+        _ => {
+            check(&format!("{label} reply"), reply, b":1\r\n", failures);
+            true
+        }
+    };
+    let payload = bulk(b"IMPORTANT-PAYLOAD");
     let old = bulk(b"previous");
-    check(
-        &format!("{label} target"),
-        call(node, &[b"GET", target]),
-        if existing { &old } else { nil },
-        failures,
-    );
+    let (source_value, target_value, source_after, target_after): (&[u8], &[u8], &[u8], &[u8]) =
+        if lands {
+            (nil, &payload, b":-2\r\n", &source_deadline)
+        } else {
+            (&payload, if existing { &old } else { nil }, &source_deadline, &target_deadline)
+        };
+    check(&format!("{label} source"), call(node, &[b"GET", source]), source_value, failures);
+    check(&format!("{label} target"), call(node, &[b"GET", target]), target_value, failures);
     check(
         &format!("{label} source deadline"),
         call(node, &[b"PEXPIRETIME", source]),
-        &source_deadline,
+        source_after,
         failures,
     );
     check(
         &format!("{label} target deadline"),
         call(node, &[b"PEXPIRETIME", target]),
-        &target_deadline,
+        target_after,
         failures,
     );
 }

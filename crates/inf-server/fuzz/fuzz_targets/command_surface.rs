@@ -27,6 +27,9 @@ fuzz_target!(|data: &[u8]| {
         &[b"INF.PEEK".as_slice(), b"move", b"ABS", data],
         &[b"INF.TAKE".as_slice(), b"move", b"IF", value, data],
         &[b"INF.TAKE".as_slice(), b"move", b"IF", value, b"-1"],
+        &[b"INF.PUT".as_slice(), b"move", value, data],
+        &[b"INF.PUT".as_slice(), b"move", value, b"-1", b"NX"],
+        &[b"INF.PUT".as_slice(), b"move", value, data, data],
     ] {
         snapshot_reply.clear();
         execute_slices(argv, &mut store, &mut cx, Nanos(1), &mut snapshot_reply);

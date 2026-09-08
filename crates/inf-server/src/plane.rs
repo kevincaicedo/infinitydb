@@ -5237,7 +5237,7 @@ async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     }
     let mut deadline_buf = [0u8; 20];
     let expiry = (deadline >= 0).then(|| crate::exec::fmt_u64(&mut deadline_buf, deadline as u64));
-    let put = move_put_args(target, &value, expiry, replace);
+    let put = move_put_args(cmd, target, &value, expiry, replace);
     let reply = run_on(shared, origin, target_owner, Protocol::Resp2, id, target_db, &put).await;
     if reply.first() == Some(&b'-') {
         return reply;
@@ -5265,18 +5265,27 @@ async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     }
 }
 
-/// Builds the bounded SET leg; the absolute deadline and NX condition
-/// travel together so neither relies on a later follow-up command.
+/// Builds the bounded put leg; the absolute deadline and NX condition
+/// travel together so neither relies on a later follow-up command. The
+/// renames ride `INF.PUT`, admitted as RENAME/RENAMENX are (no DENYOOM —
+/// ADR-0110 third amendment); `COPY` keeps the client-shaped `SET`, whose
+/// DENYOOM is COPY's own. Both reply `+OK` / null-on-NX.
 fn move_put_args<'a>(
+    cmd: CommandId,
     target: &'a [u8],
     value: &'a [u8],
     deadline: Option<&'a [u8]>,
     replace: bool,
 ) -> Vec<&'a [u8]> {
-    let mut put: Vec<&[u8]> = vec![b"SET", target, value];
-    if let Some(deadline) = deadline {
-        put.extend_from_slice(&[b"PXAT", deadline]);
-    }
+    let mut put: Vec<&[u8]> = if cmd == CommandId::Copy {
+        let mut put: Vec<&[u8]> = vec![b"SET", target, value];
+        if let Some(deadline) = deadline {
+            put.extend_from_slice(&[b"PXAT", deadline]);
+        }
+        put
+    } else {
+        vec![b"INF.PUT", target, value, deadline.unwrap_or(b"-1")]
+    };
     if !replace {
         put.push(b"NX");
     }

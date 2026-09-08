@@ -362,7 +362,7 @@ fn replay(
 
 /// Every registry row appears in the scripts the twins replay, so a new
 /// command cannot land outside the cell-count-invariance check. The
-/// exclusions carry their reason: two internal fabric-program ops a
+/// exclusions carry their reason: three internal fabric-program ops a
 /// client never speaks, and `QUIT`, which ends the scripted connection
 /// (its bindings are covered by `node_e2e::connection_level_commands_
 /// ignore_the_bound_namespace`).
@@ -376,7 +376,7 @@ fn every_registry_command_is_scripted() {
         scripted.insert(case.argv[0].to_ascii_uppercase());
     }
     let excluded = |id: CommandId| match id {
-        CommandId::InfTake | CommandId::InfPeek => {
+        CommandId::InfTake | CommandId::InfPeek | CommandId::InfPut => {
             Some("internal fabric-program op (RENAME/COPY legs) — never a client case")
         }
         CommandId::Quit => Some("closes the scripted connection — covered by the conn-level e2e"),

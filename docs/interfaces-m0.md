@@ -642,3 +642,18 @@ without those counters. The SET builder represents optional expiry with an
 returns `-BUSY source changed during cross-cell move; destination may contain
 a copy`; RENAMENX retry may return `:0` against that copy. The hidden
 `parse_take_reply` export exists for direct decoder fuzzing.
+
+ADR-0110 third amendment (2026-09-08, batch 17): a third registered internal
+command, `INF.PUT key value unix_expiry_ms [NX]` — the RENAME/RENAMENX
+destination leg. Registry flags are RENAME's (`write`, no `denyoom`); the put
+is `CellStore::set` (store bounds typed, arena exhaustion answers OOM, any
+type at the destination is overwritten as RENAME does); the deadline is `-1`
+or a positive Unix-ms timestamp (otherwise `ERR invalid move snapshot
+deadline`, before any mutation); replies are SET's (`+OK`, null on a refused
+NX). The move runs snapshot → `INF.PUT … [NX]` → conditional cleanup for the
+renames; COPY keeps `SET [PXAT] [NX]` and therefore COPY's `denyoom`. Deadline
+arithmetic at the command seam is ADR-0111: every expire argument is decided
+in i64 Unix milliseconds exactly as Redis decides it, and every accepted
+instant saturates into the record's u40-ms bound (`inf_store::MAX_EXPIRE_MS`,
+`inf_store::saturating_deadline` — now public); the ADR-0008 clamp is the
+declared deviation for read-backs of a saturated deadline.

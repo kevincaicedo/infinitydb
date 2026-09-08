@@ -15,8 +15,8 @@ corpus runs against both, plus a namespace-bound fan-out/tier lane
 (`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned
 byte-exact there, never silently excused.
 
-**Corpus:** 585 byte-compared executions · 59 documented deviations · 0 tolerated failures.
-**Surface:** 90 commands — 54 full · 32 partial · 0 stub · 2 extension · 2 internal.
+**Corpus:** 623 byte-compared executions · 61 documented deviations · 0 tolerated failures.
+**Surface:** 91 commands — 54 full · 32 partial · 0 stub · 2 extension · 3 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
 are representational: ordering, identity payloads, opaque cursors/art);
@@ -33,14 +33,14 @@ program primitives, not a client surface.
 | `HELLO` | full | M0 | fast | -1 | 1 | identity fields (server/version) are InfinityDB's own, as for any non-Redis server |
 | `QUIT` | partial | M1 | fast | 1 | 0 | replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus because closing tears down the shared oracle connection — covered by a unit test and the client-smoke suite |
 | `GET` | full | M0 | readonly fast | 2 | 28 |  |
-| `SET` | full | M0 | write denyoom | -3 | 84 |  |
+| `SET` | full | M0 | write denyoom | -3 | 94 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `SETNX` | full | M0 | write denyoom fast | 3 | 2 |  |
-| `SETEX` | full | M0 | write denyoom | 4 | 4 |  |
-| `PSETEX` | full | M0 | write denyoom | 4 | 2 |  |
+| `SETEX` | full | M0 | write denyoom | 4 | 6 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
+| `PSETEX` | full | M0 | write denyoom | 4 | 4 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `GETSET` | full | M0 | write denyoom fast | 3 | 2 |  |
 | `GETDEL` | full | M0 | write fast | 2 | 2 |  |
 | `DEL` | full | M0 | write | -2 | 4 |  |
-| `EXISTS` | full | M0 | readonly fast | -2 | 11 |  |
+| `EXISTS` | full | M0 | readonly fast | -2 | 18 |  |
 | `TYPE` | full | M0 | readonly fast | 2 | 4 | only the string type exists until M3 |
 | `INCR` | full | M0 | write denyoom fast | 2 | 8 |  |
 | `DECR` | full | M0 | write denyoom fast | 2 | 2 |  |
@@ -48,10 +48,10 @@ program primitives, not a client surface.
 | `DECRBY` | full | M0 | write denyoom fast | 3 | 2 |  |
 | `APPEND` | full | M0 | write denyoom fast | 3 | 4 |  |
 | `STRLEN` | full | M0 | readonly fast | 2 | 5 |  |
-| `EXPIRE` | full | M0 | write fast | -3 | 17 | TTLs ≥ ~34.8 years clamp to the u40 record bound |
-| `PEXPIRE` | full | M0 | write fast | -3 | 1 | same u40 clamp |
-| `TTL` | full | M0 | readonly fast | 2 | 20 |  |
-| `PTTL` | full | M0 | readonly fast | 2 | 3 |  |
+| `EXPIRE` | full | M0 | write fast | -3 | 21 | TTLs ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
+| `PEXPIRE` | full | M0 | write fast | -3 | 4 | same u40 clamp |
+| `TTL` | full | M0 | readonly fast | 2 | 20 | a clamped deadline reads as the u40 bound (ADR-0111) |
+| `PTTL` | full | M0 | readonly fast | 2 | 3 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PERSIST` | full | M0 | write fast | 2 | 3 |  |
 | `INFO` | partial | M0 | admin | -1 | 0 | sections + field vocabulary present; gauges are this cell's slice until the control plane aggregates (client-smoke CI is the open M1-S14 AC) |
 | `COMMAND` | partial | M0 | admin | -1 | 3 | COMMAND DOCS is an honest empty map; the registry covers the implemented surface only |
@@ -60,7 +60,7 @@ program primitives, not a client surface.
 | `MSETNX` | partial | M1 | write denyoom | -3 | 3 | cross-cell keys are check-then-set until M4 transactions; single-cell exact |
 | `GETRANGE` | full | M1 | readonly | 4 | 8 |  |
 | `SETRANGE` | full | M1 | write denyoom | 4 | 4 | values bound at 16 MiB − 1 (record format v0) |
-| `GETEX` | full | M1 | write fast | -2 | 16 |  |
+| `GETEX` | full | M1 | write fast | -2 | 20 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `INCRBYFLOAT` | partial | M1 | write denyoom fast | 3 | 6 | computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision tails may differ |
 | `SUBSTR` | full | M1 | readonly | 4 | 1 |  |
 | `RENAME` | partial | M1 | write | 3 | 2 | cross-owner string moves use snapshot/put/conditional-delete (ADR-0110); destination refusal preserves source; changed-source cleanup returns -BUSY and may leave a copy; destination OOM remains possible because the SET leg is DENYOOM; full atomicity at M6 |
@@ -76,10 +76,10 @@ program primitives, not a client surface.
 | `FLUSHALL` | partial | M1 | write | -1 | 2 | atomic per cell, eventually complete across cells within one scatter round (no global pause) |
 | `OBJECT` | partial | M1 | readonly | -2 | 11 | IDLETIME is an honest 0 (CLOCK recency, no LRU clock); FREQ is the CMS Morris estimate |
 | `DEBUG` | partial | M1 | admin | -2 | 3 | subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE; OBJECT routes to the key's owner cell and COMMAND GETKEYS reports that key (ADR-0104); SLEEP stalls one cell, never the node |
-| `EXPIREAT` | full | M1 | write fast | -3 | 6 |  |
-| `PEXPIREAT` | full | M1 | write fast | -3 | 1 |  |
-| `EXPIRETIME` | full | M1 | readonly fast | 2 | 5 |  |
-| `PEXPIRETIME` | full | M1 | readonly fast | 2 | 4 |  |
+| `EXPIREAT` | full | M1 | write fast | -3 | 10 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
+| `PEXPIREAT` | full | M1 | write fast | -3 | 3 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
+| `EXPIRETIME` | full | M1 | readonly fast | 2 | 5 | a clamped deadline reads as the u40 bound (ADR-0111) |
+| `PEXPIRETIME` | full | M1 | readonly fast | 2 | 4 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `SELECT` | full | M1 | fast | 2 | 7 |  |
 | `CONFIG` | partial | M1 | admin | -2 | 34 | typed M1 key subset with frozen hot-reload classes |
 | `CLIENT` | partial | M1 | admin | -2 | 5 | KILL supports the ID filter form; LIST addr/fd are placeholders until peername capture |
@@ -96,6 +96,7 @@ program primitives, not a client surface.
 | `LASTSAVE` | partial | M2 | readonly fast | 1 | 0 | unix seconds of the newest durable MANIFEST publication; 0 before the first (Redis reports process-start time); loading flag docs-derived, not capture-verified |
 | `INF.TAKE` | internal | M1 | write fast | -2 | 0 | legacy read/delete+TTL; IF value deadline conditionally deletes the matching string snapshot (ADR-0110) |
 | `INF.PEEK` | internal | M1 | readonly fast | -2 | 0 | legacy read+TTL; ABS reads a string snapshot with absolute Unix expiry; ABS NOSTATS omits client hit/miss accounting (ADR-0110) |
+| `INF.PUT` | internal | M1 | write | -4 | 0 | the RENAME/RENAMENX destination leg: `key value deadline [NX]`, absolute Unix-ms deadline or -1, SET's replies; admitted as RENAME is — no DENYOOM — while the arena's own refusal still answers OOM (ADR-0110 third amendment) |
 | `JSON.SET` | partial | M3 | write denyoom | -4 | 32 | S21 corpus exact except parser-specific malformed-input text; root sets preserve TTL (as RedisJSON — S22 probe); durable writes use M3-S17 document records |
 | `JSON.GET` | partial | M3 | readonly | -2 | 36 | S21 corpus exact except documented large-exponent f64 text and module-specific WRONGTYPE wording; INDENT/NEWLINE/SPACE covered; path match sets capped by doc-max-path-matches |
 | `JSON.MGET` | partial | M3 | readonly | -3 | 2 | S21 corpus exact; per-key atomicity only — no cross-cell snapshot (each cell serves its key at its own serve time) |
@@ -131,6 +132,10 @@ bytes or post-state differ by an understood, reviewed design decision.
 - identity fields differ; proto switch verified locally
 - NOPROTO error text verified in unit tests
 
+### `PTTL`
+
+- same u40 clamp — the remaining TTL is measured to the bound (ADR-0111)
+
 ### `INFO`
 
 - section payloads differ (InfinityDB identity/tripwires); shape client-parseable
@@ -164,6 +169,10 @@ bytes or post-state differ by an understood, reviewed design decision.
 
 - removed in Redis 8; InfinityDB accepts it as a no-op (M1-S03 surface)
 - value-address/serialized-length fields are engine-internal
+
+### `PEXPIRETIME`
+
+- deadlines ≥ ~34.8 years clamp to the u40 record bound — the read-back reports the bound, not Redis's i64 instant (ADR-0008, ADR-0111)
 
 ### `CONFIG`
 
