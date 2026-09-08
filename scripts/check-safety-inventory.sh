@@ -14,42 +14,49 @@
 # unsafe *usage* tokens, not the word in prose or `forbid(unsafe_code)`.
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
 
-fail=0
-pattern='\bunsafe[[:space:]]+(\{|fn\b|impl\b|extern\b)'
+python3 - <<'PY'
+from pathlib import Path
+import re
+import sys
 
-for crate_dir in crates/* bins/*; do
-    [ -d "$crate_dir/src" ] || continue
-    inventory="$crate_dir/SAFETY.md"
-    # Files whose unsafe usage survives comment stripping would need a real
-    # parser; the token match over-approximates (prose mentioning `unsafe fn`
-    # forces an inventory line) — over-approximation errs safe.
-    # Portable read-into-array (macOS bash 3.2 has no `mapfile`).
-    unsafe_files=()
-    while IFS= read -r f; do
-        unsafe_files+=("$f")
-    done < <(grep -rlE "$pattern" "$crate_dir/src" 2>/dev/null || true)
-    if [ "${#unsafe_files[@]}" -eq 0 ]; then
+unsafe = re.compile(r"\bunsafe\s+(?:\{|fn\b|impl\b|extern\b)")
+path_char = r"A-Za-z0-9_./-"
+crates = files = unsafe_files = 0
+errors = []
+for root in [Path("crates"), Path("bins")]:
+    if not root.is_dir():
+        errors.append(f"SAFETY INVENTORY SCOPE: missing {root}")
         continue
-    fi
-    if [ ! -f "$inventory" ]; then
-        echo "SAFETY INVENTORY MISSING: $crate_dir has unsafe in src/ but no SAFETY.md:"
-        printf '  %s\n' "${unsafe_files[@]}"
-        fail=1
-        continue
-    fi
-    for file in "${unsafe_files[@]}"; do
-        name=$(basename "$file")
-        if ! grep -q "$name" "$inventory"; then
-            echo "SAFETY INVENTORY GAP: $file uses unsafe but $inventory never names $name"
-            fail=1
-        fi
-    done
-done
-
-if [ "$fail" -ne 0 ]; then
-    echo "safety-inventory check FAILED — inventory the unsafe (SAFETY.md + // SAFETY: + Miri/Loom) or make it safe"
-    exit 1
-fi
-echo "safety-inventory OK: every unsafe-bearing src file is named in its crate's SAFETY.md"
+    for crate in sorted(root.iterdir()):
+        if not crate.is_dir():
+            continue
+        source = crate / "src"
+        rust = sorted(source.rglob("*.rs"))
+        if not source.is_dir() or not rust:
+            errors.append(f"SAFETY INVENTORY SCOPE: missing or empty {source}")
+            continue
+        crates += 1
+        files += len(rust)
+        inventory = crate / "SAFETY.md"
+        text = inventory.read_text() if inventory.is_file() else ""
+        for file in rust:
+            if not unsafe.search(file.read_text()):
+                continue
+            unsafe_files += 1
+            relative = file.relative_to(source).as_posix()
+            names = [relative, f"src/{relative}", file.as_posix()]
+            literal = "|".join(re.escape(name) for name in names)
+            pattern = rf"(?<![{path_char}])(?:{literal})(?![{path_char}])"
+            if not re.search(pattern, text):
+                errors.append(f"SAFETY INVENTORY GAP: {file} uses unsafe but {inventory} never names {relative}")
+if crates == 0:
+    errors.append("SAFETY INVENTORY SCOPE: no source crates")
+scope = f"{crates} crates, {files} Rust files, {unsafe_files} unsafe-bearing files"
+if errors:
+    print("\n".join(errors))
+    print(f"safety-inventory FAILED: {scope}")
+    sys.exit(1)
+print(f"safety-inventory OK: {scope}; every unsafe file has an exact inventory path")
+PY

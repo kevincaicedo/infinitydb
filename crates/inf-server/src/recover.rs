@@ -65,7 +65,7 @@ use inf_log::ckpt::{
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
     FrameStamp, LogCorruption, Lsn, Manifest, ReadError, ReaderConfig, RegionEvidence, RegionScan,
-    SegmentId, SegmentReader, SegmentRotor, SegmentScan, create_cell_dirs,
+    SegmentId, SegmentReader, SegmentRotor, SegmentScan, check_segment_len, create_cell_dirs,
     create_cell_dirs_deferred, read_manifest, scan_log_dir_from, scan_region_evidence,
     segment_file_name,
 };
@@ -715,7 +715,12 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 .fs()
                 .open_read(&self.log_dir.join(segment_file_name(segment)))
                 .map_err(io_invalid)?;
-            self.seg_sizes.push(file.file_size().map_err(io_invalid)?);
+            // Before a checkpoint is loaded or a record replayed: a file
+            // whose end no LSN can name is refused, never truncated to fit
+            // (ADR-0018).
+            let size = file.file_size().map_err(io_invalid)?;
+            check_segment_len(segment, size).map_err(io_invalid)?;
+            self.seg_sizes.push(size);
         }
         self.bytes_total = self.seg_sizes.iter().sum();
 

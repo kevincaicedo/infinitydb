@@ -894,9 +894,20 @@ EOF
 )
 expect green "fsync: a test-only module is stripped" env INF_CHECK_ROOT="$root" $FSYNC
 
+# The inventory + dep-DAG fixtures plant whole crate trees and a `cargo`
+# shim, so they are a Python suite; its cases join this script's tally.
+inventory_dag_log="$work/inventory-dag.log"
+if python3 "$SCRIPT_DIR/check-inventory-dag-selftest.py" >"$inventory_dag_log" 2>&1; then
+    pass=$((pass + $(sed -n 's/^Ran \([0-9]*\) tests.*/\1/p' "$inventory_dag_log")))
+else
+    fail=$((fail + 1))
+    echo "SELFTEST FAIL: inventory / dep-DAG fixtures"
+    sed 's/^/    | /' "$inventory_dag_log"
+fi
+
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, safety-inventory, dep-dag each red on a planted violation)"

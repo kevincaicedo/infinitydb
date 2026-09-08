@@ -207,6 +207,22 @@ from the header and never bounded: a CRC-valid frame declaring
 offset of its length prefix within its segment. **No global LSN exists**
 (master plan §8.1).
 
+`inf-log::MAX_SEGMENT_LEN` is the largest physical segment length whose
+one-past end is a representable LSN offset, and `check_segment_len` is the one
+refusal (ADR-0018, 2026-09-08 amendment). Recovery applies it to every
+retained segment before loading a checkpoint or replaying records; both
+tail-scan entry points and `SegmentReader::open` apply it to the opened file
+before reading. Every cursor advance and frame-implied address in both read
+paths is checked, so `new` — which takes a caller's handle — cannot wrap onto
+a live frame's address either. A refusal is `io::ErrorKind::InvalidData`
+naming the segment, its length and the limit.
+
+The bound is the format's address range, not the current rotation size: an
+older segment may exceed today's `segment_bytes` and stay replayable. The
+rotor seals before a frame would cross `segment_bytes` (a `u32`), so an
+oversized file is planted or foreign. Refusal never truncates the file or
+ignores its unaddressable suffix.
+
 ## Segment naming + lifecycle (`inf-log::segment`, `inf-log::scan`)
 
 - Files: `seg-{:06}.ilog` under `shard-k/log` (ids > 999999 grow digits);

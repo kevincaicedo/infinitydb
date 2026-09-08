@@ -30,7 +30,7 @@ use std::path::Path;
 
 use crate::frame::{FRAME_HEADER_LEN, FrameDecodeError, FrameRef, decode_frame, frame_shape};
 use crate::fs::{SegmentFile, SegmentFs};
-use crate::lsn::{Lsn, SegmentId};
+use crate::lsn::{Lsn, SegmentId, check_segment_len};
 use crate::segment::segment_file_name;
 
 /// Default read-ahead window (bytes): large sequential reads amortize the
@@ -275,8 +275,11 @@ impl<File: SegmentFile> SegmentReader<File> {
         cfg: ReaderConfig,
     ) -> Result<SegmentReader<File>, ReadError> {
         let path = log_dir.join(segment_file_name(segment));
-        let file =
-            fs.open_read(&path).map_err(|source| ReadError::Io { segment, offset: 0, source })?;
+        let at_open = |source| ReadError::Io { segment, offset: 0, source };
+        let file = fs.open_read(&path).map_err(at_open)?;
+        // A file whose end no LSN can name is refused here, not wrapped
+        // later (ADR-0018): the cursor below is a u32.
+        check_segment_len(segment, file.file_size().map_err(at_open)?).map_err(at_open)?;
         Ok(SegmentReader::new(file, segment, cfg))
     }
 
@@ -331,7 +334,26 @@ impl<File: SegmentFile> SegmentReader<File> {
         match decode_frame(window, self.cfg.max_frame_len) {
             Ok((frame, consumed)) => {
                 debug_assert_eq!(consumed, frame_len, "peek and decode_frame disagree");
-                let expected = Lsn::new(self.segment, at + frame.header_len() as u32);
+                // Both addresses this frame implies — its first record and
+                // its successor's base — must be nameable before either is
+                // used. Unreachable through `open`, which bounds the file;
+                // `new` takes any handle, so the cursor is checked rather
+                // than wrapped onto a live frame's address.
+                let addresses = u32::try_from(frame.header_len()).ok().and_then(|header| {
+                    Some((at.checked_add(header)?, at.checked_add(frame.padded_len())?))
+                });
+                let Some((first_record_at, next_offset)) = addresses else {
+                    self.failed = true;
+                    return Err(ReadError::Io {
+                        segment: self.segment,
+                        offset: at,
+                        source: io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "frame ends outside the u32 segment address limit",
+                        ),
+                    });
+                };
+                let expected = Lsn::new(self.segment, first_record_at);
                 let stored = frame.first_lsn();
                 // Planted-bug canary (ADR-0090 D5): a reader blind to the
                 // segment id replays recycled residue as data — the
@@ -363,9 +385,8 @@ impl<File: SegmentFile> SegmentReader<File> {
                 // ahead of `valid`; the next peek's refill compacts from
                 // the boundary (a file ending inside the padding is a
                 // clean `FileEnd`, like any other short tail).
-                let advance = frame.padded_len() as usize;
-                self.start += advance;
-                self.next_offset += advance as u32;
+                self.start += frame.padded_len() as usize;
+                self.next_offset = next_offset;
                 Ok(Some(frame))
             }
             Err(error) => {
