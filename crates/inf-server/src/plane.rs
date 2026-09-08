@@ -5196,11 +5196,9 @@ async fn program_msetnx<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     int_reply(shared, proto, 1)
 }
 
-/// Cross-owner RENAME/RENAMENX/COPY: `INF.TAKE`/`INF.PEEK` at the source
-/// (atomic there), `SET [PX] [NX]` at the destination. Atomic per cell;
-/// full cross-cell atomicity arrives with M4 transactions (documented). The
-/// TTL transfers as relative milliseconds — the hop skew is microseconds
-/// (recorded deviation vs Redis's absolute deadline).
+/// Cross-owner moves snapshot first, put second, and conditionally remove
+/// the source last (ADR-0110). A refused put cannot destroy the source;
+/// failed cleanup may retain a copy. Full cross-cell atomicity belongs to M6.
 async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
@@ -5210,81 +5208,173 @@ async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     cmd: CommandId,
     argv: &[&[u8]],
 ) -> Vec<u8> {
-    let (src, dst) = (argv[1], argv[2]);
-    let src_owner = shared.router.cell_of(SlotRouter::slot_of(src));
-    let dst_owner = shared.router.cell_of(SlotRouter::slot_of(dst));
-    let mut replace = false;
-    let mut dst_db = db;
-    if cmd == CommandId::Copy {
-        let mut i = 3;
-        while i < argv.len() {
-            let opt = argv[i];
-            if opt.eq_ignore_ascii_case(b"REPLACE") {
-                replace = true;
-            } else if opt.eq_ignore_ascii_case(b"DB") && i + 1 < argv.len() {
-                match crate::exec::parse_i64(argv[i + 1]) {
-                    Ok(n @ 0..=15) => dst_db = n as u16,
-                    Ok(_) => return error_reply(shared, proto, "ERR DB index is out of range"),
-                    Err(()) => {
-                        return error_reply(
-                            shared,
-                            proto,
-                            "ERR value is not an integer or out of range",
-                        );
-                    }
-                }
-                i += 1;
-            } else {
-                return error_reply(shared, proto, "ERR syntax error");
-            }
-            i += 1;
-        }
+    let (source, target) = (argv[1], argv[2]);
+    let target_owner = shared.router.cell_of(SlotRouter::slot_of(target));
+    let (target_db, replace) = match move_options(cmd, argv, db) {
+        Ok(options) => options,
+        Err(error) => return error_reply(shared, proto, error),
+    };
+    let snapshot = match move_read(shared, origin, id, db, source, cmd).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return error,
+    };
+    let (value, deadline) = match snapshot {
+        Some(snapshot) => snapshot,
+        None if cmd == CommandId::Copy => return int_reply(shared, proto, 0),
+        None => return error_reply(shared, proto, "ERR no such key"),
+    };
+    if deadline < -1 {
+        return error_reply(shared, proto, "ERR cross-cell program reply malformed");
     }
     if cmd == CommandId::Renamenx {
-        // Pre-check at the destination (the window between this check and
-        // the SET below is the documented non-atomicity).
-        match count_on(shared, origin, dst_owner, proto, db, b"EXISTS", dst).await {
+        // Preserve the existing-target no-op even under OOM. SET NX below
+        // still owns the condition if another writer arrives after this read.
+        match count_on(shared, origin, target_owner, proto, db, b"EXISTS", target).await {
             Ok(0) => {}
             Ok(_) => return int_reply(shared, proto, 0),
             Err(error) => return error,
         }
     }
-    let probe: &[u8] = if cmd == CommandId::Copy { b"INF.PEEK" } else { b"INF.TAKE" };
-    let raw = run_on(shared, origin, src_owner, Protocol::Resp2, id, db, &[probe, src]).await;
-    if raw.first() == Some(&b'-') {
-        return raw;
-    }
-    let Some(taken) = parse_take_reply(&raw) else {
-        return error_reply(shared, proto, "ERR cross-cell program reply malformed");
-    };
-    shared.recycle_reply_buf(raw);
-    let Some((value, pttl)) = taken else {
-        return match cmd {
-            CommandId::Copy => int_reply(shared, proto, 0),
-            _ => error_reply(shared, proto, "ERR no such key"),
-        };
-    };
-    let mut ttl_buf = [0u8; 20];
-    let mut put: Vec<&[u8]> = vec![b"SET", dst, &value];
-    if pttl >= 0 {
-        put.push(b"PX");
-        put.push(crate::exec::fmt_u64(&mut ttl_buf, pttl as u64));
-    }
-    if cmd == CommandId::Copy && !replace {
-        put.push(b"NX"); // TOCTOU-free destination guard
-    }
-    // COPY's destination database rides the Apply db byte (M1-S08).
-    let reply = run_on(shared, origin, dst_owner, Protocol::Resp2, id, dst_db, &put).await;
+    let mut deadline_buf = [0u8; 20];
+    let expiry = (deadline >= 0).then(|| crate::exec::fmt_u64(&mut deadline_buf, deadline as u64));
+    let put = move_put_args(target, &value, expiry, replace);
+    let reply = run_on(shared, origin, target_owner, Protocol::Resp2, id, target_db, &put).await;
     if reply.first() == Some(&b'-') {
         return reply;
     }
-    let set_applied = reply.starts_with(b"+OK");
+    let applied = reply == b"+OK\r\n";
+    let skipped = reply == b"$-1\r\n";
     shared.recycle_reply_buf(reply);
+    if skipped && !replace {
+        return int_reply(shared, proto, 0);
+    }
+    if !applied {
+        return error_reply(shared, proto, "ERR cross-cell program reply malformed");
+    }
+    if cmd == CommandId::Copy {
+        return int_reply(shared, proto, 1);
+    }
+    if let Err(error) =
+        move_remove(shared, origin, id, db, source, &value, expiry.unwrap_or(b"-1")).await
+    {
+        return error;
+    }
     match cmd {
         CommandId::Rename => simple_reply(shared, proto, "OK"),
-        CommandId::Renamenx => int_reply(shared, proto, 1),
-        _ => int_reply(shared, proto, i64::from(set_applied)),
+        _ => int_reply(shared, proto, 1),
     }
+}
+
+/// Builds the bounded SET leg; the absolute deadline and NX condition
+/// travel together so neither relies on a later follow-up command.
+fn move_put_args<'a>(
+    target: &'a [u8],
+    value: &'a [u8],
+    deadline: Option<&'a [u8]>,
+    replace: bool,
+) -> Vec<&'a [u8]> {
+    let mut put: Vec<&[u8]> = vec![b"SET", target, value];
+    if let Some(deadline) = deadline {
+        put.extend_from_slice(&[b"PXAT", deadline]);
+    }
+    if !replace {
+        put.push(b"NX");
+    }
+    put
+}
+
+/// The non-destructive read leg owns its snapshot before it can suspend again.
+async fn move_read<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    origin: ExecOrigin,
+    id: u64,
+    db: u16,
+    source: &[u8],
+    command: CommandId,
+) -> Result<Option<(Vec<u8>, i64)>, Vec<u8>> {
+    let owner = shared.router.cell_of(SlotRouter::slot_of(source));
+    let args: &[&[u8]] = if command == CommandId::Copy {
+        &[b"INF.PEEK", source, b"ABS"]
+    } else {
+        &[b"INF.PEEK", source, b"ABS", b"NOSTATS"]
+    };
+    let raw = run_on(shared, origin, owner, Protocol::Resp2, id, db, args).await;
+    if raw.first() == Some(&b'-') {
+        return Err(raw);
+    }
+    let snapshot = parse_take_reply(&raw);
+    shared.recycle_reply_buf(raw);
+    snapshot.ok_or_else(|| {
+        error_reply(shared, Protocol::Resp2, "ERR cross-cell program reply malformed")
+    })
+}
+
+/// Only an exact match at the source authorizes removal after a successful
+/// put. A failure leaves the destination alone: another writer may own it.
+async fn move_remove<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    origin: ExecOrigin,
+    id: u64,
+    db: u16,
+    source: &[u8],
+    value: &[u8],
+    deadline_text: &[u8],
+) -> Result<(), Vec<u8>> {
+    let source_owner = shared.router.cell_of(SlotRouter::slot_of(source));
+    let reply = run_on(
+        shared,
+        origin,
+        source_owner,
+        Protocol::Resp2,
+        id,
+        db,
+        &[b"INF.TAKE", source, b"IF", value, deadline_text],
+    )
+    .await;
+    if reply.first() == Some(&b'-') {
+        return Err(reply);
+    }
+    let removed = reply == b":1\r\n";
+    let changed = reply == b":0\r\n";
+    shared.recycle_reply_buf(reply);
+    if changed {
+        return Err(error_reply(
+            shared,
+            Protocol::Resp2,
+            "BUSY source changed during cross-cell move; destination may contain a copy",
+        ));
+    }
+    if !removed {
+        return Err(error_reply(shared, Protocol::Resp2, "ERR cross-cell program reply malformed"));
+    }
+    Ok(())
+}
+
+/// COPY's options are bounded by the command frame; moves without options
+/// use the current numbered database and their own replacement condition.
+fn move_options(cmd: CommandId, argv: &[&[u8]], db: u16) -> Result<(u16, bool), &'static str> {
+    if cmd != CommandId::Copy {
+        return Ok((db, cmd == CommandId::Rename));
+    }
+    let mut target_db = db;
+    let mut replace = false;
+    let mut i = 3;
+    while i < argv.len() {
+        if argv[i].eq_ignore_ascii_case(b"REPLACE") {
+            replace = true;
+        } else if argv[i].eq_ignore_ascii_case(b"DB") && i + 1 < argv.len() {
+            target_db = match crate::exec::parse_i64(argv[i + 1]) {
+                Ok(n @ 0..=15) => n as u16,
+                Ok(_) => return Err("ERR DB index is out of range"),
+                Err(()) => return Err("ERR value is not an integer or out of range"),
+            };
+            i += 1;
+        } else {
+            return Err("ERR syntax error");
+        }
+        i += 1;
+    }
+    Ok((target_db, replace))
 }
 
 /// Scattered KEYS: local sweep + one Apply per peer, arrays merged by
@@ -5977,21 +6067,22 @@ fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
     Some((cursor, 4 + 1 + start + len + 2))
 }
 
-/// `INF.TAKE`/`INF.PEEK` RESP2 reply: `*-1` ⇒ `Some(None)` (missing);
-/// `*2 [$value][:pttl]` ⇒ value + pttl (−1 = no TTL).
-fn parse_take_reply(raw: &[u8]) -> Option<Option<(Vec<u8>, i64)>> {
-    if raw.starts_with(b"*-1\r\n") {
+/// Two-field snapshot reply: `*-1` means missing; `*2 [$value][:time]`
+/// carries milliseconds (-1 means no expiry). Legacy forms return remaining
+/// TTL; the move program's `INF.PEEK key ABS` returns absolute Unix expiry.
+pub fn parse_take_reply(raw: &[u8]) -> Option<Option<(Vec<u8>, i64)>> {
+    if raw == b"*-1\r\n" {
         return Some(None);
     }
     let rest = raw.strip_prefix(b"*2\r\n$")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let len: usize = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
-    let start = nl + 2;
-    let value = rest.get(start..start + len)?.to_vec();
-    let tail = rest.get(start + len + 2..)?.strip_prefix(b":")?;
-    let nl2 = tail.windows(2).position(|w| w == b"\r\n")?;
-    let pttl: i64 = core::str::from_utf8(&tail[..nl2]).ok()?.parse().ok()?;
-    Some(Some((value, pttl)))
+    let start = nl.checked_add(2)?;
+    let end = start.checked_add(len)?;
+    let value = rest.get(start..end)?;
+    let tail = rest.get(end..)?.strip_prefix(b"\r\n:")?.strip_suffix(b"\r\n")?;
+    let pttl: i64 = core::str::from_utf8(tail).ok()?.parse().ok()?;
+    Some(Some((value.to_vec(), pttl)))
 }
 
 /// The store-level fold behind [`ServerPlane::fold_live_entries`], shared
@@ -7318,3 +7409,7 @@ mod conn_slab_tests {
         assert_eq!(slab.cap, CONN_SLOT_CAP);
     }
 }
+
+#[cfg(test)]
+#[path = "move_tests.rs"]
+mod move_tests;

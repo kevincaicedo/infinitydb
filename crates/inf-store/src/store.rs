@@ -616,6 +616,17 @@ impl CellStore {
         self.index.probe_groups(self.hash_key(key), |addr| record_at(arena, addr).key() == key)
     }
 
+    /// Internal string read without client hit/miss accounting (ADR-0110).
+    /// Type checks, access tracking and expire-on-read match `get_str`.
+    pub fn peek_str(&mut self, key: &[u8], now: Nanos) -> Result<Option<&[u8]>, OpError> {
+        let Some((addr, len)) = self.resolve(key, now) else { return Ok(None) };
+        let view = RecordView::new(self.arena.bytes(addr, len));
+        if view.type_tag() != TypeTag::String {
+            return Err(OpError::WrongType);
+        }
+        Ok(Some(view.value()))
+    }
+
     /// Batched `GET` — the full §7.3 pipeline. Per 32-key chunk:
     /// 1. hash every key and prefetch its probe lines (ctrl + slots);
     /// 2. probe to the first 22-bit-fingerprint candidate (no record touch)

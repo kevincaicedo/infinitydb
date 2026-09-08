@@ -610,3 +610,35 @@ lifecycle storms reconcile in both, and the S04 echo gate passes ×30+
 first live run found and fixed three driver bugs — recorded in
 `reviews/infinity-m0-skeleton.md`. Still pending: the 5.15/6.1 kernel-matrix
 CI legs and the reference-box gate campaign (S21).
+
+
+## M1-S02 move primitives — ADR-0110 amendment (2026-09-05)
+
+The registered internal commands retain their two-argument forms and add:
+
+- `INF.PEEK key ABS`: non-destructive string snapshot `[value, unix_expiry_ms]`,
+  expiry `-1` for persistent, null array for missing, WRONGTYPE for non-string.
+- `INF.TAKE key IF value unix_expiry_ms`: integer 1 if bytes and absolute
+  expiry both match and the owning cell deletes synchronously, otherwise 0.
+  Deadlines accept `-1` or a nonnegative signed 64-bit millisecond timestamp.
+  Bad shape/options/deadlines return a typed error before any mutation.
+
+The cross-cell string move runs snapshot → SET [PXAT] [NX] → conditional
+cleanup; COPY omits cleanup. Only exact `+OK` authorizes deletion, and the
+comparison/removal shares one execution instant. A refused put preserves the
+source; refused/failed cleanup can retain a copy and reports failure. Independent
+expiry/eviction/writes keep their effects; identical-content ABA is not detected.
+No borrowed store state crosses suspension; Apply/RESP codecs and persisted
+formats are unchanged. Full atomicity stays M6; named-namespace cross-owner
+moves retain ADR-0015's refusal. One additional bounded source leg, no shared
+state and no change to ordinary GET/SET paths (Correctness-only).
+
+ADR-0110 first amendment (2026-09-07): snapshots require exact framing,
+checked length arithmetic and no trailing bytes. `INF.PEEK key ABS NOSTATS`
+and conditional TAKE omit client hit/miss counters; COPY retains counted ABS.
+`CellStore::peek_str` keeps string type checks and expiry/access resolution
+without those counters. The SET builder represents optional expiry with an
+`Option`, and accepts zero from injected anchors. Changed-source cleanup
+returns `-BUSY source changed during cross-cell move; destination may contain
+a copy`; RENAMENX retry may return `:0` against that copy. The hidden
+`parse_take_reply` export exists for direct decoder fuzzing.

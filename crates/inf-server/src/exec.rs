@@ -937,7 +937,11 @@ fn execute_db(
         CommandId::Lolwut => w.bulk(b"InfinityDB ver. 0.1.0-alpha.0\n"),
         // ---- internal fabric-program ops ----
         CommandId::InfTake | CommandId::InfPeek => {
-            inf_take_peek(argv, store, meta.id == CommandId::InfTake, now, &mut w);
+            if argv.len() == 2 {
+                inf_take_peek(argv, store, meta.id == CommandId::InfTake, now, &mut w);
+            } else {
+                inf_move_snapshot(argv, store, meta.id, &cx.node, now, &mut w);
+            }
         }
         // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041) ----
         CommandId::JsonSet
@@ -1620,6 +1624,64 @@ fn inf_take_peek(
         }
     }
     w.int(pttl);
+}
+
+/// ADR-0110: the move snapshot and cleanup compare bytes plus an absolute
+/// deadline. No store borrow or record identity survives a fabric hop.
+fn inf_move_snapshot(
+    argv: &(impl Argv + ?Sized),
+    store: &mut CellStore,
+    command: CommandId,
+    node: &NodeInfo,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) {
+    let expected = match command {
+        CommandId::InfPeek
+            if (argv.len() == 3
+                || (argv.len() == 4 && argv.arg(3).eq_ignore_ascii_case(b"NOSTATS")))
+                && argv.arg(2).eq_ignore_ascii_case(b"ABS") =>
+        {
+            None
+        }
+        CommandId::InfTake if argv.len() == 5 && argv.arg(2).eq_ignore_ascii_case(b"IF") => {
+            match parse_i64(argv.arg(4)) {
+                Ok(deadline) if deadline >= -1 => Some(deadline),
+                _ => return w.error("ERR invalid move snapshot deadline"),
+            }
+        }
+        _ => return w.error("ERR syntax error"),
+    };
+    let key = argv.arg(1);
+    let deadline = match store.expire_at(key, now) {
+        Ttl::Missing => return if expected.is_some() { w.int(0) } else { w.null_array() },
+        Ttl::NoExpiry => -1,
+        Ttl::Ms(ms) => unix_from_internal_ms(node, ms),
+    };
+    let value = if expected.is_some() || argv.len() == 4 {
+        store.peek_str(key, now)
+    } else {
+        store.get_str(key, now)
+    };
+    let value = match value {
+        Ok(Some(value)) => value,
+        Ok(None) => return if expected.is_some() { w.int(0) } else { w.null_array() },
+        // A changed type is a mismatched cleanup, not permission to delete.
+        Err(_) if expected.is_some() => return w.int(0),
+        Err(error) => return op_error(error, w),
+    };
+    if let Some(expected) = expected {
+        if deadline != expected || value != argv.arg(3) {
+            return w.int(0);
+        }
+        // Comparison and removal share one owner execution and one `now`.
+        let removed = store.del(key, now);
+        debug_assert!(removed, "snapshot matched a live key at this same instant");
+        return w.int(i64::from(removed));
+    }
+    w.array_header(2);
+    w.bulk(value);
+    w.int(deadline);
 }
 
 // ---- shared helpers ---------------------------------------------------------------

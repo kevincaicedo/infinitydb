@@ -240,6 +240,7 @@ jobs:
           INF_COMPAT_ORACLE_ADDR: 127.0.0.1:6390
           INF_COMPAT_JSON_ORACLE_ADDR: 127.0.0.1:6391
           INFINITYD_BIN: ${{ github.workspace }}/target/debug/infinityd
+          INF_COMPAT_REQUIRE_BINARY: '1'
 
   client-smoke:
     # M1-S03/S14: major Redis client libraries work against infinityd out of
