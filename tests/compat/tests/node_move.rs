@@ -125,7 +125,7 @@ fn check(label: &str, actual: Vec<u8>, expected: &[u8], failures: &mut Vec<Strin
 /// `RENAME`/`RENAMENX` land under `maxmemory` — neither is DENYOOM — and
 /// `COPY` refuses; every outcome keeps both values and both absolute
 /// deadlines exact. Pre-fix the destination leg was a client-shaped `SET`,
-/// so all 32 rename rows answered `-OOM` and moved nothing.
+/// so all 24 rename rows answered `-OOM` and moved nothing.
 #[test]
 fn cross_cell_move_pressure_matrix() {
     let mut failures = Vec::new();
