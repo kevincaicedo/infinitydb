@@ -1619,7 +1619,8 @@ impl<F: SegmentFs> DurableCell<F> {
         } else if *walk_done && *sidecar_done {
             let block = stream.footer_block_len() as u64;
             if self.budget.admit(IoClass::Checkpoint, block, 1) != Admission::Granted {
-                return 1;
+                *streamed_bytes += u64::from(emitted);
+                return emitted.div_ceil(1024).max(1);
             }
             let lease = stream.finish();
             *write_seq += 1;

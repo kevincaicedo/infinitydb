@@ -535,6 +535,7 @@ dependencies = [
  "inf-alloc",
  "inf-fabric",
  "inf-foundation",
+ "inf-log",
  "inf-probe",
  "inf-runtime",
  "inf-server",

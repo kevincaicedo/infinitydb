@@ -64,10 +64,10 @@ use inf_log::ckpt::{
 };
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    FrameStamp, LogCorruption, Lsn, Manifest, ReadError, ReaderConfig, RegionEvidence, RegionScan,
-    SegmentId, SegmentReader, SegmentRotor, SegmentScan, check_segment_len, create_cell_dirs,
-    create_cell_dirs_deferred, read_manifest, scan_log_dir_from, scan_region_evidence,
-    segment_file_name,
+    FrameStamp, LogCorruption, Lsn, Manifest, ReadError, ReadStep, ReaderConfig, RegionEvidence,
+    RegionScan, SegmentId, SegmentReader, SegmentRotor, SegmentScan, check_segment_len,
+    create_cell_dirs, create_cell_dirs_deferred, read_manifest, scan_log_dir_from,
+    scan_region_evidence, segment_file_name,
 };
 use inf_store::{Keyspace, ReplayOutcome, WallAnchor};
 
@@ -637,22 +637,17 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             Phase::Ick { reader } => self.step_ick(ks, reader, budget_bytes),
             Phase::Replay { idx, reader } => self.step_replay(ks, idx, reader, budget_bytes),
             Phase::Audit { idx } => self.step_audit(idx),
-            // Replay is over once probing starts or Finish is reached:
-            // the end-of-replay checks run exactly once, here.
-            Phase::Probe { idx } => {
-                self.end_of_replay_checks(ks)?;
-                self.step_probe(idx)
-            }
+            // Replay is not over while a hole can still be lifted
+            // (F-L14-01): the end-of-replay checks run inside the finish
+            // step, once the lift is declined — never at a probe.
+            Phase::Probe { idx } => self.step_probe(idx),
             // Finish reports `Working` and the *next* step `Complete`
             // (M4.5-S39d): the driver samples its clock around every
             // step, so the finish step's time is only attributable once a
             // later call exists — one extra polling iteration at boot.
-            Phase::Finish => {
-                self.end_of_replay_checks(ks)?;
-                // Either outcome (complete, or a lifted hole resuming
-                // replay) is more stepping from the driver's view.
-                self.step_finish().map(|_| RecoveryProgress::Working)
-            }
+            // Either outcome (complete, or a lifted hole resuming replay)
+            // is more stepping from the driver's view.
+            Phase::Finish => self.step_finish(ks).map(|_| RecoveryProgress::Working),
             Phase::Complete => Ok(RecoveryProgress::Complete),
         }
     }
@@ -804,8 +799,13 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         Ok(RecoveryProgress::Working)
     }
 
-    /// The end-of-replay checks (tiered state, sidecar commit), once.
+    /// The end-of-replay checks (tiered state, sidecar commit), once —
+    /// after the last replayed record, which a lifted hole moves past
+    /// the probed segments (review F-L14-01: run at the first probe
+    /// step, they audited an empty displacement register and froze the
+    /// index/shadow projections before the lifted segments applied).
     fn end_of_replay_checks(&mut self, ks: &mut Keyspace) -> io::Result<()> {
+        debug_assert!(!self.tier_replay_checked, "end-of-replay checks run once");
         if !self.tier_replay_checked {
             self.finish_tier_replay(ks)?;
             self.finish_index_replay(ks);
@@ -914,8 +914,8 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         Ok(())
     }
 
-    /// End-of-replay tiered checks (M4-S26), run once when replay hands
-    /// to the audit: a non-empty displacement register means the log
+    /// End-of-replay tiered checks (M4-S26), run once when the finish
+    /// step has declined a lift: a non-empty displacement register means the log
     /// ended between a marker and its paired mutation — corrupt input
     /// by the ADR-0057 D4 same-frame rule (fail-stop, never a skip);
     /// then the extent orphan sweep seeds from the boot listing
@@ -980,7 +980,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     }
 
     /// End-of-replay sidecar commit (M4.5-S06, ADR-0078 D6), run once
-    /// on entering the audit: loaded trees are tail-caught-up — mark
+    /// after the last replayed record: loaded trees are tail-caught-up — mark
     /// them converged + cell `Ready`, disarm replay maintenance, and
     /// log every per-index rebuild-vs-load decision (the was-ready
     /// downgrade loudly — L10). No-checkpoint boots commit an empty
@@ -1217,8 +1217,8 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // v2 stamp continuity (ADR-0031 D3) is checked before any record
         // of the frame applies.
         loop {
-            match reader.next_frame() {
-                Ok(Some(frame)) => {
+            match reader.next_step() {
+                Ok(ReadStep::Frame(frame)) => {
                     let frame_base =
                         frame.first_lsn().offset - u32::try_from(frame.header_len()).expect("40");
                     let verdict = self.classify_stamp(
@@ -1295,8 +1295,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                         return Ok(RecoveryProgress::Working);
                     }
                 }
-                Ok(None) => {
-                    let end = reader.read_end().expect("clean exhaustion records an end");
+                Ok(ReadStep::End(end)) => {
                     // Continuity never spans a segment boundary (ADR-0031
                     // D3): a torn rotation-tail frame leaves the same
                     // clean-end shape as ordinary prealloc slack, so a seq
@@ -1555,7 +1554,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         Ok(RecoveryProgress::Working)
     }
 
-    fn step_finish(&mut self) -> io::Result<RecoveryProgress> {
+    fn step_finish(&mut self, ks: &mut Keyspace) -> io::Result<RecoveryProgress> {
         debug_assert_eq!(self.ends.len(), self.segments.len(), "every segment has an end");
         debug_assert_eq!(self.evidence.len(), self.segments.len(), "every segment was audited");
         // ADR-0031 D5 as amended (2026-08-21), the non-local half: a hole
@@ -1587,6 +1586,10 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 return Ok(RecoveryProgress::Working);
             }
         }
+        // No lift: the last replayed record is behind us — the tiered
+        // audit, extent sweep seed, shadow rebuild and sidecar commit see
+        // the finished keyspace (F-L14-01).
+        self.end_of_replay_checks(ks)?;
         let ends = &self.ends;
         // The resume segment (ADR-0087 D6): the hole's, when it holds
         // data; else the last data-bearing segment before it (a hole at

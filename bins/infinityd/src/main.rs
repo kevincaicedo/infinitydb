@@ -643,7 +643,7 @@ fn short_uuid(uuid: &str) -> String {
     if uuid.is_empty() {
         "(no uuid)".to_owned()
     } else {
-        format!("uuid {}…", &uuid[..uuid.len().min(8)])
+        format!("uuid {}…", uuid.chars().take(8).collect::<String>())
     }
 }
 
@@ -1342,6 +1342,19 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    /// Review L14 (batch 19): the boot line abbreviates by character,
+    /// never by byte — an operator-edited multi-byte `fs_uuid` is a
+    /// truncated note, not a boot panic.
+    #[test]
+    fn short_uuid_abbreviates_by_character() {
+        assert_eq!(short_uuid(""), "(no uuid)");
+        assert_eq!(short_uuid("c97c5418-ec09"), "uuid c97c5418…");
+        assert_eq!(short_uuid("ééééééééé"), "uuid éééééééé…");
+        // Byte 8 falls inside a 3-byte character: the old byte slice panicked.
+        assert_eq!(short_uuid("€€€€€€€€€"), "uuid €€€€€€€€…");
+        assert_eq!(short_uuid("ab"), "uuid ab…");
     }
 
     fn device(uuid: &str) -> DeviceIdentity {

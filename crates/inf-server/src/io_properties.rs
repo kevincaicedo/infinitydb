@@ -297,18 +297,20 @@ fn parse_model_key(
         }
         // Schema 3 (ADR-0091 D2/D3): the identity block; the strings are
         // the kernel's own names (quoted, unescaped here).
-        "fs_type" => props.identity.fs_type = parse_string(value),
-        "fs_uuid" => props.identity.fs_uuid = parse_string(value),
-        "device_path" => props.identity.device_path = parse_string(value),
-        "device_major_minor" => props.identity.device_major_minor = parse_string(value),
+        "fs_type" => props.identity.fs_type = parse_string("fs_type", value)?,
+        "fs_uuid" => props.identity.fs_uuid = parse_string("fs_uuid", value)?,
+        "device_path" => props.identity.device_path = parse_string("device_path", value)?,
+        "device_major_minor" => {
+            props.identity.device_major_minor = parse_string("device_major_minor", value)?
+        }
         "block_logical_bytes" => {
             props.identity.block_logical_bytes = parse_u32("block_logical_bytes", value)?;
         }
         "block_physical_bytes" => {
             props.identity.block_physical_bytes = parse_u32("block_physical_bytes", value)?;
         }
-        "kernel_release" => props.identity.kernel_release = parse_string(value),
-        "fua_unsupported" => props.fua_unsupported = Some(parse_string(value)),
+        "kernel_release" => props.identity.kernel_release = parse_string("kernel_release", value)?,
+        "fua_unsupported" => props.fua_unsupported = Some(parse_string("fua_unsupported", value)?),
         _ => {}
     }
     Ok(())
@@ -326,18 +328,31 @@ fn parse_class(value: &str) -> Result<SegmentIoMode, IoPropertiesError> {
 }
 
 /// A double-quoted string (the probe's `quoted`): the quotes stripped,
-/// `\"` and `\\` unescaped. An unquoted value is taken verbatim.
-fn parse_string(value: &str) -> String {
-    let inner = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value);
+/// `\"` and `\\` unescaped. Anything else — unquoted, unterminated, an
+/// escape the writer never emits — is the typed refusal, not a guess.
+fn parse_string(key: &'static str, value: &str) -> Result<String, IoPropertiesError> {
+    let malformed = |what: &str| IoPropertiesError::Value {
+        key,
+        detail: format!("expected a double-quoted string ({what}), found {value:?}"),
+    };
+    let inner = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .ok_or_else(|| malformed("unquoted or unterminated"))?;
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(ch) = chars.next() {
         match ch {
-            '\\' => out.push(chars.next().unwrap_or('\\')),
+            '\\' => match chars.next() {
+                Some(escaped @ ('"' | '\\')) => out.push(escaped),
+                Some(_) => return Err(malformed("unsupported escape")),
+                None => return Err(malformed("unterminated escape")),
+            },
+            '"' => return Err(malformed("unescaped quote")),
             c => out.push(c),
         }
     }
-    out
+    Ok(out)
 }
 
 fn parse_u32(key: &'static str, value: &str) -> Result<u32, IoPropertiesError> {
@@ -358,6 +373,25 @@ fn parse_u64(key: &'static str, value: &str) -> Result<u64, IoPropertiesError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review L14 (batch 19): a string value is exactly what the probe's
+    /// `quoted` writes — double-quoted, `\"` and `\\` the only escapes.
+    /// Anything else is the typed refusal the module contract promises,
+    /// never a verbatim or backslash-appended guess.
+    #[test]
+    fn string_values_are_quoted_or_refused() {
+        let parse = |value: &str| {
+            IoProperties::parse(&format!("barrier_class = \"flush\"\nfs_uuid = {value}\n"))
+                .map(|p| p.identity.fs_uuid)
+        };
+        assert_eq!(parse("\"a\\\"b\\\\c\"").expect("escapes"), "a\"b\\c");
+        for malformed in ["abc", "\"open", "close\"", "\"trailing\\\"", "\"bad\\n\"", "\""] {
+            match parse(malformed) {
+                Err(IoPropertiesError::Value { key: "fs_uuid", .. }) => {}
+                other => panic!("{malformed}: expected a typed fs_uuid refusal, got {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn parses_the_probe_output_shape() {

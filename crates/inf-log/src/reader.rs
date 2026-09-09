@@ -69,6 +69,14 @@ pub enum ReadEnd {
     FileEnd { at: u32 },
 }
 
+/// One [`SegmentReader::next_step`] outcome: a validated frame, or the
+/// clean end of the written portion.
+#[derive(Debug)]
+pub enum ReadStep<'a> {
+    Frame(FrameRef<'a>),
+    End(ReadEnd),
+}
+
 impl ReadEnd {
     /// Byte offset one past the last valid frame — the recovered
     /// `tail_offset` for reopening the segment as the active tail.
@@ -287,27 +295,40 @@ impl<File: SegmentFile> SegmentReader<File> {
     /// cleanly ([`read_end`](Self::read_end) then reports how). Errors are
     /// terminal: the reader yields nothing after one.
     pub fn next_frame(&mut self) -> Result<Option<FrameRef<'_>>, ReadError> {
-        if self.end.is_some() || self.failed {
+        if self.failed {
             return Ok(None);
+        }
+        match self.next_step()? {
+            ReadStep::Frame(frame) => Ok(Some(frame)),
+            ReadStep::End(_) => Ok(None),
+        }
+    }
+
+    /// One read step: the next validated frame, or how the written
+    /// portion ended — the end rides the return value, so a replay loop
+    /// never asks for an end it must assume was recorded. A clean end
+    /// repeats on every later call; a terminal error is reported again
+    /// (the failing window is left untouched — [`next_frame`]
+    /// (Self::next_frame) is the fusing form).
+    pub fn next_step(&mut self) -> Result<ReadStep<'_>, ReadError> {
+        if let Some(end) = self.end {
+            return Ok(ReadStep::End(end));
         }
         let frame_len = loop {
             let window = &self.buf[self.start.min(self.valid)..self.valid];
             match peek(window, self.cfg.max_frame_len) {
                 Peek::Ready(frame_len) => break frame_len,
                 Peek::ZeroTail => {
-                    self.end = Some(ReadEnd::ZeroTail { at: self.next_offset });
-                    return Ok(None);
+                    return Ok(self.end_at(ReadEnd::ZeroTail { at: self.next_offset }));
                 }
                 Peek::NeedMore(needed) if self.hit_eof => {
                     if window.is_empty() {
-                        self.end = Some(ReadEnd::FileEnd { at: self.next_offset });
-                        return Ok(None);
+                        return Ok(self.end_at(ReadEnd::FileEnd { at: self.next_offset }));
                     }
                     if window.iter().all(|&b| b == 0) {
                         // Shorter than a magic word but all zeros: still
                         // the preallocated tail, same as decode_frame.
-                        self.end = Some(ReadEnd::ZeroTail { at: self.next_offset });
-                        return Ok(None);
+                        return Ok(self.end_at(ReadEnd::ZeroTail { at: self.next_offset }));
                     }
                     self.failed = true;
                     return Err(ReadError::Frame {
@@ -387,13 +408,19 @@ impl<File: SegmentFile> SegmentReader<File> {
                 // clean `FileEnd`, like any other short tail).
                 self.start += frame.padded_len() as usize;
                 self.next_offset = next_offset;
-                Ok(Some(frame))
+                Ok(ReadStep::Frame(frame))
             }
             Err(error) => {
                 self.failed = true;
                 Err(ReadError::Frame { segment: self.segment, offset: at, error })
             }
         }
+    }
+
+    /// Records the clean end (repeated by every later step) and returns it.
+    fn end_at(&mut self, end: ReadEnd) -> ReadStep<'_> {
+        self.end = Some(end);
+        ReadStep::End(end)
     }
 
     /// Batch-apply every remaining frame (the replay shape: validate, then
@@ -403,14 +430,12 @@ impl<File: SegmentFile> SegmentReader<File> {
         mut apply: impl FnMut(FrameRef<'_>) -> Result<(), E>,
     ) -> Result<ReadEnd, ApplyError<E>> {
         loop {
-            match self.next_frame() {
-                Ok(Some(frame)) => {
+            match self.next_step() {
+                Ok(ReadStep::Frame(frame)) => {
                     let at = frame.first_lsn();
                     apply(frame).map_err(|error| ApplyError::Apply { at, error })?;
                 }
-                Ok(None) => {
-                    return Ok(self.end.expect("clean exhaustion always records an end"));
-                }
+                Ok(ReadStep::End(end)) => return Ok(end),
                 Err(err) => return Err(ApplyError::Read(err)),
             }
         }

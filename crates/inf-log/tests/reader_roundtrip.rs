@@ -430,3 +430,53 @@ fn read_end_feeds_open_existing_round_trip() {
         .collect();
     assert_eq!(keys, vec![b"pre".to_vec(), b"post".to_vec()]);
 }
+
+/// Review L14 (batch 19): `next_step` carries the clean end in its return
+/// value (no end to ask for after the fact) and repeats it; after a
+/// terminal error it reports the error again while `next_frame` fuses.
+#[test]
+fn next_step_carries_the_end_and_repeats_a_terminal_error() {
+    use inf_log::ReadStep;
+    let fs = MemFs::new();
+    let (mut rotor, log_dir) = mem_rotor(&fs, 4096);
+    write_frame(&mut rotor, &[RecordView::Delete { ns: NsId(1), key: b"aaaa" }]);
+    let torn_at = rotor.active_written();
+    write_frame(&mut rotor, &[RecordView::Delete { ns: NsId(1), key: b"bbbb" }]);
+    let full = fs.contents(&log_dir.join(segment_file_name(SegmentId(0)))).expect("image");
+
+    // Clean: one frame, then the zero tail — reported, recorded, repeated.
+    let mut reader =
+        SegmentReader::open(&fs, &log_dir, SegmentId(0), ReaderConfig::default()).expect("open");
+    assert!(matches!(reader.next_step().expect("frame"), ReadStep::Frame(_)));
+    assert!(matches!(reader.next_step().expect("frame"), ReadStep::Frame(_)));
+    let end = rotor.active_written();
+    for _ in 0..2 {
+        assert!(matches!(
+            reader.next_step().expect("clean end"),
+            ReadStep::End(ReadEnd::ZeroTail { at }) if at == end
+        ));
+    }
+    assert_eq!(reader.read_end(), Some(ReadEnd::ZeroTail { at: end }));
+    assert!(reader.next_frame().expect("fused clean").is_none());
+
+    // Torn: the second frame cut short — the error again, `next_frame` fused.
+    let dir = PathBuf::from("torn");
+    fs.create_dir_all(&dir).expect("dir");
+    let cut = torn_at as usize + 7;
+    let mut file =
+        fs.create_segment(&dir.join(segment_file_name(SegmentId(0))), cut as u64).expect("create");
+    file.write_at(0, &full[..cut]).expect("write");
+    let mut reader =
+        SegmentReader::open(&fs, &dir, SegmentId(0), ReaderConfig::default()).expect("open");
+    assert!(matches!(reader.next_step().expect("first frame intact"), ReadStep::Frame(_)));
+    for _ in 0..2 {
+        match reader.next_step().expect_err("torn frame must not decode") {
+            ReadError::Frame { offset, error: FrameDecodeError::Truncated { .. }, .. } => {
+                assert_eq!(offset, torn_at);
+            }
+            other => panic!("expected Truncated, got {other}"),
+        }
+    }
+    assert!(reader.next_frame().expect("fused after an error").is_none());
+    assert_eq!(reader.read_end(), None, "an error is not an end");
+}
