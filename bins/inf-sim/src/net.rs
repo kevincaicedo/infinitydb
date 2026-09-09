@@ -314,11 +314,15 @@ fn plain_write(disk: &SimDisk, fd: i32, offset: u64, data: &StableBytes) -> Comp
     }
 }
 
-/// The errno a failed sim write reports, as a kernel would: the disk's
-/// `InvalidInput` (a direct write the filesystem refuses — ADR-0088 D3 as
-/// amended, the checkpoint's in-band downgrade signal) is `EINVAL`;
-/// everything else (the dead switch, a bad fd) is `EIO`.
+/// The errno a failed sim write reports, as a kernel would: an OS error
+/// the disk raised passes through (`EBADF` on a closed fd — F-L01-02),
+/// the disk's `InvalidInput` (a direct write the filesystem refuses —
+/// ADR-0088 D3 as amended, the checkpoint's in-band downgrade signal)
+/// is `EINVAL`; everything else (the dead switch) is `EIO`.
 fn write_errno(err: &std::io::Error) -> i32 {
+    if let Some(errno) = err.raw_os_error() {
+        return errno;
+    }
     if err.kind() == std::io::ErrorKind::InvalidInput { libc::EINVAL } else { libc::EIO }
 }
 

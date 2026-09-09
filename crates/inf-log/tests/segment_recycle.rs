@@ -314,7 +314,9 @@ fn a_failed_open_of_the_pooled_file_falls_back_and_never_wedges_the_rotor() {
     );
     // Not wedged: the fill completes, the rotation lands, and the next
     // generation recycles from the pool as if nothing happened.
-    let fd = barrier.expect("barrier").dir.raw_fd().expect("sim dir fd");
+    // The handle stays open across the driver op, as the ledger holds it.
+    let barrier = barrier.expect("barrier");
+    let fd = barrier.dir.raw_fd().expect("sim dir fd");
     lab.disk.driver_fdatasync(fd).expect("dir barrier");
     while let Some(slice) = lab.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) {
         let zeros = vec![0u8; slice.len as usize];

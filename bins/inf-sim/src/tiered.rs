@@ -145,6 +145,12 @@ pub struct TieredScenario {
     /// M4.5-S37 (ADR-0093 D8): the shadow arm — `CONFIG SET
     /// tiered-shadow-overwrite yes` after the tiered DDL.
     pub shadow: bool,
+    /// Review 2026-08-30, F-L01-02: arm `tier_dir_open_fail` once — the
+    /// first tier-file creation's directory hold is refused (`EMFILE`
+    /// physics). Pre-fix the round carried the dropped writer's header
+    /// write; the driver answered `EBADF` forever and the flush wedged.
+    /// The flush-liveness oracle and the command audit stand on it.
+    pub dir_open_fault: bool,
 }
 
 impl TieredScenario {
@@ -175,6 +181,7 @@ impl TieredScenario {
             ckpt_interval_bytes: 24 << 10,
             stall: Some(m2_stall_config()),
             shadow: seed % 4 != 3,
+            dir_open_fault: seed % 8 == 5,
         }
     }
 
@@ -214,6 +221,7 @@ impl TieredScenario {
             prealloc: inf_server::PreallocPolicy::DEFAULT,
             recycle_oracle: false,
             recycle_open_fault: false,
+            lift_regime: false,
         }
     }
 }
@@ -262,6 +270,11 @@ pub struct TieredNodeReport {
     /// disclosed per seed (a sweep whose races never replanned proved
     /// nothing about the guard).
     pub race_replans: u64,
+    /// F-L01-02: the `tier_dir_open_fail` arm this seed ran and how often
+    /// the point fired (an armed seed on which it never fired proved
+    /// nothing — the sweep counts both).
+    pub dir_open_fault_arm: bool,
+    pub dir_open_faults_fired: u64,
     /// Typed `DISKFULL` refusals observed at the clamped budget.
     pub diskfull_refusals: u64,
     /// Admission reopened after the budget lifted (phase 8's second
@@ -725,6 +738,13 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             return finish(report, &observer, &clock);
         }
     }
+    // F-L01-02: the first tier-file creation's directory hold is refused.
+    // Every cell runs on this thread (thread-local registry), so the
+    // first creation in any cell takes it.
+    report.dir_open_fault_arm = scenario.dir_open_fault;
+    if scenario.dir_open_fault {
+        inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
+    }
     // The shadow arm (M4.5-S37, ADR-0093 D8): a CONFIG key, fanned to
     // every cell like `tiered-promote-on-read`.
     report.shadow_arm = scenario.shadow;
@@ -1010,6 +1030,38 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             report.shadow_pending_at_cut = info_field(&text, "tiering_shadow_pending");
         }
         Err(err) => fail(&mut report, format!("pre-cut scrape: {err}")),
+    }
+    // F-L01-02 arm: the refused hold must have left no staged op behind —
+    // a write retry after it is the dropped writer's fd reaching the
+    // driver (`EBADF`, retried forever pre-fix: 4410 retries on the seed
+    // that proved it). Per cell: the section is cell-scoped and the point
+    // fires on whichever cell creates first. Flush progress before the
+    // cut is disclosed, not required — the cut can land before any
+    // cell's first round (several sweep shards report 0 B pre-cut).
+    if scenario.dir_open_fault {
+        for cell in 0..usize::from(scenario.cells) {
+            let mut probe = MiniClient::connect(&mut node, cell);
+            match info_tiering(&mut probe, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max)
+            {
+                Ok(text) => {
+                    let retries = info_field(&text, "tiering_flush_write_retries");
+                    if retries > 0 {
+                        fail(
+                            &mut report,
+                            format!(
+                                "DIR-OPEN FAULT VIOLATION cell {cell}: {retries} flush write \
+                                 retries before the cut (confirmed {} B, rounds {}, in flight \
+                                 {}) — a refused directory hold must stage nothing (F-L01-02)",
+                                info_field(&text, "tiering_flush_confirmed_bytes"),
+                                info_field(&text, "tiering_flush_rounds"),
+                                info_field(&text, "tiering_flush_rounds_inflight"),
+                            ),
+                        );
+                    }
+                }
+                Err(err) => fail(&mut report, format!("dir-open fault scrape cell {cell}: {err}")),
+            }
+        }
     }
 
     // ---- phase 3: POWER CUT --------------------------------------------
@@ -2368,6 +2420,17 @@ fn finish(
     observer: &TraceObserver,
     clock: &Rc<VirtualClock>,
 ) -> TieredNodeReport {
+    if report.dir_open_fault_arm {
+        report.dir_open_faults_fired =
+            inf_foundation::fault::fired(inf_log::fault::TIER_DIR_OPEN_FAIL);
+        inf_foundation::fault::disarm(inf_log::fault::TIER_DIR_OPEN_FAIL);
+        if report.dir_open_faults_fired == 0 {
+            report.violations.push(
+                "DIR-OPEN FAULT ROW VACUOUS: the point was armed and no tier file was created"
+                    .to_owned(),
+            );
+        }
+    }
     report.trace = observer.trace_bytes();
     report.trace_hash = hash64(&report.trace, 0x71E7);
     report.sim_seconds = clock.now().0.saturating_sub(1) as f64 / 1e9;

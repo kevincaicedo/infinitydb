@@ -140,6 +140,73 @@ fn renamenx_retry_after_busy_is_a_noop() {
     assert_eq!(rig.local(1, &[b"GET", &rig.target]), b"$7\r\npayroll\r\n");
 }
 
+/// ADR-0115: on the plane, a client-shaped execution (`program = false`,
+/// the mirror/fast-path shape) of an internal row is unknown; the
+/// program's own leg (`run_local`) runs it.
+#[test]
+fn a_client_typed_internal_command_is_unknown_on_the_plane() {
+    let rig = Rig::new(0);
+    let shared = &rig.planes[0].shared;
+    let argv: &[&[u8]] = &[b"INF.PUT", &rig.source, b"v", b"-1"];
+    let mut reply = Vec::new();
+    shared.execute_owned_into(
+        ExecOrigin::Conn(0, 0),
+        argv,
+        Protocol::Resp2,
+        1,
+        0,
+        None,
+        false,
+        &mut reply,
+    );
+    assert!(reply.starts_with(b"-ERR unknown command 'INF.PUT'"), "{reply:?}");
+    assert_eq!(rig.source(&[b"GET", &rig.source]), b"$-1\r\n", "nothing landed");
+    assert_eq!(rig.local(0, argv), b"+OK\r\n", "the program leg runs");
+    assert_eq!(rig.source(&[b"GET", &rig.source]), b"$1\r\nv\r\n");
+}
+
+/// ADR-0115 D3/D5: the owner executes an internal row on a fabric frame
+/// only when the frame carries the program mark — an unmarked frame
+/// (a forwarded client command) answers unknown, the marked twin lands.
+#[test]
+fn an_unmarked_apply_carrying_an_internal_command_is_unknown() {
+    let rig = Rig::new(0);
+    let owner = 1;
+    let key = &rig.target; // owned by cell 1
+    let shared = &rig.planes[owner].shared;
+    let mut replies = Vec::new();
+    for (seq, program) in [(1u64, false), (2, true)] {
+        let args = ApplyArgs::new(&[b"INF.PUT".as_slice(), key, b"v", b"-1"]).unwrap();
+        let op = Op::Apply {
+            token: FabricToken::new(CellId(0), seq),
+            slot: SlotRouter::slot_of(key),
+            cmd: 2,
+            args,
+            program,
+        };
+        let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0u64);
+        handle_fabric_op(
+            shared,
+            shared.now.get(),
+            CellId(0),
+            op,
+            &mut scratch,
+            &mut staged,
+            &mut pubs,
+            &mut gated,
+            &mut orphans,
+        );
+        let (_, _, reply) = staged.pop().expect("one staged reply");
+        let StagedReply::Bytes(start, end) = reply else { panic!("expected raw reply bytes") };
+        let bytes = scratch[start..end].to_vec();
+        replies.push(bytes);
+    }
+    assert!(replies[0].starts_with(b"-ERR unknown command 'INF.PUT'"), "{:?}", replies[0]);
+    assert_eq!(replies[1], b"+OK\r\n");
+    assert_eq!(rig.local(owner, &[b"GET", key]), b"$1\r\nv\r\n", "only the marked frame landed");
+}
+
 /// The destination leg: `INF.PUT` for the renames, `SET` for COPY
 /// (ADR-0110 third amendment).
 fn is_put(args: &[&[u8]]) -> bool {

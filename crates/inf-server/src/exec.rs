@@ -232,6 +232,9 @@ pub struct NodeInfo {
     pub recycle_wait_active_bytes_max: Cell<u64>,
     pub recover_segment_residue_stops: Cell<u64>,
     pub recover_recycled_residue_slacks: Cell<u64>,
+    /// Epoch-classified discarded-life residue the boot lifted past
+    /// (ADR-0031 D5 as amended; the F-L14-01 regime's observable).
+    pub recover_stale_residue_slacks: Cell<u64>,
     /// M4.5-S39d: this cell's boot recovery decomposed (loop-resident
     /// boots only; zero on a memory node).
     pub recover_phases: Cell<crate::recover::RecoverPhases>,
@@ -430,6 +433,10 @@ pub struct ConnCx {
     /// Set by `QUIT`: reply `+OK`, then the plane closes the connection after
     /// flushing. Interior-mutable so a `&ConnCx` handler can request it.
     pub close_requested: Cell<bool>,
+    /// The execution was composed by a plane program (a move leg, a
+    /// fabric `Apply` carrying the program mark) — never a client
+    /// connection. `INTERNAL` rows execute only under it (ADR-0115).
+    pub program: bool,
 }
 
 impl Default for ConnCx {
@@ -443,6 +450,7 @@ impl Default for ConnCx {
             sub_patterns: Vec::new(),
             node: Rc::new(NodeInfo::default()),
             close_requested: Cell::new(false),
+            program: false,
         }
     }
 }
@@ -519,6 +527,12 @@ pub fn execute(
         let mut w = RespWriter::new(out, cx.proto);
         return unknown_command(argv, &mut w);
     };
+    // ADR-0115: a fabric-program primitive is unknown to every client —
+    // decided at lookup, before arity, as Redis decides internal commands.
+    if meta.flags.contains(CmdFlags::INTERNAL) && !cx.program {
+        let mut w = RespWriter::new(out, cx.proto);
+        return unknown_command(argv, &mut w);
+    }
     if !arity_ok(meta, argv.len()) {
         let mut w = RespWriter::new(out, cx.proto);
         return arity_error(meta.name, &mut w);
@@ -1717,6 +1731,12 @@ const UNKNOWN_ARGS_BUDGET: usize = 128;
 // conversion would change the byte budget as well as the bytes. CR/LF
 // inside them cannot break framing: `RespWriter` sanitizes the line
 // (ADR-0097 — review finding C6, where these bytes forged a second reply).
+/// The unknown-command reply for a client-typed `INTERNAL` row, refused
+/// at the plane's dispatch funnels before any routing (ADR-0115).
+pub(crate) fn unknown_command_reply(argv: &[&[u8]], proto: Protocol, out: &mut Vec<u8>) {
+    unknown_command(argv, &mut RespWriter::new(out, proto));
+}
+
 fn unknown_command(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
     // One allocation, always: the message is bounded by its own two caps.
     let mut text = Vec::with_capacity(UNKNOWN_NAME_MAX + UNKNOWN_ARGS_BUDGET + 64);
@@ -2314,7 +2334,8 @@ mod tests {
     /// and whose replies are SET's so the program's parser is unchanged.
     #[test]
     fn inf_put_is_a_bounded_put_admitted_like_rename() {
-        let mut cx = ConnCx::default();
+        // ADR-0115: the leg runs under the program context.
+        let mut cx = ConnCx { program: true, ..ConnCx::default() };
         let mut store = Keyspace::new(StoreConfig::default());
         cx.node.wall_anchor.set((1_000, 5_000_000));
         let now = Nanos::from_millis(1_000);
@@ -2376,6 +2397,56 @@ mod tests {
         );
         assert_eq!(run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"x", b"y", b"-1"]), b"+OK\r\n");
         assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"x"]), b"$1\r\ny\r\n");
+    }
+
+    /// ADR-0115: the fabric-program primitives are internal commands in
+    /// Redis 8's sense — a client typing one gets the unknown-command
+    /// reply (before arity, as Redis decides), also under `maxmemory`;
+    /// only a program-composed execution runs them.
+    #[test]
+    fn internal_commands_are_unknown_to_clients() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let unknown = |argv: &[&[u8]]| {
+            let mut text = b"-ERR unknown command '".to_vec();
+            text.extend_from_slice(argv[0]);
+            text.extend_from_slice(b"', with args beginning with: ");
+            for arg in &argv[1..] {
+                text.push(b'\'');
+                text.extend_from_slice(arg);
+                text.extend_from_slice(b"' ");
+            }
+            text.extend_from_slice(b"\r\n");
+            text
+        };
+        for argv in [
+            &[b"INF.PUT".as_slice(), b"k", b"v", b"-1"][..],
+            &[b"INF.TAKE", b"k"],
+            &[b"INF.PEEK", b"k", b"ABS"],
+            &[b"INF.PUT"], // arity would answer differently: lookup decides first
+            &[b"inf.put", b"k", b"v", b"-1"],
+        ] {
+            assert_eq!(run(&mut cx, &mut store, argv), unknown(argv), "{argv:?}");
+        }
+        assert_eq!(run(&mut cx, &mut store, &[b"GET", b"k"]), b"$-1\r\n", "nothing landed");
+        run(
+            &mut cx,
+            &mut store,
+            &[b"CONFIG", b"SET", b"maxmemory", b"1", b"maxmemory-policy", b"noeviction"],
+        );
+        let argv: &[&[u8]] = &[b"INF.PUT", b"k", b"v", b"-1"];
+        assert_eq!(run(&mut cx, &mut store, argv), unknown(argv), "under maxmemory too");
+        assert_eq!(run(&mut cx, &mut store, &[b"COMMAND", b"INFO", b"INF.PUT"]), b"*1\r\n$-1\r\n");
+        assert!(
+            run(&mut cx, &mut store, &[b"COMMAND", b"GETKEYS", b"INF.PUT", b"k", b"v", b"-1"])
+                .starts_with(b"-ERR Invalid command specified"),
+        );
+        let listed = run(&mut cx, &mut store, &[b"COMMAND"]);
+        assert!(!listed.windows(7).any(|w| w == b"inf.put"), "COMMAND hides internal rows");
+        // The program's own execution runs the leg.
+        cx.program = true;
+        assert_eq!(run(&mut cx, &mut store, argv), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"INF.PEEK", b"k"]), b"*2\r\n$1\r\nv\r\n:-1\r\n");
     }
 
     #[test]

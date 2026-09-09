@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use inf_alloc::BufferPool;
+use inf_doc::path::compile;
 use inf_fabric::{Mesh, MeshConfig};
 use inf_foundation::fault::FaultSpec;
 use inf_foundation::rng::{Entropy, SplitMix64};
@@ -39,7 +40,9 @@ use inf_server::{
     ControlInbox, ExecOrigin, ExecScope, NodeInfo, PlaneObserver, SegmentIoMode, ServerPlane,
     SimDisk, SimDiskConfig, StallConfig, load_catalog_from,
 };
-use inf_store::{Keyspace, NsId, StoreConfig, WallAnchor};
+use inf_store::{
+    IndexId, IndexKeyType, IndexSpec, IndexState, Keyspace, NsId, StoreConfig, WallAnchor,
+};
 
 use crate::harness::node_hasher;
 
@@ -182,6 +185,15 @@ pub struct DurableScenario {
     /// the pool did not serve). The m2 durability and log-quiescence
     /// oracles hold unchanged.
     pub recycle_oracle: bool,
+    /// Review 2026-08-30, F-L14-01 — the lift regime (batch 20): the
+    /// main life also drives a **tiered** namespace (displacement pairs,
+    /// blob extents) and an **indexed** document namespace, so the
+    /// segments a later boot lifts past a discarded life's residue carry
+    /// those records — the class batch 19 fixed (the end-of-replay checks
+    /// ran before the lifted segments applied). Oracles: the §8.2 audit on
+    /// both classes, the index digest-walk equality after the final boot,
+    /// and the lift's own coverage (`stale_residue_slacks`).
+    pub lift_regime: bool,
     /// Review 2026-08-30 (F-L02-01, ADR-0090 A14): arm `recycle_open_fail`
     /// once — the first pooled file this life reuses fails to open. The
     /// generation must fall back fresh (counted) and the run must go on;
@@ -303,6 +315,7 @@ impl DurableScenario {
             prealloc: inf_server::PreallocPolicy::DEFAULT,
             recycle_oracle: false,
             recycle_open_fault: false,
+            lift_regime: false,
         }
     }
 
@@ -473,6 +486,10 @@ impl DurableScenario {
         // frame. (`m2_durable`'s odd-seed arming would land in the
         // prelude, whose counters the cut never scrapes.)
         scenario.fill = if seed.is_multiple_of(4) { m2_fill_config() } else { Default::default() };
+        // The lift regime on a quarter of the seeds (≡ 2, 6 mod 8: both
+        // barrier orders, checkpoints on — the sidecar-commit arm needs
+        // a published checkpoint before the lifted tail).
+        scenario.lift_regime = seed % 4 == 2;
         scenario
     }
 
@@ -546,6 +563,7 @@ impl DurableScenario {
             prealloc: inf_server::PreallocPolicy::DEFAULT,
             recycle_oracle: false,
             recycle_open_fault: false,
+            lift_regime: false,
         }
     }
 
@@ -593,6 +611,7 @@ impl DurableScenario {
             prealloc: inf_server::PreallocPolicy::DEFAULT,
             recycle_oracle: false,
             recycle_open_fault: false,
+            lift_regime: false,
         }
     }
 }
@@ -688,6 +707,16 @@ pub struct DurableReport {
     pub recycle_waits_satisfied: u64,
     pub recycle_waits_expired: u64,
     pub segment_inline_preallocs: u64,
+    /// The lift regime (F-L14-01): whether this seed ran it, the acked
+    /// mutating ops the tiered and indexed writers landed in the main
+    /// life (the records behind the lift), the sidecars the final boot
+    /// loaded (the commit-ordering arm's coverage), and — every seed —
+    /// the epoch-classified residue slacks the final boot lifted past.
+    pub lift_regime: bool,
+    pub lift_tiered_ops: u64,
+    pub lift_indexed_ops: u64,
+    pub lift_sidecars_loaded: u64,
+    pub stale_residue_slacks: u64,
 }
 
 impl DurableReport {
@@ -752,6 +781,10 @@ pub(crate) enum NsClass {
     Always,
     Everysec,
     Memory,
+    /// The lift regime's tiered `always` namespace (F-L14-01).
+    Tiered,
+    /// The lift regime's indexed document `always` namespace.
+    Indexed,
 }
 
 impl NsClass {
@@ -759,6 +792,8 @@ impl NsClass {
         match self {
             NsClass::Always => b"alw",
             NsClass::Everysec => b"esec",
+            NsClass::Tiered => b"tier",
+            NsClass::Indexed => b"idx",
             // The combined scenario's named memory-mode namespace
             // (M2.5-S14); the durable scenario's memory writers stay on
             // the default DB (`setup == false`) and never USE it.
@@ -872,6 +907,43 @@ impl Writer {
         }
     }
 
+    /// The lift regime's tiered traffic (the `m4-tiered` value classes):
+    /// inline SETs that demote through the ring, blob SETs that ride
+    /// extents, overwrites and deletes of cold keys that stage
+    /// displacement pairs — every reply exact.
+    fn next_tiered_command(&mut self, scenario: &DurableScenario) -> (Vec<u8>, Pending) {
+        let key = self.key(scenario.keys_per_writer);
+        let roll = self.rng.next_below(100);
+        if roll < 67 {
+            let len = if roll < 55 {
+                1024 + self.rng.next_below(2048) as usize
+            } else {
+                (6 << 10) + self.rng.next_below(4096) as usize
+            };
+            let stamp = format!("t:{}:{}:", self.id, self.sent).into_bytes();
+            let value: Vec<u8> = stamp.iter().copied().cycle().take(len).collect();
+            let wire = encode(&[b"SET", &key, &value]);
+            let pending = Pending {
+                key,
+                state_after: Some(value),
+                expect: b"+OK\r\n".to_vec(),
+                mutates: true,
+                taints: false,
+            };
+            (wire, pending)
+        } else if roll < 85 {
+            let state_after = self.last_state(&key);
+            let expect = state_after.as_ref().map_or(b"$-1\r\n".to_vec(), |v| bulk(v));
+            let wire = encode(&[b"GET", &key]);
+            (wire, Pending { key, state_after, expect, mutates: false, taints: false })
+        } else {
+            let existed = self.last_state(&key).is_some();
+            let expect = if existed { b":1\r\n".to_vec() } else { b":0\r\n".to_vec() };
+            let wire = encode(&[b"DEL", &key]);
+            (wire, Pending { key, state_after: None, expect, mutates: true, taints: false })
+        }
+    }
+
     pub(crate) fn key(&mut self, keys_per_writer: u64) -> Vec<u8> {
         format!("k:{}:{}", self.id, self.rng.next_below(keys_per_writer)).into_bytes()
     }
@@ -966,8 +1038,11 @@ impl Writer {
 
     /// Builds the next command + its exact expected reply.
     pub(crate) fn next_command(&mut self, scenario: &DurableScenario) -> (Vec<u8>, Pending) {
-        if scenario.workload == DurableWorkload::Document {
+        if scenario.workload == DurableWorkload::Document || self.class == NsClass::Indexed {
             return crate::document::next_document_command(self, scenario);
+        }
+        if self.class == NsClass::Tiered {
+            return self.next_tiered_command(scenario);
         }
         let key = self.key(scenario.keys_per_writer);
         let roll = self.rng.next_below(100);
@@ -1236,7 +1311,7 @@ pub(crate) fn required_index(class: NsClass, ops: &[OpRec], cut_time: Nanos) -> 
     ops.iter().rposition(|op| match op.acked_at {
         None => false,
         Some(at) => match class {
-            NsClass::Always => true,
+            NsClass::Always | NsClass::Tiered | NsClass::Indexed => true,
             NsClass::Everysec => at + EVERYSEC_WINDOW <= cut_time,
             NsClass::Memory => false,
         },
@@ -1326,6 +1401,11 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         recycle_waits_satisfied: 0,
         recycle_waits_expired: 0,
         segment_inline_preallocs: 0,
+        lift_regime: scenario.lift_regime,
+        lift_tiered_ops: 0,
+        lift_indexed_ops: 0,
+        lift_sidecars_loaded: 0,
+        stale_residue_slacks: 0,
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -1371,6 +1451,14 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                 return finish(report, &observer, &clock);
             }
         }
+    }
+
+    if scenario.lift_regime
+        && let Err(what) =
+            lift_regime_ddl(&mut node, &mut setup, &mut rng, &clock, &disk, scenario, &mut report)
+    {
+        fail(&mut report, what);
+        return finish(report, &observer, &clock);
     }
 
     if scenario.recycle_open_fault {
@@ -1513,6 +1601,29 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         }
         for writer in &mut writers {
             writer.reconnect(&mut node, scenario.ops_per_writer);
+        }
+        // The lift regime's writers join the main life only: their records
+        // are exactly what the final boot lifts past the prelude's residue.
+        if scenario.lift_regime {
+            for class in [NsClass::Tiered, NsClass::Tiered, NsClass::Indexed, NsClass::Indexed] {
+                let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
+                let fd = node.nets[cell].borrow_mut().connect();
+                let writer = Writer::new(
+                    id,
+                    cell,
+                    fd,
+                    class,
+                    scenario.seed,
+                    scenario.ops_per_writer,
+                    true,
+                    0,
+                );
+                node.nets[cell]
+                    .borrow_mut()
+                    .client_send(fd, &encode(&[b"INF.NS", b"USE", class.name()]));
+                writers.push(writer);
+                id += 1;
+            }
         }
     }
 
@@ -1888,6 +1999,19 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
     for cell in 0..usize::from(scenario.cells) {
         let residue = node.control.recovery_board().slot(cell as u16).residue();
         report.recycled_residue_slacks += residue.recycled_residue_slacks;
+        report.stale_residue_slacks += residue.stale_residue_slacks;
+    }
+    if scenario.lift_regime {
+        for writer in &writers {
+            let acked =
+                writer.ledger.values().flatten().filter(|op| op.acked_at.is_some()).count() as u64;
+            match writer.class {
+                NsClass::Tiered => report.lift_tiered_ops += acked,
+                NsClass::Indexed => report.lift_indexed_ops += acked,
+                _ => {}
+            }
+        }
+        lift_regime_index_oracle(&mut node, &mut rng, &clock, &disk, scenario, &mut report);
     }
 
     // ---- the "at end" equivalence check (M3-S23) -----------------------
@@ -1973,7 +2097,10 @@ fn audit_ledgers(
     report: &mut DurableReport,
 ) -> Result<(), ()> {
     let mut audit = MiniClient::connect(node, 0);
-    for class in [NsClass::Always, NsClass::Everysec] {
+    for class in [NsClass::Always, NsClass::Everysec, NsClass::Tiered, NsClass::Indexed] {
+        if !writers.iter().any(|w| w.class == class) {
+            continue;
+        }
         let reply = audit.call(
             node,
             rng,
@@ -1992,10 +2119,9 @@ fn audit_ledgers(
                 let required = required_index(class, ops, cut_time);
                 report.required_ops += required.map_or(0, |i| i as u64 + 1);
                 report.allowed_lost_ops += ops.len() as u64 - required.map_or(0, |i| i as u64 + 1);
-                let command: [&[u8]; 2] = match scenario.workload {
-                    DurableWorkload::KeyValue => [b"GET", key],
-                    DurableWorkload::Document => [b"JSON.GET", key],
-                };
+                let document =
+                    scenario.workload == DurableWorkload::Document || class == NsClass::Indexed;
+                let command: [&[u8]; 2] = if document { [b"JSON.GET", key] } else { [b"GET", key] };
                 let reply = match audit.call(node, rng, clock, disk, scenario.step_ns_max, &command)
                 {
                     Ok(Some(reply)) => reply,
@@ -2044,6 +2170,165 @@ fn audit_ledgers(
         }
     }
     Ok(())
+}
+
+/// The lift regime's index (F-L14-01): `$.meta.tag`, the document
+/// model's always-present integer member.
+const LIFT_INDEX: (u32, &str, IndexKeyType) = (1, "$.meta.tag", IndexKeyType::I64);
+
+/// The lift regime's DDL: a tiered `always` namespace (the `m4-tiered`
+/// budget shape — demotion, extents and displacement pairs inside a
+/// short run) and an indexed `always` document namespace whose index is
+/// declared through the production catalog swap and converged before
+/// any traffic.
+#[allow(clippy::too_many_arguments)] // the scheduler tuple the MiniClient calls need
+fn lift_regime_ddl(
+    node: &mut Node,
+    setup: &mut MiniClient,
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &SimDisk,
+    scenario: &DurableScenario,
+    report: &mut DurableReport,
+) -> Result<(), String> {
+    let tier: &[&[u8]] = &[
+        b"INF.NS",
+        b"CREATE",
+        NsClass::Tiered.name(),
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"always",
+        b"MEM-BUDGET",
+        b"3mb",
+        b"MUTABLE-FRACTION",
+        b"100",
+        b"MAINTAIN-SLICE",
+        b"1mb",
+        b"BLOB-THRESHOLD",
+        b"4kb",
+        b"TIER-IO-MODE",
+        b"buffered",
+    ];
+    let idx: &[&[u8]] =
+        &[b"INF.NS", b"CREATE", NsClass::Indexed.name(), b"MODE", b"durable", b"FSYNC", b"always"];
+    for create in [tier, idx] {
+        match setup.call(node, rng, clock, disk, scenario.step_ns_max, create) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => return Err(format!("lift-regime DDL {:?} answered {other:?}", create[2])),
+        }
+    }
+    let ns = node
+        .plane(0)
+        .keyspace()
+        .ns_iter()
+        .find(|s| s.name == NsClass::Indexed.name())
+        .map(|s| s.id)
+        .ok_or_else(|| "lift-regime: idx namespace missing after DDL".to_owned())?;
+    let (id, path, key_type) = LIFT_INDEX;
+    let program = compile(path.as_bytes()).expect("valid index path").as_bytes().to_vec();
+    let mut catalog = node.plane(0).keyspace().export_catalog(node.control.next_ns_id(), 2, 2);
+    catalog.index.entries.push(IndexSpec {
+        id: IndexId(id),
+        generation: u64::from(id),
+        ns,
+        name: b"by-tag".to_vec(),
+        program,
+        key_type,
+        state: IndexState::Declared,
+    });
+    node.control.request_persist(catalog);
+    // The swap lands on disk here; the live registries see the
+    // declaration at the transition boot (boot-seeding — the live DDL fan
+    // is S10's), and the S05 machine converges during the main life.
+    for _ in 0..64 {
+        node.step(rng, clock, disk, scenario.step_ns_max)
+            .map_err(|e| format!("lift-regime persist: {e}"))?;
+        report.scheduler_steps += 1;
+    }
+    Ok(())
+}
+
+/// The lift regime's index oracle after the final boot: once every
+/// cell's machine reads Ready again (a loaded sidecar caught up on the
+/// tail, or the S05 rebuild ran), each cell's tree equals the
+/// scan-derived truth over its recovered documents and no index is
+/// degraded — the lifted documents' entries included. Pre-batch-19 the
+/// sidecar committed before the lifted segments replayed, so a loaded
+/// tree missed exactly those documents.
+fn lift_regime_index_oracle(
+    node: &mut Node,
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &SimDisk,
+    scenario: &DurableScenario,
+    report: &mut DurableReport,
+) {
+    let Some(ns) = node
+        .plane(0)
+        .keyspace()
+        .ns_iter()
+        .find(|s| s.name == NsClass::Indexed.name())
+        .map(|s| s.id)
+    else {
+        report.violations.push(format!(
+            "LIFT REGIME VIOLATION seed {:#x}: the idx namespace did not survive the cut",
+            scenario.seed
+        ));
+        return;
+    };
+    let (id, path, key_type) = LIFT_INDEX;
+    let id = IndexId(id);
+    for cell in 0..usize::from(scenario.cells) {
+        report.lift_sidecars_loaded +=
+            u64::from(node.plane(cell).keyspace().idx_sidecar_info().loaded);
+    }
+    let mut ready = false;
+    for _ in 0..STALL_STEPS {
+        ready = (0..usize::from(scenario.cells)).all(|cell| {
+            node.plane(cell).keyspace().idx_registry().cell_state(id) == Some(IndexState::Ready)
+        });
+        if ready {
+            break;
+        }
+        if node.step(rng, clock, disk, scenario.step_ns_max).is_err() {
+            break;
+        }
+        report.scheduler_steps += 1;
+    }
+    if !ready {
+        report.violations.push(format!(
+            "LIFT REGIME VIOLATION seed {:#x}: the index never re-converged after the final boot",
+            scenario.seed
+        ));
+        return;
+    }
+    let program = compile(path.as_bytes()).expect("valid index path");
+    let now = clock.now();
+    for cell in 0..usize::from(scenario.cells) {
+        let ks = node.plane(cell).keyspace();
+        let truth = crate::backfill::cell_truth(&ks, ns, &program, key_type, now);
+        let tree = crate::backfill::cell_tree(&ks, ns, id);
+        if tree != truth {
+            report.violations.push(format!(
+                "LIFT REGIME INDEX VIOLATION seed {:#x} cell {cell}: index tree ≠ scan-derived \
+                 truth after the final boot ({} tree entries vs {} derived; sidecars loaded \
+                 {}, stale slacks lifted {})",
+                scenario.seed,
+                tree.len(),
+                truth.len(),
+                report.lift_sidecars_loaded,
+                report.stale_residue_slacks
+            ));
+        }
+        if ks.idx_degraded(ns, id) == Some(true) {
+            report.violations.push(format!(
+                "LIFT REGIME INDEX VIOLATION seed {:#x} cell {cell}: index degraded after the \
+                 final boot",
+                scenario.seed
+            ));
+        }
+    }
 }
 
 /// A RESP bulk reply → the value (`None` for the null bulk); `None` for

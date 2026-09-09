@@ -14,7 +14,8 @@ fn call(store: &mut Keyspace, cx: &mut ConnCx, argv: &[&[u8]]) -> Vec<u8> {
 #[test]
 fn snapshot_validation_and_legacy_forms() {
     let mut store = Keyspace::new(StoreConfig::default());
-    let mut cx = ConnCx::default();
+    // ADR-0115: the program primitives run only under a program context.
+    let mut cx = ConnCx { program: true, ..ConnCx::default() };
     assert_eq!(call(&mut store, &mut cx, &[b"SET", b"key", b"value"]), b"+OK\r\n");
     let cases: &[&[&[u8]]] = &[
         &[b"INF.TAKE", b"key", b"IF"],
@@ -53,7 +54,8 @@ fn snapshot_validation_and_legacy_forms() {
 #[test]
 fn zero_deadline_and_quiet_reads() {
     let mut store = Keyspace::new(StoreConfig::default());
-    let mut cx = ConnCx::default();
+    // ADR-0115: the program primitives run only under a program context.
+    let mut cx = ConnCx { program: true, ..ConnCx::default() };
     cx.node.wall_anchor.set((60_000, 0));
     assert_eq!(call(&mut store, &mut cx, &[b"SET", b"key", b"v", b"PX", b"60000"]), b"+OK\r\n");
     let before = store.stats();
@@ -71,7 +73,8 @@ fn zero_deadline_and_quiet_reads() {
 #[test]
 fn quiet_snapshot_preserves_type_and_missing_semantics() {
     let mut store = Keyspace::new(StoreConfig::default());
-    let mut cx = ConnCx::default();
+    // ADR-0115: the program primitives run only under a program context.
+    let mut cx = ConnCx { program: true, ..ConnCx::default() };
     let before = store.stats();
     assert_eq!(
         call(&mut store, &mut cx, &[b"INF.PEEK", b"missing", b"ABS", b"NOSTATS"]),
@@ -92,7 +95,8 @@ fn quiet_snapshot_preserves_type_and_missing_semantics() {
 #[test]
 fn snapshot_matches_binary_value_and_deadline() {
     let mut store = Keyspace::new(StoreConfig::default());
-    let mut cx = ConnCx::default();
+    // ADR-0115: the program primitives run only under a program context.
+    let mut cx = ConnCx { program: true, ..ConnCx::default() };
     let value = b"\0\xff\r\n$-1\r\n";
     assert_eq!(call(&mut store, &mut cx, &[b"SET", b"key", value, b"PX", b"60000"]), b"+OK\r\n");
     let deadline = call(&mut store, &mut cx, &[b"PEXPIRETIME", b"key"]);

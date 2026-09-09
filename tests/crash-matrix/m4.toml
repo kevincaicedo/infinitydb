@@ -139,6 +139,16 @@ tier = "node"
 test = "recovery_v2.rs"
 expect = "reclaim-deferred-nonfatal"
 
+# Review 2026-08-30, F-L01-02: a tier-file creation refused at its
+# directory hold (EMFILE physics) must stage nothing — the round keeps
+# only the ops it staged before, each on a handle the pipeline owns —
+# and the cut after that round recovers the sealed file whole.
+[[row]]
+point = "tier_dir_open_fail"
+tier = "node"
+test = "tier.rs"
+expect = "creation-retried-round-owned"
+
 # ---- M4-S17 blob-extent windows (ADR-0061 D3/D5/D9) ----
 
 [[row]]

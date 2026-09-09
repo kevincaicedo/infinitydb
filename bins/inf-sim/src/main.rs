@@ -55,6 +55,9 @@ fn main() {
     let mut shard = (0u64, 1u64);
     let mut out_dir: Option<String> = None;
     let mut replay_canary = false;
+    // F-L14-01 (batch 20): force the m2 lift regime on any seed — the
+    // arm on a seed known to lift (the sweep discloses which).
+    let mut lift_regime = false;
     let mut ops_override: Option<u64> = None;
 
     let mut it = std::env::args().skip(1);
@@ -92,6 +95,7 @@ fn main() {
                 }
                 "--out" => out_dir = Some(take("--out")?),
                 "--replay-canary" => replay_canary = true,
+                "--lift-regime" => lift_regime = true,
                 // m4-cold: total op count (the AC's 10⁶ run sets it; the
                 // smoke default is lighter).
                 "--ops" => {
@@ -101,7 +105,7 @@ fn main() {
                     println!(
                         "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m2-device-budget|m2-mode-transition|m2-reorder-window|m2-ckpt-refused|m2-recycle|m3-document|m2-combined|boot-storm \
                          [--seed N|0xN] [--verify-determinism] \
-                         [--plant lost-wakeup|fsync-lies] [--replay-canary] [--cells N] \
+                         [--plant lost-wakeup|fsync-lies] [--replay-canary] [--lift-regime] [--cells N] \
                          [--connections N] [--commands N] [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]]"
                     );
@@ -134,6 +138,7 @@ fn main() {
             seed,
             plant,
             replay_canary,
+            lift_regime,
             verify,
             sweep,
             shard,
@@ -483,6 +488,8 @@ fn main() {
             let mut cold_resolves = 0u64;
             let mut blob_sets = 0u64;
             let mut race_replans = 0u64;
+            let mut dir_open_fault_seeds = 0u64;
+            let mut dir_open_faults_fired = 0u64;
             let mut diskfull_refusals = 0u64;
             let mut drop_values = 0u64;
             let mut drop_other = 0u64;
@@ -547,6 +554,8 @@ fn main() {
                 cold_resolves += report.cold_resolves;
                 blob_sets += report.blob_sets;
                 race_replans += report.race_replans;
+                dir_open_fault_seeds += u64::from(report.dir_open_fault_arm);
+                dir_open_faults_fired += report.dir_open_faults_fired;
                 diskfull_refusals += report.diskfull_refusals;
                 drop_values += report.drop_replies_value;
                 drop_other += report.drop_replies_other;
@@ -577,7 +586,8 @@ fn main() {
                  violations, {refused} legal taxonomy refusals, {commands} commands, {audited} \
                  keys audited, {flushed_pre_cut} B flushed pre-cut, {cold_resolves} cold \
                  resolves, {blob_sets} blob sets, {race_replans} blob-key race replans, \
-                 {diskfull_refusals} DISKFULL refusals, \
+                 dir-open fault armed on {dir_open_fault_seeds} seeds ({dir_open_faults_fired} \
+                 fired), {diskfull_refusals} DISKFULL refusals, \
                  drop-race {drop_values} values / {drop_other} typed-other; post-drop reboots \
                  {drop_reboots} ({drop_reboot_residue} with MANIFEST residue), cut inside DROP: \
                  {drop_cut_whole} whole / {drop_cut_swept} swept (ADR-0100); shadow arm on \
@@ -602,7 +612,9 @@ fn main() {
                      shard={shard_i}/{shard_k} seeds_run={ran} violations={violations} \
                      refused={refused} commands={commands} keys_audited={audited} \
                      flushed_pre_cut={flushed_pre_cut} cold_resolves={cold_resolves} \
-                     blob_sets={blob_sets} diskfull_refusals={diskfull_refusals} \
+                     blob_sets={blob_sets} dir_open_fault_seeds={dir_open_fault_seeds} \
+                     dir_open_faults_fired={dir_open_faults_fired} \
+                     diskfull_refusals={diskfull_refusals} \
                      drop_values={drop_values} drop_other={drop_other} \
                      drop_reboots={drop_reboots} drop_reboot_residue={drop_reboot_residue} \
                      drop_cut_whole={drop_cut_whole} drop_cut_swept={drop_cut_swept} \
@@ -638,8 +650,8 @@ fn main() {
              steps: {:?}, refused-boot {}, shadow arm {} ({} tickets, {} open at the cut, \
              {} same-key / {} collision, {} stale, {} fallbacks; phase 6b cold resolves {}; \
              phase 6c {} pairs: {} tickets, {} collision verdicts, {} ticketed fallbacks, {} \
-             DBSIZE drains, {} SCAN twins), blob-key race {} replans, trace {} bytes, hash \
-             {:#018x}",
+             DBSIZE drains, {} SCAN twins), blob-key race {} replans, dir-open fault arm {} \
+             (fired {}), trace {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -673,6 +685,8 @@ fn main() {
             report.collide_dbsize_drains,
             report.collide_scan_twins,
             report.race_replans,
+            report.dir_open_fault_arm,
+            report.dir_open_faults_fired,
             report.trace.len(),
             report.trace_hash
         );
@@ -1042,6 +1056,7 @@ fn run_durable(
     seed: u64,
     plant: Plant,
     replay_canary: bool,
+    lift_regime: bool,
     verify: bool,
     sweep: Option<u64>,
     (shard_i, shard_k): (u64, u64),
@@ -1060,6 +1075,7 @@ fn run_durable(
         };
         scenario.plant = plant;
         scenario.replay_canary = replay_canary;
+        scenario.lift_regime |= lift_regime;
         run_durable_scenario(&scenario)
     };
 
@@ -1068,7 +1084,8 @@ fn run_durable(
         println!(
             "inf-sim: scenario {scenario_name} seed {seed:#x}: {} commands, {} steps, {} keys \
              audited, {} required ops, {} allowed-lost, {} equivalence checks, {} documents \
-             compared, {} corpus docs, cut classes {:?}, trace {} bytes, hash {:#018x}",
+             compared, {} corpus docs, cut classes {:?}, lift regime {} (tiered ops {}, indexed \
+             ops {}, sidecars loaded {}, stale slacks lifted {}), trace {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -1078,6 +1095,11 @@ fn run_durable(
             report.documents_compared,
             report.corpus_documents_used,
             report.cut_classes,
+            report.lift_regime,
+            report.lift_tiered_ops,
+            report.lift_indexed_ops,
+            report.lift_sidecars_loaded,
+            report.stale_residue_slacks,
             report.trace.len(),
             report.trace_hash
         );
@@ -1150,6 +1172,14 @@ fn run_durable(
     let mut waits_satisfied = 0u64;
     let mut waits_expired = 0u64;
     let mut inline_preallocs = 0u64;
+    // The lift regime (F-L14-01): seeds that ran it, the records its
+    // writers landed behind the lift, the sidecars the final boot loaded,
+    // and — every seed — the residue slacks the final boot lifted past.
+    let mut lift_seeds = 0u64;
+    let mut lift_tiered_ops = 0u64;
+    let mut lift_indexed_ops = 0u64;
+    let mut lift_sidecars_loaded = 0u64;
+    let mut stale_slacks = 0u64;
     for i in (shard_i..sweep).step_by(shard_k as usize) {
         let seed = seed.wrapping_add(i);
         let report = run_one(seed);
@@ -1176,6 +1206,11 @@ fn run_durable(
         waits_satisfied += report.recycle_waits_satisfied;
         waits_expired += report.recycle_waits_expired;
         inline_preallocs += report.segment_inline_preallocs;
+        lift_seeds += u64::from(report.lift_regime);
+        lift_tiered_ops += report.lift_tiered_ops;
+        lift_indexed_ops += report.lift_indexed_ops;
+        lift_sidecars_loaded += report.lift_sidecars_loaded;
+        stale_slacks += report.stale_residue_slacks;
         sim_seconds += report.sim_seconds;
         equivalence_checks += report.equivalence_checks;
         documents_compared += report.documents_compared;
@@ -1212,7 +1247,9 @@ fn run_durable(
          waits_fill:{waits_fill} waits_group:{waits_group}, recycling [recycled:{recycled} misses:{recycle_misses} \
          fallbacks:{recycle_fallbacks} rotations:{rotations} residue_slacks:{residue_slacks} \
          waits_started:{waits_started} waits_satisfied:{waits_satisfied} \
-         waits_expired:{waits_expired} inline_preallocs:{inline_preallocs}]",
+         waits_expired:{waits_expired} inline_preallocs:{inline_preallocs}], lift regime \
+         [seeds:{lift_seeds} tiered_ops:{lift_tiered_ops} indexed_ops:{lift_indexed_ops} \
+         sidecars_loaded:{lift_sidecars_loaded} stale_slacks:{stale_slacks}]",
         classes.join(" ")
     );
     println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
@@ -1232,7 +1269,9 @@ fn run_durable(
              recycle_fallbacks={recycle_fallbacks} segment_rotations={rotations} \
              recycled_residue_slacks={residue_slacks} recycle_waits_started={waits_started} \
              recycle_waits_satisfied={waits_satisfied} recycle_waits_expired={waits_expired} \
-             segment_inline_preallocs={inline_preallocs}\n",
+             segment_inline_preallocs={inline_preallocs} lift_seeds={lift_seeds} \
+             lift_tiered_ops={lift_tiered_ops} lift_indexed_ops={lift_indexed_ops} \
+             lift_sidecars_loaded={lift_sidecars_loaded} stale_residue_slacks={stale_slacks}\n",
             classes.join(" ")
         );
         std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest).expect("manifest");

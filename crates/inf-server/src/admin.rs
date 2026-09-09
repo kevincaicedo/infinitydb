@@ -448,6 +448,10 @@ pub(crate) fn info(
                 node.recover_recycled_residue_slacks.get()
             ),
         );
+        push(
+            &mut text,
+            &format!("recover_stale_residue_slacks:{}", node.recover_stale_residue_slacks.get()),
+        );
         // M4.5-S39d: the boot's recovery decomposed by phase (bytes read
         // and loop-clock µs; the µs sum to `recover_total_us` exactly).
         let phases = node.recover_phases.get();
@@ -986,22 +990,27 @@ fn human_bytes(bytes: u64) -> String {
 // ---- COMMAND -----------------------------------------------------------------
 
 pub(crate) fn command_introspection(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
+    // ADR-0115: `INTERNAL` rows are not a client surface — absent from
+    // every COMMAND form, exactly as Redis hides its internal commands.
+    let visible = || inf_wire::COMMANDS.iter().filter(|m| !m.flags.contains(CmdFlags::INTERNAL));
     if argv.len() == 1 {
-        w.array_header(inf_wire::COMMANDS.len());
-        for meta in &inf_wire::COMMANDS {
+        w.array_header(visible().count());
+        for meta in visible() {
             command_row(meta, w);
         }
         return;
     }
     let sub = argv.arg(1);
     if sub.eq_ignore_ascii_case(b"COUNT") {
-        w.int(inf_wire::COMMANDS.len() as i64);
+        w.int(visible().count() as i64);
     } else if sub.eq_ignore_ascii_case(b"INFO") {
         w.array_header(argv.len() - 2);
         for i in 2..argv.len() {
             match inf_wire::lookup(argv.arg(i)) {
-                Some(meta) => command_row(meta, w),
-                None => w.null_array(),
+                Some(meta) if !meta.flags.contains(CmdFlags::INTERNAL) => command_row(meta, w),
+                // A null bulk, as Redis answers an unknown name (oracle:
+                // `COMMAND INFO nosuch` → `$-1`; found by the ADR-0115 lane).
+                _ => w.null(),
             }
         }
     } else if sub.eq_ignore_ascii_case(b"DOCS") {
@@ -1056,7 +1065,9 @@ fn command_getkeys(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
             "ERR Unknown subcommand or wrong number of arguments for 'GETKEYS'. Try COMMAND HELP.",
         );
     }
-    let Some(meta) = inf_wire::lookup(argv.arg(2)) else {
+    let Some(meta) =
+        inf_wire::lookup(argv.arg(2)).filter(|m| !m.flags.contains(CmdFlags::INTERNAL))
+    else {
         return w.error("ERR Invalid command specified");
     };
     if !inf_wire::arity_ok(meta, argv.len() - 2) {
@@ -2748,7 +2759,10 @@ mod tests {
         let mut cx = ConnCx::default();
         let mut store = Keyspace::new(StoreConfig::default());
         let count = run(&mut cx, &mut store, &[b"COMMAND", b"COUNT"]);
-        assert_eq!(count, format!(":{}\r\n", inf_wire::COMMANDS.len()).into_bytes());
+        // ADR-0115: the three INTERNAL rows are not a client surface.
+        let visible = inf_wire::COMMANDS.iter().filter(|m| !m.flags.contains(CmdFlags::INTERNAL));
+        assert_eq!(count, format!(":{}\r\n", visible.count()).into_bytes());
+        assert_eq!(count, format!(":{}\r\n", inf_wire::COMMANDS.len() - 3).into_bytes());
         let getkeys = run(
             &mut cx,
             &mut store,
