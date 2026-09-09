@@ -70,7 +70,9 @@ pub use manifest::{
     Manifest, ManifestDecodeError, TierFileRange, TierNsManifest, manifest_envelope, read_manifest,
     write_manifest,
 };
-pub use reader::{ApplyError, DEFAULT_READ_CHUNK, ReadEnd, ReadError, ReaderConfig, SegmentReader};
+pub use reader::{
+    ApplyError, DEFAULT_READ_CHUNK, ReadEnd, ReadError, ReadStep, ReaderConfig, SegmentReader,
+};
 pub use record::{
     DOC_VERSION_MASK, DocLineage, NsId, RecordDecodeError, RecordType, RecordView, decode_record,
 };

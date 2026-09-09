@@ -19,9 +19,12 @@ use inf_log::{
     SegmentId, SegmentRotor, StagingConfig, create_cell_dirs, segment_file_name,
 };
 use inf_server::{DurableConfig, open_cell_log};
-use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig, WallAnchor};
+use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig, TierSpec, WallAnchor};
 
 const NS: NsId = NsId(16);
+/// A tiered namespace beside the plain one (F-L14-01): its displacement
+/// markers are what the end-of-replay check audits.
+const TIER_NS: NsId = NsId(17);
 const CELL: u16 = 0;
 
 fn now() -> Nanos {
@@ -59,6 +62,23 @@ fn fresh_keyspace() -> Keyspace {
         tier: None,
     })
     .expect("ns");
+    ks
+}
+
+/// `fresh_keyspace` plus a materialized tiered namespace (no MANIFEST —
+/// the first-crash shape: the catalog names it, no checkpoint does).
+fn tiered_keyspace() -> Keyspace {
+    let mut ks = fresh_keyspace();
+    ks.ns_create(NsSpec {
+        id: TIER_NS,
+        name: b"hot".to_vec(),
+        mode: NsMode::Durable,
+        fsync: Some(FsyncClass::Always),
+        policy: None,
+        maxmemory: None,
+        tier: Some(TierSpec::for_budget(8 << 20)),
+    })
+    .expect("tiered ns");
     ks
 }
 
@@ -113,8 +133,27 @@ impl HandLog {
         value: &[u8],
         stamp: FrameStamp,
     ) -> u32 {
+        self.records_in(
+            segment,
+            offset,
+            &[RecordView::StringPostImage { ns: NS, key, value }],
+            stamp,
+        )
+    }
+
+    /// Place one v2 frame carrying `records` at `offset` of `segment`;
+    /// returns its length.
+    fn records_in(
+        &self,
+        segment: SegmentId,
+        offset: u32,
+        records: &[RecordView<'_>],
+        stamp: FrameStamp,
+    ) -> u32 {
         let mut b = FrameBuilder::new();
-        b.append(&RecordView::StringPostImage { ns: NS, key, value });
+        for record in records {
+            b.append(record);
+        }
         let first = Lsn::new(segment, offset + FRAME_HEADER_LEN as u32);
         let bytes = b.finalize(first, stamp, FrameLayout::Packed).to_vec();
         self.poke_in(segment, offset, &bytes);
@@ -398,4 +437,79 @@ fn stale_trailing_segment_beyond_the_last_data_resumes_at_that_data_end() {
     assert_eq!(rotor.active_segment(), SegmentId(0), "resume in the live segment");
     assert_eq!(rotor.active_written(), end, "at its data end — never offset 0");
     assert_eq!(rotor.resume_epoch(), 4);
+}
+
+/// The lift shape of the test above, with the live log's last record a
+/// tiered displacement marker and no paired mutation.
+fn lifted_log_ending_with(fs: &MemFs, tail: &[RecordView<'_>]) {
+    let mut log = HandLog::new(fs);
+    let gap = {
+        log.v2_frame(b"a", b"1", stamp(1, 1, 0));
+        log.v2_frame(b"b", b"2", stamp(1, 2, 0));
+        log.offset
+    };
+    log.v2_frame_in(SegmentId(0), gap + 63, b"ghost", b"stale", stamp(1, 4, u64::from(gap)));
+    log.prealloc(SegmentId(1));
+    let first = Lsn::new(SegmentId(1), 0);
+    let len = log.v2_frame_in(SegmentId(1), 0, b"c", b"3", stamp(2, 1, u64::from(gap)));
+    let second_covered = first.advance(len).to_u64();
+    log.records_in(SegmentId(1), len, tail, stamp(2, 2, second_covered));
+}
+
+/// F-L14-01 (review of 2026-08-30): the end-of-replay checks run once,
+/// after the *last* replayed record — which, on a lifted hole, is in the
+/// probed-then-replayed segments, not at the hole. A log whose lifted
+/// tail ends between a displacement marker and its paired mutation must
+/// refuse (ADR-0057 D4); it booted before the fix because the register
+/// was audited at the first probe step, while it was still empty.
+#[test]
+fn a_lifted_hole_replays_before_the_end_of_replay_checks_run() {
+    let fs = MemFs::new();
+    lifted_log_ending_with(&fs, &[RecordView::ColdDisplace { ns: TIER_NS, old_addr: 4096 }]);
+    let mut ks = tiered_keyspace();
+    let err = match recover(&fs, &mut ks) {
+        Err(err) => err,
+        Ok((rotor, stats)) => panic!(
+            "booted on a log ending with an unpaired displacement marker: register {} deep, \
+             c={:?}, segments {}, stale slacks {}, resume epoch {}",
+            ks.displace_register_len(),
+            get(&mut ks, b"c"),
+            stats.segments,
+            stats.stale_residue_slacks,
+            rotor.resume_epoch()
+        ),
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("1 unpaired displacement marker") && text.contains("ADR-0057 D4"),
+        "{text}"
+    );
+}
+
+/// The control: the same lifted tail with the marker paired in its
+/// frame replays and serves — the lift applies tiered records too.
+#[test]
+fn a_lifted_hole_replays_tiered_pairs_and_serves_them() {
+    let fs = MemFs::new();
+    lifted_log_ending_with(
+        &fs,
+        &[
+            RecordView::ColdDisplace { ns: TIER_NS, old_addr: 4096 },
+            RecordView::StringPostImage { ns: TIER_NS, key: b"t", value: b"paired" },
+        ],
+    );
+    let mut ks = tiered_keyspace();
+    let (rotor, stats) = recover(&fs, &mut ks).expect("a paired marker is legal");
+    assert_eq!(ks.displace_register_len(), 0, "drained by its paired mutation");
+    assert_eq!(get(&mut ks, b"c").as_deref(), Some(&b"3"[..]), "the lifted segment replayed");
+    assert_eq!(get(&mut ks, b"ghost"), None);
+    let hash = ks.hasher().hash(b"t");
+    let table = ks.tiered_store_mut(TIER_NS).expect("tiered");
+    assert!(
+        matches!(table.lookup(b"t", hash, &[]), inf_store::TieredLookup::Ram(_)),
+        "the tiered record of the lifted segment is live"
+    );
+    assert_eq!(stats.segments, 2);
+    assert_eq!(stats.stale_residue_slacks, 1);
+    assert_eq!(rotor.resume_epoch(), 3);
 }

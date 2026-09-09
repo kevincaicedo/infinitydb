@@ -285,7 +285,6 @@ I	1	crates/inf-log/src/meta.rs	expect	4-byte slice	fixed-width sub-slice of a le
 I	1	crates/inf-log/src/meta.rs	expect	4-byte trailer	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-log/src/meta.rs	expect	envelope size fits usize	u64 → usize is lossless on every supported (64-bit) target
 I	2	crates/inf-log/src/reader.rs	expect	4-byte slice	fixed-width sub-slice of a length-checked buffer — infallible by construction
-I	1	crates/inf-log/src/reader.rs	expect	clean exhaustion always records an end	reader state machine: `end` is recorded on every clean exhaustion path before `Ok(None)`
 I	1	crates/inf-log/src/record.rs	expect	4-byte field	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-log/src/record.rs	expect	8-byte field	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	3	crates/inf-log/src/record.rs	expect	8 bytes	fixed-width sub-slice of a length-checked buffer — infallible by construction
@@ -509,12 +508,11 @@ I	8	crates/inf-server/src/plane/tiered.rs	expect	resolved on this table	`resolve
 I	1	crates/inf-server/src/plane/tiered.rs	expect	tiered namespace has plane state	the tier state materializes every catalogued tiered namespace at MAINTAIN (`sync_namespaces`) before writes are admitted to it
 C	3	crates/inf-server/src/plane/tiered.rs	expect	tiered namespaces always carry a durability class	a tiered namespace is a configuration of `MODE durable`, refused otherwise at creation (`crates/inf-store/src/keyspace.rs:Keyspace::ns_create_check` via the registry's spec check), and durable namespaces carry an fsync class
 I	1	crates/inf-server/src/recover.rs	expect	40	the frame header length is the constant `FRAME_HEADER_LEN` (40)
-I	1	crates/inf-server/src/recover.rs	expect	clean exhaustion records an end	`SegmentReader` records `read_end` whenever `next_frame` returns `Ok(None)` (this crate's boot reader contract)
 I	1	crates/inf-server/src/recover.rs	expect	evidence anchor set with a valid frame	the anchor is set in the same loop whenever a scan reports `valid_frames > 0`
 I	2	crates/inf-server/src/recover.rs	expect	fs present	the machine's own phase order: `fs` is taken once, when the rotor is built at completion
 I	1	crates/inf-server/src/recover.rs	expect	fs present until finish	the machine's own phase order: `fs` is taken once, when the rotor is built at completion
 I	1	crates/inf-server/src/recover.rs	expect	ick phase	`Phase::Ick` is entered only after the manifest is stored
-I	1	crates/inf-server/src/recover.rs	expect	loader present until the audit	the sidecar loader is taken once, on entering the audit, after the ick phase that uses it
+I	1	crates/inf-server/src/recover.rs	expect	loader present until the audit	the sidecar loader is taken once, by the end-of-replay checks in the finish step (after any lift), long after the ick phase that uses it
 I	1	crates/inf-server/src/recover.rs	expect	non-empty scan	the fresh-cell branch (empty scan) completed earlier; the finish phase runs only over a non-empty scan
 I	1	crates/inf-server/src/recover.rs	expect	recovery complete before finish()	documented panic: `finish` after `Complete` (callers loop on `step`)
 I	1	crates/inf-server/src/recover.rs	expect	scan set	`scan` is stored in the start phase before any later phase runs
