@@ -905,9 +905,52 @@ else
     sed 's/^/    | /' "$inventory_dag_log"
 fi
 
+# ------------------------------------------- doc-read profile (D13)
+# ADR-0106 fourth amendment (F-L20-08): the parser-symbol profile gate's
+# verdict runs on a planted flat report through INF_PROFILE_REPORT — an
+# empty report, too few rows or samples, a missing positive control, and a
+# banned symbol at 0.01% (below perf's old 0.05% floor) are each red; the
+# sanctioned shape is green and names its positive control.
+PROFILE=./scripts/check-doc-read-profile.sh
+profile_report() {  # <path> <samples> <rows> <expected: yes|no> <banned: yes|no>
+    local path=$1 samples=$2 rows=$3 expected=$4 banned=$5
+    {
+        printf '# To display the perf.data header info, please use --header/--header-only options.\n#\n'
+        printf '# Samples: %s of event '"'"'cpu_core/cycles/P'"'"'\n# Event count (approx.): 109049269736\n#\n' "$samples"
+        printf '# Overhead  Command  Shared Object  Symbol\n# ........  .......  .............  ......\n#\n'
+        if [ "$expected" = yes ]; then
+            printf '     4.65%%  cell-0  infinityd  [.] <inf_doc::tape::ObjIter as core::iter::traits::iterator::Iterator>::next\n'
+            printf '     1.74%%  cell-0  infinityd  [.] inf_doc::tape::read_value\n'
+            printf '     0.29%%  cell-0  infinityd  [.] inf_store::doc::<impl inf_store::store::CellStore>::json_get\n'
+        fi
+        if [ "$banned" = yes ]; then
+            printf '     0.01%%  cell-2  infinityd  [.] inf_doc::json::JsonParser::parse_into\n'
+        fi
+        local i=0
+        while [ "$i" -lt "$rows" ]; do
+            printf '     0.02%%  cell-1  infinityd  [.] inf_store::store::CellStore::lookup_%d\n' "$i"
+            i=$((i + 1))
+        done
+    } >"$path"
+}
+: >"$work/profile-empty.txt"
+profile_report "$work/profile-ok.txt" 68K 250 yes no
+profile_report "$work/profile-few-rows.txt" 68K 5 yes no
+profile_report "$work/profile-few-samples.txt" 900 250 yes no
+profile_report "$work/profile-no-control.txt" 68K 250 no no
+profile_report "$work/profile-banned.txt" 68K 250 yes yes
+expect red "doc-read-profile: an empty report is not a measurement" env INF_PROFILE_REPORT="$work/profile-empty.txt" $PROFILE "$work/profile-out"
+expect red "doc-read-profile: too few symbol rows" env INF_PROFILE_REPORT="$work/profile-few-rows.txt" $PROFILE "$work/profile-out"
+expect red "doc-read-profile: too few samples" env INF_PROFILE_REPORT="$work/profile-few-samples.txt" $PROFILE "$work/profile-out"
+expect red "doc-read-profile: positive control missing" env INF_PROFILE_REPORT="$work/profile-no-control.txt" $PROFILE "$work/profile-out"
+expect red "doc-read-profile: a parser symbol at 0.01% is seen" env INF_PROFILE_REPORT="$work/profile-banned.txt" $PROFILE "$work/profile-out"
+expect green "doc-read-profile: the sanctioned shape" env INF_PROFILE_REPORT="$work/profile-ok.txt" $PROFILE "$work/profile-out"
+expect_output "doc-read-profile: the pass names its positive control" "positive control present" env INF_PROFILE_REPORT="$work/profile-ok.txt" $PROFILE "$work/profile-out"
+expect_output "doc-read-profile: the pass names the flat floor" "percent-limit 0" env INF_PROFILE_REPORT="$work/profile-ok.txt" $PROFILE "$work/profile-out"
+
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, safety-inventory, dep-dag each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, safety-inventory, dep-dag, doc-read-profile each red on a planted violation)"
