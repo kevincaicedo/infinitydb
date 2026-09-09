@@ -1085,7 +1085,8 @@ fn run_durable(
             "inf-sim: scenario {scenario_name} seed {seed:#x}: {} commands, {} steps, {} keys \
              audited, {} required ops, {} allowed-lost, {} equivalence checks, {} documents \
              compared, {} corpus docs, cut classes {:?}, lift regime {} (tiered ops {}, indexed \
-             ops {}, sidecars loaded {}, stale slacks lifted {}), trace {} bytes, hash {:#018x}",
+             ops {}, sidecars loaded {}, stale slacks lifted {}; plant: cells {}, lifts {}, \
+             sidecars {}), trace {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -1100,6 +1101,9 @@ fn run_durable(
             report.lift_indexed_ops,
             report.lift_sidecars_loaded,
             report.stale_residue_slacks,
+            report.lift_plants,
+            report.lift_plant_lifts,
+            report.lift_plant_sidecars,
             report.trace.len(),
             report.trace_hash
         );
@@ -1179,6 +1183,9 @@ fn run_durable(
     let mut lift_tiered_ops = 0u64;
     let mut lift_indexed_ops = 0u64;
     let mut lift_sidecars_loaded = 0u64;
+    let mut lift_plants = 0u64;
+    let mut lift_plant_lifts = 0u64;
+    let mut lift_plant_sidecars = 0u64;
     let mut stale_slacks = 0u64;
     for i in (shard_i..sweep).step_by(shard_k as usize) {
         let seed = seed.wrapping_add(i);
@@ -1211,6 +1218,9 @@ fn run_durable(
         lift_indexed_ops += report.lift_indexed_ops;
         lift_sidecars_loaded += report.lift_sidecars_loaded;
         stale_slacks += report.stale_residue_slacks;
+        lift_plants += report.lift_plants;
+        lift_plant_lifts += report.lift_plant_lifts;
+        lift_plant_sidecars += report.lift_plant_sidecars;
         sim_seconds += report.sim_seconds;
         equivalence_checks += report.equivalence_checks;
         documents_compared += report.documents_compared;
@@ -1249,7 +1259,8 @@ fn run_durable(
          waits_started:{waits_started} waits_satisfied:{waits_satisfied} \
          waits_expired:{waits_expired} inline_preallocs:{inline_preallocs}], lift regime \
          [seeds:{lift_seeds} tiered_ops:{lift_tiered_ops} indexed_ops:{lift_indexed_ops} \
-         sidecars_loaded:{lift_sidecars_loaded} stale_slacks:{stale_slacks}]",
+         sidecars_loaded:{lift_sidecars_loaded} stale_slacks:{stale_slacks} \
+         plants:{lift_plants} plant_lifts:{lift_plant_lifts} plant_sidecars:{lift_plant_sidecars}]",
         classes.join(" ")
     );
     println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
@@ -1271,7 +1282,9 @@ fn run_durable(
              recycle_waits_satisfied={waits_satisfied} recycle_waits_expired={waits_expired} \
              segment_inline_preallocs={inline_preallocs} lift_seeds={lift_seeds} \
              lift_tiered_ops={lift_tiered_ops} lift_indexed_ops={lift_indexed_ops} \
-             lift_sidecars_loaded={lift_sidecars_loaded} stale_residue_slacks={stale_slacks}\n",
+             lift_sidecars_loaded={lift_sidecars_loaded} stale_residue_slacks={stale_slacks} \
+             lift_plants={lift_plants} lift_plant_lifts={lift_plant_lifts} \
+             lift_plant_sidecars={lift_plant_sidecars}\n",
             classes.join(" ")
         );
         std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest).expect("manifest");

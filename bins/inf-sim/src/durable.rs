@@ -23,7 +23,7 @@
 use core::cell::RefCell;
 use std::collections::BTreeMap;
 use std::os::fd::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use inf_alloc::BufferPool;
@@ -45,6 +45,7 @@ use inf_store::{
 };
 
 use crate::harness::node_hasher;
+use crate::lift::LiftNs;
 
 use crate::net::{CellNet, Plant, SimDriver, listener_fd};
 use crate::resp::reply_len;
@@ -193,6 +194,14 @@ pub struct DurableScenario {
     /// ran before the lifted segments applied). Oracles: the §8.2 audit on
     /// both classes, the index digest-walk equality after the final boot,
     /// and the lift's own coverage (`stale_residue_slacks`).
+    ///
+    /// Batch 21 — the residue plant (`crate::lift`): the index is live
+    /// from a clean restart after the DDL, seed documents and a forced
+    /// checkpoint give every cell a sidecar, and after the prelude cut
+    /// the lift shape is written into every cell's log, so the
+    /// transition boot lifts on every arm seed and the index oracle runs
+    /// against a loaded sidecar right there — the falsifier the natural
+    /// sweep never produced (3 lifts in 400 seeds, none on this class).
     pub lift_regime: bool,
     /// Review 2026-08-30 (F-L02-01, ADR-0090 A14): arm `recycle_open_fail`
     /// once — the first pooled file this life reuses fails to open. The
@@ -717,6 +726,13 @@ pub struct DurableReport {
     pub lift_indexed_ops: u64,
     pub lift_sidecars_loaded: u64,
     pub stale_residue_slacks: u64,
+    /// The residue plant (batch 21): cells planted after the prelude
+    /// cut, the residue slacks the transition boot lifted on them, and
+    /// the sidecars it loaded — the plant's oracle requires one of each
+    /// per planted cell, so a vacuous plant is red, never a pass.
+    pub lift_plants: u64,
+    pub lift_plant_lifts: u64,
+    pub lift_plant_sidecars: u64,
 }
 
 impl DurableReport {
@@ -1406,6 +1422,9 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         lift_indexed_ops: 0,
         lift_sidecars_loaded: 0,
         stale_residue_slacks: 0,
+        lift_plants: 0,
+        lift_plant_lifts: 0,
+        lift_plant_sidecars: 0,
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -1453,12 +1472,36 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         }
     }
 
-    if scenario.lift_regime
-        && let Err(what) =
-            lift_regime_ddl(&mut node, &mut setup, &mut rng, &clock, &disk, scenario, &mut report)
-    {
-        fail(&mut report, what);
-        return finish(report, &observer, &clock);
+    let mut lift_ns = None;
+    if scenario.lift_regime {
+        match lift_regime_ddl(&mut node, &mut setup, &mut rng, &clock, &disk, scenario, &mut report)
+        {
+            Ok(ns) => lift_ns = Some(ns),
+            Err(what) => {
+                fail(&mut report, what);
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    // The residue plant's precondition (batch 21): the index must be live
+    // in the prelude life and a checkpoint must carry its sidecar before
+    // the prelude cut — a clean restart seeds the declaration (the live
+    // DDL fan is S10's), then seed documents and a forced checkpoint.
+    if lift_ns.is_some() && scenario.prelude.is_some() {
+        drop(setup);
+        node = match lift_regime_seed_life(node, &first_life, &disk, &clock, &observer) {
+            Ok(node) => node,
+            Err(what) => {
+                fail(&mut report, what);
+                return finish(report, &observer, &clock);
+            }
+        };
+        if let Err(what) =
+            lift_regime_seed_checkpoint(&mut node, &mut rng, &clock, &disk, scenario, &mut report)
+        {
+            fail(&mut report, what);
+            return finish(report, &observer, &clock);
+        }
     }
 
     if scenario.recycle_open_fault {
@@ -1547,6 +1590,30 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         let prelude_cut_time = clock.now();
         drop(node);
         disk.power_cut(scenario.seed ^ 0x0FF5_EED2);
+        // The residue plant (batch 21): the lift shape on every cell,
+        // between the cut and the boot that must lift past it.
+        let mut planted = Vec::new();
+        if let Some(ns) = lift_ns {
+            match crate::lift::plant_lifted_tail(
+                &disk,
+                Path::new("node"),
+                scenario.cells,
+                u64::from(scenario.segment_bytes),
+                ns,
+            ) {
+                Ok((cells, skipped)) => {
+                    for what in skipped {
+                        eprintln!("lift plant skipped: {what}");
+                    }
+                    report.lift_plants += cells.len() as u64;
+                    planted = cells;
+                }
+                Err(what) => {
+                    fail(&mut report, format!("lift plant: {what}"));
+                    return finish(report, &observer, &clock);
+                }
+            }
+        }
         node = match boot(scenario, PathBuf::from("node"), &disk, &clock, &observer) {
             Ok(node) => node,
             Err(err) => {
@@ -1577,6 +1644,12 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             if let Some(stats) = node.plane(cell).durable_stats() {
                 report.reopened_packed_tails += stats.reopened_packed_tails;
             }
+        }
+        // The plant's oracle: every planted cell lifted, its sidecar
+        // loaded, the tree equals the truth (the planted document
+        // included), the lifted records serve, the residue never does.
+        if !planted.is_empty() {
+            lift_plant_oracle(&mut node, &planted, &mut rng, &clock, &disk, scenario, &mut report);
         }
         // Every writer's in-flight op is now unacked forever (the cut ate
         // the reply path): the ledger already holds it with `acked_at:
@@ -2011,7 +2084,19 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                 _ => {}
             }
         }
-        lift_regime_index_oracle(&mut node, &mut rng, &clock, &disk, scenario, &mut report);
+        for cell in 0..usize::from(scenario.cells) {
+            report.lift_sidecars_loaded +=
+                u64::from(node.plane(cell).keyspace().idx_sidecar_info().loaded);
+        }
+        lift_regime_index_oracle(
+            &mut node,
+            &mut rng,
+            &clock,
+            &disk,
+            scenario,
+            "after the final boot",
+            &mut report,
+        );
     }
 
     // ---- the "at end" equivalence check (M3-S23) -----------------------
@@ -2190,7 +2275,7 @@ fn lift_regime_ddl(
     disk: &SimDisk,
     scenario: &DurableScenario,
     report: &mut DurableReport,
-) -> Result<(), String> {
+) -> Result<LiftNs, String> {
     let tier: &[&[u8]] = &[
         b"INF.NS",
         b"CREATE",
@@ -2218,13 +2303,12 @@ fn lift_regime_ddl(
             other => return Err(format!("lift-regime DDL {:?} answered {other:?}", create[2])),
         }
     }
-    let ns = node
-        .plane(0)
-        .keyspace()
-        .ns_iter()
-        .find(|s| s.name == NsClass::Indexed.name())
-        .map(|s| s.id)
+    let ns_named =
+        |name: &[u8]| node.plane(0).keyspace().ns_iter().find(|s| s.name == name).map(|s| s.id);
+    let ns = ns_named(NsClass::Indexed.name())
         .ok_or_else(|| "lift-regime: idx namespace missing after DDL".to_owned())?;
+    let tier_ns = ns_named(NsClass::Tiered.name())
+        .ok_or_else(|| "lift-regime: tier namespace missing after DDL".to_owned())?;
     let (id, path, key_type) = LIFT_INDEX;
     let program = compile(path.as_bytes()).expect("valid index path").as_bytes().to_vec();
     let mut catalog = node.plane(0).keyspace().export_catalog(node.control.next_ns_id(), 2, 2);
@@ -2246,22 +2330,244 @@ fn lift_regime_ddl(
             .map_err(|e| format!("lift-regime persist: {e}"))?;
         report.scheduler_steps += 1;
     }
-    Ok(())
+    Ok(LiftNs { tier: tier_ns, idx: ns })
 }
 
-/// The lift regime's index oracle after the final boot: once every
+/// The plant's first precondition (batch 21): a clean restart in the
+/// prelude's class so the persisted index declaration boot-seeds into
+/// every cell's registry (no cut — the page cache is the OS's; a process
+/// restart, not a crash). The log quiesces first so nothing staged rides
+/// the drop.
+fn lift_regime_seed_life(
+    node: Node,
+    first_life: &DurableScenario,
+    disk: &SimDisk,
+    clock: &Rc<VirtualClock>,
+    observer: &TraceObserver,
+) -> Result<Node, String> {
+    let mut node = node;
+    let mut rng = SplitMix64::new(first_life.seed ^ 0x5EED_11F7);
+    let mut quiet_steps = 0u64;
+    for _ in 0..STALL_STEPS {
+        node.step(&mut rng, clock, disk, first_life.step_ns_max)
+            .map_err(|e| format!("lift seed life: quiesce: {e}"))?;
+        let quiet = (0..usize::from(first_life.cells)).all(|cell| {
+            node.plane(cell)
+                .durable_stats()
+                .is_none_or(|s| s.frames_in_flight_now == 0 && s.records_staged == 0)
+        });
+        quiet_steps = if quiet { quiet_steps + 1 } else { 0 };
+        if quiet_steps >= 64 {
+            break;
+        }
+    }
+    if quiet_steps < 64 {
+        return Err("lift seed life: the log never quiesced before the restart".to_owned());
+    }
+    drop(node);
+    let mut node = boot(first_life, PathBuf::from("node"), disk, clock, observer)
+        .map_err(|e| format!("lift seed boot refused: {e}"))?;
+    for _ in 0..STALL_STEPS {
+        if node.ready() {
+            return Ok(node);
+        }
+        node.step(&mut rng, clock, disk, first_life.step_ns_max)
+            .map_err(|e| format!("lift seed boot failed: {e}"))?;
+    }
+    Err("lift seed boot: recovery stalled".to_owned())
+}
+
+/// The plant's second precondition: the boot-seeded index converges,
+/// every cell owns a few indexed seed documents, and a checkpoint
+/// requested on every cell publishes — so the transition boot loads a
+/// sidecar with entries, the state the commit-ordering defect needs.
+#[allow(clippy::too_many_arguments)] // the scheduler tuple the MiniClient calls need
+fn lift_regime_seed_checkpoint(
+    node: &mut Node,
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &SimDisk,
+    scenario: &DurableScenario,
+    report: &mut DurableReport,
+) -> Result<(), String> {
+    let (id, _, _) = LIFT_INDEX;
+    let id = IndexId(id);
+    let mut ready = false;
+    for _ in 0..STALL_STEPS {
+        ready = (0..usize::from(scenario.cells)).all(|cell| {
+            node.plane(cell).keyspace().idx_registry().cell_state(id) == Some(IndexState::Ready)
+        });
+        if ready {
+            break;
+        }
+        node.step(rng, clock, disk, scenario.step_ns_max)
+            .map_err(|e| format!("lift seed: index convergence: {e}"))?;
+        report.scheduler_steps += 1;
+    }
+    if !ready {
+        return Err("lift seed: the boot-seeded index never converged".to_owned());
+    }
+    for cell in 0..usize::from(scenario.cells) {
+        let mut client = MiniClient::connect(node, cell);
+        let reply = client.call(
+            node,
+            rng,
+            clock,
+            disk,
+            scenario.step_ns_max,
+            &[b"INF.NS", b"USE", NsClass::Indexed.name()],
+        );
+        if !matches!(reply, Ok(Some(ref ok)) if ok == b"+OK\r\n") {
+            return Err(format!("lift seed: USE idx on cell {cell} answered {reply:?}"));
+        }
+        for n in 0..3usize {
+            let key = crate::lift::local_key(&format!("lift:seed{n}"), cell, scenario.cells);
+            let text = crate::lift::planted_doc_text(i64::try_from(cell * 8 + n).expect("small"));
+            let reply = client.call(
+                node,
+                rng,
+                clock,
+                disk,
+                scenario.step_ns_max,
+                &[b"JSON.SET", &key, b"$", &text],
+            );
+            if !matches!(reply, Ok(Some(ref ok)) if ok == b"+OK\r\n") {
+                return Err(format!("lift seed: JSON.SET on cell {cell} answered {reply:?}"));
+            }
+        }
+    }
+    let epoch = node.control.request_ckpt_all();
+    for _ in 0..STALL_STEPS {
+        if node.control.ckpt_board().min_published() >= epoch {
+            return Ok(());
+        }
+        node.step(rng, clock, disk, scenario.step_ns_max)
+            .map_err(|e| format!("lift seed: checkpoint: {e}"))?;
+        report.scheduler_steps += 1;
+    }
+    Err(format!("lift seed: checkpoint epoch {epoch} never published on every cell"))
+}
+
+/// The plant's oracle after the transition boot (batch 21): every
+/// planted cell lifted exactly the planted residue (the board's
+/// `stale_residue_slacks`), loaded its sidecar, its tree equals the
+/// scan-derived truth with the planted document in it, the lifted tiered
+/// record and document serve, and the discarded life's residue never
+/// does. A cell that did not lift or load is a vacuous plant — red.
+#[allow(clippy::too_many_arguments)] // the scheduler tuple the MiniClient calls need
+fn lift_plant_oracle(
+    node: &mut Node,
+    planted: &[crate::lift::PlantedCell],
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &SimDisk,
+    scenario: &DurableScenario,
+    report: &mut DurableReport,
+) {
+    let seed = scenario.seed;
+    for plant in planted {
+        let cell = u16::try_from(plant.cell).expect("cell fits u16");
+        let lifted = node.control.recovery_board().slot(cell).residue().stale_residue_slacks;
+        let loaded = u64::from(node.plane(plant.cell).keyspace().idx_sidecar_info().loaded);
+        report.lift_plant_lifts += lifted;
+        report.lift_plant_sidecars += loaded;
+        if lifted == 0 {
+            report.violations.push(format!(
+                "LIFT PLANT VACUOUS seed {seed:#x} cell {}: the transition boot lifted no residue \
+                 (planted segment {} beyond segment {})",
+                plant.cell, plant.lifted_segment.0, plant.residue_segment.0
+            ));
+        }
+        if loaded == 0 {
+            report.violations.push(format!(
+                "LIFT PLANT VACUOUS seed {seed:#x} cell {}: no index sidecar loaded at the \
+                 transition boot (the forced checkpoint carried none)",
+                plant.cell
+            ));
+        }
+    }
+    lift_regime_index_oracle(node, rng, clock, disk, scenario, "after the transition boot", report);
+    let (_, path, key_type) = LIFT_INDEX;
+    let program = compile(path.as_bytes()).expect("valid index path");
+    let now = clock.now();
+    for plant in planted {
+        let ks = node.plane(plant.cell).keyspace();
+        let Some(ns) = ks.ns_iter().find(|s| s.name == NsClass::Indexed.name()).map(|s| s.id)
+        else {
+            continue;
+        };
+        let truth = crate::backfill::cell_truth(&ks, ns, &program, key_type, now);
+        let hash = ks.hasher().hash(&plant.doc_key);
+        if !truth.iter().any(|(_, h)| *h == hash) {
+            report.violations.push(format!(
+                "LIFT PLANT VIOLATION seed {seed:#x} cell {}: the lifted document {:?} is not in \
+                 the recovered store",
+                plant.cell,
+                String::from_utf8_lossy(&plant.doc_key)
+            ));
+        }
+        drop(ks);
+        let mut client = MiniClient::connect(node, plant.cell);
+        let expect: [(&[u8], &[u8], Vec<u8>); 3] = [
+            (NsClass::Tiered.name(), &plant.tier_key, bulk(crate::lift::LIFTED_VALUE)),
+            (NsClass::Tiered.name(), &plant.ghost_key, b"$-1\r\n".to_vec()),
+            (
+                NsClass::Indexed.name(),
+                &plant.doc_key,
+                bulk(&crate::lift::planted_doc_text(plant.tag)),
+            ),
+        ];
+        for (ns_name, key, want) in expect {
+            let reply = client.call(
+                node,
+                rng,
+                clock,
+                disk,
+                scenario.step_ns_max,
+                &[b"INF.NS", b"USE", ns_name],
+            );
+            if !matches!(reply, Ok(Some(ref ok)) if ok == b"+OK\r\n") {
+                report.violations.push(format!(
+                    "lift plant: USE {} answered {reply:?}",
+                    String::from_utf8_lossy(ns_name)
+                ));
+                return;
+            }
+            let read: &[u8] = if ns_name == NsClass::Indexed.name() { b"JSON.GET" } else { b"GET" };
+            let reply = client.call(node, rng, clock, disk, scenario.step_ns_max, &[read, key]);
+            if !matches!(reply, Ok(Some(ref got)) if *got == want) {
+                report.violations.push(format!(
+                    "LIFT PLANT VIOLATION seed {seed:#x} cell {}: {} {:?} answered {:?}, want {:?}",
+                    plant.cell,
+                    String::from_utf8_lossy(read),
+                    String::from_utf8_lossy(key),
+                    reply
+                        .as_ref()
+                        .ok()
+                        .and_then(|r| r.as_ref())
+                        .map(|r| String::from_utf8_lossy(r).into_owned()),
+                    String::from_utf8_lossy(&want)
+                ));
+            }
+        }
+    }
+}
+
+/// The lift regime's index oracle after a lifting boot: once every
 /// cell's machine reads Ready again (a loaded sidecar caught up on the
 /// tail, or the S05 rebuild ran), each cell's tree equals the
 /// scan-derived truth over its recovered documents and no index is
 /// degraded — the lifted documents' entries included. Pre-batch-19 the
 /// sidecar committed before the lifted segments replayed, so a loaded
 /// tree missed exactly those documents.
+#[allow(clippy::too_many_arguments)] // the scheduler tuple the MiniClient calls need
 fn lift_regime_index_oracle(
     node: &mut Node,
     rng: &mut SplitMix64,
     clock: &Rc<VirtualClock>,
     disk: &SimDisk,
     scenario: &DurableScenario,
+    context: &str,
     report: &mut DurableReport,
 ) {
     let Some(ns) = node
@@ -2279,10 +2585,6 @@ fn lift_regime_index_oracle(
     };
     let (id, path, key_type) = LIFT_INDEX;
     let id = IndexId(id);
-    for cell in 0..usize::from(scenario.cells) {
-        report.lift_sidecars_loaded +=
-            u64::from(node.plane(cell).keyspace().idx_sidecar_info().loaded);
-    }
     let mut ready = false;
     for _ in 0..STALL_STEPS {
         ready = (0..usize::from(scenario.cells)).all(|cell| {
@@ -2298,7 +2600,7 @@ fn lift_regime_index_oracle(
     }
     if !ready {
         report.violations.push(format!(
-            "LIFT REGIME VIOLATION seed {:#x}: the index never re-converged after the final boot",
+            "LIFT REGIME VIOLATION seed {:#x}: the index never re-converged {context}",
             scenario.seed
         ));
         return;
@@ -2310,21 +2612,21 @@ fn lift_regime_index_oracle(
         let truth = crate::backfill::cell_truth(&ks, ns, &program, key_type, now);
         let tree = crate::backfill::cell_tree(&ks, ns, id);
         if tree != truth {
+            let cell16 = u16::try_from(cell).expect("cell fits u16");
             report.violations.push(format!(
                 "LIFT REGIME INDEX VIOLATION seed {:#x} cell {cell}: index tree ≠ scan-derived \
-                 truth after the final boot ({} tree entries vs {} derived; sidecars loaded \
-                 {}, stale slacks lifted {})",
+                 truth {context} ({} tree entries vs {} derived; sidecars loaded {}, stale \
+                 slacks lifted {})",
                 scenario.seed,
                 tree.len(),
                 truth.len(),
-                report.lift_sidecars_loaded,
-                report.stale_residue_slacks
+                ks.idx_sidecar_info().loaded,
+                node.control.recovery_board().slot(cell16).residue().stale_residue_slacks
             ));
         }
         if ks.idx_degraded(ns, id) == Some(true) {
             report.violations.push(format!(
-                "LIFT REGIME INDEX VIOLATION seed {:#x} cell {cell}: index degraded after the \
-                 final boot",
+                "LIFT REGIME INDEX VIOLATION seed {:#x} cell {cell}: index degraded {context}",
                 scenario.seed
             ));
         }

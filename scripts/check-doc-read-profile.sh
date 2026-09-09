@@ -4,8 +4,21 @@
 # fails if any JSON-text-parser or path-compiler symbol appears — text
 # parsing sneaking onto the read path is the §7 read gate's named risk.
 #
+# Review 2026-08-30, F-L20-08 (ADR-0106 fourth amendment, D13): the
+# verdict is a measurement only when the profile proves the load reached
+# the serving cores. An empty report, a report with too few symbol rows or
+# samples, or one without the expected tape-traversal / JSON.GET symbols
+# is FAIL — never "zero parser symbols in 0 rows". The banned-symbol scan
+# reads a flat report at `--percent-limit 0`, so a parser at 0.01% is
+# seen, not filtered out by perf before the grep. This is a manual
+# reference-box step (perf, memtier_benchmark, pinned cores); no workflow
+# runs it — the claim ledger (C25) says so.
+#
 # Usage: check-doc-read-profile.sh [out-dir]
 # Env:   SERVER_CPUS (default 0-7), LOAD_CPUS (default 12-23)
+#        MIN_ROWS (default 200), MIN_SAMPLES (default 10000)
+#        INF_PROFILE_REPORT=<flat perf report>: verdict only, no profiling
+#        (the self-test hook — `check-scripts-selftest.sh` plants reports)
 set -euo pipefail
 OUT="${1:-.artifacts/m3/read-profile-$(date +%Y%m%d-%H%M)}"
 PORT="${PORT:-6400}"
@@ -13,9 +26,62 @@ SERVER_CPUS="${SERVER_CPUS:-0-7}"
 LOAD_CPUS="${LOAD_CPUS:-12-23}"
 KEYMAX=100000
 SEED=0x1D0C2026
-WORK="${WORK:-$(mktemp -d)}"
-mkdir -p "$OUT"
+MIN_ROWS="${MIN_ROWS:-200}"
+MIN_SAMPLES="${MIN_SAMPLES:-10000}"
 
+# The banned symbol classes: the JSON text parser, its stage-1 scan, and
+# the JSONPath compiler.
+BANNED='JsonParser|parse_into|parse_indexed|json_scan_structurals|path::compile|PathCompiler'
+# The positive control: a live JSON.GET load must put the tape traversal
+# and the JSON.GET handler on the serving cores. Every pattern must match.
+EXPECTED='inf_doc::tape::ObjIter
+inf_doc::tape::read_value
+json_get'
+
+# verdict <flat report> <out dir>: PASS/FAIL to stdout and verdict.txt.
+verdict() {
+    local report=$1 out=$2
+    if [ ! -s "$report" ]; then
+        echo "FAIL: empty profile report ($report) — nothing was measured" | tee "$out/verdict.txt"
+        return 1
+    fi
+    local samples rows
+    # "# Samples: 68K of event 'cycles'" → 68000 (perf abbreviates K/M/G).
+    samples=$(sed -n "s/^# Samples: *\([0-9][0-9]*\)\([KMG]\{0,1\}\) .*/\1 \2/p" "$report" | head -1 |
+        awk '{ m = 1; if ($2 == "K") m = 1000; if ($2 == "M") m = 1000000; if ($2 == "G") m = 1000000000; print $1 * m }')
+    samples=${samples:-0}
+    rows=$(grep -cE '^[[:space:]]+[0-9]+\.[0-9]+%' "$report" || true)
+    if [ "$samples" -lt "$MIN_SAMPLES" ]; then
+        echo "FAIL: $samples samples in the profile (need ≥ $MIN_SAMPLES) — the load did not reach the serving cores" | tee "$out/verdict.txt"
+        return 1
+    fi
+    if [ "$rows" -lt "$MIN_ROWS" ]; then
+        echo "FAIL: $rows symbol rows in the profile (need ≥ $MIN_ROWS) — the load did not reach the serving cores" | tee "$out/verdict.txt"
+        return 1
+    fi
+    local missing="" pattern
+    while IFS= read -r pattern; do
+        [ -n "$pattern" ] || continue
+        grep -qE -- "$pattern" "$report" || missing="$missing $pattern"
+    done <<<"$EXPECTED"
+    if [ -n "$missing" ]; then
+        echo "FAIL: positive control missing —$missing not on the profiled cores (wrong CPUs, or the load never ran JSON.GET)" | tee "$out/verdict.txt"
+        return 1
+    fi
+    if grep -E "$BANNED" "$report" >"$out/banned-hits.txt"; then
+        echo "FAIL: parser/compiler symbols on the read path:" | tee "$out/verdict.txt"
+        cat "$out/banned-hits.txt"
+        return 1
+    fi
+    echo "PASS: zero parser/compiler symbols in $rows symbol rows, $samples samples, every symbol at percent-limit 0; positive control present ($(echo "$EXPECTED" | tr '\n' ' ' | sed 's/ $//')) ($report)" | tee "$out/verdict.txt"
+}
+
+mkdir -p "$OUT"
+if [ -n "${INF_PROFILE_REPORT:-}" ]; then
+    if verdict "$INF_PROFILE_REPORT" "$OUT"; then exit 0; else exit 1; fi
+fi
+
+WORK="${WORK:-$(mktemp -d)}"
 cargo build --release -p infinityd -p inf-bench >/dev/null
 ./target/release/inf-bench doc-corpus --seed $SEED --out "$WORK/corpus" >/dev/null
 
@@ -45,12 +111,17 @@ sleep 1
 perf record -C "$SERVER_CPUS" -F 1997 -g --call-graph dwarf,16384 \
     -o "$OUT/jget-read.perf" -- sleep 8 >>"$OUT/perf.log" 2>&1
 wait $LOADPID
+# Two extractions: the call-graph view a reader cites (perf's default
+# 0.05% floor keeps it readable), and the flat per-symbol report at
+# percent-limit 0 that the verdict reads — every symbol with a sample.
 perf report -i "$OUT/jget-read.perf" --stdio --percent-limit 0.05 \
     >"$OUT/jget-read-report.txt" 2>/dev/null
+perf report -i "$OUT/jget-read.perf" --stdio --no-children -g none --percent-limit 0 \
+    >"$OUT/jget-read-flat.txt" 2>/dev/null
 # The raw sample file is machine-local intermediate data, not evidence:
 # this one runs ~1 GB, which is 10x GitHub's hard file limit and blocked a
-# push on 2026-08-16. The extracted report below is what the gate reads and
-# what a reviewer cites, so drop the raw file once it has been extracted.
+# push on 2026-08-16. The extracted reports above are what the gate reads
+# and what a reviewer cites, so drop the raw file once extracted.
 # `KEEP_PERF_DATA=1` retains it for local debugging (it is gitignored
 # either way).
 PERF_BYTES=$(stat -c %s "$OUT/jget-read.perf" 2>/dev/null || echo 0)
@@ -63,13 +134,4 @@ fi
 
 kill $SRV 2>/dev/null || true; wait $SRV 2>/dev/null || true
 
-# The banned symbol classes: the JSON text parser, its stage-1 scan, and
-# the JSONPath compiler. Tape traversal (ObjIter, read_value) is expected.
-BANNED='JsonParser|parse_into|parse_indexed|json_scan_structurals|path::compile|PathCompiler'
-if grep -E "$BANNED" "$OUT/jget-read-report.txt" > "$OUT/banned-hits.txt"; then
-    echo "FAIL: parser/compiler symbols on the read path:" | tee "$OUT/verdict.txt"
-    cat "$OUT/banned-hits.txt"
-    exit 1
-fi
-ROWS=$(grep -cE "^\s+[0-9]" "$OUT/jget-read-report.txt" || true)
-echo "PASS: zero parser/compiler symbols in $ROWS report rows ($OUT/jget-read-report.txt)" | tee "$OUT/verdict.txt"
+if verdict "$OUT/jget-read-flat.txt" "$OUT"; then exit 0; else exit 1; fi

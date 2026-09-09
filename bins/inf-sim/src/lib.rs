@@ -20,6 +20,7 @@ pub mod diskfull;
 mod document;
 pub mod durable;
 pub mod harness;
+mod lift;
 pub mod net;
 pub mod nscreate;
 pub mod nsddl;
