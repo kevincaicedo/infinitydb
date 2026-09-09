@@ -1422,13 +1422,14 @@ impl TieredTable {
             if e.is_storage_full() {
                 self.disk_admit.device_full = true;
             }
-            // A partial round may exist (a mid-pull creation failed).
-            // Every staged write is already barrier-covered by its seal
-            // — this defensive sync covers the impossible dangling case
-            // so the invariant is structural, not argued.
-            if flush.round_active() {
-                flush.sync_queued();
-            }
+            // A failed stage leaves either no round or a round holding
+            // only what it staged before the failure — a sealed file's
+            // ops, each on a handle the pipeline owns (the writer's, a
+            // pending seal's, a directory hold's): creation touches the
+            // round only after every step that can fail (F-L01-02). The
+            // plane submits such a round as any other; the seal's own
+            // barrier covers it.
+            debug_assert!(flush.round_handles_owned(), "a staged op outlived its handle");
         }
         res
     }

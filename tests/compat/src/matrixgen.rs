@@ -295,19 +295,19 @@ pub static DECLARED: &[Declared] = &[
         "INF.TAKE",
         Status::Internal,
         "M1",
-        "legacy read/delete+TTL; IF value deadline conditionally deletes the matching string snapshot (ADR-0110)",
+        "fabric-program primitive (ADR-0115): unknown to every client, hidden from COMMAND, executed only on a program-marked Apply; read/delete+TTL, IF value deadline conditionally deletes the matching string snapshot (ADR-0110)",
     ),
     d(
         "INF.PEEK",
         Status::Internal,
         "M1",
-        "legacy read+TTL; ABS reads a string snapshot with absolute Unix expiry; ABS NOSTATS omits client hit/miss accounting (ADR-0110)",
+        "fabric-program primitive (ADR-0115): unknown to every client; read+TTL, ABS reads a string snapshot with absolute Unix expiry, ABS NOSTATS omits client hit/miss accounting (ADR-0110)",
     ),
     d(
         "INF.PUT",
         Status::Internal,
         "M1",
-        "the RENAME/RENAMENX destination leg: `key value deadline [NX]`, absolute Unix-ms deadline or -1, SET's replies; admitted as RENAME is — no DENYOOM — while the arena's own refusal still answers OOM (ADR-0110 third amendment)",
+        "fabric-program primitive (ADR-0115): unknown to every client — a client-typed INF.PUT is byte-identical to Redis (unknown command), also under maxmemory; the RENAME/RENAMENX destination leg: `key value deadline [NX]`, absolute Unix-ms deadline or -1, SET's replies; admitted as RENAME is — no DENYOOM — while the arena's own refusal still answers OOM (ADR-0110 third amendment)",
     ),
     // ---- M3-S11/S12 · `JSON.*` (ADR-0041). S21 supplies the pinned
     // RedisJSON RESP2/RESP3 byte corpus and explicit deviation allowlist;
@@ -637,7 +637,7 @@ pub fn render() -> String {
     push("are representational: ordering, identity payloads, opaque cursors/art);");
     push("`partial` = a documented semantic difference exists; `stub` = accepted but");
     push("inert; `extension` = `INF.*` surface unknown to Redis; `internal` = fabric");
-    push("program primitives, not a client surface.");
+    push("program primitives — unknown to clients and hidden from COMMAND (ADR-0115).");
     push("");
     push("## Commands");
     push("");

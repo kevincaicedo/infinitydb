@@ -22,6 +22,7 @@
 //! | `tier_torn_frame` | `TierWriter::write_tail_frame` | prefix lands, call *succeeds* — final-write-before-crash physics; recovery truncates or CRC-refuses per ADR-0056 D5 |
 //! | `tier_fsync_err` | `TierWriter::sync` / `TierWriter::seal` | typed [`TierWriteFailure::Fsync`](crate::TierWriteFailure) — fatal-by-default, the flushed watermark freezes (§8.4 applies to tier files) |
 //! | `tier_footer_torn` | `TierWriter::seal` | crash between data durability and footer durability: the file recovers as *unsealed* at the manifested watermark, the seal is redone by rule |
+//! | `tier_dir_open_fail` | `TierFlush::create_file_queued` (the reactor drive's directory holds) | typed I/O error (`EMFILE` physics) before the new file's header write is staged: the round keeps only ops whose handles the pipeline owns, the creation retries next slice (review 2026-08-30, F-L01-02) |
 //! | `tier_unlink_fail` | `flush::unlink_tier_file` | typed I/O error, **non-fatal and counted** (M4-S15, ADR-0059 D3): the durable truth already excludes the file — space is deferred, never durability; the retry and the boot GC both re-drive it |
 //! | `blob_short_write` | `blob::device_write` | extent write cut short, typed I/O error — the append fails whole and the extent is abandoned (M4-S17, ADR-0061 D9) |
 //! | `blob_fsync_err` | `ExtentWriter::finish` | typed [`ExtentWriteFailure::Fsync`](crate::ExtentWriteFailure) — a **typed abort**, the ADR-0061 D3 narrower behavior: nothing durable references the extent, the file is abandoned (never retried), the id is quarantined |
@@ -48,6 +49,7 @@ pub const TIER_TORN_FRAME: &str = "tier_torn_frame";
 pub const TIER_FSYNC_ERR: &str = "tier_fsync_err";
 pub const TIER_FOOTER_TORN: &str = "tier_footer_torn";
 pub const TIER_UNLINK_FAIL: &str = "tier_unlink_fail";
+pub const TIER_DIR_OPEN_FAIL: &str = "tier_dir_open_fail";
 pub const BLOB_SHORT_WRITE: &str = "blob_short_write";
 pub const BLOB_FSYNC_ERR: &str = "blob_fsync_err";
 pub const BLOB_UNLINK_FAIL: &str = "blob_unlink_fail";
@@ -69,6 +71,7 @@ pub const ALL: &[&str] = &[
     TIER_FSYNC_ERR,
     TIER_FOOTER_TORN,
     TIER_UNLINK_FAIL,
+    TIER_DIR_OPEN_FAIL,
     BLOB_SHORT_WRITE,
     BLOB_FSYNC_ERR,
     BLOB_UNLINK_FAIL,

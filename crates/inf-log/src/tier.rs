@@ -617,6 +617,13 @@ impl<F: SegmentFs> TierWriter<F> {
     /// I/O on this path).
     ///
     /// # Panics
+    /// Returns the writer and its header block; the caller stages the
+    /// block on its round **after** every step that can fail — nothing
+    /// here touches a round, so a refused creation leaves no staged op
+    /// behind (review 2026-08-30, F-L01-02). The caller owns the cold
+    /// directory's existence.
+    ///
+    /// # Panics
     /// Panics on an fd-less file — the reactor drive is fd-backed by
     /// construction (D1).
     #[allow(clippy::too_many_arguments)] // creation names the full identity once
@@ -629,18 +636,14 @@ impl<F: SegmentFs> TierWriter<F> {
         base: LogicalAddr,
         mode: TierIoMode,
         capacity_hint: u64,
-        round: &mut TierRound,
         pool: &mut WindowPool,
-    ) -> io::Result<TierWriter<F>> {
-        let cold_dir = shard_dir.join("cold");
-        fs.create_dir_all(&cold_dir)?;
-        let path = cold_dir.join(tier_file_name(id));
+    ) -> io::Result<(TierWriter<F>, FrameStaging)> {
+        let path = shard_dir.join("cold").join(tier_file_name(id));
         let file = fs.create_tier(&path, mode)?;
-        let fd = file.raw_fd().expect("reactor drive requires fd-backed tier files (ADR-0084)");
+        assert!(file.raw_fd().is_some(), "reactor drive requires fd-backed tier files (ADR-0084)");
         let mut window = pool.take(1);
         encode_tier_header(window.frame_mut(), cell, ns, base, capacity_hint);
-        round.push_write(fd, 0, window, 1);
-        Ok(TierWriter {
+        let writer = TierWriter {
             file,
             path,
             base,
@@ -656,7 +659,8 @@ impl<F: SegmentFs> TierWriter<F> {
             // The header block is staged in this round (counted now —
             // its write either lands or the round retries it whole).
             device_bytes: TIER_HEADER_BYTES as u64,
-        })
+        };
+        Ok((writer, window))
     }
 
     /// Recovers an **unsealed** tier file to the manifested durable
@@ -1006,7 +1010,7 @@ impl<F: SegmentFs> TierWriter<F> {
 
     /// The backend fd, asserted present (D1: the reactor drive is
     /// fd-backed by construction; `MemFs` pipelines stay on the seam).
-    fn queued_fd(&self) -> std::os::fd::RawFd {
+    pub(crate) fn queued_fd(&self) -> std::os::fd::RawFd {
         self.file.raw_fd().expect("reactor drive requires fd-backed tier files (ADR-0084)")
     }
 

@@ -264,7 +264,9 @@ fn the_fallbacks_zero_fill_is_paced_from_its_origin_and_completes_before_rotatio
     let origin = lab.rotor.active_written();
     let (report, barrier) = lab.rotor.maintain_deferred(0).expect("maintain");
     assert_eq!(report.preallocated, Some(SegmentId(3)));
-    let fd = barrier.expect("barrier").dir.raw_fd().expect("fd");
+    // The handle stays open across the driver op, as the ledger holds it.
+    let barrier = barrier.expect("barrier");
+    let fd = barrier.dir.raw_fd().expect("fd");
     lab.disk.driver_fdatasync(fd).expect("dir barrier");
     let bound = |since_origin: u32| {
         let allowed = 2 * since_origin + ZERO_FILL_HEAD_START;

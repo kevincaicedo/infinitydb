@@ -22,7 +22,7 @@ Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
 are representational: ordering, identity payloads, opaque cursors/art);
 `partial` = a documented semantic difference exists; `stub` = accepted but
 inert; `extension` = `INF.*` surface unknown to Redis; `internal` = fabric
-program primitives, not a client surface.
+program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 
 ## Commands
 
@@ -94,9 +94,9 @@ program primitives, not a client surface.
 | `INF.CKPT` | extension | M2 | admin | -1 | 0 | checkpoint operator surface (M2-S20): [CELL k] [WAIT]; WAIT returns after the new MANIFEST is durable — no fork, per-cell timing (ADR-0021) |
 | `BGSAVE` | partial | M2 | admin | -1 | 0 | maps onto INF.CKPT (fuzzy checkpoint, no fork, no RDB file); SCHEDULE accepted and moot; reply byte-identical; memory-only nodes answer a documented error |
 | `LASTSAVE` | partial | M2 | readonly fast | 1 | 0 | unix seconds of the newest durable MANIFEST publication; 0 before the first (Redis reports process-start time); loading flag docs-derived, not capture-verified |
-| `INF.TAKE` | internal | M1 | write fast | -2 | 0 | legacy read/delete+TTL; IF value deadline conditionally deletes the matching string snapshot (ADR-0110) |
-| `INF.PEEK` | internal | M1 | readonly fast | -2 | 0 | legacy read+TTL; ABS reads a string snapshot with absolute Unix expiry; ABS NOSTATS omits client hit/miss accounting (ADR-0110) |
-| `INF.PUT` | internal | M1 | write | -4 | 0 | the RENAME/RENAMENX destination leg: `key value deadline [NX]`, absolute Unix-ms deadline or -1, SET's replies; admitted as RENAME is — no DENYOOM — while the arena's own refusal still answers OOM (ADR-0110 third amendment) |
+| `INF.TAKE` | internal | M1 | write fast | -2 | 0 | fabric-program primitive (ADR-0115): unknown to every client, hidden from COMMAND, executed only on a program-marked Apply; read/delete+TTL, IF value deadline conditionally deletes the matching string snapshot (ADR-0110) |
+| `INF.PEEK` | internal | M1 | readonly fast | -2 | 0 | fabric-program primitive (ADR-0115): unknown to every client; read+TTL, ABS reads a string snapshot with absolute Unix expiry, ABS NOSTATS omits client hit/miss accounting (ADR-0110) |
+| `INF.PUT` | internal | M1 | write | -4 | 0 | fabric-program primitive (ADR-0115): unknown to every client — a client-typed INF.PUT is byte-identical to Redis (unknown command), also under maxmemory; the RENAME/RENAMENX destination leg: `key value deadline [NX]`, absolute Unix-ms deadline or -1, SET's replies; admitted as RENAME is — no DENYOOM — while the arena's own refusal still answers OOM (ADR-0110 third amendment) |
 | `JSON.SET` | partial | M3 | write denyoom | -4 | 32 | S21 corpus exact except parser-specific malformed-input text; root sets preserve TTL (as RedisJSON — S22 probe); durable writes use M3-S17 document records |
 | `JSON.GET` | partial | M3 | readonly | -2 | 36 | S21 corpus exact except documented large-exponent f64 text and module-specific WRONGTYPE wording; INDENT/NEWLINE/SPACE covered; path match sets capped by doc-max-path-matches |
 | `JSON.MGET` | partial | M3 | readonly | -3 | 2 | S21 corpus exact; per-key atomicity only — no cross-cell snapshot (each cell serves its key at its own serve time) |

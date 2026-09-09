@@ -455,6 +455,66 @@ fn reactor_seal_barrier_lost_reseals_at_the_manifested_watermark() {
     }
 }
 
+/// `tier_dir_open_fail` (`creation-retried-round-owned`, review of
+/// 2026-08-30 F-L01-02): file A seals at capacity, file B's creation is
+/// refused at its directory hold. The round must carry only A's seal —
+/// every op on a handle the pipeline owns (pre-fix it carried B's header
+/// write on the dropped writer's closed fd: the sim disk answers
+/// `EBADF`, the plane would retry it forever) — execute whole, and a
+/// power cut right after it recovers A sealed at its full length; the
+/// retry then creates B.
+#[test]
+fn tier_dir_open_fail_stages_nothing_and_the_sealed_file_recovers() {
+    for seed in 0..seed_count(3) {
+        let disk = SimDisk::new();
+        let mut flush = TierFlush::new(
+            disk.clone(),
+            TierFlushConfig {
+                shard_dir: Path::new("shard-0").to_path_buf(),
+                cell: 0,
+                ns: NS,
+                mode: TierIoMode::Buffered,
+                file_capacity: 1000,
+                slice_bytes: PAGE,
+            },
+            0,
+        );
+        flush.set_drive(TierDrive::Reactor);
+        flush.append_range_queued(LogicalAddr::ZERO, &[0xA0; 600]).expect("stage A");
+        let a1 = LogicalAddr::ZERO.advanced(600).expect("fits");
+        fault::arm("tier_dir_open_fail", FaultSpec::Nth(1));
+        let err = flush.append_range_queued(a1, &[0xA1; 600]).expect_err("B's hold is refused");
+        assert!(err.to_string().contains("tier_dir_open_fail"), "typed + named: {err}");
+        assert!(fault::fired("tier_dir_open_fail") >= 1, "the row is not vacuous");
+        assert!(
+            flush.round_handles_owned(),
+            "seed {seed}: the round carries an op on a handle nobody owns ({} ops)",
+            flush.round_op_count()
+        );
+        assert!(flush.active().is_none(), "B was never created");
+        assert_eq!(flush.pending_seal_count(), 1, "A's seal is the round");
+        run_reactor_round(&disk, &mut flush, true);
+        apply_effects(&mut flush);
+        assert_eq!(flush.sealed().len(), 1);
+        assert_eq!(flush.sealed()[0].data_len, 600);
+        let sealed_path = flush.sealed()[0].path.clone();
+        disk.power_cut(0xD1F0_0000 ^ seed);
+        let image = sim_image(&disk, &sealed_path);
+        let summary = inspect_tier_bytes(&image).expect("A survives the cut sealed");
+        assert_eq!(summary.sealed.expect("footer").data_len, 600);
+        assert_eq!(summary.first_bad_frame, None);
+        assert!(
+            disk.open_read(&Path::new("shard-0").join("cold").join("tier-000001.itier")).is_err(),
+            "B never existed on the device"
+        );
+        // The retry creates B.
+        flush.append_range_queued(a1, &[0xA1; 600]).expect("the retry creates B");
+        assert!(flush.round_handles_owned());
+        assert_eq!(flush.active().map(|(id, ..)| id), Some(1));
+        fault::disarm_all();
+    }
+}
+
 /// Window 2: the seal **completed** (footer durable, catalog committed)
 /// but no MANIFEST ever named it — the cut lands between the round's
 /// completion and the next checkpoint. Recovery takes the older

@@ -324,6 +324,21 @@ impl<F: SegmentFs> TierFlush<F> {
         self.round.as_ref().map_or(0, TierRound::barrier_count)
     }
 
+    /// True when every op of the staged round names an fd this pipeline
+    /// still holds — the active writer's, a pending seal's, or a round
+    /// directory hold's. A round failing this would hand the driver a
+    /// closed (or reused) fd (review 2026-08-30, F-L01-02).
+    #[must_use]
+    pub fn round_handles_owned(&self) -> bool {
+        let Some(round) = &self.round else { return true };
+        let owned = |fd: std::os::fd::RawFd| {
+            self.writer.as_ref().and_then(TierWriter::raw_fd) == Some(fd)
+                || self.pending_seals.iter().any(|s| s.file.raw_fd() == Some(fd))
+                || self.round_dir_holds.iter().any(|h| h.raw_fd() == Some(fd))
+        };
+        (0..round.op_count()).all(|i| owned(round.op(i).fd))
+    }
+
     /// The round op at `index` — the plane converts writes to
     /// `IoOp::LogWrite` and barriers to `IoOp::Fdatasync`. The returned
     /// window bytes stay valid (pool-owned, heap-stable) until
@@ -479,10 +494,33 @@ impl<F: SegmentFs> TierFlush<F> {
         });
     }
 
+    /// Creates the next tier file on the reactor drive. Every step that
+    /// can fail — the cold directory, both directory holds, the file —
+    /// precedes the first touch of the round, so a refused creation
+    /// leaves no staged op whose handle nobody owns (review 2026-08-30,
+    /// F-L01-02: a hold refused after the header write was staged sent
+    /// the driver a write on the dropped writer's closed fd).
     fn create_file_queued(&mut self, base: LogicalAddr) -> Result<(), TierFlushError> {
         let id = self.next_id;
-        let round = self.round.get_or_insert_with(TierRound::new);
-        let writer = TierWriter::create_queued(
+        let cold = self.config.shard_dir.join("cold");
+        self.fs
+            .create_dir_all(&cold)
+            .map_err(|source| TierFlushError::Io { path: cold.clone(), source })?;
+        let mut holds = Vec::with_capacity(2);
+        for dir in [self.config.shard_dir.clone(), cold.clone()] {
+            if inf_foundation::fault::fire(crate::fault::TIER_DIR_OPEN_FAIL) {
+                return Err(TierFlushError::Io {
+                    path: dir,
+                    source: crate::fault::injected(crate::fault::TIER_DIR_OPEN_FAIL),
+                });
+            }
+            let handle = self
+                .fs
+                .open_dir(&dir)
+                .map_err(|source| TierFlushError::Io { path: dir, source })?;
+            holds.push(handle);
+        }
+        let (writer, header) = TierWriter::create_queued(
             &self.fs,
             &self.config.shard_dir,
             id,
@@ -491,21 +529,16 @@ impl<F: SegmentFs> TierFlush<F> {
             base,
             self.config.mode,
             self.config.file_capacity,
-            round,
             &mut self.pool,
         )
-        .map_err(|source| TierFlushError::Io {
-            path: self.config.shard_dir.join("cold"),
-            source,
-        })?;
+        .map_err(|source| TierFlushError::Io { path: cold, source })?;
+        // Nothing below can fail: the round is touched only now.
+        let round = self.round.get_or_insert_with(TierRound::new);
+        round.push_write(writer.queued_fd(), 0, header, 1);
         // The segment-create rule, completion-gated (ADR-0084 D2): both
         // dirent barriers join the round; the confirm waits on them, so
         // no manifest can name the file before its name is durable.
-        for dir in [self.config.shard_dir.clone(), self.config.shard_dir.join("cold")] {
-            let handle = self
-                .fs
-                .open_dir(&dir)
-                .map_err(|source| TierFlushError::Io { path: dir, source })?;
+        for handle in holds {
             let fd = handle.raw_fd().expect("reactor drive requires fd-backed dirs (ADR-0084)");
             round.push_barrier(fd);
             self.round_dir_holds.push(handle);
@@ -973,6 +1006,7 @@ mod tests {
     // ---- reactor drive (M4.5-S31, ADR-0084) ----
 
     use crate::fs::sim::SimDisk;
+    use inf_foundation::fault::FaultSpec;
 
     fn sim_pipeline(disk: &SimDisk, capacity: u64) -> TierFlush<SimDisk> {
         let mut flush = TierFlush::new(
@@ -1121,6 +1155,76 @@ mod tests {
             Some(700),
             "the whole sealed file is claimable after commit"
         );
+    }
+
+    /// F-L01-02 (review of 2026-08-30): a creation whose directory hold
+    /// fails after the header write was staged left that write in the
+    /// round while the writer — and its fd — dropped. A failed creation
+    /// stages nothing; the retry creates the file.
+    #[test]
+    fn a_failed_creation_stages_nothing() {
+        let disk = SimDisk::new();
+        let mut flush = sim_pipeline(&disk, 1 << 20);
+        inf_foundation::fault::arm(crate::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
+        let err = flush
+            .append_range_queued(LogicalAddr::ZERO, &[0x22; 64])
+            .expect_err("the directory hold is refused");
+        assert!(matches!(err, TierFlushError::Io { .. }), "{err}");
+        assert!(
+            !flush.round_active(),
+            "a failed creation left a round: {} op(s), active fd {:?}, handles owned {}",
+            flush.round_op_count(),
+            flush.active_raw_fd(),
+            flush.round_handles_owned()
+        );
+        assert!(flush.active().is_none(), "no file is active after a failed creation");
+        flush.append_range_queued(LogicalAddr::ZERO, &[0x22; 64]).expect("the retry creates");
+        flush.sync_queued();
+        assert!(flush.round_handles_owned());
+        assert_eq!(flush.round_write_count(), 2, "header + tail frame");
+        assert_eq!(flush.round_barrier_count(), 3, "file + shard dir + cold dir");
+        let effects = run_round(&disk, &mut flush);
+        assert!(matches!(effects[..], [RoundEffect::DurableTo { data_len: 64 }]));
+        assert_eq!(flush.next_file_id(), 1, "one file was created, once");
+        inf_foundation::fault::disarm_all();
+    }
+
+    /// The mid-pull shape: file A seals at capacity and file B's creation
+    /// fails. The round keeps exactly A's seal — every op on a handle the
+    /// pipeline owns — executes clean, and B is created on the retry.
+    /// Pre-fix the round carried B's header write on a closed fd.
+    #[test]
+    fn a_failed_rotation_keeps_only_the_seal_it_staged() {
+        let disk = SimDisk::new();
+        let mut flush = sim_pipeline(&disk, 1000);
+        flush.append_range_queued(LogicalAddr::ZERO, &[0xA0; 600]).expect("stage");
+        let a1 = LogicalAddr::ZERO.advanced(600).expect("fits");
+        inf_foundation::fault::arm(crate::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
+        flush.append_range_queued(a1, &[0xA1; 600]).expect_err("B's directory hold is refused");
+        assert!(
+            flush.round_handles_owned(),
+            "the round carries an op on a handle nobody owns ({} ops, active fd {:?})",
+            flush.round_op_count(),
+            flush.active_raw_fd()
+        );
+        assert_eq!(flush.pending_seal_count(), 1, "A's capacity seal is pending");
+        assert!(flush.active().is_none(), "B was never created");
+        assert_eq!(flush.next_file_id(), 1, "B's id was not consumed");
+        let effects = run_round(&disk, &mut flush);
+        assert!(matches!(effects[..], [RoundEffect::SealCommit]), "{effects:?}");
+        flush.commit_oldest_seal();
+        assert_eq!(flush.sealed()[0].data_len, 600);
+        assert_eq!(flush.confirmable_end(), Some(600));
+        // The retry: B is created, the second range lands behind A.
+        flush.append_range_queued(a1, &[0xA1; 600]).expect("the retry creates B");
+        flush.sync_queued();
+        assert!(flush.round_handles_owned());
+        let effects = run_round(&disk, &mut flush);
+        assert!(matches!(effects[..], [RoundEffect::DurableTo { data_len: 600 }]), "{effects:?}");
+        flush.confirm_durable_to(600);
+        assert_eq!(flush.next_file_id(), 2);
+        assert_eq!(flush.active().map(|(id, ..)| id), Some(1), "B is the active file");
+        inf_foundation::fault::disarm_all();
     }
 
     /// Fd-less filesystems never take the reactor drive: the queued

@@ -177,6 +177,17 @@ pub enum ExecOrigin {
     Fabric(CellId),
 }
 
+/// Who composed an `Apply`'s argv (ADR-0115): a plane program — the move
+/// legs, the pub/sub and DDL fabric vocabulary — or a client whose command
+/// the plane forwards or scatters. Rides the codec's program mark; the
+/// receiver executes `INTERNAL` rows and the pre-registry vocabulary only
+/// under `Program`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum ApplyOrigin {
+    Client,
+    Program,
+}
+
 /// Observer that observes nothing (the production default).
 #[derive(Default, Debug)]
 pub struct NoopObserver;
@@ -579,6 +590,8 @@ struct NsApply {
     ns: NsId,
     proto: Protocol,
     args: Vec<Vec<u8>>,
+    /// The frame's program mark (ADR-0115), carried to the pump.
+    program: bool,
 }
 
 /// One fabric-origin PUBLISH parked at the owner cell.
@@ -618,6 +631,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         id: u64,
         db: u16,
         ns: Option<NsId>,
+        program: bool,
         out: &mut Vec<u8>,
     ) {
         let before = out.len();
@@ -630,6 +644,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
             sub_patterns: Vec::new(),
             node: Rc::clone(&self.node),
             close_requested: Cell::new(false),
+            program,
         };
         let now = self.now.get();
         #[cfg(feature = "doc")]
@@ -1080,6 +1095,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         argv: &[&[u8]],
         proto: Protocol,
         ns: NsId,
+        program: bool,
         out: &mut Vec<u8>,
     ) -> NsApplyOutcome {
         let before = out.len();
@@ -1126,7 +1142,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
             RespWriter::new(out, proto).error(refusal.message());
             return NsApplyOutcome::Reply;
         }
-        self.execute_owned_into(ExecOrigin::Fabric(from), argv, proto, 0, 0, Some(ns), out);
+        self.execute_owned_into(
+            ExecOrigin::Fabric(from),
+            argv,
+            proto,
+            0,
+            0,
+            Some(ns),
+            program,
+            out,
+        );
         let mut outcome = NsApplyOutcome::Reply;
         if is_write
             && let (Some(meta), Some(class)) = (meta, class)
@@ -1721,6 +1746,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                             .node
                             .recover_recycled_residue_slacks
                             .set(stats.recycled_residue_slacks);
+                        self.shared
+                            .node
+                            .recover_stale_residue_slacks
+                            .set(stats.stale_residue_slacks);
                         self.shared.node.recover_phases.set(stats.phases);
                         self.shared.node.recover_stale_files_removed.set(stats.stale_files_removed);
                         self.shared
@@ -1735,6 +1764,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                                 crate::control::RecoveredResidue {
                                     segment_residue_stops: stats.segment_residue_stops,
                                     recycled_residue_slacks: stats.recycled_residue_slacks,
+                                    stale_residue_slacks: stats.stale_residue_slacks,
                                 },
                                 stats.phases,
                                 stats.records_skipped_unknown_ns,
@@ -2237,6 +2267,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                         proto: Protocol::Resp2,
                         id: 0,
                         db: 0,
+                        program: false,
                         ns,
                         sub_channels: Vec::new(),
                         sub_patterns: Vec::new(),
@@ -3345,8 +3376,8 @@ fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 *orphans += 1;
             }
         }
-        Op::Apply { token, cmd, args, .. } => {
-            handle_apply(shared, from, token, cmd, args.as_slice(), scratch, staged, pubs);
+        Op::Apply { token, cmd, args, program, .. } => {
+            handle_apply(shared, from, token, cmd, program, args.as_slice(), scratch, staged, pubs);
         }
         Op::Read { token, key, .. } => {
             let start = scratch.len();
@@ -3363,12 +3394,20 @@ fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 if hit { StagedReply::Bytes(start, scratch.len()) } else { StagedReply::Nil };
             staged.push((from, token, reply));
         }
-        Op::ApplyNs { token, cmd, ns, args, .. } => {
+        Op::ApplyNs { token, cmd, ns, args, program, .. } => {
             // Named-namespace apply (M2-S08, ADR-0015 D1): the namespace
             // travels as an explicit id; the owner resolves class and
             // semantics authoritatively (never trusting the origin).
             let argv = args.as_slice();
             let proto = if cmd & 0x0F == 3 { Protocol::Resp3 } else { Protocol::Resp2 };
+            // ADR-0115: an internal row on an unmarked frame is unknown —
+            // decided here, before the pump can park it.
+            if !program && lookup(argv[0]).is_some_and(|m| m.flags.contains(CmdFlags::INTERNAL)) {
+                let start = scratch.len();
+                crate::exec::unknown_command_reply(argv, proto, scratch);
+                staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
+                return;
+            }
             // A tiered apply can suspend on a cold read — it always
             // defers to the origin's FIFO pump instead of the synchronous
             // drain (M4-S26). A flat *durable*-namespace apply joins the
@@ -3391,6 +3430,7 @@ fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                     ns: NsId(ns),
                     proto,
                     args: argv.iter().map(|a| a.to_vec()).collect(),
+                    program,
                 });
                 return;
             }
@@ -3420,7 +3460,7 @@ fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 return;
             }
             let start = scratch.len();
-            match shared.execute_ns_owned(from, argv, proto, NsId(ns), scratch) {
+            match shared.execute_ns_owned(from, argv, proto, NsId(ns), program, scratch) {
                 NsApplyOutcome::Reply => {
                     staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
                 }
@@ -3439,6 +3479,7 @@ fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                         ns: NsId(ns),
                         proto,
                         args: argv.iter().map(|a| a.to_vec()).collect(),
+                        program,
                     });
                 }
             }
@@ -3463,6 +3504,7 @@ fn handle_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     from: CellId,
     token: FabricToken,
     cmd: u8,
+    program: bool,
     argv: &[&[u8]],
     scratch: &mut Vec<u8>,
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
@@ -3473,8 +3515,11 @@ fn handle_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             // Internal pub/sub fabric vocabulary (M1-S10) — intercepted
             // ahead of `execute`, so it needs no registry entries and stays
             // invisible to clients (an `INF.PUBFAN` typed by a client is an
-            // unknown command). One first-byte gate keys the comparisons.
-            if argv[0].first().is_some_and(|b| b | 0x20 == b'i') {
+            // unknown command). One first-byte gate keys the comparisons;
+            // only a program-marked frame reaches them (ADR-0115 D5) — an
+            // unmarked one falls through to the registry, where it is
+            // unknown.
+            if program && argv[0].first().is_some_and(|b| b | 0x20 == b'i') {
                 if handle_pubsub_apply(shared, from, token, argv, scratch, staged, pubs) {
                     return;
                 }
@@ -3512,6 +3557,7 @@ fn handle_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                     0,
                     db,
                     None,
+                    program,
                     scratch,
                 );
                 staged.push((from, token, StagedReply::Bytes(start, scratch.len())));
@@ -3529,6 +3575,7 @@ struct StagedApply {
     from: CellId,
     token: FabricToken,
     cmd: u8,
+    program: bool,
     /// Offset of the flat argv block in the stage scratch.
     off: u32,
     /// `hasher.hash(argv[1])` when the op carries a key argument.
@@ -3713,7 +3760,7 @@ fn stage_or_handle<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     orphans: &mut u64,
 ) {
     match op {
-        Op::Apply { token, cmd, args, .. } => {
+        Op::Apply { token, cmd, args, program, .. } => {
             let argv = args.as_slice();
             let db = u16::from(cmd >> 4);
             let (hash, has_key) = match argv.get(1) {
@@ -3729,7 +3776,7 @@ fn stage_or_handle<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 None => (0, false),
             };
             let off = stage_argv_block(stage_bytes, argv);
-            stage.push(StagedApply { from, token, cmd, off, hash, db, has_key });
+            stage.push(StagedApply { from, token, cmd, program, off, hash, db, has_key });
         }
         Op::Batch { ops } => {
             for nested in ops {
@@ -3786,7 +3833,17 @@ fn flush_apply_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     let mut argv_buf: [&[u8]; MAX_APPLY_ARGS] = [b""; MAX_APPLY_ARGS];
     for e in stage.iter() {
         let argc = read_argv_block(stage_bytes, e.off, &mut argv_buf);
-        handle_apply(shared, e.from, e.token, e.cmd, &argv_buf[..argc], scratch, staged, pubs);
+        handle_apply(
+            shared,
+            e.from,
+            e.token,
+            e.cmd,
+            e.program,
+            &argv_buf[..argc],
+            scratch,
+            staged,
+            pubs,
+        );
     }
     stage.clear();
     stage_bytes.clear();
@@ -3949,6 +4006,16 @@ fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     let origin = ExecOrigin::Conn(key.slot, key.generation);
     let meta = lookup(argv[0]);
     let well_formed = meta.is_some_and(|m| arity_ok(m, argv.len()));
+    // ADR-0115: a fabric-program primitive typed by a client is unknown —
+    // refused here, before any routing, so it never crosses the fabric.
+    if let Some(m) = meta
+        && m.flags.contains(CmdFlags::INTERNAL)
+    {
+        let mut reply = shared.take_reply_buf();
+        crate::exec::unknown_command_reply(argv, proto, &mut reply);
+        pending.push_back(PendingReply::Done(reply));
+        return FastDispatch::Handled;
+    }
     if let Some(meta) = meta
         && well_formed
         && ns_unavailable
@@ -4021,7 +4088,7 @@ fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
                 return FastDispatch::Fallback;
             }
             // Single-owner remote command: the hot arm.
-            return match try_send_apply(shared, first_owner, proto, db, argv) {
+            return match try_send_apply(shared, first_owner, ApplyOrigin::Client, proto, db, argv) {
                 SendNow::Sent(waiter) => {
                     *inflight += 1;
                     pending.push_back(PendingReply::Remote { waiter, proto });
@@ -4314,6 +4381,15 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
 
     let meta = lookup(argv[0]);
     let well_formed = meta.is_some_and(|m| arity_ok(m, argv.len()));
+    // ADR-0115: as on the fast path — unknown before any routing.
+    if let Some(m) = meta
+        && m.flags.contains(CmdFlags::INTERNAL)
+    {
+        let mut reply = shared.take_reply_buf();
+        crate::exec::unknown_command_reply(argv, proto, &mut reply);
+        pending.push_back(PendingReply::Done(reply));
+        return true;
+    }
     if let Some(meta) = meta
         && well_formed
         && ns_unavailable
@@ -4434,7 +4510,9 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                         // A leg that cannot be sent becomes the reply —
                         // never a partial sum (review of 2026-08-30, H1:
                         // `if let Ok` silently dropped the cell).
-                        match send_apply(shared, cell, proto, db, &[b"DBSIZE"]).await {
+                        match send_apply(shared, cell, ApplyOrigin::Client, proto, db, &[b"DBSIZE"])
+                            .await
+                        {
                             Ok(waiter) => {
                                 waiters.push(waiter);
                                 *inflight += 1;
@@ -4470,7 +4548,9 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                         let mut refusal = None;
                         'fan: for cell in peer_cells(shared) {
                             for leg in &legs {
-                                match send_apply(shared, cell, proto, db, leg).await {
+                                match send_apply(shared, cell, ApplyOrigin::Client, proto, db, leg)
+                                    .await
+                                {
                                     Ok(waiter) => {
                                         waiters.push(waiter);
                                         *inflight += 1;
@@ -4522,7 +4602,16 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 if shared.router.is_local(k, shared.cell) {
                     acc += shared.apply_counted(origin, name, k, db);
                 } else {
-                    match send_apply(shared, owner_of(k), proto, db, &[name, k]).await {
+                    match send_apply(
+                        shared,
+                        owner_of(k),
+                        ApplyOrigin::Client,
+                        proto,
+                        db,
+                        &[name, k],
+                    )
+                    .await
+                    {
                         Ok(waiter) => {
                             waiters.push(waiter);
                             *inflight += 1;
@@ -4542,10 +4631,28 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             for k in &argv[1..] {
                 if shared.router.is_local(k, shared.cell) {
                     let mut buf = shared.take_reply_buf();
-                    shared.execute_owned_into(origin, &[b"GET", k], proto, id, db, None, &mut buf);
+                    shared.execute_owned_into(
+                        origin,
+                        &[b"GET", k],
+                        proto,
+                        id,
+                        db,
+                        None,
+                        false,
+                        &mut buf,
+                    );
                     parts.push(GatherPart::Done(buf));
                 } else {
-                    match send_apply(shared, owner_of(k), proto, db, &[b"GET", k]).await {
+                    match send_apply(
+                        shared,
+                        owner_of(k),
+                        ApplyOrigin::Client,
+                        proto,
+                        db,
+                        &[b"GET", k],
+                    )
+                    .await
+                    {
                         Ok(waiter) => {
                             parts.push(GatherPart::Wait(waiter));
                             *inflight += 1;
@@ -4568,11 +4675,13 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 if shared.router.is_local(k, shared.cell) {
                     let mut buf = shared.take_reply_buf();
                     let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
-                    shared.execute_owned_into(origin, &sub, proto, id, db, None, &mut buf);
+                    shared.execute_owned_into(origin, &sub, proto, id, db, None, false, &mut buf);
                     parts.push(GatherPart::Done(buf));
                 } else {
                     let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
-                    match send_apply(shared, owner_of(k), proto, db, &sub).await {
+                    match send_apply(shared, owner_of(k), ApplyOrigin::Client, proto, db, &sub)
+                        .await
+                    {
                         Ok(waiter) => {
                             parts.push(GatherPart::Wait(waiter));
                             *inflight += 1;
@@ -4604,6 +4713,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                             id,
                             db,
                             None,
+                            false,
                             &mut buf,
                         );
                         if buf.first() == Some(&b'-') && failure.is_none() {
@@ -4624,6 +4734,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                             && let Ok(waiter) = send_apply(
                                 shared,
                                 owner_of(argv[i]),
+                                ApplyOrigin::Client,
                                 proto,
                                 db,
                                 &[b"SET", argv[i], argv[i + 1]],
@@ -4660,7 +4771,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // executes and returns its raw RESP reply. The destination is
             // the first key's owner, computed in the routing pass above.
             let owner = first_owner;
-            match send_apply(shared, owner, proto, db, argv).await {
+            match send_apply(shared, owner, ApplyOrigin::Client, proto, db, argv).await {
                 Ok(waiter) => {
                     *inflight += 1;
                     pending.push_back(PendingReply::Remote { waiter, proto });
@@ -4745,6 +4856,7 @@ fn dispatch_mirror<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             sub_patterns: c.cx.sub_patterns.clone(),
             node: Rc::clone(&shared.node),
             close_requested: Cell::new(false),
+            program: false,
         }) else {
             return false;
         };
@@ -4760,7 +4872,7 @@ fn dispatch_mirror<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             c.cx.ns = live.ns;
         });
     } else {
-        shared.execute_owned_into(origin, argv, proto, id, db, conn_ns, &mut reply);
+        shared.execute_owned_into(origin, argv, proto, id, db, conn_ns, false, &mut reply);
         if let Some(dur) = stall_request(argv) {
             shared.stall_until.set(shared.now.get().saturating_add(dur));
         }
@@ -4967,7 +5079,8 @@ fn run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     argv: &[&[u8]],
 ) -> Vec<u8> {
     let mut reply = shared.take_reply_buf();
-    shared.execute_owned_into(origin, argv, proto, id, db, None, &mut reply);
+    // A program's local leg (ADR-0115 D2).
+    shared.execute_owned_into(origin, argv, proto, id, db, None, true, &mut reply);
     reply
 }
 
@@ -4985,7 +5098,7 @@ async fn run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     if cell.0 == shared.cell.0 {
         return run_local(shared, origin, proto, id, db, argv);
     }
-    match send_apply(shared, cell, proto, db, argv).await {
+    match send_apply(shared, cell, ApplyOrigin::Program, proto, db, argv).await {
         Ok(waiter) => match waiter.await {
             OwnedOutcome::Bytes(bytes) => bytes,
             outcome => render_outcome(shared, outcome, proto),
@@ -5084,7 +5197,7 @@ async fn ns_run_local<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         }
     } else {
         let mut reply = shared.take_reply_buf();
-        shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), &mut reply);
+        shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), true, &mut reply);
         reply
     }
 }
@@ -5101,8 +5214,10 @@ async fn scatter_send<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     argv: &[&[u8]],
 ) -> Result<GateWait<u64, OwnedOutcome>, Vec<u8>> {
     match scope {
-        ScatterScope::Db => send_apply(shared, to, proto, db, argv).await,
-        ScatterScope::Ns(ns) => send_apply_ns(shared, to, proto, ns, argv).await,
+        ScatterScope::Db => send_apply(shared, to, ApplyOrigin::Client, proto, db, argv).await,
+        ScatterScope::Ns(ns) => {
+            send_apply_ns(shared, to, ApplyOrigin::Client, proto, ns, argv).await
+        }
     }
 }
 
@@ -5124,7 +5239,7 @@ async fn scatter_run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             if cell.0 == shared.cell.0 {
                 return ns_run_local(shared, origin, proto, id, db, ns, argv).await;
             }
-            match send_apply_ns(shared, cell, proto, ns, argv).await {
+            match send_apply_ns(shared, cell, ApplyOrigin::Program, proto, ns, argv).await {
                 Ok(waiter) => match waiter.await {
                     OwnedOutcome::Bytes(bytes) => bytes,
                     outcome => render_outcome(shared, outcome, proto),
@@ -5148,7 +5263,7 @@ async fn count_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     if cell.0 == shared.cell.0 {
         return Ok(shared.apply_counted(origin, name, key, db));
     }
-    match send_apply(shared, cell, Protocol::Resp2, db, &[name, key]).await {
+    match send_apply(shared, cell, ApplyOrigin::Program, Protocol::Resp2, db, &[name, key]).await {
         Ok(waiter) => match waiter.await {
             OwnedOutcome::Int(n) => Ok(n),
             _ => Err(error_reply(shared, proto, "ERR cross-cell execution failed")),
@@ -5590,8 +5705,15 @@ async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
                 let mut waiters = Vec::new();
                 for cell in targets {
                     let fan = &[&b"INF.PUBFAN"[..], channel, payload];
-                    if let Ok(waiter) =
-                        send_apply(shared, CellId(cell), Protocol::Resp2, 0, fan).await
+                    if let Ok(waiter) = send_apply(
+                        shared,
+                        CellId(cell),
+                        ApplyOrigin::Program,
+                        Protocol::Resp2,
+                        0,
+                        fan,
+                    )
+                    .await
                     {
                         note_fan(&shared.node);
                         waiters.push(waiter);
@@ -5631,7 +5753,16 @@ async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
                     }
                     None => 3,
                 };
-                match send_apply(shared, owner, Protocol::Resp2, 0, &publ[..argc]).await {
+                match send_apply(
+                    shared,
+                    owner,
+                    ApplyOrigin::Program,
+                    Protocol::Resp2,
+                    0,
+                    &publ[..argc],
+                )
+                .await
+                {
                     Ok(waiter) => {
                         *inflight += 1;
                         pending.push_back(match seq {
@@ -5672,7 +5803,9 @@ async fn send_sub_delta<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             };
             if owner.0 == shared.cell.0 {
                 shared.pubsub.borrow_mut().apply_delta(kind, name, shared.cell.0, delta);
-            } else if let Ok(waiter) = send_apply(shared, owner, Protocol::Resp2, 0, subd).await {
+            } else if let Ok(waiter) =
+                send_apply(shared, owner, ApplyOrigin::Program, Protocol::Resp2, 0, subd).await
+            {
                 waiters.push(waiter);
             }
         }
@@ -5680,7 +5813,10 @@ async fn send_sub_delta<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             shared.pubsub.borrow_mut().apply_delta(kind, name, shared.cell.0, delta);
             if !shared.route_local_only {
                 for cell in peer_cells(shared) {
-                    if let Ok(waiter) = send_apply(shared, cell, Protocol::Resp2, 0, subd).await {
+                    if let Ok(waiter) =
+                        send_apply(shared, cell, ApplyOrigin::Program, Protocol::Resp2, 0, subd)
+                            .await
+                    {
                         waiters.push(waiter);
                     }
                 }
@@ -5754,7 +5890,10 @@ async fn owner_pub_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                 Some((conn, seq)) => &[&b"INF.PUBFAN"[..], &item.channel, &item.payload, conn, seq],
                 None => &[&b"INF.PUBFAN"[..], &item.channel, &item.payload],
             };
-            if let Ok(waiter) = send_apply(&shared, CellId(cell), Protocol::Resp2, 0, fan).await {
+            if let Ok(waiter) =
+                send_apply(&shared, CellId(cell), ApplyOrigin::Program, Protocol::Resp2, 0, fan)
+                    .await
+            {
                 note_fan(&shared.node);
                 waiters.push(waiter);
             }
@@ -5790,7 +5929,9 @@ async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                 request.push(p);
             }
             for cell in peer_cells(shared) {
-                match send_apply(shared, cell, Protocol::Resp2, 0, &request).await {
+                match send_apply(shared, cell, ApplyOrigin::Program, Protocol::Resp2, 0, &request)
+                    .await
+                {
                     Ok(waiter) => waiters.push(waiter),
                     Err(refusal) => return refusal,
                 }
@@ -5839,7 +5980,9 @@ async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                 parts.push((name, Count::Local(shared.pubsub.borrow().owned_count(name))));
             } else {
                 let numsub = &[&b"INF.PUBSUB"[..], b"NUMSUB", name];
-                match send_apply(shared, owner, Protocol::Resp2, 0, numsub).await {
+                match send_apply(shared, owner, ApplyOrigin::Program, Protocol::Resp2, 0, numsub)
+                    .await
+                {
                     Ok(waiter) => parts.push((name, Count::Wait(waiter))),
                     Err(refusal) => return refusal,
                 }
@@ -6238,7 +6381,8 @@ async fn ns_apply_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
         let ordinary = !shared.store.borrow().is_tiered(item.ns)
             || lookup(argv[0]).is_some_and(|meta| keyspace_level(meta, &argv));
         if ordinary {
-            apply_flat_one(&shared, origin, item.ns, &argv, item.proto, item.token).await;
+            apply_flat_one(&shared, origin, item.ns, &argv, item.proto, item.token, item.program)
+                .await;
             continue;
         }
         match apply_tiered_one(&shared, origin, item.ns, &argv, item.proto).await {
@@ -6290,10 +6434,11 @@ async fn apply_flat_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
     argv: &[&[u8]],
     proto: Protocol,
     token: FabricToken,
+    program: bool,
 ) {
     loop {
         let mut buf = shared.take_reply_buf();
-        match shared.execute_ns_owned(CellId(origin), argv, proto, ns, &mut buf) {
+        match shared.execute_ns_owned(CellId(origin), argv, proto, ns, program, &mut buf) {
             NsApplyOutcome::Park => {
                 shared.recycle_reply_buf(buf);
                 let wait = {
@@ -6518,10 +6663,28 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
                     let sub: [&[u8]; 3] = [b"JSON.MGET", k, path];
                     if shared.router.is_local(k, shared.cell) {
                         let mut buf = shared.take_reply_buf();
-                        shared.execute_owned_into(origin, &sub, proto, id, db, Some(ns), &mut buf);
+                        shared.execute_owned_into(
+                            origin,
+                            &sub,
+                            proto,
+                            id,
+                            db,
+                            Some(ns),
+                            false,
+                            &mut buf,
+                        );
                         parts.push(GatherPart::Done(buf));
                     } else {
-                        match send_apply_ns(shared, owner_of(k), proto, ns, &sub).await {
+                        match send_apply_ns(
+                            shared,
+                            owner_of(k),
+                            ApplyOrigin::Client,
+                            proto,
+                            ns,
+                            &sub,
+                        )
+                        .await
+                        {
                             Ok(waiter) => {
                                 parts.push(GatherPart::Wait(waiter));
                                 *inflight += 1;
@@ -6543,7 +6706,7 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
             return true;
         }
         if owner.0 != shared.cell.0 {
-            match send_apply_ns(shared, owner, proto, ns, argv).await {
+            match send_apply_ns(shared, owner, ApplyOrigin::Client, proto, ns, argv).await {
                 Ok(waiter) => {
                     *inflight += 1;
                     pending.push_back(PendingReply::Remote { waiter, proto });
@@ -6572,7 +6735,7 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         let mut waiters = Vec::new();
         let mut refusal = None;
         for cell in peer_cells(shared) {
-            match send_apply_ns(shared, cell, proto, ns, &[b"DBSIZE"]).await {
+            match send_apply_ns(shared, cell, ApplyOrigin::Client, proto, ns, &[b"DBSIZE"]).await {
                 Ok(waiter) => {
                     waiters.push(waiter);
                     *inflight += 1;
@@ -6679,7 +6842,7 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         return true;
     }
     let mut reply = shared.take_reply_buf();
-    shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), &mut reply);
+    shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), false, &mut reply);
     let gated = if is_write
         && (reply.first() != Some(&b'-') || stages_despite_error(meta.id))
         && let Some(class) = class
@@ -7088,7 +7251,7 @@ async fn fan_all_or_first_error<O: PlaneObserver + 'static, F: SegmentFs + Clone
 ) -> Option<Vec<u8>> {
     let mut failure: Option<Vec<u8>> = None;
     for cell in peer_cells(shared) {
-        let leg = match send_apply(shared, cell, proto, 0, fan).await {
+        let leg = match send_apply(shared, cell, ApplyOrigin::Program, proto, 0, fan).await {
             Ok(waiter) => match waiter.await {
                 OwnedOutcome::Bytes(bytes) => bytes,
                 _ => error_reply(shared, proto, "ERR cross-cell DDL leg answered no reply bytes"),
@@ -7153,10 +7316,12 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
 async fn send_apply_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     to: CellId,
+    origin: ApplyOrigin,
     proto: Protocol,
     ns: NsId,
     argv: &[&[u8]],
 ) -> Result<GateWait<u64, OwnedOutcome>, Vec<u8>> {
+    let program = origin == ApplyOrigin::Program;
     let Some(args) = ApplyArgs::new(argv) else {
         let mut reply = Vec::new();
         RespWriter::new(&mut reply, proto).error("ERR too many arguments for cross-cell execution");
@@ -7173,7 +7338,7 @@ async fn send_apply_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
         Protocol::Resp2 => 2,
     };
     loop {
-        let op = Op::ApplyNs { token, slot, cmd: proto_byte, ns: ns.0, args };
+        let op = Op::ApplyNs { token, slot, cmd: proto_byte, ns: ns.0, args, program };
         let sent = shared.fabric.borrow_mut().send(to, &op);
         match sent {
             Ok(()) => break,
@@ -7205,10 +7370,12 @@ enum SendNow {
 fn try_send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     to: CellId,
+    origin: ApplyOrigin,
     proto: Protocol,
     db: u16,
     argv: &[&[u8]],
 ) -> SendNow {
+    let program = origin == ApplyOrigin::Program;
     let Some(args) = ApplyArgs::new(argv) else {
         let mut reply = Vec::new();
         RespWriter::new(&mut reply, proto).error("ERR too many arguments for cross-cell execution");
@@ -7224,7 +7391,7 @@ fn try_send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let (token, sent) = {
         let mut fabric = shared.fabric.borrow_mut();
         let token = fabric.next_token();
-        let sent = fabric.send(to, &Op::Apply { token, slot, cmd: cmd_byte, args });
+        let sent = fabric.send(to, &Op::Apply { token, slot, cmd: cmd_byte, args, program });
         (token, sent)
     };
     if sent.is_err() {
@@ -7245,10 +7412,12 @@ fn try_send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     to: CellId,
+    origin: ApplyOrigin,
     proto: Protocol,
     db: u16,
     argv: &[&[u8]],
 ) -> Result<GateWait<u64, OwnedOutcome>, Vec<u8>> {
+    let program = origin == ApplyOrigin::Program;
     let Some(args) = ApplyArgs::new(argv) else {
         let mut reply = Vec::new();
         RespWriter::new(&mut reply, proto).error("ERR too many arguments for cross-cell execution");
@@ -7274,13 +7443,13 @@ async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let (token, mut sent) = {
         let mut fabric = shared.fabric.borrow_mut();
         let token = fabric.next_token();
-        let sent = fabric.send(to, &Op::Apply { token, slot, cmd: cmd_byte, args });
+        let sent = fabric.send(to, &Op::Apply { token, slot, cmd: cmd_byte, args, program });
         (token, sent)
     };
     let waiter = shared.gate.waiter(token.0);
     while let Err(SendError::NoCredit { .. }) = sent {
         shared.credit_waiters.wait(to).await;
-        let op = Op::Apply { token, slot, cmd: cmd_byte, args };
+        let op = Op::Apply { token, slot, cmd: cmd_byte, args, program };
         sent = shared.fabric.borrow_mut().send(to, &op);
     }
     // RTT pairing relies on in-order replies; `INF.PUB` replies are deferred

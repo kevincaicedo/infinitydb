@@ -350,6 +350,11 @@ struct Inode {
     /// `n` more direct writes to *this file* succeed, every later one
     /// answers `InvalidInput`. `None` on every other inode.
     direct_writes_left: Option<u64>,
+    /// Open [`SimFile`] handles on this inode. At zero the fd is closed:
+    /// a driver op naming it answers `EBADF`, as the kernel would — a
+    /// staged op outliving its handle is a use-after-close the model
+    /// refuses to serve (review 2026-08-30, F-L01-02).
+    open_handles: u32,
 }
 
 impl Inode {
@@ -541,6 +546,20 @@ impl DiskState {
             return Err(io::Error::other("injected fault: power lost (sim disk dead)"));
         }
         Ok(())
+    }
+
+    /// The inode behind a driver file fd, refusing a closed one with
+    /// `EBADF` (no open handle) and an unknown one with `NotFound`.
+    fn open_inode_mut(&mut self, fd: i32) -> io::Result<&mut Inode> {
+        let ino = file_fd_ino(fd)?;
+        let inode = self
+            .inodes
+            .get_mut(&ino)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
+        if inode.open_handles == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        Ok(inode)
     }
 
     fn ino_of(&self, path: &Path) -> io::Result<u64> {
@@ -749,11 +768,7 @@ impl SimDisk {
     pub fn driver_write_at(&self, fd: i32, offset: u64, data: &[u8]) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
-        let ino = file_fd_ino(fd)?;
-        let inode = state
-            .inodes
-            .get_mut(&ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
+        let inode = state.open_inode_mut(fd)?;
         assert_direct_aligned(inode, offset, data.len());
         inode.direct_write_gate()?;
         inode.write(offset, data);
@@ -769,11 +784,7 @@ impl SimDisk {
     pub fn driver_write_through(&self, fd: i32, offset: u64, data: &[u8]) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
-        let ino = file_fd_ino(fd)?;
-        let inode = state
-            .inodes
-            .get_mut(&ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
+        let inode = state.open_inode_mut(fd)?;
         assert_direct_aligned(inode, offset, data.len());
         inode.direct_write_gate()?;
         inode.write_through(offset, data);
@@ -791,11 +802,7 @@ impl SimDisk {
     pub fn driver_read_at(&self, fd: i32, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
-        let ino = file_fd_ino(fd)?;
-        let inode = state
-            .inodes
-            .get(&ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
+        let inode = state.open_inode_mut(fd)?;
         let offset = usize::try_from(offset).expect("offset fits usize");
         if offset >= inode.os.len() {
             return Ok(0);
@@ -820,11 +827,11 @@ impl SimDisk {
             }
             return Ok(());
         }
-        let ino = file_fd_ino(fd)?;
-        let inode = state
-            .inodes
-            .get_mut(&ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
+        if i64::from(fd) >= DIR_FD_BASE {
+            // A dropped directory handle: closed, as the kernel sees it.
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        let inode = state.open_inode_mut(fd)?;
         inode.sync();
         Ok(())
     }
@@ -873,7 +880,15 @@ impl SimDisk {
             if direct && meta { state.direct_meta_writes_allowed } else { None };
         state.inodes.insert(
             ino,
-            Inode { durable, os, pending: Vec::new(), prealloc_target, direct, direct_writes_left },
+            Inode {
+                durable,
+                os,
+                pending: Vec::new(),
+                prealloc_target,
+                direct,
+                direct_writes_left,
+                open_handles: 1,
+            },
         );
         state.os_names.insert(path.to_path_buf(), ino);
         state
@@ -921,6 +936,24 @@ pub struct SimFile {
 enum Target {
     Ino(u64),
     Dir(PathBuf, i64),
+}
+
+impl Drop for SimFile {
+    fn drop(&mut self) {
+        let mut state = self.state.borrow_mut();
+        match &self.target {
+            // A power cut may already have discarded the inode (the dead
+            // process's handles drop after the cut): nothing to close.
+            Target::Ino(ino) => {
+                if let Some(inode) = state.inodes.get_mut(ino) {
+                    inode.open_handles = inode.open_handles.saturating_sub(1);
+                }
+            }
+            Target::Dir(_, fd) => {
+                state.dir_fds.remove(fd);
+            }
+        }
+    }
 }
 
 impl SegmentFile for SimFile {
@@ -1130,9 +1163,10 @@ impl SegmentFs for SimDisk {
     }
 
     fn open_write(&self, path: &Path) -> io::Result<Self::File> {
-        let state = self.state.borrow();
+        let mut state = self.state.borrow_mut();
         state.dead_check()?;
         let ino = state.ino_of(path)?;
+        state.inodes.get_mut(&ino).expect("ino_of resolved the inode").open_handles += 1;
         Ok(SimFile { state: Rc::clone(&self.state), target: Target::Ino(ino) })
     }
 

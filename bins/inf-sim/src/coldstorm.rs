@@ -151,6 +151,10 @@ struct FleetFile {
     len: u64,
     frames: u64,
     fd: RawFd,
+    /// The open handle behind `fd` — held until the unlink, as the
+    /// plane's file table holds a sealed file (the sim disk closes an fd
+    /// whose handle drops and answers `EBADF`; batch 20, F-L01-02).
+    handle: Option<TierWriter<SimDisk>>,
     path: PathBuf,
     /// Keys whose current record lives in this file (repoints remove).
     live: Vec<Vec<u8>>,
@@ -713,6 +717,7 @@ fn seal_file(world: &mut World, writer: Option<(TierWriter<SimDisk>, Vec<Vec<u8>
         frames: w.data_len().div_ceil(TIER_FRAME_DATA as u64),
         fd: w.raw_fd().expect("sim files carry fake fds"),
         path: w.path().to_owned(),
+        handle: Some(w),
         live,
         unlinked: false,
     });
@@ -766,6 +771,7 @@ fn unlink_drained(world: &mut World) {
         }
         world.disk.remove_file(&path).expect("sim unlink");
         world.files[i].unlinked = true;
+        world.files[i].handle = None; // close after the pins drained
         unlinks += 1;
     }
     world.report.unlink_deferrals += deferrals;

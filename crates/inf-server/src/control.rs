@@ -39,6 +39,11 @@ use inf_store::{FIRST_INDEX_GENERATION, FIRST_INDEX_ID, FIRST_NAMED_NS_ID, NsCat
 pub struct RecoveredResidue {
     pub segment_residue_stops: u64,
     pub recycled_residue_slacks: u64,
+    /// Slacks the audit classified as a discarded life's residue by
+    /// epoch (ADR-0031 D5 as amended) — each one lifted a residue stop,
+    /// so the segments beyond it replayed as the live log. The DST's
+    /// observable for the lift regime (review 2026-08-30, F-L14-01).
+    pub stale_residue_slacks: u64,
 }
 
 /// One cell's boot-recovery slot on the [`RecoveryBoard`] (M2-S15).
@@ -65,6 +70,7 @@ pub struct CellRecoverySlot {
     /// `recover_recycled_residue_slacks`) carry them.
     segment_residue_stops: AtomicU64,
     recycled_residue_slacks: AtomicU64,
+    stale_residue_slacks: AtomicU64,
     /// ADR-0103 D4: tail records skipped for an id no drop tombstone
     /// explains — the C14 verifier (zero on every honest boot).
     skipped_unknown_ns: AtomicU64,
@@ -106,6 +112,7 @@ impl CellRecoverySlot {
         self.torn_at.store(torn_truncated_at.map_or(0, |lsn| lsn.to_u64() + 1), Ordering::Relaxed);
         self.segment_residue_stops.store(residue.segment_residue_stops, Ordering::Relaxed);
         self.recycled_residue_slacks.store(residue.recycled_residue_slacks, Ordering::Relaxed);
+        self.stale_residue_slacks.store(residue.stale_residue_slacks, Ordering::Relaxed);
         for (slot, ns) in self.phase_ns.iter().zip(phases.phase_ns()) {
             slot.store(ns, Ordering::Relaxed);
         }
@@ -139,6 +146,7 @@ impl CellRecoverySlot {
         RecoveredResidue {
             segment_residue_stops: self.segment_residue_stops.load(Ordering::Relaxed),
             recycled_residue_slacks: self.recycled_residue_slacks.load(Ordering::Relaxed),
+            stale_residue_slacks: self.stale_residue_slacks.load(Ordering::Relaxed),
         }
     }
 

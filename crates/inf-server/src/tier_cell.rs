@@ -888,6 +888,9 @@ fn drive_flush_round<F: SegmentFs>(
         stats.rounds_deferred += 1;
         return Ok(0);
     }
+    // An errored stage may still leave a valid round (a seal staged
+    // before a refused file creation — F-L01-02): it is submitted like
+    // any other; the error surfaces after, and the next slice retries.
     let stage_result = table.stage_flush_round(&mut t.flush);
     let staged_bytes = *stage_result.as_ref().unwrap_or(&0);
     let issued_ops = if t.flush.round_active() { t.flush.round_op_count() as u64 } else { 0 };

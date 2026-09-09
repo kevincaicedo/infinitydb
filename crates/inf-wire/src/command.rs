@@ -161,6 +161,11 @@ impl CmdFlags {
     /// ECHO/SELECT/HELLO/pubsub/INFO/CONFIG/CLIENT/COMMAND/DEBUG/QUIT pass;
     /// **PING does not** (it answers `-LOADING` there, so it does here).
     pub const LOADING: CmdFlags = CmdFlags(1 << 5);
+    /// A fabric-program primitive (ADR-0115; Redis 8's internal-command
+    /// contract): unknown to every client connection, hidden from
+    /// `COMMAND`, executed only by a plane program — locally, or on a
+    /// fabric `Apply` carrying the program mark.
+    pub const INTERNAL: CmdFlags = CmdFlags(1 << 6);
 
     #[inline]
     pub fn contains(self, other: CmdFlags) -> bool {
@@ -233,6 +238,9 @@ const LOADING_FAST: CmdFlags = CmdFlags::FAST.union(CmdFlags::LOADING);
 const LOADING_ADMIN: CmdFlags = CmdFlags::ADMIN.union(CmdFlags::LOADING);
 const LOADING_RO_FAST: CmdFlags = CmdFlags::READONLY.union(CmdFlags::FAST).union(CmdFlags::LOADING);
 const W_FAST_OOM: CmdFlags = W_FAST.union(CmdFlags::DENYOOM);
+const W_FAST_INTERNAL: CmdFlags = W_FAST.union(CmdFlags::INTERNAL);
+const RO_FAST_INTERNAL: CmdFlags = RO_FAST.union(CmdFlags::INTERNAL);
+const W_INTERNAL: CmdFlags = CmdFlags::WRITE.union(CmdFlags::INTERNAL);
 
 /// One registry row (the array below stays readable at 91 entries).
 const fn cmd(
@@ -333,9 +341,9 @@ pub static COMMANDS: [CommandMeta; 91] = [
     // recorded deviation.
     cmd(CommandId::Lastsave, "LASTSAVE", 1, LOADING_RO_FAST, KeySpec::NONE),
     // ---- internal fabric-program ops (INF.* extension namespace) ----
-    cmd(CommandId::InfTake, "INF.TAKE", -2, W_FAST, KeySpec::ONE),
-    cmd(CommandId::InfPeek, "INF.PEEK", -2, RO_FAST, KeySpec::ONE),
-    cmd(CommandId::InfPut, "INF.PUT", -4, CmdFlags::WRITE, KeySpec::ONE),
+    cmd(CommandId::InfTake, "INF.TAKE", -2, W_FAST_INTERNAL, KeySpec::ONE),
+    cmd(CommandId::InfPeek, "INF.PEEK", -2, RO_FAST_INTERNAL, KeySpec::ONE),
+    cmd(CommandId::InfPut, "INF.PUT", -4, W_INTERNAL, KeySpec::ONE),
     // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041 D6–D9).
     // DENYOOM membership mirrors the RedisJSON module declarations:
     // memory-growing writes deny under OOM; DEL/FORGET/CLEAR free.

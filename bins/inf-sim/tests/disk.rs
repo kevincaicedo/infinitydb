@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use inf_alloc::BufferPool;
+use inf_log::fs::sim::SimFile;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_runtime::{
     BackendDriver, Completion, CompletionResult, CompletionToken, IoOp, StableBytes, TokenClass,
@@ -36,7 +37,9 @@ fn stable(bytes: &'static [u8]) -> StableBytes {
     unsafe { StableBytes::new(bytes) }
 }
 
-fn disk_with_segment() -> (SimDisk, i32, i32) {
+/// The handles ride along: a dropped handle is a closed fd to the sim
+/// (F-L01-02), exactly as the plane's custody rules require.
+fn disk_with_segment() -> (SimDisk, [SimFile; 2], i32, i32) {
     let disk = SimDisk::new();
     disk.create_dir_all(Path::new(DIR)).expect("dirs");
     let seg = disk.create_segment(&Path::new(DIR).join("seg-000000.ilog"), 4096).expect("create");
@@ -44,12 +47,12 @@ fn disk_with_segment() -> (SimDisk, i32, i32) {
     let fd = seg.raw_fd().expect("sim fd");
     let dir = disk.open_dir(Path::new(DIR)).expect("dir handle");
     let dir_fd = dir.raw_fd().expect("dir fd");
-    (disk, fd, dir_fd)
+    (disk, [seg, dir], fd, dir_fd)
 }
 
 #[test]
 fn log_write_is_buffered_until_the_linked_sync() {
-    let (disk, fd, _dir_fd) = disk_with_segment();
+    let (disk, _handles, fd, _dir_fd) = disk_with_segment();
     let net = CellNet::new(0, 7, Plant::None);
     let mut driver = SimDriver::with_disk(net, disk.clone());
     let mut pool = BufferPool::new(8, 512);
@@ -109,7 +112,7 @@ fn log_write_is_buffered_until_the_linked_sync() {
 /// standalone fsyncs on a dead disk fail with EIO.
 #[test]
 fn failed_write_cancels_the_linked_sync() {
-    let (disk, fd, dir_fd) = disk_with_segment();
+    let (disk, _handles, fd, dir_fd) = disk_with_segment();
     let net = CellNet::new(0, 7, Plant::None);
     let mut driver = SimDriver::with_disk(net, disk.clone());
     let mut pool = BufferPool::new(8, 512);
