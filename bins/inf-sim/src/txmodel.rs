@@ -10,7 +10,7 @@
 //! harness records. The `withdrawn_*` twins pin those reds as positive
 //! controls, so the model cannot pass vacuously.
 //!
-//! Three models, three withdrawn rules:
+//! Five models, one withdrawn rule set each:
 //!
 //! - [`acquisition`]: master plan §6.3 as written — a parallel lock fan,
 //!   grants on arrival, waiters sorted by txid — deadlocks on the F2
@@ -27,6 +27,17 @@
 //!   a checkpoint that streams a published record whose decision is not
 //!   yet durable, leaves half a transaction after a crash; the ADR-0116
 //!   D3 rules never do.
+//! - [`lineage`] (ADR-0116 A1/A2, the 2026-09-10 review's F01/F02): a
+//!   plain successor of a published-undecided record that outlives its
+//!   dropped source, and a checkpoint that streams the immediate
+//!   predecessor when that predecessor is itself undecided, both recover
+//!   a state no serial history produces; inherited dependencies, the
+//!   decision-qualified pinned image and dependency-gated `always` acks
+//!   never do.
+//! - [`identity`] (ADR-0116 A3, F03): resuming `local_seq` above the
+//!   coordinator's replayed maximum reissues a txid a remote participant's
+//!   durable prepare still carries; a durable reservation carried by the
+//!   checkpoint never does.
 
 /// The rules under test: `chosen` by default, `withdrawn` under the env
 /// hook the review harness uses to record the red.
@@ -1233,11 +1244,683 @@ pub mod durable {
     }
 }
 
+// ---------------------------------------------------------------------
+// Model 4 — pending lineage: successors, chains, the qualified image
+// ---------------------------------------------------------------------
+
+pub mod lineage {
+    use super::Rng;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    pub type Txid = u64;
+    pub type Key = u32;
+
+    /// The D3 rules the 2026-09-10 review reopened (ADR-0116 A1/A2).
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct Rules {
+        /// A record logged by a command that touched a published-undecided
+        /// key carries the key's pending txids as dependencies; recovery
+        /// applies it only when every dependency committed (A1). `false`
+        /// is D3 as written: successors are plain, and a plain write
+        /// releases the pin.
+        pub successors_inherit_dependencies: bool,
+        /// The pinned image is the decision-qualified one — the image
+        /// before the key's first pending write, held until the key's
+        /// whole pending set is durably decided — and `ckpt-begin` stays
+        /// at or before that run's first record (A2). `false` is D3 as
+        /// written: the immediate predecessor of the latest pending
+        /// record, `ckpt-begin` at the oldest undecided prepare.
+        pub pin_decision_qualified_image: bool,
+        /// An `always` ack waits for the record's own durability and for
+        /// every dependency's durable decision (A1). `false` acks on the
+        /// record's own durability alone.
+        pub ack_waits_for_dependencies: bool,
+    }
+
+    impl Rules {
+        pub fn chosen() -> Rules {
+            Rules {
+                successors_inherit_dependencies: true,
+                pin_decision_qualified_image: true,
+                ack_waits_for_dependencies: true,
+            }
+        }
+
+        pub fn withdrawn() -> Rules {
+            Rules {
+                successors_inherit_dependencies: false,
+                pin_decision_qualified_image: false,
+                ack_waits_for_dependencies: false,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Rec {
+        Prepare { txid: Txid, key: Key, value: u32, deps: Vec<Txid> },
+        Plain { op: usize, key: Key, value: u32, deps: Vec<Txid> },
+        Decision { txid: Txid },
+    }
+
+    /// One key's pending run under the chosen rule: the qualified image,
+    /// every txid the run depends on, and the run's first record.
+    #[derive(Clone, Debug)]
+    struct Run {
+        base: u32,
+        pending: BTreeSet<Txid>,
+        first_record: usize,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CellLog {
+        records: Vec<Rec>,
+        /// Records below this index survive the crash.
+        durable: usize,
+        ram: BTreeMap<Key, u32>,
+        runs: BTreeMap<Key, Run>,
+        /// D3 as written: (writer txid, immediate predecessor).
+        pinned: BTreeMap<Key, (Txid, u32)>,
+        ckpt_image: BTreeMap<Key, u32>,
+        ckpt_begin: usize,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Step {
+        /// Participant `c` executes transaction `t`'s leg under its
+        /// intents and logs the prepare.
+        Prepare(Txid, usize),
+        /// The coordinator decides `t` in memory once both legs prepared;
+        /// `UnlockOp{Commit}` publishes on both cells and releases the
+        /// intents.
+        Publish(Txid),
+        /// A plain `INCR` of cell `c`'s key — the successor.
+        Incr(usize),
+        /// An everysec timer on cell `c`.
+        Fsync(usize),
+        /// A checkpoint on cell `c` (its cut is durable first).
+        Checkpoint(usize),
+        Crash,
+    }
+
+    /// An operation in execution order, for the serial oracle.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Op {
+        Tx(Txid),
+        Incr { cell: usize, id: usize },
+    }
+
+    /// T1 arrives first; T2 queues behind it on both keys.
+    const TXNS: [Txid; 2] = [1, 2];
+
+    /// T1 is coordinated by cell 0, T2 by cell 1: their decisions live in
+    /// different logs and become durable independently.
+    fn coordinator(t: Txid) -> usize {
+        (t as usize + 1) % 2
+    }
+
+    fn tx_value(t: Txid) -> u32 {
+        100 * t as u32
+    }
+
+    fn durable_decisions(cells: &[CellLog; 2]) -> BTreeSet<Txid> {
+        cells
+            .iter()
+            .flat_map(|c| c.records.iter().take(c.durable))
+            .filter_map(|r| match r {
+                Rec::Decision { txid } => Some(*txid),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The dependencies a record logged now inherits from its key.
+    fn inherited(rules: Rules, cell: &CellLog, key: Key) -> Vec<Txid> {
+        if !rules.successors_inherit_dependencies {
+            return Vec::new();
+        }
+        match (cell.runs.get(&key), cell.pinned.get(&key)) {
+            (Some(run), _) => run.pending.iter().copied().collect(),
+            (None, Some((writer, _))) => vec![*writer],
+            (None, None) => Vec::new(),
+        }
+    }
+
+    fn conditional(rec: &Rec, decided: &BTreeSet<Txid>) -> bool {
+        match rec {
+            Rec::Prepare { txid, deps, .. } => {
+                !decided.contains(txid) || deps.iter().any(|d| !decided.contains(d))
+            }
+            Rec::Plain { deps, .. } => deps.iter().any(|d| !decided.contains(d)),
+            Rec::Decision { .. } => false,
+        }
+    }
+
+    /// Two participants, one key each (`10`/`11` at boot, each cell booted
+    /// from a checkpoint holding its pre-image); T1 then T2 write both
+    /// keys (`100`, `200`); plain `INCR`s land between them. Returns the
+    /// recovered values, or the violation.
+    pub fn run(rules: Rules, steps: &[Step]) -> Result<[u32; 2], String> {
+        let mut m = Model::new(rules);
+        for step in steps {
+            match *step {
+                Step::Prepare(t, c) => m.prepare(t, c),
+                Step::Publish(t) => m.publish(t),
+                Step::Incr(c) => m.incr(c),
+                Step::Fsync(c) => m.cells[c].durable = m.cells[c].records.len(),
+                Step::Checkpoint(c) => m.checkpoint(c),
+                Step::Crash => break,
+            }
+            m.settle();
+        }
+        m.verdict()
+    }
+
+    struct Model {
+        rules: Rules,
+        cells: [CellLog; 2],
+        prepared: BTreeMap<Txid, [bool; 2]>,
+        published: BTreeSet<Txid>,
+        decision_logged: BTreeSet<Txid>,
+        /// Executed operations in order.
+        ops: Vec<Op>,
+    }
+
+    impl Model {
+        fn new(rules: Rules) -> Model {
+            let mut cells = [CellLog::default(), CellLog::default()];
+            for (c, cell) in cells.iter_mut().enumerate() {
+                cell.ram.insert(c as Key, 10 + c as u32);
+                cell.ckpt_image.insert(c as Key, 10 + c as u32);
+            }
+            Model {
+                rules,
+                cells,
+                prepared: TXNS.iter().map(|t| (*t, [false; 2])).collect(),
+                published: BTreeSet::new(),
+                decision_logged: BTreeSet::new(),
+                ops: Vec::new(),
+            }
+        }
+
+        /// A W intent on cell `c`'s key is held by a prepared, unpublished
+        /// transaction other than `t`.
+        fn held(&self, t: Option<Txid>, c: usize) -> bool {
+            TXNS.iter().any(|o| Some(*o) != t && self.prepared[o][c] && !self.published.contains(o))
+        }
+
+        fn prepare(&mut self, t: Txid, c: usize) {
+            // Canonical acquisition: T2 arrives after T1 and queues behind it.
+            let arrived = t == TXNS[0] || self.published.contains(&TXNS[0]);
+            if self.prepared[&t][c] || !arrived || self.held(Some(t), c) {
+                return;
+            }
+            self.prepared.get_mut(&t).expect("known txid")[c] = true;
+            let cell = &mut self.cells[c];
+            let deps = inherited(self.rules, cell, c as Key);
+            cell.records.push(Rec::Prepare { txid: t, key: c as Key, value: tx_value(t), deps });
+        }
+
+        /// The in-memory decision: publish on both cells, release intents,
+        /// start (or extend) each key's pending run.
+        fn publish(&mut self, t: Txid) {
+            if self.published.contains(&t) || !self.prepared[&t].iter().all(|p| *p) {
+                return;
+            }
+            self.published.insert(t);
+            self.ops.push(Op::Tx(t));
+            for (c, cell) in self.cells.iter_mut().enumerate() {
+                let key = c as Key;
+                let (pos, deps) = cell
+                    .records
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, r)| match r {
+                        Rec::Prepare { txid, deps, .. } if *txid == t => Some((i, deps.clone())),
+                        _ => None,
+                    })
+                    .expect("prepared leg");
+                let old = cell.ram.insert(key, tx_value(t)).expect("key present");
+                let run = cell.runs.entry(key).or_insert(Run {
+                    base: old,
+                    pending: BTreeSet::new(),
+                    first_record: pos,
+                });
+                run.pending.insert(t);
+                run.pending.extend(deps);
+                cell.pinned.insert(key, (t, old));
+            }
+        }
+
+        fn incr(&mut self, c: usize) {
+            if self.held(None, c) {
+                return;
+            }
+            let id = self.ops.iter().filter(|o| matches!(o, Op::Incr { .. })).count() + 1;
+            self.ops.push(Op::Incr { cell: c, id });
+            let cell = &mut self.cells[c];
+            let key = c as Key;
+            let deps = inherited(self.rules, cell, key);
+            let value = cell.ram[&key] + 1;
+            cell.records.push(Rec::Plain { op: id, key, value, deps });
+            cell.ram.insert(key, value);
+            if !self.rules.successors_inherit_dependencies {
+                // D3 as written: a later plain write releases the pin.
+                cell.pinned.remove(&key);
+                cell.runs.remove(&key);
+            }
+        }
+
+        /// The cut is durable first; the image streams the pinned image
+        /// of a pending key; `ckpt-begin` covers every conditional record
+        /// and (A2) every pending run from its first record.
+        fn checkpoint(&mut self, c: usize) {
+            let decided = durable_decisions(&self.cells);
+            let qualified = self.rules.pin_decision_qualified_image;
+            let cell = &mut self.cells[c];
+            cell.durable = cell.records.len();
+            cell.ckpt_image = cell
+                .ram
+                .iter()
+                .map(|(k, v)| {
+                    let streamed = if qualified {
+                        cell.runs.get(k).map(|run| run.base)
+                    } else {
+                        cell.pinned.get(k).map(|(_, old)| *old)
+                    };
+                    (*k, streamed.unwrap_or(*v))
+                })
+                .collect();
+            let first_conditional = if qualified {
+                cell.records.iter().position(|r| conditional(r, &decided))
+            } else {
+                cell.records
+                    .iter()
+                    .position(|r| matches!(r, Rec::Prepare { txid, .. } if !decided.contains(txid)))
+            };
+            let run_origin =
+                if qualified { cell.runs.values().map(|r| r.first_record).min() } else { None };
+            cell.ckpt_begin = [Some(cell.records.len()), first_conditional, run_origin]
+                .into_iter()
+                .flatten()
+                .min()
+                .expect("a candidate");
+        }
+
+        /// The decision is appended to the coordinator's log once every
+        /// participant's prepare is durable (D3, unchanged); a durable
+        /// decision releases the pins that depend on nothing else.
+        fn settle(&mut self) {
+            for t in TXNS {
+                if !self.published.contains(&t) || self.decision_logged.contains(&t) {
+                    continue;
+                }
+                let prepares_durable = self.cells.iter().all(|cell| {
+                    cell.records
+                        .iter()
+                        .take(cell.durable)
+                        .any(|r| matches!(r, Rec::Prepare { txid, .. } if *txid == t))
+                });
+                if prepares_durable {
+                    self.cells[coordinator(t)].records.push(Rec::Decision { txid: t });
+                    self.decision_logged.insert(t);
+                }
+            }
+            let decided = durable_decisions(&self.cells);
+            for cell in &mut self.cells {
+                cell.runs.retain(|_, run| !run.pending.is_subset(&decided));
+                cell.pinned.retain(|_, (writer, _)| !decided.contains(writer));
+            }
+        }
+
+        /// Checkpoint image + durable tail; a tagged or dependent record
+        /// applies iff its txid and every dependency committed.
+        fn recover(&self, decided: &BTreeSet<Txid>) -> [u32; 2] {
+            let mut out = [0u32; 2];
+            for (c, cell) in self.cells.iter().enumerate() {
+                let mut state = cell.ckpt_image.clone();
+                let tail = &cell.records[cell.ckpt_begin.min(cell.durable)..cell.durable];
+                for rec in tail {
+                    match rec {
+                        Rec::Prepare { key, value, .. } | Rec::Plain { key, value, .. }
+                            if !conditional(rec, decided) =>
+                        {
+                            state.insert(*key, *value);
+                        }
+                        _ => {}
+                    }
+                }
+                out[c] = state[&(c as Key)];
+            }
+            out
+        }
+
+        /// `always` acks at the crash: a durable decision or plain record
+        /// and, under A1, every dependency durably decided.
+        fn acked(&self, decided: &BTreeSet<Txid>) -> Vec<Op> {
+            let tx_deps = |t: Txid| -> Vec<Txid> {
+                self.cells
+                    .iter()
+                    .flat_map(|cell| cell.records.iter())
+                    .filter_map(|r| match r {
+                        Rec::Prepare { txid, deps, .. } if *txid == t => Some(deps.clone()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect()
+            };
+            let mut acked = Vec::new();
+            for (c, cell) in self.cells.iter().enumerate() {
+                for rec in &cell.records[..cell.durable] {
+                    let (op, deps) = match rec {
+                        Rec::Decision { txid } => (Op::Tx(*txid), tx_deps(*txid)),
+                        Rec::Plain { op, deps, .. } => {
+                            (Op::Incr { cell: c, id: *op }, deps.clone())
+                        }
+                        Rec::Prepare { .. } => continue,
+                    };
+                    if !self.rules.ack_waits_for_dependencies
+                        || deps.iter().all(|d| decided.contains(d))
+                    {
+                        acked.push(op);
+                    }
+                }
+            }
+            acked
+        }
+
+        /// The oracle: some subset of the executed operations, replayed in
+        /// execution order with every transaction whole, must produce the
+        /// recovered state, and one such subset must contain every ack.
+        fn verdict(&self) -> Result<[u32; 2], String> {
+            let decided = durable_decisions(&self.cells);
+            let out = self.recover(&decided);
+            let acked = self.acked(&decided);
+            let ops = &self.ops;
+            let matching: Vec<Vec<Op>> = (0..1u32 << ops.len())
+                .map(|mask| {
+                    ops.iter()
+                        .enumerate()
+                        .filter(|(i, _)| mask & (1 << i) != 0)
+                        .map(|(_, o)| *o)
+                        .collect()
+                })
+                .filter(|subset: &Vec<Op>| replay(subset) == out)
+                .collect();
+            if matching.is_empty() {
+                return Err(format!(
+                    "SERIALIZABILITY VIOLATION after crash: recovered {out:?} is no serial subset of {ops:?} (decisions durable: {decided:?})"
+                ));
+            }
+            if !matching.iter().any(|s| acked.iter().all(|a| s.contains(a))) {
+                return Err(format!(
+                    "ACKED WRITE LOST after crash: {acked:?} acked under `always` but recovered {out:?} needs a subset without one of them (decisions durable: {decided:?})"
+                ));
+            }
+            Ok(out)
+        }
+    }
+
+    fn replay(ops: &[Op]) -> [u32; 2] {
+        let mut state = [10, 11];
+        for op in ops {
+            match *op {
+                Op::Tx(t) => state = [tx_value(t); 2],
+                Op::Incr { cell, .. } => state[cell] += 1,
+            }
+        }
+        state
+    }
+
+    /// F01: T1 publishes; `INCR` on cell 1 reads the published 100; cell
+    /// 1's timer fsyncs; the crash beats T1's decision.
+    pub const SUCCESSOR: [Step; 6] = [
+        Step::Prepare(1, 0),
+        Step::Prepare(1, 1),
+        Step::Publish(1),
+        Step::Incr(1),
+        Step::Fsync(1),
+        Step::Crash,
+    ];
+
+    /// F02: T1 then T2 publish over both keys; cell 0 checkpoints; the
+    /// crash beats both decisions.
+    pub const CHAIN: [Step; 8] = [
+        Step::Prepare(1, 0),
+        Step::Prepare(1, 1),
+        Step::Publish(1),
+        Step::Prepare(2, 0),
+        Step::Prepare(2, 1),
+        Step::Publish(2),
+        Step::Checkpoint(0),
+        Step::Crash,
+    ];
+
+    /// T1 then T2 publish; both cells fsync (both decisions logged, T1's
+    /// on cell 0, T2's on cell 1); cell 1 fsyncs again — T2's decision is
+    /// durable, T1's is not; crash.
+    pub const DEPENDENT_ACK: [Step; 10] = [
+        Step::Prepare(1, 0),
+        Step::Prepare(1, 1),
+        Step::Publish(1),
+        Step::Prepare(2, 0),
+        Step::Prepare(2, 1),
+        Step::Publish(2),
+        Step::Fsync(0),
+        Step::Fsync(1),
+        Step::Fsync(1),
+        Step::Crash,
+    ];
+
+    /// The oracle enumerates subsets of the executed operations, so a
+    /// history carries at most this many successors.
+    pub const MAX_INCRS: usize = 6;
+
+    /// A seeded interleaving of both transactions, successors, fsyncs and
+    /// checkpoints.
+    pub fn random_steps(seed: u64, len: usize) -> Vec<Step> {
+        let mut rng = Rng::new(seed);
+        let mut out = Vec::with_capacity(len + 1);
+        let mut incrs = 0;
+        for _ in 0..len {
+            let choices = if incrs < MAX_INCRS { 12 } else { 10 };
+            out.push(match rng.below(choices) {
+                0 => Step::Prepare(1, 0),
+                1 => Step::Prepare(1, 1),
+                2 => Step::Prepare(2, 0),
+                3 => Step::Prepare(2, 1),
+                4 => Step::Publish(1),
+                5 => Step::Publish(2),
+                6 => Step::Fsync(0),
+                7 => Step::Fsync(1),
+                8 => Step::Checkpoint(0),
+                9 => Step::Checkpoint(1),
+                10 => {
+                    incrs += 1;
+                    Step::Incr(0)
+                }
+                _ => {
+                    incrs += 1;
+                    Step::Incr(1)
+                }
+            });
+        }
+        out.push(Step::Crash);
+        out
+    }
+}
+
+// ---------------------------------------------------------------------
+// Model 5 — txid identity across boots
+// ---------------------------------------------------------------------
+
+pub mod identity {
+    use super::Rng;
+    use std::collections::BTreeSet;
+
+    /// The D9 rule the 2026-09-10 review reopened (ADR-0116 A3).
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct Rules {
+        /// A boot resumes above the last durable `txid-reserve` high-water,
+        /// which is fsynced before any txid in its range leaves the cell
+        /// (A3). `false` is D9 as written: above the highest txid the
+        /// cell's own log replayed.
+        pub resume_from_durable_reservation: bool,
+        /// The checkpoint carries the reservation high-water, so truncating
+        /// the tail never loses it (A3). `false`: the reservation records
+        /// are truncated with the tail.
+        pub checkpoint_carries_reservation: bool,
+    }
+
+    impl Rules {
+        pub fn chosen() -> Rules {
+            Rules { resume_from_durable_reservation: true, checkpoint_carries_reservation: true }
+        }
+
+        pub fn withdrawn() -> Rules {
+            Rules { resume_from_durable_reservation: false, checkpoint_carries_reservation: false }
+        }
+    }
+
+    /// Reservation chunk — small so the model crosses chunk boundaries.
+    pub const CHUNK: u64 = 16;
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum Rec {
+        Reserve { upto: u64 },
+        Tag { seq: u64 },
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Step {
+        /// The coordinator issues the next txid to a transaction.
+        Issue,
+        /// The coordinator logs its own leg's prepare for the last txid.
+        LocalPrepare,
+        /// A remote participant's durable prepare carries the last txid.
+        RemoteSurvives,
+        Fsync,
+        /// The tail is truncated behind a checkpoint.
+        Checkpoint,
+        /// Non-durable local records are lost; the cell reboots.
+        Crash,
+    }
+
+    /// One coordinator cell (cell 0) issuing txids against remote
+    /// participants whose durable prepares outlive the coordinator's own
+    /// records. Returns the number of txids issued, or the reissue.
+    pub fn run(rules: Rules, steps: &[Step]) -> Result<u64, String> {
+        let mut log: Vec<Rec> = Vec::new();
+        let mut durable = 0usize;
+        let mut next = 1u64;
+        let mut reserved_upto = 0u64;
+        let mut ckpt_reserved = 0u64;
+        let mut last_issued = None;
+        let mut remote = BTreeSet::new();
+        let mut issued = 0u64;
+        for step in steps {
+            match *step {
+                Step::Issue => {
+                    if rules.resume_from_durable_reservation && next > reserved_upto {
+                        reserved_upto = next + CHUNK - 1;
+                        log.push(Rec::Reserve { upto: reserved_upto });
+                        // Durable before any txid of the range leaves the cell.
+                        durable = log.len();
+                    }
+                    let seq = next;
+                    next += 1;
+                    issued += 1;
+                    if remote.contains(&seq) {
+                        return Err(format!(
+                            "TXID REISSUE: (0, {seq}) issued again while a remote participant's durable prepare still carries it"
+                        ));
+                    }
+                    last_issued = Some(seq);
+                }
+                Step::LocalPrepare => {
+                    if let Some(seq) = last_issued {
+                        log.push(Rec::Tag { seq });
+                    }
+                }
+                Step::RemoteSurvives => {
+                    if let Some(seq) = last_issued {
+                        remote.insert(seq);
+                    }
+                }
+                Step::Fsync => durable = log.len(),
+                Step::Checkpoint => {
+                    if rules.checkpoint_carries_reservation {
+                        ckpt_reserved = ckpt_reserved.max(reserved_upto);
+                    }
+                    log.clear();
+                    durable = 0;
+                }
+                Step::Crash => {
+                    log.truncate(durable);
+                    let replayed_max = log
+                        .iter()
+                        .filter_map(|r| match r {
+                            Rec::Tag { seq } => Some(*seq),
+                            _ => None,
+                        })
+                        .max();
+                    let reserved_max = log
+                        .iter()
+                        .filter_map(|r| match r {
+                            Rec::Reserve { upto } => Some(*upto),
+                            _ => None,
+                        })
+                        .max();
+                    let floor = if rules.resume_from_durable_reservation {
+                        replayed_max.unwrap_or(0).max(reserved_max.unwrap_or(0)).max(ckpt_reserved)
+                    } else {
+                        replayed_max.unwrap_or(0)
+                    };
+                    next = floor + 1;
+                    reserved_upto = floor;
+                    last_issued = None;
+                }
+            }
+        }
+        Ok(issued)
+    }
+
+    /// F03: forty transactions persisted locally; txid 41 issued, a remote
+    /// prepare survives, the coordinator crashes before logging anything
+    /// for 41, reboots, and issues again.
+    pub fn remote_prepare_history() -> Vec<Step> {
+        let mut steps = Vec::new();
+        for _ in 0..40 {
+            steps.push(Step::Issue);
+            steps.push(Step::LocalPrepare);
+        }
+        steps.extend([Step::Fsync, Step::Issue, Step::RemoteSurvives, Step::Crash, Step::Issue]);
+        steps
+    }
+
+    /// A seeded history of issues, local/remote prepares, fsyncs,
+    /// checkpoints and crashes.
+    pub fn random_steps(seed: u64, len: usize) -> Vec<Step> {
+        let mut rng = Rng::new(seed);
+        (0..len)
+            .map(|_| match rng.below(9) {
+                0..=2 => Step::Issue,
+                3 => Step::LocalPrepare,
+                4 => Step::RemoteSurvives,
+                5 => Step::Fsync,
+                6 => Step::Checkpoint,
+                _ => Step::Crash,
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Variant;
     use super::acquisition::{self, Acquisition, Outcome, Rules};
     use super::durable;
+    use super::identity;
+    use super::lineage;
     use super::watch::{self, Event, Representation, Verdict};
 
     fn rules() -> Rules {
@@ -1536,6 +2219,181 @@ mod tests {
             "{} of 2000 interleavings partial under {rules:?}; first: {}",
             partials.len(),
             partials[0]
+        );
+    }
+
+    // ---- lineage (ADR-0116 A1/A2) ----
+
+    fn lineage_rules() -> lineage::Rules {
+        match Variant::from_env() {
+            Variant::Chosen => lineage::Rules::chosen(),
+            Variant::Withdrawn => lineage::Rules::withdrawn(),
+        }
+    }
+
+    #[test]
+    fn a_durable_successor_never_outlives_its_dependency() {
+        let r = lineage::run(lineage_rules(), &lineage::SUCCESSOR);
+        assert!(r.is_ok(), "{}", r.unwrap_err());
+    }
+
+    #[test]
+    fn withdrawn_plain_successor_outlives_its_dropped_source() {
+        let r = lineage::run(lineage::Rules::withdrawn(), &lineage::SUCCESSOR);
+        assert_eq!(
+            r,
+            Err("SERIALIZABILITY VIOLATION after crash: recovered [10, 101] is no serial subset of [Tx(1), Incr { cell: 1, id: 1 }] (decisions durable: {})".to_string())
+        );
+        // The qualified image alone does not repair it: the successor is still plain.
+        let only_pin =
+            lineage::Rules { successors_inherit_dependencies: false, ..lineage::Rules::chosen() };
+        assert!(lineage::run(only_pin, &lineage::SUCCESSOR).is_err());
+    }
+
+    #[test]
+    fn a_checkpoint_streams_the_decision_qualified_image() {
+        let r = lineage::run(lineage_rules(), &lineage::CHAIN);
+        assert!(r.is_ok(), "{}", r.unwrap_err());
+    }
+
+    #[test]
+    fn withdrawn_immediate_predecessor_leaks_half_of_the_older_transaction() {
+        let r = lineage::run(lineage::Rules::withdrawn(), &lineage::CHAIN);
+        assert_eq!(
+            r,
+            Err("SERIALIZABILITY VIOLATION after crash: recovered [100, 11] is no serial subset of [Tx(1), Tx(2)] (decisions durable: {})".to_string())
+        );
+        // Inheritance alone does not repair it: the image is still T1's.
+        let only_inherit =
+            lineage::Rules { pin_decision_qualified_image: false, ..lineage::Rules::chosen() };
+        assert!(lineage::run(only_inherit, &lineage::CHAIN).is_err());
+    }
+
+    #[test]
+    fn an_acked_dependent_transaction_is_never_dropped() {
+        let r = lineage::run(lineage::Rules::chosen(), &lineage::DEPENDENT_ACK);
+        assert!(r.is_ok(), "{}", r.unwrap_err());
+    }
+
+    #[test]
+    fn without_ack_gating_an_acked_dependent_transaction_is_dropped() {
+        let rules =
+            lineage::Rules { ack_waits_for_dependencies: false, ..lineage::Rules::chosen() };
+        let r = lineage::run(rules, &lineage::DEPENDENT_ACK);
+        assert_eq!(
+            r,
+            Err("ACKED WRITE LOST after crash: [Tx(2)] acked under `always` but recovered [10, 11] needs a subset without one of them (decisions durable: {2})".to_string())
+        );
+    }
+
+    #[test]
+    fn random_lineage_interleavings_are_serializable_and_keep_every_ack() {
+        let rules = lineage_rules();
+        let mut violations = Vec::new();
+        for seed in 1..=2000u64 {
+            if let Err(e) = lineage::run(rules, &lineage::random_steps(seed, 20)) {
+                violations.push(format!("seed {seed}: {e}"));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "{} of 2000 interleavings violated under {rules:?}; first: {}",
+            violations.len(),
+            violations[0]
+        );
+    }
+
+    #[test]
+    fn withdrawn_lineage_rules_violate_some_random_interleavings() {
+        let count = |rules: lineage::Rules| {
+            (1..=2000u64)
+                .filter(|s| lineage::run(rules, &lineage::random_steps(*s, 20)).is_err())
+                .count()
+        };
+        let withdrawn = count(lineage::Rules::withdrawn());
+        let only_inherit = count(lineage::Rules {
+            pin_decision_qualified_image: false,
+            ..lineage::Rules::chosen()
+        });
+        let only_pin = count(lineage::Rules {
+            successors_inherit_dependencies: false,
+            ..lineage::Rules::chosen()
+        });
+        let no_ack_gate =
+            count(lineage::Rules { ack_waits_for_dependencies: false, ..lineage::Rules::chosen() });
+        eprintln!(
+            "lineage violations over 2000 interleavings: withdrawn {withdrawn}, inherit-only {only_inherit}, pin-only {only_pin}, no-ack-gate {no_ack_gate}"
+        );
+        assert!(withdrawn > 0 && only_inherit > 0 && only_pin > 0 && no_ack_gate > 0);
+    }
+
+    // ---- identity (ADR-0116 A3) ----
+
+    fn identity_rules() -> identity::Rules {
+        match Variant::from_env() {
+            Variant::Chosen => identity::Rules::chosen(),
+            Variant::Withdrawn => identity::Rules::withdrawn(),
+        }
+    }
+
+    #[test]
+    fn a_remote_prepare_never_meets_a_reissued_txid() {
+        let r = identity::run(identity_rules(), &identity::remote_prepare_history());
+        assert!(r.is_ok(), "{}", r.unwrap_err());
+    }
+
+    #[test]
+    fn withdrawn_replay_maximum_reissues_the_remote_prepares_txid() {
+        let r = identity::run(identity::Rules::withdrawn(), &identity::remote_prepare_history());
+        assert_eq!(
+            r,
+            Err("TXID REISSUE: (0, 41) issued again while a remote participant's durable prepare still carries it".to_string())
+        );
+    }
+
+    #[test]
+    fn reservation_without_the_checkpoint_field_reissues_after_truncation() {
+        let rules =
+            identity::Rules { checkpoint_carries_reservation: false, ..identity::Rules::chosen() };
+        let steps = [
+            identity::Step::Issue,
+            identity::Step::RemoteSurvives,
+            identity::Step::Checkpoint,
+            identity::Step::Crash,
+            identity::Step::Issue,
+        ];
+        assert!(identity::run(rules, &steps).is_err(), "truncation dropped the reservation");
+        assert!(identity::run(identity::Rules::chosen(), &steps).is_ok());
+    }
+
+    #[test]
+    fn random_identity_histories_never_reissue() {
+        let rules = identity_rules();
+        let mut reissues = Vec::new();
+        for seed in 1..=2000u64 {
+            if let Err(e) = identity::run(rules, &identity::random_steps(seed, 24)) {
+                reissues.push(format!("seed {seed}: {e}"));
+            }
+        }
+        assert!(
+            reissues.is_empty(),
+            "TXID REISSUE on {} of 2000 histories under {rules:?}; first: {}",
+            reissues.len(),
+            reissues[0]
+        );
+    }
+
+    #[test]
+    fn withdrawn_identity_reissues_within_2000_seeds() {
+        let n = (1..=2000u64)
+            .filter(|s| {
+                identity::run(identity::Rules::withdrawn(), &identity::random_steps(*s, 24))
+                    .is_err()
+            })
+            .count();
+        assert!(
+            n > 0,
+            "the withdrawn identity rule survived 2000 histories — the model lost its teeth"
         );
     }
 }
