@@ -144,6 +144,25 @@ pub struct RecoveryReport {
     pub shadow_collide_ops: u64,
     pub shadow_settled_at_boot: u64,
     pub shadow_drain_checks: u64,
+    /// Review of 2026-08-30 (F-L07-01; batch 23, ADR-0093 A10/A11):
+    /// winners the boot rebuild left carrying several tickets and the
+    /// directed `DEL`s that met them; the directed rows that opened a
+    /// ticket on a twin carrying relocation origins and deleted the
+    /// winner, and the origins those deletes covered with markers.
+    pub shadow_multi_ticket_winners: u64,
+    pub shadow_multi_ticket_dels: u64,
+    pub shadow_twin_origin_rows: u64,
+    pub shadow_twin_origins_covered: u64,
+    /// ADR-0093 A12 (batch 23): tickets held open through the walk and
+    /// the cut with their winner flushed below the walk watermark, and
+    /// how many the boot re-formed (pre-fix the walk referenced the
+    /// winner and the key came back as two cold slots with no ticket).
+    pub shadow_held_rows: u64,
+    pub shadow_held_reformed: u64,
+    /// Held twins an older manifest never referenced (cut-before-publish
+    /// lives): legitimately absent after the boot, the key serves its
+    /// image — disclosed, never a pass on its own.
+    pub shadow_held_not_restored: u64,
     pub trace_hash: u64,
 }
 
@@ -250,13 +269,32 @@ fn read_cold_record(disk: &SimDisk, flush: &TierFlush<SimDisk>, addr: u64) -> Op
 /// The op mix's key (ADR-0093 A7): one in sixteen is a crafted colliding
 /// key — either side of one of `pairs` — so the shadow, `DEL`, walk and
 /// recovery paths meet two real keys with one hash on every seed.
-fn seeded_key(rng: &mut SplitMix64, keys: u64, pairs: &[([u8; 48], [u8; 48])]) -> Vec<u8> {
+fn seeded_key(rng: &mut SplitMix64, keys: u64, crafted: &[[u8; 48]]) -> Vec<u8> {
     if rng.next_u64().is_multiple_of(16) {
-        let pair = &pairs[(rng.next_u64() % pairs.len() as u64) as usize];
-        return if rng.next_u64().is_multiple_of(2) { pair.0.to_vec() } else { pair.1.to_vec() };
+        return crafted[(rng.next_u64() % crafted.len() as u64) as usize].to_vec();
     }
     let idx = rng.next_u64() % keys;
     format!("rec:{idx:05}").into_bytes()
+}
+
+/// The crafted keys the op mix draws from: four colliding pairs, and —
+/// review of 2026-08-30, F-L07-01 (batch 23) — two colliding **triples**,
+/// so a boot can find two cold slots of one hash beside one RAM sibling
+/// and rebuild several tickets on one winner (a pair never yields more
+/// than one).
+fn crafted_keys(seed: u64) -> Vec<[u8; 48]> {
+    let mut crafted: Vec<[u8; 48]> = Vec::with_capacity(14);
+    for i in 0..4u64 {
+        let (a, b) = forced_collision_pair(seed ^ i.wrapping_mul(P_TAG));
+        crafted.push(a);
+        crafted.push(b);
+    }
+    for i in 0..2u64 {
+        crafted.extend(inf_store::forced_collision_triple(
+            seed ^ 0x7C7C ^ (i + 4).wrapping_mul(P_TAG),
+        ));
+    }
+    crafted
 }
 
 /// Tag spread for the crafted pairs (four unrelated pairs per seed).
@@ -274,6 +312,13 @@ struct Run {
     /// pin-analog queue; some are deliberately left for the boot GC —
     /// the swap ↔ unlink crash window).
     pending_unlink: Vec<TierFileMeta>,
+    /// Batch 23 (ADR-0093 A12): the cold address of one ticket the
+    /// reconciler is made to leave open (its reads "fail") across the
+    /// walk and the cut, so its winner is sealed and flushed below the
+    /// walk watermark while the ticket is open.
+    held_twin: Option<u64>,
+    /// The held ticket's key and hash (diagnostics for the A12 row).
+    held_key: Option<(Vec<u8>, u64)>,
     report: RecoveryReport,
 }
 
@@ -465,6 +510,7 @@ impl Run {
         // A verified ticket needs no read (ADR-0093 A1): the exact
         // length is on the ticket — the plane's `delete_one` rule.
         if let Some(len) = ticket.verified_len {
+            self.twin_origin_markers(life, &ticket);
             RecordView::ColdDisplace { ns: NS, old_addr: ticket.cold.to_raw() }
                 .encode_into(&mut self.tail);
             life.table.delete(ticket.hash, ticket.cold, len as usize);
@@ -486,6 +532,7 @@ impl Run {
                         .violations
                         .push(format!("{when}: same-key verdict on a collision twin"));
                 }
+                self.twin_origin_markers(life, &ticket);
                 RecordView::ColdDisplace { ns: NS, old_addr: ticket.cold.to_raw() }
                     .encode_into(&mut self.tail);
                 life.table.delete(ticket.hash, ticket.cold, image.len());
@@ -500,6 +547,77 @@ impl Run {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// ADR-0093 A11 (batch 23): a same-key twin's own relocation origins
+    /// ride the `DEL`'s markers ahead of its address — the origins a
+    /// checkpoint that began before the twin's relocation may still ref.
+    /// Pre-fix the plane (and this mirror) dropped them: the deleted key
+    /// resurfaced at the next boot as an orphan cold slot (the seven red
+    /// seeds of `pre-fix-dst-recovery-seeds64.log`).
+    fn twin_origin_markers(&mut self, life: &mut Life, ticket: &inf_store::ShadowTicket) {
+        for (origin, _) in life.table.take_displacement_origins(ticket.hash, ticket.cold) {
+            RecordView::ColdDisplace { ns: NS, old_addr: origin }.encode_into(&mut self.tail);
+            self.report.shadow_twin_origins_covered += 1;
+        }
+    }
+
+    /// F-L07-01 (batch 23): `DEL` of every winner the boot rebuild left
+    /// carrying two or more tickets, with them open.
+    fn delete_multi_ticket_winners(&mut self, life: &mut Life) {
+        let mut by_winner: BTreeMap<u64, usize> = BTreeMap::new();
+        for ticket in life.table.shadow_tickets() {
+            *by_winner.entry(ticket.winner.to_raw()).or_default() += 1;
+        }
+        let winners: Vec<Vec<u8>> = by_winner
+            .iter()
+            .filter(|(_, n)| **n >= 2)
+            .map(|(w, _)| {
+                life.table.record(LogicalAddr::from_raw(*w).expect("48-bit")).key.to_vec()
+            })
+            .collect();
+        for key in winners {
+            self.report.shadow_multi_ticket_winners += 1;
+            self.apply_op(life, &key, Op::Del);
+            self.report.shadow_multi_ticket_dels += 1;
+        }
+    }
+
+    /// F-L07-01 / ADR-0093 A11 (batch 23): one relocated cold slot (a
+    /// record carrying displacement origins) is overwritten through the
+    /// shadow path and its winner deleted with the ticket open. Crafted
+    /// colliding keys are skipped — the row is about origins, not hashes.
+    fn directed_twin_with_origins(&mut self, life: &mut Life, rng: &mut SplitMix64) {
+        let keys: Vec<Vec<u8>> = self
+            .model
+            .keys()
+            .filter(|k| !k.starts_with(inf_store::COLLISION_KEY_PREFIX))
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let start = (rng.next_u64() % keys.len() as u64) as usize;
+        for i in 0..keys.len() {
+            let key = &keys[(start + i) % keys.len()];
+            let hash = life.table.hash_key(key);
+            let TieredLookup::Cold(addr) = life.table.lookup(key, hash, &[]) else { continue };
+            if life.table.displacement_origins_len(hash, addr) == 0
+                || !matches!(life.table.shadow_probe(key, hash), inf_store::ShadowProbe::One(_))
+            {
+                continue;
+            }
+            let value = vec![(rng.next_u64() % 251) as u8; 40];
+            self.apply_op(life, key, Op::SetShadow(value));
+            if life.table.shadow_pending() == 0 {
+                // Admission refused (the shadow write fell back to a
+                // plain SET, which took the origins itself) — not a row.
+                return;
+            }
+            self.report.shadow_twin_origin_rows += 1;
+            self.apply_op(life, key, Op::Del);
+            return;
         }
     }
 
@@ -554,7 +672,80 @@ impl Run {
     /// harness) — oldest winner first, the store's own work list.
     fn reconcile(&mut self, life: &mut Life, max: usize, when: &str) {
         for read in life.table.shadow_work(max) {
+            if Some(read.ticket.cold.to_raw()) == self.held_twin {
+                // The reconciler's device error (ADR-0093 D4.3): the
+                // ticket stays for the next round — held on purpose.
+                life.table.shadow_read_failed(read.ticket.cold);
+                continue;
+            }
             self.reconcile_ticket(life, read.ticket, when);
+        }
+    }
+
+    /// ADR-0093 A12 (batch 23): opens one ticket the reconciler will not
+    /// resolve this life. Placed mid-phase so the ops that follow seal
+    /// and flush the winner past the mutable window before the walk.
+    fn hold_a_ticket(&mut self, life: &mut Life, rng: &mut SplitMix64) {
+        if self.held_twin.is_some() {
+            return;
+        }
+        let keys: Vec<Vec<u8>> = self
+            .model
+            .keys()
+            .filter(|k| !k.starts_with(inf_store::COLLISION_KEY_PREFIX))
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let start = (rng.next_u64() % keys.len() as u64) as usize;
+        for i in 0..keys.len() {
+            let key = &keys[(start + i) % keys.len()];
+            let hash = life.table.hash_key(key);
+            let inf_store::ShadowProbe::One(cold) = life.table.shadow_probe(key, hash) else {
+                continue;
+            };
+            let before = life.table.shadow_pending();
+            let value = vec![(rng.next_u64() % 251) as u8; 48];
+            self.apply_op(life, key, Op::SetShadow(value));
+            if life.table.shadow_pending() > before {
+                self.held_twin = Some(cold.to_raw());
+                self.held_key = Some((key.clone(), hash));
+                self.report.shadow_held_rows += 1;
+                // The row's premise: the winner is sealed and flushed
+                // **before** the walk. Twice the mutable window of plain
+                // writes on fresh keys pushes it out, then a maintain
+                // round seals and flushes it (release stops at the pin).
+                // Asserted — a winner still above `flushed` would be
+                // imaged by watermark alone and the row would prove
+                // nothing.
+                let winner = life
+                    .table
+                    .shadow_tickets()
+                    .find(|t| t.cold == cold)
+                    .map(|t| t.winner)
+                    .expect("the ticket just opened");
+                let want = 2 * demote().mutable_target_bytes();
+                let mut written = 0u64;
+                let mut i = 0u64;
+                while written < want {
+                    let filler = format!("held:{}:{i}", self.report.shadow_held_rows).into_bytes();
+                    // Inline-sized (below `BLOB_THRESHOLD`): a plain SET.
+                    self.apply_op(life, &filler, Op::Set(vec![(rng.next_u64() % 251) as u8; 200]));
+                    written += 232;
+                    i += 1;
+                }
+                self.maintain(life);
+                if life.table.space().flushed() <= winner {
+                    self.report.violations.push(format!(
+                        "HELD ROW VACUOUS: the winner at {} is still above the flushed watermark \
+                         {} after {i} filler writes and a maintain round",
+                        winner.to_raw(),
+                        life.table.space().flushed().to_raw()
+                    ));
+                }
+            }
+            return;
         }
     }
 
@@ -734,11 +925,12 @@ impl Run {
             }
             Op::Del => {
                 if let Some((addr, len, _)) = displaced {
-                    // ADR-0093 D3: a winner's ticket is verified before
-                    // its delete and the same-key twin takes the marker
-                    // path (its own `ColdDisplace` + `delete`) — the
-                    // plane's `delete_one` rule, played here.
-                    if let Some(ticket) = life.table.shadow_of_winner(addr) {
+                    // ADR-0093 D3/A10: every ticket naming the winner is
+                    // verified before its delete and each same-key twin
+                    // takes the marker path (its origins, its own
+                    // `ColdDisplace`, `delete`) — the plane's
+                    // `delete_one` rule, played here.
+                    for ticket in life.table.shadow_tickets_of_winner(addr) {
                         self.verify_twin_for_delete(life, ticket, "del");
                     }
                     for (origin, _) in life.table.take_displacement_origins(hash, addr) {
@@ -1086,6 +1278,8 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         model: BTreeMap::new(),
         tail: Vec::new(),
         pending_unlink: Vec::new(),
+        held_twin: None,
+        held_key: None,
         report: RecoveryReport::default(),
     };
     let mut life = Life {
@@ -1096,9 +1290,9 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
     };
     let mut ckpt_id = 0u64;
     // ADR-0093 A7: four crafted colliding pairs per seed — two real keys
-    // with one 64-bit hash each, routed by the shared hashtag.
-    let pairs: Vec<([u8; 48], [u8; 48])> =
-        (0..4u64).map(|i| forced_collision_pair(scenario.seed ^ i.wrapping_mul(P_TAG))).collect();
+    // with one 64-bit hash each, routed by the shared hashtag — and two
+    // triples (F-L07-01).
+    let pairs = crafted_keys(scenario.seed);
 
     for life_index in 0..scenario.lives {
         run.report.lives += 1;
@@ -1108,7 +1302,10 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         }
         // Phase A: mutations (into the tail — everything since the last
         // durable publish replays).
-        for _ in 0..scenario.ops_per_phase {
+        for op_index in 0..scenario.ops_per_phase {
+            if op_index == scenario.ops_per_phase / 2 && !life.flush_lag {
+                run.hold_a_ticket(&mut life, &mut rng);
+            }
             let key = seeded_key(&mut rng, scenario.keys, &pairs);
             let op = seeded_op(&mut rng);
             run.apply_op(&mut life, &key, op);
@@ -1153,6 +1350,14 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         if !life.flush_lag {
             run.compact(&mut life, pressure, 8, &format!("life {life_index} pre-walk"));
             run.maintain(&mut life);
+            // Review of 2026-08-30, F-L07-01 / batch 23 (ADR-0093 A11):
+            // a relocated cold slot becomes a same-key twin through the
+            // shadow path and its winner is deleted with the ticket open
+            // — the twin's own origins must ride the `DEL`'s markers, or
+            // a checkpoint that began before the relocation resurrects
+            // the deleted key at the next boot (the cut-before-publish
+            // lives replay exactly that checkpoint).
+            run.directed_twin_with_origins(&mut life, &mut rng);
         }
 
         // The fuzzy hybrid walk, slice-interleaved with mutations. The
@@ -1325,6 +1530,11 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // Tickets deliberately left open across the cut (ADR-0093 D5):
         // recovery must re-form them from the checkpoint/tail.
         run.report.shadow_open_at_cut += life.table.shadow_pending() as u64;
+        // The held ticket (A12) counts only if still open at the cut
+        // (a DEL in the mix may have ended it legitimately).
+        let held_at_cut =
+            run.held_twin.filter(|c| life.table.shadow_tickets().any(|t| t.cold.to_raw() == *c));
+        run.held_twin = None;
         // The cut: every un-fsynced byte tears (seeded physics).
         disk.power_cut(scenario.seed ^ (0xC07_0000 + life_index));
         drop(life);
@@ -1484,6 +1694,39 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // (the winner serves), then they reconcile and the cardinality
         // oracle closes the life.
         run.report.shadow_reformed += life.table.shadow_pending() as u64;
+        if let Some(cold) = held_at_cut {
+            // ADR-0093 A12: the winner was sealed and flushed below the
+            // walk watermark with the ticket open. If the twin came back
+            // (its ref is in the manifest recovery used), a ticket must
+            // name it — the walk imaged the winner; a twin an older
+            // manifest never referenced (cut-before-publish) legitimately
+            // comes back as nothing, and the key serves its image.
+            let addr = LogicalAddr::from_raw(cold).expect("48-bit");
+            let (key, hash) = run.held_key.clone().expect("a held ticket names its key");
+            if life.table.shadow_tickets().any(|t| t.cold.to_raw() == cold) {
+                run.report.shadow_held_reformed += 1;
+            } else if !life.table.contains_pair(hash, addr) {
+                run.report.shadow_held_not_restored += 1;
+            } else {
+                run.report.violations.push(format!(
+                    "life {life_index}: HELD TICKET NOT RE-FORMED — the twin at {cold} of key \
+                     {:?} was restored with no RAM winner to pair (lookup {:?}, pending {}, len \
+                     {} vs model {}): the walk referenced the flushed winner (ADR-0093 A12)",
+                    String::from_utf8_lossy(&key),
+                    life.table.lookup(&key, hash, &[]),
+                    life.table.shadow_pending(),
+                    life.table.len(),
+                    run.model.len()
+                ));
+            }
+        }
+        run.held_key = None;
+        // Review of 2026-08-30, F-L07-01 / batch 23 (ADR-0093 A10): every
+        // winner the rebuild left carrying several tickets is deleted
+        // now, with them open — the plane's `delete_one` rule played
+        // against a multi-ticket winner (pre-fix: the store's release
+        // assert, a dead cell).
+        run.delete_multi_ticket_winners(&mut life);
         run.audit(&life, &format!("life {life_index} (tickets open)"));
         run.audit_len_after_drain(&mut life, &format!("life {life_index} (tickets open)"));
         run.reconcile_all(&mut life, &format!("life {life_index} post-recovery"));
@@ -1514,6 +1757,10 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                 run.report.shadow_collision.to_le_bytes(),
                 run.report.shadow_settled_at_boot.to_le_bytes(),
                 run.report.shadow_collide_ops.to_le_bytes(),
+                run.report.shadow_multi_ticket_dels.to_le_bytes(),
+                run.report.shadow_twin_origin_rows.to_le_bytes(),
+                run.report.shadow_twin_origins_covered.to_le_bytes(),
+                run.report.shadow_held_reformed.to_le_bytes(),
             ]
             .concat(),
             run.report.trace_hash,

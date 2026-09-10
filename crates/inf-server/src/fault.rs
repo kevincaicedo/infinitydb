@@ -9,6 +9,7 @@
 //! |---|---|---|
 //! | `durable_fsync_eio` | `DurableCell::on_synced` | the fsync completion arrives as a device-reported EIO instead of `Synced` — the watermark freezes (no ack for the affected batch can ever fire) and the process fail-stops with [`EXIT_DURABLE_FAILSTOP`](crate::EXIT_DURABLE_FAILSTOP) (the fsyncgate rule; ADR-0020 D3) |
 //! | `shadow_twin_read_fail` | `plane::tiered::read_cold_record` | a shadow twin's cold read fails (M4.5-S37, ADR-0093 D4.3/A3): the reconciler leaves the ticket for the next round, `DBSIZE`'s drain answers the typed `-ERR DBSIZE: shadow twin … unreadable` (relayed through a scattered leg), `DEL`'s forced resolution answers its error — never an inexact count, never a removal |
+//! | `shadow_reconcile_read_fail` | `plane::shadow_pump` (the MAINTAIN reconciler's twin read only) | the reconciler's cold reads fail while `DBSIZE`'s and `DEL`'s own reads succeed (ADR-0093 D4.3): every open ticket stays open across MAINTAIN rounds — the lever that holds a **rebuilt** ticket set open on a real node (a boot pairs cold slots with their one RAM sibling before serving; the reconciler would otherwise resolve them within its first rounds) so `DEL` meets a winner carrying several tickets (review of 2026-08-30, F-L07-01, batch 23) |
 //! | `cold_enqueue_full` | `plane::tiered::probe` + `plane::tiered::fetch_key` | the `ColdReads` enqueue refuses `QueueFull` (the BUSY leg the review of 2026-08-30, C2′/F-L06-02/F-L06-04, found untestable deterministically): every read command answers the typed `BUSY cold-read queue saturated` — `GET`, `MGET`, `EXISTS`/`TOUCH`, and a `SCAN` page alike — never a nil, a `:0`, or a silently shorter page |
 //! | `ns_drop_before_meta` | `plane::program_ns_ddl` (the DROP branch, after the local apply, before the catalog persist request) | the DDL stops with the origin's registry already lacking the namespace and nothing durable changed — the on-disk state of a power cut before the catalog swap (ADR-0100 D5): a restart restores the namespace whole, its tier files intact on every cell (the teardown hold never released) |
 //! | `ns_drop_after_meta` | `plane::program_ns_ddl` (the DROP branch, after the catalog swap is durable, before the fan) | the DDL stops with `META` lacking the namespace and carrying its tombstone while every `MANIFEST` still names it — the on-disk state of a power cut after the swap (ADR-0100 D6): a restart boots, sweeps the residue, and the namespace is gone |
@@ -23,6 +24,7 @@
 
 pub const DURABLE_FSYNC_EIO: &str = "durable_fsync_eio";
 pub const SHADOW_TWIN_READ_FAIL: &str = "shadow_twin_read_fail";
+pub const SHADOW_RECONCILE_READ_FAIL: &str = "shadow_reconcile_read_fail";
 pub const COLD_ENQUEUE_FULL: &str = "cold_enqueue_full";
 pub const MSET_MIDWAY_OOM: &str = "mset_midway_oom";
 pub const NS_DROP_BEFORE_META: &str = "ns_drop_before_meta";
@@ -34,6 +36,7 @@ pub const NS_CREATE_FAN_REFUSED: &str = "ns_create_fan_refused";
 pub const ALL: &[&str] = &[
     DURABLE_FSYNC_EIO,
     SHADOW_TWIN_READ_FAIL,
+    SHADOW_RECONCILE_READ_FAIL,
     COLD_ENQUEUE_FULL,
     MSET_MIDWAY_OOM,
     NS_DROP_BEFORE_META,

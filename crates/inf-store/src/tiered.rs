@@ -219,8 +219,9 @@ struct DiskAdmission {
 
 /// Cap on remembered relocation origins per record (ADR-0059 D9): a
 /// record at cap defers further relocation until a covering swap
-/// drains its entry — deferral, never growth.
-pub(crate) const RELOC_ORIGIN_CAP: usize = 3;
+/// drains its entry — deferral, never growth. Public so the plane's
+/// marker budgets derive from it (ADR-0093 A11) instead of restating it.
+pub const RELOC_ORIGIN_CAP: usize = 3;
 
 /// Cap on retained unconfirmed flush-chunk ends (~32 KiB worst case).
 const FLUSH_ENDS_CAP: usize = 4096;
@@ -876,6 +877,17 @@ impl TieredTable {
             return Vec::new();
         }
         self.reloc_origins.remove(&(hash, addr.to_raw())).unwrap_or_default()
+    }
+
+    /// How many origins [`take_displacement_origins`](Self::take_displacement_origins)
+    /// would return for `(hash, addr)` — the marker count a displacing
+    /// command budgets before it stages (ADR-0093 A11); ≤ [`RELOC_ORIGIN_CAP`].
+    #[must_use]
+    pub fn displacement_origins_len(&self, hash: u64, addr: LogicalAddr) -> usize {
+        if self.reloc_origins.is_empty() {
+            return 0;
+        }
+        self.reloc_origins.get(&(hash, addr.to_raw())).map_or(0, Vec::len)
     }
 
     /// Dead-byte attribution at the repoint/delete moment, keyed by the
@@ -1579,7 +1591,13 @@ impl TieredTable {
         loop {
             let space = &self.space;
             self.index.scan_home_group_ext(cursor as usize, |addr, hash| {
-                if addr.to_raw() < w {
+                // ADR-0093 A12 (batch 23): a ticket's winner is imaged
+                // even below the flushed watermark — sealing and flushing
+                // pass it (D3), only release is pinned, so it is RAM-
+                // resident here; a ref would restore it as a second cold
+                // slot of its key with no RAM sibling for the rebuild to
+                // pair (a stale read and a phantom key after recovery).
+                if addr.to_raw() < w && !self.is_shadow_winner(addr) {
                     emit_ref(hash, addr);
                 } else {
                     let head = space.bytes(addr, crate::record::HEADER_LEN);

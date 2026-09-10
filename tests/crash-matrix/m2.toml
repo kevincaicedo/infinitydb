@@ -113,6 +113,21 @@ point = "shadow_twin_read_fail"
 tier = "node"
 test = "shadow_open_tickets"
 expect = "dbsize-typed-error"
+# Review of 2026-08-30 (F-L07-01; batch 23, ADR-0093 A10): the
+# reconciler's twin reads fail while `DBSIZE`'s and `DEL`'s succeed, so a
+# **rebuilt** ticket set stays open on a real node. Carried by
+# `inf-server/tests/node_e2e.rs` (`del_of_a_rebuilt_winner_carrying_two_
+# tickets_drains_every_ticket`) and the `m4-tiered` phase 7c rows.
+#   del-drains-every-ticket — DEL of a winner carrying two rebuilt
+#                             tickets answers `:1`, both twins verified
+#                             (collision keys stay, a same-key twin dies
+#                             through its own marker), never the cell's
+#                             release assert
+[[row]]
+point = "shadow_reconcile_read_fail"
+tier = "node"
+test = "node_e2e"
+expect = "del-drains-every-ticket"
 # Review of 2026-08-30 (C2′ / F-L06-02, F-L06-04): the ColdReads enqueue
 # refuses QueueFull — the deterministic stand-in for a saturated cold
 # queue. Carried by `inf-server/tests/node_e2e.rs`
