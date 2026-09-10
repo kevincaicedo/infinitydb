@@ -6164,3 +6164,146 @@ fn concurrent_namespace_ddl_leaves_every_cell_agreeing() {
     }
     node.stop();
 }
+
+/// Review of 2026-08-30 (F-L07-01; batch 23, ADR-0093 A10): a boot
+/// rebuild pairs **every** cold slot of one hash with its one RAM
+/// sibling, so a winner can carry several tickets — here two collision
+/// keys' cold slots beside the third key's RAM record, with the shadow
+/// arm **off** (the rebuild runs on every boot regardless of the knob).
+/// Pre-fix `delete_one` resolved the first ticket only, and
+/// `TieredTable::delete`'s release assert killed the cell (`delete of a
+/// shadow winner before its ticket resolved`). The reconciler's reads are
+/// failed by `shadow_reconcile_read_fail` so the rebuilt tickets stay
+/// open until the `DEL` — its own read is unaffected (ADR-0093 D4.3's
+/// shape on a real node). A third life proves the deletion durable and
+/// the collision keys intact.
+#[test]
+fn del_of_a_rebuilt_winner_carrying_two_tickets_drains_every_ticket() {
+    let dir = temp_data_dir("shadow-rebuilt-two-tickets");
+    let [k0, k1, k2] = inf_store::forced_collision_triple(0xF107_0001);
+    let (v0, v1, v2) = (vec![b'0'; 1500], vec![b'1'; 1400], vec![b'2'; 1300]);
+    let filler_keys = 600u64;
+    let filler = vec![b'f'; 8 << 10];
+    let bulk = |v: &[u8]| {
+        let mut e = format!("${}\r\n", v.len()).into_bytes();
+        e.extend_from_slice(v);
+        e.extend_from_slice(b"\r\n");
+        e
+    };
+    let use_t = |c: &mut TcpStream| {
+        // Promotion off: a cold GET below is a witness of cold-ness,
+        // never a relocation into RAM.
+        c.write_all(&cmd(&[b"CONFIG", b"SET", b"tiered-promote-on-read", b"no"])).expect("write");
+        read_exactly(c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+        read_exactly(c, b"+OK\r\n");
+    };
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"t",
+            b"MODE",
+            b"durable",
+            b"MEM-BUDGET",
+            b"3mb",
+            b"MUTABLE-FRACTION",
+            b"200",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        use_t(&mut c);
+        for (k, v) in [(&k0, &v0), (&k2, &v2)] {
+            c.write_all(&cmd(&[b"SET", k, v])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        for i in 0..filler_keys {
+            c.write_all(&cmd(&[b"SET", format!("fill:{i}").as_bytes(), &filler])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        wait_demoted(&mut c, 1 << 20);
+        // Cold-ness asserted (the batch-1 trap): both collision keys
+        // resolve through the cold path.
+        let before = scrape_u64(&mut c, b"tiering", "tiering_cold_resolves:");
+        c.write_all(&cmd(&[b"GET", &k0])).expect("write");
+        read_exactly(&mut c, &bulk(&v0));
+        c.write_all(&cmd(&[b"GET", &k2])).expect("write");
+        read_exactly(&mut c, &bulk(&v2));
+        assert!(
+            scrape_u64(&mut c, b"tiering", "tiering_cold_resolves:") >= before + 2,
+            "the collision keys are cold before the third key is written"
+        );
+        // The third key of the hash: two exact cold candidates ⇒ the
+        // synchronous path (no ticket), RAM at the tail.
+        c.write_all(&cmd(&[b"SET", &k1, &v1])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        // The walk: refs for the two cold slots, an image for the RAM
+        // sibling — the index the next boot rebuilds tickets from.
+        c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        drop(c);
+        node.stop();
+    }
+    // Life 2: the rebuild forms two tickets on k1's record; the
+    // reconciler cannot resolve them; DEL must.
+    let node = Node::start_durable_with_faults(
+        1,
+        &dir,
+        vec![(
+            inf_server::fault::SHADOW_RECONCILE_READ_FAIL,
+            inf_foundation::fault::FaultSpec::Always,
+        )],
+    );
+    let mut c = node.connect();
+    use_t(&mut c);
+    assert_eq!(
+        scrape_u64(&mut c, b"tiering", "tiering_shadow_pending:"),
+        2,
+        "the rebuild paired both cold collision slots with the one RAM sibling (a vacuous row \
+         otherwise)"
+    );
+    let collisions = scrape_u64(&mut c, b"tiering", "tiering_shadow_resolved_collision:");
+    let forced = scrape_u64(&mut c, b"tiering", "tiering_shadow_forced_by_delete:");
+    c.write_all(&cmd(&[b"DEL", &k1])).expect("write");
+    read_exactly(&mut c, b":1\r\n");
+    c.write_all(&cmd(&[b"GET", &k1])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    c.write_all(&cmd(&[b"GET", &k0])).expect("write");
+    read_exactly(&mut c, &bulk(&v0));
+    c.write_all(&cmd(&[b"GET", &k2])).expect("write");
+    read_exactly(&mut c, &bulk(&v2));
+    assert_eq!(scrape_u64(&mut c, b"tiering", "tiering_shadow_pending:"), 0, "every ticket ended");
+    assert_eq!(
+        scrape_u64(&mut c, b"tiering", "tiering_shadow_resolved_collision:"),
+        collisions + 2,
+        "both twins were read and told apart by DEL"
+    );
+    assert_eq!(
+        scrape_u64(&mut c, b"tiering", "tiering_shadow_forced_by_delete:"),
+        forced + 2,
+        "DEL forced both tickets"
+    );
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", filler_keys + 2).as_bytes());
+    drop(c);
+    node.stop();
+    // Life 3 (no fault): the deletion is durable, the collision keys
+    // survive, no ticket re-forms (the winner is gone).
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    use_t(&mut c);
+    c.write_all(&cmd(&[b"GET", &k1])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    c.write_all(&cmd(&[b"GET", &k0])).expect("write");
+    read_exactly(&mut c, &bulk(&v0));
+    c.write_all(&cmd(&[b"GET", &k2])).expect("write");
+    read_exactly(&mut c, &bulk(&v2));
+    assert_eq!(scrape_u64(&mut c, b"tiering", "tiering_shadow_pending:"), 0);
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", filler_keys + 2).as_bytes());
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}

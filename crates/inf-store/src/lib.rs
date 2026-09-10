@@ -74,8 +74,8 @@ pub use inf_foundation::LogicalAddr;
 pub use inf_foundation::{KeyHashId, KeyHasher};
 pub use inf_log::{FsyncClass, NsId};
 pub use keyspace::{
-    DEFAULT_DBS, EvictBudget, Keyspace, PressureConfig, ReplayError, ReplayOutcome, StateDigest,
-    TIERED_VA_LIMIT_DEFAULT, TieredCreateError, TieredUsage,
+    DEFAULT_DBS, DISPLACE_REGISTER_CAP, EvictBudget, Keyspace, PressureConfig, ReplayError,
+    ReplayOutcome, StateDigest, TIERED_VA_LIMIT_DEFAULT, TieredCreateError, TieredUsage,
 };
 pub use live_set::{FileLiveSet, LiveSet};
 pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, valid_ns_name};
@@ -101,7 +101,7 @@ pub use tiered::shadow::{
     ShadowRebuild, ShadowRebuildError, ShadowRefusal, ShadowTicket, ShadowVerdict,
     forced_collision_pair, forced_collision_triple,
 };
-pub use tiered::{RecordParts, TieredLookup, TieredTable};
+pub use tiered::{RELOC_ORIGIN_CAP, RecordParts, TieredLookup, TieredTable};
 pub use tiered_recover::{
     RecoveredTier, TierRecoverStats, apply_blob_ref_section, apply_live_set_section,
     apply_ref_section, recover_tiered_ns,

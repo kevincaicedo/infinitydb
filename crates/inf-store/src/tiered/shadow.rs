@@ -714,12 +714,39 @@ impl TieredTable {
         self.shadow_note_alloc();
     }
 
-    /// The first ticket naming `winner`, if any (the `DEL` path's probe,
-    /// D3).
+    /// The first ticket naming `winner`, if any (the `delete` assert's
+    /// probe, D3/I7).
     #[must_use]
     pub fn shadow_of_winner(&self, winner: LogicalAddr) -> Option<ShadowTicket> {
         let cold = self.shadow.winner_tickets(winner.to_raw()).next()?;
         self.shadow.ticket(cold)
+    }
+
+    /// Every ticket naming `winner`, ascending by cold address (the
+    /// `DEL` path's snapshot — ADR-0093 A10). One winner carries several
+    /// tickets after a boot rebuild paired several cold slots of one
+    /// hash with its one RAM sibling (a same-key twin beside collision
+    /// keys, or several collision keys); the review of 2026-08-30
+    /// (F-L07-01) found `DEL` resolving only the first.
+    #[must_use]
+    pub fn shadow_tickets_of_winner(&self, winner: LogicalAddr) -> Vec<ShadowTicket> {
+        if self.shadow.by_winner.is_empty() {
+            return Vec::new();
+        }
+        self.shadow
+            .winner_tickets(winner.to_raw())
+            .map(|cold| self.shadow.ticket(cold).expect("by_winner and by_cold agree"))
+            .collect()
+    }
+
+    /// Whether an open ticket names `addr` as its winner (the checkpoint
+    /// walk consults this below its watermark — A12). RAM-resident by
+    /// the pin whenever true.
+    #[inline]
+    #[must_use]
+    pub fn is_shadow_winner(&self, addr: LogicalAddr) -> bool {
+        !self.shadow.by_winner.is_empty()
+            && self.shadow.winner_tickets(addr.to_raw()).next().is_some()
     }
 
     /// Whether `addr` is a ticket's cold address (compaction, promotion

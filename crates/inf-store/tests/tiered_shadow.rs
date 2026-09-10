@@ -1420,3 +1420,187 @@ fn compaction_defers_a_tickets_cold_slot_until_resolution() {
     let report = rig.table.space().report();
     assert_eq!(rig.table.live_bytes() + report.dead_bytes, report.allocated_bytes);
 }
+
+/// ADR-0093 A10 (review of 2026-08-30, F-L07-01; batch 23): a winner
+/// lists **every** ticket naming it, ascending by cold address — the
+/// `DEL` path's snapshot; `shadow_of_winner` (the delete assert's probe)
+/// is its first. Resolving one leaves the rest listed — the state the
+/// plane's single-ticket `DEL` used to delete into — and `delete`
+/// proceeds only once every one has ended through its own removal.
+#[test]
+fn a_winner_lists_every_ticket_naming_it_in_cold_order() {
+    let key = b"k".to_vec();
+    let hash = KeyHasher::default().hash(&key);
+    let mut t = recovered_table();
+    let twins: Vec<LogicalAddr> =
+        (1..=3u64).map(|i| LogicalAddr::from_raw(i * 4096).expect("fits")).collect();
+    for twin in &twins {
+        t.apply_ref(hash, *twin);
+    }
+    let winner = t.apply_image(&key, b"new", hash).expect("fits");
+    t.rebuild_shadow_tickets(no_settle).expect("one RAM sibling: three tickets");
+    let listed = t.shadow_tickets_of_winner(winner);
+    assert_eq!(listed.iter().map(|t| t.cold).collect::<Vec<_>>(), twins, "every twin, in order");
+    assert!(
+        listed.iter().all(|t| t.winner == winner && t.hash == hash && t.verified_len.is_none())
+    );
+    assert_eq!(t.shadow_of_winner(winner).map(|t| t.cold), Some(twins[0]));
+    assert!(t.shadow_tickets_of_winner(twins[0]).is_empty(), "a cold address names no winner");
+    let image = record_image(&key, b"old");
+    assert_eq!(t.resolve_shadow(hash, twins[1], &image), ShadowVerdict::SameKey);
+    assert_eq!(
+        t.shadow_tickets_of_winner(winner).iter().map(|t| t.cold).collect::<Vec<_>>(),
+        vec![twins[0], twins[2]],
+        "the settled one is gone, the others stay listed"
+    );
+    // The DEL rule per remaining twin: verify, its origins (none here),
+    // its own removal — the ticket ends with the slot.
+    for twin in [twins[0], twins[2]] {
+        assert_eq!(t.verify_shadow(hash, twin, &image), ShadowVerdict::SameKey);
+        assert!(t.take_displacement_origins(hash, twin).is_empty());
+        t.delete(hash, twin, image.len());
+    }
+    assert!(t.shadow_tickets_of_winner(winner).is_empty(), "every ticket ended");
+    let origins = t.take_displacement_origins(hash, winner);
+    assert_eq!(origins.iter().map(|(a, _)| *a).collect::<Vec<_>>(), vec![twins[1].to_raw()]);
+    let len = t.record(winner).encoded_len;
+    t.delete(hash, winner, len);
+    assert!(matches!(t.lookup(&key, hash, &[]), TieredLookup::Miss));
+    assert_eq!(t.len(), 0);
+}
+
+/// ADR-0093 A11 (review of 2026-08-30, F-L07-01's neighbour; batch 23):
+/// a ticket's cold twin can carry relocation origins — compaction moved
+/// it before the overwrite opened the ticket (admission allows up to
+/// `RELOC_ORIGIN_CAP − 1`) — and the `DEL` rule takes them ahead of the
+/// twin's own marker. Pre-fix the plane dropped them and the deleted key
+/// resurfaced from the origin slot at the next boot (seven of 64
+/// `m4-recovery` seeds).
+#[test]
+fn a_ticketed_twin_carries_its_relocation_origins_for_the_delete() {
+    let mut rig = Rig::new();
+    rig.table.set_shadow_enabled(true);
+    rig.table.set_compaction_config(CompactionConfig { dead_ratio_pct: 50, slice_bytes: 1 << 20 });
+    let hash = KeyHasher::default().hash(b"c:1");
+    for i in 0..8u32 {
+        let key = format!("c:{i}");
+        rig.table
+            .insert(key.as_bytes(), &[0x44; 900], KeyHasher::default().hash(key.as_bytes()))
+            .expect("fits");
+    }
+    for i in 0..6u32 {
+        let key = format!("f:{i}");
+        rig.table
+            .insert(key.as_bytes(), &[0x77; 900], KeyHasher::default().hash(key.as_bytes()))
+            .expect("fits");
+    }
+    rig.maintain();
+    let TieredLookup::Cold(old) = rig.table.lookup(b"c:1", hash, &[]) else { panic!("c:1 cold") };
+    // Kill c:1's file-mates so the file crosses the dead-ratio trigger,
+    // then relocate c:1 — its origin chains onto the copy (ADR-0059 D9).
+    for key in [b"c:0".as_slice(), b"c:2", b"c:3"] {
+        rig.sync_overwrite_cold(key, &[0x66; 900]);
+    }
+    rig.maintain();
+    let CompactionWork::Read { file_id, addr, len } =
+        rig.table.compaction_work(&rig.flush, false, 1 << 20)
+    else {
+        panic!("a candidate file exists");
+    };
+    let chunk = rig.read_cold(addr.to_raw(), usize::try_from(len).expect("fits")).expect("chunk");
+    let applied = rig.table.compaction_apply(file_id, addr, &chunk);
+    assert!(applied.relocated >= 1, "c:1 relocated: {applied:?}");
+    let TieredLookup::Ram(moved) = rig.table.lookup(b"c:1", hash, &[]) else {
+        panic!("the copy lands in the tail")
+    };
+    assert_ne!(moved, old);
+    assert_eq!(rig.table.displacement_origins_len(hash, moved), 1, "the origin chained");
+    // Push the copy cold again; it is now the key's one exact cold
+    // candidate, origins and all.
+    for i in 6..14u32 {
+        let key = format!("f:{i}");
+        rig.table
+            .insert(key.as_bytes(), &[0x77; 900], KeyHasher::default().hash(key.as_bytes()))
+            .expect("fits");
+    }
+    rig.maintain();
+    assert_eq!(rig.table.space().resolve(moved), AddrClass::Cold, "the copy went cold");
+    let ShadowProbe::One(twin) = rig.table.shadow_probe(b"c:1", hash) else {
+        panic!("one exact cold candidate")
+    };
+    assert_eq!(twin, moved);
+    rig.table.shadow_admit(hash, twin, 920).expect("one origin: room under the cap");
+    let winner = rig.table.insert(b"c:1", &[0x55; 900], hash).expect("fits");
+    rig.table.register_shadow(hash, twin, winner);
+    assert_eq!(rig.table.displacement_origins_len(hash, twin), 1, "the ticketed twin keeps it");
+    // The DEL rule (ADR-0093 D3/A11): verify by full key, then the twin's
+    // origins ride the markers ahead of the twin's own.
+    let head = rig.read_cold(twin.to_raw(), TieredTable::RECORD_HEADER_LEN).expect("head");
+    let twin_len = TieredTable::record_len_from_header(&head);
+    let image = rig.read_cold(twin.to_raw(), twin_len).expect("record");
+    assert_eq!(rig.table.verify_shadow(hash, twin, &image), ShadowVerdict::SameKey);
+    let origins = rig.table.take_displacement_origins(hash, twin);
+    assert_eq!(
+        origins.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+        vec![old.to_raw()],
+        "the marker run names the origin before the twin"
+    );
+    rig.table.delete(hash, twin, image.len());
+    assert!(rig.table.shadow_tickets_of_winner(winner).is_empty(), "the ticket ended");
+    assert_eq!(
+        rig.table.displacement_origins_len(hash, twin),
+        0,
+        "nothing left keyed by a dead address"
+    );
+    let wlen = rig.table.record(winner).encoded_len;
+    rig.table.delete(hash, winner, wlen);
+    assert!(matches!(rig.table.lookup(b"c:1", hash, &[]), TieredLookup::Miss));
+    let report = rig.table.space().report();
+    assert_eq!(rig.table.live_bytes() + report.dead_bytes, report.allocated_bytes);
+}
+
+/// ADR-0093 A12 (batch 23 — found by phase 7c's vacuous row, N13): a
+/// ticketed winner that sealing and flushing passed (D3 lets them; only
+/// release is pinned) sits **below** the flushed watermark when a
+/// checkpoint walk begins. D5 assumed "an image for `B` (RAM)"; the walk
+/// emitted by watermark alone — refs for both, so recovery restored two
+/// cold slots of one key with no RAM sibling: a stale read (`m4-tiered`
+/// `GET s0 … STALE READ`) and a phantom key. Pre-fix: `refs
+/// [LogicalAddr(0x0), LogicalAddr(0xb)], images []`.
+#[test]
+fn a_flushed_winner_is_imaged_by_the_walk_not_referenced() {
+    let mut h = Harness::new();
+    let a = cold_key(&mut h, b"k", b"v1");
+    let (_, w) = h.shadow_set(b"k", b"v2");
+    // Seal + flush everything; release stops at the pinned winner.
+    let tail = h.table.space().tail();
+    h.table.space_mut().advance_ro_boundary(tail);
+    h.flush_to(tail.to_raw());
+    let ceiling = h.table.space().release_ceiling();
+    h.table.space_mut().advance_head(LogicalAddr::from_raw(ceiling).expect("fits"));
+    assert!(h.table.space().flushed() > w, "the winner was flushed");
+    assert_ne!(h.table.space().resolve(w), AddrClass::Cold, "…but the pin keeps it RAM-resident");
+    assert_eq!(h.table.space().resolve(a), AddrClass::Cold);
+    let _ = h.table.begin_ckpt_walk(1);
+    let mut refs: Vec<LogicalAddr> = Vec::new();
+    let mut images: Vec<Vec<u8>> = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        cursor = h.table.ckpt_walk_slice(
+            cursor,
+            48,
+            |_, addr| refs.push(addr),
+            |parts| images.push(parts.key.to_vec()),
+        );
+        if cursor == 0 {
+            break;
+        }
+    }
+    h.table.end_ckpt_walk();
+    assert!(refs.contains(&a), "the twin is referenced: {refs:?}");
+    assert!(
+        images.iter().any(|k| k == b"k") && !refs.contains(&w),
+        "the ticketed winner is imaged even below the flushed watermark (D5) — refs {refs:?}, \
+         images {images:?}"
+    );
+}

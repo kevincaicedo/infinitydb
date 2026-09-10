@@ -344,10 +344,24 @@ fn main() {
             let mut shadow_collide_ops = 0u64;
             let mut shadow_settled_at_boot = 0u64;
             let mut shadow_drain_checks = 0u64;
+            let mut shadow_multi_winners = 0u64;
+            let mut shadow_multi_dels = 0u64;
+            let mut shadow_twin_origin_rows = 0u64;
+            let mut shadow_twin_origins_covered = 0u64;
+            let mut shadow_held_rows = 0u64;
+            let mut shadow_held_reformed = 0u64;
+            let mut shadow_held_not_restored = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
                 ran += 1;
+                shadow_held_rows += report.shadow_held_rows;
+                shadow_held_reformed += report.shadow_held_reformed;
+                shadow_held_not_restored += report.shadow_held_not_restored;
+                shadow_multi_winners += report.shadow_multi_ticket_winners;
+                shadow_multi_dels += report.shadow_multi_ticket_dels;
+                shadow_twin_origin_rows += report.shadow_twin_origin_rows;
+                shadow_twin_origins_covered += report.shadow_twin_origins_covered;
                 shadow_opened += report.shadow_opened;
                 shadow_at_cut += report.shadow_open_at_cut;
                 shadow_reformed += report.shadow_reformed;
@@ -391,7 +405,12 @@ fn main() {
                  {shadow_same_key} same-key / {shadow_collision} collision verdicts; \
                  {shadow_collide_ops} ops on crafted colliding pairs, \
                  {shadow_settled_at_boot} slots settled at boot, {shadow_drain_checks} \
-                 DBSIZE-drain checks"
+                 DBSIZE-drain checks; rebuilt multi-ticket winners {shadow_multi_winners} \
+                 ({shadow_multi_dels} DELs drained them), twin-with-origins rows \
+                 {shadow_twin_origin_rows} ({shadow_twin_origins_covered} origins covered by \
+                 DEL markers), held-across-the-walk rows {shadow_held_rows} \
+                 ({shadow_held_reformed} re-formed at boot, {shadow_held_not_restored} not \
+                 restored by an older manifest)"
             );
             if let Some(dir) = out_dir {
                 std::fs::create_dir_all(&dir).expect("--out dir");
@@ -407,7 +426,14 @@ fn main() {
                      shadow_reformed={shadow_reformed} shadow_same_key={shadow_same_key} \
                      shadow_collision={shadow_collision} shadow_collide_ops={shadow_collide_ops} \
                      shadow_settled_at_boot={shadow_settled_at_boot} \
-                     shadow_drain_checks={shadow_drain_checks}\n"
+                     shadow_drain_checks={shadow_drain_checks} \
+                     shadow_multi_winners={shadow_multi_winners} \
+                     shadow_multi_dels={shadow_multi_dels} \
+                     shadow_twin_origin_rows={shadow_twin_origin_rows} \
+                     shadow_twin_origins_covered={shadow_twin_origins_covered} \
+                     shadow_held_rows={shadow_held_rows} \
+                     shadow_held_reformed={shadow_held_reformed} \
+                     shadow_held_not_restored={shadow_held_not_restored}\n"
                 );
                 std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
                     .expect("manifest");
@@ -426,7 +452,8 @@ fn main() {
              entries, {} relocations, {} retired, {} unlinked, {} left-to-boot-gc, \
              {} blobs, {} orphans-planted, {} blob-reclaims, shadow {} opened / {} open at a \
              cut / {} re-formed / {} same-key / {} collision, {} collide-ops, {} settled-at-boot, \
-             {} drain-checks, trace {:#x}",
+             {} drain-checks, {} multi-ticket winners / {} DELs, {} twin-origin rows / {} \
+             origins covered, {} held rows / {} re-formed / {} not restored, trace {:#x}",
             report.lives,
             report.refs_emitted,
             report.images_emitted,
@@ -450,6 +477,13 @@ fn main() {
             report.shadow_collide_ops,
             report.shadow_settled_at_boot,
             report.shadow_drain_checks,
+            report.shadow_multi_ticket_winners,
+            report.shadow_multi_ticket_dels,
+            report.shadow_twin_origin_rows,
+            report.shadow_twin_origins_covered,
+            report.shadow_held_rows,
+            report.shadow_held_reformed,
+            report.shadow_held_not_restored,
             report.trace_hash
         );
         if verify {
@@ -520,10 +554,22 @@ fn main() {
             let mut open_collisions = 0u64;
             let mut open_read_faults = 0u64;
             let mut open_settled_without_read = 0u64;
+            let mut rebuilt_seeds = 0u64;
+            let mut rebuilt_tickets = 0u64;
+            let mut rebuilt_multi_dels = 0u64;
+            let mut rebuilt_same_key_twins = 0u64;
+            let mut rebuilt_fill_sets = 0u64;
+            let mut rebuilt_reboots = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
                 ran += 1;
+                rebuilt_seeds += u64::from(report.rebuilt_rows);
+                rebuilt_tickets += report.rebuilt_tickets;
+                rebuilt_multi_dels += report.rebuilt_multi_dels;
+                rebuilt_same_key_twins += report.rebuilt_same_key_twins;
+                rebuilt_fill_sets += report.rebuilt_fill_sets;
+                rebuilt_reboots += report.rebuilt_reboots;
                 open_seeds += u64::from(report.open_rows);
                 open_tickets += report.open_tickets;
                 open_drains += report.open_dbsize_drains;
@@ -602,7 +648,10 @@ fn main() {
                  retargets, {open_forced_deletes} read-free forced deletes, {open_ticketed} \
                  ticketed fallbacks, {open_collisions} collision verdicts, {open_read_faults} \
                  injected read errors relayed, {open_settled_without_read} settled without a \
-                 read after resume"
+                 read after resume; rebuilt multi-ticket rows on {rebuilt_seeds} seeds: \
+                 {rebuilt_tickets} tickets rebuilt, {rebuilt_multi_dels} DELs draining several, \
+                 {rebuilt_same_key_twins} same-key twins among them, {rebuilt_fill_sets} filler \
+                 writes, {rebuilt_reboots} reboots"
             );
             println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
             if let Some(dir) = out_dir {
@@ -629,7 +678,11 @@ fn main() {
                      open_scan_twins={open_scan_twins} open_retargeted={open_retargeted} \
                      open_forced_deletes={open_forced_deletes} open_ticketed={open_ticketed} \
                      open_collisions={open_collisions} open_read_faults={open_read_faults} \
-                     open_settled_without_read={open_settled_without_read}\n"
+                     open_settled_without_read={open_settled_without_read} \
+                     rebuilt_seeds={rebuilt_seeds} rebuilt_tickets={rebuilt_tickets} \
+                     rebuilt_multi_dels={rebuilt_multi_dels} \
+                     rebuilt_same_key_twins={rebuilt_same_key_twins} \
+                     rebuilt_fill_sets={rebuilt_fill_sets} rebuilt_reboots={rebuilt_reboots}\n"
                 );
                 std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
                     .expect("manifest");

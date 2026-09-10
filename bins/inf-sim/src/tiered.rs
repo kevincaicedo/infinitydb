@@ -338,6 +338,18 @@ pub struct TieredNodeReport {
     pub open_collision_verdicts: u64,
     pub open_read_fault_errors: u64,
     pub open_settled_without_read: u64,
+    /// Phase 7c (review of 2026-08-30, F-L07-01; batch 23, ADR-0093 A10):
+    /// a boot rebuild pairs every cold slot of one hash with its one RAM
+    /// sibling — the tickets the reboot formed on the phase's winners,
+    /// the `DEL`s that met a winner carrying several, the same-key twin
+    /// among them (shadow seeds), the filler writes that demoted it, and
+    /// the two extra reboots. Every row asserts its own coverage.
+    pub rebuilt_rows: bool,
+    pub rebuilt_tickets: u64,
+    pub rebuilt_multi_dels: u64,
+    pub rebuilt_same_key_twins: u64,
+    pub rebuilt_fill_sets: u64,
+    pub rebuilt_reboots: u64,
 }
 
 impl TieredNodeReport {
@@ -850,6 +862,27 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         }
     }
     report.commands_done += OPEN_SAME_KEYS + 1 + OPEN_TRIPLES;
+    // Review of 2026-08-30 (F-L07-01; batch 23, ADR-0093 A10): phase 7c's
+    // material — two collision keys of one triple (cold again by phase
+    // 6c, both arms) and the first key of a second triple (the same-key
+    // twin's cold slot on the shadow arm), written pre-cut like the pairs.
+    let rebuilt_triple = inf_store::forced_collision_triple(seed ^ 0x7C7C_0001);
+    let rebuilt_sk = inf_store::forced_collision_triple(seed ^ 0x7C7C_0002);
+    let rebuilt_value = |tag: u8, i: u64| value_bytes(tag, 8, i, 1600);
+    const REBUILT_PRECUT_KEYS: u64 = 3;
+    for (i, key) in [&rebuilt_triple[0], &rebuilt_triple[2], &rebuilt_sk[0]].into_iter().enumerate()
+    {
+        let value = rebuilt_value(b'g', i as u64);
+        let set: &[&[u8]] = &[b"SET", key, &value];
+        match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("pre-cut SET rebuilt key {i} answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    report.commands_done += REBUILT_PRECUT_KEYS;
 
     // ---- phase 1b: the shared blob-key write race (F-L06-03) ------------
     // K clients on cell 0 write the same key with extent-sized values in
@@ -1950,6 +1983,8 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     // them (nil = absent) plus phase-6 keys by their ledgers' last state.
     let mut live_keys: u64 =
         observed.values().filter(|reply| !reply.starts_with(b"$-1")).count() as u64;
+    // Phase 7c's pre-cut material is live and untouched until 7c.
+    live_keys += REBUILT_PRECUT_KEYS;
     for writer in &post_writers {
         for ops in writer.ledger.values() {
             if ops.last().is_some_and(|op| op.state_after.is_some()) {
@@ -2015,6 +2050,293 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             ),
         );
     }
+
+    // ---- phase 7c: DEL of a rebuilt winner carrying several tickets ------
+    // Review of 2026-08-30 (F-L07-01; batch 23, ADR-0093 A10): a boot
+    // pairs every cold slot of one hash with its one RAM sibling, so one
+    // winner can carry several tickets. Two shapes under one cut: on
+    // every seed the third key of a triple written over two cold
+    // collision keys (the synchronous path — the knob is irrelevant to
+    // the rebuild); on the shadow arm a winner whose open same-key twin
+    // and a cold collision key both survive the walk. The reconciler's
+    // reads are failed through `shadow_reconcile_read_fail` so the
+    // rebuilt tickets stay open until `DEL`, whose own read succeeds.
+    // Pre-fix the DEL resolved one ticket and the cell died on the
+    // store's release assert. A second reboot proves both deletions
+    // durable — the same-key twin died through its own marker — and the
+    // collision keys intact. Every row asserts its coverage.
+    report.rebuilt_rows = true;
+    macro_rules! bail7c {
+        ($($arg:tt)*) => {{
+            fail(&mut report, format!($($arg)*));
+            inf_foundation::fault::disarm(inf_server::fault::SHADOW_RECONCILE_READ_FAIL);
+            return finish(report, &observer, &clock);
+        }};
+    }
+    macro_rules! expect7c {
+        ($client:expr, $cmd:expr, $want:expr, $what:expr) => {{
+            let want: &[u8] = $want;
+            match $client.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, $cmd) {
+                Ok(Some(reply)) if reply == want => {}
+                other => bail7c!(
+                    "REBUILT-TICKET VIOLATION seed {seed:#x}: {} answered {other:?}, wanted {}",
+                    $what,
+                    preview(want)
+                ),
+            }
+            report.commands_done += 1;
+        }};
+    }
+    macro_rules! scrape7c {
+        ($keys:expr) => {
+            match info_sum(&mut node, &mut rng, &clock, &disk, scenario, $keys) {
+                Ok(v) => v,
+                Err(err) => bail7c!("phase-7c scrape: {err}"),
+            }
+        };
+    }
+    let (t0, t1, t2) = (&rebuilt_triple[0], &rebuilt_triple[1], &rebuilt_triple[2]);
+    let (s0, s2) = (&rebuilt_sk[0], &rebuilt_sk[2]);
+    let (t0_v, t2_v, s0_v1) =
+        (rebuilt_value(b'g', 0), rebuilt_value(b'g', 1), rebuilt_value(b'g', 2));
+    let t1_v = rebuilt_value(b'h', 0);
+    let s0_v2 = rebuilt_value(b'i', 0);
+    let s2_v = rebuilt_value(b'j', 0);
+    let mut expected_live = total_keys;
+    inf_foundation::fault::arm(inf_server::fault::SHADOW_RECONCILE_READ_FAIL, FaultSpec::Always);
+    if scenario.shadow {
+        // (1) s2 on the synchronous path (the arm off for one write,
+        //     witnessed on every cell): a RAM record *below* the winner
+        //     to come, so the pinned winner never blocks its demotion.
+        let arm_off: &[&[u8]] = &[b"CONFIG", b"SET", b"tiered-shadow-overwrite", b"no"];
+        expect7c!(audit, arm_off, b"+OK\r\n", "CONFIG SET tiered-shadow-overwrite no");
+        let mut off_everywhere = false;
+        for _ in 0..16 {
+            if scrape7c!(&["tiering_shadow_enabled"])[0] == 0 {
+                off_everywhere = true;
+                break;
+            }
+        }
+        if !off_everywhere {
+            bail7c!("phase-7c arm-off fan did not reach every cell");
+        }
+        expect7c!(audit, &[b"SET", s2, &s2_v], b"+OK\r\n", "SET s2 (synchronous)");
+        expected_live += 1;
+        let arm_on: &[&[u8]] = &[b"CONFIG", b"SET", b"tiered-shadow-overwrite", b"yes"];
+        expect7c!(audit, arm_on, b"+OK\r\n", "CONFIG SET tiered-shadow-overwrite yes");
+        let mut on_everywhere = false;
+        for _ in 0..16 {
+            if scrape7c!(&["tiering_shadow_enabled"])[0] == u64::from(scenario.cells) {
+                on_everywhere = true;
+                break;
+            }
+        }
+        if !on_everywhere {
+            bail7c!("phase-7c arm-on fan did not reach every cell");
+        }
+        // (2) s0 over its cold slot: the ticket (A → W), held open.
+        let before = scrape7c!(&["tiering_shadow_created", "tiering_cold_resolves"]);
+        expect7c!(audit, &[b"SET", s0, &s0_v2], b"+OK\r\n", "SET s0 (the shadow path)");
+        let after = scrape7c!(&["tiering_shadow_created", "tiering_cold_resolves"]);
+        if after[0] - before[0] != 1 {
+            bail7c!(
+                "REBUILT-TICKET ROW VACUOUS seed {seed:#x}: SET s0 opened {} tickets (its \
+                 candidate was not cold, or the arm was off)",
+                after[0] - before[0]
+            );
+        }
+        report.rebuilt_same_key_twins += 1;
+        // (3) Fill the hashtag's cell past s2's commit page (seals land on
+        //     1 MiB page marks; the mutable window is 20‰ of 3 MiB) and
+        //     let the flush catch up: the walk refs every slot below the
+        //     flushed watermark, so s2 needs flushing, not release — and
+        //     the winner's pin never blocks a flush. The reboot's ticket
+        //     count is the hard witness; a short fill is a vacuous row.
+        let flushed_before = scrape7c!(&["tiering_flush_confirmed_bytes"])[0];
+        for batch in 0..24u64 {
+            for i in 0..32u64 {
+                let mut key = inf_store::COLLISION_KEY_PREFIX.to_vec();
+                key.extend_from_slice(format!("fill:{batch}:{i}").as_bytes());
+                let value = value_bytes(b'f', 8, batch * 32 + i, 2048);
+                expect7c!(audit, &[b"SET", &key, &value], b"+OK\r\n", "filler SET");
+                report.rebuilt_fill_sets += 1;
+                expected_live += 1;
+            }
+        }
+        let mut flushed_now = flushed_before;
+        let mut stable = 0u32;
+        for _ in 0..128 {
+            let now = scrape7c!(&["tiering_flush_confirmed_bytes"])[0];
+            stable = if now == flushed_now { stable + 1 } else { 0 };
+            flushed_now = now;
+            if stable >= 4 && flushed_now > flushed_before {
+                break;
+            }
+        }
+        if flushed_now <= flushed_before {
+            bail7c!(
+                "REBUILT-TICKET ROW VACUOUS seed {seed:#x}: the flush never advanced after the \
+                 filler writes (confirmed {flushed_before} B before, {flushed_now} B after)"
+            );
+        }
+        // A cold GET of s2 witnesses nothing here: the resolver reads the
+        // ticketed twin first (same hash). The reboot's count decides.
+    }
+    // (4) The walk names the cold twins beside the RAM winners.
+    expect7c!(audit, &[b"INF.CKPT", b"WAIT"], b"+OK\r\n", "INF.CKPT WAIT before the 7c cut");
+    // (5) t1 over two cold collision keys: the synchronous path (every
+    //     arm), a RAM image in the WAL tail.
+    expect7c!(audit, &[b"SET", t1, &t1_v], b"+OK\r\n", "SET t1 (synchronous, two cold candidates)");
+    expected_live += 1;
+    // (6) The cut; the reboot rebuilds every pair with the reconciler's
+    //     reads failing (ADR-0093 D4.3: the tickets stay).
+    drop(node);
+    disk.power_cut(seed ^ 0x0FF5_EED7);
+    node = match reboot_until_ready(
+        &harness,
+        &disk,
+        &clock,
+        &observer,
+        &mut rng,
+        &mut report,
+        scenario.step_ns_max,
+    ) {
+        Ok(node) => node,
+        Err(err) => bail7c!("phase-7c reboot: {err}"),
+    };
+    report.rebuilt_reboots += 1;
+    audit = MiniClient::connect(&mut node, 0);
+    expect7c!(audit, &[b"INF.NS", b"USE", NS_NAME], b"+OK\r\n", "USE after the 7c reboot");
+    // The stale-read oracle first (ADR-0093 A12): the winner was sealed
+    // and flushed below the walk watermark with its ticket open; if the
+    // walk referenced it instead of imaging it, the key came back as two
+    // cold slots and a read may serve the old one. (DBSIZE would drain
+    // the tickets — it runs after the DELs.)
+    if scenario.shadow {
+        expect7c!(audit, &[b"GET", s0], &bulk(&s0_v2), "GET s0 after the reboot (STALE READ)");
+    }
+    let want_tickets = 2 + if scenario.shadow { 2 } else { 0 };
+    let pending = scrape7c!(&["tiering_shadow_pending"])[0];
+    if pending != want_tickets {
+        bail7c!(
+            "REBUILT-TICKET ROW VACUOUS seed {seed:#x}: the reboot rebuilt {pending} tickets, \
+             wanted {want_tickets} (two cold collision slots beside one RAM sibling per winner)"
+        );
+    }
+    report.rebuilt_tickets += pending;
+    // (7) DEL each winner: every ticket drains — the collision keys
+    //     stay, the same-key twin dies through its own marker.
+    const REBUILT_KEYS: [&str; 3] = [
+        "tiering_shadow_forced_by_delete",
+        "tiering_shadow_resolved_collision",
+        "tiering_shadow_pending",
+    ];
+    let before = scrape7c!(&REBUILT_KEYS);
+    expect7c!(audit, &[b"DEL", t1], b":1\r\n", "DEL t1 (two rebuilt collision tickets)");
+    report.rebuilt_multi_dels += 1;
+    expected_live -= 1;
+    expect7c!(audit, &[b"GET", t1], b"$-1\r\n", "GET t1 after its DEL");
+    expect7c!(audit, &[b"GET", t0], &bulk(&t0_v), "GET t0 (a collision key, untouched)");
+    expect7c!(audit, &[b"GET", t2], &bulk(&t2_v), "GET t2 (a collision key, untouched)");
+    if scenario.shadow {
+        expect7c!(audit, &[b"DEL", s0], b":1\r\n", "DEL s0 (a same-key twin and a collision key)");
+        report.rebuilt_multi_dels += 1;
+        expected_live -= 1;
+        expect7c!(audit, &[b"GET", s0], b"$-1\r\n", "GET s0 after its DEL");
+        expect7c!(audit, &[b"GET", s2], &bulk(&s2_v), "GET s2 (the collision key, untouched)");
+    }
+    let after = scrape7c!(&REBUILT_KEYS);
+    let want_collisions = if scenario.shadow { 3 } else { 2 };
+    if after[0] - before[0] != want_tickets
+        || after[1] - before[1] != want_collisions
+        || after[2] != 0
+    {
+        bail7c!(
+            "REBUILT-TICKET VIOLATION seed {seed:#x}: DEL forced {} tickets (wanted \
+             {want_tickets}), {} collision verdicts (wanted {want_collisions}), {} still pending",
+            after[0] - before[0],
+            after[1] - before[1],
+            after[2]
+        );
+    }
+    match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+        Ok(n) if n == expected_live => {}
+        Ok(n) => bail7c!(
+            "REBUILT-TICKET VIOLATION seed {seed:#x}: DBSIZE {n} after the DELs, wanted \
+             {expected_live} (a phantom key: a flushed winner the walk referenced)"
+        ),
+        Err(err) => bail7c!("phase-7c DBSIZE: {err}"),
+    }
+    match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario) {
+        Ok(keys) => {
+            let named = |k: &[u8]| keys.iter().any(|x| x == k);
+            if !named(t0)
+                || !named(t2)
+                || named(t1)
+                || (scenario.shadow && (named(s0) || !named(s2)))
+            {
+                bail7c!(
+                    "REBUILT-TICKET VIOLATION seed {seed:#x}: SCAN after the DELs named t0 {} t1 \
+                     {} t2 {} s0 {} s2 {}",
+                    named(t0),
+                    named(t1),
+                    named(t2),
+                    named(s0),
+                    named(s2)
+                );
+            }
+        }
+        Err(err) => bail7c!("phase-7c SCAN: {err}"),
+    }
+    // (8) A second reboot without the fault: the deletions are durable
+    //     (the twin's marker replayed), the collision keys intact, no
+    //     ticket re-forms (the winners are gone).
+    inf_foundation::fault::disarm(inf_server::fault::SHADOW_RECONCILE_READ_FAIL);
+    drop(node);
+    disk.power_cut(seed ^ 0x0FF5_EED8);
+    node = match reboot_until_ready(
+        &harness,
+        &disk,
+        &clock,
+        &observer,
+        &mut rng,
+        &mut report,
+        scenario.step_ns_max,
+    ) {
+        Ok(node) => node,
+        Err(err) => bail7c!("phase-7c second reboot: {err}"),
+    };
+    report.rebuilt_reboots += 1;
+    audit = MiniClient::connect(&mut node, 0);
+    expect7c!(audit, &[b"INF.NS", b"USE", NS_NAME], b"+OK\r\n", "USE after the second 7c reboot");
+    expect7c!(audit, &[b"GET", t1], b"$-1\r\n", "GET t1 after the second reboot");
+    expect7c!(audit, &[b"GET", t0], &bulk(&t0_v), "GET t0 after the second reboot");
+    expect7c!(audit, &[b"GET", t2], &bulk(&t2_v), "GET t2 after the second reboot");
+    if scenario.shadow {
+        expect7c!(audit, &[b"GET", s0], b"$-1\r\n", "GET s0 after the second reboot");
+        expect7c!(audit, &[b"GET", s2], &bulk(&s2_v), "GET s2 after the second reboot");
+        // CONFIG keys are not durable: the arm re-applies its knob for
+        // the phases that follow, as phase 5 did.
+        let knob: &[&[u8]] = &[b"CONFIG", b"SET", b"tiered-shadow-overwrite", b"yes"];
+        expect7c!(audit, knob, b"+OK\r\n", "post-7c shadow CONFIG SET");
+    }
+    let pending = scrape7c!(&["tiering_shadow_pending"])[0];
+    if pending != 0 {
+        bail7c!(
+            "REBUILT-TICKET VIOLATION seed {seed:#x}: {pending} tickets re-formed after the \
+             deletions replayed"
+        );
+    }
+    match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+        Ok(n) if n == expected_live => {}
+        Ok(n) => bail7c!(
+            "REBUILT-TICKET VIOLATION seed {seed:#x}: DBSIZE {n} after the second reboot, \
+             wanted {expected_live}"
+        ),
+        Err(err) => bail7c!("phase-7c second-reboot DBSIZE: {err}"),
+    }
+    // Unused on the off arm; the shadow arm's twins are named above.
+    let _ = s0_v1;
 
     // ---- phase 8: DISKFULL clamp → typed refusal → reopen (ADR-0063) -----
     // A probe key guaranteed live before the clamp (GET/DEL at the cap

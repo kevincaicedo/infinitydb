@@ -6509,7 +6509,14 @@ async fn shadow_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     } else {
         inf_runtime::ReadClass::Maintain
     };
-    let image = tiered::read_cold_record(&shared, ns, read.ticket.cold, class).await;
+    // The reconciler's own device error (ADR-0093 D4.3), distinct from
+    // `shadow_twin_read_fail` so a harness can hold every ticket open
+    // while `DBSIZE` and `DEL` still read (F-L07-01's rebuilt shape).
+    let image = if inf_foundation::fault::fire(crate::fault::SHADOW_RECONCILE_READ_FAIL) {
+        Err("injected reconciler read failure (fault point shadow_reconcile_read_fail)")
+    } else {
+        tiered::read_cold_record(&shared, ns, read.ticket.cold, class).await
+    };
     let mut ks = shared.store.borrow_mut();
     // A dropped namespace took its tickets with it.
     let Some(table) = ks.tiered_store_mut(ns) else { return };

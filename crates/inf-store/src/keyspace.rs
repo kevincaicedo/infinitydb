@@ -75,8 +75,10 @@ const DRY_STEPS_PER_MEMBER: u32 = 2;
 const NS_DRY_STEP_LIMIT: u32 = 8;
 /// Replay displacement-register bound (ADR-0059 D9): one displacing
 /// mutation stages at most `RELOC_ORIGIN_CAP + 1` markers, so a longer
-/// run inside one pairing is corrupt input, not load.
-const DISPLACE_REGISTER_CAP: usize = 4;
+/// run inside one pairing is corrupt input, not load. Public so the
+/// plane checks the run it is about to stage against the bound recovery
+/// enforces (ADR-0093 A11) instead of restating it.
+pub const DISPLACE_REGISTER_CAP: usize = 4;
 
 /// Per-cell pressure configuration (pushed from the typed CONFIG store
 /// within one MAINTAIN round — the M1-S03 `hot-per-cell` class).

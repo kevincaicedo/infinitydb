@@ -31,4 +31,12 @@ fn open_ticket_rows_hold_every_plane_path_with_tickets_open() {
         report.open_read_fault_errors
     );
     assert!(report.open_settled_without_read >= 1, "{}", report.open_settled_without_read);
+    // Review of 2026-08-30, F-L07-01 (batch 23): phase 7c's rebuilt
+    // multi-ticket winners — two tickets per winner on both shapes, a
+    // same-key twin among them on this arm seed, every DEL draining all.
+    assert!(report.rebuilt_rows, "the rebuilt multi-ticket rows ran");
+    assert_eq!(report.rebuilt_tickets, 4, "two winners × two rebuilt tickets: {report:?}");
+    assert_eq!(report.rebuilt_multi_dels, 2, "both DELs drained several tickets");
+    assert_eq!(report.rebuilt_same_key_twins, 1, "one same-key twin among the rebuilt");
+    assert_eq!(report.rebuilt_reboots, 2, "the 7c cut and the durability reboot");
 }
