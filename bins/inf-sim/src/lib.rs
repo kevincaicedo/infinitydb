@@ -30,6 +30,7 @@ pub mod resp;
 pub mod sidecar;
 pub mod steel;
 pub mod tiered;
+pub mod txmodel;
 
 pub use backfill::{BackfillReport, BackfillScenario, run_backfill_scenario};
 pub use bootstorm::{BootStormReport, BootStormScenario, run_boot_storm_scenario};
