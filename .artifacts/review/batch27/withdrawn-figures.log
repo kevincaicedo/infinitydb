@@ -1,0 +1,9 @@
+credit storms: queued-grant 64/64, hop-by-hop 7/64
+fault storms: independent-legs 15/64
+fault storms: live-write 48/64, cancel-until-durable 4/64
+lineage violations over 2000 interleavings: withdrawn 64, inherit-only 1, pin-only 64, no-ack-gate 70
+lineage violations over 2000 random shapes: per-record 78, prepare-only watermarks 8, withdrawn 323
+retention claimed-bound violations over 2000 histories: 1638
+revision repeats over 2000 histories: wrap 718, restart 586, exhaustion 51
+withdrawn: test result: FAILED. 43 passed; 37 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.16s
+chosen: test result: ok. 80 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.15s

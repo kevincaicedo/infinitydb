@@ -10,7 +10,7 @@
 //! harness records. The `withdrawn_*` twins pin those reds as positive
 //! controls, so the model cannot pass vacuously.
 //!
-//! Six models, one withdrawn rule set each:
+//! Eight models, one withdrawn rule set each:
 //!
 //! - [`acquisition`]: master plan §6.3 as written — a parallel lock fan,
 //!   grants on arrival, waiters sorted by txid — deadlocks on the F2
@@ -46,7 +46,14 @@
 //!   predecessor when that predecessor is itself undecided, both recover
 //!   a state no serial history produces; inherited dependencies, the
 //!   decision-qualified pinned image and dependency-gated `always` acks
-//!   never do.
+//!   never do. (ADR-0116 A8, the fix validation's F01 reopening:)
+//!   per-record dependencies recover half of a transaction whose legs
+//!   inherited different sets — partial overlap, a read leg on one owner
+//!   and a write on another, a chain two hops from its dropped root — and
+//!   a decision gated on prepares alone outlives a plain write its read
+//!   leg observed on another log; one transaction-wide closure gathered
+//!   at the grants, carried by every prepare, and read-watermark gating
+//!   of the decision recover every transaction whole.
 //! - [`identity`] (ADR-0116 A3, F03): resuming `local_seq` above the
 //!   coordinator's replayed maximum reissues a txid a remote participant's
 //!   durable prepare still carries; a durable reservation carried by the
@@ -56,6 +63,18 @@
 //!   checkpoint drops a dead incarnation, and after the u32 counter wraps;
 //!   re-incarnation on wrap, a durable checkpoint-carried reservation and
 //!   a typed refusal at exhaustion never repeat a durable token.
+//! - [`credits`] (ADR-0116 A9, F06): D2.3's `Queued` reply plus a grant
+//!   callback returns one credit twice and overflows the pair's reply
+//!   headroom; keeping the request's credit until the grant, hop by hop,
+//!   deadlocks a holder behind its own contenders on a saturated pair;
+//!   one deferred terminal reply per `LockOp` and every hop's credit
+//!   reserved at Admit complete every storm and drain the pair.
+//! - [`retention`] (ADR-0116 A10, F08): "pinned bytes ≤ retention cap ×
+//!   frame bound" is false — a 24 B tombstone pins a 1 MiB image or a
+//!   cold extent; charging the live image at the grant against separate
+//!   pinned budgets, returned or converted at publication and released
+//!   with the pin, conserves the counter, holds the bound and leaks
+//!   nothing.
 
 /// The rules under test: `chosen` by default, `withdrawn` under the env
 /// hook the review harness uses to record the red.
@@ -2363,9 +2382,11 @@ pub mod lineage {
     use std::collections::{BTreeMap, BTreeSet};
 
     pub type Txid = u64;
-    pub type Key = u32;
+    /// One key per cell: key `c` lives on cell `c`.
+    pub type Cell = usize;
 
-    /// The D3 rules the 2026-09-10 review reopened (ADR-0116 A1/A2).
+    /// The D3 rules the 2026-09-10 review reopened (ADR-0116 A1/A2) and
+    /// the per-record rule its fix validation reopened again (A8).
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub struct Rules {
         /// A record logged by a command that touched a published-undecided
@@ -2385,6 +2406,19 @@ pub mod lineage {
         /// every dependency's durable decision (A1). `false` acks on the
         /// record's own durability alone.
         pub ack_waits_for_dependencies: bool,
+        /// A transaction's dependencies are one set — the union of the
+        /// pending sets of every key it acquires, read or write — gathered
+        /// at the grants, carried by every prepare, and given whole to
+        /// every key it publishes (A8). `false` is A1 as written: each
+        /// record carries its own key's pending set, a read leg carries
+        /// nothing, and recovery qualifies records one by one.
+        pub dependencies_are_transaction_wide: bool,
+        /// The decision waits for every read participant's durable
+        /// watermark to cover the newest record the leg observed, as D3
+        /// already makes it wait for every write participant's prepare
+        /// (A8). `false` is D3 as written: only prepares gate the decision,
+        /// so it can outlive a plain write its read leg saw on another log.
+        pub decision_waits_for_read_watermarks: bool,
     }
 
     impl Rules {
@@ -2393,6 +2427,8 @@ pub mod lineage {
                 successors_inherit_dependencies: true,
                 pin_decision_qualified_image: true,
                 ack_waits_for_dependencies: true,
+                dependencies_are_transaction_wide: true,
+                decision_waits_for_read_watermarks: true,
             }
         }
 
@@ -2401,14 +2437,156 @@ pub mod lineage {
                 successors_inherit_dependencies: false,
                 pin_decision_qualified_image: false,
                 ack_waits_for_dependencies: false,
+                dependencies_are_transaction_wide: false,
+                decision_waits_for_read_watermarks: false,
             }
+        }
+
+        /// A1–A3 as written before A8 — the rules the fix validation
+        /// review ran its partial-overlap history against.
+        pub fn per_record() -> Rules {
+            Rules {
+                dependencies_are_transaction_wide: false,
+                decision_waits_for_read_watermarks: false,
+                ..Rules::chosen()
+            }
+        }
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Access {
+        Read,
+        Write,
+    }
+
+    /// A cross-cell transaction: its coordinator's log carries its
+    /// decision; its legs are the cells it reads or writes.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Txn {
+        pub id: Txid,
+        pub coordinator: Cell,
+        pub legs: Vec<(Cell, Access)>,
+    }
+
+    impl Txn {
+        pub fn new(id: Txid, coordinator: Cell, legs: &[(Cell, Access)]) -> Txn {
+            Txn { id, coordinator, legs: legs.to_vec() }
+        }
+
+        fn writes(&self) -> impl Iterator<Item = Cell> + '_ {
+            self.legs.iter().filter(|(_, a)| *a == Access::Write).map(|(c, _)| *c)
+        }
+
+        fn touches(&self, c: Cell) -> bool {
+            self.legs.iter().any(|(l, _)| *l == c)
+        }
+
+        fn access(&self, c: Cell) -> Option<Access> {
+            self.legs.iter().find(|(l, _)| *l == c).map(|(_, a)| *a)
+        }
+    }
+
+    /// The cells and transactions of a history. Transactions arrive in
+    /// list order: a later one queues behind every earlier one it shares a
+    /// cell with (FIFO by arrival, D2.3).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Shape {
+        pub cells: usize,
+        pub txns: Vec<Txn>,
+    }
+
+    use Access::{Read as R, Write as W};
+
+    impl Shape {
+        /// The batch-24 shape: two cells, T1 then T2 write both keys.
+        pub fn full_overlap() -> Shape {
+            Shape {
+                cells: 2,
+                txns: vec![Txn::new(1, 0, &[(0, W), (1, W)]), Txn::new(2, 1, &[(0, W), (1, W)])],
+            }
+        }
+
+        /// The fix validation's F01 shape: T1 writes `a, b`; T2 writes
+        /// `b, c` — T2's `c` leg has no dependency of its own.
+        pub fn partial_overlap() -> Shape {
+            Shape {
+                cells: 3,
+                txns: vec![Txn::new(1, 0, &[(0, W), (1, W)]), Txn::new(2, 2, &[(1, W), (2, W)])],
+            }
+        }
+
+        /// T2 reads T1's `a` and writes `c`: its only record is on a key T1
+        /// never touched.
+        pub fn asymmetric_read() -> Shape {
+            Shape {
+                cells: 3,
+                txns: vec![Txn::new(1, 0, &[(0, W), (1, W)]), Txn::new(2, 2, &[(0, R), (2, W)])],
+            }
+        }
+
+        /// T1 reads cell 0 and writes cell 1; the value it reads is a plain
+        /// write that is not yet durable.
+        pub fn read_watermark() -> Shape {
+            Shape { cells: 2, txns: vec![Txn::new(1, 1, &[(0, R), (1, W)])] }
+        }
+
+        /// A chain of partial overlaps: T3 depends on T1 only through T2.
+        pub fn transitive() -> Shape {
+            Shape {
+                cells: 4,
+                txns: vec![
+                    Txn::new(1, 0, &[(0, W), (1, W)]),
+                    Txn::new(2, 2, &[(1, W), (2, W)]),
+                    Txn::new(3, 3, &[(2, W), (3, W)]),
+                ],
+            }
+        }
+
+        /// Three or four cells, two or three transactions with one or two
+        /// write legs and at most one read leg each, spanning at least two
+        /// cells; half of the later transactions overlap the previous one
+        /// on exactly one cell (the F01 shape).
+        pub fn random(seed: u64) -> Shape {
+            let mut rng = Rng::new(seed ^ 0x0053_4841_5045);
+            let cells = 3 + rng.below(2);
+            let count = 2 + rng.below(2);
+            let mut txns: Vec<Txn> = Vec::with_capacity(count);
+            for id in 1..=count as Txid {
+                let legs = loop {
+                    let mut legs: Vec<(Cell, Access)> = Vec::new();
+                    let overlap = txns.last().filter(|_| rng.below(2) == 0).map(|prev| {
+                        let (c, _) = prev.legs[rng.below(prev.legs.len())];
+                        c
+                    });
+                    if let Some(c) = overlap {
+                        legs.push((c, W));
+                    }
+                    for _ in 0..1 + rng.below(2) {
+                        let c = rng.below(cells);
+                        if !legs.iter().any(|(l, _)| *l == c) {
+                            legs.push((c, W));
+                        }
+                    }
+                    if rng.below(2) == 0 {
+                        let c = rng.below(cells);
+                        if !legs.iter().any(|(l, _)| *l == c) {
+                            legs.push((c, R));
+                        }
+                    }
+                    if legs.len() >= 2 {
+                        break legs;
+                    }
+                };
+                txns.push(Txn::new(id, rng.below(cells), &legs));
+            }
+            Shape { cells, txns }
         }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Rec {
-        Prepare { txid: Txid, key: Key, value: u32, deps: Vec<Txid> },
-        Plain { op: usize, key: Key, value: u32, deps: Vec<Txid> },
+        Prepare { txid: Txid, value: u32, deps: Vec<Txid> },
+        Plain { op: usize, value: u32, deps: Vec<Txid> },
         Decision { txid: Txid },
     }
 
@@ -2426,29 +2604,33 @@ pub mod lineage {
         records: Vec<Rec>,
         /// Records below this index survive the crash.
         durable: usize,
-        ram: BTreeMap<Key, u32>,
-        runs: BTreeMap<Key, Run>,
+        ram: u32,
+        run: Option<Run>,
         /// D3 as written: (writer txid, immediate predecessor).
-        pinned: BTreeMap<Key, (Txid, u32)>,
-        ckpt_image: BTreeMap<Key, u32>,
+        pinned: Option<(Txid, u32)>,
+        ckpt_image: u32,
         ckpt_begin: usize,
+        /// The executed operations the live value depends on — ground
+        /// truth for the oracle, independent of the rules' bookkeeping.
+        provenance: BTreeSet<usize>,
     }
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Step {
-        /// Participant `c` executes transaction `t`'s leg under its
-        /// intents and logs the prepare.
-        Prepare(Txid, usize),
-        /// The coordinator decides `t` in memory once both legs prepared;
-        /// `UnlockOp{Commit}` publishes on both cells and releases the
-        /// intents.
+        /// Transaction `t`'s leg on cell `c` executes under its intents: a
+        /// write leg logs the prepare, a read leg observes. The first leg
+        /// acquires every intent of the transaction (its rounds).
+        Prepare(Txid, Cell),
+        /// The coordinator decides `t` in memory once every leg ran;
+        /// `UnlockOp{Commit}` publishes on every written cell and releases
+        /// the intents.
         Publish(Txid),
         /// A plain `INCR` of cell `c`'s key — the successor.
-        Incr(usize),
+        Incr(Cell),
         /// An everysec timer on cell `c`.
-        Fsync(usize),
+        Fsync(Cell),
         /// A checkpoint on cell `c` (its cut is durable first).
-        Checkpoint(usize),
+        Checkpoint(Cell),
         Crash,
     }
 
@@ -2456,23 +2638,18 @@ pub mod lineage {
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Op {
         Tx(Txid),
-        Incr { cell: usize, id: usize },
-    }
-
-    /// T1 arrives first; T2 queues behind it on both keys.
-    const TXNS: [Txid; 2] = [1, 2];
-
-    /// T1 is coordinated by cell 0, T2 by cell 1: their decisions live in
-    /// different logs and become durable independently.
-    fn coordinator(t: Txid) -> usize {
-        (t as usize + 1) % 2
+        Incr { cell: Cell, id: usize },
     }
 
     fn tx_value(t: Txid) -> u32 {
         100 * t as u32
     }
 
-    fn durable_decisions(cells: &[CellLog; 2]) -> BTreeSet<Txid> {
+    fn base_value(c: Cell) -> u32 {
+        10 + c as u32
+    }
+
+    fn durable_decisions(cells: &[CellLog]) -> BTreeSet<Txid> {
         cells
             .iter()
             .flat_map(|c| c.records.iter().take(c.durable))
@@ -2483,14 +2660,14 @@ pub mod lineage {
             .collect()
     }
 
-    /// The dependencies a record logged now inherits from its key.
-    fn inherited(rules: Rules, cell: &CellLog, key: Key) -> Vec<Txid> {
+    /// The dependencies a record logged on `cell` now inherits from its key.
+    fn inherited(rules: Rules, cell: &CellLog) -> Vec<Txid> {
         if !rules.successors_inherit_dependencies {
             return Vec::new();
         }
-        match (cell.runs.get(&key), cell.pinned.get(&key)) {
+        match (&cell.run, cell.pinned) {
             (Some(run), _) => run.pending.iter().copied().collect(),
-            (None, Some((writer, _))) => vec![*writer],
+            (None, Some((writer, _))) => vec![writer],
             (None, None) => Vec::new(),
         }
     }
@@ -2505,12 +2682,11 @@ pub mod lineage {
         }
     }
 
-    /// Two participants, one key each (`10`/`11` at boot, each cell booted
-    /// from a checkpoint holding its pre-image); T1 then T2 write both
-    /// keys (`100`, `200`); plain `INCR`s land between them. Returns the
-    /// recovered values, or the violation.
-    pub fn run(rules: Rules, steps: &[Step]) -> Result<[u32; 2], String> {
-        let mut m = Model::new(rules);
+    /// Runs `steps` over `shape` (every cell booted from a checkpoint
+    /// holding `10 + c`). Returns the recovered value per cell, or the
+    /// violation.
+    pub fn run(rules: Rules, shape: &Shape, steps: &[Step]) -> Result<Vec<u32>, String> {
+        let mut m = Model::new(rules, shape);
         for step in steps {
             match *step {
                 Step::Prepare(t, c) => m.prepare(t, c),
@@ -2525,61 +2701,132 @@ pub mod lineage {
         m.verdict()
     }
 
-    struct Model {
-        rules: Rules,
-        cells: [CellLog; 2],
-        prepared: BTreeMap<Txid, [bool; 2]>,
-        published: BTreeSet<Txid>,
-        decision_logged: BTreeSet<Txid>,
-        /// Executed operations in order.
-        ops: Vec<Op>,
+    /// A transaction between its grants and its publication.
+    #[derive(Clone, Debug, Default)]
+    struct Active {
+        /// A8: the union of the pending sets of every key it acquired.
+        closure: BTreeSet<Txid>,
+        /// The operations whose values it observed (the oracle's truth).
+        observed: BTreeSet<usize>,
+        /// Per read leg: the log length the leg observed — the watermark
+        /// its decision waits for (A8).
+        read_watermarks: BTreeMap<Cell, usize>,
+        done: BTreeSet<Cell>,
     }
 
-    impl Model {
-        fn new(rules: Rules) -> Model {
-            let mut cells = [CellLog::default(), CellLog::default()];
-            for (c, cell) in cells.iter_mut().enumerate() {
-                cell.ram.insert(c as Key, 10 + c as u32);
-                cell.ckpt_image.insert(c as Key, 10 + c as u32);
-            }
+    struct Model<'a> {
+        rules: Rules,
+        shape: &'a Shape,
+        cells: Vec<CellLog>,
+        active: BTreeMap<Txid, Active>,
+        published: BTreeSet<Txid>,
+        /// Published: the read watermarks the decision still waits for.
+        read_watermarks: BTreeMap<Txid, BTreeMap<Cell, usize>>,
+        decision_logged: BTreeSet<Txid>,
+        /// Executed operations in order, each with what it observed.
+        ops: Vec<(Op, BTreeSet<usize>)>,
+    }
+
+    impl<'a> Model<'a> {
+        fn new(rules: Rules, shape: &'a Shape) -> Model<'a> {
+            let cells = (0..shape.cells)
+                .map(|c| CellLog {
+                    ram: base_value(c),
+                    ckpt_image: base_value(c),
+                    ..CellLog::default()
+                })
+                .collect();
             Model {
                 rules,
+                shape,
                 cells,
-                prepared: TXNS.iter().map(|t| (*t, [false; 2])).collect(),
+                active: BTreeMap::new(),
                 published: BTreeSet::new(),
+                read_watermarks: BTreeMap::new(),
                 decision_logged: BTreeSet::new(),
                 ops: Vec::new(),
             }
         }
 
-        /// A W intent on cell `c`'s key is held by a prepared, unpublished
-        /// transaction other than `t`.
-        fn held(&self, t: Option<Txid>, c: usize) -> bool {
-            TXNS.iter().any(|o| Some(*o) != t && self.prepared[o][c] && !self.published.contains(o))
+        fn txn(&self, t: Txid) -> &'a Txn {
+            self.shape.txns.iter().find(|x| x.id == t).expect("known txid")
         }
 
-        fn prepare(&mut self, t: Txid, c: usize) {
-            // Canonical acquisition: T2 arrives after T1 and queues behind it.
-            let arrived = t == TXNS[0] || self.published.contains(&TXNS[0]);
-            if self.prepared[&t][c] || !arrived || self.held(Some(t), c) {
+        /// An intent on cell `c` is held by an acquired, unpublished
+        /// transaction other than `except`.
+        fn held(&self, c: Cell, except: Option<Txid>) -> bool {
+            self.active.keys().any(|t| Some(*t) != except && self.txn(*t).touches(c))
+        }
+
+        /// FIFO by arrival: every earlier transaction sharing a cell with
+        /// `t` has published.
+        fn arrived(&self, t: Txid) -> bool {
+            let me = self.txn(t);
+            self.shape
+                .txns
+                .iter()
+                .take_while(|x| x.id != t)
+                .filter(|x| x.legs.iter().any(|(c, _)| me.touches(*c)))
+                .all(|x| self.published.contains(&x.id))
+        }
+
+        /// The transaction's rounds: every intent at once, the closure and
+        /// the observed set gathered from the keys as granted.
+        fn acquire(&mut self, t: Txid) -> bool {
+            if self.active.contains_key(&t) {
+                return true;
+            }
+            let txn = self.txn(t);
+            if !self.arrived(t) || txn.legs.iter().any(|(c, _)| self.held(*c, Some(t))) {
+                return false;
+            }
+            let mut a = Active::default();
+            for (c, access) in &txn.legs {
+                a.closure.extend(inherited(self.rules, &self.cells[*c]));
+                a.observed.extend(self.cells[*c].provenance.iter().copied());
+                if *access == Access::Read {
+                    a.read_watermarks.insert(*c, self.cells[*c].records.len());
+                }
+            }
+            self.active.insert(t, a);
+            true
+        }
+
+        fn prepare(&mut self, t: Txid, c: Cell) {
+            let Some(access) = self.txn(t).access(c) else { return };
+            if self.published.contains(&t) || !self.acquire(t) {
                 return;
             }
-            self.prepared.get_mut(&t).expect("known txid")[c] = true;
-            let cell = &mut self.cells[c];
-            let deps = inherited(self.rules, cell, c as Key);
-            cell.records.push(Rec::Prepare { txid: t, key: c as Key, value: tx_value(t), deps });
+            let active = self.active.get_mut(&t).expect("acquired");
+            if !active.done.insert(c) {
+                return;
+            }
+            if access == Access::Write {
+                let deps = if self.rules.dependencies_are_transaction_wide {
+                    active.closure.iter().copied().collect()
+                } else {
+                    inherited(self.rules, &self.cells[c])
+                };
+                self.cells[c].records.push(Rec::Prepare { txid: t, value: tx_value(t), deps });
+            }
         }
 
-        /// The in-memory decision: publish on both cells, release intents,
-        /// start (or extend) each key's pending run.
+        /// The in-memory decision: publish on every written cell, release
+        /// the intents, start (or extend) each key's pending run.
         fn publish(&mut self, t: Txid) {
-            if self.published.contains(&t) || !self.prepared[&t].iter().all(|p| *p) {
+            let txn = self.txn(t);
+            let ready = self.active.get(&t).is_some_and(|a| a.done.len() == txn.legs.len());
+            if self.published.contains(&t) || !ready {
                 return;
             }
+            let active = self.active.remove(&t).expect("acquired");
+            let op = self.ops.len();
             self.published.insert(t);
-            self.ops.push(Op::Tx(t));
-            for (c, cell) in self.cells.iter_mut().enumerate() {
-                let key = c as Key;
+            self.read_watermarks.insert(t, active.read_watermarks.clone());
+            self.ops.push((Op::Tx(t), active.observed.clone()));
+            for c in txn.writes() {
+                let rules = self.rules;
+                let cell = &mut self.cells[c];
                 let (pos, deps) = cell
                     .records
                     .iter()
@@ -2589,57 +2836,57 @@ pub mod lineage {
                         _ => None,
                     })
                     .expect("prepared leg");
-                let old = cell.ram.insert(key, tx_value(t)).expect("key present");
-                let run = cell.runs.entry(key).or_insert(Run {
+                let old = std::mem::replace(&mut cell.ram, tx_value(t));
+                let run = cell.run.get_or_insert(Run {
                     base: old,
                     pending: BTreeSet::new(),
                     first_record: pos,
                 });
                 run.pending.insert(t);
-                run.pending.extend(deps);
-                cell.pinned.insert(key, (t, old));
+                if rules.dependencies_are_transaction_wide {
+                    run.pending.extend(active.closure.iter().copied());
+                } else {
+                    run.pending.extend(deps);
+                }
+                cell.pinned = Some((t, old));
+                cell.provenance = active.observed.clone();
+                cell.provenance.insert(op);
             }
         }
 
-        fn incr(&mut self, c: usize) {
-            if self.held(None, c) {
+        fn incr(&mut self, c: Cell) {
+            if self.held(c, None) {
                 return;
             }
-            let id = self.ops.iter().filter(|o| matches!(o, Op::Incr { .. })).count() + 1;
-            self.ops.push(Op::Incr { cell: c, id });
+            let id = self.ops.iter().filter(|(o, _)| matches!(o, Op::Incr { .. })).count() + 1;
+            let op = self.ops.len();
             let cell = &mut self.cells[c];
-            let key = c as Key;
-            let deps = inherited(self.rules, cell, key);
-            let value = cell.ram[&key] + 1;
-            cell.records.push(Rec::Plain { op: id, key, value, deps });
-            cell.ram.insert(key, value);
+            self.ops.push((Op::Incr { cell: c, id }, cell.provenance.clone()));
+            let deps = inherited(self.rules, cell);
+            cell.ram += 1;
+            cell.records.push(Rec::Plain { op: id, value: cell.ram, deps });
+            cell.provenance.insert(op);
             if !self.rules.successors_inherit_dependencies {
                 // D3 as written: a later plain write releases the pin.
-                cell.pinned.remove(&key);
-                cell.runs.remove(&key);
+                cell.pinned = None;
+                cell.run = None;
             }
         }
 
         /// The cut is durable first; the image streams the pinned image
         /// of a pending key; `ckpt-begin` covers every conditional record
         /// and (A2) every pending run from its first record.
-        fn checkpoint(&mut self, c: usize) {
+        fn checkpoint(&mut self, c: Cell) {
             let decided = durable_decisions(&self.cells);
             let qualified = self.rules.pin_decision_qualified_image;
             let cell = &mut self.cells[c];
             cell.durable = cell.records.len();
-            cell.ckpt_image = cell
-                .ram
-                .iter()
-                .map(|(k, v)| {
-                    let streamed = if qualified {
-                        cell.runs.get(k).map(|run| run.base)
-                    } else {
-                        cell.pinned.get(k).map(|(_, old)| *old)
-                    };
-                    (*k, streamed.unwrap_or(*v))
-                })
-                .collect();
+            let streamed = if qualified {
+                cell.run.as_ref().map(|run| run.base)
+            } else {
+                cell.pinned.map(|(_, old)| old)
+            };
+            cell.ckpt_image = streamed.unwrap_or(cell.ram);
             let first_conditional = if qualified {
                 cell.records.iter().position(|r| conditional(r, &decided))
             } else {
@@ -2648,7 +2895,7 @@ pub mod lineage {
                     .position(|r| matches!(r, Rec::Prepare { txid, .. } if !decided.contains(txid)))
             };
             let run_origin =
-                if qualified { cell.runs.values().map(|r| r.first_record).min() } else { None };
+                if qualified { cell.run.as_ref().map(|r| r.first_record) } else { None };
             cell.ckpt_begin = [Some(cell.records.len()), first_conditional, run_origin]
                 .into_iter()
                 .flatten()
@@ -2657,72 +2904,83 @@ pub mod lineage {
         }
 
         /// The decision is appended to the coordinator's log once every
-        /// participant's prepare is durable (D3, unchanged); a durable
-        /// decision releases the pins that depend on nothing else.
+        /// written participant's prepare is durable (D3, unchanged); a
+        /// durable decision releases the pins that depend on nothing else.
         fn settle(&mut self) {
-            for t in TXNS {
+            let shape = self.shape;
+            for txn in &shape.txns {
+                let t = txn.id;
                 if !self.published.contains(&t) || self.decision_logged.contains(&t) {
                     continue;
                 }
-                let prepares_durable = self.cells.iter().all(|cell| {
-                    cell.records
+                let prepares_durable = txn.writes().all(|c| {
+                    self.cells[c]
+                        .records
                         .iter()
-                        .take(cell.durable)
+                        .take(self.cells[c].durable)
                         .any(|r| matches!(r, Rec::Prepare { txid, .. } if *txid == t))
                 });
-                if prepares_durable {
-                    self.cells[coordinator(t)].records.push(Rec::Decision { txid: t });
+                let reads_covered = !self.rules.decision_waits_for_read_watermarks
+                    || self.read_watermarks[&t]
+                        .iter()
+                        .all(|(c, len)| self.cells[*c].durable >= *len);
+                if prepares_durable && reads_covered {
+                    self.cells[txn.coordinator].records.push(Rec::Decision { txid: t });
                     self.decision_logged.insert(t);
                 }
             }
             let decided = durable_decisions(&self.cells);
             for cell in &mut self.cells {
-                cell.runs.retain(|_, run| !run.pending.is_subset(&decided));
-                cell.pinned.retain(|_, (writer, _)| !decided.contains(writer));
+                if cell.run.as_ref().is_some_and(|run| run.pending.is_subset(&decided)) {
+                    cell.run = None;
+                }
+                if cell.pinned.is_some_and(|(writer, _)| decided.contains(&writer)) {
+                    cell.pinned = None;
+                }
             }
         }
 
         /// Checkpoint image + durable tail; a tagged or dependent record
         /// applies iff its txid and every dependency committed.
-        fn recover(&self, decided: &BTreeSet<Txid>) -> [u32; 2] {
-            let mut out = [0u32; 2];
-            for (c, cell) in self.cells.iter().enumerate() {
-                let mut state = cell.ckpt_image.clone();
-                let tail = &cell.records[cell.ckpt_begin.min(cell.durable)..cell.durable];
-                for rec in tail {
-                    match rec {
-                        Rec::Prepare { key, value, .. } | Rec::Plain { key, value, .. }
+        fn recover(&self, decided: &BTreeSet<Txid>) -> Vec<u32> {
+            self.cells
+                .iter()
+                .map(|cell| {
+                    let tail = &cell.records[cell.ckpt_begin.min(cell.durable)..cell.durable];
+                    tail.iter().fold(cell.ckpt_image, |state, rec| match rec {
+                        Rec::Prepare { value, .. } | Rec::Plain { value, .. }
                             if !conditional(rec, decided) =>
                         {
-                            state.insert(*key, *value);
+                            *value
                         }
-                        _ => {}
-                    }
-                }
-                out[c] = state[&(c as Key)];
-            }
-            out
+                        _ => state,
+                    })
+                })
+                .collect()
+        }
+
+        /// The dependencies the coordinator of `t` knows: what its legs'
+        /// prepares carry.
+        fn tx_deps(&self, t: Txid) -> Vec<Txid> {
+            self.cells
+                .iter()
+                .flat_map(|cell| cell.records.iter())
+                .filter_map(|r| match r {
+                    Rec::Prepare { txid, deps, .. } if *txid == t => Some(deps.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
         }
 
         /// `always` acks at the crash: a durable decision or plain record
         /// and, under A1, every dependency durably decided.
         fn acked(&self, decided: &BTreeSet<Txid>) -> Vec<Op> {
-            let tx_deps = |t: Txid| -> Vec<Txid> {
-                self.cells
-                    .iter()
-                    .flat_map(|cell| cell.records.iter())
-                    .filter_map(|r| match r {
-                        Rec::Prepare { txid, deps, .. } if *txid == t => Some(deps.clone()),
-                        _ => None,
-                    })
-                    .flatten()
-                    .collect()
-            };
             let mut acked = Vec::new();
             for (c, cell) in self.cells.iter().enumerate() {
                 for rec in &cell.records[..cell.durable] {
                     let (op, deps) = match rec {
-                        Rec::Decision { txid } => (Op::Tx(*txid), tx_deps(*txid)),
+                        Rec::Decision { txid } => (Op::Tx(*txid), self.tx_deps(*txid)),
                         Rec::Plain { op, deps, .. } => {
                             (Op::Incr { cell: c, id: *op }, deps.clone())
                         }
@@ -2740,28 +2998,38 @@ pub mod lineage {
 
         /// The oracle: some subset of the executed operations, replayed in
         /// execution order with every transaction whole, must produce the
-        /// recovered state, and one such subset must contain every ack.
-        fn verdict(&self) -> Result<[u32; 2], String> {
+        /// recovered state; that subset must keep every operation an
+        /// operation in it observed; and one such subset must contain
+        /// every ack.
+        fn verdict(&self) -> Result<Vec<u32>, String> {
             let decided = durable_decisions(&self.cells);
             let out = self.recover(&decided);
             let acked = self.acked(&decided);
-            let ops = &self.ops;
-            let matching: Vec<Vec<Op>> = (0..1u32 << ops.len())
-                .map(|mask| {
-                    ops.iter()
-                        .enumerate()
-                        .filter(|(i, _)| mask & (1 << i) != 0)
-                        .map(|(_, o)| *o)
-                        .collect()
-                })
-                .filter(|subset: &Vec<Op>| replay(subset) == out)
+            let ops: Vec<Op> = self.ops.iter().map(|(o, _)| *o).collect();
+            let matching: Vec<Vec<usize>> = (0..1u32 << ops.len())
+                .map(|mask| (0..ops.len()).filter(|i| mask & (1 << i) != 0).collect::<Vec<_>>())
+                .filter(|subset| replay(self.shape, subset.iter().map(|i| ops[*i])) == out)
                 .collect();
             if matching.is_empty() {
                 return Err(format!(
                     "SERIALIZABILITY VIOLATION after crash: recovered {out:?} is no serial subset of {ops:?} (decisions durable: {decided:?})"
                 ));
             }
-            if !matching.iter().any(|s| acked.iter().all(|a| s.contains(a))) {
+            let unobserved = |subset: &Vec<usize>| {
+                subset.iter().find_map(|i| {
+                    self.ops[*i].1.iter().find(|d| !subset.contains(d)).map(|d| (ops[*i], ops[*d]))
+                })
+            };
+            let closed: Vec<&Vec<usize>> =
+                matching.iter().filter(|s| unobserved(s).is_none()).collect();
+            if closed.is_empty() {
+                let (kept, lost) = unobserved(&matching[0]).expect("not closed");
+                return Err(format!(
+                    "DEPENDENCY VIOLATION after crash: recovered {out:?} matches only subsets of {ops:?} that keep {kept:?} without {lost:?} it observed (decisions durable: {decided:?})"
+                ));
+            }
+            let contains = |s: &&Vec<usize>, a: &Op| s.iter().any(|i| ops[*i] == *a);
+            if !closed.iter().any(|s| acked.iter().all(|a| contains(s, a))) {
                 return Err(format!(
                     "ACKED WRITE LOST after crash: {acked:?} acked under `always` but recovered {out:?} needs a subset without one of them (decisions durable: {decided:?})"
                 ));
@@ -2770,11 +3038,16 @@ pub mod lineage {
         }
     }
 
-    fn replay(ops: &[Op]) -> [u32; 2] {
-        let mut state = [10, 11];
+    fn replay(shape: &Shape, ops: impl Iterator<Item = Op>) -> Vec<u32> {
+        let mut state: Vec<u32> = (0..shape.cells).map(base_value).collect();
         for op in ops {
-            match *op {
-                Op::Tx(t) => state = [tx_value(t); 2],
+            match op {
+                Op::Tx(t) => {
+                    let txn = shape.txns.iter().find(|x| x.id == t).expect("known txid");
+                    for c in txn.writes() {
+                        state[c] = tx_value(t);
+                    }
+                }
                 Op::Incr { cell, .. } => state[cell] += 1,
             }
         }
@@ -2782,7 +3055,7 @@ pub mod lineage {
     }
 
     /// F01: T1 publishes; `INCR` on cell 1 reads the published 100; cell
-    /// 1's timer fsyncs; the crash beats T1's decision.
+    /// 1's timer fsyncs; the crash beats T1's decision. (`full_overlap`)
     pub const SUCCESSOR: [Step; 6] = [
         Step::Prepare(1, 0),
         Step::Prepare(1, 1),
@@ -2793,7 +3066,7 @@ pub mod lineage {
     ];
 
     /// F02: T1 then T2 publish over both keys; cell 0 checkpoints; the
-    /// crash beats both decisions.
+    /// crash beats both decisions. (`full_overlap`)
     pub const CHAIN: [Step; 8] = [
         Step::Prepare(1, 0),
         Step::Prepare(1, 1),
@@ -2807,7 +3080,7 @@ pub mod lineage {
 
     /// T1 then T2 publish; both cells fsync (both decisions logged, T1's
     /// on cell 0, T2's on cell 1); cell 1 fsyncs again — T2's decision is
-    /// durable, T1's is not; crash.
+    /// durable, T1's is not; crash. (`full_overlap`)
     pub const DEPENDENT_ACK: [Step; 10] = [
         Step::Prepare(1, 0),
         Step::Prepare(1, 1),
@@ -2821,38 +3094,139 @@ pub mod lineage {
         Step::Crash,
     ];
 
+    /// The fix validation's F01 history (`partial_overlap`): T1 publishes
+    /// `a, b`; T2 publishes `b, c`; every prepare is durable; T2's
+    /// decision (cell 2) is durable and T1's (cell 0) is not; crash.
+    pub const PARTIAL_OVERLAP: [Step; 11] = [
+        Step::Prepare(1, 0),
+        Step::Prepare(1, 1),
+        Step::Publish(1),
+        Step::Prepare(2, 1),
+        Step::Prepare(2, 2),
+        Step::Publish(2),
+        Step::Fsync(0),
+        Step::Fsync(1),
+        Step::Fsync(2),
+        Step::Fsync(2),
+        Step::Crash,
+    ];
+
+    /// The same durability pattern over `asymmetric_read`: T2's only
+    /// record is on `c`, but it read T1's `a`.
+    pub const ASYMMETRIC_READ: [Step; 11] = [
+        Step::Prepare(1, 0),
+        Step::Prepare(1, 1),
+        Step::Publish(1),
+        Step::Prepare(2, 0),
+        Step::Prepare(2, 2),
+        Step::Publish(2),
+        Step::Fsync(0),
+        Step::Fsync(1),
+        Step::Fsync(2),
+        Step::Fsync(2),
+        Step::Crash,
+    ];
+
+    /// `read_watermark`: a plain `INCR` on cell 0, then T1 reads it and
+    /// writes cell 1; cell 1 fsyncs twice (prepare, then decision); cell 0
+    /// never does; crash.
+    pub const READ_WATERMARK: [Step; 7] = [
+        Step::Incr(0),
+        Step::Prepare(1, 0),
+        Step::Prepare(1, 1),
+        Step::Publish(1),
+        Step::Fsync(1),
+        Step::Fsync(1),
+        Step::Crash,
+    ];
+
+    /// The `transitive` chain: T1, T2, T3 publish in turn; every prepare
+    /// is durable; T2's and T3's decisions are durable, T1's is not.
+    pub const TRANSITIVE: [Step; 16] = [
+        Step::Prepare(1, 0),
+        Step::Prepare(1, 1),
+        Step::Publish(1),
+        Step::Prepare(2, 1),
+        Step::Prepare(2, 2),
+        Step::Publish(2),
+        Step::Prepare(3, 2),
+        Step::Prepare(3, 3),
+        Step::Publish(3),
+        Step::Fsync(0),
+        Step::Fsync(1),
+        Step::Fsync(2),
+        Step::Fsync(3),
+        Step::Fsync(2),
+        Step::Fsync(3),
+        Step::Crash,
+    ];
+
     /// The oracle enumerates subsets of the executed operations, so a
     /// history carries at most this many successors.
     pub const MAX_INCRS: usize = 6;
 
-    /// A seeded interleaving of both transactions, successors, fsyncs and
-    /// checkpoints.
-    pub fn random_steps(seed: u64, len: usize) -> Vec<Step> {
+    /// A seeded history that runs every transaction of the shape to its
+    /// publication — legs in a random order with successors, fsyncs and
+    /// checkpoints between — then fsyncs a random subset of cells, so the
+    /// decisions become durable asymmetrically, then a random tail.
+    pub fn random_program(shape: &Shape, seed: u64) -> Vec<Step> {
         let mut rng = Rng::new(seed);
+        let mut out = Vec::new();
+        let mut incrs = 0;
+        let noise = |rng: &mut Rng, out: &mut Vec<Step>, incrs: &mut usize| match rng.below(6) {
+            0 => out.push(Step::Fsync(rng.below(shape.cells))),
+            1 => out.push(Step::Checkpoint(rng.below(shape.cells))),
+            2 if *incrs < MAX_INCRS => {
+                *incrs += 1;
+                out.push(Step::Incr(rng.below(shape.cells)));
+            }
+            _ => {}
+        };
+        for txn in &shape.txns {
+            let mut legs = txn.legs.clone();
+            for i in (1..legs.len()).rev() {
+                legs.swap(i, rng.below(i + 1));
+            }
+            for (c, _) in legs {
+                noise(&mut rng, &mut out, &mut incrs);
+                out.push(Step::Prepare(txn.id, c));
+            }
+            out.push(Step::Publish(txn.id));
+            for c in 0..shape.cells {
+                if rng.below(2) == 0 {
+                    out.push(Step::Fsync(c));
+                }
+            }
+        }
+        for _ in 0..rng.below(6) {
+            noise(&mut rng, &mut out, &mut incrs);
+        }
+        out.push(Step::Crash);
+        out
+    }
+
+    /// A seeded interleaving of the shape's legs, publications, successors,
+    /// fsyncs and checkpoints.
+    pub fn random_steps(shape: &Shape, seed: u64, len: usize) -> Vec<Step> {
+        let mut rng = Rng::new(seed);
+        let mut choices: Vec<Step> = Vec::new();
+        for txn in &shape.txns {
+            choices.extend(txn.legs.iter().map(|(c, _)| Step::Prepare(txn.id, *c)));
+        }
+        choices.extend(shape.txns.iter().map(|t| Step::Publish(t.id)));
+        choices.extend((0..shape.cells).map(Step::Fsync));
+        choices.extend((0..shape.cells).map(Step::Checkpoint));
+        let fixed = choices.len();
+        choices.extend((0..shape.cells).map(Step::Incr));
         let mut out = Vec::with_capacity(len + 1);
         let mut incrs = 0;
         for _ in 0..len {
-            let choices = if incrs < MAX_INCRS { 12 } else { 10 };
-            out.push(match rng.below(choices) {
-                0 => Step::Prepare(1, 0),
-                1 => Step::Prepare(1, 1),
-                2 => Step::Prepare(2, 0),
-                3 => Step::Prepare(2, 1),
-                4 => Step::Publish(1),
-                5 => Step::Publish(2),
-                6 => Step::Fsync(0),
-                7 => Step::Fsync(1),
-                8 => Step::Checkpoint(0),
-                9 => Step::Checkpoint(1),
-                10 => {
-                    incrs += 1;
-                    Step::Incr(0)
-                }
-                _ => {
-                    incrs += 1;
-                    Step::Incr(1)
-                }
-            });
+            let n = if incrs < MAX_INCRS { choices.len() } else { fixed };
+            let step = choices[rng.below(n)];
+            if matches!(step, Step::Incr(_)) {
+                incrs += 1;
+            }
+            out.push(step);
         }
         out.push(Step::Crash);
         out
@@ -3293,15 +3667,1084 @@ pub mod revision {
     }
 }
 
+// ---------------------------------------------------------------------
+// Model 7 — fabric credits for queued grants (ADR-0116 A9, review F06)
+// ---------------------------------------------------------------------
+
+pub mod credits {
+    use super::Rng;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+    pub type Txn = usize;
+
+    /// D2.3's queued grant against M0-S09's credit contract (ADR-0116 A9).
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct Rules {
+        /// A `LockOp` has exactly one reply, sent when its entries are
+        /// eligible — or when validation fails, the owner refuses, or an
+        /// abort removes the parked entries; the parked `LockOp` is the
+        /// queue entry (A9). `false` is D2.3 as written: `Queued` replies
+        /// at once and the grant callback is a second reply to the same
+        /// request.
+        pub grant_is_the_deferred_terminal_reply: bool,
+        /// At Admit a transaction reserves every credit it will send toward
+        /// the owner — `LockOp`, its `ExecOp`s, `UnlockOp`, the
+        /// decision-durable notification — and is refused typed when the
+        /// pair's pool is short (A9). `false` is the mesh as-is: each hop
+        /// takes its credit when sent and waits when there is none.
+        pub credits_reserved_at_admit: bool,
+    }
+
+    impl Rules {
+        pub fn chosen() -> Rules {
+            Rules { grant_is_the_deferred_terminal_reply: true, credits_reserved_at_admit: true }
+        }
+
+        pub fn withdrawn() -> Rules {
+            Rules { grant_is_the_deferred_terminal_reply: false, credits_reserved_at_admit: false }
+        }
+
+        /// The review's named alternative: keep the request's credit until
+        /// the grant, and take every other hop's credit when it is sent.
+        pub fn deferred_hop_by_hop() -> Rules {
+            Rules { grant_is_the_deferred_terminal_reply: true, credits_reserved_at_admit: false }
+        }
+    }
+
+    /// One coordinator, one owner, one directed ring each way.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct Config {
+        /// `MeshConfig::data_credits` for the pair; each ring holds twice
+        /// as many slots (the reply-headroom invariant).
+        pub data_credits: u32,
+        /// Keys on the owner; every transaction locks one.
+        pub keys: usize,
+        /// Transactions offered, in arrival order.
+        pub txns: usize,
+        /// Scheduler steps a sent `LockOp` waits before the coordinator's
+        /// timer aborts the transaction.
+        pub timeout: usize,
+    }
+
+    /// The hops one transaction sends toward one owner: `LockOp`, one
+    /// `ExecOp` (a class-1/2 program), `UnlockOp`, the notification.
+    pub const HOPS_PER_OWNER: u32 = 4;
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Lock(Txn),
+        Exec(Txn),
+        Unlock {
+            txn: Txn,
+            commit: bool,
+        },
+        Notify(Txn),
+        /// Withdrawn: the nonterminal first reply to a parked `LockOp`.
+        Queued(Txn),
+        /// The grant: the deferred terminal reply (chosen) or the second
+        /// reply to the same request (withdrawn).
+        Granted(Txn),
+        /// Chosen: the parked `LockOp`'s terminal reply once an abort
+        /// removed its entries.
+        Aborted(Txn),
+        SubResult(Txn),
+        UnlockAck(Txn),
+        NotifyAck(Txn),
+    }
+
+    impl Msg {
+        fn txn(&self) -> Txn {
+            match *self {
+                Msg::Lock(t)
+                | Msg::Exec(t)
+                | Msg::Unlock { txn: t, .. }
+                | Msg::Notify(t)
+                | Msg::Queued(t)
+                | Msg::Granted(t)
+                | Msg::Aborted(t)
+                | Msg::SubResult(t)
+                | Msg::UnlockAck(t)
+                | Msg::NotifyAck(t) => t,
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            match self {
+                Msg::Lock(_) => "LockOp",
+                Msg::Exec(_) => "ExecOp",
+                Msg::Unlock { .. } => "UnlockOp",
+                Msg::Notify(_) => "the decision-durable notification",
+                _ => "a reply",
+            }
+        }
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum State {
+        /// The `LockOp` is in flight or parked; `since` is the send step.
+        Locking {
+            since: usize,
+        },
+        Executing,
+        Unlocking,
+        Notifying,
+        /// The timer fired: `UnlockOp{Abort}` is in flight or pending.
+        Aborting,
+        Committed,
+        Aborted,
+        Refused,
+    }
+
+    impl State {
+        fn terminal(self) -> bool {
+            matches!(self, State::Committed | State::Aborted | State::Refused)
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct Coordinator {
+        state: State,
+        /// Requests sent so far — the reserved credits already spent.
+        spent: u32,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Action {
+        /// The next transaction arrives at the coordinator.
+        Arrive,
+        DeliverToOwner,
+        DeliverToCoord,
+        /// The coordinator's timer fires for a parked transaction.
+        Timeout(Txn),
+        /// Deliver and send until nothing moves, firing the timers of
+        /// whatever is still parked when nothing else can happen.
+        Settle,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Stats {
+        pub committed: usize,
+        pub aborted: usize,
+        pub refused: usize,
+        pub max_parked: usize,
+        pub max_ring: usize,
+    }
+
+    struct Model {
+        rules: Rules,
+        cfg: Config,
+        credits: u32,
+        to_owner: VecDeque<Msg>,
+        to_coord: VecDeque<Msg>,
+        txns: Vec<Coordinator>,
+        /// Requests waiting to be sent, in the order they were queued (hop
+        /// by hop: the head waits for a credit — the mesh backpressures the
+        /// originating connection, it never reorders).
+        outbox: VecDeque<Msg>,
+        arrived: usize,
+        step: usize,
+        /// The owner: one FIFO per key, and the `LockOp`s parked behind a
+        /// head.
+        queues: Vec<VecDeque<Txn>>,
+        key_of: BTreeMap<Txn, usize>,
+        parked: BTreeSet<Txn>,
+        stats: Stats,
+    }
+
+    /// The scripted history. Returns the stats, or the violation.
+    pub fn run_script(rules: Rules, cfg: Config, actions: &[Action]) -> Result<Stats, String> {
+        let mut m = Model::new(rules, cfg);
+        for action in actions {
+            m.act(*action)?;
+        }
+        m.settle()?;
+        m.finish()
+    }
+
+    /// A seeded interleaving of arrivals, deliveries and timers until
+    /// every transaction is terminal.
+    pub fn run(rules: Rules, cfg: Config, seed: u64) -> Result<Stats, String> {
+        let mut rng = Rng::new(seed);
+        let mut m = Model::new(rules, cfg);
+        let bound = 200 * cfg.txns.max(1);
+        loop {
+            let enabled = m.enabled();
+            if enabled.is_empty() {
+                if m.parked_lockops().is_empty() {
+                    break;
+                }
+                for t in m.parked_lockops() {
+                    m.act(Action::Timeout(t))?;
+                }
+                continue;
+            }
+            m.act(enabled[rng.below(enabled.len())])?;
+            if m.step > bound {
+                return Err(format!(
+                    "NO PROGRESS: {bound} steps without every transaction terminal"
+                ));
+            }
+        }
+        m.finish()
+    }
+
+    impl Model {
+        fn new(rules: Rules, cfg: Config) -> Model {
+            Model {
+                rules,
+                cfg,
+                credits: cfg.data_credits,
+                to_owner: VecDeque::new(),
+                to_coord: VecDeque::new(),
+                txns: Vec::with_capacity(cfg.txns),
+                outbox: VecDeque::new(),
+                arrived: 0,
+                step: 0,
+                queues: vec![VecDeque::new(); cfg.keys.max(1)],
+                key_of: BTreeMap::new(),
+                parked: BTreeSet::new(),
+                stats: Stats::default(),
+            }
+        }
+
+        fn capacity(&self) -> usize {
+            2 * self.cfg.data_credits as usize
+        }
+
+        /// Transactions whose `LockOp` was sent and is not yet answered.
+        fn parked_lockops(&self) -> Vec<Txn> {
+            (0..self.txns.len())
+                .filter(|t| matches!(self.txns[*t].state, State::Locking { .. }))
+                .collect()
+        }
+
+        fn enabled(&self) -> Vec<Action> {
+            let mut out = Vec::new();
+            if self.arrived < self.cfg.txns {
+                out.push(Action::Arrive);
+            }
+            if !self.to_owner.is_empty() {
+                out.push(Action::DeliverToOwner);
+            }
+            if !self.to_coord.is_empty() {
+                out.push(Action::DeliverToCoord);
+            }
+            for t in self.parked_lockops() {
+                if let State::Locking { since } = self.txns[t].state
+                    && since + self.cfg.timeout <= self.step
+                {
+                    out.push(Action::Timeout(t));
+                }
+            }
+            out
+        }
+
+        fn act(&mut self, action: Action) -> Result<(), String> {
+            self.step += 1;
+            match action {
+                Action::Arrive => self.arrive(),
+                Action::DeliverToOwner => {
+                    if let Some(msg) = self.to_owner.pop_front() {
+                        self.owner_receives(msg)?;
+                    }
+                }
+                Action::DeliverToCoord => {
+                    if let Some(msg) = self.to_coord.pop_front() {
+                        self.coord_receives(msg)?;
+                    }
+                }
+                Action::Timeout(t) => self.timeout(t),
+                Action::Settle => self.settle()?,
+            }
+            self.retry_sends()?;
+            self.check_bounds()
+        }
+
+        /// Admit: chosen reserves every hop's credit or refuses typed;
+        /// hop by hop admits unconditionally.
+        fn arrive(&mut self) {
+            let t = self.arrived;
+            self.arrived += 1;
+            let mut c = Coordinator { state: State::Refused, spent: 0 };
+            if self.rules.credits_reserved_at_admit {
+                if self.credits < HOPS_PER_OWNER {
+                    self.stats.refused += 1;
+                    self.txns.push(c);
+                    return;
+                }
+                self.credits -= HOPS_PER_OWNER;
+            }
+            c.state = State::Locking { since: self.step };
+            self.txns.push(c);
+            self.outbox.push_back(Msg::Lock(t));
+        }
+
+        /// The coordinator's timer: a `LockOp` still in the outbox is
+        /// withdrawn locally (nothing was sent); a sent one is aborted with
+        /// `UnlockOp{Abort}`.
+        fn timeout(&mut self, t: Txn) {
+            if !matches!(self.txns[t].state, State::Locking { .. }) {
+                return;
+            }
+            if self.outbox.contains(&Msg::Lock(t)) {
+                self.outbox.retain(|m| *m != Msg::Lock(t));
+                self.finish_txn(t, State::Aborted);
+                return;
+            }
+            self.txns[t].state = State::Aborting;
+            self.outbox.push_back(Msg::Unlock { txn: t, commit: false });
+        }
+
+        /// Sends the outbox head while a credit allows (chosen: the
+        /// reservation already holds every credit, so it drains whole).
+        fn retry_sends(&mut self) -> Result<(), String> {
+            while let Some(msg) = self.outbox.front().copied() {
+                if !self.rules.credits_reserved_at_admit {
+                    if self.credits == 0 {
+                        break;
+                    }
+                    self.credits -= 1;
+                }
+                self.outbox.pop_front();
+                self.txns[msg.txn()].spent += 1;
+                self.to_owner.push_back(msg);
+                self.stats.max_ring = self.stats.max_ring.max(self.to_owner.len());
+            }
+            Ok(())
+        }
+
+        fn reply(&mut self, msg: Msg) {
+            self.to_coord.push_back(msg);
+            self.stats.max_ring = self.stats.max_ring.max(self.to_coord.len());
+        }
+
+        fn check_bounds(&mut self) -> Result<(), String> {
+            let cap = self.capacity();
+            for (name, ring) in
+                [("coordinator→owner", &self.to_owner), ("owner→coordinator", &self.to_coord)]
+            {
+                if ring.len() > cap {
+                    return Err(format!(
+                        "RING OVERFLOW: the {name} ring holds {} messages over its capacity {cap} (2 × {} data credits)",
+                        ring.len(),
+                        self.cfg.data_credits
+                    ));
+                }
+            }
+            if self.credits > self.cfg.data_credits {
+                return Err(format!(
+                    "CREDIT OVERFLOW: the coordinator holds {} credits toward the owner of {} — a second reply to one request returned its credit twice",
+                    self.credits, self.cfg.data_credits
+                ));
+            }
+            self.stats.max_parked = self.stats.max_parked.max(self.parked.len());
+            if self.parked.len() > self.cfg.data_credits as usize {
+                return Err(format!(
+                    "PARKED LOCKOPS EXCEED THE CREDIT BOUND: {} parked at the owner with {} data credits — a parked LockOp holds no credit",
+                    self.parked.len(),
+                    self.cfg.data_credits
+                ));
+            }
+            Ok(())
+        }
+
+        fn owner_receives(&mut self, msg: Msg) -> Result<(), String> {
+            match msg {
+                Msg::Lock(t) => {
+                    let k = t % self.cfg.keys.max(1);
+                    self.key_of.insert(t, k);
+                    self.queues[k].push_back(t);
+                    if self.queues[k].len() == 1 {
+                        self.reply(Msg::Granted(t));
+                    } else {
+                        self.parked.insert(t);
+                        if !self.rules.grant_is_the_deferred_terminal_reply {
+                            self.reply(Msg::Queued(t));
+                        }
+                    }
+                }
+                Msg::Exec(t) => self.reply(Msg::SubResult(t)),
+                Msg::Unlock { txn: t, .. } => {
+                    let k = self.key_of[&t];
+                    self.queues[k].retain(|x| *x != t);
+                    if self.parked.remove(&t) && self.rules.grant_is_the_deferred_terminal_reply {
+                        self.reply(Msg::Aborted(t));
+                    }
+                    self.reply(Msg::UnlockAck(t));
+                    if let Some(head) = self.queues[k].front().copied()
+                        && self.parked.remove(&head)
+                    {
+                        self.reply(Msg::Granted(head));
+                    }
+                }
+                Msg::Notify(t) => self.reply(Msg::NotifyAck(t)),
+                reply => return Err(format!("MISROUTED: {reply:?} reached the owner")),
+            }
+            Ok(())
+        }
+
+        /// Every reply returns one credit (the mesh's rule); the state
+        /// machine advances and queues its next hop.
+        fn coord_receives(&mut self, msg: Msg) -> Result<(), String> {
+            self.credits += 1;
+            let (t, next) = match msg {
+                Msg::Queued(t) => (t, None),
+                Msg::Granted(t) => match self.txns[t].state {
+                    State::Locking { .. } => (t, Some((State::Executing, Msg::Exec(t)))),
+                    // A grant that overtook the abort: the abort removes it.
+                    _ => (t, None),
+                },
+                Msg::SubResult(t) => {
+                    (t, Some((State::Unlocking, Msg::Unlock { txn: t, commit: true })))
+                }
+                Msg::UnlockAck(t) => match self.txns[t].state {
+                    State::Aborting => {
+                        self.finish_txn(t, State::Aborted);
+                        (t, None)
+                    }
+                    _ => (t, Some((State::Notifying, Msg::Notify(t)))),
+                },
+                Msg::NotifyAck(t) => {
+                    self.finish_txn(t, State::Committed);
+                    (t, None)
+                }
+                Msg::Aborted(t) => (t, None),
+                request => return Err(format!("MISROUTED: {request:?} reached the coordinator")),
+            };
+            if let Some((state, request)) = next {
+                self.txns[t].state = state;
+                self.outbox.push_back(request);
+            }
+            Ok(())
+        }
+
+        /// A terminal transaction returns the reserved credits it never
+        /// spent (its spent ones came back with their replies).
+        fn finish_txn(&mut self, t: Txn, state: State) {
+            self.txns[t].state = state;
+            if self.rules.credits_reserved_at_admit {
+                self.credits += HOPS_PER_OWNER - self.txns[t].spent;
+            }
+            match state {
+                State::Committed => self.stats.committed += 1,
+                State::Aborted => self.stats.aborted += 1,
+                _ => {}
+            }
+        }
+
+        /// Deliver and send until nothing moves; then fire every parked
+        /// timer and continue; a stuck transaction at that point is the
+        /// deadlock.
+        fn settle(&mut self) -> Result<(), String> {
+            loop {
+                while let Some(msg) = self.to_owner.pop_front() {
+                    self.owner_receives(msg)?;
+                    self.retry_sends()?;
+                    self.check_bounds()?;
+                }
+                while let Some(msg) = self.to_coord.pop_front() {
+                    self.coord_receives(msg)?;
+                    self.retry_sends()?;
+                    self.check_bounds()?;
+                }
+                if !self.to_owner.is_empty() {
+                    continue;
+                }
+                let parked = self.parked_lockops();
+                if parked.is_empty() {
+                    break;
+                }
+                for t in parked {
+                    self.timeout(t);
+                }
+                self.retry_sends()?;
+                if self.to_owner.is_empty() && self.to_coord.is_empty() {
+                    break;
+                }
+            }
+            self.quiescent()
+        }
+
+        /// No message in flight, no timer left: every transaction must be
+        /// terminal.
+        fn quiescent(&self) -> Result<(), String> {
+            let stuck: Vec<Txn> =
+                (0..self.txns.len()).filter(|t| !self.txns[*t].state.terminal()).collect();
+            let Some(first) = stuck.first().copied() else { return Ok(()) };
+            let wants = self
+                .outbox
+                .iter()
+                .find(|m| m.txn() == first)
+                .map(|m| m.name())
+                .unwrap_or("a reply that never comes");
+            let holds = self
+                .key_of
+                .get(&first)
+                .filter(|k| self.queues[**k].front() == Some(&first))
+                .map(|k| format!("holds key {k}@owner and "))
+                .unwrap_or_default();
+            let parked: Vec<String> = self.parked.iter().map(|t| format!("T{}", t + 1)).collect();
+            Err(format!(
+                "CREDIT DEADLOCK: {} transaction(s) stuck with no message in flight and {} credit(s) toward the owner — T{} {holds}waits for {wants}; {} parked LockOp(s) ({}) hold every credit",
+                stuck.len(),
+                self.credits,
+                first + 1,
+                parked.len(),
+                parked.join(", ")
+            ))
+        }
+
+        fn finish(self) -> Result<Stats, String> {
+            self.quiescent()?;
+            if self.credits != self.cfg.data_credits {
+                return Err(format!(
+                    "CREDIT LEAK: {} credits toward the owner after every transaction is terminal, budget {}",
+                    self.credits, self.cfg.data_credits
+                ));
+            }
+            if self.queues.iter().any(|q| !q.is_empty()) || !self.parked.is_empty() {
+                return Err("INTENT LEAK: the owner still queues an intent after every transaction is terminal".to_string());
+            }
+            Ok(self.stats)
+        }
+    }
+
+    /// The review's history: one hot key; T1's `LockOp` is granted at the
+    /// owner, then eight contenders send their `LockOp`s — every data
+    /// credit of the pair — before T1's grant reaches the coordinator and
+    /// T1 needs credits for its `ExecOp` and `UnlockOp`.
+    pub fn saturated_pair() -> (Config, Vec<Action>) {
+        let cfg = Config { data_credits: 8, keys: 1, txns: 9, timeout: 1 << 20 };
+        let mut actions = vec![Action::Arrive, Action::DeliverToOwner];
+        for _ in 1..9 {
+            actions.push(Action::Arrive);
+            actions.push(Action::DeliverToOwner);
+        }
+        actions.push(Action::Settle);
+        (cfg, actions)
+    }
+
+    /// A storm: two hot keys, three transactions per credit, short timers.
+    pub fn storm() -> Config {
+        Config { data_credits: 8, keys: 2, txns: 24, timeout: 12 }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Model 8 — retained-byte budget for pinned images (ADR-0116 A10, review F08)
+// ---------------------------------------------------------------------
+
+pub mod retention {
+    use super::Rng;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    pub type Txid = u64;
+    pub type Key = usize;
+
+    /// D3's "pinned bytes are bounded by the retention cap × frame bound"
+    /// against a counted budget (ADR-0116 A10).
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct Rules {
+        /// The qualified image's bytes — hot arena bytes, or a cold
+        /// extent's bytes — are charged against the cell's pinned budgets
+        /// at the grant for every written key not already pending, refused
+        /// typed when over, and released when the key's pending set is
+        /// durably decided (A10). `false` is D3 as written: nothing is
+        /// charged; the frame bound is claimed to bound retention.
+        pub charge_retained_images_at_grant: bool,
+    }
+
+    impl Rules {
+        pub fn chosen() -> Rules {
+            Rules { charge_retained_images_at_grant: true }
+        }
+
+        pub fn withdrawn() -> Rules {
+            Rules { charge_retained_images_at_grant: false }
+        }
+    }
+
+    /// The bounds in force on the cell.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct Budget {
+        /// D5: one publishable frame per transaction.
+        pub frame_max: u64,
+        /// S22: pending (published, not durably decided) decisions.
+        pub retention_cap: usize,
+        /// A10: `tx-pinned-max-bytes` (arena).
+        pub pinned_max: u64,
+        /// A10: `tx-pinned-max-extent-bytes` (cold storage).
+        pub pinned_extent_max: u64,
+    }
+
+    /// A key's live image.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Image {
+        Absent,
+        Hot(u64),
+        Cold(u64),
+    }
+
+    impl Image {
+        fn hot(self) -> u64 {
+            match self {
+                Image::Hot(b) => b,
+                _ => 0,
+            }
+        }
+
+        fn extent(self) -> u64 {
+            match self {
+                Image::Cold(b) => b,
+                _ => 0,
+            }
+        }
+    }
+
+    /// A staged effect and its serialized log bytes.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Effect {
+        /// A tombstone: `TOMBSTONE_BYTES` in the frame, whatever it pins.
+        Delete,
+        Set(u64),
+    }
+
+    pub const TOMBSTONE_BYTES: u64 = 24;
+
+    impl Effect {
+        fn staged(self) -> u64 {
+            match self {
+                Effect::Delete => TOMBSTONE_BYTES,
+                Effect::Set(b) => b,
+            }
+        }
+
+        fn apply(self) -> Image {
+            match self {
+                Effect::Delete => Image::Absent,
+                Effect::Set(b) => Image::Hot(b),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Txn {
+        pub id: Txid,
+        pub writes: Vec<(Key, Effect)>,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Step {
+        /// The grant: admission against every bound; a refused transaction
+        /// holds nothing.
+        Admit(Txid),
+        /// The in-memory decision publishes the staged effects.
+        Publish(Txid),
+        /// The decision record is durable on the coordinator.
+        Decide(Txid),
+        /// A plain write outside any transaction.
+        Plain(Key, Effect),
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum Refusal {
+        /// D5: the staged bytes exceed one frame.
+        Frame,
+        /// S22: the pending-decision cap.
+        Retention,
+        /// A10: the pinned budgets (`INF TXRETAIN`).
+        Retain,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Stats {
+        pub committed: usize,
+        pub refused: BTreeMap<Refusal, usize>,
+        pub max_retained: u64,
+        pub max_staged: u64,
+    }
+
+    /// One key's pending run: the qualified image and every txid it waits
+    /// for (A2).
+    #[derive(Clone, Debug)]
+    struct Run {
+        base: Image,
+        pending: BTreeSet<Txid>,
+    }
+
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    struct Charge {
+        hot: u64,
+        extent: u64,
+    }
+
+    struct Model<'a> {
+        rules: Rules,
+        budget: Budget,
+        txns: &'a [Txn],
+        images: Vec<Image>,
+        runs: BTreeMap<Key, Run>,
+        /// Granted, not yet published: the intents held and, per written
+        /// key, the live image's bytes reserved at the grant.
+        admitted: BTreeMap<Txid, Vec<(Key, Charge)>>,
+        published: BTreeSet<Txid>,
+        decided: BTreeSet<Txid>,
+        /// `tx_pinned_bytes` / `tx_pinned_extent_bytes` as accounted.
+        accounted: Charge,
+        stats: Stats,
+    }
+
+    /// Runs `steps` over `keys` with the given images; every published
+    /// transaction is decided at the end so the leak check is total.
+    /// Returns the stats, or the violation.
+    pub fn run(
+        rules: Rules,
+        budget: Budget,
+        images: &[Image],
+        txns: &[Txn],
+        steps: &[Step],
+    ) -> Result<Stats, String> {
+        let mut m = Model::new(rules, budget, images, txns);
+        for step in steps {
+            m.apply(*step);
+            m.check()?;
+        }
+        for t in m.admitted.keys().copied().collect::<Vec<_>>() {
+            m.apply(Step::Publish(t));
+            m.check()?;
+        }
+        for t in m.published.clone() {
+            m.apply(Step::Decide(t));
+            m.check()?;
+        }
+        m.finish()
+    }
+
+    impl<'a> Model<'a> {
+        fn new(rules: Rules, budget: Budget, images: &[Image], txns: &'a [Txn]) -> Model<'a> {
+            Model {
+                rules,
+                budget,
+                txns,
+                images: images.to_vec(),
+                runs: BTreeMap::new(),
+                admitted: BTreeMap::new(),
+                published: BTreeSet::new(),
+                decided: BTreeSet::new(),
+                accounted: Charge::default(),
+                stats: Stats::default(),
+            }
+        }
+
+        fn txn(&self, t: Txid) -> &'a Txn {
+            self.txns.iter().find(|x| x.id == t).expect("known txid")
+        }
+
+        /// A W intent on `k` is held by an admitted, unpublished transaction.
+        fn held(&self, k: Key) -> bool {
+            self.admitted.keys().any(|t| self.txn(*t).writes.iter().any(|(w, _)| *w == k))
+        }
+
+        fn pending_decisions(&self) -> usize {
+            self.published.difference(&self.decided).count()
+        }
+
+        /// What the grant reserves: the live image of every written key,
+        /// each key once. A key already pending returns it at publication
+        /// (A2: its qualified image is already pinned) unless its run was
+        /// released under the intent, in which case this is the new pin.
+        fn charge_of(&self, txn: &Txn) -> Vec<(Key, Charge)> {
+            let keys: BTreeSet<Key> = txn.writes.iter().map(|(k, _)| *k).collect();
+            keys.iter()
+                .map(|k| {
+                    (*k, Charge { hot: self.images[*k].hot(), extent: self.images[*k].extent() })
+                })
+                .collect()
+        }
+
+        fn total(charges: &[(Key, Charge)]) -> Charge {
+            charges.iter().fold(Charge::default(), |c, (_, x)| Charge {
+                hot: c.hot + x.hot,
+                extent: c.extent + x.extent,
+            })
+        }
+
+        fn refusal(&self, txn: &Txn, charge: Charge) -> Option<Refusal> {
+            let staged: u64 = txn.writes.iter().map(|(_, e)| e.staged()).sum();
+            if staged > self.budget.frame_max {
+                return Some(Refusal::Frame);
+            }
+            if self.pending_decisions() + self.admitted.len() >= self.budget.retention_cap {
+                return Some(Refusal::Retention);
+            }
+            let over_hot = self.accounted.hot + charge.hot > self.budget.pinned_max;
+            let over_extent = self.accounted.extent + charge.extent > self.budget.pinned_extent_max;
+            if self.rules.charge_retained_images_at_grant && (over_hot || over_extent) {
+                return Some(Refusal::Retain);
+            }
+            None
+        }
+
+        fn apply(&mut self, step: Step) {
+            match step {
+                Step::Admit(t) => self.admit(t),
+                Step::Publish(t) => self.publish(t),
+                Step::Decide(t) => self.decide(t),
+                Step::Plain(k, effect) => {
+                    if !self.held(k) {
+                        // A dependent write keeps the qualified image (A2);
+                        // an independent one simply replaces its predecessor.
+                        self.images[k] = effect.apply();
+                    }
+                }
+            }
+        }
+
+        fn admit(&mut self, t: Txid) {
+            if self.admitted.contains_key(&t) || self.published.contains(&t) {
+                return;
+            }
+            let txn = self.txn(t);
+            if txn.writes.iter().any(|(k, _)| self.held(*k)) {
+                return;
+            }
+            let charges = self.charge_of(txn);
+            let charge = Self::total(&charges);
+            if let Some(why) = self.refusal(txn, charge) {
+                *self.stats.refused.entry(why).or_default() += 1;
+                return;
+            }
+            let staged: u64 = txn.writes.iter().map(|(_, e)| e.staged()).sum();
+            self.stats.max_staged = self.stats.max_staged.max(staged);
+            if self.rules.charge_retained_images_at_grant {
+                self.accounted.hot += charge.hot;
+                self.accounted.extent += charge.extent;
+            }
+            self.admitted.insert(t, charges);
+        }
+
+        /// The reservation becomes the pin where the key was not pending
+        /// (the image cannot have changed under the intent) and returns
+        /// where it was.
+        fn publish(&mut self, t: Txid) {
+            let Some(charges) = self.admitted.remove(&t) else { return };
+            let txn = self.txn(t);
+            for (k, charge) in charges {
+                if self.runs.contains_key(&k) && self.rules.charge_retained_images_at_grant {
+                    self.accounted.hot -= charge.hot;
+                    self.accounted.extent -= charge.extent;
+                }
+                let old = self.images[k];
+                self.runs
+                    .entry(k)
+                    .or_insert(Run { base: old, pending: BTreeSet::new() })
+                    .pending
+                    .insert(t);
+            }
+            for (k, effect) in &txn.writes {
+                self.images[*k] = effect.apply();
+            }
+            self.published.insert(t);
+            self.stats.committed += 1;
+        }
+
+        /// A durable decision releases every pin whose pending set is
+        /// decided, and its bytes.
+        fn decide(&mut self, t: Txid) {
+            if !self.published.contains(&t) {
+                return;
+            }
+            self.decided.insert(t);
+            let decided = self.decided.clone();
+            let released: Vec<Key> = self
+                .runs
+                .iter()
+                .filter(|(_, r)| r.pending.is_subset(&decided))
+                .map(|(k, _)| *k)
+                .collect();
+            for k in released {
+                let run = self.runs.remove(&k).expect("released run");
+                if self.rules.charge_retained_images_at_grant {
+                    self.accounted.hot -= run.base.hot();
+                    self.accounted.extent -= run.base.extent();
+                }
+            }
+        }
+
+        /// What the cell really retains: the qualified image of every
+        /// pending key.
+        fn retained(&self) -> Charge {
+            self.runs.values().fold(Charge::default(), |c, r| Charge {
+                hot: c.hot + r.base.hot(),
+                extent: c.extent + r.base.extent(),
+            })
+        }
+
+        /// Charges reserved at the grant and not yet converted or returned.
+        fn reserved(&self) -> Charge {
+            self.admitted.values().fold(Charge::default(), |c, charges| {
+                let x = Self::total(charges);
+                Charge { hot: c.hot + x.hot, extent: c.extent + x.extent }
+            })
+        }
+
+        fn check(&mut self) -> Result<(), String> {
+            let retained = self.retained();
+            self.stats.max_retained = self.stats.max_retained.max(retained.hot + retained.extent);
+            if !self.rules.charge_retained_images_at_grant {
+                let claimed = self.budget.retention_cap as u64 * self.budget.frame_max;
+                if retained.hot + retained.extent > claimed {
+                    return Err(format!(
+                        "RETAINED BYTES EXCEED THE CLAIMED BOUND: {} pending transaction(s) staged at most {} B each but retain {} B of images and {} B of extents — above the retention cap × frame bound of {claimed} B",
+                        self.pending_decisions(),
+                        self.stats.max_staged,
+                        retained.hot,
+                        retained.extent
+                    ));
+                }
+                return Ok(());
+            }
+            let reserved = self.reserved();
+            let held = Charge {
+                hot: retained.hot + reserved.hot,
+                extent: retained.extent + reserved.extent,
+            };
+            if self.accounted != held {
+                return Err(format!(
+                    "PIN ACCOUNTING DRIFT: tx_pinned_bytes {} / tx_pinned_extent_bytes {} but the cell retains {} / {} and reserves {} / {}",
+                    self.accounted.hot,
+                    self.accounted.extent,
+                    retained.hot,
+                    retained.extent,
+                    reserved.hot,
+                    reserved.extent
+                ));
+            }
+            if held.hot > self.budget.pinned_max || held.extent > self.budget.pinned_extent_max {
+                return Err(format!(
+                    "PINNED BYTES OVER BUDGET: {} B of images (budget {}) and {} B of extents (budget {})",
+                    held.hot, self.budget.pinned_max, held.extent, self.budget.pinned_extent_max
+                ));
+            }
+            Ok(())
+        }
+
+        fn finish(self) -> Result<Stats, String> {
+            let retained = self.retained();
+            if retained != Charge::default()
+                || (self.rules.charge_retained_images_at_grant
+                    && self.accounted != Charge::default())
+            {
+                return Err(format!(
+                    "PIN LEAK: {} B of images and {} B of extents (accounted {} / {}) retained after every decision is durable",
+                    retained.hot, retained.extent, self.accounted.hot, self.accounted.extent
+                ));
+            }
+            Ok(self.stats)
+        }
+    }
+
+    pub const MIB: u64 = 1 << 20;
+
+    /// The review's budget: 64 B frames, four pending decisions, 2 MiB of
+    /// pinned images, 4 MiB of pinned extents.
+    pub fn budget() -> Budget {
+        Budget { frame_max: 64, retention_cap: 4, pinned_max: 2 * MIB, pinned_extent_max: 4 * MIB }
+    }
+
+    /// F08: four 1 MiB records, four transactions each deleting one with a
+    /// 24 B tombstone, no decision durable yet.
+    pub fn tombstone_storm() -> (Vec<Image>, Vec<Txn>, Vec<Step>) {
+        let images = vec![Image::Hot(MIB); 4];
+        let txns: Vec<Txn> =
+            (0..4).map(|k| Txn { id: k as Txid + 1, writes: vec![(k, Effect::Delete)] }).collect();
+        let mut steps = Vec::new();
+        for t in 1..=4 {
+            steps.push(Step::Admit(t));
+            steps.push(Step::Publish(t));
+        }
+        (images, txns, steps)
+    }
+
+    /// The same storm, then the decisions land and the refused
+    /// transactions are offered again.
+    pub fn tombstone_storm_then_decisions() -> (Vec<Image>, Vec<Txn>, Vec<Step>) {
+        let (images, txns, mut steps) = tombstone_storm();
+        steps.extend([Step::Decide(1), Step::Decide(2)]);
+        for t in 3..=4 {
+            steps.push(Step::Admit(t));
+            steps.push(Step::Publish(t));
+        }
+        (images, txns, steps)
+    }
+
+    /// A cold document's extent pinned by a tombstone; a dependent plain
+    /// write and a second pending write over the same key pin nothing new.
+    pub fn cold_extent_and_dependents() -> (Vec<Image>, Vec<Txn>, Vec<Step>) {
+        let images = vec![Image::Cold(3 * MIB), Image::Hot(MIB)];
+        let txns = vec![
+            Txn { id: 1, writes: vec![(0, Effect::Delete), (1, Effect::Set(8))] },
+            Txn { id: 2, writes: vec![(1, Effect::Set(16))] },
+        ];
+        let steps = vec![
+            Step::Admit(1),
+            Step::Publish(1),
+            Step::Plain(1, Effect::Set(32)),
+            Step::Admit(2),
+            Step::Publish(2),
+            Step::Decide(1),
+            Step::Decide(2),
+        ];
+        (images, txns, steps)
+    }
+
+    /// Seeded keys, images, transactions and interleavings.
+    pub fn random(seed: u64) -> (Vec<Image>, Vec<Txn>, Vec<Step>) {
+        let mut rng = Rng::new(seed);
+        let keys = 4;
+        let images: Vec<Image> = (0..keys)
+            .map(|_| match rng.below(3) {
+                0 => Image::Absent,
+                1 => Image::Hot(1 + rng.next_u64() % MIB),
+                _ => Image::Cold(1 + rng.next_u64() % (2 * MIB)),
+            })
+            .collect();
+        let effect = |rng: &mut Rng| {
+            if rng.below(2) == 0 { Effect::Delete } else { Effect::Set(rng.below(40) as u64) }
+        };
+        let txns: Vec<Txn> = (1..=6)
+            .map(|id| {
+                let mut writes = vec![(rng.below(keys), effect(&mut rng))];
+                let k = rng.below(keys);
+                if writes[0].0 != k {
+                    writes.push((k, effect(&mut rng)));
+                }
+                Txn { id, writes }
+            })
+            .collect();
+        let steps = (0..24)
+            .map(|_| match rng.below(4) {
+                0 => Step::Admit(1 + rng.below(6) as Txid),
+                1 => Step::Publish(1 + rng.below(6) as Txid),
+                2 => Step::Decide(1 + rng.below(6) as Txid),
+                _ => Step::Plain(rng.below(keys), effect(&mut rng)),
+            })
+            .collect();
+        (images, txns, steps)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Variant;
     use super::acquisition::{
         self, Acquisition, Cancel, CancelPhase, CancelUntil, Dependent, Outcome, Rules,
     };
+    use super::credits;
     use super::durable;
     use super::identity;
     use super::lineage;
+    use super::retention;
     use super::revision;
     use super::watch::{self, Event, RepeatedWatch, Verdict};
 
@@ -3984,13 +5427,14 @@ mod tests {
 
     #[test]
     fn a_durable_successor_never_outlives_its_dependency() {
-        let r = lineage::run(lineage_rules(), &lineage::SUCCESSOR);
+        let r = lineage::run(lineage_rules(), &lineage::Shape::full_overlap(), &lineage::SUCCESSOR);
         assert!(r.is_ok(), "{}", r.unwrap_err());
     }
 
     #[test]
     fn withdrawn_plain_successor_outlives_its_dropped_source() {
-        let r = lineage::run(lineage::Rules::withdrawn(), &lineage::SUCCESSOR);
+        let shape = lineage::Shape::full_overlap();
+        let r = lineage::run(lineage::Rules::withdrawn(), &shape, &lineage::SUCCESSOR);
         assert_eq!(
             r,
             Err("SERIALIZABILITY VIOLATION after crash: recovered [10, 101] is no serial subset of [Tx(1), Incr { cell: 1, id: 1 }] (decisions durable: {})".to_string())
@@ -3998,18 +5442,19 @@ mod tests {
         // The qualified image alone does not repair it: the successor is still plain.
         let only_pin =
             lineage::Rules { successors_inherit_dependencies: false, ..lineage::Rules::chosen() };
-        assert!(lineage::run(only_pin, &lineage::SUCCESSOR).is_err());
+        assert!(lineage::run(only_pin, &shape, &lineage::SUCCESSOR).is_err());
     }
 
     #[test]
     fn a_checkpoint_streams_the_decision_qualified_image() {
-        let r = lineage::run(lineage_rules(), &lineage::CHAIN);
+        let r = lineage::run(lineage_rules(), &lineage::Shape::full_overlap(), &lineage::CHAIN);
         assert!(r.is_ok(), "{}", r.unwrap_err());
     }
 
     #[test]
     fn withdrawn_immediate_predecessor_leaks_half_of_the_older_transaction() {
-        let r = lineage::run(lineage::Rules::withdrawn(), &lineage::CHAIN);
+        let shape = lineage::Shape::full_overlap();
+        let r = lineage::run(lineage::Rules::withdrawn(), &shape, &lineage::CHAIN);
         assert_eq!(
             r,
             Err("SERIALIZABILITY VIOLATION after crash: recovered [100, 11] is no serial subset of [Tx(1), Tx(2)] (decisions durable: {})".to_string())
@@ -4017,12 +5462,13 @@ mod tests {
         // Inheritance alone does not repair it: the image is still T1's.
         let only_inherit =
             lineage::Rules { pin_decision_qualified_image: false, ..lineage::Rules::chosen() };
-        assert!(lineage::run(only_inherit, &lineage::CHAIN).is_err());
+        assert!(lineage::run(only_inherit, &shape, &lineage::CHAIN).is_err());
     }
 
     #[test]
     fn an_acked_dependent_transaction_is_never_dropped() {
-        let r = lineage::run(lineage::Rules::chosen(), &lineage::DEPENDENT_ACK);
+        let shape = lineage::Shape::full_overlap();
+        let r = lineage::run(lineage::Rules::chosen(), &shape, &lineage::DEPENDENT_ACK);
         assert!(r.is_ok(), "{}", r.unwrap_err());
     }
 
@@ -4030,19 +5476,120 @@ mod tests {
     fn without_ack_gating_an_acked_dependent_transaction_is_dropped() {
         let rules =
             lineage::Rules { ack_waits_for_dependencies: false, ..lineage::Rules::chosen() };
-        let r = lineage::run(rules, &lineage::DEPENDENT_ACK);
+        let r = lineage::run(rules, &lineage::Shape::full_overlap(), &lineage::DEPENDENT_ACK);
         assert_eq!(
             r,
             Err("ACKED WRITE LOST after crash: [Tx(2)] acked under `always` but recovered [10, 11] needs a subset without one of them (decisions durable: {2})".to_string())
         );
     }
 
+    // ADR-0116 A8 — the fix validation's F01: a transaction's dependencies
+    // are one set, or half of it recovers.
+
+    #[test]
+    fn a_partially_overlapping_transaction_recovers_whole() {
+        let shape = lineage::Shape::partial_overlap();
+        let r = lineage::run(lineage_rules(), &shape, &lineage::PARTIAL_OVERLAP);
+        assert!(r.is_ok(), "{}", r.unwrap_err());
+        assert_eq!(
+            lineage::run(lineage::Rules::chosen(), &shape, &lineage::PARTIAL_OVERLAP),
+            Ok(vec![10, 11, 12])
+        );
+    }
+
+    #[test]
+    fn withdrawn_per_record_dependencies_recover_half_of_a_partially_overlapping_transaction() {
+        let shape = lineage::Shape::partial_overlap();
+        let r = lineage::run(lineage::Rules::per_record(), &shape, &lineage::PARTIAL_OVERLAP);
+        assert_eq!(
+            r,
+            Err("SERIALIZABILITY VIOLATION after crash: recovered [10, 11, 200] is no serial subset of [Tx(1), Tx(2)] (decisions durable: {2})".to_string())
+        );
+        // Neither decision durable, T1's only, and both: the controls pass.
+        let mut t1_only = lineage::PARTIAL_OVERLAP[..9].to_vec();
+        t1_only.extend([lineage::Step::Fsync(0), lineage::Step::Crash]);
+        let mut both = lineage::PARTIAL_OVERLAP[..10].to_vec();
+        both.extend([lineage::Step::Fsync(0), lineage::Step::Crash]);
+        for control in [lineage::PARTIAL_OVERLAP[..9].to_vec(), t1_only, both] {
+            let r = lineage::run(lineage::Rules::per_record(), &shape, &control);
+            assert!(r.is_ok(), "{}", r.unwrap_err());
+        }
+    }
+
+    #[test]
+    fn a_read_leg_makes_the_whole_transaction_dependent() {
+        let shape = lineage::Shape::asymmetric_read();
+        let r = lineage::run(lineage_rules(), &shape, &lineage::ASYMMETRIC_READ);
+        assert!(r.is_ok(), "{}", r.unwrap_err());
+        assert_eq!(
+            lineage::run(lineage::Rules::chosen(), &shape, &lineage::ASYMMETRIC_READ),
+            Ok(vec![10, 11, 12])
+        );
+    }
+
+    #[test]
+    fn withdrawn_per_record_dependencies_keep_a_write_whose_read_was_dropped() {
+        let shape = lineage::Shape::asymmetric_read();
+        let r = lineage::run(lineage::Rules::per_record(), &shape, &lineage::ASYMMETRIC_READ);
+        assert_eq!(
+            r,
+            Err("DEPENDENCY VIOLATION after crash: recovered [10, 11, 200] matches only subsets of [Tx(1), Tx(2)] that keep Tx(2) without Tx(1) it observed (decisions durable: {2})".to_string())
+        );
+    }
+
+    #[test]
+    fn a_decision_never_outlives_a_plain_write_its_read_leg_observed() {
+        let shape = lineage::Shape::read_watermark();
+        let r = lineage::run(lineage_rules(), &shape, &lineage::READ_WATERMARK);
+        assert!(r.is_ok(), "{}", r.unwrap_err());
+        assert_eq!(
+            lineage::run(lineage::Rules::chosen(), &shape, &lineage::READ_WATERMARK),
+            Ok(vec![10, 11])
+        );
+    }
+
+    #[test]
+    fn withdrawn_prepare_only_watermarks_let_a_decision_outlive_what_it_read() {
+        let shape = lineage::Shape::read_watermark();
+        let rules = lineage::Rules {
+            decision_waits_for_read_watermarks: false,
+            ..lineage::Rules::chosen()
+        };
+        let r = lineage::run(rules, &shape, &lineage::READ_WATERMARK);
+        assert_eq!(
+            r,
+            Err("DEPENDENCY VIOLATION after crash: recovered [10, 100] matches only subsets of [Incr { cell: 0, id: 1 }, Tx(1)] that keep Tx(1) without Incr { cell: 0, id: 1 } it observed (decisions durable: {1})".to_string())
+        );
+    }
+
+    #[test]
+    fn a_transitive_successor_inherits_the_whole_closure() {
+        let shape = lineage::Shape::transitive();
+        let r = lineage::run(lineage_rules(), &shape, &lineage::TRANSITIVE);
+        assert!(r.is_ok(), "{}", r.unwrap_err());
+        assert_eq!(
+            lineage::run(lineage::Rules::chosen(), &shape, &lineage::TRANSITIVE),
+            Ok(vec![10, 11, 12, 13])
+        );
+    }
+
+    #[test]
+    fn withdrawn_per_record_dependencies_recover_a_transaction_two_hops_from_its_dropped_root() {
+        let shape = lineage::Shape::transitive();
+        let r = lineage::run(lineage::Rules::per_record(), &shape, &lineage::TRANSITIVE);
+        assert_eq!(
+            r,
+            Err("DEPENDENCY VIOLATION after crash: recovered [10, 11, 300, 300] matches only subsets of [Tx(1), Tx(2), Tx(3)] that keep Tx(3) without Tx(1) it observed (decisions durable: {2, 3})".to_string())
+        );
+    }
+
     #[test]
     fn random_lineage_interleavings_are_serializable_and_keep_every_ack() {
         let rules = lineage_rules();
+        let shape = lineage::Shape::full_overlap();
         let mut violations = Vec::new();
         for seed in 1..=2000u64 {
-            if let Err(e) = lineage::run(rules, &lineage::random_steps(seed, 20)) {
+            if let Err(e) = lineage::run(rules, &shape, &lineage::random_steps(&shape, seed, 20)) {
                 violations.push(format!("seed {seed}: {e}"));
             }
         }
@@ -4055,10 +5602,31 @@ mod tests {
     }
 
     #[test]
+    fn random_lineage_shapes_are_serializable_and_keep_every_ack() {
+        let rules = lineage_rules();
+        let mut violations = Vec::new();
+        for seed in 1..=2000u64 {
+            let shape = lineage::Shape::random(seed);
+            if let Err(e) = lineage::run(rules, &shape, &lineage::random_program(&shape, seed)) {
+                violations.push(format!("seed {seed} {shape:?}: {e}"));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "{} of 2000 shapes violated under {rules:?}; first: {}",
+            violations.len(),
+            violations[0]
+        );
+    }
+
+    #[test]
     fn withdrawn_lineage_rules_violate_some_random_interleavings() {
+        let shape = lineage::Shape::full_overlap();
         let count = |rules: lineage::Rules| {
             (1..=2000u64)
-                .filter(|s| lineage::run(rules, &lineage::random_steps(*s, 20)).is_err())
+                .filter(|s| {
+                    lineage::run(rules, &shape, &lineage::random_steps(&shape, *s, 20)).is_err()
+                })
                 .count()
         };
         let withdrawn = count(lineage::Rules::withdrawn());
@@ -4076,6 +5644,28 @@ mod tests {
             "lineage violations over 2000 interleavings: withdrawn {withdrawn}, inherit-only {only_inherit}, pin-only {only_pin}, no-ack-gate {no_ack_gate}"
         );
         assert!(withdrawn > 0 && only_inherit > 0 && only_pin > 0 && no_ack_gate > 0);
+    }
+
+    #[test]
+    fn withdrawn_per_record_dependencies_violate_some_random_shapes() {
+        let count = |rules: lineage::Rules| {
+            (1..=2000u64)
+                .filter(|s| {
+                    let shape = lineage::Shape::random(*s);
+                    lineage::run(rules, &shape, &lineage::random_program(&shape, *s)).is_err()
+                })
+                .count()
+        };
+        let per_record = count(lineage::Rules::per_record());
+        let prepare_only = count(lineage::Rules {
+            decision_waits_for_read_watermarks: false,
+            ..lineage::Rules::chosen()
+        });
+        let withdrawn = count(lineage::Rules::withdrawn());
+        eprintln!(
+            "lineage violations over 2000 random shapes: per-record {per_record}, prepare-only watermarks {prepare_only}, withdrawn {withdrawn}"
+        );
+        assert!(per_record > 0 && prepare_only > 0 && withdrawn > 0, "the model lost its teeth");
     }
 
     // ---- identity (ADR-0116 A3) ----
@@ -4240,5 +5830,169 @@ mod tests {
             "revision repeats over 2000 histories: wrap {wrap}, restart {restart}, exhaustion {exhaustion}"
         );
         assert!(wrap > 0 && restart > 0 && exhaustion > 0, "the model lost its teeth");
+    }
+
+    // ---- credits (ADR-0116 A9, review F06) ----
+
+    fn credits_rules() -> credits::Rules {
+        match Variant::from_env() {
+            Variant::Chosen => credits::Rules::chosen(),
+            Variant::Withdrawn => credits::Rules::withdrawn(),
+        }
+    }
+
+    #[test]
+    fn a_saturated_pair_with_contenders_behind_a_holder_completes() {
+        let (cfg, actions) = credits::saturated_pair();
+        let r = credits::run_script(credits_rules(), cfg, &actions);
+        assert!(r.is_ok(), "{}", r.unwrap_err());
+        let stats = credits::run_script(credits::Rules::chosen(), cfg, &actions).expect("chosen");
+        assert_eq!((stats.committed, stats.aborted, stats.refused), (2, 0, 7));
+        assert!(stats.max_parked <= 1 && stats.max_ring <= cfg.data_credits as usize);
+    }
+
+    #[test]
+    fn withdrawn_queued_grant_returns_one_credit_twice() {
+        let (cfg, actions) = credits::saturated_pair();
+        let r = credits::run_script(credits::Rules::withdrawn(), cfg, &actions);
+        assert_eq!(
+            r,
+            Err("CREDIT OVERFLOW: the coordinator holds 9 credits toward the owner of 8 — a second reply to one request returned its credit twice".to_string())
+        );
+        // Reserving at Admit does not repair a second reply.
+        let queued_reserved = credits::Rules {
+            grant_is_the_deferred_terminal_reply: false,
+            ..credits::Rules::chosen()
+        };
+        let r = credits::run_script(queued_reserved, cfg, &actions);
+        assert!(r.as_ref().is_err_and(|e| e.starts_with("CREDIT OVERFLOW")), "{r:?}");
+    }
+
+    #[test]
+    fn withdrawn_hop_by_hop_credits_deadlock_a_holder_behind_its_own_contenders() {
+        let (cfg, actions) = credits::saturated_pair();
+        let r = credits::run_script(credits::Rules::deferred_hop_by_hop(), cfg, &actions);
+        assert_eq!(
+            r,
+            Err("CREDIT DEADLOCK: 9 transaction(s) stuck with no message in flight and 0 credit(s) toward the owner — T1 holds key 0@owner and waits for ExecOp; 8 parked LockOp(s) (T2, T3, T4, T5, T6, T7, T8, T9) hold every credit".to_string())
+        );
+    }
+
+    #[test]
+    fn credit_storms_complete_and_drain_the_pair() {
+        let rules = credits_rules();
+        let mut violations = Vec::new();
+        let mut committed = 0;
+        for seed in 1..=64u64 {
+            match credits::run(rules, credits::storm(), seed) {
+                Ok(stats) => committed += stats.committed,
+                Err(e) => violations.push(format!("seed {seed}: {e}")),
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "{} of 64 storms violated under {rules:?}; first: {}",
+            violations.len(),
+            violations[0]
+        );
+        assert!(committed > 0);
+    }
+
+    #[test]
+    fn withdrawn_credit_rules_violate_some_storm_within_64_seeds() {
+        let count = |rules: credits::Rules| {
+            (1..=64u64).filter(|s| credits::run(rules, credits::storm(), *s).is_err()).count()
+        };
+        let withdrawn = count(credits::Rules::withdrawn());
+        let hop_by_hop = count(credits::Rules::deferred_hop_by_hop());
+        eprintln!("credit storms: queued-grant {withdrawn}/64, hop-by-hop {hop_by_hop}/64");
+        assert!(withdrawn > 0 && hop_by_hop > 0, "the model lost its teeth");
+    }
+
+    // ---- retention (ADR-0116 A10, review F08) ----
+
+    fn retention_rules() -> retention::Rules {
+        match Variant::from_env() {
+            Variant::Chosen => retention::Rules::chosen(),
+            Variant::Withdrawn => retention::Rules::withdrawn(),
+        }
+    }
+
+    #[test]
+    fn a_tombstone_storm_is_refused_at_the_pinned_budget_and_admitted_after_the_decisions() {
+        let (images, txns, steps) = retention::tombstone_storm_then_decisions();
+        let r = retention::run(retention_rules(), retention::budget(), &images, &txns, &steps);
+        assert!(r.is_ok(), "{}", r.unwrap_err());
+        let stats =
+            retention::run(retention::Rules::chosen(), retention::budget(), &images, &txns, &steps)
+                .expect("chosen");
+        assert_eq!(stats.committed, 4);
+        assert_eq!(stats.refused.get(&retention::Refusal::Retain), Some(&2));
+        assert_eq!(stats.max_retained, 2 * retention::MIB);
+    }
+
+    #[test]
+    fn withdrawn_frame_bound_does_not_bound_what_a_tombstone_pins() {
+        let (images, txns, steps) = retention::tombstone_storm();
+        let r = retention::run(
+            retention::Rules::withdrawn(),
+            retention::budget(),
+            &images,
+            &txns,
+            &steps,
+        );
+        assert_eq!(
+            r,
+            Err("RETAINED BYTES EXCEED THE CLAIMED BOUND: 1 pending transaction(s) staged at most 24 B each but retain 1048576 B of images and 0 B of extents — above the retention cap × frame bound of 256 B".to_string())
+        );
+    }
+
+    #[test]
+    fn a_cold_extent_is_charged_and_dependent_writes_pin_nothing_new() {
+        let (images, txns, steps) = retention::cold_extent_and_dependents();
+        let r = retention::run(retention_rules(), retention::budget(), &images, &txns, &steps);
+        assert!(r.is_ok(), "{}", r.unwrap_err());
+        let stats =
+            retention::run(retention::Rules::chosen(), retention::budget(), &images, &txns, &steps)
+                .expect("chosen");
+        assert_eq!((stats.committed, stats.max_retained), (2, 4 * retention::MIB));
+        assert!(stats.refused.is_empty());
+    }
+
+    #[test]
+    fn random_retention_histories_are_conserved_bounded_and_leak_free() {
+        let rules = retention_rules();
+        let mut violations = Vec::new();
+        for seed in 1..=2000u64 {
+            let (images, txns, steps) = retention::random(seed);
+            if let Err(e) = retention::run(rules, retention::budget(), &images, &txns, &steps) {
+                violations.push(format!("seed {seed}: {e}"));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "{} of 2000 histories violated under {rules:?}; first: {}",
+            violations.len(),
+            violations[0]
+        );
+    }
+
+    #[test]
+    fn withdrawn_retention_rules_exceed_the_claimed_bound_within_2000_seeds() {
+        let count = (1..=2000u64)
+            .filter(|s| {
+                let (images, txns, steps) = retention::random(*s);
+                retention::run(
+                    retention::Rules::withdrawn(),
+                    retention::budget(),
+                    &images,
+                    &txns,
+                    &steps,
+                )
+                .is_err()
+            })
+            .count();
+        eprintln!("retention claimed-bound violations over 2000 histories: {count}");
+        assert!(count > 0, "the model lost its teeth");
     }
 }
