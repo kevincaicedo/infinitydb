@@ -1,0 +1,7 @@
+tiered-0xC0FFEF exit 0
+tiered-0xC0FFEE exit 0
+tiered-sweep64 exit 1
+recovery-sweep64 exit 1
+sim-smoke exit 0
+cargo-deny exit 0
+chain done

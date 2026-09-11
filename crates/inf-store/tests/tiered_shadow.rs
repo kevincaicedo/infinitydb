@@ -1469,6 +1469,52 @@ fn a_winner_lists_every_ticket_naming_it_in_cold_order() {
     assert_eq!(t.len(), 0);
 }
 
+/// ADR-0093 A13 (B23-R10): the `DEL` path walks a winner's tickets by
+/// a cold-address cursor — one probe per step, ascending, `None` past
+/// the last — instead of snapshotting them; a ticket ended between two
+/// steps is skipped, one still open below the cursor is never revisited,
+/// and the borrowed iterator lists the same set the cursor visits.
+#[test]
+fn the_delete_cursor_visits_every_ticket_of_a_winner_in_cold_order() {
+    let key = b"k".to_vec();
+    let hash = KeyHasher::default().hash(&key);
+    let mut t = recovered_table();
+    let twins: Vec<LogicalAddr> =
+        (1..=3u64).map(|i| LogicalAddr::from_raw(i * 4096).expect("fits")).collect();
+    for twin in &twins {
+        t.apply_ref(hash, *twin);
+    }
+    let winner = t.apply_image(&key, b"new", hash).expect("fits");
+    t.rebuild_shadow_tickets(no_settle).expect("one RAM sibling: three tickets");
+    let mut walked = Vec::new();
+    let mut cursor = None;
+    while let Some(ticket) = t.shadow_ticket_of_winner_after(winner, cursor) {
+        assert_eq!(ticket.winner, winner);
+        cursor = Some(ticket.cold);
+        walked.push(ticket.cold);
+    }
+    assert_eq!(walked, twins, "the cursor walks every ticket, ascending");
+    assert_eq!(
+        t.shadow_winner_tickets(winner).map(|t| t.cold).collect::<Vec<_>>(),
+        twins,
+        "the borrowed iterator lists the same set"
+    );
+    assert!(
+        t.shadow_ticket_of_winner_after(twins[0], None).is_none(),
+        "a cold address names no winner"
+    );
+    assert!(t.shadow_ticket_of_winner_after(winner, Some(twins[2])).is_none(), "past the last");
+    // A ticket ended between two steps is not visited; the cursor
+    // resumes above the last cold address it saw.
+    let image = record_image(&key, b"old");
+    let first = t.shadow_ticket_of_winner_after(winner, None).expect("first");
+    assert_eq!(t.resolve_shadow(hash, twins[1], &image), ShadowVerdict::SameKey);
+    let next = t.shadow_ticket_of_winner_after(winner, Some(first.cold)).expect("third");
+    assert_eq!(next.cold, twins[2], "the settled middle ticket is skipped");
+    assert!(t.shadow_ticket_of_winner_after(winner, Some(next.cold)).is_none());
+    assert_eq!(t.shadow_tickets_of_winner(winner).len(), 2);
+}
+
 /// ADR-0093 A11 (review of 2026-08-30, F-L07-01's neighbour; batch 23):
 /// a ticket's cold twin can carry relocation origins — compaction moved
 /// it before the overwrite opened the ticket (admission allows up to

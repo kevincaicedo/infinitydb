@@ -2104,9 +2104,12 @@ async fn del<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 }
 
 /// One key's deletion: resolve (cold verifies — the recorded S26
-/// policy) → stage markers + `Delete` → apply. `Ok(None)` = the key was
-/// absent; `Ok(Some((seq, value)))` = deleted (`want_value` carries the
-/// old value out for GETDEL).
+/// policy) → walk the winner's tickets (ADR-0093 A10/A13) → stage
+/// markers + `Delete` → apply. `Ok(None)` = the key was absent;
+/// `Ok(Some((seq, value)))` = deleted (`want_value` carries the old
+/// value out for GETDEL). The two suspensions are here: each unverified
+/// twin's `Foreground` read, and the drained wait when the staging
+/// window is full. No store borrow crosses either.
 async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
@@ -2117,202 +2120,44 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 ) -> Result<Option<(u64, Option<Vec<u8>>)>, Vec<u8>> {
     let hash = shared.hasher.hash(key);
     loop {
-        let (old, old_value): (Displaced, Option<Vec<u8>>) =
-            match resolve(shared, ns, key, hash, PromoteOnCold::Never).await {
-                Resolved::Miss => return Ok(None),
-                Resolved::Ram(addr) => {
-                    let ks = shared.store.borrow();
-                    let table = ks.tiered_store(ns).expect("resolved on this table");
-                    let parts = table.record(addr);
-                    let value = want_value.then(|| parts.value.to_vec());
-                    (Some((addr, parts.encoded_len, parts.version)), value)
-                }
-                Resolved::Cold { addr, value, version, encoded_len }
-                | Resolved::Extent { addr, value, version, encoded_len } => {
-                    (Some((addr, encoded_len, version)), Some(value))
-                }
-                Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
-            };
-        let Some((addr, len, _)) = old else { return Ok(None) };
-        // M4.5-S37 (ADR-0093 D3, A10/A11): a winner with open tickets must
-        // not be deleted before every twin is verified — the one command
-        // that would leave a twin as the key's value. One winner carries
-        // several tickets after a boot rebuild paired several cold slots
-        // of its hash with it (review of 2026-08-30, F-L07-01: resolving
-        // only the first tripped the store's release assert). Each is
-        // read now (the synchronous path's own read) and verified by
-        // full key; every same-key twin is then deleted through the
-        // **marker path** below — its own relocation origins first (A11:
-        // a checkpoint that began before the twin's relocation still
-        // refs them), then its address, then `delete` — the synchronous
-        // shape, attributed once whether or not a walk is pinned; a
-        // collision ends its ticket and leaves the other key alone.
-        let tickets = {
-            let ks = shared.store.borrow();
-            ks.tiered_store(ns).map_or_else(Vec::new, |table| table.shadow_tickets_of_winner(addr))
+        let Some(target) = resolve_delete_target(shared, ns, key, hash, want_value, proto).await?
+        else {
+            return Ok(None);
         };
-        let mut verified_twins: Vec<(LogicalAddr, usize)> = Vec::with_capacity(tickets.len());
+        // The ticket walk: a cold-address cursor over the registry and
+        // fixed scratch for the same-key twins (B23-R10 — no snapshot,
+        // no heap). Stale (`verify` never defers) re-resolves.
+        let mut twins = TwinScratch::default();
+        let mut cursor: Option<LogicalAddr> = None;
         let mut stale = false;
-        for ticket in tickets {
-            // A ticket already verified same-key (ADR-0093 A1) needs no
-            // read: the twin's exact length is on the ticket.
-            if let Some(len) = ticket.verified_len {
-                let mut ks = shared.store.borrow_mut();
-                let Some(table) = ks.tiered_store_mut(ns) else {
-                    stale = true;
-                    break;
-                };
-                table.note_shadow_forced_delete();
-                verified_twins.push((ticket.cold, len as usize));
-                continue;
-            }
-            let image =
-                match read_cold_record(shared, ns, ticket.cold, inf_runtime::ReadClass::Foreground)
-                    .await
-                {
-                    Ok(image) => image,
-                    Err(message) => return Err(error_bytes(shared, proto, message)),
-                };
-            let verdict = {
-                let mut ks = shared.store.borrow_mut();
-                let Some(table) = ks.tiered_store_mut(ns) else {
-                    stale = true;
-                    break;
-                };
-                table.note_shadow_forced_delete();
-                table.verify_shadow(ticket.hash, ticket.cold, &image)
+        while let Some(ticket) = next_winner_ticket(shared, ns, target.addr, cursor) {
+            cursor = Some(ticket.cold);
+            let image = if ticket.verified_len.is_some() {
+                None
+            } else {
+                let read =
+                    read_cold_record(shared, ns, ticket.cold, inf_runtime::ReadClass::Foreground)
+                        .await;
+                Some(read.map_err(|message| error_bytes(shared, proto, message))?)
             };
-            match verdict {
-                inf_store::ShadowVerdict::SameKey => {
-                    verified_twins.push((ticket.cold, image.len()));
-                }
-                inf_store::ShadowVerdict::Collision => {}
-                // Stale (`verify` never defers): re-resolve.
-                _ => {
+            match note_winner_ticket(shared, ns, &ticket, image.as_deref(), &mut twins) {
+                TicketStep::Next => {}
+                TicketStep::Stale => {
                     stale = true;
                     break;
+                }
+                TicketStep::OverRegister => {
+                    return Err(error_bytes(shared, proto, ERR_DEL_REGISTER));
                 }
             }
         }
         if stale {
             continue;
         }
-        // Atomic block: fit check → apply → markers + Delete record.
-        let staged = {
-            let mut ks = shared.store.borrow_mut();
-            let mut durable = shared.durable.borrow_mut();
-            let Some(cell) = durable.as_mut() else {
-                return Err(error_bytes(shared, proto, ERR_FAILED));
-            };
-            if cell.failed {
-                return Err(error_bytes(shared, proto, ERR_FAILED));
-            }
-            let marker =
-                MutationEffect::ColdDisplace { ns, old_addr: (1u64 << 48) - 1 }.encoded_len();
-            // The marker run (ADR-0059 D9, ADR-0093 A11): each same-key
-            // twin's origins and its address, then the winner's origins
-            // and its address. The store's caps bound every record's
-            // origins, so the budget is `RELOC_ORIGIN_CAP + 1` markers
-            // per record; the exact run is counted against the replay
-            // register below.
-            let records = verified_twins.len() + 1;
-            let worst = records * (inf_store::RELOC_ORIGIN_CAP + 1) * marker
-                + MutationEffect::Delete { ns, key }.encoded_len();
-            if !cell.would_fit(worst) {
-                None
-            } else {
-                let Some(table) = ks.tiered_store_mut(ns) else {
-                    return Err(error_bytes(
-                        shared,
-                        proto,
-                        "ERR the selected namespace was dropped (INF.NS USE again)",
-                    ));
-                };
-                // The resolve above verified identity; a raced mutation
-                // re-resolves (delete is index + accounting only).
-                match table.lookup(key, hash, &[]) {
-                    TieredLookup::Ram(now) | TieredLookup::Cold(now) if now == addr => {
-                        let class =
-                            class.expect("tiered namespaces always carry a durability class");
-                        // Twins still slotted: one a MAINTAIN settle
-                        // chained into the winner's origins meanwhile is
-                        // covered by the winner's list below.
-                        let twins: Vec<(LogicalAddr, usize)> = verified_twins
-                            .iter()
-                            .copied()
-                            .filter(|(twin, _)| table.contains_pair(hash, *twin))
-                            .collect();
-                        // A ticket this pass did not verify (none can
-                        // appear on an existing address — retargets land
-                        // on new ones — but the store's assert is the
-                        // proof, not this comment): re-resolve.
-                        let unhandled = table
-                            .shadow_tickets_of_winner(addr)
-                            .into_iter()
-                            .any(|t| !twins.iter().any(|(twin, _)| *twin == t.cold));
-                        if unhandled {
-                            Some(None)
-                        } else {
-                            let run: usize = twins
-                                .iter()
-                                .map(|(twin, _)| table.displacement_origins_len(hash, *twin) + 1)
-                                .sum::<usize>()
-                                + table.displacement_origins_len(hash, addr)
-                                + 1;
-                            if run > inf_store::DISPLACE_REGISTER_CAP {
-                                // Several same-key cold twins of one
-                                // record is input no engine writes (a
-                                // checkpoint names one cold record per
-                                // key): refuse typed, tickets intact,
-                                // rather than stage a run recovery would
-                                // refuse (ADR-0059 D9's bound).
-                                return Err(error_bytes(
-                                    shared,
-                                    proto,
-                                    "ERR DEL: displacement markers exceed the replay register \
-                                     (ADR-0093 A11)",
-                                ));
-                            }
-                            // Every verified same-key twin first (ADR-0093
-                            // D3/A11): its origins' markers, its own
-                            // marker and its exact death, the ticket
-                            // ending with the slot — then the winner as
-                            // any deleted record.
-                            for (twin, twin_len) in twins {
-                                for (origin_addr, _) in table.take_displacement_origins(hash, twin)
-                                {
-                                    let m =
-                                        MutationEffect::ColdDisplace { ns, old_addr: origin_addr };
-                                    cell.stage_tiered(table, &m, class);
-                                }
-                                let m =
-                                    MutationEffect::ColdDisplace { ns, old_addr: twin.to_raw() };
-                                cell.stage_tiered(table, &m, class);
-                                table.delete(hash, twin, twin_len);
-                            }
-                            table.delete(hash, addr, len);
-                            for (origin_addr, _) in table.take_displacement_origins(hash, addr) {
-                                let m = MutationEffect::ColdDisplace { ns, old_addr: origin_addr };
-                                cell.stage_tiered(table, &m, class);
-                            }
-                            let m = MutationEffect::ColdDisplace { ns, old_addr: addr.to_raw() };
-                            cell.stage_tiered(table, &m, class);
-                            let seq = cell.stage_tiered(
-                                table,
-                                &MutationEffect::Delete { ns, key },
-                                class,
-                            );
-                            Some(Some(seq))
-                        }
-                    }
-                    _ => Some(None), // moved underneath us: re-resolve
-                }
-            }
-        };
-        match staged {
-            Some(Some(seq)) => return Ok(Some((seq, old_value))),
-            Some(None) => continue,
-            None => {
+        match stage_delete(shared, ns, class, key, hash, &target, &mut twins, proto)? {
+            Staged::Applied(seq) => return Ok(Some((seq, target.value))),
+            Staged::Moved => continue,
+            Staged::NoRoom => {
                 let wait = {
                     let durable = shared.durable.borrow();
                     let Some(cell) = durable.as_ref() else {
@@ -2324,6 +2169,264 @@ async fn delete_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             }
         }
     }
+}
+
+const ERR_DEL_REGISTER: &str =
+    "ERR DEL: displacement markers exceed the replay register (ADR-0093 A11)";
+
+/// The record a `DEL` resolved: its address, encoded length and — for
+/// GETDEL — its value.
+struct DeleteTarget {
+    addr: LogicalAddr,
+    len: usize,
+    value: Option<Vec<u8>>,
+}
+
+/// `DEL`'s command scratch (ADR-0093 A13): the same-key twins one
+/// winner can carry and still fit the replay register — each twin costs
+/// at least one marker, the winner one more, so the register minus one.
+/// A twin past the cap refuses typed before its read; the count is
+/// `tiering_shadow_delete_run_refused`. 24 B per slot on the stack.
+const TWIN_SCRATCH_CAP: usize = inf_store::DISPLACE_REGISTER_CAP - 1;
+
+/// Fixed-capacity `(twin, encoded_len)` scratch — the walk's only state
+/// besides the cursor. Never heap-allocated.
+#[derive(Default)]
+struct TwinScratch {
+    slots: [(Option<LogicalAddr>, usize); TWIN_SCRATCH_CAP],
+    len: usize,
+}
+
+impl TwinScratch {
+    /// `false` when the scratch is full (the caller refuses).
+    fn push(&mut self, twin: LogicalAddr, len: usize) -> bool {
+        if self.len == TWIN_SCRATCH_CAP {
+            return false;
+        }
+        self.slots[self.len] = (Some(twin), len);
+        self.len += 1;
+        true
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (LogicalAddr, usize)> + '_ {
+        self.slots[..self.len].iter().filter_map(|(twin, len)| Some((*twin.as_ref()?, *len)))
+    }
+
+    fn contains(&self, twin: LogicalAddr) -> bool {
+        self.iter().any(|(t, _)| t == twin)
+    }
+
+    /// Keeps the twins `keep` accepts, in order, in place.
+    fn retain(&mut self, mut keep: impl FnMut(LogicalAddr) -> bool) {
+        let mut kept = 0;
+        for i in 0..self.len {
+            let slot = self.slots[i];
+            let Some(twin) = slot.0 else { continue };
+            if keep(twin) {
+                self.slots[kept] = slot;
+                kept += 1;
+            }
+        }
+        self.len = kept;
+    }
+}
+
+enum TicketStep {
+    Next,
+    /// The table is gone or the ticket's state moved: re-resolve.
+    Stale,
+    /// A same-key twin past [`TWIN_SCRATCH_CAP`] (A11's refusal).
+    OverRegister,
+}
+
+enum Staged {
+    Applied(u64),
+    /// The key moved underneath the walk: re-resolve.
+    Moved,
+    /// The staging window cannot fit the worst-case run: wait drained.
+    NoRoom,
+}
+
+/// The resolve arm of `delete_one`: `Ok(None)` = absent.
+async fn resolve_delete_target<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    key: &[u8],
+    hash: u64,
+    want_value: bool,
+    proto: Protocol,
+) -> Result<Option<DeleteTarget>, Vec<u8>> {
+    let target = match resolve(shared, ns, key, hash, PromoteOnCold::Never).await {
+        Resolved::Miss => None,
+        Resolved::Ram(addr) => {
+            let ks = shared.store.borrow();
+            let table = ks.tiered_store(ns).expect("resolved on this table");
+            let parts = table.record(addr);
+            let value = want_value.then(|| parts.value.to_vec());
+            Some(DeleteTarget { addr, len: parts.encoded_len, value })
+        }
+        Resolved::Cold { addr, value, encoded_len, .. }
+        | Resolved::Extent { addr, value, encoded_len, .. } => {
+            Some(DeleteTarget { addr, len: encoded_len, value: Some(value) })
+        }
+        Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
+    };
+    Ok(target)
+}
+
+/// One cursor step over the winner's tickets (A13), inside its own
+/// borrow. A dropped table reads as no ticket; the atomic block refuses
+/// it typed.
+fn next_winner_ticket<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    winner: LogicalAddr,
+    after: Option<LogicalAddr>,
+) -> Option<inf_store::ShadowTicket> {
+    let ks = shared.store.borrow();
+    ks.tiered_store(ns)?.shadow_ticket_of_winner_after(winner, after)
+}
+
+/// One ticket's verdict (A10): a ticket already verified same-key (A1)
+/// carries the twin's exact length and needs no read; an unverified one
+/// is verified by its full-key `image`. Same-key twins land in the
+/// scratch; a collision verdict ends its ticket and leaves the other
+/// key alone.
+fn note_winner_ticket<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    ticket: &inf_store::ShadowTicket,
+    image: Option<&[u8]>,
+    twins: &mut TwinScratch,
+) -> TicketStep {
+    let mut ks = shared.store.borrow_mut();
+    let Some(table) = ks.tiered_store_mut(ns) else {
+        return TicketStep::Stale;
+    };
+    table.note_shadow_forced_delete();
+    let twin_len = match (ticket.verified_len, image) {
+        (Some(len), _) => len as usize,
+        (None, Some(image)) => match table.verify_shadow(ticket.hash, ticket.cold, image) {
+            inf_store::ShadowVerdict::SameKey => image.len(),
+            inf_store::ShadowVerdict::Collision => return TicketStep::Next,
+            _ => return TicketStep::Stale,
+        },
+        (None, None) => return TicketStep::Stale,
+    };
+    if twins.push(ticket.cold, twin_len) {
+        TicketStep::Next
+    } else {
+        table.note_shadow_delete_run_refused();
+        TicketStep::OverRegister
+    }
+}
+
+/// The atomic block: fit check → identity recheck → markers + `Delete`.
+/// One store borrow, no suspension.
+#[allow(clippy::too_many_arguments)]
+fn stage_delete<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    class: Option<FsyncClass>,
+    key: &[u8],
+    hash: u64,
+    target: &DeleteTarget,
+    twins: &mut TwinScratch,
+    proto: Protocol,
+) -> Result<Staged, Vec<u8>> {
+    let mut ks = shared.store.borrow_mut();
+    let mut durable = shared.durable.borrow_mut();
+    let Some(cell) = durable.as_mut() else {
+        return Err(error_bytes(shared, proto, ERR_FAILED));
+    };
+    if cell.failed {
+        return Err(error_bytes(shared, proto, ERR_FAILED));
+    }
+    // The marker run (ADR-0059 D9, ADR-0093 A11): each same-key twin's
+    // origins and its address, then the winner's origins and its
+    // address. The store's caps bound every record's origins, so the
+    // budget is `RELOC_ORIGIN_CAP + 1` markers per record; the exact run
+    // is counted against the replay register in `stage_delete_run`.
+    let marker = MutationEffect::ColdDisplace { ns, old_addr: (1u64 << 48) - 1 }.encoded_len();
+    let records = twins.len + 1;
+    let worst = records * (inf_store::RELOC_ORIGIN_CAP + 1) * marker
+        + MutationEffect::Delete { ns, key }.encoded_len();
+    if !cell.would_fit(worst) {
+        return Ok(Staged::NoRoom);
+    }
+    let Some(table) = ks.tiered_store_mut(ns) else {
+        return Err(error_bytes(
+            shared,
+            proto,
+            "ERR the selected namespace was dropped (INF.NS USE again)",
+        ));
+    };
+    // The resolve verified identity; a raced mutation re-resolves
+    // (delete is index + accounting only).
+    match table.lookup(key, hash, &[]) {
+        TieredLookup::Ram(now) | TieredLookup::Cold(now) if now == target.addr => {}
+        _ => return Ok(Staged::Moved),
+    }
+    // Twins still slotted: one a MAINTAIN settle chained into the
+    // winner's origins meanwhile is covered by the winner's list.
+    twins.retain(|twin| table.contains_pair(hash, twin));
+    // A ticket this pass did not verify (none can appear on an existing
+    // address — retargets land on new ones — but the store's assert is
+    // the proof, not this comment): re-resolve.
+    if table.shadow_winner_tickets(target.addr).any(|t| !twins.contains(t.cold)) {
+        return Ok(Staged::Moved);
+    }
+    let class = class.expect("tiered namespaces always carry a durability class");
+    match stage_delete_run(cell, table, ns, class, key, hash, target, twins) {
+        Some(seq) => Ok(Staged::Applied(seq)),
+        None => {
+            table.note_shadow_delete_run_refused();
+            Err(error_bytes(shared, proto, ERR_DEL_REGISTER))
+        }
+    }
+}
+
+/// The marker run, counted against the replay register first (`None` =
+/// over it, nothing staged, tickets intact — ADR-0059 D9's bound; on
+/// engine-written input the run never exceeds it). Every verified
+/// same-key twin first (ADR-0093 D3/A11): its origins' markers, its own
+/// marker and its exact death, the ticket ending with the slot — then
+/// the winner as any deleted record.
+#[allow(clippy::too_many_arguments)]
+fn stage_delete_run<F: SegmentFs + Clone + 'static>(
+    cell: &mut DurableCell<F>,
+    table: &mut TieredTable,
+    ns: NsId,
+    class: FsyncClass,
+    key: &[u8],
+    hash: u64,
+    target: &DeleteTarget,
+    twins: &TwinScratch,
+) -> Option<u64> {
+    let run: usize =
+        twins.iter().map(|(twin, _)| table.displacement_origins_len(hash, twin) + 1).sum::<usize>()
+            + table.displacement_origins_len(hash, target.addr)
+            + 1;
+    if run > inf_store::DISPLACE_REGISTER_CAP {
+        return None;
+    }
+    for (twin, twin_len) in twins.iter() {
+        for (origin_addr, _) in table.take_displacement_origins(hash, twin) {
+            let m = MutationEffect::ColdDisplace { ns, old_addr: origin_addr };
+            cell.stage_tiered(table, &m, class);
+        }
+        let m = MutationEffect::ColdDisplace { ns, old_addr: twin.to_raw() };
+        cell.stage_tiered(table, &m, class);
+        table.delete(hash, twin, twin_len);
+    }
+    table.delete(hash, target.addr, target.len);
+    for (origin_addr, _) in table.take_displacement_origins(hash, target.addr) {
+        let m = MutationEffect::ColdDisplace { ns, old_addr: origin_addr };
+        cell.stage_tiered(table, &m, class);
+    }
+    let m = MutationEffect::ColdDisplace { ns, old_addr: target.addr.to_raw() };
+    cell.stage_tiered(table, &m, class);
+    Some(cell.stage_tiered(table, &MutationEffect::Delete { ns, key }, class))
 }
 
 async fn mset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -2406,4 +2509,36 @@ fn format_float(f: f64) -> Vec<u8> {
         }
     }
     text.into_bytes()
+}
+
+#[cfg(test)]
+mod twin_scratch_tests {
+    use super::*;
+
+    fn addr(i: u64) -> LogicalAddr {
+        LogicalAddr::from_raw(i * 4096).expect("fits")
+    }
+
+    /// The scratch holds `DISPLACE_REGISTER_CAP - 1` twins and refuses
+    /// the next (A13); `retain` compacts in place, in order.
+    #[test]
+    fn the_twin_scratch_is_bounded_by_the_register_and_retains_in_order() {
+        let mut twins = TwinScratch::default();
+        for i in 1..=TWIN_SCRATCH_CAP as u64 {
+            assert!(twins.push(addr(i), i as usize), "slot {i} fits");
+        }
+        assert!(!twins.push(addr(99), 1), "one past the register refuses");
+        assert_eq!(twins.len, TWIN_SCRATCH_CAP);
+        assert!(twins.contains(addr(1)) && !twins.contains(addr(99)));
+        twins.retain(|twin| twin != addr(2));
+        assert_eq!(
+            twins.iter().collect::<Vec<_>>(),
+            (1..=TWIN_SCRATCH_CAP as u64)
+                .filter(|i| *i != 2)
+                .map(|i| (addr(i), i as usize))
+                .collect::<Vec<_>>()
+        );
+        assert!(twins.push(addr(5), 5), "the freed slot is reusable");
+        assert_eq!(std::mem::size_of::<TwinScratch>(), 24 * TWIN_SCRATCH_CAP + 8, "stack-only");
+    }
 }
