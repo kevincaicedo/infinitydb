@@ -1,0 +1,412 @@
+# Redis server v=8.0.5 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=9729964261b8fc0f
+# transport: Unix socket, TCP disabled; seed 20260910; 9 named + 400 random histories
+# W<k> WATCH  S<k> SET  D<k> DEL  F FLUSHDB  U UNWATCH  X MULTI/SET out/EXEC
+W0 S0 W0 X	abort
+W0 S0 W1 X	abort
+W0 S0 U W0 X	commit
+W0 U S0 X	commit
+W0 D0 X	commit
+W0 F X	commit
+S0 W0 F X	abort
+W0 S1 X	commit
+W0 W1 S1 W0 X	abort
+D0 S1 F W0 X	commit
+S0 U W0 S1 S1 X	commit
+S1 U S1 W0 X	commit
+D1 W0 U U S1 W1 S1 X	abort
+S1 W1 U S1 W1 W0 F S0 X	abort
+S1 D0 W1 S0 F X	abort
+W1 F S1 W0 W1 W1 S0 X	abort
+S0 W1 S1 S0 S1 F X	abort
+U S1 W0 F W0 X	commit
+D0 S1 S1 S1 W1 D1 D1 X	abort
+W1 D0 W0 F U S0 S0 U X	commit
+D0 F S1 D1 W1 W1 W0 X	commit
+S1 D1 W1 W0 D1 X	commit
+S1 S1 U W1 S0 S1 F W1 X	abort
+W0 F S1 S1 D1 D1 X	commit
+D1 W0 W0 W1 S0 S1 U W0 X	commit
+S0 U U U W1 S1 W0 U X	commit
+D1 S1 S1 D1 X	commit
+W1 F W1 W1 X	commit
+S1 W1 S0 W0 W1 W1 X	commit
+W0 W1 U D0 W0 U W1 W0 X	commit
+S0 W1 S1 D1 W0 S1 S1 X	abort
+U W0 S1 W1 S0 S0 W0 D0 X	abort
+W0 S1 F W0 X	commit
+S1 D0 S0 S0 X	commit
+F D1 D1 W1 S0 W1 S1 X	abort
+U S1 U W0 X	commit
+W0 W1 W1 D1 D0 W0 X	commit
+S0 S1 W1 W1 W1 X	commit
+U S1 D1 S0 S1 F S1 X	commit
+S1 S0 U D1 S1 S0 S0 S1 X	commit
+W1 S1 W1 U W0 D0 X	commit
+W0 S0 W0 S1 S1 D1 S1 W1 X	abort
+S1 S1 U W1 S0 X	commit
+D1 D1 W1 U F S1 U X	commit
+S0 S0 S0 W1 W1 W1 W1 W0 X	commit
+U S1 W0 F S1 W0 S0 X	abort
+S0 S0 D0 S0 F F S0 X	commit
+F F U W1 D0 X	commit
+U F S0 F F S1 X	commit
+W1 F S0 S1 X	abort
+U W1 S0 F F S0 D0 S0 X	commit
+S0 U W1 S1 W1 S1 W0 X	abort
+S1 D0 F U W0 D1 X	commit
+F F W0 S1 D1 W0 F X	commit
+W1 S1 U S1 W1 X	commit
+S0 S0 S1 S0 U F X	commit
+S0 F F S1 W0 X	commit
+S0 S0 S0 W1 U X	commit
+S0 W1 F W0 F W0 X	commit
+U W1 F U D0 F W0 X	commit
+W0 S0 W0 W1 W0 F W1 X	abort
+S0 F U F X	commit
+W1 S0 U S0 W1 S1 U X	commit
+U S1 F S1 D1 W0 S1 W0 X	commit
+S1 F S0 W0 X	commit
+D0 U D0 S1 W1 S0 F X	abort
+D0 S1 S0 W1 W0 S1 X	abort
+D0 W1 W0 D1 W0 S1 W0 X	abort
+W0 S0 W1 F S0 S1 D1 S1 X	abort
+W0 S1 S0 F W1 X	abort
+S1 W1 S1 W1 W0 D0 X	abort
+D1 U W0 S0 F S1 S0 X	abort
+D0 S0 U W1 U W0 X	commit
+W0 W1 W1 S0 S0 W1 X	abort
+W1 W0 S0 W1 X	abort
+F W1 D0 W1 U U W0 X	commit
+S0 U W1 S0 F S0 X	commit
+S1 S1 S1 S1 D0 W0 X	commit
+U F W0 U W0 W1 X	commit
+S0 S1 W0 W0 D1 S1 X	commit
+W1 S0 S0 S0 W0 S0 X	abort
+U U S0 F D0 W0 S1 X	commit
+W1 F F S1 X	abort
+F S1 S1 W0 F X	commit
+W0 S1 D0 D1 W1 S1 S1 W0 X	abort
+F W1 D0 S1 S0 X	abort
+D0 D1 W1 S1 X	abort
+S1 W0 S1 F F W1 S1 X	abort
+U U W1 W0 W1 W0 S1 X	abort
+W1 D0 W0 S1 F U S0 X	commit
+D0 W0 W0 S0 X	abort
+U S0 U F D1 U S0 W0 X	commit
+S1 W0 S1 W1 W1 X	commit
+W1 F W1 W0 W1 D1 X	commit
+S0 S1 S0 U D1 X	commit
+W1 W1 S1 D0 W1 F W0 D0 X	abort
+D1 F S1 S0 S1 D0 W0 W1 X	commit
+W1 S0 S0 F W0 W0 F X	commit
+W0 W0 F S1 S0 S1 S0 U X	commit
+F U W1 F D0 W0 W0 X	commit
+D0 S0 W1 F U X	commit
+S0 U S1 S0 W0 X	commit
+W1 D0 W0 W1 S1 W1 X	abort
+U S1 W0 F W1 S1 W0 W0 X	abort
+S1 S0 S0 W1 S0 S0 S0 X	commit
+D1 D0 U D0 W1 D0 X	commit
+D1 S0 S1 S0 W1 D1 X	abort
+S1 S1 W0 U X	commit
+W0 U U W1 U S0 S1 F X	commit
+F U S0 D1 W1 X	commit
+U U S1 S1 S0 X	commit
+F W1 U S0 U X	commit
+S1 S1 D0 W0 W0 D1 S0 W0 X	abort
+W1 W1 S1 S0 S0 W0 U X	commit
+S1 W1 W1 U F S0 U W0 X	commit
+W0 W0 S0 U W0 S0 W0 X	abort
+U W1 U W0 S0 X	abort
+S0 W0 D1 S1 S1 W1 X	commit
+S0 D0 S0 D0 F X	commit
+W1 W0 W0 W1 S0 W0 W0 F X	abort
+S1 W0 F W1 S0 X	abort
+S0 W0 S1 W0 F D0 W0 X	abort
+S1 D0 S0 W1 F W0 X	abort
+W0 U W0 S0 D0 X	abort
+F S1 W0 S0 U X	commit
+S1 W0 D1 W1 W0 W1 U S0 X	commit
+W0 U U U W0 W1 W0 X	commit
+D0 W0 W1 S1 U X	commit
+S1 F F D1 F W1 W1 X	commit
+U W0 S1 W1 W0 S0 S1 X	abort
+S1 W1 W0 W1 W1 F S0 W1 X	abort
+S0 F U S0 W0 W0 F U X	commit
+D1 S1 S0 S0 U W0 X	commit
+W1 S0 W0 W0 X	commit
+U W1 F W0 W1 X	commit
+W1 S1 W1 W0 S0 X	abort
+F S1 D0 S1 F S0 S0 X	commit
+S1 S0 S1 S1 D1 D0 W0 W1 X	commit
+S0 S0 F W1 X	commit
+W1 U U W1 S1 X	abort
+U U F F X	commit
+S0 F D0 S0 S0 S0 X	commit
+S1 S1 F W1 S1 X	abort
+U W0 W0 W0 W0 X	commit
+S0 D1 W1 F W1 S1 S0 X	abort
+W1 W1 S0 S0 W0 S0 W0 S0 X	abort
+W0 U W0 U D0 W0 U W0 X	commit
+D1 S1 W0 U X	commit
+S0 W0 W0 W0 S0 X	abort
+S1 S1 U W1 X	commit
+W1 D1 W1 W0 W0 W1 D0 X	commit
+U W0 W0 F X	commit
+U W1 U S0 X	commit
+D1 S0 D0 F S1 S0 W0 X	commit
+S1 S0 F S0 X	commit
+W0 S1 S0 W1 S1 S0 X	abort
+F U S1 F S0 X	commit
+S0 U D0 W1 W1 D0 F W1 X	commit
+W0 S0 D0 W0 D1 W1 W0 W1 X	abort
+S1 S1 W1 S0 D0 F S0 S0 X	abort
+S1 F U D0 W1 S0 X	commit
+S1 S0 S1 S1 U S0 X	commit
+W1 W0 U W0 S0 W1 X	abort
+W1 S0 S0 S0 S0 X	commit
+F U S0 S1 S1 X	commit
+S0 D0 W0 W1 F S1 D1 X	abort
+W0 S0 D1 F S0 S1 S0 S1 X	abort
+U S1 F S0 S0 S0 X	commit
+W0 S0 S0 W0 F S1 F X	abort
+F S1 W1 D0 S1 U U D0 X	commit
+F W1 D1 W0 S1 D0 S1 X	abort
+D1 S0 S1 S0 X	commit
+W0 W0 W1 W1 S1 S0 X	abort
+F F W1 S0 W0 U W1 W0 X	commit
+D1 S1 U D1 X	commit
+U W1 S1 W0 S1 X	abort
+S0 W1 W0 F S1 W1 S0 W0 X	abort
+U S1 F F S1 S1 W1 X	commit
+W1 F F F F X	commit
+D0 W0 S1 D1 U W1 X	commit
+W1 W1 S0 W0 W0 X	commit
+S1 D1 W0 W1 X	commit
+S0 W0 S0 U D0 S1 W0 X	commit
+D0 S1 D1 S0 S1 S1 X	commit
+W1 S0 W0 S1 W1 S1 D0 X	abort
+S1 S0 F F W1 X	commit
+U S1 W0 S0 W1 U S1 X	commit
+F W0 U U U F X	commit
+S0 F F S0 W0 S1 W0 X	commit
+S1 U U S0 X	commit
+S0 S0 S0 S0 W0 X	commit
+S1 U W0 F S1 W1 S1 X	abort
+S1 S0 S0 S1 S1 X	commit
+U F S1 F W1 X	commit
+W0 S0 W0 U W1 W1 X	commit
+S1 W1 F W0 F W1 S1 W1 X	abort
+S0 U D1 F S0 W1 X	commit
+W0 U S0 W1 S0 S0 D1 W0 X	commit
+U W1 W0 S1 S0 S0 W0 X	abort
+S0 W0 U S0 W0 S0 S0 X	abort
+F S0 W1 W0 X	commit
+S1 S1 F W0 F X	commit
+S0 W1 D1 D0 S0 W1 X	commit
+D0 S0 W0 W1 S0 X	abort
+W1 F S0 W0 F W1 S0 X	abort
+S0 W0 S1 W0 S0 X	abort
+D1 S0 S1 S1 U F W0 U X	commit
+W1 S0 F S0 W1 S1 X	abort
+F S0 W0 S1 X	commit
+S0 U W0 W0 D1 S1 S1 W0 X	commit
+S1 F S0 U D0 F X	commit
+W1 U S0 D0 W0 U S0 X	commit
+U W0 S0 F S0 X	abort
+S0 W1 W1 U S1 S1 W0 X	commit
+W1 U S1 F D0 S1 W0 F X	commit
+W0 S0 W0 W1 X	abort
+S0 D0 D1 D0 W0 X	commit
+S1 D0 W1 W1 X	commit
+F W0 F W1 S0 X	abort
+W1 W0 W0 D1 S1 X	abort
+F S0 W0 W0 W0 S1 U S0 X	commit
+S1 D1 S1 U W0 X	commit
+W1 W0 D0 W1 X	commit
+U W0 D1 D0 S1 D0 S1 X	commit
+W1 W1 U W1 X	commit
+D0 W1 U W1 U S0 W1 S0 X	commit
+S1 S0 W1 W0 S1 X	abort
+W1 U D1 W1 X	commit
+W1 S1 W1 S0 X	abort
+W1 W0 S1 S1 X	abort
+S0 W1 F S1 W1 W1 F F X	abort
+U W0 D1 S1 W1 W1 W0 W1 X	commit
+U W1 D0 W1 X	commit
+W0 S0 S0 D1 W0 W0 W1 X	abort
+W0 W1 W0 W1 X	commit
+S1 S1 U F F F D0 X	commit
+S0 S0 U S1 X	commit
+D0 W0 W1 W0 X	commit
+S0 W0 D1 S0 X	abort
+S1 S0 S0 S0 S0 S0 F X	commit
+D1 F U W0 U S0 X	commit
+W1 W0 W1 W1 X	commit
+S0 S0 S1 S1 S0 X	commit
+D1 W1 U D1 X	commit
+D0 D1 F W1 X	commit
+W1 S1 W1 D1 W0 D0 W0 S1 X	abort
+W1 S0 S0 S0 F D1 F D0 X	commit
+S1 W0 F S1 W1 F X	abort
+F S1 U U X	commit
+W0 W1 W0 S1 U S1 W1 X	commit
+U S1 S0 W0 X	commit
+W0 S1 W1 U S1 X	commit
+F D0 S1 W0 U S0 X	commit
+F S0 W0 S0 X	abort
+S0 W1 F W1 S1 F W1 X	abort
+W0 W1 W0 U W1 W0 X	commit
+U S1 W0 W1 W1 X	commit
+W0 U S0 W1 S1 W0 X	abort
+S1 S1 S0 S1 U S1 W0 X	commit
+U S1 S1 F F U X	commit
+S0 S0 W1 F W0 D0 X	commit
+W1 U D1 S1 X	commit
+W0 S0 W1 W1 S1 W0 U X	commit
+S0 S0 W0 S1 W0 U F X	commit
+W0 D0 D1 U S1 S0 X	commit
+F S1 S1 W0 S0 F W0 W0 X	abort
+U D0 S0 D1 F F S0 X	commit
+S0 S1 F U X	commit
+U U S1 W1 D1 S1 S0 F X	abort
+S0 F D0 W1 S1 X	abort
+F S0 W0 W0 W0 X	commit
+S1 W0 S0 D1 U D1 X	commit
+S1 W1 S1 W1 S1 S1 X	abort
+S1 S0 U W1 W1 S0 X	commit
+S1 S0 S0 S0 W0 X	commit
+F F W0 U S1 W1 X	commit
+D1 S1 U S0 S1 F X	commit
+W0 S1 S0 U S1 W0 W0 X	commit
+D1 S1 W0 U X	commit
+S0 U W0 F S0 X	abort
+F U F F F W1 S1 X	abort
+S1 S0 S0 S0 F S1 U X	commit
+W0 W0 W1 W1 X	commit
+W1 S0 U D0 S0 F D0 W0 X	commit
+S0 D0 S1 F S0 S1 F W0 X	commit
+F S0 U W0 F S0 S0 X	abort
+F S1 U D0 W0 D1 D1 W0 X	commit
+W1 F U W1 F S0 X	commit
+S0 W0 S1 W0 U W1 W0 X	commit
+S1 D1 S1 W1 U W0 D1 D1 X	commit
+U S1 W1 S0 D1 W1 S1 F X	abort
+W1 W0 F W0 X	commit
+S0 D1 S1 W0 W1 W1 S1 S1 X	abort
+D1 W0 S0 D1 U W1 X	commit
+S0 S1 S1 F W1 F W1 X	commit
+D0 U D0 W0 S1 W1 S1 W0 X	abort
+D0 W1 S0 W1 W1 X	commit
+W0 W1 D1 W1 S0 S1 S0 D1 X	abort
+W0 F S1 D1 X	commit
+D1 W0 S1 S1 U W0 W1 X	commit
+W1 U D1 S1 W1 S0 X	commit
+D0 W1 W1 W0 W1 F S0 X	abort
+S1 S0 W1 S1 W1 F U X	commit
+D1 W1 S0 S0 S1 W1 X	abort
+F S1 F D1 S0 W1 X	commit
+S1 W0 W0 S0 S1 X	abort
+W1 S0 S1 F W1 F X	abort
+D0 S1 F U S1 X	commit
+D1 W0 W1 W1 F W1 X	commit
+W0 F F W1 W0 X	commit
+W1 W0 W0 W0 X	commit
+S0 F S1 W1 X	commit
+S1 W0 W0 U W0 W0 X	commit
+S0 S0 S1 S1 W1 W0 W0 X	commit
+S0 F W1 W1 S0 F X	commit
+S1 F D0 S1 W1 W0 F F X	abort
+W1 F D1 D1 X	commit
+S0 U S0 W0 W0 X	commit
+U F D1 W0 X	commit
+F S0 S0 F F F X	commit
+W1 W1 F S1 S1 X	abort
+W0 D1 S0 S1 W1 F X	abort
+F W1 U U U F X	commit
+S1 U S1 F S1 X	commit
+S0 W0 U S0 W0 X	commit
+F W1 D1 W1 F S0 F X	commit
+W0 D0 W1 D1 U W0 W0 X	commit
+S0 W1 W1 S1 D0 D0 D1 S0 X	abort
+S1 D0 S0 S1 S1 S0 X	commit
+S0 W1 D1 D0 W0 S1 X	abort
+S1 W1 W1 S0 S1 X	abort
+S1 W1 W1 F F W1 X	abort
+W1 F S0 S1 S0 S1 X	abort
+W1 W1 W1 F U X	commit
+S1 U W0 S1 X	commit
+U W1 W0 S0 S1 U S1 W0 X	commit
+F W0 S1 U X	commit
+U F W0 W0 D0 D1 S1 W0 X	commit
+F W1 F S0 D0 X	commit
+D1 F F F X	commit
+W0 W0 W0 U W0 W1 X	commit
+D0 W0 W1 S1 S1 X	abort
+S1 D0 W0 S1 X	commit
+W1 D1 W0 F W1 F F X	commit
+S1 W0 S1 F X	commit
+D0 U F S1 U X	commit
+W0 W1 S1 D1 D0 S1 U W0 X	commit
+S1 D0 W0 S1 W1 S1 U X	commit
+S1 U F D1 X	commit
+W1 S1 S0 S1 S1 W0 X	abort
+W0 S0 S1 W0 X	abort
+W0 S0 S1 S0 X	abort
+W0 U S0 W1 X	commit
+S0 W0 F D1 D0 S0 X	abort
+S0 F W0 F F W0 X	commit
+W0 W0 U W0 S0 X	abort
+W0 S1 W0 W1 W1 X	commit
+W1 W1 S1 S0 S1 S1 D0 S0 X	abort
+S0 F F S0 D0 F W1 S0 X	commit
+U U F W0 S0 W1 F X	abort
+S1 S0 W0 W0 X	commit
+S1 S0 S0 S0 D1 W1 S1 X	abort
+W1 W1 W1 U X	commit
+W1 S1 D0 W1 W0 S1 S1 D0 X	abort
+W1 U U D1 W0 X	commit
+S1 D0 S1 W1 S0 W0 W0 W1 X	commit
+D1 U S1 U S0 W1 S1 U X	commit
+D1 S1 S1 F D1 W1 X	commit
+D0 S1 W1 W1 D1 W0 X	abort
+W0 S0 W0 U X	commit
+U S0 F S0 S0 S0 S0 X	commit
+W0 U W0 W1 D1 S0 X	abort
+S0 W1 S1 U W1 U X	commit
+W1 U W0 W0 S0 X	abort
+W1 W0 W1 W0 F X	commit
+F W0 S0 S0 D1 X	abort
+W0 D0 W1 W0 X	commit
+S0 S1 S1 U S0 W1 X	commit
+D0 W0 S1 W0 S0 W1 U U X	commit
+S1 W0 W1 D0 F X	abort
+S0 W1 F W0 W0 D0 W0 X	commit
+U W0 S1 W0 X	commit
+S1 D1 W0 S0 D1 X	abort
+F S1 W0 U U W1 X	commit
+W0 D1 S0 W1 D1 W1 X	abort
+W1 F F S1 W1 S1 W0 X	abort
+W0 U D1 U D1 W0 X	commit
+W0 U D0 U S1 X	commit
+D1 D0 S1 W1 X	commit
+W1 S1 W0 S0 W0 W0 W1 D0 X	abort
+U D1 S0 S1 W1 S0 X	commit
+S0 W1 S1 S1 W0 S0 S1 X	abort
+S0 W1 S1 D0 X	abort
+S0 W1 S0 W1 W1 W0 X	commit
+S0 D1 S1 F X	commit
+W1 F S1 D0 S0 F W0 X	abort
+W0 W1 S1 U W0 S1 S1 X	commit
+S0 S1 S0 F S1 X	commit
+W0 S0 S0 W1 S1 S1 X	abort
+U W1 W1 S1 X	abort
+D1 S1 W1 S1 W1 X	abort
+U W1 F U U W0 D1 W1 X	commit
+W1 W1 U S0 X	commit
+F W0 W0 W0 D1 U X	commit
+S1 S0 W1 S1 F W0 W1 X	abort
+W0 S1 S0 U U W0 S1 W0 X	commit
+W1 S0 F U S0 U W0 S0 X	abort
+S1 W1 U S1 U S0 X	commit
+D0 S1 S0 U X	commit

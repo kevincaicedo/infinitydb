@@ -18,11 +18,19 @@
 //!   Dragonfly's reschedule rule completes too, with counted retries.
 //!   Readers that bypass intents observe uncommitted writes; a WATCH-only
 //!   R intent released after validation lets a mutation land before the
-//!   decision.
+//!   decision. (ADR-0116 A4, the 2026-09-10 review's F09:) a leg that
+//!   writes live values leaves an aborted transaction's write published;
+//!   a cancellation honoured past the in-memory decision publishes half a
+//!   commit or answers a false abort; private staging and the A4 phase
+//!   table never do, at any of the seven phases a cancellation can land.
 //! - [`watch`]: endpoint version equality (`Version | MISSING`) accepts
 //!   the F3 absent → present → absent history and a delete/recreate;
 //!   the owner's registration (ADR-0116 D4) agrees with the history
 //!   oracle on every history, including eviction and owner restart.
+//!   (ADR-0116 A5, F07:) re-registering on a repeated `WATCH` launders
+//!   the mutation between the two; the additive rule agrees with the
+//!   sticky-window oracle and with Redis 8.0.5's verdicts on every line
+//!   of `seeds/watch-redis-oracle.txt`.
 //! - [`durable`]: a decision that does not wait for durable prepares, or
 //!   a checkpoint that streams a published record whose decision is not
 //!   yet durable, leaves half a transaction after a crash; the ADR-0116
@@ -83,7 +91,7 @@ impl Rng {
 }
 
 // ---------------------------------------------------------------------
-// Model 1 — intent acquisition across owners
+// Model 1 — intent acquisition, staging, decision, cancellation
 // ---------------------------------------------------------------------
 
 pub mod acquisition {
@@ -110,6 +118,18 @@ pub mod acquisition {
         Reschedule { max_retries: u32 },
     }
 
+    /// The last phase in which disconnect or timeout still aborts.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum CancelUntil {
+        /// ADR-0116 A4: the coordinator's in-memory decision is the
+        /// irreversible point — `UnlockOp{Commit}` may already have
+        /// published on an owner.
+        Decision,
+        /// M6-S08 as written: cancellation aborts until the decision is
+        /// durable, so an abort can chase a commit that already published.
+        DurableDecision,
+    }
+
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub struct Rules {
         pub acquisition: Acquisition,
@@ -120,6 +140,11 @@ pub mod acquisition {
         /// A WATCH-only key's R intent is held from validation through the
         /// decision (ADR-0114 D1). `false` is validate-and-release.
         pub hold_watch_intents: bool,
+        /// A participant's leg writes into a private set published only by
+        /// `UnlockOp{Commit}` (ADR-0116 D5/A4). `false` is the batch-22
+        /// model as written: the leg writes live values at execution.
+        pub stage_privately: bool,
+        pub cancel_until: CancelUntil,
     }
 
     impl Rules {
@@ -128,6 +153,8 @@ pub mod acquisition {
                 acquisition: Acquisition::Canonical,
                 reads_wait: true,
                 hold_watch_intents: true,
+                stage_privately: true,
+                cancel_until: CancelUntil::Decision,
             }
         }
 
@@ -136,6 +163,44 @@ pub mod acquisition {
                 acquisition: Acquisition::WithdrawnTxidSorted,
                 reads_wait: false,
                 hold_watch_intents: false,
+                stage_privately: false,
+                cancel_until: CancelUntil::DurableDecision,
+            }
+        }
+    }
+
+    /// Where a disconnect or timeout lands (ADR-0116 A4's phase table).
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum CancelPhase {
+        /// Admitted, no `LockOp` sent yet.
+        Admit,
+        /// The `LockOp` for round `n` is in flight.
+        Acquire(usize),
+        /// Every round granted; `ExecOp` fanned.
+        Execute,
+        /// The `n`-th `SubResult` arrived with legs still outstanding.
+        Executed(usize),
+        /// Decided in memory; the cancellation lands at a seeded point
+        /// while `UnlockOp{outcome}` is in flight — before, between or
+        /// after the owners' publications, or after the durable decision.
+        Decided,
+        /// The decision record is durable.
+        Durable,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Cancel {
+        Disconnect,
+        Timeout,
+    }
+
+    impl Cancel {
+        fn reason(self, after_decision: bool) -> &'static str {
+            match (self, after_decision) {
+                (Cancel::Disconnect, false) => "disconnect",
+                (Cancel::Timeout, false) => "timeout",
+                (Cancel::Disconnect, true) => "disconnect after the decision",
+                (Cancel::Timeout, true) => "timeout after the decision",
             }
         }
     }
@@ -148,6 +213,16 @@ pub mod acquisition {
         pub writes: Vec<Key>,
         pub reads: Vec<Key>,
         pub watches: Vec<Key>,
+        /// Native `INF.TX`: a leg's failed condition aborts the whole
+        /// transaction. `false` is Redis `EXEC`: the failure is embedded
+        /// in that leg's reply and the decision is still `Commit`.
+        pub native: bool,
+        /// The owner whose leg fails its condition (`NX`, `IF REV`, …)
+        /// before writing anything.
+        pub fails_at: Option<Cell>,
+        /// A disconnect or timeout delivered to the coordinator the moment
+        /// the transaction enters this phase.
+        pub cancel: Option<(CancelPhase, Cancel)>,
     }
 
     /// A client's sequential program: the next transaction is issued only
@@ -200,6 +275,14 @@ pub mod acquisition {
         refused: bool,
         retries: u32,
         granted: Vec<bool>,
+        /// Per owner: the leg reported a failed condition.
+        failed: Vec<bool>,
+        /// Per owner: the leg's staged writes were published.
+        published: Vec<bool>,
+        /// The coordinator decided `Commit` in memory.
+        decided_commit: bool,
+        /// The decision record is durable.
+        durable: bool,
         /// Read-uncommitted variant: a pure read that takes no intent.
         bypass: bool,
         /// Registration snapshot per watched key (the owner's mutation
@@ -211,15 +294,56 @@ pub mod acquisition {
 
     #[derive(Clone, Debug)]
     enum Msg {
-        Lock { txn: usize, owner: Cell },
-        Granted { txn: usize, owner: Cell },
-        WatchFail { txn: usize, owner: Cell },
-        Refused { txn: usize, owner: Cell },
-        Cancel { txn: usize, txid: u64, owner: Cell },
-        Exec { txn: usize, owner: Cell },
-        SubResult { txn: usize },
-        Unlock { txn: usize, owner: Cell },
+        Lock {
+            txn: usize,
+            owner: Cell,
+        },
+        Granted {
+            txn: usize,
+            owner: Cell,
+        },
+        WatchFail {
+            txn: usize,
+            owner: Cell,
+        },
+        Refused {
+            txn: usize,
+            owner: Cell,
+        },
+        Cancel {
+            txn: usize,
+            txid: u64,
+            owner: Cell,
+        },
+        Exec {
+            txn: usize,
+            owner: Cell,
+        },
+        SubResult {
+            txn: usize,
+            failed: bool,
+        },
+        /// `UnlockOp{outcome}`: publish or discard the staged leg, then
+        /// release every intent.
+        Unlock {
+            txn: usize,
+            owner: Cell,
+            commit: bool,
+        },
+        /// The coordinator's decision record reached the disk.
+        DecisionDurable {
+            txn: usize,
+        },
+        /// A disconnect or timeout planted for `CancelPhase::Decided`.
+        CancelAt {
+            txn: usize,
+            kind: Cancel,
+        },
     }
+
+    /// Endpoint of the coordinator-side messages that carry no owner.
+    pub const COORD: Cell = usize::MAX;
+    pub const DISK: Cell = usize::MAX - 1;
 
     impl Msg {
         fn endpoint(&self) -> (usize, Cell) {
@@ -230,8 +354,9 @@ pub mod acquisition {
                 | Msg::Refused { txn, owner }
                 | Msg::Cancel { txn, owner, .. }
                 | Msg::Exec { txn, owner }
-                | Msg::Unlock { txn, owner } => (txn, owner),
-                Msg::SubResult { txn } => (txn, usize::MAX),
+                | Msg::Unlock { txn, owner, .. } => (txn, owner),
+                Msg::SubResult { txn, .. } | Msg::CancelAt { txn, .. } => (txn, COORD),
+                Msg::DecisionDurable { txn } => (txn, DISK),
             }
         }
     }
@@ -239,7 +364,10 @@ pub mod acquisition {
     #[derive(Clone, Debug, Default)]
     struct Owner {
         queues: BTreeMap<Key, VecDeque<Entry>>,
+        /// Published values: the last writer, if any.
         values: BTreeMap<Key, Option<usize>>,
+        /// Private write sets awaiting `UnlockOp`, per transaction.
+        staged: BTreeMap<usize, Vec<Key>>,
     }
 
     /// What one run observed.
@@ -269,7 +397,7 @@ pub mod acquisition {
         script: VecDeque<(usize, Cell)>,
         next_txid: u64,
         next_commit: u64,
-        /// Ground-truth mutation count per key.
+        /// Ground-truth mutation count per key (published writes).
         mutations: BTreeMap<Key, u64>,
         committed_writes: BTreeMap<Key, Vec<(u64, usize)>>,
         rng: Rng,
@@ -339,6 +467,10 @@ pub mod acquisition {
                 refused: false,
                 retries: 0,
                 granted: vec![false; n],
+                failed: vec![false; n],
+                published: vec![false; n],
+                decided_commit: false,
+                durable: false,
                 bypass,
                 reg,
                 reads_seen: Vec::new(),
@@ -373,13 +505,21 @@ pub mod acquisition {
                 *g = false;
             }
             t.phase = Phase::Acquiring;
-            if t.owners.is_empty() {
+            let first_attempt = t.retries == 0;
+            if first_attempt {
+                self.enter(txn, CancelPhase::Admit);
+                if matches!(self.txns[txn].phase, Phase::Terminal(_)) {
+                    return;
+                }
+            }
+            if self.txns[txn].owners.is_empty() {
                 self.decide(txn);
                 return;
             }
-            let parallel = t.bypass || !matches!(self.rules.acquisition, Acquisition::Canonical);
-            if t.bypass {
-                t.phase = Phase::Executing;
+            let bypass = self.txns[txn].bypass;
+            let parallel = bypass || !matches!(self.rules.acquisition, Acquisition::Canonical);
+            if bypass {
+                self.txns[txn].phase = Phase::Executing;
             }
             if parallel {
                 let owners = self.txns[txn].owners.clone();
@@ -387,9 +527,55 @@ pub mod acquisition {
                 for owner in owners {
                     self.pending.push(Msg::Lock { txn, owner });
                 }
+                // A parallel fan has no later round: every `Acquire(n)`
+                // is this one.
+                for round in 0..self.txns[txn].owners.len() {
+                    self.enter(txn, CancelPhase::Acquire(round));
+                }
             } else {
                 let owner = self.txns[txn].owners[0];
                 self.pending.push(Msg::Lock { txn, owner });
+                self.enter(txn, CancelPhase::Acquire(0));
+            }
+        }
+
+        /// The transaction enters `phase`: a cancellation planted there
+        /// lands now.
+        fn enter(&mut self, txn: usize, phase: CancelPhase) {
+            if let Some((at, kind)) = self.txns[txn].spec.cancel
+                && at == phase
+            {
+                self.cancel(txn, kind);
+            }
+        }
+
+        /// Disconnect or timeout at the coordinator (ADR-0116 A4).
+        fn cancel(&mut self, txn: usize, kind: Cancel) {
+            match self.txns[txn].phase {
+                Phase::Acquiring | Phase::Cancelling | Phase::Executing => {
+                    self.abort(txn, kind.reason(false));
+                }
+                Phase::Terminal(Outcome::Committed)
+                    if !self.txns[txn].durable
+                        && self.rules.cancel_until == CancelUntil::DurableDecision =>
+                {
+                    // M6-S08 as written: the coordinator future runs to
+                    // abort — the `UnlockOp{Commit}` still staged in an
+                    // unflushed outbound batch leaves as `Abort`; owners
+                    // whose batch already flushed have published.
+                    self.txns[txn].phase = Phase::Terminal(Outcome::Aborted(kind.reason(true)));
+                    self.report.committed -= 1;
+                    self.report.aborted += 1;
+                    for msg in &mut self.pending {
+                        if let Msg::Unlock { txn: t, commit, .. } = msg
+                            && *t == txn
+                        {
+                            *commit = false;
+                        }
+                    }
+                }
+                // The outcome completes; the client may never learn it.
+                Phase::Terminal(_) => {}
             }
         }
 
@@ -416,14 +602,82 @@ pub mod acquisition {
                     "ACQUISITION DEADLOCK: {} transaction(s) stuck with no message in flight — {waits}",
                     self.report.stuck.len()
                 ));
+                return &self.report;
             }
             let residue = self.held_intents();
-            if residue != 0 && self.report.stuck.is_empty() {
+            if residue != 0 {
                 self.report.violations.push(format!(
                     "INTENT LEAK: {residue} intent(s) held after every transaction reached a terminal state"
                 ));
             }
+            let staged: usize = self.owners.iter().map(|o| o.staged.len()).sum();
+            if staged != 0 {
+                self.report.violations.push(format!(
+                    "STAGING LEAK: {staged} private write set(s) held after every transaction reached a terminal state"
+                ));
+            }
+            self.check_publication();
             &self.report
+        }
+
+        /// An aborted transaction published nothing; a committed one
+        /// published every non-failed leg.
+        fn check_publication(&mut self) {
+            for i in 0..self.txns.len() {
+                let t = &self.txns[i];
+                let Phase::Terminal(outcome) = &t.phase else { continue };
+                let legs: Vec<(usize, Cell)> = t
+                    .owners
+                    .iter()
+                    .enumerate()
+                    .map(|(oi, o)| (oi, *o))
+                    .filter(|(_, o)| t.spec.writes.iter().any(|k| self.owner_of(*k) == *o))
+                    .collect();
+                let published: Vec<Cell> =
+                    legs.iter().filter(|(oi, _)| t.published[*oi]).map(|(_, o)| *o).collect();
+                let unpublished: Vec<Cell> = legs
+                    .iter()
+                    .filter(|(oi, _)| !t.published[*oi] && !t.failed[*oi])
+                    .map(|(_, o)| *o)
+                    .collect();
+                let msg = match outcome {
+                    Outcome::Committed if !unpublished.is_empty() => Some(format!(
+                        "PARTIAL PUBLICATION: T{} decided Commit but cell(s) {unpublished:?} never published its leg",
+                        i + 1
+                    )),
+                    Outcome::Aborted(reason) if t.decided_commit && !published.is_empty() => {
+                        if unpublished.is_empty() {
+                            Some(format!(
+                                "FALSE ABORT: T{} replied aborted ({reason}) but every owner published its leg",
+                                i + 1
+                            ))
+                        } else {
+                            Some(format!(
+                                "PARTIAL PUBLICATION: T{} ({reason}) published on cell(s) {published:?} and discarded on cell(s) {unpublished:?}",
+                                i + 1
+                            ))
+                        }
+                    }
+                    Outcome::Aborted(reason) if !published.is_empty() => {
+                        let key = t
+                            .spec
+                            .writes
+                            .iter()
+                            .find(|k| self.owner_of(**k) == published[0])
+                            .copied()
+                            .expect("a written key on the published leg");
+                        Some(format!(
+                            "STAGING VIOLATION: T{} aborted ({reason}) but its write to key {key}@cell{} is published",
+                            i + 1,
+                            published[0]
+                        ))
+                    }
+                    _ => None,
+                };
+                if let Some(msg) = msg {
+                    self.report.violations.push(msg);
+                }
+            }
         }
 
         fn held_intents(&self) -> usize {
@@ -456,6 +710,13 @@ pub mod acquisition {
             out.join("; ")
         }
 
+        /// Delivery is a seeded pick among the pending messages, subject
+        /// to the fabric's per-pair order: two messages from one
+        /// coordinator to one owner for one transaction ride one SPSC
+        /// ring (M0-S05) and arrive in the order they were sent, so an
+        /// `UnlockOp` never overtakes the `LockOp` or `ExecOp` it cancels.
+        /// Everything else — other pairs, the coordinator's inbound
+        /// results, the disk — reorders freely.
         fn pick(&mut self) -> Option<Msg> {
             if self.pending.is_empty() {
                 return None;
@@ -468,7 +729,13 @@ pub mod acquisition {
             }
             // The scripted endpoint (if any) is not in flight yet: deliver
             // something else and keep waiting for it.
-            let pos = self.rng.below(self.pending.len());
+            let eligible: Vec<usize> = (0..self.pending.len())
+                .filter(|&i| {
+                    let ep = self.pending[i].endpoint();
+                    ep.1 >= DISK || !self.pending[..i].iter().any(|m| m.endpoint() == ep)
+                })
+                .collect();
+            let pos = eligible[self.rng.below(eligible.len())];
             Some(self.pending.remove(pos))
         }
 
@@ -504,8 +771,13 @@ pub mod acquisition {
                     }
                 }
                 Msg::Exec { txn, owner } => self.owner_exec(txn, owner),
-                Msg::SubResult { txn } => self.coord_subresult(txn),
-                Msg::Unlock { txn, owner } => self.remove_entries(txn, None, owner),
+                Msg::SubResult { txn, failed } => self.coord_subresult(txn, failed),
+                Msg::Unlock { txn, owner, commit } => self.owner_unlock(txn, owner, commit),
+                Msg::DecisionDurable { txn } => {
+                    self.txns[txn].durable = true;
+                    self.enter(txn, CancelPhase::Durable);
+                }
+                Msg::CancelAt { txn, kind } => self.cancel(txn, kind),
             }
         }
 
@@ -517,7 +789,7 @@ pub mod acquisition {
                 for (key, _) in &intents {
                     self.observe_read(txn, owner, *key);
                 }
-                self.pending.push(Msg::SubResult { txn });
+                self.pending.push(Msg::SubResult { txn, failed: false });
                 return;
             }
             if let Acquisition::Reschedule { .. } = self.rules.acquisition {
@@ -616,6 +888,7 @@ pub mod acquisition {
                     if cursor < self.txns[txn].owners.len() {
                         let owner = self.txns[txn].owners[cursor];
                         self.pending.push(Msg::Lock { txn, owner });
+                        self.enter(txn, CancelPhase::Acquire(cursor));
                     } else {
                         self.exec_fan(txn);
                     }
@@ -666,6 +939,7 @@ pub mod acquisition {
             for owner in owners {
                 self.pending.push(Msg::Exec { txn, owner });
             }
+            self.enter(txn, CancelPhase::Execute);
         }
 
         fn observe_read(&mut self, txn: usize, owner: Cell, key: Key) {
@@ -683,6 +957,8 @@ pub mod acquisition {
             self.txns[txn].reads_seen.push((key, seen));
         }
 
+        /// The leg: reads, then the condition, then the writes — staged
+        /// privately (chosen) or written live (withdrawn).
         fn owner_exec(&mut self, txn: usize, owner: Cell) {
             let spec = self.txns[txn].spec.clone();
             let reads: Vec<Key> =
@@ -692,32 +968,68 @@ pub mod acquisition {
             for key in reads {
                 self.observe_read(txn, owner, key);
             }
-            for key in writes {
-                self.owners[owner].values.insert(key, Some(txn));
-                *self.mutations.entry(key).or_insert(0) += 1;
+            if spec.fails_at == Some(owner) {
+                self.pending.push(Msg::SubResult { txn, failed: true });
+                return;
             }
-            self.pending.push(Msg::SubResult { txn });
+            if !writes.is_empty() {
+                if self.rules.stage_privately {
+                    self.owners[owner].staged.insert(txn, writes);
+                } else {
+                    self.publish(txn, owner, &writes);
+                }
+            }
+            self.pending.push(Msg::SubResult { txn, failed: false });
         }
 
-        fn coord_subresult(&mut self, txn: usize) {
+        fn publish(&mut self, txn: usize, owner: Cell, keys: &[Key]) {
+            for key in keys {
+                self.owners[owner].values.insert(*key, Some(txn));
+                *self.mutations.entry(*key).or_insert(0) += 1;
+            }
+            let oi = self.txns[txn].owners.iter().position(|o| *o == owner).expect("a participant");
+            self.txns[txn].published[oi] = true;
+        }
+
+        fn coord_subresult(&mut self, txn: usize, failed: bool) {
+            if failed {
+                // The failing leg is the one still outstanding; mark by
+                // elimination is ambiguous, so record the spec's owner.
+                let owner = self.txns[txn].spec.fails_at.expect("a failing leg");
+                let oi = self.txns[txn].owners.iter().position(|o| *o == owner).expect("owner");
+                self.txns[txn].failed[oi] = true;
+            }
             self.txns[txn].cursor -= 1;
-            if self.txns[txn].cursor == 0 {
+            if self.txns[txn].cursor != 0 {
+                let arrived = self.txns[txn].owners.len() - self.txns[txn].cursor;
+                self.enter(txn, CancelPhase::Executed(arrived));
+                return;
+            }
+            if self.txns[txn].phase != Phase::Executing {
+                // Cancelled while the legs were executing: the abort's
+                // unlocks are already in flight.
+                return;
+            }
+            if self.txns[txn].spec.native && self.txns[txn].failed.iter().any(|f| *f) {
+                self.abort(txn, "condition failed");
+            } else {
                 self.decide(txn);
             }
         }
 
         fn decide(&mut self, txn: usize) {
             // Ground truth: a mutation of a watched key between the
-            // registration and this decision must abort the EXEC.
-            // The transaction's own write of a watched key is not a
-            // foreign mutation.
+            // registration and this decision must abort the EXEC. Under
+            // the withdrawn live-write rule the transaction's own write of
+            // a watched key is already counted and is not foreign.
             let own = &self.txns[txn].spec.writes;
+            let own_live = !self.rules.stage_privately;
             let dirty: Vec<Key> = self.txns[txn]
                 .reg
                 .iter()
                 .filter(|(k, reg)| {
                     self.mutations.get(*k).copied().unwrap_or(0)
-                        != **reg + u64::from(own.contains(k))
+                        != **reg + u64::from(own_live && own.contains(k))
                 })
                 .map(|(k, _)| *k)
                 .collect();
@@ -730,7 +1042,19 @@ pub mod acquisition {
             let seq = self.next_commit;
             self.next_commit += 1;
             self.txns[txn].commit_seq = Some(seq);
-            for key in self.txns[txn].spec.writes.clone() {
+            self.txns[txn].decided_commit = true;
+            let t = &self.txns[txn];
+            let committed: Vec<Key> = t
+                .spec
+                .writes
+                .iter()
+                .copied()
+                .filter(|k| {
+                    let oi = t.owners.iter().position(|o| *o == self.owner_of(*k)).expect("owner");
+                    !t.failed[oi]
+                })
+                .collect();
+            for key in committed {
                 self.committed_writes.entry(key).or_default().push((seq, txn));
             }
             // A bypass read has no exclusion interval to pin its point to;
@@ -754,7 +1078,11 @@ pub mod acquisition {
             }
             self.txns[txn].phase = Phase::Terminal(Outcome::Committed);
             self.report.committed += 1;
-            self.finish(txn);
+            self.finish(txn, true);
+            self.pending.push(Msg::DecisionDurable { txn });
+            if let Some((CancelPhase::Decided, kind)) = self.txns[txn].spec.cancel {
+                self.pending.push(Msg::CancelAt { txn, kind });
+            }
         }
 
         fn abort(&mut self, txn: usize, reason: &'static str) {
@@ -763,17 +1091,27 @@ pub mod acquisition {
             }
             self.txns[txn].phase = Phase::Terminal(Outcome::Aborted(reason));
             self.report.aborted += 1;
-            self.finish(txn);
+            self.finish(txn, false);
         }
 
-        /// Every terminal path releases every intent on every owner.
-        fn finish(&mut self, txn: usize) {
+        /// Every terminal path carries the outcome to every owner, which
+        /// publishes or discards its leg and releases every intent.
+        fn finish(&mut self, txn: usize, commit: bool) {
             for owner in self.txns[txn].owners.clone() {
-                self.pending.push(Msg::Unlock { txn, owner });
+                self.pending.push(Msg::Unlock { txn, owner, commit });
             }
             if let Some(client) = self.client_of.get(&txn).copied() {
                 self.issue_next(client);
             }
+        }
+
+        fn owner_unlock(&mut self, txn: usize, owner: Cell, commit: bool) {
+            if let Some(keys) = self.owners[owner].staged.remove(&txn)
+                && commit
+            {
+                self.publish(txn, owner, &keys);
+            }
+            self.remove_entries(txn, None, owner);
         }
 
         fn remove_entries(&mut self, txn: usize, txid: Option<u64>, owner: Cell) {
@@ -809,6 +1147,11 @@ pub mod acquisition {
                 _ => Outcome::Stuck,
             }
         }
+
+        /// The published writer of `key`, if any.
+        pub fn published(&self, key: Key) -> Option<usize> {
+            self.owners[self.owner_of(key)].values.get(&key).copied().flatten()
+        }
     }
 
     fn name(txn: Option<usize>) -> String {
@@ -827,8 +1170,21 @@ pub mod acquisition {
     }
 
     /// A seeded storm: `txns` transactions over `keys` keys across `cells`
-    /// cells, 1–4 keys each, mixed reads/writes/watches, random delivery.
+    /// cells, 1–4 keys each, mixed reads/writes/watches, random delivery;
+    /// with `faults`, one in four is native, one in four fails a leg and
+    /// one in four is cancelled at a random phase.
     pub fn storm(rules: Rules, cells: usize, keys: u32, txns: usize, seed: u64) -> Report {
+        storm_with(rules, cells, keys, txns, seed, false)
+    }
+
+    pub fn storm_with(
+        rules: Rules,
+        cells: usize,
+        keys: u32,
+        txns: usize,
+        seed: u64,
+        faults: bool,
+    ) -> Report {
         let mut rng = Rng::new(seed ^ 0xA5A5);
         let mut m = Model::new(rules, cells, seed);
         for _ in 0..txns {
@@ -840,6 +1196,25 @@ pub mod acquisition {
                     0 => spec.reads.push(k),
                     1 => spec.watches.push(k),
                     _ => spec.writes.push(k),
+                }
+            }
+            if faults {
+                spec.native = rng.below(4) == 0;
+                if rng.below(4) == 0 {
+                    let owner = spec.writes.first().map(|k| *k as usize % cells);
+                    spec.fails_at = owner;
+                }
+                if rng.below(4) == 0 {
+                    let phase = match rng.below(6) {
+                        0 => CancelPhase::Admit,
+                        1 => CancelPhase::Acquire(rng.below(3)),
+                        2 => CancelPhase::Execute,
+                        3 => CancelPhase::Executed(1),
+                        4 => CancelPhase::Decided,
+                        _ => CancelPhase::Durable,
+                    };
+                    let kind = if rng.below(2) == 0 { Cancel::Disconnect } else { Cancel::Timeout };
+                    spec.cancel = Some((phase, kind));
                 }
             }
             m.submit(spec);
@@ -875,19 +1250,77 @@ pub mod acquisition {
         });
         let w = m.submit(TxnSpec { coordinator: 1, writes: vec![1], ..Default::default() });
         // T1 acquires a@0, validates b@1 (clean); then W's lock, exec,
-        // decision and unlock on b@1; then T1's exec and decision.
-        m.script(&[
-            (t1, 0),
-            (t1, 0),
-            (t1, 1),
-            (t1, 1),
-            (w, 1),
-            (w, 1),
-            (w, 1),
-            (w, usize::MAX),
-            (w, 1),
-        ]);
+        // decision and unlock (publication) on b@1; then T1's exec and
+        // decision.
+        m.script(&[(t1, 0), (t1, 0), (t1, 1), (t1, 1), (w, 1), (w, 1), (w, 1), (w, COORD), (w, 1)]);
         m.run(10_000).clone()
+    }
+
+    /// A native `INF.TX` writing `a@0` and `b@1` whose leg on cell 1 fails
+    /// its condition after cell 0's leg succeeded: nothing may be
+    /// published (ADR-0116 D5/A4). Returns the report and T's outcome.
+    pub fn native_failure_history(rules: Rules) -> (Report, Outcome, Option<usize>) {
+        let mut m = Model::new(rules, 2, 5);
+        let t = m.submit(TxnSpec {
+            coordinator: 0,
+            writes: vec![0, 1],
+            native: true,
+            fails_at: Some(1),
+            ..Default::default()
+        });
+        m.run(10_000);
+        (m.report.clone(), m.outcome(t), m.published(0))
+    }
+
+    /// The same history as Redis `EXEC`: the failed command's error is
+    /// embedded, the rest commits.
+    pub fn exec_failure_history(rules: Rules) -> (Report, Outcome, [Option<usize>; 2]) {
+        let mut m = Model::new(rules, 2, 5);
+        let t = m.submit(TxnSpec {
+            coordinator: 0,
+            writes: vec![0, 1],
+            fails_at: Some(1),
+            ..Default::default()
+        });
+        m.run(10_000);
+        (m.report.clone(), m.outcome(t), [m.published(0), m.published(1)])
+    }
+
+    /// T writes `a@0` and `b@1`; a disconnect or timeout lands the moment
+    /// T enters `phase`. Returns the report, T's outcome and whether each
+    /// key was published.
+    pub fn cancellation_history(
+        rules: Rules,
+        phase: CancelPhase,
+        kind: Cancel,
+        seed: u64,
+    ) -> (Report, Outcome, [bool; 2]) {
+        let mut m = Model::new(rules, 2, seed);
+        let t = m.submit(TxnSpec {
+            coordinator: 0,
+            writes: vec![0, 1],
+            cancel: Some((phase, kind)),
+            ..Default::default()
+        });
+        m.run(10_000);
+        let published = [m.published(0) == Some(t), m.published(1) == Some(t)];
+        (m.report.clone(), m.outcome(t), published)
+    }
+
+    /// Every phase a cancellation can land in, for the two-owner history.
+    pub const PHASES: [CancelPhase; 7] = [
+        CancelPhase::Admit,
+        CancelPhase::Acquire(0),
+        CancelPhase::Acquire(1),
+        CancelPhase::Execute,
+        CancelPhase::Executed(1),
+        CancelPhase::Decided,
+        CancelPhase::Durable,
+    ];
+
+    /// The phases before the decision: a cancellation there aborts.
+    pub fn before_decision(phase: CancelPhase) -> bool {
+        !matches!(phase, CancelPhase::Decided | CancelPhase::Durable)
     }
 }
 
@@ -897,6 +1330,11 @@ pub mod acquisition {
 
 pub mod watch {
     use super::Rng;
+
+    /// Two keys on one owner: enough for a repeated WATCH of one key and a
+    /// WATCH of the other after the first changed.
+    pub type Key = usize;
+    pub const KEYS: usize = 2;
 
     /// How WATCH remembers what it saw.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -909,17 +1347,55 @@ pub mod watch {
         OwnerRegistration,
     }
 
+    /// What a `WATCH` of a key the connection already watches does.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum RepeatedWatch {
+        /// The batch-22 model as written: a fresh registration — a new
+        /// observation, a clean dirty bit, eviction and restart forgotten.
+        Reregister,
+        /// ADR-0116 A5: a connection-local no-op — the first registration,
+        /// its dirty state and its fate stand until EXEC/DISCARD/UNWATCH/
+        /// RESET/disconnect release every registration together.
+        Additive,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct Rules {
+        pub representation: Representation,
+        pub repeated_watch: RepeatedWatch,
+    }
+
+    impl Rules {
+        pub fn chosen() -> Rules {
+            Rules {
+                representation: Representation::OwnerRegistration,
+                repeated_watch: RepeatedWatch::Additive,
+            }
+        }
+
+        pub fn withdrawn() -> Rules {
+            Rules {
+                representation: Representation::EndpointEquality,
+                repeated_watch: RepeatedWatch::Reregister,
+            }
+        }
+    }
+
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Event {
-        Watch,
-        Set,
-        Del,
-        Expire,
+        Watch(Key),
+        Set(Key),
+        Del(Key),
+        Expire(Key),
+        /// `FLUSHDB`: every present key is deleted.
         Flush,
-        /// The registration table evicts this entry (capacity).
-        Evict,
+        /// The registration table evicts this key's entry (capacity).
+        Evict(Key),
         /// The owner restarts: registrations and intents are lost.
         Restart,
+        /// `UNWATCH`/`DISCARD`/`RESET`/disconnect: the lifecycle reset that
+        /// releases every registration the connection holds.
+        Unwatch,
         Exec,
     }
 
@@ -929,7 +1405,7 @@ pub mod watch {
         Abort,
     }
 
-    #[derive(Clone, Debug, Default)]
+    #[derive(Clone, Copy, Debug, Default)]
     struct Record {
         present: bool,
         /// u24 record version: bumps per mutation; a recreated record
@@ -937,78 +1413,105 @@ pub mod watch {
         version: u32,
     }
 
+    /// The connection's token for one key and the owner's entry behind it.
+    #[derive(Clone, Copy, Debug)]
+    struct Registration {
+        observed: Option<u32>,
+        dirty: bool,
+        evicted: bool,
+        /// The owner restarted: the token is unknown there.
+        lost: bool,
+    }
+
+    /// The sticky-window oracle: the connection is watching from its first
+    /// `Watch` until `Exec`/`Unwatch`; anything inside that window that a
+    /// registration cannot vouch for — a mutation of a watched key, an
+    /// eviction, an owner restart — is a violation no later `Watch` can
+    /// undo. Deliberately not the per-registration bits the model keeps.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Window {
+        watched: [bool; KEYS],
+        violated: bool,
+    }
+
+    impl Window {
+        fn open(&self) -> bool {
+            self.watched.iter().any(|w| *w)
+        }
+    }
+
     /// Run `history` (must end with `Exec`) and return the verdict the
-    /// representation gives and the history oracle's verdict.
-    pub fn run(repr: Representation, history: &[Event]) -> (Verdict, Verdict) {
-        let mut rec = Record::default();
-        let mut observed: Option<Option<u32>> = None;
-        let mut registered = false;
-        let mut dirty = false;
-        let mut evicted = false;
-        let mut restarted = false;
-        let mut mutated_since_watch = false;
-        let mut watching = false;
+    /// rules give and the sticky-window oracle's verdict.
+    pub fn run(rules: Rules, history: &[Event]) -> (Verdict, Verdict) {
+        let mut recs = [Record::default(); KEYS];
+        let mut regs: [Option<Registration>; KEYS] = [None; KEYS];
+        let mut window = Window::default();
         for ev in history {
-            match ev {
-                Event::Watch => {
-                    watching = true;
-                    mutated_since_watch = false;
-                    observed = Some(rec.present.then_some(rec.version));
-                    registered = true;
-                    dirty = false;
-                    evicted = false;
-                    restarted = false;
+            match *ev {
+                Event::Watch(k) => {
+                    if regs[k].is_none() || rules.repeated_watch == RepeatedWatch::Reregister {
+                        regs[k] = Some(Registration {
+                            observed: recs[k].present.then_some(recs[k].version),
+                            dirty: false,
+                            evicted: false,
+                            lost: false,
+                        });
+                    }
+                    window.watched[k] = true;
                 }
-                Event::Set => {
-                    if rec.present {
-                        rec.version = (rec.version + 1) & 0x00FF_FFFF;
+                Event::Set(k) => {
+                    if recs[k].present {
+                        recs[k].version = (recs[k].version + 1) & 0x00FF_FFFF;
                     } else {
-                        rec = Record { present: true, version: 0 };
+                        recs[k] = Record { present: true, version: 0 };
                     }
-                    dirty |= registered;
-                    mutated_since_watch |= watching;
+                    mutate(&mut regs, &mut window, k);
                 }
-                Event::Del | Event::Expire | Event::Flush => {
-                    if rec.present {
-                        rec = Record::default();
-                        dirty |= registered;
-                        mutated_since_watch |= watching;
+                Event::Del(k) | Event::Expire(k) => {
+                    if recs[k].present {
+                        recs[k] = Record::default();
+                        mutate(&mut regs, &mut window, k);
                     }
                 }
-                Event::Evict => evicted |= registered,
+                Event::Flush => {
+                    let present: Vec<Key> = (0..KEYS).filter(|k| recs[*k].present).collect();
+                    for k in present {
+                        recs[k] = Record::default();
+                        mutate(&mut regs, &mut window, k);
+                    }
+                }
+                Event::Evict(k) => {
+                    if let Some(reg) = &mut regs[k] {
+                        reg.evicted = true;
+                    }
+                    window.violated |= window.watched[k];
+                }
                 Event::Restart => {
-                    registered = false;
-                    restarted = true;
+                    for reg in regs.iter_mut().flatten() {
+                        reg.lost = true;
+                    }
+                    window.violated |= window.open();
+                }
+                Event::Unwatch => {
+                    regs = [None; KEYS];
+                    window = Window::default();
                 }
                 Event::Exec => {
-                    let oracle = if !watching {
-                        Verdict::Commit
-                    } else if mutated_since_watch || evicted || restarted {
-                        // Fail-closed: an evicted or lost registration
-                        // cannot prove the absence of a mutation.
-                        Verdict::Abort
-                    } else {
-                        Verdict::Commit
-                    };
-                    let verdict = match repr {
+                    let oracle = if window.violated { Verdict::Abort } else { Verdict::Commit };
+                    let clean = |k: usize, reg: &Registration| match rules.representation {
                         Representation::EndpointEquality => {
-                            let now = rec.present.then_some(rec.version);
-                            if observed.is_none_or(|o| o == now) {
-                                Verdict::Commit
-                            } else {
-                                Verdict::Abort
-                            }
+                            reg.observed == recs[k].present.then_some(recs[k].version)
                         }
                         Representation::OwnerRegistration => {
-                            if !watching {
-                                Verdict::Commit
-                            } else if !registered || evicted || dirty {
-                                Verdict::Abort
-                            } else {
-                                Verdict::Commit
-                            }
+                            !(reg.dirty || reg.evicted || reg.lost)
                         }
                     };
+                    let verdict =
+                        if regs.iter().enumerate().all(|(k, r)| r.is_none_or(|r| clean(k, &r))) {
+                            Verdict::Commit
+                        } else {
+                            Verdict::Abort
+                        };
                     return (verdict, oracle);
                 }
             }
@@ -1016,33 +1519,90 @@ pub mod watch {
         panic!("history must end with Exec");
     }
 
+    /// The owner marks the key's registration dirty synchronously; the
+    /// window records the violation.
+    fn mutate(regs: &mut [Option<Registration>; KEYS], window: &mut Window, k: Key) {
+        if let Some(reg) = &mut regs[k] {
+            reg.dirty = true;
+        }
+        window.violated |= window.watched[k];
+    }
+
     /// The F3 history: WATCH an absent key, another client creates and
     /// deletes it, EXEC sees `MISSING` again.
     pub const ABSENT_PRESENT_ABSENT: [Event; 4] =
-        [Event::Watch, Event::Set, Event::Del, Event::Exec];
+        [Event::Watch(0), Event::Set(0), Event::Del(0), Event::Exec];
     /// Delete/recreate: the recreated record's initial version equals the
     /// observed one.
     pub const DELETE_RECREATE: [Event; 5] =
-        [Event::Set, Event::Watch, Event::Del, Event::Set, Event::Exec];
+        [Event::Set(0), Event::Watch(0), Event::Del(0), Event::Set(0), Event::Exec];
+    /// The review's F07 history: a repeated WATCH must not launder the
+    /// mutation between the two.
+    pub const REPEATED_WATCH: [Event; 4] =
+        [Event::Watch(0), Event::Set(0), Event::Watch(0), Event::Exec];
+    /// Watching another key after the first watched key changed.
+    pub const ADDITIONAL_KEY_AFTER_CHANGE: [Event; 4] =
+        [Event::Watch(0), Event::Set(0), Event::Watch(1), Event::Exec];
+    /// A repeated WATCH after an eviction or an owner restart is a no-op:
+    /// the first token is the one EXEC presents, and it is unknown.
+    pub const REPEATED_WATCH_AFTER_EVICTION: [Event; 5] =
+        [Event::Set(0), Event::Watch(0), Event::Evict(0), Event::Watch(0), Event::Exec];
+    pub const REPEATED_WATCH_AFTER_RESTART: [Event; 5] =
+        [Event::Set(0), Event::Watch(0), Event::Restart, Event::Watch(0), Event::Exec];
+    /// `UNWATCH` is the real reset: the WATCH after it starts clean.
+    pub const RESET_THEN_WATCH: [Event; 5] =
+        [Event::Watch(0), Event::Set(0), Event::Unwatch, Event::Watch(0), Event::Exec];
 
-    /// A seeded random history of `len` events ending in `Exec`.
+    /// A seeded random history of `len` events over both keys ending in
+    /// `Exec`.
     pub fn random_history(seed: u64, len: usize) -> Vec<Event> {
         let mut rng = Rng::new(seed);
         let mut out = Vec::with_capacity(len + 1);
         for _ in 0..len {
-            out.push(match rng.below(8) {
-                0 => Event::Watch,
-                1 | 2 => Event::Set,
-                3 => Event::Del,
-                4 => Event::Expire,
-                5 => Event::Flush,
-                6 => Event::Evict,
-                _ => Event::Restart,
+            let k = rng.below(KEYS);
+            out.push(match rng.below(11) {
+                0 | 1 => Event::Watch(k),
+                2 | 3 => Event::Set(k),
+                4 => Event::Del(k),
+                5 => Event::Expire(k),
+                6 => Event::Flush,
+                7 => Event::Evict(k),
+                8 => Event::Restart,
+                9 => Event::Unwatch,
+                _ => Event::Set(k),
             });
         }
         out.push(Event::Exec);
         out
     }
+
+    /// One line of `seeds/watch-redis-oracle.txt`: the history and Redis's
+    /// own verdict (`scripts/txmodel-watch-redis-oracle.py`).
+    pub fn parse_fixture_line(line: &str) -> Option<(Vec<Event>, Verdict)> {
+        let (history, verdict) = line.split_once('\t')?;
+        let verdict = match verdict.trim() {
+            "abort" => Verdict::Abort,
+            "commit" => Verdict::Commit,
+            _ => return None,
+        };
+        let key = |tok: &str| tok[1..].parse::<usize>().ok().filter(|k| *k < KEYS);
+        let events = history
+            .split_whitespace()
+            .map(|tok| match tok.as_bytes()[0] {
+                b'W' => key(tok).map(Event::Watch),
+                b'S' => key(tok).map(Event::Set),
+                b'D' => key(tok).map(Event::Del),
+                b'F' => Some(Event::Flush),
+                b'U' => Some(Event::Unwatch),
+                b'X' => Some(Event::Exec),
+                _ => None,
+            })
+            .collect::<Option<Vec<Event>>>()?;
+        Some((events, verdict))
+    }
+
+    /// The fixture, compiled in so the test needs no working directory.
+    pub const REDIS_FIXTURE: &str = include_str!("../seeds/watch-redis-oracle.txt");
 }
 
 // ---------------------------------------------------------------------
@@ -1917,11 +2477,11 @@ pub mod identity {
 #[cfg(test)]
 mod tests {
     use super::Variant;
-    use super::acquisition::{self, Acquisition, Outcome, Rules};
+    use super::acquisition::{self, Acquisition, Cancel, CancelPhase, CancelUntil, Outcome, Rules};
     use super::durable;
     use super::identity;
     use super::lineage;
-    use super::watch::{self, Event, Representation, Verdict};
+    use super::watch::{self, Event, RepeatedWatch, Verdict};
 
     fn rules() -> Rules {
         match Variant::from_env() {
@@ -2043,18 +2603,15 @@ mod tests {
     }
 
     #[test]
-    fn every_terminal_path_releases_every_intent() {
+    fn every_terminal_path_releases_every_intent_and_every_staged_set() {
+        let leak = |v: &String| v.starts_with("INTENT LEAK") || v.starts_with("STAGING LEAK");
         for seed in 1..=32u64 {
-            let r = acquisition::storm(Rules::chosen(), 3, 4, 16, seed);
-            assert!(
-                !r.violations.iter().any(|v| v.starts_with("INTENT LEAK")),
-                "seed {seed}: {r:?}"
-            );
-            let r = acquisition::storm(reschedule(2), 3, 4, 16, seed);
-            assert!(
-                !r.violations.iter().any(|v| v.starts_with("INTENT LEAK")),
-                "seed {seed}: {r:?}"
-            );
+            for faults in [false, true] {
+                let r = acquisition::storm_with(Rules::chosen(), 3, 4, 16, seed, faults);
+                assert!(!r.violations.iter().any(leak), "seed {seed}: {r:?}");
+                let r = acquisition::storm_with(reschedule(2), 3, 4, 16, seed, faults);
+                assert!(!r.violations.iter().any(leak), "seed {seed}: {r:?}");
+            }
         }
     }
 
@@ -2070,95 +2627,327 @@ mod tests {
         assert_eq!(m.outcome(t), Outcome::Committed);
     }
 
-    // ---- watch ----
+    // ---- staging, decision functions, cancellation (ADR-0116 A4) ----
 
-    fn repr() -> Representation {
-        match Variant::from_env() {
-            Variant::Chosen => Representation::OwnerRegistration,
-            Variant::Withdrawn => Representation::EndpointEquality,
+    #[test]
+    fn a_failed_native_condition_publishes_nothing() {
+        let (r, outcome, published) = acquisition::native_failure_history(rules());
+        assert!(r.violations.is_empty(), "{}", r.violations.join("\n"));
+        assert_eq!(outcome, Outcome::Aborted("condition failed"));
+        assert_eq!(published, None);
+    }
+
+    #[test]
+    fn withdrawn_live_writes_survive_a_failed_native_condition() {
+        let (r, outcome, published) = acquisition::native_failure_history(Rules {
+            stage_privately: false,
+            ..Rules::chosen()
+        });
+        assert_eq!(outcome, Outcome::Aborted("condition failed"));
+        assert_eq!(published, Some(0));
+        assert_eq!(
+            r.violations,
+            vec![
+                "STAGING VIOLATION: T1 aborted (condition failed) but its write to key 0@cell0 is published"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_exec_command_is_embedded_and_the_rest_commits() {
+        let (r, outcome, published) = acquisition::exec_failure_history(rules());
+        assert!(r.violations.is_empty(), "{}", r.violations.join("\n"));
+        assert_eq!(outcome, Outcome::Committed);
+        assert_eq!(published, [Some(0), None]);
+    }
+
+    #[test]
+    fn cancellation_aborts_before_the_decision_and_completes_after_it() {
+        let rules = rules();
+        for phase in acquisition::PHASES {
+            for kind in [Cancel::Disconnect, Cancel::Timeout] {
+                for seed in 1..=16u64 {
+                    let (r, outcome, published) =
+                        acquisition::cancellation_history(rules, phase, kind, seed);
+                    assert!(
+                        r.violations.is_empty(),
+                        "{phase:?} {kind:?} seed {seed}: {}",
+                        r.violations.join("\n")
+                    );
+                    if acquisition::before_decision(phase) {
+                        let reason = match kind {
+                            Cancel::Disconnect => "disconnect",
+                            Cancel::Timeout => "timeout",
+                        };
+                        assert_eq!(outcome, Outcome::Aborted(reason), "{phase:?} {kind:?}");
+                        assert_eq!(published, [false, false], "{phase:?} {kind:?}");
+                    } else {
+                        assert_eq!(outcome, Outcome::Committed, "{phase:?} {kind:?}");
+                        assert_eq!(published, [true, true], "{phase:?} {kind:?}");
+                    }
+                }
+            }
         }
     }
 
     #[test]
+    fn withdrawn_cancel_until_durable_publishes_half_a_commit_within_64_seeds() {
+        let rules = Rules { cancel_until: CancelUntil::DurableDecision, ..Rules::chosen() };
+        let mut partial = Vec::new();
+        let mut false_abort = 0;
+        for seed in 1..=64u64 {
+            let (r, _, _) = acquisition::cancellation_history(
+                rules,
+                CancelPhase::Decided,
+                Cancel::Disconnect,
+                seed,
+            );
+            partial.extend(r.violations.iter().filter(|v| v.starts_with("PARTIAL")).cloned());
+            false_abort += usize::from(r.violations.iter().any(|v| v.starts_with("FALSE ABORT")));
+        }
+        assert!(
+            !partial.is_empty(),
+            "no partial publication in 64 seeds — the model lost its teeth"
+        );
+        eprintln!(
+            "cancel-until-durable: {} partial, {false_abort} false aborts over 64 seeds",
+            partial.len()
+        );
+        assert_eq!(
+            partial[0],
+            "PARTIAL PUBLICATION: T1 (disconnect after the decision) published on cell(s) [0] and discarded on cell(s) [1]"
+        );
+        assert!(false_abort > 0, "no false abort in 64 seeds");
+    }
+
+    #[test]
+    fn withdrawn_live_writes_outlive_a_cancel_between_two_legs() {
+        let rules = Rules { stage_privately: false, ..Rules::chosen() };
+        let (r, outcome, _) =
+            acquisition::cancellation_history(rules, CancelPhase::Executed(1), Cancel::Timeout, 3);
+        assert_eq!(outcome, Outcome::Aborted("timeout"));
+        assert_eq!(r.violations.len(), 1, "{r:?}");
+        assert!(
+            r.violations[0]
+                .starts_with("STAGING VIOLATION: T1 aborted (timeout) but its write to key"),
+            "{}",
+            r.violations[0]
+        );
+    }
+
+    #[test]
+    fn fault_storms_publish_all_or_nothing_and_leak_nothing() {
+        let rules = rules();
+        for seed in 1..=64u64 {
+            let r = acquisition::storm_with(rules, 4, 6, 24, seed, true);
+            assert!(r.violations.is_empty(), "seed {seed}: {}", r.violations.join("\n"));
+            assert_eq!(r.committed + r.aborted, 24, "seed {seed}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn withdrawn_rules_violate_some_fault_storm_within_64_seeds() {
+        let staging = Rules { stage_privately: false, ..Rules::chosen() };
+        let cancel = Rules { cancel_until: CancelUntil::DurableDecision, ..Rules::chosen() };
+        let hits = |rules: Rules, prefix: &str| {
+            (1..=64u64)
+                .filter(|s| {
+                    acquisition::storm_with(rules, 4, 6, 24, *s, true)
+                        .violations
+                        .iter()
+                        .any(|v| v.starts_with(prefix))
+                })
+                .count()
+        };
+        let staging_hits = hits(staging, "STAGING VIOLATION");
+        let partial_hits = hits(cancel, "PARTIAL PUBLICATION");
+        eprintln!(
+            "fault storms: live-write {staging_hits}/64, cancel-until-durable {partial_hits}/64"
+        );
+        assert!(staging_hits > 0 && partial_hits > 0);
+    }
+
+    // ---- watch ----
+
+    fn watch_rules() -> watch::Rules {
+        match Variant::from_env() {
+            Variant::Chosen => watch::Rules::chosen(),
+            Variant::Withdrawn => watch::Rules::withdrawn(),
+        }
+    }
+
+    /// The chosen registration with the batch-22 repeated-WATCH rule.
+    fn reregister() -> watch::Rules {
+        watch::Rules { repeated_watch: RepeatedWatch::Reregister, ..watch::Rules::chosen() }
+    }
+
+    #[test]
     fn absent_present_absent_aborts() {
-        let (verdict, oracle) = watch::run(repr(), &watch::ABSENT_PRESENT_ABSENT);
+        let (verdict, oracle) = watch::run(watch_rules(), &watch::ABSENT_PRESENT_ABSENT);
         assert_eq!(oracle, Verdict::Abort);
         assert_eq!(
             verdict,
             oracle,
             "WATCH HISTORY VIOLATION: absent → present → absent accepted by {:?}",
-            repr()
+            watch_rules()
         );
     }
 
     #[test]
     fn withdrawn_endpoint_equality_accepts_absent_present_absent() {
         let (verdict, oracle) =
-            watch::run(Representation::EndpointEquality, &watch::ABSENT_PRESENT_ABSENT);
+            watch::run(watch::Rules::withdrawn(), &watch::ABSENT_PRESENT_ABSENT);
         assert_eq!((verdict, oracle), (Verdict::Commit, Verdict::Abort));
-        let (verdict, oracle) =
-            watch::run(Representation::EndpointEquality, &watch::DELETE_RECREATE);
+        let (verdict, oracle) = watch::run(watch::Rules::withdrawn(), &watch::DELETE_RECREATE);
         assert_eq!((verdict, oracle), (Verdict::Commit, Verdict::Abort));
     }
 
     #[test]
     fn delete_recreate_aborts() {
-        let (verdict, oracle) = watch::run(repr(), &watch::DELETE_RECREATE);
+        let (verdict, oracle) = watch::run(watch_rules(), &watch::DELETE_RECREATE);
         assert_eq!(oracle, Verdict::Abort);
         assert_eq!(
             verdict,
             oracle,
             "WATCH HISTORY VIOLATION: delete/recreate accepted by {:?}",
-            repr()
+            watch_rules()
         );
     }
 
     #[test]
     fn eviction_and_owner_restart_fail_closed() {
         for h in [
-            [Event::Set, Event::Watch, Event::Evict, Event::Exec],
-            [Event::Set, Event::Watch, Event::Restart, Event::Exec],
+            [Event::Set(0), Event::Watch(0), Event::Evict(0), Event::Exec],
+            [Event::Set(0), Event::Watch(0), Event::Restart, Event::Exec],
         ] {
-            let (verdict, oracle) = watch::run(repr(), &h);
+            let (verdict, oracle) = watch::run(watch_rules(), &h);
             assert_eq!(oracle, Verdict::Abort);
             assert_eq!(
                 verdict,
                 Verdict::Abort,
                 "WATCH HISTORY VIOLATION: {h:?} accepted by {:?}",
-                repr()
+                watch_rules()
             );
         }
     }
 
+    // ---- repeated WATCH (ADR-0116 A5, the review's F07) ----
+
+    #[test]
+    fn a_repeated_watch_keeps_the_first_registrations_history() {
+        for h in [
+            &watch::REPEATED_WATCH[..],
+            &watch::ADDITIONAL_KEY_AFTER_CHANGE,
+            &watch::REPEATED_WATCH_AFTER_EVICTION,
+            &watch::REPEATED_WATCH_AFTER_RESTART,
+        ] {
+            let (verdict, oracle) = watch::run(watch_rules(), h);
+            assert_eq!(oracle, Verdict::Abort, "{h:?}");
+            assert_eq!(
+                verdict,
+                Verdict::Abort,
+                "WATCH ORACLE RESET: {h:?} accepted by {:?}",
+                watch_rules()
+            );
+        }
+        // UNWATCH is the reset; the oracle is not vacuously strict.
+        assert_eq!(
+            watch::run(watch_rules(), &watch::RESET_THEN_WATCH),
+            (Verdict::Commit, Verdict::Commit)
+        );
+    }
+
+    #[test]
+    fn withdrawn_reregistration_launders_the_mutation_between_two_watches() {
+        assert_eq!(
+            watch::run(reregister(), &watch::REPEATED_WATCH),
+            (Verdict::Commit, Verdict::Abort),
+            "WATCH ORACLE RESET: a second WATCH must not clear an earlier modification"
+        );
+        for h in [&watch::REPEATED_WATCH_AFTER_EVICTION, &watch::REPEATED_WATCH_AFTER_RESTART] {
+            assert_eq!(watch::run(reregister(), h), (Verdict::Commit, Verdict::Abort), "{h:?}");
+        }
+        // The per-key rule is not what a second key exercises: the
+        // additional-key history aborts under both.
+        assert_eq!(
+            watch::run(reregister(), &watch::ADDITIONAL_KEY_AFTER_CHANGE),
+            (Verdict::Abort, Verdict::Abort)
+        );
+    }
+
     #[test]
     fn registration_agrees_with_the_history_oracle_on_random_histories() {
-        let repr = repr();
+        let rules = watch_rules();
         let mut disagreements = Vec::new();
         for seed in 1..=2000u64 {
-            let h = watch::random_history(seed, 6);
-            let (verdict, oracle) = watch::run(repr, &h);
+            let h = watch::random_history(seed, 7);
+            let (verdict, oracle) = watch::run(rules, &h);
             if verdict != oracle {
                 disagreements.push(format!("seed {seed} {h:?}: {verdict:?} vs oracle {oracle:?}"));
             }
         }
         assert!(
             disagreements.is_empty(),
-            "WATCH HISTORY VIOLATION on {} of 2000 histories under {repr:?}; first: {}",
+            "WATCH HISTORY VIOLATION on {} of 2000 histories under {rules:?}; first: {}",
             disagreements.len(),
             disagreements[0]
         );
     }
 
     #[test]
-    fn withdrawn_endpoint_equality_disagrees_on_random_histories() {
-        let n = (1..=2000u64)
-            .filter(|s| {
-                let (v, o) =
-                    watch::run(Representation::EndpointEquality, &watch::random_history(*s, 6));
-                v != o
-            })
-            .count();
-        assert!(n > 0);
+    fn withdrawn_watch_rules_disagree_on_random_histories() {
+        let count = |rules: watch::Rules| {
+            (1..=2000u64)
+                .filter(|s| {
+                    let (v, o) = watch::run(rules, &watch::random_history(*s, 7));
+                    v != o
+                })
+                .count()
+        };
+        let withdrawn = count(watch::Rules::withdrawn());
+        let reregister = count(reregister());
+        eprintln!(
+            "watch disagreements over 2000 histories: withdrawn {withdrawn}, reregister-only {reregister}"
+        );
+        assert!(withdrawn > 0 && reregister > 0);
+    }
+
+    /// Redis 8.0.5's own verdicts (`seeds/watch-redis-oracle.txt`,
+    /// regenerated by `scripts/txmodel-watch-redis-oracle.py`): the
+    /// chosen rules and the sticky-window oracle agree with Redis on
+    /// every line; the batch-22 repeated-WATCH rule does not.
+    #[test]
+    fn chosen_rules_and_oracle_agree_with_redis_on_every_fixture_line() {
+        let lines: Vec<(Vec<Event>, Verdict)> = watch::REDIS_FIXTURE
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .map(|l| watch::parse_fixture_line(l).unwrap_or_else(|| panic!("fixture line {l:?}")))
+            .collect();
+        assert!(lines.len() >= 400, "fixture holds {} histories", lines.len());
+        let mut disagreements = Vec::new();
+        let mut reregister_disagreements = 0;
+        for (h, redis) in &lines {
+            let (verdict, oracle) = watch::run(watch::Rules::chosen(), h);
+            if verdict != *redis || oracle != *redis {
+                disagreements
+                    .push(format!("{h:?}: model {verdict:?}, oracle {oracle:?}, Redis {redis:?}"));
+            }
+            let (verdict, _) = watch::run(reregister(), h);
+            reregister_disagreements += usize::from(verdict != *redis);
+        }
+        assert!(
+            disagreements.is_empty(),
+            "REDIS ORACLE MISMATCH on {} of {} fixture lines; first: {}",
+            disagreements.len(),
+            lines.len(),
+            disagreements[0]
+        );
+        eprintln!(
+            "redis fixture: {} lines, chosen 0 disagreements, reregister {reregister_disagreements}",
+            lines.len()
+        );
+        assert!(reregister_disagreements > 0, "the fixture does not reach the repeated-WATCH rule");
     }
 
     // ---- durable ----
