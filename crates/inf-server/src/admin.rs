@@ -805,6 +805,7 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tiering_shadow_promote_skip:{}", shadow.promote_skip));
     push(text, &format!("tiering_shadow_scan_twins_emitted:{}", shadow.scan_twins_emitted));
     push(text, &format!("tiering_shadow_forced_by_delete:{}", shadow.forced_by_delete));
+    push(text, &format!("tiering_shadow_delete_run_refused:{}", shadow.delete_run_refused));
     push(text, &format!("tiering_shadow_retargeted:{}", shadow.retargeted));
     push(text, &format!("tiering_shadow_dropped_by_removal:{}", shadow.dropped_by_removal));
     push(text, &format!("tiering_shadow_deferred_walk:{}", shadow.deferred_walk));

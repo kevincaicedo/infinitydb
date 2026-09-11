@@ -338,6 +338,10 @@ pub struct ShadowCounters {
     /// like any cold slot (A3).
     pub scan_twins_emitted: u64,
     pub forced_by_delete: u64,
+    /// `DEL`/`GETDEL`s refused typed because the same-key twins of one
+    /// winner would overrun the replay register (A11/A13 — input no
+    /// engine writes; the twin scratch is sized from the register).
+    pub delete_run_refused: u64,
     /// Tickets retargeted to a later winner (the key was overwritten
     /// while its ticket was open).
     pub retargeted: u64,
@@ -400,6 +404,7 @@ impl ShadowCounters {
             promote_skip,
             scan_twins_emitted,
             forced_by_delete,
+            delete_run_refused,
             retargeted,
             dropped_by_removal,
             deferred_walk,
@@ -649,6 +654,11 @@ impl TieredTable {
         self.shadow.counters.forced_by_delete += 1;
     }
 
+    /// Counts a `DEL`/`GETDEL` refused at the replay register (A11/A13).
+    pub fn note_shadow_delete_run_refused(&mut self) {
+        self.shadow.counters.delete_run_refused += 1;
+    }
+
     /// Counts one twin read by a `DBSIZE` drain (A3).
     pub fn note_shadow_dbsize_read(&mut self) {
         self.shadow.counters.dbsize_reads += 1;
@@ -722,21 +732,49 @@ impl TieredTable {
         self.shadow.ticket(cold)
     }
 
-    /// Every ticket naming `winner`, ascending by cold address (the
-    /// `DEL` path's snapshot — ADR-0093 A10). One winner carries several
-    /// tickets after a boot rebuild paired several cold slots of one
-    /// hash with its one RAM sibling (a same-key twin beside collision
-    /// keys, or several collision keys); the review of 2026-08-30
-    /// (F-L07-01) found `DEL` resolving only the first.
-    #[must_use]
-    pub fn shadow_tickets_of_winner(&self, winner: LogicalAddr) -> Vec<ShadowTicket> {
-        if self.shadow.by_winner.is_empty() {
-            return Vec::new();
-        }
+    /// Every ticket naming `winner`, ascending by cold address, borrowed
+    /// (ADR-0093 A10/A13 — the `DEL` path's in-borrow recheck). One
+    /// winner carries several tickets after a boot rebuild paired
+    /// several cold slots of one hash with its one RAM sibling (a
+    /// same-key twin beside collision keys, or several collision keys);
+    /// the review of 2026-08-30 (F-L07-01) found `DEL` resolving only
+    /// the first.
+    pub fn shadow_winner_tickets(
+        &self,
+        winner: LogicalAddr,
+    ) -> impl Iterator<Item = ShadowTicket> + '_ {
         self.shadow
             .winner_tickets(winner.to_raw())
             .map(|cold| self.shadow.ticket(cold).expect("by_winner and by_cold agree"))
-            .collect()
+    }
+
+    /// The `DEL` path's resumable ticket cursor (A13): the first ticket
+    /// naming `winner` whose cold address is above `after` (`None` =
+    /// the first). One probe per step, no snapshot — the plane suspends
+    /// on each twin's read and resumes from the last cold address it
+    /// saw; a ticket ended meanwhile is simply not visited, one
+    /// registered meanwhile lands on a new winner address (retargets)
+    /// and the plane's lookup recheck re-resolves.
+    #[must_use]
+    pub fn shadow_ticket_of_winner_after(
+        &self,
+        winner: LogicalAddr,
+        after: Option<LogicalAddr>,
+    ) -> Option<ShadowTicket> {
+        if self.shadow.by_winner.is_empty() {
+            return None;
+        }
+        let w = winner.to_raw();
+        let from = after.map_or(0, |a| a.to_raw().saturating_add(1));
+        let (_, cold) = self.shadow.by_winner.range((w, from)..=(w, u64::MAX)).next()?.0;
+        self.shadow.ticket(*cold)
+    }
+
+    /// [`shadow_winner_tickets`](Self::shadow_winner_tickets) collected
+    /// (tests and the DST mirror; the plane never snapshots — A13).
+    #[must_use]
+    pub fn shadow_tickets_of_winner(&self, winner: LogicalAddr) -> Vec<ShadowTicket> {
+        self.shadow_winner_tickets(winner).collect()
     }
 
     /// Whether an open ticket names `addr` as its winner (the checkpoint
