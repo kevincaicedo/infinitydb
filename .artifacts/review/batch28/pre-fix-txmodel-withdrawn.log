@@ -1,0 +1,361 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/inf_sim-709dd5dbb0fb1a03)
+
+running 88 tests
+test txmodel::tests::a_cold_extent_is_charged_and_dependent_writes_pin_nothing_new ... FAILED
+test txmodel::tests::a_dead_incarnation_is_never_reissued_after_a_checkpointed_restart ... FAILED
+test txmodel::tests::a_checkpoint_streams_the_decision_qualified_image ... FAILED
+test txmodel::tests::a_decision_never_outlives_a_plain_write_its_read_leg_observed ... FAILED
+test txmodel::tests::a_cross_owner_rename_ships_the_value_the_transaction_staged ... FAILED
+test txmodel::tests::a_durable_successor_never_outlives_its_dependency ... FAILED
+test txmodel::tests::a_cross_owner_msetnx_is_one_condition_over_every_owner ... FAILED
+test txmodel::tests::a_dependent_command_never_spans_one_owner ... ok
+test txmodel::tests::a_failed_exec_command_is_embedded_and_the_rest_commits ... ok
+test txmodel::tests::a_partially_overlapping_transaction_recovers_whole ... FAILED
+test txmodel::tests::a_read_leg_makes_the_whole_transaction_dependent ... FAILED
+test txmodel::tests::a_failed_native_condition_publishes_nothing ... FAILED
+test txmodel::tests::a_refused_command_followed_by_reads_embeds_under_exec_and_aborts_under_native ... FAILED
+test txmodel::tests::a_repeated_watch_keeps_the_first_registrations_history ... FAILED
+test txmodel::tests::a_stage_compiles_monotonically_in_queue_order ... ok
+test txmodel::tests::a_refused_destination_never_strands_the_source ... FAILED
+test txmodel::tests::a_tombstone_storm_is_refused_at_the_pinned_budget_and_admitted_after_the_decisions ... FAILED
+test txmodel::tests::a_remote_prepare_never_meets_a_reissued_txid ... FAILED
+test txmodel::tests::absent_present_absent_aborts ... FAILED
+test txmodel::tests::a_revision_token_never_repeats_across_the_version_wrap ... FAILED
+test txmodel::tests::a_transitive_successor_inherits_the_whole_closure ... FAILED
+test txmodel::tests::a_saturated_pair_with_contenders_behind_a_holder_completes ... FAILED
+test txmodel::tests::an_exhausted_incarnation_counter_refuses_instead_of_repeating ... FAILED
+test txmodel::tests::an_acked_dependent_transaction_is_never_dropped ... ok
+test txmodel::tests::a_watch_only_key_is_held_through_the_decision ... FAILED
+test txmodel::tests::delete_recreate_aborts ... FAILED
+test txmodel::tests::everysec_checkpoint_never_holds_half_a_transaction ... FAILED
+test txmodel::tests::eviction_and_owner_restart_fail_closed ... FAILED
+test txmodel::tests::consecutive_dependent_commands_each_see_the_previous_apply ... FAILED
+test txmodel::tests::outcome_is_typed ... ok
+test txmodel::tests::reservation_without_the_checkpoint_field_reissues_after_truncation ... ok
+test txmodel::tests::replies_come_back_in_queue_order_whatever_the_legs_arrival_order ... FAILED
+test txmodel::tests::reschedule_rule_completes_the_two_key_history_with_a_counted_retry ... ok
+test txmodel::tests::withdrawn_endpoint_equality_accepts_absent_present_absent ... ok
+test txmodel::tests::readers_never_observe_an_uncommitted_write ... FAILED
+test txmodel::tests::cancellation_aborts_before_the_decision_and_completes_after_it ... FAILED
+test txmodel::tests::withdrawn_hop_by_hop_credits_deadlock_a_holder_behind_its_own_contenders ... ok
+test txmodel::tests::withdrawn_frame_bound_does_not_bound_what_a_tombstone_pins ... ok
+test txmodel::tests::the_ordered_rename_history_replies_in_queue_order_and_reads_its_own_move ... FAILED
+test txmodel::tests::two_key_history_completes_without_deadlock ... FAILED
+test txmodel::tests::withdrawn_incarnation_at_creation_repeats_after_the_version_wraps ... ok
+test txmodel::tests::withdrawn_independent_legs_answer_the_ordered_rename_from_published_state ... ok
+test txmodel::tests::withdrawn_immediate_predecessor_leaks_half_of_the_older_transaction ... ok
+test txmodel::tests::withdrawn_independent_legs_break_consecutive_dependent_commands ... ok
+test txmodel::tests::chosen_rules_and_oracle_agree_with_redis_on_every_fixture_line ... ok
+test txmodel::tests::withdrawn_independent_legs_publish_half_an_msetnx ... ok
+test txmodel::tests::fault_storms_publish_all_or_nothing_and_leak_nothing ... FAILED
+test txmodel::tests::withdrawn_independent_legs_rename_from_the_pre_transaction_value ... ok
+test txmodel::tests::withdrawn_live_writes_outlive_a_cancel_between_two_legs ... ok
+test txmodel::tests::withdrawn_live_writes_survive_a_failed_native_condition ... ok
+test txmodel::tests::withdrawn_per_record_dependencies_recover_a_transaction_two_hops_from_its_dropped_root ... ok
+test txmodel::tests::withdrawn_plain_successor_outlives_its_dropped_source ... ok
+test txmodel::tests::storms_never_deadlock_and_reads_are_serializable ... FAILED
+test txmodel::tests::withdrawn_per_record_dependencies_keep_a_write_whose_read_was_dropped ... ok
+test txmodel::tests::withdrawn_published_reads_miss_the_transactions_own_writes ... ok
+test txmodel::tests::withdrawn_per_record_dependencies_recover_half_of_a_partially_overlapping_transaction ... ok
+test txmodel::tests::withdrawn_prepare_only_watermarks_let_a_decision_outlive_what_it_read ... ok
+test txmodel::tests::withdrawn_queued_grant_returns_one_credit_twice ... ok
+test txmodel::tests::withdrawn_replay_maximum_reissues_the_remote_prepares_txid ... ok
+test txmodel::tests::withdrawn_replayed_maximum_reissues_a_dead_incarnation ... ok
+test txmodel::tests::withdrawn_rule_deadlocks_on_the_two_key_history ... ok
+test txmodel::tests::withdrawn_reregistration_launders_the_mutation_between_two_watches ... ok
+test txmodel::tests::dependent_stages_abort_at_the_combine_step_and_complete_after_the_decision ... FAILED
+test txmodel::tests::withdrawn_cancel_until_durable_publishes_half_a_commit_within_64_seeds ... ok
+test txmodel::tests::registration_agrees_with_the_history_oracle_on_random_histories ... FAILED
+test txmodel::tests::random_identity_histories_never_reissue ... FAILED
+test txmodel::tests::withdrawn_identity_reissues_within_2000_seeds ... ok
+test txmodel::tests::withdrawn_read_bypass_observes_an_uncommitted_write_within_64_seeds ... ok
+test txmodel::tests::random_crash_interleavings_are_all_or_nothing ... FAILED
+test txmodel::tests::credit_storms_complete_and_drain_the_pair ... FAILED
+test txmodel::tests::withdrawn_validate_and_release_commits_over_a_mutated_watch ... ok
+test txmodel::tests::without_ack_gating_an_acked_dependent_transaction_is_dropped ... ok
+test txmodel::tests::withdrawn_watch_rules_disagree_on_random_histories ... ok
+test txmodel::tests::withdrawn_credit_rules_violate_some_storm_within_64_seeds ... ok
+test txmodel::tests::random_revision_histories_never_repeat_a_durable_token ... FAILED
+test txmodel::tests::withdrawn_retention_rules_exceed_the_claimed_bound_within_2000_seeds ... ok
+test txmodel::tests::withdrawn_independent_legs_violate_some_fault_storm_within_64_seeds ... ok
+test txmodel::tests::withdrawn_rules_leave_half_a_transaction_in_the_checkpoint ... ok
+test txmodel::tests::random_retention_histories_are_conserved_bounded_and_leak_free ... FAILED
+test txmodel::tests::withdrawn_revision_rules_repeat_within_2000_seeds ... ok
+test txmodel::tests::every_terminal_path_releases_every_intent_and_every_staged_set ... ok
+test txmodel::tests::withdrawn_rule_deadlocks_some_storm_within_64_seeds ... ok
+test txmodel::tests::random_lineage_interleavings_are_serializable_and_keep_every_ack ... FAILED
+test txmodel::tests::random_lineage_shapes_are_serializable_and_keep_every_ack ... FAILED
+test txmodel::tests::withdrawn_lineage_rules_violate_some_random_interleavings ... ok
+test txmodel::tests::reschedule_retries_scale_with_contention_and_canonical_has_none ... ok
+test txmodel::tests::withdrawn_per_record_dependencies_violate_some_random_shapes ... ok
+test txmodel::tests::withdrawn_rules_violate_some_fault_storm_within_256_seeds ... ok
+
+failures:
+
+---- txmodel::tests::a_cold_extent_is_charged_and_dependent_writes_pin_nothing_new stdout ----
+
+thread 'txmodel::tests::a_cold_extent_is_charged_and_dependent_writes_pin_nothing_new' (114462) panicked at bins/inf-sim/src/txmodel.rs:6687:9:
+RETAINED BYTES EXCEED THE CLAIMED BOUND: 1 pending transaction(s) staged at most 32 B each but retain 1048576 B of images and 3145728 B of extents — above the retention cap × frame bound of 256 B
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- txmodel::tests::a_dead_incarnation_is_never_reissued_after_a_checkpointed_restart stdout ----
+
+thread 'txmodel::tests::a_dead_incarnation_is_never_reissued_after_a_checkpointed_restart' (114465) panicked at bins/inf-sim/src/txmodel.rs:6503:9:
+REVISION REPEAT: (1, 0) issued again for a new incarnation — the counter resumed below a dead incarnation after a restart
+
+---- txmodel::tests::a_checkpoint_streams_the_decision_qualified_image stdout ----
+
+thread 'txmodel::tests::a_checkpoint_streams_the_decision_qualified_image' (114461) panicked at bins/inf-sim/src/txmodel.rs:6184:9:
+SERIALIZABILITY VIOLATION after crash: recovered [100, 11] is no serial subset of [Tx(1), Tx(2)] (decisions durable: {})
+
+---- txmodel::tests::a_decision_never_outlives_a_plain_write_its_read_leg_observed stdout ----
+
+thread 'txmodel::tests::a_decision_never_outlives_a_plain_write_its_read_leg_observed' (114466) panicked at bins/inf-sim/src/txmodel.rs:6277:9:
+DEPENDENCY VIOLATION after crash: recovered [10, 100] matches only subsets of [Incr { cell: 0, id: 1 }, Tx(1)] that keep Tx(1) without Incr { cell: 0, id: 1 } it observed (decisions durable: {1})
+
+---- txmodel::tests::a_cross_owner_rename_ships_the_value_the_transaction_staged stdout ----
+
+thread 'txmodel::tests::a_cross_owner_rename_ships_the_value_the_transaction_staged' (114464) panicked at bins/inf-sim/src/txmodel.rs:5600:13:
+native false: REPLY MISMATCH: T1's RENAME 0→1 replied no such key where the serial history replies OK
+DEPENDENT COMMAND: T1's RENAME 0→1 left key 1@cell1 = absent where the serial history gives T1
+
+---- txmodel::tests::a_durable_successor_never_outlives_its_dependency stdout ----
+
+thread 'txmodel::tests::a_durable_successor_never_outlives_its_dependency' (114468) panicked at bins/inf-sim/src/txmodel.rs:6164:9:
+SERIALIZABILITY VIOLATION after crash: recovered [10, 101] is no serial subset of [Tx(1), Incr { cell: 1, id: 1 }] (decisions durable: {})
+
+---- txmodel::tests::a_cross_owner_msetnx_is_one_condition_over_every_owner stdout ----
+
+thread 'txmodel::tests::a_cross_owner_msetnx_is_one_condition_over_every_owner' (114463) panicked at bins/inf-sim/src/txmodel.rs:5657:13:
+native false: DEPENDENT COMMAND: T2's MSETNX [0, 1] left key 0@cell0 = T2 where the serial history gives absent
+
+---- txmodel::tests::a_partially_overlapping_transaction_recovers_whole stdout ----
+
+thread 'txmodel::tests::a_partially_overlapping_transaction_recovers_whole' (114471) panicked at bins/inf-sim/src/txmodel.rs:6226:9:
+DEPENDENCY VIOLATION after crash: recovered [10, 200, 200] matches only subsets of [Tx(1), Tx(2)] that keep Tx(2) without Tx(1) it observed (decisions durable: {2})
+
+---- txmodel::tests::a_read_leg_makes_the_whole_transaction_dependent stdout ----
+
+thread 'txmodel::tests::a_read_leg_makes_the_whole_transaction_dependent' (114472) panicked at bins/inf-sim/src/txmodel.rs:6256:9:
+DEPENDENCY VIOLATION after crash: recovered [10, 11, 200] matches only subsets of [Tx(1), Tx(2)] that keep Tx(2) without Tx(1) it observed (decisions durable: {2})
+
+---- txmodel::tests::a_failed_native_condition_publishes_nothing stdout ----
+
+thread 'txmodel::tests::a_failed_native_condition_publishes_nothing' (114470) panicked at bins/inf-sim/src/txmodel.rs:5450:9:
+STAGING VIOLATION: T1 aborted (condition failed) but its write to key 0@cell0 is published
+
+---- txmodel::tests::a_refused_command_followed_by_reads_embeds_under_exec_and_aborts_under_native stdout ----
+
+thread 'txmodel::tests::a_refused_command_followed_by_reads_embeds_under_exec_and_aborts_under_native' (114473) panicked at bins/inf-sim/src/txmodel.rs:5849:9:
+REPLY MISMATCH: T1's GET 0 replied absent where the serial history replies T1
+DEPENDENT COMMAND: T1's RENAME 0→1 left key 0@cell0 = absent where the serial history gives T1
+
+---- txmodel::tests::a_repeated_watch_keeps_the_first_registrations_history stdout ----
+
+thread 'txmodel::tests::a_repeated_watch_keeps_the_first_registrations_history' (114476) panicked at bins/inf-sim/src/txmodel.rs:5985:13:
+assertion `left == right` failed: WATCH ORACLE RESET: [Watch(0), Set(0), Watch(0), Exec] accepted by Rules { representation: EndpointEquality, repeated_watch: Reregister }
+  left: Commit
+ right: Abort
+
+---- txmodel::tests::a_refused_destination_never_strands_the_source stdout ----
+
+thread 'txmodel::tests::a_refused_destination_never_strands_the_source' (114474) panicked at bins/inf-sim/src/txmodel.rs:5609:9:
+DEPENDENT COMMAND: T1's RENAME 0→1 left key 0@cell0 = absent where the serial history gives T1
+
+---- txmodel::tests::a_tombstone_storm_is_refused_at_the_pinned_budget_and_admitted_after_the_decisions stdout ----
+
+thread 'txmodel::tests::a_tombstone_storm_is_refused_at_the_pinned_budget_and_admitted_after_the_decisions' (114480) panicked at bins/inf-sim/src/txmodel.rs:6658:9:
+RETAINED BYTES EXCEED THE CLAIMED BOUND: 1 pending transaction(s) staged at most 24 B each but retain 1048576 B of images and 0 B of extents — above the retention cap × frame bound of 256 B
+
+---- txmodel::tests::a_remote_prepare_never_meets_a_reissued_txid stdout ----
+
+thread 'txmodel::tests::a_remote_prepare_never_meets_a_reissued_txid' (114475) panicked at bins/inf-sim/src/txmodel.rs:6416:9:
+TXID REISSUE: (0, 41) issued again while a remote participant's durable prepare still carries it
+
+---- txmodel::tests::absent_present_absent_aborts stdout ----
+
+thread 'txmodel::tests::absent_present_absent_aborts' (114483) panicked at bins/inf-sim/src/txmodel.rs:5927:9:
+assertion `left == right` failed: WATCH HISTORY VIOLATION: absent → present → absent accepted by Rules { representation: EndpointEquality, repeated_watch: Reregister }
+  left: Commit
+ right: Abort
+
+---- txmodel::tests::a_revision_token_never_repeats_across_the_version_wrap stdout ----
+
+thread 'txmodel::tests::a_revision_token_never_repeats_across_the_version_wrap' (114477) panicked at bins/inf-sim/src/txmodel.rs:6486:46:
+REVISION REPEAT: (1, 0) issued again after 8 mutations of a record that never left — the u3 version wrapped under incarnation 1
+
+---- txmodel::tests::a_transitive_successor_inherits_the_whole_closure stdout ----
+
+thread 'txmodel::tests::a_transitive_successor_inherits_the_whole_closure' (114481) panicked at bins/inf-sim/src/txmodel.rs:6302:9:
+DEPENDENCY VIOLATION after crash: recovered [10, 200, 300, 300] matches only subsets of [Tx(1), Tx(2), Tx(3)] that keep Tx(2) without Tx(1) it observed (decisions durable: {2, 3})
+
+---- txmodel::tests::a_saturated_pair_with_contenders_behind_a_holder_completes stdout ----
+
+thread 'txmodel::tests::a_saturated_pair_with_contenders_behind_a_holder_completes' (114478) panicked at bins/inf-sim/src/txmodel.rs:6581:9:
+CREDIT OVERFLOW: the coordinator holds 9 credits toward the owner of 8 — a second reply to one request returned its credit twice
+
+---- txmodel::tests::an_exhausted_incarnation_counter_refuses_instead_of_repeating stdout ----
+
+thread 'txmodel::tests::an_exhausted_incarnation_counter_refuses_instead_of_repeating' (114485) panicked at bins/inf-sim/src/txmodel.rs:6520:46:
+REVISION REPEAT: (1, 0) issued again for a new incarnation — the u4 incarnation counter wrapped
+
+---- txmodel::tests::a_watch_only_key_is_held_through_the_decision stdout ----
+
+thread 'txmodel::tests::a_watch_only_key_is_held_through_the_decision' (114482) panicked at bins/inf-sim/src/txmodel.rs:5403:9:
+WATCH INTERVAL VIOLATION: T1 committed after key 1 was mutated between the owner's validation and the decision
+
+---- txmodel::tests::delete_recreate_aborts stdout ----
+
+thread 'txmodel::tests::delete_recreate_aborts' (114490) panicked at bins/inf-sim/src/txmodel.rs:5948:9:
+assertion `left == right` failed: WATCH HISTORY VIOLATION: delete/recreate accepted by Rules { representation: EndpointEquality, repeated_watch: Reregister }
+  left: Commit
+ right: Abort
+
+---- txmodel::tests::everysec_checkpoint_never_holds_half_a_transaction stdout ----
+
+thread 'txmodel::tests::everysec_checkpoint_never_holds_half_a_transaction' (114493) panicked at bins/inf-sim/src/txmodel.rs:6103:9:
+PARTIAL COMMIT after crash: key0 = 10, key1 = 100 (decision durable: false)
+
+---- txmodel::tests::eviction_and_owner_restart_fail_closed stdout ----
+
+thread 'txmodel::tests::eviction_and_owner_restart_fail_closed' (114494) panicked at bins/inf-sim/src/txmodel.rs:5964:13:
+assertion `left == right` failed: WATCH HISTORY VIOLATION: [Set(0), Watch(0), Evict(0), Exec] accepted by Rules { representation: EndpointEquality, repeated_watch: Reregister }
+  left: Commit
+ right: Abort
+
+---- txmodel::tests::consecutive_dependent_commands_each_see_the_previous_apply stdout ----
+
+thread 'txmodel::tests::consecutive_dependent_commands_each_see_the_previous_apply' (114488) panicked at bins/inf-sim/src/txmodel.rs:5807:13:
+native false: STALE READ: T1 read key 2 = T1 but the last committed writer before it was absent
+
+---- txmodel::tests::replies_come_back_in_queue_order_whatever_the_legs_arrival_order stdout ----
+
+thread 'txmodel::tests::replies_come_back_in_queue_order_whatever_the_legs_arrival_order' (114505) panicked at bins/inf-sim/src/txmodel.rs:5872:9:
+STALE READ: T1 read key 0 = T1 but the last committed writer before it was absent
+STALE READ: T1 read key 1 = T1 but the last committed writer before it was absent
+
+---- txmodel::tests::readers_never_observe_an_uncommitted_write stdout ----
+
+thread 'txmodel::tests::readers_never_observe_an_uncommitted_write' (114503) panicked at bins/inf-sim/src/txmodel.rs:5383:13:
+seed 4: READ UNCOMMITTED: T3 read key 1 written by T1 before T1's decision
+
+---- txmodel::tests::cancellation_aborts_before_the_decision_and_completes_after_it stdout ----
+
+thread 'txmodel::tests::cancellation_aborts_before_the_decision_and_completes_after_it' (114486) panicked at bins/inf-sim/src/txmodel.rs:5488:21:
+Execute(0) Disconnect seed 1: STAGING VIOLATION: T1 aborted (disconnect) but its write to key 0@cell0 is published
+
+---- txmodel::tests::the_ordered_rename_history_replies_in_queue_order_and_reads_its_own_move stdout ----
+
+thread 'txmodel::tests::the_ordered_rename_history_replies_in_queue_order_and_reads_its_own_move' (114510) panicked at bins/inf-sim/src/txmodel.rs:5744:13:
+native false: REPLY MISMATCH: T1's RENAME 0→1 replied no such key where the serial history replies OK
+REPLY MISMATCH: T1's GET 1 replied absent where the serial history replies T1
+DEPENDENT COMMAND: T1's RENAME 0→1 left key 1@cell1 = absent where the serial history gives T1
+
+---- txmodel::tests::two_key_history_completes_without_deadlock stdout ----
+
+thread 'txmodel::tests::two_key_history_completes_without_deadlock' (114511) panicked at bins/inf-sim/src/txmodel.rs:5317:9:
+ACQUISITION DEADLOCK: 2 transaction(s) stuck with no message in flight — T1 waits on key 1@cell1 behind T2; T2 waits on key 0@cell0 behind T1
+
+---- txmodel::tests::fault_storms_publish_all_or_nothing_and_leak_nothing stdout ----
+
+thread 'txmodel::tests::fault_storms_publish_all_or_nothing_and_leak_nothing' (114495) panicked at bins/inf-sim/src/txmodel.rs:5563:13:
+seed 1: ACQUISITION DEADLOCK: 20 transaction(s) stuck with no message in flight — T2 waits on key 4@cell0 behind T17; T2 waits on key 2@cell2 behind T8; T3 waits on key 4@cell0 behind T17,T2; T3 waits on key 1@cell1 behind T14; T4 waits on key 4@cell0 behind T17,T2,T3; T4 waits on key 2@cell2 behind T8,T2; T5 waits on key 1@cell1 behind T14,T3; T5 waits on key 5@cell1 behind T17; T5 waits on key 2@cell2 behind T8,T2,T4; T5 waits on key 3@cell3 behind T4; T6 waits on key 2@cell2 behind T8,T2,T4,T5; T7 waits on key 2@cell2 behind T8,T2,T4,T5,T6; T8 waits on key 4@cell0 behind T17,T2,T3,T4; T8 waits on key 1@cell1 behind T14,T3,T5; T8 waits on key 5@cell1 behind T17,T5; T10 waits on key 3@cell3 behind T4,T5; T11 waits on key 3@cell3 behind T4,T5,T10; T12 waits on key 5@cell1 behind T17,T5,T8; T12 waits on key 2@cell2 behind T8,T2,T4,T5,T6,T7; T13 waits on key 2@cell2 behind T8,T2,T4,T5,T6,T7,T12; T14 waits on key 0@cell0 behind T17; T14 waits on key 2@cell2 behind T8,T2,T4,T5,T6,T7,T12,T13; T15 waits on key 1@cell1 behind T14,T3,T5,T8; T15 waits on key 3@cell3 behind T4,T5,T10,T11; T16 waits on key 4@cell0 behind T17,T2,T3,T4,T8; T17 waits on key 1@cell1 behind T14,T3,T5,T8,T15; T17 waits on key 2@cell2 behind T8,T2,T4,T5,T6,T7,T12,T13,T14; T17 waits on key 3@cell3 behind T4,T5,T10,T11,T15; T19 waits on key 0@cell0 behind T17,T14; T19 waits on key 1@cell1 behind T14,T3,T5,T8,T15,T17; T19 waits on key 5@cell1 behind T17,T5,T8,T12; T20 waits on key 4@cell0 behind T17,T2,T3,T4,T8,T16; T20 waits on key 1@cell1 behind T14,T3,T5,T8,T15,T17,T19; T21 waits on key 0@cell0 behind T17,T14,T19; T21 waits on key 4@cell0 behind T17,T2,T3,T4,T8,T16,T20; T23 waits on key 0@cell0 behind T17,T14,T19,T21; T23 waits on key 1@cell1 behind T14,T3,T5,T8,T15,T17,T19,T20; T23 waits on key 5@cell1 behind T17,T5,T8,T12,T19; T23 waits on key 3@cell3 behind T4,T5,T10,T11,T15,T17; T24 waits on key 4@cell0 behind T17,T2,T3,T4,T8,T16,T20,T21; T24 waits on key 5@cell1 behind T17,T5,T8,T12,T19,T23
+
+---- txmodel::tests::storms_never_deadlock_and_reads_are_serializable stdout ----
+
+thread 'txmodel::tests::storms_never_deadlock_and_reads_are_serializable' (114509) panicked at bins/inf-sim/src/txmodel.rs:5344:13:
+seed 1: ACQUISITION DEADLOCK: 22 transaction(s) stuck with no message in flight — T1 waits on key 0@cell0 behind T18; T2 waits on key 0@cell0 behind T18,T1; T2 waits on key 4@cell0 behind T10; T2 waits on key 3@cell3 behind T9; T3 waits on key 4@cell0 behind T10,T2; T4 waits on key 4@cell0 behind T10,T2,T3; T4 waits on key 3@cell3 behind T9,T2; T6 waits on key 5@cell1 behind T13; T6 waits on key 2@cell2 behind T15,T3; T8 waits on key 2@cell2 behind T15,T3,T6; T9 waits on key 0@cell0 behind T18,T1,T2; T10 waits on key 2@cell2 behind T15,T3,T6,T8; T11 waits on key 2@cell2 behind T15,T3,T6,T8,T10; T12 waits on key 2@cell2 behind T15,T3,T6,T8,T10,T11; T12 waits on key 3@cell3 behind T9,T2,T4; T13 waits on key 0@cell0 behind T18,T1,T2,T9; T14 waits on key 2@cell2 behind T15,T3,T6,T8,T10,T11,T12; T15 waits on key 1@cell1 behind T12; T16 waits on key 0@cell0 behind T18,T1,T2,T9,T13; T16 waits on key 4@cell0 behind T10,T2,T3,T4; T17 waits on key 4@cell0 behind T10,T2,T3,T4,T16; T17 waits on key 1@cell1 behind T12,T15; T17 waits on key 2@cell2 behind T15,T3,T6,T8,T10,T11,T12,T14; T18 waits on key 2@cell2 behind T15,T3,T6,T8,T10,T11,T12,T14,T17; T18 waits on key 3@cell3 behind T9,T2,T4,T12; T19 waits on key 1@cell1 behind T12,T15,T17; T19 waits on key 5@cell1 behind T13,T6; T19 waits on key 3@cell3 behind T9,T2,T4,T12,T18; T20 waits on key 1@cell1 behind T12,T15,T17,T19; T21 waits on key 3@cell3 behind T9,T2,T4,T12,T18,T19; T22 waits on key 1@cell1 behind T12,T15,T17,T19,T20; T22 waits on key 5@cell1 behind T13,T6,T19; T22 waits on key 2@cell2 behind T15,T3,T6,T8,T10,T11,T12,T14,T17,T18; T23 waits on key 0@cell0 behind T18,T1,T2,T9,T13,T16; T23 waits on key 5@cell1 behind T13,T6,T19,T22; T23 waits on key 2@cell2 behind T15,T3,T6,T8,T10,T11,T12,T14,T17,T18,T22; T24 waits on key 5@cell1 behind T13,T6,T19,T22,T23; T24 waits on key 2@cell2 behind T15,T3,T6,T8,T10,T11,T12,T14,T17,T18,T22,T23
+
+---- txmodel::tests::dependent_stages_abort_at_the_combine_step_and_complete_after_the_decision stdout ----
+
+thread 'txmodel::tests::dependent_stages_abort_at_the_combine_step_and_complete_after_the_decision' (114491) panicked at bins/inf-sim/src/txmodel.rs:5688:21:
+Execute(0) Disconnect seed 1: STAGING VIOLATION: T1 aborted (disconnect) but its write to key 0@cell0 is published
+
+---- txmodel::tests::registration_agrees_with_the_history_oracle_on_random_histories stdout ----
+
+thread 'txmodel::tests::registration_agrees_with_the_history_oracle_on_random_histories' (114504) panicked at bins/inf-sim/src/txmodel.rs:6028:9:
+WATCH HISTORY VIOLATION on 390 of 2000 histories under Rules { representation: EndpointEquality, repeated_watch: Reregister }; first: seed 11 [Expire(1), Unwatch, Restart, Expire(1), Restart, Watch(0), Evict(0), Exec]: Commit vs oracle Abort
+
+---- txmodel::tests::random_identity_histories_never_reissue stdout ----
+
+thread 'txmodel::tests::random_identity_histories_never_reissue' (114498) panicked at bins/inf-sim/src/txmodel.rs:6452:9:
+TXID REISSUE on 889 of 2000 histories under Rules { resume_from_durable_reservation: false, checkpoint_carries_reservation: false }; first: seed 1: TXID REISSUE: (0, 1) issued again while a remote participant's durable prepare still carries it
+
+---- txmodel::tests::random_crash_interleavings_are_all_or_nothing stdout ----
+
+thread 'txmodel::tests::random_crash_interleavings_are_all_or_nothing' (114497) panicked at bins/inf-sim/src/txmodel.rs:6144:9:
+926 of 2000 interleavings partial under Rules { decision_waits_for_durable_prepares: false, checkpoint_streams_predecessor: false }; first: seed 1: PARTIAL COMMIT after crash: key0 = 10, key1 = 100 (decision durable: false)
+
+---- txmodel::tests::credit_storms_complete_and_drain_the_pair stdout ----
+
+thread 'txmodel::tests::credit_storms_complete_and_drain_the_pair' (114489) panicked at bins/inf-sim/src/txmodel.rs:6625:9:
+64 of 64 storms violated under Rules { grant_is_the_deferred_terminal_reply: false, credits_reserved_at_admit: false }; first: seed 1: CREDIT OVERFLOW: the coordinator holds 9 credits toward the owner of 8 — a second reply to one request returned its credit twice
+
+---- txmodel::tests::random_revision_histories_never_repeat_a_durable_token stdout ----
+
+thread 'txmodel::tests::random_revision_histories_never_repeat_a_durable_token' (114502) panicked at bins/inf-sim/src/txmodel.rs:6539:9:
+REVISION REPEAT on 1208 of 2000 histories under Rules { reincarnate_on_wrap: false, resume_from_durable_reservation: false, refuse_at_exhaustion: false }; first: seed 3: REVISION REPEAT: (2, 0) issued again after 8 mutations of a record that never left — the u3 version wrapped under incarnation 2
+
+---- txmodel::tests::random_retention_histories_are_conserved_bounded_and_leak_free stdout ----
+
+thread 'txmodel::tests::random_retention_histories_are_conserved_bounded_and_leak_free' (114501) panicked at bins/inf-sim/src/txmodel.rs:6705:9:
+1638 of 2000 histories violated under Rules { charge_retained_images_at_grant: false }; first: seed 1: RETAINED BYTES EXCEED THE CLAIMED BOUND: 1 pending transaction(s) staged at most 57 B each but retain 615749 B of images and 0 B of extents — above the retention cap × frame bound of 256 B
+
+---- txmodel::tests::random_lineage_interleavings_are_serializable_and_keep_every_ack stdout ----
+
+thread 'txmodel::tests::random_lineage_interleavings_are_serializable_and_keep_every_ack' (114499) panicked at bins/inf-sim/src/txmodel.rs:6329:9:
+64 of 2000 interleavings violated under Rules { successors_inherit_dependencies: false, pin_decision_qualified_image: false, ack_waits_for_dependencies: false, dependencies_are_transaction_wide: false, decision_waits_for_read_watermarks: false }; first: seed 5: SERIALIZABILITY VIOLATION after crash: recovered [10, 101] is no serial subset of [Tx(1), Incr { cell: 1, id: 1 }] (decisions durable: {})
+
+---- txmodel::tests::random_lineage_shapes_are_serializable_and_keep_every_ack stdout ----
+
+thread 'txmodel::tests::random_lineage_shapes_are_serializable_and_keep_every_ack' (114500) panicked at bins/inf-sim/src/txmodel.rs:6347:9:
+323 of 2000 shapes violated under Rules { successors_inherit_dependencies: false, pin_decision_qualified_image: false, ack_waits_for_dependencies: false, dependencies_are_transaction_wide: false, decision_waits_for_read_watermarks: false }; first: seed 4 Shape { cells: 3, txns: [Txn { id: 1, coordinator: 2, legs: [(0, Write), (1, Write), (2, Read)] }, Txn { id: 2, coordinator: 2, legs: [(0, Write), (2, Read)] }, Txn { id: 3, coordinator: 2, legs: [(0, Write), (2, Write)] }] }: DEPENDENCY VIOLATION after crash: recovered [300, 11, 300] matches only subsets of [Incr { cell: 2, id: 1 }, Tx(1), Tx(2), Tx(3)] that keep Tx(3) without Incr { cell: 2, id: 1 } it observed (decisions durable: {2, 3})
+
+
+failures:
+    txmodel::tests::a_checkpoint_streams_the_decision_qualified_image
+    txmodel::tests::a_cold_extent_is_charged_and_dependent_writes_pin_nothing_new
+    txmodel::tests::a_cross_owner_msetnx_is_one_condition_over_every_owner
+    txmodel::tests::a_cross_owner_rename_ships_the_value_the_transaction_staged
+    txmodel::tests::a_dead_incarnation_is_never_reissued_after_a_checkpointed_restart
+    txmodel::tests::a_decision_never_outlives_a_plain_write_its_read_leg_observed
+    txmodel::tests::a_durable_successor_never_outlives_its_dependency
+    txmodel::tests::a_failed_native_condition_publishes_nothing
+    txmodel::tests::a_partially_overlapping_transaction_recovers_whole
+    txmodel::tests::a_read_leg_makes_the_whole_transaction_dependent
+    txmodel::tests::a_refused_command_followed_by_reads_embeds_under_exec_and_aborts_under_native
+    txmodel::tests::a_refused_destination_never_strands_the_source
+    txmodel::tests::a_remote_prepare_never_meets_a_reissued_txid
+    txmodel::tests::a_repeated_watch_keeps_the_first_registrations_history
+    txmodel::tests::a_revision_token_never_repeats_across_the_version_wrap
+    txmodel::tests::a_saturated_pair_with_contenders_behind_a_holder_completes
+    txmodel::tests::a_tombstone_storm_is_refused_at_the_pinned_budget_and_admitted_after_the_decisions
+    txmodel::tests::a_transitive_successor_inherits_the_whole_closure
+    txmodel::tests::a_watch_only_key_is_held_through_the_decision
+    txmodel::tests::absent_present_absent_aborts
+    txmodel::tests::an_exhausted_incarnation_counter_refuses_instead_of_repeating
+    txmodel::tests::cancellation_aborts_before_the_decision_and_completes_after_it
+    txmodel::tests::consecutive_dependent_commands_each_see_the_previous_apply
+    txmodel::tests::credit_storms_complete_and_drain_the_pair
+    txmodel::tests::delete_recreate_aborts
+    txmodel::tests::dependent_stages_abort_at_the_combine_step_and_complete_after_the_decision
+    txmodel::tests::everysec_checkpoint_never_holds_half_a_transaction
+    txmodel::tests::eviction_and_owner_restart_fail_closed
+    txmodel::tests::fault_storms_publish_all_or_nothing_and_leak_nothing
+    txmodel::tests::random_crash_interleavings_are_all_or_nothing
+    txmodel::tests::random_identity_histories_never_reissue
+    txmodel::tests::random_lineage_interleavings_are_serializable_and_keep_every_ack
+    txmodel::tests::random_lineage_shapes_are_serializable_and_keep_every_ack
+    txmodel::tests::random_retention_histories_are_conserved_bounded_and_leak_free
+    txmodel::tests::random_revision_histories_never_repeat_a_durable_token
+    txmodel::tests::readers_never_observe_an_uncommitted_write
+    txmodel::tests::registration_agrees_with_the_history_oracle_on_random_histories
+    txmodel::tests::replies_come_back_in_queue_order_whatever_the_legs_arrival_order
+    txmodel::tests::storms_never_deadlock_and_reads_are_serializable
+    txmodel::tests::the_ordered_rename_history_replies_in_queue_order_and_reads_its_own_move
+    txmodel::tests::two_key_history_completes_without_deadlock
+
+test result: FAILED. 47 passed; 41 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.20s
+
+error: test failed, to rerun pass `-p inf-sim --lib`

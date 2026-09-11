@@ -180,6 +180,13 @@ pub mod acquisition {
         /// written: fixed arguments make the per-owner legs independent,
         /// so each owner runs its half of the command alone.
         pub stage_dependents: bool,
+        /// A plain read inside the transaction sees the private write set
+        /// first (ADR-0116 D5/A6: every leg runs its slice against its
+        /// private set). `false` is the batch-22 model as written: every
+        /// read returns the published value, so a `GET` queued after the
+        /// transaction's own write — or after a dependent command's apply
+        /// — answers the pre-transaction state.
+        pub read_your_writes: bool,
     }
 
     impl Rules {
@@ -191,6 +198,7 @@ pub mod acquisition {
                 stage_privately: true,
                 cancel_until: CancelUntil::Decision,
                 stage_dependents: true,
+                read_your_writes: true,
             }
         }
 
@@ -202,24 +210,27 @@ pub mod acquisition {
                 stage_privately: false,
                 cancel_until: CancelUntil::DurableDecision,
                 stage_dependents: false,
+                read_your_writes: false,
             }
         }
     }
 
-    /// Where a disconnect or timeout lands (ADR-0116 A4's phase table).
+    /// Where a disconnect or timeout lands (ADR-0116 A4's phase table,
+    /// per stage since A6).
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum CancelPhase {
         /// Admitted, no `LockOp` sent yet.
         Admit,
         /// The `LockOp` for round `n` is in flight.
         Acquire(usize),
-        /// Every round granted; `ExecOp` fanned.
-        Execute,
-        /// The `n`-th `SubResult` arrived with legs still outstanding.
-        Executed(usize),
-        /// Every leg is in and the coordinator combines a dependent
-        /// command's gather results before its apply stage (A6).
-        Combine,
+        /// Every round granted; stage `s`'s `ExecOp`s fanned.
+        Execute(usize),
+        /// The `n`-th `SubResult` of stage `s` arrived with legs still
+        /// outstanding.
+        Executed(usize, usize),
+        /// Every leg of stage `s` is in and the coordinator combines its
+        /// dependent command's gather results before the apply stage (A6).
+        Combine(usize),
         /// Decided in memory; the cancellation lands at a seeded point
         /// while `UnlockOp{outcome}` is in flight — before, between or
         /// after the owners' publications, or after the durable decision.
@@ -273,13 +284,122 @@ pub mod acquisition {
         }
     }
 
-    /// One transaction: writes take W intents, reads and WATCH-only keys
-    /// take R intents (a key both read/watched and written takes W).
-    /// Program order: the reads, then the plain writes, then the
-    /// dependent command.
+    /// One queued command (ADR-0116 A6): the program is ordered and the
+    /// coordinator compiles it into stages — a stage is the maximal run
+    /// of plain commands up to and including one dependent command,
+    /// whose apply half is the stage(s) that follow.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum Cmd {
+        /// `SET k`: a plain write of this transaction's value.
+        Set(Key),
+        /// `GET k`: a read — the private set first (D5, read-your-writes).
+        Get(Key),
+        /// A dependent multi-owner command.
+        Dep(Dependent),
+    }
+
+    impl Cmd {
+        fn keys(&self) -> Vec<Key> {
+            match self {
+                Cmd::Set(k) | Cmd::Get(k) => vec![*k],
+                Cmd::Dep(dep) => dep.keys(),
+            }
+        }
+
+        fn writes(&self) -> bool {
+            !matches!(self, Cmd::Get(_))
+        }
+
+        fn label(&self) -> String {
+            match self {
+                Cmd::Set(k) => format!("SET {k}"),
+                Cmd::Get(k) => format!("GET {k}"),
+                Cmd::Dep(dep) => dep.label(),
+            }
+        }
+    }
+
+    /// One element of the transaction's reply array, in queue order.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum Reply {
+        Ok,
+        /// `GET`: the writer seen (`None` = absent).
+        Value(Option<usize>),
+        /// `MSETNX`: 1 set, 0 condition failed.
+        Int(u8),
+        /// `EXEC` embeds the failed command's error.
+        Err(&'static str),
+    }
+
+    impl Reply {
+        fn text(&self) -> String {
+            match self {
+                Reply::Ok => "OK".to_string(),
+                Reply::Value(v) => name(*v),
+                Reply::Int(n) => n.to_string(),
+                Reply::Err(e) => (*e).to_string(),
+            }
+        }
+
+        /// The failure a reply carries, if any (`INF.TX` aborts on it).
+        fn failure(&self) -> Option<&'static str> {
+            match self {
+                Reply::Err(e) => Some(e),
+                Reply::Int(0) => Some("condition failed"),
+                _ => None,
+            }
+        }
+
+        /// Of two owners' halves of one command (the withdrawn independent
+        /// split), the failure wins.
+        fn worse(self, other: Reply) -> Reply {
+            if self.failure().is_some() { self } else { other }
+        }
+    }
+
+    /// One execute stage: the plain commands running in the owners' legs
+    /// and the dependent command whose gather rides their tail.
+    #[derive(Clone, Debug, Default)]
+    struct Stage {
+        cmds: Vec<usize>,
+        dep: Option<usize>,
+    }
+
+    /// The stage compiler (A6): stage assignment is monotone in queue
+    /// order; a dependent command closes its stage.
+    fn compile(program: &[Cmd]) -> Vec<Stage> {
+        let mut stages = Vec::new();
+        let mut cur = Stage::default();
+        for (i, cmd) in program.iter().enumerate() {
+            match cmd {
+                Cmd::Dep(_) => {
+                    cur.dep = Some(i);
+                    stages.push(std::mem::take(&mut cur));
+                }
+                Cmd::Set(_) | Cmd::Get(_) => cur.cmds.push(i),
+            }
+        }
+        if !cur.cmds.is_empty() {
+            stages.push(cur);
+        }
+        stages
+    }
+
+    /// The stages a program compiles to, as `(index, closes with a
+    /// dependent command)` — the storm's cancel-phase menu.
+    pub fn stages_of(program: &[Cmd]) -> Vec<(usize, bool)> {
+        compile(program).iter().enumerate().map(|(i, s)| (i, s.dep.is_some())).collect()
+    }
+
+    /// One transaction. `program` is the queue in order (A6); when it is
+    /// empty the legacy fields compile to one: the reads, then the plain
+    /// writes, then the dependent command. Writes take W intents, reads
+    /// and WATCH-only keys take R intents (a key both read/watched and
+    /// written takes W).
     #[derive(Clone, Debug, Default)]
     pub struct TxnSpec {
         pub coordinator: Cell,
+        pub program: Vec<Cmd>,
         pub writes: Vec<Key>,
         pub reads: Vec<Key>,
         pub watches: Vec<Key>,
@@ -292,8 +412,8 @@ pub mod acquisition {
         /// transaction. `false` is Redis `EXEC`: the failure is embedded
         /// in that leg's reply and the decision is still `Commit`.
         pub native: bool,
-        /// The owner whose leg fails its condition (`NX`, `IF REV`, …)
-        /// before writing anything.
+        /// The owner whose first plain write fails its condition (`NX`,
+        /// `IF REV`, …) and stages nothing for that command.
         pub fails_at: Option<Cell>,
         /// A disconnect or timeout delivered to the coordinator the moment
         /// the transaction enters this phase.
@@ -345,19 +465,38 @@ pub mod acquisition {
         /// Distinct owners in canonical order.
         owners: Vec<Cell>,
         /// Every key the transaction writes: plain writes ∪ the dependent
-        /// command's keys.
+        /// commands' keys.
         writes_all: Vec<Key>,
-        /// The execute stage in flight (A6).
+        /// The queue in order, its compiled stages and the one in flight
+        /// (A6).
+        program: Vec<Cmd>,
+        stages: Vec<Stage>,
+        si: usize,
+        /// The execute step of the stage in flight.
         stage: ExecStage,
-        /// Gather results of the dependent command: a conditioned key
-        /// exists somewhere; the source's value; an owner refused.
+        /// `ExecOp`s fanned for the step in flight.
+        fan: usize,
+        /// Gather results of the stage's dependent command: a conditioned
+        /// key exists somewhere; the source's value; an owner refused.
         probe_any: bool,
         probe_value: Option<usize>,
         probe_refused: bool,
-        /// The dependent command failed (its reason), whole.
+        /// The stage's dependent command failed (its reason), whole.
         dep_failed: Option<&'static str>,
-        /// Published values of the written keys when execution began —
-        /// the serial oracle's pre-state (intents are held from here).
+        /// The first plain write on `fails_at` failed its condition (and
+        /// which command it was).
+        cond_failed: bool,
+        failed_set: Option<usize>,
+        /// The command whose failure aborted a native transaction — set
+        /// only on that abort, so a cancellation racing a failed leg is
+        /// not mistaken for the command's own abort.
+        failed_idx: Option<usize>,
+        /// Replies by program index; the array in queue order once decided.
+        replies: BTreeMap<usize, Reply>,
+        reply: Option<Vec<Reply>>,
+        /// Published values of every key the program names when execution
+        /// began — the serial oracle's pre-state (intents are held from
+        /// here).
         pre: BTreeMap<Key, Option<usize>>,
         /// Canonical: the round in flight. Parallel fans and cancels:
         /// replies outstanding.
@@ -378,7 +517,9 @@ pub mod acquisition {
         /// Registration snapshot per watched key (the owner's mutation
         /// count when the connection watched).
         reg: BTreeMap<Key, u64>,
-        reads_seen: Vec<(Key, Option<usize>)>,
+        /// Every read: the key, the value seen, whether it came from the
+        /// transaction's own private set.
+        reads_seen: Vec<(Key, Option<usize>, bool)>,
         commit_seq: Option<u64>,
     }
 
@@ -410,12 +551,7 @@ pub mod acquisition {
             owner: Cell,
             stage: ExecStage,
         },
-        SubResult {
-            txn: usize,
-            failed: bool,
-            probe: Probe,
-            dep_failed: Option<&'static str>,
-        },
+        SubResult(SubResult),
         /// `UnlockOp{outcome}`: publish or discard the staged leg, then
         /// release every intent.
         Unlock {
@@ -434,12 +570,13 @@ pub mod acquisition {
         },
     }
 
-    /// Which slice of the transaction an `ExecOp` carries (ADR-0116 A6).
+    /// Which step of the stage in flight an `ExecOp` carries (ADR-0116
+    /// A6).
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     enum ExecStage {
-        /// Every owner's plain leg. Chosen: the gather half of a dependent
-        /// command rides its tail. Withdrawn: the owner runs its whole
-        /// half of the command here, alone.
+        /// Every owner's plain leg of the stage. Chosen: the gather half
+        /// of the stage's dependent command rides its tail. Withdrawn: the
+        /// owner runs its whole half of the command here, alone.
         Legs,
         /// Move: the destination's reserve-then-stage put of the shipped
         /// value.
@@ -448,6 +585,22 @@ pub mod acquisition {
         ApplySrc,
         /// Set-if-none-exist: stage the sets reserved in the gather.
         Apply,
+    }
+
+    /// A leg's result back to the coordinator.
+    #[derive(Clone, Debug)]
+    struct SubResult {
+        txn: usize,
+        owner: Cell,
+        /// The leg's first plain write failed its condition.
+        failed: bool,
+        probe: Probe,
+        dep_failed: Option<&'static str>,
+        /// The leg's replies by program index, in queue order.
+        replies: Vec<(usize, Reply)>,
+        /// The withdrawn independent split: this owner's half of the
+        /// dependent command replied.
+        dep_reply: Option<Reply>,
     }
 
     /// What a leg reports back for a dependent command's gather half.
@@ -459,6 +612,14 @@ pub mod acquisition {
         value: Option<usize>,
         /// The owner could not reserve the command's publication resources.
         refused: bool,
+    }
+
+    /// The serial oracle's verdict: the program run alone against the
+    /// pre-state.
+    struct Serial {
+        replies: Vec<Reply>,
+        state: BTreeMap<Key, Option<usize>>,
+        abort: Option<&'static str>,
     }
 
     /// Endpoint of the coordinator-side messages that carry no owner.
@@ -475,7 +636,7 @@ pub mod acquisition {
                 | Msg::Cancel { txn, owner, .. }
                 | Msg::Exec { txn, owner, .. }
                 | Msg::Unlock { txn, owner, .. } => (txn, owner),
-                Msg::SubResult { txn, .. } | Msg::CancelAt { txn, .. } => (txn, COORD),
+                Msg::SubResult(SubResult { txn, .. }) | Msg::CancelAt { txn, .. } => (txn, COORD),
                 Msg::DecisionDurable { txn } => (txn, DISK),
             }
         }
@@ -560,22 +721,48 @@ pub mod acquisition {
         /// Register a transaction (WATCH registrations are taken now —
         /// the connection watched before `MULTI`). Returns its index.
         pub fn submit(&mut self, mut spec: TxnSpec) -> usize {
-            for keys in [&mut spec.writes, &mut spec.reads, &mut spec.watches] {
+            if spec.program.is_empty() {
+                for keys in [&mut spec.writes, &mut spec.reads] {
+                    keys.sort_unstable();
+                    keys.dedup();
+                }
+                spec.program = spec
+                    .reads
+                    .iter()
+                    .map(|k| Cmd::Get(*k))
+                    .chain(spec.writes.iter().map(|k| Cmd::Set(*k)))
+                    .chain(spec.dependent.iter().cloned().map(Cmd::Dep))
+                    .collect();
+            }
+            spec.watches.sort_unstable();
+            spec.watches.dedup();
+            let (mut reads, mut writes, mut writes_all) = (Vec::new(), Vec::new(), Vec::new());
+            for cmd in &spec.program {
+                match cmd {
+                    Cmd::Get(k) => reads.push(*k),
+                    Cmd::Set(k) => {
+                        writes.push(*k);
+                        writes_all.push(*k);
+                    }
+                    Cmd::Dep(dep) => {
+                        let keys = dep.keys();
+                        let mut dep_owners: Vec<Cell> =
+                            keys.iter().map(|k| self.owner_of(*k)).collect();
+                        dep_owners.sort_unstable();
+                        dep_owners.dedup();
+                        assert!(dep_owners.len() >= 2, "a dependent command spans owners");
+                        writes_all.extend(keys);
+                    }
+                }
+            }
+            for keys in [&mut reads, &mut writes, &mut writes_all] {
                 keys.sort_unstable();
                 keys.dedup();
             }
+            spec.reads = reads;
+            spec.writes = writes;
             let reg =
                 spec.watches.iter().map(|k| (*k, *self.mutations.get(k).unwrap_or(&0))).collect();
-            let mut writes_all = spec.writes.clone();
-            if let Some(dep) = &spec.dependent {
-                let keys = dep.keys();
-                let mut dep_owners: Vec<Cell> = keys.iter().map(|k| self.owner_of(*k)).collect();
-                dep_owners.dedup();
-                assert!(dep_owners.len() == keys.len(), "a dependent command spans owners");
-                writes_all.extend(keys);
-            }
-            writes_all.sort_unstable();
-            writes_all.dedup();
             let mut owners: Vec<Cell> = writes_all
                 .iter()
                 .chain(&spec.reads)
@@ -585,22 +772,33 @@ pub mod acquisition {
             owners.sort_unstable();
             owners.dedup();
             let bypass = !self.rules.reads_wait
-                && spec.writes.is_empty()
+                && writes_all.is_empty()
                 && spec.watches.is_empty()
                 && !spec.reads.is_empty();
             let idx = self.txns.len();
             let n = owners.len();
+            let program = spec.program.clone();
+            let stages = compile(&program);
             self.txns.push(Txn {
                 spec,
                 txid: 0,
                 phase: Phase::Acquiring,
                 owners,
                 writes_all,
+                program,
+                stages,
+                si: 0,
                 stage: ExecStage::Legs,
+                fan: 0,
                 probe_any: false,
                 probe_value: None,
                 probe_refused: false,
                 dep_failed: None,
+                cond_failed: false,
+                failed_set: None,
+                failed_idx: None,
+                replies: BTreeMap::new(),
+                reply: None,
                 pre: BTreeMap::new(),
                 cursor: 0,
                 refused: false,
@@ -663,6 +861,7 @@ pub mod acquisition {
             if parallel {
                 let owners = self.txns[txn].owners.clone();
                 self.txns[txn].cursor = owners.len();
+                self.txns[txn].fan = owners.len();
                 for owner in owners {
                     self.pending.push(Msg::Lock { txn, owner });
                 }
@@ -756,7 +955,7 @@ pub mod acquisition {
                 ));
             }
             self.check_publication();
-            self.check_dependents();
+            self.check_programs();
             &self.report
         }
 
@@ -819,82 +1018,159 @@ pub mod acquisition {
             }
         }
 
-        /// The serial oracle for a dependent command: run the program
-        /// alone against the pre-state (reads, plain writes, then the
-        /// command) and compare with what the owners published.
-        fn check_dependents(&mut self) {
+        /// The serial oracle (M6-S07's AC): every terminal transaction's
+        /// reply array and published state equal the program run alone
+        /// against the pre-state, in queue order.
+        fn check_programs(&mut self) {
             for i in 0..self.txns.len() {
                 let t = &self.txns[i];
-                let Some(dep) = t.spec.dependent.clone() else { continue };
                 let Phase::Terminal(outcome) = t.phase.clone() else { continue };
-                let (succeeds, expected) = self.serial_expectation(i);
-                let label = dep.label();
+                if t.bypass || t.program.is_empty() {
+                    continue;
+                }
+                let serial = self.serial_run(i);
                 match outcome {
-                    Outcome::Aborted(reason) if t.dep_failed == Some(reason) && succeeds => {
-                        self.report.violations.push(format!(
-                            "DEPENDENT LEG: T{} aborted ({reason}) but the serial history commits its {label}",
-                            i + 1
-                        ));
-                    }
-                    Outcome::Committed => {
-                        let seq = t.commit_seq.expect("committed");
-                        for (key, want) in expected {
-                            let later = self
-                                .committed_writes
-                                .get(&key)
-                                .is_some_and(|v| v.iter().any(|(s, _)| *s > seq));
-                            if later {
-                                continue;
-                            }
-                            let got = self.published(key);
-                            if got != want {
-                                self.report.violations.push(format!(
-                                    "DEPENDENT COMMAND: T{}'s {label} left key {key}@cell{} = {} where the serial history gives {}",
-                                    i + 1,
-                                    self.owner_of(key),
-                                    name(got),
-                                    name(want)
-                                ));
-                            }
-                        }
-                    }
-                    _ => {}
+                    Outcome::Committed => self.check_committed(i, &serial),
+                    Outcome::Aborted(reason) => self.check_aborted(i, reason, &serial),
+                    Outcome::Stuck => {}
                 }
             }
         }
 
-        /// Whether the dependent command succeeds serially, and the value
-        /// of each of its keys afterwards.
-        fn serial_expectation(&self, txn: usize) -> (bool, Vec<(Key, Option<usize>)>) {
-            let t = &self.txns[txn];
-            // A plain write on the owner whose leg failed its condition
-            // never happened (the leg stages nothing before the command).
-            let view = |k: Key| -> Option<usize> {
-                if t.spec.writes.contains(&k) && t.spec.fails_at != Some(self.owner_of(k)) {
-                    Some(txn)
-                } else {
-                    t.pre.get(&k).copied().flatten()
-                }
-            };
-            match t.spec.dependent.as_ref().expect("a dependent command") {
-                Dependent::Move { src, dst } => {
-                    let (src_view, dst_view) = (view(*src), view(*dst));
-                    let refused = t.spec.refuses_at == Some(self.owner_of(*dst));
-                    if src_view.is_some() && !refused {
-                        (true, vec![(*src, None), (*dst, src_view)])
-                    } else {
-                        (false, vec![(*src, src_view), (*dst, dst_view)])
-                    }
-                }
-                Dependent::SetIfNoneExist { keys } => {
-                    let refused = keys.iter().any(|k| t.spec.refuses_at == Some(self.owner_of(*k)));
-                    if keys.iter().all(|k| view(*k).is_none()) && !refused {
-                        (true, keys.iter().map(|k| (*k, Some(txn))).collect())
-                    } else {
-                        (false, keys.iter().map(|k| (*k, view(*k))).collect())
-                    }
+        fn check_committed(&mut self, i: usize, serial: &Serial) {
+            let t = &self.txns[i];
+            if let Some(reason) = serial.abort {
+                self.report.violations.push(format!(
+                    "PROGRAM ORACLE: T{} committed where the serial history aborts ({reason})",
+                    i + 1
+                ));
+                return;
+            }
+            let got = t.reply.clone().expect("a committed transaction replied");
+            let mut out = Vec::new();
+            for (idx, (g, w)) in got.iter().zip(&serial.replies).enumerate() {
+                if g != w {
+                    out.push(format!(
+                        "REPLY MISMATCH: T{}'s {} replied {} where the serial history replies {}",
+                        i + 1,
+                        t.program[idx].label(),
+                        g.text(),
+                        w.text()
+                    ));
                 }
             }
+            let seq = t.commit_seq.expect("committed");
+            for key in t.writes_all.clone() {
+                let later = self
+                    .committed_writes
+                    .get(&key)
+                    .is_some_and(|v| v.iter().any(|(s, _)| *s > seq));
+                if later {
+                    continue;
+                }
+                let want = serial.state.get(&key).copied().flatten();
+                let got = self.published(key);
+                if got == want {
+                    continue;
+                }
+                let writer = t
+                    .program
+                    .iter()
+                    .rposition(|c| c.writes() && c.keys().contains(&key))
+                    .expect("a written key has a writing command");
+                let kind = match t.program[writer] {
+                    Cmd::Dep(_) => "DEPENDENT COMMAND",
+                    _ => "PLAIN COMMAND",
+                };
+                out.push(format!(
+                    "{kind}: T{}'s {} left key {key}@cell{} = {} where the serial history gives {}",
+                    i + 1,
+                    t.program[writer].label(),
+                    self.owner_of(key),
+                    name(got),
+                    name(want)
+                ));
+            }
+            self.report.violations.extend(out);
+        }
+
+        fn check_aborted(&mut self, i: usize, reason: &'static str, serial: &Serial) {
+            let t = &self.txns[i];
+            // Only a command's own failure is the oracle's business —
+            // cancellations, dirty watches and refusals are not.
+            let Some(idx) = t.failed_idx else { return };
+            let label = t.program[idx].label();
+            let msg = match serial.abort {
+                None => format!(
+                    "DEPENDENT LEG: T{} aborted ({reason}) but the serial history commits its {label}",
+                    i + 1
+                ),
+                Some(want) if want != reason => format!(
+                    "PROGRAM ORACLE: T{} aborted ({reason}) where the serial history aborts ({want})",
+                    i + 1
+                ),
+                Some(_) => return,
+            };
+            self.report.violations.push(msg);
+        }
+
+        /// The program run alone against the pre-state with the same
+        /// planted refusal and condition failure: replies in queue order,
+        /// the state afterwards, and where `INF.TX` aborts.
+        fn serial_run(&self, txn: usize) -> Serial {
+            let t = &self.txns[txn];
+            let spec = &t.spec;
+            let mut state = t.pre.clone();
+            let mut replies = Vec::new();
+            let mut cond_used = false;
+            let mut abort = None;
+            for cmd in &t.program {
+                let reply = match cmd {
+                    Cmd::Get(k) => Reply::Value(state.get(k).copied().flatten()),
+                    Cmd::Set(k) => {
+                        if spec.fails_at == Some(self.owner_of(*k)) && !cond_used {
+                            cond_used = true;
+                            Reply::Err("condition failed")
+                        } else {
+                            state.insert(*k, Some(txn));
+                            Reply::Ok
+                        }
+                    }
+                    Cmd::Dep(Dependent::Move { src, dst }) => {
+                        let value = state.get(src).copied().flatten();
+                        if value.is_none() {
+                            Reply::Err("no such key")
+                        } else if spec.refuses_at == Some(self.owner_of(*dst)) {
+                            Reply::Err("destination refused")
+                        } else {
+                            state.insert(*dst, value);
+                            state.insert(*src, None);
+                            Reply::Ok
+                        }
+                    }
+                    Cmd::Dep(Dependent::SetIfNoneExist { keys }) => {
+                        if keys.iter().any(|k| spec.refuses_at == Some(self.owner_of(*k))) {
+                            Reply::Err("refused")
+                        } else if keys.iter().any(|k| state.get(k).copied().flatten().is_some()) {
+                            Reply::Int(0)
+                        } else {
+                            for k in keys {
+                                state.insert(*k, Some(txn));
+                            }
+                            Reply::Int(1)
+                        }
+                    }
+                };
+                let failure = reply.failure();
+                replies.push(reply);
+                if spec.native
+                    && let Some(reason) = failure
+                {
+                    abort = Some(reason);
+                    break;
+                }
+            }
+            Serial { replies, state, abort }
         }
 
         fn held_intents(&self) -> usize {
@@ -988,9 +1264,7 @@ pub mod acquisition {
                     }
                 }
                 Msg::Exec { txn, owner, stage } => self.owner_exec(txn, owner, stage),
-                Msg::SubResult { txn, failed, probe, dep_failed } => {
-                    self.coord_subresult(txn, failed, probe, dep_failed)
-                }
+                Msg::SubResult(res) => self.coord_subresult(res),
                 Msg::Unlock { txn, owner, commit } => self.owner_unlock(txn, owner, commit),
                 Msg::DecisionDurable { txn } => {
                     self.txns[txn].durable = true;
@@ -1005,15 +1279,25 @@ pub mod acquisition {
             let txid = self.txns[txn].txid;
             if self.txns[txn].bypass {
                 // Read-uncommitted variant: the read is the whole visit.
-                for (key, _) in &intents {
-                    self.observe_read(txn, owner, *key);
+                let program = self.txns[txn].program.clone();
+                let mut replies = Vec::new();
+                for (i, cmd) in program.iter().enumerate() {
+                    if let Cmd::Get(key) = cmd
+                        && self.owner_of(*key) == owner
+                    {
+                        let seen = self.observe_read(txn, owner, *key);
+                        replies.push((i, Reply::Value(seen)));
+                    }
                 }
-                self.pending.push(Msg::SubResult {
+                self.pending.push(Msg::SubResult(SubResult {
                     txn,
+                    owner,
                     failed: false,
                     probe: Probe::default(),
                     dep_failed: None,
-                });
+                    replies,
+                    dep_reply: None,
+                }));
                 return;
             }
             if let Acquisition::Reschedule { .. } = self.rules.acquisition {
@@ -1156,23 +1440,91 @@ pub mod acquisition {
             }
         }
 
+        /// Every intent granted: snapshot the pre-state and fan the first
+        /// stage (a program with no stage decides at once).
         fn exec_fan(&mut self, txn: usize) {
             self.txns[txn].phase = Phase::Executing;
-            self.txns[txn].stage = ExecStage::Legs;
-            let pre: BTreeMap<Key, Option<usize>> =
-                self.txns[txn].writes_all.iter().map(|k| (*k, self.published(*k))).collect();
-            self.txns[txn].pre = pre;
-            let owners = self.txns[txn].owners.clone();
-            self.txns[txn].cursor = owners.len();
+            let mut keys: Vec<Key> = self.txns[txn].program.iter().flat_map(Cmd::keys).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            self.txns[txn].pre = keys.iter().map(|k| (*k, self.published(*k))).collect();
+            self.txns[txn].si = 0;
+            if self.txns[txn].stages.is_empty() {
+                self.decide(txn);
+                return;
+            }
+            self.fan_stage(txn);
+        }
+
+        /// Fan the stage in flight to every owner with a plain command in
+        /// it and to its dependent command's owners (the gather).
+        fn fan_stage(&mut self, txn: usize) {
+            let si = self.txns[txn].si;
+            let owners = self.stage_owners(txn, si);
+            let t = &mut self.txns[txn];
+            t.stage = ExecStage::Legs;
+            t.fan = owners.len();
+            t.cursor = owners.len();
+            t.probe_any = false;
+            t.probe_value = None;
+            t.probe_refused = false;
             for owner in owners {
                 self.pending.push(Msg::Exec { txn, owner, stage: ExecStage::Legs });
             }
-            self.enter(txn, CancelPhase::Execute);
+            self.enter(txn, CancelPhase::Execute(si));
         }
 
-        fn observe_read(&mut self, txn: usize, owner: Cell, key: Key) {
-            let seen = self.owners[owner].values.get(&key).copied().flatten();
-            if let Some(w) = seen
+        fn stage_owners(&self, txn: usize, si: usize) -> Vec<Cell> {
+            let t = &self.txns[txn];
+            let stage = &t.stages[si];
+            let mut owners: Vec<Cell> = stage
+                .cmds
+                .iter()
+                .chain(stage.dep.iter())
+                .flat_map(|i| t.program[*i].keys())
+                .map(|k| self.owner_of(k))
+                .collect();
+            owners.sort_unstable();
+            owners.dedup();
+            owners
+        }
+
+        /// The dependent command closing stage `si`, if any.
+        fn stage_dep(&self, txn: usize, si: usize) -> Option<(usize, Dependent)> {
+            let t = &self.txns[txn];
+            t.stages[si].dep.map(|i| match &t.program[i] {
+                Cmd::Dep(dep) => (i, dep.clone()),
+                cmd => unreachable!("a stage closes with a dependent command, not {cmd:?}"),
+            })
+        }
+
+        /// The stage after the one in flight, or the decision.
+        fn next_stage(&mut self, txn: usize) {
+            let t = &mut self.txns[txn];
+            t.si += 1;
+            t.dep_failed = None;
+            if t.si < t.stages.len() {
+                self.fan_stage(txn);
+            } else {
+                self.decide(txn);
+            }
+        }
+
+        /// A read at the owner: the private set first under
+        /// read-your-writes, else the published value. Records what was
+        /// seen for the decision's stale-read check.
+        fn observe_read(&mut self, txn: usize, owner: Cell, key: Key) -> Option<usize> {
+            let staged = self.owners[owner]
+                .staged
+                .get(&txn)
+                .and_then(|s| s.iter().rev().find(|(k, _)| *k == key).map(|(_, v)| *v));
+            let (seen, own) = match staged {
+                Some(v) if self.rules.read_your_writes => (v, true),
+                _ => (self.owners[owner].values.get(&key).copied().flatten(), false),
+            };
+            if !own
+                && let Some(w) = seen
+                && w != txn
                 && self.txns[w].commit_seq.is_none()
             {
                 self.report.violations.push(format!(
@@ -1182,18 +1534,20 @@ pub mod acquisition {
                     w + 1
                 ));
             }
-            self.txns[txn].reads_seen.push((key, seen));
+            self.txns[txn].reads_seen.push((key, seen, own));
+            seen
         }
 
         fn owner_exec(&mut self, txn: usize, owner: Cell, stage: ExecStage) {
-            let dep = self.txns[txn].spec.dependent.clone();
+            if stage == ExecStage::Legs {
+                self.owner_legs(txn, owner);
+                return;
+            }
+            let si = self.txns[txn].si;
+            let (_, dep) = self.stage_dep(txn, si).expect("an apply step has its command");
             let mut probe = Probe::default();
             match (stage, dep) {
-                (ExecStage::Legs, _) => {
-                    self.owner_legs(txn, owner);
-                    return;
-                }
-                (ExecStage::ApplyDest, Some(Dependent::Move { dst, .. })) => {
+                (ExecStage::ApplyDest, Dependent::Move { dst, .. }) => {
                     if self.txns[txn].spec.refuses_at == Some(owner) {
                         probe.refused = true;
                     } else {
@@ -1201,58 +1555,87 @@ pub mod acquisition {
                         self.stage_write(txn, owner, dst, value);
                     }
                 }
-                (ExecStage::ApplySrc, Some(Dependent::Move { src, .. })) => {
+                (ExecStage::ApplySrc, Dependent::Move { src, .. }) => {
                     self.stage_write(txn, owner, src, None);
                 }
-                (ExecStage::Apply, Some(Dependent::SetIfNoneExist { keys })) => {
+                (ExecStage::Apply, Dependent::SetIfNoneExist { keys }) => {
                     for key in keys {
                         if self.owner_of(key) == owner {
                             self.stage_write(txn, owner, key, Some(txn));
                         }
                     }
                 }
-                (stage, dep) => unreachable!("stage {stage:?} without its command: {dep:?}"),
+                (stage, dep) => unreachable!("step {stage:?} without its command: {dep:?}"),
             }
-            self.pending.push(Msg::SubResult { txn, failed: false, probe, dep_failed: None });
+            self.pending.push(Msg::SubResult(SubResult {
+                txn,
+                owner,
+                failed: false,
+                probe,
+                dep_failed: None,
+                replies: Vec::new(),
+                dep_reply: None,
+            }));
         }
 
-        /// The plain leg: reads, then the condition, then the writes —
-        /// staged privately (chosen) or written live (withdrawn); then the
-        /// dependent command's gather half (chosen) or its whole
-        /// owner-local half (withdrawn).
+        /// The plain leg of the stage in flight: this owner's slice of the
+        /// program in queue order — reads against the private set, writes
+        /// staged privately (chosen) or written live (withdrawn), the
+        /// first write on `fails_at` failing its condition — then the
+        /// stage's dependent command: its gather half (chosen) or its
+        /// whole owner-local half (withdrawn).
         fn owner_legs(&mut self, txn: usize, owner: Cell) {
-            let spec = self.txns[txn].spec.clone();
-            let reads: Vec<Key> =
-                spec.reads.iter().copied().filter(|k| self.owner_of(*k) == owner).collect();
-            let writes: Vec<Key> =
-                spec.writes.iter().copied().filter(|k| self.owner_of(*k) == owner).collect();
-            for key in reads {
-                self.observe_read(txn, owner, key);
+            let si = self.txns[txn].si;
+            let stage = self.txns[txn].stages[si].clone();
+            let program = self.txns[txn].program.clone();
+            let fails_here = self.txns[txn].spec.fails_at == Some(owner);
+            if self.rules.stage_privately {
+                self.owners[owner].staged.entry(txn).or_default();
             }
-            // A failed condition stages nothing of the plain writes; the
-            // dependent command is a later command and still runs.
-            let failed = spec.fails_at == Some(owner);
-            if !failed {
-                if self.rules.stage_privately {
-                    self.owners[owner].staged.entry(txn).or_default();
-                } else {
-                    let oi = self.txns[txn].owners.iter().position(|o| *o == owner).expect("owner");
-                    self.txns[txn].published[oi] = true;
+            let mut replies = Vec::new();
+            let mut failed = false;
+            for i in stage.cmds {
+                match &program[i] {
+                    Cmd::Get(key) if self.owner_of(*key) == owner => {
+                        let seen = self.observe_read(txn, owner, *key);
+                        replies.push((i, Reply::Value(seen)));
+                    }
+                    Cmd::Set(key) if self.owner_of(*key) == owner => {
+                        if fails_here && !self.txns[txn].cond_failed {
+                            self.txns[txn].cond_failed = true;
+                            failed = true;
+                            replies.push((i, Reply::Err("condition failed")));
+                        } else {
+                            self.stage_write(txn, owner, *key, Some(txn));
+                            replies.push((i, Reply::Ok));
+                        }
+                    }
+                    _ => {}
                 }
-                for key in writes {
-                    self.stage_write(txn, owner, key, Some(txn));
-                }
+            }
+            if !self.rules.stage_privately && !failed {
+                let oi = self.txns[txn].owners.iter().position(|o| *o == owner).expect("owner");
+                self.txns[txn].published[oi] = true;
             }
             let mut probe = Probe::default();
             let mut dep_failed = None;
-            if let Some(dep) = &spec.dependent {
+            let mut dep_reply = None;
+            if let Some((_, dep)) = self.stage_dep(txn, si) {
                 if self.rules.stage_dependents {
-                    probe = self.gather(txn, owner, dep);
+                    probe = self.gather(txn, owner, &dep);
                 } else {
-                    dep_failed = self.independent_half(txn, owner, dep);
+                    (dep_failed, dep_reply) = self.independent_half(txn, owner, &dep);
                 }
             }
-            self.pending.push(Msg::SubResult { txn, failed, probe, dep_failed });
+            self.pending.push(Msg::SubResult(SubResult {
+                txn,
+                owner,
+                failed,
+                probe,
+                dep_failed,
+                replies,
+                dep_reply,
+            }));
         }
 
         /// A key as the owner's leg sees it: the transaction's private
@@ -1292,46 +1675,51 @@ pub mod acquisition {
         /// arguments it has — the other owner's private set is invisible,
         /// so a source's staged value is read as published (pre-transaction)
         /// and the source's delete does not wait for the destination.
+        /// Returns the half's failure and its reply.
         fn independent_half(
             &mut self,
             txn: usize,
             owner: Cell,
             dep: &Dependent,
-        ) -> Option<&'static str> {
+        ) -> (Option<&'static str>, Option<Reply>) {
             match dep {
                 Dependent::Move { src, dst } => {
                     if self.owner_of(*src) == owner {
                         self.stage_write(txn, owner, *src, None);
                     }
-                    if self.owner_of(*dst) == owner {
-                        if self.txns[txn].spec.refuses_at == Some(owner) {
-                            return Some("destination refused");
-                        }
-                        let Some(value) =
-                            self.owners[self.owner_of(*src)].values.get(src).copied().flatten()
-                        else {
-                            return Some("no such key");
-                        };
-                        self.stage_write(txn, owner, *dst, Some(value));
+                    if self.owner_of(*dst) != owner {
+                        return (None, None);
                     }
-                    None
+                    if self.txns[txn].spec.refuses_at == Some(owner) {
+                        return (
+                            Some("destination refused"),
+                            Some(Reply::Err("destination refused")),
+                        );
+                    }
+                    let Some(value) =
+                        self.owners[self.owner_of(*src)].values.get(src).copied().flatten()
+                    else {
+                        return (Some("no such key"), Some(Reply::Err("no such key")));
+                    };
+                    self.stage_write(txn, owner, *dst, Some(value));
+                    (None, Some(Reply::Ok))
                 }
                 Dependent::SetIfNoneExist { keys } => {
                     let mine: Vec<Key> =
                         keys.iter().copied().filter(|k| self.owner_of(*k) == owner).collect();
                     if mine.is_empty() {
-                        return None;
+                        return (None, None);
                     }
                     if self.txns[txn].spec.refuses_at == Some(owner) {
-                        return Some("refused");
+                        return (Some("refused"), Some(Reply::Err("refused")));
                     }
                     if mine.iter().any(|k| self.view(txn, owner, *k).is_some()) {
-                        return Some("condition failed");
+                        return (Some("condition failed"), Some(Reply::Int(0)));
                     }
                     for key in mine {
                         self.stage_write(txn, owner, key, Some(txn));
                     }
-                    None
+                    (None, Some(Reply::Int(1)))
                 }
             }
         }
@@ -1355,21 +1743,30 @@ pub mod acquisition {
             self.txns[txn].published[oi] = true;
         }
 
-        fn coord_subresult(
-            &mut self,
-            txn: usize,
-            failed: bool,
-            probe: Probe,
-            dep_failed: Option<&'static str>,
-        ) {
-            if failed {
-                // The failing leg is the one still outstanding; mark by
-                // elimination is ambiguous, so record the spec's owner.
-                let owner = self.txns[txn].spec.fails_at.expect("a failing leg");
-                let oi = self.txns[txn].owners.iter().position(|o| *o == owner).expect("owner");
-                self.txns[txn].failed[oi] = true;
-            }
+        fn coord_subresult(&mut self, res: SubResult) {
+            let SubResult { txn, owner, failed, probe, dep_failed, replies, dep_reply } = res;
+            let si = self.txns[txn].si;
+            let dep_idx = self.txns[txn].stages.get(si).and_then(|s| s.dep);
             let t = &mut self.txns[txn];
+            if failed {
+                let oi = t.owners.iter().position(|o| *o == owner).expect("owner");
+                t.failed[oi] = true;
+                if t.failed_set.is_none() {
+                    t.failed_set =
+                        replies.iter().find(|(_, r)| r.failure().is_some()).map(|(i, _)| *i);
+                }
+            }
+            for (i, r) in replies {
+                t.replies.insert(i, r);
+            }
+            if let Some(r) = dep_reply {
+                let idx = dep_idx.expect("a half of the stage's dependent command");
+                let merged = match t.replies.remove(&idx) {
+                    Some(prev) => prev.worse(r),
+                    None => r,
+                };
+                t.replies.insert(idx, merged);
+            }
             if probe.present {
                 t.probe_any = true;
                 t.probe_value = probe.value;
@@ -1382,8 +1779,8 @@ pub mod acquisition {
             let stage = t.stage;
             if t.cursor != 0 {
                 if stage == ExecStage::Legs {
-                    let arrived = self.txns[txn].owners.len() - self.txns[txn].cursor;
-                    self.enter(txn, CancelPhase::Executed(arrived));
+                    let arrived = self.txns[txn].fan - self.txns[txn].cursor;
+                    self.enter(txn, CancelPhase::Executed(si, arrived));
                 }
                 return;
             }
@@ -1397,13 +1794,18 @@ pub mod acquisition {
                 ExecStage::Legs => {
                     let leg_failed = self.txns[txn].failed.iter().any(|f| *f);
                     let dep_failed = self.txns[txn].dep_failed;
-                    if native && (leg_failed || dep_failed.is_some()) {
-                        self.abort(txn, dep_failed.unwrap_or("condition failed"));
-                    } else if self.txns[txn].spec.dependent.is_some() && self.rules.stage_dependents
-                    {
+                    if native && leg_failed {
+                        // Queue order: the plain write failed before the
+                        // stage's dependent command ran.
+                        self.txns[txn].failed_idx = self.txns[txn].failed_set;
+                        self.abort(txn, "condition failed");
+                    } else if native && let Some(reason) = dep_failed {
+                        self.txns[txn].failed_idx = dep_idx;
+                        self.abort(txn, reason);
+                    } else if dep_idx.is_some() && self.rules.stage_dependents {
                         self.combine(txn);
                     } else {
-                        self.decide(txn);
+                        self.next_stage(txn);
                     }
                 }
                 ExecStage::ApplyDest => {
@@ -1411,16 +1813,25 @@ pub mod acquisition {
                         self.dependent_failed(txn, "destination refused");
                         return;
                     }
-                    let Some(Dependent::Move { src, .. }) = self.txns[txn].spec.dependent.clone()
-                    else {
+                    let Some((_, Dependent::Move { src, .. })) = self.stage_dep(txn, si) else {
                         unreachable!("ApplyDest is the move family's")
                     };
                     let owner = self.owner_of(src);
                     self.txns[txn].stage = ExecStage::ApplySrc;
                     self.txns[txn].cursor = 1;
+                    self.txns[txn].fan = 1;
                     self.pending.push(Msg::Exec { txn, owner, stage: ExecStage::ApplySrc });
                 }
-                ExecStage::ApplySrc | ExecStage::Apply => self.decide(txn),
+                ExecStage::ApplySrc => {
+                    let idx = dep_idx.expect("the move family's stage");
+                    self.txns[txn].replies.insert(idx, Reply::Ok);
+                    self.next_stage(txn);
+                }
+                ExecStage::Apply => {
+                    let idx = dep_idx.expect("the condition family's stage");
+                    self.txns[txn].replies.insert(idx, Reply::Int(1));
+                    self.next_stage(txn);
+                }
             }
         }
 
@@ -1428,11 +1839,13 @@ pub mod acquisition {
         /// into the verdict and the apply stage(s); a cancellation planted
         /// here aborts with every owner's private set discarded.
         fn combine(&mut self, txn: usize) {
-            self.enter(txn, CancelPhase::Combine);
+            let si = self.txns[txn].si;
+            self.enter(txn, CancelPhase::Combine(si));
             if self.txns[txn].phase != Phase::Executing {
                 return;
             }
-            match self.txns[txn].spec.dependent.clone().expect("a dependent command") {
+            let (_, dep) = self.stage_dep(txn, si).expect("a dependent command");
+            match dep {
                 Dependent::Move { dst, .. } => {
                     if !self.txns[txn].probe_any {
                         self.dependent_failed(txn, "no such key");
@@ -1441,6 +1854,7 @@ pub mod acquisition {
                     let owner = self.owner_of(dst);
                     self.txns[txn].stage = ExecStage::ApplyDest;
                     self.txns[txn].cursor = 1;
+                    self.txns[txn].fan = 1;
                     self.pending.push(Msg::Exec { txn, owner, stage: ExecStage::ApplyDest });
                 }
                 Dependent::SetIfNoneExist { keys } => {
@@ -1457,6 +1871,7 @@ pub mod acquisition {
                     owners.dedup();
                     self.txns[txn].stage = ExecStage::Apply;
                     self.txns[txn].cursor = owners.len();
+                    self.txns[txn].fan = owners.len();
                     for owner in owners {
                         self.pending.push(Msg::Exec { txn, owner, stage: ExecStage::Apply });
                     }
@@ -1465,13 +1880,28 @@ pub mod acquisition {
         }
 
         /// The dependent command fails whole with nothing of it staged:
-        /// `INF.TX` aborts, `EXEC` embeds the error and commits the rest.
+        /// `INF.TX` aborts, `EXEC` embeds the error (0 for a failed
+        /// `MSETNX` condition) and continues with the next stage.
         fn dependent_failed(&mut self, txn: usize, reason: &'static str) {
-            self.txns[txn].dep_failed = Some(reason);
-            if self.txns[txn].spec.native {
+            let si = self.txns[txn].si;
+            let (idx, dep) = self.stage_dep(txn, si).expect("a dependent command");
+            let reply = match (dep, reason) {
+                (Dependent::SetIfNoneExist { .. }, "condition failed") => Reply::Int(0),
+                _ => Reply::Err(reason),
+            };
+            let native = {
+                let t = &mut self.txns[txn];
+                t.dep_failed = Some(reason);
+                t.replies.insert(idx, reply);
+                if t.spec.native {
+                    t.failed_idx = Some(idx);
+                }
+                t.spec.native
+            };
+            if native {
                 self.abort(txn, reason);
             } else {
-                self.decide(txn);
+                self.next_stage(txn);
             }
         }
 
@@ -1502,6 +1932,9 @@ pub mod acquisition {
             self.txns[txn].commit_seq = Some(seq);
             self.txns[txn].decided_commit = true;
             let t = &self.txns[txn];
+            let reply: Vec<Reply> = (0..t.program.len())
+                .map(|i| t.replies.get(&i).cloned().expect("every queued command replied"))
+                .collect();
             let committed: Vec<(Key, Option<usize>)> = if self.rules.stage_privately {
                 // What the owners will publish: their private sets.
                 t.owners
@@ -1521,13 +1954,19 @@ pub mod acquisition {
                     .map(|k| (k, Some(txn)))
                     .collect()
             };
+            self.txns[txn].reply = Some(reply);
             for (key, value) in committed {
                 self.committed_writes.entry(key).or_default().push((seq, value));
             }
             // A bypass read has no exclusion interval to pin its point to;
-            // its uncommitted-read check above is the meaningful one.
+            // its uncommitted-read check above is the meaningful one. A
+            // read answered from the private set is the program's own
+            // business — the serial oracle checks it.
             if !self.txns[txn].bypass {
-                for (key, seen) in self.txns[txn].reads_seen.clone() {
+                for (key, seen, own) in self.txns[txn].reads_seen.clone() {
+                    if own {
+                        continue;
+                    }
                     let last = self
                         .committed_writes
                         .get(&key)
@@ -1619,6 +2058,12 @@ pub mod acquisition {
         pub fn published(&self, key: Key) -> Option<usize> {
             self.owners[self.owner_of(key)].values.get(&key).copied().flatten()
         }
+
+        /// A committed transaction's reply array in queue order (`None`
+        /// until it decided, or if it aborted).
+        pub fn reply(&self, txn: usize) -> Option<Vec<Reply>> {
+            self.txns[txn].reply.clone()
+        }
     }
 
     fn name(txn: Option<usize>) -> String {
@@ -1637,11 +2082,12 @@ pub mod acquisition {
     }
 
     /// A seeded storm: `txns` transactions over `keys` keys across `cells`
-    /// cells, 1–4 keys each, mixed reads/writes/watches, random delivery;
-    /// with `faults`, one in four is native, one in four fails a leg, one
-    /// in four carries a cross-owner `RENAME` or `MSETNX` (one in four of
-    /// those with a refusing owner) and one in four is cancelled at a
-    /// random phase.
+    /// cells, ordered programs of 1–4 `GET`/`SET`/WATCH steps, random
+    /// delivery; with `faults`, one in four is native, one in four fails
+    /// its first plain write, one in four carries a cross-owner `RENAME`
+    /// or `MSETNX` at a random queue position (one in four of those a
+    /// second one, one in four with a refusing owner) and one in four is
+    /// cancelled at a random phase of a random stage.
     pub fn storm(rules: Rules, cells: usize, keys: u32, txns: usize, seed: u64) -> Report {
         storm_with(rules, cells, keys, txns, seed, false)
     }
@@ -1662,54 +2108,73 @@ pub mod acquisition {
             for _ in 0..n {
                 let k = rng.below(keys as usize) as Key;
                 match rng.below(4) {
-                    0 => spec.reads.push(k),
+                    0 => spec.program.push(Cmd::Get(k)),
                     1 => spec.watches.push(k),
-                    _ => spec.writes.push(k),
+                    _ => spec.program.push(Cmd::Set(k)),
                 }
             }
             if faults {
-                spec.native = rng.below(4) == 0;
-                if rng.below(4) == 0 {
-                    let owner = spec.writes.first().map(|k| *k as usize % cells);
-                    spec.fails_at = owner;
-                }
-                if rng.below(4) == 0 && cells >= 2 {
-                    let a = rng.below(keys as usize) as Key;
-                    let b = rng.below(keys as usize) as Key;
-                    if a as usize % cells != b as usize % cells {
-                        let dep = if rng.below(2) == 0 {
-                            Dependent::Move { src: a, dst: b }
-                        } else {
-                            Dependent::SetIfNoneExist { keys: vec![a, b] }
-                        };
-                        if rng.below(4) == 0 {
-                            spec.refuses_at = Some(match dep {
-                                Dependent::Move { dst, .. } => dst as usize % cells,
-                                Dependent::SetIfNoneExist { .. } => {
-                                    [a, b][rng.below(2)] as usize % cells
-                                }
-                            });
-                        }
-                        spec.dependent = Some(dep);
-                    }
-                }
-                if rng.below(4) == 0 {
-                    let phase = match rng.below(7) {
-                        0 => CancelPhase::Admit,
-                        1 => CancelPhase::Acquire(rng.below(3)),
-                        2 => CancelPhase::Execute,
-                        3 => CancelPhase::Executed(1),
-                        4 => CancelPhase::Decided,
-                        5 if spec.dependent.is_some() => CancelPhase::Combine,
-                        _ => CancelPhase::Durable,
-                    };
-                    let kind = if rng.below(2) == 0 { Cancel::Disconnect } else { Cancel::Timeout };
-                    spec.cancel = Some((phase, kind));
-                }
+                storm_faults(&mut rng, &mut spec, cells, keys);
             }
             m.submit(spec);
         }
         m.run(200_000).clone()
+    }
+
+    fn storm_faults(rng: &mut Rng, spec: &mut TxnSpec, cells: usize, keys: u32) {
+        spec.native = rng.below(4) == 0;
+        if rng.below(4) == 0 {
+            spec.fails_at = spec.program.iter().find_map(|c| match c {
+                Cmd::Set(k) => Some(*k as usize % cells),
+                _ => None,
+            });
+        }
+        let deps = match (rng.below(4), rng.below(4)) {
+            (0, 0) => 2,
+            (0, _) => 1,
+            _ => 0,
+        };
+        for _ in 0..deps {
+            if cells < 2 {
+                break;
+            }
+            let a = rng.below(keys as usize) as Key;
+            let b = rng.below(keys as usize) as Key;
+            if a as usize % cells == b as usize % cells {
+                continue;
+            }
+            let dep = if rng.below(2) == 0 {
+                Dependent::Move { src: a, dst: b }
+            } else {
+                Dependent::SetIfNoneExist { keys: vec![a, b] }
+            };
+            if rng.below(4) == 0 {
+                spec.refuses_at = Some(match dep {
+                    Dependent::Move { dst, .. } => dst as usize % cells,
+                    Dependent::SetIfNoneExist { .. } => [a, b][rng.below(2)] as usize % cells,
+                });
+            }
+            let at = rng.below(spec.program.len() + 1);
+            spec.program.insert(at, Cmd::Dep(dep));
+        }
+        if rng.below(4) == 0 {
+            let stages = stages_of(&spec.program);
+            let s = if stages.is_empty() { 0 } else { stages[rng.below(stages.len())].0 };
+            let combines: Vec<usize> = stages.iter().filter(|(_, d)| *d).map(|(i, _)| *i).collect();
+            let phase = match rng.below(7) {
+                0 => CancelPhase::Admit,
+                1 => CancelPhase::Acquire(rng.below(3)),
+                2 => CancelPhase::Execute(s),
+                3 => CancelPhase::Executed(s, 1),
+                4 => CancelPhase::Decided,
+                5 if !combines.is_empty() => {
+                    CancelPhase::Combine(combines[rng.below(combines.len())])
+                }
+                _ => CancelPhase::Durable,
+            };
+            let kind = if rng.below(2) == 0 { Cancel::Disconnect } else { Cancel::Timeout };
+            spec.cancel = Some((phase, kind));
+        }
     }
 
     /// Two clients: T writes `a@0` and `b@1`; a reader issues `GET a`
@@ -1841,9 +2306,94 @@ pub mod acquisition {
         (m.report.clone(), m.outcome(1), [m.published(0), m.published(1)])
     }
 
-    /// `SET a; RENAME a b` with a disconnect or timeout landing the moment
-    /// T enters `phase` — `Combine` included. Returns the report, T's
-    /// outcome and whether the serial outcome (`a` absent, `b` = T) holds.
+    /// What an ordered history returns: the report, T's outcome, its reply
+    /// array (committed only) and the published writer of each key.
+    pub type Ordered<const N: usize> = (Report, Outcome, Option<Vec<Reply>>, [Option<usize>; N]);
+
+    fn ordered<const N: usize>(m: &Model, t: usize) -> Ordered<N> {
+        let published: [Option<usize>; N] = std::array::from_fn(|k| m.published(k as Key));
+        (m.report.clone(), m.outcome(t), m.reply(t), published)
+    }
+
+    /// The review's complete F04 history: `EXEC { SET a; RENAME a b;
+    /// GET b }` with `a@0`, `b@1` — the `GET` is queued after the
+    /// dependent command and must answer the value its apply staged on
+    /// the other owner, in queue order.
+    pub fn ordered_rename_history(rules: Rules, native: bool) -> Ordered<2> {
+        let mut m = Model::new(rules, 2, 19);
+        let t = m.submit(TxnSpec {
+            coordinator: 0,
+            program: vec![Cmd::Set(0), Cmd::Dep(Dependent::Move { src: 0, dst: 1 }), Cmd::Get(1)],
+            native,
+            ..Default::default()
+        });
+        m.run(10_000);
+        ordered(&m, t)
+    }
+
+    /// Two dependent commands in one queue over three owners: `MSETNX a b;
+    /// RENAME b c; GET c; GET b` with `a@0`, `b@1`, `c@2` — the second
+    /// command's gather must see the first's apply in `b`'s private set.
+    pub fn consecutive_dependents_history(rules: Rules, native: bool) -> Ordered<3> {
+        let mut m = Model::new(rules, 3, 23);
+        let t = m.submit(TxnSpec {
+            coordinator: 0,
+            program: vec![
+                Cmd::Dep(Dependent::SetIfNoneExist { keys: vec![0, 1] }),
+                Cmd::Dep(Dependent::Move { src: 1, dst: 2 }),
+                Cmd::Get(2),
+                Cmd::Get(1),
+            ],
+            native,
+            ..Default::default()
+        });
+        m.run(10_000);
+        ordered(&m, t)
+    }
+
+    /// A refused command followed by reads: `SET a; RENAME a b; GET a;
+    /// GET b` where `b`'s owner cannot reserve — `EXEC` embeds the refusal
+    /// and the reads see the `SET` kept and `b` untouched; `INF.TX`
+    /// aborts with nothing published.
+    pub fn refused_then_read_history(rules: Rules, native: bool) -> Ordered<2> {
+        let mut m = Model::new(rules, 2, 29);
+        let t = m.submit(TxnSpec {
+            coordinator: 0,
+            program: vec![
+                Cmd::Set(0),
+                Cmd::Dep(Dependent::Move { src: 0, dst: 1 }),
+                Cmd::Get(0),
+                Cmd::Get(1),
+            ],
+            native,
+            refuses_at: Some(1),
+            ..Default::default()
+        });
+        m.run(10_000);
+        ordered(&m, t)
+    }
+
+    /// Reply order across owners with a failed condition in the middle:
+    /// `SET a; SET b; GET b; GET a` with `a@0`, `b@1`, `b`'s `SET` failing
+    /// its condition (`fails`) — the replies come back in queue order
+    /// whatever the legs' arrival order, and each `GET` answers its own
+    /// leg's private set.
+    pub fn reply_order_history(rules: Rules, fails: bool) -> Ordered<2> {
+        let mut m = Model::new(rules, 2, 31);
+        let t = m.submit(TxnSpec {
+            coordinator: 1,
+            program: vec![Cmd::Set(0), Cmd::Set(1), Cmd::Get(1), Cmd::Get(0)],
+            fails_at: fails.then_some(1),
+            ..Default::default()
+        });
+        m.run(10_000);
+        ordered(&m, t)
+    }
+
+    /// `SET a; RENAME a b; GET b` with a disconnect or timeout landing the
+    /// moment T enters `phase` — `Combine(0)` and the second stage
+    /// included. Returns the report, T's outcome and whether the serial
+    /// outcome (`a` absent, `b` = T) holds.
     pub fn dependent_cancellation_history(
         rules: Rules,
         phase: CancelPhase,
@@ -1853,8 +2403,7 @@ pub mod acquisition {
         let mut m = Model::new(rules, 2, seed);
         let t = m.submit(TxnSpec {
             coordinator: 0,
-            writes: vec![0],
-            dependent: Some(Dependent::Move { src: 0, dst: 1 }),
+            program: vec![Cmd::Set(0), Cmd::Dep(Dependent::Move { src: 0, dst: 1 }), Cmd::Get(1)],
             cancel: Some((phase, kind)),
             ..Default::default()
         });
@@ -1864,14 +2413,15 @@ pub mod acquisition {
     }
 
     /// Every phase a cancellation can land in when the transaction carries
-    /// a dependent command.
-    pub const DEP_PHASES: [CancelPhase; 8] = [
+    /// a dependent command followed by a second stage.
+    pub const DEP_PHASES: [CancelPhase; 9] = [
         CancelPhase::Admit,
         CancelPhase::Acquire(0),
         CancelPhase::Acquire(1),
-        CancelPhase::Execute,
-        CancelPhase::Executed(1),
-        CancelPhase::Combine,
+        CancelPhase::Execute(0),
+        CancelPhase::Executed(0, 1),
+        CancelPhase::Combine(0),
+        CancelPhase::Execute(1),
         CancelPhase::Decided,
         CancelPhase::Durable,
     ];
@@ -1881,8 +2431,8 @@ pub mod acquisition {
         CancelPhase::Admit,
         CancelPhase::Acquire(0),
         CancelPhase::Acquire(1),
-        CancelPhase::Execute,
-        CancelPhase::Executed(1),
+        CancelPhase::Execute(0),
+        CancelPhase::Executed(0, 1),
         CancelPhase::Decided,
         CancelPhase::Durable,
     ];
@@ -4738,7 +5288,7 @@ pub mod retention {
 mod tests {
     use super::Variant;
     use super::acquisition::{
-        self, Acquisition, Cancel, CancelPhase, CancelUntil, Dependent, Outcome, Rules,
+        self, Acquisition, Cancel, CancelPhase, CancelUntil, Cmd, Dependent, Outcome, Reply, Rules,
     };
     use super::credits;
     use super::durable;
@@ -4989,8 +5539,12 @@ mod tests {
     #[test]
     fn withdrawn_live_writes_outlive_a_cancel_between_two_legs() {
         let rules = Rules { stage_privately: false, ..Rules::chosen() };
-        let (r, outcome, _) =
-            acquisition::cancellation_history(rules, CancelPhase::Executed(1), Cancel::Timeout, 3);
+        let (r, outcome, _) = acquisition::cancellation_history(
+            rules,
+            CancelPhase::Executed(0, 1),
+            Cancel::Timeout,
+            3,
+        );
         assert_eq!(outcome, Outcome::Aborted("timeout"));
         assert_eq!(r.violations.len(), 1, "{r:?}");
         assert!(
@@ -5012,11 +5566,11 @@ mod tests {
     }
 
     #[test]
-    fn withdrawn_rules_violate_some_fault_storm_within_64_seeds() {
+    fn withdrawn_rules_violate_some_fault_storm_within_256_seeds() {
         let staging = Rules { stage_privately: false, ..Rules::chosen() };
         let cancel = Rules { cancel_until: CancelUntil::DurableDecision, ..Rules::chosen() };
-        let hits = |rules: Rules, prefix: &str| {
-            (1..=64u64)
+        let hits = |rules: Rules, prefix: &str, seeds: u64| {
+            (1..=seeds)
                 .filter(|s| {
                     acquisition::storm_with(rules, 4, 6, 24, *s, true)
                         .violations
@@ -5025,12 +5579,16 @@ mod tests {
                 })
                 .count()
         };
-        let staging_hits = hits(staging, "STAGING VIOLATION");
-        let partial_hits = hits(cancel, "PARTIAL PUBLICATION");
+        let staging_hits = hits(staging, "STAGING VIOLATION", 64);
+        // A cancellation planted at `Decided` reaches the half-published
+        // interleaving in roughly one storm in fifty (the CancelAt must
+        // land between two owners' unlocks) — 256 seeds for that arm.
+        let partial_hits = hits(cancel, "PARTIAL PUBLICATION", 256);
+        let false_aborts = hits(cancel, "FALSE ABORT", 256);
         eprintln!(
-            "fault storms: live-write {staging_hits}/64, cancel-until-durable {partial_hits}/64"
+            "fault storms: live-write {staging_hits}/64, cancel-until-durable partial {partial_hits}/256, false abort {false_aborts}/256"
         );
-        assert!(staging_hits > 0 && partial_hits > 0);
+        assert!(staging_hits > 0 && partial_hits > 0 && false_aborts > 0);
     }
 
     // ---- dependent multi-owner commands (ADR-0116 A6) ----
@@ -5066,8 +5624,10 @@ mod tests {
         assert_eq!(
             r.violations,
             vec![
+                "REPLY MISMATCH: T1's RENAME 0→1 replied no such key where the serial history replies OK"
+                    .to_string(),
                 "DEPENDENT COMMAND: T1's RENAME 0→1 left key 1@cell1 = absent where the serial history gives T1"
-                    .to_string()
+                    .to_string(),
             ]
         );
         let (r, outcome, _) = acquisition::rename_history(rules, true, false);
@@ -5171,6 +5731,179 @@ mod tests {
             })
         }));
         assert!(r.is_err(), "keys 0 and 2 share cell 0: not a cross-owner command");
+    }
+
+    // ---- ordered programs: replies in queue order, read-your-writes
+    // across a dependent command (the fix validation's F04 follow-up) ----
+
+    #[test]
+    fn the_ordered_rename_history_replies_in_queue_order_and_reads_its_own_move() {
+        for native in [false, true] {
+            let (r, outcome, reply, published) =
+                acquisition::ordered_rename_history(rules(), native);
+            assert!(r.violations.is_empty(), "native {native}: {}", r.violations.join("\n"));
+            assert_eq!(outcome, Outcome::Committed, "native {native}");
+            assert_eq!(
+                reply,
+                Some(vec![Reply::Ok, Reply::Ok, Reply::Value(Some(0))]),
+                "native {native}: SET, RENAME, then GET b = the moved value"
+            );
+            assert_eq!(published, [None, Some(0)], "native {native}");
+        }
+    }
+
+    #[test]
+    fn withdrawn_independent_legs_answer_the_ordered_rename_from_published_state() {
+        let rules = Rules { stage_dependents: false, ..Rules::chosen() };
+        let (r, outcome, reply, published) = acquisition::ordered_rename_history(rules, false);
+        assert_eq!(outcome, Outcome::Committed);
+        assert_eq!(
+            reply,
+            Some(vec![Reply::Ok, Reply::Err("no such key"), Reply::Value(None)]),
+            "the destination never saw the staged value and the GET read the pre-state"
+        );
+        assert_eq!(published, [None, None]);
+        assert_eq!(
+            r.violations,
+            vec![
+                "REPLY MISMATCH: T1's RENAME 0→1 replied no such key where the serial history replies OK"
+                    .to_string(),
+                "REPLY MISMATCH: T1's GET 1 replied absent where the serial history replies T1"
+                    .to_string(),
+                "DEPENDENT COMMAND: T1's RENAME 0→1 left key 1@cell1 = absent where the serial history gives T1"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn withdrawn_published_reads_miss_the_transactions_own_writes() {
+        let rules = Rules { read_your_writes: false, ..Rules::chosen() };
+        let (r, outcome, reply, published) = acquisition::ordered_rename_history(rules, false);
+        assert_eq!(outcome, Outcome::Committed);
+        assert_eq!(published, [None, Some(0)], "the state is right — only the reply is wrong");
+        assert_eq!(reply, Some(vec![Reply::Ok, Reply::Ok, Reply::Value(None)]));
+        assert_eq!(
+            r.violations,
+            vec![
+                "REPLY MISMATCH: T1's GET 1 replied absent where the serial history replies T1"
+                    .to_string()
+            ]
+        );
+        let (r, _, reply, _) = acquisition::reply_order_history(rules, false);
+        assert_eq!(
+            reply,
+            Some(vec![Reply::Ok, Reply::Ok, Reply::Value(None), Reply::Value(None)]),
+            "a GET after the transaction's own SET answers the pre-state"
+        );
+        assert_eq!(r.violations.len(), 2, "{}", r.violations.join("\n"));
+    }
+
+    #[test]
+    fn consecutive_dependent_commands_each_see_the_previous_apply() {
+        for native in [false, true] {
+            let (r, outcome, reply, published) =
+                acquisition::consecutive_dependents_history(rules(), native);
+            assert!(r.violations.is_empty(), "native {native}: {}", r.violations.join("\n"));
+            assert_eq!(outcome, Outcome::Committed, "native {native}");
+            assert_eq!(
+                reply,
+                Some(vec![Reply::Int(1), Reply::Ok, Reply::Value(Some(0)), Reply::Value(None)]),
+                "native {native}: MSETNX set both, RENAME moved b to c, GET c = T, GET b absent"
+            );
+            assert_eq!(published, [Some(0), None, Some(0)], "native {native}");
+        }
+    }
+
+    #[test]
+    fn withdrawn_independent_legs_break_consecutive_dependent_commands() {
+        let rules = Rules { stage_dependents: false, ..Rules::chosen() };
+        let (r, outcome, reply, published) =
+            acquisition::consecutive_dependents_history(rules, false);
+        assert_eq!(outcome, Outcome::Committed);
+        assert_eq!(
+            reply,
+            Some(vec![
+                Reply::Int(1),
+                Reply::Err("no such key"),
+                Reply::Value(None),
+                Reply::Value(None)
+            ]),
+            "the RENAME read b as published (absent) and both GETs answered the pre-state"
+        );
+        assert_eq!(published, [Some(0), None, None], "c never received the value");
+        assert!(
+            r.violations.iter().any(|v| v.starts_with("REPLY MISMATCH: T1's RENAME 1→2"))
+                && r.violations.iter().any(|v| v.starts_with("REPLY MISMATCH: T1's GET 2"))
+                && r.violations
+                    .iter()
+                    .any(|v| v.starts_with("DEPENDENT COMMAND: T1's RENAME 1→2 left key 2@cell2")),
+            "{}",
+            r.violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_refused_command_followed_by_reads_embeds_under_exec_and_aborts_under_native() {
+        let (r, outcome, reply, published) = acquisition::refused_then_read_history(rules(), false);
+        assert!(r.violations.is_empty(), "{}", r.violations.join("\n"));
+        assert_eq!(outcome, Outcome::Committed);
+        assert_eq!(
+            reply,
+            Some(vec![
+                Reply::Ok,
+                Reply::Err("destination refused"),
+                Reply::Value(Some(0)),
+                Reply::Value(None)
+            ]),
+            "the SET is kept, the refusal embedded, the reads see exactly that"
+        );
+        assert_eq!(published, [Some(0), None]);
+        let (r, outcome, reply, published) = acquisition::refused_then_read_history(rules(), true);
+        assert!(r.violations.is_empty(), "{}", r.violations.join("\n"));
+        assert_eq!(outcome, Outcome::Aborted("destination refused"));
+        assert_eq!(reply, None, "an aborted INF.TX has no reply array");
+        assert_eq!(published, [None, None]);
+    }
+
+    #[test]
+    fn replies_come_back_in_queue_order_whatever_the_legs_arrival_order() {
+        let (r, outcome, reply, published) = acquisition::reply_order_history(rules(), false);
+        assert!(r.violations.is_empty(), "{}", r.violations.join("\n"));
+        assert_eq!(outcome, Outcome::Committed);
+        assert_eq!(
+            reply,
+            Some(vec![Reply::Ok, Reply::Ok, Reply::Value(Some(0)), Reply::Value(Some(0))])
+        );
+        assert_eq!(published, [Some(0), Some(0)]);
+        let (r, outcome, reply, published) = acquisition::reply_order_history(rules(), true);
+        assert!(r.violations.is_empty(), "{}", r.violations.join("\n"));
+        assert_eq!(outcome, Outcome::Committed, "EXEC embeds the failed condition");
+        assert_eq!(
+            reply,
+            Some(vec![
+                Reply::Ok,
+                Reply::Err("condition failed"),
+                Reply::Value(None),
+                Reply::Value(Some(0))
+            ]),
+            "the failed SET staged nothing, so GET b is absent and GET a is the SET"
+        );
+        assert_eq!(published, [Some(0), None]);
+    }
+
+    #[test]
+    fn a_stage_compiles_monotonically_in_queue_order() {
+        let program = vec![
+            Cmd::Get(0),
+            Cmd::Dep(Dependent::Move { src: 0, dst: 1 }),
+            Cmd::Set(1),
+            Cmd::Dep(Dependent::SetIfNoneExist { keys: vec![2, 3] }),
+            Cmd::Get(3),
+        ];
+        assert_eq!(acquisition::stages_of(&program), vec![(0, true), (1, true), (2, false)]);
+        assert_eq!(acquisition::stages_of(&[Cmd::Set(0)]), vec![(0, false)]);
+        assert_eq!(acquisition::stages_of(&[]), Vec::<(usize, bool)>::new());
     }
 
     // ---- watch ----

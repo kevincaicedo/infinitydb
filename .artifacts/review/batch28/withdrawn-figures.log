@@ -1,0 +1,4 @@
+cancel-until-durable: 11 partial, 8 false aborts over 64 seeds
+fault storms: independent-legs 12/64
+fault storms: live-write 47/64, cancel-until-durable partial 2/256, false abort 17/256
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 88 filtered out; finished in 0.21s
