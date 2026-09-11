@@ -34,6 +34,13 @@ pub struct LoadSpec {
     pub warmup: Duration,
     /// Fill mode: SET exactly this many keys (partitioned), ignore duration.
     pub fill: Option<u64>,
+    /// Fill mode's first key index: the range is `fill_from ..
+    /// fill_from + fill` (M4.5-S37 ticketed-`DEL` row: a fresh key
+    /// window per SET/DEL cycle).
+    pub fill_from: u64,
+    /// Fill mode's command — `SET` (every pre-S37 row) or `DEL` (the
+    /// ticketed-`DEL` row: each key of the window deleted exactly once).
+    pub fill_op: FillOp,
     /// M1 TTL-heavy rows: every SET carries `PX <seeded uniform in range>`.
     pub ttl_range_ms: Option<(u64, u64)>,
     /// M1 expiry-storm fill: every SET carries `PXAT <abs unix ms>` — the
@@ -58,6 +65,13 @@ pub struct LoadSpec {
     pub target_ops_per_sec: Option<u64>,
 }
 
+/// The command fill mode sends per key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillOp {
+    Set,
+    Del,
+}
+
 impl Default for LoadSpec {
     fn default() -> LoadSpec {
         LoadSpec {
@@ -75,6 +89,8 @@ impl Default for LoadSpec {
             seed: 0xC0FFEE,
             warmup: Duration::from_secs(1),
             fill: None,
+            fill_from: 0,
+            fill_op: FillOp::Set,
             ttl_range_ms: None,
             pxat_ms: None,
             setup: Vec::new(),
@@ -224,7 +240,7 @@ fn run_conn(
         let per = total / spec.conns as u64;
         let start = per * conn_index as u64;
         let end = if conn_index == spec.conns - 1 { total } else { start + per };
-        start..end
+        spec.fill_from + start..spec.fill_from + end
     });
 
     let mut inflight: VecDeque<SentAt> = VecDeque::with_capacity(spec.pipeline);
@@ -301,7 +317,9 @@ fn run_conn(
                 Some(range) => match range.next() {
                     Some(i) => {
                         let key = make_key(spec, i);
-                        if let Some(at) = spec.pxat_ms {
+                        if spec.fill_op == FillOp::Del {
+                            tx.extend_from_slice(&encode_command(&[b"DEL", &key]));
+                        } else if let Some(at) = spec.pxat_ms {
                             let at = at.to_string();
                             tx.extend_from_slice(&encode_command(&[
                                 b"SET",
