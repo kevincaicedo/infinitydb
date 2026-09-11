@@ -1,0 +1,32 @@
+warning: `core::arch::x86_64::_rdtscp` does not refer to a reachable function
+  --> /home/kcaicedo/Documents/Projects/databases/infinitydb/clippy.toml:29:5
+   |
+29 |     { path = "core::arch::x86_64::_rdtscp", reason = "no ambient clocks in cell code (L7) — the TSC spelling" },
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: add `allow-invalid = true` to the entry to suppress this warning
+
+warning: `inf-foundation` (lib) generated 1 warning
+warning: `inf-simd` (lib) generated 1 warning (1 duplicate)
+warning: `inf-fabric` (build script) generated 1 warning (1 duplicate)
+warning: `inf-wire` (lib) generated 1 warning (1 duplicate)
+warning: `inf-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `inf-log` (lib) generated 1 warning (1 duplicate)
+warning: `inf-fabric` (lib) generated 1 warning (1 duplicate)
+warning: `inf-doc` (lib) generated 1 warning (1 duplicate)
+warning: `inf-runtime` (lib) generated 1 warning (1 duplicate)
+warning: `inf-store` (lib) generated 1 warning (1 duplicate)
+warning: `inf-server` (lib) generated 1 warning (1 duplicate)
+    Checking inf-sim v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/inf-sim)
+warning: `inf-sim` (lib) generated 1 warning (1 duplicate)
+warning: `inf-sim` (test "combined") generated 1 warning (1 duplicate)
+warning: `inf-sim` (test "corpus") generated 1 warning (1 duplicate)
+warning: `inf-sim` (test "bootstorm") generated 1 warning (1 duplicate)
+warning: `inf-sim` (test "durable_sweep") generated 1 warning (1 duplicate)
+warning: `inf-sim` (test "disk") generated 1 warning (1 duplicate)
+warning: `inf-sim` (test "sim") generated 1 warning (1 duplicate)
+warning: `inf-sim` (test "document_durability") generated 1 warning (1 duplicate)
+warning: `inf-sim` (lib test) generated 1 warning (1 duplicate)
+warning: `inf-sim` (bin "inf-sim" test) generated 1 warning (1 duplicate)
+warning: `inf-sim` (bin "inf-sim") generated 1 warning (1 duplicate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.68s

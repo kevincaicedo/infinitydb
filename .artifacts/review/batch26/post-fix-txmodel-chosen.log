@@ -1,0 +1,68 @@
+   Compiling inf-sim v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/inf-sim)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.54s
+     Running unittests src/lib.rs (target/debug/deps/inf_sim-709dd5dbb0fb1a03)
+
+running 60 tests
+test txmodel::tests::a_dead_incarnation_is_never_reissued_after_a_checkpointed_restart ... ok
+test txmodel::tests::a_dependent_command_never_spans_one_owner ... ok
+test txmodel::tests::a_checkpoint_streams_the_decision_qualified_image ... ok
+test txmodel::tests::a_durable_successor_never_outlives_its_dependency ... ok
+test txmodel::tests::a_failed_exec_command_is_embedded_and_the_rest_commits ... ok
+test txmodel::tests::a_failed_native_condition_publishes_nothing ... ok
+test txmodel::tests::a_cross_owner_rename_ships_the_value_the_transaction_staged ... ok
+test txmodel::tests::a_remote_prepare_never_meets_a_reissued_txid ... ok
+test txmodel::tests::a_repeated_watch_keeps_the_first_registrations_history ... ok
+test txmodel::tests::a_cross_owner_msetnx_is_one_condition_over_every_owner ... ok
+test txmodel::tests::a_revision_token_never_repeats_across_the_version_wrap ... ok
+test txmodel::tests::a_refused_destination_never_strands_the_source ... ok
+test txmodel::tests::absent_present_absent_aborts ... ok
+test txmodel::tests::a_watch_only_key_is_held_through_the_decision ... ok
+test txmodel::tests::an_acked_dependent_transaction_is_never_dropped ... ok
+test txmodel::tests::an_exhausted_incarnation_counter_refuses_instead_of_repeating ... ok
+test txmodel::tests::delete_recreate_aborts ... ok
+test txmodel::tests::everysec_checkpoint_never_holds_half_a_transaction ... ok
+test txmodel::tests::eviction_and_owner_restart_fail_closed ... ok
+test txmodel::tests::outcome_is_typed ... ok
+test txmodel::tests::reservation_without_the_checkpoint_field_reissues_after_truncation ... ok
+test txmodel::tests::reschedule_rule_completes_the_two_key_history_with_a_counted_retry ... ok
+test txmodel::tests::withdrawn_endpoint_equality_accepts_absent_present_absent ... ok
+test txmodel::tests::two_key_history_completes_without_deadlock ... ok
+test txmodel::tests::withdrawn_incarnation_at_creation_repeats_after_the_version_wraps ... ok
+test txmodel::tests::withdrawn_immediate_predecessor_leaks_half_of_the_older_transaction ... ok
+test txmodel::tests::withdrawn_independent_legs_publish_half_an_msetnx ... ok
+test txmodel::tests::withdrawn_independent_legs_rename_from_the_pre_transaction_value ... ok
+test txmodel::tests::withdrawn_live_writes_survive_a_failed_native_condition ... ok
+test txmodel::tests::withdrawn_plain_successor_outlives_its_dropped_source ... ok
+test txmodel::tests::withdrawn_reregistration_launders_the_mutation_between_two_watches ... ok
+test txmodel::tests::withdrawn_rule_deadlocks_on_the_two_key_history ... ok
+test txmodel::tests::withdrawn_live_writes_outlive_a_cancel_between_two_legs ... ok
+test txmodel::tests::withdrawn_replay_maximum_reissues_the_remote_prepares_txid ... ok
+test txmodel::tests::chosen_rules_and_oracle_agree_with_redis_on_every_fixture_line ... ok
+test txmodel::tests::withdrawn_cancel_until_durable_publishes_half_a_commit_within_64_seeds ... ok
+test txmodel::tests::registration_agrees_with_the_history_oracle_on_random_histories ... ok
+test txmodel::tests::readers_never_observe_an_uncommitted_write ... ok
+test txmodel::tests::withdrawn_read_bypass_observes_an_uncommitted_write_within_64_seeds ... ok
+test txmodel::tests::withdrawn_replayed_maximum_reissues_a_dead_incarnation ... ok
+test txmodel::tests::withdrawn_validate_and_release_commits_over_a_mutated_watch ... ok
+test txmodel::tests::without_ack_gating_an_acked_dependent_transaction_is_dropped ... ok
+test txmodel::tests::withdrawn_identity_reissues_within_2000_seeds ... ok
+test txmodel::tests::random_identity_histories_never_reissue ... ok
+test txmodel::tests::cancellation_aborts_before_the_decision_and_completes_after_it ... ok
+test txmodel::tests::random_crash_interleavings_are_all_or_nothing ... ok
+test txmodel::tests::dependent_stages_abort_at_the_combine_step_and_complete_after_the_decision ... ok
+test txmodel::tests::withdrawn_watch_rules_disagree_on_random_histories ... ok
+test txmodel::tests::random_revision_histories_never_repeat_a_durable_token ... ok
+test txmodel::tests::withdrawn_rules_leave_half_a_transaction_in_the_checkpoint ... ok
+test txmodel::tests::withdrawn_independent_legs_violate_some_fault_storm_within_64_seeds ... ok
+test txmodel::tests::fault_storms_publish_all_or_nothing_and_leak_nothing ... ok
+test txmodel::tests::withdrawn_revision_rules_repeat_within_2000_seeds ... ok
+test txmodel::tests::storms_never_deadlock_and_reads_are_serializable ... ok
+test txmodel::tests::random_lineage_interleavings_are_serializable_and_keep_every_ack ... ok
+test txmodel::tests::withdrawn_rule_deadlocks_some_storm_within_64_seeds ... ok
+test txmodel::tests::withdrawn_rules_violate_some_fault_storm_within_64_seeds ... ok
+test txmodel::tests::every_terminal_path_releases_every_intent_and_every_staged_set ... ok
+test txmodel::tests::reschedule_retries_scale_with_contention_and_canonical_has_none ... ok
+test txmodel::tests::withdrawn_lineage_rules_violate_some_random_interleavings ... ok
+
+test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.12s
+

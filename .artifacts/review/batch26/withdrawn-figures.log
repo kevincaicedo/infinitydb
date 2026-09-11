@@ -1,0 +1,3 @@
+revision repeats over 2000 histories: wrap 718, restart 586, exhaustion 51
+fault storms: independent-legs 15/64
+fault storms: live-write 48/64, cancel-until-durable 4/64
