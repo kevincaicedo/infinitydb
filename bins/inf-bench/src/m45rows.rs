@@ -198,7 +198,14 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
     }
     if only_s37 {
         m.note("--only-s37: every other row was skipped; their gate keys are absent");
-        s37_row(flags, &infinityd, cells, duration, replicates, &data_root, &mut m)?;
+        let ticketed_del = flags.bool("s37-ticketed-del");
+        if ticketed_del {
+            s37_ticketed_del_row(flags, &infinityd, cells, replicates, &data_root, &mut m)?;
+        } else {
+            s37_row(flags, &infinityd, cells, duration, replicates, &data_root, &mut m)?;
+        }
+        let shipping =
+            ticketed_del || flags.bool("s37-shadow") || flags.get("s37-cold-read-qd").is_some();
         return finish_report(
             "m4.5",
             &gates_list,
@@ -209,8 +216,12 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
             &format!(
                 "binary {infinityd}{} · cells {cells} · {replicates} replicates · S37 {} row \
                  only · {arms_note}",
-                if flags.get("s37-cold-read-qd").is_some() { "" } else { " (bench-diagnostics)" },
-                if flags.get("s37-cold-read-qd").is_some() {
+                if shipping { "" } else { " (bench-diagnostics)" },
+                if ticketed_del {
+                    "ticketed-DEL RSS/tail"
+                } else if flags.bool("s37-shadow") {
+                    "shadow-slot arm"
+                } else if flags.get("s37-cold-read-qd").is_some() {
                     "cold-read-qd discriminator"
                 } else {
                     "ceiling"
@@ -3738,6 +3749,421 @@ fn s37_row(
         );
     }
     m.raw_section("s37 per-leg samples", &raw);
+    Ok(())
+}
+
+// ---- M4.5-S37: the ticketed-DEL RSS/tail row (ADR-0093 A13, batch 30) ------
+
+/// Keys per SET/DEL window of the ticketed-`DEL` row unless
+/// `--s37-del-keys` says otherwise: 3 072 per cell at four cells — under
+/// `SHADOW_TICKETS_CAP` (4 096) so every cold key of the window opens a
+/// ticket on arm B instead of falling back at the cap, and ≈ 3 MiB of
+/// pinned suffix per cell against the 16 MiB pin cap.
+const S37_DEL_DEFAULT_KEYS: u64 = 12_288;
+/// SET/DEL cycles per leg (each on a fresh key window) unless
+/// `--s37-del-cycles` says otherwise: four windows = 49 152 `DEL`s per
+/// leg, enough samples for a p99.9 that is not one request.
+const S37_DEL_DEFAULT_CYCLES: u64 = 4;
+
+/// One SET/DEL cycle of the ticketed-`DEL` row: the window's SET pass
+/// (tickets opened on B — the reconciler is paused so they stay open)
+/// and its DEL pass (every ticketed winner walks its ticket: the twin's
+/// Foreground read, the markers, the delete), with the process RSS
+/// sampled through the DEL pass.
+struct S37DelCycle {
+    sets: u64,
+    tickets: u64,
+    set_fallbacks: u64,
+    dels: u64,
+    forced: u64,
+    refused: u64,
+    pending_after: u64,
+    reads_fg: u64,
+    del_ops_per_sec: f64,
+    del_p50_us: f64,
+    del_p99_us: f64,
+    del_p999_us: f64,
+    del_max_us: u64,
+    rss_before_del: u64,
+    rss_peak_del: u64,
+    rss_after_del: u64,
+}
+
+fn s37_del_cycle(
+    port: u16,
+    pid: u32,
+    cells: u16,
+    from: u64,
+    keys: u64,
+) -> Result<S37DelCycle, String> {
+    let window = |op: crate::load::FillOp| LoadSpec {
+        port,
+        conns: CONNS_LOW,
+        pipeline: 1,
+        fill: Some(keys),
+        fill_from: from,
+        fill_op: op,
+        keys,
+        key_prefix: "s37tier:".into(),
+        value_size: 1024,
+        setup: vec![vec![b"INF.NS".to_vec(), b"USE".to_vec(), b"s37tier".to_vec()]],
+        ..LoadSpec::default()
+    };
+    let before = scrape_cells(port, cells)?;
+    let set = run_load(&window(crate::load::FillOp::Set))?;
+    if set.errors > 0 {
+        return Err(format!("s37 ticketed-DEL SET window @{from}: {} errors", set.errors));
+    }
+    let mid = scrape_cells(port, cells)?;
+    let d_set = |f: &str| sum_field(&mid, f).saturating_sub(sum_field(&before, f));
+    let rss_before_del = crate::gaterun::rss_bytes_of(pid);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let peak = std::sync::atomic::AtomicU64::new(rss_before_del);
+    let del = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                peak.fetch_max(
+                    crate::gaterun::rss_bytes_of(pid),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                #[allow(clippy::disallowed_methods)] // bench sampler, not cell code
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let del = run_load(&window(crate::load::FillOp::Del));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        del
+    })?;
+    if del.errors > del.busy_retryable {
+        return Err(format!(
+            "s37 ticketed-DEL DEL window @{from}: {} non-BUSY errors (first: {:?})",
+            del.errors - del.busy_retryable,
+            del.error_samples.first()
+        ));
+    }
+    let rss_after_del = crate::gaterun::rss_bytes_of(pid);
+    let after = scrape_cells(port, cells)?;
+    let d_del = |f: &str| sum_field(&after, f).saturating_sub(sum_field(&mid, f));
+    Ok(S37DelCycle {
+        sets: set.ops,
+        tickets: d_set("tiering_shadow_created"),
+        set_fallbacks: d_set("tiering_shadow_fallback_off")
+            + d_set("tiering_shadow_fallback_fence")
+            + d_set("tiering_shadow_fallback_multi")
+            + d_set("tiering_shadow_fallback_ticketed")
+            + d_set("tiering_shadow_fallback_tickets")
+            + d_set("tiering_shadow_fallback_pin")
+            + d_set("tiering_shadow_fallback_origin"),
+        dels: del.ops,
+        forced: d_del("tiering_shadow_forced_by_delete"),
+        refused: d_del("tiering_shadow_delete_run_refused"),
+        pending_after: sum_field(&after, "tiering_shadow_pending"),
+        reads_fg: d_del("tiering_shadow_reads_foreground"),
+        del_ops_per_sec: del.ops_per_sec,
+        del_p50_us: del.p50_us as f64,
+        del_p99_us: del.p99_us as f64,
+        del_p999_us: del.p999_us as f64,
+        del_max_us: del.max_us,
+        rss_before_del,
+        rss_peak_del: peak.load(std::sync::atomic::Ordering::Relaxed),
+        rss_after_del,
+    })
+}
+
+/// One leg of the ticketed-`DEL` row, folded over its cycles: medians
+/// of the per-cycle DEL readings, the worst RSS growth through any DEL
+/// pass, the coverage sums.
+struct S37DelLeg {
+    cycles: usize,
+    sets: u64,
+    tickets: u64,
+    set_fallbacks: u64,
+    dels: u64,
+    forced: u64,
+    refused: u64,
+    pending_after: u64,
+    reads_fg: u64,
+    del_ops_per_sec: f64,
+    del_p50_us: f64,
+    del_p99_us: f64,
+    del_p999_us: f64,
+    del_max_us: u64,
+    /// Worst `peak − before` over the DEL passes.
+    del_rss_growth: u64,
+    /// `after the last DEL − before the first SET`.
+    rss_end_delta: i64,
+}
+
+/// The M4.5-S37 ticketed-`DEL` RSS/tail row (ADR-0093 A13 — the
+/// evidence batch 29 named): A = the shipping path, B =
+/// `tiered-shadow-overwrite yes` with `tiered-shadow-reconcile no`, so
+/// every cold key the SET window meets opens a ticket that stays open
+/// until its `DEL` walks it (the twin's Foreground read + its own
+/// marker) — the walk's memory and tail isolated from the reconciler's
+/// cadence. Fresh server + 1 M-key fill per leg (the knob after the
+/// fill), then `--s37-del-cycles` windows of `--s37-del-keys` keys: SET
+/// the window (pipeline 1, 64 conns), DEL the window (same), RSS sampled
+/// through the DEL. ABBA across replicates. Every reading is
+/// informational — the row records, the D9 campaign decides.
+fn s37_ticketed_del_row(
+    flags: &Flags,
+    infinityd: &str,
+    cells: u16,
+    replicates: usize,
+    data_root: &str,
+    m: &mut Measurements,
+) -> Result<(), String> {
+    let keys = flags.u64_or("s37-keys", S37_DEFAULT_KEYS)?;
+    let del_keys = flags.u64_or("s37-del-keys", S37_DEL_DEFAULT_KEYS)?;
+    let cycles = flags.u64_or("s37-del-cycles", S37_DEL_DEFAULT_CYCLES)?;
+    if del_keys == 0 || cycles == 0 || del_keys * cycles > keys {
+        return Err(format!(
+            "--s37-del-keys {del_keys} × --s37-del-cycles {cycles} must be > 0 and ≤ --s37-keys \
+             {keys}"
+        ));
+    }
+    let idle_s = flags.u64_or("leg-idle-s", 0)?;
+    let arms: [(&str, Vec<(&str, &str)>); 2] = [
+        ("A", vec![("tiered-shadow-overwrite", "no")]),
+        ("B", vec![("tiered-shadow-overwrite", "yes"), ("tiered-shadow-reconcile", "no")]),
+    ];
+    m.note(format!(
+        "s37 ticketed-DEL row (ADR-0093 A13): {cells} cells · {replicates} replicates (ABBA) · \
+         tiered always, MEM-BUDGET {MEM_BUDGET}/cell, {keys} keys × 1 KiB filled per leg, then \
+         {cycles} cycles × {del_keys} keys: SET the window (tickets on B), DEL the window \
+         (pipeline 1, {CONNS_LOW} conns), VmRSS sampled every 20 ms through the DEL · A = \
+         tiered-shadow-overwrite no, B = yes + tiered-shadow-reconcile no (tickets held open \
+         until DEL) — the same binary; per-cycle readings on the raw line"
+    ));
+    let mut raw = String::new();
+    let mut legs: Vec<(usize, String, S37DelLeg)> = Vec::new();
+    for rep in 0..replicates {
+        for slot in 0..arms.len() {
+            let (label, config) = &arms[(rep + slot) % arms.len()];
+            let dir = format!("{data_root}/s37-tdel-{label}-rep{rep}");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
+            crate::m2rows::copy_probe_file(flags, std::path::Path::new(&dir))?;
+            let mut extra: Vec<String> = vec!["--data-dir".into(), dir.clone()];
+            if let Some(pin) = flags.get("pin-start") {
+                extra.push("--pin-start".into());
+                extra.push(pin.to_string());
+            }
+            extra.extend(crate::m2rows::pipeline_args(flags));
+            let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
+            s35_idle(idle_s, &format!("s37 ticketed-DEL {label} rep{rep}"));
+            let server = spawn_infinityd(infinityd, cells, &extra_refs)?;
+            let (port, pid) = (server.port, server.pid());
+            let ddl: Vec<&[u8]> = vec![
+                b"INF.NS",
+                b"CREATE",
+                b"s37tier",
+                b"MODE",
+                b"durable",
+                b"FSYNC",
+                b"always",
+                b"MEM-BUDGET",
+                MEM_BUDGET.as_bytes(),
+                b"DISK-BUDGET",
+                b"10gb",
+                b"TIER-IO-MODE",
+                b"direct",
+            ];
+            create_ns(port, &ddl)?;
+            await_fan(port, "s37tier", cells)?;
+            let fill = run_load(&LoadSpec {
+                port,
+                conns: 64,
+                pipeline: 4,
+                fill: Some(keys),
+                keys,
+                key_prefix: "s37tier:".into(),
+                value_size: 1024,
+                setup: vec![vec![b"INF.NS".to_vec(), b"USE".to_vec(), b"s37tier".to_vec()]],
+                ..LoadSpec::default()
+            })?;
+            if fill.errors > 0 {
+                return Err(format!(
+                    "s37 ticketed-DEL {label} rep{rep} fill: {} errors",
+                    fill.errors
+                ));
+            }
+            for (key, value) in config {
+                config_set(port, key, value)?;
+            }
+            let rss_base = crate::gaterun::rss_bytes_of(pid);
+            let mut rows: Vec<S37DelCycle> = Vec::new();
+            for cycle in 0..cycles {
+                let from = cycle * del_keys;
+                let c = s37_del_cycle(port, pid, cells, from, del_keys)?;
+                raw.push_str(&format!(
+                    "rep{rep} {label} cycle{cycle} keys@{from}: sets={} tickets={} ({:.3}/set) \
+                     set_fallbacks={} dels={} forced={} ({:.3}/del) refused={} pending_after={} \
+                     reads_fg={} del_ops/s={:.0} del_p50_us={:.0} del_p99_us={:.0} \
+                     del_p999_us={:.0} del_max_us={} rss_before_del={} rss_peak_del={} \
+                     rss_after_del={} (growth {})\n",
+                    c.sets,
+                    c.tickets,
+                    c.tickets as f64 / c.sets.max(1) as f64,
+                    c.set_fallbacks,
+                    c.dels,
+                    c.forced,
+                    c.forced as f64 / c.dels.max(1) as f64,
+                    c.refused,
+                    c.pending_after,
+                    c.reads_fg,
+                    c.del_ops_per_sec,
+                    c.del_p50_us,
+                    c.del_p99_us,
+                    c.del_p999_us,
+                    c.del_max_us,
+                    c.rss_before_del,
+                    c.rss_peak_del,
+                    c.rss_after_del,
+                    c.rss_peak_del.saturating_sub(c.rss_before_del),
+                ));
+                println!("  s37 {}", raw.lines().last().unwrap_or(""));
+                rows.push(c);
+            }
+            let rss_end = crate::gaterun::rss_bytes_of(pid);
+            let med = |f: &dyn Fn(&S37DelCycle) -> f64| {
+                let mut v: Vec<f64> = rows.iter().map(f).collect();
+                median(&mut v)
+            };
+            let leg = S37DelLeg {
+                cycles: rows.len(),
+                sets: rows.iter().map(|c| c.sets).sum(),
+                tickets: rows.iter().map(|c| c.tickets).sum(),
+                set_fallbacks: rows.iter().map(|c| c.set_fallbacks).sum(),
+                dels: rows.iter().map(|c| c.dels).sum(),
+                forced: rows.iter().map(|c| c.forced).sum(),
+                refused: rows.iter().map(|c| c.refused).sum(),
+                pending_after: rows.last().map_or(0, |c| c.pending_after),
+                reads_fg: rows.iter().map(|c| c.reads_fg).sum(),
+                del_ops_per_sec: med(&|c| c.del_ops_per_sec),
+                del_p50_us: med(&|c| c.del_p50_us),
+                del_p99_us: med(&|c| c.del_p99_us),
+                del_p999_us: med(&|c| c.del_p999_us),
+                del_max_us: rows.iter().map(|c| c.del_max_us).max().unwrap_or(0),
+                del_rss_growth: rows
+                    .iter()
+                    .map(|c| c.rss_peak_del.saturating_sub(c.rss_before_del))
+                    .max()
+                    .unwrap_or(0),
+                rss_end_delta: rss_end as i64 - rss_base as i64,
+            };
+            raw.push_str(&format!(
+                "rep{rep} {label} leg: cycles={} sets={} tickets={} set_fallbacks={} dels={} \
+                 forced={} ({:.3}/del) refused={} pending_after={} reads_fg={} del_ops/s={:.0} \
+                 del_p50_us={:.0} del_p99_us={:.0} del_p999_us={:.0} del_max_us={} \
+                 del_rss_growth={} rss_base={} rss_end={} (delta {})\n",
+                leg.cycles,
+                leg.sets,
+                leg.tickets,
+                leg.set_fallbacks,
+                leg.dels,
+                leg.forced,
+                leg.forced as f64 / leg.dels.max(1) as f64,
+                leg.refused,
+                leg.pending_after,
+                leg.reads_fg,
+                leg.del_ops_per_sec,
+                leg.del_p50_us,
+                leg.del_p99_us,
+                leg.del_p999_us,
+                leg.del_max_us,
+                leg.del_rss_growth,
+                rss_base,
+                rss_end,
+                leg.rss_end_delta,
+            ));
+            println!("  s37 {}", raw.lines().last().unwrap_or(""));
+            legs.push((rep, (*label).to_string(), leg));
+            drop(server);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    let find = |rep: usize, arm: &str| {
+        legs.iter().find(|(r, a, _)| *r == rep && a == arm).map(|(.., l)| l)
+    };
+    let mut ops_x = Vec::new();
+    let mut p50_x = Vec::new();
+    let mut p99_x = Vec::new();
+    let mut p999_x = Vec::new();
+    let mut p99_a = Vec::new();
+    let mut p99_b = Vec::new();
+    let mut p999_b = Vec::new();
+    let mut max_b = Vec::new();
+    let mut share_b = Vec::new();
+    let mut share_a = Vec::new();
+    let mut tickets_b = Vec::new();
+    let mut refused_b = Vec::new();
+    let mut growth_a = Vec::new();
+    let mut growth_b = Vec::new();
+    let mut end_a = Vec::new();
+    let mut end_b = Vec::new();
+    for rep in 0..replicates {
+        let (Some(a), Some(b)) = (find(rep, "A"), find(rep, "B")) else {
+            continue;
+        };
+        ops_x.push(b.del_ops_per_sec / a.del_ops_per_sec.max(1.0));
+        p50_x.push(b.del_p50_us / a.del_p50_us.max(1.0));
+        p99_x.push(b.del_p99_us / a.del_p99_us.max(1.0));
+        p999_x.push(b.del_p999_us / a.del_p999_us.max(1.0));
+        p99_a.push(a.del_p99_us);
+        p99_b.push(b.del_p99_us);
+        p999_b.push(b.del_p999_us);
+        max_b.push(b.del_max_us as f64);
+        share_b.push(b.forced as f64 / b.dels.max(1) as f64);
+        share_a.push(a.forced as f64 / a.dels.max(1) as f64);
+        tickets_b.push(b.tickets as f64 / b.sets.max(1) as f64);
+        refused_b.push(b.refused as f64);
+        growth_a.push(a.del_rss_growth as f64);
+        growth_b.push(b.del_rss_growth as f64);
+        end_a.push(a.rss_end_delta as f64);
+        end_b.push(b.rss_end_delta as f64);
+    }
+    if ops_x.is_empty() {
+        return Err("s37 ticketed-DEL: no A/B pair completed".into());
+    }
+    let pairs = ops_x.len();
+    let (ops, p50, p99, p999) =
+        (median(&mut ops_x), median(&mut p50_x), median(&mut p99_x), median(&mut p999_x));
+    m.set("s37:tdel_ops_x_c64", ops);
+    m.set("s37:tdel_p50_x_c64", p50);
+    m.set("s37:tdel_p99_x_c64", p99);
+    m.set("s37:tdel_p999_x_c64", p999);
+    m.set("s37:tdel_p99_us_a_c64", median(&mut p99_a));
+    m.set("s37:tdel_p99_us_b_c64", median(&mut p99_b));
+    m.set("s37:tdel_p999_us_b_c64", median(&mut p999_b));
+    m.set("s37:tdel_max_us_b_c64", median(&mut max_b));
+    m.set("s37:tdel_ticketed_share_b", median(&mut share_b));
+    m.set("s37:tdel_ticketed_share_a", median(&mut share_a));
+    m.set("s37:tdel_tickets_per_set_b", median(&mut tickets_b));
+    m.set("s37:tdel_refused_b", median(&mut refused_b));
+    m.set("s37:tdel_rss_growth_bytes_a", median(&mut growth_a));
+    m.set("s37:tdel_rss_growth_bytes_b", median(&mut growth_b));
+    m.set("s37:tdel_rss_end_delta_bytes_a", median(&mut end_a));
+    m.set("s37:tdel_rss_end_delta_bytes_b", median(&mut end_b));
+    m.note(format!(
+        "s37 ticketed-DEL B vs A (c64, pipeline 1): DEL ops {ops:.3} × · p50 {p50:.3} × · p99 \
+         {p99:.3} × · p99.9 {p999:.3} × · B p99 {:.0} µs / p99.9 {:.0} µs / max {:.0} µs · \
+         ticketed share B {:.3} (A {:.3}) · tickets/SET B {:.3} · refused B {:.0} · RSS growth \
+         through a DEL pass A {:.0} B / B {:.0} B · RSS end−base A {:.0} B / B {:.0} B (medians \
+         of {pairs} pairs; per-leg = medians over cycles, growth = worst cycle)",
+        median(&mut p99_b.clone()),
+        median(&mut p999_b.clone()),
+        median(&mut max_b.clone()),
+        median(&mut share_b.clone()),
+        median(&mut share_a.clone()),
+        median(&mut tickets_b.clone()),
+        median(&mut refused_b.clone()),
+        median(&mut growth_a.clone()),
+        median(&mut growth_b.clone()),
+        median(&mut end_a.clone()),
+        median(&mut end_b.clone()),
+    ));
+    m.raw_section("s37 ticketed-DEL per-cycle samples", &raw);
     Ok(())
 }
 

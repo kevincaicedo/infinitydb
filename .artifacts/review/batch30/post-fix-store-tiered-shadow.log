@@ -1,0 +1,8 @@
+test deferred_settles_run_in_registry_order_not_hash_order ... ok
+test rebuild_walks_a_displaced_chain_and_settles_mid_chain ... ok
+test registering_at_the_cap_panics - should panic ... ok
+test admission_refuses_at_every_bound_and_counts ... ok
+test rebuild_sends_pairs_beyond_the_cap_to_the_boot_settle_one_at_a_time ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+

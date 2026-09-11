@@ -1266,6 +1266,50 @@ fn a_full_origin_list_defers_the_settle_until_the_winner_moves() {
     assert_eq!(t.take_displacement_origins(hash, winner).len(), 1);
 }
 
+/// F-L07-02 (full-codebase review, lane L07): verified tickets whose
+/// settle a walk deferred settle in the registry's order — oldest
+/// winner, then ascending cold address — never in a hash map's
+/// per-process order. Four same-key twins on one rebuilt winner, all
+/// verified under a pinned walk, then one settle round against
+/// `RELOC_ORIGIN_CAP` (3): the **highest** cold address is the one that
+/// meets the cap and the winner's origins chain ascending. Sixteen fresh
+/// tables = sixteen hash seeds; pre-fix the survivor varied across them.
+#[test]
+fn deferred_settles_run_in_registry_order_not_hash_order() {
+    let key = b"k".to_vec();
+    let hash = KeyHasher::default().hash(&key);
+    for round in 0..16u32 {
+        let mut t = recovered_table();
+        let twins: Vec<LogicalAddr> =
+            (1..=4u64).map(|i| LogicalAddr::from_raw(i * 4096).expect("fits")).collect();
+        for twin in &twins {
+            t.apply_ref(hash, *twin);
+        }
+        let winner = t.apply_image(&key, b"new", hash).expect("fits");
+        t.rebuild_shadow_tickets(no_settle).expect("one RAM sibling: four tickets");
+        assert_eq!(t.shadow_pending(), 4);
+        let image = record_image(&key, b"old");
+        t.begin_ckpt_walk(8);
+        for twin in &twins {
+            assert_eq!(t.resolve_shadow(hash, *twin, &image), ShadowVerdict::Deferred, "{round}");
+        }
+        assert_eq!(t.shadow_unverified(), 0);
+        t.end_ckpt_walk();
+        assert_eq!(t.shadow_settle_verified(), 3, "round {round}: three fit the origin cap");
+        assert!(
+            t.contains_pair(hash, twins[3]),
+            "round {round}: the highest cold address is the deferred one"
+        );
+        for twin in &twins[..3] {
+            assert!(!t.contains_pair(hash, *twin), "round {round}: settled in order");
+        }
+        let origins: Vec<u64> =
+            t.take_displacement_origins(hash, winner).iter().map(|(o, _)| *o).collect();
+        let want: Vec<u64> = twins[..3].iter().map(|a| a.to_raw()).collect();
+        assert_eq!(origins, want, "round {round}: the origins chain in cold order");
+    }
+}
+
 // ---- compaction over the real pipeline (MemFs) --------------------------
 
 const NS: NsId = NsId(37);

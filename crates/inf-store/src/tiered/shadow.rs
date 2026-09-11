@@ -436,7 +436,9 @@ pub(super) struct ShadowSet {
     /// unresolved winner — the record pin — and the read order.
     by_winner: BTreeMap<(u64, u64), ()>,
     /// `cold → (hash, winner, verified)`: the compaction/promotion/
-    /// removal probe and the ticket's state.
+    /// removal probe and the ticket's state. Keyed access only — never
+    /// walked to choose an order (its `RandomState` is per process;
+    /// F-L07-02): every walk goes through `by_winner`.
     by_cold: HashMap<u64, ColdEntry>,
     /// Open tickets whose twin has not been read (A1).
     unverified: usize,
@@ -476,6 +478,21 @@ impl ShadowSet {
 
     fn winner_tickets(&self, winner: u64) -> impl Iterator<Item = u64> + '_ {
         self.by_winner.range((winner, 0)..=(winner, u64::MAX)).map(|((_, cold), ())| *cold)
+    }
+
+    /// The first verified ticket past `after` in registry order
+    /// (`(winner, cold)` ascending): its cold address and its key.
+    fn next_verified_after(&self, after: Option<(u64, u64)>) -> Option<(u64, (u64, u64))> {
+        let from = match after {
+            None => (0, 0),
+            Some((w, c)) if c == u64::MAX => (w.checked_add(1)?, 0),
+            Some((w, c)) => (w, c + 1),
+        };
+        self.by_winner
+            .range(from..)
+            .map(|(key, ())| *key)
+            .find(|(_, cold)| self.by_cold[cold].verified_len.is_some())
+            .map(|key| (key.1, key))
     }
 
     fn ticket(&self, cold: u64) -> Option<ShadowTicket> {
@@ -853,22 +870,22 @@ impl TieredTable {
     }
 
     /// Settles every verified ticket whose obstacle is gone (no walk
-    /// pinned — the caller checked; origin room re-checked per ticket).
-    /// Returns how many settled.
+    /// pinned — the caller checked; origin room re-checked per ticket),
+    /// **oldest winner first, then ascending cold address** — the
+    /// registry's order, as every other ordering decision here (F-L07-02:
+    /// a hash-map walk settled in `RandomState` order, so which twin of
+    /// a multi-ticket winner met the origin cap and the order its origins
+    /// chained were per-process random). A cursor over `by_winner`: one
+    /// range probe per step, no snapshot. Returns how many settled.
     pub fn shadow_settle_verified(&mut self) -> usize {
         if self.shadow.unverified == self.shadow.by_winner.len() {
             return 0;
         }
         debug_assert!(self.space.walk_watermark().is_none(), "settle under a pinned walk");
-        let verified: Vec<u64> = self
-            .shadow
-            .by_cold
-            .iter()
-            .filter(|(_, e)| e.verified_len.is_some())
-            .map(|(c, _)| *c)
-            .collect();
         let mut settled = 0usize;
-        for cold in verified {
+        let mut after: Option<(u64, u64)> = None;
+        while let Some((cold, key)) = self.shadow.next_verified_after(after) {
+            after = Some(key);
             if self.settle_ticket(cold) {
                 self.shadow.counters.settled_without_read += 1;
                 settled += 1;

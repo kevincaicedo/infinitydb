@@ -1,0 +1,19 @@
+
+running 1 test
+test deferred_settles_run_in_registry_order_not_hash_order ... FAILED
+
+failures:
+
+---- deferred_settles_run_in_registry_order_not_hash_order stdout ----
+
+thread 'deferred_settles_run_in_registry_order_not_hash_order' (282656) panicked at crates/inf-store/tests/tiered_shadow.rs:1299:9:
+round 0: the highest cold address is the deferred one
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    deferred_settles_run_in_registry_order_not_hash_order
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 37 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-store --test tiered_shadow`
