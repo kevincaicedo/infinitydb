@@ -1,0 +1,26 @@
+{
+  "command": [
+    "./scripts/run-s37-reference.sh"
+  ],
+  "revision": "6429fba43f92d984500e03c10730109f01554431",
+  "git_status_before": "",
+  "exit_code": 1,
+  "elapsed_seconds": 18.90817239000171,
+  "external_artifacts": "/home/kcaicedo/bench-data/s37/batch32-reference-preflight-20260912T022932071466Z",
+  "binary_sha256": {
+    "target/release/infinityd": "4f580ad16e77e06568cbffc7d321533c835ed510e2abd06a7c12c1e0e86626e6",
+    "target/release/inf-bench": "320513bce126053311bb8a72a6f2217b3f95c291d4e3e0043aa0a8a708f1c3ef",
+    "target/release/inf": "e9c56af4c45a5b8edd9c77204b609a93b56028d325f9a346fdd1afc3b72502e6"
+  },
+  "sudo_preflight": {
+    "command": [
+      "sudo",
+      "-n",
+      "true"
+    ],
+    "exit_code": 1,
+    "stderr": "sudo: interactive authentication is required\n",
+    "scope": "Observed separately immediately after the runner stopped; no privileged change performed."
+  },
+  "result": "Blocked before reference rows: thermal-throttle, package count 72. No reference performance evidence."
+}

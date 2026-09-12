@@ -16,6 +16,14 @@ the reference acceptance criteria. The current NVMe is ADATA LEGEND 700,
 Gen3 DRAM-less, the explicitly designated ADR-0022 deviation. Linux is
 7.0.0-31-generic; the older designation's kernel version is historical.
 
+The strict runner was attempted on clean commit `6429fba`. Its shipping
+build succeeded and the dirty-tree, governor and EPP probes passed; it
+exited **1** at the thermal probe before any reference measurement or
+device probing. `reference-preflight.log` and `reference-preflight.json`
+retain that attempt, exact revision, binary hashes and exit code. This
+is a blocked reference run, not a completed campaign. The later evidence
+commit changes documentation/artifacts only.
+
 The development smoke in `smoke-fresh-db/` checks the fresh-database
 DBSIZE shape: A has zero tickets; B observes 12,288 unverified tickets,
 reads all 12,288, returns exactly 1,000,000 keys and leaves zero unverified.

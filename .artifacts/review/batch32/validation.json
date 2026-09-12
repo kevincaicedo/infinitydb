@@ -122,5 +122,23 @@
     "environment": {
       "CARGO_NET_OFFLINE": "true"
     }
+  },
+  {
+    "command": [
+      "./scripts/run-s37-reference.sh"
+    ],
+    "log": "../../m4.5/s37/campaign-R/reference-preflight.log",
+    "revision": "6429fba43f92d984500e03c10730109f01554431",
+    "exit_code": 1,
+    "status": "Blocked: thermal-throttle; clean-tree admission passed"
+  },
+  {
+    "command": [
+      "python3",
+      "scripts/s37-host-sample.py",
+      ".artifacts/m4.5/s37/campaign-R/reference-host.jsonl",
+      "--once"
+    ],
+    "exit_code": 0
   }
 ]

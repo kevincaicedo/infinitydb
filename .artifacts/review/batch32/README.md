@@ -29,7 +29,9 @@ S37 development smoke, including refused trials, is retained under
 instrument used for the successful fresh-database DBSIZE and D9 smoke.
 Final benchmark edits add checked counter arithmetic, summary notes and
 write-leg CPU/error reporting; targeted checks passed without repeating
-the long smoke. `final-binaries.json` identifies the final local build.
+the long smoke. `final-binaries.json` identifies the final local build
+before the source commit; campaign R's `reference-preflight.json` records
+the shipping build at clean commit `6429fba`.
 Source hashes are in `source-manifest.json`; artifact checksums are in
 `artifact-sha256.txt`. The checksum list excludes itself.
 

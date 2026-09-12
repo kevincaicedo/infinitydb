@@ -1,5 +1,8 @@
-061050da4596458cf1a022fe0752d677a308117a3901d506c96d1cedb7ba5a3d  .artifacts/m4.5/s37/campaign-R/README.md
+4daacb49a6890e5cb48649ba7bcaab72c22cc404c868893575cf62e3ced092bc  .artifacts/m4.5/s37/campaign-R/README.md
 ba19a20ee86399d366b8990f226a34b5f705a0bf98195aa82cba1807f9496f6d  .artifacts/m4.5/s37/campaign-R/preflight-host.jsonl
+c84bd1e9d1b52804303fb1663888268deed938d43ba6636d88131c7eb02b915d  .artifacts/m4.5/s37/campaign-R/reference-host.jsonl
+fe4de776b129b3239026ab951e549d52c57dde3afdadef289c491961b6b9262c  .artifacts/m4.5/s37/campaign-R/reference-preflight.json
+c4a8fde241ed29f4fc25b39b3de292bcd13198ad8e4ae6407abbe8f68da60f51  .artifacts/m4.5/s37/campaign-R/reference-preflight.log
 bfb0631cd2c7089b37ec8aa9deb5096a7080f4c5b9058d48edb1784f2fd798fb  .artifacts/m4.5/s37/campaign-R/smoke/DBSIZE/stderr/infinityd-38191.stderr
 064e7b59f61fe5320bf08f134a416665792393ee4a0e562d40920a54a5528db0  .artifacts/m4.5/s37/campaign-R/smoke/DBSIZE/stderr/infinityd-45497.stderr
 77b1c31e4d6c619790524ad4a6b3ad9008569a7f5034b929d9786040a99a6056  .artifacts/m4.5/s37/campaign-R/smoke/DBSIZE.log
@@ -24,7 +27,7 @@ ad5166929a4a7a63499dc8e152711c05eb9e57dfb4e2a38d1071bf30d7195bd8  .artifacts/m4.
 7f56bfb4a65c56d25f50d1d5436e02f7304e3b5568919586ad1eafaf513a55f0  .artifacts/m4.5/s37/campaign-R/smoke-fresh-db/io-properties.toml
 4d7547e4fe42dc651989b3d326dd0b246bb027e786fbdcc3d8894be372730a8a  .artifacts/m4.5/s37/campaign-R/smoke-fresh-db/observations.json
 d8ec82cd7595e5ffb3f3528b5e9f0336262b46d22e1ba131c74d36ed052f1701  .artifacts/m4.5/s37/campaign-R/smoke-fresh-db/validation.json
-41e211e6219ac4ef5bc4979e6605571b0930373aa6cb6d181dbfecb951267261  .artifacts/review/batch32/README.md
+9505ef4b933ffb8162c7c07d0c20d5616914d7be11c362f2c3a426c3b422ae4f  .artifacts/review/batch32/README.md
 d38a1e5a969ce82e8f1e62177cf45be85ed3da255453a6899c897c1336f308af  .artifacts/review/batch32/bench-clippy-checked-final.log
 d3d1eecb5cc4bc9ae1c54ff47bc925fe02c429c812142332228db6a8df1de8d5  .artifacts/review/batch32/bench-clippy-final.log
 e7114712f1a881e7942f2f8049df18e3ad550c88415372ca704f3219c62ffe76  .artifacts/review/batch32/bench-tests-final.log
@@ -54,4 +57,4 @@ d9fa0f87e2f6816dd331fcbf3006a4dea5851a78b16ebc96b200efbcda4b3daf  .artifacts/rev
 ff0a4440b9dc9c8008bdeaaebdcfc976b73b5031ca97665e2494193650206035  .artifacts/review/batch32/tiered-64.log
 e566f4e54256e89ea101ece0e09413f099b5fe39bee8e1b3ca450981a6e73f91  .artifacts/review/batch32/txmodel-after.log
 3417f4f207ed0f64e29b2823abf0f38f54e474614a6ce393ef8e5dbe7136c790  .artifacts/review/batch32/txmodel-before.log
-50eaca77530ed5844ea200b8153d360e1e787607c319b15f4fdf7d290197267a  .artifacts/review/batch32/validation.json
+2b03dc3eed7926e3e1a46915d38a476d13ad78272f2fdf9d4c1b28f013cd4421  .artifacts/review/batch32/validation.json
