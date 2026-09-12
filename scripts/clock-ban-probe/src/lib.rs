@@ -45,6 +45,11 @@ pub fn h_glob() -> std::time::SystemTime {
 pub fn i_tsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() } // PLANT core::arch::x86_64::_rdtsc
 }
+#[cfg(target_arch = "x86_64")]
+pub fn i2_tsc_aux() -> u64 {
+    let mut aux = 0u32;
+    unsafe { core::arch::x86_64::__rdtscp(&mut aux) } // PLANT core::arch::x86_64::__rdtscp
+}
 pub fn j_sleep() {
     std::thread::sleep(Duration::from_millis(1)) // PLANT std::thread::sleep
 }

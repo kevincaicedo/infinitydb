@@ -26,5 +26,9 @@ disallowed-methods = [
     { path = "libc::gettimeofday", reason = "no ambient clocks in cell code (L7) — the libc spelling" },
     { path = "libc::time", reason = "no ambient clocks in cell code (L7) — the libc spelling" },
     { path = "core::arch::x86_64::_rdtsc", reason = "no ambient clocks in cell code (L7) — the TSC spelling" },
-    { path = "core::arch::x86_64::_rdtscp", reason = "no ambient clocks in cell code (L7) — the TSC spelling" },
+    # `__rdtscp` (two underscores — the Intel intrinsic name std uses); the
+    # batch-14 entry was `_rdtscp`, which does not exist, so clippy warned
+    # "does not refer to a reachable function" on every crate and the ban on
+    # this spelling was inert (batch 34, ADR-0106 D7.5).
+    { path = "core::arch::x86_64::__rdtscp", reason = "no ambient clocks in cell code (L7) — the TSC spelling" },
 ]

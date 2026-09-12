@@ -525,6 +525,8 @@ fn main() {
             let mut race_replans = 0u64;
             let mut dir_open_fault_seeds = 0u64;
             let mut dir_open_faults_fired = 0u64;
+            let mut ckpt_downgrades = 0u64;
+            let mut ckpt_bound_splits = 0u64;
             let mut diskfull_refusals = 0u64;
             let mut drop_values = 0u64;
             let mut drop_other = 0u64;
@@ -603,6 +605,8 @@ fn main() {
                 race_replans += report.race_replans;
                 dir_open_fault_seeds += u64::from(report.dir_open_fault_arm);
                 dir_open_faults_fired += report.dir_open_faults_fired;
+                ckpt_downgrades += report.ckpt_downgrades;
+                ckpt_bound_splits += report.ckpt_bound_splits;
                 diskfull_refusals += report.diskfull_refusals;
                 drop_values += report.drop_replies_value;
                 drop_other += report.drop_replies_other;
@@ -634,7 +638,8 @@ fn main() {
                  keys audited, {flushed_pre_cut} B flushed pre-cut, {cold_resolves} cold \
                  resolves, {blob_sets} blob sets, {race_replans} blob-key race replans, \
                  dir-open fault armed on {dir_open_fault_seeds} seeds ({dir_open_faults_fired} \
-                 fired), {diskfull_refusals} DISKFULL refusals, \
+                 fired), ckpt arms [downgrades {ckpt_downgrades} bound_splits \
+                 {ckpt_bound_splits}], {diskfull_refusals} DISKFULL refusals, \
                  drop-race {drop_values} values / {drop_other} typed-other; post-drop reboots \
                  {drop_reboots} ({drop_reboot_residue} with MANIFEST residue), cut inside DROP: \
                  {drop_cut_whole} whole / {drop_cut_swept} swept (ADR-0100); shadow arm on \
@@ -664,6 +669,7 @@ fn main() {
                      flushed_pre_cut={flushed_pre_cut} cold_resolves={cold_resolves} \
                      blob_sets={blob_sets} dir_open_fault_seeds={dir_open_fault_seeds} \
                      dir_open_faults_fired={dir_open_faults_fired} \
+                     ckpt_downgrades={ckpt_downgrades} ckpt_bound_splits={ckpt_bound_splits} \
                      diskfull_refusals={diskfull_refusals} \
                      drop_values={drop_values} drop_other={drop_other} \
                      drop_reboots={drop_reboots} drop_reboot_residue={drop_reboot_residue} \
@@ -1142,7 +1148,8 @@ fn run_durable(
              audited, {} required ops, {} allowed-lost, {} equivalence checks, {} documents \
              compared, {} corpus docs, cut classes {:?}, lift regime {} (tiered ops {}, indexed \
              ops {}, sidecars loaded {}, stale slacks lifted {}; plant: cells {}, lifts {}, \
-             sidecars {}), trace {} bytes, hash {:#018x}",
+             sidecars {}), arms [ckpt_downgrades {} bound_splits {} waits_fill {} waits_group \
+             {} plant_fired {}], trace {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -1160,6 +1167,11 @@ fn run_durable(
             report.lift_plants,
             report.lift_plant_lifts,
             report.lift_plant_sidecars,
+            report.ckpt_downgrades,
+            report.ckpt_bound_splits,
+            report.frame_waits_fill,
+            report.frame_waits_group,
+            report.plant_fired,
             report.trace.len(),
             report.trace_hash
         );
@@ -1208,6 +1220,7 @@ fn run_durable(
     let mut waits_rotation = 0u64;
     let mut waits_reorder = 0u64;
     let mut ckpt_downgrades = 0u64;
+    let mut bound_splits = 0u64;
     let mut waits_fill = 0u64;
     let mut waits_group = 0u64;
     // Device-budget coverage (ADR-0088 D8): background bytes granted,
@@ -1253,6 +1266,7 @@ fn run_durable(
         waits_rotation += report.frame_waits_rotation;
         waits_reorder += report.frame_waits_reorder;
         ckpt_downgrades += report.ckpt_downgrades;
+        bound_splits += report.ckpt_bound_splits;
         waits_fill += report.frame_waits_fill;
         waits_group += report.frame_waits_group;
         budget_bytes += report.budget_background_bytes;
@@ -1310,7 +1324,7 @@ fn run_durable(
          waits_rotation:{waits_rotation} waits_reorder:{waits_reorder}], device budget [background_bytes:{budget_bytes} \
          deferrals:{budget_deferrals} waits_pace:{waits_pace} write_stall_max_us:{stall_max_us}], \
          reopened_packed_tails:{reopened_packed_tails} ckpt_downgrades:{ckpt_downgrades} \
-         waits_fill:{waits_fill} waits_group:{waits_group}, recycling [recycled:{recycled} misses:{recycle_misses} \
+         bound_splits:{bound_splits} waits_fill:{waits_fill} waits_group:{waits_group}, recycling [recycled:{recycled} misses:{recycle_misses} \
          fallbacks:{recycle_fallbacks} rotations:{rotations} residue_slacks:{residue_slacks} \
          waits_started:{waits_started} waits_satisfied:{waits_satisfied} \
          waits_expired:{waits_expired} inline_preallocs:{inline_preallocs}], lift regime \
@@ -1332,7 +1346,7 @@ fn run_durable(
              waits_reorder={waits_reorder} budget_background_bytes={budget_bytes} budget_deferrals={budget_deferrals} \
              waits_pace={waits_pace} write_stall_max_us={stall_max_us} \
              reopened_packed_tails={reopened_packed_tails} ckpt_downgrades={ckpt_downgrades} \
-             waits_fill={waits_fill} waits_group={waits_group} segments_recycled={recycled} recycle_misses={recycle_misses} \
+             ckpt_bound_splits={bound_splits} waits_fill={waits_fill} waits_group={waits_group} segments_recycled={recycled} recycle_misses={recycle_misses} \
              recycle_fallbacks={recycle_fallbacks} segment_rotations={rotations} \
              recycled_residue_slacks={residue_slacks} recycle_waits_started={waits_started} \
              recycle_waits_satisfied={waits_satisfied} recycle_waits_expired={waits_expired} \

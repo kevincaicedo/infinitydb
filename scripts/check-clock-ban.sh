@@ -30,7 +30,7 @@ PROBE_SRC="$SCRIPT_DIR/clock-ban-probe"
 
 fail=0
 # ---- 1. the config ------------------------------------------------------
-ENTRIES="std::time::Instant::now std::time::Instant::elapsed std::time::SystemTime::now std::time::SystemTime::elapsed libc::clock_gettime libc::gettimeofday libc::time core::arch::x86_64::_rdtsc core::arch::x86_64::_rdtscp"
+ENTRIES="std::time::Instant::now std::time::Instant::elapsed std::time::SystemTime::now std::time::SystemTime::elapsed libc::clock_gettime libc::gettimeofday libc::time core::arch::x86_64::_rdtsc core::arch::x86_64::__rdtscp"
 entries=0
 if [ ! -f clippy.toml ]; then
     echo "CLOCK-BAN violation: clippy.toml missing at $(pwd) — the ban has no config"
@@ -150,6 +150,14 @@ else
         echo "CLOCK-BAN SCOPE ERROR: probe carries $plants planted lines (expected ≥ 10) — the fixture was edited down"
         fail=1
     fi
+    # An entry that names no reachable item bans nothing: clippy only
+    # warns ("does not refer to a reachable function") and the check stays
+    # green — batch 14's `_rdtscp` (the intrinsic is `__rdtscp`) was inert
+    # for four months (batch 34, ADR-0106 D7.5).
+    while IFS= read -r row; do
+        echo "CLOCK-BAN violation: clippy.toml entry does not resolve — $row"
+        fail=1
+    done < <(grep -o '`[^`]*` does not refer to a reachable [a-z]*' "$diag" | sort -u)
     if grep -q "^error" "$diag"; then
         echo "CLOCK-BAN SCOPE ERROR: the probe did not compile:"
         sed 's/^/    | /' "$diag"

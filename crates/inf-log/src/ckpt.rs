@@ -2342,391 +2342,375 @@ impl<File: SegmentFile> IckReader<File> {
         if self.offset == self.file_size {
             return Err(IckReadError::MissingFooter.into());
         }
-        let mut tag = [0u8; 1];
-        read_exact_at(&self.file, self.offset, &mut tag)?;
-        match tag[0] {
-            BLOCK_SECTION => {
-                let mut head = [0u8; SECTION_HEADER_LEN];
-                read_exact_at(&self.file, self.offset, &mut head)?;
-                let body_len = le_u32(&head[1..5]);
-                if body_len > self.cfg.max_section_bytes {
-                    return Err(IckReadError::SectionTooLarge {
-                        len: body_len,
-                        max: self.cfg.max_section_bytes,
-                    }
-                    .into());
-                }
-                let record_count = le_u32(&head[5..9]);
-                let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
-                self.block.resize(block_len, 0);
-                read_exact_at(&self.file, self.offset, &mut self.block)?;
-                // Read-ahead the next blocks (M2.5-S08): their device reads
-                // overlap this section's CRC + decode + apply. Four blocks
-                // deep — sections share the staging capacity class and are
-                // small enough that one-ahead loses the race against the
-                // prefetcher's wakeup latency. Hint-only; EOF-safe.
-                self.advise_next_blocks(block_len);
-                let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
-                if crc32c(&self.block[..block_len - CRC_LEN]) != stored_crc {
-                    return Err(
-                        IckReadError::SectionCrc { index: self.sections, at: self.offset }.into()
-                    );
-                }
-                self.digest = fold_digest(self.digest, stored_crc);
-                let mut body = &self.block[SECTION_HEADER_LEN..block_len - CRC_LEN];
-                let mut decoded = 0u32;
-                while !body.is_empty() {
-                    let (view, consumed) = decode_record(body)
-                        .map_err(|error| IckReadError::Record { section: self.sections, error })?;
-                    if let RecordView::StringPostImage { ns, .. } | RecordView::DocFull { ns, .. } =
-                        view
-                    {
-                        match self.entries_seen.iter_mut().find(|(id, _)| *id == ns.0) {
-                            Some((_, n)) => *n += 1,
-                            None => self.entries_seen.push((ns.0, 1)),
-                        }
-                    }
-                    apply(view)
-                        .map_err(|error| IckApplyError::Apply { section: self.sections, error })?;
-                    decoded += 1;
-                    body = &body[consumed..];
-                }
-                if decoded != record_count {
-                    return Err(
-                        IckReadError::FooterMismatch { field: "section record_count" }.into()
-                    );
-                }
-                self.sections += 1;
-                self.records_total += u64::from(record_count);
-                let hop = self.hop(block_len)?;
-                self.offset += hop;
-                Ok(IckStep::Section { bytes: hop })
-            }
-            BLOCK_ADDR_SECTION if self.info.version >= ICK_VERSION_V2 => {
-                let mut head = [0u8; SECTION_HEADER_LEN];
-                read_exact_at(&self.file, self.offset, &mut head)?;
-                let body_len = le_u32(&head[1..5]);
-                if body_len > self.cfg.max_section_bytes {
-                    return Err(IckReadError::SectionTooLarge {
-                        len: body_len,
-                        max: self.cfg.max_section_bytes,
-                    }
-                    .into());
-                }
-                let record_count = le_u32(&head[5..9]);
-                let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
-                self.block.resize(block_len, 0);
-                read_exact_at(&self.file, self.offset, &mut self.block)?;
-                self.advise_next_blocks(block_len);
-                let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
-                if crc32c(&self.block[..block_len - CRC_LEN]) != stored_crc {
-                    return Err(
-                        IckReadError::SectionCrc { index: self.sections, at: self.offset }.into()
-                    );
-                }
-                self.digest = fold_digest(self.digest, stored_crc);
-                // Shape audit: body = {ns, walk_watermark} + exactly
-                // record_count entries; never empty (the writer only
-                // seals non-empty sections).
-                let body = &self.block[SECTION_HEADER_LEN..block_len - CRC_LEN];
-                let entry_bytes = body.len().saturating_sub(ADDR_SECTION_META_LEN);
-                if body.len() < ADDR_SECTION_META_LEN
-                    || record_count == 0
-                    || !entry_bytes.is_multiple_of(ADDR_REF_ENTRY_LEN)
-                    || entry_bytes / ADDR_REF_ENTRY_LEN != record_count as usize
-                {
-                    return Err(IckReadError::RefSectionMalformed {
-                        index: self.sections,
-                        at: self.offset,
-                    }
-                    .into());
-                }
-                let ns = le_u32(&body[0..4]);
-                let walk_watermark = le_u64(&body[4..12]);
-                if walk_watermark >= ADDR_LIMIT {
-                    return Err(IckReadError::RefSectionMalformed {
-                        index: self.sections,
-                        at: self.offset,
-                    }
-                    .into());
-                }
-                let entries = &body[ADDR_SECTION_META_LEN..];
-                // Watermark audit (the §3.1 corollary's decode half)
-                // before the applier sees a single entry.
-                for entry in entries.chunks_exact(ADDR_REF_ENTRY_LEN) {
-                    let mut addr = [0u8; 8];
-                    addr[..6].copy_from_slice(&entry[8..14]);
-                    if u64::from_le_bytes(addr) >= walk_watermark {
-                        return Err(IckReadError::RefBeyondWatermark {
-                            index: self.sections,
-                            at: self.offset,
-                        }
-                        .into());
-                    }
-                }
-                let Some(on_refs) = refs else {
-                    return Err(IckReadError::RefSectionUnsupported { at: self.offset }.into());
-                };
-                match self.entries_seen.iter_mut().find(|(id, _)| *id == ns) {
-                    Some((_, n)) => *n += u64::from(record_count),
-                    None => self.entries_seen.push((ns, u64::from(record_count))),
-                }
-                on_refs(IckRefSection { ns, walk_watermark, entries })
-                    .map_err(|error| IckApplyError::Apply { section: self.sections, error })?;
-                self.sections += 1;
-                self.records_total += u64::from(record_count);
-                let hop = self.hop(block_len)?;
-                self.offset += hop;
-                Ok(IckStep::Section { bytes: hop })
-            }
-            BLOCK_LIVESET if self.info.version >= ICK_VERSION_V2 => {
-                let mut head = [0u8; SECTION_HEADER_LEN];
-                read_exact_at(&self.file, self.offset, &mut head)?;
-                let body_len = le_u32(&head[1..5]);
-                if body_len > self.cfg.max_section_bytes {
-                    return Err(IckReadError::SectionTooLarge {
-                        len: body_len,
-                        max: self.cfg.max_section_bytes,
-                    }
-                    .into());
-                }
-                let record_count = le_u32(&head[5..9]);
-                let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
-                self.block.resize(block_len, 0);
-                read_exact_at(&self.file, self.offset, &mut self.block)?;
-                self.advise_next_blocks(block_len);
-                let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
-                if crc32c(&self.block[..block_len - CRC_LEN]) != stored_crc {
-                    return Err(
-                        IckReadError::SectionCrc { index: self.sections, at: self.offset }.into()
-                    );
-                }
-                self.digest = fold_digest(self.digest, stored_crc);
-                // Shape audit: body = ns + exactly record_count entries;
-                // never empty (the writer only seals non-empty sections).
-                let body = &self.block[SECTION_HEADER_LEN..block_len - CRC_LEN];
-                let entry_bytes = body.len().saturating_sub(LIVESET_META_LEN);
-                if body.len() < LIVESET_META_LEN
-                    || record_count == 0
-                    || !entry_bytes.is_multiple_of(LIVESET_ENTRY_LEN)
-                    || entry_bytes / LIVESET_ENTRY_LEN != record_count as usize
-                {
-                    return Err(IckReadError::LiveSetSectionMalformed {
-                        index: self.sections,
-                        at: self.offset,
-                    }
-                    .into());
-                }
-                let ns = le_u32(&body[0..4]);
-                let entries = &body[LIVESET_META_LEN..];
-                // Entry audit (ADR-0058 D3): unknown flag bits are
-                // fail-stop within the frozen version, and a dead count
-                // above the file's data bytes is the over-count the D4
-                // sound-direction rule exists to make unrepresentable.
-                for entry in entries.chunks_exact(LIVESET_ENTRY_LEN) {
-                    if entry[20] & !LIVESET_FLAG_BYTE_EXACT != 0
-                        || le_u64(&entry[12..20]) > le_u64(&entry[4..12])
-                    {
-                        return Err(IckReadError::LiveSetSectionMalformed {
-                            index: self.sections,
-                            at: self.offset,
-                        }
-                        .into());
-                    }
-                }
-                let Some(on_live_set) = live_set else {
-                    return Err(IckReadError::LiveSetSectionUnsupported { at: self.offset }.into());
-                };
-                // Deliberately NOT entries_seen: the per-ns counts
-                // presize the index at recovery, and a file entry is not
-                // an index entry (mirrors the writer).
-                on_live_set(IckLiveSetSection { ns, entries })
-                    .map_err(|error| IckApplyError::Apply { section: self.sections, error })?;
-                self.sections += 1;
-                self.records_total += u64::from(record_count);
-                let hop = self.hop(block_len)?;
-                self.offset += hop;
-                Ok(IckStep::Section { bytes: hop })
-            }
-            BLOCK_BLOBREF if self.info.version >= ICK_VERSION_V2 => {
-                let mut head = [0u8; SECTION_HEADER_LEN];
-                read_exact_at(&self.file, self.offset, &mut head)?;
-                let body_len = le_u32(&head[1..5]);
-                if body_len > self.cfg.max_section_bytes {
-                    return Err(IckReadError::SectionTooLarge {
-                        len: body_len,
-                        max: self.cfg.max_section_bytes,
-                    }
-                    .into());
-                }
-                let record_count = le_u32(&head[5..9]);
-                let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
-                self.block.resize(block_len, 0);
-                read_exact_at(&self.file, self.offset, &mut self.block)?;
-                self.advise_next_blocks(block_len);
-                let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
-                if crc32c(&self.block[..block_len - CRC_LEN]) != stored_crc {
-                    return Err(
-                        IckReadError::SectionCrc { index: self.sections, at: self.offset }.into()
-                    );
-                }
-                self.digest = fold_digest(self.digest, stored_crc);
-                // Shape audit: body = ns + exactly record_count entries;
-                // never empty (the writer only seals non-empty sections).
-                let body = &self.block[SECTION_HEADER_LEN..block_len - CRC_LEN];
-                let entry_bytes = body.len().saturating_sub(BLOBREF_META_LEN);
-                if body.len() < BLOBREF_META_LEN
-                    || record_count == 0
-                    || !entry_bytes.is_multiple_of(BLOBREF_ENTRY_LEN)
-                    || entry_bytes / BLOBREF_ENTRY_LEN != record_count as usize
-                {
-                    return Err(IckReadError::BlobRefSectionMalformed {
-                        index: self.sections,
-                        at: self.offset,
-                    }
-                    .into());
-                }
-                let ns = le_u32(&body[0..4]);
-                let entries = &body[BLOBREF_META_LEN..];
-                // Entry audit (ADR-0061 D6): a zero-length reference and
-                // out-of-order addresses are non-canonical — fail-stop
-                // within the frozen version. (Addresses are 48-bit by
-                // encoding: six bytes cannot exceed the limit.)
-                let mut prev_addr: Option<u64> = None;
-                for entry in entries.chunks_exact(BLOBREF_ENTRY_LEN) {
-                    let mut addr = [0u8; 8];
-                    addr[..6].copy_from_slice(&entry[0..6]);
-                    let addr = u64::from_le_bytes(addr);
-                    if le_u64(&entry[14..22]) == 0 || prev_addr.is_some_and(|p| addr <= p) {
-                        return Err(IckReadError::BlobRefSectionMalformed {
-                            index: self.sections,
-                            at: self.offset,
-                        }
-                        .into());
-                    }
-                    prev_addr = Some(addr);
-                }
-                let Some(on_blob_refs) = blob_refs else {
-                    return Err(IckReadError::BlobRefSectionUnsupported { at: self.offset }.into());
-                };
-                // Deliberately NOT entries_seen: a cold blob record's
-                // index slot was already counted by its 0x03 ref entry —
-                // this section is bookkeeping, not index content
-                // (mirrors the writer).
-                on_blob_refs(IckBlobRefSection { ns, entries })
-                    .map_err(|error| IckApplyError::Apply { section: self.sections, error })?;
-                self.sections += 1;
-                self.records_total += u64::from(record_count);
-                let hop = self.hop(block_len)?;
-                self.offset += hop;
-                Ok(IckStep::Section { bytes: hop })
-            }
-            BLOCK_IDXSIDECAR if self.info.version >= ICK_VERSION_V2 => {
-                let mut head = [0u8; SECTION_HEADER_LEN];
-                read_exact_at(&self.file, self.offset, &mut head)?;
-                let body_len = le_u32(&head[1..5]);
-                if body_len > self.cfg.max_section_bytes {
-                    return Err(IckReadError::SectionTooLarge {
-                        len: body_len,
-                        max: self.cfg.max_section_bytes,
-                    }
-                    .into());
-                }
-                let record_count = le_u32(&head[5..9]);
-                let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
-                self.block.resize(block_len, 0);
-                read_exact_at(&self.file, self.offset, &mut self.block)?;
-                self.advise_next_blocks(block_len);
-                let Some(on_idx_sidecar) = idx_sidecar else {
-                    return Err(
-                        IckReadError::IdxSidecarSectionUnsupported { at: self.offset }.into()
-                    );
-                };
-                // The stored CRC folds into the digest BEFORE
-                // verification (ADR-0073 D3.3/D6): the file-level audit
-                // and the body verdict are independent — that is what
-                // makes 0x06 the file's only soft body class. Damage to
-                // the CRC *field* itself fails the footer digest audit
-                // ⇒ fail-stop, conservatively (the D6 asymmetry).
-                let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
-                self.digest = fold_digest(self.digest, stored_crc);
-                let step = if crc32c(&self.block[..block_len - CRC_LEN]) == stored_crc {
-                    let body = &self.block[SECTION_HEADER_LEN..block_len - CRC_LEN];
-                    match parse_idx_sidecar_body(body, record_count) {
-                        Some(section) => IckIdxSidecarStep::Section(section),
-                        None => IckIdxSidecarStep::Damaged { at: self.offset },
-                    }
-                } else {
-                    IckIdxSidecarStep::Damaged { at: self.offset }
-                };
-                on_idx_sidecar(step)
-                    .map_err(|error| IckApplyError::Apply { section: self.sections, error })?;
-                // Sidecar entries join neither `records_total` nor the
-                // per-ns counts (ADR-0078 D2, mirroring the writer):
-                // no soft-class body byte may be load-bearing for the
-                // footer audit.
-                self.sections += 1;
-                let hop = self.hop(block_len)?;
-                self.offset += hop;
-                Ok(IckStep::Section { bytes: hop })
-            }
-            BLOCK_FOOTER => {
-                let mut fixed = [0u8; FOOTER_FIXED_LEN];
-                read_exact_at(&self.file, self.offset, &mut fixed)?;
-                let footer_sections = le_u32(&fixed[1..5]);
-                let footer_records = le_u64(&fixed[5..13]);
-                let footer_ns = le_u32(&fixed[13..17]) as usize;
-                if footer_ns > (1 << 20) {
-                    return Err(IckReadError::Truncated { at: self.offset + 13 }.into());
-                }
-                let tail_len = footer_ns * 12 + 8 + CRC_LEN;
-                let block_len = FOOTER_FIXED_LEN + tail_len;
-                self.block.resize(block_len, 0);
-                read_exact_at(&self.file, self.offset, &mut self.block)?;
-                let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
-                if crc32c(&self.block[..block_len - CRC_LEN]) != stored_crc {
-                    return Err(IckReadError::FooterCrc { at: self.offset }.into());
-                }
-                let stored_digest =
-                    le_u64(&self.block[block_len - CRC_LEN - 8..block_len - CRC_LEN]);
-                if footer_sections != self.sections {
-                    return Err(IckReadError::FooterMismatch { field: "section_count" }.into());
-                }
-                if footer_records != self.records_total {
-                    return Err(IckReadError::FooterMismatch { field: "records_total" }.into());
-                }
-                if stored_digest != self.digest {
-                    return Err(IckReadError::FooterMismatch { field: "digest" }.into());
-                }
-                let mut footer_entries: Vec<(u32, u64)> = Vec::with_capacity(footer_ns);
-                for chunk in
-                    self.block[FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + footer_ns * 12].chunks_exact(12)
-                {
-                    footer_entries.push((le_u32(&chunk[0..4]), le_u64(&chunk[4..12])));
-                }
-                let mut seen_sorted = self.entries_seen.clone();
-                seen_sorted.sort_unstable();
-                let mut footer_sorted = footer_entries.clone();
-                footer_sorted.sort_unstable();
-                if seen_sorted != footer_sorted {
-                    return Err(IckReadError::FooterMismatch { field: "entries_per_ns" }.into());
-                }
-                let end = self.offset + self.hop(block_len)?;
-                if end != self.file_size {
-                    return Err(IckReadError::TrailingData { at: end }.into());
-                }
-                self.done = true;
-                Ok(IckStep::Done(IckSummary {
-                    sections: self.sections,
-                    records: self.records_total,
-                    entries_per_ns: footer_entries,
-                    digest: self.digest,
-                    bytes: end,
-                }))
-            }
-            tag => Err(IckReadError::UnknownBlock { tag, at: self.offset }.into()),
+        // One header read serves the tag dispatch and the section frame
+        // (review L03, batch 34): a footer's tag sits in the same bytes.
+        let mut head = [0u8; SECTION_HEADER_LEN];
+        read_exact_at(&self.file, self.offset, &mut head)?;
+        let BlockTag::Section(class) = self.classify(head[0])? else {
+            return self.step_footer().map_err(IckApplyError::Read);
+        };
+        let frame = self.read_block(head)?;
+        match class {
+            SectionTag::Records => self.step_records(frame, apply),
+            SectionTag::Refs => self.step_refs(frame, refs),
+            SectionTag::LiveSet => self.step_live_set(frame, live_set),
+            SectionTag::BlobRefs => self.step_blob_refs(frame, blob_refs),
+            SectionTag::IdxSidecar => self.step_idx_sidecar(frame, idx_sidecar),
         }
     }
+
+    /// The block class a tag names under the file's version: the v2
+    /// vocabulary (0x03–0x06) is corruption in a v1 file. Every tag
+    /// `seal_section` can emit is listed here and in the counts hop
+    /// (the ADR-0073 D4 rule).
+    fn classify(&self, tag: u8) -> Result<BlockTag, IckReadError> {
+        let v2 = self.info.version >= ICK_VERSION_V2;
+        Ok(match tag {
+            BLOCK_SECTION => BlockTag::Section(SectionTag::Records),
+            BLOCK_FOOTER => BlockTag::Footer,
+            BLOCK_ADDR_SECTION if v2 => BlockTag::Section(SectionTag::Refs),
+            BLOCK_LIVESET if v2 => BlockTag::Section(SectionTag::LiveSet),
+            BLOCK_BLOBREF if v2 => BlockTag::Section(SectionTag::BlobRefs),
+            BLOCK_IDXSIDECAR if v2 => BlockTag::Section(SectionTag::IdxSidecar),
+            tag => return Err(IckReadError::UnknownBlock { tag, at: self.offset }),
+        })
+    }
+
+    /// The shared section preamble: bound the body by the loader config,
+    /// read the rest of the block behind the header already in hand, hint
+    /// the read-ahead. Two dependent reads per section block (was three —
+    /// review L03). The CRC is *not* checked here: tag 0x06 folds it
+    /// before verification (the soft class).
+    fn read_block(&mut self, head: [u8; SECTION_HEADER_LEN]) -> Result<SectionFrame, IckReadError> {
+        let body_len = le_u32(&head[1..5]);
+        if body_len > self.cfg.max_section_bytes {
+            return Err(IckReadError::SectionTooLarge {
+                len: body_len,
+                max: self.cfg.max_section_bytes,
+            });
+        }
+        let record_count = le_u32(&head[5..9]);
+        let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
+        self.block.resize(block_len, 0);
+        self.block[..SECTION_HEADER_LEN].copy_from_slice(&head);
+        read_exact_at(
+            &self.file,
+            self.offset + SECTION_HEADER_LEN as u64,
+            &mut self.block[SECTION_HEADER_LEN..],
+        )?;
+        // Read-ahead the next blocks (M2.5-S08): their device reads
+        // overlap this section's CRC + decode + apply. Four blocks deep —
+        // sections share the staging capacity class and are small enough
+        // that one-ahead loses the race against the prefetcher's wakeup
+        // latency. Hint-only; EOF-safe.
+        self.advise_next_blocks(block_len);
+        let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
+        Ok(SectionFrame { record_count, block_len, stored_crc })
+    }
+
+    /// The hard CRC audit: a mismatch is fail-stop, a match folds into
+    /// the footer digest.
+    fn audit_crc(&mut self, frame: SectionFrame) -> Result<(), IckReadError> {
+        if !frame.crc_ok(&self.block) {
+            return Err(IckReadError::SectionCrc { index: self.sections, at: self.offset });
+        }
+        self.digest = fold_digest(self.digest, frame.stored_crc);
+        Ok(())
+    }
+
+    /// Accounts one validated section and hops to the next block.
+    fn finish_section(
+        &mut self,
+        frame: SectionFrame,
+        records: u64,
+    ) -> Result<IckStep, IckReadError> {
+        self.sections += 1;
+        self.records_total += records;
+        let hop = self.hop(frame.block_len)?;
+        self.offset += hop;
+        Ok(IckStep::Section { bytes: hop })
+    }
+
+    fn apply_err<E>(&self, error: E) -> IckApplyError<E> {
+        IckApplyError::Apply { section: self.sections, error }
+    }
+
+    fn step_records<E>(
+        &mut self,
+        frame: SectionFrame,
+        apply: &mut dyn FnMut(RecordView<'_>) -> Result<(), E>,
+    ) -> Result<IckStep, IckApplyError<E>> {
+        self.audit_crc(frame)?;
+        let section = self.sections;
+        let mut body = frame.body(&self.block);
+        let mut decoded = 0u32;
+        while !body.is_empty() {
+            let (view, consumed) =
+                decode_record(body).map_err(|error| IckReadError::Record { section, error })?;
+            if let RecordView::StringPostImage { ns, .. } | RecordView::DocFull { ns, .. } = view {
+                count_entries(&mut self.entries_seen, ns.0, 1);
+            }
+            apply(view).map_err(|error| IckApplyError::Apply { section, error })?;
+            decoded += 1;
+            body = &body[consumed..];
+        }
+        if decoded != frame.record_count {
+            return Err(IckReadError::FooterMismatch { field: "section record_count" }.into());
+        }
+        Ok(self.finish_section(frame, u64::from(frame.record_count))?)
+    }
+
+    fn step_refs<E>(
+        &mut self,
+        frame: SectionFrame,
+        refs: Option<RefHandler<'_, E>>,
+    ) -> Result<IckStep, IckApplyError<E>> {
+        self.audit_crc(frame)?;
+        let malformed = IckReadError::RefSectionMalformed { index: self.sections, at: self.offset };
+        let (ns, walk_watermark, entries) =
+            audit_ref_body(frame.body(&self.block), frame.record_count).ok_or(malformed)?;
+        // Watermark audit (the §3.1 corollary's decode half) before the
+        // applier sees a single entry.
+        if entries.chunks_exact(ADDR_REF_ENTRY_LEN).any(|e| ref_addr(&e[8..]) >= walk_watermark) {
+            return Err(
+                IckReadError::RefBeyondWatermark { index: self.sections, at: self.offset }.into()
+            );
+        }
+        let Some(on_refs) = refs else {
+            return Err(IckReadError::RefSectionUnsupported { at: self.offset }.into());
+        };
+        count_entries(&mut self.entries_seen, ns, u64::from(frame.record_count));
+        on_refs(IckRefSection { ns, walk_watermark, entries }).map_err(|e| self.apply_err(e))?;
+        Ok(self.finish_section(frame, u64::from(frame.record_count))?)
+    }
+
+    fn step_live_set<E>(
+        &mut self,
+        frame: SectionFrame,
+        live_set: Option<LiveSetHandler<'_, E>>,
+    ) -> Result<IckStep, IckApplyError<E>> {
+        self.audit_crc(frame)?;
+        let malformed =
+            IckReadError::LiveSetSectionMalformed { index: self.sections, at: self.offset };
+        let (ns, entries) =
+            audit_live_set_body(frame.body(&self.block), frame.record_count).ok_or(malformed)?;
+        let Some(on_live_set) = live_set else {
+            return Err(IckReadError::LiveSetSectionUnsupported { at: self.offset }.into());
+        };
+        // Deliberately NOT entries_seen: the per-ns counts presize the
+        // index at recovery, and a file entry is not an index entry
+        // (mirrors the writer).
+        on_live_set(IckLiveSetSection { ns, entries }).map_err(|e| self.apply_err(e))?;
+        Ok(self.finish_section(frame, u64::from(frame.record_count))?)
+    }
+
+    fn step_blob_refs<E>(
+        &mut self,
+        frame: SectionFrame,
+        blob_refs: Option<BlobRefHandler<'_, E>>,
+    ) -> Result<IckStep, IckApplyError<E>> {
+        self.audit_crc(frame)?;
+        let malformed =
+            IckReadError::BlobRefSectionMalformed { index: self.sections, at: self.offset };
+        let (ns, entries) =
+            audit_blob_ref_body(frame.body(&self.block), frame.record_count).ok_or(malformed)?;
+        let Some(on_blob_refs) = blob_refs else {
+            return Err(IckReadError::BlobRefSectionUnsupported { at: self.offset }.into());
+        };
+        // Deliberately NOT entries_seen: a cold blob record's index slot
+        // was already counted by its 0x03 ref entry — this section is
+        // bookkeeping, not index content (mirrors the writer).
+        on_blob_refs(IckBlobRefSection { ns, entries }).map_err(|e| self.apply_err(e))?;
+        Ok(self.finish_section(frame, u64::from(frame.record_count))?)
+    }
+
+    fn step_idx_sidecar<E>(
+        &mut self,
+        frame: SectionFrame,
+        idx_sidecar: Option<IdxSidecarHandler<'_, E>>,
+    ) -> Result<IckStep, IckApplyError<E>> {
+        let Some(on_idx_sidecar) = idx_sidecar else {
+            return Err(IckReadError::IdxSidecarSectionUnsupported { at: self.offset }.into());
+        };
+        // The stored CRC folds into the digest BEFORE verification
+        // (ADR-0073 D3.3/D6): the file-level audit and the body verdict
+        // are independent — that is what makes 0x06 the file's only soft
+        // body class. Damage to the CRC *field* itself fails the footer
+        // digest audit ⇒ fail-stop, conservatively (the D6 asymmetry).
+        self.digest = fold_digest(self.digest, frame.stored_crc);
+        let step = if frame.crc_ok(&self.block) {
+            match parse_idx_sidecar_body(frame.body(&self.block), frame.record_count) {
+                Some(section) => IckIdxSidecarStep::Section(section),
+                None => IckIdxSidecarStep::Damaged { at: self.offset },
+            }
+        } else {
+            IckIdxSidecarStep::Damaged { at: self.offset }
+        };
+        on_idx_sidecar(step).map_err(|e| self.apply_err(e))?;
+        // Sidecar entries join neither `records_total` nor the per-ns
+        // counts (ADR-0078 D2, mirroring the writer): no soft-class body
+        // byte may be load-bearing for the footer audit.
+        Ok(self.finish_section(frame, 0)?)
+    }
+
+    fn step_footer(&mut self) -> Result<IckStep, IckReadError> {
+        let mut fixed = [0u8; FOOTER_FIXED_LEN];
+        read_exact_at(&self.file, self.offset, &mut fixed)?;
+        let footer_sections = le_u32(&fixed[1..5]);
+        let footer_records = le_u64(&fixed[5..13]);
+        let footer_ns = le_u32(&fixed[13..17]) as usize;
+        if footer_ns > (1 << 20) {
+            return Err(IckReadError::Truncated { at: self.offset + 13 });
+        }
+        let tail_len = footer_ns * 12 + 8 + CRC_LEN;
+        let block_len = FOOTER_FIXED_LEN + tail_len;
+        self.block.resize(block_len, 0);
+        read_exact_at(&self.file, self.offset, &mut self.block)?;
+        let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
+        if crc32c(&self.block[..block_len - CRC_LEN]) != stored_crc {
+            return Err(IckReadError::FooterCrc { at: self.offset });
+        }
+        let stored_digest = le_u64(&self.block[block_len - CRC_LEN - 8..block_len - CRC_LEN]);
+        if footer_sections != self.sections {
+            return Err(IckReadError::FooterMismatch { field: "section_count" });
+        }
+        if footer_records != self.records_total {
+            return Err(IckReadError::FooterMismatch { field: "records_total" });
+        }
+        if stored_digest != self.digest {
+            return Err(IckReadError::FooterMismatch { field: "digest" });
+        }
+        let footer_entries: Vec<(u32, u64)> = self.block
+            [FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + footer_ns * 12]
+            .chunks_exact(12)
+            .map(|chunk| (le_u32(&chunk[0..4]), le_u64(&chunk[4..12])))
+            .collect();
+        let mut seen_sorted = self.entries_seen.clone();
+        seen_sorted.sort_unstable();
+        let mut footer_sorted = footer_entries.clone();
+        footer_sorted.sort_unstable();
+        if seen_sorted != footer_sorted {
+            return Err(IckReadError::FooterMismatch { field: "entries_per_ns" });
+        }
+        let end = self.offset + self.hop(block_len)?;
+        if end != self.file_size {
+            return Err(IckReadError::TrailingData { at: end });
+        }
+        self.done = true;
+        Ok(IckStep::Done(IckSummary {
+            sections: self.sections,
+            records: self.records_total,
+            entries_per_ns: footer_entries,
+            digest: self.digest,
+            bytes: end,
+        }))
+    }
+}
+
+/// What a block header's tag names on the read side (see
+/// [`IckReader::classify`]); the writer's `SectionClass` carries the
+/// staged namespace, this carries only the tag.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BlockTag {
+    Section(SectionTag),
+    Footer,
+}
+
+/// The five section classes `seal_section` emits, by tag.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SectionTag {
+    Records,
+    Refs,
+    LiveSet,
+    BlobRefs,
+    IdxSidecar,
+}
+
+/// One section block read into `IckReader::block`: the header's counts and
+/// the block geometry every arm needs.
+#[derive(Copy, Clone, Debug)]
+struct SectionFrame {
+    record_count: u32,
+    block_len: usize,
+    stored_crc: u32,
+}
+
+impl SectionFrame {
+    fn body<'a>(&self, block: &'a [u8]) -> &'a [u8] {
+        &block[SECTION_HEADER_LEN..self.block_len - CRC_LEN]
+    }
+
+    fn crc_ok(&self, block: &[u8]) -> bool {
+        crc32c(&block[..self.block_len - CRC_LEN]) == self.stored_crc
+    }
+}
+
+/// The per-ns presize count fold (the footer audits it).
+fn count_entries(seen: &mut Vec<(u32, u64)>, ns: u32, n: u64) {
+    match seen.iter_mut().find(|(id, _)| *id == ns) {
+        Some((_, count)) => *count += n,
+        None => seen.push((ns, n)),
+    }
+}
+
+/// A 48-bit little-endian address at the head of `bytes`.
+fn ref_addr(bytes: &[u8]) -> u64 {
+    let mut addr = [0u8; 8];
+    addr[..6].copy_from_slice(&bytes[..6]);
+    u64::from_le_bytes(addr)
+}
+
+/// Shape audit shared by the fixed-entry classes: `meta_len` bytes of
+/// meta, then exactly `record_count` entries of `entry_len`; never empty
+/// (the writer only seals non-empty sections).
+fn fixed_entries(
+    body: &[u8],
+    meta_len: usize,
+    entry_len: usize,
+    record_count: u32,
+) -> Option<&[u8]> {
+    let entry_bytes = body.len().checked_sub(meta_len)?;
+    (record_count != 0
+        && entry_bytes.is_multiple_of(entry_len)
+        && entry_bytes / entry_len == record_count as usize)
+        .then(|| &body[meta_len..])
+}
+
+/// Addr-ref body (ADR-0057 D3): `{ns, walk_watermark}` + entries; the
+/// watermark is a legal address.
+fn audit_ref_body(body: &[u8], record_count: u32) -> Option<(u32, u64, &[u8])> {
+    let entries = fixed_entries(body, ADDR_SECTION_META_LEN, ADDR_REF_ENTRY_LEN, record_count)?;
+    let walk_watermark = le_u64(&body[4..12]);
+    (walk_watermark < ADDR_LIMIT).then(|| (le_u32(&body[0..4]), walk_watermark, entries))
+}
+
+/// Live-set body (ADR-0058 D3): `ns` + entries; unknown flag bits are
+/// fail-stop within the frozen version, and a dead count above the
+/// file's data bytes is the over-count the D4 sound-direction rule
+/// exists to make unrepresentable.
+fn audit_live_set_body(body: &[u8], record_count: u32) -> Option<(u32, &[u8])> {
+    let entries = fixed_entries(body, LIVESET_META_LEN, LIVESET_ENTRY_LEN, record_count)?;
+    let sound = entries.chunks_exact(LIVESET_ENTRY_LEN).all(|entry| {
+        entry[20] & !LIVESET_FLAG_BYTE_EXACT == 0 && le_u64(&entry[12..20]) <= le_u64(&entry[4..12])
+    });
+    sound.then(|| (le_u32(&body[0..4]), entries))
+}
+
+/// Blob-ref body (ADR-0061 D6): `ns` + entries; a zero-length reference
+/// and out-of-order addresses are non-canonical — fail-stop within the
+/// frozen version. (Addresses are 48-bit by encoding: six bytes cannot
+/// exceed the limit.)
+fn audit_blob_ref_body(body: &[u8], record_count: u32) -> Option<(u32, &[u8])> {
+    let entries = fixed_entries(body, BLOBREF_META_LEN, BLOBREF_ENTRY_LEN, record_count)?;
+    let mut prev_addr: Option<u64> = None;
+    for entry in entries.chunks_exact(BLOBREF_ENTRY_LEN) {
+        let addr = ref_addr(entry);
+        if le_u64(&entry[14..22]) == 0 || prev_addr.is_some_and(|p| addr <= p) {
+            return None;
+        }
+        prev_addr = Some(addr);
+    }
+    Some((le_u32(&body[0..4]), entries))
 }
 
 /// Validating streaming load: header → per-section CRC-then-apply → footer
@@ -3059,6 +3043,129 @@ mod tests {
         let counts =
             read_ick_counts(&pad, &path, IckReaderConfig::default()).expect("hop fallback");
         assert_eq!(counts, summary.entries_per_ns, "fallback hint matches the footer");
+    }
+
+    /// The five section classes written by `seal_section`, one each, in
+    /// a v2 file (no block padding, so every hop is exact).
+    fn write_every_v2_class(fs: &MemFs, dir: &Path) -> (IckSummary, std::path::PathBuf) {
+        let mut w = SyncIckWriter::create_v2(
+            fs.clone(),
+            dir,
+            &small_cfg(),
+            0,
+            21,
+            Lsn::new(crate::lsn::SegmentId(1), 64),
+            &[16],
+        )
+        .expect("create v2");
+        w.append(&RecordView::StringPostImage { ns: NsId(16), key: b"k", value: b"v" })
+            .expect("image");
+        w.append_ref(16, 4096, 0xfeed_beef, 128).expect("addr ref");
+        w.append_live_set(16, 1, 4096, 0, true).expect("live set");
+        w.append_blob_ref(16, 100, 7, 4096).expect("blob ref");
+        let meta = IdxSidecarMeta {
+            ns: 16,
+            index_id: 1,
+            generation: 1,
+            key_encoding_version: 1,
+            fixed8: true,
+        };
+        w.append_idx_entry(&meta, 0, &7u64.to_be_bytes(), 42).expect("idx entry");
+        w.append_idx_final(&meta, 1).expect("idx final");
+        (w.finish().expect("finish"), dir.join(ick_file_name(21)))
+    }
+
+    /// Review L03 (batch 34): one section block costs two dependent
+    /// reads — the header, then the rest of the block — for every class.
+    /// The pre-batch-34 arms read the tag, the header and the whole block
+    /// (three), on the cold recovery path the M2 boot gate measures.
+    #[test]
+    fn every_section_block_costs_two_dependent_reads() {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let (summary, path) = write_every_v2_class(&fs, dir);
+        assert_eq!(summary.sections, 5, "one section per class");
+        let mut reader = IckReader::open(&fs, &path, IckReaderConfig::default()).expect("open");
+        let mut sections = 0u32;
+        loop {
+            let before = fs.reads();
+            let step = reader
+                .next_step_hybrid(
+                    |_| Ok::<(), ()>(()),
+                    |_| Ok(()),
+                    |_| Ok(()),
+                    |_| Ok(()),
+                    |_| Ok(()),
+                )
+                .expect("step");
+            let reads = fs.reads() - before;
+            match step {
+                IckStep::Section { .. } => {
+                    sections += 1;
+                    assert_eq!(reads, 2, "section {sections}: header + block, nothing else");
+                }
+                IckStep::Done(_) => {
+                    assert_eq!(reads, 3, "footer: dispatch header + fixed part + block");
+                    break;
+                }
+            }
+        }
+        assert_eq!(sections, 5);
+    }
+
+    /// Review L03 style row 3: the loader bound is one check in one place.
+    /// A section header of every class whose body length exceeds the
+    /// configured bound is refused before any body byte is read — the
+    /// "one arm forgot a check" class the five-arm loader once hit
+    /// (ADR-0073 D4's hop arm).
+    #[test]
+    fn every_section_class_is_bounded_by_the_loader_config() {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let (_, path) = write_every_v2_class(&fs, dir);
+        let header_len = HEADER_FIXED_LEN + 4 + CRC_LEN;
+        let header = fs.contents(&path).expect("ick bytes")[..header_len].to_vec();
+        let cfg = IckReaderConfig { max_section_bytes: 64 };
+        for tag in
+            [BLOCK_SECTION, BLOCK_ADDR_SECTION, BLOCK_LIVESET, BLOCK_BLOBREF, BLOCK_IDXSIDECAR]
+        {
+            let mut image = header.clone();
+            image.push(tag);
+            image.extend_from_slice(&65u32.to_le_bytes());
+            image.extend_from_slice(&1u32.to_le_bytes());
+            image.extend_from_slice(&[0xaa; 65 + CRC_LEN]);
+            let bad = MemFs::new();
+            bad.create_dir_all(dir).unwrap();
+            use crate::fs::{SegmentFile, SegmentFs as _};
+            let mut f = bad.create_meta(&path).expect("create");
+            f.write_at(0, &image).expect("write");
+            let before = bad.reads();
+            let err = read_ick_hybrid(
+                &bad,
+                &path,
+                cfg,
+                |_| Ok::<(), ()>(()),
+                |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .expect_err("an over-bound section is refused");
+            assert!(
+                matches!(
+                    err,
+                    IckApplyError::Read(IckReadError::SectionTooLarge { len: 65, max: 64 })
+                ),
+                "tag {tag:#04x}: {err:?}"
+            );
+            assert_eq!(
+                bad.reads() - before,
+                3,
+                "tag {tag:#04x}: two header reads + one section header, no body read"
+            );
+        }
     }
 
     /// M4.5-S36 (ADR-0088 D3): the v3 container — every block starts on
