@@ -36,6 +36,17 @@ use crate::index_key::KeySkip;
 /// — wrong results are never served either way).
 pub const BRACKET_ENTRY_CAP: usize = 65_536;
 
+/// Retained bracket scratch per store (ADR-0076 A1; review L07): a
+/// pathological wildcard document grows the scratch to its match set —
+/// up to [`BRACKET_ENTRY_CAP`] entries of up to `ORDERED_KEY_MAX` bytes
+/// per phase — and the store must not keep paying for it in RSS. Past
+/// these bounds the buffers shrink back when the bracket (or death
+/// hook) closes; the retained scratch is attributed in
+/// `doc_scratch_bytes` either way (L5). Encoded-key bytes per buffer.
+pub const SCRATCH_RETAIN_BYTES: usize = 64 << 10;
+/// Entries per scratch set past which the set shrinks back.
+pub const SCRATCH_RETAIN_ENTRIES: usize = 4096;
+
 /// Why the bracket pre-half refused the mutation (typed, mapped to a
 /// RESP error at the command layer — ADR-0072 D7.1: nothing changed).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -119,7 +130,10 @@ mod imp {
     use inf_doc::{DocValue, PathProgram, PathStep};
     use inf_foundation::fault;
 
-    use super::{BRACKET_ENTRY_CAP, IdxCounters, IdxMaintRefusal, MaintMode};
+    use super::{
+        BRACKET_ENTRY_CAP, IdxCounters, IdxMaintRefusal, MaintMode, SCRATCH_RETAIN_BYTES,
+        SCRATCH_RETAIN_ENTRIES,
+    };
     use crate::doc;
     use crate::index_key::{IndexKeyBuf, IndexKeyType, IndexScalar, index_key_encode};
     use crate::index_registry::{INDEXES_PER_NODE_MAX, IndexId, IndexMemory, IndexTree};
@@ -177,6 +191,40 @@ mod imp {
         key_buf: IndexKeyBuf,
         death_bytes: Vec<u8>,
         death_entries: Vec<ScratchEntry>,
+    }
+
+    // The prune / participation / touched masks are `u64` bit sets
+    // indexed by attach ordinal: the node cap must fit the word (a bump
+    // past 64 would wrap the shifts in release).
+    const _: () = assert!(INDEXES_PER_NODE_MAX <= 64, "attach-block bitmasks are u64");
+
+    impl MaintScratch {
+        /// Capacity held by every scratch buffer (the L5 fold).
+        fn retained_bytes(&self) -> u64 {
+            let entries = |v: &Vec<ScratchEntry>| (v.capacity() * size_of::<ScratchEntry>()) as u64;
+            (self.bytes.capacity() + self.death_bytes.capacity()) as u64
+                + entries(&self.old)
+                + entries(&self.new)
+                + entries(&self.death_entries)
+                + (self.write_hashes.capacity() * size_of::<u64>()) as u64
+        }
+
+        /// Shrinks any buffer a pathological document grew past the
+        /// retention bound (ADR-0076 A1) — a capacity compare per
+        /// buffer on the common path, a reallocation only past it.
+        fn shrink_retained(&mut self) {
+            if self.bytes.capacity() > SCRATCH_RETAIN_BYTES {
+                self.bytes.shrink_to(SCRATCH_RETAIN_BYTES);
+            }
+            if self.death_bytes.capacity() > SCRATCH_RETAIN_BYTES {
+                self.death_bytes.shrink_to(SCRATCH_RETAIN_BYTES);
+            }
+            for set in [&mut self.old, &mut self.new, &mut self.death_entries] {
+                if set.capacity() > SCRATCH_RETAIN_ENTRIES {
+                    set.shrink_to(SCRATCH_RETAIN_ENTRIES);
+                }
+            }
+        }
     }
 
     #[derive(Copy, Clone, PartialEq, Eq)]
@@ -359,6 +407,23 @@ mod imp {
             }
         }
 
+        /// Discharges a veto raised during boot replay (ADR-0078 A1):
+        /// the tree empties and the veto clears — the boot-fresh state
+        /// the no-sidecar path has (ADR-0075 D4's rebuild without a
+        /// generation bump); the S05 walk starts from zero. `true` iff
+        /// the veto was set. Never a live-path repair: a serving cell's
+        /// veto clears only through the rebuild edge.
+        pub(crate) fn discharge_boot_veto(&mut self, id: IndexId) -> bool {
+            let Some(entry) = self.entry_mut(id) else { return false };
+            if !entry.degraded {
+                return false;
+            }
+            entry.tree = IndexTree::new(entry.key_type);
+            entry.degraded = false;
+            entry.converged = false;
+            true
+        }
+
         pub(crate) fn counters(&self, id: IndexId) -> Option<IdxCounters> {
             self.entries.iter().find(|e| e.id == id).map(|e| e.counters)
         }
@@ -400,6 +465,13 @@ mod imp {
             self.scratch.write_hashes.clear();
             self.scratch.prune_mask = 0;
             self.scratch.participating = 0;
+            self.scratch.shrink_retained();
+        }
+
+        /// Retained scratch capacity — folded into the store's
+        /// `doc_scratch_bytes` (ADR-0076 A1: bounded and attributed).
+        pub(crate) fn scratch_bytes(&self) -> u64 {
+            self.scratch.retained_bytes()
         }
 
         fn note_write_key(&mut self, hash: u64) {
@@ -707,6 +779,7 @@ mod imp {
                     }
                 }
             }
+            scratch.shrink_retained();
             Ok(fresh)
         }
 
@@ -777,6 +850,7 @@ mod imp {
                     }
                 }
             }
+            scratch.shrink_retained();
         }
     }
 
@@ -978,6 +1052,11 @@ impl CellIndexes {
     }
 
     #[inline]
+    pub(crate) fn scratch_bytes(&self) -> u64 {
+        0
+    }
+
+    #[inline]
     pub(crate) fn counters_fold(&self) -> IdxCounters {
         IdxCounters::default()
     }
@@ -994,6 +1073,39 @@ mod tests {
 
     fn program(text: &str) -> PathProgram {
         compile(text.as_bytes()).expect("valid path")
+    }
+
+    /// ADR-0076 A1 (review L07, perf/DX): a pathological wildcard
+    /// document grows the bracket scratch to its match set; the store
+    /// shrinks it back at bracket close and attributes what it keeps in
+    /// `doc_scratch_bytes` — never an unbounded, invisible retention.
+    #[test]
+    fn bracket_scratch_is_bounded_in_retention_and_attributed() {
+        use super::{MaintMode, SCRATCH_RETAIN_BYTES, SCRATCH_RETAIN_ENTRIES};
+        use crate::index_key::IndexKeyType;
+        use crate::index_registry::IndexId;
+        use crate::store::{CellStore, StoreConfig};
+        use inf_foundation::time::Nanos;
+        let mut store = CellStore::new(StoreConfig::default());
+        store.idx.install(IndexId(1), 1, IndexKeyType::Utf8, program("$.tags[*]").as_bytes());
+        let now = Nanos(1_000_000_000);
+        let tags: Vec<String> = (0..20_000).map(|i| format!("\"t{i:05}\"")).collect();
+        let json = format!(r#"{{"tags":[{}]}}"#, tags.join(","));
+        let idoc = inf_doc::JsonParser::new().parse(json.as_bytes()).expect("valid doc");
+        let key: &[u8] = b"doc:big";
+        store.idx_bracket_begin(&[key], None).expect("headroom");
+        store.json_set(key, &idoc, Default::default(), now).expect("set");
+        store.idx_bracket_commit(&[key], MaintMode::Strict);
+        assert_eq!(store.idx.tree(IndexId(1)).map(|t| t.len()), Some(20_000));
+        // `ScratchEntry` is 16 B; the write-set hashes stay tiny.
+        let bound = (2 * SCRATCH_RETAIN_BYTES + 3 * SCRATCH_RETAIN_ENTRIES * 16 + 64 * 8) as u64;
+        let retained = store.idx.scratch_bytes();
+        assert!(retained <= bound, "retained {retained} B of bracket scratch, bound {bound} B");
+        assert_eq!(
+            store.report().doc_scratch_bytes,
+            store.docs.report().scratch_bytes + retained,
+            "the index scratch is attributed in doc_scratch_bytes (L5)"
+        );
     }
 
     /// The ADR-0076 D6 rule, case by case: only a proven per-step

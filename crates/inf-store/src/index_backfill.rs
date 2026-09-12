@@ -428,9 +428,20 @@ impl Keyspace {
     /// the same rank from the same replicated declaration set, and boot
     /// re-derives it from the seeded catalog). Always < `INDEX_SLOTS`.
     pub fn idx_slot_of(&self, id: IndexId) -> Option<usize> {
+        Self::slot_in(&self.idx_slot_ranks(), id)
+    }
+
+    /// The rank domain: live catalog ids ascending — one sort per
+    /// caller, so a tick that reports every ready index sorts once
+    /// (review L07: it sorted once per index).
+    fn idx_slot_ranks(&self) -> Vec<u32> {
         let mut ids: Vec<u32> = self.idx_registry().iter().map(|spec| spec.id.0).collect();
         ids.sort_unstable();
-        ids.iter().position(|&candidate| candidate == id.0)
+        ids
+    }
+
+    fn slot_in(ranks: &[u32], id: IndexId) -> Option<usize> {
+        ranks.iter().position(|&candidate| candidate == id.0)
     }
 
     /// `(slot, generation)` for every index this cell has completed —
@@ -438,11 +449,12 @@ impl Keyspace {
     /// tick (ADR-0077 D4: republication makes D5's rank drift
     /// self-healing).
     pub fn idx_ready_reports(&self) -> Vec<(usize, u64)> {
+        let ranks = self.idx_slot_ranks();
         self.idx_registry()
             .iter()
             .filter(|spec| spec.state != IndexState::Dropping)
             .filter(|spec| self.idx_registry().cell_state(spec.id) == Some(IndexState::Ready))
-            .filter_map(|spec| self.idx_slot_of(spec.id).map(|slot| (slot, spec.generation)))
+            .filter_map(|spec| Self::slot_in(&ranks, spec.id).map(|slot| (slot, spec.generation)))
             .collect()
     }
 
@@ -451,11 +463,12 @@ impl Keyspace {
     /// `fleet_ready(slot, generation)` and transition the local catalog
     /// entry to `ready`.
     pub fn idx_fleet_candidates(&self) -> Vec<(IndexId, usize, u64)> {
+        let ranks = self.idx_slot_ranks();
         self.idx_registry()
             .iter()
             .filter(|spec| spec.state == IndexState::Backfilling)
             .filter_map(|spec| {
-                self.idx_slot_of(spec.id).map(|slot| (spec.id, slot, spec.generation))
+                Self::slot_in(&ranks, spec.id).map(|slot| (spec.id, slot, spec.generation))
             })
             .collect()
     }

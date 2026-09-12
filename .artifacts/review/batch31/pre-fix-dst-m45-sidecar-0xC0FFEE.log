@@ -1,0 +1,20 @@
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/1 sidecar loaded (1500 entries; tail caught up)
+cell 1: index 16/2 sidecar loaded (1500 entries; tail caught up)
+cell 0: index 16/1 sidecar loaded (1500 entries; tail caught up)
+cell 0: index 16/2 sidecar loaded (1499 entries; tail caught up)
+cell 1: index 16/1 sidecar loaded (1493 entries; tail caught up)
+cell 1: index 16/2 sidecar loaded (1493 entries; tail caught up)
+cell 0: index 16/1 sidecar loaded (1493 entries; tail caught up)
+cell 0: index 16/2 sidecar loaded (1493 entries; tail caught up)
+inf-sim: scenario m45-sidecar seed 0xc0ffee: 5 boots, cuts ["mid-write(extra=3,published=0)", "post-publish(storm=8)", "degraded-tail"], 4 loaded, 8 storm-during-stream, 14 ready checks, 6 refused bindings, 0 degraded-tail rebuilds, 531 steps, hash 0x7cce54332a39649d
+inf-sim: VIOLATION: degraded-tail: cell 0 index 1 committed cell-Ready over a vetoed tree (Some(Loaded { entries: 1493 })) — F-L07-04
+inf-sim: VIOLATION: degraded-tail: cell 0 index 2 committed cell-Ready over a vetoed tree (Some(Loaded { entries: 1493 })) — F-L07-04
+inf-sim: VIOLATION: degraded-tail: the planted trip turned no load into a rebuild — the leg went unexercised
+inf-sim: VIOLATION: degraded-tail: cell 0 index 1 degraded
+inf-sim: VIOLATION: degraded-tail: cell 0 index 1 tree ≠ digest-walk truth (1493 tree entries vs 1493 derived)
+inf-sim: VIOLATION: degraded-tail: cell 0 index 2 degraded
+inf-sim: VIOLATION: degraded-tail: cell 0 index 2 tree ≠ digest-walk truth (1493 tree entries vs 1493 derived)

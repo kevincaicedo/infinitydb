@@ -1,0 +1,2 @@
+inf-sim: scenario m45-sidecar seed 0xc0ffee: 5 boots, cuts ["mid-write(extra=3,published=0)", "post-publish(storm=8)", "degraded-tail"], 4 loaded, 8 storm-during-stream, 14 ready checks, 6 refused bindings, 2 degraded-tail rebuilds, 539 steps, hash 0x056d1a46bed814c6
+inf-sim: determinism verified — second run hash-identical

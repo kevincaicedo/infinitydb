@@ -1,0 +1,5 @@
+thread 'index_maint::tests::bracket_scratch_is_bounded_in_retention_and_attributed' (379327) panicked at crates/inf-store/src/index_maint.rs:1104:9:
+assertion `left == right` failed: the index scratch is attributed in doc_scratch_bytes (L5)
+  left: 0
+ right: 131104
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -12,7 +12,10 @@
 //! the pair are ignored). At checkpoint end, `Accepting` means the
 //! writer abandoned the stream mid-emission or an unattributed damaged
 //! section swallowed part of it — either way `Incomplete`, discarded
-//! (the ADR-0078 D4 resolution of unattributable damage).
+//! (the ADR-0078 D4 resolution of unattributable damage). At end of
+//! replay a `Loaded` tree commits `Ready` only if its cell-local veto
+//! is still clear: a trip in the `CatchUp` tail commits as `Rebuilt {
+//! Degraded }` (ADR-0078 A1) — the veto is never laundered by a reboot.
 //!
 //! Ordering across sections needs no bookkeeping: the tree starts
 //! empty at boot and replay maintenance is unarmed until
@@ -239,8 +242,11 @@ impl SidecarLoader {
     /// End of tail replay: loaded trees are caught up — commit them
     /// (converged + cell `Ready`; the ADR-0077 D4 completion protocol,
     /// entered sideways), disarm replay maintenance, and record every
-    /// index's decision (L10). Returns the rows for the caller's boot
-    /// log; the fold lands on the keyspace for `INFO stats`.
+    /// index's decision (L10). A loaded tree whose veto rose during the
+    /// tail commits as `Rebuilt { Degraded }` instead (ADR-0078 A1): it
+    /// stopped tracking the tail at the trip, so `Ready` would launder
+    /// the veto through the reboot. Returns the rows for the caller's
+    /// boot log; the fold lands on the keyspace for `INFO stats`.
     pub fn commit_ready(mut self, ks: &mut Keyspace) -> Vec<SidecarBootRow> {
         self.finish_load(ks);
         for ns in self.armed.drain(..) {
@@ -251,7 +257,7 @@ impl SidecarLoader {
         let specs: Vec<(NsId, IndexId)> = ks.idx_registry().iter().map(|s| (s.ns, s.id)).collect();
         let mut rows = Vec::with_capacity(specs.len());
         for (ns, id) in specs {
-            let decision = match self.records.iter().find(|r| r.ns == ns && r.id == id) {
+            let mut decision = match self.records.iter().find(|r| r.ns == ns && r.id == id) {
                 Some(LoadRec { state: LoadState::Loaded { total }, .. }) => {
                     SidecarBootDecision::Loaded { entries: *total }
                 }
@@ -263,6 +269,16 @@ impl SidecarLoader {
                 }
                 None => SidecarBootDecision::Rebuilt { reason: SidecarRebuildReason::NoSidecar },
             };
+            // The commit gate (ADR-0078 A1): a veto raised by the tail
+            // outranks the load. Discharge into the boot-fresh state —
+            // empty tree, veto clear — and let S05 walk from zero; a
+            // veto on a discarded or absent tree discharges the same
+            // way (the from-zero walk covers it, the reason stands).
+            if ks.idx_sidecar_discharge_veto(ns, id)
+                && matches!(decision, SidecarBootDecision::Loaded { .. })
+            {
+                decision = SidecarBootDecision::Rebuilt { reason: SidecarRebuildReason::Degraded };
+            }
             if let SidecarBootDecision::Loaded { entries } = decision {
                 info.loaded += 1;
                 info.entries_loaded += entries;

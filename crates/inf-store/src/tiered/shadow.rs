@@ -45,7 +45,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use inf_foundation::{LocalCounter, LogicalAddr};
+use inf_foundation::{BuildIntHasher, LocalCounter, LogicalAddr};
 
 use super::TieredTable;
 use crate::address_space::AddrClass;
@@ -437,9 +437,11 @@ pub(super) struct ShadowSet {
     by_winner: BTreeMap<(u64, u64), ()>,
     /// `cold → (hash, winner, verified)`: the compaction/promotion/
     /// removal probe and the ticket's state. Keyed access only — never
-    /// walked to choose an order (its `RandomState` is per process;
-    /// F-L07-02): every walk goes through `by_winner`.
-    by_cold: HashMap<u64, ColdEntry>,
+    /// walked to choose an order (F-L07-02): every walk goes through
+    /// `by_winner`. Hashed by `BuildIntHasher` (ADR-0093 A15): cold
+    /// addresses are allocator-issued, never client-chosen, and a
+    /// cell-resident map carries no per-process `RandomState` (L7).
+    by_cold: HashMap<u64, ColdEntry, BuildIntHasher>,
     /// Open tickets whose twin has not been read (A1).
     unverified: usize,
     /// Cold addresses whose read is in flight (bounded by
@@ -461,7 +463,7 @@ impl ShadowSet {
     pub(super) fn new() -> ShadowSet {
         ShadowSet {
             by_winner: BTreeMap::new(),
-            by_cold: HashMap::new(),
+            by_cold: HashMap::default(),
             unverified: 0,
             in_flight: Vec::with_capacity(SHADOW_READS_IN_FLIGHT),
             fence: 0,
@@ -572,7 +574,11 @@ impl TieredTable {
     pub fn shadow_counters(&self) -> ShadowCounters {
         let mut counters = self.shadow.counters;
         counters.pending = self.shadow_pending() as u64;
-        counters.verified_pending = (self.shadow_pending() - self.shadow.unverified) as u64;
+        // A scrape never panics on a counter drift (review L07): the
+        // invariant is debug-asserted, the gauge saturates.
+        debug_assert!(self.shadow.unverified <= self.shadow_pending(), "unverified ≤ pending");
+        counters.verified_pending =
+            self.shadow_pending().saturating_sub(self.shadow.unverified) as u64;
         counters.pinned_bytes = self.shadow_pinned_bytes();
         counters.pinned_bytes_peak = counters.pinned_bytes_peak.max(counters.pinned_bytes);
         counters.pin_cap_bytes = self.shadow_pin_cap_bytes();

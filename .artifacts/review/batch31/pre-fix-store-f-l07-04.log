@@ -1,0 +1,40 @@
+    |     ---------------- method in this implementation
+...
+368 |         pub(crate) fn discharge_boot_veto(&mut self, id: IndexId) -> bool {
+    |                       ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `idx_sidecar_discharge_veto` is never used
+    --> crates/inf-store/src/keyspace.rs:1761:19
+     |
+ 218 | impl Keyspace {
+     | ------------- method in this implementation
+...
+1761 |     pub(crate) fn idx_sidecar_discharge_veto(&mut self, ns: NsId, id: IndexId) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `inf-store` (lib) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.77s
+     Running tests/index_sidecar.rs (target/debug/deps/index_sidecar-0da039b4e9db22d0)
+
+running 1 test
+test a_tail_trip_after_the_load_commits_as_a_rebuild_not_ready ... FAILED
+
+failures:
+
+---- a_tail_trip_after_the_load_commits_as_a_rebuild_not_ready stdout ----
+
+thread 'a_tail_trip_after_the_load_commits_as_a_rebuild_not_ready' (374833) panicked at crates/inf-store/tests/index_sidecar.rs:880:9:
+assertion `left != right` failed: F-L07-04: index 1 committed cell-Ready with the veto Some(true) (93 tree entries vs 86 derived)
+  left: Some(Ready)
+ right: Some(Ready)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_tail_trip_after_the_load_commits_as_a_rebuild_not_ready
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-store --test index_sidecar`

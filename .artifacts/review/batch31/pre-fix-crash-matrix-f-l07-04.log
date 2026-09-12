@@ -1,0 +1,25 @@
+...
+368 |         pub(crate) fn discharge_boot_veto(&mut self, id: IndexId) -> bool {
+ 218 | impl Keyspace {
+...
+1761 |     pub(crate) fn idx_sidecar_discharge_veto(&mut self, ns: NsId, id: IndexId) -> bool {
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling crash-matrix v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/tests/crash-matrix)
+   Compiling inf-sim v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/inf-sim)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.93s
+     Running tests/sidecar.rs (target/debug/deps/sidecar-7d005848bffc94d2)
+running 1 test
+test a_tail_trip_turns_the_load_into_a_rebuild ... FAILED
+failures:
+---- a_tail_trip_turns_the_load_into_a_rebuild stdout ----
+cell 0: index 16/1 sidecar loaded (40 entries; tail caught up)
+cell 0: index 16/2 sidecar loaded (40 entries; tail caught up)
+thread 'a_tail_trip_turns_the_load_into_a_rebuild' (375959) panicked at tests/crash-matrix/tests/sidecar.rs:441:9:
+assertion `left != right` failed: F-L07-04: index 1 committed cell-Ready over a vetoed tree (veto Some(true), decision Some(Loaded { entries: 40 }))
+  left: Some(Ready)
+ right: Some(Ready)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+failures:
+    a_tail_trip_turns_the_load_into_a_rebuild
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+error: test failed, to rerun pass `-p crash-matrix --test sidecar`

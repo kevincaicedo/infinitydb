@@ -1,0 +1,6 @@
+test mid_sidecar_write_without_any_published_unit_rebuilds ... ok
+test damaged_sidecar_body_rebuilds_one_index_and_boots ... ok
+test mid_sidecar_write_orphan_is_harmless_and_collected ... ok
+test a_tail_trip_turns_the_load_into_a_rebuild ... ok
+test truncated_published_sidecar_unit_fail_stops ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s

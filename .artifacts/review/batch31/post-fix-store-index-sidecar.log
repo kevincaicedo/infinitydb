@@ -1,0 +1,8 @@
+test encoding_version_mismatch_discards_and_rebuilds ... ok
+test key_scheme_mismatch_discards_and_rebuilds ... ok
+test ordinal_gap_discards_and_rebuilds ... ok
+test cross_section_regression_discards_as_out_of_order ... ok
+test stale_declaration_sections_are_swallowed ... ok
+test a_tail_trip_after_the_load_commits_as_a_rebuild_not_ready ... ok
+test sidecar_load_and_catchup_converge_to_oracle ... ok
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s

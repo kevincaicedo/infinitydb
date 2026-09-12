@@ -300,6 +300,13 @@ verdict of every shard.
   (`disallowed-methods`, ADR-0106 D7; `UNIX_EPOCH.elapsed()` and
   `_rdtsc` included): it breaks the simulator's authority over the
   universe, which is the single most valuable testing asset we own.
+  The same rule reaches containers: a cell-resident `HashMap`/`HashSet`
+  never carries `std`'s per-process `RandomState` — use
+  `inf_foundation::BuildIntHasher` for internally generated keys
+  (addresses, tokens, keyed-hash outputs; the shadow set and the
+  relocation-origin map, ADR-0093 A15) or a `BTreeMap` when the walk
+  order is part of the state; and no walk of a hash map ever chooses
+  an order that mutates state (F-L07-02).
 
 ### Style by the numbers
 

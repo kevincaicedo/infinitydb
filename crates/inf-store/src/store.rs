@@ -398,8 +398,10 @@ pub struct MemoryReport {
     /// Unused tree capacity within `doc_arena_bytes` (diagnostic overlay).
     pub doc_slack_bytes: u64,
     /// Retained parser/ingest/freeze/effect scratch owned by this report's
-    /// store or cell. `CellStore::report` contributes store-local scratch;
-    /// the command plane adds its one-per-cell buffers.
+    /// store or cell, plus the index-maintenance bracket scratch (bounded
+    /// in retention — ADR-0076 A1). `CellStore::report` contributes
+    /// store-local scratch; the command plane adds its one-per-cell
+    /// buffers.
     pub doc_scratch_bytes: u64,
     /// One bounded path-program cache per cell; zero in a store-only report.
     pub doc_path_cache_bytes: u64,
@@ -556,7 +558,9 @@ impl CellStore {
             doc_resident_bytes: docs.resident_bytes,
             doc_intern_bytes: docs.domain.intern_bytes,
             doc_slack_bytes: docs.domain.slack_bytes,
-            doc_scratch_bytes: docs.scratch_bytes,
+            // The index-maintenance bracket scratch rides the same
+            // retained-scratch domain (ADR-0076 A1: bounded, attributed).
+            doc_scratch_bytes: docs.scratch_bytes + self.idx.scratch_bytes(),
             doc_path_cache_bytes: 0,
             idx_tree_bytes: idx.idx_tree_bytes,
             idx_slack_bytes: idx.idx_slack_bytes,

@@ -1,0 +1,14 @@
+215 |         fn shrink_retained(&mut self) {
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.51s
+     Running unittests src/lib.rs (target/debug/deps/inf_store-6661c9250c69ff20)
+running 1 test
+test index_maint::tests::bracket_scratch_is_bounded_in_retention_and_attributed ... FAILED
+failures:
+---- index_maint::tests::bracket_scratch_is_bounded_in_retention_and_attributed stdout ----
+thread 'index_maint::tests::bracket_scratch_is_bounded_in_retention_and_attributed' (378953) panicked at crates/inf-store/src/index_maint.rs:1103:9:
+retained 786464 B of bracket scratch, bound 328192 B
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+failures:
+    index_maint::tests::bracket_scratch_is_bounded_in_retention_and_attributed
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 181 filtered out; finished in 1.75s
+error: test failed, to rerun pass `-p inf-store --lib`

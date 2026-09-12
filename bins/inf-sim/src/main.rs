@@ -222,13 +222,14 @@ fn main() {
         println!(
             "inf-sim: scenario m45-sidecar seed {seed:#x}: {} boots, cuts {:?}, \
              {} loaded, {} storm-during-stream, {} ready checks, {} refused bindings, \
-             {} steps, hash {:#018x}",
+             {} degraded-tail rebuilds, {} steps, hash {:#018x}",
             report.boots,
             report.cuts,
             report.loaded,
             report.storm_during_stream,
             report.ready_checks,
             report.refused_bindings,
+            report.degraded_rebuilds,
             report.scheduler_steps,
             report.trace_hash
         );

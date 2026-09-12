@@ -25,7 +25,7 @@ pub mod shadow;
 
 use std::collections::{HashMap, VecDeque};
 
-use inf_foundation::{KeyHasher, LogicalAddr};
+use inf_foundation::{BuildIntHasher, KeyHasher, LogicalAddr};
 
 use inf_log::flush::{TierFileMeta, TierFlush, TierFlushError};
 use inf_log::fs::SegmentFs;
@@ -143,7 +143,10 @@ pub struct TieredTable {
     /// relocations. Bounded: [`RELOC_ORIGIN_CAP`] origins per record
     /// (the scan defers at cap); entries drop at covering swaps;
     /// per-life (boot starts it empty — no live relocation exists).
-    reloc_origins: HashMap<(u64, u64), Vec<(u64, u64)>>,
+    /// Hashed by `BuildIntHasher` (ADR-0093 A15): the key is a keyed
+    /// SipHash output and an allocator-issued address, and a
+    /// cell-resident map carries no per-process `RandomState` (L7).
+    reloc_origins: HashMap<(u64, u64), Vec<(u64, u64)>, BuildIntHasher>,
     /// Blob-extent reference map + refcounts + reclaim queue (M4-S17,
     /// ADR-0061 D4/D5): fed by the same `note_death` routing as the
     /// live set; the checkpoint 0x05 section and the replay appliers
@@ -272,7 +275,7 @@ impl TieredTable {
             live: LiveSet::new(config.life_origin.to_raw()),
             compact_cfg: compact::CompactionConfig::default(),
             compact: None,
-            reloc_origins: HashMap::new(),
+            reloc_origins: HashMap::default(),
             extents: crate::extents::ExtentRefs::new(),
             blob: Self::clamp_blob_config(
                 config.reserve_bytes as u64,
