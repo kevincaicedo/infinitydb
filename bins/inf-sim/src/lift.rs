@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use inf_doc::JsonParser;
 use inf_foundation::CellId;
+use inf_log::fs::sim::DEFAULT_SECTOR_BYTES;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
     DocLineage, FRAME_HEADER_LEN, FrameBuilder, FrameLayout, FrameStamp, Lsn, NsId, ReaderConfig,
@@ -129,6 +130,57 @@ fn resume_point(
         }
     }
     Err("no data-bearing segment".to_owned())
+}
+
+/// The torn-tail plant (batch 35, N17): the FLUSH → FUA prelude's cut
+/// lands after its traffic drained, its frames are sub-sector, and the
+/// rotor's immediate prealloc left an empty next segment — so recovery
+/// legally resumes *there* at offset 0 and the transition never touches
+/// packed data. This writes what the sim's own sector-granular cut writes
+/// for a frame that spans sectors: the first sector of the next frame,
+/// zeros behind it. Recovery then truncates at the last whole frame,
+/// removes the empty next segment and reopens the packed tail under the
+/// `Direct` rotor (ADR-0086 D4 as amended). Returns the planted cells.
+pub(crate) fn plant_torn_tail(
+    disk: &SimDisk,
+    data_dir: &Path,
+    cells: u16,
+    ns: NsId,
+) -> Result<Vec<usize>, String> {
+    let sector = usize::try_from(DEFAULT_SECTOR_BYTES).expect("sector fits usize");
+    let mut planted = Vec::new();
+    for cell in 0..usize::from(cells) {
+        let log_dir: PathBuf = data_dir.join(format!("shard-{cell}")).join("log");
+        let (seg, end, last, size) =
+            resume_point(disk, &log_dir).map_err(|e| format!("cell {cell}: {e}"))?;
+        let key = local_key("torn", cell, cells);
+        let value = [b't'; 1024];
+        let torn = frame(
+            seg,
+            end,
+            &[RecordView::StringPostImage { ns, key: &key, value: &value }],
+            FrameStamp {
+                epoch: last.epoch,
+                seq: last.seq + 1,
+                covered_lsn: Lsn::new(seg, end).to_u64(),
+            },
+        );
+        assert!(torn.len() > sector, "the planted frame spans sectors");
+        if u64::from(end) + sector as u64 > size {
+            return Err(format!(
+                "cell {cell}: segment {} has no sector past {end} of {size}",
+                seg.0
+            ));
+        }
+        let seg_path = log_dir.join(segment_file_name(seg));
+        let slack = usize::try_from(size - u64::from(end)).expect("segment fits usize");
+        poke(disk, &seg_path, u64::from(end), &vec![0u8; slack])
+            .map_err(|e| format!("cell {cell}: zero slack: {e}"))?;
+        poke(disk, &seg_path, u64::from(end), &torn[..sector])
+            .map_err(|e| format!("cell {cell}: torn sector: {e}"))?;
+        planted.push(cell);
+    }
+    Ok(planted)
 }
 
 /// Writes the lift shape into every cell's log (see the module doc).

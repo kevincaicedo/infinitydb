@@ -763,6 +763,10 @@ pub struct DurableReport {
     pub lift_plants: u64,
     pub lift_plant_lifts: u64,
     pub lift_plant_sidecars: u64,
+    /// The torn-tail plant (batch 35, N17): cells whose FLUSH prelude
+    /// tail was torn after the cut so the FUA transition boot reopens
+    /// packed data on the half the lift plant does not own.
+    pub torn_plants: u64,
 }
 
 impl DurableReport {
@@ -1458,6 +1462,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         lift_sidecars_loaded: 0,
         stale_residue_slacks: 0,
         lift_plants: 0,
+        torn_plants: 0,
         lift_plant_lifts: 0,
         lift_plant_sidecars: 0,
     };
@@ -1649,6 +1654,27 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                 }
             }
         }
+        // N17 (batch 35): without the lift plant the FLUSH prelude's cut
+        // lands after its traffic drained and its frames are sub-sector,
+        // so nothing tears, the immediately preallocated empty next
+        // segment survives, and recovery resumes there at offset 0 — a
+        // class change at a segment boundary, never the packed reopen
+        // ADR-0086 D4 reasons about. The torn-tail plant (the sim's own
+        // sector-granular cut of a multi-sector frame) makes every
+        // FLUSH → FUA seed cross the transition on packed data.
+        let torn_ns = NsId(1);
+        if first_life.io_mode == SegmentIoMode::Buffered
+            && scenario.io_mode == SegmentIoMode::Direct
+            && lift_ns.is_none()
+        {
+            match crate::lift::plant_torn_tail(&disk, Path::new("node"), scenario.cells, torn_ns) {
+                Ok(cells) => report.torn_plants += cells.len() as u64,
+                Err(what) => {
+                    fail(&mut report, format!("torn-tail plant: {what}"));
+                    return finish(report, &observer, &clock);
+                }
+            }
+        }
         node = match boot(scenario, PathBuf::from("node"), &disk, &clock, &observer) {
             Ok(node) => node,
             Err(err) => {
@@ -1680,25 +1706,22 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                 report.reopened_packed_tails += stats.reopened_packed_tails;
             }
         }
-        // Batch 34 engagement: a FLUSH → FUA transition boot reopens the
-        // prelude's packed tail (ADR-0086 D4 as amended: ≥ 1 per cell with
-        // a v2 tail). Asserted on the K ≥ 2 half only — on every K = 1
-        // seed of the 64-seed sweep the transition boot's highest segment
-        // was the empty preallocated next one (tail offset 0), so that
-        // half crosses the class change without a packed tail; the
-        // mechanism is open as N17 in the review ledger, and the
-        // manifest's `reopened_packed_tails` discloses the split.
+        // Engagement (batch 34, widened in batch 35): every FLUSH → FUA
+        // transition boot reopens one packed tail per cell — the torn
+        // prelude tail on the plain half, the lift plant's life-2
+        // segment on the lift half (ADR-0086 D4 as amended: ≥ 1 per cell
+        // with a v2 tail).
+        let reopened = report.reopened_packed_tails;
         if first_life.io_mode == SegmentIoMode::Buffered
             && scenario.io_mode == SegmentIoMode::Direct
-            && scenario.frames_in_flight >= 2
-            && report.reopened_packed_tails == 0
+            && reopened < u64::from(scenario.cells)
         {
             fail(
                 &mut report,
                 format!(
-                    "TRANSITION ARM VACUOUS seed {:#x}: FLUSH → FUA (K = {}) reopened no packed \
-                     tail",
-                    scenario.seed, scenario.frames_in_flight
+                    "TRANSITION ARM VACUOUS seed {:#x}: FLUSH → FUA (K = {}) reopened {reopened} \
+                     packed tails on {} cells",
+                    scenario.seed, scenario.frames_in_flight, scenario.cells
                 ),
             );
         }

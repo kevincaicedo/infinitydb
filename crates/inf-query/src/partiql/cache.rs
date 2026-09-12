@@ -186,8 +186,9 @@ impl StatementCache {
         self.link_front(slot);
     }
 
-    /// Drop `slot` entirely (epoch invalidation): swap-remove keeps the
-    /// slab dense, so the displaced tail entry's links re-target.
+    /// Drop `slot` entirely (epoch invalidation, eviction): swap-remove
+    /// keeps the slab dense, so the displaced tail entry's links
+    /// re-target.
     fn remove(&mut self, slot: u32) {
         self.unlink_lru(slot);
         self.unlink_chain(slot);
@@ -233,8 +234,11 @@ impl StatementCache {
 
     fn unlink_lru(&mut self, slot: u32) {
         let (prev, next) = {
-            let e = &self.slab[slot as usize];
-            (e.prev, e.next)
+            let e = &mut self.slab[slot as usize];
+            let links = (e.prev, e.next);
+            // An unlinked slot carries no links a later splice could read.
+            (e.prev, e.next) = (NIL, NIL);
+            links
         };
         if prev != NIL {
             self.slab[prev as usize].next = next;
@@ -273,35 +277,26 @@ impl StatementCache {
         entry_heap: usize,
     ) {
         debug_assert!(entry_heap <= self.budget_bytes, "oversize entries stay uncached");
-        let mut reuse: Option<u32> = None;
+        // Every victim leaves the slab (F-L09-01): unlinking alone kept
+        // the slot resident — unreachable, uncounted, with stale links.
         while self.slab.len() as u32 >= self.capacity
             || (self.entry_bytes + entry_heap > self.budget_bytes && !self.slab.is_empty())
         {
             let victim = self.lru_tail;
             debug_assert_ne!(victim, NIL, "eviction requires a resident entry");
-            self.unlink_lru(victim);
-            self.unlink_chain(victim);
-            self.entry_bytes -= self.slab[victim as usize].heap_bytes();
+            self.remove(victim);
             self.evictions += 1;
-            reuse = Some(victim);
-            if self.slab.len() as u32 <= self.capacity
-                && self.entry_bytes + entry_heap <= self.budget_bytes
-            {
-                break;
-            }
         }
-        let entry =
-            Entry { hash, key: text.into(), compiled, epoch, chain: NIL, prev: NIL, next: NIL };
-        let slot = match reuse {
-            Some(slot) => {
-                self.slab[slot as usize] = entry;
-                slot
-            }
-            None => {
-                self.slab.push(entry);
-                (self.slab.len() - 1) as u32
-            }
-        };
+        self.slab.push(Entry {
+            hash,
+            key: text.into(),
+            compiled,
+            epoch,
+            chain: NIL,
+            prev: NIL,
+            next: NIL,
+        });
+        let slot = (self.slab.len() - 1) as u32;
         self.entry_bytes += entry_heap;
         let bucket = self.bucket_of(hash);
         self.slab[slot as usize].chain = self.buckets[bucket];
@@ -542,5 +537,120 @@ mod tests {
         cache.get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP).expect("ok");
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.misses(), 2);
+    }
+
+    /// The structural invariants the slab/LRU mechanics promise: every
+    /// slab slot is chained from its bucket, the LRU list threads exactly
+    /// the slab, the byte ledger is the sum of the resident entries.
+    fn check_invariants(cache: &StatementCache) {
+        let n = cache.slab.len();
+        assert!(n <= cache.capacity as usize, "slab {n} over capacity {}", cache.capacity);
+        let mut heap = 0usize;
+        for (s, e) in cache.slab.iter().enumerate() {
+            assert_eq!(
+                cache.find(e.hash, &e.key),
+                Some(s as u32),
+                "slot {s} is orphaned from its bucket chain"
+            );
+            heap += e.heap_bytes();
+        }
+        assert_eq!(cache.entry_bytes, heap, "entry_bytes drifted from the resident entries");
+        assert!(cache.entry_bytes <= cache.budget_bytes, "budget exceeded");
+        let (mut seen, mut prev, mut cur) = (0usize, NIL, cache.lru_head);
+        while cur != NIL {
+            let e = &cache.slab[cur as usize];
+            assert_eq!(e.prev, prev, "LRU prev link at slot {cur}");
+            prev = cur;
+            cur = e.next;
+            seen += 1;
+            assert!(seen <= n, "LRU list cycles");
+        }
+        assert_eq!(prev, cache.lru_tail, "LRU tail");
+        assert_eq!(seen, n, "the LRU list threads {seen} of {n} slots");
+        let expected = heap
+            + cache.slab.capacity() * size_of::<Entry>()
+            + cache.buckets.len() * size_of::<u32>();
+        assert_eq!(cache.bytes(), expected, "bytes() is not exact");
+    }
+
+    /// A statement whose text is padded to `len` bytes (whitespace is
+    /// not part of the compilation, only of the key).
+    fn padded(i: usize, len: usize) -> Vec<u8> {
+        let mut s = format!("SELECT * FROM ns WHERE v = {i}").into_bytes();
+        s.resize(len.max(s.len()), b' ');
+        s
+    }
+
+    /// F-L09-01: an insert whose byte budget needs a second victim used
+    /// to unlink both but reuse one slot — the other stayed in the slab,
+    /// unreachable, uncounted, with stale LRU links.
+    #[test]
+    fn multi_victim_eviction_does_not_leak_slots() {
+        let catalog = TestCatalog::new();
+        let mut cache = StatementCache::new(4); // budget = 4 × 8192
+        let tiny = padded(0, 0);
+        cache.get_or_compile(&tiny, &catalog, CAP).expect("ok");
+        let big: Vec<Vec<u8>> = (1..=4).map(|i| padded(i, CAP)).collect();
+        for s in &big[..3] {
+            cache.get_or_compile(s, &catalog, CAP).expect("ok");
+        }
+        assert_eq!((cache.len(), cache.evictions()), (4, 0));
+        // Evicting `tiny` frees ~100 B: the fourth big entry takes a
+        // second victim.
+        cache.get_or_compile(&big[3], &catalog, CAP).expect("ok");
+        assert_eq!(cache.evictions(), 2);
+        assert_eq!(cache.len(), 3, "two victims out, one entry in");
+        check_invariants(&cache);
+    }
+
+    /// The same shape driven by a generator: mixed sizes, hits, epoch
+    /// bumps (the swap-remove path) — every step keeps the structure.
+    #[test]
+    fn eviction_and_invalidation_keep_the_structure() {
+        use proptest::prelude::*;
+        // Sizes at both ends of the share: the byte budget binds only
+        // when near-cap entries meet, and a second victim is taken only
+        // when the tail is tiny — the generator must reach that regime.
+        let pad = prop_oneof![Just(0usize), (CAP - 256)..=CAP];
+        let op = (0u8..8, 0usize..12, pad);
+        let multi_victim = Cell::new(0u64);
+        proptest!(ProptestConfig::with_cases(512), |(capacity in 1usize..6, ops in proptest::collection::vec(op, 1..64))| {
+            let catalog = TestCatalog::new();
+            let mut cache = StatementCache::new(capacity);
+            for (kind, idx, pad) in ops {
+                if kind == 7 {
+                    catalog.epoch.set(catalog.epoch.get() + 1);
+                }
+                let before = cache.evictions();
+                let text = padded(idx, pad);
+                cache.get_or_compile(&text, &catalog, CAP).expect("ok");
+                if cache.evictions() >= before + 2 {
+                    multi_victim.set(multi_victim.get() + 1);
+                }
+                check_invariants(&cache);
+            }
+        });
+        assert!(multi_victim.get() > 0, "the generator never took two victims in one insert");
+    }
+
+    /// The review's "Likely" tail: an orphan swap-removed into a live
+    /// slot splices its stale links into the LRU list, and a later
+    /// eviction walks a bucket chain that does not hold it. No structure
+    /// checks here — only that the sequence never panics.
+    #[test]
+    fn eviction_and_invalidation_never_panic() {
+        use proptest::prelude::*;
+        let pad = prop_oneof![Just(0usize), (CAP - 256)..=CAP];
+        let op = (0u8..8, 0usize..12, pad);
+        proptest!(ProptestConfig::with_cases(4096), |(capacity in 1usize..6, ops in proptest::collection::vec(op, 1..96))| {
+            let catalog = TestCatalog::new();
+            let mut cache = StatementCache::new(capacity);
+            for (kind, idx, pad) in ops {
+                if kind == 7 {
+                    catalog.epoch.set(catalog.epoch.get() + 1);
+                }
+                cache.get_or_compile(&padded(idx, pad), &catalog, CAP).expect("ok");
+            }
+        });
     }
 }

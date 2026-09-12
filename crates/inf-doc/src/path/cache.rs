@@ -196,8 +196,11 @@ impl ProgramCache {
 
     fn unlink_lru(&mut self, slot: u32) {
         let (prev, next) = {
-            let e = &self.slab[slot as usize];
-            (e.prev, e.next)
+            let e = &mut self.slab[slot as usize];
+            let links = (e.prev, e.next);
+            // An unlinked slot carries no links a later splice could read.
+            (e.prev, e.next) = (NIL, NIL);
+            links
         };
         if prev != NIL {
             self.slab[prev as usize].next = next;
@@ -231,42 +234,69 @@ impl ProgramCache {
     /// entry cap and the byte budget hold. Returns the slab slot.
     fn insert(&mut self, hash: u64, text: &[u8], program: PathProgram, entry_heap: usize) -> u32 {
         debug_assert!(entry_heap <= self.budget_bytes, "oversize entries stay uncached");
-        let mut reuse: Option<u32> = None;
+        // Every victim leaves the slab (F-L09-01's class): unlinking alone
+        // kept the slot resident — unreachable, uncounted, with stale links.
         while self.slab.len() as u32 >= self.capacity
             || (self.entry_bytes + entry_heap > self.budget_bytes && !self.slab.is_empty())
         {
             let victim = self.lru_tail;
             debug_assert_ne!(victim, NIL, "eviction requires a resident entry");
-            self.unlink_lru(victim);
-            self.unlink_chain(victim);
-            self.entry_bytes -= self.slab[victim as usize].heap_bytes();
+            self.remove(victim);
             self.evictions += 1;
-            reuse = Some(victim);
-            // A reused slot serves this insert; keep evicting only while
-            // the byte budget still binds.
-            if self.slab.len() as u32 <= self.capacity
-                && self.entry_bytes + entry_heap <= self.budget_bytes
-            {
-                break;
-            }
         }
-        let entry = Entry { hash, key: text.into(), program, chain: NIL, prev: NIL, next: NIL };
-        let slot = match reuse {
-            Some(slot) => {
-                self.slab[slot as usize] = entry;
-                slot
-            }
-            None => {
-                self.slab.push(entry);
-                (self.slab.len() - 1) as u32
-            }
-        };
+        self.slab.push(Entry { hash, key: text.into(), program, chain: NIL, prev: NIL, next: NIL });
+        let slot = (self.slab.len() - 1) as u32;
         self.entry_bytes += entry_heap;
         let bucket = self.bucket_of(hash);
         self.slab[slot as usize].chain = self.buckets[bucket];
         self.buckets[bucket] = slot;
         self.link_front(slot);
         slot
+    }
+
+    /// Drop `slot` entirely: swap-remove keeps the slab dense, so the
+    /// displaced tail entry's links re-target.
+    fn remove(&mut self, slot: u32) {
+        self.unlink_lru(slot);
+        self.unlink_chain(slot);
+        self.entry_bytes -= self.slab[slot as usize].heap_bytes();
+        let last = (self.slab.len() - 1) as u32;
+        self.slab.swap_remove(slot as usize);
+        if slot != last {
+            self.retarget(last, slot);
+        }
+    }
+
+    /// Every link that pointed at `from` now points at `to` (the
+    /// swap-remove fixup).
+    fn retarget(&mut self, from: u32, to: u32) {
+        let (hash, prev, next) = {
+            let e = &self.slab[to as usize];
+            (e.hash, e.prev, e.next)
+        };
+        if prev != NIL {
+            self.slab[prev as usize].next = to;
+        } else if self.lru_head == from {
+            self.lru_head = to;
+        }
+        if next != NIL {
+            self.slab[next as usize].prev = to;
+        } else if self.lru_tail == from {
+            self.lru_tail = to;
+        }
+        let bucket = self.bucket_of(hash);
+        if self.buckets[bucket] == from {
+            self.buckets[bucket] = to;
+        } else {
+            let mut cursor = self.buckets[bucket];
+            while cursor != NIL {
+                if self.slab[cursor as usize].chain == from {
+                    self.slab[cursor as usize].chain = to;
+                    break;
+                }
+                cursor = self.slab[cursor as usize].chain;
+            }
+        }
     }
 
     fn unlink_chain(&mut self, slot: u32) {
@@ -404,5 +434,99 @@ mod tests {
         }
         assert_eq!(cache.len(), 4);
         assert_eq!(cache.evictions(), 60);
+    }
+
+    /// The structural invariants the slab/LRU mechanics promise: every
+    /// slab slot is chained from its bucket, the LRU list threads exactly
+    /// the slab, the byte ledger is the sum of the resident entries.
+    fn check_invariants(cache: &ProgramCache) {
+        let n = cache.slab.len();
+        assert!(n <= cache.capacity as usize, "slab {n} over capacity {}", cache.capacity);
+        let mut heap = 0usize;
+        for (s, e) in cache.slab.iter().enumerate() {
+            assert_eq!(
+                cache.find(e.hash, &e.key),
+                Some(s as u32),
+                "slot {s} is orphaned from its bucket chain"
+            );
+            heap += e.heap_bytes();
+        }
+        assert_eq!(cache.entry_bytes, heap, "entry_bytes drifted from the resident entries");
+        assert!(cache.entry_bytes <= cache.budget_bytes, "budget exceeded");
+        let (mut seen, mut prev, mut cur) = (0usize, NIL, cache.lru_head);
+        while cur != NIL {
+            let e = &cache.slab[cur as usize];
+            assert_eq!(e.prev, prev, "LRU prev link at slot {cur}");
+            prev = cur;
+            cur = e.next;
+            seen += 1;
+            assert!(seen <= n, "LRU list cycles");
+        }
+        assert_eq!(prev, cache.lru_tail, "LRU tail");
+        assert_eq!(seen, n, "the LRU list threads {seen} of {n} slots");
+        let expected = heap
+            + cache.slab.capacity() * size_of::<Entry>()
+            + cache.buckets.len() * size_of::<u32>()
+            + cache.uncached.as_ref().map_or(0, |program| program.as_bytes().len());
+        assert_eq!(cache.bytes(), expected, "bytes() is not exact");
+    }
+
+    /// A path whose last member name pads the text to `len` bytes.
+    fn padded(i: usize, len: usize) -> Vec<u8> {
+        let mut s = format!("$.k{i}").into_bytes();
+        if len > s.len() + 1 {
+            s.push(b'.');
+            s.resize(len, b'a');
+        }
+        s
+    }
+
+    const NS_CAP: usize = 4096;
+
+    /// F-L09-01's class in the M3 cache (the S09 statement cache copied
+    /// this loop): an insert whose byte budget needs a second victim
+    /// unlinked both but reused one slot — the other stayed in the slab,
+    /// unreachable, uncounted, with stale LRU links.
+    #[test]
+    fn multi_victim_eviction_does_not_leak_slots() {
+        let mut cache = ProgramCache::new(4); // budget = 4 × 4096
+        cache.get_or_compile(&padded(0, 0), NS_CAP).expect("ok");
+        // A 2 560 B path compiles to a program of about its own size:
+        // three such entries and the tiny one fit, a fourth does not.
+        let big: Vec<Vec<u8>> = (1..=4).map(|i| padded(i, NS_CAP * 5 / 8)).collect();
+        for p in &big[..3] {
+            cache.get_or_compile(p, NS_CAP).expect("ok");
+        }
+        assert_eq!((cache.len(), cache.evictions()), (4, 0));
+        // Evicting the tiny tail frees ~20 B: the fourth big entry takes
+        // a second victim.
+        cache.get_or_compile(&big[3], NS_CAP).expect("ok");
+        assert_eq!(cache.evictions(), 2);
+        assert_eq!(cache.len(), 3, "two victims out, one entry in");
+        check_invariants(&cache);
+    }
+
+    /// The same shape driven by a generator: mixed sizes and hits —
+    /// every step keeps the structure.
+    #[test]
+    fn eviction_keeps_the_structure() {
+        use std::cell::Cell;
+
+        use proptest::prelude::*;
+        let pad = prop_oneof![Just(0usize), (NS_CAP - 128)..=NS_CAP];
+        let op = (0usize..12, pad);
+        let multi_victim = Cell::new(0u64);
+        proptest!(ProptestConfig::with_cases(512), |(capacity in 1usize..6, ops in proptest::collection::vec(op, 1..64))| {
+            let mut cache = ProgramCache::new(capacity);
+            for (idx, pad) in ops {
+                let before = cache.evictions();
+                cache.get_or_compile(&padded(idx, pad), NS_CAP).expect("ok");
+                if cache.evictions() >= before + 2 {
+                    multi_victim.set(multi_victim.get() + 1);
+                }
+                check_invariants(&cache);
+            }
+        });
+        assert!(multi_victim.get() > 0, "the generator never took two victims in one insert");
     }
 }

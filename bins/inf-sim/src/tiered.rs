@@ -2190,37 +2190,61 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             );
         }
         report.rebuilt_same_key_twins += 1;
-        // (3) Fill the hashtag's cell past s2's commit page (seals land on
-        //     1 MiB page marks; the mutable window is 20‰ of 3 MiB) and
-        //     let the flush catch up: the walk refs every slot below the
+        // (3) Fill the hashtag's cell past s2's commit page and keep
+        //     filling until the flush lane confirms the page above the
+        //     head the scrape saw: the walk refs every slot below the
         //     flushed watermark, so s2 needs flushing, not release — and
         //     the winner's pin never blocks a flush. The reboot's ticket
         //     count is the hard witness; a short fill is a vacuous row.
-        let flushed_before = scrape7c!(&["tiering_flush_confirmed_bytes"])[0];
-        for batch in 0..24u64 {
+        //     N16 (batch 35): a fixed 1.5 MiB fill plus "advanced, then
+        //     stable for four scrapes" was not that witness — the lane
+        //     confirms in coarse units and holds a partial tail back, so
+        //     whether s2's bytes were confirmed before the checkpoint
+        //     depended on where the fill ended; on seed 0xd5ee0016 the
+        //     lane stopped one unit short (cell 1: flushed 3 148 926, ro
+        //     4 197 133, s2 ≈ 3.67 MiB), the walk latched W below s2, s2
+        //     came back as a RAM image and the boot settled the twin by
+        //     full key (A4′: two RAM siblings), leaving two tickets. The
+        //     precondition is exact now: s2 ≤ the head at the scrape ≤
+        //     the seal boundary + the mutable window, so `confirmed ≥ the
+        //     1 MiB mark above that` puts s2 below any W a later walk
+        //     latches — and filling is what moves the lane (pressure).
+        let before = scrape7c!(&["tiering_flush_confirmed_bytes", "tiering_demote_sealed_bytes"]);
+        let (flushed_before, sealed_before) = (before[0], before[1]);
+        const PAGE: u64 = 1 << 20;
+        const WINDOW_SLACK: u64 = 128 << 10;
+        let s2_page_end = (sealed_before + WINDOW_SLACK).div_ceil(PAGE) * PAGE;
+        let mut caught_up = false;
+        let mut now = before;
+        let mut batches = 0u64;
+        while batches < 256 {
             for i in 0..32u64 {
                 let mut key = inf_store::COLLISION_KEY_PREFIX.to_vec();
-                key.extend_from_slice(format!("fill:{batch}:{i}").as_bytes());
-                let value = value_bytes(b'f', 8, batch * 32 + i, 2048);
+                key.extend_from_slice(format!("fill:{batches}:{i}").as_bytes());
+                let value = value_bytes(b'f', 8, batches * 32 + i, 2048);
                 expect7c!(audit, &[b"SET", &key, &value], b"+OK\r\n", "filler SET");
                 report.rebuilt_fill_sets += 1;
                 expected_live += 1;
             }
-        }
-        let mut flushed_now = flushed_before;
-        let mut stable = 0u32;
-        for _ in 0..128 {
-            let now = scrape7c!(&["tiering_flush_confirmed_bytes"])[0];
-            stable = if now == flushed_now { stable + 1 } else { 0 };
-            flushed_now = now;
-            if stable >= 4 && flushed_now > flushed_before {
+            batches += 1;
+            for _ in 0..8 {
+                if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
+                    bail7c!("phase-7c fill: {err}");
+                }
+            }
+            now = scrape7c!(&["tiering_flush_confirmed_bytes", "tiering_demote_sealed_bytes"]);
+            if now[0] >= s2_page_end {
+                caught_up = true;
                 break;
             }
         }
-        if flushed_now <= flushed_before {
+        if !caught_up {
             bail7c!(
-                "REBUILT-TICKET ROW VACUOUS seed {seed:#x}: the flush never advanced after the \
-                 filler writes (confirmed {flushed_before} B before, {flushed_now} B after)"
+                "REBUILT-TICKET ROW VACUOUS seed {seed:#x}: {batches} filler batches never moved \
+                 the flush lane past the page above s2 (mark {s2_page_end}; sealed \
+                 {sealed_before} → {} B, confirmed {flushed_before} → {} B)",
+                now[1],
+                now[0]
             );
         }
         // A cold GET of s2 witnesses nothing here: the resolver reads the
@@ -2270,11 +2294,26 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         expect7c!(audit, &[b"GET", s0], &bulk(&s0_v2), "GET s0 after the reboot (STALE READ)");
     }
     let want_tickets = 2 + if scenario.shadow { 2 } else { 0 };
-    let pending = scrape7c!(&["tiering_shadow_pending"])[0];
+    let rows = scrape7c!(&[
+        "tiering_shadow_pending",
+        "tiering_shadow_rebuild_settled_same_key",
+        "tiering_shadow_rebuild_settled_distinct",
+        "tiering_shadow_rebuild_over_cap",
+    ]);
+    let pending = rows[0];
     if pending != want_tickets {
+        // A boot settle means a hash had two RAM siblings (or the cap
+        // bound) — the row's material moved; none means a pair the boot
+        // should have formed is missing (product).
+        let settled = rows[1] + rows[2] + rows[3];
         bail7c!(
-            "REBUILT-TICKET ROW VACUOUS seed {seed:#x}: the reboot rebuilt {pending} tickets, \
-             wanted {want_tickets} (two cold collision slots beside one RAM sibling per winner)"
+            "REBUILT-TICKET {} seed {seed:#x}: the reboot rebuilt {pending} tickets, wanted \
+             {want_tickets} (two cold collision slots beside one RAM sibling per winner; boot \
+             settles same-key {} / distinct {} / over-cap {})",
+            if settled > 0 { "ROW VACUOUS" } else { "VIOLATION" },
+            rows[1],
+            rows[2],
+            rows[3]
         );
     }
     report.rebuilt_tickets += pending;

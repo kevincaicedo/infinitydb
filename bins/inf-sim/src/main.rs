@@ -1148,8 +1148,8 @@ fn run_durable(
              audited, {} required ops, {} allowed-lost, {} equivalence checks, {} documents \
              compared, {} corpus docs, cut classes {:?}, lift regime {} (tiered ops {}, indexed \
              ops {}, sidecars loaded {}, stale slacks lifted {}; plant: cells {}, lifts {}, \
-             sidecars {}), arms [ckpt_downgrades {} bound_splits {} waits_fill {} waits_group \
-             {} plant_fired {}], trace {} bytes, hash {:#018x}",
+             sidecars {}; torn plants {}), arms [ckpt_downgrades {} bound_splits {} waits_fill \
+             {} waits_group {} plant_fired {}], trace {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -1167,6 +1167,7 @@ fn run_durable(
             report.lift_plants,
             report.lift_plant_lifts,
             report.lift_plant_sidecars,
+            report.torn_plants,
             report.ckpt_downgrades,
             report.ckpt_bound_splits,
             report.frame_waits_fill,
