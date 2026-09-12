@@ -1,7 +1,7 @@
-//! The index-range page step (M4.5-S09, ADR-0080 D4): one place owns
-//! the frozen form's paging semantics — seek (resume pair or lower
-//! edge), upper-edge check, scan-budget check, LIMIT countdown, resume
-//! production. The caller (S11's query future; the S09 tests) resolves
+//! The index-range page step (M4.5-S09, ADR-0080 D4, A1): one place
+//! owns the frozen form's paging semantics — seek (resume pair clamped
+//! to the lower edge), upper-edge check, scan-budget check, LIMIT
+//! countdown, resume production. The caller (S11's query future; the S09 tests) resolves
 //! each candidate's pk ref, evaluates the residual VM, and reports
 //! matches back — evaluation stays with the owner of doc custody, the
 //! interpretation of the bounds does not fork.
@@ -59,10 +59,14 @@ pub struct RangePager {
 
 impl RangePager {
     /// A page starting at `resume` (strictly after that pair) or at the
-    /// range's lower edge. `limit_remaining` is the statement `LIMIT`
-    /// minus prior pages' matches (`None` = unlimited); `scan_budget`
-    /// bounds this page's work in entries scanned (≥ 1 — a zero-work
-    /// page is a caller bug).
+    /// range's lower edge — whichever is later. A resume pair is client
+    /// input (S11's cursor binds index + generation, not the statement's
+    /// range), so a pair below `lo` seeds from `lo` instead: the tree
+    /// iterates in key order, so one clamp at the seek is exactly a
+    /// lower-edge check on every candidate (ADR-0080 A1). `limit_remaining`
+    /// is the statement `LIMIT` minus prior pages' matches (`None` =
+    /// unlimited); `scan_budget` bounds this page's work in entries
+    /// scanned (≥ 1 — a zero-work page is a caller bug).
     pub fn new(
         lo: &RangeEdge,
         hi: &RangeEdge,
@@ -72,8 +76,10 @@ impl RangePager {
     ) -> RangePager {
         debug_assert!(scan_budget >= 1, "a page scans at least one entry");
         let cursor = match resume {
-            Some(r) => OrderedCursor::resume_after(&r.key, r.entry_ref),
-            None => match lo {
+            Some(r) if lo.admits_from_below(&r.key) => {
+                OrderedCursor::resume_after(&r.key, r.entry_ref)
+            }
+            _ => match lo {
                 RangeEdge::Unbounded => OrderedCursor::from_start(),
                 RangeEdge::Included(key) => OrderedCursor::from_key(key, true),
                 RangeEdge::Excluded(key) => OrderedCursor::from_key(key, false),

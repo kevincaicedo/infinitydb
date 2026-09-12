@@ -9,9 +9,11 @@
 use std::collections::{HashMap, HashSet};
 
 use inf_doc::{DocValue, JsonParser, TapeDoc, path};
-use inf_query::access::AccessStep;
+use inf_query::access::{AccessStep, RangeEdge};
 use inf_query::page::{PageOutcome, PageResume, RangePager};
 use inf_query::partiql::{CatalogView, CompiledStatement, compile};
+use proptest::prelude::*;
+
 use inf_store::{
     Fixed8, IndexId, IndexKeyBuf, IndexKeyType, IndexScalar, IndexSpec, IndexState, IndexTree,
     NsId, OrderedMap, index_key_encode,
@@ -273,4 +275,76 @@ fn suspension_resumes_without_loss() {
     let outcome = run_page(&tree, &docs, &compiled, Some(&resume), 100, None, &mut emitted);
     assert!(!outcome.more);
     assert_eq!(emitted, (0..10).collect::<Vec<u64>>());
+}
+
+// ---------------------------------------------------------------------
+// The lower edge on the resume path (review 2026-08-30, F-L09-03). A
+// cursor is client input: S11's binding checks (CRC, version, shape,
+// {index id, generation}) are all satisfied by a resume pair taken from
+// a *different statement over the same index*, so the pager itself
+// must keep every served key inside the compiled range.
+// ---------------------------------------------------------------------
+
+/// A resume pair well below `lo` (the first statement's cursor replayed
+/// against `price > 1000`) must not serve the rows between them.
+#[test]
+fn resume_below_the_lower_edge_serves_nothing_out_of_range() {
+    let catalog = catalog("$.price", IndexKeyType::I64);
+    let mut tree = IndexTree::Fixed8(OrderedMap::<Fixed8>::new());
+    let mut docs = Docs { docs: HashMap::new() };
+    for pk in 0..1200u64 {
+        docs.insert(&mut tree, pk, pk as i64, true);
+    }
+    let compiled = compile(b"SELECT * FROM ns WHERE price > 1000", &catalog).expect("compiles");
+    let AccessStep::IndexRange { lo, hi, .. } = &compiled.access.step else { unreachable!() };
+    assert!(compiled.access.residual.is_none(), "the conjunct folds into the range");
+    let forged = PageResume { key: i64_key(5), entry_ref: 5 };
+    let mut pager = RangePager::new(lo, hi, Some(&forged), 10_000, None);
+    let mut served: Vec<u64> = Vec::new();
+    while let Some((key, pk)) = pager.next(&tree) {
+        assert!(lo.admits_from_below(key), "served pk {pk} below the lower edge (price > 1000)");
+        served.push(pk);
+    }
+    assert_eq!(served, (1001..1200).collect::<Vec<u64>>());
+}
+
+fn edge_strategy() -> impl Strategy<Value = RangeEdge> {
+    prop_oneof![
+        Just(RangeEdge::Unbounded),
+        (-24i64..24).prop_map(|v| RangeEdge::Included(i64_key(v))),
+        (-24i64..24).prop_map(|v| RangeEdge::Excluded(i64_key(v))),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+    /// Every page over `[lo, hi]` from any resume pair — the statement's
+    /// own or a forged one anywhere in key space — serves exactly the
+    /// in-range pairs strictly after the resume pair, in tree order.
+    #[test]
+    fn resume_pairs_never_widen_the_range(
+        entries in prop::collection::btree_set((-20i64..20, 0u64..4), 0..48),
+        lo in edge_strategy(),
+        hi in edge_strategy(),
+        resume in prop::option::of((-24i64..24, 0u64..6)),
+    ) {
+        let mut tree = IndexTree::Fixed8(OrderedMap::<Fixed8>::new());
+        for &(v, pk) in &entries {
+            prop_assert!(tree.insert(&i64_key(v), pk).expect("capacity"));
+        }
+        let resume = resume.map(|(v, pk)| PageResume { key: i64_key(v), entry_ref: pk });
+        let expected: Vec<(Vec<u8>, u64)> = entries
+            .iter()
+            .map(|&(v, pk)| (i64_key(v), pk))
+            .filter(|(key, _)| lo.admits_from_below(key) && hi.admits_from_above(key))
+            .filter(|pair| resume.as_ref().is_none_or(|r| *pair > (r.key.clone(), r.entry_ref)))
+            .collect();
+        let mut pager = RangePager::new(&lo, &hi, resume.as_ref(), 10_000, None);
+        let mut served: Vec<(Vec<u8>, u64)> = Vec::new();
+        while let Some((key, pk)) = pager.next(&tree) {
+            served.push((key.to_vec(), pk));
+        }
+        prop_assert_eq!(served, expected, "lo={:?} hi={:?} resume={:?}", lo, hi, resume);
+    }
 }

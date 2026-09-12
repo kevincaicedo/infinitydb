@@ -155,7 +155,15 @@ while IFS=$'\t' read -r ptr file kind message; do
         fail=1
         continue
     fi
-    if ! awk -f "$STRIP" "$path" | awk -v sym="$sym" -f "$RESOLVE" > /dev/null; then
+    # Resolve from a stripped *file*, never a pipe: the resolver exits at
+    # the first definition, and a piped stripper takes SIGPIPE under
+    # pipefail once the file outgrows the pipe buffer (ADR-0106 D14).
+    stripped="$work/stripped/$path"
+    if [ ! -f "$stripped" ]; then
+        mkdir -p "$(dirname "$stripped")"
+        awk -f "$STRIP" "$path" > "$stripped"
+    fi
+    if ! awk -v sym="$sym" -f "$RESOLVE" "$stripped" > /dev/null; then
         echo "RELEASE-ASSERT violation: proof pointer '$ptr' does not resolve — $path defines no '$sym' in production code (renamed, moved, or test-only?) (row: $file $kind \"$message\")"
         fail=1
     fi

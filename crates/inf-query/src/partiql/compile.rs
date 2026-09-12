@@ -385,7 +385,10 @@ fn utf8_interval(cmp: CmpOp, s: &str) -> Interval {
     }
     let mut image = IndexKeyBuf::new();
     let full_len = index_key_escape_prefix(s, &mut image);
-    debug_assert!(full_len > ORDERED_KEY_MAX, "encode only refuses over-cap strings");
+    // The cap is on the *encoded* form (escape + terminator), so the
+    // encoder refuses at escaped length == cap too; the image is then
+    // the untruncated escape and the bounds below stay exact.
+    debug_assert!(full_len >= ORDERED_KEY_MAX, "encode refuses at escaped length >= the cap");
     let image = image.as_bytes().to_vec();
     match cmp {
         CmpOp::Eq => Interval::empty_fixed(&image),

@@ -349,6 +349,13 @@ fn utf8_boundary_corpus() {
         "\u{10FFFF}".into(),
         "x".repeat(500),
         "x".repeat(1023),
+        // The exact encoded cap and one past it (F-L09-02): escaped
+        // length 1024 is refused by the encoder (the terminator makes
+        // the encoded form 1025) and binds at the untruncated image.
+        "x".repeat(1024),
+        "x".repeat(1025),
+        "\u{0}".repeat(512),
+        "\u{0}".repeat(511) + "xy",
         "x".repeat(1030),
     ];
     let values: Vec<DocScalar> = strings.iter().map(|s| DocScalar::Str(s.clone())).collect();
@@ -363,6 +370,38 @@ fn utf8_boundary_corpus() {
         for value in &values {
             assert_agreement(IndexKeyType::Utf8, &op, value);
         }
+    }
+}
+
+/// A utf8 literal whose *escaped* form is exactly `ORDERED_KEY_MAX`
+/// bytes is client input (a ~1 KiB statement, far under the ceiling);
+/// every comparison over it compiles (F-L09-02 — the compiler
+/// debug-asserted `>` where the encoder refuses at `>=`).
+#[test]
+fn utf8_literal_at_the_exact_encoded_cap_compiles() {
+    let cap = inf_store::ORDERED_KEY_MAX;
+    let literals = ["x".repeat(cap), "\u{0}".repeat(cap / 2), "\u{0}".repeat(cap / 2 - 1) + "xy"];
+    for lit in &literals {
+        for cmp in CMPS {
+            let op = Op::Cmp(cmp, Lit::Str(lit.clone()));
+            let statement = op.statement();
+            let compiled = compile(statement.as_bytes(), &catalog(IndexKeyType::Utf8))
+                .expect("a cap-length literal compiles");
+            let AccessStep::IndexRange { lo, hi, .. } = &compiled.access.step else {
+                panic!("one-leaf statements compile to index ranges");
+            };
+            // The bound stays exact over every storable key: the image is
+            // a proper prefix of nothing storable, so `k < s ⇔ k ≤ image`.
+            let below = "x".repeat(cap - 1);
+            let value = DocScalar::Str(below);
+            assert_agreement(IndexKeyType::Utf8, &op, &value);
+            assert!(matches!(cmp, CmpOp::Eq) || lo != hi, "{statement}");
+        }
+        assert_agreement(
+            IndexKeyType::Utf8,
+            &Op::BeginsWith(lit.clone()),
+            &DocScalar::Str(lit.clone()),
+        );
     }
 }
 
@@ -387,7 +426,17 @@ fn bool_boundary_corpus() {
 
 fn lit_strategy(key_type: IndexKeyType) -> BoxedStrategy<Lit> {
     match key_type {
-        IndexKeyType::Utf8 => "[\\x00-\\x7Fé☃]{0,24}".prop_map(Lit::Str).boxed(),
+        IndexKeyType::Utf8 => prop_oneof![
+            4 => "[\\x00-\\x7Fé☃]{0,24}".prop_map(Lit::Str),
+            // The key-cap band (F-L09-02): escaped lengths straddling
+            // `ORDERED_KEY_MAX`, NULs included (each escapes to two).
+            1 => (1016usize..1032, 0usize..8).prop_map(|(len, nuls)| {
+                let mut s = "x".repeat(len);
+                s.replace_range(..nuls, &"\u{0}".repeat(nuls));
+                Lit::Str(s)
+            }),
+        ]
+        .boxed(),
         IndexKeyType::Bool => any::<bool>().prop_map(Lit::Bool).boxed(),
         // Numeric indexes take both numeric families — the cross-type
         // mapping is the interesting surface.

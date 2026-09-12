@@ -74,6 +74,8 @@ compat:
 # re-pressure flush liveness → DISKFULL clamp → the S19 drop race).
 sim-smoke:
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
+    # F-L11-05: an accept-path error is a counter, never connection teardown.
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --plant accept-error
     # Group 0 (review 2026-08-30 §5.5): adversarial key/value lengths at
     # 4 cells — the two parameters no other gate exercises.
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-adversarial --seed 0xC0FFEE --cells 4 --verify-determinism
