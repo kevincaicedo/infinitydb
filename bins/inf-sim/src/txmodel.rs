@@ -3890,25 +3890,7 @@ pub mod identity {
                 }
                 Step::Crash => {
                     log.truncate(durable);
-                    let replayed_max = log
-                        .iter()
-                        .filter_map(|r| match r {
-                            Rec::Tag { seq } => Some(*seq),
-                            _ => None,
-                        })
-                        .max();
-                    let reserved_max = log
-                        .iter()
-                        .filter_map(|r| match r {
-                            Rec::Reserve { upto } => Some(*upto),
-                            _ => None,
-                        })
-                        .max();
-                    let floor = if rules.resume_from_durable_reservation {
-                        replayed_max.unwrap_or(0).max(reserved_max.unwrap_or(0)).max(ckpt_reserved)
-                    } else {
-                        replayed_max.unwrap_or(0)
-                    };
+                    let floor = replay_floor(rules, &log, ckpt_reserved);
                     next = floor + 1;
                     reserved_upto = floor;
                     last_issued = None;
@@ -3916,6 +3898,22 @@ pub mod identity {
             }
         }
         Ok(issued)
+    }
+
+    fn replay_floor(rules: Rules, log: &[Rec], ckpt_reserved: u64) -> u64 {
+        let mut replayed_max = 0;
+        let mut reserved_max = ckpt_reserved;
+        for rec in log {
+            match rec {
+                Rec::Tag { seq } => replayed_max = replayed_max.max(*seq),
+                Rec::Reserve { upto } => reserved_max = reserved_max.max(*upto),
+            }
+        }
+        if rules.resume_from_durable_reservation {
+            replayed_max.max(reserved_max)
+        } else {
+            replayed_max
+        }
     }
 
     /// F03: forty transactions persisted locally; txid 41 issued, a remote
@@ -4040,128 +4038,140 @@ pub mod revision {
     /// `everysec` for a write the crash window lost may be reissued — the
     /// same window as the write, disclosed in the ADR.)
     pub fn run(rules: Rules, steps: &[Step]) -> Result<Stats, String> {
-        let inc_max = 1u64 << INCARNATION_BITS;
-        let ver_max = 1u64 << VERSION_BITS;
-        let mut log: Vec<Rec> = Vec::new();
-        let mut durable = 0usize;
-        let mut ckpt: Option<(Option<Token>, u64)> = None;
-        let mut live: Option<Token> = None;
-        let mut next_inc: u64 = 1;
-        let mut reserved_upto: u64 = 0;
-        let mut counter_wrapped = false;
-        let mut issued_durable: BTreeSet<Token> = BTreeSet::new();
-        let mut stats = Stats::default();
-
-        fn fsync(log: &[Rec], durable: &mut usize, issued: &mut BTreeSet<Token>) {
-            for rec in &log[*durable..] {
-                if let Rec::Live(t) = rec {
-                    issued.insert(*t);
-                }
-            }
-            *durable = log.len();
-        }
-
+        let mut state = State { next_inc: 1, ..State::default() };
         for step in steps {
             match step {
-                Step::Create | Step::Update => {
-                    let next = match live {
-                        None if *step == Step::Update => continue,
-                        Some(t) if t.version + 1 < ver_max => {
-                            Token { incarnation: t.incarnation, version: t.version + 1 }
-                        }
-                        Some(t) if !rules.reincarnate_on_wrap => {
-                            // D8 as written: the version wraps under the
-                            // incarnation the record was created with.
-                            let wrapped = Token { incarnation: t.incarnation, version: 0 };
-                            if issued_durable.contains(&wrapped) {
-                                return Err(format!(
-                                    "REVISION REPEAT: ({}, 0) issued again after {ver_max} mutations of a record that never left — the u{VERSION_BITS} version wrapped under incarnation {}",
-                                    t.incarnation, t.incarnation
-                                ));
-                            }
-                            wrapped
-                        }
-                        prior => {
-                            // A create, or the wrap re-incarnating (A7).
-                            if rules.resume_from_durable_reservation && next_inc > reserved_upto {
-                                let upto = (reserved_upto + CHUNK).min(inc_max);
-                                log.push(Rec::Reserve { upto });
-                                fsync(&log, &mut durable, &mut issued_durable);
-                                reserved_upto = upto;
-                            }
-                            if next_inc >= inc_max {
-                                if rules.refuse_at_exhaustion {
-                                    stats.refused += 1;
-                                    continue;
-                                }
-                                next_inc = 0;
-                                counter_wrapped = true;
-                            }
-                            let incarnation = next_inc;
-                            next_inc += 1;
-                            if prior.is_some() {
-                                stats.reincarnations += 1;
-                            }
-                            let fresh = Token { incarnation, version: 0 };
-                            if issued_durable.contains(&fresh) {
-                                let why = if counter_wrapped {
-                                    format!("the u{INCARNATION_BITS} incarnation counter wrapped")
-                                } else {
-                                    "the counter resumed below a dead incarnation after a restart"
-                                        .to_string()
-                                };
-                                return Err(format!(
-                                    "REVISION REPEAT: ({incarnation}, 0) issued again for a new incarnation — {why}"
-                                ));
-                            }
-                            fresh
-                        }
-                    };
-                    stats.issued += 1;
-                    live = Some(next);
-                    log.push(Rec::Live(next));
-                }
+                Step::Create | Step::Update => state.write(rules, *step)?,
                 Step::Delete => {
-                    if live.take().is_some() {
-                        log.push(Rec::Tombstone);
+                    if state.live.take().is_some() {
+                        state.log.push(Rec::Tombstone);
                     }
                 }
-                Step::Fsync => fsync(&log, &mut durable, &mut issued_durable),
+                Step::Fsync => state.fsync(),
                 Step::Checkpoint => {
-                    fsync(&log, &mut durable, &mut issued_durable);
-                    ckpt = Some((live, reserved_upto));
-                    log.clear();
-                    durable = 0;
+                    state.fsync();
+                    state.ckpt = Some((state.live, state.reserved_upto));
+                    state.log.clear();
+                    state.durable = 0;
                 }
-                Step::Crash => {
-                    stats.boots += 1;
-                    log.truncate(durable);
-                    let (image, ckpt_reserved) = ckpt.unwrap_or((None, 0));
-                    live = image;
-                    let mut replayed_max = image.map_or(0, |t| t.incarnation);
-                    let mut reservation = ckpt_reserved;
-                    for rec in &log {
-                        match rec {
-                            Rec::Reserve { upto } => reservation = reservation.max(*upto),
-                            Rec::Live(t) => {
-                                live = Some(*t);
-                                replayed_max = replayed_max.max(t.incarnation);
-                            }
-                            Rec::Tombstone => live = None,
-                        }
-                    }
-                    if rules.resume_from_durable_reservation {
-                        // A boot burns the rest of the chunk: it resumes
-                        // above the reservation and reserves anew.
-                        next_inc = reservation + 1;
-                        reserved_upto = reservation;
-                    } else {
-                        next_inc = replayed_max + 1;
-                    }
-                }
+                Step::Crash => state.crash(rules),
             }
         }
-        Ok(stats)
+        Ok(state.stats)
+    }
+
+    #[derive(Default)]
+    struct State {
+        log: Vec<Rec>,
+        durable: usize,
+        ckpt: Option<(Option<Token>, u64)>,
+        live: Option<Token>,
+        next_inc: u64,
+        reserved_upto: u64,
+        counter_wrapped: bool,
+        issued_durable: BTreeSet<Token>,
+        stats: Stats,
+    }
+
+    impl State {
+        fn write(&mut self, rules: Rules, step: Step) -> Result<(), String> {
+            let ver_max = 1u64 << VERSION_BITS;
+            let next = match self.live {
+                None if step == Step::Update => return Ok(()),
+                Some(t) if t.version + 1 < ver_max => {
+                    Token { incarnation: t.incarnation, version: t.version + 1 }
+                }
+                Some(t) if !rules.reincarnate_on_wrap => {
+                    // The withdrawn rule wraps without changing incarnation.
+                    let wrapped = Token { incarnation: t.incarnation, version: 0 };
+                    if self.issued_durable.contains(&wrapped) {
+                        return Err(format!(
+                            "REVISION REPEAT: ({}, 0) issued again after {ver_max} mutations of a record that never left — the u{VERSION_BITS} version wrapped under incarnation {}",
+                            t.incarnation, t.incarnation
+                        ));
+                    }
+                    wrapped
+                }
+                _ => {
+                    let Some(fresh) = self.reincarnate(rules)? else { return Ok(()) };
+                    fresh
+                }
+            };
+            self.stats.issued += 1;
+            self.live = Some(next);
+            self.log.push(Rec::Live(next));
+            Ok(())
+        }
+
+        fn reincarnate(&mut self, rules: Rules) -> Result<Option<Token>, String> {
+            let inc_max = 1u64 << INCARNATION_BITS;
+            if rules.resume_from_durable_reservation && self.next_inc > self.reserved_upto {
+                let upto = (self.reserved_upto + CHUNK).min(inc_max);
+                self.log.push(Rec::Reserve { upto });
+                self.fsync();
+                self.reserved_upto = upto;
+            }
+            if self.next_inc >= inc_max {
+                if rules.refuse_at_exhaustion {
+                    self.stats.refused += 1;
+                    return Ok(None);
+                }
+                self.next_inc = 0;
+                self.counter_wrapped = true;
+            }
+            let incarnation = self.next_inc;
+            self.next_inc += 1;
+            if self.live.is_some() {
+                self.stats.reincarnations += 1;
+            }
+            let fresh = Token { incarnation, version: 0 };
+            if self.issued_durable.contains(&fresh) {
+                let why = if self.counter_wrapped {
+                    format!("the u{INCARNATION_BITS} incarnation counter wrapped")
+                } else {
+                    "the counter resumed below a dead incarnation after a restart".to_string()
+                };
+                return Err(format!(
+                    "REVISION REPEAT: ({incarnation}, 0) issued again for a new incarnation — {why}"
+                ));
+            }
+            Ok(Some(fresh))
+        }
+
+        fn fsync(&mut self) {
+            for rec in &self.log[self.durable..] {
+                if let Rec::Live(t) = rec {
+                    self.issued_durable.insert(*t);
+                }
+            }
+            self.durable = self.log.len();
+        }
+
+        fn crash(&mut self, rules: Rules) {
+            self.stats.boots += 1;
+            self.log.truncate(self.durable);
+            let (image, ckpt_reserved) = self.ckpt.unwrap_or((None, 0));
+            self.live = image;
+            let mut replayed_max = image.map_or(0, |t| t.incarnation);
+            let mut reservation = ckpt_reserved;
+            for rec in &self.log {
+                match rec {
+                    Rec::Reserve { upto } => reservation = reservation.max(*upto),
+                    Rec::Live(t) => {
+                        self.live = Some(*t);
+                        replayed_max = replayed_max.max(t.incarnation);
+                    }
+                    Rec::Tombstone => self.live = None,
+                }
+            }
+            if rules.resume_from_durable_reservation {
+                // Burn the unused part of the durable reservation on boot.
+                self.next_inc = reservation + 1;
+                self.reserved_upto = reservation;
+            } else {
+                self.next_inc = replayed_max + 1;
+            }
+        }
     }
 
     /// F05's history: one record, never deleted, updated past the version

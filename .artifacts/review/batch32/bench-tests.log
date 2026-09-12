@@ -1,0 +1,70 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling inf-bench v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/inf-bench)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.98s
+     Running unittests src/main.rs (target/debug/deps/inf_bench-adf6455d9b4cbaf3)
+
+running 61 tests
+test cli::tests::parses_values_and_bools ... ok
+test cli::tests::require_and_defaults ... ok
+test cli::tests::rejects_unknown_flag ... ok
+test cli::tests::rejects_duplicate_flag ... ok
+test cli::tests::rejects_missing_value_and_positionals ... ok
+test envcheck::tests::battery_power_fails_ac_passes ... ok
+test envcheck::tests::clean_tree_passes_dirty_tree_fails ... ok
+test envcheck::tests::epp_balance_performance_fails ... ok
+test envcheck::tests::git_unavailable_is_skipped_not_failed ... ok
+test envcheck::tests::low_power_mode_states ... ok
+test envcheck::tests::performance_governor_passes ... ok
+test envcheck::tests::missing_cpufreq_skips ... ok
+test finehist::tests::bucket_bounds_tile_the_range_without_gaps ... ok
+test envcheck::tests::throttle_counts_zero_pass_nonzero_fail ... ok
+test envcheck::tests::powersave_governor_fails_with_named_cpu ... ok
+test finehist::tests::percentile_is_upper_bound_clamped_to_max ... ok
+test finehist::tests::resolution_at_the_s35_octave_is_two_microseconds ... ok
+test finehist::tests::small_values_are_exact ... ok
+test gaterun::tests::a_row_without_write_amplification_refuses_the_report ... ok
+test finehist::tests::merge_adds_counts_and_keeps_max ... ok
+test load::tests::skipped_slots_are_counted_from_the_due_slot_and_inside_the_window ... ok
+test gates::tests::parses_the_checked_in_gates_file ... ok
+test writeamp::tests::blob_reported_ratio_must_match_the_recomputation ... ok
+test m45rows::s37measure::tests::an_empty_or_drained_ticket_set_cannot_validate_the_shadow_measurement ... ok
+test writeamp::tests::blob_aggregate_must_be_the_max_of_its_lines ... ok
+test writeamp::tests::aggregate_must_be_the_max_of_its_lines ... ok
+test gates::tests::parses_the_m3_gates_file ... ok
+test gates::tests::parses_the_m2_gates_file ... ok
+test writeamp::tests::blob_bytes_without_a_denominator_is_unbounded ... ok
+test writeamp::tests::blob_split_measures_the_worst_blob_namespace ... ok
+test gates::tests::parses_the_m1_gates_file ... ok
+test writeamp::tests::memory_mode_row_reports_no_tiered_namespace ... ok
+test writeamp::tests::tables_without_lines_is_a_broken_surface ... ok
+test gates::tests::parses_the_m4_gates_file ... ok
+test writeamp::tests::blob_split_reports_absence_when_nothing_is_out_of_line ... ok
+test writeamp::tests::reported_ratio_must_match_the_recomputation ... ok
+test writeamp::tests::unbounded_namespace_refuses_to_become_a_number ... ok
+test writeamp::tests::worst_namespace_across_cells_is_the_gate_value ... ok
+test ycsb::tests::scan_cursor_parses_and_refuses ... ok
+test ycsb::tests::mem_hit_refuses_too_few_ops_for_a_p999 ... ok
+test ycsb::tests::workload_percentages_sum_to_100 ... ok
+test ycsb::tests::withdrawn_ram_hit_fields_do_not_refuse_a_tiered_row ... ok
+test zipfian::tests::splitmix_is_deterministic ... ok
+test envcheck::tests::allow_dirty_excuses_only_the_dirty_tree ... ok
+test gaterun::tests::device_root_admission_refuses_memory_filesystems_for_binding_and_fua_runs ... ok
+test ycsb::tests::zipf_uniform_theta_would_fail_validation ... ok
+test ycsb::tests::mem_hit_refuses_when_the_populations_overlap ... ok
+test ycsb::tests::a_generator_config_mismatch_refuses_the_hot_set_citation ... ok
+test ycsb::tests::mem_hit_still_refuses_a_zero_cold_p50_when_cold_reads_happened ... ok
+test ycsb::tests::a_reference_leg_that_is_not_ram_resident_is_refused ... ok
+test ycsb::tests::mem_hit_accepts_the_ram_resident_reference_leg ... ok
+test ycsb::tests::mem_hit_refuses_a_cold_dominated_row ... ok
+test ycsb::tests::mem_hit_truncation_recovers_the_memory_population ... ok
+test ycsb::tests::mem_hit_tsv_round_trips_through_the_reference_carrier ... ok
+test doc_corpus::tests::checked_manifest_is_the_generator_witness ... ok
+test ycsb::tests::stream_generation_is_deterministic ... ok
+test ycsb::tests::zipf_hot_share_matches_analytic ... ok
+test zipfian::tests::zipf_sampling_is_skewed_and_deterministic ... ok
+test doc_corpus::tests::canonical_shapes_are_byte_deterministic_and_contract_sized ... ok
+test ycsb::tests::reference_leg_rows_are_judged_on_ram_residency_not_separation ... ok
+test doc_corpus::tests::corpus_v2_instances_are_unique_deterministic_and_contract_sized ... ok
+
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+

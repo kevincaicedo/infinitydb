@@ -1,0 +1,14 @@
+    Checking inf-foundation v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-foundation)
+warning: `core::arch::x86_64::_rdtscp` does not refer to a reachable function
+  --> /home/kcaicedo/Documents/Projects/databases/infinitydb/clippy.toml:29:5
+   |
+29 |     { path = "core::arch::x86_64::_rdtscp", reason = "no ambient clocks in cell code (L7) — the TSC spelling" },
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: add `allow-invalid = true` to the entry to suppress this warning
+
+warning: `inf-foundation` (lib) generated 1 warning
+    Checking inf-bench v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/inf-bench)
+warning: `inf-bench` (bin "inf-bench") generated 1 warning (1 duplicate)
+warning: `inf-bench` (bin "inf-bench" test) generated 1 warning (1 duplicate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.80s

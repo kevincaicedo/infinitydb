@@ -1,0 +1,126 @@
+[
+  {
+    "command": "just check",
+    "log": "just-check.log",
+    "exit_code": 0
+  },
+  {
+    "command": "cargo deny --offline check",
+    "log": "cargo-deny.log",
+    "exit_code": 0
+  },
+  {
+    "command": "just sim-smoke",
+    "log": "sim-smoke.log",
+    "exit_code": 0
+  },
+  {
+    "command": "CARGO_NET_OFFLINE=true cargo test -p inf-sim txmodel (before)",
+    "log": "txmodel-before.log",
+    "exit_code": 0
+  },
+  {
+    "command": "CARGO_NET_OFFLINE=true cargo test -p inf-sim txmodel (after)",
+    "log": "txmodel-after.log",
+    "exit_code": 0
+  },
+  {
+    "command": "CARGO_NET_OFFLINE=true cargo test -p inf-bench",
+    "log": "bench-tests.log",
+    "exit_code": 0
+  },
+  {
+    "command": "target/release/inf-sim --scenario m4-tiered --seed 0xc10000 --sweep 64 --out .artifacts/review/batch32/tiered-64",
+    "log": "tiered-64.log",
+    "exit_code": 0
+  },
+  {
+    "command": "target/release/inf-sim --scenario m4-recovery --seed 0xc10000 --sweep 64 --out .artifacts/review/batch32/recovery-64",
+    "log": "recovery-64.log",
+    "exit_code": 0
+  },
+  {
+    "command": "./target/batch32-equivalence/run (rustc --edition 2024 -O; original c4ea42c vs refactor)",
+    "log": "model-equivalence.log",
+    "exit_code": 0
+  },
+  {
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "log": "fmt-checked-final.log",
+    "exit_code": 0,
+    "elapsed_seconds": 1.5806988859985722,
+    "environment": {
+      "CARGO_NET_OFFLINE": "true"
+    }
+  },
+  {
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "inf-bench",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "log": "bench-clippy-checked-final.log",
+    "exit_code": 0,
+    "elapsed_seconds": 1.0032745279968367,
+    "environment": {
+      "CARGO_NET_OFFLINE": "true"
+    }
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "inf-bench"
+    ],
+    "log": "bench-tests-final.log",
+    "exit_code": 0,
+    "elapsed_seconds": 1.2051631630019983,
+    "environment": {
+      "CARGO_NET_OFFLINE": "true"
+    }
+  },
+  {
+    "command": [
+      "cargo",
+      "build",
+      "--release",
+      "-p",
+      "infinityd",
+      "-p",
+      "inf-bench",
+      "-p",
+      "inf"
+    ],
+    "log": "build-shipping-final.log",
+    "exit_code": 0,
+    "elapsed_seconds": 14.870702949003316,
+    "environment": {
+      "CARGO_NET_OFFLINE": "true"
+    }
+  },
+  {
+    "command": [
+      "bash",
+      "-n",
+      "scripts/run-s37-reference.sh"
+    ],
+    "log": "reference-script-syntax.log",
+    "exit_code": 0,
+    "elapsed_seconds": 0.0014929509998182766,
+    "environment": {
+      "CARGO_NET_OFFLINE": "true"
+    }
+  }
+]

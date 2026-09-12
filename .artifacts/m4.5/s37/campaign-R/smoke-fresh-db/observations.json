@@ -1,0 +1,13 @@
+{
+  "tier": "development instrument smoke; no reference acceptance",
+  "report": ".artifacts/m4.5/s37/campaign-R/smoke-fresh-db/D9/run/1789179869-gate-run/report.md",
+  "basis": "Ratios derived from rounded raw report rows; one replicate, two-second measurement durations. INFO deltas include warmup. Aggregate fallback/SET is not the D9 cap-fallback/eligible denominator.",
+  "ratios": {
+    "c64_write_b_over_a": 1.3802,
+    "c256_write_b_over_a": 0.5245,
+    "c256_p50_b_over_a": 1.3038,
+    "c256_b_tiered_over_flat": 0.0655,
+    "read_b_over_a": 0.9699,
+    "read_aa_absolute_fractional_difference": 0.0146
+  }
+}

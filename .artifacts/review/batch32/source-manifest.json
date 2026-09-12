@@ -1,0 +1,16 @@
+{
+  "baseline": "c4ea42c0318bfc32681f83b3d1925fd955bbb983",
+  "tree": "dirty and disclosed during validation; source hashes identify tested files",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+  "sha256": {
+    "bins/inf-sim/src/txmodel.rs": "2fd7655b58dd7ea2481d45f32ba7a2e37a8fee1d304c5bc7ccb1dc2370248059",
+    "bins/inf-bench/src/gaterun.rs": "d05d41d7495f9db961668ba5fcf97fcd3f50cb0f72de679e9848957727710522",
+    "bins/inf-bench/src/m45rows.rs": "375bc1c078ea1e59ac6e7be3581240265351342a943b77e63779fb9c3b26ae46",
+    "bins/inf-bench/src/m45rows/s37measure.rs": "93e338128bc2e5f81daf1102cfcc5e27d0e68ff359af5085b95b03f817fcee9d",
+    "docs/interfaces-m0.md": "100be3c03c107957f637817d8d6971c76dc6c7c783f294b66ea7796660ce7674",
+    "docs/interfaces-m2.md": "f4e5cd8eee15f80b21db35701e9f4d5b95301ad786120d94e8208ed985400965",
+    "scripts/run-s37-reference.sh": "36ac161a9cbb42aa44e3c5cf833ec54c3f51867fe1606692e58036f43c9906aa",
+    "scripts/s37-host-sample.py": "ec06407e1c49805844ef354d0872b0c41871a7c47eae49f8122c8ab61f764547"
+  }
+}

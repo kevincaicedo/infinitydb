@@ -1,0 +1,17 @@
+inf-bench env-check
+  PROBE                RESULT
+  git-dirty-tree       FAIL  dirty git tree: 10 uncommitted entries
+  cpufreq-governor     PASS
+  cpufreq-epp          PASS
+  thermal-throttle     FAIL  thermal throttling occurred: cpu0/package_throttle_count=72, cpu1/package_throttle_count=72, cpu10/core_throttle_count=38, cpu10/package_throttle_count=72
+  power-source         SKIP  macos-only probe (this host: linux)
+  low-power-mode       SKIP  macos-only probe (this host: linux)
+
+  *** DIRTY TREE — dev run only, output is not citation-grade ***
+gate-run: CONTINUING WITH FAILED ENV-CHECK — results are not citation-grade
+  s35: 1s drive-state idle before DBSIZE before fill
+  s35: 1s drive-state idle before DBSIZE post-fill quiescence
+s37 DBSIZE rep0 A cycle0: 35 us
+s37 DBSIZE rep0 A cycle1: 34 us
+  s35: 1s drive-state idle before DBSIZE before fill
+inf-bench: s37tier fill: 1000000 ops, 189 errors, expected 1000000

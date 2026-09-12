@@ -1,0 +1,72 @@
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0xbf09f8177e9215cc; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 4 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties absent: probing the device under /home/kcaicedo/bench-data/s37/batch32-smoke-ysipbvi1/DBSIZE/s37-dbsize-A-rep0 (1 s per row, 256 MiB scratch) — once per data directory (ADR-0091 D1)
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 5s
+control: cell 1 not ready — in spawned (0/0 bytes) for 5s
+control: cell 2 not ready — in spawned (0/0 bytes) for 5s
+control: cell 3 not ready — in spawned (0/0 bytes) for 5s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 6s
+control: cell 1 not ready — in spawned (0/0 bytes) for 6s
+control: cell 2 not ready — in spawned (0/0 bytes) for 6s
+control: cell 3 not ready — in spawned (0/0 bytes) for 6s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 7s
+control: cell 1 not ready — in spawned (0/0 bytes) for 7s
+control: cell 2 not ready — in spawned (0/0 bytes) for 7s
+control: cell 3 not ready — in spawned (0/0 bytes) for 7s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 8s
+control: cell 1 not ready — in spawned (0/0 bytes) for 8s
+control: cell 2 not ready — in spawned (0/0 bytes) for 8s
+control: cell 3 not ready — in spawned (0/0 bytes) for 8s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 9s
+control: cell 1 not ready — in spawned (0/0 bytes) for 9s
+control: cell 2 not ready — in spawned (0/0 bytes) for 9s
+control: cell 3 not ready — in spawned (0/0 bytes) for 9s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 10s
+control: cell 1 not ready — in spawned (0/0 bytes) for 10s
+control: cell 2 not ready — in spawned (0/0 bytes) for 10s
+control: cell 3 not ready — in spawned (0/0 bytes) for 10s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 11s
+control: cell 1 not ready — in spawned (0/0 bytes) for 11s
+control: cell 2 not ready — in spawned (0/0 bytes) for 11s
+control: cell 3 not ready — in spawned (0/0 bytes) for 11s
+control: recovery 0/4 cells ready, 0/0 bytes (100.0%), eta 0s
+control: cell 0 not ready — in spawned (0/0 bytes) for 12s
+control: cell 1 not ready — in spawned (0/0 bytes) for 12s
+control: cell 2 not ready — in spawned (0/0 bytes) for 12s
+control: cell 3 not ready — in spawned (0/0 bytes) for 12s
+infinityd: probe: flush bytes=4096     p50=   919 us  p99=  1332 us  barriers/s=  1056
+infinityd: probe: fua   bytes=4096     p50=   295 us  p99=   647 us  barriers/s=  2994
+infinityd: probe: flush bytes=65536    p50=   897 us  p99=  1395 us  barriers/s=  1040
+infinityd: probe: fua   bytes=65536    p50=   331 us  p99=   678 us  barriers/s=  2769
+infinityd: probe: flush bytes=262144   p50=  1140 us  p99=  2297 us  barriers/s=   847
+infinityd: probe: fua   bytes=262144   p50=   445 us  p99=  1423 us  barriers/s=  2019
+infinityd: probe: flush bytes=1048576  p50=  1606 us  p99=  3310 us  barriers/s=   582
+infinityd: probe: fua   bytes=1048576  p50=   931 us  p99=  2661 us  barriers/s=   963
+infinityd: probe: fua   bytes=4096     writers=4 barriers/s=  8204 (aggregate)
+infinityd: probe: read  bytes=262144   readers=4 bytes/s=1360457541 (aggregate, direct)
+infinityd: probe: read  bytes=262144   readers=1 bytes/s=1209126584 (direct)
+infinityd: io-properties: probed-at-boot (schema 4, 12.2 s; identity ext4 /dev/nvme0n1p3 uuid c97c5418…) → barrier class fua
+infinityd: log barrier class fua (source: probed-at-boot; fua_max_frame_bytes 1048576; probed p50 fua 295 µs / flush 919 µs); frames in flight 3 (auto: fua) × 4 MiB staging
+infinityd: segment recycling on, 1 slot(s) × 256 MiB per cell, pool wait quarter (ADR-0090)
+infinityd: device model probed (schema 4): write 504 MiB/s, 2994 ops/s (qd4 barriers 8204/s); per-cell share write 126 MiB/s
+infinityd: checkpoint cap replay term 324 MiB/s per cell (min(probed read rows qd1 1153 MiB/s, qd4 1297 MiB/s ÷ 4 — the four-reader share at 4 cells, assumption A1); ADR-0088 D4 as amended)
+infinityd c4ea42c (git c4ea42c0318b-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 45497, backend io_uring, route natural
+infinityd: listening on 45497
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 2 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 4 cells serving (12257 ms)

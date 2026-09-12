@@ -1,0 +1,9 @@
+{
+  "build": "cargo build --release -p infinityd -p inf-bench -p inf; simulator previously built separately with DST",
+  "sha256": {
+    "target/release/infinityd": "429049f623f6ac4611fa863552295bea95fb7fd4d1e6bc7a80c88d5b0766fcd7",
+    "target/release/inf-bench": "320513bce126053311bb8a72a6f2217b3f95c291d4e3e0043aa0a8a708f1c3ef",
+    "target/release/inf": "e9c56af4c45a5b8edd9c77204b609a93b56028d325f9a346fdd1afc3b72502e6",
+    "target/release/inf-sim": "42511d70a18ffda27b3452826f66c3545336273b204971ba327cb96144c92563"
+  }
+}
