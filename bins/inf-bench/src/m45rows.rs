@@ -50,6 +50,8 @@ use crate::gaterun::{
 use crate::load::{LoadSpec, run as run_load};
 use crate::resp::{connect, request};
 
+mod s37measure;
+
 /// Keys per namespace fill (× 1 KiB values ≈ 200 MiB per namespace —
 /// enough that the tiered demoter runs against the budget below, small
 /// enough that a 3-replicate row stays under ~5 minutes).
@@ -199,13 +201,21 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
     if only_s37 {
         m.note("--only-s37: every other row was skipped; their gate keys are absent");
         let ticketed_del = flags.bool("s37-ticketed-del");
-        if ticketed_del {
+        let dbsize = flags.bool("s37-dbsize");
+        if dbsize && (ticketed_del || flags.bool("s37-shadow")) {
+            return Err("--s37-dbsize is a separate row from DEL and shadow throughput".into());
+        }
+        if dbsize {
+            s37measure::dbsize_row(flags, &infinityd, cells, replicates, &data_root, &mut m)?;
+        } else if ticketed_del {
             s37_ticketed_del_row(flags, &infinityd, cells, replicates, &data_root, &mut m)?;
         } else {
             s37_row(flags, &infinityd, cells, duration, replicates, &data_root, &mut m)?;
         }
-        let shipping =
-            ticketed_del || flags.bool("s37-shadow") || flags.get("s37-cold-read-qd").is_some();
+        let shipping = dbsize
+            || ticketed_del
+            || flags.bool("s37-shadow")
+            || flags.get("s37-cold-read-qd").is_some();
         return finish_report(
             "m4.5",
             &gates_list,
@@ -217,7 +227,9 @@ pub fn cmd_gate_run_m45(flags: &Flags) -> Result<(), String> {
                 "binary {infinityd}{} · cells {cells} · {replicates} replicates · S37 {} row \
                  only · {arms_note}",
                 if shipping { "" } else { " (bench-diagnostics)" },
-                if ticketed_del {
+                if dbsize {
+                    "DBSIZE under tickets"
+                } else if ticketed_del {
                     "ticketed-DEL RSS/tail"
                 } else if flags.bool("s37-shadow") {
                     "shadow-slot arm"
@@ -3281,9 +3293,10 @@ fn s37_leg(
     conns: usize,
     duration: u64,
     keys: u64,
+    raw: &mut String,
 ) -> Result<S37Leg, String> {
     let before = scrape_cells(port, cells)?;
-    let report = run_load(&LoadSpec {
+    let (report, cpu_pct) = s37measure::measured_load(&LoadSpec {
         port,
         conns,
         pipeline: 1,
@@ -3305,6 +3318,11 @@ fn s37_leg(
         ));
     }
     let after = scrape_cells(port, cells)?;
+    raw.push_str(&format!(
+        "ops={} errors={} busy_retryable={} generator_cpu_pct={cpu_pct:.1}\n",
+        report.ops, report.errors, report.busy_retryable
+    ));
+    raw.push_str(&format!("INFO before={before:?}\nINFO after={after:?}\n"));
     let d = |f: &str| sum_field(&after, f).saturating_sub(sum_field(&before, f));
     Ok(S37Leg {
         ops_per_sec: report.ops_per_sec,
@@ -3447,6 +3465,11 @@ fn s37_row(
 ) -> Result<(), String> {
     let keys = flags.u64_or("s37-keys", S37_DEFAULT_KEYS)?;
     let idle_s = flags.u64_or("leg-idle-s", 0)?;
+    let controls_enabled = flags.bool("s37-controls");
+    if controls_enabled && (!flags.bool("s37-shadow") || !flags.bool("read-leg-fill")) {
+        return Err("--s37-controls requires --s37-shadow --read-leg-fill".into());
+    }
+    let mut controls = Vec::new();
     let (arms, ceiling) = s37_arms(flags)?;
     let labels: Vec<&str> = arms.iter().map(|a| a.label.as_str()).collect();
     if ceiling {
@@ -3540,7 +3563,9 @@ fn s37_row(
                 return Err(format!("s37 {} rep{rep} fill: {} errors", arm.label, fill.errors));
             }
             for conns in [CONNS_LOW, CONNS_HIGH] {
-                let leg = s37_leg(port, cells, conns, duration, keys)?;
+                s35_idle(idle_s, &format!("s37 {} rep{rep} c{conns} post-fill", arm.label));
+                raw.push_str(&format!("rep{rep} {} c{conns} counters\n", arm.label));
+                let leg = s37_leg(port, cells, conns, duration, keys, &mut raw)?;
                 raw.push_str(&format!(
                     "rep{rep} {:<5} c{conns:<3} ops/s={:<8.0} p50_us={:<6.0} p99_us={:<7.0} \
                      p999_us={:<7.0} sets={} cold_resolves={} ({:.3}/set) blind={} ({:.3}/set) \
@@ -3574,6 +3599,12 @@ fn s37_row(
                 println!("  s37 {}", raw.lines().last().unwrap_or(""));
                 legs.push((rep, arm.label.clone(), conns, leg));
             }
+            if controls_enabled {
+                raw.push_str(&format!("rep{rep} {} D9 controls\n", arm.label));
+                let control = s37measure::controls(port, cells, duration, keys, idle_s, &mut raw)?;
+                let tiered_ops = legs.last().expect("c256 leg was measured").3.ops_per_sec;
+                controls.push((arm.label.clone(), tiered_ops, control));
+            }
             drop(server);
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -3581,6 +3612,9 @@ fn s37_row(
     let find = |rep: usize, arm: &str, conns: usize| {
         legs.iter().find(|(r, a, c, _)| *r == rep && a == arm && *c == conns).map(|(.., l)| l)
     };
+    if controls_enabled {
+        s37measure::summarize_controls(&controls, m);
+    }
     let key = |name: String| -> &'static str { Box::leak(name.into_boxed_str()) };
     for conns in [CONNS_LOW, CONNS_HIGH] {
         let tag: &'static str = if conns == CONNS_LOW { "c64" } else { "c256" };
@@ -3988,6 +4022,7 @@ fn s37_ticketed_del_row(
                     fill.errors
                 ));
             }
+            s35_idle(idle_s, &format!("s37 ticketed-DEL {label} rep{rep} post-fill"));
             for (key, value) in config {
                 config_set(port, key, value)?;
             }

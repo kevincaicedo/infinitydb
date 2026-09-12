@@ -19,11 +19,11 @@ Formats defined by ADR-0011 unless noted.
 | `MutationEffect` → record seam | `inf-store` → `inf-log` | implemented (M2-S03/S08, ADR-0012/0015; dep edge + command-layer post-image emission live) |
 | Document record classes + replay contract | `inf-doc`/`inf-store`/`inf-log` | implemented (M3-S17, ADR-0043 — tags 6/7, incarnation lineage, recorded replay witnesses, static opcode registry, modular-u24 replay, checkpoint full images) |
 | Log staging domain (`StagingRing`) | `inf-log` | implemented (M2-S03; reactor wiring at S05) |
-| Sequential read path (`SegmentReader`) | `inf-log` | implemented (M2-S04; `BackendDriver` reads at S05; S14 tail policy implemented — ADR-0018) |
+| Sequential read path (`SegmentReader`) | `inf-log` | implemented (M2-S04; `ReadStep`/`next_step` make the clean end explicit; S14 tail policy — ADR-0018, foreign-segment classification — ADR-0090 D2) |
 | Durability watermark contract | `inf-log`/`inf-runtime` | implemented (M2-S05/S06/S08, ADR-0013/0015; live on `ServerPlane` — acks seq-keyed, semantics unchanged; sim disk at S18) |
 | Driver file ops (`LogWrite`/`Fdatasync`) | `inf-runtime` | implemented (M2-S05, ADR-0013 D1 — extends the frozen M0 `BackendDriver` contract) |
 | Node catalog `META` swap (`inf-log::meta`) | `inf-log` | implemented (M2-S08, ADR-0015 D3 — the S11 MANIFEST protocol class; payload = `inf-store::catalog` v1 → v2 (ADR-0062 D6) → v3 (ADR-0075 D2) → **v4 (ADR-0100 D1, 2026-09-01)**: a drop-tombstone section, written iff non-empty, owned by the catalog writer) |
-| Namespace selection + `Op::ApplyNs` | `inf-server`/`inf-fabric` | implemented (M2-S08, ADR-0015 D1 — the ADR-0009 §4 codec revision, additive opcode 6; `ns ≥ 16` enforced at decode) |
+| Namespace selection + `Op::ApplyNs` | `inf-server`/`inf-fabric` | implemented (M2-S08, ADR-0015 D1 — additive opcode 6; `ns ≥ 16` enforced at decode; `program: bool` and header bit 0 carry execution origin under ADR-0115 D2–D5, as specified in `interfaces-m0.md` §4) |
 | `.ick` checkpoint format v1 | `inf-log` | implemented (M2-S10, ADR-0016 — record-v1 payload; digest = hash64 chain, recorded deviation from "xxh3") |
 | Checkpoint scheduler group + ckpt token classes | `inf-runtime` | implemented (M2-S10/S11, ADR-0016 D4/D5 + ADR-0017 D3 — `GroupClass::Checkpoint`; `TokenClass::{CkptWrite,CkptSync,ManifestSync}` routing-only extensions of the frozen M0 token contract) |
 | MANIFEST schema (epoch 3) | `inf-log` | implemented (M2-S11, ADR-0017 — `INFMAN1\0` payload in the META envelope class; swap steps ride the driver via `TokenClass::ManifestSync` on the reactor tier). Epoch 2 added tier sections (M4-S12, ADR-0057 D5); **epoch 3 (ADR-0094 D6, 2026-08-30)** adds `key_hash_id: u64` after `begin` and makes `tier_ns_count` always present — the manifest names the key-hash secret that placed its checkpoint's refs, and recovery compares before the checkpoint loads. Epochs 1/2 decode to the typed `PredatesKeyHashBinding` (no migration) |
@@ -453,10 +453,24 @@ is the K = 1 constructor tests and tooling use.
 `SegmentReader` over one segment (sealed or active tail), reads through
 the `SegmentFs` seam (→ `BackendDriver` at S05):
 
-- `next_frame() -> Result<Option<FrameRef>, ReadError>` (lending,
-  validate-then-yield, one CRC pass per frame via header peek) and
-  `apply_frames(callback) -> Result<ReadEnd, ApplyError>` (the replay
-  batch-apply shape).
+- `next_step() -> Result<ReadStep<'_>, ReadError>` is the lending,
+  validate-then-yield operation (one CRC pass per frame via header peek).
+  `ReadStep<'a> = Frame(FrameRef<'a>) | End(ReadEnd)` carries the clean
+  end in the return value; no caller must infer it from an absent frame.
+  A clean end repeats on subsequent calls. An invalid frame remains at
+  the failing cursor and subsequent steps report its error again; read
+  errors never authorize skipping bytes or treating failure as clean EOF.
+- `next_frame() -> Result<Option<FrameRef<'_>>, ReadError>` is the
+  compatibility wrapper: `Frame` becomes `Some`, `End` becomes `None`.
+  After a terminal read failure it fuses to `Ok(None)`; this is **not**
+  a clean end (`read_end()` remains `None`). `read_end()` returns `Some`
+  only once either stepping API has recorded a clean `ReadEnd`.
+- `apply_frames(callback) -> Result<ReadEnd, ApplyError<E>>` loops over
+  `next_step`: apply each validated frame, return its explicit clean end,
+  propagate `ApplyError::Read` on read failure. A callback failure returns
+  `ApplyError::Apply { at: frame.first_lsn(), error }`; that frame has
+  already been consumed. A `FrameRef` borrows the reader window and must
+  be released before another step.
 - Stored `first_lsn` cross-checked against physical offset per frame —
   `ReadError::LsnMismatch` on misdirected writes (ADR-0011 D2). **M4.5-S39b
   (ADR-0090 D2 as amended):** a frame that decodes in full (magic, length,
@@ -474,6 +488,11 @@ the `SegmentFs` seam (→ `BackendDriver` at S05):
   never truncates and never skips.
 - `ReaderConfig{chunk_bytes = 1 MiB, max_frame_len}`; window grows only
   when a frame exceeds it (bounded by `max_frame_len`).
+
+These are reader facts; recovery owns tail policy under
+[ADR-0018](../../docs/adr/0018-m2-s13-s14-recovery-semantics.md) and
+ADR-0090 D2. B18-23-R11 propagates the implemented contract; no decoder,
+format or recovery policy changes with this documentation update.
 
 ## Driver file ops (`inf-runtime`, M2-S05, ADR-0013 D1)
 

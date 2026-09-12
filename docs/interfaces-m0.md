@@ -279,7 +279,11 @@ pub enum Op<'a> {
     Write { token: FabricToken, slot: KeySlot, key: &'a [u8], value: &'a [u8],
             expire_at: Option<Nanos>, flags: WriteFlags },
     /// Generic remote command execution, M0-experimental (M4 reshapes into Exec).
-    Apply { token: FabricToken, slot: KeySlot, cmd: u8, args: /* ≤ MAX_APPLY_ARGS slices */ },
+    Apply { token: FabricToken, slot: KeySlot, cmd: u8,
+            args: /* ≤ MAX_APPLY_ARGS slices */, program: bool },
+    /// Named namespace; defaults 0..16 use Apply (ADR-0015 D1).
+    ApplyNs { token: FabricToken, slot: KeySlot, cmd: u8, ns: u32,
+              args: /* ≤ MAX_APPLY_ARGS slices */, program: bool },
     Batch { ops: /* nested Read/Write/Apply, one destination */ },
     Reply { token: FabricToken, outcome: Outcome<'a> },
 }
@@ -322,6 +326,23 @@ impl CellFabric {
     pub fn stats(&self) -> FabricStats;             // spill/orphan/publish tripwires
 }
 ```
+
+**Execution origin (ADR-0115 D2–D5).** `Apply` and `ApplyNs` carry
+`program: bool`: `false` for forwarded client argv, `true` for legs composed
+by a plane program. Codec v0 header bit 0 is `FLAG_PROGRAM = 1`, set iff
+`program`; bits 1–15 remain reserved (`CodecError::ReservedFlags`). Bit 0
+on any other opcode is `CodecError::FlagNotApplicable`; a Batch's children
+carry their own origin. Namespace encoding and argument bounds are unchanged.
+
+The send funnels require `ApplyOrigin::{Client, Program}`. Receivers
+propagate the mark into `ConnCx::program`, including staged and
+namespace-parked execution; local composed legs set the same context field.
+Ordinary connections start with `program = false`. `CmdFlags::INTERNAL`
+commands are refused as unknown before arity checks on client execution,
+and hidden by client `COMMAND` introspection. Pre-registry program verbs
+are intercepted only for marked execution. This is an execution class
+between cells in one process, not authentication or an ACL capability.
+See [ADR-0115](../../docs/adr/0115-internal-command-origin-fence.md).
 
 ## 5. `inf-wire` — RESP port + command metadata (implemented — the code is the spec)
 
