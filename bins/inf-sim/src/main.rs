@@ -1069,7 +1069,7 @@ fn main() {
     // Machine-readable line for the nightly fleet (sim-seconds budget sum).
     println!(
         "inf-sim: sim_seconds={:.6} published={} delivered={} audits={} flushes={} \
-         scan_walks={} replays_skipped={} plant_fired={}",
+         scan_walks={} replays_skipped={} plant_fired={} accept_resumes={}",
         report.sim_seconds,
         report.published,
         report.delivered,
@@ -1077,7 +1077,8 @@ fn main() {
         report.flushes,
         report.scan_walks,
         report.replays_skipped,
-        report.plant_fired
+        report.plant_fired,
+        report.accept_resumes
     );
     if let Some(path) = &trace_out
         && let Err(e) = std::fs::write(path, &report.trace)

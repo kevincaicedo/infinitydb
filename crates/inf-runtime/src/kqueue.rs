@@ -21,8 +21,8 @@ use std::time::Duration;
 use inf_alloc::{BufferId, BufferPool, LeaseKind};
 
 use crate::driver::{
-    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
-    StableBytesMut, SubmitStats, Wait, WriteBarrier,
+    AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd,
+    StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier, classify_accept_errno,
 };
 use crate::token::CompletionToken;
 
@@ -44,13 +44,22 @@ struct PendingSend {
     written: u32,
 }
 
+/// One listener's accept arm; `parked` = the read filter is disabled after
+/// an exhaustion/broken failure (the shared table in `driver.rs`,
+/// F-L11-02/F-L11-06) until `AcceptArm` or (exhaustion only) a `Close`.
+#[derive(Copy, Clone, Debug)]
+struct AcceptState {
+    token: CompletionToken,
+    parked: Option<AcceptFailure>,
+}
+
 /// kqueue-backed [`BackendDriver`]. See module docs for tier caveats.
 pub struct KqueueDriver {
     kq: RawFd,
     pending_ops: Vec<IoOp>,
     /// Filter changes to apply on the next `kevent` (before its wait).
     changes: Vec<libc::kevent>,
-    accepts: HashMap<RawFd, CompletionToken>,
+    accepts: HashMap<RawFd, AcceptState>,
     recvs: HashMap<RawFd, RecvState>,
     sends: HashMap<RawFd, VecDeque<PendingSend>>,
     events: Vec<libc::kevent>,
@@ -93,8 +102,9 @@ impl KqueueDriver {
         for op in ops {
             match op {
                 IoOp::AcceptArm { listener, token } => {
+                    // Idempotent while armed; a parked arm resumes.
                     set_nonblocking(listener);
-                    self.accepts.insert(listener, token);
+                    self.accepts.insert(listener, AcceptState { token, parked: None });
                     self.push_change(listener, libc::EVFILT_READ, libc::EV_ADD | libc::EV_ENABLE);
                 }
                 IoOp::RecvArm { fd, token } => {
@@ -156,6 +166,9 @@ impl KqueueDriver {
                             }
                         },
                     });
+                    // close(2) released the descriptor either way: every
+                    // exhaustion-parked accept arm may try again.
+                    self.resume_exhausted_accepts();
                 }
                 // File ops (M2-S05, ADR-0013): regular files are always
                 // "ready" — the readiness tier executes them synchronously
@@ -285,7 +298,10 @@ impl KqueueDriver {
             let token = if ev.filter == libc::EVFILT_WRITE {
                 self.sends.get(&fd).and_then(|q| q.front()).map(|p| p.token)
             } else {
-                self.accepts.get(&fd).copied().or_else(|| self.recvs.get(&fd).map(|s| s.token))
+                self.accepts
+                    .get(&fd)
+                    .map(|a| a.token)
+                    .or_else(|| self.recvs.get(&fd).map(|s| s.token))
             };
             if let Some(token) = token {
                 out.push(Completion {
@@ -316,7 +332,7 @@ impl KqueueDriver {
 
     /// Multishot-accept emulation: drain a bounded slice of the backlog.
     fn accept_slice(&mut self, listener: RawFd, out: &mut Vec<Completion>) {
-        let token = self.accepts[&listener];
+        let token = self.accepts[&listener].token;
         for _ in 0..ACCEPT_BATCH {
             // SAFETY: plain accept; we pass no out-pointers for the peer.
             let fd =
@@ -328,14 +344,40 @@ impl KqueueDriver {
                 continue;
             }
             let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            match errno {
-                libc::EAGAIN | libc::ECONNABORTED | libc::EINTR => {}
-                _ => out.push(Completion {
+            // The shared table (driver.rs): transient ⇒ wait for the next
+            // readiness edge; exhaustion/broken ⇒ one `Error` and the
+            // read filter is disabled (parked) — a level-triggered listener
+            // would otherwise refire every kevent (the F-L11-02 spin).
+            let class = classify_accept_errno(errno);
+            if class != AcceptFailure::Transient {
+                if let Some(arm) = self.accepts.get_mut(&listener) {
+                    arm.parked = Some(class);
+                }
+                self.push_change(listener, libc::EVFILT_READ, libc::EV_DISABLE);
+                out.push(Completion {
                     token,
                     result: CompletionResult::Error { errno, buf: None },
-                }),
+                });
             }
             break;
+        }
+    }
+
+    /// An fd returned to the process: every exhaustion-parked accept arm
+    /// re-enables its read filter (the consumer's timed `AcceptArm` covers
+    /// fds freed outside this driver).
+    fn resume_exhausted_accepts(&mut self) {
+        let parked: Vec<RawFd> = self
+            .accepts
+            .iter()
+            .filter(|(_, arm)| arm.parked == Some(AcceptFailure::Exhausted))
+            .map(|(fd, _)| *fd)
+            .collect();
+        for listener in parked {
+            if let Some(arm) = self.accepts.get_mut(&listener) {
+                arm.parked = None;
+            }
+            self.push_change(listener, libc::EVFILT_READ, libc::EV_ENABLE);
         }
     }
 

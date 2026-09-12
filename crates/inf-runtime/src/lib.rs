@@ -39,8 +39,8 @@ pub use cold::{
     ReadClass, TierFileId,
 };
 pub use driver::{
-    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
-    StableBytesMut, SubmitStats, Wait, WriteBarrier,
+    AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd,
+    StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier, classify_accept_errno,
 };
 pub use executor::{CellExecutor, PollImmediate, TaskId};
 pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate, WatermarkWait};

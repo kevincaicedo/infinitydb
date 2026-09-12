@@ -156,7 +156,14 @@ pub enum IoOp {
     /// Arm accepting on a listening socket. Multishot where the backend
     /// supports it (one arm yields `Accepted` completions until disarmed or
     /// terminal error); re-armed internally otherwise. The same token rides
-    /// on every resulting completion.
+    /// on every resulting completion. An `accept(2)` failure is classified
+    /// by [`classify_accept_errno`] on every backend (F-L11-02/F-L11-06):
+    /// a transient one never surfaces; an exhaustion or broken-listener
+    /// one is delivered as ONE `Error` and the arm is **parked** — the
+    /// driver never re-arms into a persistent failure (the L3 spin). A
+    /// parked arm resumes on a later `AcceptArm` for the same listener
+    /// (idempotent while armed), and an exhaustion-parked arm also resumes
+    /// on its own once any `Close` on this driver returns an fd.
     AcceptArm { listener: RawFd, token: CompletionToken },
     /// Arm receiving on a connection. The DRIVER leases recv buffers from
     /// the pool and delivers them in completions; the consumer owns each
@@ -206,6 +213,50 @@ pub enum IoOp {
     /// `Error{EIO}` — tier reads are always within the flushed range, so
     /// a short file is corruption, not a condition.
     TierRead { fd: RawFd, offset: u64, buf: StableBytesMut, token: CompletionToken },
+}
+
+/// How every backend treats an `accept(2)` failure — one table, so the
+/// kqueue dev tier and io_uring cannot disagree on which failures are
+/// conditions and which are errors (F-L11-06), and no tier re-arms into a
+/// failure that will repeat on the next submit (F-L11-02).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AcceptFailure {
+    /// Routine on any listener (the peer aborted before we accepted, a
+    /// signal, a pending network error the kernel hands over on the new
+    /// socket — `accept(2)` says treat these like `EAGAIN`): the arm stays
+    /// up and nothing is delivered.
+    Transient,
+    /// Descriptor or memory exhaustion (`EMFILE`, `ENFILE`, `ENOBUFS`,
+    /// `ENOMEM`): an operating condition at `maxclients`, not a bug. One
+    /// `Error` is delivered and the arm is parked until an fd returns
+    /// (`Close`) or the consumer re-arms.
+    Exhausted,
+    /// The listener itself is unusable (`EBADF`, `EINVAL`, `ENOTSOCK`,
+    /// `EOPNOTSUPP`, `EFAULT`, anything unknown): one `Error`, the arm is
+    /// parked, and only an explicit `AcceptArm` tries again.
+    Broken,
+}
+
+/// The accept-failure table (see [`AcceptFailure`]). `errno` is positive.
+#[must_use]
+pub fn classify_accept_errno(errno: i32) -> AcceptFailure {
+    match errno {
+        libc::EAGAIN
+        | libc::EINTR
+        | libc::ECONNABORTED
+        | libc::EPROTO
+        | libc::EPERM
+        | libc::ENETDOWN
+        | libc::ENETUNREACH
+        | libc::EHOSTDOWN
+        | libc::EHOSTUNREACH
+        | libc::ENOPROTOOPT
+        | libc::ETIMEDOUT => AcceptFailure::Transient,
+        #[cfg(target_os = "linux")]
+        libc::ENONET => AcceptFailure::Transient,
+        libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM => AcceptFailure::Exhausted,
+        _ => AcceptFailure::Broken,
+    }
 }
 
 /// One reaped completion: the token that was armed plus the outcome.

@@ -373,6 +373,15 @@ impl Conn {
 /// `Accepted` arm) so its `Close` completion routes to no connection.
 const CONN_SLOT_CAP: u32 = inf_runtime::MAX_SLOT;
 
+/// The accept-retry wheel key (F-L11-02): after the driver parks the
+/// accept arm on an exhaustion/broken failure, the plane re-arms it at this
+/// cadence — one `accept(2)` per window while the condition persists, never
+/// a spin — so descriptors freed outside the driver (segment files,
+/// checkpoint handles) let queued clients in without waiting for a
+/// connection to close.
+const ACCEPT_RETRY_TIMER_KEY: u64 = 0xACCE_0001;
+const ACCEPT_RETRY: Nanos = Nanos::from_millis(100);
+
 /// Generation-keyed connection slab. Generic over the entry so the
 /// admission bound is unit-testable without building a `Conn`.
 struct ConnSlab<T = Conn> {
@@ -1472,6 +1481,8 @@ pub struct ServerPlane<
     config_pushed: u64,
     /// The everysec wheel key was armed (M2-S05; once per plane).
     everysec_armed: bool,
+    /// An accept-retry wheel key is pending (F-L11-02: at most one).
+    accept_retry_armed: bool,
     /// Last manual-checkpoint epoch observed on the control handle
     /// (M2-S10 — one relaxed load per MAINTAIN, edge-detected).
     ckpt_epoch_seen: u64,
@@ -1610,6 +1621,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // MAX forces one push on the first MAINTAIN (boot-time config).
             config_pushed: u64::MAX,
             everysec_armed: false,
+            accept_retry_armed: false,
             ckpt_epoch_seen: 0,
             early_fabric_flush: false,
             boot: None,
@@ -2407,11 +2419,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     );
                     return;
                 }
-                // Accept-path failures (`EMFILE`/`ENFILE`/`ECONNABORTED`)
-                // belong to the listener, never to a connection
-                // (F-L11-05): count them; the driver re-arms the accept.
+                // Accept-path failures (`EMFILE`/`ENFILE`) belong to the
+                // listener, never to a connection (F-L11-05): count them.
+                // The driver has PARKED the arm (F-L11-02); the retry
+                // wheel re-arms it at a bounded cadence.
                 if c.token.class() == TokenClass::Accept {
                     self.shared.accept_errors.set(self.shared.accept_errors.get() + 1);
+                    if !self.accept_retry_armed {
+                        self.accept_retry_armed = true;
+                        cx.timers.insert(cx.now + ACCEPT_RETRY, ACCEPT_RETRY_TIMER_KEY);
+                    }
                     return;
                 }
                 // Only connection classes reach housekeeping — a class
@@ -2496,6 +2513,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             && let Some(cell) = self.shared.durable.borrow_mut().as_mut()
         {
             cell.on_everysec_tick(cx);
+        }
+        if key == ACCEPT_RETRY_TIMER_KEY {
+            // Idempotent on an armed listener; resumes a parked one. A
+            // still-exhausted accept fails again → one more count and one
+            // more window (bounded by wall time, F-L11-02).
+            self.accept_retry_armed = false;
+            cx.push(IoOp::AcceptArm {
+                listener: self.listener,
+                token: CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0),
+            });
         }
         // `FILL_TIMER_KEY` (M4.5-S39a) needs no handler: the wake is the
         // effect — this iteration's LOG step seals the held frame.
@@ -6225,7 +6252,9 @@ fn parse_publisher_tag(conn: &[u8], seq: &[u8]) -> Option<(ConnKey, u64)> {
 }
 
 /// `*N\r\n` array header → `(N, body offset)`. `None` for errors/nulls.
-fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
+/// Public for the fuzz target.
+#[doc(hidden)]
+pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
     let rest = raw.strip_prefix(b"*")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let n: i64 = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
@@ -6236,13 +6265,21 @@ fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
 }
 
 /// `*2\r\n$N\r\n<cursor>\r\n…` SCAN reply head → `(cursor, keys offset)`.
-fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
+/// Every bound is checked before it is indexed (F-L12-06): the cursor's
+/// trailing CRLF must exist, so the offset never lands past the buffer
+/// (`&raw[rest_at..]` at the caller). Public for the fuzz target.
+#[doc(hidden)]
+pub fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
     let rest = raw.strip_prefix(b"*2\r\n$")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let len: usize = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
-    let start = nl + 2;
-    let cursor = crate::exec::parse_cursor(rest.get(start..start + len)?)?;
-    Some((cursor, 4 + 1 + start + len + 2))
+    let start = nl.checked_add(2)?;
+    let end = start.checked_add(len)?;
+    let cursor = crate::exec::parse_cursor(rest.get(start..end)?)?;
+    if rest.get(end..end.checked_add(2)?)? != b"\r\n" {
+        return None;
+    }
+    Some((cursor, 4 + 1 + end + 2))
 }
 
 /// Two-field snapshot reply: `*-1` means missing; `*2 [$value][:time]`
@@ -7492,6 +7529,49 @@ async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
     }
     Ok(waiter)
+}
+
+#[cfg(test)]
+mod scatter_reply_parsers {
+    use super::{parse_array_header, parse_scan_head, parse_take_reply};
+
+    /// F-L12-06: a SCAN head without its trailing CRLF must be refused,
+    /// never answered with an offset past the buffer.
+    #[test]
+    fn scan_head_without_a_terminator_is_refused() {
+        assert_eq!(parse_scan_head(b"*2\r\n$1\r\n0\r\n"), Some((0, 11)));
+        assert_eq!(parse_scan_head(b"*2\r\n$1\r\n0"), None);
+        assert_eq!(parse_scan_head(b"*2\r\n$1\r\n0\r"), None);
+        assert_eq!(parse_scan_head(b"*2\r\n$1\r\n0\n\n"), None);
+        assert_eq!(parse_scan_head(b"*2\r\n$2\r\n0"), None);
+        let ok = b"*2\r\n$3\r\n123\r\n*0\r\n";
+        let (cursor, at) = parse_scan_head(ok).expect("well formed");
+        assert_eq!((cursor, &ok[at..]), (123, &b"*0\r\n"[..]));
+    }
+
+    #[test]
+    fn every_scatter_parser_is_total_on_short_input() {
+        let samples: &[&[u8]] = &[
+            b"",
+            b"*",
+            b"*2",
+            b"*2\r\n$",
+            b"*2\r\n$1",
+            b"*2\r\n$1\r\n",
+            b"*2\r\n$1\r\n0",
+            b"*2\r\n$99999999999999999999\r\n0\r\n",
+            b"*-1\r",
+            b"*-2\r\n",
+            b"*2\r\n$1\r\nx\r\n:",
+        ];
+        for raw in samples {
+            for n in 0..=raw.len() {
+                let _ = parse_scan_head(&raw[..n]);
+                let _ = parse_take_reply(&raw[..n]);
+                let _ = parse_array_header(&raw[..n]);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

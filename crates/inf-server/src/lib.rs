@@ -62,7 +62,7 @@ pub use inf_log::fs::StdSegmentFs;
 #[cfg(feature = "doc")]
 pub use json::{JSON_REPLY_SHAPES, ReplyShape};
 #[doc(hidden)]
-pub use plane::parse_take_reply;
+pub use plane::{parse_array_header, parse_scan_head, parse_take_reply};
 // M2-S18 (ADR-0020 D6/D7): the sim tier's disk, re-exported for the
 // assembly/simulator tier exactly like `StdSegmentFs` above — bins name
 // `inf-server` only (dep-DAG).

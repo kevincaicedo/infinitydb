@@ -43,8 +43,8 @@ use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
 type DriverMap<K, V> = HashMap<K, V, BuildIntHasher>;
 
 use crate::driver::{
-    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
-    StableBytesMut, SubmitStats, Wait, WriteBarrier,
+    AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd,
+    StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier, classify_accept_errno,
 };
 use crate::token::CompletionToken;
 
@@ -145,6 +145,17 @@ struct RecvArm {
     paused: bool,
 }
 
+/// One listener's accept arm. `op_id` is the in-flight SQE (multishot or
+/// oneshot); `None` while parked (F-L11-02: a parked arm is never re-armed
+/// by a CQE — only by `AcceptArm` or, when `parked == Exhausted`, by an fd
+/// returning through `Close`).
+#[derive(Copy, Clone, Debug)]
+struct AcceptArm {
+    token: CompletionToken,
+    op_id: Option<u64>,
+    parked: Option<AcceptFailure>,
+}
+
 struct CloseWait {
     token: CompletionToken,
     close_seen: bool,
@@ -160,7 +171,7 @@ pub struct UringDriver {
     backlog: VecDeque<SqeChain>,
     states: DriverMap<u64, OpState>,
     next_id: u64,
-    accepts: DriverMap<RawFd, CompletionToken>,
+    accepts: DriverMap<RawFd, AcceptArm>,
     recvs: DriverMap<RawFd, RecvArm>,
     /// Outstanding sends per fd — `Closed` is delivered only after they
     /// resolve (cancelled sends return their buffers first, per contract).
@@ -456,6 +467,25 @@ impl UringDriver {
                 .user_data(id)
         };
         self.push_sqe(entry);
+        if let Some(arm) = self.accepts.get_mut(&listener) {
+            arm.op_id = Some(id);
+            arm.parked = None;
+        }
+    }
+
+    /// An fd returned to the process: every exhaustion-parked accept arm
+    /// may try again (the contract's own resume; the consumer's timed
+    /// `AcceptArm` covers fds freed outside this driver).
+    fn resume_exhausted_accepts(&mut self) {
+        let parked: Vec<(RawFd, CompletionToken)> = self
+            .accepts
+            .iter()
+            .filter(|(_, arm)| arm.parked == Some(AcceptFailure::Exhausted))
+            .map(|(fd, arm)| (*fd, arm.token))
+            .collect();
+        for (listener, token) in parked {
+            self.arm_accept_sqe(listener, token);
+        }
     }
 
     fn set_recv_op(&mut self, fd: RawFd, id: u64) {
@@ -556,8 +586,17 @@ impl UringDriver {
         for op in ops {
             match op {
                 IoOp::AcceptArm { listener, token } => {
-                    self.accepts.insert(listener, token);
-                    self.arm_accept_sqe(listener, token);
+                    // Idempotent while an SQE is in flight (two multishot
+                    // arms would double-deliver); a parked arm resumes.
+                    match self.accepts.get_mut(&listener) {
+                        Some(arm) if arm.op_id.is_some() => arm.token = token,
+                        Some(_) => self.arm_accept_sqe(listener, token),
+                        None => {
+                            self.accepts
+                                .insert(listener, AcceptArm { token, op_id: None, parked: None });
+                            self.arm_accept_sqe(listener, token);
+                        }
+                    }
                 }
                 IoOp::RecvArm { fd, token } => {
                     self.recvs
@@ -652,6 +691,8 @@ impl UringDriver {
                 CompletionResult::Error { errno: -wait.close_result, buf: None }
             },
         });
+        // close(2) releases the descriptor even when it reports an error.
+        self.resume_exhausted_accepts();
     }
 
     fn send_resolved(&mut self, fd: RawFd, out: &mut Vec<Completion>) {
@@ -725,21 +766,44 @@ impl UringDriver {
     ) {
         match state {
             OpState::Accept { listener, token } => {
+                if let Some(arm) = self.accepts.get_mut(&listener) {
+                    arm.op_id = None;
+                }
+                if result == -libc::ECANCELED {
+                    return;
+                }
                 if result >= 0 {
                     set_nonblocking(result);
                     out.push(Completion {
                         token,
                         result: CompletionResult::Accepted { fd: result },
                     });
-                } else if result != -libc::ECANCELED {
-                    out.push(Completion {
-                        token,
-                        result: CompletionResult::Error { errno: -result, buf: None },
-                    });
+                    // Multishot ended (or oneshot fired): re-arm while armed.
+                    if self.accepts.contains_key(&listener) {
+                        self.arm_accept_sqe(listener, token);
+                    }
+                    return;
                 }
-                // Multishot ended (or oneshot fired): re-arm while armed.
-                if result != -libc::ECANCELED && self.accepts.contains_key(&listener) {
-                    self.arm_accept_sqe(listener, token);
+                // The shared table (driver.rs): a transient failure re-arms
+                // silently; exhaustion and a broken listener deliver one
+                // `Error` and PARK the arm — never a re-arm into the same
+                // failure on the next submit (F-L11-02).
+                let class = classify_accept_errno(-result);
+                match class {
+                    AcceptFailure::Transient => {
+                        if self.accepts.contains_key(&listener) {
+                            self.arm_accept_sqe(listener, token);
+                        }
+                    }
+                    AcceptFailure::Exhausted | AcceptFailure::Broken => {
+                        if let Some(arm) = self.accepts.get_mut(&listener) {
+                            arm.parked = Some(class);
+                        }
+                        out.push(Completion {
+                            token,
+                            result: CompletionResult::Error { errno: -result, buf: None },
+                        });
+                    }
                 }
             }
             OpState::RecvMulti { fd, token } => {

@@ -893,6 +893,24 @@ pub(super) async fn read_cold_record<O: PlaneObserver + 'static, F: SegmentFs + 
 /// fdatasync op itself rides the next MAINTAIN), then markers + the
 /// `StringSetExtent` record. A typed apply failure abandons the extent
 /// file to the orphan sweep — the D3 quarantine rule.
+/// Why an out-of-line write failed, typed end to end (F-L04-09): the
+/// plane used to erase `ExtentWriteFailure` into `io::Error::other` and
+/// then string-match for a word the message never carried.
+enum BlobWriteError {
+    Open(std::io::Error),
+    Chunk(std::io::Error),
+    Seal(inf_log::blob::ExtentWriteFailure),
+}
+
+impl BlobWriteError {
+    fn is_storage_full(&self) -> bool {
+        match self {
+            BlobWriteError::Open(e) | BlobWriteError::Chunk(e) => inf_log::is_storage_exhausted(e),
+            BlobWriteError::Seal(f) => f.is_storage_full(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // the write funnel's blob half
 fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
@@ -925,9 +943,10 @@ fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         value.len() as u64,
         mode,
     )
+    .map_err(BlobWriteError::Open)
     .and_then(|mut writer| {
-        writer.append_chunk(value).map_err(std::io::Error::other)?;
-        writer.finish_deferred().map_err(std::io::Error::other)
+        writer.append_chunk(value).map_err(BlobWriteError::Chunk)?;
+        writer.finish_deferred().map_err(BlobWriteError::Seal)
     });
     // ADR-0088 D1/D5 (recorded limitation 2): the extent write is
     // synchronous foreground device I/O outside the driver — metered as
@@ -938,9 +957,10 @@ fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         Ok(pair) => pair,
         // The failed extent is abandoned (never referenced, id never
         // reused); the orphan sweep reclaims the file (ADR-0061 D3).
+        // The type survives to the reply (F-L04-09): a space refusal is
+        // `DISKFULL` on the blob path exactly as on the inline path.
         Err(err) => {
-            let reply = if err.to_string().contains("StorageFull") || err.raw_os_error() == Some(28)
-            {
+            let reply = if err.is_storage_full() {
                 diskfull_bytes(shared, proto, inf_store::DiskFullCause::Device)
             } else {
                 error_bytes(shared, proto, ERR_BLOB_READ)

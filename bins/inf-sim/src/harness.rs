@@ -275,6 +275,10 @@ pub struct SimReport {
     /// The `--plant` canary reached its arming point (engagement check —
     /// a plant that never fired proves nothing).
     pub plant_fired: bool,
+    /// Parked accept arms resumed (F-L11-02): the plane's retry wheel or
+    /// a `Close`. `--plant accept-error` needs ≥ 1 or the queued clients
+    /// were never let in (and the run stalls).
+    pub accept_resumes: u64,
 }
 
 impl SimReport {
@@ -1190,6 +1194,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         scan_walks: 0,
         replays_skipped: 0,
         plant_fired: false,
+        accept_resumes: 0,
     };
     let mut violations: Vec<String> = Vec::new();
 
@@ -1434,6 +1439,14 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     }
 
     report.plant_fired = nets.iter().any(|net| net.borrow().plant_fired());
+    report.accept_resumes = nets.iter().map(|net| net.borrow().accept_resumes()).sum();
+    if scenario.plant == Plant::AcceptError && report.plant_fired && report.accept_resumes == 0 {
+        report.oracle_violations.push(
+            "accept-error plant: the parked accept arm was never resumed (F-L11-02: the plane \
+             must re-arm on its retry wheel)"
+                .to_string(),
+        );
+    }
 
     // Accounting reconciliation oracle (M1-S15): equalize active-vs-lazy
     // expiry at one instant, then live records must reconcile exactly; every
