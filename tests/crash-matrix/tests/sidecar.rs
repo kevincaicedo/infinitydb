@@ -409,3 +409,66 @@ fn damaged_sidecar_body_rebuilds_one_index_and_boots() {
     assert!(info.rebuilt >= 1, "the damaged stream resolves as a rebuild");
     assert!(info.loaded >= 1, "one section's damage never spreads to the neighbor");
 }
+
+/// F-L07-04 (full-codebase review, lane L07; ADR-0078 A1) at the
+/// recovery-driver tier: a trip during the `CatchUp` tail — planted
+/// through `idx_apply_trip`, the ADR-0076 D5 post-half backstop, in the
+/// first replayed bracket — turns the load into a rebuild. The cell
+/// never reports `Ready` over a tree the veto says stopped tracking the
+/// tail; the S05 machine rebuilds from zero. Row `degraded-tail-rebuilds`
+/// in `m45.toml`.
+#[test]
+fn a_tail_trip_turns_the_load_into_a_rebuild() {
+    use inf_foundation::fault::{self, FaultSpec};
+    let fs = MemFs::new();
+    build_shard(&fs, 5);
+    let mut ks = booted_keyspace();
+    fault::arm(inf_store::fault::IDX_APPLY_TRIP, FaultSpec::Nth(1));
+    let boot = open_cell_log(fs, &mut ks, CELL, &cfg(), anchor(), now());
+    let fired = fault::fired(inf_store::fault::IDX_APPLY_TRIP);
+    fault::disarm(inf_store::fault::IDX_APPLY_TRIP);
+    boot.expect("a vetoed tree never refuses a boot (L2)");
+    assert_eq!(fired, 1, "the planted trip fired once, in the replayed tail");
+    assert!(ks.idx_counters_total().degraded_trips >= 1, "the trip is counted (L10)");
+
+    // The commit gate: pre-fix the loaded indexes committed cell-Ready
+    // with the veto set — the shape a query would answer from.
+    for &(id, ..) in INDEXES {
+        let id = IndexId(id);
+        let state = ks.idx_registry().cell_state(id);
+        let veto = ks.idx_degraded(NS, id);
+        let decision = ks.idx_registry().sidecar_boot(id);
+        assert_ne!(
+            state,
+            Some(IndexState::Ready),
+            "F-L07-04: index {} committed cell-Ready over a vetoed tree (veto {veto:?}, \
+             decision {decision:?})",
+            id.0
+        );
+        assert_eq!(
+            decision,
+            Some(SidecarBootDecision::Rebuilt {
+                reason: inf_store::SidecarRebuildReason::Degraded
+            }),
+            "index {} records the veto as its rebuild reason",
+            id.0
+        );
+        assert_eq!(veto, Some(false), "discharged into the boot-fresh state");
+        assert_eq!(tree_len(&ks, id), 0, "the suspect tree is gone");
+    }
+    let info = ks.idx_sidecar_info();
+    assert_eq!((info.loaded, info.rebuilt), (0, 2), "the fold records two rebuilds");
+
+    // The S05 machine rebuilds from zero: the trees equal the post-tail
+    // store, and the cell re-earns Ready the ordinary way.
+    for _ in 0..64 {
+        if ks.idx_backfill_tick(now(), inf_store::BackfillBudget::default()).active == 0 {
+            break;
+        }
+    }
+    for &(id, path, key_type) in INDEXES {
+        assert_eq!(ks.idx_registry().cell_state(IndexId(id)), Some(IndexState::Ready));
+        assert_eq!(ks.idx_degraded(NS, IndexId(id)), Some(false));
+        assert_tree_matches_store(&ks, id, path, key_type);
+    }
+}

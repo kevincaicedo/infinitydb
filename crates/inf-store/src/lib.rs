@@ -57,7 +57,10 @@ pub use index_key::{
     IndexScalar, KeySkip, compare_i64_f64, index_key_decode, index_key_encode,
     index_key_escape_prefix, index_scalar_coerce,
 };
-pub use index_maint::{BRACKET_ENTRY_CAP, IdxCounters, IdxMaintRefusal, MaintMode};
+pub use index_maint::{
+    BRACKET_ENTRY_CAP, IdxCounters, IdxMaintRefusal, MaintMode, SCRATCH_RETAIN_BYTES,
+    SCRATCH_RETAIN_ENTRIES,
+};
 #[cfg(feature = "doc")]
 pub use index_registry::validate_index_program;
 pub use index_registry::{

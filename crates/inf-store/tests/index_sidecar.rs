@@ -17,6 +17,7 @@
 //! | 10 | empty converged tree (zero-entry FINAL) | `Loaded{0}` |
 //! | 11 | tail deletes / overwrites / string-overwrite deaths under CatchUp | remove-may-miss legal; converges |
 //! | 12 | damaged-section notes | counted in the INFO fold, never fatal |
+//! | 13 | a veto raised by the `CatchUp` tail (the post-half eval overflow, client-reachable) | `Rebuilt{degraded}`, tree empty, veto clear, cell stays `Backfilling`; S05 rebuild converges (ADR-0078 A1, F-L07-04) |
 //!
 //! `TotalMismatch` is reachable only from hand-forged bytes (the writer
 //! asserts the total, and `NonContiguous` fires first on every writer-
@@ -82,7 +83,11 @@ const INDEXES: &[(u32, &str, IndexKeyType)] = &[
 ];
 
 fn durable_keyspace() -> Keyspace {
-    let mut ks = Keyspace::new(StoreConfig::default());
+    durable_keyspace_with(StoreConfig::default())
+}
+
+fn durable_keyspace_with(cfg: StoreConfig) -> Keyspace {
+    let mut ks = Keyspace::new(cfg);
     ks.ns_create(NsSpec {
         id: NS,
         name: b"docs".to_vec(),
@@ -325,7 +330,16 @@ fn load_sections(loader: &mut SidecarLoader, ks: &mut Keyspace, fs: &MemFs, path
 /// A fresh "rebooted" node: same catalog, phase-A corpus replayed with
 /// maintenance unarmed (the boot default — ADR-0076 D7).
 fn rebooted(source: &Keyspace, corpus: &[(Vec<u8>, Vec<u8>)], now: Nanos) -> Keyspace {
-    let mut ks = Keyspace::new(StoreConfig::default());
+    rebooted_with(StoreConfig::default(), source, corpus, now)
+}
+
+fn rebooted_with(
+    cfg: StoreConfig,
+    source: &Keyspace,
+    corpus: &[(Vec<u8>, Vec<u8>)],
+    now: Nanos,
+) -> Keyspace {
+    let mut ks = Keyspace::new(cfg);
     ks.seed_catalog(&source.export_catalog(100, 100, 100)).expect("seed");
     for (key, idoc) in corpus {
         let full =
@@ -356,7 +370,15 @@ type Corpus = Vec<(Vec<u8>, Vec<u8>)>;
 /// backfill to convergence, catalog flipped `ready` (the fleet-flip
 /// model — sets the `was_ready` hint on the reboot).
 fn converged_fixture(count: u64, seed: u64) -> (Keyspace, Corpus, Rng, Nanos) {
-    let mut ks = durable_keyspace();
+    converged_fixture_with(StoreConfig::default(), count, seed)
+}
+
+fn converged_fixture_with(
+    cfg: StoreConfig,
+    count: u64,
+    seed: u64,
+) -> (Keyspace, Corpus, Rng, Nanos) {
+    let mut ks = durable_keyspace_with(cfg);
     let mut rng = Rng(seed);
     let now = Nanos(1_000_000_000);
     let mut corpus = Vec::new();
@@ -797,4 +819,102 @@ fn damaged_sections_count_into_the_info_fold() {
     loader.finish_load(&mut ks2);
     let _ = loader.commit_ready(&mut ks2);
     assert_eq!(ks2.idx_sidecar_info().damaged_sections, 2);
+}
+
+// ---- leg 13: a veto raised by the tail outranks the load -----------------
+
+/// F-L07-04 (full-codebase review, lane L07; ADR-0078 A1): a loaded
+/// index whose `CatchUp` tail replay raises the degraded veto commits
+/// as a rebuild, never as converged + cell-`Ready`. The trip here is
+/// the client-reachable one — ADR-0076 D5's post-half eval overflow, a
+/// `JSON.SET` after the checkpoint whose wildcard matches exceed
+/// `doc_max_path_matches`: live it degraded every participating index
+/// behind the veto; the reboot replays the same record under `CatchUp`
+/// and must not launder that veto into `Ready`.
+#[test]
+fn a_tail_trip_after_the_load_commits_as_a_rebuild_not_ready() {
+    let cfg = StoreConfig { doc_max_path_matches: 4, ..StoreConfig::default() };
+    let (mut ks1, corpus, mut rng, mut now) = converged_fixture_with(cfg, 120, 0x5107);
+    let (fs, path) = emit_sidecars(&mut ks1, 16, |_| {}, |meta| meta);
+    now.0 += 1_000_000_000;
+
+    // The tail, recorded exactly as the log holds it: the flooding
+    // document (five tags over a cap of four) raises the veto on the
+    // live node, an overwrite shrinks it back, ordinary traffic follows.
+    let mut tail: Vec<TailOp> = Vec::new();
+    let key = key_of(3);
+    let flood = parse(r#"{"price":1,"name":"flood","qty":1,"tags":["a","b","c","d","e"]}"#);
+    bracketed(&mut ks1, &[&key], |s| {
+        let _ = s.json_set(&key, &flood, Default::default(), now);
+    });
+    tail.push(TailOp::Doc(key.clone(), flood));
+    for &(id, ..) in INDEXES {
+        assert_eq!(ks1.idx_degraded(NS, IndexId(id)), Some(true), "live: the flood vetoed {id}");
+    }
+    let small = parse(r#"{"price":2,"name":"small","qty":2,"tags":["a"]}"#);
+    bracketed(&mut ks1, &[&key], |s| {
+        let _ = s.json_set(&key, &small, Default::default(), now);
+    });
+    tail.push(TailOp::Doc(key, small));
+    for _ in 0..40 {
+        live_op(&mut ks1, &mut rng, now, &mut tail);
+        now.0 += 1_000_000;
+    }
+
+    // The fresh boot: load, arm CatchUp, replay the tail (the flood
+    // trips the veto again), commit.
+    let mut ks2 = rebooted_with(cfg, &ks1, &corpus, now);
+    let mut loader = SidecarLoader::default();
+    load_sections(&mut loader, &mut ks2, &fs, &path);
+    loader.finish_load(&mut ks2);
+    replay_tail(&mut ks2, &tail, now);
+    for &(id, ..) in INDEXES {
+        assert_eq!(ks2.idx_degraded(NS, IndexId(id)), Some(true), "replay: the flood vetoed {id}");
+    }
+    let rows = loader.commit_ready(&mut ks2);
+
+    // The commit gate: no index reports Ready over a vetoed tree — the
+    // pre-fix shape is Loaded + Ready + veto set + a tree that stopped
+    // tracking the tail at the trip (the wrong-answer class).
+    for &(id, path_expr, key_type) in INDEXES {
+        let state = ks2.idx_registry().cell_state(IndexId(id));
+        let veto = ks2.idx_degraded(NS, IndexId(id));
+        let tree = tree_entries(&ks2, IndexId(id)).len();
+        let truth = oracle_entries(&mut ks2, path_expr, key_type, now).len();
+        assert_ne!(
+            state,
+            Some(IndexState::Ready),
+            "F-L07-04: index {id} committed cell-Ready with the veto {veto:?} \
+             ({tree} tree entries vs {truth} derived)"
+        );
+    }
+    for row in &rows {
+        assert_eq!(
+            row.decision,
+            SidecarBootDecision::Rebuilt { reason: SidecarRebuildReason::Degraded },
+            "index {} records the veto as its rebuild reason (L10)",
+            row.id.0
+        );
+        assert!(row.was_ready, "the downgrade is the loud case");
+    }
+    for &(id, ..) in INDEXES {
+        assert_eq!(ks2.idx_registry().cell_state(IndexId(id)), Some(IndexState::Backfilling));
+        assert_eq!(ks2.idx_degraded(NS, IndexId(id)), Some(false), "discharged: boot-fresh");
+        assert!(tree_entries(&ks2, IndexId(id)).is_empty(), "the suspect tree is gone");
+    }
+    let info = ks2.idx_sidecar_info();
+    assert_eq!((info.loaded, info.rebuilt, info.damaged_sections), (0, 4, 0));
+
+    // The S05 machine rebuilds from zero and converges to the oracle —
+    // the trees serve the post-tail store, the flood long overwritten.
+    backfill_to_convergence(&mut ks2, now);
+    for &(id, path_expr, key_type) in INDEXES {
+        assert_eq!(ks2.idx_registry().cell_state(IndexId(id)), Some(IndexState::Ready));
+        assert_eq!(ks2.idx_degraded(NS, IndexId(id)), Some(false));
+        assert_eq!(
+            tree_entries(&ks2, IndexId(id)),
+            oracle_entries(&mut ks2, path_expr, key_type, now),
+            "index {id} diverged from the oracle after the degraded-tail rebuild"
+        );
+    }
 }

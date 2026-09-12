@@ -44,3 +44,16 @@ point = "idx_backfill_trip"
 tier = "node"
 test = "inf-store/tests/index_backfill_storm.rs"
 expect = "parks-and-rebuild-recovers"
+
+# The sidecar boot's commit gate (ADR-0078 A1; review F-L07-04): a trip
+# in the CatchUp tail turns a loaded index into a rebuild — never a
+# cell-Ready over a vetoed tree.
+#   degraded-tail-rebuilds   — the tripped index commits `rebuilt{degraded}`,
+#                              its tree empty and veto clear, cell state
+#                              stays backfilling; S05 rebuilds and converges
+
+[[row]]
+point = "idx_apply_trip"
+tier = "node"
+test = "tests/crash-matrix/tests/sidecar.rs"
+expect = "degraded-tail-rebuilds"

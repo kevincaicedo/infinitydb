@@ -588,6 +588,7 @@ C	1	crates/inf-store/src/index_key.rs	unreachable	coerce admitted null	`crates/i
 I	1	crates/inf-store/src/index_key.rs	unreachable	utf8 is not fixed8	key-type dispatch invariant (utf8 keys are never fixed8; nonempty checked in the preceding statement)
 C	1	crates/inf-store/src/index_maint.rs	expect	registry validated the program	`crates/inf-store/src/index_registry.rs:validate_index_program` — called by `IndexRegistry::create` and by `crates/inf-store/src/catalog.rs:decode_index_record`
 I	1	crates/inf-store/src/index_maint.rs	unreachable	loop condition	the loop guard excludes the (None, None) arm
+I	1	crates/inf-store/src/index_maint.rs	assert	attach-block bitmasks are u64	compile-time const evaluation (`const _: () = assert!`): the prune/participation/touched masks are u64 bit sets over attach ordinals, so INDEXES_PER_NODE_MAX ≤ 64 is checked by rustc, never at run time (review L07 style row, ADR-0076 A1)
 I	1	crates/inf-store/src/index_registry.rs	assert	<no message>  assert!(INDEX_KEY_ENCODING_VERSION == 1);	compile-time const assertion — never executes
 I	1	crates/inf-store/src/index.rs	assert	insert found no slot — load invariant broken	SwissTable load invariant (grow before full)
 I	1	crates/inf-store/src/index.rs	expect	group-aligned	fixed-width sub-slice of a length-checked buffer — infallible by construction

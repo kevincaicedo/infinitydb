@@ -33,9 +33,12 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use inf_doc::path::compile;
+use inf_foundation::fault::FaultSpec;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
-use inf_store::{IndexId, IndexKeyType, IndexSpec, IndexState, NsId};
+use inf_store::{
+    IndexId, IndexKeyType, IndexSpec, IndexState, NsId, SidecarBootDecision, SidecarRebuildReason,
+};
 
 use crate::backfill::{cell_tree, cell_truth};
 use crate::durable::{
@@ -82,6 +85,9 @@ pub struct SidecarReport {
     pub storm_during_stream: u64,
     /// Indexes loaded from sidecars across cells on the load leg.
     pub loaded: u64,
+    /// Loaded indexes the degraded-tail leg committed as rebuilds
+    /// (ADR-0078 A1; zero fails the run — the leg must bite).
+    pub degraded_rebuilds: u64,
     pub scheduler_steps: u64,
     pub trace_hash: u64,
 }
@@ -518,6 +524,87 @@ pub fn run_sidecar_scenario(scenario: &SidecarScenario) -> SidecarReport {
         }
     }
     check_serving_contract(&node, scenario.cells, ns, clock.now(), "final", &mut report);
+
+    // ---- cut 3: a veto raised by the tail outranks the load (F-L07-04) --
+    // Checkpoint under quiet, publish, a tail of mutations, then a trip
+    // planted in the reboot's `CatchUp` tail (`idx_apply_trip`, the
+    // ADR-0076 D5 post-half backstop — fires once, in the first replayed
+    // bracket of whichever cell gets there first). The tripped cell must
+    // commit its loaded trees as rebuilds and re-earn ready through S05
+    // (ADR-0078 A1); a cell reporting ready over a vetoed tree is the
+    // wrong-answer class the serving contract catches.
+    let published_before = manifests_published(&node, scenario.cells);
+    let _ = op.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, &[b"INF.CKPT"]);
+    drive_until!(
+        node,
+        "cut-3 publish",
+        manifests_published(&node, scenario.cells) >= published_before + u64::from(scenario.cells)
+    );
+    for round in 0..60u64 {
+        let i = rng.next_u64() % scenario.docs;
+        let key = key_of(i);
+        let doc = doc_of(i ^ (round << 24));
+        if op
+            .call(
+                &mut node,
+                &mut rng,
+                &clock,
+                &disk,
+                scenario.step_ns_max,
+                &[b"JSON.SET", &key, b"$", &doc],
+            )
+            .is_err()
+        {
+            break;
+        }
+    }
+    inf_foundation::fault::arm(inf_store::fault::IDX_APPLY_TRIP, FaultSpec::Nth(1));
+    disk.power_cut(scenario.seed ^ 0x51DE_0004);
+    report.cuts.push("degraded-tail".into());
+    node = reboot!("degraded-tail");
+    let recovered = drive_until!(node, "degraded-tail recovery", node.ready());
+    let fired = inf_foundation::fault::fired(inf_store::fault::IDX_APPLY_TRIP);
+    inf_foundation::fault::disarm(inf_store::fault::IDX_APPLY_TRIP);
+    if !recovered {
+        report.trace_hash = inf_foundation::hash64(&trace, 0x4501_51DE);
+        return report;
+    }
+    if fired != 1 {
+        report.violations.push(format!(
+            "degraded-tail: the planted trip fired {fired} times, wanted exactly one in the \
+             replayed tail"
+        ));
+    }
+    for cell in 0..usize::from(scenario.cells) {
+        let ks = node.plane(cell).keyspace();
+        for &(id, ..) in INDEXES {
+            let idx = IndexId(id);
+            let decision = ks.idx_registry().sidecar_boot(idx);
+            if decision
+                == Some(SidecarBootDecision::Rebuilt { reason: SidecarRebuildReason::Degraded })
+            {
+                report.degraded_rebuilds += 1;
+            }
+            let ready = ks.idx_registry().cell_state(idx) == Some(IndexState::Ready);
+            if ready && ks.idx_degraded(ns, idx) == Some(true) {
+                report.violations.push(format!(
+                    "degraded-tail: cell {cell} index {id} committed cell-Ready over a vetoed \
+                     tree ({decision:?}) — F-L07-04"
+                ));
+            }
+        }
+    }
+    if report.degraded_rebuilds == 0 {
+        report.violations.push(
+            "degraded-tail: the planted trip turned no load into a rebuild — the leg went \
+             unexercised"
+                .into(),
+        );
+    }
+    trace.extend_from_slice(&report.degraded_rebuilds.to_le_bytes());
+    drive_until!(node, "degraded-tail ready", fleet_catalog_ready(&node, scenario.cells));
+    check_serving_contract(&node, scenario.cells, ns, clock.now(), "degraded-tail", &mut report);
+
     if report.storm_during_stream == 0 {
         report.violations.push(
             "no mutation landed while a sidecar-bearing stream was open — the fuzzy-overlap \

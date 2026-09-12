@@ -176,6 +176,11 @@ pub enum SidecarRebuildReason {
     AfterFinal,
     /// The FINAL total disagreed with what loaded.
     TotalMismatch,
+    /// The cell-local veto rose during the `CatchUp` tail (ADR-0076
+    /// D5/D7): the loaded tree stopped tracking the tail at the trip,
+    /// so it commits as a rebuild, never as converged + `Ready`
+    /// (ADR-0078 A1; review F-L07-04).
+    Degraded,
 }
 
 impl SidecarRebuildReason {
@@ -192,6 +197,7 @@ impl SidecarRebuildReason {
             SidecarRebuildReason::Incomplete => "incomplete",
             SidecarRebuildReason::AfterFinal => "after-final",
             SidecarRebuildReason::TotalMismatch => "total-mismatch",
+            SidecarRebuildReason::Degraded => "degraded",
         }
     }
 }

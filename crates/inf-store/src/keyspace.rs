@@ -1755,6 +1755,13 @@ impl Keyspace {
         }
     }
 
+    /// The loader's commit gate (ADR-0078 A1): a veto raised during the
+    /// tail discharges into the boot-fresh state; `true` iff it was set.
+    #[cfg(feature = "doc")]
+    pub(crate) fn idx_sidecar_discharge_veto(&mut self, ns: NsId, id: IndexId) -> bool {
+        self.existing_store_mut(ns).is_some_and(|s| s.idx.discharge_boot_veto(id))
+    }
+
     /// This boot's sidecar fold (`INFO stats` renders `idx_sidecar_*`).
     #[must_use]
     pub fn idx_sidecar_info(&self) -> crate::index_sidecar::SidecarBootInfo {
