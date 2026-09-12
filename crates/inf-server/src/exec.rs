@@ -266,6 +266,11 @@ pub struct NodeInfo {
     pub io_provenance: Cell<crate::IoProvenance>,
     /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).
     pub ckpts_completed: Cell<u64>,
+    /// F-L03-04 witness: publications that walked a tiered table under
+    /// an older checkpoint id (sticky, cell scope).
+    pub ckpt_walks_behind: Cell<u64>,
+    /// ADR-0117: sections sealed for the section bound (cell scope).
+    pub ckpt_bound_splits: Cell<u64>,
     pub ckpts_aborted: Cell<u64>,
     pub ckpt_last_unix_ms: Cell<u64>,
     pub ckpt_last_begin_lsn: Cell<u64>,

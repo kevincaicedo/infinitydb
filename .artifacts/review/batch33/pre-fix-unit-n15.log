@@ -1,0 +1,8 @@
+test ckpt::tests::an_aborted_manual_checkpoint_keeps_its_request ... FAILED
+
+failures:
+--
+thread 'ckpt::tests::an_aborted_manual_checkpoint_keeps_its_request' (27990) panicked at crates/inf-server/src/ckpt.rs:1162:9:
+an abort re-arms the manual request
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--

@@ -1,0 +1,3 @@
+blob-key race 11 replans, dir-open fault arm false (fired 0), ckpt downgrades 2 / bound splits 0, trace 21676594 bytes, hash 0xc536dc3e9d3d8d21
+inf-sim: sim_seconds=34.704242 published=0 delivered=0
+inf-sim: VIOLATION: seed 0x6: F-L03-04 VIOLATION seed 0x6: 1 publication(s) walked a tiered table under a stale checkpoint id (a leaked walk pin was reused)

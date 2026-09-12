@@ -1,0 +1,10 @@
+test an_empty_durable_namespace_does_not_defeat_the_footer_probe ... FAILED
+
+failures:
+--
+thread 'an_empty_durable_namespace_does_not_defeat_the_footer_probe' (25171) panicked at tests/crash-matrix/tests/footer_probe.rs:136:5:
+assertion `left == right` failed: F-L03-03: the header names {16, 17}, the footer lists 16 alone — the probe must still locate the footer instead of hopping every section
+  left: Some(false)
+ right: Some(true)
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

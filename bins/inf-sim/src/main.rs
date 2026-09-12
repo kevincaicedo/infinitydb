@@ -705,7 +705,7 @@ fn main() {
              {} same-key / {} collision, {} stale, {} fallbacks; phase 6b cold resolves {}; \
              phase 6c {} pairs: {} tickets, {} collision verdicts, {} ticketed fallbacks, {} \
              DBSIZE drains, {} SCAN twins), blob-key race {} replans, dir-open fault arm {} \
-             (fired {}), trace {} bytes, hash {:#018x}",
+             (fired {}), ckpt downgrades {} / bound splits {}, trace {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -741,6 +741,8 @@ fn main() {
             report.race_replans,
             report.dir_open_fault_arm,
             report.dir_open_faults_fired,
+            report.ckpt_downgrades,
+            report.ckpt_bound_splits,
             report.trace.len(),
             report.trace_hash
         );

@@ -48,7 +48,7 @@ pub use extents::{
     BLOB_MAX_BYTES_DEFAULT, BLOB_RECLAIM_PER_SLICE_DEFAULT, BLOB_THRESHOLD_DEFAULT, BlobConfig,
     ExtentRefs, ExtentStats, ReclaimCandidate, ReclaimOrigin,
 };
-pub use index::{HomeGroupCursor, Index, MemoryMode, SlotMode, TieredMode};
+pub use index::{ChainPos, HomeGroupCursor, Index, MemoryMode, SlotMode, TieredMode, WalkCursor};
 pub use index_backfill::{
     BackfillBudget, BackfillInfo, BackfillPhase, BackfillProgress, BackfillTickStats,
 };

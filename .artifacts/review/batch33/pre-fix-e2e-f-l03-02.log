@@ -1,0 +1,12 @@
+test large_values_checkpoint_within_the_loader_bound_and_reboot ... FAILED
+
+failures:
+--
+thread '<unnamed>' (23870) panicked at crates/inf-server/tests/node_e2e.rs:562:25:
+cell 0 recovery failed (fail-stop, §8.4): checkpoint /home/kcaicedo/.cache/inf-tmp/inf-s08-bigval-23859/shard-0/ckpt/ckpt-000001.ick: Read(SectionTooLarge { len: 73728210, max: 67108864 })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'large_values_checkpoint_within_the_loader_bound_and_reboot' (23860) panicked at crates/inf-server/tests/node_e2e.rs:580:17:
+a cell thread exited during recovery (fail-stop — see stderr)
+
+--

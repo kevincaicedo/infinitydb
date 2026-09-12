@@ -1,0 +1,16 @@
+
+thread 'ckpt::tests::the_footer_probe_hits_with_an_empty_namespace' (16782) panicked at crates/inf-log/src/ckpt.rs:2887:9:
+an empty namespace must not defeat the end-of-file probe
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+--
+
+thread 'ckpt::tests::a_partial_section_never_grows_past_the_loader_bound' (16781) panicked at crates/inf-log/src/ckpt.rs:2867:14:
+the writer's own default-configured loader accepts every section: Read(SectionTooLarge { len: 67108974, max: 67108864 })
+
+
+--
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 100 filtered out; finished in 0.54s
+
+error: test failed, to rerun pass `-p inf-log --lib`

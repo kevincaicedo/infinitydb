@@ -476,6 +476,9 @@ pub(crate) fn info(
         // Fuzzy-checkpoint gauges (M2-S10; `ckpt_age_s` derives at S21).
         push(&mut text, &format!("ckpts_completed:{}", node.ckpts_completed.get()));
         push(&mut text, &format!("ckpts_aborted:{}", node.ckpts_aborted.get()));
+        // ADR-0117 D1/D2: sections sealed because the next image would
+        // have breached the loader bound (the walk resumed at it).
+        push(&mut text, &format!("ckpt_bound_splits:{}", node.ckpt_bound_splits.get()));
         push(&mut text, &format!("ckpt_last_unix_ms:{}", node.ckpt_last_unix_ms.get()));
         push(&mut text, &format!("ckpt_last_begin_lsn:{}", node.ckpt_last_begin_lsn.get()));
         push(&mut text, &format!("ckpt_buffer_bytes:{}", node.ckpt_buffer_bytes.get()));
@@ -729,6 +732,12 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     // the key moved while they were suspended on an extent read — a
     // legal interleaving, counted so the race is observable.
     push(text, &format!("tiering_write_replans:{}", tiering.write_replans));
+    // F-L03-04 (review of 2026-08-30; ADR-0057 A3): publications whose
+    // walk of some tiered table began under an older checkpoint id — a
+    // walk that reused a leaked pin (never re-latched its watermark,
+    // never advanced the retirement stamp). Sticky; zero in every
+    // correct run; the `m4-tiered` DST's oracle.
+    push(text, &format!("tiering_walk_behind:{}", node.ckpt_walks_behind.get()));
     // M4.5-S37 step 1: the ceiling arm's count — present only in a
     // `bench-diagnostics` build, so a shipping INFO cannot be mistaken
     // for one.
@@ -2219,6 +2228,8 @@ mod tests {
             "tiering_cold_read_errors",
             // F-L06-03: no table, no write to replan.
             "tiering_write_replans",
+            // F-L03-04: no table, no walk to trail a checkpoint.
+            "tiering_walk_behind",
             // M4-S17 (ADR-0061 D8): no table, no extents — the blob leg
             // reads zero for the same structural reason.
             "tiering_blob_user_bytes",

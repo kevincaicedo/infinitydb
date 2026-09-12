@@ -101,6 +101,8 @@ pub struct TieredTable {
     hasher: KeyHasher,
     index: Index<TieredMode>,
     space: AddressSpace,
+    /// The id the latest checkpoint walk began under (F-L03-04 witness).
+    walk_ckpt_id: Option<u64>,
     live_bytes: u64,
     demote: DemotionConfig,
     /// Record-start addresses the ro-boundary may seal to (ADR-0053 D2):
@@ -265,6 +267,7 @@ impl TieredTable {
             hasher,
             index: Index::with_capacity(initial_keys.max(64)),
             space,
+            walk_ckpt_id: None,
             live_bytes: 0,
             demote,
             seal_marks: VecDeque::new(),
@@ -1556,7 +1559,17 @@ impl TieredTable {
     /// file (M4-S15, ADR-0059 D3).
     pub fn begin_ckpt_walk(&mut self, ckpt_id: u64) -> LogicalAddr {
         self.live.note_ckpt_begun(ckpt_id);
+        self.walk_ckpt_id = Some(ckpt_id);
         self.space.begin_walk()
+    }
+
+    /// The checkpoint id the latest walk began under (`None` before the
+    /// first walk of this life). Outlives the walk: a table whose value
+    /// trails a published checkpoint that walked it was walked under a
+    /// leaked pin — the F-L03-04 witness (ADR-0057 A3).
+    #[must_use]
+    pub fn walk_ckpt_id(&self) -> Option<u64> {
+        self.walk_ckpt_id
     }
 
     /// Releases the walk pin; the held-back release debt drains in the
@@ -1584,34 +1597,74 @@ impl TieredTable {
         &self,
         cursor: u64,
         count: usize,
-        mut emit_ref: impl FnMut(u64, LogicalAddr),
+        emit_ref: impl FnMut(u64, LogicalAddr),
         mut emit_image: impl FnMut(RecordParts<'_>),
     ) -> u64 {
+        let mut at = crate::index::WalkCursor { group: cursor, chain: None };
+        let done = self.ckpt_walk_slice_bounded(&mut at, count, emit_ref, |parts| {
+            emit_image(parts);
+            true
+        });
+        if done { 0 } else { at.group }
+    }
+
+    /// [`ckpt_walk_slice`](Self::ckpt_walk_slice) with an image emission
+    /// the caller may refuse (ADR-0117 D2): `emit_image` returns `false`
+    /// to stop *before* that entry, and the next call resumes at exactly
+    /// it through the cursor's in-chain position. References are never
+    /// refused (24 B each — a chunk of them sits far under any bound).
+    /// Returns `true` once the index is fully walked.
+    pub fn ckpt_walk_slice_bounded(
+        &self,
+        cursor: &mut crate::index::WalkCursor,
+        count: usize,
+        mut emit_ref: impl FnMut(u64, LogicalAddr),
+        mut emit_image: impl FnMut(RecordParts<'_>) -> bool,
+    ) -> bool {
         let w = self.space.walk_watermark().expect("walk not begun").to_raw();
         let mask = self.index.group_count() as u64 - 1;
-        let mut cursor = cursor & mask;
+        let mut group = cursor.group & mask;
+        let mut resume = cursor.chain.take();
         let mut emitted = 0usize;
         loop {
             let space = &self.space;
-            self.index.scan_home_group_ext(cursor as usize, |addr, hash| {
-                // ADR-0093 A12 (batch 23): a ticket's winner is imaged
-                // even below the flushed watermark — sealing and flushing
-                // pass it (D3), only release is pinned, so it is RAM-
-                // resident here; a ref would restore it as a second cold
-                // slot of its key with no RAM sibling for the rebuild to
-                // pair (a stale read and a phantom key after recovery).
-                if addr.to_raw() < w && !self.is_shadow_winner(addr) {
-                    emit_ref(hash, addr);
-                } else {
-                    let head = space.bytes(addr, crate::record::HEADER_LEN);
-                    let full_len = crate::record::encoded_len_from_header(head);
-                    emit_image(RecordParts::of(RecordView::new(space.bytes(addr, full_len))));
-                }
-                emitted += 1;
-            });
-            cursor = crate::store::next_rev_cursor(cursor, mask);
-            if cursor == 0 || emitted >= count {
-                return cursor;
+            let stopped = self.index.scan_home_group_ext_from(
+                group as usize,
+                resume.take(),
+                |addr, hash, _pos| {
+                    // ADR-0093 A12 (batch 23): a ticket's winner is imaged
+                    // even below the flushed watermark — sealing and
+                    // flushing pass it (D3), only release is pinned, so it
+                    // is RAM-resident here; a ref would restore it as a
+                    // second cold slot of its key with no RAM sibling for
+                    // the rebuild to pair (a stale read and a phantom key
+                    // after recovery).
+                    if addr.to_raw() < w && !self.is_shadow_winner(addr) {
+                        emit_ref(hash, addr);
+                    } else {
+                        let head = space.bytes(addr, crate::record::HEADER_LEN);
+                        let full_len = crate::record::encoded_len_from_header(head);
+                        let parts = RecordParts::of(RecordView::new(space.bytes(addr, full_len)));
+                        if !emit_image(parts) {
+                            return false;
+                        }
+                    }
+                    emitted += 1;
+                    true
+                },
+            );
+            if let Some(pos) = stopped {
+                *cursor = crate::index::WalkCursor { group, chain: Some(pos) };
+                return false;
+            }
+            group = crate::store::next_rev_cursor(group, mask);
+            if group == 0 {
+                *cursor = crate::index::WalkCursor::START;
+                return true;
+            }
+            if emitted >= count {
+                *cursor = crate::index::WalkCursor { group, chain: None };
+                return false;
             }
         }
     }

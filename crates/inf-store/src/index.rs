@@ -200,6 +200,49 @@ pub struct Index<M: SlotMode = MemoryMode> {
     capacity: usize,
     live: usize,
     tombstones: usize,
+    /// Stop-and-copy rebuilds so far (doublings and same-size tombstone
+    /// recycles) — every entry re-places, so a [`ChainPos`] cut under an
+    /// older count is void (ADR-0117 D2).
+    rebuilds: u64,
+}
+
+/// A position inside one home group's probe chain — the checkpoint
+/// walk's in-chain resume (ADR-0117 D2, amending ADR-0016 D2's
+/// group-only cursor). Exact across removals (slots never move; `remove`
+/// writes EMPTY only into groups that already hold one, so no chain
+/// shortens under it) and across inserts (a filled slot behind the
+/// position is a mid-walk write the log tail covers); void across a
+/// rebuild, which the `rebuilds` stamp detects — the home group then
+/// restarts from its head, re-emitting at most one chain (duplicates
+/// only, never a miss; a walk sees at most `log₂` doublings).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ChainPos {
+    rebuilds: u64,
+    home: usize,
+    group: usize,
+    stride: usize,
+    slot: usize,
+}
+
+/// The checkpoint walk's resumable position over one index: a home-group
+/// cursor (reverse-binary order, ADR-0016 D2) plus an optional in-chain
+/// resume inside that group (ADR-0117 D2). `START` names the beginning;
+/// a completed walk hands `START` back.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WalkCursor {
+    pub group: u64,
+    pub chain: Option<ChainPos>,
+}
+
+impl WalkCursor {
+    pub const START: WalkCursor = WalkCursor { group: 0, chain: None };
+
+    /// True at a pass boundary: nothing of this index was walked yet
+    /// (or the walk completed and reset).
+    #[must_use]
+    pub fn at_start(&self) -> bool {
+        self.group == 0 && self.chain.is_none()
+    }
 }
 
 /// The position of a resumable home-group walk
@@ -232,6 +275,7 @@ impl<M: SlotMode> Index<M> {
             capacity,
             live: 0,
             tombstones: 0,
+            rebuilds: 0,
         }
     }
 
@@ -501,6 +545,80 @@ impl<M: SlotMode> Index<M> {
         }
     }
 
+    /// One home group's probe chain, resumable at a [`ChainPos`] (ADR-0117
+    /// D2): visits every live slot from the position (or the chain's head
+    /// when `resume` is `None` or predates a rebuild), handing `visit`
+    /// the slot index and its position; `visit` returns `false` to stop
+    /// *before* consuming that slot, and the position comes back so the
+    /// next call resumes exactly there. `None` = the chain ended.
+    fn walk_chain(
+        &self,
+        home_group: usize,
+        resume: Option<ChainPos>,
+        mut visit: impl FnMut(usize, ChainPos) -> bool,
+    ) -> Option<ChainPos> {
+        let mask = self.group_mask();
+        let home = home_group & mask;
+        let mut pos = match resume {
+            Some(p) if p.rebuilds == self.rebuilds && p.home == home => p,
+            _ => ChainPos { rebuilds: self.rebuilds, home, group: home, stride: 0, slot: 0 },
+        };
+        loop {
+            let ctrl = self.ctrl_group(pos.group);
+            while pos.slot < GROUP {
+                if ctrl[pos.slot] & 0x80 == 0 && !visit(pos.group * GROUP + pos.slot, pos) {
+                    return Some(pos);
+                }
+                pos.slot += 1;
+            }
+            if eq_mask16(ctrl, CTRL_EMPTY) != 0 {
+                return None;
+            }
+            pos.stride += 1;
+            if pos.stride > mask {
+                return None;
+            }
+            pos.group = (pos.group + pos.stride) & mask;
+            pos.slot = 0;
+        }
+    }
+
+    /// [`scan_home_group`](Self::scan_home_group) resumable at a
+    /// [`ChainPos`] (ADR-0117 D2): `emit(addr, pos)` returns `false` to
+    /// stop before that entry; the returned position resumes there.
+    pub fn scan_home_group_from(
+        &self,
+        home_group: usize,
+        resume: Option<ChainPos>,
+        mut hash_of: impl FnMut(M::Addr) -> u64,
+        mut emit: impl FnMut(M::Addr, ChainPos) -> bool,
+    ) -> Option<ChainPos> {
+        let mask = self.group_mask();
+        let home = home_group & mask;
+        self.walk_chain(home_group, resume, |slot, pos| {
+            let addr = M::addr_from_raw(self.slots[slot].addr_raw());
+            (hash_of(addr) as usize) & mask != home || emit(addr, pos)
+        })
+    }
+
+    /// [`scan_home_group_ext`](Self::scan_home_group_ext) resumable at a
+    /// [`ChainPos`] (ADR-0117 D2): `emit(addr, hash, pos)` returns `false`
+    /// to stop before that entry; the returned position resumes there.
+    pub fn scan_home_group_ext_from(
+        &self,
+        home_group: usize,
+        resume: Option<ChainPos>,
+        mut emit: impl FnMut(M::Addr, u64, ChainPos) -> bool,
+    ) -> Option<ChainPos> {
+        let mask = self.group_mask();
+        let home = home_group & mask;
+        self.walk_chain(home_group, resume, |slot, pos| {
+            let hash = M::ext_hash(&self.ext, slot);
+            (hash as usize) & mask != home
+                || emit(M::addr_from_raw(self.slots[slot].addr_raw()), hash, pos)
+        })
+    }
+
     /// A resumable home-group walk positioned at `group`'s home (M4.5-S37,
     /// ADR-0093 A4′): [`scan_home_group_step`](Self::scan_home_group_step)
     /// visits the chain one 16-slot probe group at a time, so a caller
@@ -687,6 +805,7 @@ impl<M: SlotMode> Index<M> {
             capacity: new_capacity,
             live: 0,
             tombstones: 0,
+            rebuilds: self.rebuilds + 1,
         };
         for pos in 0..self.capacity {
             if self.ctrl[pos] & 0x80 == 0 {

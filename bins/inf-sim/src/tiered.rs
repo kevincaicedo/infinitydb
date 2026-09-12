@@ -151,6 +151,17 @@ pub struct TieredScenario {
     /// write; the driver answered `EBADF` forever and the flush wedged.
     /// The flush-liveness oracle and the command audit stand on it.
     pub dir_open_fault: bool,
+    /// ADR-0117 D2's generator widening (see `DurableScenario`): one
+    /// seed in four walks under a 1 KiB section bound, so the tiered
+    /// pass-1 image resume runs at nearly every image.
+    pub ckpt_section_bound: Option<u32>,
+    /// F-L03-04 (ADR-0057 A3): `Some(n)` lets the sim disk take `n`
+    /// direct checkpoint writes (the probe's block and the header), then
+    /// refuses the first section write with `EINVAL` — the in-band
+    /// downgrade aborts a walk that already pinned its tables, and the
+    /// next checkpoint must re-latch the pin under its own id. The
+    /// `tiering_walk_behind` oracle below is the witness.
+    pub ckpt_direct_refused_after: Option<u64>,
 }
 
 impl TieredScenario {
@@ -182,6 +193,8 @@ impl TieredScenario {
             stall: Some(m2_stall_config()),
             shadow: seed % 4 != 3,
             dir_open_fault: seed % 8 == 5,
+            ckpt_section_bound: DurableScenario::section_bound_for(seed),
+            ckpt_direct_refused_after: (seed % 8 == 6).then_some(2),
         }
     }
 
@@ -206,6 +219,7 @@ impl TieredScenario {
             ckpt_interval_bytes: self.ckpt_interval_bytes,
             ckpt_stream_bytes_per_sec: None,
             ckpt_section_bytes: None,
+            ckpt_section_bound: self.ckpt_section_bound,
             stall: self.stall.clone(),
             replay_canary: false,
             io_mode: inf_server::SegmentIoMode::Buffered,
@@ -213,7 +227,7 @@ impl TieredScenario {
             device: Default::default(),
             budget_oracle: false,
             reorder_oracle: false,
-            ckpt_direct_refused_after: None,
+            ckpt_direct_refused_after: self.ckpt_direct_refused_after,
             fill: Default::default(),
             group: Default::default(),
             prelude: None,
@@ -275,6 +289,11 @@ pub struct TieredNodeReport {
     /// nothing — the sweep counts both).
     pub dir_open_fault_arm: bool,
     pub dir_open_faults_fired: u64,
+    /// F-L03-04 / ADR-0117 engagement: checkpoint staging downgrades
+    /// (the `EINVAL` seeds) and sections sealed for the bound (the
+    /// section-bound seeds), summed over cells at phase 10b.
+    pub ckpt_downgrades: u64,
+    pub ckpt_bound_splits: u64,
     /// Typed `DISKFULL` refusals observed at the clamped budget.
     pub diskfull_refusals: u64,
     /// Admission reopened after the budget lifted (phase 8's second
@@ -550,6 +569,26 @@ fn dbsize_sum(
     Ok(agreed.unwrap_or(0))
 }
 
+/// The batch-33 engagement witnesses of one node life, summed over
+/// cells: checkpoint staging downgrades (the `EINVAL` arm) and sections
+/// sealed for the section bound (the section-bound arm). Folded into
+/// the report before every cut — the counters are life-scoped.
+fn ckpt_witness(node: &Node, cells: u16) -> (u64, u64) {
+    (0..usize::from(cells)).fold((0, 0), |acc, cell| {
+        let s = node.plane(cell).durable_stats();
+        (
+            acc.0 + s.as_ref().map_or(0, |s| s.ckpt_io_mode_downgrades),
+            acc.1 + s.as_ref().map_or(0, |s| s.ckpt_bound_splits),
+        )
+    })
+}
+
+fn note_ckpt_witness(node: &Node, cells: u16, report: &mut TieredNodeReport) {
+    let (downgrades, splits) = ckpt_witness(node, cells);
+    report.ckpt_downgrades += downgrades;
+    report.ckpt_bound_splits += splits;
+}
+
 /// `INFO tiering` fields summed over every cell (the section is
 /// cell-scoped), one value per key in `keys`' order.
 fn info_sum(
@@ -707,6 +746,9 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     let harness = scenario.harness();
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
     let disk = build_disk(scenario.seed, scenario.stall.as_ref());
+    if let Some(allowed) = scenario.ckpt_direct_refused_after {
+        disk.refuse_direct_writes_after(allowed);
+    }
     let observer = TraceObserver::default();
     let mut rng = SplitMix64::new(scenario.seed ^ 0x71E7_ED00);
     let mut report = TieredNodeReport::default();
@@ -1099,6 +1141,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
 
     // ---- phase 3: POWER CUT --------------------------------------------
     let cut_time = clock.now();
+    note_ckpt_witness(&node, scenario.cells, &mut report);
     drop(node);
     disk.power_cut(scenario.seed ^ 0x0FF5_EED0);
 
@@ -1146,6 +1189,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         if node.ready() {
             break node;
         }
+        note_ckpt_witness(&node, scenario.cells, &mut report);
         drop(node);
         disk.power_cut(scenario.seed ^ 0x0FF5_EED1 ^ boots);
     };
@@ -2184,12 +2228,22 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     }
     // (4) The walk names the cold twins beside the RAM winners.
     expect7c!(audit, &[b"INF.CKPT", b"WAIT"], b"+OK\r\n", "INF.CKPT WAIT before the 7c cut");
+    // F-L03-04 (ADR-0057 A3): no publication walked a table under a
+    // stale checkpoint id — the leaked-pin witness stays zero.
+    let behind = scrape7c!(&["tiering_walk_behind"])[0];
+    if behind != 0 {
+        bail7c!(
+            "F-L03-04 VIOLATION seed {seed:#x}: {behind} publication(s) walked a tiered table \
+             under a stale checkpoint id (a leaked walk pin was reused)"
+        );
+    }
     // (5) t1 over two cold collision keys: the synchronous path (every
     //     arm), a RAM image in the WAL tail.
     expect7c!(audit, &[b"SET", t1, &t1_v], b"+OK\r\n", "SET t1 (synchronous, two cold candidates)");
     expected_live += 1;
     // (6) The cut; the reboot rebuilds every pair with the reconciler's
     //     reads failing (ADR-0093 D4.3: the tickets stay).
+    note_ckpt_witness(&node, scenario.cells, &mut report);
     drop(node);
     disk.power_cut(seed ^ 0x0FF5_EED7);
     node = match reboot_until_ready(
@@ -2292,6 +2346,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     //     (the twin's marker replayed), the collision keys intact, no
     //     ticket re-forms (the winners are gone).
     inf_foundation::fault::disarm(inf_server::fault::SHADOW_RECONCILE_READ_FAIL);
+    note_ckpt_witness(&node, scenario.cells, &mut report);
     drop(node);
     disk.power_cut(seed ^ 0x0FF5_EED8);
     node = match reboot_until_ready(
@@ -2553,6 +2608,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     // residue and recovery sweeps `ns-16/cold`. Disclosed, never assumed:
     // a seed whose MANIFESTs no longer name the namespace (a checkpoint
     // raced the drop) is counted inert for this row.
+    note_ckpt_witness(&node, scenario.cells, &mut report);
     drop(node);
     for cell in 0..scenario.cells {
         let shard = PathBuf::from("node").join(format!("shard-{cell}"));
@@ -2632,6 +2688,54 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             return finish(report, &observer, &clock);
         }
     }
+    // F-L03-04 (ADR-0057 A3): every publication so far walked its tiered
+    // tables under its own id — the leaked-pin witness stays zero (the
+    // `ckpt_direct_refused_after` seeds aborted an early walk mid-pin).
+    match info_sum(&mut node, &mut rng, &clock, &disk, scenario, &["tiering_walk_behind"]) {
+        Ok(v) if v[0] == 0 => {}
+        Ok(v) => {
+            fail(
+                &mut report,
+                format!(
+                    "F-L03-04 VIOLATION seed {:#x}: {} publication(s) walked a tiered table \
+                     under a stale checkpoint id (a leaked walk pin was reused)",
+                    scenario.seed, v[0]
+                ),
+            );
+            return finish(report, &observer, &clock);
+        }
+        Err(err) => {
+            fail(&mut report, format!("phase 10b INFO tiering: {err}"));
+            return finish(report, &observer, &clock);
+        }
+    }
+    // Engagement (a vacuous arm is a rotted arm): the `EINVAL` seeds
+    // must have downgraded some cell mid-walk, and the section-bound
+    // seeds must have split sections for the bound.
+    let (downgrades, splits) = {
+        let (d, b) = ckpt_witness(&node, scenario.cells);
+        (report.ckpt_downgrades + d, report.ckpt_bound_splits + b)
+    };
+    if scenario.ckpt_direct_refused_after.is_some() && downgrades == 0 {
+        fail(
+            &mut report,
+            format!(
+                "EINVAL ARM VACUOUS seed {:#x}: no cell downgraded its checkpoint staging",
+                scenario.seed
+            ),
+        );
+        return finish(report, &observer, &clock);
+    }
+    if scenario.ckpt_section_bound.is_some() && splits == 0 {
+        fail(
+            &mut report,
+            format!(
+                "SECTION-BOUND ARM VACUOUS seed {:#x}: no section sealed for the bound",
+                scenario.seed
+            ),
+        );
+        return finish(report, &observer, &clock);
+    }
     let cut_steps = rng.next_below(CUT_STEPS_MAX);
     report.drop_cut_steps = cut_steps;
     let dropper_cell = (rng.next_u64() as usize) % scenario.cells as usize;
@@ -2646,6 +2750,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             return finish(report, &observer, &clock);
         }
     }
+    note_ckpt_witness(&node, scenario.cells, &mut report);
     drop(node);
     disk.power_cut(scenario.seed ^ 0x0D20_9C07);
     let mut node = match reboot_until_ready(

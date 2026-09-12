@@ -23,7 +23,7 @@ use inf_foundation::time::Nanos;
 
 use crate::doc::{self, DocStore};
 use crate::evict::{self, EvictState, EvictStats, EvictionPolicy, Tracking};
-use crate::index::Index;
+use crate::index::{ChainPos, Index, WalkCursor};
 use crate::record::{
     HEADER_LEN, MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN, RecordKind, RecordSpec, RecordView,
     TypeTag, flags_ref_decrement, flags_ref_saturate, flags_ref_write,
@@ -1591,22 +1591,48 @@ impl CellStore {
         now: Nanos,
         mut emit: impl FnMut(&[u8], CheckpointImage<'_>, Option<u64>),
     ) -> u64 {
+        let mut at = WalkCursor { group: cursor, chain: None };
+        let done = self.scan_checkpoint_images_bounded(&mut at, count, now, |key, image, exp| {
+            emit(key, image, exp);
+            true
+        });
+        if done { 0 } else { at.group }
+    }
+
+    /// [`scan_checkpoint_images`](Self::scan_checkpoint_images) with an
+    /// emission the caller may refuse (ADR-0117 D2): `emit` returns
+    /// `false` to stop *before* that entry — the section it would not fit
+    /// seals, and the next call resumes at exactly that entry through the
+    /// cursor's in-chain position. Returns `true` once the index is fully
+    /// walked (the cursor resets to [`WalkCursor::START`]).
+    pub fn scan_checkpoint_images_bounded(
+        &mut self,
+        cursor: &mut WalkCursor,
+        count: usize,
+        now: Nanos,
+        mut emit: impl FnMut(&[u8], CheckpointImage<'_>, Option<u64>) -> bool,
+    ) -> bool {
         let mask = self.index.group_count() as u64 - 1;
-        let mut cursor = cursor & mask;
+        let mut group = cursor.group & mask;
+        let mut resume = cursor.chain.take();
         let mut emitted = 0usize;
-        let mut batch: Vec<ArenaAddr> = Vec::new();
+        let mut batch: Vec<(ArenaAddr, ChainPos)> = Vec::new();
         loop {
             batch.clear();
             {
                 let hasher = self.cfg.hasher;
                 let arena = &self.arena;
-                self.index.scan_home_group(
-                    cursor as usize,
+                self.index.scan_home_group_from(
+                    group as usize,
+                    resume.take(),
                     |addr| hasher.hash(record_at(arena, addr).key()),
-                    |addr| batch.push(addr),
+                    |addr, pos| {
+                        batch.push((addr, pos));
+                        true
+                    },
                 );
             }
-            for &addr in &batch {
+            for &(addr, pos) in &batch {
                 let view = record_at(&self.arena, addr);
                 if view.is_expired(now) {
                     let (hash, len) = (self.hash_key(view.key()), view.encoded_len());
@@ -1614,13 +1640,9 @@ impl CellStore {
                     self.note_reap_lazy();
                     continue;
                 }
-                match view.type_tag() {
+                let taken = match view.type_tag() {
                     TypeTag::String => {
-                        emit(
-                            view.key(),
-                            CheckpointImage::String(view.value()),
-                            view.expire_at_ms(),
-                        );
+                        emit(view.key(), CheckpointImage::String(view.value()), view.expire_at_ms())
                     }
                     TypeTag::StringExtent => {
                         unreachable!("StringExtent records exist only in tiered namespaces")
@@ -1638,17 +1660,28 @@ impl CellStore {
                                     idoc,
                                 },
                                 view.expire_at_ms(),
-                            );
+                            )
                         }
                         #[cfg(not(feature = "doc"))]
                         unreachable!("JsonDoc records cannot exist without the doc feature");
                     }
+                };
+                if !taken {
+                    // Refused: resume at this very entry (the slot never
+                    // moves; a rebuild in between restarts the group).
+                    *cursor = WalkCursor { group, chain: Some(pos) };
+                    return false;
                 }
                 emitted += 1;
             }
-            cursor = next_rev_cursor(cursor, mask);
-            if cursor == 0 || emitted >= count {
-                return cursor;
+            group = next_rev_cursor(group, mask);
+            if group == 0 {
+                *cursor = WalkCursor::START;
+                return true;
+            }
+            if emitted >= count {
+                *cursor = WalkCursor { group, chain: None };
+                return false;
             }
         }
     }

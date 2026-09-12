@@ -73,6 +73,18 @@ pub const fn ick_align_up(len: usize) -> usize {
     len.div_ceil(ICK_BLOCK_ALIGN) * ICK_BLOCK_ALIGN
 }
 
+/// The section-body bound shared by the writer and the default-configured
+/// loader (ADR-0117 D1): one maximal staging record (the frame bound —
+/// `StagingRing::new` asserts the capacity under it) plus
+/// [`ICK_SECTION_SLACK`], so a record at the staging ceiling and its
+/// expiry companion always fit an empty section. `seal_section` asserts
+/// it; the walker seals before a record that would breach it.
+pub const ICK_MAX_SECTION_BYTES: u32 = crate::frame::DEFAULT_MAX_FRAME_LEN + ICK_SECTION_SLACK;
+/// Room above one maximal record for its expiry record (≤ 274 B at the
+/// store's 255 B key bound) — one alignment block, no arithmetic on the
+/// record encoding.
+pub const ICK_SECTION_SLACK: u32 = ICK_BLOCK_ALIGN as u32;
+
 const BLOCK_SECTION: u8 = 1;
 const BLOCK_FOOTER: u8 = 2;
 /// Address-reference section (v2 only — ADR-0057 D3).
@@ -180,6 +192,12 @@ pub const DEFAULT_CKPT_STREAM_BYTES_PER_SEC: u32 = 64 << 20;
 pub struct CkptConfig {
     /// Section seal target (bytes of record body per section).
     pub section_bytes: u32,
+    /// The body size a section may not be staged past (ADR-0117 D1):
+    /// the walker seals first when the next record would breach it.
+    /// Defaults to [`ICK_MAX_SECTION_BYTES`] and may never exceed it
+    /// (asserted at stream construction); the DST lowers it so every
+    /// record boundary becomes a split point.
+    pub section_bound: u32,
     /// Trigger: staged log bytes since the last completed checkpoint.
     pub interval_bytes: u64,
     /// Hard cap on bytes streamed per MAINTAIN slice (budget in bytes —
@@ -202,6 +220,7 @@ impl Default for CkptConfig {
     fn default() -> CkptConfig {
         CkptConfig {
             section_bytes: DEFAULT_SECTION_BYTES,
+            section_bound: ICK_MAX_SECTION_BYTES,
             interval_bytes: DEFAULT_CKPT_INTERVAL_BYTES,
             slice_bytes: DEFAULT_CKPT_SLICE_BYTES,
             stream_bytes_per_sec: DEFAULT_CKPT_STREAM_BYTES_PER_SEC,
@@ -499,6 +518,8 @@ pub struct IckStream {
     in_flight: Option<InFlight>,
     generation: u64,
     section_target: u32,
+    /// The split point `fits` answers against (ADR-0117 D1).
+    section_bound: u32,
     file_offset: u64,
     staged_records: u32,
     staged_class: Option<SectionClass>,
@@ -582,6 +603,10 @@ impl IckStream {
     }
 
     fn with_version(cfg: &CkptConfig, version: u16) -> IckStream {
+        assert!(
+            cfg.section_bound <= ICK_MAX_SECTION_BYTES,
+            "section bound exceeds the loader bound"
+        );
         let raw = cfg.section_bytes as usize + SECTION_HEADER_LEN + CRC_LEN;
         let aligned = version >= ICK_VERSION_V3;
         let capacity = if aligned { ick_align_up(raw) } else { raw };
@@ -594,6 +619,7 @@ impl IckStream {
             in_flight: None,
             generation: 0,
             section_target: cfg.section_bytes,
+            section_bound: cfg.section_bound,
             file_offset: 0,
             staged_records: 0,
             staged_class: None,
@@ -852,7 +878,9 @@ impl IckStream {
         self.staged_idx_prev_ref = entry_ref;
         let buf = &mut self.bufs[self.staging];
         if !meta.fixed8 {
-            buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            buf.extend_from_slice(
+                &u16::try_from(key.len()).expect("sidecar key fits u16").to_le_bytes(),
+            );
         }
         buf.extend_from_slice(key);
         buf.extend_from_slice(&entry_ref.to_le_bytes());
@@ -934,6 +962,17 @@ impl IckStream {
         self.staged_body_bytes() >= self.section_target
     }
 
+    /// True when `bytes` more of body keep the pending section within
+    /// the configured bound (ADR-0117 D1) — the walker's stage-or-seal
+    /// test before every image. An empty section always takes one legal
+    /// record: the format bound holds a maximal record plus its expiry
+    /// companion, and the configured bound only moves the split point.
+    #[must_use]
+    pub fn fits(&self, bytes: usize) -> bool {
+        self.staged_class.is_none()
+            || self.staged_body_bytes() as usize + bytes <= self.section_bound as usize
+    }
+
     /// True while any section is open in staging (the seal-first signal
     /// for phase-boundary drivers — M4.5-S06).
     #[must_use]
@@ -990,6 +1029,9 @@ impl IckStream {
         let class = self.staged_class.take().expect("can_seal implies a class");
         let buf = &mut self.bufs[self.staging];
         let body_len = u32::try_from(buf.len() - SECTION_HEADER_LEN).expect("body fits u32");
+        // ADR-0117 D1: a walker that staged past the loader bound fails
+        // here, at write time — never at the next boot.
+        assert!(body_len <= ICK_MAX_SECTION_BYTES, "section body exceeds the loader bound");
         buf[0] = match class {
             SectionClass::Images => BLOCK_SECTION,
             SectionClass::Refs { .. } => BLOCK_ADDR_SECTION,
@@ -1224,7 +1266,9 @@ impl<F: SegmentFs> SyncIckWriter<F> {
     /// # Errors
     /// Write failure.
     pub fn append(&mut self, view: &RecordView<'_>) -> io::Result<()> {
-        if self.stream.staged_class.is_some_and(|class| class != SectionClass::Images) {
+        if self.stream.staged_class.is_some_and(|class| class != SectionClass::Images)
+            || !self.stream.fits(view.encoded_len())
+        {
             self.write_sealed()?;
         }
         self.stream.stage_record(view);
@@ -1592,7 +1636,7 @@ pub struct IckReaderConfig {
 
 impl Default for IckReaderConfig {
     fn default() -> IckReaderConfig {
-        IckReaderConfig { max_section_bytes: crate::frame::DEFAULT_MAX_FRAME_LEN }
+        IckReaderConfig { max_section_bytes: ICK_MAX_SECTION_BYTES }
     }
 }
 
@@ -1631,6 +1675,52 @@ fn le_u16(bytes: &[u8]) -> u16 {
     u16::from_le_bytes(bytes.try_into().expect("2 bytes"))
 }
 
+/// The end-of-file footer probe (ADR-0028 D3 as amended): one read of the
+/// longest footer block the header's namespace count allows, then each
+/// candidate count from that maximum down names a footer start; the
+/// first whose tag and own count agree is CRC-checked once. `None` =
+/// the hop chain locates the footer (trailing bytes, damage, or a file
+/// too short for the probe).
+fn probe_footer<File: SegmentFile>(
+    file: &File,
+    file_size: u64,
+    sections_at: u64,
+    header_ns: usize,
+    aligned: bool,
+) -> Result<Option<Vec<(u32, u64)>>, IckReadError> {
+    let hop = |len: usize| if aligned { ick_align_up(len) } else { len };
+    let footer_len = |ns: usize| FOOTER_FIXED_LEN + ns * 12 + 8 + CRC_LEN;
+    let max_block = hop(footer_len(header_ns));
+    if file_size < sections_at + max_block as u64 {
+        return Ok(None);
+    }
+    let tail_at = file_size - max_block as u64;
+    let mut tail = vec![0u8; max_block];
+    if read_exact_at(file, tail_at, &mut tail).is_err() {
+        return Ok(None);
+    }
+    for ns in (0..=header_ns).rev() {
+        let len = footer_len(ns);
+        let start = max_block - hop(len);
+        let block = &tail[start..];
+        if block[0] != BLOCK_FOOTER || le_u32(&block[13..17]) as usize != ns {
+            continue;
+        }
+        let hit = crc32c(&block[..len - CRC_LEN]) == le_u32(&block[len - CRC_LEN..len])
+            && block[len..].iter().all(|b| *b == 0);
+        if !hit {
+            return Ok(None);
+        }
+        return Ok(Some(
+            block[FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + ns * 12]
+                .chunks_exact(12)
+                .map(|chunk| (le_u32(&chunk[0..4]), le_u64(&chunk[4..12])))
+                .collect(),
+        ));
+    }
+    Ok(None)
+}
+
 fn le_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes.try_into().expect("4 bytes"))
 }
@@ -1657,6 +1747,19 @@ pub fn read_ick_counts<F: SegmentFs>(
     path: &Path,
     cfg: IckReaderConfig,
 ) -> Result<Vec<(u32, u64)>, IckReadError> {
+    read_ick_counts_probed(fs, path, cfg).map(|(counts, _)| counts)
+}
+
+/// [`read_ick_counts`] plus whether the end-of-file footer probe hit
+/// (`false` = the dependent hop chain located the footer).
+///
+/// # Errors
+/// As [`read_ick_counts`].
+pub fn read_ick_counts_probed<F: SegmentFs>(
+    fs: &F,
+    path: &Path,
+    cfg: IckReaderConfig,
+) -> Result<(Vec<(u32, u64)>, bool), IckReadError> {
     let file = fs.open_read(path).map_err(IckReadError::Io)?;
     let mut fixed = [0u8; HEADER_FIXED_LEN];
     read_exact_at(&file, 0, &mut fixed)?;
@@ -1680,31 +1783,19 @@ pub fn read_ick_counts<F: SegmentFs>(
     }
     let mut offset = hop(header_len) as u64;
     // Direct footer probe (M2.5-S08): a well-formed `.ick` ends exactly at
-    // its footer, whose length is computable from the header's `ns_count` —
-    // two reads instead of hopping every section header (a chain of
-    // *dependent* small reads; cold, each hop is a synchronous page fault —
-    // measured as the dominant cold ick cost). The footer CRC validates the
-    // probe; any mismatch falls back to the hop below, and a wrong hint
-    // could only ever cost memory geometry (the streaming pass re-audits).
-    // Under v3 the footer block is padded: the probe reads the padded
-    // length and the footer sits at its head (ADR-0088 D3).
-    let probe_len = FOOTER_FIXED_LEN + ns_count * 12 + 8 + CRC_LEN;
-    let probe_block = hop(probe_len);
-    if file_size >= offset + probe_block as u64 {
-        let probe_at = file_size - probe_block as u64;
-        let mut block = vec![0u8; probe_block];
-        if read_exact_at(&file, probe_at, &mut block).is_ok()
-            && block[0] == BLOCK_FOOTER
-            && le_u32(&block[13..17]) as usize == ns_count
-            && crc32c(&block[..probe_len - CRC_LEN])
-                == le_u32(&block[probe_len - CRC_LEN..probe_len])
-            && block[probe_len..].iter().all(|b| *b == 0)
-        {
-            return Ok(block[FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + ns_count * 12]
-                .chunks_exact(12)
-                .map(|chunk| (le_u32(&chunk[0..4]), le_u64(&chunk[4..12])))
-                .collect());
-        }
+    // its footer — two reads instead of hopping every section header (a
+    // chain of *dependent* small reads; cold, each hop is a synchronous
+    // page fault — measured as the dominant cold ick cost). The footer's
+    // namespace count is its own, not the header's (ADR-0028 A1): a
+    // namespace with no live entries is absent from the footer, so the
+    // probe reads the longest possible footer block and locates the
+    // footer by the count each candidate length implies. The footer CRC
+    // validates the probe; any mismatch falls back to the hop below, and
+    // a wrong hint could only ever cost memory geometry (the streaming
+    // pass re-audits). Under v3 the footer block is padded: the footer
+    // sits at the head of its aligned block (ADR-0088 D3).
+    if let Some(counts) = probe_footer(&file, file_size, offset, ns_count, aligned)? {
+        return Ok((counts, true));
     }
     loop {
         if offset >= file_size {
@@ -1751,10 +1842,13 @@ pub fn read_ick_counts<F: SegmentFs>(
                 if aligned {
                     verify_padding(&file, offset + block_len as u64, hop(block_len) - block_len)?;
                 }
-                return Ok(block[FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + footer_ns * 12]
-                    .chunks_exact(12)
-                    .map(|chunk| (le_u32(&chunk[0..4]), le_u64(&chunk[4..12])))
-                    .collect());
+                return Ok((
+                    block[FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + footer_ns * 12]
+                        .chunks_exact(12)
+                        .map(|chunk| (le_u32(&chunk[0..4]), le_u64(&chunk[4..12])))
+                        .collect(),
+                    false,
+                ));
             }
             tag => return Err(IckReadError::UnknownBlock { tag, at: offset }),
         }
@@ -2166,6 +2260,16 @@ impl<File: SegmentFile> IckReader<File> {
     /// The distance to the next block: the exact length on v1/v2, the
     /// aligned length on v3 — whose padding must read back as zeros
     /// (ADR-0088 D3; a non-zero pad byte is the CRC's fail-stop class).
+    /// Read-ahead hint for the blocks after the current one (M2.5-S08):
+    /// four blocks deep, aimed at the *next block start* — on v3 that is
+    /// the aligned offset, not the padding (review L03, batch 33).
+    /// Hint-only; EOF-safe.
+    fn advise_next_blocks(&self, block_len: usize) {
+        let next =
+            if self.info.version < ICK_VERSION_V3 { block_len } else { ick_align_up(block_len) };
+        self.file.advise_read_ahead(self.offset + next as u64, 4 * next as u64);
+    }
+
     fn hop(&self, block_len: usize) -> Result<u64, IckReadError> {
         if self.info.version < ICK_VERSION_V3 {
             return Ok(block_len as u64);
@@ -2261,7 +2365,7 @@ impl<File: SegmentFile> IckReader<File> {
                 // deep — sections share the staging capacity class and are
                 // small enough that one-ahead loses the race against the
                 // prefetcher's wakeup latency. Hint-only; EOF-safe.
-                self.file.advise_read_ahead(self.offset + block_len as u64, 4 * block_len as u64);
+                self.advise_next_blocks(block_len);
                 let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
                 if crc32c(&self.block[..block_len - CRC_LEN]) != stored_crc {
                     return Err(
@@ -2313,7 +2417,7 @@ impl<File: SegmentFile> IckReader<File> {
                 let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
                 self.block.resize(block_len, 0);
                 read_exact_at(&self.file, self.offset, &mut self.block)?;
-                self.file.advise_read_ahead(self.offset + block_len as u64, 4 * block_len as u64);
+                self.advise_next_blocks(block_len);
                 let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
                 if crc32c(&self.block[..block_len - CRC_LEN]) != stored_crc {
                     return Err(
@@ -2390,7 +2494,7 @@ impl<File: SegmentFile> IckReader<File> {
                 let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
                 self.block.resize(block_len, 0);
                 read_exact_at(&self.file, self.offset, &mut self.block)?;
-                self.file.advise_read_ahead(self.offset + block_len as u64, 4 * block_len as u64);
+                self.advise_next_blocks(block_len);
                 let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
                 if crc32c(&self.block[..block_len - CRC_LEN]) != stored_crc {
                     return Err(
@@ -2459,7 +2563,7 @@ impl<File: SegmentFile> IckReader<File> {
                 let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
                 self.block.resize(block_len, 0);
                 read_exact_at(&self.file, self.offset, &mut self.block)?;
-                self.file.advise_read_ahead(self.offset + block_len as u64, 4 * block_len as u64);
+                self.advise_next_blocks(block_len);
                 let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
                 if crc32c(&self.block[..block_len - CRC_LEN]) != stored_crc {
                     return Err(
@@ -2532,7 +2636,7 @@ impl<File: SegmentFile> IckReader<File> {
                 let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
                 self.block.resize(block_len, 0);
                 read_exact_at(&self.file, self.offset, &mut self.block)?;
-                self.file.advise_read_ahead(self.offset + block_len as u64, 4 * block_len as u64);
+                self.advise_next_blocks(block_len);
                 let Some(on_idx_sidecar) = idx_sidecar else {
                     return Err(
                         IckReadError::IdxSidecarSectionUnsupported { at: self.offset }.into()
@@ -2800,6 +2904,107 @@ mod tests {
         let counts =
             read_ick_counts(&pad, &path, IckReaderConfig::default()).expect("hop fallback");
         assert_eq!(counts, summary.entries_per_ns, "fallback hint matches the footer");
+    }
+
+    /// F-L03-02 (review 2026-08-30; ADR-0117 D1): a partial section
+    /// never grows past the loader's bound. A 100 B record leaves a
+    /// 4 KiB-target section open; the next record is one byte under the
+    /// bound on its own, so staging it behind the first would seal a
+    /// body the default-configured loader refuses (`SectionTooLarge`) —
+    /// the writer must seal first. The record is the format's largest
+    /// legal image (one frame + the slack), so the test also proves a
+    /// maximal record still fits an empty section.
+    #[test]
+    fn a_partial_section_never_grows_past_the_loader_bound() {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let mut w = SyncIckWriter::create_v3(
+            fs.clone(),
+            dir,
+            &CkptConfig { section_bytes: 4096, ..Default::default() },
+            0,
+            9,
+            Lsn::new(crate::lsn::SegmentId(1), 64),
+            &[16],
+        )
+        .expect("create v3");
+        let ns = NsId(16);
+        let small = vec![b'a'; 100];
+        w.append(&RecordView::StringPostImage { ns, key: b"small", value: &small })
+            .expect("append");
+        let head = RecordView::StringPostImage { ns, key: b"big", value: b"" }.encoded_len();
+        let big = vec![b'b'; ICK_MAX_SECTION_BYTES as usize - head - 3];
+        let rec = RecordView::StringPostImage { ns, key: b"big", value: &big };
+        assert!(rec.encoded_len() <= ICK_MAX_SECTION_BYTES as usize, "a legal record");
+        w.append(&rec).expect("append");
+        let summary = w.finish().expect("finish");
+        let mut seen = 0usize;
+        let (_, audit) =
+            read_ick(&fs, &dir.join(ick_file_name(9)), IckReaderConfig::default(), |view| {
+                if let RecordView::StringPostImage { value, .. } = view {
+                    seen += value.len();
+                }
+                Ok::<(), ()>(())
+            })
+            .expect("the writer's own default-configured loader accepts every section");
+        assert_eq!(audit, summary);
+        assert_eq!(seen, small.len() + big.len());
+        assert_eq!(summary.sections, 2, "the big record opened its own section");
+    }
+
+    /// F-L03-03 (review 2026-08-30; ADR-0028 A1): the footer probe locates
+    /// the footer by the footer's own namespace count, so a durable
+    /// namespace with no live entries (`write_sample` names 16 and 17,
+    /// stages only 16) no longer defeats it into the dependent hop chain.
+    #[test]
+    fn the_footer_probe_hits_with_an_empty_namespace() {
+        let fs = MemFs::new();
+        let dir = Path::new("/ckpt");
+        fs.create_dir_all(dir).unwrap();
+        let summary = write_sample(&fs, dir);
+        let path = dir.join(ick_file_name(7));
+        let (counts, probe_hit) =
+            read_ick_counts_probed(&fs, &path, IckReaderConfig::default()).expect("peek");
+        assert_eq!(counts, summary.entries_per_ns);
+        assert!(probe_hit, "an empty namespace must not defeat the end-of-file probe");
+
+        // Every namespace populated: the probe hits as before.
+        let full = MemFs::new();
+        full.create_dir_all(dir).unwrap();
+        let mut w = SyncIckWriter::create_v3(
+            full.clone(),
+            dir,
+            &small_cfg(),
+            0,
+            8,
+            Lsn::new(crate::lsn::SegmentId(1), 64),
+            &[16, 17, 18],
+        )
+        .expect("create v3");
+        for ns in [16u32, 17, 18] {
+            w.append(&RecordView::StringPostImage { ns: NsId(ns), key: b"k", value: b"v" })
+                .expect("append");
+        }
+        let summary = w.finish().expect("finish");
+        let (counts, probe_hit) =
+            read_ick_counts_probed(&full, &dir.join(ick_file_name(8)), IckReaderConfig::default())
+                .expect("peek");
+        assert_eq!(counts, summary.entries_per_ns);
+        assert!(probe_hit, "a fully populated v3 file probes directly");
+
+        // Trailing bytes still fall back to the hop, honestly reported.
+        let bytes = fs.contents(&path).expect("ick bytes");
+        let mut padded = bytes.clone();
+        padded.extend_from_slice(b"junk");
+        let pad = MemFs::new();
+        pad.create_dir_all(dir).unwrap();
+        use crate::fs::{SegmentFile, SegmentFs as _};
+        let mut f = pad.create_meta(&path).expect("create");
+        f.write_at(0, &padded).expect("write");
+        let (_, probe_hit) =
+            read_ick_counts_probed(&pad, &path, IckReaderConfig::default()).expect("hop");
+        assert!(!probe_hit, "trailing bytes defeat the probe; the hop finds the footer");
     }
 
     // The hop fallback must recognize every tag `seal_section` can emit:
