@@ -32,6 +32,11 @@ pub enum Plant {
     /// eats acked bytes. Models any path that acks ahead of durable
     /// coverage; the oracle must catch it within 1,000 seeds.
     FsyncLies,
+    /// One accept-path error (`EMFILE`) on the listener token after the
+    /// first connection is live — the F-L11-05 canary (review 2026-08-30):
+    /// an accept failure is a counter, never connection housekeeping;
+    /// the first client (`ConnKey {0, 0}`) must keep being served.
+    AcceptError,
 }
 
 #[derive(Debug, Default)]
@@ -621,6 +626,16 @@ impl BackendDriver for SimDriver {
             let token = net.accept_token.expect("armed implies token");
             while let Some(fd) = net.backlog.pop_front() {
                 out.push(Completion { token, result: CompletionResult::Accepted { fd } });
+            }
+            // The accept-error plant: the kernel refused one accept (fd
+            // limit) once a connection is live — uring surfaces it on the
+            // listener token; the plane must not route it to a connection.
+            if net.plant == Plant::AcceptError && !net.plant_fired && !net.conns.is_empty() {
+                net.plant_fired = true;
+                out.push(Completion {
+                    token,
+                    result: CompletionResult::Error { errno: libc::EMFILE, buf: None },
+                });
             }
         }
 

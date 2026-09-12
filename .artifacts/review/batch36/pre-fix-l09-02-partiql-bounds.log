@@ -1,0 +1,25 @@
+running 2 tests
+test utf8_literal_at_the_exact_encoded_cap_compiles ... FAILED
+test utf8_boundary_corpus ... FAILED
+
+failures:
+
+---- utf8_literal_at_the_exact_encoded_cap_compiles stdout ----
+
+thread 'utf8_literal_at_the_exact_encoded_cap_compiles' (106354) panicked at crates/inf-query/src/partiql/compile.rs:388:5:
+encode only refuses over-cap strings
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- utf8_boundary_corpus stdout ----
+
+thread 'utf8_boundary_corpus' (106353) panicked at crates/inf-query/src/partiql/compile.rs:388:5:
+encode only refuses over-cap strings
+
+
+failures:
+    utf8_boundary_corpus
+    utf8_literal_at_the_exact_encoded_cap_compiles
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p inf-query --test partiql_bounds`

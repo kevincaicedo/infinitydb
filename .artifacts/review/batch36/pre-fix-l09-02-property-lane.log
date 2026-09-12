@@ -1,0 +1,12 @@
+	successes: 5
+	local rejects: 0
+	global rejects: 0
+
+
+
+failures:
+    bounds_agree_with_the_vm
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p inf-query --test partiql_bounds`

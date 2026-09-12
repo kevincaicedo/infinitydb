@@ -1,0 +1,12 @@
+test folded_bounds_agree_with_the_vm ... ok
+test utf8_boundary_corpus ... ok
+test numeric_boundary_corpus ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+test count_pages_sum_to_truth_under_mutation ... ok
+test resume_below_the_lower_edge_serves_nothing_out_of_range ... ok
+test resume_pairs_never_widen_the_range ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+

@@ -1,0 +1,40 @@
+        0,
+        0,
+        1,
+    ],
+), hi = Excluded(
+    [
+        128,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+    ],
+), resume = Some(
+    (
+        -1,
+        0,
+    ),
+)
+	successes: 13
+	local rejects: 0
+	global rejects: 0
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- resume_below_the_lower_edge_serves_nothing_out_of_range stdout ----
+
+thread 'resume_below_the_lower_edge_serves_nothing_out_of_range' (106582) panicked at crates/inf-query/tests/count_paging.rs:305:9:
+served pk 6 below the lower edge (price > 1000)
+
+
+failures:
+    resume_below_the_lower_edge_serves_nothing_out_of_range
+    resume_pairs_never_widen_the_range
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p inf-query --test count_paging`

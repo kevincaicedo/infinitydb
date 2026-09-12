@@ -272,6 +272,9 @@ pub struct SimReport {
     pub flushes: u64,
     pub scan_walks: u64,
     pub replays_skipped: u64,
+    /// The `--plant` canary reached its arming point (engagement check —
+    /// a plant that never fired proves nothing).
+    pub plant_fired: bool,
 }
 
 impl SimReport {
@@ -1186,6 +1189,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         flushes: 0,
         scan_walks: 0,
         replays_skipped: 0,
+        plant_fired: false,
     };
     let mut violations: Vec<String> = Vec::new();
 
@@ -1428,6 +1432,8 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             }
         }
     }
+
+    report.plant_fired = nets.iter().any(|net| net.borrow().plant_fired());
 
     // Accounting reconciliation oracle (M1-S15): equalize active-vs-lazy
     // expiry at one instant, then live records must reconcile exactly; every

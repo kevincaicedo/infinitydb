@@ -1,0 +1,7 @@
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling inf-sim v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/inf-sim)
+    Finished `release` profile [optimized + debuginfo] target(s) in 54.48s
+     Running `target/release/inf-sim --scenario m0-smoke --seed 0xC0FFEE --plant accept-error`
+inf-sim: scenario m0-smoke seed 0xc0ffee: 100000 commands, 105240 apply events, 6045 steps, trace 4964163 bytes, hash 0x7d48ca3ff1d41b65
+inf-sim: sim_seconds=0.051971 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=true
+exit=0

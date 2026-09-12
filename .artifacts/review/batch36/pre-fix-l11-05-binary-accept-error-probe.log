@@ -1,0 +1,4 @@
+c0 first PING: b'+PONG\r\n'
+c0 PING after accept errors: b''
+INFO stats: c0 gone: [Errno 32] Broken pipe
+VERDICT: C0 KILLED BY AN ACCEPT ERROR

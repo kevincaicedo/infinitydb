@@ -72,6 +72,7 @@ fn main() {
                     plant = match take("--plant")?.as_str() {
                         "lost-wakeup" => Plant::LostWakeup,
                         "fsync-lies" => Plant::FsyncLies,
+                        "accept-error" => Plant::AcceptError,
                         other => return Err(format!("unknown plant {other}")),
                     }
                 }
@@ -105,7 +106,7 @@ fn main() {
                     println!(
                         "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m2-device-budget|m2-mode-transition|m2-reorder-window|m2-ckpt-refused|m2-recycle|m3-document|m2-combined|boot-storm \
                          [--seed N|0xN] [--verify-determinism] \
-                         [--plant lost-wakeup|fsync-lies] [--replay-canary] [--lift-regime] [--cells N] \
+                         [--plant lost-wakeup|fsync-lies|accept-error] [--replay-canary] [--lift-regime] [--cells N] \
                          [--connections N] [--commands N] [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]]"
                     );
@@ -1068,14 +1069,15 @@ fn main() {
     // Machine-readable line for the nightly fleet (sim-seconds budget sum).
     println!(
         "inf-sim: sim_seconds={:.6} published={} delivered={} audits={} flushes={} \
-         scan_walks={} replays_skipped={}",
+         scan_walks={} replays_skipped={} plant_fired={}",
         report.sim_seconds,
         report.published,
         report.delivered,
         report.audits,
         report.flushes,
         report.scan_walks,
-        report.replays_skipped
+        report.replays_skipped,
+        report.plant_fired
     );
     if let Some(path) = &trace_out
         && let Err(e) = std::fs::write(path, &report.trace)

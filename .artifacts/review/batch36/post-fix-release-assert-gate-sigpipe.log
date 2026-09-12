@@ -1,0 +1,2 @@
+  excluded crates/inf-probe/src — the boot-time device probe (ADR-0086 D7 / ADR-0091): a dev tool that runs before any cell starts; its own header sanctions Instant::now + std::thread
+post-fix gate exit=0

@@ -1,0 +1,7 @@
+   Compiling inf-sim v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/inf-sim)
+    Finished `release` profile [optimized + debuginfo] target(s) in 52.21s
+     Running `target/release/inf-sim --scenario m0-smoke --seed 0xC0FFEE --plant accept-error`
+inf-sim: scenario m0-smoke seed 0xc0ffee: 97000 commands, 102097 apply events, 26046 steps, trace 4814292 bytes, hash 0x2edbc45c93a4c941
+inf-sim: sim_seconds=0.220750 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=true
+inf-sim: STALL — no progress for the detector window (seed 0xc0ffee)
+exit=0

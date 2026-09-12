@@ -1,0 +1,4 @@
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.59s
+infinityd 2649c51 (git 2649c51e854c-dirty, x86_64-unknown-linux-gnu)

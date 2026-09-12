@@ -1,0 +1,1 @@
+check-scripts self-test OK (161 cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, safety-inventory, dep-dag, doc-read-profile each red on a planted violation)

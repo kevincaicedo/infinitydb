@@ -1,0 +1,4 @@
+(docs/release-assert-inventory.tsv — ADR-0107 D2): I invariant, C caller-claim with the enforcing
+check named, F sanctioned fail-stop. An operating condition is a typed error, never a row.
+pre-fix gate exit=1
+1:RELEASE-ASSERT violation: proof pointer 'crates/fake/src/lib.rs:check_bounds' does not resolve — crates/fake/src/lib.rs defines no 'check_bounds' in production code (renamed, moved, or test-only?) (row: crates/fake/src/lib.rs assert "caller validated the length")

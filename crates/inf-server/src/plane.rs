@@ -491,6 +491,9 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     reply_pool_bytes: Cell<u64>,
     cmd_pool_bytes: Cell<u64>,
     recv_dropped: Cell<u64>,
+    /// Accept completions that failed (F-L11-05): `INFO stats
+    /// accept_errors`, never connection housekeeping.
+    accept_errors: Cell<u64>,
     /// Pub/sub registries (M1-S10): local subscriber lists, owner-side
     /// per-cell counts, the replicated pattern index.
     pubsub: RefCell<PubSubCell<ConnKey>>,
@@ -1569,6 +1572,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 reply_pool_bytes: Cell::new(0),
                 cmd_pool_bytes: Cell::new(0),
                 recv_dropped: Cell::new(0),
+                accept_errors: Cell::new(0),
                 pubsub: RefCell::new(PubSubCell::new(cells)),
                 pub_queue: RefCell::new(VecDeque::new()),
                 pub_pump_active: Cell::new(false),
@@ -2403,6 +2407,22 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     );
                     return;
                 }
+                // Accept-path failures (`EMFILE`/`ENFILE`/`ECONNABORTED`)
+                // belong to the listener, never to a connection
+                // (F-L11-05): count them; the driver re-arms the accept.
+                if c.token.class() == TokenClass::Accept {
+                    self.shared.accept_errors.set(self.shared.accept_errors.get() + 1);
+                    return;
+                }
+                // Only connection classes reach housekeeping — a class
+                // this arm does not know must not tear down whichever
+                // connection shares its slot/generation.
+                if !matches!(
+                    c.token.class(),
+                    TokenClass::Recv | TokenClass::Send | TokenClass::Close
+                ) {
+                    return;
+                }
                 let key = Self::key_of(c.token);
                 let live = self
                     .shared
@@ -2651,9 +2671,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
         if !self.started {
             self.started = true;
+            // The listener rides the reserved top slot no connection ever
+            // holds (F-L11-05): an accept-class completion can never share
+            // `{slot, generation}` with a live connection.
             cx.push(IoOp::AcceptArm {
                 listener: self.listener,
-                token: CompletionToken::new(TokenClass::Accept, 0, 0),
+                token: CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0),
             });
         }
         if !self.everysec_armed && self.shared.durable.borrow().is_some() {
@@ -3232,6 +3255,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         // ---- stats flush
         let node = &self.shared.node;
         node.recv_dropped.set(self.shared.recv_dropped.get());
+        node.accept_errors.set(self.shared.accept_errors.get());
         node.fabric_rtt_p50_ns.set(self.shared.rtt_ns.borrow().percentile(50.0));
         {
             let ps = self.shared.pubsub.borrow();

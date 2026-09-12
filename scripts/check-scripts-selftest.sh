@@ -526,6 +526,21 @@ C	1	crates/fake/src/lib.rs	assert	caller validated the length	`crates/fake/src/l
 EOF
 expect green "release-asserts: a C row citing a resolving free fn is accepted" env INF_CHECK_ROOT="$root" $RELEASE
 expect_output "release-asserts: resolved pointers are counted" "1 proof pointers resolved" env INF_CHECK_ROOT="$root" $RELEASE
+# ADR-0106 D14 (batch 36): the resolver exits at the first definition; a
+# piped stripper took SIGPIPE under pipefail once the file outgrew the
+# pipe buffer (plane.rs at 320 KiB went red on an unrelated edit). The
+# fixture defines the symbol first and then outgrows any pipe buffer.
+root_big=$(fixture ra-early-def-large-file <<EOF
+pub fn write(len: usize) { assert!(len <= 255, "caller validated the length"); }
+pub fn check_bounds(len: usize) -> bool { len <= 255 }
+$(awk 'BEGIN { for (i = 0; i < 12000; i++) printf "pub fn filler_%d(n: usize) -> usize { n + %d }\n", i, i }')
+EOF
+)
+inventory "$root_big" <<'EOF'
+C	1	crates/fake/src/lib.rs	assert	caller validated the length	`crates/fake/src/lib.rs:check_bounds` at every write entry
+EOF
+expect green "release-asserts: an early definition in a file larger than the pipe buffer resolves" env INF_CHECK_ROOT="$root_big" $RELEASE
+expect_output "release-asserts: the large-file pointer is counted" "1 proof pointers resolved" env INF_CHECK_ROOT="$root_big" $RELEASE
 inventory "$root" <<'EOF'
 C	1	crates/fake/src/lib.rs	assert	caller validated the length	`crates/fake/src/lib.rs:Store::bound` (a multi-line generic impl) and `crates/fake/src/lib.rs:MAX_LEN`, `crates/fake/src/lib.rs:Bounds::other`, `crates/fake/src/lib.rs:guard::admit`
 EOF

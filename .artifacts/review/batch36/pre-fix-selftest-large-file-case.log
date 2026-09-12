@@ -1,0 +1,2 @@
+1:SELFTEST FAIL: expected green, got exit 1 — release-asserts: an early definition in a file larger than the pipe buffer resolves
+7:check-scripts self-test FAILED: 1 of 161 cases
