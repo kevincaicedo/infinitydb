@@ -1,0 +1,12 @@
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 11 aborted at I/O: EINVAL under O_DIRECT
+inf-sim: m4-tiered seed 0xd5ee0016: 5872 commands, 18941 steps, 144 keys audited, 2007 required ops, 0 allowed-lost, 1051199 B flushed pre-cut, 1049553 B flushed final, 213 cold resolves, 492 blob sets, 0 DISKFULL refusals (reopened: false), drop-race 0 values / 0 typed-other, post-drop reboot false (MANIFEST residue false), cut inside DROP after 0 steps: NotReached, refused-boot false, shadow arm true (59 tickets, 0 open at the cut, 59 same-key / 0 collision, 0 stale, 0 fallbacks; phase 6b cold resolves 171; phase 6c 4 pairs: 8 tickets, 4 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins), blob-key race 10 replans, dir-open fault arm false (fired 0), ckpt downgrades 4 / bound splits 0, trace 22005415 bytes, hash 0x34811e3ac64f6561
+inf-sim: sim_seconds=38.590939 published=0 delivered=0
+inf-sim: VIOLATION: seed 0xd5ee0016: REBUILT-TICKET ROW VACUOUS seed 0xd5ee0016: the reboot rebuilt 2 tickets, wanted 4 (two cold collision slots beside one RAM sibling per winner)
+sim exit 1

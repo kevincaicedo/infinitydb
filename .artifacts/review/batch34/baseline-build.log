@@ -1,0 +1,15 @@
+   Compiling inf-foundation v0.0.0 (/home/kcaicedo/.cache/inf-campaign/wt-ae33637/crates/inf-foundation)
+   Compiling libc v0.2.186
+   Compiling inf-simd v0.0.0 (/home/kcaicedo/.cache/inf-campaign/wt-ae33637/crates/inf-simd)
+   Compiling zmij v1.0.21
+   Compiling inf-fabric v0.0.0 (/home/kcaicedo/.cache/inf-campaign/wt-ae33637/crates/inf-fabric)
+   Compiling inf-wire v0.0.0 (/home/kcaicedo/.cache/inf-campaign/wt-ae33637/crates/inf-wire)
+   Compiling inf-alloc v0.0.0 (/home/kcaicedo/.cache/inf-campaign/wt-ae33637/crates/inf-alloc)
+   Compiling inf-log v0.0.0 (/home/kcaicedo/.cache/inf-campaign/wt-ae33637/crates/inf-log)
+   Compiling inf-doc v0.0.0 (/home/kcaicedo/.cache/inf-campaign/wt-ae33637/crates/inf-doc)
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/.cache/inf-campaign/wt-ae33637/crates/inf-runtime)
+   Compiling inf-store v0.0.0 (/home/kcaicedo/.cache/inf-campaign/wt-ae33637/crates/inf-store)
+   Compiling inf-server v0.0.0 (/home/kcaicedo/.cache/inf-campaign/wt-ae33637/crates/inf-server)
+   Compiling inf-sim v0.0.0 (/home/kcaicedo/.cache/inf-campaign/wt-ae33637/bins/inf-sim)
+    Finished `release` profile [optimized + debuginfo] target(s) in 57.54s
+build exit 0

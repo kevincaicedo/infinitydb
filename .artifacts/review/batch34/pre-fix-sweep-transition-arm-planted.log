@@ -1,0 +1,6 @@
+inf-sim: m2-mode-transition sweep shard 1/2: 4 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:3 depth_max:4
+inf-sim: TRANSITION ARM VACUOUS shard 1/2: 4 seeds, no packed tail reopened at any FLUSH → FUA transition boot
+inf-sim: seed 0xd5ee0002: LIFT PLANT VACUOUS seed 0xd5ee0002: the lift regime planted no cell
+inf-sim: seed 0xd5ee0006: LIFT PLANT VACUOUS seed 0xd5ee0006: the lift regime planted no cell
+inf-sim: m2-mode-transition sweep shard 0/2: 4 seeds, 2 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:2 depth_max:3
+inf-sim: TRANSITION ARM VACUOUS shard 0/2: 4 seeds, no packed tail reopened at any FLUSH → FUA transition boot

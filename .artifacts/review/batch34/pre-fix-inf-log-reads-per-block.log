@@ -1,0 +1,12 @@
+test ckpt::tests::every_section_block_costs_two_dependent_reads ... FAILED
+test ckpt::tests::every_section_class_is_bounded_by_the_loader_config ... FAILED
+test ckpt::tests::v3_covers_every_section_class ... ok
+thread 'ckpt::tests::every_section_block_costs_two_dependent_reads' (154957) panicked at crates/inf-log/src/ckpt.rs:3122:21:
+assertion `left == right` failed: section 1: header + block, nothing else
+  left: 3
+ right: 2
+thread 'ckpt::tests::every_section_class_is_bounded_by_the_loader_config' (154958) panicked at crates/inf-log/src/ckpt.rs:3179:13:
+assertion `left == right` failed: tag 0x01: two header reads + one section header, no body read
+  left: 4
+ right: 3
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 101 filtered out; finished in 0.00s

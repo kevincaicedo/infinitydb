@@ -1,0 +1,7 @@
+seed 0x1: arms [ckpt_downgrades 0 bound_splits 178 waits_fill 0 waits_group 0] determinism verified — second run trace byte-identical 
+seed 0x5: arms [ckpt_downgrades 0 bound_splits 198 waits_fill 0 waits_group 0] determinism verified — second run trace byte-identical 
+seed 0x9: arms [ckpt_downgrades 0 bound_splits 194 waits_fill 0 waits_group 0] determinism verified — second run trace byte-identical 
+seed 0xd: arms [ckpt_downgrades 0 bound_splits 37 waits_fill 0 waits_group 0] determinism verified — second run trace byte-identical 
+seed 0x3: arms [ckpt_downgrades 0 bound_splits 0 waits_fill 247 waits_group 0] determinism verified — second run trace byte-identical 
+seed 0x0: arms [ckpt_downgrades 0 bound_splits 0 waits_fill 0 waits_group 157] determinism verified — second run trace byte-identical 
+seed 0x2: arms [ckpt_downgrades 0 bound_splits 0 waits_fill 0 waits_group 0] determinism verified — second run trace byte-identical 

@@ -1,0 +1,735 @@
+=== m2-durable 2026-09-12T01:43:15-04:00
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+inf-sim: m2-durable sweep shard 0/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:0 depth_max:1 waits_barrier:0 waits_rotation:0 waits_reorder:0], device budget [background_bytes:0 deferrals:0 waits_pace:0 write_stall_max_us:91844], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:0 waits_group:2410, recycling [recycled:0 misses:0 fallbacks:0 rotations:30 residue_slacks:0 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=66.395577 published=0 delivered=0
+inf-sim: m2-durable sweep shard 2/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:2 waits_barrier:1215 waits_rotation:4 waits_reorder:0], device budget [background_bytes:0 deferrals:0 waits_pace:0 write_stall_max_us:3983], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:0 waits_group:0, recycling [recycled:0 misses:0 fallbacks:0 rotations:30 residue_slacks:0 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=69.838703 published=0 delivered=0
+inf-sim: m2-durable sweep shard 3/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:2 waits_barrier:448 waits_rotation:757 waits_reorder:0], device budget [background_bytes:27947008 deferrals:0 waits_pace:0 write_stall_max_us:3989], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:3606 waits_group:0, recycling [recycled:1238 misses:753 fallbacks:0 rotations:1959 residue_slacks:43 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=50.862232 published=0 delivered=0
+inf-sim: m2-durable sweep shard 1/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:8 depth_max:3 waits_barrier:376 waits_rotation:418 waits_reorder:0], device budget [background_bytes:55685120 deferrals:0 waits_pace:0 write_stall_max_us:3956], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:3031 waits_fill:0 waits_group:0, recycling [recycled:330 misses:904 fallbacks:0 rotations:2461 residue_slacks:10 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=66.066491 published=0 delivered=0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=64 shard=0/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=0 depth_max=1 waits_barrier=0 waits_rotation=0 waits_reorder=0 budget_background_bytes=0 budget_deferrals=0 waits_pace=0 write_stall_max_us=91844 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=0 waits_group=2410 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=30 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=64 shard=1/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=8 depth_max=3 waits_barrier=376 waits_rotation=418 waits_reorder=0 budget_background_bytes=55685120 budget_deferrals=0 waits_pace=0 write_stall_max_us=3956 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=3031 waits_fill=0 waits_group=0 segments_recycled=330 recycle_misses=904 recycle_fallbacks=0 segment_rotations=2461 recycled_residue_slacks=10 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=64 shard=2/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=2 waits_barrier=1215 waits_rotation=4 waits_reorder=0 budget_background_bytes=0 budget_deferrals=0 waits_pace=0 write_stall_max_us=3983 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=0 waits_group=0 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=30 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=64 shard=3/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=2 waits_barrier=448 waits_rotation=757 waits_reorder=0 budget_background_bytes=27947008 budget_deferrals=0 waits_pace=0 write_stall_max_us=3989 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=3606 waits_group=0 segments_recycled=1238 recycle_misses=753 recycle_fallbacks=0 segment_rotations=1959 recycled_residue_slacks=43 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+run-sweep: m2-durable sweep OK (4 shards, 64 seeds from 0xD5EE0000; manifests under /tmp/tmp.WoXTYzJeyo)
+=== m2-durable exit 0 2026-09-12T01:43:15-04:00
+=== m2-recycle 2026-09-12T01:43:15-04:00
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+inf-sim: m2-recycle sweep shard 3/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:4 waits_barrier:729 waits_rotation:969 waits_reorder:0], device budget [background_bytes:36839424 deferrals:0 waits_pace:0 write_stall_max_us:87817], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:5034 waits_group:0, recycling [recycled:1603 misses:695 fallbacks:8 rotations:2275 residue_slacks:46 waits_started:13 waits_satisfied:3 waits_expired:10 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=91.974558 published=0 delivered=0
+inf-sim: m2-recycle sweep shard 1/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:8 depth_max:3 waits_barrier:429 waits_rotation:383 waits_reorder:0], device budget [background_bytes:62144512 deferrals:0 waits_pace:0 write_stall_max_us:85244], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:5190 waits_fill:5431 waits_group:0, recycling [recycled:787 misses:1466 fallbacks:0 rotations:2221 residue_slacks:38 waits_started:12 waits_satisfied:0 waits_expired:12 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=125.106929 published=0 delivered=0
+inf-sim: m2-recycle sweep shard 2/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:4 waits_barrier:1274 waits_rotation:1068 waits_reorder:0], device budget [background_bytes:46825472 deferrals:0 waits_pace:0 write_stall_max_us:89594], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:0 waits_group:0, recycling [recycled:1841 misses:1029 fallbacks:0 rotations:2838 residue_slacks:48 waits_started:112 waits_satisfied:103 waits_expired:9 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=131.145410 published=0 delivered=0
+inf-sim: m2-recycle sweep shard 0/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:8 depth_max:3 waits_barrier:661 waits_rotation:513 waits_reorder:0], device budget [background_bytes:44326912 deferrals:0 waits_pace:0 write_stall_max_us:82202], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:0 waits_group:0, recycling [recycled:1768 misses:916 fallbacks:0 rotations:2652 residue_slacks:52 waits_started:194 waits_satisfied:188 waits_expired:6 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=125.067777 published=0 delivered=0
+scenario=m2-recycle base_seed=0xd5ee0000 sweep=64 shard=0/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=8 depth_max=3 waits_barrier=661 waits_rotation=513 waits_reorder=0 budget_background_bytes=44326912 budget_deferrals=0 waits_pace=0 write_stall_max_us=82202 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=0 waits_group=0 segments_recycled=1768 recycle_misses=916 recycle_fallbacks=0 segment_rotations=2652 recycled_residue_slacks=52 recycle_waits_started=194 recycle_waits_satisfied=188 recycle_waits_expired=6 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-recycle base_seed=0xd5ee0000 sweep=64 shard=1/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=8 depth_max=3 waits_barrier=429 waits_rotation=383 waits_reorder=0 budget_background_bytes=62144512 budget_deferrals=0 waits_pace=0 write_stall_max_us=85244 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=5190 waits_fill=5431 waits_group=0 segments_recycled=787 recycle_misses=1466 recycle_fallbacks=0 segment_rotations=2221 recycled_residue_slacks=38 recycle_waits_started=12 recycle_waits_satisfied=0 recycle_waits_expired=12 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-recycle base_seed=0xd5ee0000 sweep=64 shard=2/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=4 waits_barrier=1274 waits_rotation=1068 waits_reorder=0 budget_background_bytes=46825472 budget_deferrals=0 waits_pace=0 write_stall_max_us=89594 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=0 waits_group=0 segments_recycled=1841 recycle_misses=1029 recycle_fallbacks=0 segment_rotations=2838 recycled_residue_slacks=48 recycle_waits_started=112 recycle_waits_satisfied=103 recycle_waits_expired=9 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-recycle base_seed=0xd5ee0000 sweep=64 shard=3/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=4 waits_barrier=729 waits_rotation=969 waits_reorder=0 budget_background_bytes=36839424 budget_deferrals=0 waits_pace=0 write_stall_max_us=87817 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=5034 waits_group=0 segments_recycled=1603 recycle_misses=695 recycle_fallbacks=8 segment_rotations=2275 recycled_residue_slacks=46 recycle_waits_started=13 recycle_waits_satisfied=3 recycle_waits_expired=10 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+run-sweep: m2-recycle sweep OK (4 shards, 64 seeds from 0xD5EE0000; manifests under /tmp/tmp.hHQ4R0rV1N)
+=== m2-recycle exit 0 2026-09-12T01:43:16-04:00
+=== m2-ckpt-refused 2026-09-12T01:43:16-04:00
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell cell 01: checkpoint staging downgraded to buffered I/O — O_DIRECT : checkpoint staging downgraded to buffered I/O — O_DIRECT I/OI/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades: refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:11)
+)
+cell cell 01: checkpoint : checkpoint 11 aborted at  aborted at I/OI/O: : EINVAL under O_DIRECTEINVAL under O_DIRECT
+
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT cell I/O1 refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:: checkpoint staging downgraded to buffered I/O — O_DIRECT 1I/O)
+ refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:cell 11)
+: checkpoint cell 11 aborted at : checkpoint I/O1:  aborted at EINVAL under O_DIRECTI/O
+: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+inf-sim: m2-ckpt-refused sweep shard 0/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:0 depth_max:1 waits_barrier:0 waits_rotation:0 waits_reorder:0], device budget [background_bytes:655360 deferrals:0 waits_pace:0 write_stall_max_us:90108], reopened_packed_tails:0 ckpt_downgrades:32 bound_splits:0 waits_fill:0 waits_group:2435, recycling [recycled:0 misses:0 fallbacks:0 rotations:30 residue_slacks:0 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=66.400554 published=0 delivered=0
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+inf-sim: m2-ckpt-refused sweep shard 2/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:2 waits_barrier:1165 waits_rotation:6 waits_reorder:0], device budget [background_bytes:655360 deferrals:0 waits_pace:0 write_stall_max_us:3983], reopened_packed_tails:0 ckpt_downgrades:32 bound_splits:0 waits_fill:0 waits_group:0, recycling [recycled:0 misses:0 fallbacks:0 rotations:30 residue_slacks:0 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=69.851322 published=0 delivered=0
+inf-sim: m2-ckpt-refused sweep shard 3/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:2 waits_barrier:406 waits_rotation:739 waits_reorder:0], device budget [background_bytes:28618752 deferrals:0 waits_pace:0 write_stall_max_us:85032], reopened_packed_tails:0 ckpt_downgrades:32 bound_splits:0 waits_fill:3667 waits_group:0, recycling [recycled:1226 misses:765 fallbacks:0 rotations:1959 residue_slacks:37 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=50.863557 published=0 delivered=0
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+inf-sim: m2-ckpt-refused sweep shard 1/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:8 depth_max:3 waits_barrier:398 waits_rotation:365 waits_reorder:0], device budget [background_bytes:56074240 deferrals:0 waits_pace:0 write_stall_max_us:3966], reopened_packed_tails:0 ckpt_downgrades:32 bound_splits:3011 waits_fill:0 waits_group:0, recycling [recycled:324 misses:899 fallbacks:0 rotations:2458 residue_slacks:11 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=66.087235 published=0 delivered=0
+scenario=m2-ckpt-refused base_seed=0xd5ee0000 sweep=64 shard=0/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=0 depth_max=1 waits_barrier=0 waits_rotation=0 waits_reorder=0 budget_background_bytes=655360 budget_deferrals=0 waits_pace=0 write_stall_max_us=90108 reopened_packed_tails=0 ckpt_downgrades=32 ckpt_bound_splits=0 waits_fill=0 waits_group=2435 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=30 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-ckpt-refused base_seed=0xd5ee0000 sweep=64 shard=1/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=8 depth_max=3 waits_barrier=398 waits_rotation=365 waits_reorder=0 budget_background_bytes=56074240 budget_deferrals=0 waits_pace=0 write_stall_max_us=3966 reopened_packed_tails=0 ckpt_downgrades=32 ckpt_bound_splits=3011 waits_fill=0 waits_group=0 segments_recycled=324 recycle_misses=899 recycle_fallbacks=0 segment_rotations=2458 recycled_residue_slacks=11 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-ckpt-refused base_seed=0xd5ee0000 sweep=64 shard=2/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=2 waits_barrier=1165 waits_rotation=6 waits_reorder=0 budget_background_bytes=655360 budget_deferrals=0 waits_pace=0 write_stall_max_us=3983 reopened_packed_tails=0 ckpt_downgrades=32 ckpt_bound_splits=0 waits_fill=0 waits_group=0 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=30 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-ckpt-refused base_seed=0xd5ee0000 sweep=64 shard=3/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=2 waits_barrier=406 waits_rotation=739 waits_reorder=0 budget_background_bytes=28618752 budget_deferrals=0 waits_pace=0 write_stall_max_us=85032 reopened_packed_tails=0 ckpt_downgrades=32 ckpt_bound_splits=0 waits_fill=3667 waits_group=0 segments_recycled=1226 recycle_misses=765 recycle_fallbacks=0 segment_rotations=1959 recycled_residue_slacks=37 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+run-sweep: m2-ckpt-refused sweep OK (4 shards, 64 seeds from 0xD5EE0000; manifests under /tmp/tmp.TpugsPgLTP)
+=== m2-ckpt-refused exit 0 2026-09-12T01:43:17-04:00
+=== m2-reorder-window 2026-09-12T01:43:17-04:00
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+inf-sim: m2-reorder-window sweep shard 3/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:2 waits_barrier:0 waits_rotation:32 waits_reorder:63], device budget [background_bytes:25784320 deferrals:0 waits_pace:0 write_stall_max_us:153467], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:3854 waits_group:0, recycling [recycled:22 misses:94 fallbacks:0 rotations:84 residue_slacks:21 waits_started:52 waits_satisfied:22 waits_expired:30 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=50.735692 published=0 delivered=0
+inf-sim: m2-reorder-window sweep shard 0/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:3 waits_barrier:0 waits_rotation:0 waits_reorder:115], device budget [background_bytes:0 deferrals:0 waits_pace:0 write_stall_max_us:153870], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:0 waits_group:3, recycling [recycled:0 misses:0 fallbacks:0 rotations:0 residue_slacks:0 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=66.271013 published=0 delivered=0
+inf-sim: m2-reorder-window sweep shard 2/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:3 waits_barrier:0 waits_rotation:0 waits_reorder:111], device budget [background_bytes:0 deferrals:0 waits_pace:0 write_stall_max_us:153447], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:0 waits_group:0, recycling [recycled:0 misses:0 fallbacks:0 rotations:0 residue_slacks:0 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=69.699918 published=0 delivered=0
+inf-sim: m2-reorder-window sweep shard 1/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:2 waits_barrier:1 waits_rotation:43 waits_reorder:70], device budget [background_bytes:32157696 deferrals:0 waits_pace:0 write_stall_max_us:153242], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:444 waits_fill:4223 waits_group:0, recycling [recycled:15 misses:48 fallbacks:0 rotations:94 residue_slacks:15 waits_started:30 waits_satisfied:14 waits_expired:16 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=65.905336 published=0 delivered=0
+scenario=m2-reorder-window base_seed=0xd5ee0000 sweep=64 shard=0/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=3 waits_barrier=0 waits_rotation=0 waits_reorder=115 budget_background_bytes=0 budget_deferrals=0 waits_pace=0 write_stall_max_us=153870 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=0 waits_group=3 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=0 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-reorder-window base_seed=0xd5ee0000 sweep=64 shard=1/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=2 waits_barrier=1 waits_rotation=43 waits_reorder=70 budget_background_bytes=32157696 budget_deferrals=0 waits_pace=0 write_stall_max_us=153242 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=444 waits_fill=4223 waits_group=0 segments_recycled=15 recycle_misses=48 recycle_fallbacks=0 segment_rotations=94 recycled_residue_slacks=15 recycle_waits_started=30 recycle_waits_satisfied=14 recycle_waits_expired=16 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-reorder-window base_seed=0xd5ee0000 sweep=64 shard=2/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=3 waits_barrier=0 waits_rotation=0 waits_reorder=111 budget_background_bytes=0 budget_deferrals=0 waits_pace=0 write_stall_max_us=153447 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=0 waits_group=0 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=0 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-reorder-window base_seed=0xd5ee0000 sweep=64 shard=3/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=2 waits_barrier=0 waits_rotation=32 waits_reorder=63 budget_background_bytes=25784320 budget_deferrals=0 waits_pace=0 write_stall_max_us=153467 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=3854 waits_group=0 segments_recycled=22 recycle_misses=94 recycle_fallbacks=0 segment_rotations=84 recycled_residue_slacks=21 recycle_waits_started=52 recycle_waits_satisfied=22 recycle_waits_expired=30 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+run-sweep: m2-reorder-window sweep OK (4 shards, 64 seeds from 0xD5EE0000; manifests under /tmp/tmp.r3SCw1Bmem)
+=== m2-reorder-window exit 0 2026-09-12T01:43:17-04:00
+=== m2-mode-transition 2026-09-12T01:43:17-04:00
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+inf-sim: seed 0xd5ee0000: TRANSITION ARM VACUOUS seed 0xd5ee0000: FLUSH → FUA reopened no packed tail
+inf-sim: seed 0xd5ee0004: TRANSITION ARM VACUOUS seed 0xd5ee0004: FLUSH → FUA reopened no packed tail
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+inf-sim: seed 0xd5ee0008: TRANSITION ARM VACUOUS seed 0xd5ee0008: FLUSH → FUA reopened no packed tail
+inf-sim: seed 0xd5ee000c: TRANSITION ARM VACUOUS seed 0xd5ee000c: FLUSH → FUA reopened no packed tail
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 rebuilding (no-sidecar)
+inf-sim: seed 0xd5ee0010: TRANSITION ARM VACUOUS seed 0xd5ee0010: FLUSH → FUA reopened no packed tail
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+inf-sim: seed 0xd5ee0014: TRANSITION ARM VACUOUS seed 0xd5ee0014: FLUSH → FUA reopened no packed tail
+inf-sim: seed 0xd5ee0018: TRANSITION ARM VACUOUS seed 0xd5ee0018: FLUSH → FUA reopened no packed tail
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+inf-sim: seed 0xd5ee001c: TRANSITION ARM VACUOUS seed 0xd5ee001c: FLUSH → FUA reopened no packed tail
+inf-sim: seed 0xd5ee0020: TRANSITION ARM VACUOUS seed 0xd5ee0020: FLUSH → FUA reopened no packed tail
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+inf-sim: m2-mode-transition sweep shard 3/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:4 waits_barrier:1135 waits_rotation:5 waits_reorder:0], device budget [background_bytes:0 deferrals:0 waits_pace:0 write_stall_max_us:82255], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:0 waits_group:0, recycling [recycled:0 misses:0 fallbacks:0 rotations:28 residue_slacks:9 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=73.108147 published=0 delivered=0
+inf-sim: m2-mode-transition sweep shard 1/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:8 depth_max:3 waits_barrier:556 waits_rotation:0 waits_reorder:0], device budget [background_bytes:0 deferrals:0 waits_pace:0 write_stall_max_us:90219], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:0 waits_group:0, recycling [recycled:0 misses:0 fallbacks:0 rotations:30 residue_slacks:5 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=76.764713 published=0 delivered=0
+inf-sim: seed 0xd5ee0024: TRANSITION ARM VACUOUS seed 0xd5ee0024: FLUSH → FUA reopened no packed tail
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+inf-sim: seed 0xd5ee0028: TRANSITION ARM VACUOUS seed 0xd5ee0028: FLUSH → FUA reopened no packed tail
+inf-sim: seed 0xd5ee002c: TRANSITION ARM VACUOUS seed 0xd5ee002c: FLUSH → FUA reopened no packed tail
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 rebuilding (no-sidecar)
+inf-sim: seed 0xd5ee0030: TRANSITION ARM VACUOUS seed 0xd5ee0030: FLUSH → FUA reopened no packed tail
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 rebuilding (no-sidecar)
+inf-sim: seed 0xd5ee0034: TRANSITION ARM VACUOUS seed 0xd5ee0034: FLUSH → FUA reopened no packed tail
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+inf-sim: seed 0xd5ee0038: TRANSITION ARM VACUOUS seed 0xd5ee0038: FLUSH → FUA reopened no packed tail
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+inf-sim: seed 0xd5ee003c: TRANSITION ARM VACUOUS seed 0xd5ee003c: FLUSH → FUA reopened no packed tail
+inf-sim: m2-mode-transition sweep shard 0/4: 16 seeds, 16 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:0 depth_max:1 waits_barrier:0 waits_rotation:0 waits_reorder:0], device budget [background_bytes:983040 deferrals:72463 waits_pace:0 write_stall_max_us:91188], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:4507 waits_group:0, recycling [recycled:0 misses:1967 fallbacks:0 rotations:1935 residue_slacks:0 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=110.376982 published=0 delivered=0
+run-sweep: m2-mode-transition shard 0/4 exited non-zero
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (9 entries; tail caught up)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+inf-sim: m2-mode-transition sweep shard 2/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:2 waits_barrier:1836 waits_rotation:1219 waits_reorder:0], device budget [background_bytes:27885568 deferrals:63888 waits_pace:0 write_stall_max_us:89419], reopened_packed_tails:32 ckpt_downgrades:0 bound_splits:0 waits_fill:0 waits_group:0, recycling [recycled:679 misses:3171 fallbacks:0 rotations:3818 residue_slacks:13 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:16 tiered_ops:3232 indexed_ops:3715 sidecars_loaded:32 stale_slacks:0 plants:32 plant_lifts:32 plant_sidecars:32]
+inf-sim: sim_seconds=135.157477 published=0 delivered=0
+run-sweep: m2-mode-transition shard 0/4 reports violations:
+0xd5ee0000 VIOLATION TRANSITION ARM VACUOUS seed 0xd5ee0000: FLUSH → FUA reopened no packed tail
+0xd5ee0004 VIOLATION TRANSITION ARM VACUOUS seed 0xd5ee0004: FLUSH → FUA reopened no packed tail
+0xd5ee0008 VIOLATION TRANSITION ARM VACUOUS seed 0xd5ee0008: FLUSH → FUA reopened no packed tail
+0xd5ee000c VIOLATION TRANSITION ARM VACUOUS seed 0xd5ee000c: FLUSH → FUA reopened no packed tail
+0xd5ee0010 VIOLATION TRANSITION ARM VACUOUS seed 0xd5ee0010: FLUSH → FUA reopened no packed tail
+scenario=m2-mode-transition base_seed=0xd5ee0000 sweep=64 shard=0/4 plant=None replay_canary=false seeds_run=16 violations=16 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=0 depth_max=1 waits_barrier=0 waits_rotation=0 waits_reorder=0 budget_background_bytes=983040 budget_deferrals=72463 waits_pace=0 write_stall_max_us=91188 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=4507 waits_group=0 segments_recycled=0 recycle_misses=1967 recycle_fallbacks=0 segment_rotations=1935 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-mode-transition base_seed=0xd5ee0000 sweep=64 shard=1/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=8 depth_max=3 waits_barrier=556 waits_rotation=0 waits_reorder=0 budget_background_bytes=0 budget_deferrals=0 waits_pace=0 write_stall_max_us=90219 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=0 waits_group=0 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=30 recycled_residue_slacks=5 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-mode-transition base_seed=0xd5ee0000 sweep=64 shard=2/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=208 cut_classes=[] pipelined_seeds=16 depth_max=2 waits_barrier=1836 waits_rotation=1219 waits_reorder=0 budget_background_bytes=27885568 budget_deferrals=63888 waits_pace=0 write_stall_max_us=89419 reopened_packed_tails=32 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=0 waits_group=0 segments_recycled=679 recycle_misses=3171 recycle_fallbacks=0 segment_rotations=3818 recycled_residue_slacks=13 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=16 lift_tiered_ops=3232 lift_indexed_ops=3715 lift_sidecars_loaded=32 stale_residue_slacks=0 lift_plants=32 lift_plant_lifts=32 lift_plant_sidecars=32
+scenario=m2-mode-transition base_seed=0xd5ee0000 sweep=64 shard=3/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=4 waits_barrier=1135 waits_rotation=5 waits_reorder=0 budget_background_bytes=0 budget_deferrals=0 waits_pace=0 write_stall_max_us=82255 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=0 waits_group=0 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=28 recycled_residue_slacks=9 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+run-sweep: m2-mode-transition sweep FAILED (results under /tmp/tmp.XNRShjkPSl)
+=== m2-mode-transition exit 1 2026-09-12T01:43:18-04:00
+=== m2-device-budget 2026-09-12T01:43:18-04:00
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+inf-sim: m2-device-budget sweep shard 3/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:3 waits_barrier:1557 waits_rotation:242 waits_reorder:0], device budget [background_bytes:21905408 deferrals:61242 waits_pace:0 write_stall_max_us:5827], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:0 waits_group:0, recycling [recycled:0 misses:0 fallbacks:0 rotations:640 residue_slacks:0 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=63.495961 published=0 delivered=0
+inf-sim: m2-device-budget sweep shard 2/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:3 waits_barrier:1553 waits_rotation:235 waits_reorder:0], device budget [background_bytes:21909504 deferrals:59329 waits_pace:0 write_stall_max_us:5121], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:0 waits_group:0, recycling [recycled:0 misses:0 fallbacks:0 rotations:635 residue_slacks:0 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=69.809974 published=0 delivered=0
+inf-sim: m2-device-budget sweep shard 1/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:3 waits_barrier:1813 waits_rotation:261 waits_reorder:0], device budget [background_bytes:24920064 deferrals:73180 waits_pace:2 write_stall_max_us:5178], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:0 waits_group:0, recycling [recycled:0 misses:0 fallbacks:0 rotations:730 residue_slacks:0 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=78.797117 published=0 delivered=0
+inf-sim: m2-device-budget sweep shard 0/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 0 equivalence checks, 0 documents compared, cut classes [], frame pipeline [pipelined_seeds:16 depth_max:3 waits_barrier:1755 waits_rotation:271 waits_reorder:0], device budget [background_bytes:25358336 deferrals:73878 waits_pace:1 write_stall_max_us:5148], reopened_packed_tails:0 ckpt_downgrades:0 bound_splits:0 waits_fill:0 waits_group:0, recycling [recycled:0 misses:0 fallbacks:0 rotations:734 residue_slacks:0 waits_started:0 waits_satisfied:0 waits_expired:0 inline_preallocs:0], lift regime [seeds:0 tiered_ops:0 indexed_ops:0 sidecars_loaded:0 stale_slacks:0 plants:0 plant_lifts:0 plant_sidecars:0]
+inf-sim: sim_seconds=82.017006 published=0 delivered=0
+scenario=m2-device-budget base_seed=0xd5ee0000 sweep=64 shard=0/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=3 waits_barrier=1755 waits_rotation=271 waits_reorder=0 budget_background_bytes=25358336 budget_deferrals=73878 waits_pace=1 write_stall_max_us=5148 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=0 waits_group=0 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=734 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-device-budget base_seed=0xd5ee0000 sweep=64 shard=1/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=3 waits_barrier=1813 waits_rotation=261 waits_reorder=0 budget_background_bytes=24920064 budget_deferrals=73180 waits_pace=2 write_stall_max_us=5178 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=0 waits_group=0 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=730 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-device-budget base_seed=0xd5ee0000 sweep=64 shard=2/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=3 waits_barrier=1553 waits_rotation=235 waits_reorder=0 budget_background_bytes=21909504 budget_deferrals=59329 waits_pace=0 write_stall_max_us=5121 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=0 waits_group=0 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=635 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+scenario=m2-device-budget base_seed=0xd5ee0000 sweep=64 shard=3/4 plant=None replay_canary=false seeds_run=16 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classes=[] pipelined_seeds=16 depth_max=3 waits_barrier=1557 waits_rotation=242 waits_reorder=0 budget_background_bytes=21905408 budget_deferrals=61242 waits_pace=0 write_stall_max_us=5827 reopened_packed_tails=0 ckpt_downgrades=0 ckpt_bound_splits=0 waits_fill=0 waits_group=0 segments_recycled=0 recycle_misses=0 recycle_fallbacks=0 segment_rotations=640 recycled_residue_slacks=0 recycle_waits_started=0 recycle_waits_satisfied=0 recycle_waits_expired=0 segment_inline_preallocs=0 lift_seeds=0 lift_tiered_ops=0 lift_indexed_ops=0 lift_sidecars_loaded=0 stale_residue_slacks=0 lift_plants=0 lift_plant_lifts=0 lift_plant_sidecars=0
+run-sweep: m2-device-budget sweep OK (4 shards, 64 seeds from 0xD5EE0000; manifests under /tmp/tmp.srQGwbhufO)
+=== m2-device-budget exit 0 2026-09-12T01:43:19-04:00
+=== m4-tiered 2026-09-12T01:43:19-04:00
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+cell 1: swept dropped namespace 16 residue (16 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (17 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 20 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (16 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 9 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 17 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 21 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (16 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (16 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (5 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (5 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 11 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+inf-sim: seed 0xd5ee0016: seed 0xd5ee0016: REBUILT-TICKET ROW VACUOUS seed 0xd5ee0016: the reboot rebuilt 2 tickets, wanted 4 (two cold collision slots beside one RAM sibling per winner)
+cell 0: swept dropped namespace 16 residue (16 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (25 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (18 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (23 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 21 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 18 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (17 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (19 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 9 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 9 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (18 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (18 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 16 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 18 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+inf-sim: m4-tiered sweep shard 3/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 72537 commands, 2269 keys audited, 2098997 B flushed pre-cut, 2193 cold resolves, 6868 blob sets, 177 blob-key race replans, dir-open fault armed on 0 seeds (0 fired), 16 DISKFULL refusals, drop-race 282 values / 198 typed-other; post-drop reboots 16 (16 with MANIFEST residue), cut inside DROP: 1 whole / 15 swept (ADR-0100); shadow arm on 0 seeds: 0 tickets (0 open at the cut), 0 same-key / 0 collision verdicts, 0 stale, 0 fallbacks; forced collisions: 0 tickets, 0 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins; open-ticket rows on 0 seeds: 0 tickets held open, 0 DBSIZE drains reading 0 twins, 0 SCAN twins, 0 retargets, 0 read-free forced deletes, 0 ticketed fallbacks, 0 collision verdicts, 0 injected read errors relayed, 0 settled without a read after resume; rebuilt multi-ticket rows on 16 seeds: 32 tickets rebuilt, 16 DELs draining several, 0 same-key twins among them, 0 filler writes, 32 reboots
+inf-sim: sim_seconds=380.596547 published=0 delivered=0
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (17 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (17 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (24 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 5 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 5 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (18 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 13 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 15 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (17 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 11 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (18 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (18 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (20 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+inf-sim: m4-tiered sweep shard 0/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 81897 commands, 2270 keys audited, 8404757 B flushed pre-cut, 3226 cold resolves, 6472 blob sets, 176 blob-key race replans, dir-open fault armed on 0 seeds (0 fired), 16 DISKFULL refusals, drop-race 225 values / 255 typed-other; post-drop reboots 16 (16 with MANIFEST residue), cut inside DROP: 2 whole / 14 swept (ADR-0100); shadow arm on 16 seeds: 905 tickets (0 open at the cut), 902 same-key / 0 collision verdicts, 0 stale, 0 fallbacks; forced collisions: 128 tickets, 64 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins; open-ticket rows on 16 seeds: 64 tickets held open, 48 DBSIZE drains reading 90 twins, 128 SCAN twins, 64 retargets, 32 read-free forced deletes, 64 ticketed fallbacks, 64 collision verdicts, 16 injected read errors relayed, 51 settled without a read after resume; rebuilt multi-ticket rows on 16 seeds: 64 tickets rebuilt, 32 DELs draining several, 16 same-key twins among them, 12288 filler writes, 32 reboots
+inf-sim: sim_seconds=586.026261 published=0 delivered=0
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+inf-sim: m4-tiered sweep shard 1/4: 16 seeds, 0 violations, 0 legal taxonomy refusals, 84349 commands, 2295 keys audited, 8395423 B flushed pre-cut, 3418 cold resolves, 6658 blob sets, 185 blob-key race replans, dir-open fault armed on 8 seeds (8 fired), 16 DISKFULL refusals, drop-race 113 values / 367 typed-other; post-drop reboots 16 (16 with MANIFEST residue), cut inside DROP: 2 whole / 14 swept (ADR-0100); shadow arm on 16 seeds: 960 tickets (0 open at the cut), 955 same-key / 0 collision verdicts, 0 stale, 0 fallbacks; forced collisions: 128 tickets, 64 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 2 SCAN twins; open-ticket rows on 16 seeds: 64 tickets held open, 48 DBSIZE drains reading 87 twins, 128 SCAN twins, 64 retargets, 32 read-free forced deletes, 64 ticketed fallbacks, 64 collision verdicts, 16 injected read errors relayed, 94 settled without a read after resume; rebuilt multi-ticket rows on 16 seeds: 64 tickets rebuilt, 32 DELs draining several, 16 same-key twins among them, 12288 filler writes, 32 reboots
+inf-sim: sim_seconds=597.448506 published=0 delivered=0
+cell 1: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 18 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 20 aborted at I/O: EINVAL under O_DIRECT
+inf-sim: m4-tiered sweep shard 2/4: 16 seeds, 1 violations, 0 legal taxonomy refusals, 88595 commands, 2279 keys audited, 11549442 B flushed pre-cut, 3316 cold resolves, 7172 blob sets, 183 blob-key race replans, dir-open fault armed on 0 seeds (0 fired), 15 DISKFULL refusals, drop-race 162 values / 288 typed-other; post-drop reboots 15 (15 with MANIFEST residue), cut inside DROP: 1 whole / 14 swept (ADR-0100); shadow arm on 16 seeds: 929 tickets (0 open at the cut), 927 same-key / 0 collision verdicts, 0 stale, 0 fallbacks; forced collisions: 128 tickets, 64 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins; open-ticket rows on 16 seeds: 64 tickets held open, 48 DBSIZE drains reading 87 twins, 128 SCAN twins, 64 retargets, 32 read-free forced deletes, 64 ticketed fallbacks, 64 collision verdicts, 16 injected read errors relayed, 49 settled without a read after resume; rebuilt multi-ticket rows on 16 seeds: 60 tickets rebuilt, 30 DELs draining several, 16 same-key twins among them, 12288 filler writes, 31 reboots
+inf-sim: sim_seconds=611.025360 published=0 delivered=0
+run-sweep: m4-tiered shard 2/4 exited non-zero
+run-sweep: m4-tiered shard 2/4 reports violations:
+0xd5ee0016 VIOLATION seed 0xd5ee0016: REBUILT-TICKET ROW VACUOUS seed 0xd5ee0016: the reboot rebuilt 2 tickets, wanted 4 (two cold collision slots beside one RAM sibling per winner)
+scenario=m4-tiered base_seed=0xd5ee0000 sweep=64 shard=0/4 seeds_run=16 violations=0 refused=0 commands=81897 keys_audited=2270 flushed_pre_cut=8404757 cold_resolves=3226 blob_sets=6472 dir_open_fault_seeds=0 dir_open_faults_fired=0 diskfull_refusals=16 drop_values=225 drop_other=255 drop_reboots=16 drop_reboot_residue=16 drop_cut_whole=2 drop_cut_swept=14 shadow_seeds=16 shadow_created=905 shadow_at_cut=0 shadow_same_key=902 shadow_collision=0 shadow_stale=0 shadow_fallbacks=0 collide_tickets=128 collide_verdicts=64 collide_ticketed=0 collide_drains=0 collide_scan_twins=0 open_seeds=16 open_tickets=64 open_drains=48 open_reads=90 open_scan_twins=128 open_retargeted=64 open_forced_deletes=32 open_ticketed=64 open_collisions=64 open_read_faults=16 open_settled_without_read=51 rebuilt_seeds=16 rebuilt_tickets=64 rebuilt_multi_dels=32 rebuilt_same_key_twins=16 rebuilt_fill_sets=12288 rebuilt_reboots=32
+scenario=m4-tiered base_seed=0xd5ee0000 sweep=64 shard=1/4 seeds_run=16 violations=0 refused=0 commands=84349 keys_audited=2295 flushed_pre_cut=8395423 cold_resolves=3418 blob_sets=6658 dir_open_fault_seeds=8 dir_open_faults_fired=8 diskfull_refusals=16 drop_values=113 drop_other=367 drop_reboots=16 drop_reboot_residue=16 drop_cut_whole=2 drop_cut_swept=14 shadow_seeds=16 shadow_created=960 shadow_at_cut=0 shadow_same_key=955 shadow_collision=0 shadow_stale=0 shadow_fallbacks=0 collide_tickets=128 collide_verdicts=64 collide_ticketed=0 collide_drains=0 collide_scan_twins=2 open_seeds=16 open_tickets=64 open_drains=48 open_reads=87 open_scan_twins=128 open_retargeted=64 open_forced_deletes=32 open_ticketed=64 open_collisions=64 open_read_faults=16 open_settled_without_read=94 rebuilt_seeds=16 rebuilt_tickets=64 rebuilt_multi_dels=32 rebuilt_same_key_twins=16 rebuilt_fill_sets=12288 rebuilt_reboots=32
+scenario=m4-tiered base_seed=0xd5ee0000 sweep=64 shard=2/4 seeds_run=16 violations=1 refused=0 commands=88595 keys_audited=2279 flushed_pre_cut=11549442 cold_resolves=3316 blob_sets=7172 dir_open_fault_seeds=0 dir_open_faults_fired=0 diskfull_refusals=15 drop_values=162 drop_other=288 drop_reboots=15 drop_reboot_residue=15 drop_cut_whole=1 drop_cut_swept=14 shadow_seeds=16 shadow_created=929 shadow_at_cut=0 shadow_same_key=927 shadow_collision=0 shadow_stale=0 shadow_fallbacks=0 collide_tickets=128 collide_verdicts=64 collide_ticketed=0 collide_drains=0 collide_scan_twins=0 open_seeds=16 open_tickets=64 open_drains=48 open_reads=87 open_scan_twins=128 open_retargeted=64 open_forced_deletes=32 open_ticketed=64 open_collisions=64 open_read_faults=16 open_settled_without_read=49 rebuilt_seeds=16 rebuilt_tickets=60 rebuilt_multi_dels=30 rebuilt_same_key_twins=16 rebuilt_fill_sets=12288 rebuilt_reboots=31
+scenario=m4-tiered base_seed=0xd5ee0000 sweep=64 shard=3/4 seeds_run=16 violations=0 refused=0 commands=72537 keys_audited=2269 flushed_pre_cut=2098997 cold_resolves=2193 blob_sets=6868 dir_open_fault_seeds=0 dir_open_faults_fired=0 diskfull_refusals=16 drop_values=282 drop_other=198 drop_reboots=16 drop_reboot_residue=16 drop_cut_whole=1 drop_cut_swept=15 shadow_seeds=0 shadow_created=0 shadow_at_cut=0 shadow_same_key=0 shadow_collision=0 shadow_stale=0 shadow_fallbacks=0 collide_tickets=0 collide_verdicts=0 collide_ticketed=0 collide_drains=0 collide_scan_twins=0 open_seeds=0 open_tickets=0 open_drains=0 open_reads=0 open_scan_twins=0 open_retargeted=0 open_forced_deletes=0 open_ticketed=0 open_collisions=0 open_read_faults=0 open_settled_without_read=0 rebuilt_seeds=16 rebuilt_tickets=32 rebuilt_multi_dels=16 rebuilt_same_key_twins=0 rebuilt_fill_sets=0 rebuilt_reboots=32
+run-sweep: m4-tiered sweep FAILED (results under /tmp/tmp.H1yR4DYxoI)
+=== m4-tiered exit 1 2026-09-12T01:43:25-04:00
+=== plant positive control
+seed 0x1: 
+seed 0x2: ORACLE VIOLATION: audit GET [107, 58, 52, 58, 48] answered Ok(None) 
+seed 0x3: ORACLE VIOLATION: audit GET [107, 58, 50, 58, 48] answered Ok(None) 
+seed 0x4: 
+seed 0x5: ORACLE VIOLATION: audit GET [107, 58, 53, 58, 49] answered Ok(None) 
+seed 0x6: ORACLE VIOLATION: audit GET [107, 58, 49, 58, 52] answered Ok(None) 
+seed 0x7: 
+seed 0x8: 
+=== ALL DONE 2026-09-12T01:43:25-04:00

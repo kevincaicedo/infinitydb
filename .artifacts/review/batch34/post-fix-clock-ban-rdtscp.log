@@ -1,0 +1,8 @@
+  allowed crates/inf-foundation/src/time.rs:92: the injected clock's real-time origin (L7)
+  allowed crates/inf-foundation/src/time.rs:106: the injected clock's one real-clock read (L7)
+  allowed crates/inf-server/src/control.rs:1274: control thread (ADR-0015 D3): boot narration, never oracle input
+  allowed crates/inf-server/src/control.rs:1332: control thread (ADR-0015 D3): boot narration, never oracle input
+  allowed crates/inf-server/src/control.rs:1341: control thread (ADR-0015 D3): boot narration, never oracle input
+  allowed crates/inf-server/src/control.rs:1375: control thread (ADR-0015 D3): boot narration, never oracle input
+clock ban OK (config 9/9 entries, 0 shadow configs, 16 cell crates / 160 files scanned, 6 allowed sites in cell code; probe: 12 planted bypasses red, 3 controls green)
+  excluded crates/inf-probe/src — the boot-time device probe (ADR-0086 D7 / ADR-0091): a dev tool that runs before any cell starts; its own header sanctions Instant::now + std::thread
