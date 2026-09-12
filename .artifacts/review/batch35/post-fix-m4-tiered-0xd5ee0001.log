@@ -1,0 +1,4 @@
+cell 0: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+inf-sim: m4-tiered seed 0xd5ee0001: 5854 commands, 20235 steps, 144 keys audited, 1972 required ops, 0 allowed-lost, 1049015 B flushed pre-cut, 1049529 B flushed final, 219 cold resolves, 464 blob sets, 1 DISKFULL refusals (reopened: true), drop-race 11 values / 19 typed-other, post-drop reboot true (MANIFEST residue true), cut inside DROP after 41 steps: Swept, refused-boot false, shadow arm true (61 tickets, 0 open at the cut, 60 same-key / 0 collision, 0 stale, 0 fallbacks; phase 6b cold resolves 174; phase 6c 4 pairs: 8 tickets, 4 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins), blob-key race 20 replans, dir-open fault arm false (fired 0), ckpt downgrades 0 / bound splits 2374, trace 21746362 bytes, hash 0xfc20ad157056ee8b
+inf-sim: sim_seconds=42.629683 published=0 delivered=0

@@ -1,0 +1,12 @@
+test partiql::cache::tests::epoch_invalidation_recompiles_and_can_reject ... ok
+test partiql::cache::tests::capacity_zero_disables_but_still_serves ... ok
+test partiql::cache::tests::hit_returns_the_cached_statement_and_counts ... ok
+test partiql::cache::tests::lru_evicts_the_coldest_entry ... ok
+test partiql::cache::tests::invalidation_keeps_the_table_consistent ... ok
+test partiql::cache::tests::rejections_are_never_cached ... ok
+test partiql::cache::tests::spelling_variants_are_distinct_keys ... ok
+test partiql::cache::tests::multi_victim_eviction_does_not_leak_slots ... ok
+test partiql::cache::tests::cache_hot_mix_hits_over_99_percent ... ok
+test partiql::cache::tests::eviction_and_invalidation_keep_the_structure ... ok
+test partiql::cache::tests::eviction_and_invalidation_never_panic ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 6.20s

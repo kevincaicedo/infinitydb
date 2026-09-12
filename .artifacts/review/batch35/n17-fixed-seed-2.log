@@ -1,0 +1,20 @@
+cell 0: index 19/1 rebuilding (no-sidecar)
+N17-TRACE finish segments=[SegmentId(0), SegmentId(1)] ends=[(0, None), (0, None)] residue=[false, false] stale=[false, false] last_data=0 torn=false stale_trailing=false resume=Lsn { segment: SegmentId(1), offset: 0 }
+N17-TRACE open_existing tail=SegmentId(1) tail_offset=0 packed=false mode=Buffered segments=[SegmentId(0), SegmentId(1)]
+cell 1: index 19/1 rebuilding (no-sidecar)
+N17-TRACE finish segments=[SegmentId(0), SegmentId(1)] ends=[(0, None), (0, None)] residue=[false, false] stale=[false, false] last_data=0 torn=false stale_trailing=false resume=Lsn { segment: SegmentId(1), offset: 0 }
+N17-TRACE open_existing tail=SegmentId(1) tail_offset=0 packed=false mode=Buffered segments=[SegmentId(0), SegmentId(1)]
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+N17-TRACE finish segments=[SegmentId(1), SegmentId(2)] ends=[(6047, None), (176, None)] residue=[true, false] stale=[true, false] last_data=1 torn=false stale_trailing=false resume=Lsn { segment: SegmentId(2), offset: 176 }
+N17-TRACE open_existing tail=SegmentId(2) tail_offset=176 packed=true mode=Direct segments=[SegmentId(1), SegmentId(2)]
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+N17-TRACE finish segments=[SegmentId(1), SegmentId(2)] ends=[(5410, None), (176, None)] residue=[true, false] stale=[true, false] last_data=1 torn=false stale_trailing=false resume=Lsn { segment: SegmentId(2), offset: 176 }
+N17-TRACE open_existing tail=SegmentId(2) tail_offset=176 packed=true mode=Direct segments=[SegmentId(1), SegmentId(2)]
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+N17-TRACE finish segments=[SegmentId(133), SegmentId(134)] ends=[(16384, None), (0, None)] residue=[false, false] stale=[false, false] last_data=0 torn=false stale_trailing=false resume=Lsn { segment: SegmentId(134), offset: 0 }
+N17-TRACE open_existing tail=SegmentId(134) tail_offset=0 packed=false mode=Direct segments=[SegmentId(133), SegmentId(134)]
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+N17-TRACE finish segments=[SegmentId(131), SegmentId(132), SegmentId(133), SegmentId(134), SegmentId(135)] ends=[(16384, None), (4096, None), (16384, None), (16384, None), (0, None)] residue=[false, false, false, false, false] stale=[false, false, false, false, false] last_data=3 torn=false stale_trailing=false resume=Lsn { segment: SegmentId(135), offset: 0 }
+N17-TRACE open_existing tail=SegmentId(135) tail_offset=0 packed=false mode=Direct segments=[SegmentId(131), SegmentId(132), SegmentId(133), SegmentId(134), SegmentId(135)]
+inf-sim: scenario m2-mode-transition seed 0x2: 2000 commands, 10036 steps, 96 keys audited, 1429 required ops, 0 allowed-lost, 0 equivalence checks, 0 documents compared, 14 corpus docs, cut classes [], lift regime true (tiered ops 238, indexed ops 246, sidecars loaded 2, stale slacks lifted 0; plant: cells 2, lifts 2, sidecars 2; torn plants 0), arms [ckpt_downgrades 0 bound_splits 0 waits_fill 0 waits_group 0 plant_fired false], trace 865438 bytes, hash 0x901da0d3439314ad
+inf-sim: sim_seconds=10.720582 published=0 delivered=0

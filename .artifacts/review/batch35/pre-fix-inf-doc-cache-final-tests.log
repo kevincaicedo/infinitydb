@@ -1,0 +1,126 @@
+test path::cache::tests::compile_failures_are_not_cached ... ok
+test path::cache::tests::capacity_zero_disables_but_still_serves ... ok
+test path::cache::tests::distinct_texts_are_distinct_keys_even_when_programs_agree ... ok
+test path::cache::tests::hit_returns_the_cached_program_and_counts ... ok
+test path::cache::tests::legacy_and_dollar_mode_share_the_key_space ... ok
+test path::cache::tests::byte_accounting_is_exact_across_churn ... ok
+test path::cache::tests::lru_evicts_the_coldest_entry ... ok
+test path::cache::tests::namespace_cap_binds_before_the_lookup ... ok
+test path::cache::tests::multi_victim_eviction_does_not_leak_slots ... FAILED
+test path::cache::tests::eviction_keeps_the_structure ... FAILED
+thread 'path::cache::tests::multi_victim_eviction_does_not_leak_slots' (17551) panicked at crates/inf-doc/src/path/cache.rs:475:9:
+assertion `left == right` failed: two victims out, one entry in
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 1 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+thread 'path::cache::tests::eviction_keeps_the_structure' (17547) panicked at crates/inf-doc/src/path/cache.rs:489:9:
+Test failed: assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+minimal failing input: capacity = 2, ops = [
+test result: FAILED. 8 passed; 2 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.01s

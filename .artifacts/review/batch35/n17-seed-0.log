@@ -1,0 +1,2 @@
+inf-sim: scenario m2-mode-transition seed 0x0: 1440 commands, 6835 steps, 72 keys audited, 844 required ops, 99 allowed-lost, 0 equivalence checks, 0 documents compared, 0 corpus docs, cut classes [], lift regime false (tiered ops 0, indexed ops 0, sidecars loaded 0, stale slacks lifted 0; plant: cells 0, lifts 0, sidecars 0), arms [ckpt_downgrades 0 bound_splits 0 waits_fill 287 waits_group 0 plant_fired false], trace 78220 bytes, hash 0xca04263cc9251c53
+inf-sim: sim_seconds=7.244221 published=0 delivered=0

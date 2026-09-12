@@ -1,0 +1,6 @@
+set b'+OK\r\n'
+cold 8420
+after poison 4254710
+hot-set resident bytes 460006
+fresh-cache hot-set bytes 480256
+SHORTFALL 20250 bytes -> LEAK (slots orphaned)

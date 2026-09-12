@@ -1,0 +1,8 @@
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+inf-sim: scenario m2-mode-transition seed 0x2: 2000 commands, 10036 steps, 96 keys audited, 1429 required ops, 0 allowed-lost, 0 equivalence checks, 0 documents compared, 14 corpus docs, cut classes [], lift regime true (tiered ops 238, indexed ops 246, sidecars loaded 2, stale slacks lifted 0; plant: cells 2, lifts 2, sidecars 2), arms [ckpt_downgrades 0 bound_splits 0 waits_fill 0 waits_group 0 plant_fired false], trace 865438 bytes, hash 0x901da0d3439314ad
+inf-sim: sim_seconds=10.720582 published=0 delivered=0

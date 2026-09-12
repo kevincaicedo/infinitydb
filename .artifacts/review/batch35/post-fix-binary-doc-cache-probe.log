@@ -1,0 +1,7 @@
+set b'+OK\r\n'
+cold 8420
+after poison 4255115
+hot-set resident bytes 480256
+fresh-cache hot-set bytes 480256
+SHORTFALL 0 bytes -> exact
+probe exit 0

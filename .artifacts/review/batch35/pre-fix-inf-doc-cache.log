@@ -1,0 +1,40 @@
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+  left: None
+ right: Some(0)
+
+thread 'path::cache::tests::eviction_keeps_the_structure' (15880) panicked at crates/inf-doc/src/path/cache.rs:417:13:
+assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+  left: None
+ right: Some(0)
+
+thread 'path::cache::tests::eviction_keeps_the_structure' (15880) panicked at crates/inf-doc/src/path/cache.rs:487:9:
+Test failed: assertion `left == right` failed: slot 0 is orphaned from its bucket chain
+  left: None
+ right: Some(0).
+minimal failing input: capacity = 2, ops = [
+    (
+        0,
+        0,
+    ),
+    (
+        0,
+        3968,
+    ),
+    (
+        0,
+        3969,
+    ),
+]
+	successes: 0
+	local rejects: 0
+	global rejects: 0
+
+
+
+failures:
+    path::cache::tests::eviction_keeps_the_structure
+    path::cache::tests::multi_victim_eviction_does_not_leak_slots
+
+test result: FAILED. 8 passed; 2 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p inf-doc --lib`

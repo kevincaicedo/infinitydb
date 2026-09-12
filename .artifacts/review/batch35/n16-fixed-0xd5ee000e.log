@@ -1,0 +1,403 @@
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+N17-TRACE finish segments=[SegmentId(33), SegmentId(34)] ends=[(41276, None), (0, None)] residue=[false, false] stale=[false, false] last_data=0 torn=false stale_trailing=false resume=Lsn { segment: SegmentId(34), offset: 0 }
+N17-TRACE open_existing tail=SegmentId(34) tail_offset=0 packed=false mode=Buffered segments=[SegmentId(33), SegmentId(34)]
+N17-TRACE finish segments=[SegmentId(29), SegmentId(30), SegmentId(31), SegmentId(32), SegmentId(33), SegmentId(34), SegmentId(35), SegmentId(36)] ends=[(63218, None), (60633, None), (63742, None), (65452, None), (64985, None), (62427, None), (7535, None), (0, None)] residue=[false, false, false, false, false, false, false, false] stale=[false, false, false, false, false, false, false, false] last_data=6 torn=false stale_trailing=false resume=Lsn { segment: SegmentId(36), offset: 0 }
+N17-TRACE open_existing tail=SegmentId(36) tail_offset=0 packed=false mode=Buffered segments=[SegmentId(29), SegmentId(30), SegmentId(31), SegmentId(32), SegmentId(33), SegmentId(34), SegmentId(35), SegmentId(36)]
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 9 aborted at I/O: EINVAL under O_DIRECT
+N16-TRACE register hash=0x589694a72f34f21d cold=0x85651 winner=0x2d3101 key="k:0:1"
+N16-TRACE settle_pair hash=0x589694a72f34f21d cold=0x85651 winner=0x2d3101
+N16-TRACE drop_ticket cold=0x85651 entry=Some((6383452967616705053, 2961665))
+N16-TRACE register hash=0x440a7bb1480a2a88 cold=0x53952 winner=0x2d429c key="k:0:11"
+N16-TRACE settle_pair hash=0x440a7bb1480a2a88 cold=0x53952 winner=0x2d429c
+N16-TRACE drop_ticket cold=0x53952 entry=Some((4902867145694259848, 2966172))
+N16-TRACE register hash=0xee8bc7ec84f9e684 cold=0x62a7 winner=0x2609dc key="k:0:12"
+N16-TRACE settle_pair hash=0xee8bc7ec84f9e684 cold=0x62a7 winner=0x2609dc
+N16-TRACE drop_ticket cold=0x62a7 entry=Some((17189052221446809220, 2492892))
+N16-TRACE register hash=0xf95f1fe349f67410 cold=0xe8f winner=0x2613ea key="k:0:13"
+N16-TRACE settle_pair hash=0xf95f1fe349f67410 cold=0xe8f winner=0x2613ea
+N16-TRACE drop_ticket cold=0xe8f entry=Some((17969116099290493968, 2495466))
+N16-TRACE register hash=0xecb9abe54e3feec1 cold=0x77778 winner=0x2d4c2a key="k:0:14"
+N16-TRACE settle_pair hash=0xecb9abe54e3feec1 cold=0x77778 winner=0x2d4c2a
+N16-TRACE drop_ticket cold=0x77778 entry=Some((17057854064991137473, 2968618))
+N16-TRACE register hash=0x877417589511b4b0 cold=0x65399 winner=0x2d5f46 key="k:0:18"
+N16-TRACE settle_pair hash=0x877417589511b4b0 cold=0x65399 winner=0x2d5f46
+N16-TRACE drop_ticket cold=0x65399 entry=Some((9760451961644233904, 2973510))
+N16-TRACE register hash=0x8f99b74d7eefc88d cold=0x726ac winner=0x2d68d4 key="k:0:19"
+N16-TRACE settle_pair hash=0x8f99b74d7eefc88d cold=0x726ac winner=0x2d68d4
+N16-TRACE drop_ticket cold=0x726ac entry=Some((10347503162330433677, 2975956))
+N16-TRACE register hash=0xea45f7bea9a86cd3 cold=0x22944 winner=0x263014 key="k:0:2"
+N16-TRACE settle_pair hash=0xea45f7bea9a86cd3 cold=0x22944 winner=0x263014
+N16-TRACE drop_ticket cold=0x22944 entry=Some((16881171176530406611, 2502676))
+N16-TRACE register hash=0xcf8862c6ae872b82 cold=0x3cced winner=0x2d72e2 key="k:0:20"
+N16-TRACE settle_pair hash=0xcf8862c6ae872b82 cold=0x3cced winner=0x2d72e2
+N16-TRACE drop_ticket cold=0x3cced entry=Some((14954311168154872706, 2978530))
+N16-TRACE register hash=0x63a731299a117289 cold=0x6c38a winner=0x2d7df0 key="k:0:21"
+N16-TRACE settle_pair hash=0x63a731299a117289 cold=0x6c38a winner=0x2d7df0
+N16-TRACE drop_ticket cold=0x6c38a entry=Some((7180762185613800073, 2981360))
+N16-TRACE register hash=0x2e735fc43137c693 cold=0x2198d winner=0x263aa1 key="k:0:22"
+N16-TRACE settle_pair hash=0x2e735fc43137c693 cold=0x2198d winner=0x263aa1
+N16-TRACE drop_ticket cold=0x2198d entry=Some((3347124244310378131, 2505377))
+N16-TRACE register hash=0x9719f31da5f0832e cold=0x2c276 winner=0x264c3d key="k:0:3"
+N16-TRACE settle_pair hash=0x9719f31da5f0832e cold=0x2c276 winner=0x264c3d
+N16-TRACE drop_ticket cold=0x2c276 entry=Some((10888000882808488750, 2509885))
+N16-TRACE register hash=0x957ce87f4e14f96e cold=0x872bb winner=0x2d85fe key="k:0:4"
+N16-TRACE settle_pair hash=0x957ce87f4e14f96e cold=0x872bb winner=0x2d85fe
+N16-TRACE drop_ticket cold=0x872bb entry=Some((10771740042231871854, 2983422))
+N16-TRACE register hash=0x744112f1c49d2baa cold=0x62931 winner=0x2d900b key="k:0:5"
+N16-TRACE settle_pair hash=0x744112f1c49d2baa cold=0x62931 winner=0x2d900b
+N16-TRACE drop_ticket cold=0x62931 entry=Some((8376997611480886186, 2985995))
+N16-TRACE register hash=0x9d0264b9fc7e739c cold=0xb535 winner=0x2655ca key="k:0:6"
+N16-TRACE settle_pair hash=0x9d0264b9fc7e739c cold=0xb535 winner=0x2655ca
+N16-TRACE drop_ticket cold=0xb535 entry=Some((11313715963875980188, 2512330))
+N16-TRACE register hash=0x7e69830bd230fd47 cold=0x26fa5 winner=0x2660d7 key="k:0:7"
+N16-TRACE settle_pair hash=0x7e69830bd230fd47 cold=0x26fa5 winner=0x2660d7
+N16-TRACE drop_ticket cold=0x26fa5 entry=Some((9108955808127843655, 2515159))
+N16-TRACE register hash=0x44c23330c399b589 cold=0x7598e winner=0x2d9a98 key="k:0:8"
+N16-TRACE settle_pair hash=0x44c23330c399b589 cold=0x7598e winner=0x2d9a98
+N16-TRACE drop_ticket cold=0x7598e entry=Some((4954578824594044297, 2988696))
+N16-TRACE register hash=0x29d513aa1442481 cold=0x17cb8 winner=0x267271 key="k:1:1"
+N16-TRACE settle_pair hash=0x29d513aa1442481 cold=0x17cb8 winner=0x267271
+N16-TRACE drop_ticket cold=0x17cb8 entry=Some((188396071674979457, 2519665))
+N16-TRACE register hash=0x29b5c27d52f6fcb6 cold=0x11781 winner=0x267c7e key="k:1:10"
+N16-TRACE settle_pair hash=0x29b5c27d52f6fcb6 cold=0x11781 winner=0x267c7e
+N16-TRACE drop_ticket cold=0x11781 entry=Some((3005522169858292918, 2522238))
+N16-TRACE register hash=0x1e19eb624cce57ae cold=0x134fd winner=0x26921a key="k:1:14"
+N16-TRACE settle_pair hash=0x1e19eb624cce57ae cold=0x134fd winner=0x26921a
+N16-TRACE drop_ticket cold=0x134fd entry=Some((2169023502983518126, 2527770))
+N16-TRACE register hash=0xaa977fcf45456514 cold=0x7d49 winner=0x269b28 key="k:1:15"
+N16-TRACE settle_pair hash=0xaa977fcf45456514 cold=0x7d49 winner=0x269b28
+N16-TRACE drop_ticket cold=0x7d49 entry=Some((12292434236128191764, 2530088))
+N16-TRACE register hash=0xe328e96d5732a505 cold=0x786d1 winner=0x2dbcce key="k:1:16"
+N16-TRACE settle_pair hash=0xe328e96d5732a505 cold=0x786d1 winner=0x2dbcce
+N16-TRACE drop_ticket cold=0x786d1 entry=Some((16368589501501711621, 2997454))
+N16-TRACE register hash=0xaa68350f058c2f33 cold=0x6fe94 winner=0x2dc6dc key="k:1:17"
+N16-TRACE settle_pair hash=0xaa68350f058c2f33 cold=0x6fe94 winner=0x2dc6dc
+N16-TRACE drop_ticket cold=0x6fe94 entry=Some((12279122722659512115, 3000028))
+N16-TRACE register hash=0x55f154ff4899aa4d cold=0x1df54 winner=0x26a4b6 key="k:1:18"
+N16-TRACE settle_pair hash=0x55f154ff4899aa4d cold=0x1df54 winner=0x26a4b6
+N16-TRACE drop_ticket cold=0x1df54 entry=Some((6192824418022566477, 2532534))
+N16-TRACE register hash=0x637b5ce65476f65b cold=0x8b8ed winner=0x2dd16a key="k:1:2"
+N16-TRACE settle_pair hash=0x637b5ce65476f65b cold=0x8b8ed winner=0x2dd16a
+N16-TRACE drop_ticket cold=0x8b8ed entry=Some((7168425376219592283, 3002730))
+N16-TRACE register hash=0x97667290eb73f6b4 cold=0x8970 winner=0x26b7d2 key="k:1:20"
+N16-TRACE settle_pair hash=0x97667290eb73f6b4 cold=0x8970 winner=0x26b7d2
+N16-TRACE drop_ticket cold=0x8970 entry=Some((10909533114102707892, 2537426))
+N16-TRACE register hash=0xf1da81ec19fc40a0 cold=0x26 winner=0x26c0e0 key="k:1:21"
+N16-TRACE settle_pair hash=0xf1da81ec19fc40a0 cold=0x26 winner=0x26c0e0
+N16-TRACE drop_ticket cold=0x26 entry=Some((17427384559111782560, 2539744))
+N16-TRACE register hash=0x5fbaf8470ea1381 cold=0x5ba04 winner=0x2dd9f7 key="k:1:22"
+N16-TRACE settle_pair hash=0x5fbaf8470ea1381 cold=0x5ba04 winner=0x2dd9f7
+N16-TRACE drop_ticket cold=0x5ba04 entry=Some((431131172708946817, 3004919))
+N16-TRACE register hash=0xfad418bf05b6c7fc cold=0x82f21 winner=0x2de405 key="k:1:23"
+N16-TRACE settle_pair hash=0xfad418bf05b6c7fc cold=0x82f21 winner=0x2de405
+N16-TRACE drop_ticket cold=0x82f21 entry=Some((18074098413258328060, 3007493))
+N16-TRACE register hash=0xa00374c5fbc1e3be cold=0x8665c winner=0x2dee93 key="k:1:3"
+N16-TRACE settle_pair hash=0xa00374c5fbc1e3be cold=0x8665c winner=0x2dee93
+N16-TRACE drop_ticket cold=0x8665c entry=Some((11530187864679769022, 3010195))
+N16-TRACE register hash=0xbf8ca0edf241f4c2 cold=0xc42a winner=0x26ca6e key="k:1:4"
+N16-TRACE settle_pair hash=0xbf8ca0edf241f4c2 cold=0xc42a winner=0x26ca6e
+N16-TRACE drop_ticket cold=0xc42a entry=Some((13802583901815829698, 2542190))
+N16-TRACE register hash=0xcb1ee10eb83c8ecc cold=0xa627 winner=0x26d27b key="k:1:5"
+N16-TRACE settle_pair hash=0xcb1ee10eb83c8ecc cold=0xa627 winner=0x26d27b
+N16-TRACE drop_ticket cold=0xa627 entry=Some((14636383292337458892, 2544251))
+N16-TRACE register hash=0x1efaefce08675cd0 cold=0x7caad winner=0x2df9a0 key="k:1:6"
+N16-TRACE settle_pair hash=0x1efaefce08675cd0 cold=0x7caad winner=0x2df9a0
+N16-TRACE drop_ticket cold=0x7caad entry=Some((2232360233498795216, 3013024))
+N16-TRACE register hash=0xd3b7350991ac250a cold=0x48062 winner=0x2e02ad key="k:1:7"
+N16-TRACE settle_pair hash=0xd3b7350991ac250a cold=0x48062 winner=0x2e02ad
+N16-TRACE drop_ticket cold=0x48062 entry=Some((15255720577955800330, 3015341))
+N16-TRACE register hash=0x1c3f3e7bd2d3c958 cold=0x55fa winner=0x26db08 key="k:1:8"
+N16-TRACE settle_pair hash=0x1c3f3e7bd2d3c958 cold=0x55fa winner=0x26db08
+N16-TRACE drop_ticket cold=0x55fa entry=Some((2035414258133748056, 2546440))
+N16-TRACE register hash=0x110cf47fcc2b7f73 cold=0x237ee winner=0x26efa2 key="k:2:0"
+N16-TRACE settle_pair hash=0x110cf47fcc2b7f73 cold=0x237ee winner=0x26efa2
+N16-TRACE drop_ticket cold=0x237ee entry=Some((1228625628088729459, 2551714))
+N16-TRACE register hash=0x56d1d97f4c617144 cold=0x6f3a winner=0x26faaf key="k:2:1"
+N16-TRACE settle_pair hash=0x56d1d97f4c617144 cold=0x6f3a winner=0x26faaf
+N16-TRACE drop_ticket cold=0x6f3a entry=Some((6256020498159857988, 2554543))
+N16-TRACE register hash=0x1d7f85bb878bbb49 cold=0x1a60e winner=0x2702bc key="k:2:10"
+N16-TRACE settle_pair hash=0x1d7f85bb878bbb49 cold=0x1a60e winner=0x2702bc
+N16-TRACE drop_ticket cold=0x1a60e entry=Some((2125564589621623625, 2556604))
+N16-TRACE register hash=0x1f5029318b46df08 cold=0x29a7 winner=0x270b4a key="k:2:11"
+N16-TRACE settle_pair hash=0x1f5029318b46df08 cold=0x29a7 winner=0x270b4a
+N16-TRACE drop_ticket cold=0x29a7 entry=Some((2256348706079432456, 2558794))
+N16-TRACE register hash=0xd8bcf196f465c9b cold=0x6635a winner=0x2e15c8 key="k:2:13"
+N16-TRACE settle_pair hash=0xd8bcf196f465c9b cold=0x6635a winner=0x2e15c8
+N16-TRACE drop_ticket cold=0x6635a entry=Some((976101452403858587, 3020232))
+N16-TRACE register hash=0xf03408c2a4f5496f cold=0x6d024 winner=0x2e1fd6 key="k:2:16"
+N16-TRACE settle_pair hash=0xf03408c2a4f5496f cold=0x6d024 winner=0x2e1fd6
+N16-TRACE drop_ticket cold=0x6d024 entry=Some((17308468899975874927, 3022806))
+N16-TRACE register hash=0xc94e0b216385d13c cold=0xcc04 winner=0x2e27e4 key="k:2:17"
+N16-TRACE settle_pair hash=0xc94e0b216385d13c cold=0xcc04 winner=0x2e27e4
+N16-TRACE drop_ticket cold=0xcc04 entry=Some((14505543687838486844, 3024868))
+N16-TRACE register hash=0x8b12f1e805b2e635 cold=0x1c1c8 winner=0x2729f4 key="k:2:18"
+N16-TRACE settle_pair hash=0x8b12f1e805b2e635 cold=0x1c1c8 winner=0x2729f4
+N16-TRACE drop_ticket cold=0x1c1c8 entry=Some((10021338099683092021, 2566644))
+N16-TRACE register hash=0x5735a08e0bf58fa8 cold=0x2b404 winner=0x273302 key="k:2:19"
+N16-TRACE settle_pair hash=0x5735a08e0bf58fa8 cold=0x2b404 winner=0x273302
+N16-TRACE drop_ticket cold=0x2b404 entry=Some((6284105387011837864, 2568962))
+N16-TRACE register hash=0xccbe6322f0c3a260 cold=0x85676 winner=0x2e3072 key="k:2:2"
+N16-TRACE settle_pair hash=0xccbe6322f0c3a260 cold=0x85676 winner=0x2e3072
+N16-TRACE drop_ticket cold=0x85676 entry=Some((14753338431031714400, 3027058))
+N16-TRACE register hash=0xcd4bd92331576f46 cold=0x108c3 winner=0x273c90 key="k:2:20"
+N16-TRACE settle_pair hash=0xcd4bd92331576f46 cold=0x108c3 winner=0x273c90
+N16-TRACE drop_ticket cold=0x108c3 entry=Some((14793156146203422534, 2571408))
+N16-TRACE register hash=0xd1996c9aa4d26493 cold=0x20a5d winner=0x27471e key="k:2:21"
+N16-TRACE settle_pair hash=0xd1996c9aa4d26493 cold=0x20a5d winner=0x27471e
+N16-TRACE drop_ticket cold=0x20a5d entry=Some((15103222236809684115, 2574110))
+N16-TRACE register hash=0xb0115cc0f2593ef7 cold=0x7a1aa winner=0x2e3a7f key="k:2:22"
+N16-TRACE settle_pair hash=0xb0115cc0f2593ef7 cold=0x7a1aa winner=0x2e3a7f
+N16-TRACE drop_ticket cold=0x7a1aa entry=Some((12687023609048809207, 3029631))
+N16-TRACE register hash=0xe6dfd60af6ae7cca cold=0x6feba winner=0x2e428d key="k:2:23"
+N16-TRACE settle_pair hash=0xe6dfd60af6ae7cca cold=0x6feba winner=0x2e428d
+N16-TRACE drop_ticket cold=0x6feba entry=Some((16636250891106548938, 3031693))
+N16-TRACE register hash=0xbee5286d00fbfe55 cold=0x4c59b winner=0x2e4b1b key="k:2:3"
+N16-TRACE settle_pair hash=0xbee5286d00fbfe55 cold=0x4c59b winner=0x2e4b1b
+N16-TRACE drop_ticket cold=0x4c59b entry=Some((13755445085506109013, 3033883))
+N16-TRACE register hash=0x4087226714d07882 cold=0xc405 winner=0x27522c key="k:2:4"
+N16-TRACE settle_pair hash=0x4087226714d07882 cold=0xc405 winner=0x27522c
+N16-TRACE drop_ticket cold=0xc405 entry=Some((4649722966409508994, 2576940))
+N16-TRACE register hash=0x9ba139fdbf43a4d8 cold=0x6282 winner=0x275bb9 key="k:2:5"
+N16-TRACE settle_pair hash=0x9ba139fdbf43a4d8 cold=0x6282 winner=0x275bb9
+N16-TRACE drop_ticket cold=0x6282 entry=Some((11214308309127636184, 2579385))
+N16-TRACE register hash=0x9597e43f9c06a8f1 cold=0x76775 winner=0x2e5eb5 key="k:2:7"
+N16-TRACE settle_pair hash=0x9597e43f9c06a8f1 cold=0x76775 winner=0x2e5eb5
+N16-TRACE drop_ticket cold=0x76775 entry=Some((10779335194986326257, 3038901))
+N16-TRACE register hash=0xd466d62a73fd33ae cold=0x142d9 winner=0x2765c6 key="k:2:8"
+N16-TRACE settle_pair hash=0xd466d62a73fd33ae cold=0x142d9 winner=0x2765c6
+N16-TRACE drop_ticket cold=0x142d9 entry=Some((15305155861488153518, 2581958))
+N16-TRACE register hash=0xbfcb6cf393f21da9 cold=0x1b52a winner=0x276dd3 key="k:2:9"
+N16-TRACE settle_pair hash=0xbfcb6cf393f21da9 cold=0x1b52a winner=0x276dd3
+N16-TRACE drop_ticket cold=0x1b52a entry=Some((13820259674931469737, 2584019))
+N16-TRACE register hash=0x1b528271bd3e09f cold=0x6cfff winner=0x2e69c2 key="k:3:0"
+N16-TRACE settle_pair hash=0x1b528271bd3e09f cold=0x6cfff winner=0x2e69c2
+N16-TRACE drop_ticket cold=0x6cfff entry=Some((123048713258262687, 3041730))
+N16-TRACE register hash=0x47fff1b12e31c5cd cold=0x88e96 winner=0x2e866a key="k:3:11"
+N16-TRACE settle_pair hash=0x47fff1b12e31c5cd cold=0x88e96 winner=0x2e866a
+N16-TRACE drop_ticket cold=0x88e96 entry=Some((5188131039040619981, 3049066))
+N16-TRACE register hash=0xf34faa2e836e6f08 cold=0x3934 winner=0x277660 key="k:3:12"
+N16-TRACE settle_pair hash=0xf34faa2e836e6f08 cold=0x3934 winner=0x277660
+N16-TRACE drop_ticket cold=0x3934 entry=Some((17532418991126900488, 2586208))
+N16-TRACE register hash=0xbe6c8e895b8b846 cold=0x1089d winner=0x27816e key="k:3:13"
+N16-TRACE settle_pair hash=0xbe6c8e895b8b846 cold=0x1089d winner=0x27816e
+N16-TRACE drop_ticket cold=0x1089d entry=Some((857593680330537030, 2589038))
+N16-TRACE register hash=0xf0eb2cd8f3892620 cold=0x5f17d winner=0x2e90f8 key="k:3:14"
+N16-TRACE settle_pair hash=0xf0eb2cd8f3892620 cold=0x5f17d winner=0x2e90f8
+N16-TRACE drop_ticket cold=0x5f17d entry=Some((17360018498940118560, 3051768))
+N16-TRACE register hash=0xf71f5edb04d24be cold=0x8141c winner=0x2e9986 key="k:3:15"
+N16-TRACE settle_pair hash=0xf71f5edb04d24be cold=0x8141c winner=0x2e9986
+N16-TRACE drop_ticket cold=0x8141c entry=Some((1112940984151123134, 3053958))
+N16-TRACE register hash=0xedb3577ceeaf5cd0 cold=0x1b97 winner=0x27897c key="k:3:16"
+N16-TRACE settle_pair hash=0xedb3577ceeaf5cd0 cold=0x1b97 winner=0x27897c
+N16-TRACE drop_ticket cold=0x1b97 entry=Some((17128130001912159440, 2591100))
+N16-TRACE register hash=0x356574ced8d03fa2 cold=0xd392 winner=0x27930a key="k:3:17"
+N16-TRACE settle_pair hash=0x356574ced8d03fa2 cold=0xd392 winner=0x27930a
+N16-TRACE drop_ticket cold=0xd392 entry=Some((3847609888407568290, 2593546))
+N16-TRACE register hash=0x1024f8a375484d44 cold=0x3ccc7 winner=0x2ea294 key="k:3:18"
+N16-TRACE settle_pair hash=0x1024f8a375484d44 cold=0x3ccc7 winner=0x2ea294
+N16-TRACE drop_ticket cold=0x3ccc7 entry=Some((1163327984699460932, 3056276))
+N16-TRACE register hash=0xa13d248fc827120d cold=0x1cf67 winner=0x279d18 key="k:3:2"
+N16-TRACE settle_pair hash=0xa13d248fc827120d cold=0x1cf67 winner=0x279d18
+N16-TRACE drop_ticket cold=0x1cf67 entry=Some((11618482813642674701, 2596120))
+N16-TRACE register hash=0x429e45f20d8fad90 cold=0x6534d winner=0x2eb830 key="k:3:20"
+N16-TRACE settle_pair hash=0x429e45f20d8fad90 cold=0x6534d winner=0x2eb830
+N16-TRACE drop_ticket cold=0x6534d entry=Some((4800351158735449488, 3061808))
+N16-TRACE register hash=0x5fcffd2fd587a0e4 cold=0x5ac8d winner=0x2ec0be key="k:3:21"
+N16-TRACE settle_pair hash=0x5fcffd2fd587a0e4 cold=0x5ac8d winner=0x2ec0be
+N16-TRACE drop_ticket cold=0x5ac8d entry=Some((6904015135669985508, 3063998))
+N16-TRACE register hash=0x604fb0b00dc7a89a cold=0xdfec winner=0x27a525 key="k:3:22"
+N16-TRACE settle_pair hash=0x604fb0b00dc7a89a cold=0xdfec winner=0x27a525
+N16-TRACE drop_ticket cold=0xdfec entry=Some((6939959820993144986, 2598181))
+N16-TRACE register hash=0x49cb3f11d43c1e1e cold=0x14fe0 winner=0x27aeb3 key="k:3:23"
+N16-TRACE settle_pair hash=0x49cb3f11d43c1e1e cold=0x14fe0 winner=0x27aeb3
+N16-TRACE drop_ticket cold=0x14fe0 entry=Some((5317413130848706078, 2600627))
+N16-TRACE register hash=0x82269590685de591 cold=0x1979a winner=0x27b8c1 key="k:3:3"
+N16-TRACE settle_pair hash=0x82269590685de591 cold=0x1979a winner=0x27b8c1
+N16-TRACE drop_ticket cold=0x1979a entry=Some((9378347721504449937, 2603201))
+N16-TRACE register hash=0x5a6de4490506a074 cold=0x3314f winner=0x2ec9cc key="k:3:4"
+N16-TRACE settle_pair hash=0x5a6de4490506a074 cold=0x3314f winner=0x2ec9cc
+N16-TRACE drop_ticket cold=0x3314f entry=Some((6516115238143041652, 3066316))
+N16-TRACE register hash=0x2c8d21f7050451c0 cold=0x59dc8 winner=0x2ed4d9 key="k:3:5"
+N16-TRACE settle_pair hash=0x2c8d21f7050451c0 cold=0x59dc8 winner=0x2ed4d9
+N16-TRACE drop_ticket cold=0x59dc8 entry=Some((3210259454209839552, 3069145))
+N16-TRACE register hash=0x7b4548cbec4ca40c cold=0x96f6 winner=0x27c34e key="k:3:6"
+N16-TRACE settle_pair hash=0x7b4548cbec4ca40c cold=0x96f6 winner=0x27c34e
+N16-TRACE drop_ticket cold=0x96f6 entry=Some((8882585880738178060, 2605902))
+N16-TRACE register hash=0xce031c787aecbaa8 cold=0x48ca winner=0x27cbdb key="k:3:7"
+N16-TRACE settle_pair hash=0xce031c787aecbaa8 cold=0x48ca winner=0x27cbdb
+N16-TRACE drop_ticket cold=0x48ca entry=Some((14844740100527274664, 2608091))
+N16-TRACE register hash=0xfaf783aa2a68a825 cold=0x7d8ff winner=0x2edce6 key="k:3:8"
+N16-TRACE settle_pair hash=0xfaf783aa2a68a825 cold=0x7d8ff winner=0x2edce6
+N16-TRACE drop_ticket cold=0x7d8ff entry=Some((18084067595608696869, 3071206))
+N16-TRACE register hash=0x80e71e9007f37fba cold=0x70dba winner=0x2ee673 key="k:3:9"
+N16-TRACE settle_pair hash=0x80e71e9007f37fba cold=0x70dba winner=0x2ee673
+N16-TRACE drop_ticket cold=0x70dba entry=Some((9288426360432459706, 3073651))
+N16-TRACE register hash=0xd3287f6fdefa4c8b cold=0x28f53 winner=0x2efb0d key="k:4:1"
+N16-TRACE settle_pair hash=0xd3287f6fdefa4c8b cold=0x28f53 winner=0x2efb0d
+N16-TRACE drop_ticket cold=0x28f53 entry=Some((15215551459530263691, 3078925))
+N16-TRACE register hash=0xbbfab8250297174c cold=0x5716b winner=0x2f061a key="k:4:10"
+N16-TRACE settle_pair hash=0xbbfab8250297174c cold=0x5716b winner=0x2f061a
+N16-TRACE drop_ticket cold=0x5716b entry=Some((13545341298366945100, 3081754))
+N16-TRACE register hash=0xd67e093178898f59 cold=0x6df99 winner=0x2f0e28 key="k:4:11"
+N16-TRACE settle_pair hash=0xd67e093178898f59 cold=0x6df99 winner=0x2f0e28
+N16-TRACE drop_ticket cold=0x6df99 entry=Some((15455801079262449497, 3083816))
+N16-TRACE register hash=0xd72eda2113f7ed0f cold=0x28981 winner=0x27d4e8 key="k:4:12"
+N16-TRACE settle_pair hash=0xd72eda2113f7ed0f cold=0x28981 winner=0x27d4e8
+N16-TRACE drop_ticket cold=0x28981 entry=Some((15505570402686987535, 2610408))
+N16-TRACE register hash=0x970c2e1c010f8b03 cold=0x1facd winner=0x27ddf6 key="k:4:13"
+N16-TRACE settle_pair hash=0x970c2e1c010f8b03 cold=0x1facd winner=0x27ddf6
+N16-TRACE drop_ticket cold=0x1facd entry=Some((10884125097259404035, 2612726))
+N16-TRACE register hash=0xd4d5f02d0df69c4d cold=0x52a91 winner=0x2f16b6 key="k:4:14"
+N16-TRACE settle_pair hash=0xd4d5f02d0df69c4d cold=0x52a91 winner=0x2f16b6
+N16-TRACE drop_ticket cold=0x52a91 entry=Some((15336428182378552397, 3086006))
+N16-TRACE register hash=0x7d323a187a2c43b3 cold=0x8057b winner=0x2f20c4 key="k:4:15"
+N16-TRACE settle_pair hash=0x7d323a187a2c43b3 cold=0x8057b winner=0x2f20c4
+N16-TRACE drop_ticket cold=0x8057b entry=Some((9021336880379872179, 3088580))
+N16-TRACE register hash=0xc2aec6b7fe415e3d cold=0x1faa7 winner=0x27e784 key="k:4:16"
+N16-TRACE settle_pair hash=0xc2aec6b7fe415e3d cold=0x1faa7 winner=0x27e784
+N16-TRACE drop_ticket cold=0x1faa7 entry=Some((14028368382852685373, 2615172))
+N16-TRACE register hash=0x3e26935a51386e9f cold=0x2974f winner=0x27f292 key="k:4:17"
+N16-TRACE settle_pair hash=0x3e26935a51386e9f cold=0x2974f winner=0x27f292
+N16-TRACE drop_ticket cold=0x2974f entry=Some((4478428895585529503, 2618002))
+N16-TRACE register hash=0xd5506d61a0b8910b cold=0x8ab36 winner=0x2f2b52 key="k:4:18"
+N16-TRACE settle_pair hash=0xd5506d61a0b8910b cold=0x8ab36 winner=0x2f2b52
+N16-TRACE drop_ticket cold=0x8ab36 entry=Some((15370905794291208459, 3091282))
+N16-TRACE register hash=0xe2f9f6348b578f84 cold=0x6a79e winner=0x2f3cee key="k:4:20"
+N16-TRACE settle_pair hash=0xe2f9f6348b578f84 cold=0x6a79e winner=0x2f3cee
+N16-TRACE drop_ticket cold=0x6a79e entry=Some((16355374227309170564, 3095790))
+N16-TRACE register hash=0x6ddbbc957531a306 cold=0xfaf6 winner=0x28042d key="k:4:22"
+N16-TRACE settle_pair hash=0x6ddbbc957531a306 cold=0xfaf6 winner=0x28042d
+N16-TRACE drop_ticket cold=0xfaf6 entry=Some((7916128120136114950, 2622509))
+N16-TRACE register hash=0xf57ab2c19308fb00 cold=0x0 winner=0x280f3b key="k:4:23"
+N16-TRACE settle_pair hash=0xf57ab2c19308fb00 cold=0x0 winner=0x280f3b
+N16-TRACE drop_ticket cold=0x0 entry=Some((17688647030916315904, 2625339))
+N16-TRACE register hash=0xb77710986f337afd cold=0x83c82 winner=0x2f518a key="k:4:4"
+N16-TRACE settle_pair hash=0xb77710986f337afd cold=0x83c82 winner=0x2f518a
+N16-TRACE drop_ticket cold=0x83c82 entry=Some((13220053478056098557, 3101066))
+N16-TRACE register hash=0xdb4ae4bf359c3a59 cold=0x7333a winner=0x2f5a97 key="k:4:5"
+N16-TRACE settle_pair hash=0xdb4ae4bf359c3a59 cold=0x7333a winner=0x2f5a97
+N16-TRACE drop_ticket cold=0x7333a entry=Some((15801693752472123993, 3103383))
+N16-TRACE register hash=0xbf108e988dfa1a43 cold=0x20a38 winner=0x281fd6 key="k:4:6"
+N16-TRACE settle_pair hash=0xbf108e988dfa1a43 cold=0x20a38 winner=0x281fd6
+N16-TRACE drop_ticket cold=0x20a38 entry=Some((13767660846739757635, 2629590))
+N16-TRACE register hash=0x9aa5656df828c95 cold=0x1c1a3 winner=0x2829e3 key="k:4:7"
+N16-TRACE settle_pair hash=0x9aa5656df828c95 cold=0x1c1a3 winner=0x2829e3
+N16-TRACE drop_ticket cold=0x1c1a3 entry=Some((696464023499213973, 2632163))
+N16-TRACE register hash=0x6455677bdbf9a087 cold=0x87f11 winner=0x2f6424 key="k:4:8"
+N16-TRACE settle_pair hash=0x6455677bdbf9a087 cold=0x87f11 winner=0x2f6424
+N16-TRACE drop_ticket cold=0x87f11 entry=Some((7229798558482407559, 3105828))
+N16-TRACE register hash=0x869ecd2185e15865 cold=0x7e909 winner=0x2f6f31 key="k:4:9"
+N16-TRACE settle_pair hash=0x869ecd2185e15865 cold=0x7e909 winner=0x2f6f31
+N16-TRACE drop_ticket cold=0x7e909 entry=Some((9700416191266379877, 3108657))
+N16-TRACE register hash=0xe1846e644ab8e5e2 cold=0xd3b8 winner=0x283cfd key="k:5:1"
+N16-TRACE settle_pair hash=0xe1846e644ab8e5e2 cold=0xd3b8 winner=0x283cfd
+N16-TRACE drop_ticket cold=0xd3b8 entry=Some((16250234732489008610, 2637053))
+N16-TRACE register hash=0xe34934e87a960067 cold=0x27bdd winner=0x284f98 key="k:5:11"
+N16-TRACE settle_pair hash=0xe34934e87a960067 cold=0x27bdd winner=0x284f98
+N16-TRACE drop_ticket cold=0x27bdd entry=Some((16377679693003227239, 2641816))
+N16-TRACE register hash=0x500acac0e996da4e cold=0x7f6d1 winner=0x2f773e key="k:5:12"
+N16-TRACE settle_pair hash=0x500acac0e996da4e cold=0x7f6d1 winner=0x2f773e
+N16-TRACE drop_ticket cold=0x7f6d1 entry=Some((5767645202702850638, 3110718))
+N16-TRACE register hash=0xf7571025e9a14a5f cold=0x2a5b7 winner=0x2859a6 key="k:5:14"
+N16-TRACE settle_pair hash=0xf7571025e9a14a5f cold=0x2a5b7 winner=0x2859a6
+N16-TRACE drop_ticket cold=0x2a5b7 entry=Some((17822731805361523295, 2644390))
+N16-TRACE register hash=0x5c5f753503a3b1ba cold=0xee41 winner=0x2861b4 key="k:5:15"
+N16-TRACE settle_pair hash=0x5c5f753503a3b1ba cold=0xee41 winner=0x2861b4
+N16-TRACE drop_ticket cold=0xee41 entry=Some((6656167644831658426, 2646452))
+N16-TRACE register hash=0x2cd7c43ec5e001d4 cold=0x93dc winner=0x2f8cda key="k:5:16"
+N16-TRACE settle_pair hash=0x2cd7c43ec5e001d4 cold=0x93dc winner=0x2f8cda
+N16-TRACE drop_ticket cold=0x93dc entry=Some((3231267031548428756, 3116250))
+N16-TRACE register hash=0x39af3917dc12b947 cold=0x2daf3 winner=0x2f95e8 key="k:5:17"
+N16-TRACE settle_pair hash=0x39af3917dc12b947 cold=0x2daf3 winner=0x2f95e8
+N16-TRACE drop_ticket cold=0x2daf3 entry=Some((4156603755725502791, 3118568))
+N16-TRACE register hash=0x7d6bf0ccbfbf025b cold=0x25434 winner=0x286a42 key="k:5:18"
+N16-TRACE settle_pair hash=0x7d6bf0ccbfbf025b cold=0x25434 winner=0x286a42
+N16-TRACE drop_ticket cold=0x25434 entry=Some((9037581839429993051, 2648642))
+N16-TRACE register hash=0xa37d9cb40a41777a cold=0x6d04a winner=0x2f9f76 key="k:5:2"
+N16-TRACE settle_pair hash=0xa37d9cb40a41777a cold=0x6d04a winner=0x2f9f76
+N16-TRACE drop_ticket cold=0x6d04a entry=Some((11780744497351194490, 3121014))
+N16-TRACE register hash=0xbf562086e871f76b cold=0x2447e winner=0x287ede key="k:5:20"
+N16-TRACE settle_pair hash=0xbf562086e871f76b cold=0x2447e winner=0x287ede
+N16-TRACE drop_ticket cold=0x2447e entry=Some((13787243073038841707, 2653918))
+N16-TRACE register hash=0x44ea2160496a7b61 cold=0x18b3f winner=0x2886ec key="k:5:21"
+N16-TRACE settle_pair hash=0x44ea2160496a7b61 cold=0x18b3f winner=0x2886ec
+N16-TRACE drop_ticket cold=0x18b3f entry=Some((4965818236561685345, 2655980))
+N16-TRACE register hash=0xffc920c34038e4f1 cold=0x5545c winner=0x2faa83 key="k:5:22"
+N16-TRACE settle_pair hash=0xffc920c34038e4f1 cold=0x5545c winner=0x2faa83
+N16-TRACE drop_ticket cold=0x5545c entry=Some((18431298972958647537, 3123843))
+N16-TRACE register hash=0xeb10a883b78635ed cold=0x233bf winner=0x2fb391 key="k:5:23"
+N16-TRACE settle_pair hash=0xeb10a883b78635ed cold=0x233bf winner=0x2fb391
+N16-TRACE drop_ticket cold=0x233bf entry=Some((16938223482213643757, 3126161))
+N16-TRACE register hash=0x38fd6a2d7cb34bcc cold=0x60c2a winner=0x2fbd1f key="k:5:3"
+N16-TRACE settle_pair hash=0x38fd6a2d7cb34bcc cold=0x60c2a winner=0x2fbd1f
+N16-TRACE drop_ticket cold=0x60c2a entry=Some((4106555178829958092, 3128607))
+N16-TRACE register hash=0x716de12399188a07 cold=0x2606f winner=0x288f7a key="k:5:4"
+N16-TRACE settle_pair hash=0x716de12399188a07 cold=0x2606f winner=0x288f7a
+N16-TRACE drop_ticket cold=0x2606f entry=Some((8173436441755945479, 2658170))
+N16-TRACE register hash=0x6ddc44baa58744ad cold=0x1edc0 winner=0x289a07 key="k:5:5"
+N16-TRACE settle_pair hash=0x6ddc44baa58744ad cold=0x1edc0 winner=0x289a07
+N16-TRACE drop_ticket cold=0x1edc0 entry=Some((7916277813442200749, 2660871))
+N16-TRACE register hash=0xa693c9afc2e092ff cold=0x6ef57 winner=0x2fcf39 key="k:5:7"
+N16-TRACE settle_pair hash=0xa693c9afc2e092ff cold=0x6ef57 winner=0x2fcf39
+N16-TRACE drop_ticket cold=0x6ef57 entry=Some((12003159188598461183, 3133241))
+N16-TRACE register hash=0x9446ff5aa4bb31b7 cold=0x2895c winner=0x28a514 key="k:5:8"
+N16-TRACE settle_pair hash=0x9446ff5aa4bb31b7 cold=0x2895c winner=0x28a514
+N16-TRACE drop_ticket cold=0x2895c entry=Some((10684507930758951351, 2663700))
+N16-TRACE register hash=0x6022f8dd7e597d9e cold=0x15f7c winner=0x28ae21 key="k:5:9"
+N16-TRACE settle_pair hash=0x6022f8dd7e597d9e cold=0x15f7c winner=0x28ae21
+N16-TRACE drop_ticket cold=0x15f7c entry=Some((6927372807040499102, 2666017))
+N16-TRACE register hash=0x9364200c5e653004 cold=0x6e8c winner=0x2fd7c6 key="{shadow-collide}&ɘʡ�e(\u{e}\0��\0\0\0\0bbbbbbbbbbbbbbbb"
+N16-TRACE drop_ticket cold=0x6e8c entry=Some((10620649058741858308, 3135430))
+N16-TRACE register hash=0x9364200c5e653004 cold=0x6e8c winner=0x2fddfe key="{shadow-collide}&ɘʡ�e(\u{e}\0��\0\0\0\0aaaaaaaaaaaaaaaa"
+N16-TRACE settle_pair hash=0x9364200c5e653004 cold=0x6e8c winner=0x2fddfe
+N16-TRACE drop_ticket cold=0x6e8c entry=Some((10620649058741858308, 3137022))
+N16-TRACE register hash=0x863658374f94cd cold=0x1f358 winner=0x2fe736 key="{shadow-collide}7Bi��J)�\u{1b}|���y7�bbbbbbbbbbbbbbbb"
+N16-TRACE drop_ticket cold=0x1f358 entry=Some((37777399392212173, 3139382))
+N16-TRACE register hash=0x863658374f94cd cold=0x1f358 winner=0x2fed6e key="{shadow-collide}7Bi��J)�\u{1b}|���y7�aaaaaaaaaaaaaaaa"
+N16-TRACE settle_pair hash=0x863658374f94cd cold=0x1f358 winner=0x2fed6e
+N16-TRACE drop_ticket cold=0x1f358 entry=Some((37777399392212173, 3140974))
+N16-TRACE register hash=0x1e5ece34c5ea53a7 cold=0x2e83f winner=0x2ff6a6 key="{shadow-collide}�ʯ�\u{16}.z�$�z+r�n<bbbbbbbbbbbbbbbb"
+N16-TRACE drop_ticket cold=0x2e83f entry=Some((2188413195002729383, 3143334))
+N16-TRACE register hash=0x1e5ece34c5ea53a7 cold=0x2e83f winner=0x2ffcde key="{shadow-collide}�ʯ�\u{16}.z�$�z+r�n<aaaaaaaaaaaaaaaa"
+N16-TRACE settle_pair hash=0x1e5ece34c5ea53a7 cold=0x2e83f winner=0x2ffcde
+N16-TRACE drop_ticket cold=0x2e83f entry=Some((2188413195002729383, 3144926))
+N16-TRACE register hash=0x272ee794a8ab3a4d cold=0x1fb90 winner=0x300616 key="{shadow-collide}\u{5}D��z�\u{10}c1t1�,m��bbbbbbbbbbbbbbbb"
+N16-TRACE drop_ticket cold=0x1fb90 entry=Some((2823448642078849613, 3147286))
+N16-TRACE register hash=0x272ee794a8ab3a4d cold=0x1fb90 winner=0x300c4e key="{shadow-collide}\u{5}D��z�\u{10}c1t1�,m��aaaaaaaaaaaaaaaa"
+N16-TRACE settle_pair hash=0x272ee794a8ab3a4d cold=0x1fb90 winner=0x300c4e
+N16-TRACE drop_ticket cold=0x1fb90 entry=Some((2823448642078849613, 3148878))
+N16-TRACE register hash=0xc6bc4039275e867b cold=0x2d3e2 winner=0x301586 key="open:sk:0"
+N16-TRACE register hash=0x2bfeeaaab8102375 cold=0x1ec47 winner=0x301d17 key="open:sk:1"
+N16-TRACE register hash=0x3bef25970c7a08de cold=0x16e96 winner=0x28b7ae key="open:sk:2"
+N16-TRACE register hash=0x38b315b8d535a97e cold=0x175a7 winner=0x28bf3f key="open:sk:3"
+N16-TRACE drop_ticket cold=0x2d3e2 entry=Some((14320391529349154427, 3155112))
+N16-TRACE drop_ticket cold=0x1ec47 entry=Some((3170229206668813173, 3157305))
+N16-TRACE register hash=0xb9c4b80f761f044a cold=0x1030b winner=0x3035ca key="{shadow-collide}��\u{5aa}/�A���\u{18}��ͻ�bbbbbbbbbbbbbbbb"
+N16-TRACE register hash=0x45050ec6411184de cold=0x14ef3 winner=0x30423a key="{shadow-collide}�N%���d��\\�\t�G�bbbbbbbbbbbbbbbb"
+N16-TRACE register hash=0xe5086134f0ea5ac5 cold=0x1c879 winner=0x304eaa key="{shadow-collide}\u{c}Z\u{13}f>�$��أ�>�*.bbbbbbbbbbbbbbbb"
+N16-TRACE register hash=0x2ecefdb1e068ed3f cold=0x31d81 winner=0x305b1a key="{shadow-collide}\u{1d}�Y\u{1d}���{�Tx\u{8}�:b�bbbbbbbbbbbbbbbb"
+N16-TRACE drop_ticket cold=0x1030b entry=Some((13386026368997721162, 3159498))
+N16-TRACE drop_ticket cold=0x14ef3 entry=Some((4973397608158561502, 3162682))
+N16-TRACE drop_ticket cold=0x1c879 entry=Some((16503547714507266757, 3165866))
+N16-TRACE drop_ticket cold=0x31d81 entry=Some((3372912111363091775, 3169050))
+N16-TRACE register hash=0xe3151af7293ee6f3 cold=0x28841 winner=0x30846a key="open:fault"
+N16-TRACE settle_pair hash=0x3bef25970c7a08de cold=0x16e96 winner=0x28c6d0
+N16-TRACE drop_ticket cold=0x16e96 entry=Some((4318711898351208670, 2672336))
+N16-TRACE settle_pair hash=0x38b315b8d535a97e cold=0x175a7 winner=0x28cf61
+N16-TRACE drop_ticket cold=0x175a7 entry=Some((4085633170550401406, 2674529))
+N16-TRACE settle_pair hash=0xe3151af7293ee6f3 cold=0x28841 winner=0x30846a
+N16-TRACE drop_ticket cold=0x28841 entry=Some((16363014469971797747, 3179626))
+N16-TRACE register hash=0x20b011b11e36076d cold=0x22d47 winner=0x3090f4 key="{shadow-collide}��w�\u{16}ylK\u{c}\0��\0\0\0\0aaaaaaaaaaaaaaaa"
+N16-TRACE walk addr=0x22d47 w=0x2008d7 winner=false cold=true hash=0x20b011b11e36076d
+N16-TRACE walk addr=0x3090f4 w=0x2008d7 winner=true cold=false hash=0x20b011b11e36076d
+N16-TRACE walk addr=0x22d47 w=0x2008d7 winner=false cold=true hash=0x20b011b11e36076d
+N16-TRACE walk addr=0x3090f4 w=0x2008d7 winner=true cold=false hash=0x20b011b11e36076d
+inf-sim: m4-tiered seed 0xd5ee000e: 5620 commands, 13328 steps, 144 keys audited, 1785 required ops, 5 allowed-lost, 0 B flushed pre-cut, 1050329 B flushed final, 212 cold resolves, 472 blob sets, 0 DISKFULL refusals (reopened: false), drop-race 0 values / 0 typed-other, post-drop reboot false (MANIFEST residue false), cut inside DROP after 0 steps: NotReached, refused-boot false, shadow arm true (60 tickets, 0 open at the cut, 60 same-key / 0 collision, 0 stale, 0 fallbacks; phase 6b cold resolves 174; phase 6c 4 pairs: 8 tickets, 4 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins), blob-key race 8 replans, dir-open fault arm false (fired 0), ckpt downgrades 2 / bound splits 0, trace 29791483 bytes, hash 0x15690837bfa9274a
+inf-sim: sim_seconds=53.238962 published=0 delivered=0
+inf-sim: VIOLATION: seed 0xd5ee000e: REBUILT-TICKET ROW VACUOUS seed 0xd5ee000e: the flush lane never caught the seal boundary past s2 (sealed 5244901 → 6291919 B, confirmed 3149744 → 5244633 B)

@@ -1,0 +1,10 @@
+   Compiling inf-doc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-doc)
+   Compiling inf-query v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-query)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.54s
+     Running unittests src/lib.rs (target/debug/deps/inf_query-dfe633b83bf7426d)
+
+running 1 test
+test partiql::cache::tests::eviction_and_invalidation_never_panic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 6.08s
+

@@ -1,0 +1,16 @@
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 18 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 20 aborted at I/O: EINVAL under O_DIRECT
+inf-sim: m4-tiered seed 0xd5ee003e: 5726 commands, 20218 steps, 144 keys audited, 1973 required ops, 0 allowed-lost, 1049225 B flushed pre-cut, 1048617 B flushed final, 194 cold resolves, 485 blob sets, 1 DISKFULL refusals (reopened: true), drop-race 3 values / 27 typed-other, post-drop reboot true (MANIFEST residue true), cut inside DROP after 31 steps: Swept, refused-boot false, shadow arm true (54 tickets, 0 open at the cut, 54 same-key / 0 collision, 0 stale, 0 fallbacks; phase 6b cold resolves 156; phase 6c 4 pairs: 8 tickets, 4 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins), blob-key race 9 replans, dir-open fault arm false (fired 0), ckpt downgrades 6 / bound splits 0, trace 22091018 bytes, hash 0x6f580fa9aea35170
+inf-sim: sim_seconds=40.773270 published=0 delivered=0
