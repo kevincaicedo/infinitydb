@@ -122,6 +122,7 @@ fn base(scenario: &SidecarScenario) -> DurableScenario {
         // land inside, and mid-write cuts land across every phase.
         ckpt_stream_bytes_per_sec: Some(2 << 20),
         ckpt_section_bytes: None,
+        ckpt_section_bound: None,
         stall: None,
         replay_canary: false,
         io_mode: inf_server::SegmentIoMode::Buffered,

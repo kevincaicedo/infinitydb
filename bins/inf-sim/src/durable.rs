@@ -110,6 +110,13 @@ pub struct DurableScenario {
     /// checkpoints are smaller than the 256 KiB default section never
     /// engages the budget — `m2_device_budget` sets 8 KiB sections.
     pub ckpt_section_bytes: Option<u32>,
+    /// The writer's section bound (ADR-0117 D1; `None` = the format's
+    /// 64 MiB + slack). A small bound makes every image boundary a
+    /// split point: the walk seals before the record and resumes at it
+    /// through the in-chain cursor (D2) on every slice — the generator
+    /// widening for review F-L03-02. `m2_durable`/`m4_tiered` arm it on
+    /// one seed in four.
+    pub ckpt_section_bound: Option<u32>,
     /// Device service-time model (M2.5-S14). `None` = instant fsyncs
     /// (the pre-S14 device); `m2_durable` arms the reference stall
     /// device so the fleet sees nonzero fsync latency every night.
@@ -260,6 +267,13 @@ pub(crate) fn build_disk(seed: u64, stall: Option<&StallConfig>) -> SimDisk {
 
 impl DurableScenario {
     #[must_use]
+    /// ADR-0117 D2's generator widening: one seed in four walks every
+    /// checkpoint under a 1 KiB section bound, so the in-chain resume
+    /// runs at nearly every image under the scenario's churn and cuts.
+    pub fn section_bound_for(seed: u64) -> Option<u32> {
+        (seed % 4 == 1).then_some(1 << 10)
+    }
+
     pub fn m2_durable(seed: u64) -> DurableScenario {
         DurableScenario {
             seed,
@@ -282,6 +296,7 @@ impl DurableScenario {
             ckpt_interval_bytes: 24 << 10,
             ckpt_stream_bytes_per_sec: None,
             ckpt_section_bytes: None,
+            ckpt_section_bound: Self::section_bound_for(seed),
             stall: Some(m2_stall_config()),
             replay_canary: false,
             // Odd seeds run the FUA class (ADR-0086 D8): half of every
@@ -551,6 +566,7 @@ impl DurableScenario {
             ckpt_interval_bytes: 24 << 10,
             ckpt_stream_bytes_per_sec: None,
             ckpt_section_bytes: Some(8 << 10),
+            ckpt_section_bound: None,
             stall: Some(stall),
             replay_canary: false,
             io_mode: SegmentIoMode::Direct,
@@ -605,6 +621,7 @@ impl DurableScenario {
             ckpt_interval_bytes: 24 << 10,
             ckpt_stream_bytes_per_sec: None,
             ckpt_section_bytes: None,
+            ckpt_section_bound: None,
             stall: Some(m2_stall_config()),
             replay_canary: false,
             io_mode: SegmentIoMode::Buffered,
@@ -1183,6 +1200,9 @@ pub(crate) fn boot(
                 section_bytes: scenario
                     .ckpt_section_bytes
                     .unwrap_or(inf_server::CkptConfig::default().section_bytes),
+                section_bound: scenario
+                    .ckpt_section_bound
+                    .unwrap_or(inf_server::CkptConfig::default().section_bound),
                 ..Default::default()
             },
             recover: Default::default(),

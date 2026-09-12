@@ -60,7 +60,7 @@ use std::path::PathBuf;
 
 use inf_foundation::time::Nanos;
 use inf_log::ckpt::{
-    IckReader, IckReaderConfig, IckStep, ick_file_name, parse_ick_file_name, read_ick_counts,
+    IckReader, IckReaderConfig, IckStep, ick_file_name, parse_ick_file_name, read_ick_counts_probed,
 };
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
@@ -196,6 +196,11 @@ pub struct RecoverStats {
     /// Tail records below `begin-LSN` in the floor segment, skipped (the
     /// checkpoint supersedes them).
     pub records_pre_begin: u64,
+    /// F-L03-03 (ADR-0028 A1): whether the checkpoint's presize counts
+    /// came from the end-of-file footer probe (`Some(false)` = the
+    /// dependent hop chain located the footer). `None` without a
+    /// checkpoint.
+    pub ckpt_footer_probe_hit: Option<bool>,
     /// Boot GC: stale below-floor segments + unnamed `.ick`/`.ick.new`
     /// orphans removed.
     pub stale_files_removed: u64,
@@ -748,9 +753,10 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             let ick_path = self.ckpt_dir.join(ick_file_name(manifest.ckpt_id));
             // Presize from the footer counts before streaming (M2-S13):
             // the bulk apply must not pay a doubling-rehash storm.
-            let counts =
-                read_ick_counts(&self.boot_reads, &ick_path, IckReaderConfig::default())
+            let (counts, probe_hit) =
+                read_ick_counts_probed(&self.boot_reads, &ick_path, IckReaderConfig::default())
                     .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
+            self.stats.ckpt_footer_probe_hit = Some(probe_hit);
             for &(ns, entries) in &counts {
                 ks.reserve_ns(inf_log::NsId(ns), entries);
             }

@@ -478,6 +478,9 @@ pub struct DurableStats {
     /// fallback, ADR-0088 D3 as amended).
     pub ckpt_io_mode_buffered: u64,
     pub ckpt_io_mode_downgrades: u64,
+    /// ADR-0117: sections sealed for the section bound (the DST's
+    /// engagement witness for the in-chain resume).
+    pub ckpt_bound_splits: u64,
     /// `ceil_milli((log_frame_bytes + ckpt_bytes_total +
     /// manifest_bytes_total) / append_bytes)` — cell scope, boot life;
     /// undefined (0, with `_undefined = 1`) until the first checkpoint
@@ -1348,7 +1351,7 @@ impl<F: SegmentFs> DurableCell<F> {
                     self.commit.note_staged(FsyncClass::Everysec);
                     self.records_appended += 1;
                     self.last_seq += 1;
-                    self.ckpt.requested = false;
+                    self.ckpt.consume_request();
                     // The epoch this checkpoint satisfies (M2-S20) — one
                     // transition in flight, so a single value suffices.
                     self.ckpt.epoch_in_flight = self.ckpt.req_epoch;
@@ -1408,6 +1411,13 @@ impl<F: SegmentFs> DurableCell<F> {
             let unix_now = anchor.unix_from_internal(cx.now);
             match self.ckpt.publish(st, unix_now) {
                 Ok(()) => {
+                    // F-L03-04 witness: every tiered table this walk
+                    // covered began under `id` (pass 0 owns the pin).
+                    let behind = ks
+                        .tiered_namespaces()
+                        .filter(|(_, table)| table.walk_ckpt_id().is_some_and(|w| w < id))
+                        .count() as u64;
+                    self.ckpt.note_walks_behind(behind);
                     self.manifest.note_published_ick(id, begin_lsn, self.ckpt.epoch_in_flight);
                 }
                 Err(err) => self.ckpt.abort("publish", &err.to_string()),
@@ -1423,6 +1433,8 @@ impl<F: SegmentFs> DurableCell<F> {
             ns_ids,
             ns_idx,
             cursor,
+            resume,
+            bound_splits: walk_bound_splits,
             tier_pass,
             walk_done,
             v2,
@@ -1479,6 +1491,7 @@ impl<F: SegmentFs> DurableCell<F> {
         // resize-stable SCAN cursor, ADR-0016 D2).
         let mut emitted: u32 = 0;
         let mut force_seal = false;
+        let mut bound_splits = 0u64;
         let slice_cap = cfg.slice_bytes.min(budget_units.saturating_mul(1024)).max(1);
         if !*walk_done {
             while emitted < slice_cap && !*walk_done && !stream.section_full() && !force_seal {
@@ -1499,6 +1512,7 @@ impl<F: SegmentFs> DurableCell<F> {
                                 ns,
                                 *id,
                                 cursor,
+                                resume,
                                 tier_pass,
                                 slice_cap,
                                 &mut emitted,
@@ -1512,9 +1526,14 @@ impl<F: SegmentFs> DurableCell<F> {
                     match step {
                         TierStep::Progress => {}
                         TierStep::SealFirst => force_seal = true,
+                        TierStep::SealForBound => {
+                            force_seal = true;
+                            bound_splits += 1;
+                        }
                         TierStep::NsDone => {
                             *ns_idx += 1;
                             *cursor = 0;
+                            *resume = None;
                             *tier_pass = 0;
                             if *ns_idx == ns_ids.len() {
                                 *walk_done = true;
@@ -1528,11 +1547,13 @@ impl<F: SegmentFs> DurableCell<F> {
                     None => {
                         *ns_idx += 1;
                         *cursor = 0;
+                        *resume = None;
                     }
                     Some(store) => {
                         let bytes = &mut emitted;
-                        let next = store.scan_checkpoint_images(
-                            *cursor,
+                        let mut at = inf_store::WalkCursor { group: *cursor, chain: resume.take() };
+                        let done = store.scan_checkpoint_images_bounded(
+                            &mut at,
                             SCAN_CHUNK_ENTRIES,
                             cx.now,
                             |key, image, expire_ms| {
@@ -1545,22 +1566,38 @@ impl<F: SegmentFs> DurableCell<F> {
                                         RecordView::DocFull { ns, key, lineage, version, idoc }
                                     }
                                 };
-                                *bytes = bytes.saturating_add(rec.encoded_len() as u32);
-                                stream.stage_record(&rec);
-                                if let Some(ms) = expire_ms {
+                                let expiry = expire_ms.map(|ms| {
                                     let at_unix_ms =
                                         anchor.unix_from_internal(Nanos::from_millis(ms));
-                                    let rec = RecordView::ExpireAt { ns, at_unix_ms, key };
+                                    RecordView::ExpireAt { ns, at_unix_ms, key }
+                                });
+                                // ADR-0117 D1: an image and its expiry ride
+                                // one section; a pair the pending section
+                                // cannot take seals it first (the walk
+                                // resumes at this entry — D2).
+                                let len = rec.encoded_len() + expiry.map_or(0, |e| e.encoded_len());
+                                if !stream.fits(len) {
+                                    return false;
+                                }
+                                *bytes = bytes.saturating_add(rec.encoded_len() as u32);
+                                stream.stage_record(&rec);
+                                if let Some(rec) = expiry {
                                     *bytes = bytes.saturating_add(rec.encoded_len() as u32);
                                     stream.stage_record(&rec);
                                 }
+                                true
                             },
                         );
-                        if next == 0 {
+                        if done {
                             *ns_idx += 1;
                             *cursor = 0;
                         } else {
-                            *cursor = next;
+                            *cursor = at.group;
+                            *resume = at.chain;
+                            if at.chain.is_some() {
+                                force_seal = true;
+                                bound_splits += 1;
+                            }
                         }
                         if *ns_idx == ns_ids.len() {
                             *walk_done = true;
@@ -1590,6 +1627,7 @@ impl<F: SegmentFs> DurableCell<F> {
                 *sidecar_done = true;
             }
         }
+        *walk_bound_splits += bound_splits;
         // Queue at most one block per slice: a full (or final partial)
         // section, a class-boundary seal (M4-S26 tiered passes / S06
         // index boundaries), or — once everything drained — the footer.
@@ -1939,6 +1977,7 @@ impl<F: SegmentFs> DurableCell<F> {
             ckpt_cap_bytes: self.ckpt.cfg.cap_bytes(),
             ckpt_io_mode_buffered: ckpt.io_mode_buffered,
             ckpt_io_mode_downgrades: ckpt.io_mode_downgrades,
+            ckpt_bound_splits: ckpt.bound_splits,
             write_amp_milli_log_checkpoint: write_amp,
             write_amp_log_checkpoint_undefined: undefined,
             accounted_host_write_bytes,
@@ -1981,6 +2020,9 @@ enum TierStep {
     /// A pending section of another class must seal before this pass
     /// stages — the caller queues the block now (class purity).
     SealFirst,
+    /// The next image would breach the section bound (ADR-0117 D1): the
+    /// pending section seals now and the walk resumes at that image.
+    SealForBound,
     /// This namespace's walk is complete (retirement scan included).
     NsDone,
 }
@@ -2002,20 +2044,31 @@ fn tier_walk_step<F: SegmentFs>(
     ns: NsId,
     ckpt_id: u64,
     cursor: &mut u64,
+    resume: &mut Option<inf_store::ChainPos>,
     tier_pass: &mut u8,
     slice_cap: u32,
     emitted: &mut u32,
 ) -> TierStep {
     // Pass boundaries: seal any pending section before a class change.
-    if *cursor == 0 && stream.can_seal() {
+    if *cursor == 0 && resume.is_none() && stream.can_seal() {
         return TierStep::SealFirst;
     }
     match *tier_pass {
         0 => {
-            if table.space().walk_watermark().is_none() {
+            if *cursor == 0 {
+                // The pin belongs to this checkpoint id (ADR-0057 A3,
+                // F-L03-04): a pin still held here leaked from an aborted
+                // walk the reconciliation never saw (the `EINVAL`
+                // downgrade retries without a backoff), so it is released
+                // — with its stamped-but-uncovered retirement marks — and
+                // the walk re-latches `W` and the stamp under its own id.
+                if table.space().walk_watermark().is_some() {
+                    table.end_ckpt_walk();
+                    table.abort_retirement();
+                }
                 table.begin_ckpt_walk(ckpt_id);
             }
-            let w = table.space().walk_watermark().expect("begun above").to_raw();
+            let w = table.space().walk_watermark().expect("begun at cursor 0").to_raw();
             let next = table.ckpt_walk_slice(
                 *cursor,
                 TIER_WALK_CHUNK,
@@ -2029,8 +2082,9 @@ fn tier_walk_step<F: SegmentFs>(
             TierStep::Progress
         }
         1 => {
-            let next = table.ckpt_walk_slice(
-                *cursor,
+            let mut at = inf_store::WalkCursor { group: *cursor, chain: resume.take() };
+            let done = table.ckpt_walk_slice_bounded(
+                &mut at,
                 TIER_WALK_CHUNK,
                 |_hash, _addr| {},
                 |parts| {
@@ -2052,15 +2106,27 @@ fn tier_walk_step<F: SegmentFs>(
                         // namespaces in M4 — a doc image here is a bug.
                         other => {
                             debug_assert!(false, "tiered walk met a {other:?} record");
-                            return;
+                            return true;
                         }
                     };
+                    // ADR-0117 D1/D2: seal before an image the section
+                    // cannot take; the walk resumes at this entry.
+                    if !stream.fits(rec.encoded_len()) {
+                        return false;
+                    }
                     *emitted = emitted.saturating_add(rec.encoded_len() as u32);
                     stream.stage_record(&rec);
+                    true
                 },
             );
-            advance_pass(cursor, tier_pass, next);
-            TierStep::Progress
+            if done {
+                *cursor = 0;
+                *tier_pass = 2;
+                return TierStep::Progress;
+            }
+            *cursor = at.group;
+            *resume = at.chain;
+            if at.chain.is_some() { TierStep::SealForBound } else { TierStep::Progress }
         }
         2 => {
             // Resume by file id, not ordinal (the C4 rule applied

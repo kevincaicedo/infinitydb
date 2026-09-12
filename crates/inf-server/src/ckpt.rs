@@ -70,6 +70,13 @@ pub(crate) struct Streaming<File: SegmentFile> {
     pub ns_ids: Vec<u32>,
     pub ns_idx: usize,
     pub cursor: u64,
+    /// The in-chain resume inside `cursor`'s home group (ADR-0117 D2):
+    /// `Some` only after an image was refused for the section bound —
+    /// the next slice re-enters that group at exactly that entry.
+    pub resume: Option<inf_store::ChainPos>,
+    /// Sections this walk sealed for the section bound (folded into
+    /// `CkptStats::bound_splits` at publish).
+    pub bound_splits: u64,
     /// Tiered-namespace walk sub-pass (M4-S26, ADR-0057 D1/D3): 0 =
     /// address refs, 1 = RAM images, 2 = live-set + blob-ref sections +
     /// walk end + retirement scan. Section classes never mix inside a
@@ -109,6 +116,17 @@ pub(crate) struct Streaming<File: SegmentFile> {
 pub struct CkptStats {
     pub completed: u64,
     pub aborted: u64,
+    /// The last published checkpoint's id (0 before the first).
+    pub last_id: u64,
+    /// F-L03-04 witness (ADR-0057 A3): publications that walked some
+    /// tiered table under an older checkpoint id — a leaked pin reused.
+    /// Counted by the driver at publish; sticky.
+    pub walks_behind: u64,
+    /// ADR-0117 D1/D2: sections sealed because the next image would
+    /// have breached the section bound (the walk resumed at that
+    /// image). Zero unless a chunk sums past the bound — or the DST
+    /// lowers the bound; its engagement witness.
+    pub bound_splits: u64,
     /// 1 when the staging mode in force is `Buffered` (ADR-0088 D3 as
     /// amended) — the disclosed fallback, probed at boot or downgraded
     /// in-band (`io_mode_downgrades`, 0 or 1 per cell life).
@@ -172,6 +190,10 @@ pub(crate) struct CkptCell<F: SegmentFs> {
     next_id: u64,
     /// Manual trigger latch (`INF.CKPT` via the control handle — S20).
     pub requested: bool,
+    /// The checkpoint in flight was begun for a manual request (N15,
+    /// batch 33): an abort re-arms `requested`, so `INF.CKPT WAIT` is
+    /// answered by the retry instead of hanging until the bytes trigger.
+    serving_request: bool,
     /// Latest `INF.CKPT` request epoch seen (M2-S20) — recorded at
     /// request, consumed into `epoch_in_flight` when the begin marker
     /// stages, published to the control board at the MANIFEST commit.
@@ -221,6 +243,7 @@ impl<F: SegmentFs> CkptCell<F> {
             backoff_slices: 0,
             next_id,
             requested: false,
+            serving_request: false,
             req_epoch: 0,
             epoch_in_flight: 0,
             bytes_at_last: 0,
@@ -367,6 +390,8 @@ impl<F: SegmentFs> CkptCell<F> {
             ns_ids,
             ns_idx: 0,
             cursor: 0,
+            resume: None,
+            bound_splits: 0,
             tier_pass: 0,
             walk_done: false,
             v2,
@@ -405,6 +430,7 @@ impl<F: SegmentFs> CkptCell<F> {
         let begin = st.begin_lsn;
         let ick_bytes = st.stream.file_bytes();
         let padding = st.stream.padding_bytes();
+        let bound_splits = st.bound_splits;
         drop(st); // closes the fd before rename (write handle no longer needed)
         self.fs
             .rename(&self.dir.join(ick_staging_file_name(id)), &self.dir.join(ick_file_name(id)))?;
@@ -418,6 +444,9 @@ impl<F: SegmentFs> CkptCell<F> {
         // wrote (ADR-0088 D4): the file's size is the measurement.
         self.rederive_interval(ick_bytes);
         self.stats.completed += 1;
+        self.stats.last_id = id;
+        self.stats.bound_splits += bound_splits;
+        self.serving_request = false;
         self.stats.last_unix_ms = unix_now_ms;
         self.stats.last_begin_lsn = begin.to_u64();
         self.phase = CkptPhase::Idle;
@@ -441,7 +470,26 @@ impl<F: SegmentFs> CkptCell<F> {
             self.next_id = id + 1;
             self.stats.aborted += 1;
             self.backoff_slices = ABORT_BACKOFF_SLICES;
+            // N15: a manual request the aborted checkpoint was serving
+            // survives it — the retry answers `INF.CKPT WAIT`.
+            if self.serving_request {
+                self.serving_request = false;
+                self.requested = true;
+            }
         }
+    }
+
+    /// The begin marker is staging: the manual latch is consumed into the
+    /// checkpoint in flight (an abort hands it back — N15).
+    pub fn consume_request(&mut self) {
+        self.serving_request = self.requested;
+        self.requested = false;
+    }
+
+    /// The publication `id` walked `behind` tiered tables under an older
+    /// id (the F-L03-04 witness; zero in every correct run).
+    pub fn note_walks_behind(&mut self, behind: u64) {
+        self.stats.walks_behind += behind;
     }
 
     /// `records_total` is the cell's records-staged counter (the record
@@ -1099,6 +1147,43 @@ mod tests {
         ckpt.open_stream(2, Lsn::new(SegmentId(0), 80), vec![16], false, Nanos::ZERO)
             .expect("buffered stream after the downgrade");
         assert!(matches!(ckpt.phase, CkptPhase::Stream(_)));
+    }
+
+    /// N15 (batch 33, found by the `m4-tiered` `EINVAL` arm): the manual
+    /// latch is consumed at begin, so an aborted checkpoint used to drop
+    /// the request — `INF.CKPT WAIT` then hung until the bytes trigger
+    /// (256 MiB by default; forever on an idle node). The abort hands
+    /// the request back; the retry answers it.
+    #[test]
+    fn an_aborted_manual_checkpoint_keeps_its_request() {
+        let fs = SimDisk::new();
+        let mut ckpt = cell(&fs);
+        ckpt.requested = true;
+        ckpt.consume_request();
+        assert!(!ckpt.requested, "the latch is consumed at begin");
+        ckpt.open_stream(1, Lsn::new(SegmentId(0), 40), vec![16], false, Nanos::ZERO)
+            .expect("stream");
+        ckpt.abort("test", "injected");
+        assert!(ckpt.requested, "an abort re-arms the manual request");
+        while ckpt.tick_backoff() {}
+        assert!(ckpt.should_begin(0, 0), "the retry serves the request");
+        // The in-band downgrade path too.
+        let fs = SimDisk::new();
+        fs.refuse_direct_writes_after(1);
+        let mut ckpt = cell(&fs);
+        ckpt.requested = true;
+        ckpt.consume_request();
+        ckpt.open_stream(2, Lsn::new(SegmentId(0), 80), vec![16], false, Nanos::ZERO)
+            .expect("stream");
+        ckpt.abort_refused_direct("I/O");
+        assert!(ckpt.should_begin(0, 0), "the downgrade retry serves the request");
+        // A bytes-triggered checkpoint hands nothing back.
+        let mut ckpt = cell(&SimDisk::new());
+        ckpt.consume_request();
+        ckpt.open_stream(1, Lsn::new(SegmentId(0), 40), vec![16], false, Nanos::ZERO)
+            .expect("stream");
+        ckpt.abort("test", "injected");
+        assert!(!ckpt.requested, "no request, nothing to hand back");
     }
 
     /// An aborted checkpoint holds the trigger for a backoff of slices —

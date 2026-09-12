@@ -568,7 +568,10 @@ discipline:
   cell recovers — the measured regime split.
   Also under this ADR: `read_ick_counts` gained a direct end-of-file
   footer probe (CRC-validated, hops as fallback) — a parse-path change
-  covered by the extended `ick_decode` fuzz oracle.
+  covered by the extended `ick_decode` fuzz oracle. ADR-0028 A1
+  (2026-09-12, review F-L03-03): the probe locates the footer by the
+  footer's **own** namespace count (an empty durable namespace is absent
+  from it), and `read_ick_counts_probed` reports whether it hit.
 - **`SegmentFs::create_segment_unsynced`** (default method, falls back to
   the synced create): segment creation with no durability side effects —
   the caller owns metadata durability via ledger barriers. Consumers:
@@ -732,6 +735,17 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   doubling-rehash storm cost ~15% of replay throughput). Both the stream
   writer and footer-audit count `StringPostImage | DocFull` as namespace
   entries; metadata records do not inflate the presize count.
+- **Section bound (ADR-0117 D1, 2026-09-12):** `ICK_MAX_SECTION_BYTES`
+  (= `DEFAULT_MAX_FRAME_LEN` + `ICK_SECTION_SLACK`, 64 MiB + 4 KiB) is
+  both `IckReaderConfig::default().max_section_bytes` and the writer's
+  seal ceiling (`seal_section` release-asserts it). `IckStream::fits`
+  is the walker's stage-or-seal test — true for an empty section
+  unconditionally (one maximal record plus its expiry companion fits by
+  the slack), else `body + bytes ≤ CkptConfig::section_bound` (default =
+  the constant, asserted ≤ it; the DST lowers it). A walker that
+  refuses an image resumes at it through the store's guarded in-chain
+  cursor (`WalkCursor`/`ChainPos`, ADR-0117 D2). Every published `.ick`
+  loads under the default reader.
 - Writer tiers: `IckStream` (double-buffered section pair, `SectionLease`
   custody — the reactor tier rides `IoOp::LogWrite`/`Fdatasync` on the
   `.ick` fd with `TokenClass::CkptWrite/CkptSync`) and `SyncIckWriter`

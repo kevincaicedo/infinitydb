@@ -3743,6 +3743,73 @@ fn info_u64(info: &str, field: &str) -> u64 {
 /// checkpoint (their segments are gone), so the restart leg proves
 /// manifest-named recovery end to end: MANIFEST → `.ick` load → tail
 /// replay from begin.
+/// F-L03-02 (review of 2026-08-30; ADR-0117 D1/D2): large values at the
+/// default flags. Twenty 3.5 MiB strings (grown by `APPEND` under the
+/// 1 MiB frame cap) sum to 70 MiB inside one 32-entry scan chunk; the
+/// walk used to stage the whole chunk into one section, publishing a
+/// `.ick` whose body exceeded the loader's 64 MiB bound — the next boot
+/// fail-stopped on `SectionTooLarge` with no other recovery unit on
+/// disk. Now the walk seals before the image that would breach the
+/// bound and resumes at exactly that entry; the reboot serves every
+/// byte.
+#[test]
+fn large_values_checkpoint_within_the_loader_bound_and_reboot() {
+    let dir = temp_data_dir("bigval");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"big", b"MODE", b"durable", b"FSYNC", b"everysec"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"big"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    const KEYS: usize = 20;
+    const APPENDS: usize = 4;
+    let chunk = vec![b'v'; 900 << 10];
+    for k in 0..KEYS {
+        let key = format!("k{k}");
+        for a in 1..=APPENDS {
+            c.write_all(&cmd(&[b"APPEND", key.as_bytes(), &chunk])).expect("write");
+            read_exactly(&mut c, format!(":{}\r\n", a * chunk.len()).as_bytes());
+        }
+    }
+    c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // The engagement witness: the walk sealed once for the bound (the
+    // 18th image would have carried the section past 64 MiB).
+    c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
+    let info = String::from_utf8(read_bulk(&mut c)).expect("ascii");
+    let splits = info_field(&info, "ckpt_bound_splits");
+    assert!(splits >= 1, "no section sealed for the bound:\n{info}");
+    drop(c);
+    node.stop();
+
+    let ick: Vec<u64> = std::fs::read_dir(dir.join("shard-0").join("ckpt"))
+        .expect("ckpt dir")
+        .map(|e| e.expect("entry").metadata().expect("meta").len())
+        .collect();
+    assert_eq!(ick.len(), 1, "one published checkpoint");
+    assert!(ick[0] > 70 << 20, "the checkpoint carries every image ({} B)", ick[0]);
+
+    // Pre-fix the harness panicked here: `cell 0 recovery failed
+    // (fail-stop, §8.4): ... SectionTooLarge`.
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"big"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, format!(":{KEYS}\r\n").as_bytes());
+    for k in 0..KEYS {
+        let key = format!("k{k}");
+        c.write_all(&cmd(&[b"STRLEN", key.as_bytes()])).expect("write");
+        read_exactly(&mut c, format!(":{}\r\n", APPENDS * chunk.len()).as_bytes());
+    }
+    c.write_all(&cmd(&[b"GETRANGE", b"k7", b"3686390", b"3686399"])).expect("write");
+    read_exactly(&mut c, b"$10\r\nvvvvvvvvvv\r\n");
+    drop(c);
+    node.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn truncation_bounds_log_size_and_restart_recovers_from_checkpoint() {
     let dir = temp_data_dir("trunc");

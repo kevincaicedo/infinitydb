@@ -3192,6 +3192,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 unix_now_ms.saturating_sub(ckpt.last_unix_ms) / 1000
             });
             node.ckpts_completed.set(ckpt.completed);
+            node.ckpt_walks_behind.set(ckpt.walks_behind);
+            node.ckpt_bound_splits.set(ckpt.bound_splits);
             node.ckpts_aborted.set(ckpt.aborted);
             node.ckpt_last_unix_ms.set(ckpt.last_unix_ms);
             node.ckpt_last_begin_lsn.set(ckpt.last_begin_lsn);
