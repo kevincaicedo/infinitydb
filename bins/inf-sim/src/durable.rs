@@ -267,12 +267,19 @@ pub(crate) fn build_disk(seed: u64, stall: Option<&StallConfig>) -> SimDisk {
 
 impl DurableScenario {
     #[must_use]
-    /// ADR-0117 D2's generator widening: one seed in four walks every
-    /// checkpoint under a 1 KiB section bound, so the in-chain resume
+    /// ADR-0117 D4's generator widening: one seed in four walks every
+    /// checkpoint under a tiny section bound, so the in-chain resume
     /// runs at nearly every image under the scenario's churn and cuts.
-    pub fn section_bound_for(seed: u64) -> Option<u32> {
-        (seed % 4 == 1).then_some(1 << 10)
+    /// `bound` is the shape's: 1 KiB on the tiered shape (values up to
+    /// several KiB), 64 B on the m2 shapes — batch 34 found the 1 KiB
+    /// bound never split a 48-byte-value checkpoint (~400 B a file), so
+    /// the m2 arm had run vacuous since batch 33.
+    pub fn section_bound_for(seed: u64, bound: u32) -> Option<u32> {
+        (seed % 4 == 1).then_some(bound)
     }
+
+    /// The m2 shapes' section bound (see [`Self::section_bound_for`]).
+    pub const M2_SECTION_BOUND: u32 = 64;
 
     pub fn m2_durable(seed: u64) -> DurableScenario {
         DurableScenario {
@@ -296,7 +303,7 @@ impl DurableScenario {
             ckpt_interval_bytes: 24 << 10,
             ckpt_stream_bytes_per_sec: None,
             ckpt_section_bytes: None,
-            ckpt_section_bound: Self::section_bound_for(seed),
+            ckpt_section_bound: Self::section_bound_for(seed, Self::M2_SECTION_BOUND),
             stall: Some(m2_stall_config()),
             replay_canary: false,
             // Odd seeds run the FUA class (ADR-0086 D8): half of every
@@ -700,6 +707,12 @@ pub struct DurableReport {
     /// as amended), scraped at the cut — the `m2-ckpt-refused` oracle's
     /// coverage disclosure.
     pub ckpt_downgrades: u64,
+    /// Sections sealed for the ADR-0117 section bound, scraped at the
+    /// cut — the section-bound arm's engagement witness (batch 34).
+    pub ckpt_bound_splits: u64,
+    /// The requested plant fired (batch 34 disclosure for the positive
+    /// controls — a plant that never fires is a vacuous run).
+    pub plant_fired: bool,
     /// M4.5-S39a: fill-policy hold episodes, scraped at the cut — the
     /// manifest's coverage disclosure and the reorder scenario's oracle.
     pub frame_waits_fill: u64,
@@ -1421,6 +1434,8 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         frame_waits_rotation: 0,
         frame_waits_reorder: 0,
         ckpt_downgrades: 0,
+        ckpt_bound_splits: 0,
+        plant_fired: false,
         frame_waits_fill: 0,
         frame_waits_group: 0,
         budget_background_bytes: 0,
@@ -1664,6 +1679,39 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             if let Some(stats) = node.plane(cell).durable_stats() {
                 report.reopened_packed_tails += stats.reopened_packed_tails;
             }
+        }
+        // Batch 34 engagement: a FLUSH → FUA transition boot reopens the
+        // prelude's packed tail (ADR-0086 D4 as amended: ≥ 1 per cell with
+        // a v2 tail). Asserted on the K ≥ 2 half only — on every K = 1
+        // seed of the 64-seed sweep the transition boot's highest segment
+        // was the empty preallocated next one (tail offset 0), so that
+        // half crosses the class change without a packed tail; the
+        // mechanism is open as N17 in the review ledger, and the
+        // manifest's `reopened_packed_tails` discloses the split.
+        if first_life.io_mode == SegmentIoMode::Buffered
+            && scenario.io_mode == SegmentIoMode::Direct
+            && scenario.frames_in_flight >= 2
+            && report.reopened_packed_tails == 0
+        {
+            fail(
+                &mut report,
+                format!(
+                    "TRANSITION ARM VACUOUS seed {:#x}: FLUSH → FUA (K = {}) reopened no packed \
+                     tail",
+                    scenario.seed, scenario.frames_in_flight
+                ),
+            );
+        }
+        // The lift plant is the arm: a regime whose plant skipped every
+        // cell asserts nothing (the skips were only narrated before).
+        if lift_ns.is_some() && planted.is_empty() {
+            fail(
+                &mut report,
+                format!(
+                    "LIFT PLANT VACUOUS seed {:#x}: the lift regime planted no cell",
+                    scenario.seed
+                ),
+            );
         }
         // The plant's oracle: every planted cell lifted, its sidecar
         // loaded, the tree equals the truth (the planted document
@@ -1926,6 +1974,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             }
         }
     }
+    engagement_checks(scenario, &node, &mut report);
     if scenario.budget_oracle {
         budget_oracles(scenario, &node, clock.now(), &mut report);
     }
@@ -2803,6 +2852,72 @@ pub(crate) fn survival_audit(
                 }
             }
         }
+    }
+}
+
+/// Batch 34 — an armed knob that never fired proves nothing: every
+/// seed-cadence arm of the durable shapes asserts its own engagement at
+/// the cut (the counters are life-scoped, so this runs before the node
+/// drops). Each rule names the activity a life must have reached for the
+/// arm to be reachable at all — below it the arm is disclosed, not judged.
+fn engagement_checks(scenario: &DurableScenario, node: &Node, report: &mut DurableReport) {
+    let seed = scenario.seed;
+    for cell in 0..usize::from(scenario.cells) {
+        let Some(stats) = node.plane(cell).durable_stats() else { continue };
+        report.ckpt_bound_splits += stats.ckpt_bound_splits;
+        // ADR-0117 D4: under the m2 bound one image fills a section, so
+        // a life that completed a checkpoint after a working set of
+        // records must have sealed for the bound (two live keys in one
+        // namespace suffice).
+        let (completed, _) = node.plane(cell).ckpt_stats_for_sim();
+        if let Some(bound) = scenario.ckpt_section_bound
+            && completed > 0
+            && stats.records_appended >= 64
+            && stats.ckpt_bound_splits == 0
+        {
+            report.violations.push(format!(
+                "SECTION-BOUND ARM VACUOUS seed {seed:#x} cell {cell}: {completed} checkpoints \
+                 after {} records under a {bound} B bound, no section sealed for it",
+                stats.records_appended
+            ));
+        }
+        let active = stats.log_frame_bytes >= 4 * u64::from(scenario.segment_bytes);
+        // M4.5-S39a: the fill policy holds aligned frames — an active
+        // `Direct` life must have held at least once (the reorder shape
+        // asserts the same below with its own wording).
+        if scenario.fill.enabled()
+            && scenario.io_mode == SegmentIoMode::Direct
+            && active
+            && stats.frame_waits_fill == 0
+        {
+            report.violations.push(format!(
+                "FILL ARM VACUOUS seed {seed:#x} cell {cell}: {} frame bytes on the aligned \
+                     class, the policy never held a frame",
+                stats.log_frame_bytes
+            ));
+        }
+        // M4.5-S43: the group hold rides packed segments — an active
+        // `Buffered` life must have held at least once.
+        if scenario.group.enabled()
+            && scenario.io_mode == SegmentIoMode::Buffered
+            && active
+            && stats.frame_waits_group == 0
+        {
+            report.violations.push(format!(
+                "GROUP-HOLD ARM VACUOUS seed {seed:#x} cell {cell}: {} frame bytes on the \
+                     packed class, the hold never held a frame",
+                stats.log_frame_bytes
+            ));
+        }
+    }
+    // A positive control that never fired proves nothing about the
+    // oracle it exists to trip.
+    report.plant_fired |= node.nets.iter().any(|net| net.borrow().plant_fired());
+    if scenario.plant != Plant::None && !report.plant_fired {
+        report.violations.push(format!(
+            "PLANT VACUOUS seed {seed:#x}: {:?} was requested and never fired",
+            scenario.plant
+        ));
     }
 }
 

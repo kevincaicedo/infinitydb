@@ -193,7 +193,7 @@ impl TieredScenario {
             stall: Some(m2_stall_config()),
             shadow: seed % 4 != 3,
             dir_open_fault: seed % 8 == 5,
-            ckpt_section_bound: DurableScenario::section_bound_for(seed),
+            ckpt_section_bound: DurableScenario::section_bound_for(seed, 1 << 10),
             ckpt_direct_refused_after: (seed % 8 == 6).then_some(2),
         }
     }

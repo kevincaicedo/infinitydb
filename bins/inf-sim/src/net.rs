@@ -67,6 +67,13 @@ pub fn listener_fd(cell: u16) -> RawFd {
 }
 
 impl CellNet {
+    /// True once the requested plant has fired (batch 34: a positive
+    /// control that never fires is a vacuous run, not a green one).
+    #[must_use]
+    pub fn plant_fired(&self) -> bool {
+        self.plant_fired
+    }
+
     pub fn new(cell: u16, seed: u64, plant: Plant) -> Rc<RefCell<CellNet>> {
         Rc::new(RefCell::new(CellNet {
             cell,

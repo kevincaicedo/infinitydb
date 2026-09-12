@@ -133,8 +133,12 @@ force multiplier for DST and fuzzing.
 - **All errors are handled.** The majority of catastrophic production
   failures in distributed systems come from mishandled *non-fatal* errors —
   so error paths get tests, fault points, and crash-matrix rows like any
-  other code. `unwrap()`/`expect()` on an operational `Result` is a review
-  reject; `expect()` with an invariant justification is an assertion and is
+  other code. A DST arm or fault plant asserts its own **engagement** in
+  the same commit that adds it — a seed cadence that never fired is a
+  `VACUOUS` violation, never a green run (ADR-0117 A1: the m2
+  section-bound arm ran vacuous for a batch; life-scoped counters are
+  folded before every cut). `unwrap()`/`expect()` on an operational
+  `Result` is a review reject; `expect()` with an invariant justification is an assertion and is
   judged as one. Every release `assert!`/`expect()`/`panic!`/`unreachable!`
   in cell code is a row of `docs/release-assert-inventory.tsv` (ADR-0107
   D2): `I` an invariant on the callee's own state, `C` a claim about a
@@ -180,7 +184,9 @@ The mechanical checks — `check-dep-dag.sh` (crate boundaries),
 `check-cell-denylist.sh` (no locks/sleep/ambient time in cells) with
 `check-clock-ban.sh` (the type-resolved half of the same rule: clippy's
 `disallowed-methods` for `Instant`/`SystemTime` `now`/`elapsed`, libc
-and the TSC, proven on a planted-bypass probe — ADR-0106 D7),
+and the TSC, proven on a planted-bypass probe — ADR-0106 D7; an entry
+the lint cannot resolve is a violation, not a warning — D7.5: batch
+14's `_rdtscp` banned nothing for a week),
 fault-point and fsync-fail-stop greps, the attribution-divergence gate,
 `check-shipping-features.sh` (no test/DST feature on a normal dependency
 edge — ADR-0107 D1), `check-release-asserts.sh` (the classified

@@ -502,6 +502,9 @@ pub mod mem {
         /// `create_segment` — the ENOSPC injection point.
         capacity: Option<u64>,
         fail_next_sync_data: bool,
+        /// `read_at` calls across every file — the dependent-read oracle
+        /// for the `.ick` loader (review L03, batch 34).
+        reads: u64,
         /// `create_meta_direct` answers `Unsupported` — the filesystem /
         /// platform without `O_DIRECT` (ADR-0088 D3 as amended): the
         /// checkpoint's probed buffered fallback is exercised here.
@@ -586,6 +589,12 @@ pub mod mem {
         pub fn contents(&self, path: &Path) -> Option<Vec<u8>> {
             self.state.borrow().files.get(path).map(|data| data.borrow().clone())
         }
+
+        /// `read_at` calls so far across every file (test assertions).
+        #[must_use]
+        pub fn reads(&self) -> u64 {
+            self.state.borrow().reads
+        }
     }
 
     /// Handle onto one in-memory file.
@@ -609,6 +618,7 @@ pub mod mem {
         }
 
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+            self.fs.borrow_mut().reads += 1;
             let bytes = self.data.borrow();
             let offset = usize::try_from(offset).expect("offset fits usize");
             if offset >= bytes.len() {
