@@ -1,0 +1,55 @@
+== post-fix node_e2e DISKFULL
+test blob_write_at_disk_full_replies_diskfull ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.01s
+
+== pre-fix L04-09 (tiered.rs stashed)
+test blob_write_at_disk_full_replies_diskfull ... FAILED
+
+failures:
+--
+thread 'blob_write_at_disk_full_replies_diskfull' (235646) panicked at crates/inf-server/tests/node_e2e.rs:2627:5:
+a space-refused blob write is DISKFULL, got "-ERR blob extent read failed (tier I/O error)\r\n"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p inf-server --test node_e2e`
+== pre-fix L04-03 (segment.rs stashed)
+test edquot_is_the_disk_full_class ... FAILED
+
+failures:
+--
+thread 'edquot_is_the_disk_full_class' (236093) panicked at crates/inf-log/tests/segment_lifecycle.rs:109:36:
+maintain never hard-fails on a quota refusal: Io { segment: SegmentId(1), source: Os { code: 122, kind: QuotaExceeded, message: "Disk quota exceeded" } }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-log --test segment_lifecycle`
+== pre-fix L04-10 (read_full call sites reverted to one read_at)
+test blob::tests::short_reads_are_looped_never_reported_as_corruption ... FAILED
+
+failures:
+--
+thread 'blob::tests::short_reads_are_looped_never_reported_as_corruption' (236378) panicked at crates/inf-log/src/blob.rs:902:37:
+open under a 1-byte read cap: "/shard-0/cold/blob-000003.iblob": input too short
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 104 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-log --lib`
+== pre-fix L12-06 (terminator check removed)
+test plane::scatter_reply_parsers::scan_head_without_a_terminator_is_refused ... FAILED
+
+--
+thread 'plane::scatter_reply_parsers::scan_head_without_a_terminator_is_refused' (237041) panicked at crates/inf-server/src/plane.rs:7540:9:
+assertion `left == right` failed
+  left: Some((0, 11))
+ right: None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 126 filtered out; finished in 0.00s
+
+== CHAIN DONE

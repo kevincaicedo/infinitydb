@@ -1615,7 +1615,7 @@ fn create_prealloc_deferred<F: SegmentFs>(
         SegmentIoMode::Direct => fs.create_segment_direct(&path, u64::from(cfg.segment_bytes)),
     };
     created.map_err(|source| {
-        if source.kind() == io::ErrorKind::StorageFull || source.raw_os_error() == Some(28) {
+        if crate::fs::is_storage_exhausted(&source) {
             LogError::NoSpace { segment: id }
         } else {
             LogError::Io { segment: id, source }
@@ -1695,7 +1695,7 @@ fn create_prealloc<F: SegmentFs>(
         SegmentIoMode::Direct => fs.create_segment_direct(&path, u64::from(cfg.segment_bytes)),
     };
     let file = created.map_err(|source| {
-        if source.kind() == io::ErrorKind::StorageFull || source.raw_os_error() == Some(28) {
+        if crate::fs::is_storage_exhausted(&source) {
             LogError::NoSpace { segment: id }
         } else {
             LogError::Io { segment: id, source }

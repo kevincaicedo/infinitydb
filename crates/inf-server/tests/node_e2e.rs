@@ -2589,6 +2589,53 @@ fn blob_values_round_trip_and_survive_restart() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// F-L04-09: a blob write refused for space answers `DISKFULL`, the same
+/// typed reply the inline path gives — not the generic blob I/O error.
+/// The `blob_write_nospace` fault point is the `StorageFull` refusal at
+/// `blob::device_write` (no byte lands, ADR-0063 D4).
+#[test]
+fn blob_write_at_disk_full_replies_diskfull() {
+    let dir = temp_data_dir("tiered-blob-diskfull");
+    let node = Node::start_durable_with_faults(
+        1,
+        &dir,
+        vec![(inf_log::fault::BLOB_WRITE_NOSPACE, inf_foundation::fault::FaultSpec::Always)],
+    );
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"b",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+        b"MEM-BUDGET",
+        b"3mb",
+        b"BLOB-THRESHOLD",
+        b"4kb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // Inline values still land: the refusal is the device's, per extent.
+    c.write_all(&cmd(&[b"SET", b"small", b"v"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"big", &vec![0xA1u8; 8 << 10]])).expect("write");
+    let reply = read_line(&mut c);
+    assert!(
+        reply.starts_with(b"-DISKFULL"),
+        "a space-refused blob write is DISKFULL, got {:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    c.write_all(&cmd(&[b"GET", b"big"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Reads one GET reply: `Ok(body)` for a bulk, `Err(line)` for an error
 /// reply, `Ok(empty)` is unreachable here (no test key is empty).
 fn read_get(stream: &mut TcpStream) -> Result<Vec<u8>, String> {

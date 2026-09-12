@@ -1,0 +1,4 @@
+c0 first PING: b'+PONG\r\n'
+c0 PING after accept errors: b'+PONG\r\n'
+INFO stats: ['total_connections_received:89', 'rejected_connections:0', 'accept_errors:20']
+VERDICT: C0 SURVIVED

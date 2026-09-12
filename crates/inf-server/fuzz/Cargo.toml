@@ -46,3 +46,10 @@ path = "fuzz_targets/move_snapshot.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "scatter_replies"
+path = "fuzz_targets/scatter_replies.rs"
+test = false
+doc = false
+bench = false

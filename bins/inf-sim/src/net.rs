@@ -32,10 +32,14 @@ pub enum Plant {
     /// eats acked bytes. Models any path that acks ahead of durable
     /// coverage; the oracle must catch it within 1,000 seeds.
     FsyncLies,
-    /// One accept-path error (`EMFILE`) on the listener token after the
-    /// first connection is live — the F-L11-05 canary (review 2026-08-30):
+    /// One accept-path error (`EMFILE`) on the listener token while
+    /// connections are queued — the F-L11-05 canary (review 2026-08-30):
     /// an accept failure is a counter, never connection housekeeping;
-    /// the first client (`ConnKey {0, 0}`) must keep being served.
+    /// the first client (`ConnKey {0, 0}`) must keep being served. Since
+    /// batch 37 (F-L11-02) the model also PARKS the arm the way the real
+    /// backends do: the queued connections stay in the backlog until the
+    /// plane re-arms (its retry timer) or a `Close` returns an fd — a
+    /// plane that never re-arms strands every later client (`STALL`).
     AcceptError,
 }
 
@@ -58,6 +62,10 @@ pub struct CellNet {
     cell: u16,
     accept_armed: bool,
     accept_token: Option<CompletionToken>,
+    /// Parked after the plant fired: no accepts until `AcceptArm`/`Close`.
+    accept_parked: bool,
+    /// `AcceptArm` ops that resumed a parked arm (the plane's retry witness).
+    accept_resumes: u64,
     backlog: VecDeque<RawFd>,
     conns: BTreeMap<RawFd, SimConn>,
     next_fd: RawFd,
@@ -79,11 +87,21 @@ impl CellNet {
         self.plant_fired
     }
 
+    /// How many times a parked accept arm was resumed (F-L11-02: the
+    /// plane's retry timer and the driver's close-resume are the only
+    /// two paths; the count is bounded by wall time, never a spin).
+    #[must_use]
+    pub fn accept_resumes(&self) -> u64 {
+        self.accept_resumes
+    }
+
     pub fn new(cell: u16, seed: u64, plant: Plant) -> Rc<RefCell<CellNet>> {
         Rc::new(RefCell::new(CellNet {
             cell,
             accept_armed: false,
             accept_token: None,
+            accept_parked: false,
+            accept_resumes: 0,
             backlog: VecDeque::new(),
             conns: BTreeMap::new(),
             next_fd: 0,
@@ -442,6 +460,10 @@ impl BackendDriver for SimDriver {
         for op in ops.drain(..) {
             match op {
                 IoOp::AcceptArm { token, .. } => {
+                    if net.accept_parked {
+                        net.accept_parked = false;
+                        net.accept_resumes += 1;
+                    }
                     net.accept_armed = true;
                     net.accept_token = Some(token);
                 }
@@ -472,6 +494,12 @@ impl BackendDriver for SimDriver {
                         conn.recv_armed = false;
                     }
                     out.push(Completion { token, result: CompletionResult::Closed });
+                    // An fd returned: an exhaustion-parked arm resumes
+                    // (the driver contract's own resume path).
+                    if net.accept_parked {
+                        net.accept_parked = false;
+                        net.accept_resumes += 1;
+                    }
                 }
                 // The simulated disk (M2-S18, ADR-0020 D7). Completion
                 // order is submission order — the group-commit ledger
@@ -621,21 +649,29 @@ impl BackendDriver for SimDriver {
         }
         self.ops = ops;
 
-        // Accept everything queued (multishot semantics).
-        if net.accept_armed {
+        // Accept everything queued (multishot semantics) — unless parked.
+        if net.accept_armed && !net.accept_parked {
             let token = net.accept_token.expect("armed implies token");
-            while let Some(fd) = net.backlog.pop_front() {
+            // The accept-error plant: the kernel refused a QUEUED accept
+            // (fd limit). The error rides the listener token (the plane
+            // must not route it to a connection, F-L11-05) and the arm
+            // parks with the backlog intact (F-L11-02): only the plane's
+            // re-arm or a `Close` lets the queued clients in.
+            if net.plant == Plant::AcceptError && !net.plant_fired && net.backlog.len() >= 2 {
+                // The limit lands mid-batch: one client is let in first
+                // (F-L11-05's live `{0, 0}`), the rest stay queued.
+                let fd = net.backlog.pop_front().expect("two queued");
                 out.push(Completion { token, result: CompletionResult::Accepted { fd } });
-            }
-            // The accept-error plant: the kernel refused one accept (fd
-            // limit) once a connection is live — uring surfaces it on the
-            // listener token; the plane must not route it to a connection.
-            if net.plant == Plant::AcceptError && !net.plant_fired && !net.conns.is_empty() {
                 net.plant_fired = true;
+                net.accept_parked = true;
                 out.push(Completion {
                     token,
                     result: CompletionResult::Error { errno: libc::EMFILE, buf: None },
                 });
+            } else {
+                while let Some(fd) = net.backlog.pop_front() {
+                    out.push(Completion { token, result: CompletionResult::Accepted { fd } });
+                }
             }
         }
 

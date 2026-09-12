@@ -162,6 +162,15 @@ impl CompletionToken {
 
 pub enum IoOp {
     /// Multishot accept: one arm yields Accepted completions until disarmed/error.
+    /// ADR-0118 (batch 37): an accept failure is classified by ONE table on
+    /// every backend — `classify_accept_errno(errno) -> AcceptFailure::
+    /// {Transient, Exhausted, Broken}`. Transient ⇒ nothing delivered, the arm
+    /// stays up; Exhausted/Broken ⇒ one `Error` on the listener token and the
+    /// arm is PARKED (never re-armed into the same failure). A parked arm
+    /// resumes on a later `AcceptArm` (idempotent while armed) and, for
+    /// Exhausted, on any `Closed` fd of the same driver. io_uring captures
+    /// `RLIMIT_NOFILE` when the SQE is prepared: a raised limit lands at the
+    /// next park/resume.
     AcceptArm { listener: RawFd, token: CompletionToken },
     /// Provided-buffer recv: the DRIVER leases recv buffers from the pool and
     /// delivers them in completions; the consumer must `release` each one.

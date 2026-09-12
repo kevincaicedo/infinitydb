@@ -1,0 +1,24 @@
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.61s
+     Running tests/accept_exhaustion.rs (target/debug/deps/accept_exhaustion-a52e53de8b114950)
+
+running 2 tests
+test table_agrees_on_every_backend ... ok
+test emfile_parks_the_arm_and_a_close_resumes_it ... FAILED
+
+failures:
+
+---- emfile_parks_the_arm_and_a_close_resumes_it stdout ----
+
+thread 'emfile_parks_the_arm_and_a_close_resumes_it' (228783) panicked at crates/inf-runtime/tests/accept_exhaustion.rs:224:5:
+parked: no re-arm into the same failure, got [24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    emfile_parks_the_arm_and_a_close_resumes_it
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-runtime --test accept_exhaustion`
+exit=101

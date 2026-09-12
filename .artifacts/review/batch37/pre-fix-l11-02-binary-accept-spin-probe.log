@@ -1,0 +1,4 @@
+cpu idle 0.0%  held-at-EMFILE 100.3%  accept_errors 429234 -> 2968368 over 3.0s
+c0 PING at the limit: b'+PONG\r\n'
+accepted during the flood: 40; queued at the limit: 48; served after C0 closed: 1
+VERDICT: ACCEPT ARM SPINS AT EMFILE; RESUMED AFTER AN FD FREED

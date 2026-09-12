@@ -1,0 +1,94 @@
+== fuzz scatter_replies 90s
+"1[\015" # Uses: 99267
+",\000\000\000\000\000\000\000" # Uses: 95109
+"$2\000" # Uses: 98899
+"222" # Uses: 80685
+###### End of recommended dictionary. ######
+Done 33011788 runs in 91 second(s)
+fuzz exit=0
+== just check
+ use inf_alloc::BufferPool;
+ use inf_runtime::{
+[31m-    AcceptFailure, BackendDriver, Completion, CompletionResult, CompletionToken, IoOp,
+(B[m[31m-    TokenClass, Wait, classify_accept_errno,
+(B[m[32m+    AcceptFailure, BackendDriver, Completion, CompletionResult, CompletionToken, IoOp, TokenClass,
+(B[m[32m+    Wait, classify_accept_errno,
+(B[m };
+ 
+ #[cfg(target_os = "macos")]
+Diff in /home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime/tests/accept_exhaustion.rs:140:
+     for e in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+         assert_eq!(classify_accept_errno(e), AcceptFailure::Exhausted, "errno {e}");
+     }
+[31m-    for e in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EOPNOTSUPP, libc::EFAULT, 0, 9999]
+(B[m[31m-    {
+(B[m[32m+    for e in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EOPNOTSUPP, libc::EFAULT, 0, 9999] {
+(B[m         assert_eq!(classify_accept_errno(e), AcceptFailure::Broken, "errno {e}");
+     }
+ }
+Diff in /home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server/src/plane.rs:7552:
+     #[test]
+     fn every_scatter_parser_is_total_on_short_input() {
+         let samples: &[&[u8]] = &[
+[31m-            b"", b"*", b"*2", b"*2\r\n$", b"*2\r\n$1", b"*2\r\n$1\r\n", b"*2\r\n$1\r\n0",
+(B[m[31m-            b"*2\r\n$99999999999999999999\r\n0\r\n", b"*-1\r", b"*-2\r\n", b"*2\r\n$1\r\nx\r\n:",
+(B[m[32m+            b"",
+(B[m[32m+            b"*",
+(B[m[32m+            b"*2",
+(B[m[32m+            b"*2\r\n$",
+(B[m[32m+            b"*2\r\n$1",
+(B[m[32m+            b"*2\r\n$1\r\n",
+(B[m[32m+            b"*2\r\n$1\r\n0",
+(B[m[32m+            b"*2\r\n$99999999999999999999\r\n0\r\n",
+(B[m[32m+            b"*-1\r",
+(B[m[32m+            b"*-2\r\n",
+(B[m[32m+            b"*2\r\n$1\r\nx\r\n:",
+(B[m         ];
+         for raw in samples {
+             for n in 0..=raw.len() {
+error: Recipe `check` failed on line 6 with exit code 1
+check exit=0
+== cargo deny
+   │
+11 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+deny exit=0
+== just compat
+  DefaultDb/Spread: 580 compared (570 byte-identical), 0 tainted-by-shape, 0 spanning-key deviations, 0 failures
+  MemoryNs/Spread: 580 compared (529 byte-identical), 16 tainted-by-shape, 24 spanning-key deviations, 0 failures
+  DurableNs/Spread: 580 compared (529 byte-identical), 16 tainted-by-shape, 24 spanning-key deviations, 0 failures
+  TieredNs/Spread: 580 compared (539 byte-identical), 8 tainted-by-shape, 24 spanning-key deviations, 0 failures
+  DefaultDb/Tagged: 580 compared (563 byte-identical), 0 tainted-by-shape, 0 spanning-key deviations, 0 failures
+  MemoryNs/Tagged: 580 compared (564 byte-identical), 0 tainted-by-shape, 0 spanning-key deviations, 0 failures
+  DurableNs/Tagged: 580 compared (564 byte-identical), 0 tainted-by-shape, 0 spanning-key deviations, 0 failures
+  TieredNs/Tagged: 580 compared (570 byte-identical), 0 tainted-by-shape, 0 spanning-key deviations, 0 failures
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.77s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+compat exit=0
+== just sim-smoke
+     Running `target/release/inf-sim --scenario m2-ns-create-window --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m2-ns-create-window seed 0xc0ffee: 8 commands, 318 steps, swap held 301 steps, 2 USE attempts (2 refused, 0 writes acked in the window), 0 untombstoned unknown-ns skips, 2 released keys found, trace 658 bytes, hash 0xa1f3f1fb99338571
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ns-ddl-race --seed 0xC0FFEE --verify-determinism
+     Running `target/release/inf-sim --scenario m2-ns-ddl-race --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m2-ns-ddl-race seed 0xc0ffee: 38 commands, 103 steps, DROP after 6 steps (found, origin frozen 0 steps), 'x' served on 0 cells before the cut / 0 after, refused leg 1 left 0 cells serving 'y', 0 untombstoned unknown-ns skips, 4 released keys found, trace 3056 bytes, hash 0x950cf499bebdc1f7
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-device-budget --seed 0xC0FFEE --verify-determinism
+     Running `target/release/inf-sim --scenario m2-device-budget --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m2-device-budget seed 0xc0ffee: 1120 commands, 6276 steps, 233 keys audited, 821 required ops, 0 allowed-lost, 0 equivalence checks, 0 documents compared, 0 corpus docs, cut classes [], lift regime false (tiered ops 0, indexed ops 0, sidecars loaded 0, stale slacks lifted 0; plant: cells 0, lifts 0, sidecars 0; torn plants 0), arms [ckpt_downgrades 0 bound_splits 0 waits_fill 0 waits_group 0 plant_fired false], trace 71891 bytes, hash 0xf7d96f8ecc216726
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-mode-transition --seed 0xC0FFEE --verify-determinism
+     Running `target/release/inf-sim --scenario m2-mode-transition --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m2-mode-transition seed 0xc0ffee: 2000 commands, 7444 steps, 96 keys audited, 1340 required ops, 101 allowed-lost, 0 equivalence checks, 0 documents compared, 13 corpus docs, cut classes [], lift regime true (tiered ops 224, indexed ops 257, sidecars loaded 2, stale slacks lifted 0; plant: cells 2, lifts 2, sidecars 2; torn plants 0), arms [ckpt_downgrades 0 bound_splits 0 waits_fill 0 waits_group 0 plant_fired false], trace 836369 bytes, hash 0xf5a3dd0de293c11a
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-reorder-window --seed 0xC0FFEE --verify-determinism
+     Running `target/release/inf-sim --scenario m2-reorder-window --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m2-reorder-window seed 0xc0ffee: 1120 commands, 5570 steps, 36 keys audited, 720 required ops, 0 allowed-lost, 0 equivalence checks, 0 documents compared, 0 corpus docs, cut classes [], lift regime false (tiered ops 0, indexed ops 0, sidecars loaded 0, stale slacks lifted 0; plant: cells 0, lifts 0, sidecars 0; torn plants 0), arms [ckpt_downgrades 0 bound_splits 0 waits_fill 0 waits_group 0 plant_fired false], trace 59330 bytes, hash 0xd36db106214e40c0
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ckpt-refused --seed 0xC0FFEE --verify-determinism
+     Running `target/release/inf-sim --scenario m2-ckpt-refused --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m2-ckpt-refused seed 0xc0ffee: 1120 commands, 5573 steps, 36 keys audited, 720 required ops, 0 allowed-lost, 0 equivalence checks, 0 documents compared, 0 corpus docs, cut classes [], lift regime false (tiered ops 0, indexed ops 0, sidecars loaded 0, stale slacks lifted 0; plant: cells 0, lifts 0, sidecars 0; torn plants 0), arms [ckpt_downgrades 2 bound_splits 0 waits_fill 0 waits_group 0 plant_fired false], trace 59377 bytes, hash 0xf7285c01c04045b4
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-recycle --seed 0xC0FFEE --verify-determinism
+     Running `target/release/inf-sim --scenario m2-recycle --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m2-recycle seed 0xc0ffee: 3200 commands, 15533 steps, 36 keys audited, 2065 required ops, 0 allowed-lost, 0 equivalence checks, 0 documents compared, 0 corpus docs, cut classes [], lift regime false (tiered ops 0, indexed ops 0, sidecars loaded 0, stale slacks lifted 0; plant: cells 0, lifts 0, sidecars 0; torn plants 0), arms [ckpt_downgrades 0 bound_splits 0 waits_fill 0 waits_group 0 plant_fired false], trace 167448 bytes, hash 0x3a6d53f1202ff92d
+sim-smoke exit=0
+VALIDATION-CHAIN-DONE

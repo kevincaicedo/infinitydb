@@ -1,0 +1,16 @@
+== seed 0xC0FFEE
+inf-sim: scenario m0-smoke seed 0xc0ffee: 100000 commands, 105240 apply events, 11904 steps, trace 4963289 bytes, hash 0x93eec65356914989
+inf-sim: sim_seconds=0.101761 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=true accept_resumes=3
+exit=0
+== seed 1
+inf-sim: scenario m0-smoke seed 0x1: 100000 commands, 105282 apply events, 11993 steps, trace 4968995 bytes, hash 0x1600002b31ea1255
+inf-sim: sim_seconds=0.102886 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=true accept_resumes=3
+exit=0
+== seed 2
+inf-sim: scenario m0-smoke seed 0x2: 100000 commands, 105273 apply events, 11971 steps, trace 4966635 bytes, hash 0x3fc65c754285ae21
+inf-sim: sim_seconds=0.102439 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=true accept_resumes=3
+exit=0
+== seed 3
+inf-sim: scenario m0-smoke seed 0x3: 100000 commands, 105275 apply events, 11905 steps, trace 4965984 bytes, hash 0x8324a23d83da4a84
+inf-sim: sim_seconds=0.100851 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=true accept_resumes=3
+exit=0

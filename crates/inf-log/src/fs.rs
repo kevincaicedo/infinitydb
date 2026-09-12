@@ -56,6 +56,19 @@ pub enum SegmentIoMode {
     Direct,
 }
 
+/// The storage-exhaustion class — ADR-0063's typed, non-fatal admission
+/// path (`LogError::NoSpace`, the tier/blob `is_storage_full` legs,
+/// `DISKFULL` at the client). `ENOSPC` and, since F-L04-03, `EDQUOT`: a
+/// quota'd filesystem (the reference box's `/tmp usrquota`) reports the
+/// same operator condition with a different errno, and
+/// `ErrorKind::FilesystemQuotaExceeded` is unstable, so the raw errno is
+/// the stable test. Every site classifies through here — never inline.
+#[must_use]
+pub fn is_storage_exhausted(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded)
+        || matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
+}
+
 /// One open segment file. Offsets are absolute; the caller (the rotor)
 /// owns position bookkeeping.
 pub trait SegmentFile {
@@ -501,6 +514,13 @@ pub mod mem {
         /// Remaining preallocation budget; `None` = unlimited. Debited by
         /// `create_segment` — the ENOSPC injection point.
         capacity: Option<u64>,
+        /// The errno an over-capacity create reports (`None` = the
+        /// `StorageFull` kind). `Some(libc::EDQUOT)` models a quota'd
+        /// filesystem (F-L04-03).
+        exhaustion_errno: Option<i32>,
+        /// Cap on bytes one `read_at` returns (`None` = unlimited): the
+        /// partial-read model every reader must loop over (F-L04-10).
+        read_cap: Option<usize>,
         fail_next_sync_data: bool,
         /// `read_at` calls across every file — the dependent-read oracle
         /// for the `.ick` loader (review L03, batch 34).
@@ -554,6 +574,17 @@ pub mod mem {
 
         /// Cap the total bytes `create_segment` may preallocate from now
         /// on. `None` lifts the cap.
+        /// Over-capacity creates fail with this raw errno instead of the
+        /// `StorageFull` kind (`libc::EDQUOT` = a quota'd filesystem).
+        pub fn set_exhaustion_errno(&self, errno: Option<i32>) {
+            self.state.borrow_mut().exhaustion_errno = errno;
+        }
+
+        /// Every `read_at` returns at most `cap` bytes (partial reads).
+        pub fn set_read_cap(&self, cap: Option<usize>) {
+            self.state.borrow_mut().read_cap = cap;
+        }
+
         pub fn set_capacity(&self, bytes: Option<u64>) {
             self.state.borrow_mut().capacity = bytes;
         }
@@ -618,13 +649,17 @@ pub mod mem {
         }
 
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-            self.fs.borrow_mut().reads += 1;
+            let read_cap = {
+                let mut fs = self.fs.borrow_mut();
+                fs.reads += 1;
+                fs.read_cap
+            };
             let bytes = self.data.borrow();
             let offset = usize::try_from(offset).expect("offset fits usize");
             if offset >= bytes.len() {
                 return Ok(0);
             }
-            let n = buf.len().min(bytes.len() - offset);
+            let n = buf.len().min(bytes.len() - offset).min(read_cap.unwrap_or(usize::MAX));
             buf[..n].copy_from_slice(&bytes[offset..offset + n]);
             Ok(n)
         }
@@ -718,7 +753,10 @@ pub mod mem {
             }
             if let Some(capacity) = state.capacity.as_mut() {
                 if prealloc_bytes > *capacity {
-                    return Err(io::Error::new(io::ErrorKind::StorageFull, "injected ENOSPC"));
+                    return Err(match state.exhaustion_errno {
+                        Some(errno) => io::Error::from_raw_os_error(errno),
+                        None => io::Error::new(io::ErrorKind::StorageFull, "injected ENOSPC"),
+                    });
                 }
                 *capacity -= prealloc_bytes;
             }

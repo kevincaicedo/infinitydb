@@ -77,3 +77,8 @@ name = "cold_shaping"
 harness = false
 test = false
 required-features = ["uring"]
+
+[[test]]
+name = "accept_exhaustion"
+path = "tests/accept_exhaustion.rs"
+required-features = ["uring"]

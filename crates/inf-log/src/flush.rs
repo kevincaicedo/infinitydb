@@ -142,9 +142,7 @@ impl TierFlushError {
     #[must_use]
     pub fn is_storage_full(&self) -> bool {
         match self {
-            TierFlushError::Io { source, .. } => {
-                source.kind() == io::ErrorKind::StorageFull || source.raw_os_error() == Some(28)
-            }
+            TierFlushError::Io { source, .. } => crate::fs::is_storage_exhausted(source),
             // fsync-fail-stop-allow: is_retryable classifier: answers false — the rule that forbids the fsyncgate retry
             TierFlushError::Fsync { .. } => false,
         }

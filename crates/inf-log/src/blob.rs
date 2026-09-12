@@ -138,9 +138,7 @@ impl ExtentWriteFailure {
     #[must_use]
     pub fn is_storage_full(&self) -> bool {
         match self {
-            ExtentWriteFailure::Write(e) => {
-                e.kind() == io::ErrorKind::StorageFull || e.raw_os_error() == Some(28)
-            }
+            ExtentWriteFailure::Write(e) => crate::fs::is_storage_exhausted(e),
             // fsync-fail-stop-allow: is_retryable classifier: false — the ADR-0061 D3 typed abort is never retried
             ExtentWriteFailure::Fsync(_) => false,
         }
@@ -534,7 +532,7 @@ pub fn parse_extent_header(block: &[u8]) -> Result<ExtentHeaderV1, TierDecodeErr
 pub fn probe_extent_file<F: SegmentFs>(fs: &F, path: &Path) -> io::Result<ExtentHeaderV1> {
     let file = fs.open_read(path)?;
     let mut block = vec![0u8; BLOB_HEADER_BYTES];
-    let got = file.read_at(0, &mut block)?;
+    let got = read_full(&file, 0, &mut block)?;
     parse_extent_header(&block[..got])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{path:?}: {e}")))
 }
@@ -655,7 +653,7 @@ impl<File: SegmentFile> ExtentReader<File> {
         }
         self.window.resize(window_len, 0);
         let device_at = extent_frame_offset(first_frame);
-        let got = self.file.read_at(device_at, &mut self.window)?;
+        let got = read_full(&self.file, device_at, &mut self.window)?;
         if got < window_len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -709,6 +707,22 @@ pub fn list_extent_ids<F: SegmentFs>(fs: &F, shard_dir: &Path) -> io::Result<Vec
     let mut ids: Vec<ExtentId> = names.iter().filter_map(|n| parse_extent_file_name(n)).collect();
     ids.sort_unstable();
     Ok(ids)
+}
+
+/// Fill `buf` from `offset`, looping over partial reads (the
+/// `SegmentFile::read_at` contract: "partial reads are legal — readers
+/// loop", F-L04-10). Returns the bytes read; short only at EOF, so a
+/// short return is the honest "the file really is shorter".
+fn read_full<File: SegmentFile>(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    let mut read = 0usize;
+    while read < buf.len() {
+        let n = file.read_at(offset + read as u64, &mut buf[read..])?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+    }
+    Ok(read)
 }
 
 /// Opens an existing extent for reading in `mode` (cold blob reads).
@@ -871,6 +885,29 @@ mod tests {
             w.append_chunk(chunk).expect("append");
         }
         w.finish().expect("finish")
+    }
+
+    /// F-L04-10: a filesystem that returns short reads (every `pread`
+    /// may) must not turn an intact extent into "header does not verify"
+    /// / "extent shorter than its declared frames" — both readers loop.
+    #[test]
+    fn short_reads_are_looped_never_reported_as_corruption() {
+        let fs = MemFs::default();
+        let bytes = value(2 * TIER_FRAME_DATA + 77, 9);
+        let sealed = write_extent(&fs, 3, &bytes);
+        assert_eq!(sealed.data_len(), bytes.len() as u64);
+        for cap in [1usize, 7, 35, 36, 4095, 4096] {
+            fs.set_read_cap(Some(cap));
+            let mut reader = open_extent(&fs, Path::new(SHARD), ExtentId(3), TierIoMode::Buffered)
+                .unwrap_or_else(|e| panic!("open under a {cap}-byte read cap: {e}"));
+            let mut out = Vec::new();
+            reader
+                .read(0, bytes.len(), &mut out)
+                .unwrap_or_else(|e| panic!("read under a {cap}-byte read cap: {e}"))
+                .expect("crc");
+            assert_eq!(out, bytes, "read cap {cap}");
+        }
+        fs.set_read_cap(None);
     }
 
     #[test]

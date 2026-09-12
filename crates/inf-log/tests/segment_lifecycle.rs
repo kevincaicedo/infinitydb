@@ -96,6 +96,26 @@ fn unmaintained_rotation_counts_inline_prealloc() {
     assert_eq!(rotor.stats().inline_preallocs, 1, "slow path taken and counted");
 }
 
+/// F-L04-03: a quota'd filesystem reports `EDQUOT` (errno 122), not
+/// `ENOSPC`, for the same operator condition — it must take the typed
+/// admission path (`prealloc_failed`, `space_exhausted`, `NoSpace`),
+/// never the fail-stop `Io` class.
+#[test]
+fn edquot_is_the_disk_full_class() {
+    let fs = MemFs::new();
+    fs.set_capacity(Some(u64::from(SEGMENT_BYTES)));
+    fs.set_exhaustion_errno(Some(libc::EDQUOT));
+    let mut rotor = mem_rotor(&fs);
+    let report = rotor.maintain(0).expect("maintain never hard-fails on a quota refusal");
+    assert!(report.prealloc_failed);
+    assert!(rotor.space_exhausted());
+    assert_eq!(rotor.stats().prealloc_failures, 1);
+    fs.set_capacity(None);
+    let report = rotor.maintain(0).expect("maintain");
+    assert_eq!(report.preallocated, Some(SegmentId(1)));
+    assert!(!rotor.space_exhausted());
+}
+
 #[test]
 fn enospc_surfaces_in_maintain_before_writes_need_it() {
     let fs = MemFs::new();
