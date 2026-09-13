@@ -119,6 +119,17 @@ use crate::staging::MAX_FRAMES_IN_FLIGHT;
 /// is a constant (16 × 32 B) and never a function of device behaviour.
 pub const REORDER_WINDOW_FRAMES: usize = 2 * MAX_FRAMES_IN_FLIGHT as usize;
 
+/// Write-through tickets the ledger holds unfolded at once (batch 44,
+/// ADR-0087 D2 third amendment). Behind a wedged FLUSH-class front entry
+/// (a seal, a dir barrier, a linked sync) every FUA frame still completes
+/// at `LogWritten` and its ticket sits in `pending` until the front
+/// folds — one per frame, bounded before only by the gated clients'
+/// outstanding commands. At the window `frame_plan` answers `Plain`: the
+/// due accumulates (§8.2) and the first barrier after the front covers
+/// it; its acks waited for the front anyway. Same width as the reorder
+/// window, above any configured K.
+pub const WRITE_THROUGH_WINDOW_ENTRIES: usize = REORDER_WINDOW_FRAMES;
+
 /// Durability class of a staged effect's namespace (§8.2). `memory`
 /// namespaces never reach the log, so they have no representation here —
 /// zero cost by construction (M2-S09).
@@ -313,6 +324,10 @@ pub struct GroupCommit<File> {
     /// `syncs_in_flight()` in O(1), maintained at push / complete / error
     /// (batch 43; the scan it replaces is the debug oracle).
     flush_in_flight: usize,
+    /// Write-through tickets registered and not yet folded into the
+    /// durable prefix — bounded at `WRITE_THROUGH_WINDOW_ENTRIES` by
+    /// `frame_plan`'s `Plain`, release-asserted at registration (batch 44).
+    write_through_pending: usize,
     queued_up_to: Option<Lsn>,
     queued_bytes: u64,
     /// Frames queued and not yet part of the written prefix, in queue
@@ -389,6 +404,7 @@ impl<File: SegmentFile> GroupCommit<File> {
             always_queued_up_to: None,
             flush_bound: bound,
             flush_in_flight: 0,
+            write_through_pending: 0,
             queued_up_to: None,
             queued_bytes: 0,
             queued: VecDeque::with_capacity(REORDER_WINDOW_FRAMES),
@@ -487,6 +503,20 @@ impl<File: SegmentFile> GroupCommit<File> {
         self.queued.len() >= REORDER_WINDOW_FRAMES
     }
 
+    /// True while `WRITE_THROUGH_WINDOW_ENTRIES` write-through tickets sit
+    /// unfolded behind a wedged front (batch 44): the next due frame
+    /// seals `Plain` instead of minting another ticket.
+    #[must_use]
+    pub fn write_through_window_full(&self) -> bool {
+        self.write_through_pending >= WRITE_THROUGH_WINDOW_ENTRIES
+    }
+
+    /// Unfolded write-through tickets — the `write_through_entries` gauge.
+    #[must_use]
+    pub fn write_through_entries(&self) -> usize {
+        self.write_through_pending
+    }
+
     /// Should this iteration's frame write chain an fdatasync (the
     /// FLUSH-class barrier, bounded by the FLUSH pipeline)? A linked
     /// fdatasync is ordered after *its own* write only (`IO_LINK`), so it
@@ -536,7 +566,10 @@ impl<File: SegmentFile> GroupCommit<File> {
         if !self.sync_due {
             return FramePlan::Plain;
         }
-        if write_through_ok && (seal_ahead || self.write_through_due()) {
+        if write_through_ok
+            && (seal_ahead || self.write_through_due())
+            && !self.write_through_window_full()
+        {
             return FramePlan::WriteThrough;
         }
         if !self.drained() {
@@ -901,7 +934,16 @@ impl<File: SegmentFile> GroupCommit<File> {
                 "FLUSH-class barrier into a full pipeline"
             );
         }
-        if reason != SyncReason::WriteThrough {
+        if reason == SyncReason::WriteThrough {
+            // Release assert (batch 44): a ticket enters only through a
+            // window `frame_plan` found open — the sibling of the reorder
+            // window's queue assert.
+            assert!(
+                self.write_through_pending < WRITE_THROUGH_WINDOW_ENTRIES,
+                "write-through ticket into a full window"
+            );
+            self.write_through_pending += 1;
+        } else {
             self.flush_in_flight += 1;
         }
         self.next_ticket += 1;
@@ -916,6 +958,11 @@ impl<File: SegmentFile> GroupCommit<File> {
             failed: false,
             held,
         });
+        debug_assert_eq!(
+            self.write_through_pending,
+            self.pending.iter().filter(|p| p.reason == SyncReason::WriteThrough).count(),
+            "write-through count tracks the FIFO"
+        );
         FsyncTicket(ticket)
     }
 
@@ -1031,6 +1078,9 @@ impl<File: SegmentFile> GroupCommit<File> {
             }
             self.durable_up_to = Some(front.covers_up_to);
             self.durable_bytes = front.covers_bytes;
+            if front.reason == SyncReason::WriteThrough {
+                self.write_through_pending -= 1;
+            }
             self.pending.pop_front();
         }
         (self.durable_up_to != before).then(|| self.durable_up_to.expect("advanced past None"))
@@ -1738,6 +1788,76 @@ mod tests {
         assert_eq!(gc.on_fsync_complete(tickets[1], Nanos::from_micros(320)), Some(lsn(0, 12288)));
         assert!(gc.drained());
         assert_eq!(gc.stats().fsyncs_write_through, 3, "K frames, K barriers");
+    }
+
+    /// Batch 44 (ADR-0087 D2 third amendment): behind a wedged FLUSH-class
+    /// front the ledger mints at most `WRITE_THROUGH_WINDOW_ENTRIES`
+    /// write-through tickets; the next due frame seals `Plain` and its due
+    /// accumulates until the front folds. Pre-fix every frame took a
+    /// ticket — `pending` grew by one per frame for the whole wedge.
+    #[test]
+    fn write_through_tickets_behind_a_wedged_front_are_bounded() {
+        let fs = crate::fs::mem::MemFs::new();
+        fs.create_dir_all(std::path::Path::new("log")).expect("mem dir");
+        let mut gc = commit();
+        // The wedged front: a coverage-neutral dir barrier that never lands.
+        let dir = fs.open_dir(std::path::Path::new("log")).expect("mem dir handle");
+        let wedge = gc.register_prealloc_barrier(dir, Nanos::ZERO);
+        let window = u32::try_from(WRITE_THROUGH_WINDOW_ENTRIES).expect("small constant");
+        let mut tickets = Vec::new();
+        for i in 1..=window {
+            gc.note_staged(FsyncClass::Always);
+            assert_eq!(gc.frame_plan(true, false), FramePlan::WriteThrough, "frame {i}");
+            gc.note_frame_queued(lsn(0, i * 4096), 4096);
+            tickets.push(gc.register_write_through(Nanos::ZERO));
+            write_oldest(&mut gc);
+            assert_eq!(gc.on_fsync_complete(tickets[i as usize - 1], Nanos::from_micros(40)), None);
+        }
+        assert!(gc.write_through_window_full());
+        assert_eq!(gc.write_through_entries(), WRITE_THROUGH_WINDOW_ENTRIES);
+        // The window is full: due frames flow plain, the ledger stays bounded.
+        for i in window + 1..=3 * window {
+            gc.note_staged(FsyncClass::Always);
+            assert_eq!(gc.frame_plan(true, false), FramePlan::Plain, "frame {i}");
+            gc.note_frame_queued(lsn(0, i * 4096), 4096);
+            write_oldest(&mut gc);
+            assert!(gc.sync_due(), "the due accumulates behind the front");
+            assert_eq!(gc.pending_entries(), WRITE_THROUGH_WINDOW_ENTRIES + 1);
+        }
+        // The front folds: the prefix runs through every ticket, the
+        // window reopens, and the uncovered plain frames take a linked
+        // sync (the prefix rule), never a write-through.
+        assert_eq!(gc.on_fsync_complete(wedge, Nanos::from_millis(5)), Some(lsn(0, window * 4096)));
+        assert_eq!(gc.write_through_entries(), 0);
+        assert!(!gc.write_through_due(), "plain frames below: FLUSH class covers the gap");
+        assert_eq!(gc.frame_plan(true, false), FramePlan::LinkedFsync);
+        gc.note_frame_queued(lsn(0, (3 * window + 1) * 4096), 4096);
+        let t = gc.register_linked_fsync(Nanos::ZERO);
+        write_oldest(&mut gc);
+        assert_eq!(
+            gc.on_fsync_complete(t, Nanos::from_micros(900)),
+            Some(lsn(0, (3 * window + 1) * 4096))
+        );
+        assert!(gc.drained());
+    }
+
+    /// Registering past the window is a plane bug, release-asserted.
+    #[test]
+    #[should_panic(expected = "full window")]
+    fn write_through_into_a_full_window_panics() {
+        let fs = crate::fs::mem::MemFs::new();
+        fs.create_dir_all(std::path::Path::new("log")).expect("mem dir");
+        let mut gc = commit();
+        let dir = fs.open_dir(std::path::Path::new("log")).expect("mem dir handle");
+        let _wedge = gc.register_prealloc_barrier(dir, Nanos::ZERO);
+        let window = u32::try_from(WRITE_THROUGH_WINDOW_ENTRIES).expect("small constant");
+        for i in 1..=window + 1 {
+            gc.note_staged(FsyncClass::Always);
+            gc.note_frame_queued(lsn(0, i * 4096), 4096);
+            let t = gc.register_write_through(Nanos::ZERO);
+            write_oldest(&mut gc);
+            gc.on_fsync_complete(t, Nanos::from_micros(40));
+        }
     }
 
     #[test]

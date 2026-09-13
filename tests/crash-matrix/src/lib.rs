@@ -23,6 +23,7 @@
 //!   final unflushed/torn records (within the loss window by
 //!   construction here; the ack-stream oracle proper binds at S19);
 //! - recovery is idempotent (second recovery digest-equal).
+#![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

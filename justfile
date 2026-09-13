@@ -13,6 +13,10 @@ check:
     # panic/unreachable in cell code is a classified inventory row.
     ./scripts/check-release-asserts.sh
     ./scripts/check-safety-inventory.sh
+    # ADR-0121 (review 2026-08-30, F-L17-09): every crate root forbids or
+    # denies unsafe_code, the deny set is the audited-leaf list, and every
+    # allow is module-scoped — the §17.3 posture, mechanical.
+    ./scripts/check-unsafe-roots.sh
     # ADR-0107 (review 2026-08-30, F-L16-01): no normal dependency edge may
     # request fault-points/collision-oracle — a workspace build would link
     # infinityd against a colliding hasher.

@@ -1,0 +1,11 @@
+UNSAFE ROOT UNGOVERNED: crates/inf-alloc/src/lib.rs carries neither forbid nor deny(unsafe_code)
+UNSAFE ROOT UNGOVERNED: crates/inf-runtime/src/lib.rs carries neither forbid nor deny(unsafe_code)
+UNSAFE ALLOW NOT ON A MOD ITEM: crates/inf-simd/src/group16.rs:50
+UNSAFE ALLOW NOT ON A MOD ITEM: crates/inf-simd/src/group16.rs:85
+UNSAFE ALLOW NOT ON A MOD ITEM: crates/inf-simd/src/json.rs:214
+UNSAFE ROOT UNGOVERNED: bins/inf-sim/src/lib.rs carries neither forbid nor deny(unsafe_code)
+UNSAFE ROOT UNGOVERNED: tests/crash-matrix/src/lib.rs carries neither forbid nor deny(unsafe_code)
+UNSAFE LEAF LIST STALE: inf-alloc is listed but carries no deny root (a forbid crate leaves the list by ADR)
+UNSAFE LEAF LIST STALE: inf-runtime is listed but carries no deny root (a forbid crate leaves the list by ADR)
+UNSAFE LEAF LIST STALE: inf-sim is listed but carries no deny root (a forbid crate leaves the list by ADR)
+unsafe-roots FAILED: 25 crate roots, 5 deny crates (inf-doc, inf-fabric, inf-probe, inf-server, inf-simd), 8 module-scoped allows

@@ -1,0 +1,12 @@
+   Compiling inf-foundation v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-foundation)
+   Compiling inf-simd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-simd)
+   Compiling inf-fabric v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-fabric)
+   Compiling inf-alloc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-alloc)
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+   Compiling inf-wire v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-wire)
+   Compiling inf-doc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-doc)
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling inf-sim v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/inf-sim)
+    Finished `release` profile [optimized + debuginfo] target(s) in 38.17s

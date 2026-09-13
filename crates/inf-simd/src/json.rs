@@ -211,7 +211,6 @@ fn flush_block(base: usize, masks: BlockMasks, state: &mut ScanState, out: &mut 
     let mut n = out.len();
     // SAFETY: `reserve(64)` guarantees capacity for the at-most-64 set
     // bits of `emit`; `set_len(n)` exposes exactly the written prefix.
-    #[allow(unsafe_code)]
     unsafe {
         let dst = out.as_mut_ptr();
         while emit != 0 {

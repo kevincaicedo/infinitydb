@@ -1,0 +1,5 @@
+thread 'commit::tests::write_through_tickets_behind_a_wedged_front_are_bounded' (414748) panicked at crates/inf-log/src/commit.rs:1814:13:
+assertion `left == right` failed: frame 17
+  left: WriteThrough
+ right: Plain
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 110 filtered out; finished in 0.00s

@@ -51,7 +51,7 @@ pub use ckpt::{
 };
 pub use commit::{
     CommitStats, FrameId, FramePlan, FsyncClass, FsyncTicket, GroupCommit, REORDER_WINDOW_FRAMES,
-    SyncReason,
+    SyncReason, WRITE_THROUGH_WINDOW_ENTRIES,
 };
 pub use effect::MutationEffect;
 pub use flush::{

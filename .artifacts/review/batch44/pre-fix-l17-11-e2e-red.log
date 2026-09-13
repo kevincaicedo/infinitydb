@@ -1,0 +1,12 @@
+test durable_mset_midway_failure_stages_on_the_fabric_path ... FAILED
+test durable_mset_bounds_failure_is_atomic_across_recovery ... ok
+test durable_mset_midway_failure_stages_what_it_wrote ... FAILED
+thread 'durable_mset_midway_failure_stages_on_the_fabric_path' (426083) panicked at crates/inf-server/tests/node_e2e.rs:665:5:
+assertion `left == right` failed: reply mismatch: got "$3\r\nold\r\n" want "$3\r\nnew\r\n"
+  left: [36, 51, 13, 10, 111, 108, 100, 13, 10]
+ right: [36, 51, 13, 10, 110, 101, 119, 13, 10]
+thread 'durable_mset_midway_failure_stages_what_it_wrote' (426084) panicked at crates/inf-server/tests/node_e2e.rs:665:5:
+assertion `left == right` failed: reply mismatch: got "$3\r\nold\r\n" want "$3\r\nnew\r\n"
+  left: [36, 51, 13, 10, 111, 108, 100, 13, 10]
+ right: [36, 51, 13, 10, 110, 101, 119, 13, 10]
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 72 filtered out; finished in 0.02s

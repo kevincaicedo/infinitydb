@@ -1,0 +1,3 @@
+just check exit 0
+cargo deny exit 0
+sim-smoke exit 0

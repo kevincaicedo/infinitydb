@@ -12,6 +12,13 @@
 //! byte-for-byte (the single-key linearizability oracle: apply points on a
 //! single thread form a real total order).
 
+// §17.3 as amended (ADR-0121, batch 44): the simulator's backend driver
+// (`net`) and its steel-thread tier reader (`steel`) execute driver ops
+// over `StableBytes` payloads — the two named `allow`s (SAFETY.md); the
+// library root, where the unsafe lives, carries the deny (the binary's
+// `forbid` governed a root with none of it).
+#![deny(unsafe_code)]
+
 pub mod backfill;
 pub mod bootstorm;
 pub mod coldstorm;
@@ -21,6 +28,7 @@ mod document;
 pub mod durable;
 pub mod harness;
 mod lift;
+#[allow(unsafe_code)]
 pub mod net;
 pub mod nscreate;
 pub mod nsddl;
@@ -28,6 +36,7 @@ pub mod pressure;
 pub mod recovery;
 pub mod resp;
 pub mod sidecar;
+#[allow(unsafe_code)]
 pub mod steel;
 pub mod tiered;
 pub mod txmodel;

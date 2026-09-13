@@ -105,7 +105,7 @@ fn main() {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m2-device-budget|m2-mode-transition|m2-reorder-window|m2-fill-tick|m2-group-hold|m2-ckpt-refused|m2-recycle|m3-document|m2-combined|boot-storm \
+                        "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m2-device-budget|m2-mode-transition|m2-reorder-window|m2-fill-tick|m2-group-hold|m2-fua-pending|m2-ckpt-refused|m2-recycle|m3-document|m2-combined|boot-storm \
                          [--seed N|0xN] [--verify-determinism] \
                          [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio] [--replay-canary] [--lift-regime] [--cells N] \
                          [--connections N] [--commands N] [--trace-out FILE] \
@@ -133,6 +133,7 @@ fn main() {
             | "m2-reorder-window"
             | "m2-fill-tick"
             | "m2-group-hold"
+            | "m2-fua-pending"
             | "m2-ckpt-refused"
             | "m2-recycle"
             | "m3-document"
@@ -1195,6 +1196,7 @@ fn run_durable(
             "m2-reorder-window" => DurableScenario::m2_reorder_window(seed),
             "m2-fill-tick" => DurableScenario::m2_fill_tick(seed),
             "m2-group-hold" => DurableScenario::m2_group_hold(seed),
+            "m2-fua-pending" => DurableScenario::m2_fua_pending(seed),
             "m2-ckpt-refused" => DurableScenario::m2_ckpt_refused(seed),
             "m2-recycle" => DurableScenario::m2_recycle(seed),
             "m3-document" => DurableScenario::m3_document(seed),
@@ -1215,7 +1217,8 @@ fn run_durable(
              ops {}, sidecars loaded {}, stale slacks lifted {}; plant: cells {}, lifts {}, \
              sidecars {}; torn plants {}), arms [ckpt_downgrades {} bound_splits {} waits_fill \
              {} waits_group {} plant_fired {}], log oracles [idle_tick_violations {} \
-             frames_awaiting_max {} fsync_entries_max {} hold_episode_violations {}], trace {} \
+             frames_awaiting_max {} fsync_entries_max {} write_through_entries_max {} \
+             hold_episode_violations {}], trace {} \
              bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
@@ -1243,6 +1246,7 @@ fn run_durable(
             report.idle_tick_violations,
             report.frames_awaiting_max,
             report.fsync_entries_max,
+            report.write_through_entries_max,
             report.hold_episode_violations,
             report.trace.len(),
             report.trace_hash
@@ -1300,6 +1304,7 @@ fn run_durable(
     let mut idle_tick_violations = 0u64;
     let mut frames_awaiting_max = 0u64;
     let mut fsync_entries_max = 0u64;
+    let mut write_through_entries_max = 0u64;
     let mut hold_episode_violations = 0u64;
     // Device-budget coverage (ADR-0088 D8): background bytes granted,
     // deferrals issued, seal-pace waits, worst frame-write latency.
@@ -1350,6 +1355,7 @@ fn run_durable(
         idle_tick_violations += report.idle_tick_violations;
         frames_awaiting_max = frames_awaiting_max.max(report.frames_awaiting_max);
         fsync_entries_max = fsync_entries_max.max(report.fsync_entries_max);
+        write_through_entries_max = write_through_entries_max.max(report.write_through_entries_max);
         hold_episode_violations += report.hold_episode_violations;
         budget_bytes += report.budget_background_bytes;
         budget_deferrals += report.budget_deferrals;
@@ -1408,7 +1414,9 @@ fn run_durable(
          reopened_packed_tails:{reopened_packed_tails} ckpt_downgrades:{ckpt_downgrades} \
          bound_splits:{bound_splits} waits_fill:{waits_fill} waits_group:{waits_group}, log oracles \
          [idle_tick_violations:{idle_tick_violations} frames_awaiting_max:{frames_awaiting_max} \
-         fsync_entries_max:{fsync_entries_max} hold_episode_violations:{hold_episode_violations}], \
+         fsync_entries_max:{fsync_entries_max} \
+         write_through_entries_max:{write_through_entries_max} \
+         hold_episode_violations:{hold_episode_violations}], \
          recycling [recycled:{recycled} misses:{recycle_misses} \
          fallbacks:{recycle_fallbacks} rotations:{rotations} residue_slacks:{residue_slacks} \
          waits_started:{waits_started} waits_satisfied:{waits_satisfied} \
@@ -1433,7 +1441,9 @@ fn run_durable(
              reopened_packed_tails={reopened_packed_tails} ckpt_downgrades={ckpt_downgrades} \
              ckpt_bound_splits={bound_splits} waits_fill={waits_fill} waits_group={waits_group} \
              idle_tick_violations={idle_tick_violations} frames_awaiting_max={frames_awaiting_max} \
-             fsync_entries_max={fsync_entries_max} hold_episode_violations={hold_episode_violations} \
+             fsync_entries_max={fsync_entries_max} \
+             write_through_entries_max={write_through_entries_max} \
+             hold_episode_violations={hold_episode_violations} \
              segments_recycled={recycled} recycle_misses={recycle_misses} \
              recycle_fallbacks={recycle_fallbacks} segment_rotations={rotations} \
              recycled_residue_slacks={residue_slacks} recycle_waits_started={waits_started} \
