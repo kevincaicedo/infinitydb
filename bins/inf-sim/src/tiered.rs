@@ -162,6 +162,13 @@ pub struct TieredScenario {
     /// next checkpoint must re-latch the pin under its own id. The
     /// `tiering_walk_behind` oracle below is the witness.
     pub ckpt_direct_refused_after: Option<u64>,
+    /// F-L04-02 (ADR-0119 D2): before the phase-7 cold re-read sweep,
+    /// arm one `EIO` on the next read of every tier file. Each fault must
+    /// reach the client as exactly one typed `ERR cold read failed`
+    /// reply and one `tiering_cold_read_errors` increment — a nil, a
+    /// stale value, or an unattributed fault is a violation. Seeds ≡ 7
+    /// (mod 8); `--plant tier-read-eio` forces it.
+    pub tier_read_fault: bool,
 }
 
 impl TieredScenario {
@@ -195,6 +202,7 @@ impl TieredScenario {
             dir_open_fault: seed % 8 == 5,
             ckpt_section_bound: DurableScenario::section_bound_for(seed, 1 << 10),
             ckpt_direct_refused_after: (seed % 8 == 6).then_some(2),
+            tier_read_fault: seed % 8 == 7,
         }
     }
 
@@ -289,6 +297,14 @@ pub struct TieredNodeReport {
     /// nothing — the sweep counts both).
     pub dir_open_fault_arm: bool,
     pub dir_open_faults_fired: u64,
+    /// F-L04-02: the tier-read `EIO` arm this seed ran, the faults the
+    /// sweep's reads consumed, and the typed replies they produced
+    /// (equal, or the plane folded a device error).
+    pub tier_read_fault_arm: bool,
+    pub tier_read_faults_fired: u64,
+    pub tier_read_error_replies: u64,
+    /// Armed faults the audit never consumed (disarmed after it).
+    pub tier_read_faults_unconsumed: u64,
     /// F-L03-04 / ADR-0117 engagement: checkpoint staging downgrades
     /// (the `EINVAL` seeds) and sections sealed for the bound (the
     /// section-bound seeds), summed over cells at phase 10b.
@@ -500,6 +516,98 @@ fn pump_writers(
         progress += 1;
     }
     progress
+}
+
+/// Phase 6a (F-L04-02): see the call site. `Err` is a harness failure
+/// (a stalled call); oracle violations ride the report.
+#[allow(clippy::too_many_arguments)]
+fn tier_read_fault_probe(
+    node: &mut Node,
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &SimDisk,
+    scenario: &TieredScenario,
+    audit: &mut MiniClient,
+    observed: &BTreeMap<Vec<u8>, Vec<u8>>,
+    report: &mut TieredNodeReport,
+) -> Result<(), String> {
+    let seed = scenario.seed;
+    report.tier_read_fault_arm = true;
+    let mut armed = 0u64;
+    for (path, _) in disk.image() {
+        if path.extension().is_some_and(|ext| ext == "itier") {
+            disk.inject(&path, inf_server::DeviceFault::ReadEio, 1)
+                .map_err(|err| format!("tier-read arm {path:?}: {err}"))?;
+            armed += 1;
+        }
+    }
+    if armed == 0 {
+        return Err("TIER-READ FAULT ARM VACUOUS: no tier file to arm after phase 6".to_owned());
+    }
+    let errors_before = info_sum(node, rng, clock, disk, scenario, &["tiering_cold_read_errors"])
+        .map_err(|err| format!("cold-read error scrape: {err}"))?[0];
+    let faults_before = disk.faults_fired();
+    let cold_io: &[u8] = b"-ERR cold read failed (tier I/O error)\r\n";
+    for (key, want) in observed {
+        let get: &[&[u8]] = &[b"GET", key];
+        let mut reply = audit
+            .call(node, rng, clock, disk, scenario.step_ns_max, get)
+            .map_err(|err| format!("probe GET {key:?}: {err}"))?
+            .ok_or_else(|| format!("probe GET {key:?} stalled"))?;
+        if reply == cold_io {
+            report.tier_read_error_replies += 1;
+            reply = audit
+                .call(node, rng, clock, disk, scenario.step_ns_max, get)
+                .map_err(|err| format!("probe retry GET {key:?}: {err}"))?
+                .ok_or_else(|| format!("probe retry GET {key:?} stalled"))?;
+            if reply == cold_io {
+                report.violations.push(format!(
+                    "TIER-READ FAULT STICKS seed {seed:#x} key {:?}: one armed EIO, the retry \
+                     failed too",
+                    String::from_utf8_lossy(key)
+                ));
+                continue;
+            }
+        }
+        if &reply != want {
+            report.violations.push(format!(
+                "TIER-READ PROBE VIOLATION seed {seed:#x} key {:?}: audit observed {}, probe \
+                 read {}",
+                String::from_utf8_lossy(key),
+                preview(want),
+                preview(&reply)
+            ));
+        }
+    }
+    report.tier_read_faults_fired = disk.faults_fired() - faults_before;
+    report.tier_read_faults_unconsumed = disk.clear_faults();
+    if report.tier_read_faults_fired == 0 {
+        report.violations.push(format!(
+            "TIER-READ FAULT ARM VACUOUS seed {seed:#x}: {armed} tier files armed, the probe's \
+             {} reads consumed none",
+            observed.len()
+        ));
+        return Ok(());
+    }
+    if report.tier_read_error_replies != report.tier_read_faults_fired {
+        report.violations.push(format!(
+            "TIER-READ FAULT FOLDED seed {seed:#x}: {} device errors fired, {} typed replies \
+             reached the client (F-L04-02 / L06-02: a device error is never a miss or a value)",
+            report.tier_read_faults_fired, report.tier_read_error_replies
+        ));
+    }
+    // The operator's witness: one increment per fault (cell scoped, summed).
+    let errors_after = info_sum(node, rng, clock, disk, scenario, &["tiering_cold_read_errors"])
+        .map_err(|err| format!("cold-read error scrape: {err}"))?[0];
+    if errors_after - errors_before != report.tier_read_faults_fired {
+        report.violations.push(format!(
+            "TIER-READ FAULT UNCOUNTED seed {seed:#x}: {} device errors fired, \
+             tiering_cold_read_errors rose by {}",
+            report.tier_read_faults_fired,
+            errors_after - errors_before
+        ));
+    }
+    Ok(())
 }
 
 fn preview(reply: &[u8]) -> String {
@@ -1388,6 +1496,29 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         );
     }
     report.flushed_final_bytes = flushed_now;
+
+    // ---- phase 6a: the tier-read fault probe (F-L04-02, ADR-0119 D2) ----
+    // The audited keys are cold again (phase 6 re-demoted them) and every
+    // tier file exists: arm one `EIO` on the next read of each, GET every
+    // audited key, and require each fault to reach the client as exactly
+    // one typed reply — then the value on the retry (one op, not a dead
+    // file) — and one counter increment. Leftovers are disarmed so no
+    // later phase meets a fault its oracle never modeled.
+    if scenario.tier_read_fault
+        && let Err(what) = tier_read_fault_probe(
+            &mut node,
+            &mut rng,
+            &clock,
+            &disk,
+            scenario,
+            &mut audit,
+            &observed,
+            &mut report,
+        )
+    {
+        fail(&mut report, what);
+        return finish(report, &observer, &clock);
+    }
 
     // ---- phase 6b: overwrite + delete the cold phase-2 keys (M4.5-S37) --
     // The recovered life re-demoted the audited keys (phase 6's fill

@@ -73,6 +73,7 @@ fn main() {
                         "lost-wakeup" => Plant::LostWakeup,
                         "fsync-lies" => Plant::FsyncLies,
                         "accept-error" => Plant::AcceptError,
+                        "tier-read-eio" => Plant::TierReadEio,
                         other => return Err(format!("unknown plant {other}")),
                     }
                 }
@@ -106,7 +107,7 @@ fn main() {
                     println!(
                         "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m2-device-budget|m2-mode-transition|m2-reorder-window|m2-ckpt-refused|m2-recycle|m3-document|m2-combined|boot-storm \
                          [--seed N|0xN] [--verify-determinism] \
-                         [--plant lost-wakeup|fsync-lies|accept-error] [--replay-canary] [--lift-regime] [--cells N] \
+                         [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio] [--replay-canary] [--lift-regime] [--cells N] \
                          [--connections N] [--commands N] [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]]"
                     );
@@ -507,7 +508,9 @@ fn main() {
     // DISKFULL clamp → drop race). Sweep mode mirrors m4-recovery.
     if scenario_name == "m4-tiered" {
         let run_one = |seed: u64| {
-            let scenario = inf_sim::TieredScenario::m4_tiered(seed);
+            let mut scenario = inf_sim::TieredScenario::m4_tiered(seed);
+            // F-L04-02: the flag forces the seed-cadence arm on.
+            scenario.tier_read_fault |= plant == Plant::TierReadEio;
             inf_sim::run_tiered_scenario(&scenario)
         };
         if let Some(sweep) = sweep {
@@ -526,6 +529,10 @@ fn main() {
             let mut race_replans = 0u64;
             let mut dir_open_fault_seeds = 0u64;
             let mut dir_open_faults_fired = 0u64;
+            let mut tier_read_fault_seeds = 0u64;
+            let mut tier_read_faults_fired = 0u64;
+            let mut tier_read_error_replies = 0u64;
+            let mut tier_read_faults_unconsumed = 0u64;
             let mut ckpt_downgrades = 0u64;
             let mut ckpt_bound_splits = 0u64;
             let mut diskfull_refusals = 0u64;
@@ -606,6 +613,10 @@ fn main() {
                 race_replans += report.race_replans;
                 dir_open_fault_seeds += u64::from(report.dir_open_fault_arm);
                 dir_open_faults_fired += report.dir_open_faults_fired;
+                tier_read_fault_seeds += u64::from(report.tier_read_fault_arm);
+                tier_read_faults_fired += report.tier_read_faults_fired;
+                tier_read_error_replies += report.tier_read_error_replies;
+                tier_read_faults_unconsumed += report.tier_read_faults_unconsumed;
                 ckpt_downgrades += report.ckpt_downgrades;
                 ckpt_bound_splits += report.ckpt_bound_splits;
                 diskfull_refusals += report.diskfull_refusals;
@@ -639,7 +650,10 @@ fn main() {
                  keys audited, {flushed_pre_cut} B flushed pre-cut, {cold_resolves} cold \
                  resolves, {blob_sets} blob sets, {race_replans} blob-key race replans, \
                  dir-open fault armed on {dir_open_fault_seeds} seeds ({dir_open_faults_fired} \
-                 fired), ckpt arms [downgrades {ckpt_downgrades} bound_splits \
+                 fired), tier-read EIO armed on {tier_read_fault_seeds} seeds \
+                 ({tier_read_faults_fired} fired, {tier_read_error_replies} typed replies, \
+                 {tier_read_faults_unconsumed} unconsumed), \
+                 ckpt arms [downgrades {ckpt_downgrades} bound_splits \
                  {ckpt_bound_splits}], {diskfull_refusals} DISKFULL refusals, \
                  drop-race {drop_values} values / {drop_other} typed-other; post-drop reboots \
                  {drop_reboots} ({drop_reboot_residue} with MANIFEST residue), cut inside DROP: \
@@ -670,6 +684,10 @@ fn main() {
                      flushed_pre_cut={flushed_pre_cut} cold_resolves={cold_resolves} \
                      blob_sets={blob_sets} dir_open_fault_seeds={dir_open_fault_seeds} \
                      dir_open_faults_fired={dir_open_faults_fired} \
+                     tier_read_fault_seeds={tier_read_fault_seeds} \
+                     tier_read_faults_fired={tier_read_faults_fired} \
+                     tier_read_error_replies={tier_read_error_replies} \
+                     tier_read_faults_unconsumed={tier_read_faults_unconsumed} \
                      ckpt_downgrades={ckpt_downgrades} ckpt_bound_splits={ckpt_bound_splits} \
                      diskfull_refusals={diskfull_refusals} \
                      drop_values={drop_values} drop_other={drop_other} \
@@ -700,9 +718,26 @@ fn main() {
                 )
                 .expect("results");
             }
+            // F-L04-02 engagement at sweep scope (batch 34's rule): armed
+            // seeds whose audits never met a fault proved nothing.
+            if tier_read_fault_seeds > 0 && tier_read_faults_fired == 0 {
+                eprintln!(
+                    "inf-sim: VIOLATION: TIER-READ FAULT ARM VACUOUS across the shard: \
+                     {tier_read_fault_seeds} armed seeds, no fault consumed"
+                );
+                violations += 1;
+            }
             std::process::exit(if violations > 0 { 1 } else { 0 });
         }
-        let report = run_one(seed);
+        let mut report = run_one(seed);
+        // The forced arm is a positive control: it must fire on this seed.
+        if plant == Plant::TierReadEio && report.tier_read_faults_fired == 0 {
+            report.violations.push(format!(
+                "TIER-READ FAULT ARM VACUOUS seed {seed:#x}: --plant tier-read-eio forced the \
+                 arm and the audit consumed no fault (pick a seed whose flush confirmed before \
+                 the cut)"
+            ));
+        }
         println!(
             "inf-sim: m4-tiered seed {seed:#x}: {} commands, {} steps, {} keys audited, {} \
              required ops, {} allowed-lost, {} B flushed pre-cut, {} B flushed final, {} cold \
@@ -712,7 +747,8 @@ fn main() {
              {} same-key / {} collision, {} stale, {} fallbacks; phase 6b cold resolves {}; \
              phase 6c {} pairs: {} tickets, {} collision verdicts, {} ticketed fallbacks, {} \
              DBSIZE drains, {} SCAN twins), blob-key race {} replans, dir-open fault arm {} \
-             (fired {}), ckpt downgrades {} / bound splits {}, trace {} bytes, hash {:#018x}",
+             (fired {}), tier-read EIO arm {} (fired {}, {} typed replies), ckpt downgrades {} \
+             / bound splits {}, trace {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -748,12 +784,22 @@ fn main() {
             report.race_replans,
             report.dir_open_fault_arm,
             report.dir_open_faults_fired,
+            report.tier_read_fault_arm,
+            report.tier_read_faults_fired,
+            report.tier_read_error_replies,
             report.ckpt_downgrades,
             report.ckpt_bound_splits,
             report.trace.len(),
             report.trace_hash
         );
-        println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+        println!(
+            "inf-sim: sim_seconds={:.6} published=0 delivered=0 tier_read_fault_arm={} \
+             tier_read_faults_fired={} tier_read_error_replies={}",
+            report.sim_seconds,
+            report.tier_read_fault_arm,
+            report.tier_read_faults_fired,
+            report.tier_read_error_replies
+        );
         if verify {
             let second = run_one(seed);
             if second.trace != report.trace {

@@ -91,6 +91,9 @@ sim-smoke:
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-recovery --seed 0xC0FFEE --verify-determinism
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-diskfull --seed 0xC0FFEE --verify-determinism
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-tiered --seed 0xC0FFEE --verify-determinism
+    # F-L04-02 (ADR-0119): one EIO under a cold read is one typed reply and
+    # one counter increment — the forced arm must fire (vacuous = red).
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-tiered --seed 0xC0FFEE --plant tier-read-eio
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ns-create-window --seed 0xC0FFEE --verify-determinism
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ns-ddl-race --seed 0xC0FFEE --verify-determinism
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-device-budget --seed 0xC0FFEE --verify-determinism
