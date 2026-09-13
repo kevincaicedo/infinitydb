@@ -5,11 +5,20 @@
 //! M0 contents: `BufferPool` (wire buffers, registered with the backend
 //! driver) and the record `Arena` (size-class slabs over mmap chunks).
 
+// §17.3 as amended (ADR-0121, batch 44): an audited leaf is still
+// `deny(unsafe_code)` at the root — every unsafe-bearing module is a
+// named `allow` that SAFETY.md inventories; `buffer_pool` stays safe.
+#![deny(unsafe_code)]
+
+#[allow(unsafe_code)]
 pub mod aligned;
+#[allow(unsafe_code)]
 pub mod arena;
 pub mod buffer_pool;
 #[cfg(any(test, feature = "test-counting-allocator"))]
+#[allow(unsafe_code)]
 mod counting_allocator;
+#[allow(unsafe_code)]
 pub mod region;
 
 pub use aligned::{AlignedBox, AlignedBufId, AlignedLeak, AlignedPool, TIER_READ_ALIGN};

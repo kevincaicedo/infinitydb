@@ -35,7 +35,8 @@ use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_foundation::{CellId, hash64};
 use inf_log::ckpt::{IckReaderConfig, ick_file_name, read_ick};
 use inf_log::{
-    REORDER_WINDOW_FRAMES, ReaderConfig, SegmentId, SegmentReader, read_manifest, scan_log_dir_from,
+    REORDER_WINDOW_FRAMES, ReaderConfig, SegmentId, SegmentReader, WRITE_THROUGH_WINDOW_ENTRIES,
+    read_manifest, scan_log_dir_from,
 };
 use inf_runtime::{CellLoop, LoopConfig};
 use inf_server::{
@@ -282,6 +283,8 @@ impl LogOracle {
             report.frames_awaiting_max =
                 report.frames_awaiting_max.max(stats.frames_awaiting_watermark);
             report.fsync_entries_max = report.fsync_entries_max.max(stats.fsync_entries);
+            report.write_through_entries_max =
+                report.write_through_entries_max.max(stats.write_through_entries);
             if (stats.fill_hold_open > 0 || stats.group_hold_open > 0) && stats.hold_open == 0 {
                 report.hold_episode_violations += 1;
             }
@@ -525,6 +528,44 @@ impl DurableScenario {
         scenario.segment_bytes = 256 << 10;
         scenario.reorder_oracle = true;
         scenario.fill = m2_fill_config();
+        scenario
+    }
+
+    /// `m2-fua-pending` (batch 44, ADR-0087 D2 third amendment): a
+    /// **single-cell, pure-`always`, `Direct`** shape with many gated
+    /// clients — the regime where every frame mints a write-through
+    /// ticket and the ledger's `pending` FIFO is bounded only by the
+    /// clients' outstanding commands. The front wedge is the rotation's
+    /// seal (a FLUSH-class fdatasync on a device whose flush base is
+    /// 10 ms while FUA writes complete in 40 µs), so on 64 KiB segments
+    /// every rotation opens a window in which dozens of FUA frames land
+    /// and fold nowhere. 48 writers, one command in flight each: the
+    /// pre-fix peak is ~the writer count; the fixed ledger holds at
+    /// `WRITE_THROUGH_WINDOW_ENTRIES`. No stall episodes (the wedge is
+    /// the seal itself); the m2 durability oracle unchanged.
+    #[must_use]
+    pub fn m2_fua_pending(seed: u64) -> DurableScenario {
+        let mut scenario = DurableScenario::m2_durable(seed);
+        scenario.cells = 1;
+        scenario.always_writers = 48;
+        scenario.esec_writers = 0;
+        scenario.mem_writers = 0;
+        scenario.ops_per_writer = 60;
+        scenario.io_mode = SegmentIoMode::Direct;
+        scenario.frames_in_flight = 1 + ((seed / 2) % 4) as u8;
+        scenario.segment_bytes = 64 << 10;
+        // Fine steps: a 3 ms seal spans many LOG iterations.
+        scenario.step_ns_max = 200_000;
+        scenario.double_cut = false;
+        scenario.ckpt_section_bound = None;
+        scenario.fill = Default::default();
+        scenario.group = Default::default();
+        scenario.recycle_slots = inf_server::DEFAULT_RECYCLE_SLOTS;
+        let mut stall = m2_stall_config();
+        stall.base_ns = 10_000_000;
+        stall.tail_permille = 0;
+        stall.episode_gap_ns = u64::MAX / 4;
+        scenario.stall = Some(stall);
         scenario
     }
 
@@ -858,6 +899,9 @@ pub struct DurableReport {
     pub idle_tick_violations: u64,
     pub frames_awaiting_max: u64,
     pub fsync_entries_max: u64,
+    /// Batch 44: the ledger's deepest count of unfolded write-through
+    /// tickets; bounded at `WRITE_THROUGH_WINDOW_ENTRIES`.
+    pub write_through_entries_max: u64,
     /// Batch 43 (F-L01-04): samples with a fill / group-hold clock open
     /// and nothing held — a stale episode; zero required.
     pub hold_episode_violations: u64,
@@ -1592,6 +1636,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         hold_episode_violations: 0,
         frames_awaiting_max: 0,
         fsync_entries_max: 0,
+        write_through_entries_max: 0,
         budget_background_bytes: 0,
         budget_deferrals: 0,
         frame_waits_pace: 0,
@@ -2234,6 +2279,17 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             map_bound,
             REORDER_WINDOW_FRAMES,
             report.fsync_entries_max
+        );
+        fail(&mut report, what);
+    }
+    // Batch 44 (ADR-0087 D2 third amendment): write-through tickets
+    // behind a wedged front never outgrow the window — one per frame
+    // before, bounded only by the gated clients' outstanding commands.
+    if report.write_through_entries_max > WRITE_THROUGH_WINDOW_ENTRIES as u64 {
+        let what = format!(
+            "WRITE-THROUGH TICKETS UNBOUNDED seed {:#x}: unfolded write-through tickets \
+             peaked at {} against the window of {}",
+            scenario.seed, report.write_through_entries_max, WRITE_THROUGH_WINDOW_ENTRIES
         );
         fail(&mut report, what);
     }

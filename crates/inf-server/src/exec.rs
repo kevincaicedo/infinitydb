@@ -1980,6 +1980,416 @@ mod tests {
         run_at(cx, store, Nanos(1), parts)
     }
 
+    /// Batch 44 (review of 2026-08-30, F-L17-11 verified against ADR-0098
+    /// D4): the durable emission gate stages on a non-error reply, so
+    /// every write-class command must be all-or-nothing — an error reply
+    /// implies zero mutation — unless it is in `stages_despite_error`.
+    /// ADR-0098's "M5 checklist item" is mechanical here: every `WRITE`
+    /// row of the registry needs at least one argv template (a new
+    /// multi-key write with none fails this test by name), every command
+    /// must produce at least one error reply across its templates, and
+    /// after every error reply the keyspace digest is byte-identical.
+    /// The pool covers the §5.5 blind spots (a 9-byte key, a 6-byte
+    /// value), a 256-byte key and a `MAX_VAL_LEN + 1` value (the two
+    /// bounds), an expiring key, a document, and an absent key; argv are
+    /// slices (the queued/remote paths execute slices; the 16 MiB bulk
+    /// exceeds the test parser's frame cap).
+    #[test]
+    fn an_error_reply_never_leaves_a_mutation_for_any_write_command() {
+        use inf_wire::COMMANDS;
+
+        let mut cx = ConnCx { program: true, ..ConnCx::default() };
+        let mut store = Keyspace::new(StoreConfig::default());
+        let big_key = vec![b'k'; MAX_KEY_LEN + 1];
+        let big_val = vec![b'v'; MAX_VAL_LEN + 1];
+        let pool: Vec<(&[u8], Vec<u8>)> = vec![
+            (b"{k}", b"a".to_vec()),
+            (b"{k9}", b"k9bytes__".to_vec()),
+            (b"{ke}", b"e".to_vec()),
+            (b"{kj}", b"j".to_vec()),
+            (b"{km}", b"missing".to_vec()),
+            (b"{bigk}", big_key),
+            (b"{v}", b"v".to_vec()),
+            (b"{v6}", b"sixval".to_vec()),
+            (b"{bigv}", big_val),
+            (b"{num}", b"5".to_vec()),
+            (b"{bad}", b"notanumber".to_vec()),
+            (b"{neg}", b"-1".to_vec()),
+            (b"{huge}", b"99999999999999999999".to_vec()),
+            (b"{json}", br#"{"a":1,"arr":[1,2],"s":"x","b":true}"#.to_vec()),
+            (b"{badjson}", b"{bad".to_vec()),
+            (b"{path}", b"$.arr".to_vec()),
+            (b"{spath}", b"$.s".to_vec()),
+            (b"{bpath}", b"$.b".to_vec()),
+            (b"{badpath}", b"$[".to_vec()),
+        ];
+        let fill = |tok: &str| -> Vec<u8> {
+            pool.iter()
+                .find(|(t, _)| *t == tok.as_bytes())
+                .map_or_else(|| tok.as_bytes().to_vec(), |(_, v)| v.clone())
+        };
+        let keys: Vec<Vec<u8>> = [b"a".as_slice(), b"k9bytes__", b"e", b"j", b"missing"]
+            .iter()
+            .map(|k| k.to_vec())
+            .collect();
+        let seed = |cx: &mut ConnCx, store: &mut Keyspace| {
+            assert_eq!(run(cx, store, &[b"SET", b"a", b"old"]), b"+OK\r\n");
+            assert_eq!(run(cx, store, &[b"SET", b"k9bytes__", b"sixval"]), b"+OK\r\n");
+            assert_eq!(run(cx, store, &[b"SET", b"e", b"ev", b"PX", b"100000"]), b"+OK\r\n");
+            #[cfg(feature = "doc")]
+            assert_eq!(
+                run(
+                    cx,
+                    store,
+                    &[b"JSON.SET", b"j", b"$", br#"{"a":1,"arr":[1,2],"s":"x","b":true}"#]
+                ),
+                b"+OK\r\n"
+            );
+            run(cx, store, &[b"DEL", b"missing"]);
+        };
+        let digest = |cx: &mut ConnCx, store: &mut Keyspace| -> Vec<u8> {
+            let mut d = run(cx, store, &[b"DBSIZE"]);
+            for k in &keys {
+                let ty = run(cx, store, &[b"TYPE", k]);
+                d.extend_from_slice(&ty);
+                d.extend_from_slice(&run(cx, store, &[b"PTTL", k]));
+                if ty.starts_with(b"+string") {
+                    d.extend_from_slice(&run(cx, store, &[b"GET", k]));
+                } else if !ty.starts_with(b"+none") {
+                    #[cfg(feature = "doc")]
+                    d.extend_from_slice(&run(cx, store, &[b"JSON.GET", k]));
+                }
+            }
+            d
+        };
+
+        // One template list per write-class command: valid shapes seed
+        // the partial-apply paths, invalid ones drive the error replies.
+        type T = &'static [&'static [&'static str]];
+        let templates: &[(&str, T)] = &[
+            (
+                "SET",
+                &[
+                    &["{k}", "{v}"],
+                    &["{k}", "{bigv}"],
+                    &["{bigk}", "{v}"],
+                    &["{k}", "{v}", "EX", "0"],
+                    &["{k}", "{v}", "EX", "{bad}"],
+                    &["{k}", "{v}", "NX", "XX"],
+                    &["{k}", "{v}", "PX", "{huge}"],
+                    &["{k}", "{v}", "GET", "EX", "{neg}"],
+                    &["{kj}", "{v}", "GET"],
+                ],
+            ),
+            ("SETNX", &[&["{km}", "{v}"], &["{k}", "{bigv}"], &["{bigk}", "{v}"], &["{k}"]]),
+            (
+                "SETEX",
+                &[
+                    &["{k}", "{num}", "{v}"],
+                    &["{k}", "0", "{v}"],
+                    &["{k}", "{bad}", "{v}"],
+                    &["{k}", "{num}", "{bigv}"],
+                    &["{bigk}", "{num}", "{v}"],
+                ],
+            ),
+            (
+                "PSETEX",
+                &[
+                    &["{k}", "{num}", "{v}"],
+                    &["{k}", "{neg}", "{v}"],
+                    &["{k}", "{huge}", "{v}"],
+                    &["{k}", "{num}", "{bigv}"],
+                ],
+            ),
+            (
+                "GETSET",
+                &[&["{k}", "{v}"], &["{kj}", "{v}"], &["{k}", "{bigv}"], &["{bigk}", "{v}"]],
+            ),
+            ("GETDEL", &[&["{k}"], &["{kj}"], &["{km}"], &["{k}", "{v}"]]),
+            ("DEL", &[&["{k}", "{km}", "{k9}"], &["{bigk}"], &[]]),
+            ("INCR", &[&["{k}"], &["{km}"], &["{kj}"], &["{bigk}"]]),
+            ("DECR", &[&["{k}"], &["{kj}"], &["{k}", "{num}"]]),
+            (
+                "INCRBY",
+                &[&["{k}", "{num}"], &["{k}", "{bad}"], &["{k}", "{huge}"], &["{kj}", "{num}"]],
+            ),
+            ("DECRBY", &[&["{k}", "{num}"], &["{k}", "{bad}"], &["{k9}", "{num}"]]),
+            (
+                "APPEND",
+                &[&["{k}", "{v}"], &["{k}", "{bigv}"], &["{kj}", "{v}"], &["{bigk}", "{v}"]],
+            ),
+            (
+                "EXPIRE",
+                &[
+                    &["{k}", "{num}"],
+                    &["{k}", "{bad}"],
+                    &["{k}", "{num}", "NX", "XX"],
+                    &["{k}", "{num}", "BOGUS"],
+                    &["{k}", "{huge}"],
+                ],
+            ),
+            ("PEXPIRE", &[&["{k}", "{num}"], &["{k}", "{bad}"], &["{k}", "{num}", "GT", "LT"]]),
+            ("PERSIST", &[&["{ke}"], &["{k}", "{v}"], &["{bigk}"]]),
+            (
+                "MSET",
+                &[
+                    &["{k}", "{v}", "{bigk}", "{v}"],
+                    &["{k}", "{v}", "{k9}", "{bigv}"],
+                    &["{k}", "{v}", "{k9}"],
+                    &["{k}", "{v}", "{k9}", "{v6}"],
+                ],
+            ),
+            (
+                "MSETNX",
+                &[
+                    &["{km}", "{v}", "{bigk}", "{v}"],
+                    &["{km}", "{v}", "{k}", "{bigv}"],
+                    &["{km}", "{v}"],
+                    &["{km}", "{v}", "{k9}"],
+                ],
+            ),
+            (
+                "SETRANGE",
+                &[
+                    &["{k}", "0", "{v}"],
+                    &["{k}", "{neg}", "{v}"],
+                    &["{k}", "{huge}", "{v}"],
+                    &["{k}", "536870911", "{v}"],
+                    &["{kj}", "0", "{v}"],
+                    &["{k}", "1", "{bigv}"],
+                ],
+            ),
+            (
+                "GETEX",
+                &[
+                    &["{k}", "EX", "{num}"],
+                    &["{k}", "EX", "0"],
+                    &["{k}", "EX", "{bad}"],
+                    &["{k}", "BOGUS"],
+                    &["{kj}", "PERSIST"],
+                    &["{k}", "PX", "{huge}"],
+                ],
+            ),
+            (
+                "INCRBYFLOAT",
+                &[
+                    &["{k}", "1.5"],
+                    &["{k}", "{bad}"],
+                    &["{k}", "inf"],
+                    &["{kj}", "1"],
+                    &["{k9}", "1e400"],
+                ],
+            ),
+            (
+                "RENAME",
+                &[
+                    &["{k}", "{k9}"],
+                    &["{k}", "{bigk}"],
+                    &["{km}", "{k}"],
+                    &["{bigk}", "{k}"],
+                    &["{k}"],
+                ],
+            ),
+            (
+                "RENAMENX",
+                &[&["{k}", "{km}"], &["{k}", "{bigk}"], &["{km}", "{k}"], &["{k}", "{k9}"]],
+            ),
+            (
+                "COPY",
+                &[
+                    &["{k}", "{km}"],
+                    &["{k}", "{bigk}"],
+                    &["{km}", "{k}"],
+                    &["{k}", "{k9}"],
+                    &["{k}", "{km}", "DB", "{bad}"],
+                    &["{k}", "{km}", "DB", "99999"],
+                    &["{k}", "{km}", "BOGUS"],
+                ],
+            ),
+            ("UNLINK", &[&["{k9}", "{km}"], &["{bigk}"], &[]]),
+            ("FLUSHDB", &[&["BOGUS"], &["ASYNC", "SYNC"]]),
+            ("FLUSHALL", &[&["BOGUS"], &["ASYNC", "SYNC"]]),
+            (
+                "EXPIREAT",
+                &[&["{k}", "{huge}"], &["{k}", "{bad}"], &["{k}", "{neg}"], &["{k}", "1", "BOGUS"]],
+            ),
+            ("PEXPIREAT", &[&["{k}", "{huge}"], &["{k}", "{bad}"], &["{k}", "{num}", "NX", "XX"]]),
+            (
+                "INF.TAKE",
+                &[
+                    &["{k}"],
+                    &["{km}"],
+                    &["{k}", "IF", "{bad}", "{bad}"],
+                    &["{k}", "IF", "{v}", "{bad}"],
+                    &["{bigk}"],
+                ],
+            ),
+            (
+                "INF.PUT",
+                &[
+                    &["{km}", "{v}", "-1"],
+                    &["{km}", "{v}", "{bad}"],
+                    &["{bigk}", "{v}", "-1"],
+                    &["{km}", "{bigv}", "-1"],
+                    &["{km}", "{v}", "-1", "BOGUS"],
+                    &["{k}", "{v}", "-1", "NX"],
+                ],
+            ),
+            (
+                "JSON.SET",
+                &[
+                    &["{kj}", "$", "{json}"],
+                    &["{kj}", "$", "{badjson}"],
+                    &["{kj}", "{badpath}", "{json}"],
+                    &["{kj}", "$.new", "{json}", "XX", "NX"],
+                    &["{k}", "$", "{json}"],
+                    &["{bigk}", "$", "{json}"],
+                    &["{km}", "$.a", "{json}"],
+                ],
+            ),
+            ("JSON.DEL", &[&["{kj}", "{path}"], &["{kj}", "{badpath}"], &["{k}"], &["{km}"]]),
+            ("JSON.FORGET", &[&["{kj}", "{badpath}"], &["{k}", "$"], &["{km}", "$"]]),
+            (
+                "JSON.NUMINCRBY",
+                &[
+                    &["{kj}", "$.a", "{num}"],
+                    &["{kj}", "$.a", "{bad}"],
+                    &["{kj}", "{badpath}", "{num}"],
+                    &["{k}", "$.a", "{num}"],
+                    &["{kj}", "$.a", "1e400"],
+                ],
+            ),
+            (
+                "JSON.NUMMULTBY",
+                &[
+                    &["{kj}", "$.a", "{num}"],
+                    &["{kj}", "$.a", "{bad}"],
+                    &["{k}", "$.a", "{num}"],
+                    &["{km}", "$.a", "{num}"],
+                ],
+            ),
+            (
+                "JSON.STRAPPEND",
+                &[
+                    &["{kj}", "{spath}", "\"y\""],
+                    &["{kj}", "{spath}", "{badjson}"],
+                    &["{kj}", "{spath}", "1"],
+                    &["{kj}", "{badpath}", "\"y\""],
+                    &["{k}", "{spath}", "\"y\""],
+                ],
+            ),
+            (
+                "JSON.TOGGLE",
+                &[
+                    &["{kj}", "{bpath}"],
+                    &["{kj}", "{badpath}"],
+                    &["{k}", "{bpath}"],
+                    &["{km}", "{bpath}"],
+                ],
+            ),
+            ("JSON.CLEAR", &[&["{kj}", "{path}"], &["{kj}", "{badpath}"], &["{k}"], &["{km}"]]),
+            (
+                "JSON.ARRAPPEND",
+                &[
+                    &["{kj}", "{path}", "3"],
+                    &["{kj}", "{path}", "3", "{badjson}"],
+                    &["{kj}", "{badpath}", "3"],
+                    &["{k}", "{path}", "3"],
+                    &["{kj}", "{path}"],
+                ],
+            ),
+            (
+                "JSON.ARRINSERT",
+                &[
+                    &["{kj}", "{path}", "0", "3"],
+                    &["{kj}", "{path}", "0", "3", "{badjson}"],
+                    &["{kj}", "{path}", "{bad}", "3"],
+                    &["{kj}", "{path}", "99", "3"],
+                    &["{k}", "{path}", "0", "3"],
+                ],
+            ),
+            (
+                "JSON.ARRPOP",
+                &[
+                    &["{kj}", "{path}"],
+                    &["{kj}", "{path}", "{bad}"],
+                    &["{kj}", "{badpath}"],
+                    &["{k}"],
+                    &["{kj}", "{path}", "99"],
+                ],
+            ),
+            (
+                "JSON.ARRTRIM",
+                &[
+                    &["{kj}", "{path}", "0", "0"],
+                    &["{kj}", "{path}", "{bad}", "0"],
+                    &["{kj}", "{badpath}", "0", "0"],
+                    &["{k}", "{path}", "0", "0"],
+                ],
+            ),
+            (
+                "JSON.MERGE",
+                &[
+                    &["{kj}", "$", "{json}"],
+                    &["{kj}", "$", "{badjson}"],
+                    &["{kj}", "{badpath}", "{json}"],
+                    &["{k}", "$", "{json}"],
+                    &["{bigk}", "$", "{json}"],
+                ],
+            ),
+        ];
+
+        let mut cases = 0usize;
+        let mut errors_seen = 0usize;
+        let mut covered: Vec<&str> = Vec::new();
+        for (name, shapes) in templates {
+            let meta =
+                lookup(name.as_bytes()).unwrap_or_else(|| panic!("{name} is not a registry row"));
+            assert!(meta.flags.contains(CmdFlags::WRITE), "{name} is not a write-class row");
+            #[cfg(not(feature = "doc"))]
+            if name.starts_with("JSON.") {
+                continue;
+            }
+            covered.push(name);
+            let mut errors_for_this = 0usize;
+            for shape in shapes.iter() {
+                seed(&mut cx, &mut store);
+                let before = digest(&mut cx, &mut store);
+                let owned: Vec<Vec<u8>> = std::iter::once(name.as_bytes().to_vec())
+                    .chain(shape.iter().map(|tok| fill(tok)))
+                    .collect();
+                let argv: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+                let mut reply = Vec::new();
+                execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut reply);
+                cases += 1;
+                if reply.first() == Some(&b'-') {
+                    errors_seen += 1;
+                    errors_for_this += 1;
+                    let after = digest(&mut cx, &mut store);
+                    assert_eq!(
+                        after,
+                        before,
+                        "{name} {:?} replied {:?} and mutated the keyspace",
+                        shape,
+                        String::from_utf8_lossy(&reply[..reply.len().min(80)])
+                    );
+                }
+            }
+            assert!(errors_for_this > 0, "{name}: no template produced an error reply");
+        }
+        // Every WRITE row is covered, or the M5 rule has an unchecked command.
+        let uncovered: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|m| m.flags.contains(CmdFlags::WRITE))
+            .filter(|m| !covered.contains(&m.name))
+            .filter(|m| cfg!(feature = "doc") || !m.name.starts_with("JSON."))
+            .map(|m| m.name)
+            .collect();
+        assert!(uncovered.is_empty(), "write-class rows without a template: {uncovered:?}");
+        eprintln!("{} write rows, {cases} cases, {errors_seen} error replies", covered.len());
+        assert!(cases >= 150 && errors_seen >= 80, "{cases} cases, {errors_seen} errors");
+    }
+
     /// Review of 2026-08-30 (H2 / F-L13-06, F-L17-11, ADR-0098): `MSET` is
     /// atomic — an over-bound pair anywhere refuses the whole command with
     /// zero mutation, so an error reply implies nothing changed (the

@@ -12,12 +12,23 @@
 //! simulator driver implemented in `inf-sim` (M0-S20) against
 //! [`BackendDriver`].
 
+// §17.3 as amended (ADR-0121, batch 44): "parts of `inf-runtime`" is a
+// root `deny(unsafe_code)` with the backend/affinity/executor modules as
+// named `allow`s (SAFETY.md); the reactor, scheduler, timer, token,
+// budget and gate modules are safe and stay so.
+#![deny(unsafe_code)]
+
+#[allow(unsafe_code)]
 mod affinity;
 mod budget;
+#[allow(unsafe_code)]
 mod cold;
+#[allow(unsafe_code)]
 mod driver;
+#[allow(unsafe_code)]
 mod executor;
 pub mod gate;
+#[allow(unsafe_code)]
 pub mod net;
 mod reactor;
 mod sched;
@@ -25,8 +36,10 @@ mod timer;
 mod token;
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 mod kqueue;
 #[cfg(all(target_os = "linux", feature = "uring"))]
+#[allow(unsafe_code)]
 mod uring;
 
 pub use affinity::unpin_current_thread;

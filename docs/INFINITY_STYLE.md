@@ -168,9 +168,17 @@ force multiplier for DST and fuzzing.
 ### Unsafe Rust
 
 Safe Rust is the default; `#![forbid(unsafe_code)]` everywhere except the
-audited leaf crates (`inf-simd`, `inf-alloc`, `inf-fabric`, parts of
-`inf-runtime`) and the single module-scoped emit region `inf_doc::emit`
-(ADR-0049 — crate stays `deny(unsafe_code)` with one module allow).
+audited leaf crates (`inf-simd`, `inf-alloc`, `inf-fabric`, `inf-runtime`'s
+backend/affinity/executor modules) and the module-scoped regions
+`inf_doc::emit`, `inf_server::log_bytes`, `inf_probe::evict`,
+`inf_sim::{net, steel}` (ADR-0049, ADR-0121 — the crate stays
+`deny(unsafe_code)` at its root with `#[allow(unsafe_code)]` on exactly
+the audited `mod` items, or one whole-file inner allow; never on a
+function or block). The posture is mechanical: `check-unsafe-roots.sh`
+refuses a crate root with no attribute, a `deny` root outside the §17.3
+list, a listed leaf that went `forbid`, and any allow that is not
+module-scoped — a new unsafe block outside a named module is a compile
+error in every build.
 Every unsafe block has a concrete `// SAFETY:` argument, an
 entry in the crate's `SAFETY.md` inventory (script-checked), Miri/Loom
 coverage where applicable, and a reviewer who read the argument, not just
@@ -190,7 +198,9 @@ the lint cannot resolve is a violation, not a warning — D7.5: batch
 fault-point and fsync-fail-stop greps, the attribution-divergence gate,
 `check-shipping-features.sh` (no test/DST feature on a normal dependency
 edge — ADR-0107 D1), `check-release-asserts.sh` (the classified
-release-assert inventory — ADR-0107 D2) —
+release-assert inventory — ADR-0107 D2), `check-unsafe-roots.sh` (every
+crate root governs `unsafe_code`, the deny set is the §17.3 leaf list,
+allows are module-scoped — ADR-0121) —
 are not bureaucracy; they are laws made cheap. Never weaken a check to
 merge; change the law first (ADR) or fix the code.
 

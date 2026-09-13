@@ -458,6 +458,9 @@ pub struct DurableStats {
     /// window plus the entries plus one (F-L01-03, batch 42).
     pub frames_awaiting_watermark: u64,
     pub fsync_entries: u64,
+    /// Batch 44: unfolded write-through tickets — bounded at the ledger's
+    /// `WRITE_THROUGH_WINDOW_ENTRIES` (ADR-0087 D2 third amendment).
+    pub write_through_entries: u64,
     /// Batch 43 (F-L01-04): `hold_open` = 1 while the LOG step is holding
     /// a frame or a standalone (an episode of `frame_waits_*`); the other
     /// two = 1 while the fill / group-hold episode clock is open. A clock
@@ -2025,6 +2028,7 @@ impl<F: SegmentFs> DurableCell<F> {
             everysec_idle_ticks: self.commit.stats().idle_ticks,
             frames_awaiting_watermark: self.frame_seqs.len() as u64,
             fsync_entries: self.commit.pending_entries() as u64,
+            write_through_entries: self.commit.write_through_entries() as u64,
             hold_open: u64::from(self.frame_held),
             fill_hold_open: u64::from(self.fill_since.is_some()),
             group_hold_open: u64::from(self.group_since.is_some()),

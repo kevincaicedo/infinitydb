@@ -963,9 +963,97 @@ expect green "doc-read-profile: the sanctioned shape" env INF_PROFILE_REPORT="$w
 expect_output "doc-read-profile: the pass names its positive control" "positive control present" env INF_PROFILE_REPORT="$work/profile-ok.txt" $PROFILE "$work/profile-out"
 expect_output "doc-read-profile: the pass names the flat floor" "percent-limit 0" env INF_PROFILE_REPORT="$work/profile-ok.txt" $PROFILE "$work/profile-out"
 
+# ------------------------------------------------- unsafe roots (batch 44)
+# ADR-0121 (review 2026-08-30 F-L17-09): `inf-alloc` and `inf-runtime` — the
+# two named audited leaves — carried no root attribute at all, so a new
+# unsafe block anywhere in them produced no lint and no diff signal.
+ROOTS=./scripts/check-unsafe-roots.sh
+unsafe_fixture() { # <name> <crate> <lib.rs body> [module file] [module body]
+    local root="$work/$1"
+    [ -n "$1" ] && [ -n "$2" ] && [ -n "$work" ] || { echo "unsafe_fixture: empty name" >&2; exit 2; }
+    [ -e "$root" ] && rm -rf "$root"
+    mkdir -p "$root/crates/$2/src" "$root/bins" "$root/tests"
+    printf '[package]\nname = "%s"\n' "$2" >"$root/crates/$2/Cargo.toml"
+    printf '%s\n' "$3" >"$root/crates/$2/src/lib.rs"
+    if [ -n "${4:-}" ]; then printf '%s\n' "$5" >"$root/crates/$2/src/$4"; fi
+    echo "$root"
+}
+root=$(unsafe_fixture ur-forbid safe '#![forbid(unsafe_code)]
+pub fn f() {}')
+expect green "unsafe-roots: a forbid root outside the leaf list" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="" $ROOTS
+expect_output "unsafe-roots: the scope line counts the roots" "1 crate roots, 0 deny crates" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="" $ROOTS
+
+# The finding, exactly: a listed leaf whose root carries no attribute.
+root=$(unsafe_fixture ur-naked leaf 'pub mod m;' m.rs 'pub unsafe fn f() {}')
+expect red "unsafe-roots: a root with neither forbid nor deny (the F-L17-09 shape)" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="leaf" $ROOTS
+
+# The ADR-0049 posture: deny at the root, a module-scoped allow, on the list.
+root=$(unsafe_fixture ur-deny leaf '#![deny(unsafe_code)]
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub mod m;' m.rs 'pub unsafe fn f() {}')
+expect green "unsafe-roots: deny root plus a module allow on a listed leaf" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="leaf" $ROOTS
+expect_output "unsafe-roots: the scope line names the deny set" "1 deny crates (leaf), 1 module-scoped allows" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="leaf" $ROOTS
+expect red "unsafe-roots: the same deny root outside the leaf list" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="" $ROOTS
+
+# List drift the other way: a listed leaf that is forbid has left the list.
+root=$(unsafe_fixture ur-stale leaf '#![forbid(unsafe_code)]
+pub fn f() {}')
+expect red "unsafe-roots: a listed leaf carrying forbid is a stale list" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="leaf" $ROOTS
+
+# Allows are module-scoped only.
+root=$(unsafe_fixture ur-fn-allow leaf '#![deny(unsafe_code)]
+pub mod m;' m.rs '#[allow(unsafe_code)]
+pub fn f() {}')
+expect red "unsafe-roots: an allow on a function is not module-scoped" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="leaf" $ROOTS
+root=$(unsafe_fixture ur-inner leaf '#![deny(unsafe_code)]
+pub mod m;' m.rs '//! the whole module is the audit surface
+#![allow(unsafe_code)]
+pub unsafe fn f() {}')
+expect green "unsafe-roots: a whole-module inner allow (the log_bytes.rs shape)" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="leaf" $ROOTS
+root=$(unsafe_fixture ur-inline leaf '#![deny(unsafe_code)]
+#[allow(unsafe_code)]
+mod imp { pub unsafe fn f() {} }')
+expect green "unsafe-roots: an inline mod item (the group16.rs per-arch shape)" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="leaf" $ROOTS
+root=$(unsafe_fixture ur-forbid-allow safe '#![forbid(unsafe_code)]
+#[allow(unsafe_code)]
+pub mod m;' m.rs 'pub fn f() {}')
+expect red "unsafe-roots: an allow under a forbid root" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="" $ROOTS
+
+# A binary crate's own root counts; the library root where the unsafe
+# lives is the one the finding caught ungoverned.
+root=$(unsafe_fixture ur-bin leaf '#![deny(unsafe_code)]
+#[allow(unsafe_code)]
+pub mod m;' m.rs 'pub unsafe fn f() {}')
+printf 'fn main() {}\n' >"$root/crates/leaf/src/main.rs"
+expect red "unsafe-roots: a binary root with no attribute" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="leaf" $ROOTS
+printf '#![forbid(unsafe_code)]\nfn main() {}\n' >"$root/crates/leaf/src/main.rs"
+expect green "unsafe-roots: both roots governed" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="leaf" $ROOTS
+
+# Scope: a manifest without a root, and an empty tree, are failures.
+root=$(unsafe_fixture ur-scope leaf '#![deny(unsafe_code)]')
+rm -f "$root/crates/leaf/src/lib.rs"
+expect red "unsafe-roots: a manifest with no crate root is a scope error" env INF_CHECK_ROOT="$root" INF_UNSAFE_LEAVES="" $ROOTS
+mkdir -p "$work/ur-empty/crates" "$work/ur-empty/bins" "$work/ur-empty/tests"
+expect red "unsafe-roots: zero crate roots is a scope error" env INF_CHECK_ROOT="$work/ur-empty" INF_UNSAFE_LEAVES="" $ROOTS
+expect red "unsafe-roots: a missing top-level directory is a scope error" env INF_CHECK_ROOT="$work/ur-empty/crates" INF_UNSAFE_LEAVES="" $ROOTS
+
+# ---------------------------------------------- safety inventory (batch 44)
+# The verdict line below had claimed this gate since ADR-0106 with no
+# case behind it (found while adding the unsafe-roots cases).
+INVENTORY=./scripts/check-safety-inventory.sh
+root=$(unsafe_fixture si-gap leaf '#![deny(unsafe_code)]
+#[allow(unsafe_code)]
+pub mod m;' m.rs 'pub unsafe fn f() {}')
+expect red "safety-inventory: an unsafe file no SAFETY.md names" env INF_CHECK_ROOT="$root" $INVENTORY
+printf '| `src/m.rs` | invariant | coverage |\n' >"$root/crates/leaf/SAFETY.md"
+expect green "safety-inventory: the file named by its exact path" env INF_CHECK_ROOT="$root" $INVENTORY
+printf '| `src/m.rs.old` | invariant | coverage |\n' >"$root/crates/leaf/SAFETY.md"
+expect red "safety-inventory: a path that only contains the file name is not naming it" env INF_CHECK_ROOT="$root" $INVENTORY
+
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, safety-inventory, dep-dag, doc-read-profile each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory each red on a planted violation)"
