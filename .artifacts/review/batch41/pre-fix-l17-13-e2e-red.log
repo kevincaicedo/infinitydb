@@ -1,0 +1,25 @@
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.72s
+     Running tests/node_e2e.rs (target/debug/deps/node_e2e-a1d69910f64808e6)
+
+running 1 test
+test tiered_scan_batches_its_cold_key_reads ... FAILED
+
+failures:
+
+---- tiered_scan_batches_its_cold_key_reads stdout ----
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 1 cells serving (2 ms)
+scan page: 4102 keys, 1855 cold intents, 1855 device reads, qd p99 1
+
+thread 'tiered_scan_batches_its_cold_key_reads' (18167) panicked at crates/inf-server/tests/node_e2e.rs:2680:5:
+no coalescing on the page: 1855 device reads for 1855 cold keys — one intent per drain (F-L17-13)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tiered_scan_batches_its_cold_key_reads
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 74 filtered out; finished in 0.57s
+
+error: test failed, to rerun pass `-p inf-server --test node_e2e`

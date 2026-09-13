@@ -288,9 +288,12 @@ pub enum Op<'a> {
     Write { token: FabricToken, slot: KeySlot, key: &'a [u8], value: &'a [u8],
             expire_at: Option<Nanos>, flags: WriteFlags },
     /// Generic remote command execution, M0-experimental (M4 reshapes into Exec).
+    /// args: ≤ MAX_APPLY_ARGS = 1024 slices — the client parser's argv bound
+    /// (ADR-0120 D1); ≤ MAX_INLINE_APPLY_ARGS = 16 ride inline (no allocation),
+    /// wider argvs one exact-sized table (D2). Wire layout unchanged (D3).
     Apply { token: FabricToken, slot: KeySlot, cmd: u8,
             args: /* ≤ MAX_APPLY_ARGS slices */, program: bool },
-    /// Named namespace; defaults 0..16 use Apply (ADR-0015 D1).
+    /// Named namespace; defaults 0..16 use Apply (ADR-0015 D1). Same bound.
     ApplyNs { token: FabricToken, slot: KeySlot, cmd: u8, ns: u32,
               args: /* ≤ MAX_APPLY_ARGS slices */, program: bool },
     Batch { ops: /* nested Read/Write/Apply, one destination */ },

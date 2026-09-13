@@ -181,6 +181,29 @@ impl<F: SegmentFs> TierNs<F> {
         addr: LogicalAddr,
         len: usize,
     ) -> Option<(std::os::fd::RawFd, TierFileId, u64, u64, usize)> {
+        self.plan_cold_window(addr, len, false)
+    }
+
+    /// [`plan_cold_read`](Self::plan_cold_read) for a caller that needs
+    /// only the record's first `len` bytes (`SCAN`'s key resolution): the
+    /// window is the frames that cover them, not the whole pool buffer —
+    /// a quarter of the bytes per key, and windows of neighbouring
+    /// records overlap or touch, so the cold drain merges them (ADR-0055
+    /// D4; review of 2026-08-30, F-L17-13).
+    pub fn plan_cold_prefix(
+        &self,
+        addr: LogicalAddr,
+        len: usize,
+    ) -> Option<(std::os::fd::RawFd, TierFileId, u64, u64, usize)> {
+        self.plan_cold_window(addr, len, true)
+    }
+
+    fn plan_cold_window(
+        &self,
+        addr: LogicalAddr,
+        len: usize,
+        prefix: bool,
+    ) -> Option<(std::os::fd::RawFd, TierFileId, u64, u64, usize)> {
         let raw = addr.to_raw();
         let locate = |base: u64, data_len: u64| raw >= base && raw < base + data_len;
         // Sealed catalog first (ascending by base; linear scan — a cell
@@ -197,6 +220,7 @@ impl<F: SegmentFs> TierNs<F> {
                     meta.data_len,
                     raw,
                     len,
+                    prefix,
                 ));
             }
         }
@@ -214,13 +238,14 @@ impl<F: SegmentFs> TierNs<F> {
                     pending.confirmed_len,
                     raw,
                     len,
+                    prefix,
                 ));
             }
         }
         let (id, base, data_len, durable_len, _) = self.flush.active()?;
         if locate(base.to_raw(), durable_len) {
             let fd = self.flush.active_raw_fd()?;
-            return Some(Self::window(fd, id, base.to_raw(), data_len, raw, len));
+            return Some(Self::window(fd, id, base.to_raw(), data_len, raw, len, prefix));
         }
         None
     }
@@ -232,11 +257,13 @@ impl<F: SegmentFs> TierNs<F> {
         data_len: u64,
         raw: u64,
         len: usize,
+        prefix: bool,
     ) -> (std::os::fd::RawFd, TierFileId, u64, u64, usize) {
-        let (first, _, skip) = inf_log::tier_frame_span(raw - base, len.max(1));
+        let (first, span, skip) = inf_log::tier_frame_span(raw - base, len.max(1));
         let file_frames = data_len.div_ceil(inf_log::TIER_FRAME_DATA as u64);
-        let window_frames =
-            ((COLD_POOL_BUF / inf_log::TIER_FRAME_BYTES) as u64).min(file_frames - first);
+        let pool_frames = (COLD_POOL_BUF / inf_log::TIER_FRAME_BYTES) as u64;
+        let want = if prefix { pool_frames.min(u64::from(span)) } else { pool_frames };
+        let window_frames = want.min(file_frames - first);
         debug_assert!(window_frames > 0, "cold window inside the file's range");
         (fd, TierFileId::new(id), inf_log::tier_frame_offset(first), window_frames, skip)
     }

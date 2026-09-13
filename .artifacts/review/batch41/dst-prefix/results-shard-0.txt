@@ -1,0 +1,24 @@
+0xb41 VIOLATION SCAN BATCHING VIOLATION: cell 1 page at cursor 281474976710656 resolved 355 cold slots in 374 iterations — one device round trip per key, never a batch (F-L17-13, L3 / ADR-0055 D1)
+0xb42 ok
+0xb43 ok
+0xb44 ok
+0xb45 ok
+0xb46 ok
+0xb47 ok
+0xb48 ok
+0xb49 VIOLATION SCAN BATCHING VIOLATION: cell 1 page at cursor 281474976710656 resolved 335 cold slots in 358 iterations — one device round trip per key, never a batch (F-L17-13, L3 / ADR-0055 D1)
+0xb4a ok
+0xb4b ok
+0xb4c ok
+0xb4d VIOLATION SCAN BATCHING VIOLATION: cell 1 page at cursor 281474976710656 resolved 342 cold slots in 361 iterations — one device round trip per key, never a batch (F-L17-13, L3 / ADR-0055 D1)
+0xb4e ok
+0xb4f ok
+0xb50 ok
+0xb51 ok
+0xb52 ok
+0xb53 ok
+0xb54 ok
+0xb55 ok
+0xb56 ok
+0xb57 ok
+0xb58 ok

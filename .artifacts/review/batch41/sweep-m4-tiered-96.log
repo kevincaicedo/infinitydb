@@ -1,0 +1,360 @@
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (16 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (17 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (17 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (5 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (16 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (5 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (16 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (17 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (18 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (21 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (5 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (18 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (4 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+inf-sim: m4-tiered sweep shard 0/4: 24 seeds, 0 violations, 0 legal taxonomy refusals, 133761 commands, 3440 keys audited, 18905234 B flushed pre-cut, 5063 cold resolves, 10925 blob sets, 240 blob-key race replans, dir-open fault armed on 12 seeds (12 fired), tier-read EIO armed on 0 seeds (0 fired, 0 typed replies, 0 unconsumed), SCAN batching oracle on 366 cold pages (19566 cold intents), ckpt arms [downgrades 0 bound_splits 43866], 24 DISKFULL refusals, drop-race 311 values / 409 typed-other; post-drop reboots 24 (24 with MANIFEST residue), cut inside DROP: 3 whole / 21 swept (ADR-0100); shadow arm on 24 seeds: 1413 tickets (0 open at the cut), 1407 same-key / 0 collision verdicts, 0 stale, 0 fallbacks; forced collisions: 192 tickets, 96 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins; open-ticket rows on 24 seeds: 96 tickets held open, 72 DBSIZE drains reading 132 twins, 192 SCAN twins, 96 retargets, 48 read-free forced deletes, 96 ticketed fallbacks, 96 collision verdicts, 24 injected read errors relayed, 121 settled without a read after resume; rebuilt multi-ticket rows on 24 seeds: 96 tickets rebuilt, 48 DELs draining several, 24 same-key twins among them, 18816 filler writes, 48 reboots
+inf-sim: sim_seconds=955.827792 published=0 delivered=0
+shard 0 exit=0
+cell 1: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 20 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (5 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 18 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (4 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 18 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 20 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 8 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 8 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (23 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 17 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 16 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (16 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 18 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 18 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 5 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 4 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 13 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 14 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 8 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 8 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 16 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 18 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 6 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 6 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 14 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 15 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (19 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 18 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 20 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (16 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 20 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 10 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+inf-sim: m4-tiered sweep shard 1/4: 24 seeds, 0 violations, 0 legal taxonomy refusals, 128017 commands, 3416 keys audited, 16809364 B flushed pre-cut, 5015 cold resolves, 10652 blob sets, 219 blob-key race replans, dir-open fault armed on 0 seeds (0 fired), tier-read EIO armed on 0 seeds (0 fired, 0 typed replies, 0 unconsumed), SCAN batching oracle on 360 cold pages (19198 cold intents), ckpt arms [downgrades 72 bound_splits 0], 24 DISKFULL refusals, drop-race 274 values / 446 typed-other; post-drop reboots 24 (24 with MANIFEST residue), cut inside DROP: 1 whole / 23 swept (ADR-0100); shadow arm on 24 seeds: 1409 tickets (0 open at the cut), 1409 same-key / 0 collision verdicts, 0 stale, 0 fallbacks; forced collisions: 192 tickets, 96 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins; open-ticket rows on 24 seeds: 96 tickets held open, 72 DBSIZE drains reading 134 twins, 192 SCAN twins, 96 retargets, 48 read-free forced deletes, 96 ticketed fallbacks, 96 collision verdicts, 24 injected read errors relayed, 72 settled without a read after resume; rebuilt multi-ticket rows on 24 seeds: 96 tickets rebuilt, 48 DELs draining several, 24 same-key twins among them, 15392 filler writes, 48 reboots
+inf-sim: sim_seconds=871.197889 published=0 delivered=0
+shard 1 exit=0
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (5 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (5 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (5 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (4 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (17 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+inf-sim: m4-tiered sweep shard 2/4: 24 seeds, 0 violations, 0 legal taxonomy refusals, 110254 commands, 3438 keys audited, 6301696 B flushed pre-cut, 4692 cold resolves, 10555 blob sets, 241 blob-key race replans, dir-open fault armed on 0 seeds (0 fired), tier-read EIO armed on 12 seeds (24 fired, 24 typed replies, 0 unconsumed), SCAN batching oracle on 240 cold pages (1661 cold intents), ckpt arms [downgrades 0 bound_splits 0], 24 DISKFULL refusals, drop-race 485 values / 235 typed-other; post-drop reboots 24 (24 with MANIFEST residue), cut inside DROP: 1 whole / 23 swept (ADR-0100); shadow arm on 0 seeds: 0 tickets (0 open at the cut), 0 same-key / 0 collision verdicts, 0 stale, 0 fallbacks; forced collisions: 0 tickets, 0 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins; open-ticket rows on 0 seeds: 0 tickets held open, 0 DBSIZE drains reading 0 twins, 0 SCAN twins, 0 retargets, 0 read-free forced deletes, 0 ticketed fallbacks, 0 collision verdicts, 0 injected read errors relayed, 0 settled without a read after resume; rebuilt multi-ticket rows on 24 seeds: 48 tickets rebuilt, 24 DELs draining several, 0 same-key twins among them, 0 filler writes, 48 reboots
+inf-sim: sim_seconds=587.331608 published=0 delivered=0
+shard 2 exit=0
+cell 0: swept dropped namespace 16 residue (15 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (21 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (16 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (20 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (19 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (14 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (0 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (5 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (5 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (9 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (11 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (12 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (4 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (7 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (8 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (17 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (10 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (5 files) — ADR-0100 D6
+inf-sim: m4-tiered sweep shard 3/4: 24 seeds, 0 violations, 0 legal taxonomy refusals, 134385 commands, 3453 keys audited, 21004786 B flushed pre-cut, 5021 cold resolves, 11320 blob sets, 276 blob-key race replans, dir-open fault armed on 0 seeds (0 fired), tier-read EIO armed on 0 seeds (0 fired, 0 typed replies, 0 unconsumed), SCAN batching oracle on 362 cold pages (18721 cold intents), ckpt arms [downgrades 0 bound_splits 0], 24 DISKFULL refusals, drop-race 270 values / 450 typed-other; post-drop reboots 24 (24 with MANIFEST residue), cut inside DROP: 1 whole / 23 swept (ADR-0100); shadow arm on 24 seeds: 1395 tickets (0 open at the cut), 1395 same-key / 0 collision verdicts, 0 stale, 0 fallbacks; forced collisions: 192 tickets, 96 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins; open-ticket rows on 24 seeds: 96 tickets held open, 72 DBSIZE drains reading 131 twins, 192 SCAN twins, 96 retargets, 48 read-free forced deletes, 96 ticketed fallbacks, 96 collision verdicts, 24 injected read errors relayed, 75 settled without a read after resume; rebuilt multi-ticket rows on 24 seeds: 96 tickets rebuilt, 48 DELs draining several, 24 same-key twins among them, 15616 filler writes, 48 reboots
+inf-sim: sim_seconds=915.766181 published=0 delivered=0
+shard 3 exit=0

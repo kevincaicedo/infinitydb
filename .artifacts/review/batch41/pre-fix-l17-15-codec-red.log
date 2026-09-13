@@ -1,0 +1,25 @@
+test codec::tests::hostile_argc_is_truncated_before_any_spill ... FAILED
+
+failures:
+
+---- codec::tests::apply_args_beyond_the_inline_width_round_trip stdout ----
+
+thread 'codec::tests::apply_args_beyond_the_inline_width_round_trip' (17257) panicked at crates/inf-fabric/src/codec.rs:1012:66:
+17 args refused
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- codec::tests::hostile_argc_is_truncated_before_any_spill stdout ----
+
+thread 'codec::tests::hostile_argc_is_truncated_before_any_spill' (17258) panicked at crates/inf-fabric/src/codec.rs:1048:9:
+assertion `left == right` failed
+  left: Err(BadVarint)
+ right: Err(Truncated)
+
+
+failures:
+    codec::tests::apply_args_beyond_the_inline_width_round_trip
+    codec::tests::hostile_argc_is_truncated_before_any_spill
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-fabric --lib`

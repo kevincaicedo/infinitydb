@@ -1,0 +1,11 @@
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+test fabric_apply_bound_covers_every_client_argv ... ok
+test durable_mset_midway_failure_stages_what_it_wrote ... ok
+test named_ns_wide_mset_ships_whole_to_its_remote_owner ... ok
+test durable_mset_midway_failure_stages_on_the_fabric_path ... ok
+test tiered_scan_names_every_cold_key_across_the_window ... ok
+test tiered_cold_read_failure_is_typed_for_every_read_command ... ok
+test tiered_scan_batches_its_cold_key_reads ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.50s
