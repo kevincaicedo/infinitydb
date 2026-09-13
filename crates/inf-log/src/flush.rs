@@ -187,7 +187,7 @@ pub struct TierFlush<F: SegmentFs> {
     /// SealCommit`]); until then the open handle serves cold reads on
     /// the confirmed prefix and the file stays manifest-visible as an
     /// unsealed range. Empty whenever no round is in flight.
-    pending_seals: Vec<PendingSeal<F>>,
+    pending_seals: std::collections::VecDeque<PendingSeal<F>>,
 }
 
 /// A seal staged but not yet completion-committed (ADR-0084 D2).
@@ -267,7 +267,7 @@ impl<F: SegmentFs> TierFlush<F> {
             pool: WindowPool::new(),
             round: None,
             round_dir_holds: Vec::new(),
-            pending_seals: Vec::new(),
+            pending_seals: std::collections::VecDeque::new(),
         }
     }
 
@@ -453,8 +453,7 @@ impl<F: SegmentFs> TierFlush<F> {
     /// # Panics
     /// Panics without a pending seal — effects mirror stage order.
     pub fn commit_oldest_seal(&mut self) {
-        assert!(!self.pending_seals.is_empty(), "SealCommit without a pending seal");
-        let seal = self.pending_seals.remove(0);
+        let seal = self.pending_seals.pop_front().expect("SealCommit without a pending seal");
         self.sealed_device_bytes += seal.device_bytes;
         self.sealed_handles.push((seal.id, seal.file));
         self.sealed.push(TierFileMeta {
@@ -490,7 +489,7 @@ impl<F: SegmentFs> TierFlush<F> {
         let round = self.round.get_or_insert_with(TierRound::new);
         let sealed: QueuedSeal<F::File> = writer.seal_queued(reason, round, &mut self.pool);
         round.push_effect(RoundEffect::SealCommit);
-        self.pending_seals.push(PendingSeal {
+        self.pending_seals.push_back(PendingSeal {
             id: self.active_id,
             base: sealed.base,
             data_len: sealed.outcome.data_len,
@@ -668,7 +667,12 @@ impl<F: SegmentFs> TierFlush<F> {
         let file = self.fs.open_read(&path)?;
         let (first, count, skip) = tier_frame_span(addr - base, len);
         let from = tier_frame_offset(first);
-        let span = count as usize * TIER_FRAME_BYTES;
+        let span = usize::try_from(count)
+            .ok()
+            .and_then(|frames| frames.checked_mul(TIER_FRAME_BYTES))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "cold read span overflows")
+            })?;
         let mut window = vec![0u8; span];
         let mut done = 0usize;
         while done < span {

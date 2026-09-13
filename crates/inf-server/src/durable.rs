@@ -458,6 +458,14 @@ pub struct DurableStats {
     /// window plus the entries plus one (F-L01-03, batch 42).
     pub frames_awaiting_watermark: u64,
     pub fsync_entries: u64,
+    /// Batch 43 (F-L01-04): `hold_open` = 1 while the LOG step is holding
+    /// a frame or a standalone (an episode of `frame_waits_*`); the other
+    /// two = 1 while the fill / group-hold episode clock is open. A clock
+    /// is set by a hold and cleared by the issue, so an open clock is a
+    /// hold — the DST's hold-episode oracle.
+    pub hold_open: u64,
+    pub fill_hold_open: u64,
+    pub group_hold_open: u64,
     /// M4.5-S36 (ADR-0088 D7): the device budget's ledger — model
     /// presence, the cell's byte shares, per-class spent bytes/ops and
     /// deferrals (`IoClass::ALL` order) — and the seal pacer's wait
@@ -995,7 +1003,8 @@ impl<F: SegmentFs> DurableCell<F> {
                 self.frame_held = true;
                 return;
             }
-            self.frame_held = false;
+            // The hold episode ends at the issue (`note_issued`), not
+            // here: a reservation that waits below keeps the episode.
             let deferred = match self.rotor.begin_frame_deferred(frame_len, cx.now.as_millis()) {
                 Ok(deferred) => deferred,
                 Err(inf_log::LogError::NextNotReady { .. }) => {
@@ -1036,12 +1045,26 @@ impl<F: SegmentFs> DurableCell<F> {
                 self.frame_held = true;
                 return;
             }
-            self.frame_held = false;
+            self.note_issued();
             let ticket = self.commit.register_standalone_fsync(cx.now);
             let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
             self.budget.charge(IoClass::LogFrame, 0, 1); // ledger-class barrier (ADR-0088 D7)
             cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
         }
+    }
+
+    /// The LOG step issued what it was holding — a frame or a standalone
+    /// fdatasync: the hold episode and both policy clocks end here, and
+    /// only here (batch 43, F-L01-04: the standalone path left the group
+    /// clock open, so the next episode's first sight read as elapsed and
+    /// sealed at once; the fill and group episodes end at the issue, not
+    /// at the decision — a reservation that waits keeps its episode, and
+    /// a hold that follows it is the same episode, never a second one in
+    /// `frame_waits_*`).
+    fn note_issued(&mut self) {
+        self.frame_held = false;
+        self.fill_since = None;
+        self.group_since = None;
     }
 
     /// M4.5-S39a: should the pending frame be held for fill? The pure
@@ -1060,6 +1083,12 @@ impl<F: SegmentFs> DurableCell<F> {
         if !self.fill.enabled() {
             return false;
         }
+        // Release assert (batch 43): an open episode clock is a held
+        // frame — the clock is set by a hold and cleared by the issue.
+        assert!(
+            self.fill_since.is_none() || self.frame_held,
+            "open fill episode without a held frame"
+        );
         let layout =
             if rotation_due { self.rotor.next_layout() } else { self.rotor.active_layout() };
         match self.fill.decide(plan, layout, frame_len, self.fill_since, cx.now) {
@@ -1085,6 +1114,13 @@ impl<F: SegmentFs> DurableCell<F> {
         if !self.group.enabled() {
             return false;
         }
+        // Release assert (batch 43, F-L01-04): an open episode clock is a
+        // held frame or standalone — a stale clock reads as elapsed and
+        // seals the next episode's first sight at once.
+        assert!(
+            self.group_since.is_none() || self.frame_held,
+            "open group-hold episode without a held frame"
+        );
         let layout =
             if rotation_due { self.rotor.next_layout() } else { self.rotor.active_layout() };
         let uncovered = self.last_seq.saturating_sub(self.acked_seq);
@@ -1113,14 +1149,7 @@ impl<F: SegmentFs> DurableCell<F> {
     /// (padding included on aligned segments) is what the cursor, the
     /// ledger, and the barrier all advance by (ADR-0086 D3).
     fn queue_frame(&mut self, cx: &mut LoopCx<'_>, slot: inf_log::FrameSlot, plan: FramePlan) {
-        // The fill episode (M4.5-S39a) ends at the seal, not at the
-        // decision: a reservation that waits (zero-fill in flight, space)
-        // keeps the same episode clock.
-        self.fill_since = None;
-        // The group-hold episode ends here too, and the frame's record
-        // count becomes the next hold's target (ADR-0092 D1: the last
-        // frame is the population's own measurement of itself).
-        self.group_since = None;
+        self.note_issued();
         self.last_frame_records = self.staging.pending_records();
         let end = slot.base().advance(slot.len());
         let covered = self.commit.watermark().map_or(0, |lsn| lsn.to_u64());
@@ -1996,6 +2025,9 @@ impl<F: SegmentFs> DurableCell<F> {
             everysec_idle_ticks: self.commit.stats().idle_ticks,
             frames_awaiting_watermark: self.frame_seqs.len() as u64,
             fsync_entries: self.commit.pending_entries() as u64,
+            hold_open: u64::from(self.frame_held),
+            fill_hold_open: u64::from(self.fill_since.is_some()),
+            group_hold_open: u64::from(self.group_since.is_some()),
             io_budget_model_absent: u64::from(self.budget.model_absent()),
             io_budget_write_bytes_per_s: write_share,
             io_budget_read_bytes_per_s: read_share,

@@ -309,6 +309,10 @@ pub struct GroupCommit<File> {
     /// arm (M2.5-S07; never more — a queue is the batch=1.0 disease
     /// reborn). Write-through tickets never count (ADR-0086 D5).
     flush_bound: usize,
+    /// FLUSH-class entries registered and not yet completed or failed —
+    /// `syncs_in_flight()` in O(1), maintained at push / complete / error
+    /// (batch 43; the scan it replaces is the debug oracle).
+    flush_in_flight: usize,
     queued_up_to: Option<Lsn>,
     queued_bytes: u64,
     /// Frames queued and not yet part of the written prefix, in queue
@@ -384,6 +388,7 @@ impl<File: SegmentFile> GroupCommit<File> {
             everysec_unqueued: false,
             always_queued_up_to: None,
             flush_bound: bound,
+            flush_in_flight: 0,
             queued_up_to: None,
             queued_bytes: 0,
             queued: VecDeque::with_capacity(REORDER_WINDOW_FRAMES),
@@ -446,10 +451,15 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// at 1, M2.5-S07 evaluates 2). Write-through tickets are excluded
     /// (ADR-0086 D5): they never queue on the flush unit.
     fn syncs_in_flight(&self) -> usize {
-        self.pending
-            .iter()
-            .filter(|p| !p.done && !p.failed && p.reason != SyncReason::WriteThrough)
-            .count()
+        debug_assert_eq!(
+            self.flush_in_flight,
+            self.pending
+                .iter()
+                .filter(|p| !p.done && !p.failed && p.reason != SyncReason::WriteThrough)
+                .count(),
+            "flush_in_flight tracks the ledger"
+        );
+        self.flush_in_flight
     }
 
     /// Is a sync owed right now (everysec tick fired or `always` traffic
@@ -507,9 +517,10 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// given whether the rotor allows write-through for it and whether a
     /// rotation's seal fdatasync will be registered ahead of it
     /// (`seal_ahead`: the seal covers every queued byte, so the frame
-    /// extends the durable prefix by construction — the LOG step decides
-    /// before rotating, so the ledger cannot show the entry yet). The
-    /// `Wait` arm is the rule that keeps a due from starving behind
+    /// extends the durable prefix by construction — and its fdatasync is
+    /// FLUSH-class, so it takes a pipeline slot; the LOG step decides
+    /// before rotating, so the ledger cannot show the entry yet and the
+    /// slot arm counts it here — F-L01-05, batch 43). The `Wait` arm is the rule that keeps a due from starving behind
     /// barrier-less frames: sealing with no barrier while writes are in
     /// flight below would let every later frame find the same shape. The
     /// FLUSH-slot arm keeps §8.2 batching byte-for-byte (the due
@@ -531,7 +542,7 @@ impl<File: SegmentFile> GroupCommit<File> {
         if !self.drained() {
             return FramePlan::Wait;
         }
-        if self.syncs_in_flight() < self.flush_bound {
+        if self.syncs_in_flight() + usize::from(seal_ahead) < self.flush_bound {
             return FramePlan::LinkedFsync;
         }
         FramePlan::Plain
@@ -879,6 +890,20 @@ impl<File: SegmentFile> GroupCommit<File> {
             self.pending.back().is_none_or(|p| p.covers_up_to <= covers_up_to),
             "fsync coverage must be monotone in submission order"
         );
+        // Release assert (batch 43, F-L01-05): the LOG step's own barriers
+        // enter only through a slot `frame_plan` / `*_fsync_due` found
+        // free — a seal registered between the plan and this call is
+        // counted by the plan. Seals, zero-fill, boot and extent barriers
+        // are not discretionary and bypass the bound by design.
+        if matches!(reason, SyncReason::Linked | SyncReason::Standalone | SyncReason::Completion) {
+            assert!(
+                self.flush_in_flight < self.flush_bound,
+                "FLUSH-class barrier into a full pipeline"
+            );
+        }
+        if reason != SyncReason::WriteThrough {
+            self.flush_in_flight += 1;
+        }
         self.next_ticket += 1;
         let ticket = self.next_ticket;
         self.pending.push_back(PendingFsync {
@@ -917,7 +942,7 @@ impl<File: SegmentFile> GroupCommit<File> {
         debug_assert_eq!(frame.id, id, "queue ordinals are consecutive");
         assert!(!frame.written, "frame written twice");
         frame.written = true;
-        self.unwritten -= 1;
+        self.unwritten = self.unwritten.checked_sub(1).expect("LogWritten with no unwritten frame");
         while let Some(front) = self.queued.front() {
             if !front.written {
                 break;
@@ -943,6 +968,20 @@ impl<File: SegmentFile> GroupCommit<File> {
         self.queued.len()
     }
 
+    /// The ledger entry for `ticket`, by ordinal arithmetic: tickets are
+    /// consecutive and `pending` pops only at the front, so an entry's
+    /// index is its distance from the front's ticket (O(1), never a
+    /// scan — batch 43; the `queued` FIFO's ADR-0087 D2 rule). `None`
+    /// for a ticket already folded into the durable prefix or never
+    /// minted.
+    fn pending_mut(&mut self, ticket: FsyncTicket) -> Option<&mut PendingFsync<File>> {
+        let front = self.pending.front()?.ticket;
+        let index = usize::try_from(ticket.0.checked_sub(front)?).ok()?;
+        let entry = self.pending.get_mut(index)?;
+        debug_assert_eq!(entry.ticket, ticket.0, "ticket ordinals are consecutive");
+        Some(entry)
+    }
+
     /// Rebase a pending linked fsync's latency clock to `now` — its
     /// covering write just completed (M4.5-S27, ADR-0083 D4). A linked
     /// fdatasync is an `IO_LINK` chain: the sync SQE starts only after
@@ -952,7 +991,7 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// No-ops on a ticket already completed or failed (a short-write
     /// resubmission chain may complete its sync out of band).
     pub fn rebase_clock(&mut self, ticket: FsyncTicket, now: Nanos) {
-        if let Some(entry) = self.pending.iter_mut().find(|p| p.ticket == ticket.0)
+        if let Some(entry) = self.pending_mut(ticket)
             && !entry.done
             && !entry.failed
         {
@@ -969,20 +1008,19 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// On an unknown or already-completed ticket — completions are
     /// exactly-once by the driver contract.
     pub fn on_fsync_complete(&mut self, ticket: FsyncTicket, now: Nanos) -> Option<Lsn> {
-        let entry = self
-            .pending
-            .iter_mut()
-            .find(|p| p.ticket == ticket.0)
-            .expect("fsync completion for an unknown ticket");
+        let entry = self.pending_mut(ticket).expect("fsync completion for an unknown ticket");
         assert!(!entry.done && !entry.failed, "fsync ticket completed twice");
         entry.done = true;
+        let reason = entry.reason;
         // Seal durability and write-handle drop coincide (ADR-0013 D4);
         // boot-barrier dir handles close the same way (M2.5-S01).
         entry.held = HeldHandle::None;
         let elapsed = now.saturating_sub(entry.submitted_at);
         self.fsync_hist_us.record(elapsed.as_micros());
-        if entry.reason == SyncReason::WriteThrough {
+        if reason == SyncReason::WriteThrough {
             self.write_through_hist_us.record(elapsed.as_micros());
+        } else {
+            self.flush_in_flight -= 1;
         }
         self.stats.fsyncs_completed += 1;
 
@@ -1005,14 +1043,14 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// path can name what was lost, never so the caller can continue).
     // fsync-fail-stop-allow: freezes the watermark so the loss is observable and nameable; every caller fail-stops the cell next (§8.4) — this never resumes a commit
     pub fn on_fsync_error(&mut self, ticket: FsyncTicket) -> SyncReason {
-        let entry = self
-            .pending
-            .iter_mut()
-            .find(|p| p.ticket == ticket.0)
-            .expect("fsync error for an unknown ticket");
-        assert!(!entry.done, "fsync ticket errored after completing");
+        let entry = self.pending_mut(ticket).expect("fsync error for an unknown ticket");
+        assert!(!entry.done && !entry.failed, "fsync ticket errored after completing");
         entry.failed = true;
-        entry.reason
+        let reason = entry.reason;
+        if reason != SyncReason::WriteThrough {
+            self.flush_in_flight -= 1;
+        }
+        reason
     }
 
     // ---- Observability (S21 counter-set vocabulary) -------------------------
@@ -1246,7 +1284,9 @@ mod tests {
 
     #[test]
     fn watermark_advances_only_on_completion_and_by_done_prefix() {
-        let mut gc = commit();
+        // Two linked syncs in flight: the measured bound-2 arm (at bound 1
+        // the second registration is refused — batch 43).
+        let mut gc: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2);
         gc.note_frame_queued(lsn(0, 100), 100);
         let t1 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
@@ -1757,6 +1797,55 @@ mod tests {
     }
 
     #[test]
+    fn rotation_seal_and_linked_sync_respect_the_flush_bound() {
+        // F-L01-05 (batch 43): the seal fdatasync a rotation registers
+        // ahead of the frame takes the FLUSH slot — at bound 1 the frame
+        // seals plain and its due accumulates behind the seal (§8.2),
+        // never a second FLUSH-class barrier in the same iteration.
+        let mut gc = commit();
+        let a = gc.note_frame_queued(lsn(0, 4096), 4096);
+        gc.note_frame_written(a);
+        gc.note_everysec_tick();
+        let t = gc.register_standalone_fsync(Nanos::ZERO);
+        assert_eq!(gc.on_fsync_complete(t, Nanos::from_micros(500)), Some(lsn(0, 4096)));
+        assert_eq!(gc.syncs_in_flight(), 0, "the ledger is empty");
+        gc.note_staged(FsyncClass::Always);
+        assert_eq!(
+            gc.frame_plan(false, false),
+            FramePlan::LinkedFsync,
+            "no seal: the slot is free"
+        );
+        assert_eq!(gc.frame_plan(false, true), FramePlan::Plain, "the seal takes the only slot");
+        // Write-through does not queue on the flush unit: a seal ahead
+        // still lets a FUA-capable frame go write-through.
+        assert_eq!(gc.frame_plan(true, true), FramePlan::WriteThrough);
+        // Bound 2 keeps one slot for the frame behind the seal.
+        let mut gc2: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2);
+        gc2.note_staged(FsyncClass::Always);
+        assert_eq!(gc2.frame_plan(false, true), FramePlan::LinkedFsync);
+    }
+
+    #[test]
+    fn a_discretionary_barrier_never_enters_a_full_pipeline() {
+        // The registration asserts what `frame_plan` decided: a linked
+        // sync registered behind a seal at bound 1 is the F-L01-05 shape.
+        let mut gc = commit();
+        let a = gc.note_frame_queued(lsn(0, 4096), 4096);
+        gc.note_frame_written(a);
+        gc.note_staged(FsyncClass::Always);
+        let fs = crate::fs::mem::MemFs::new();
+        fs.create_dir_all(std::path::Path::new("log")).expect("mem dir");
+        let file = fs.open_dir(std::path::Path::new("log")).expect("mem handle");
+        let handoff = crate::segment::SealHandoff::for_test(SegmentId(0), file, 4096);
+        let _seal = gc.register_seal_fsync(handoff, Nanos::ZERO);
+        gc.note_frame_queued(lsn(1, 512), 512);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gc.register_linked_fsync(Nanos::ZERO);
+        }));
+        assert!(outcome.is_err(), "a second FLUSH-class barrier at bound 1 is refused");
+    }
+
+    #[test]
     fn zero_fill_barrier_is_coverage_neutral() {
         // ADR-0086 D4: the zero-fill fdatasync enters at the coverage tail
         // and fences later data syncs without advancing anything itself.
@@ -1773,7 +1862,7 @@ mod tests {
 
     #[test]
     fn failed_fsync_freezes_the_watermark() {
-        let mut gc = commit();
+        let mut gc: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2);
         gc.note_frame_queued(lsn(0, 100), 100);
         let t1 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);

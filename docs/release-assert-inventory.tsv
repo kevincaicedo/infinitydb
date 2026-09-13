@@ -220,6 +220,8 @@ I	1	crates/inf-log/src/commit.rs	assert_eq	write-through frame must extend the d
 I	1	crates/inf-log/src/commit.rs	expect	advanced past None	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	expect	completion fsync with nothing written	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	expect	fsync completion for an unknown ticket	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
+I	1	crates/inf-log/src/commit.rs	assert	FLUSH-class barrier into a full pipeline	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3); batch 43 (F-L01-05): a Linked/Standalone/Completion entry enters only through a slot `frame_plan` (seal counted) or `*_fsync_due` found free
+I	1	crates/inf-log/src/commit.rs	expect	LogWritten with no unwritten frame	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	expect	fsync error for an unknown ticket	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	expect	linked fsync before any frame was queued	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
 I	1	crates/inf-log/src/commit.rs	expect	LogWritten for a frame already written	GroupCommit's own FIFO / ticket / coverage state machine (M2.5-S13 release asserts; ADR-0086 D3, ADR-0087 D3)
@@ -232,7 +234,7 @@ C	1	crates/inf-log/src/flush.rs	assert	catalog ranges must not overlap	`crates/i
 I	1	crates/inf-log/src/flush.rs	assert	drive change with a round in flight	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 I	1	crates/inf-log/src/flush.rs	assert	drive change with pending seals	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 C	1	crates/inf-log/src/flush.rs	assert	next_id collides with a seeded file	`crates/inf-log/src/manifest.rs:Manifest::decode_tiers` refuses typed unless file ids and ranges strictly ascend without overlap; `crates/inf-store/src/tiered_recover.rs:recover_tiered_ns` seeds next_id = max id + 1
-I	1	crates/inf-log/src/flush.rs	assert	SealCommit without a pending seal	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
+I	1	crates/inf-log/src/flush.rs	expect	SealCommit without a pending seal	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 I	1	crates/inf-log/src/flush.rs	assert	seam append while a reactor round is in flight	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 I	1	crates/inf-log/src/flush.rs	assert	seam gap seal while a reactor round is in flight	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 I	2	crates/inf-log/src/flush.rs	assert	seam seal while a reactor round is in flight	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
@@ -312,6 +314,7 @@ C	1	crates/inf-log/src/staging.rs	assert	staging capacity exceeds the frame deco
 I	1	crates/inf-log/src/staging.rs	assert_eq	set_frame_epoch after a seal (boot wiring only)	boot-wiring order: the ring's own seal counter is zero until the first frame
 I	1	crates/inf-log/src/staging.rs	assert_eq	stale StagedAt: token generation does not match this lease	StagingRing lease / generation state machine (a stale `StagedAt` or lease is a violated invariant)
 I	1	crates/inf-log/src/staging.rs	expect	a free buffer exists when not backlogged	StagingRing lease / generation state machine (a stale `StagedAt` or lease is a violated invariant)
+I	1	crates/inf-log/src/staging.rs	expect	release with no frame in flight	StagingRing lease / generation state machine (a stale `StagedAt` or lease is a violated invariant)
 I	2	crates/inf-log/src/staging.rs	expect	frame fits u32	a sealed frame is one staging slot ≤ 64 MiB
 I	1	crates/inf-log/src/staging.rs	expect	lease does not match any in-flight frame	StagingRing lease / generation state machine (a stale `StagedAt` or lease is a violated invariant)
 I	1	crates/inf-log/src/tail.rs	expect	16-byte slice	fixed-width sub-slice of a length-checked buffer — infallible by construction
@@ -447,6 +450,8 @@ I	1	crates/inf-server/src/durable.rs	expect	CkptWrite with no in-flight lease	th
 I	1	crates/inf-server/src/durable.rs	expect	header staged by open_stream	`open_stream` stages the header block and returns `Ok` only with the lease in `in_flight`
 I	1	crates/inf-server/src/durable.rs	expect	index from position	`position` returned an index into the same `Vec`
 I	1	crates/inf-server/src/durable.rs	expect	LogWritten for a frame not in flight	frame ids are minted here and stay in `in_flight` until their one `LogWritten`; the driver delivers each completion once
+I	1	crates/inf-server/src/durable.rs	assert	open fill episode without a held frame	DurableCell's own hold-episode state machine (batch 43, ADR-0092 D1 rule 6 amendment): the clock is set by a hold that sets frame_held and cleared only by note_issued, which clears both
+I	1	crates/inf-server/src/durable.rs	assert	open group-hold episode without a held frame	DurableCell's own hold-episode state machine (batch 43, ADR-0092 D1 rule 6 amendment): the clock is set by a hold that sets frame_held and cleared only by note_issued, which clears both
 C	4	crates/inf-server/src/durable.rs	expect	std segment tier has fds	the reactor-driven plane runs only on fd-backed tiers: `StdSegmentFs` at `bins/infinityd/src/main.rs:main` and the harnesses, the sim disk in `inf-sim` (`crates/inf-log/src/fs/sim.rs:SimFile::raw_fd`); `MemFs` reaches only the synchronous `open_cell_log` tier
 I	1	crates/inf-server/src/durable.rs	panic	CkptSync completion with no checkpoint streaming	the cell's own checkpoint phase: a `CkptSync` token is minted only by the streaming phase
 I	1	crates/inf-server/src/durable.rs	panic	CkptWrite completion with no checkpoint streaming	the cell's own checkpoint phase: a `CkptWrite` token is minted only by the streaming phase

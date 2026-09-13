@@ -271,6 +271,13 @@ impl FrameBuilder {
         &self.buf[self.at..self.at + self.sealed_len]
     }
 
+    /// The finished frame's length (padding included), 0 before
+    /// `finalize` — an observability read that never panics.
+    #[must_use]
+    pub fn sealed_len(&self) -> usize {
+        self.sealed_len
+    }
+
     /// Clear for the next iteration, keeping the allocation. O(1): only the
     /// header is re-zeroed; a later `finalize` rewrites every byte it
     /// emits (padding included).

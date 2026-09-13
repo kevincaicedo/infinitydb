@@ -1,0 +1,24 @@
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.70s
+     Running tests/staging_ring.rs (target/debug/deps/staging_ring-62148dda98e36b80)
+
+running 1 test
+test flush_into_releases_the_lease_when_the_write_fails ... FAILED
+
+failures:
+
+---- flush_into_releases_the_lease_when_the_write_fails stdout ----
+
+thread 'flush_into_releases_the_lease_when_the_write_fails' (302710) panicked at crates/inf-log/tests/staging_ring.rs:387:5:
+assertion `left == right` failed: the failed frame's lease is released, not leaked
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    flush_into_releases_the_lease_when_the_write_fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-log --test staging_ring`

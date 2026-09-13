@@ -216,6 +216,7 @@ impl TieredScenario {
             cells: self.cells,
             always_writers: 0,
             esec_think_ns_max: 0,
+            always_think_ns_max: 0,
             esec_writers: 0,
             mem_writers: 0,
             ops_per_writer: 0,

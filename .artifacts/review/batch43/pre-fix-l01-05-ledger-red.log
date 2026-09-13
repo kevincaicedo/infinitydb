@@ -1,0 +1,30 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.46s
+     Running unittests src/lib.rs (target/debug/deps/inf_log-4ca621fdf3c76e67)
+
+running 2 tests
+test commit::tests::rotation_seal_and_linked_sync_respect_the_flush_bound ... FAILED
+test commit::tests::a_discretionary_barrier_never_enters_a_full_pipeline ... FAILED
+
+failures:
+
+---- commit::tests::rotation_seal_and_linked_sync_respect_the_flush_bound stdout ----
+
+thread 'commit::tests::rotation_seal_and_linked_sync_respect_the_flush_bound' (302409) panicked at crates/inf-log/src/commit.rs:1774:9:
+assertion `left == right` failed: the seal takes the only slot
+  left: LinkedFsync
+ right: Plain
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- commit::tests::a_discretionary_barrier_never_enters_a_full_pipeline stdout ----
+
+thread 'commit::tests::a_discretionary_barrier_never_enters_a_full_pipeline' (302408) panicked at crates/inf-log/src/commit.rs:1801:9:
+a second FLUSH-class barrier at bound 1 is refused
+
+
+failures:
+    commit::tests::a_discretionary_barrier_never_enters_a_full_pipeline
+    commit::tests::rotation_seal_and_linked_sync_respect_the_flush_bound
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 108 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-log --lib`
