@@ -15,7 +15,7 @@ corpus runs against both, plus a namespace-bound fan-out/tier lane
 (`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned
 byte-exact there, never silently excused.
 
-**Corpus:** 623 byte-compared executions · 61 documented deviations · 0 tolerated failures.
+**Corpus:** 628 byte-compared executions · 61 documented deviations · 0 tolerated failures.
 **Surface:** 91 commands — 54 full · 32 partial · 0 stub · 2 extension · 3 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
@@ -32,8 +32,8 @@ program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 | `ECHO` | full | M0 | fast | 2 | 3 |  |
 | `HELLO` | full | M0 | fast | -1 | 1 | identity fields (server/version) are InfinityDB's own, as for any non-Redis server |
 | `QUIT` | partial | M1 | fast | 1 | 0 | replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus because closing tears down the shared oracle connection — covered by a unit test and the client-smoke suite |
-| `GET` | full | M0 | readonly fast | 2 | 28 |  |
-| `SET` | full | M0 | write denyoom | -3 | 94 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111); bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122) |
+| `GET` | full | M0 | readonly fast | 2 | 29 |  |
+| `SET` | full | M0 | write denyoom | -3 | 95 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111); bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122) |
 | `SETNX` | full | M0 | write denyoom fast | 3 | 2 |  |
 | `SETEX` | full | M0 | write denyoom | 4 | 6 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `PSETEX` | full | M0 | write denyoom | 4 | 4 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
@@ -63,8 +63,8 @@ program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 | `GETEX` | full | M1 | write fast | -2 | 20 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `INCRBYFLOAT` | partial | M1 | write denyoom fast | 3 | 6 | computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision tails may differ |
 | `SUBSTR` | full | M1 | readonly | 4 | 1 |  |
-| `RENAME` | partial | M1 | write | 3 | 2 | cross-owner string moves use snapshot/put/conditional-delete (ADR-0110); destination refusal preserves source; changed-source cleanup returns -BUSY and may leave a copy; destination OOM remains possible because the SET leg is DENYOOM; full atomicity at M6 |
-| `RENAMENX` | partial | M1 | write fast | 3 | 3 | same cross-owner window and -BUSY cleanup error as RENAME; retry after -BUSY can return 0 against the leftover destination copy without removing the source |
+| `RENAME` | partial | M1 | write | 3 | 3 | cross-owner string moves use snapshot/put/conditional-delete (ADR-0110); destination refusal preserves source; changed-source cleanup returns -BUSY and may leave a copy; destination OOM remains possible because the SET leg is DENYOOM; full atomicity at M6 |
+| `RENAMENX` | partial | M1 | write fast | 3 | 5 | same cross-owner window and -BUSY cleanup error as RENAME; retry after -BUSY can return 0 against the leftover destination copy without removing the source |
 | `COPY` | partial | M1 | write denyoom | -3 | 12 | cross-owner string copy uses an absolute expiry deadline (ADR-0110); destination NX is checked at write; same cross-owner window as RENAME |
 | `TOUCH` | full | M1 | readonly fast | -2 | 1 |  |
 | `UNLINK` | full | M1 | write fast | -2 | 1 |  |

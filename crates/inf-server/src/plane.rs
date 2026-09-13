@@ -644,7 +644,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     /// Executes owned argv locally (queued and remote-`Apply` paths),
     /// appending the reply to `out` (callers reuse scratch buffers — the
     /// owner side of a remote `Apply` is zero-allocation, M0-E8), and
-    /// reports the apply point.
+    /// reports the apply point. Returns whether the command asked for the
+    /// connection to close after its reply (`QUIT`) — the pump's client
+    /// sites hand it to [`close_after_reply`]; fabric callers never see
+    /// `QUIT` (it addresses no key).
     #[allow(clippy::too_many_arguments)] // internal execution funnel
     fn execute_owned_into(
         &self,
@@ -656,7 +659,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         ns: Option<NsId>,
         program: bool,
         out: &mut Vec<u8>,
-    ) {
+    ) -> bool {
         let before = out.len();
         let mut cx = ConnCx {
             proto,
@@ -730,7 +733,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
                 &out[before..],
                 now,
             );
-            return;
+            return false;
         }
         let scope = ExecScope::of(&cx);
         execute_slices(argv, &mut self.store.borrow_mut(), &mut cx, now, out);
@@ -743,6 +746,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
         #[cfg(feature = "doc")]
         self.node.doc_log_admission.set(None);
         self.observer.borrow_mut().on_execute(self.cell, origin, scope, argv, &out[before..], now);
+        cx.close_requested.get()
     }
 
     /// The mutation's path program for the S04 static path-overlap prune
@@ -4952,13 +4956,33 @@ fn dispatch_mirror<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             c.cx.ns = live.ns;
         });
     } else {
-        shared.execute_owned_into(origin, argv, proto, id, db, conn_ns, false, &mut reply);
+        let close =
+            shared.execute_owned_into(origin, argv, proto, id, db, conn_ns, false, &mut reply);
         if let Some(dur) = stall_request(argv) {
             shared.stall_until.set(shared.now.get().saturating_add(dur));
+        }
+        if close {
+            close_after_reply(shared, key);
         }
     }
     pending.push_back(PendingReply::Done(reply));
     true
+}
+
+/// `QUIT` through the pump (review of 2026-08-30, F-L13-08): the
+/// connection closes once the replies ahead of it have flushed, and
+/// nothing queued behind it runs — the inline path's `break`, for the
+/// pump. Later input is dropped at the read (`close_after_flush`).
+fn close_after_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    key: ConnKey,
+) {
+    shared.with_conn(key, |conn| {
+        conn.close_after_flush = true;
+        for cmd in conn.queue.drain(..) {
+            shared.recycle_cmd_buf(cmd.into_buf());
+        }
+    });
 }
 
 /// Render an owner's outcome as the RESP reply for a whole-argv `Apply`
@@ -6940,7 +6964,10 @@ async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
         return true;
     }
     let mut reply = shared.take_reply_buf();
-    shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), false, &mut reply);
+    let close = shared.execute_owned_into(origin, argv, proto, id, db, Some(ns), false, &mut reply);
+    if close {
+        close_after_reply(shared, key);
+    }
     let gated = if is_write
         && (reply.first() != Some(&b'-') || stages_despite_error(meta.id))
         && let Some(class) = class

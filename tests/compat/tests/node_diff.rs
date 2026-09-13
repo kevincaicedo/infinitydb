@@ -24,7 +24,7 @@
 //! CI); unset skips loudly. The redis oracle follows the diff.rs rules.
 
 use std::collections::BTreeSet;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 
@@ -474,4 +474,37 @@ fn info_names_every_field_once_on_a_real_node() {
     assert!(body.contains("tripwire_scope:cell\r\n"), "{body}");
     assert!(body.contains("used_memory_doc_resident:"), "{body}");
     assert!(body.contains("\r\ndoc_resident_bytes:"), "{body}");
+}
+
+/// Batch 46 (review of 2026-08-30, F-L13-08): `QUIT` on a namespace-bound
+/// connection — the pump path — answers `+OK` and closes, as Redis does.
+/// Pre-fix the spawned binary answered `+OK` and held the socket open
+/// until the client's read timeout.
+#[test]
+fn quit_closes_a_namespace_bound_connection_like_redis() {
+    let Some((_node_guard, mut node)) = infinityd(1, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let Some((_oracle_guard, mut oracle)) = oracle() else {
+        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        return;
+    };
+    let (mut ob, mut nb) = (Vec::new(), Vec::new());
+    for preamble in
+        [&["INF.NS", "CREATE", "cache", "MODE", "memory"][..], &["INF.NS", "USE", "cache"][..]]
+    {
+        assert_eq!(cmd(&mut node, &mut nb, preamble), b"+OK\r\n", "preamble {preamble:?}");
+    }
+    let o = cmd(&mut oracle, &mut ob, &["QUIT"]);
+    let n = cmd(&mut node, &mut nb, &["QUIT"]);
+    assert_eq!(o, n, "QUIT reply differs from Redis");
+    for (who, stream) in [("redis", &mut oracle), ("node", &mut node)] {
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("timeout");
+        let mut rest = Vec::new();
+        match stream.read_to_end(&mut rest) {
+            Ok(_) => assert!(rest.is_empty(), "{who}: bytes after QUIT's +OK: {rest:?}"),
+            Err(e) => panic!("{who}: the server never closed the connection after QUIT ({e})"),
+        }
+    }
 }
