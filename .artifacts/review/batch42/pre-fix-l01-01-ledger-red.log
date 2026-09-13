@@ -1,0 +1,25 @@
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.95s
+     Running unittests src/lib.rs (target/debug/deps/inf_log-4ca621fdf3c76e67)
+
+running 1 test
+test commit::tests::everysec_tick_is_not_idle_while_records_are_staged ... FAILED
+
+failures:
+
+---- commit::tests::everysec_tick_is_not_idle_while_records_are_staged stdout ----
+
+thread 'commit::tests::everysec_tick_is_not_idle_while_records_are_staged' (203924) panicked at crates/inf-log/src/commit.rs:1279:9:
+assertion `left == right` failed: a tick over staged records is not idle
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    commit::tests::everysec_tick_is_not_idle_while_records_are_staged
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 107 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-log --lib`

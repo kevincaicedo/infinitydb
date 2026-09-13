@@ -310,9 +310,10 @@ fn parse_args() -> Result<Args, String> {
                 args.fill_window_us = take("--fill-window-us")?
                     .parse()
                     .map_err(|e| format!("--fill-window-us: {e}"))?;
-                // A hold past the everysec tick would move the loss
-                // window; 100 ms is already two orders past the design
-                // point (1 ms).
+                // The tick seals a held frame with its barrier (ADR-0013
+                // D3 second amendment), so a hold never moves the loss
+                // window; 100 ms is still two orders past the design
+                // point (1 ms) — the cap stays as a belt.
                 if args.fill_window_us > 100_000 {
                     return Err("--fill-window-us is 0..=100000 (µs)".into());
                 }

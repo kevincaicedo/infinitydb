@@ -296,6 +296,11 @@ pub struct GroupCommit<File> {
     /// still sits in the staging ring, so no standalone sync can cover it
     /// yet (M2.5-S07 completion-issue discharge check).
     always_unqueued: bool,
+    /// An `everysec` record was staged after the last frame queued (F-L01-01,
+    /// batch 42): the ledger is byte-clean but the cell is not idle — a
+    /// tick over it owes the held frame its barrier, and a sync settling
+    /// at `written_up_to` cannot discharge it.
+    everysec_unqueued: bool,
     /// Exclusive end of the last queued frame carrying `always` records:
     /// a standalone covering ≥ this discharges `always_pending`.
     always_queued_up_to: Option<Lsn>,
@@ -338,6 +343,8 @@ impl<File> fmt::Debug for GroupCommit<File> {
         f.debug_struct("GroupCommit")
             .field("sync_due", &self.sync_due)
             .field("always_pending", &self.always_pending)
+            .field("always_unqueued", &self.always_unqueued)
+            .field("everysec_unqueued", &self.everysec_unqueued)
             .field("queued_up_to", &self.queued_up_to)
             .field("written_up_to", &self.written_up_to)
             .field("durable_up_to", &self.durable_up_to)
@@ -374,6 +381,7 @@ impl<File: SegmentFile> GroupCommit<File> {
             sync_due: false,
             always_pending: false,
             always_unqueued: false,
+            everysec_unqueued: false,
             always_queued_up_to: None,
             flush_bound: bound,
             queued_up_to: None,
@@ -399,18 +407,27 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// frame carry a linked fsync (the ack gates on it); `Everysec` records
     /// ride the timer — the fast path pays nothing extra here.
     pub fn note_staged(&mut self, class: FsyncClass) {
-        if class == FsyncClass::Always {
-            self.always_pending = true;
-            self.always_unqueued = true;
-            self.sync_due = true;
+        match class {
+            FsyncClass::Always => {
+                self.always_pending = true;
+                self.always_unqueued = true;
+                self.sync_due = true;
+            }
+            FsyncClass::Everysec => self.everysec_unqueued = true,
         }
     }
 
     /// The everysec timer fired (plane-armed on the injected wheel — L7).
-    /// Idle ticks (nothing dirty, nothing pending it) are counted and cost
-    /// nothing.
+    /// Idle ticks (nothing dirty, nothing pending it, nothing staged) are
+    /// counted and cost nothing. Staged-but-unsealed records are dirty
+    /// (F-L01-01): the tick's promise is every record staged before it,
+    /// and a held frame (fill, group hold, extent barrier) leaves the
+    /// byte counters clean while acked records wait in the builder.
     pub fn note_everysec_tick(&mut self) {
-        if self.queued_bytes == self.durable_bytes && !self.always_pending {
+        if self.queued_bytes == self.durable_bytes
+            && !self.always_pending
+            && !self.everysec_unqueued
+        {
             self.stats.idle_ticks += 1;
             return;
         }
@@ -564,7 +581,9 @@ impl<File: SegmentFile> GroupCommit<File> {
     fn settle_due_at_written(&mut self) {
         let always_owed = self.always_pending && !self.always_discharged_at_written();
         let in_flight_uncovered = self.written_bytes < self.queued_bytes;
-        self.sync_due = always_owed || in_flight_uncovered;
+        // Records still in the builder sit outside any written coverage
+        // (F-L01-01): the due stays for the frame that seals them.
+        self.sync_due = always_owed || in_flight_uncovered || self.everysec_unqueued;
         self.always_pending = always_owed;
     }
 
@@ -730,6 +749,7 @@ impl<File: SegmentFile> GroupCommit<File> {
             self.always_queued_up_to = Some(end);
             self.always_unqueued = false;
         }
+        self.everysec_unqueued = false;
         id
     }
 
@@ -1037,6 +1057,28 @@ impl<File: SegmentFile> GroupCommit<File> {
         self.pending.iter().filter(|p| !p.done).count()
     }
 
+    /// Ledger entries not yet folded into the durable prefix — in flight
+    /// or completed behind an earlier one still in flight.
+    #[must_use]
+    pub fn pending_entries(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Does an unfolded ledger entry cover up to a point in `lo..hi`?
+    /// The plane's ack map coalesces written frames across which no
+    /// such point lies (F-L01-03): a later barrier covers both or neither.
+    #[must_use]
+    pub fn pending_covers_within(&self, lo: Lsn, hi: Lsn) -> bool {
+        self.pending.iter().any(|p| lo <= p.covers_up_to && p.covers_up_to < hi)
+    }
+
+    /// Exclusive end of the written prefix — every queued frame below it
+    /// has its `LogWritten` (ADR-0087 D2). `None` until the first lands.
+    #[must_use]
+    pub fn written_up_to(&self) -> Option<Lsn> {
+        self.written_up_to
+    }
+
     /// Durability-barrier completion latency, microseconds, all classes
     /// (`fsync_latency_hist`).
     #[must_use]
@@ -1257,6 +1299,30 @@ mod tests {
         gc.on_fsync_complete(t, Nanos::from_millis(3));
         gc.rebase_clock(t, Nanos::from_secs(9));
         assert_eq!(gc.fsync_latency_hist().count(), 1, "completed ticket stays completed");
+    }
+
+    /// F-L01-01 (review of 2026-08-30): the tick's promise is every
+    /// record staged before it. A record acked at apply and still in the
+    /// staging builder (a held frame — fill, group hold, extent barrier)
+    /// leaves the ledger byte-clean, and the tick must not count itself
+    /// idle over it: the held frame carries the barrier when it seals.
+    #[test]
+    fn everysec_tick_is_not_idle_while_records_are_staged() {
+        let mut gc = commit();
+        gc.note_staged(FsyncClass::Everysec);
+        gc.note_everysec_tick();
+        assert_eq!(gc.stats().idle_ticks, 0, "a tick over staged records is not idle");
+        assert!(gc.sync_due(), "the staged record's due survives the tick");
+        assert!(!gc.standalone_fsync_due(), "nothing written: the frame carries it");
+        assert_eq!(gc.frame_plan(false, false), FramePlan::LinkedFsync);
+        let a = gc.note_frame_queued(lsn(0, 64), 64);
+        let t = gc.register_linked_fsync(Nanos::ZERO);
+        gc.note_frame_written(a);
+        assert_eq!(gc.on_fsync_complete(t, Nanos::ZERO), Some(lsn(0, 64)));
+        // The seal drained the builder: a clean tick is idle again.
+        gc.note_everysec_tick();
+        assert_eq!(gc.stats().idle_ticks, 1);
+        assert!(!gc.sync_due());
     }
 
     #[test]
