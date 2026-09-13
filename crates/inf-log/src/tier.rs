@@ -334,7 +334,7 @@ pub enum RoundEffect {
 struct StagedWrite {
     fd: std::os::fd::RawFd,
     offset: u64,
-    window: FrameStaging,
+    window: PooledWindow,
     frames: usize,
 }
 
@@ -388,7 +388,7 @@ impl TierRound {
                 fd: w.fd,
                 is_barrier: false,
                 offset: w.offset,
-                bytes: w.window.filled(w.frames),
+                bytes: w.window.staging().filled(w.frames),
             };
         }
         let fd = self.barriers[index - self.writes.len()];
@@ -399,7 +399,7 @@ impl TierRound {
         &mut self,
         fd: std::os::fd::RawFd,
         offset: u64,
-        window: FrameStaging,
+        window: PooledWindow,
         frames: usize,
     ) {
         self.admit_op();
@@ -446,6 +446,49 @@ pub(crate) struct WindowPool {
     outstanding: u32,
 }
 
+/// A window the pool issued (F-L04-13): the only kind a round may carry,
+/// so every `recycle` returns exactly what `take` counted — the pool's
+/// count cannot go below its issued windows. Made by [`WindowPool::take`]
+/// alone.
+pub(crate) struct PooledWindow(FrameStaging);
+
+impl PooledWindow {
+    pub(crate) fn staging(&self) -> &FrameStaging {
+        &self.0
+    }
+
+    pub(crate) fn staging_mut(&mut self) -> &mut FrameStaging {
+        &mut self.0
+    }
+}
+
+/// The writer's append batch window, typed by the drive that staged into
+/// it: the seam path owns its window outright; the queued path stages
+/// into a pooled one that moves onto the round (F-L04-13 — a seam window
+/// can never be `put`). The drives never interleave (ADR-0084 D2): a
+/// retained seam window is dropped at the first queued frame and at a
+/// drive switch.
+enum BatchWindow {
+    Seam(FrameStaging),
+    Pooled(PooledWindow),
+}
+
+impl BatchWindow {
+    fn staging(&self) -> &FrameStaging {
+        match self {
+            BatchWindow::Seam(w) => w,
+            BatchWindow::Pooled(w) => w.staging(),
+        }
+    }
+
+    fn staging_mut(&mut self) -> &mut FrameStaging {
+        match self {
+            BatchWindow::Seam(w) => w,
+            BatchWindow::Pooled(w) => w.staging_mut(),
+        }
+    }
+}
+
 /// Ops a round may stage (ADR-0084 D3): the plane packs the op index
 /// into 8 token bits (`slot = lane × 256 + op_index`), so a 257th op
 /// would share another op's completion token.
@@ -461,16 +504,23 @@ impl WindowPool {
         WindowPool { batch: Vec::new(), single: Vec::new(), outstanding: 0 }
     }
 
-    fn take(&mut self, frames: usize) -> FrameStaging {
+    fn take(&mut self, frames: usize) -> PooledWindow {
         self.outstanding += 1;
         assert!(self.outstanding <= WINDOWS_OUTSTANDING_CAP, "flush window pool overrun");
         let free = if frames == TIER_BATCH_FRAMES { &mut self.batch } else { &mut self.single };
-        free.pop().unwrap_or_else(|| FrameStaging::new(frames))
+        PooledWindow(free.pop().unwrap_or_else(|| FrameStaging::new(frames)))
     }
 
-    fn put(&mut self, window: FrameStaging) {
-        debug_assert!(self.outstanding > 0, "window returned twice");
-        self.outstanding -= 1;
+    #[cfg(test)]
+    pub(crate) fn outstanding(&self) -> u32 {
+        self.outstanding
+    }
+
+    fn put(&mut self, window: PooledWindow) {
+        // Release-checked: a `u32` floor a debug assert alone left to wrap
+        // (F-L04-13); the type makes it unreachable, the check names it.
+        self.outstanding = self.outstanding.checked_sub(1).expect("window returned twice");
+        let PooledWindow(window) = window;
         if window.frames == TIER_BATCH_FRAMES {
             self.batch.push(window);
         } else {
@@ -505,7 +555,7 @@ pub struct TierWriter<F: SegmentFs> {
     /// Lazily allocated on the first full frame; in the reactor drive
     /// (ADR-0084) the window comes from the pipeline's pool and moves
     /// into the round on spill, so `None` between rounds costs nothing.
-    batch: Option<FrameStaging>,
+    batch: Option<BatchWindow>,
     batch_frames: usize,
     batch_first_frame: u64,
     /// Bytes this writer handed the device (M4-S13): the header block,
@@ -637,12 +687,12 @@ impl<F: SegmentFs> TierWriter<F> {
         mode: TierIoMode,
         capacity_hint: u64,
         pool: &mut WindowPool,
-    ) -> io::Result<(TierWriter<F>, FrameStaging)> {
+    ) -> io::Result<(TierWriter<F>, PooledWindow)> {
         let path = shard_dir.join("cold").join(tier_file_name(id));
         let file = fs.create_tier(&path, mode)?;
         assert!(file.raw_fd().is_some(), "reactor drive requires fd-backed tier files (ADR-0084)");
         let mut window = pool.take(1);
-        encode_tier_header(window.frame_mut(), cell, ns, base, capacity_hint);
+        encode_tier_header(window.staging_mut().frame_mut(), cell, ns, base, capacity_hint);
         let writer = TierWriter {
             file,
             path,
@@ -854,6 +904,20 @@ impl<F: SegmentFs> TierWriter<F> {
         result
     }
 
+    /// Drive-switch reconciliation (F-L04-13): a pooled window goes back
+    /// to the pool, a seam window is dropped — the next drive stages into
+    /// its own kind. Staged, unflushed frames at a switch are the
+    /// interleave ADR-0084 D2 forbids.
+    ///
+    /// # Panics
+    /// Panics with frames staged.
+    pub(crate) fn release_batch_window(&mut self, pool: &mut WindowPool) {
+        assert_eq!(self.batch_frames, 0, "drive change with staged frames");
+        if let Some(BatchWindow::Pooled(window)) = self.batch.take() {
+            pool.put(window);
+        }
+    }
+
     /// Stages the (full) tail frame into the append batch; the batch
     /// reaches the device as one multi-frame write when the window fills
     /// or at the next barrier/seal (L3 — never one syscall per frame).
@@ -869,7 +933,10 @@ impl<F: SegmentFs> TierWriter<F> {
             "batched frames are consecutive"
         );
         let crc = crc32c(&self.tail);
-        let batch = self.batch.get_or_insert_with(|| FrameStaging::new(TIER_BATCH_FRAMES));
+        let batch = self
+            .batch
+            .get_or_insert_with(|| BatchWindow::Seam(FrameStaging::new(TIER_BATCH_FRAMES)))
+            .staging_mut();
         let slot = batch.slot_mut(self.batch_frames);
         slot[..TIER_FRAME_DATA].copy_from_slice(&self.tail);
         slot[TIER_FRAME_DATA..].copy_from_slice(&crc.to_le_bytes());
@@ -894,7 +961,12 @@ impl<F: SegmentFs> TierWriter<F> {
         let count = self.batch_frames;
         // The borrow is split by hand: `filled` reads the batch window,
         // the write targets the file.
-        let bytes = self.batch.as_ref().expect("staged frames imply a batch window").filled(count);
+        let bytes = self
+            .batch
+            .as_ref()
+            .expect("staged frames imply a batch window")
+            .staging()
+            .filled(count);
         let len = bytes.len() as u64;
         device_write(&mut self.file, offset, bytes)?;
         self.batch_frames = 0;
@@ -1064,7 +1136,15 @@ impl<F: SegmentFs> TierWriter<F> {
             "batched frames are consecutive"
         );
         let crc = crc32c(&self.tail);
-        let batch = self.batch.get_or_insert_with(|| pool.take(TIER_BATCH_FRAMES));
+        let batch = match &mut self.batch {
+            Some(b @ BatchWindow::Pooled(_)) => b,
+            // Seam frames under the reactor drive: staged where they are;
+            // the spill refuses them (ADR-0084 D2).
+            Some(b @ BatchWindow::Seam(_)) if self.batch_frames > 0 => b,
+            // None, or a seam window retained empty after its flush.
+            slot => slot.insert(BatchWindow::Pooled(pool.take(TIER_BATCH_FRAMES))),
+        }
+        .staging_mut();
         let slot = batch.slot_mut(self.batch_frames);
         slot[..TIER_FRAME_DATA].copy_from_slice(&self.tail);
         slot[TIER_FRAME_DATA..].copy_from_slice(&crc.to_le_bytes());
@@ -1079,7 +1159,9 @@ impl<F: SegmentFs> TierWriter<F> {
         if self.batch_frames == 0 {
             return;
         }
-        let window = self.batch.take().expect("staged frames imply a batch window");
+        let Some(BatchWindow::Pooled(window)) = self.batch.take() else {
+            panic!("staged frames imply a pooled batch window (ADR-0084 D2)");
+        };
         let offset = tier_frame_offset(self.batch_first_frame);
         let len = (self.batch_frames * TIER_FRAME_BYTES) as u64;
         round.push_write(self.queued_fd(), offset, window, self.batch_frames);
@@ -1092,7 +1174,7 @@ impl<F: SegmentFs> TierWriter<F> {
     fn stage_tail_frame_queued(&mut self, round: &mut TierRound, pool: &mut WindowPool) {
         let frame_index = (self.data_len - 1) / TIER_FRAME_DATA as u64;
         let mut window = pool.take(1);
-        let frame = window.frame_mut();
+        let frame = window.staging_mut().frame_mut();
         frame[..TIER_FRAME_DATA].copy_from_slice(&self.tail);
         frame[TIER_FRAME_DATA..].copy_from_slice(&crc32c(&self.tail).to_le_bytes());
         round.push_write(self.queued_fd(), tier_frame_offset(frame_index), window, 1);
@@ -1130,7 +1212,7 @@ impl<F: SegmentFs> TierWriter<F> {
         let frames = self.data_len.div_ceil(TIER_FRAME_DATA as u64);
         let footer_at = TIER_HEADER_BYTES as u64 + frames * TIER_FRAME_BYTES as u64;
         let mut window = pool.take(1);
-        encode_tier_footer(window.frame_mut(), self.data_len, reason);
+        encode_tier_footer(window.staging_mut().frame_mut(), self.data_len, reason);
         round.push_write(self.queued_fd(), footer_at, window, 1);
         self.device_bytes += TIER_FOOTER_BYTES as u64;
         round.push_barrier(self.queued_fd());

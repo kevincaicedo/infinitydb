@@ -223,7 +223,10 @@ impl ExtentRefs {
         if let Some(at) = self.reclaimable.iter().position(|r| r.extent_id == extent_id) {
             self.reclaimable.remove(at);
         }
-        debug_assert!(
+        // Release-checked (F-L04-12): a candidate the plane holds is
+        // being disposed of on this very slice — a revival here would
+        // leave a live reference to an unlinked file.
+        assert!(
             !self.in_reclaim.iter().any(|&(id, _, _)| id == extent_id),
             "a handed-out reclaim candidate re-registered (the plane may be unlinking it)"
         );
@@ -253,7 +256,9 @@ impl ExtentRefs {
             return false;
         };
         let prev = self.refs.insert(new_addr, entry);
-        debug_assert!(prev.is_none(), "relocation target already registered");
+        // Release-checked (F-L04-12): a clobbered reference would keep
+        // its extent's count above zero forever — a silent disk leak.
+        assert!(prev.is_none(), "relocation target already registered");
         true
     }
 
@@ -264,8 +269,9 @@ impl ExtentRefs {
     pub fn note_death(&mut self, addr: u64) -> Option<u64> {
         let (extent_id, len) = self.refs.remove(&addr)?;
         let entry = self.extents.get_mut(&extent_id).expect("a mapped reference has an extent");
-        debug_assert!(entry.refs > 0, "refcount underflow");
-        entry.refs -= 1;
+        // Release-checked (the F-L04-12 class): a wrapped count is an
+        // extent that never reclaims.
+        entry.refs = entry.refs.checked_sub(1).expect("refcount underflow");
         if entry.refs > 0 {
             return None;
         }
@@ -622,5 +628,32 @@ mod tests {
             vec![100, 200, 300, 500],
             "a still-live pre-watermark entry was never emitted into any 0x05 section"
         );
+    }
+
+    /// F-L04-12: a candidate handed to the plane for disposal cannot be
+    /// revived — the guard holds in every profile (a release build once
+    /// let the unlink proceed against a live reference).
+    #[test]
+    #[should_panic(expected = "a handed-out reclaim candidate re-registered")]
+    fn reviving_a_handed_out_candidate_is_refused_in_every_profile() {
+        let mut x = ExtentRefs::new();
+        let e = x.allocate_id();
+        x.register(100, e, 64);
+        x.note_death(100);
+        x.stamp(1);
+        assert_eq!(x.reclaim_work(1, 8).len(), 1, "handed out");
+        x.register(200, e, 64);
+    }
+
+    /// F-L04-12: a relocation onto a live address is a lifecycle bug in
+    /// every profile (a release build once dropped the displaced
+    /// reference — that extent's count could never reach zero again).
+    #[test]
+    #[should_panic(expected = "relocation target already registered")]
+    fn relocating_onto_a_live_reference_is_refused_in_every_profile() {
+        let mut x = ExtentRefs::new();
+        x.register(100, 1, 64);
+        x.register(200, 2, 64);
+        x.relocate(100, 200);
     }
 }
