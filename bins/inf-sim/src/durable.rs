@@ -91,6 +91,11 @@ pub struct DurableScenario {
     /// tick-contract oracle's precondition: the finding needs a frame
     /// staged into a byte-clean ledger inside the hold before a tick.
     pub esec_think_ns_max: u64,
+    /// Batch 43: the same think time for `always` writers (0 = closed
+    /// loop). Bursts with quiet gaps between them are the group hold's
+    /// standalone regime: a round of ≥ 2 acked, then a tick over plain
+    /// frames with nothing staged.
+    pub always_think_ns_max: u64,
     pub esec_writers: usize,
     pub mem_writers: usize,
     /// Ops per writer.
@@ -246,6 +251,13 @@ pub struct Prelude {
 ///
 /// **Ack-map bound (F-L01-03):** the map's depth and the ledger's entry
 /// count are tracked as maxima; the post-cut check compares them.
+///
+/// **Hold episode (F-L01-04, batch 43):** a fill or group-hold episode
+/// clock is set by a hold and cleared by the issue (ADR-0092 D1 rule 6:
+/// "cleared at the seal" — the standalone fdatasync is an issue too), so
+/// an open clock at a sample is a held frame or standalone
+/// (`hold_open`). An open clock with nothing held is a stale episode:
+/// its next first sight reads as elapsed and seals at once.
 struct LogOracle {
     prev: Vec<Option<(u64, u64, u64)>>,
 }
@@ -270,6 +282,9 @@ impl LogOracle {
             report.frames_awaiting_max =
                 report.frames_awaiting_max.max(stats.frames_awaiting_watermark);
             report.fsync_entries_max = report.fsync_entries_max.max(stats.fsync_entries);
+            if (stats.fill_hold_open > 0 || stats.group_hold_open > 0) && stats.hold_open == 0 {
+                report.hold_episode_violations += 1;
+            }
             *prev = Some(now);
         }
     }
@@ -338,6 +353,7 @@ impl DurableScenario {
             cells: 2,
             always_writers: 3,
             esec_think_ns_max: 0,
+            always_think_ns_max: 0,
             esec_writers: 3,
             mem_writers: 2,
             ops_per_writer: 140,
@@ -547,6 +563,32 @@ impl DurableScenario {
         scenario
     }
 
+    /// `m2-group-hold` (batch 43, F-L01-04): the FLUSH class (`Buffered`,
+    /// packed segments, K = 1) with the group hold armed on every seed
+    /// and *bursty* writers — two `always` and one `everysec`, each
+    /// thinking up to 20 ms between ops. A burst acks a round of ≥ 2, so
+    /// the next barrier's target is ≥ `MIN_GROUP`; a tick then fires over
+    /// plain everysec frames with nothing staged — the standalone hold —
+    /// and elapses in the quiet gap. The hold-episode oracle samples
+    /// every step; the m2 durability oracle holds unchanged. Continuous
+    /// traffic never meets the precondition (a frame is always staged at
+    /// the tick — the frame path, never the standalone).
+    #[must_use]
+    pub fn m2_group_hold(seed: u64) -> DurableScenario {
+        let mut scenario = DurableScenario::m2_durable(seed);
+        scenario.always_writers = 2;
+        scenario.esec_writers = 1;
+        scenario.always_think_ns_max = 20_000_000;
+        scenario.esec_think_ns_max = 20_000_000;
+        scenario.ops_per_writer = 3_000;
+        scenario.ckpt_section_bound = None;
+        scenario.io_mode = SegmentIoMode::Buffered;
+        scenario.frames_in_flight = 1;
+        scenario.fill = Default::default();
+        scenario.group = inf_server::GroupHoldConfig::ARM;
+        scenario
+    }
+
     /// `m2-mode-transition` (ADR-0086 D4 as amended, 2026-08-21): the m2
     /// durable shape with a **prelude life in the other barrier class**.
     /// Even seeds go FLUSH → FUA (the packed tail reopened under a
@@ -648,6 +690,7 @@ impl DurableScenario {
             cells,
             always_writers: 3,
             esec_think_ns_max: 0,
+            always_think_ns_max: 0,
             esec_writers: 3,
             mem_writers: 1,
             ops_per_writer: 160,
@@ -704,6 +747,7 @@ impl DurableScenario {
             cells: 2,
             always_writers: 3,
             esec_think_ns_max: 0,
+            always_think_ns_max: 0,
             esec_writers: 2,
             mem_writers: 0,
             ops_per_writer: 180,
@@ -814,6 +858,9 @@ pub struct DurableReport {
     pub idle_tick_violations: u64,
     pub frames_awaiting_max: u64,
     pub fsync_entries_max: u64,
+    /// Batch 43 (F-L01-04): samples with a fill / group-hold clock open
+    /// and nothing held — a stale episode; zero required.
+    pub hold_episode_violations: u64,
     /// Device-budget coverage (M4.5-S36, ADR-0088 D8), scraped at the
     /// cut: background bytes the budget granted, deferrals it issued
     /// (a sweep whose budget never deferred proves nothing), the seal
@@ -1542,6 +1589,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         frame_waits_fill: 0,
         frame_waits_group: 0,
         idle_tick_violations: 0,
+        hold_episode_violations: 0,
         frames_awaiting_max: 0,
         fsync_entries_max: 0,
         budget_background_bytes: 0,
@@ -1951,9 +1999,13 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             net.client_send(writer.fd, &wire);
             writer.sent += 1;
             progress += 1;
-            if scenario.esec_think_ns_max > 0 && writer.class == NsClass::Everysec {
-                writer.idle_until =
-                    clock.now() + Nanos(writer.rng.next_below(scenario.esec_think_ns_max));
+            let think = match writer.class {
+                NsClass::Everysec => scenario.esec_think_ns_max,
+                NsClass::Always => scenario.always_think_ns_max,
+                _ => 0,
+            };
+            if think > 0 {
+                writer.idle_until = clock.now() + Nanos(writer.rng.next_below(think));
             }
         }
         // The log must be quiescent too (ADR-0087 D7): an `everysec` ack
@@ -2151,6 +2203,19 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
              while records sat in the staging builder (waits_fill {}, waits_group {})",
             scenario.seed,
             report.idle_tick_violations,
+            report.frame_waits_fill,
+            report.frame_waits_group
+        );
+        fail(&mut report, what);
+    }
+    // Batch 43 (F-L01-04): an open hold-episode clock with nothing held
+    // is a stale clock — the next episode's first sight reads as elapsed.
+    if report.hold_episode_violations > 0 {
+        let what = format!(
+            "HOLD EPISODE CLOCK OPEN WITH NOTHING HELD seed {:#x}: {} sample(s) with a fill or \
+             group-hold clock open and no frame or standalone held (waits_fill {}, waits_group {})",
+            scenario.seed,
+            report.hold_episode_violations,
             report.frame_waits_fill,
             report.frame_waits_group
         );

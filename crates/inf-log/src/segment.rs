@@ -397,6 +397,12 @@ impl<File: SegmentFile> SealHandoff<File> {
     pub fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
         self.file.raw_fd()
     }
+
+    /// A handoff without a rotation, for ledger unit tests only.
+    #[cfg(test)]
+    pub(crate) fn for_test(segment: SegmentId, file: File, end_offset: u32) -> SealHandoff<File> {
+        SealHandoff { segment, file, end_offset }
+    }
 }
 
 /// What [`SegmentRotor::begin_frame_deferred`] yields: the reserved frame

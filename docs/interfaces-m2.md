@@ -432,7 +432,9 @@ is the K = 1 constructor tests and tooling use.
   swaps to the free buffer; at most one frame in flight) →
   `leased_frame(&lease)` for the writev → `release(lease)` on completion.
   `flush_into(&mut SegmentRotor, now_ms)` is the synchronous pre-S05
-  choreography.
+  choreography; on a failed write it releases the lease and returns the
+  error — the failed frame's records are gone with the buffer, the ring
+  is never wedged (batch 43, F-L01-06).
 - LSN handoff (L6): `FrameLease::lsn_of(StagedAt) -> Lsn`,
   generation-checked — the S06 `WatermarkGate` registration input.
 - Accounting (L5): `staged_bytes`/`in_flight_bytes` exact at every
@@ -634,7 +636,10 @@ earlier in-flight frames count as coverage; `seal_ahead` = a rotation's
 seal entry will precede the frame and covers every queued byte);
 `LinkedFsync` only when `drained()` (every earlier write completed —
 `IO_LINK` orders the sync after *this* frame's write alone; release-
-asserted in `register_linked_fsync`) and the FLUSH slot is free; `Wait`
+asserted in `register_linked_fsync`) and the FLUSH slot is free — **the
+seal a `seal_ahead` rotation registers counts as occupying it (batch
+43, F-L01-05, ADR-0087 D3/D4 amendment): at bound 1 the rotation's frame
+seals `Plain`**; `Wait`
 when a sync is due, write-through is inadmissible, and frames are still in
 flight below (the frame is held ≤ one write latency — sealing it
 barrier-less would starve the due); `Plain` otherwise (FLUSH slot busy:
@@ -653,7 +658,9 @@ it is durable or covered by a pending FLUSH-class entry; a FUA write
 persists itself, never the un-barriered frames before it) and
 `SyncReason::ZeroFill` (coverage-neutral, `register_zero_fill_barrier`).
 `syncs_in_flight()` — the ADR-0022 D3 pipeline bound — counts FLUSH-class
-entries only. `write_through_latency_hist()` is the class-split
+entries only (O(1) on `flush_in_flight`, batch 43; a `Linked` /
+`Standalone` / `Completion` registration into a full pipeline is
+release-refused). `write_through_latency_hist()` is the class-split
 histogram; `CommitStats::{fsyncs_write_through, fsyncs_zero_fill}`.
 
 
@@ -1442,6 +1449,8 @@ so promotion is free.
 | 1.17 | `register_write_through`: coverage tail == this frame's base (the prefix rule, ADR-0086 D2.5) with the base read from the FIFO (`queued.iter().rev().nth(1)`, else `written_bytes`) | A FUA ticket claiming bytes it did not write | `assert_eq!` **release** | keep (S34's assert, base re-derived for K > 1) |
 | 1.18 | `frame_plan`: a due frame that cannot take write-through while writes are in flight below is **held** (`Wait`), never sealed barrier-less | Sealing it plain lets every later frame find the same shape — the due starves under load (livelock) | by-construction (decision order) ; pinned by `a_due_frame_waits_behind_in_flight_plain_frames_then_links`; `frame_waits_barrier` counts episodes | keep |
 | 1.20 | `pending_covers_within(lo, hi)` / `written_up_to()` / `pending_entries()` (batch 42, F-L01-03): the plane's LSN→seq ack map (`DurableCell::frame_seqs`) coalesces written entries across which no unfolded ledger coverage point lies — every later barrier covers both or neither — at each `LogWritten`, and release-asserts `len ≤ frames_behind_prefix() + pending_entries() + 1` | One entry per sealed frame accumulated for the whole life of a stalled barrier and between two ticks (the reorder window bounded the sibling FIFO, ADR-0087 D2 as amended; this map was the last unbounded structure on the commit path — L3) | `assert!` **release** in `coalesce_frame_seqs`; the DST's `frames_awaiting_watermark` gauge against `REORDER_WINDOW_FRAMES + fsync_entries + 1` on every durable scenario; `ack_map_tests` pin the merge rule (a coverage point between two written frames keeps the earlier; an unwritten frame is never merged into) | keep — **added 2026-09-13 (ADR-0087 D2 second amendment)** |
+| 1.21 | `frame_plan(_, seal_ahead = true)`: the FLUSH-slot arm counts the seal fdatasync the rotation registers ahead of the frame — `syncs_in_flight() + 1 < flush_bound`, so at bound 1 the frame seals `Plain` and its due accumulates behind the seal (batch 43, F-L01-05) | Two FLUSH-class barriers in one iteration queue on the device-wide flush unit (ADR-0086 Context: ~1 000/s) — the batch=1.0 disease at the device tier; no durability consequence | by-construction (the arm); `assert!` **release** in `push_pending` for `Linked`/`Standalone`/`Completion` (`FLUSH-class barrier into a full pipeline`); pinned by `rotation_seal_and_linked_sync_respect_the_flush_bound` and `a_discretionary_barrier_never_enters_a_full_pipeline`; the `m2-durable` DST dies on the assert with the plan unfixed | keep — **added 2026-09-13 (ADR-0087 D3/D4 amendment)** |
+| 1.22 | `DurableCell::note_issued` (batch 43, F-L01-04): a hold episode (`frame_held`, `fill_since`, `group_since`) ends only at the issue — the frame's `queue_frame` or the standalone's fdatasync; a reservation that waits keeps the episode | The standalone path left `group_since` open, so the next episode's first sight read as elapsed and sealed at once (the hold intermittently inert, `frame_waits_group` under-counted); the reservation-failure returns inflated `frame_waits_*` by one per return | two `assert!` **release** at each decision (`open group-hold episode without a held frame`, the fill twin); `DurableStats::{hold_open, fill_hold_open, group_hold_open}` under the DST's hold-episode oracle on every durable scenario (`m2-group-hold` 24/24 seeds red pre-fix, `m2-durable` 6/24 — the ARM seeds) | keep — **added 2026-09-13 (ADR-0092 D1 rule 6 amendment)** |
 
 ---
 

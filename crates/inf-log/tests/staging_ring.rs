@@ -367,3 +367,30 @@ fn ring_of_k_plus_one_buffers_releases_leases_in_any_order() {
     assert_eq!(ring.stats().seals, 4);
     assert_eq!(ring.stats().releases, 4);
 }
+
+/// F-L01-06 (batch 43): a failed `commit_frame` inside `flush_into` must
+/// not leak the frame lease — the ring stays usable (the records of the
+/// failed frame are gone with the buffer; the error is the caller's
+/// signal), never wedged behind a phantom in-flight slot.
+#[test]
+fn flush_into_releases_the_lease_when_the_write_fails() {
+    use inf_foundation::fault::{self, FaultSpec};
+    fault::disarm_all();
+    let fs = MemFs::new();
+    let (mut rotor, _) = mem_rotor(&fs, 1 << 20);
+    let mut ring = StagingRing::new(StagingConfig { frames_in_flight: 1, ..Default::default() });
+    ring.stage(&MutationEffect::StringSet { ns: NsId(1), key: b"k", value: b"v" }).expect("stage");
+    fault::arm(inf_log::fault::LOG_APPEND_SHORT_WRITE, FaultSpec::Nth(1));
+    let err = ring.flush_into(&mut rotor, 0).expect_err("the short write fails the append");
+    fault::disarm_all();
+    assert!(err.to_string().contains("log_append_short_write"), "{err}");
+    assert_eq!(ring.in_flight(), 0, "the failed frame's lease is released, not leaked");
+    assert!(ring.is_empty(), "the failed frame's records left the builder");
+    assert_eq!(ring.stats().releases, 1);
+    ring.stage(&MutationEffect::StringSet { ns: NsId(1), key: b"k2", value: b"v2" })
+        .expect("stage");
+    assert!(ring.can_seal(), "the ring is not backlogged after the failure");
+    let lease = ring.flush_into(&mut rotor, 0).expect("the next flush succeeds").expect("frame");
+    ring.release(lease);
+    assert!(ring.drained());
+}

@@ -360,7 +360,9 @@ impl StagingRing {
     /// caller's backpressure signal; the effect is *not* partially staged.
     pub fn stage(&mut self, effect: &MutationEffect<'_>) -> Result<StagedAt, StagingFull> {
         let record = effect.record();
-        let needed = record.encoded_len() as u32;
+        // A record beyond `u32` is refused as full, never truncated into
+        // an admission (the wire cap bounds records far below this).
+        let needed = u32::try_from(record.encoded_len()).unwrap_or(u32::MAX);
         let available = self.remaining_capacity();
         if needed > available {
             self.stats.refusals += 1;
@@ -431,7 +433,7 @@ impl StagingRing {
             .iter()
             .zip(&self.bufs)
             .filter(|(state, _)| matches!(state, BufState::InFlight { .. }))
-            .map(|(_, buf)| u32::try_from(buf.sealed_frame().len()).expect("frame fits u32"))
+            .map(|(_, buf)| u32::try_from(buf.sealed_len()).expect("frame fits u32"))
             .sum()
     }
 
@@ -558,8 +560,7 @@ impl StagingRing {
         let index = self.leased_index(&lease);
         self.bufs[index].reset();
         self.state[index] = BufState::Free;
-        debug_assert!(self.in_flight > 0);
-        self.in_flight -= 1;
+        self.in_flight = self.in_flight.checked_sub(1).expect("release with no frame in flight");
         self.stats.releases += 1;
     }
 
@@ -570,10 +571,12 @@ impl StagingRing {
     /// Frames stamp `covered_lsn = 0` — the synchronous tiers run no
     /// group commit, and 0 attests nothing (conservative — ADR-0031 D6).
     ///
-    /// On rotor errors the staged records stay intact: a failed
-    /// reservation (`NoSpace`, seal-fsync) leaves staging untouched for
-    /// retry-after-maintain; a failed *write* is fail-stop territory for
-    /// the cell anyway (§8.4).
+    /// On a failed reservation (`NoSpace`, seal-fsync) the staged records
+    /// stay intact for retry-after-maintain. On a failed *write* the
+    /// sealed frame's records are gone with its buffer — the lease is
+    /// released here, never leaked (F-L01-06, batch 43: a leaked lease
+    /// left the ring backlogged and the next call panicking), and the
+    /// caller re-stages or fail-stops (§8.4 — the cell's territory).
     ///
     /// # Panics
     /// If every in-flight slot is taken (see [`seal`](Self::seal)).
@@ -587,7 +590,10 @@ impl StagingRing {
         }
         let slot = rotor.begin_frame(self.pending_frame_len(), now_ms)?;
         let lease = self.seal(slot.first_record_lsn(), 0, slot.layout());
-        rotor.commit_frame(slot, self.leased_frame(&lease))?;
+        if let Err(err) = rotor.commit_frame(slot, self.leased_frame(&lease)) {
+            self.release(lease);
+            return Err(err);
+        }
         Ok(Some(lease))
     }
 
