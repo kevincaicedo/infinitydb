@@ -466,9 +466,7 @@ fn device_write<File: SegmentFile>(file: &mut File, offset: u64, bytes: &[u8]) -
     // ADR-0061 D9 `blob_short_write`: the device accepts a prefix and
     // the write FAILS — the caller abandons the extent whole.
     if inf_foundation::fault::fire(crate::fault::BLOB_SHORT_WRITE) {
-        let cut = bytes.len() / 2;
-        let torn: Vec<u8> = bytes[..cut].to_vec();
-        let _ = file.write_at(offset, &torn);
+        let _ = crate::tier::write_torn_prefix(file, offset, bytes, bytes.len() / 2);
         return Err(crate::fault::injected(crate::fault::BLOB_SHORT_WRITE));
     }
     file.write_at(offset, bytes)

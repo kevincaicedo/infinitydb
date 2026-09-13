@@ -1031,9 +1031,12 @@ impl<F: SegmentFs> TierWriter<F> {
         // for death). Recovery sees an unsealed file and re-seals at the
         // manifested watermark (the crash-matrix row's contract).
         if inf_foundation::fault::fire(crate::fault::TIER_FOOTER_TORN) {
+            // The CRC cover torn inside its sector — the CRC-refuse input
+            // (D7) — written as the whole legal block (F-L04-14): a
+            // Direct fd takes it, the sim asserts it.
             let cut = TIER_FOOTER_CRC_COVER / 2;
-            let torn: Vec<u8> = footer[..cut].to_vec();
-            self.file.write_at(footer_at, &torn).map_err(TierWriteFailure::Write)?;
+            footer[cut..].fill(0);
+            self.file.write_at(footer_at, footer).map_err(TierWriteFailure::Write)?;
             return Err(TierWriteFailure::Write(crate::fault::injected(
                 crate::fault::TIER_FOOTER_TORN,
             )));
@@ -1267,9 +1270,7 @@ fn device_write<File: SegmentFile>(file: &mut File, offset: u64, bytes: &[u8]) -
     // ADR-0056 D6 `tier_short_write`: the device accepts a prefix and
     // the write FAILS — the caller treats the range as never written.
     if inf_foundation::fault::fire(crate::fault::TIER_SHORT_WRITE) {
-        let cut = bytes.len() / 2;
-        let torn: Vec<u8> = bytes[..cut].to_vec();
-        let _ = file.write_at(offset, &torn);
+        let _ = write_torn_prefix(file, offset, bytes, bytes.len() / 2);
         return Err(crate::fault::injected(crate::fault::TIER_SHORT_WRITE));
     }
     // ADR-0056 D6 `tier_torn_frame`: a prefix lands and the write
@@ -1277,11 +1278,53 @@ fn device_write<File: SegmentFile>(file: &mut File, offset: u64, bytes: &[u8]) -
     // final write before a crash (recovery truncates or CRC-refuses
     // per D5; the crash-matrix row proves which).
     if inf_foundation::fault::fire(crate::fault::TIER_TORN_FRAME) {
-        let cut = bytes.len() * 2 / 3;
-        let torn: Vec<u8> = bytes[..cut].to_vec();
-        return file.write_at(offset, &torn);
+        return write_torn_prefix(file, offset, bytes, bytes.len() * 2 / 3);
     }
     file.write_at(offset, bytes)
+}
+
+/// The tear grid a torn write lands on — the device's sector, the
+/// simulator's coin granularity (ADR-0020 D6).
+const TORN_SECTOR_BYTES: usize = 512;
+
+/// Lands the first `cut` bytes of a staged write, rounded down to the
+/// sector grid, as **whole aligned blocks** (F-L04-14, ADR-0119 A1): the
+/// intact prefix is a sub-slice of the aligned window; the sector-torn
+/// block keeps its prior on-device content beyond the tear (read back
+/// through an aligned scratch block — zeros past EOF), which is what a
+/// power cut leaves on media. Every write here is legal on an `O_DIRECT`
+/// fd, where the sub-block `to_vec` prefix these points once wrote was
+/// refused `EINVAL` (the tmpfs/`MemFs` tiers swallowed it). Fault-path
+/// only: the scratch block is allocated when a point fires.
+pub(crate) fn write_torn_prefix<File: SegmentFile>(
+    file: &mut File,
+    offset: u64,
+    bytes: &[u8],
+    cut: usize,
+) -> io::Result<()> {
+    debug_assert_eq!(offset % TIER_FRAME_BYTES as u64, 0, "staged writes are block-aligned");
+    debug_assert_eq!(bytes.len() % TIER_FRAME_BYTES, 0, "staged writes are whole blocks");
+    let landed = cut.min(bytes.len()) / TORN_SECTOR_BYTES * TORN_SECTOR_BYTES;
+    let full = landed / TIER_FRAME_BYTES * TIER_FRAME_BYTES;
+    if full > 0 {
+        file.write_at(offset, &bytes[..full])?;
+    }
+    if landed > full {
+        let block_at = offset + full as u64;
+        let mut scratch = FrameStaging::new(1);
+        let block = scratch.frame_mut();
+        block.fill(0);
+        let mut read = 0usize;
+        while read < block.len() {
+            match file.read_at(block_at + read as u64, &mut block[read..])? {
+                0 => break,
+                n => read += n,
+            }
+        }
+        block[..landed - full].copy_from_slice(&bytes[full..landed]);
+        file.write_at(block_at, block)?;
+    }
+    Ok(())
 }
 
 // ---- v1 block codecs + the untrusted-input decoder (ADR-0056 D1/D7) ----

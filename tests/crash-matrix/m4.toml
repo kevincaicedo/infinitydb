@@ -92,6 +92,36 @@ tier = "node"
 test = "tier.rs"
 expect = "reseal-at-watermark"
 
+# ---- F-L04-14 (review 2026-08-30): the same points on a `Direct`-mode
+# file (the namespace default) — carried by `tests/tier_direct.rs` on
+# `SimDisk`, which asserts the O_DIRECT contract on every write, plus
+# one real-`O_DIRECT` leg under `TMPDIR`. A point whose torn prefix is
+# not whole aligned blocks cannot inject here (it did not, before).
+
+[[row]]
+point = "tier_torn_frame"
+tier = "node"
+test = "tier_direct.rs"
+expect = "reseal-at-watermark"
+
+[[row]]
+point = "tier_short_write"
+tier = "node"
+test = "tier_direct.rs"
+expect = "append-fails-typed"
+
+[[row]]
+point = "tier_footer_torn"
+tier = "node"
+test = "tier_direct.rs"
+expect = "reseal-at-watermark"
+
+[[row]]
+point = "blob_short_write"
+tier = "node"
+test = "tier_direct.rs"
+expect = "blob-write-fails-typed"
+
 # ---- M4-S12 recovery-unit windows (ADR-0057 D8) ----
 
 [[row]]

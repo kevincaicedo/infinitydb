@@ -1375,6 +1375,19 @@ impl<F: SegmentFs> SegmentRotor<F> {
         self.active.file.raw_fd()
     }
 
+    /// The prefix a torn/short injection lands (F-L04-14): byte-granular
+    /// on a packed `Buffered` segment; sector-granular, whole aligned
+    /// blocks on a `Direct` one (an `O_DIRECT` fd refuses anything else,
+    /// and the sim asserts it) — `tier::write_torn_prefix`'s physics.
+    fn write_torn(&mut self, offset: u64, frame: &[u8], cut: usize) -> io::Result<()> {
+        match self.active.io_mode {
+            SegmentIoMode::Buffered => self.active.file.write_at(offset, &frame[..cut]),
+            SegmentIoMode::Direct => {
+                crate::tier::write_torn_prefix(&mut self.active.file, offset, frame, cut)
+            }
+        }
+    }
+
     /// Write a finalized frame at its reserved base. Returns the frame's
     /// base LSN.
     ///
@@ -1395,7 +1408,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
         // scripted driver's leg; this is the sync tier's).
         if inf_foundation::fault::fire(crate::fault::LOG_APPEND_SHORT_WRITE) {
             let cut = frame.len() / 2;
-            let _ = self.active.file.write_at(u64::from(slot.base.offset), &frame[..cut]);
+            let _ = self.write_torn(u64::from(slot.base.offset), frame, cut);
             return Err(LogError::Io {
                 segment: self.active.id,
                 source: crate::fault::injected(crate::fault::LOG_APPEND_SHORT_WRITE),
@@ -1407,10 +1420,8 @@ impl<F: SegmentFs> SegmentRotor<F> {
         // validating frame would turn into fail-stop corruption — exactly
         // the M2-S14 taxonomy).
         if inf_foundation::fault::fire(crate::fault::TORN_FRAME) {
-            let cut = frame.len() * 2 / 3;
-            self.active
-                .file
-                .write_at(u64::from(slot.base.offset), &frame[..cut.max(1)])
+            let cut = (frame.len() * 2 / 3).max(1);
+            self.write_torn(u64::from(slot.base.offset), frame, cut)
                 .map_err(|source| LogError::Io { segment: self.active.id, source })?;
             self.active.written += slot.len;
             return Ok(slot.base);

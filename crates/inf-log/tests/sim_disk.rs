@@ -354,3 +354,42 @@ fn handles_follow_inodes_and_cross_dir_renames_refuse() {
     let bytes = disk.contents(&path("META")).expect("renamed + committed");
     assert_eq!(&bytes[..18], b"through-old-handle", "handle followed the inode");
 }
+
+/// Review 2026-08-30, F-L04-05 (ADR-0119 A2): an unsynced prealloc's
+/// length is journal metadata a cut can lose — the file reboots at 0, or
+/// at the end of whichever pending piece survived, never at the prealloc
+/// length; a barrier on the fd makes the length durable on every seed.
+#[test]
+fn unsynced_prealloc_length_is_pending_until_a_barrier() {
+    let mut zero = 0u32;
+    let mut extended = 0u32;
+    for seed in 0..32u64 {
+        let disk = disk();
+        let mut file =
+            disk.create_segment_unsynced(&path("seg-000001.ilog"), 4096).expect("create");
+        assert_eq!(file.file_size().expect("size"), 4096, "the OS sees the set_len length");
+        disk.sync_dir(Path::new(DIR)).expect("dir barrier");
+        file.write_at(1024, &[0xAB; 512]).expect("one pending sector");
+        disk.power_cut(seed);
+        let bytes = disk.contents(&path("seg-000001.ilog")).expect("named ⇒ survives");
+        match bytes.len() {
+            0 => zero += 1,
+            1536 => {
+                extended += 1;
+                assert_eq!(&bytes[1024..], &[0xAB; 512][..], "the surviving piece is intact");
+            }
+            len => panic!("seed {seed}: length {len} — the prealloc length is not durable"),
+        }
+    }
+    assert!(zero > 0 && extended > 0, "both outcomes reachable: zero={zero} extended={extended}");
+    for seed in 0..8u64 {
+        let disk = disk();
+        let mut file =
+            disk.create_segment_unsynced(&path("seg-000001.ilog"), 4096).expect("create");
+        disk.sync_dir(Path::new(DIR)).expect("dir barrier");
+        file.sync_data().expect("the caller's barrier");
+        disk.power_cut(seed);
+        let bytes = disk.contents(&path("seg-000001.ilog")).expect("named ⇒ survives");
+        assert_eq!(bytes.len(), 4096, "seed {seed}: a synced length is law");
+    }
+}
