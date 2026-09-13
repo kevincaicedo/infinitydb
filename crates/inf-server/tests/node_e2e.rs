@@ -870,6 +870,72 @@ fn parse_batch_prefetch_matches_inline_semantics() {
     node.stop();
 }
 
+/// The server closes: the next read is EOF — not a timeout, not bytes.
+fn assert_closed(stream: &mut TcpStream, what: &str) {
+    let mut rest = Vec::new();
+    match stream.read_to_end(&mut rest) {
+        Ok(_) => assert!(
+            rest.is_empty(),
+            "{what}: bytes after the reply: {:?}",
+            String::from_utf8_lossy(&rest)
+        ),
+        Err(e) => panic!("{what}: the server never closed the connection ({e})"),
+    }
+}
+
+/// Batch 46 (review of 2026-08-30, F-L13-08): every command on a
+/// namespace-bound connection rides the pump, and the pump executed
+/// `QUIT` under a throwaway `ConnCx` — `+OK`, socket left open, slot
+/// held until the peer gave up. Single-cell node, memory namespace: the
+/// §5.5 regime. The pipelined form pins the discard rule: the command
+/// before `QUIT` answers, the one after never runs.
+#[test]
+fn quit_on_a_namespace_bound_connection_closes_after_its_reply() {
+    let dir = temp_data_dir("quit-bound");
+    let node = Node::start_durable(1, &dir);
+    let mut admin = node.connect();
+    admin.write_all(&cmd(&[b"INF.NS", b"CREATE", b"cache", b"MODE", b"memory"])).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+
+    let mut bound = connect_use(&node, b"cache");
+    bound.write_all(&cmd(&[b"QUIT"])).expect("write");
+    read_exactly(&mut bound, b"+OK\r\n");
+    assert_closed(&mut bound, "QUIT on a memory-bound connection");
+
+    let mut bound = connect_use(&node, b"cache");
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", b"before", b"1"]));
+    pipeline.extend(cmd(&[b"QUIT"]));
+    pipeline.extend(cmd(&[b"SET", b"after", b"1"]));
+    bound.write_all(&pipeline).expect("write");
+    read_exactly(&mut bound, b"+OK\r\n+OK\r\n");
+    assert_closed(&mut bound, "pipelined QUIT on a memory-bound connection");
+    let mut check = connect_use(&node, b"cache");
+    check.write_all(&cmd(&[b"MGET", b"before", b"after"])).expect("write");
+    read_exactly(&mut check, b"*2\r\n$1\r\n1\r\n$-1\r\n");
+    node.stop();
+}
+
+/// The same defect without namespaces: on a multi-cell node a cross-cell
+/// command spawns the pump and a `QUIT` pipelined behind it defers there.
+#[test]
+fn quit_deferred_behind_a_cross_cell_command_closes_after_its_reply() {
+    let node = Node::start(2);
+    let mut client = conn_on_cell(&node, 0);
+    let remote = key_for_cell(2, 1);
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", &remote, b"1"]));
+    pipeline.extend(cmd(&[b"QUIT"]));
+    pipeline.extend(cmd(&[b"SET", b"after", b"1"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n");
+    assert_closed(&mut client, "QUIT deferred behind a cross-cell SET");
+    let mut check = node.connect();
+    check.write_all(&cmd(&[b"MGET", &remote, b"after"])).expect("write");
+    read_exactly(&mut check, b"*2\r\n$1\r\n1\r\n$-1\r\n");
+    node.stop();
+}
+
 /// The de-async dispatch fast path (M2.5 Phase H, `--deasync-dispatch`,
 /// ADR-0030 D4) must be behavior-invisible: same replies, same order —
 /// across the fast arms (single-owner remote Apply, local mirror,
@@ -6263,7 +6329,7 @@ fn connection_level_commands_ignore_the_bound_namespace() {
     let show = |argv: &[&[u8]]| {
         argv.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect::<Vec<_>>().join(" ")
     };
-    for (_, argv, compare) in templates {
+    for (name, argv, compare) in templates {
         let argv_text = show(argv);
         let mut unbound = node.connect();
         let mut mem = connect_use(&node, b"mem");
@@ -6274,6 +6340,12 @@ fn connection_level_commands_ignore_the_bound_namespace() {
         {
             conn.write_all(&cmd(argv)).expect("write");
             let reply = read_frame(conn);
+            // Batch 46 (F-L13-08): the template read one frame and never
+            // asserted the close — a bound connection's QUIT rides the
+            // pump, which dropped `close_requested`.
+            if *name == "QUIT" {
+                assert_closed(conn, &format!("QUIT on a {binding} connection"));
+            }
             if reply == TIERED_REFUSAL {
                 failures.push(format!(
                     "`{argv_text}` on a {binding} connection: the tiered arm's catch-all refusal"

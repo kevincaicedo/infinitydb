@@ -1,0 +1,40 @@
+
+running 3 tests
+test quit_on_a_namespace_bound_connection_closes_after_its_reply ... FAILED
+test quit_deferred_behind_a_cross_cell_command_closes_after_its_reply ... FAILED
+test connection_level_commands_ignore_the_bound_namespace ... FAILED
+
+failures:
+
+---- quit_on_a_namespace_bound_connection_closes_after_its_reply stdout ----
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 1 cells serving (3 ms)
+
+thread 'quit_on_a_namespace_bound_connection_closes_after_its_reply' (619543) panicked at crates/inf-server/tests/node_e2e.rs:882:19:
+QUIT on a memory-bound connection: the server never closed the connection (Resource temporarily unavailable (os error 11))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- quit_deferred_behind_a_cross_cell_command_closes_after_its_reply stdout ----
+
+thread 'quit_deferred_behind_a_cross_cell_command_closes_after_its_reply' (619542) panicked at crates/inf-server/tests/node_e2e.rs:882:19:
+QUIT deferred behind a cross-cell SET: the server never closed the connection (Resource temporarily unavailable (os error 11))
+
+---- connection_level_commands_ignore_the_bound_namespace stdout ----
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 2 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 4 cells serving (3 ms)
+
+thread 'connection_level_commands_ignore_the_bound_namespace' (619541) panicked at crates/inf-server/tests/node_e2e.rs:882:19:
+QUIT on a memory-bound connection: the server never closed the connection (Resource temporarily unavailable (os error 11))
+
+
+failures:
+    connection_level_commands_ignore_the_bound_namespace
+    quit_deferred_behind_a_cross_cell_command_closes_after_its_reply
+    quit_on_a_namespace_bound_connection_closes_after_its_reply
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 77 filtered out; finished in 5.43s
+
+error: test failed, to rerun pass `-p inf-server --test node_e2e`

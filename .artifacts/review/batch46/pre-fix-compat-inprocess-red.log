@@ -1,0 +1,5 @@
+failures:
+compat-diff v1: 460 byte-compared cases, 41 documented deviations, 1 failures
+case 227 ["RENAMENX", "rnself", "rnself"]:
+failures:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s

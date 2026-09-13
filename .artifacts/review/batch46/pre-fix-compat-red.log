@@ -1,0 +1,10 @@
+compat-diff node lane: 460 byte-compared cases on a 4-cell durable node, 41 documented deviations, 1 pinned node deviations, 1 failures
+thread 'node_matrix_replies_match_redis' (620676) panicked at tests/compat/tests/node_diff.rs:79:5:
+case 227 ["RENAMENX", "rnself", "rnself"]:
+thread 'quit_closes_a_namespace_bound_connection_like_redis' (620677) panicked at tests/compat/tests/node_diff.rs:507:23:
+node: the server never closed the connection after QUIT (Resource temporarily unavailable (os error 11))
+test quit_closes_a_namespace_bound_connection_like_redis ... FAILED
+failures:
+failures:
+    quit_closes_a_namespace_bound_connection_like_redis
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 3 filtered out; finished in 5.49s

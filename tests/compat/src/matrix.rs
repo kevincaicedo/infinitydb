@@ -343,6 +343,13 @@ pub static MATRIX: &[Case] = &[
     c(&["RENAMENX", "rnx1", "rnxfresh"]),
     c(&["GET", "rnxfresh"]),
     c(&["RENAMENX", "missing", "x"]),
+    // F-L13-03 (batch 46): the same-key case answers before the store is
+    // touched — `:0` for RENAMENX, `+OK` for RENAME (renameGenericCommand).
+    c(&["SET", "rnself", "v"]),
+    c(&["RENAMENX", "rnself", "rnself"]),
+    c(&["RENAME", "rnself", "rnself"]),
+    c(&["GET", "rnself"]),
+    c(&["RENAMENX", "rnabsent", "rnabsent"]),
     c(&["SET", "cp1", "tocopy", "EX", "100"]),
     c(&["COPY", "cp1", "cp2"]),
     c(&["GET", "cp2"]),

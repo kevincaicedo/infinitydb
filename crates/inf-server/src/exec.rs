@@ -904,7 +904,9 @@ fn execute_db(
             if !store.exists(argv.arg(1), now) {
                 return w.error("ERR no such key");
             }
-            if store.exists(argv.arg(2), now) && argv.arg(1) != argv.arg(2) {
+            // Same key answers `:0` before the store is touched (Redis
+            // `renameGenericCommand`; RENAME's same-key case is `+OK`).
+            if argv.arg(1) == argv.arg(2) || store.exists(argv.arg(2), now) {
                 return w.int(0);
             }
             match store.rename(argv.arg(1), argv.arg(2), now) {
@@ -2592,6 +2594,23 @@ mod tests {
         cx.close_requested.set(false);
         assert_eq!(run(&mut cx, &mut store, &[b"QUIT"]), b"+OK\r\n");
         assert!(cx.close_requested.get());
+    }
+
+    /// Batch 46 (review of 2026-08-30, F-L13-03): Redis's
+    /// `renameGenericCommand` answers the same-key case before it touches
+    /// the store — `:0` for RENAMENX, `+OK` for RENAME.
+    #[test]
+    fn renamenx_onto_itself_answers_zero_like_redis() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"RENAMENX", b"k", b"k"]), b":0\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"RENAME", b"k", b"k"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"GET", b"k"]), b"$1\r\nv\r\n");
+        assert_eq!(
+            run(&mut cx, &mut store, &[b"RENAMENX", b"absent", b"absent"]),
+            b"-ERR no such key\r\n"
+        );
     }
 
     #[test]

@@ -1,0 +1,15 @@
+---- exec::tests::renamenx_onto_itself_answers_zero_like_redis stdout ----
+
+thread 'exec::tests::renamenx_onto_itself_answers_zero_like_redis' (618981) panicked at crates/inf-server/src/exec.rs:2605:9:
+assertion `left == right` failed
+  left: [58, 49, 13, 10]
+ right: [58, 48, 13, 10]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    exec::tests::renamenx_onto_itself_answers_zero_like_redis
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 134 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-server --lib`
