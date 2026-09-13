@@ -23,8 +23,8 @@ use inf_alloc::AlignedBox;
 use inf_foundation::time::Nanos;
 use inf_log::fs::SegmentFs;
 use inf_log::{
-    FrameId, FramePlan, FsyncClass, FsyncTicket, GroupCommit, IdxSidecarMeta, MutationEffect, NsId,
-    RecordView, SealedDisposal, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
+    FrameId, FramePlan, FsyncClass, FsyncTicket, GroupCommit, IdxSidecarMeta, Lsn, MutationEffect,
+    NsId, RecordView, SealedDisposal, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
     ZERO_FILL_SLICE_BYTES,
 };
 use inf_runtime::{
@@ -450,6 +450,14 @@ pub struct DurableStats {
     /// shadow-replay oracle waits on exactly this (ADR-0087 D7).
     pub frames_in_flight_now: u64,
     pub records_staged: u64,
+    /// Everysec ticks the ledger counted idle (nothing dirty, nothing
+    /// staged): the DST's tick-contract oracle (F-L01-01, batch 42).
+    pub everysec_idle_ticks: u64,
+    /// Frames queued and not yet fsync-covered in the ack map, and the
+    /// ledger's unfolded entries: the map is bounded by the reorder
+    /// window plus the entries plus one (F-L01-03, batch 42).
+    pub frames_awaiting_watermark: u64,
+    pub fsync_entries: u64,
     /// M4.5-S36 (ADR-0088 D7): the device budget's ledger — model
     /// presence, the cell's byte shares, per-class spent bytes/ops and
     /// deferrals (`IoClass::ALL` order) — and the seal pacer's wait
@@ -637,7 +645,13 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     /// the group-formation distribution the ≥ 0.8× gate reads.
     group_hist_records: inf_foundation::LogHistogram,
     /// Frames queued but not yet durable: (exclusive-end LSN, last seq).
-    frame_seqs: VecDeque<(u64, u64)>,
+    /// Bounded (F-L01-03, batch 42): written entries across which no
+    /// ledger coverage point lies coalesce at every `LogWritten`
+    /// ([`coalesce_ack_map`]), so the map holds at most the frames behind
+    /// the written prefix (the reorder window), one entry per unfolded
+    /// ledger entry, and one more — never one per frame sealed behind a
+    /// stalled barrier or between two ticks.
+    frame_seqs: VecDeque<(Lsn, u64)>,
     write_seq: u64,
     records_appended: u64,
     acks_gated: u64,
@@ -1115,7 +1129,7 @@ impl<F: SegmentFs> DurableCell<F> {
         // A pending ckpt-begin marker rides this frame: its LSN is now
         // real (ADR-0016 D3).
         self.ckpt.on_frame_sealed(&lease);
-        self.frame_seqs.push_back((end.to_u64(), self.last_seq));
+        self.frame_seqs.push_back((end, self.last_seq));
         let id = self.commit.note_frame_queued(end, slot.len());
         // Barrier class per frame (ADR-0086 D1, ADR-0087 D3): the plan
         // decided before the seal; `Wait` never reaches here.
@@ -1181,6 +1195,7 @@ impl<F: SegmentFs> DurableCell<F> {
         let frame = self.in_flight.remove(index).expect("index from position");
         self.write_stall_hist.record(now.saturating_sub(frame.submitted_at).as_micros());
         self.commit.note_frame_written(frame.id);
+        self.coalesce_frame_seqs();
         self.staging.release(frame.lease);
         self.drained.wake_all(());
         match frame.barrier {
@@ -1188,6 +1203,24 @@ impl<F: SegmentFs> DurableCell<F> {
             FrameBarrier::Linked(ticket) => self.commit.rebase_clock(ticket, now),
             FrameBarrier::WriteThrough(ticket) => self.on_synced(cx, fsync_token(ticket)),
         }
+    }
+
+    /// F-L01-03 (batch 42): coalesce the ack map over the written prefix
+    /// and release-assert its bound — the frames behind the prefix plus
+    /// one entry per unfolded ledger entry plus one, by construction of
+    /// [`coalesce_ack_map`]. Per `LogWritten`, over the entries the
+    /// prefix newly reached: O(coverage points) per call.
+    fn coalesce_frame_seqs(&mut self) {
+        let Some(written) = self.commit.written_up_to() else { return };
+        let commit = &self.commit;
+        coalesce_ack_map(&mut self.frame_seqs, written, |lo, hi| {
+            commit.pending_covers_within(lo, hi)
+        });
+        assert!(
+            self.frame_seqs.len()
+                <= self.commit.frames_behind_prefix() + self.commit.pending_entries() + 1,
+            "ack map outgrew the reorder window plus the ledger's coverage points"
+        );
     }
 
     /// One admission park episode began (local pump or fabric pump) —
@@ -1216,9 +1249,8 @@ impl<F: SegmentFs> DurableCell<F> {
             self.rotor.note_zero_fill_synced();
         }
         if let Some(end) = self.commit.on_fsync_complete(ticket, cx.now) {
-            let watermark = end.to_u64();
             let mut last_covered = None;
-            while self.frame_seqs.front().is_some_and(|&(end_lsn, _)| end_lsn <= watermark) {
+            while self.frame_seqs.front().is_some_and(|&(end_lsn, _)| end_lsn <= end) {
                 last_covered = self.frame_seqs.pop_front().map(|(_, seq)| seq);
             }
             if let Some(seq) = last_covered {
@@ -1961,6 +1993,9 @@ impl<F: SegmentFs> DurableCell<F> {
             io_provenance: self.io_provenance,
             frames_in_flight_now: u64::from(self.staging.in_flight()),
             records_staged: u64::from(self.staging.pending_records()),
+            everysec_idle_ticks: self.commit.stats().idle_ticks,
+            frames_awaiting_watermark: self.frame_seqs.len() as u64,
+            fsync_entries: self.commit.pending_entries() as u64,
             io_budget_model_absent: u64::from(self.budget.model_absent()),
             io_budget_write_bytes_per_s: write_share,
             io_budget_read_bytes_per_s: read_share,
@@ -2314,6 +2349,86 @@ fn write_token(seq: u64) -> CompletionToken {
 /// Inverse of [`write_token`]: the frame's write sequence (== `FrameId`).
 fn write_seq_of(token: CompletionToken) -> u64 {
     u64::from(token.slot()) | (u64::from(token.generation()) << 24)
+}
+
+/// The LSN→seq ack map's coalescing rule (F-L01-03, batch 42). The gate
+/// consumes only the *last* entry a watermark covers, so an entry `a`
+/// is redundant once its successor `b` is covered by every future
+/// watermark that covers `a`. That holds for two written frames with no
+/// ledger coverage point in `a.end..b.end`: every barrier registered
+/// after `b` landed covers `b` — a linked or write-through sync covers
+/// `queued_up_to ≥ b`, a standalone or completion sync covers
+/// `written_up_to ≥ b`, a rotation's seal covers the old segment's end
+/// (`≥ b` for a written `b` queued before it), and the ledger-only
+/// barriers reuse the coverage tail — and the ledger's coverage is
+/// monotone in submission order. A coverage point between them (the
+/// linked sync on `a` with plain `b` behind it) keeps `a`: `a`'s acks
+/// must not wait for `b`'s barrier. An unwritten `b` is never merged
+/// into — a standalone may still cover exactly `a`.
+fn coalesce_ack_map(
+    map: &mut VecDeque<(Lsn, u64)>,
+    written: Lsn,
+    covers_within: impl Fn(Lsn, Lsn) -> bool,
+) {
+    let mut i = 0;
+    while i + 1 < map.len() {
+        let (a, _) = map[i];
+        let (b, _) = map[i + 1];
+        if b > written {
+            break;
+        }
+        if covers_within(a, b) {
+            i += 1;
+        } else {
+            map.remove(i);
+        }
+    }
+}
+
+#[cfg(test)]
+mod ack_map_tests {
+    use std::collections::VecDeque;
+
+    use inf_log::{Lsn, SegmentId};
+
+    use super::coalesce_ack_map;
+
+    fn lsn(off: u32) -> Lsn {
+        Lsn::new(SegmentId(1), off)
+    }
+
+    fn map(ends: &[u32]) -> VecDeque<(Lsn, u64)> {
+        ends.iter().map(|&e| (lsn(e), u64::from(e))).collect()
+    }
+
+    /// Plain frames landing between two barriers collapse to the last
+    /// written one: the gate reads the same seq at the next watermark.
+    #[test]
+    fn written_plain_frames_without_a_coverage_point_collapse_to_one() {
+        let mut m = map(&[64, 128, 192, 256]);
+        coalesce_ack_map(&mut m, lsn(256), |_, _| false);
+        assert_eq!(m, map(&[256]));
+    }
+
+    /// A coverage point inside `a..b` (the linked sync on `a`, plain
+    /// `b` behind it) keeps `a`: its acks release at `a`'s barrier.
+    #[test]
+    fn a_coverage_point_between_two_written_frames_keeps_the_earlier() {
+        let mut m = map(&[64, 128, 192]);
+        coalesce_ack_map(&mut m, lsn(192), |lo, hi| lo <= lsn(64) && lsn(64) < hi);
+        assert_eq!(m, map(&[64, 192]));
+    }
+
+    /// Entries behind the written prefix never merge — a standalone may
+    /// still cover exactly the last written end.
+    #[test]
+    fn unwritten_frames_are_never_merged_into() {
+        let mut m = map(&[64, 128, 192]);
+        coalesce_ack_map(&mut m, lsn(64), |_, _| false);
+        assert_eq!(m, map(&[64, 128, 192]));
+        coalesce_ack_map(&mut m, lsn(128), |_, _| false);
+        assert_eq!(m, map(&[128, 192]));
+    }
 }
 
 #[cfg(test)]

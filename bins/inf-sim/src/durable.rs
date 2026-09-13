@@ -34,7 +34,9 @@ use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_foundation::{CellId, hash64};
 use inf_log::ckpt::{IckReaderConfig, ick_file_name, read_ick};
-use inf_log::{ReaderConfig, SegmentId, SegmentReader, read_manifest, scan_log_dir_from};
+use inf_log::{
+    REORDER_WINDOW_FRAMES, ReaderConfig, SegmentId, SegmentReader, read_manifest, scan_log_dir_from,
+};
 use inf_runtime::{CellLoop, LoopConfig};
 use inf_server::{
     ControlInbox, ExecOrigin, ExecScope, NodeInfo, PlaneObserver, SegmentIoMode, ServerPlane,
@@ -84,6 +86,11 @@ pub struct DurableScenario {
     /// Writers per namespace class (`always` / `everysec`), plus
     /// default-DB memory writers interleaved (the zero-cost coexistence).
     pub always_writers: usize,
+    /// Batch 42: an everysec writer's think time after each send, drawn
+    /// per op below this bound (0 = closed loop). A quiet cell is the
+    /// tick-contract oracle's precondition: the finding needs a frame
+    /// staged into a byte-clean ledger inside the hold before a tick.
+    pub esec_think_ns_max: u64,
     pub esec_writers: usize,
     pub mem_writers: usize,
     /// Ops per writer.
@@ -225,6 +232,49 @@ pub struct Prelude {
     pub ops_per_writer: u64,
 }
 
+/// Per-step log oracles (batch 42). One sample per cell per traffic
+/// step: `(idle_ticks, records_staged, frames_queued)`.
+///
+/// **Tick contract (F-L01-01):** records leave the staging builder only
+/// through a seal, and a seal bumps `frames_queued`; so records staged at
+/// two consecutive samples with `frames_queued` unchanged sat staged for
+/// the whole step — including at any tick that fired in it. An
+/// `idle_ticks` increment across such a step is a tick that dropped its
+/// due over acked records. No false positives: a tick before the step's
+/// EXECUTE sees the previous sample's records, which only a seal (a
+/// `frames_queued` change) could have removed.
+///
+/// **Ack-map bound (F-L01-03):** the map's depth and the ledger's entry
+/// count are tracked as maxima; the post-cut check compares them.
+struct LogOracle {
+    prev: Vec<Option<(u64, u64, u64)>>,
+}
+
+impl LogOracle {
+    fn new(cells: u16) -> LogOracle {
+        LogOracle { prev: vec![None; usize::from(cells)] }
+    }
+
+    fn sample(&mut self, node: &Node, report: &mut DurableReport) {
+        for (cell, prev) in self.prev.iter_mut().enumerate() {
+            let Some(stats) = node.plane(cell).durable_stats() else { continue };
+            let now = (stats.everysec_idle_ticks, stats.records_staged, stats.frames_queued);
+            if let Some((idle, staged, queued)) = *prev
+                && now.0 > idle
+                && staged > 0
+                && now.1 > 0
+                && now.2 == queued
+            {
+                report.idle_tick_violations += now.0 - idle;
+            }
+            report.frames_awaiting_max =
+                report.frames_awaiting_max.max(stats.frames_awaiting_watermark);
+            report.fsync_entries_max = report.fsync_entries_max.max(stats.fsync_entries);
+            *prev = Some(now);
+        }
+    }
+}
+
 /// The S14 reference stall device: ~120 µs base (warm NVMe fdatasync),
 /// 3% heavy tail up to 8× base, and a 50–90 ms stall episode roughly
 /// every 1.5 sim-seconds — 1–3 episodes land inside a durable run's
@@ -287,6 +337,7 @@ impl DurableScenario {
             workload: DurableWorkload::KeyValue,
             cells: 2,
             always_writers: 3,
+            esec_think_ns_max: 0,
             esec_writers: 3,
             mem_writers: 2,
             ops_per_writer: 140,
@@ -461,6 +512,41 @@ impl DurableScenario {
         scenario
     }
 
+    /// `m2-fill-tick` (batch 42, F-L01-01): a **quiet** everysec cell on
+    /// the `Direct` class with the fill policy at an operator-reachable
+    /// but wide point — a 50 ms window (the binary caps at 100 ms) and a
+    /// 64 KiB target, so a held frame outlives a scheduler step. One
+    /// writer with seconds of think time: a burst lands on a byte-clean
+    /// ledger (the previous frame covered by an earlier tick), and when
+    /// the next tick fires inside the hold the pre-fix ledger counts it
+    /// idle — the finding's exact precondition, which continuous traffic
+    /// never meets (a plain frame is always queued at the tick). The
+    /// per-step tick-contract oracle discriminates; the fixed ledger
+    /// seals the held frame with its barrier. No write wedge; the m2
+    /// stall device and the loss-window oracle unchanged.
+    #[must_use]
+    pub fn m2_fill_tick(seed: u64) -> DurableScenario {
+        let mut scenario = DurableScenario::m2_durable(seed);
+        scenario.always_writers = 0;
+        scenario.esec_writers = 1;
+        // One writer thinking up to 3 s between ops: most ops land on a
+        // byte-clean ledger, ~5 % of them inside the 50 ms before a tick.
+        // The quota is never reached — the cut (a step count scaled by
+        // the quota) lands after ~1–6 sim-minutes at the m2 step size,
+        // ~40–240 ops.
+        scenario.esec_think_ns_max = 3_000_000_000;
+        scenario.ops_per_writer = 60_000;
+        // A quiet cell checkpoints tiny images: the section-bound arm's
+        // engagement witness is not this scenario's subject.
+        scenario.ckpt_section_bound = None;
+        scenario.io_mode = SegmentIoMode::Direct;
+        scenario.frames_in_flight = 1 + ((seed / 2) % 4) as u8;
+        scenario.segment_bytes = 256 << 10;
+        scenario.fill =
+            inf_server::FillConfig { window: Nanos::from_millis(50), target_bytes: 64 << 10 };
+        scenario
+    }
+
     /// `m2-mode-transition` (ADR-0086 D4 as amended, 2026-08-21): the m2
     /// durable shape with a **prelude life in the other barrier class**.
     /// Even seeds go FLUSH → FUA (the packed tail reopened under a
@@ -561,6 +647,7 @@ impl DurableScenario {
             workload: DurableWorkload::KeyValue,
             cells,
             always_writers: 3,
+            esec_think_ns_max: 0,
             esec_writers: 3,
             mem_writers: 1,
             ops_per_writer: 160,
@@ -616,6 +703,7 @@ impl DurableScenario {
             workload: DurableWorkload::Document,
             cells: 2,
             always_writers: 3,
+            esec_think_ns_max: 0,
             esec_writers: 2,
             mem_writers: 0,
             ops_per_writer: 180,
@@ -718,6 +806,14 @@ pub struct DurableReport {
     pub frame_waits_fill: u64,
     /// M4.5-S43: group-hold episodes, scraped at the cut (coverage).
     pub frame_waits_group: u64,
+    /// Batch 42 log oracles, sampled every traffic step. F-L01-01: ticks
+    /// the ledger counted idle while records sat staged across the step
+    /// (no seal in between) — the tick contract, zero required. F-L01-03:
+    /// the ack map's deepest point and the ledger's deepest entry count;
+    /// the map is bounded by the reorder window plus the entries plus one.
+    pub idle_tick_violations: u64,
+    pub frames_awaiting_max: u64,
+    pub fsync_entries_max: u64,
     /// Device-budget coverage (M4.5-S36, ADR-0088 D8), scraped at the
     /// cut: background bytes the budget granted, deferrals it issued
     /// (a sweep whose budget never deferred proves nothing), the seal
@@ -889,6 +985,8 @@ pub(crate) struct Writer {
     pub(crate) quota: u64,
     pub(crate) rx: Vec<u8>,
     pub(crate) inflight: Option<Pending>,
+    /// Batch 42 think time: no send before this instant.
+    pub(crate) idle_until: Nanos,
     /// USE handshake outstanding (named-ns writers).
     pub(crate) setup: bool,
     pub(crate) ledger: Ledger,
@@ -948,6 +1046,7 @@ impl Writer {
             quota,
             rx: Vec::new(),
             inflight: None,
+            idle_until: Nanos(0),
             setup,
             ledger: Ledger::new(),
             tainted: std::collections::BTreeSet::new(),
@@ -1442,6 +1541,9 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         plant_fired: false,
         frame_waits_fill: 0,
         frame_waits_group: 0,
+        idle_tick_violations: 0,
+        frames_awaiting_max: 0,
+        fsync_entries_max: 0,
         budget_background_bytes: 0,
         budget_deferrals: 0,
         frame_waits_pace: 0,
@@ -1808,12 +1910,14 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
     let mut next_check = if document_workload { 0 } else { checks_at.len() };
     let mut idle_steps = 0u64;
     let mut last_progress = 0u64;
+    let mut log_oracle = LogOracle::new(scenario.cells);
     for step in 0..cut_step {
         report.scheduler_steps += 1;
         if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
             fail(&mut report, format!("traffic phase: {err}"));
             return finish(report, &observer, &clock);
         }
+        log_oracle.sample(&node, &mut report);
         let quiesce = next_check < checks_at.len() && step >= checks_at[next_check];
         let mut progress = 0u64;
         for writer in &mut writers {
@@ -1832,6 +1936,9 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                 // Mid-run oracle instant: drain, don't send.
                 continue;
             }
+            if clock.now() < writer.idle_until {
+                continue;
+            }
             let (wire, pending) = writer.next_command(scenario);
             if pending.mutates {
                 writer.ledger.entry(pending.key.clone()).or_default().push(OpRec {
@@ -1844,6 +1951,10 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             net.client_send(writer.fd, &wire);
             writer.sent += 1;
             progress += 1;
+            if scenario.esec_think_ns_max > 0 && writer.class == NsClass::Everysec {
+                writer.idle_until =
+                    clock.now() + Nanos(writer.rng.next_below(scenario.esec_think_ns_max));
+            }
         }
         // The log must be quiescent too (ADR-0087 D7): an `everysec` ack
         // precedes its frame landing, and under the stall model plain
@@ -2031,6 +2142,35 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                 );
             }
         }
+    }
+    // Batch 42 (F-L01-01): a tick that fired over staged records and
+    // counted itself idle dropped its due — the records wait a second.
+    if report.idle_tick_violations > 0 {
+        let what = format!(
+            "EVERYSEC TICK IDLE OVER STAGED RECORDS seed {:#x}: {} tick(s) counted idle \
+             while records sat in the staging builder (waits_fill {}, waits_group {})",
+            scenario.seed,
+            report.idle_tick_violations,
+            report.frame_waits_fill,
+            report.frame_waits_group
+        );
+        fail(&mut report, what);
+    }
+    // Batch 42 (F-L01-03): the LSN→seq ack map holds at most the frames
+    // behind the written prefix, one entry per ledger coverage point,
+    // and one more — never one per frame sealed behind a stalled barrier.
+    let map_bound = REORDER_WINDOW_FRAMES as u64 + report.fsync_entries_max + 1;
+    if report.frames_awaiting_max > map_bound {
+        let what = format!(
+            "ACK MAP UNBOUNDED seed {:#x}: frames awaiting the watermark peaked at {} \
+             against a bound of {} (reorder window {} + ledger entries {} + 1)",
+            scenario.seed,
+            report.frames_awaiting_max,
+            map_bound,
+            REORDER_WINDOW_FRAMES,
+            report.fsync_entries_max
+        );
+        fail(&mut report, what);
     }
     // M4.5-S39a: on the aligned class every frame of the everysec-only
     // reorder shape is barrier-less and far below the target — the
