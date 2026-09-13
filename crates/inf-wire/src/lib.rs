@@ -15,5 +15,8 @@ pub use command::{
     COMMANDS, CmdFlags, CommandId, CommandMeta, KeyIter, KeySpec, KeyspaceScope, arity_ok,
     extract_keys, key_spec, keyspace_scope, lookup,
 };
-pub use parser::{ArgvRef, ConnParser, FrameIter, INLINE_ARGS, Parsed, ParserLimits, WireError};
+pub use parser::{
+    ArgvRef, ConnParser, DEFAULT_MAX_BULK_BYTES, FRAME_HEADROOM_BYTES, FrameIter, INLINE_ARGS,
+    Parsed, ParserLimits, WireError,
+};
 pub use writer::{Protocol, RespWriter};

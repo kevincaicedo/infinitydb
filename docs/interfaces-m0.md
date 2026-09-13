@@ -371,11 +371,17 @@ See [ADR-0115](../../docs/adr/0115-internal-command-origin-fence.md).
 // parse with ZERO scanning (length-directed); payload bytes are never read.
 pub struct ConnParser;                      // one per connection
 pub enum Parsed<'a> { Command(ArgvRef<'a>), Inline(ArgvRef<'a>), Incomplete, ProtocolError(WireError) }
+pub struct ParserLimits { pub max_bulk_bytes: usize, pub max_frame_bytes: usize, pub max_args: usize }
+//  ADR-0122: `max_bulk_bytes` = `proto-max-bulk-len` (16 MiB default), checked from the
+//  length line; `max_frame_bytes` = the whole frame (bulk cap + 64 KiB headroom),
+//  checked from the declared layout — the accumulator bound is per frame, not per bulk.
 impl ConnParser {
     pub fn new(limits: ParserLimits) -> Self;
     pub fn feed<'p>(&'p mut self, input: &'p [u8]) -> FrameIter<'p>;
     pub fn buffered(&self) -> usize;        // accumulator occupancy (bound asserts)
     pub fn is_poisoned(&self) -> bool;      // protocol error ⇒ close the connection
+    pub fn limits(&self) -> ParserLimits;
+    pub fn set_limits(&mut self, limits: ParserLimits); // CONFIG SET proto-max-bulk-len (ADR-0122)
 }
 impl FrameIter<'_> {
     /// Lending: `while let Some(p) = iter.next()`. Drive to None (or drop —

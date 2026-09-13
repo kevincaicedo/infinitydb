@@ -12,8 +12,11 @@ fuzz_target!(|data: &[u8]| {
     // First byte steers the chunk size so the corpus explores split points.
     let chunk = usize::from(data[0]).max(1);
     let cap = 4096;
-    let mut parser =
-        inf_wire::ConnParser::new(inf_wire::ParserLimits { max_frame_bytes: cap, max_args: 256 });
+    let mut parser = inf_wire::ConnParser::new(inf_wire::ParserLimits {
+        max_bulk_bytes: cap,
+        max_frame_bytes: cap,
+        max_args: 256,
+    });
     let mut poisoned_seen = false;
     for piece in data[1..].chunks(chunk) {
         let mut iter = parser.feed(piece);

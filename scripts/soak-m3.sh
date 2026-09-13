@@ -65,7 +65,7 @@ redis-cli -p $PORT INFO persistence >"$OUT/info-start.txt"
     mem=$(redis-cli -p $PORT INFO memory 2>/dev/null || true)
     pers=$(redis-cli -p $PORT INFO persistence 2>/dev/null || true)
     docs=$(grep -oP 'docs_live:\K\d+' <<<"$mem" | head -1 || echo 0)
-    dres=$(grep -oP 'doc_resident_bytes:\K\d+' <<<"$mem" | head -1 || echo 0)
+    dres=$(grep -oP 'used_memory_doc_resident:\K\d+' <<<"$mem" | head -1 || echo 0)
     ck=$(grep -oP 'ckpts_completed:\K\d+' <<<"$pers" | paste -sd+ | bc 2>/dev/null || echo 0)
     lv=$(grep -oP 'log_segments_live:\K\d+' <<<"$pers" | paste -sd+ | bc 2>/dev/null || echo 0)
     echo "$(date +%s),$rss,${docs:-0},${dres:-0},$ck,$lv" >>"$OUT/rss.csv"

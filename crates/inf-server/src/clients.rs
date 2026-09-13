@@ -20,6 +20,13 @@ pub struct ClientInfo {
     pub created_ms: u64,
     /// Negotiated RESP version (2/3).
     pub resp: u8,
+    /// Selected db, mirrored from the connection at SELECT / `INF.NS USE`
+    /// (F-L15-09: tracked state is reported, never a placeholder zero).
+    pub db: u16,
+    /// Channel / pattern subscription counts, mirrored at every
+    /// (un)subscribe.
+    pub sub: u32,
+    pub psub: u32,
     pub kill_requested: bool,
 }
 
@@ -34,7 +41,16 @@ impl ClientRegistry {
     pub fn register(&mut self, id: u64, addr: String, created_ms: u64) {
         self.clients.insert(
             id,
-            ClientInfo { name: Vec::new(), addr, created_ms, resp: 2, kill_requested: false },
+            ClientInfo {
+                name: Vec::new(),
+                addr,
+                created_ms,
+                resp: 2,
+                db: 0,
+                sub: 0,
+                psub: 0,
+                kill_requested: false,
+            },
         );
     }
 
@@ -50,12 +66,24 @@ impl ClientRegistry {
             addr: "0.0.0.0:0".to_string(),
             created_ms,
             resp: 2,
+            db: 0,
+            sub: 0,
+            psub: 0,
             kill_requested: false,
         })
     }
 
     pub fn get(&self, id: u64) -> Option<&ClientInfo> {
         self.clients.get(&id)
+    }
+
+    /// Mirrors the connection's db and subscription counts (F-L15-09);
+    /// registers a caller the plane never saw, like [`ClientRegistry::ensure`].
+    pub fn note_conn_state(&mut self, id: u64, created_ms: u64, db: u16, sub: u32, psub: u32) {
+        let c = self.ensure(id, created_ms);
+        c.db = db;
+        c.sub = sub;
+        c.psub = psub;
     }
 
     pub fn set_resp(&mut self, id: u64, resp: u8) {
@@ -106,15 +134,20 @@ pub fn valid_client_name(name: &[u8]) -> bool {
 }
 
 /// One `CLIENT LIST`/`CLIENT INFO` line (no trailing newline) — Redis field
-/// vocabulary with honest zeros for stats this build does not track yet.
+/// vocabulary. `db`/`sub`/`psub`/`resp`/`name`/`age` are tracked; the
+/// zeros (`idle`, `cmd`, `tot-*`, buffer gauges) are stats this build
+/// does not track — the compat matrix's `CLIENT` deviation names them.
 pub fn format_client_line(id: u64, info: &ClientInfo, age_secs: u64, last_cmd: &str) -> String {
     format!(
         "id={id} addr={addr} laddr=0.0.0.0:0 fd=-1 name={name} age={age_secs} idle=0 flags=N \
-         db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 \
-         tot-net-in=0 tot-net-out=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r \
-         cmd={last_cmd} user=default redir=-1 resp={resp} lib-name= lib-ver= tot-cmds=0",
+         db={db} sub={sub} psub={psub} ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 \
+         multi-mem=0 tot-net-in=0 tot-net-out=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 \
+         events=r cmd={last_cmd} user=default redir=-1 resp={resp} lib-name= lib-ver= tot-cmds=0",
         addr = info.addr,
         name = String::from_utf8_lossy(&info.name),
+        db = info.db,
+        sub = info.sub,
+        psub = info.psub,
         resp = info.resp,
     )
 }

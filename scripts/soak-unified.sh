@@ -263,7 +263,7 @@ sample_line() {
   # `INFO tiering` counters are genuinely per-cell and are summed.
   awk -F: -v ts="$(date +%s)" -v rss="$rss" '
     $1 == "docs_live"                   { if ($2 + 0 > docs) docs = $2 + 0 }
-    $1 == "doc_resident_bytes"          { if ($2 + 0 > dres) dres = $2 + 0 }
+    $1 == "used_memory_doc_resident"    { if ($2 + 0 > dres) dres = $2 + 0 }
     $1 == "used_memory"                 { if ($2 + 0 > um)   um   = $2 + 0 }
     $1 == "tiering_disk_used_bytes"     { disk += $2 }
     $1 == "tiering_write_amp_milli_max" { if ($2 + 0 > wam) wam = $2 + 0 }

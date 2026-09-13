@@ -142,7 +142,6 @@ pub(crate) fn info(
         push(&mut text, &format!("maxclients:{maxclients}"));
         push(&mut text, "blocked_clients:0");
         push(&mut text, "tracking_clients:0");
-        push(&mut text, &format!("total_connections_received:{}", node.total_connections.get()));
         text.push_str("\r\n");
     }
     #[cfg(feature = "doc")]
@@ -181,18 +180,21 @@ pub(crate) fn info(
         let frag = if used > 0 { rss as f64 / used as f64 } else { 0.0 };
         push(&mut text, &format!("mem_fragmentation_ratio:{frag:.2}"));
         push(&mut text, "mem_allocator:inf-arena");
-        push(&mut text, &format!("doc_tape_bytes:{}", g.doc_tape_bytes));
-        push(&mut text, &format!("doc_arena_bytes:{}", g.doc_arena_bytes));
-        push(&mut text, &format!("doc_resident_bytes:{}", g.doc_resident_bytes));
-        push(&mut text, &format!("doc_intern_bytes:{}", g.doc_intern_bytes));
-        push(&mut text, &format!("doc_slack_bytes:{}", g.doc_slack_bytes));
-        push(&mut text, &format!("doc_scratch_bytes:{}", g.doc_scratch_bytes));
-        push(&mut text, &format!("doc_path_cache_bytes:{}", g.doc_path_cache_bytes));
+        // The attribution fold under the `used_memory_*` family (ADR-0122
+        // D3, F-L15-06): the frozen tripwire names stay cell-scope in
+        // `# Tripwires`; one name never carries two scopes in one reply.
+        push(&mut text, &format!("used_memory_doc_tape:{}", g.doc_tape_bytes));
+        push(&mut text, &format!("used_memory_doc_arena:{}", g.doc_arena_bytes));
+        push(&mut text, &format!("used_memory_doc_resident:{}", g.doc_resident_bytes));
+        push(&mut text, &format!("used_memory_doc_intern:{}", g.doc_intern_bytes));
+        push(&mut text, &format!("used_memory_doc_slack:{}", g.doc_slack_bytes));
+        push(&mut text, &format!("used_memory_doc_scratch:{}", g.doc_scratch_bytes));
+        push(&mut text, &format!("used_memory_doc_path_cache:{}", g.doc_path_cache_bytes));
         push(&mut text, &format!("docs_live:{}", g.docs_live));
         // Index-tree domains (M4.5-S03, ADR-0075 D6): counted in
         // used_memory and the namespace budgets — never a second ledger.
-        push(&mut text, &format!("idx_tree_bytes:{}", g.idx_tree_bytes));
-        push(&mut text, &format!("idx_slack_bytes:{}", g.idx_slack_bytes));
+        push(&mut text, &format!("used_memory_idx_tree:{}", g.idx_tree_bytes));
+        push(&mut text, &format!("used_memory_idx_slack:{}", g.idx_slack_bytes));
         text.push_str("\r\n");
     }
     if wants("persistence") {
@@ -585,6 +587,9 @@ pub(crate) fn info(
         use inf_foundation::tripwire as tw;
         let [sqes, cqes, cmds, fabric, p999] = node.tripwires.get();
         push(&mut text, "# Tripwires");
+        // Every gauge below is this cell's slice (`inf-bench` scrapes each
+        // cell and sums); `process_rss` alone is process-wide.
+        push(&mut text, "tripwire_scope:cell");
         push(&mut text, &format!("{}:{sqes}", tw::SQES_PER_SUBMIT));
         push(&mut text, &format!("{}:{cqes}", tw::CQES_PER_REAP));
         push(&mut text, &format!("{}:{cmds}", tw::CMDS_PER_ITER));
@@ -616,7 +621,6 @@ pub(crate) fn info(
         push(&mut text, &format!("idx_slack_bytes:{}", report.idx_slack_bytes));
         push(&mut text, &format!("wheel_fallback:{}", stats.wheel_fallback));
         push(&mut text, &format!("wheel_stale:{}", stats.wheel_stale));
-        push(&mut text, &format!("evicted_keys:{}", stats.evicted_keys));
         push(&mut text, &format!("pubsub_fan_msgs:{}", node.pubsub_fan_msgs.get()));
         push(&mut text, &format!("pubsub_delivered:{}", node.pubsub_delivered.get()));
         push(&mut text, &format!("pubsub_state_bytes:{}", node.pubsub_state_bytes.get()));
@@ -1275,6 +1279,7 @@ pub(crate) fn inf_ns(
     ks: &mut Keyspace,
     cx: &mut ConnCx,
     node: &NodeInfo,
+    now: Nanos,
     w: &mut RespWriter<'_>,
 ) {
     let sub = argv.arg(1);
@@ -1307,6 +1312,7 @@ pub(crate) fn inf_ns(
             cx.db = db as u16;
             cx.ns = crate::exec::ConnNamespace::Default;
             let _ = ks.db_mut(db);
+            cx.publish_client_state(now);
             return w.simple("OK");
         }
         let Some(spec) = ks.ns_get(name) else {
@@ -2096,6 +2102,64 @@ mod tests {
         assert_eq!(cx.node.config.borrow().get("timeout"), Some("9"));
     }
 
+    /// Batch 45 (review 2026-08-30, F-L15-06): one `INFO` reply names every
+    /// field once. Pre-fix nine attribution names rendered twice — the
+    /// node fold in `# Memory`, this cell's slice in `# Tripwires` — and a
+    /// flat-map parser (every client library, `inf-bench`'s own scrape)
+    /// kept whichever section came last.
+    #[test]
+    fn info_all_names_every_field_once() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        let all = String::from_utf8(run(&mut cx, &mut store, &[b"INFO"])).expect("ascii");
+        let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+        for line in all.lines().skip(1) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (name, _) = line.split_once(':').unwrap_or_else(|| panic!("no ':' in {line:?}"));
+            *seen.entry(name).or_default() += 1;
+        }
+        let twice: Vec<&str> = seen.iter().filter(|(_, n)| **n > 1).map(|(k, _)| *k).collect();
+        assert!(twice.is_empty(), "INFO names a field more than once: {twice:?}");
+        // Both scopes are disclosed beside the numbers they qualify.
+        assert!(all.contains("memory_scope:"), "{all}");
+        assert!(all.contains("tripwire_scope:cell\r\n"), "{all}");
+    }
+
+    /// Batch 45 (review 2026-08-30, F-L15-09): `db`, `sub` and `psub` are
+    /// tracked state, so `CLIENT LIST`/`INFO` report them — RESP3 so the
+    /// subscribed connection may still be inspected (Redis shape).
+    #[test]
+    fn client_info_reports_the_selected_db_and_subscription_counts() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let info = |cx: &mut ConnCx, store: &mut Keyspace| -> String {
+            let reply = run(cx, store, &[b"CLIENT", b"INFO"]);
+            let text = String::from_utf8(reply).expect("ascii");
+            let body = text.strip_prefix('$').and_then(|t| t.split_once("\r\n")).expect("bulk").1;
+            body.trim_end_matches("\r\n").to_string()
+        };
+        assert!(run(&mut cx, &mut store, &[b"HELLO", b"3"]).starts_with(b"%"));
+        assert!(info(&mut cx, &mut store).contains(" db=0 sub=0 psub=0 "));
+        assert_eq!(run(&mut cx, &mut store, &[b"SELECT", b"7"]), b"+OK\r\n");
+        run(&mut cx, &mut store, &[b"SUBSCRIBE", b"a", b"b", b"c"]);
+        let line = info(&mut cx, &mut store);
+        assert!(line.contains(" db=7 sub=3 psub=0 "), "{line}");
+        run(&mut cx, &mut store, &[b"PSUBSCRIBE", b"p*"]);
+        run(&mut cx, &mut store, &[b"UNSUBSCRIBE", b"a"]);
+        let line = info(&mut cx, &mut store);
+        assert!(line.contains(" db=7 sub=2 psub=1 "), "{line}");
+        assert_eq!(run(&mut cx, &mut store, &[b"INF.NS", b"USE", b"db3"]), b"+OK\r\n");
+        let line = info(&mut cx, &mut store);
+        assert!(line.contains(" db=3 sub=2 psub=1 "), "{line}");
+        run(&mut cx, &mut store, &[b"PUNSUBSCRIBE"]);
+        run(&mut cx, &mut store, &[b"UNSUBSCRIBE"]);
+        let line = info(&mut cx, &mut store);
+        assert!(line.contains(" db=3 sub=0 psub=0 "), "{line}");
+    }
+
     #[test]
     fn client_name_and_kill_flow() {
         let mut cx = ConnCx::default();
@@ -2148,13 +2212,15 @@ mod tests {
         let memory =
             String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"memory"])).expect("ascii");
         for name in [
-            "doc_tape_bytes",
-            "doc_arena_bytes",
-            "doc_resident_bytes",
-            "doc_intern_bytes",
-            "doc_slack_bytes",
-            "doc_scratch_bytes",
-            "doc_path_cache_bytes",
+            "used_memory_doc_tape",
+            "used_memory_doc_arena",
+            "used_memory_doc_resident",
+            "used_memory_doc_intern",
+            "used_memory_doc_slack",
+            "used_memory_doc_scratch",
+            "used_memory_doc_path_cache",
+            "used_memory_idx_tree",
+            "used_memory_idx_slack",
             "docs_live",
         ] {
             assert!(memory.contains(&format!("{name}:")), "missing {name}: {memory}");
