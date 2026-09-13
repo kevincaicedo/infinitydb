@@ -18,10 +18,12 @@
 //! bounded per-connection accumulator: the partial tail is copied in (the
 //! only copy in the parser), completed by later feeds, and parsed from
 //! there. The accumulator is hard-capped by
-//! [`ParserLimits::max_frame_bytes`]; a declared bulk length over the cap is
-//! rejected **from its header line** — a `$104857600` announcement on a
-//! 1 MiB-cap connection fails immediately without buffering a byte of
-//! payload (the bounded-accumulator AC).
+//! [`ParserLimits::max_frame_bytes`] — the frame as a whole, from its
+//! declared layout (ADR-0122 D1) — and each bulk by
+//! [`ParserLimits::max_bulk_bytes`] (`proto-max-bulk-len`); a declared
+//! length over either cap is rejected **from its length line** — a
+//! `$104857600` announcement on a 16 MiB-cap connection fails immediately
+//! without buffering a byte of payload (the bounded-accumulator AC).
 //!
 //! ## Retention rule, enforced by lifetimes
 //!
@@ -41,18 +43,45 @@ use inf_simd::{find_crlf, swar_parse_int};
 /// Most args carried without allocation (frozen contract: "no alloc ≤ 16").
 pub const INLINE_ARGS: usize = 16;
 
-/// Per-connection parser limits. Defaults are the M0 reference shape.
-#[derive(Copy, Clone, Debug)]
+/// The product bulk cap: `proto-max-bulk-len`'s default (ADR-0122) — the
+/// record bound (`MAX_VAL_LEN` + 1), so every storable value is admitted
+/// and nothing unstorable is buffered.
+pub const DEFAULT_MAX_BULK_BYTES: usize = 16 << 20;
+/// Headroom a frame gets past its largest bulk: the command name, a key at
+/// its bound and the length lines (ADR-0122 D1).
+pub const FRAME_HEADROOM_BYTES: usize = 64 << 10;
+
+/// Per-connection parser limits. Defaults are the product shape
+/// (`proto-max-bulk-len` mirrors [`DEFAULT_MAX_BULK_BYTES`]).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct ParserLimits {
-    /// Hard cap for one frame (and the partial-frame accumulator).
+    /// Hard cap for one bulk string, checked from its length line before
+    /// any payload is buffered (`proto-max-bulk-len`).
+    pub max_bulk_bytes: usize,
+    /// Hard cap for one whole frame — every bulk plus the length lines —
+    /// and therefore the partial-frame accumulator. Checked from the
+    /// declared lengths, before the bytes arrive.
     pub max_frame_bytes: usize,
     /// Maximum argv entries per command.
     pub max_args: usize,
 }
 
+impl ParserLimits {
+    /// Limits for a bulk cap: the frame gets [`FRAME_HEADROOM_BYTES`] past
+    /// it, the argv bound stays the registry's 1024.
+    #[must_use]
+    pub const fn for_bulk_cap(max_bulk_bytes: usize) -> ParserLimits {
+        ParserLimits {
+            max_bulk_bytes,
+            max_frame_bytes: max_bulk_bytes.saturating_add(FRAME_HEADROOM_BYTES),
+            max_args: 1024,
+        }
+    }
+}
+
 impl Default for ParserLimits {
     fn default() -> ParserLimits {
-        ParserLimits { max_frame_bytes: 1024 * 1024, max_args: 1024 }
+        ParserLimits::for_bulk_cap(DEFAULT_MAX_BULK_BYTES)
     }
 }
 
@@ -60,8 +89,12 @@ impl Default for ParserLimits {
 /// compat harness diffs replies.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum WireError {
-    /// Declared or accumulated frame exceeds `max_frame_bytes`.
+    /// A bulk's declared length (or an inline line) exceeds
+    /// `max_bulk_bytes`.
     FrameTooLarge { declared: usize, cap: usize },
+    /// The frame's declared layout exceeds `max_frame_bytes` (ADR-0122
+    /// D1: the accumulator is bounded per frame, not per bulk).
+    FrameTooLong { size: usize, cap: usize },
     /// Multibulk argc over `max_args`.
     TooManyArgs { declared: u64, cap: usize },
     /// `*` line is not a well-formed non-negative count.
@@ -81,6 +114,9 @@ impl core::fmt::Display for WireError {
         match self {
             WireError::FrameTooLarge { declared, cap } => {
                 write!(f, "invalid bulk length: {declared} exceeds limit {cap}")
+            }
+            WireError::FrameTooLong { size, cap } => {
+                write!(f, "invalid frame length: {size} exceeds limit {cap}")
             }
             WireError::TooManyArgs { declared, cap } => {
                 write!(f, "invalid multibulk count: {declared} exceeds limit {cap}")
@@ -176,6 +212,18 @@ impl ConnParser {
     /// Bytes currently held for a spanning frame (tests + memory asserts).
     pub fn buffered(&self) -> usize {
         self.acc.len()
+    }
+
+    /// The limits in force.
+    pub fn limits(&self) -> ParserLimits {
+        self.limits
+    }
+
+    /// Re-limits a live connection (`CONFIG SET proto-max-bulk-len`,
+    /// ADR-0122 D2): the next frame parses under the new caps; a
+    /// spanning frame already past a lowered cap fails at its next feed.
+    pub fn set_limits(&mut self, limits: ParserLimits) {
+        self.limits = limits;
     }
 
     /// True after a protocol error: the connection must be closed.
@@ -402,14 +450,22 @@ fn parse_multibulk(buf: &[u8], limits: &ParserLimits) -> ParseOne {
         }
         let len = len as usize;
         // Early reject from the header line: a 100 MB announcement on a
-        // 1 MiB-cap connection dies HERE, before buffering any payload.
-        if len > limits.max_frame_bytes {
+        // 16 MiB-cap connection dies HERE, before buffering any payload.
+        if len > limits.max_bulk_bytes {
             return ParseOne::Error(WireError::FrameTooLarge {
                 declared: len,
-                cap: limits.max_frame_bytes,
+                cap: limits.max_bulk_bytes,
             });
         }
         let payload_end = after_len + len;
+        // The frame as a whole, from its declared layout: `argc` bulks
+        // each under the bulk cap must not accumulate `argc × cap`.
+        if payload_end + 2 > limits.max_frame_bytes {
+            return ParseOne::Error(WireError::FrameTooLong {
+                size: payload_end + 2,
+                cap: limits.max_frame_bytes,
+            });
+        }
         if buf.len() < payload_end + 2 {
             return ParseOne::Incomplete;
         }
@@ -457,10 +513,10 @@ fn parse_count_line(
 /// path that scans (`inf_simd::find_crlf`); bounded by the frame cap.
 fn parse_inline(buf: &[u8], limits: &ParserLimits) -> ParseOne {
     let Some(end) = find_crlf(buf, 0) else {
-        return if buf.len() > limits.max_frame_bytes {
+        return if buf.len() > limits.max_bulk_bytes {
             ParseOne::Error(WireError::FrameTooLarge {
                 declared: buf.len(),
-                cap: limits.max_frame_bytes,
+                cap: limits.max_bulk_bytes,
             })
         } else {
             ParseOne::Incomplete

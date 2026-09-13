@@ -97,7 +97,7 @@ fn oversized_bulk_header_is_rejected_immediately_with_bounded_memory() {
     // rejected with the documented error, memory bounded — the rejection
     // fires from the header line, before any payload is buffered.
     let cap = 1024 * 1024;
-    let mut parser = ConnParser::new(ParserLimits { max_frame_bytes: cap, max_args: 1024 });
+    let mut parser = ConnParser::new(ParserLimits::for_bulk_cap(cap));
     let declared = 100 * 1024 * 1024;
     let header = format!("*2\r\n$3\r\nSET\r\n${declared}\r\n");
     let (cmds, err) = drain(&mut parser, header.as_bytes());
@@ -130,7 +130,8 @@ fn protocol_errors_poison_the_connection() {
 
 #[test]
 fn arg_count_over_limit_is_rejected() {
-    let mut parser = ConnParser::new(ParserLimits { max_frame_bytes: 1024, max_args: 4 });
+    let mut parser =
+        ConnParser::new(ParserLimits { max_bulk_bytes: 1024, max_frame_bytes: 1024, max_args: 4 });
     let (_, err) = drain(&mut parser, b"*5\r\n");
     assert_eq!(err, Some(WireError::TooManyArgs { declared: 5, cap: 4 }));
 }
@@ -231,7 +232,11 @@ mod chunking {
             )
         ) {
             let cap = 256;
-            let mut parser = ConnParser::new(ParserLimits { max_frame_bytes: cap, max_args: 64 });
+            let mut parser = ConnParser::new(ParserLimits {
+                max_bulk_bytes: cap,
+                max_frame_bytes: cap,
+                max_args: 64,
+            });
             for chunk in &chunks {
                 let mut iter = parser.feed(chunk);
                 while let Some(parsed) = iter.next() {
@@ -248,4 +253,73 @@ mod chunking {
             }
         }
     }
+}
+
+/// Batch 45 (review 2026-08-30, F-L15-04 correction): the "bounded
+/// accumulator" invariant held per *bulk*, not per frame — `argc` bulks
+/// each under the cap accumulated `argc × cap`. A frame is bounded as a
+/// whole: past the cap it is a protocol error, never a bigger buffer.
+#[test]
+fn a_multibulk_frame_is_bounded_as_a_whole_not_only_per_bulk() {
+    let cap = 256;
+    let mut parser =
+        ConnParser::new(ParserLimits { max_bulk_bytes: cap, max_frame_bytes: cap, max_args: 64 });
+    let bulk = vec![b'x'; 200];
+    let mut frame = b"*4\r\n$4\r\nMSET\r\n".to_vec();
+    for _ in 0..3 {
+        frame.extend_from_slice(b"$200\r\n");
+        frame.extend_from_slice(&bulk);
+        frame.extend_from_slice(b"\r\n");
+    }
+    let mut rejected = false;
+    for chunk in frame.chunks(64) {
+        let (cmds, err) = drain(&mut parser, chunk);
+        assert!(cmds.is_empty(), "a frame over the cap must never execute");
+        if err.is_some() {
+            rejected = true;
+            break;
+        }
+        assert!(
+            parser.buffered() <= cap + 64 + 2,
+            "accumulator exceeded its bound: {} > {}",
+            parser.buffered(),
+            cap + 64 + 2
+        );
+    }
+    assert!(rejected, "a {}-byte frame on a {cap}-byte cap must be refused", frame.len());
+    assert!(parser.is_poisoned());
+    // The whole frame is refused from its declared layout, not after
+    // arriving: the same frame in one feed is the same typed error.
+    let mut parser =
+        ConnParser::new(ParserLimits { max_bulk_bytes: cap, max_frame_bytes: cap, max_args: 64 });
+    let (_, err) = drain(&mut parser, &frame);
+    // `*4\r\n$4\r\nMSET\r\n` (14) + two `$200\r\n<200>\r\n` bulks (208 each) passes 256.
+    assert_eq!(err, Some(WireError::FrameTooLong { size: 14 + 2 * 208, cap }));
+    assert_eq!(parser.buffered(), 0);
+}
+
+/// ADR-0122 D1: the frame cap is the bulk cap plus headroom, so a bulk at
+/// exactly the cap under a key at its bound is admitted whole (no sliver
+/// between "storable" and "parseable"); the product default is the
+/// record bound.
+#[test]
+fn the_default_admits_a_bulk_at_the_cap_under_a_bound_key() {
+    let limits = ParserLimits::default();
+    assert_eq!(limits.max_bulk_bytes, 16 << 20);
+    assert_eq!(limits.max_frame_bytes, (16 << 20) + (64 << 10));
+    let mut parser = ConnParser::new(limits);
+    let key = vec![b'k'; 255];
+    let value = vec![b'v'; limits.max_bulk_bytes];
+    let mut frame = b"*3\r\n$3\r\nSET\r\n$255\r\n".to_vec();
+    frame.extend_from_slice(&key);
+    frame.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
+    frame.extend_from_slice(&value);
+    frame.extend_from_slice(b"\r\n");
+    let (cmds, err) = drain(&mut parser, &frame);
+    assert_eq!(err, None);
+    assert_eq!(cmds.len(), 1);
+    assert_eq!(cmds[0][2].len(), limits.max_bulk_bytes);
+    let over = limits.max_bulk_bytes + 1;
+    let (_, err) = drain(&mut parser, format!("*2\r\n$3\r\nGET\r\n${over}\r\n").as_bytes());
+    assert_eq!(err, Some(WireError::FrameTooLarge { declared: over, cap: limits.max_bulk_bytes }));
 }

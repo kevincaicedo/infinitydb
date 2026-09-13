@@ -33,7 +33,7 @@ program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 | `HELLO` | full | M0 | fast | -1 | 1 | identity fields (server/version) are InfinityDB's own, as for any non-Redis server |
 | `QUIT` | partial | M1 | fast | 1 | 0 | replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus because closing tears down the shared oracle connection — covered by a unit test and the client-smoke suite |
 | `GET` | full | M0 | readonly fast | 2 | 28 |  |
-| `SET` | full | M0 | write denyoom | -3 | 94 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
+| `SET` | full | M0 | write denyoom | -3 | 94 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111); bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122) |
 | `SETNX` | full | M0 | write denyoom fast | 3 | 2 |  |
 | `SETEX` | full | M0 | write denyoom | 4 | 6 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `PSETEX` | full | M0 | write denyoom | 4 | 4 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
@@ -46,20 +46,20 @@ program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 | `DECR` | full | M0 | write denyoom fast | 2 | 2 |  |
 | `INCRBY` | full | M0 | write denyoom fast | 3 | 3 |  |
 | `DECRBY` | full | M0 | write denyoom fast | 3 | 2 |  |
-| `APPEND` | full | M0 | write denyoom fast | 3 | 4 |  |
+| `APPEND` | full | M0 | write denyoom fast | 3 | 4 | bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122) |
 | `STRLEN` | full | M0 | readonly fast | 2 | 5 |  |
 | `EXPIRE` | full | M0 | write fast | -3 | 21 | TTLs ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `PEXPIRE` | full | M0 | write fast | -3 | 4 | same u40 clamp |
 | `TTL` | full | M0 | readonly fast | 2 | 20 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PTTL` | full | M0 | readonly fast | 2 | 3 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PERSIST` | full | M0 | write fast | 2 | 3 |  |
-| `INFO` | partial | M0 | admin | -1 | 0 | sections + field vocabulary present; gauges are this cell's slice until the control plane aggregates (client-smoke CI is the open M1-S14 AC) |
+| `INFO` | partial | M0 | admin | -1 | 0 | sections + field vocabulary present; every name appears once per reply — `# Memory` is the node fold (`memory_scope`, the attribution family under `used_memory_*`), `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice (`tripwire_scope:cell`; ADR-0122 D3); client-smoke CI is the open M1-S14 AC |
 | `COMMAND` | partial | M0 | admin | -1 | 3 | COMMAND DOCS is an honest empty map; the registry covers the implemented surface only |
 | `MGET` | full | M1 | readonly fast | -2 | 4 |  |
-| `MSET` | full | M1 | write denyoom | -3 | 3 |  |
+| `MSET` | full | M1 | write denyoom | -3 | 3 | bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); the whole frame is bounded at the bulk cap + 64 KiB (Redis bounds the query buffer separately at 1 GiB) |
 | `MSETNX` | partial | M1 | write denyoom | -3 | 3 | cross-cell keys are check-then-set until M4 transactions; single-cell exact |
 | `GETRANGE` | full | M1 | readonly | 4 | 8 |  |
-| `SETRANGE` | full | M1 | write denyoom | 4 | 4 | values bound at 16 MiB − 1 (record format v0) |
+| `SETRANGE` | full | M1 | write denyoom | 4 | 4 | values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 (proto-max-bulk-len 16 MiB) |
 | `GETEX` | full | M1 | write fast | -2 | 20 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `INCRBYFLOAT` | partial | M1 | write denyoom fast | 3 | 6 | computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision tails may differ |
 | `SUBSTR` | full | M1 | readonly | 4 | 1 |  |
@@ -81,8 +81,8 @@ program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 | `EXPIRETIME` | full | M1 | readonly fast | 2 | 5 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PEXPIRETIME` | full | M1 | readonly fast | 2 | 4 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `SELECT` | full | M1 | fast | 2 | 7 |  |
-| `CONFIG` | partial | M1 | admin | -2 | 34 | typed M1 key subset with frozen hot-reload classes |
-| `CLIENT` | partial | M1 | admin | -2 | 5 | KILL supports the ID filter form; LIST addr/fd are placeholders until peername capture |
+| `CONFIG` | partial | M1 | admin | -2 | 34 | typed M1 key subset with frozen hot-reload classes; `proto-max-bulk-len` defaults to 16 MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next MAINTAIN (ADR-0122); `maxclients`/`timeout`/`tcp-keepalive` are accepted and not yet applied (F-L15-05) |
+| `CLIENT` | partial | M1 | admin | -2 | 5 | KILL supports the ID filter form; LIST/INFO report the tracked fields (id, name, age, resp, db, sub, psub) — addr/fd are placeholders until peername capture, and idle/cmd/tot-*/buffer gauges are untracked zeros |
 | `LOLWUT` | partial | M1 | readonly | -1 | 0 | the whole reply is version art (nothing byte-comparable by design) |
 | `SUBSCRIBE` | full | M1 | fast | -2 | 5 |  |
 | `UNSUBSCRIBE` | full | M1 | fast | -1 | 5 | bare-form confirmations emit in subscription order (Redis: dict order) |

@@ -90,7 +90,7 @@ pub static DECLARED: &[Declared] = &[
         "SET",
         Status::Full,
         "M0",
-        "deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)",
+        "deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111); bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122)",
     ),
     d("SETNX", Status::Full, "M0", ""),
     d(
@@ -114,7 +114,12 @@ pub static DECLARED: &[Declared] = &[
     d("DECR", Status::Full, "M0", ""),
     d("INCRBY", Status::Full, "M0", ""),
     d("DECRBY", Status::Full, "M0", ""),
-    d("APPEND", Status::Full, "M0", ""),
+    d(
+        "APPEND",
+        Status::Full,
+        "M0",
+        "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122)",
+    ),
     d("STRLEN", Status::Full, "M0", ""),
     d(
         "EXPIRE",
@@ -130,7 +135,7 @@ pub static DECLARED: &[Declared] = &[
         "INFO",
         Status::Partial,
         "M0",
-        "sections + field vocabulary present; gauges are this cell's slice until the control plane aggregates (client-smoke CI is the open M1-S14 AC)",
+        "sections + field vocabulary present; every name appears once per reply — `# Memory` is the node fold (`memory_scope`, the attribution family under `used_memory_*`), `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice (`tripwire_scope:cell`; ADR-0122 D3); client-smoke CI is the open M1-S14 AC",
     ),
     d(
         "COMMAND",
@@ -139,7 +144,12 @@ pub static DECLARED: &[Declared] = &[
         "COMMAND DOCS is an honest empty map; the registry covers the implemented surface only",
     ),
     d("MGET", Status::Full, "M1", ""),
-    d("MSET", Status::Full, "M1", ""),
+    d(
+        "MSET",
+        Status::Full,
+        "M1",
+        "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); the whole frame is bounded at the bulk cap + 64 KiB (Redis bounds the query buffer separately at 1 GiB)",
+    ),
     d(
         "MSETNX",
         Status::Partial,
@@ -147,7 +157,12 @@ pub static DECLARED: &[Declared] = &[
         "cross-cell keys are check-then-set until M4 transactions; single-cell exact",
     ),
     d("GETRANGE", Status::Full, "M1", ""),
-    d("SETRANGE", Status::Full, "M1", "values bound at 16 MiB − 1 (record format v0)"),
+    d(
+        "SETRANGE",
+        Status::Full,
+        "M1",
+        "values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 (proto-max-bulk-len 16 MiB)",
+    ),
     d(
         "GETEX",
         Status::Full,
@@ -224,12 +239,17 @@ pub static DECLARED: &[Declared] = &[
     d("EXPIRETIME", Status::Full, "M1", "a clamped deadline reads as the u40 bound (ADR-0111)"),
     d("PEXPIRETIME", Status::Full, "M1", "a clamped deadline reads as the u40 bound (ADR-0111)"),
     d("SELECT", Status::Full, "M1", ""),
-    d("CONFIG", Status::Partial, "M1", "typed M1 key subset with frozen hot-reload classes"),
+    d(
+        "CONFIG",
+        Status::Partial,
+        "M1",
+        "typed M1 key subset with frozen hot-reload classes; `proto-max-bulk-len` defaults to 16 MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next MAINTAIN (ADR-0122); `maxclients`/`timeout`/`tcp-keepalive` are accepted and not yet applied (F-L15-05)",
+    ),
     d(
         "CLIENT",
         Status::Partial,
         "M1",
-        "KILL supports the ID filter form; LIST addr/fd are placeholders until peername capture",
+        "KILL supports the ID filter form; LIST/INFO report the tracked fields (id, name, age, resp, db, sub, psub) — addr/fd are placeholders until peername capture, and idle/cmd/tot-*/buffer gauges are untracked zeros",
     ),
     d(
         "LOLWUT",

@@ -1,0 +1,153 @@
+cargo fmt --all --check
+./scripts/check-dep-dag.sh
+dep-dag dev-edge exempt: inf-doc -> inf-alloc (tests may cross layers)
+dep-dag dev-edge exempt: inf-log -> inf-alloc (tests may cross layers)
+dep-dag dev-edge exempt: inf-log -> inf-foundation (tests may cross layers)
+dep-dag dev-edge exempt: inf-log -> inf-runtime (tests may cross layers)
+dep-dag dev-edge exempt: inf-runtime -> inf-log (tests may cross layers)
+dep-dag dev-edge exempt: inf-runtime -> inf-store (tests may cross layers)
+dep-dag dev-edge exempt: inf-store -> inf-foundation (tests may cross layers)
+dep-dag dev-edge exempt: inf-query -> inf-alloc (tests may cross layers)
+dep-dag dev-edge exempt: inf-server -> inf-foundation (tests may cross layers)
+dep-dag dev-edge exempt: inf-server -> inf-simd (tests may cross layers)
+dep-dag dev-edge exempt: inf-server -> inf-runtime (tests may cross layers)
+dep-dag dev-edge exempt: infinityd -> inf-log (tests may cross layers)
+dep-dag dev-edge exempt: crash-matrix -> inf-doc (tests may cross layers)
+dep-dag dev-edge exempt: crash-matrix -> inf-foundation (tests may cross layers)
+dep-dag dev-edge exempt: crash-matrix -> inf-sim (tests may cross layers)
+dep-dag dev-edge exempt: crash-matrix -> inf-alloc (tests may cross layers)
+dep-dag dev-edge exempt: crash-matrix -> inf-fabric (tests may cross layers)
+dep-dag dev-edge exempt: crash-matrix -> inf-runtime (tests may cross layers)
+dep-dag scope: 24 workspace crates, 55 checked edges, 18 dev edges exempt
+dep-dag OK: 24 workspace crates, all edges allowed
+./scripts/check-cell-denylist.sh
+  allowed crates/inf-foundation/src/time.rs:94: the injected clock's real-time origin - the one sanctioned call (L7).
+  allowed crates/inf-server/src/control.rs:27: the cell->control DDL channel (ADR-0015 D3), drained on this thread only.
+  allowed crates/inf-server/src/control.rs:1194: the control thread itself (ADR-0015 D3) - the slow plane, never a cell.
+  allowed crates/inf-server/src/control.rs:1279: boot-narration wall clock on the control thread, never oracle input.
+  allowed crates/inf-server/src/control.rs:1337: boot-narration wall clock on the control thread, never oracle input.
+  allowed crates/inf-server/src/readahead.rs:78: boot-scoped prefetch thread (M2.5-S08, the §3.3 recovery exception).
+  allowed crates/inf-server/src/readahead.rs:93: the prefetch thread parks itself, not a cell.
+cell deny-list OK (16 crates, 159 files, 108804 lines scanned, 18643 test-only lines stripped, 7 allowed sites)
+  excluded crates/inf-probe/src — the boot-time device probe (ADR-0086 D7 / ADR-0091): a dev tool that runs before any cell starts; its own header sanctions Instant::now + std::thread
+./scripts/check-fault-points.sh
+  armed log_append_short_write <- crate-tests
+  armed torn_frame <- crate-tests
+  armed fsync_err <- crate-tests
+  armed manifest_rename_fail <- crate-tests,workspace-tests
+  armed dir_fsync_fail <- crate-tests,workspace-tests
+  armed power_cut_after_seal <- crate-tests
+  armed prealloc_no_space <- crate-tests,workspace-tests
+  armed recycle_open_fail <- crate-tests,dst
+  armed tier_short_write <- workspace-tests
+  armed tier_torn_frame <- workspace-tests
+  armed tier_fsync_err <- workspace-tests
+  armed tier_footer_torn <- workspace-tests
+  armed tier_unlink_fail <- workspace-tests
+  armed tier_dir_open_fail <- dst,unit-tests,workspace-tests
+  armed blob_short_write <- unit-tests,workspace-tests
+  armed blob_fsync_err <- unit-tests,workspace-tests
+  armed blob_unlink_fail <- unit-tests,workspace-tests
+  armed tier_write_nospace <- crate-tests,workspace-tests
+  armed blob_write_nospace <- crate-tests,workspace-tests
+  armed durable_fsync_eio <- workspace-tests
+  armed shadow_twin_read_fail <- dst
+  armed shadow_reconcile_read_fail <- crate-tests,dst
+  armed cold_enqueue_full <- crate-tests
+  armed mset_midway_oom <- crate-tests
+  armed ns_drop_before_meta <- crate-tests
+  armed ns_drop_after_meta <- crate-tests
+  armed ns_create_after_meta <- crate-tests
+  armed ns_create_fan_refused <- crate-tests
+  armed idx_reserve_refuse <- crate-tests
+  armed idx_apply_trip <- crate-tests,dst,workspace-tests
+  armed idx_backfill_trip <- crate-tests
+fault-point inventory OK (31 points / 4 declaration modules, 20 production files scanned for firing, 130 exerciser files scanned for arming (window +/-2 lines))
+./scripts/check-fsync-fail-stop.sh
+  audited crates/inf-log/src/blob.rs:126 — Display arm: renders, never handles
+  audited crates/inf-log/src/blob.rs:143 — is_retryable classifier: false — the ADR-0061 D3 typed abort is never retried
+  audited crates/inf-log/src/blob.rs:387 — blob_fsync_err injection: constructs and returns typed
+  audited crates/inf-log/src/blob.rs:392 — the extent barrier: mapped to ExtentWriteFailure::Fsync and propagated with `?`
+  audited crates/inf-log/src/commit.rs:1095 — freezes the watermark so the loss is observable and nameable; every caller fail-stops the cell next (§8.4) — this never resumes a commit
+  audited crates/inf-log/src/flush.rs:115 — Display arm: renders, never handles
+  audited crates/inf-log/src/flush.rs:135 — is_fatal classifier: answers true, takes no action
+  audited crates/inf-log/src/flush.rs:147 — is_retryable classifier: answers false — the rule that forbids the fsyncgate retry
+  audited crates/inf-log/src/flush.rs:865 — conversion between the two typed fsync errors; still propagating
+  audited crates/inf-log/src/segment.rs:237 — the type itself — an fsync failure's identity; constructed only in this file
+  audited crates/inf-log/src/segment.rs:243 — Display for the typed error: renders, never recovers
+  audited crates/inf-log/src/segment.rs:250 — Error::source for the typed error: renders the chain, never recovers
+  audited crates/inf-log/src/segment.rs:277 — the LogError variant declaration
+  audited crates/inf-log/src/segment.rs:297 — Display arm: renders the failure, never handles it
+  audited crates/inf-log/src/segment.rs:307 — Error::source arm: hands out the io::Error, never handles it
+  audited crates/inf-log/src/segment.rs:1452 — fsync_err injection: constructs and returns typed — nothing catches it
+  audited crates/inf-log/src/segment.rs:1463 — the seal fsync: mapped to LogError::Fsync and propagated with `?`
+  audited crates/inf-log/src/segment.rs:1733 — dir_fsync_fail injection: constructs and returns typed
+  audited crates/inf-log/src/segment.rs:1739 — the dir barrier: mapped to LogError::Fsync and returned
+  audited crates/inf-log/src/tier.rs:102 — Display arm: renders, never handles
+  audited crates/inf-log/src/tier.rs:996 — tier_fsync_err injection (sync): constructs and returns typed
+  audited crates/inf-log/src/tier.rs:1001 — the tier sync barrier: mapped to TierWriteFailure::Fsync and propagated with `?`
+  audited crates/inf-log/src/tier.rs:1048 — tier_fsync_err injection (seal): constructs and returns typed
+  audited crates/inf-log/src/tier.rs:1053 — the tier seal barrier: mapped to TierWriteFailure::Fsync and propagated with `?`
+  audited crates/inf-server/src/durable.rs:1371 — records the freeze for the ledger; the very next statement is fail_stop() -> !, so the SyncReason has no reader and no path continues
+  audited crates/inf-server/src/tier_cell.rs:876 — reactor-drive flush barrier: constructs and returns to maintain_ns, which routes it to DurableCell::fail_stop (ADR-0084 D4)
+fsync fail-stop OK (6 derived fsync-error patterns, 217 files / 156729 lines scanned, 26 typed sites (26 audited), 36 raw sync call sites)
+./scripts/check-panic-policy.sh
+panic-policy grep OK (16 crates, 159 files, 108804 lines scanned, 18643 test-only lines stripped, 5 inline cfg(test) items scanned as production, 0 allowed sites, 0 naked unwrap)
+  excluded crates/inf-probe/src — the boot-time device probe (ADR-0086 D7 / ADR-0091): a dev tool that runs before any cell starts; its own header sanctions Instant::now + std::thread
+# ADR-0107 D2 (review 2026-08-30, Theme 4): every release assert/expect/
+# panic/unreachable in cell code is a classified inventory row.
+./scripts/check-release-asserts.sh
+release-assert inventory OK (16 crates, 159 files, 108804 lines scanned, /tmp/tmp.1TdbGLUo6C/stripped/crates/inf-wire/src/parser.rs test-only lines stripped, 913 release-panic sites in 709 identities; inventory 709 rows (I=704 C=200 F=9 U=0); 88 proof pointers resolved)
+  excluded crates/inf-probe/src — the boot-time device probe (ADR-0086 D7 / ADR-0091): a dev tool that runs before any cell starts; its own header sanctions Instant::now + std::thread
+./scripts/check-safety-inventory.sh
+safety-inventory OK: 22 crates, 217 Rust files, 22 unsafe-bearing files; every unsafe file has an exact inventory path
+# ADR-0121 (review 2026-08-30, F-L17-09): every crate root forbids or
+# denies unsafe_code, the deny set is the audited-leaf list, and every
+# allow is module-scoped — the §17.3 posture, mechanical.
+./scripts/check-unsafe-roots.sh
+unsafe-roots OK: 25 crate roots, 8 deny crates (inf-alloc, inf-doc, inf-fabric, inf-probe, inf-runtime, inf-server, inf-sim, inf-simd), 23 module-scoped allows; every root governed, every allow a named module of a listed leaf
+# ADR-0107 (review 2026-08-30, F-L16-01): no normal dependency edge may
+# request fault-points/collision-oracle — a workspace build would link
+# infinityd against a colliding hasher.
+./scripts/check-shipping-features.sh
+shipping-feature fence OK (31 manifests scanned, 2 forwarder feature(s) declared; resolver: workspace normal-edge inf-foundation features = {default}; infinityd, inf clean)
+# ADR-0106: the gates above must go red on a planted violation, or
+# their OK is a claim (review 2026-08-30 P1/P1c: two were inert).
+./scripts/check-scripts-selftest.sh
+check-scripts self-test OK (180 cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory each red on a planted violation)
+# ADR-0106 first amendment (review 2026-08-30 F-L18-05): the ambient-
+# clock ban is clippy's type-resolved disallowed-methods; this gate
+# proves the config is in force on planted bypass spellings and lists
+# every sanctioned site in cell code.
+./scripts/check-clock-ban.sh
+  allowed crates/inf-foundation/src/time.rs:92: the injected clock's real-time origin (L7)
+  allowed crates/inf-foundation/src/time.rs:106: the injected clock's one real-clock read (L7)
+  allowed crates/inf-server/src/control.rs:1274: control thread (ADR-0015 D3): boot narration, never oracle input
+  allowed crates/inf-server/src/control.rs:1332: control thread (ADR-0015 D3): boot narration, never oracle input
+  allowed crates/inf-server/src/control.rs:1341: control thread (ADR-0015 D3): boot narration, never oracle input
+  allowed crates/inf-server/src/control.rs:1375: control thread (ADR-0015 D3): boot narration, never oracle input
+clock ban OK (config 9/9 entries, 0 shadow configs, 16 cell crates / 160 files scanned, 6 allowed sites in cell code; probe: 12 planted bypasses red, 3 controls green)
+  excluded crates/inf-probe/src — the boot-time device probe (ADR-0086 D7 / ADR-0091): a dev tool that runs before any cell starts; its own header sanctions Instant::now + std::thread
+# ADR-0106 second amendment (review 2026-08-30, F-L20-03): the M0-S06
+# AC's own gate ran nowhere and scanned zero instructions per waker.
+./scripts/check-waker-atomics.sh
+  unfollowed callees (no body in this asm): memcpy memmove _RNvCsfLfy6EI15iL_7___rustc14___rust_dealloc _RNvNtCsgEmfK2I1SDS_4core4cell22panic_already_borrowed _Unwind_Resume _ZN5alloc7raw_vec19RawVec$LT$T$C$A$GT$8grow_one17h41221b4543d1f011E 
+waker-atomics OK (elf asm, vtable-resolved: 4 wakers + 3 called bodies, 208 instruction lines scanned, 6 unresolved edges, 0 zero-instruction bodies; probe: 3 planted wakers red, 2 controls green)
+cargo clippy --workspace --all-targets -- -D warnings
+    Checking inf-wire v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-wire)
+   Compiling infinityd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/infinityd)
+    Checking inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+error: useless use of `format!`
+   --> crates/inf-wire/tests/parser.rs:313:21
+    |
+313 |     let mut frame = format!("*3\r\n$3\r\nSET\r\n$255\r\n").into_bytes();
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.to_string()`: `"*3\r\n$3\r\nSET\r\n$255\r\n".to_string()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#useless_format
+    = note: `-D clippy::useless-format` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::useless_format)]`
+
+error: could not compile `inf-wire` (test "parser") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: Recipe `check` failed on line 35 with exit code 101
+exit=101

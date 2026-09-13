@@ -448,6 +448,27 @@ pub struct ConnCx {
     pub program: bool,
 }
 
+impl ConnCx {
+    /// Mirrors db and subscription counts into the cell's client registry
+    /// (F-L15-09) — called where they change, so `CLIENT LIST` from any
+    /// connection reads tracked state. `program` contexts (fabric legs)
+    /// are never clients and never register.
+    pub(crate) fn publish_client_state(&self, now: Nanos) {
+        if self.program {
+            return;
+        }
+        let sub = u32::try_from(self.sub_channels.len()).unwrap_or(u32::MAX);
+        let psub = u32::try_from(self.sub_patterns.len()).unwrap_or(u32::MAX);
+        self.node.clients.borrow_mut().note_conn_state(
+            self.id,
+            now.as_millis(),
+            self.db,
+            sub,
+            psub,
+        );
+    }
+}
+
 impl Default for ConnCx {
     fn default() -> ConnCx {
         ConnCx {
@@ -584,7 +605,7 @@ pub fn execute(
         // ---- keyspace-level commands (M1-E3/E4) ----
         CommandId::Select => {
             let mut w = RespWriter::new(out, cx.proto);
-            select(argv, ks, cx, &mut w);
+            select(argv, ks, cx, now, &mut w);
         }
         CommandId::Flushall => {
             let mut w = RespWriter::new(out, cx.proto);
@@ -625,7 +646,7 @@ pub fn execute(
         CommandId::InfNs => {
             let node = Rc::clone(&cx.node);
             let mut w = RespWriter::new(out, cx.proto);
-            admin::inf_ns(argv, ks, cx, &node, &mut w);
+            admin::inf_ns(argv, ks, cx, &node, now, &mut w);
         }
         // ---- pub/sub (M1-S10): conn-state ops here; registries, delivery,
         // and fan-out are plane state, so inside a node the plane intercepts
@@ -639,7 +660,7 @@ pub fn execute(
                 pubsub::SubKind::Pattern
             };
             let names: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
-            pubsub::apply_subscribe(&names, kind, cx, out);
+            pubsub::apply_subscribe(&names, kind, cx, now, out);
         }
         CommandId::Unsubscribe | CommandId::Punsubscribe => {
             let kind = if meta.id == CommandId::Unsubscribe {
@@ -649,7 +670,7 @@ pub fn execute(
             };
             let names: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
             let names = if names.is_empty() { None } else { Some(names.as_slice()) };
-            pubsub::apply_unsubscribe(names, kind, cx, out);
+            pubsub::apply_unsubscribe(names, kind, cx, now, out);
         }
         CommandId::Publish => pubsub::publish_fallback(argv.arg(1), argv.arg(2), cx, out),
         CommandId::Pubsub => {
@@ -1502,13 +1523,20 @@ fn object_subcommand_error(sub: &[u8], w: &mut RespWriter<'_>) {
 /// `SELECT 0..15` maps to the default namespaces (M1-S08). The selection
 /// is connection state — the plane serializes it in pipeline order exactly
 /// like HELLO's protocol switch (a conn-state barrier).
-fn select(argv: &(impl Argv + ?Sized), ks: &mut Keyspace, cx: &mut ConnCx, w: &mut RespWriter<'_>) {
+fn select(
+    argv: &(impl Argv + ?Sized),
+    ks: &mut Keyspace,
+    cx: &mut ConnCx,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) {
     match parse_i64(argv.arg(1)) {
         Ok(n @ 0..=15) => {
             cx.db = n as u16;
             cx.ns = ConnNamespace::Default; // explicit escape from a required default
             // Materialize eagerly: a SELECTed db is about to be used.
             let _ = ks.db_mut(n as usize);
+            cx.publish_client_state(now);
             w.simple("OK");
         }
         Ok(_) => w.error("ERR DB index is out of range"),

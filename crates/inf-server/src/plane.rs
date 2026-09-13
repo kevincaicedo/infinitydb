@@ -453,6 +453,13 @@ impl<T> ConnSlab<T> {
             .map(|(slot, _)| ConnKey { slot: slot as u32, generation: self.gens[slot] })
             .collect()
     }
+
+    /// Every live connection, in slot order (the config sweep).
+    fn for_each_mut(&mut self, mut f: impl FnMut(&mut T)) {
+        for conn in self.slots.iter_mut().flatten() {
+            f(conn);
+        }
+    }
 }
 
 // ---- shared cell state (futures hold an Rc) -----------------------------------
@@ -514,6 +521,9 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// Parsed `client-output-buffer-limit pubsub` `(hard, soft, soft_ms)`
     /// (M1-S11); refreshed by the MAINTAIN config sweep. Zeros disable.
     cob_pubsub: Cell<(u64, u64, u64)>,
+    /// `proto-max-bulk-len` as parser limits (ADR-0122): taken by every
+    /// accept, pushed to every live parser by the same sweep.
+    parser_limits: Cell<ParserLimits>,
     /// The durable plane (M2-S08, ADR-0015): `None` = memory-only cell —
     /// the zero-cost branch every memory-path check reduces to (M2-S09).
     durable: RefCell<Option<DurableCell<F>>>,
@@ -1589,6 +1599,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 pub_queue: RefCell::new(VecDeque::new()),
                 pub_pump_active: Cell::new(false),
                 cob_pubsub: Cell::new((0, 0, 0)),
+                parser_limits: Cell::new(ParserLimits::default()),
                 durable: RefCell::new(None),
                 tier: RefCell::new(None),
                 ns_drop_releases: RefCell::new(Vec::new()),
@@ -2279,7 +2290,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 let ns = self.conn_default_ns();
                 let inserted = self.shared.conns.borrow_mut().insert(Conn {
                     fd,
-                    parser: ConnParser::new(ParserLimits::default()),
+                    parser: ConnParser::new(self.shared.parser_limits.get()),
                     cx: ConnCx {
                         proto: Protocol::Resp2,
                         id: 0,
@@ -2886,7 +2897,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                                 out,
                             );
                             let mut w = RespWriter::new(out, conn_cx.proto);
-                            w.error(&format!("ERR Protocol error: {e:?}"));
+                            // Display, not Debug (batch 45): the Redis
+                            // phrasing the compat harness diffs.
+                            w.error(&format!("ERR Protocol error: {e}"));
                             protocol_error = true;
                             break;
                         }
@@ -3069,6 +3082,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             self.shared
                 .cob_pubsub
                 .set(crate::config::pubsub_output_limit(&self.shared.node.config.borrow()));
+            // `proto-max-bulk-len` (ADR-0122 D2): the accept-time limits,
+            // and every live parser of this cell — bounded by the slab,
+            // once per config change, never per command.
+            let limits = crate::config::parser_limits(&self.shared.node.config.borrow());
+            if limits != self.shared.parser_limits.get() {
+                self.shared.parser_limits.set(limits);
+                self.shared.conns.borrow_mut().for_each_mut(|conn| conn.parser.set_limits(limits));
+            }
         }
         // ---- eviction slice (M1-S06/S07): budgeted clock/CMS sweep toward
         // the low watermark + CMS decay. A no-op without a configured limit
@@ -5710,12 +5731,13 @@ async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
             let adding = matches!(id, CommandId::Subscribe | CommandId::Psubscribe);
             let names: Vec<&[u8]> = argv[1..].to_vec();
             let mut frames = shared.take_reply_buf();
+            let now = shared.now.get();
             let Some(changes) = shared.with_conn(key, |conn| {
                 if adding {
-                    pubsub::apply_subscribe(&names, kind, &mut conn.cx, &mut frames)
+                    pubsub::apply_subscribe(&names, kind, &mut conn.cx, now, &mut frames)
                 } else {
                     let names = (!names.is_empty()).then_some(names.as_slice());
-                    pubsub::apply_unsubscribe(names, kind, &mut conn.cx, &mut frames)
+                    pubsub::apply_unsubscribe(names, kind, &mut conn.cx, now, &mut frames)
                 }
             }) else {
                 return false;

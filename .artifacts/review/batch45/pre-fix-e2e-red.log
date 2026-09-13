@@ -1,0 +1,38 @@
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.14s
+     Running tests/node_e2e.rs (target/debug/deps/node_e2e-a1d69910f64808e6)
+
+running 3 tests
+test proto_max_bulk_len_is_enforced_and_applies_to_live_connections ... FAILED
+test info_names_every_field_once_on_a_multi_cell_node ... FAILED
+test client_list_reports_the_db_and_subscriptions_of_another_connection ... FAILED
+
+failures:
+
+---- proto_max_bulk_len_is_enforced_and_applies_to_live_connections stdout ----
+
+thread 'proto_max_bulk_len_is_enforced_and_applies_to_live_connections' (520249) panicked at crates/inf-server/tests/node_e2e.rs:6630:5:
+assertion `left == right` failed: the declared default is the record-bound cap
+  left: 536870912
+ right: 16777216
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- info_names_every_field_once_on_a_multi_cell_node stdout ----
+
+thread 'info_names_every_field_once_on_a_multi_cell_node' (520248) panicked at crates/inf-server/tests/node_e2e.rs:6707:5:
+INFO names a field more than once: ["doc_arena_bytes", "doc_intern_bytes", "doc_path_cache_bytes", "doc_resident_bytes", "doc_scratch_bytes", "doc_slack_bytes", "doc_tape_bytes", "evicted_keys", "idx_slack_bytes", "idx_tree_bytes", "total_connections_received"]
+
+---- client_list_reports_the_db_and_subscriptions_of_another_connection stdout ----
+
+thread 'client_list_reports_the_db_and_subscriptions_of_another_connection' (520247) panicked at crates/inf-server/tests/node_e2e.rs:6747:5:
+id=0 addr=0.0.0.0:0 laddr=0.0.0.0:0 fd=-1 name= age=0 idle=0 flags=N db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 tot-net-in=0 tot-net-out=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd=client user=default redir=-1 resp=2 lib-name= lib-ver= tot-cmds=0
+
+
+failures:
+    client_list_reports_the_db_and_subscriptions_of_another_connection
+    info_names_every_field_once_on_a_multi_cell_node
+    proto_max_bulk_len_is_enforced_and_applies_to_live_connections
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 75 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p inf-server --test node_e2e`

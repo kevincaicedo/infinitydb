@@ -387,3 +387,91 @@ fn node_fanout_and_tier_match_redis_under_namespace() {
     );
     assert!(failures.is_empty(), "{} ns-lane mismatches:\n{}", failures.len(), failures.join("\n"));
 }
+
+/// Batch 45 (review 2026-08-30, F-L15-04): values up to the record bound
+/// round-trip byte-exact on both engines — 2 MiB (the size the finding
+/// proved closed the connection) and `MAX_VAL_LEN` under a 255-byte key.
+/// One byte past `proto-max-bulk-len` is the pinned deviation: Redis
+/// (512 MiB default) answers `+OK`; the node refuses from the bulk
+/// header, exactly as Redis does past *its* cap, and closes.
+#[test]
+fn large_values_match_redis_up_to_the_bulk_cap() {
+    let Some((_node_guard, mut node)) = infinityd(4, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let Some((_oracle_guard, mut oracle)) = oracle() else {
+        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        return;
+    };
+    let mut nb = Vec::new();
+    let mut ob = Vec::new();
+    let mut failures = Vec::new();
+    let key255 = "k".repeat(255);
+    for (label, key, len) in [
+        ("2 MiB", "big:2mib", 2usize << 20),
+        ("MAX_VAL_LEN under a 255-byte key", key255.as_str(), (16usize << 20) - 1),
+    ] {
+        let value = "v".repeat(len);
+        let o = cmd(&mut oracle, &mut ob, &["SET", key, &value]);
+        let n = cmd(&mut node, &mut nb, &["SET", key, &value]);
+        assert_pair(&o, &n, &format!("SET {label}"), &mut failures);
+        let o = cmd(&mut oracle, &mut ob, &["GET", key]);
+        let n = cmd(&mut node, &mut nb, &["GET", key]);
+        assert_pair(&o, &n, &format!("GET {label}"), &mut failures);
+        let bulk_len = format!("${len}\r\n").len() + len + 2;
+        assert_eq!(o.len(), bulk_len, "GET {label}: the whole value came back");
+    }
+    assert!(
+        failures.is_empty(),
+        "{} large-value mismatches:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+
+    let over = (16usize << 20) + 1;
+    let o = cmd(&mut oracle, &mut ob, &["SET", "over", &"v".repeat(over)]);
+    assert_eq!(o, b"+OK\r\n", "the oracle admits one byte past our default cap");
+    // Header only: the node rejects from the declared length, before any payload.
+    node.write_all(format!("*3\r\n$3\r\nSET\r\n$4\r\nover\r\n${over}\r\n").as_bytes())
+        .expect("write");
+    let n = read_frames(&mut node, &mut nb, 1);
+    assert_eq!(
+        n,
+        format!("-ERR Protocol error: invalid bulk length: {over} exceeds limit 16777216\r\n")
+            .into_bytes(),
+        "{:?}",
+        String::from_utf8_lossy(&n)
+    );
+    let mut rest = Vec::new();
+    std::io::Read::read_to_end(&mut node, &mut rest).expect("read to close");
+    assert!(rest.is_empty(), "the protocol error closes the connection");
+    println!("compat-diff large-value lane: 2 MiB + MAX_VAL_LEN byte-exact, 16 MiB + 1 pinned");
+}
+
+/// Batch 45 (review 2026-08-30, F-L15-06) at the binary: a spawned 4-cell
+/// `infinityd` (the memory board wired, `memory_scope:node`) names every
+/// `INFO` field once, so a flat-map client sees one scope per name.
+#[test]
+fn info_names_every_field_once_on_a_real_node() {
+    let Some((_node_guard, mut node)) = infinityd(4, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let mut nb = Vec::new();
+    assert_eq!(cmd(&mut node, &mut nb, &["SET", "k", "v"]), b"+OK\r\n");
+    let reply = cmd(&mut node, &mut nb, &["INFO"]);
+    let text = String::from_utf8_lossy(&reply);
+    let body = text.split_once("\r\n").expect("bulk header").1;
+    let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+    for line in body.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let (name, _) = line.split_once(':').unwrap_or_else(|| panic!("no ':' in {line:?}"));
+        *seen.entry(name).or_default() += 1;
+    }
+    let twice: Vec<&str> = seen.iter().filter(|(_, n)| **n > 1).map(|(k, _)| *k).collect();
+    assert!(twice.is_empty(), "INFO names a field more than once: {twice:?}");
+    assert!(body.contains("memory_scope:node\r\n"), "{body}");
+    assert!(body.contains("tripwire_scope:cell\r\n"), "{body}");
+    assert!(body.contains("used_memory_doc_resident:"), "{body}");
+    assert!(body.contains("\r\ndoc_resident_bytes:"), "{body}");
+}

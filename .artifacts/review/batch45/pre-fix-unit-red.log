@@ -1,0 +1,50 @@
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.06s
+     Running unittests src/lib.rs (target/debug/deps/inf_server-3e7bd2822375684f)
+
+running 3 tests
+test config::tests::proto_max_bulk_len_default_is_the_cap_the_parser_enforces ... FAILED
+test admin::tests::client_info_reports_the_selected_db_and_subscription_counts ... FAILED
+test admin::tests::info_all_names_every_field_once ... FAILED
+
+failures:
+
+---- config::tests::proto_max_bulk_len_default_is_the_cap_the_parser_enforces stdout ----
+
+thread 'config::tests::proto_max_bulk_len_default_is_the_cap_the_parser_enforces' (519360) panicked at crates/inf-server/src/config.rs:376:9:
+assertion `left == right` failed
+  left: 536870912
+ right: 1048576
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- admin::tests::client_info_reports_the_selected_db_and_subscription_counts stdout ----
+
+thread 'admin::tests::client_info_reports_the_selected_db_and_subscription_counts' (519358) panicked at crates/inf-server/src/admin.rs:2143:9:
+id=1 addr=0.0.0.0:0 laddr=0.0.0.0:0 fd=-1 name= age=0 idle=0 flags=N db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 tot-net-in=0 tot-net-out=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd=client user=default redir=-1 resp=3 lib-name= lib-ver= tot-cmds=0
+
+---- admin::tests::info_all_names_every_field_once stdout ----
+
+thread 'admin::tests::info_all_names_every_field_once' (519359) panicked at crates/inf-server/src/admin.rs:2115:68:
+no ':' in "$9797"
+
+
+failures:
+    admin::tests::client_info_reports_the_selected_db_and_subscription_counts
+    admin::tests::info_all_names_every_field_once
+    config::tests::proto_max_bulk_len_default_is_the_cap_the_parser_enforces
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 131 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-server --lib`
+
+thread 'admin::tests::info_all_names_every_field_once' (519680) panicked at crates/inf-server/src/admin.rs:2119:9:
+INFO names a field more than once: ["doc_arena_bytes", "doc_intern_bytes", "doc_path_cache_bytes", "doc_resident_bytes", "doc_scratch_bytes", "doc_slack_bytes", "doc_tape_bytes", "evicted_keys", "idx_slack_bytes", "idx_tree_bytes", "total_connections_received"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    admin::tests::info_all_names_every_field_once
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 133 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-server --lib`

@@ -1,0 +1,22 @@
+   Compiling inf-wire v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-wire)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.30s
+     Running tests/parser.rs (target/debug/deps/parser-9a0190e99533dd1b)
+
+running 1 test
+test a_multibulk_frame_is_bounded_as_a_whole_not_only_per_bulk ... FAILED
+
+failures:
+
+---- a_multibulk_frame_is_bounded_as_a_whole_not_only_per_bulk stdout ----
+
+thread 'a_multibulk_frame_is_bounded_as_a_whole_not_only_per_bulk' (519029) panicked at crates/inf-wire/tests/parser.rs:276:9:
+accumulator exceeded its bound: 384 > 322
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_multibulk_frame_is_bounded_as_a_whole_not_only_per_bulk
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-wire --test parser`

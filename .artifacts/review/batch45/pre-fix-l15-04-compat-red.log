@@ -1,0 +1,21 @@
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling compat v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/tests/compat)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.08s
+     Running tests/node_diff.rs (target/debug/deps/node_diff-414dc14f3498c426)
+
+running 1 test
+
+thread 'large_values_match_redis_up_to_the_bulk_cap' (522320) panicked at tests/compat/tests/node_diff.rs:101:47:
+write: Os { code: 32, kind: BrokenPipe, message: "Broken pipe" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test large_values_match_redis_up_to_the_bulk_cap ... FAILED
+
+failures:
+
+failures:
+    large_values_match_redis_up_to_the_bulk_cap
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.13s
+
+error: test failed, to rerun pass `-p compat --test node_diff`

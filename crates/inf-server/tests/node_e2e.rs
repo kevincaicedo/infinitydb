@@ -6606,3 +6606,157 @@ fn del_of_a_rebuilt_winner_carrying_two_tickets_drains_every_ticket() {
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Reads a `CONFIG GET <one key>` reply (`*2` of bulks) and returns the value.
+fn read_config_value(stream: &mut TcpStream) -> String {
+    assert_eq!(read_line(stream), b"*2\r\n");
+    let _key = read_bulk(stream);
+    String::from_utf8(read_bulk(stream)).expect("ascii")
+}
+
+/// Batch 45 (review 2026-08-30, F-L15-04): `proto-max-bulk-len` is the cap
+/// the parser enforces — `CONFIG GET` answers it, a value under it is
+/// admitted on the local and the fabric path, `CONFIG SET` re-limits the
+/// cell's live connections in the same MAINTAIN that follows the apply and
+/// reaches every cell through the fan. Pre-fix the key answered 512 MiB,
+/// accepted any value, and changed nothing: the cap was a hard-coded
+/// 1 MiB and a 2 MiB `SET` closed the connection.
+#[test]
+fn proto_max_bulk_len_is_enforced_and_applies_to_live_connections() {
+    let node = Node::start(2);
+    let mut a = conn_on_cell(&node, 0);
+    a.write_all(&cmd(&[b"CONFIG", b"GET", b"proto-max-bulk-len"])).expect("write");
+    let declared: usize = read_config_value(&mut a).parse().expect("an integer");
+    assert_eq!(declared, 16 << 20, "the declared default is the record-bound cap");
+
+    // A 2 MiB value: admitted on both owners (one of them crosses the fabric).
+    let two_mib = vec![b'v'; 2 << 20];
+    for cell in 0..2u16 {
+        let key = key_for_cell(2, cell);
+        a.write_all(&cmd(&[b"SET", &key, &two_mib])).expect("write");
+        read_exactly(&mut a, b"+OK\r\n");
+        a.write_all(&cmd(&[b"GET", &key])).expect("write");
+        assert_eq!(read_bulk(&mut a), two_mib, "cell {cell} owner round-trips 2 MiB");
+    }
+
+    // Lower the cap from `a`: `b`, live on the same cell, is re-limited
+    // before `a` even reads its `+OK` (apply → MAINTAIN push → RESPOND).
+    let mut b = conn_on_cell(&node, 0);
+    a.write_all(&cmd(&[b"CONFIG", b"SET", b"proto-max-bulk-len", b"1mb"])).expect("write");
+    read_exactly(&mut a, b"+OK\r\n");
+    let k0 = key_for_cell(2, 0);
+    // The refusal fires from the length line, before any payload: send
+    // the frame up to it (a full 2 MiB write would race the close).
+    let header = |key: &[u8]| {
+        let mut h = format!("*3\r\n$3\r\nSET\r\n${}\r\n", key.len()).into_bytes();
+        h.extend_from_slice(key);
+        h.extend_from_slice(format!("\r\n${}\r\n", two_mib.len()).as_bytes());
+        h
+    };
+    b.write_all(&header(&k0)).expect("write");
+    let line = read_line(&mut b);
+    assert!(
+        line.starts_with(
+            b"-ERR Protocol error: invalid bulk length: 2097152 exceeds limit 1048576"
+        ),
+        "{:?}",
+        String::from_utf8_lossy(&line)
+    );
+    let mut rest = Vec::new();
+    b.read_to_end(&mut rest).expect("read to close");
+    assert!(rest.is_empty(), "a protocol error closes the connection");
+
+    // The fan reaches cell 1: once its `CONFIG GET` shows the value, the
+    // push ran in the same iteration, so a fresh connection there parses
+    // under the new cap.
+    let mut c1 = conn_on_cell(&node, 1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        c1.write_all(&cmd(&[b"CONFIG", b"GET", b"proto-max-bulk-len"])).expect("write");
+        if read_config_value(&mut c1) == "1048576" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the CONFIG fan never reached cell 1");
+    }
+    let mut d1 = conn_on_cell(&node, 1);
+    d1.write_all(&header(&k0)).expect("write");
+    let line = read_line(&mut d1);
+    assert!(line.starts_with(b"-ERR Protocol error: invalid bulk length"), "{line:?}");
+
+    // Redis's floor (1 MiB) is the floor here too.
+    a.write_all(&cmd(&[b"CONFIG", b"SET", b"proto-max-bulk-len", b"512kb"])).expect("write");
+    let line = read_line(&mut a);
+    assert!(line.starts_with(b"-ERR CONFIG SET failed"), "{line:?}");
+
+    // Raised again: a fresh connection admits what the cap admits.
+    a.write_all(&cmd(&[b"CONFIG", b"SET", b"proto-max-bulk-len", b"4mb"])).expect("write");
+    read_exactly(&mut a, b"+OK\r\n");
+    let mut c = conn_on_cell(&node, 0);
+    c.write_all(&cmd(&[b"SET", &k0, &two_mib])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    node.stop();
+}
+
+/// Batch 45 (review 2026-08-30, F-L15-06): one `INFO` reply from a
+/// multi-cell node names every field once, and each section's scope is
+/// disclosed beside its numbers. Pre-fix nine attribution names appeared
+/// twice — node-folded in `# Memory`, this cell's slice in `# Tripwires`.
+#[test]
+fn info_names_every_field_once_on_a_multi_cell_node() {
+    let node = Node::start(2);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"SET", b"k", b"v"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let all = info_text(&mut c, b"all");
+    let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+    for line in all.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let (name, _) = line.split_once(':').unwrap_or_else(|| panic!("no ':' in {line:?}"));
+        *seen.entry(name).or_default() += 1;
+    }
+    let twice: Vec<&str> = seen.iter().filter(|(_, n)| **n > 1).map(|(k, _)| *k).collect();
+    assert!(twice.is_empty(), "INFO names a field more than once: {twice:?}");
+    // This harness assembles no control plane, so the memory section says
+    // `cell`; the board-backed `node` fold is proven by the admin unit
+    // test and by the compat lane's spawned `infinityd`.
+    assert!(all.contains("memory_scope:cell\r\n"), "{all}");
+    assert!(all.contains("tripwire_scope:cell\r\n"), "{all}");
+    // Each section carries its own family only.
+    let memory = info_text(&mut c, b"memory");
+    assert!(memory.contains("used_memory_doc_resident:"), "{memory}");
+    assert!(!memory.contains("doc_resident_bytes:"), "{memory}");
+    let tripwires = info_text(&mut c, b"tripwires");
+    assert!(tripwires.contains("doc_resident_bytes:"), "{tripwires}");
+    assert!(!tripwires.contains("used_memory_doc_resident:"), "{tripwires}");
+    node.stop();
+}
+
+/// Batch 45 (review 2026-08-30, F-L15-09): `CLIENT LIST` from one
+/// connection reports another's selected db and subscription counts.
+/// Pre-fix every line said `db=0 sub=0 psub=0`.
+#[test]
+fn client_list_reports_the_db_and_subscriptions_of_another_connection() {
+    let node = Node::start(2);
+    let mut a = conn_on_cell(&node, 0);
+    let mut b = conn_on_cell(&node, 0);
+    a.write_all(&cmd(&[b"CLIENT", b"ID"])).expect("write");
+    let id_line = read_line(&mut a);
+    let id = String::from_utf8_lossy(&id_line[1..id_line.len() - 2]).to_string();
+    a.write_all(&cmd(&[b"SELECT", b"7"])).expect("write");
+    read_exactly(&mut a, b"+OK\r\n");
+    a.write_all(&cmd(&[b"SUBSCRIBE", b"x", b"y", b"z"])).expect("write");
+    let mut want = Vec::new();
+    for (i, ch) in ["x", "y", "z"].iter().enumerate() {
+        want.extend_from_slice(
+            format!("*3\r\n$9\r\nsubscribe\r\n$1\r\n{ch}\r\n:{}\r\n", i + 1).as_bytes(),
+        );
+    }
+    read_exactly(&mut a, &want);
+    b.write_all(&cmd(&[b"CLIENT", b"LIST"])).expect("write");
+    let list = String::from_utf8(read_bulk(&mut b)).expect("ascii");
+    let line = list
+        .lines()
+        .find(|l| l.starts_with(&format!("id={id} ")))
+        .unwrap_or_else(|| panic!("client {id} missing from CLIENT LIST:\n{list}"));
+    assert!(line.contains(" db=7 sub=3 psub=0 "), "{line}");
+    node.stop();
+}

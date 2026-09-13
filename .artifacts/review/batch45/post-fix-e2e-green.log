@@ -1,0 +1,8 @@
+running 4 tests
+test hello_switch_and_protocol_error_close ... ok
+test client_list_reports_the_db_and_subscriptions_of_another_connection ... ok
+test info_names_every_field_once_on_a_multi_cell_node ... ok
+test proto_max_bulk_len_is_enforced_and_applies_to_live_connections ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 74 filtered out; finished in 0.06s
+

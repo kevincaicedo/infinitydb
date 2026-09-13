@@ -1,0 +1,79 @@
+cargo fmt --all --check
+Diff in /home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server/src/config.rs:211:
+         let text = String::from_utf8_lossy(value).to_string();
+         let normalized = match entry.kind {
+             Kind::Memory => parse_memory(&text)
+[31m-                .filter(|&bytes| entry.key != "proto-max-bulk-len" || bytes >= PROTO_MAX_BULK_LEN_FLOOR)
+(B[m[32m+                .filter(|&bytes| {
+(B[m[32m+                    entry.key != "proto-max-bulk-len" || bytes >= PROTO_MAX_BULK_LEN_FLOOR
+(B[m[32m+                })
+(B[m                 .map(|b| b.to_string())
+                 .ok_or_else(|| ConfigSetError::Invalid {
+                     key: key_str.clone(),
+Diff in /home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server/src/exec.rs:459:
+         }
+         let sub = u32::try_from(self.sub_channels.len()).unwrap_or(u32::MAX);
+         let psub = u32::try_from(self.sub_patterns.len()).unwrap_or(u32::MAX);
+[31m-        self.node.clients.borrow_mut().note_conn_state(self.id, now.as_millis(), self.db, sub, psub);
+(B[m[32m+        self.node.clients.borrow_mut().note_conn_state(
+(B[m[32m+            self.id,
+(B[m[32m+            now.as_millis(),
+(B[m[32m+            self.db,
+(B[m[32m+            sub,
+(B[m[32m+            psub,
+(B[m[32m+        );
+(B[m     }
+ }
+ 
+Diff in /home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server/tests/node_e2e.rs:6656:
+     b.write_all(&header(&k0)).expect("write");
+     let line = read_line(&mut b);
+     assert!(
+[31m-        line.starts_with(b"-ERR Protocol error: invalid bulk length: 2097152 exceeds limit 1048576"),
+(B[m[32m+        line.starts_with(
+(B[m[32m+            b"-ERR Protocol error: invalid bulk length: 2097152 exceeds limit 1048576"
+(B[m[32m+        ),
+(B[m         "{:?}",
+         String::from_utf8_lossy(&line)
+     );
+Diff in /home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-wire/src/lib.rs:16:
+     extract_keys, key_spec, keyspace_scope, lookup,
+ };
+ pub use parser::{
+[31m-    ArgvRef, ConnParser, DEFAULT_MAX_BULK_BYTES, FRAME_HEADROOM_BYTES, FrameIter, INLINE_ARGS, Parsed,
+(B[m[31m-    ParserLimits, WireError,
+(B[m[32m+    ArgvRef, ConnParser, DEFAULT_MAX_BULK_BYTES, FRAME_HEADROOM_BYTES, FrameIter, INLINE_ARGS,
+(B[m[32m+    Parsed, ParserLimits, WireError,
+(B[m };
+ pub use writer::{Protocol, RespWriter};
+ 
+Diff in /home/kcaicedo/Documents/Projects/databases/infinitydb/tests/compat/src/matrixgen.rs:114:
+     d("DECR", Status::Full, "M0", ""),
+     d("INCRBY", Status::Full, "M0", ""),
+     d("DECRBY", Status::Full, "M0", ""),
+[31m-    d("APPEND", Status::Full, "M0", "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122)"),
+(B[m[32m+    d(
+(B[m[32m+        "APPEND",
+(B[m[32m+        Status::Full,
+(B[m[32m+        "M0",
+(B[m[32m+        "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122)",
+(B[m[32m+    ),
+(B[m     d("STRLEN", Status::Full, "M0", ""),
+     d(
+         "EXPIRE",
+Diff in /home/kcaicedo/Documents/Projects/databases/infinitydb/tests/compat/tests/node_diff.rs:422:
+         let bulk_len = format!("${len}\r\n").len() + len + 2;
+         assert_eq!(o.len(), bulk_len, "GET {label}: the whole value came back");
+     }
+[31m-    assert!(failures.is_empty(), "{} large-value mismatches:\n{}", failures.len(), failures.join("\n"));
+(B[m[32m+    assert!(
+(B[m[32m+        failures.is_empty(),
+(B[m[32m+        "{} large-value mismatches:\n{}",
+(B[m[32m+        failures.len(),
+(B[m[32m+        failures.join("\n")
+(B[m[32m+    );
+(B[m 
+     let over = (16usize << 20) + 1;
+     let o = cmd(&mut oracle, &mut ob, &["SET", "over", &"v".repeat(over)]);
+error: Recipe `check` failed on line 6 with exit code 1
+exit=1

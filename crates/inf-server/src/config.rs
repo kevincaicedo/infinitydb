@@ -120,7 +120,10 @@ impl Default for ConfigStore {
                     "noeviction",
                 ),
                 e("maxmemory-samples", ReloadClass::HotPerCell, Kind::Int, "5"),
-                e("proto-max-bulk-len", ReloadClass::Hot, Kind::Memory, "536870912"),
+                // ADR-0122: the parser's bulk cap — the record bound by
+                // default (16 MiB; Redis 512 MiB), floored at Redis's
+                // 1 MiB, pushed to every live parser on the MAINTAIN sweep.
+                e("proto-max-bulk-len", ReloadClass::HotPerCell, Kind::Memory, "16777216"),
                 e("save", ReloadClass::Hot, Kind::Str, "3600 1 300 100 60 10000"),
                 e("tcp-keepalive", ReloadClass::Hot, Kind::Int, "300"),
                 // M4.5-S30 (ADR-0085 D6): read-driven promotion
@@ -207,9 +210,15 @@ impl ConfigStore {
         }
         let text = String::from_utf8_lossy(value).to_string();
         let normalized = match entry.kind {
-            Kind::Memory => parse_memory(&text).map(|b| b.to_string()).ok_or_else(|| {
-                ConfigSetError::Invalid { key: key_str.clone(), value: text.clone() }
-            })?,
+            Kind::Memory => parse_memory(&text)
+                .filter(|&bytes| {
+                    entry.key != "proto-max-bulk-len" || bytes >= PROTO_MAX_BULK_LEN_FLOOR
+                })
+                .map(|b| b.to_string())
+                .ok_or_else(|| ConfigSetError::Invalid {
+                    key: key_str.clone(),
+                    value: text.clone(),
+                })?,
             Kind::Int => text.parse::<i64>().map(|v| v.to_string()).map_err(|_| {
                 ConfigSetError::Invalid { key: key_str.clone(), value: text.clone() }
             })?,
@@ -248,6 +257,22 @@ impl ConfigStore {
     pub fn version(&self) -> u64 {
         self.version
     }
+}
+
+/// Redis's floor for `proto-max-bulk-len` (1 MiB): below it the value is
+/// refused, as Redis refuses it.
+pub const PROTO_MAX_BULK_LEN_FLOOR: u64 = 1024 * 1024;
+
+/// The parser limits `proto-max-bulk-len` names (ADR-0122): applied at
+/// accept and pushed to every live parser of the cell on the MAINTAIN
+/// config sweep. The value was validated at SET, so a parse failure is
+/// the declared default, never a wider cap.
+pub fn parser_limits(cfg: &ConfigStore) -> inf_wire::ParserLimits {
+    let cap = cfg
+        .get("proto-max-bulk-len")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(inf_wire::DEFAULT_MAX_BULK_BYTES);
+    inf_wire::ParserLimits::for_bulk_cap(cap)
 }
 
 /// `client-output-buffer-limit` value as `(class_index, [hard, soft,
@@ -363,6 +388,29 @@ mod tests {
         assert_eq!(cfg.apply(v), ReloadClass::HotPerCell);
         assert_eq!(cfg.get("maxmemory"), Some("104857600"));
         assert_eq!(cfg.version(), 1);
+    }
+
+    /// Batch 45 (review 2026-08-30, F-L15-04): `CONFIG GET proto-max-bulk-len`
+    /// answers the cap the parser enforces — the declared default and the
+    /// wire default are one number.
+    #[test]
+    fn proto_max_bulk_len_default_is_the_cap_the_parser_enforces() {
+        let mut cfg = ConfigStore::default();
+        let declared: usize =
+            cfg.get("proto-max-bulk-len").expect("declared").parse().expect("an integer");
+        assert_eq!(declared, inf_wire::ParserLimits::default().max_bulk_bytes);
+        assert_eq!(parser_limits(&cfg), inf_wire::ParserLimits::default());
+        // A set value is the cap the next accept and the sweep apply.
+        assert_eq!(cfg.set(b"proto-max-bulk-len", b"4mb"), Ok(ReloadClass::HotPerCell));
+        assert_eq!(parser_limits(&cfg).max_bulk_bytes, 4 << 20);
+        assert_eq!(parser_limits(&cfg).max_frame_bytes, (4 << 20) + (64 << 10));
+        // Redis's floor: 1 MiB.
+        assert_eq!(cfg.set(b"proto-max-bulk-len", b"1mb"), Ok(ReloadClass::HotPerCell));
+        assert!(matches!(
+            cfg.set(b"proto-max-bulk-len", b"1048575"),
+            Err(ConfigSetError::Invalid { .. })
+        ));
+        assert_eq!(cfg.get("proto-max-bulk-len"), Some("1048576"));
     }
 
     #[test]

@@ -34,6 +34,7 @@
 
 use std::collections::BTreeMap;
 
+use inf_foundation::time::Nanos;
 use inf_wire::{CommandId, Protocol, RespWriter};
 
 use crate::exec::ConnCx;
@@ -170,6 +171,7 @@ pub(crate) fn apply_subscribe(
     names: &[&[u8]],
     kind: SubKind,
     cx: &mut ConnCx,
+    now: Nanos,
     out: &mut Vec<u8>,
 ) -> Vec<SubChange> {
     let mut changes = Vec::with_capacity(names.len());
@@ -192,6 +194,7 @@ pub(crate) fn apply_subscribe(
         w.int(count);
         changes.push((name.to_vec(), added));
     }
+    cx.publish_client_state(now);
     changes
 }
 
@@ -203,6 +206,7 @@ pub(crate) fn apply_unsubscribe(
     names: Option<&[&[u8]]>,
     kind: SubKind,
     cx: &mut ConnCx,
+    now: Nanos,
     out: &mut Vec<u8>,
 ) -> Vec<SubChange> {
     let targets: Vec<Vec<u8>> = match names {
@@ -242,6 +246,7 @@ pub(crate) fn apply_unsubscribe(
         w.int(count);
         changes.push((name, removed));
     }
+    cx.publish_client_state(now);
     changes
 }
 
@@ -525,7 +530,7 @@ mod tests {
     fn subscribe_frames_and_counts_are_redis_shaped() {
         let mut cx = cx(Protocol::Resp2);
         let mut out = Vec::new();
-        let changes = apply_subscribe(&[b"a", b"b"], SubKind::Channel, &mut cx, &mut out);
+        let changes = apply_subscribe(&[b"a", b"b"], SubKind::Channel, &mut cx, Nanos(1), &mut out);
         assert_eq!(
             out,
             b"*3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:1\r\n*3\r\n$9\r\nsubscribe\r\n$1\r\nb\r\n:2\r\n"
@@ -533,12 +538,12 @@ mod tests {
         assert_eq!(changes, vec![(b"a".to_vec(), true), (b"b".to_vec(), true)]);
         // Re-subscribe: frame still emitted, no state change.
         let mut out = Vec::new();
-        let changes = apply_subscribe(&[b"a"], SubKind::Channel, &mut cx, &mut out);
+        let changes = apply_subscribe(&[b"a"], SubKind::Channel, &mut cx, Nanos(1), &mut out);
         assert_eq!(out, b"*3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:2\r\n");
         assert_eq!(changes, vec![(b"a".to_vec(), false)]);
         // Patterns join the same count.
         let mut out = Vec::new();
-        apply_subscribe(&[b"n.*"], SubKind::Pattern, &mut cx, &mut out);
+        apply_subscribe(&[b"n.*"], SubKind::Pattern, &mut cx, Nanos(1), &mut out);
         assert_eq!(out, b"*3\r\n$10\r\npsubscribe\r\n$3\r\nn.*\r\n:3\r\n");
     }
 
@@ -546,7 +551,7 @@ mod tests {
     fn resp3_confirmations_are_push_frames() {
         let mut cx = cx(Protocol::Resp3);
         let mut out = Vec::new();
-        apply_subscribe(&[b"a"], SubKind::Channel, &mut cx, &mut out);
+        apply_subscribe(&[b"a"], SubKind::Channel, &mut cx, Nanos(1), &mut out);
         assert_eq!(out, b">3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:1\r\n");
     }
 
@@ -554,7 +559,7 @@ mod tests {
     fn unsubscribe_bare_with_nothing_emits_one_nil_frame() {
         let mut cx = cx(Protocol::Resp2);
         let mut out = Vec::new();
-        let changes = apply_unsubscribe(None, SubKind::Channel, &mut cx, &mut out);
+        let changes = apply_unsubscribe(None, SubKind::Channel, &mut cx, Nanos(1), &mut out);
         assert!(changes.is_empty());
         assert_eq!(out, b"*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n");
     }
@@ -563,9 +568,9 @@ mod tests {
     fn unsubscribe_bare_drops_in_subscription_order() {
         let mut cx = cx(Protocol::Resp2);
         let mut out = Vec::new();
-        apply_subscribe(&[b"z", b"a"], SubKind::Channel, &mut cx, &mut out);
+        apply_subscribe(&[b"z", b"a"], SubKind::Channel, &mut cx, Nanos(1), &mut out);
         let mut out = Vec::new();
-        let changes = apply_unsubscribe(None, SubKind::Channel, &mut cx, &mut out);
+        let changes = apply_unsubscribe(None, SubKind::Channel, &mut cx, Nanos(1), &mut out);
         assert_eq!(changes, vec![(b"z".to_vec(), true), (b"a".to_vec(), true)]);
         assert!(cx.sub_channels.is_empty());
     }
@@ -574,8 +579,8 @@ mod tests {
     fn publish_fallback_replies_then_self_delivers_channel_before_pattern() {
         let mut cx = cx(Protocol::Resp3);
         let mut out = Vec::new();
-        apply_subscribe(&[b"news.tech"], SubKind::Channel, &mut cx, &mut out);
-        apply_subscribe(&[b"news.*"], SubKind::Pattern, &mut cx, &mut out);
+        apply_subscribe(&[b"news.tech"], SubKind::Channel, &mut cx, Nanos(1), &mut out);
+        apply_subscribe(&[b"news.*"], SubKind::Pattern, &mut cx, Nanos(1), &mut out);
         let mut out = Vec::new();
         publish_fallback(b"news.tech", b"hi", &mut cx, &mut out);
         // Oracle-pinned order: the receiver count precedes the push frames.
